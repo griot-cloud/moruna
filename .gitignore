@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.orig
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+*.pyd
+
+# Benchmarks and traces
+/bench/data/
+*.trace.arrow
+/profiles/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
