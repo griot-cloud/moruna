@@ -1,6 +1,6 @@
-# Contributing to Morsel
+# Contributing to Amoru
 
-Thank you for considering a contribution. Morsel is designed before it is built, so the most valuable contributions at this stage are to the design documents, and code contributions are expected to trace back to them.
+Thank you for considering a contribution. Amoru is designed before it is built, so the most valuable contributions at this stage are to the design documents, and code contributions are expected to trace back to them.
 
 ## How the project works
 

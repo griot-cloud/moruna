@@ -1,6 +1,6 @@
 # Security policy
 
-Morsel is a runtime that reads files, allocates pinned memory, issues direct IO, and executes user-supplied kernels. Bugs in those paths can have security consequences, and we want to hear about them privately first.
+Amoru is a runtime that reads files, allocates pinned memory, issues direct IO, and executes user-supplied kernels. Bugs in those paths can have security consequences, and we want to hear about them privately first.
 
 ## Reporting
 

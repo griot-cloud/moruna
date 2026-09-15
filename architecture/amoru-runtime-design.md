@@ -1,4 +1,4 @@
-# Morsel Runtime: Architecture Design
+# Amoru: Architecture Design
 
 **Document type:** full architecture design (not an ADR)
 **Status:** DRAFT for review · revision 2 · 2026-09-15 (revision 1: 2026-09-12)
@@ -6,7 +6,7 @@
 **Scope:** a single-process runtime that runs a full pass over a dataset, tabular or tensor, larger than the process's memory budget, applying a transformation a query engine cannot express, at close to the budget's capacity, with no tuning by the user. Explicitly OUT: distributed execution, query planning or optimisation, transformations that need random access across the whole dataset (shuffles, exact pairwise, hierarchical clustering), streaming with per-record latency requirements, and the packing or reclaim policies of any host platform that runs this runtime inside a pod, VM or notebook. Griot Cloud's compute plane is a consumer of this runtime, not part of this document.
 **Companion:** none yet. A Griot Cloud compute plane design (pod sizing, packing, idle reclaim) will consume this document.
 
-"Morsel" is a working name; see open question Q1.
+The runtime is named Amoru (Adaptive MOrsel RUntime). "Morsel" is the unit of work throughout this document, not the product.
 
 ---
 
@@ -104,7 +104,7 @@ Each criterion is testable and each implementation gate in section 9 cites the c
 
 **S6. Breaches degrade, never kill.** Against the adversarial benchmark kernel whose amplification rises fourfold at the midpoint of the dataset, the run either completes within B or terminates with a diagnostic that names the morsel sequence number, its input size, its measured footprint and the budget. It is never terminated by signal.
 
-**S7. A kernel is portable without change.** A kernel crate written against `morsel-kernel` alone compiles into the runtime, into a Polars expression plugin, and into a DataFusion scalar function through three thin wrapper crates that contain no kernel logic.
+**S7. A kernel is portable without change.** A kernel crate written against `amoru-kernel` alone compiles into the runtime, into a Polars expression plugin, and into a DataFusion scalar function through three thin wrapper crates that contain no kernel logic.
 
 **S8. Python kernels are first-class.** Under free-threaded CPython, a GIL-releasing NumPy kernel supplied as a Python callable reaches at least 0.7 times the worker count in speedup over one worker. Under a GIL build, the same run completes correctly and the run report states that Python kernels were GIL-serialised.
 
@@ -243,7 +243,7 @@ A source refuses to know what the kernel will do with a batch. It exposes statis
 
 ### 5.3 Kernel
 
-The contract with the transformation, and the crate boundary that makes portability possible. `morsel-kernel` contains these types and depends only on arrow.
+The contract with the transformation, and the crate boundary that makes portability possible. `amoru-kernel` contains these types and depends only on arrow.
 
 ```rust
 pub trait Kernel: Send + Sync + 'static {
@@ -275,7 +275,7 @@ pub struct KernelHints {
 
 **Python kernels.** `PyKernel` wraps a Python callable or an object with `setup()` and `__call__`. `apply` attaches the worker thread to the interpreter (`Python::attach` in free-threaded PyO3; the GIL acquisition in a GIL build), exports the input across the C Data Interface as a `pyarrow.RecordBatch` or across DLPack as an object any framework can consume with `from_dlpack` (`torch.from_dlpack`, `jax.dlpack`, `cupy.from_dlpack`), calls the object, and imports the returned `pyarrow` batch or any object implementing `__dlpack__` the same way. No copy occurs in either direction, on host or device. `setup()` maps to `init`, so a model loaded in `setup` is a stateful kernel with the instance count taken from a decorator argument. The runtime reads `sys._is_gil_enabled()` at start and records the answer in the run report; a GIL build does not fail the run, it caps the effective parallelism of Python stages at one and says so.
 
-**Portability.** A kernel author implements `Kernel` and nothing else. `morsel-polars` wraps a `Kernel` into a Polars expression plugin by converting the plugin's input Series to a RecordBatch and back; `morsel-datafusion` does the same for a `ScalarUDF`. Both wrappers are under a hundred lines and contain no kernel logic (S7). The runtime is the only host that uses `kind`, `hints` and `init` fully; the others treat every kernel as stateless and call `init` once.
+**Portability.** A kernel author implements `Kernel` and nothing else. `amoru-polars` wraps a `Kernel` into a Polars expression plugin by converting the plugin's input Series to a RecordBatch and back; `amoru-datafusion` does the same for a `ScalarUDF`. Both wrappers are under a hundred lines and contain no kernel logic (S7). The runtime is the only host that uses `kind`, `hints` and `init` fully; the others treat every kernel as stateless and call `init` once.
 
 A kernel refuses to know where its input came from, where its output goes, what morsel size it will be given, or how many workers exist.
 
@@ -405,7 +405,7 @@ pub trait Sizer: Send {
 
 `Envelope` carries the hard bounds derived from the budget and the probe; the controller clamps whatever a sizer proposes to it (D7). `LearnedSizer`, a later phase, fits an online quantile regression from morsel features (rows, per-column bytes, mean string length, null ratio, active workers) to observed peak per input byte, predicting the 95th percentile, and warm-starts from the profile store. When its rolling prediction error exceeds twice `RuleSizer`'s, the controller switches back to `RuleSizer` for the rest of the run and records the switch in the report.
 
-**Profile store.** After every run, the controller writes `{fingerprint, schema_hash, A_k quantiles, morsel_target at end, workers at end, error stats}` as a small JSON record to a profile directory (default `~/.morsel/profiles/`, overridable, disableable). The next run with the same fingerprint and schema starts from those values instead of from defaults, so the second run of a job is efficient from its first morsel. Profiles are advisory: the probe still runs and overrides them on drift.
+**Profile store.** After every run, the controller writes `{fingerprint, schema_hash, A_k quantiles, morsel_target at end, workers at end, error stats}` as a small JSON record to a profile directory (default `~/.amoru/profiles/`, overridable, disableable). The next run with the same fingerprint and schema starts from those values instead of from defaults, so the second run of a job is efficient from its first morsel. Profiles are advisory: the probe still runs and overrides them on drift.
 
 The controller refuses to know how a source reads or how a queue spills. It sets numbers; the components act.
 
@@ -429,26 +429,26 @@ The run report is computed from the trace and the limits alone: peak memory agai
 ### 5.10 Python surface
 
 ```python
-import morsel
+import amoru
 
-@morsel.kernel(stateful=True, instances=1, device_memory=True)
+@amoru.kernel(stateful=True, instances=1, device_memory=True)
 class Score:
     def setup(self):
         self.model = torch.load("model.pt").cuda().eval()
     def __call__(self, batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch:
         ...
 
-report = morsel.run(
-    source=morsel.ParquetSource("s3://bucket/data/", columns=["id", "text"]),
+report = amoru.run(
+    source=amoru.ParquetSource("s3://bucket/data/", columns=["id", "text"]),
     kernels=[normalize, Score()],
-    sink=morsel.ParquetSink("s3://bucket/scored/"),
+    sink=amoru.ParquetSink("s3://bucket/scored/"),
     budget=None,            # discovered; a string like "6GiB" overrides
     trace="./trace.arrow",  # optional
 )
 print(report)
 ```
 
-A plain function is a stateless kernel. Kernels may also be Polars expressions (`morsel.polars(lambda df: ...)`, applied per morsel through the lazy API) or Rust plugins loaded by name. The package is built with maturin as version-specific wheels for CPython 3.13 and 3.14, GIL and free-threaded (abi3 cannot target free-threaded builds). `morsel.run` refuses to start if a kernel is Python and the interpreter reports the GIL enabled, unless `allow_gil=True`, in which case it proceeds serialised and the report says so.
+A plain function is a stateless kernel. Kernels may also be Polars expressions (`amoru.polars(lambda df: ...)`, applied per morsel through the lazy API) or Rust plugins loaded by name. The package is built with maturin as version-specific wheels for CPython 3.13 and 3.14, GIL and free-threaded (abi3 cannot target free-threaded builds). `amoru.run` refuses to start if a kernel is Python and the interpreter reports the GIL enabled, unless `allow_gil=True`, in which case it proceeds serialised and the report says so.
 
 ---
 
@@ -456,7 +456,7 @@ A plain function is a stateless kernel. Kernels may also be Polars expressions (
 
 The runtime has to be the same library in five hosts, and the design must say what changes in each.
 
-**A pod or container with cgroup v2 limits.** Discovery reads the cgroup; the budget is `memory.high` if the platform set one, otherwise 90% of `memory.max`; workers from `cpu.max`. The runtime holds anon memory below the ceiling and lets the kernel reclaim page cache and spill mappings. Spill goes to the pod's ephemeral volume and is bounded by its limit when discoverable from the downward API, otherwise by the 20% rule. A platform that wants the runtime to behave differently (a tighter reserve, a fixed spill path) sets environment variables `MORSEL_BUDGET`, `MORSEL_SPILL_DIR`, `MORSEL_SPILL_LIMIT`; there is no configuration file.
+**A pod or container with cgroup v2 limits.** Discovery reads the cgroup; the budget is `memory.high` if the platform set one, otherwise 90% of `memory.max`; workers from `cpu.max`. The runtime holds anon memory below the ceiling and lets the kernel reclaim page cache and spill mappings. Spill goes to the pod's ephemeral volume and is bounded by its limit when discoverable from the downward API, otherwise by the 20% rule. A platform that wants the runtime to behave differently (a tighter reserve, a fixed spill path) sets environment variables `AMORU_BUDGET`, `AMORU_SPILL_DIR`, `AMORU_SPILL_LIMIT`; there is no configuration file.
 
 **A single-node Databricks cluster.** There is no cgroup limit on the driver process that reflects the user's intent, and a JVM holds a large fraction of the machine. Discovery falls back to OS totals, which would be wrong, so this host is the one where an explicit budget is expected: the documented pattern is `budget=` set from the cluster's driver memory minus the JVM's configured heap. Spill defaults to `/local_disk0`. Spark is not used; the runtime reads Parquet from DBFS or the object store directly through object_store. The report notes `LimitSource::Explicit`.
 
@@ -466,9 +466,9 @@ The runtime has to be the same library in five hosts, and the design must say wh
 
 **A host with RDMA-capable networking and a storage peer that speaks it.** Not a v1 host. The arena is registered with the NIC at start, and an `RdmaSource` behind the Source trait receives morsels written directly into it by the peer (AIStor's S3 over RDMA is one such peer; a storage daemon that decodes Parquet on the storage side and pushes Arrow morsels is another, and would be Griot's own). On a single machine RDMA is meaningless; the equivalent, a shared-memory Arrow region between the storage process and the runtime, is a `SharedMemorySource` and is the recommended way for any co-located gate or proxy to feed the runtime without a copy.
 
-**Inside another engine.** `morsel-polars` and `morsel-datafusion` host a kernel, not the runtime. In those hosts the engine schedules, the engine sizes, and the kernel is a stateless batch function; the runtime's controller is absent. This is by design: the runtime cannot take over an engine's scheduler, and the kernel crate is what carries across.
+**Inside another engine.** `amoru-polars` and `amoru-datafusion` host a kernel, not the runtime. In those hosts the engine schedules, the engine sizes, and the kernel is a stateless batch function; the runtime's controller is absent. This is by design: the runtime cannot take over an engine's scheduler, and the kernel crate is what carries across.
 
-**Crate layout** that makes this true: `morsel-kernel` (traits, Morsel, Payload, features; depends on arrow and dlpark only), `morsel-runtime` (everything in section 5 except 5.3's trait and 5.10), `morsel-py` (PyO3 bindings, depends on runtime), `morsel-polars` and `morsel-datafusion` (bridges, depend on kernel only). A kernel author's crate depends on `morsel-kernel` alone.
+**Crate layout** that makes this true: `amoru-kernel` (traits, Morsel, Payload, features; depends on arrow and dlpark only), `amoru-runtime` (everything in section 5 except 5.3's trait and 5.10), `amoru-py` (PyO3 bindings, depends on runtime), `amoru-polars` and `amoru-datafusion` (bridges, depend on kernel only). A kernel author's crate depends on `amoru-kernel` alone.
 
 ---
 
@@ -547,7 +547,7 @@ The runtime has to be the same library in five hosts, and the design must say wh
 A synthetic Parquet generator with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio, and row-group size; it writes to local disk and to an S3-compatible store (MinIO in a container). Five kernels: **identity** (IO-bound, A about 1); **normalise** (regex over a text column in Rust, A about 1.5); **tokenise-explode** (splits text into a list column and explodes, A 5 to 10); **wide-intermediate** (a Python NumPy kernel that materialises a float matrix per batch, A about 20, releases the GIL); **adversarial** (A jumps 4x at the midpoint of the dataset). Two tensor kernels from Phase 5 on: **embed-score** (numeric Arrow columns crossed to a tensor, a small matrix multiply, result crossed back as a column; host and, where present, device) and **torch-score** (a stateful PyTorch model on a GPU host, weights in safetensors read by TensorSource). A tensor-only dataset generator writes safetensors and aligned binary at controllable sizes. A **hand-tuned baseline** script for each: a plain loop over row groups with a fixed batch size and a fixed thread count, grid-searched, reported as rows per second. All gates run inside a container with `--memory` and `--cpus` set, and on the bare host.
 
 ### Phase 0: contract and skeleton
-Deliverables: `morsel-kernel` with `Kernel`, `Morsel`, `Payload` (both variants, `Tier` with only `Host` exercised), `MorselFeatures`, `KernelKind`, `KernelHints`, `PayloadSpec`; `morsel-runtime` with the host arena (unpinned, huge pages where offered), `ParquetSource` (plan from footers, read with projection and row selection into arena buffers), `ParquetSink`, a single-threaded driver that runs source → kernels → sink with fixed 128 MB morsels; the trace writer with the 5.9 schema; the benchmark generator and the identity kernel. Gate: S12 (overhead within 5% of a plain loop), S9 partial (trace written with full schema), S7 partial (`morsel-kernel` depends on arrow and dlpark only; verified by `cargo tree`).
+Deliverables: `amoru-kernel` with `Kernel`, `Morsel`, `Payload` (both variants, `Tier` with only `Host` exercised), `MorselFeatures`, `KernelKind`, `KernelHints`, `PayloadSpec`; `amoru-runtime` with the host arena (unpinned, huge pages where offered), `ParquetSource` (plan from footers, read with projection and row selection into arena buffers), `ParquetSink`, a single-threaded driver that runs source → kernels → sink with fixed 128 MB morsels; the trace writer with the 5.9 schema; the benchmark generator and the identity kernel. Gate: S12 (overhead within 5% of a plain loop), S9 partial (trace written with full schema), S7 partial (`amoru-kernel` depends on arrow and dlpark only; verified by `cargo tree`).
 
 ### Phase 1: scheduler, queues, workers
 Deliverables: worker pool with parked/active split; `TieredQueue` with the `Host` tier only; stage chain; admission rule; stateless kernels only; completion and error handling with the default terminate policy. Gate: S4 for compute-bound kernels on the bare host (worker busy at least 85% of cores); S11 trivially (no controller yet, so no oscillation; the test harness exists).
@@ -559,16 +559,16 @@ Deliverables: cgroup v2 and OS discovery; sampler; the probe; `RuleSizer` with l
 Deliverables: `TieredQueue` with `Host` and `Disk` tiers; page-aligned Arrow IPC staging segments written with O_DIRECT on the IO reactor (io_uring with `pread` fallback), tail-first demotion, head promotion window, direct-IO reload into the arena with mmap fallback, disk bound from ephemeral limit or free-space rule, staging trigger in the controller, placement-miss tracing. Gate: S10 with the throttled sink; S15 (post-spill throughput at least 70% of pre-spill on NVMe); S1 re-run with the disk tier active.
 
 ### Phase 4: Python surface
-Deliverables: `morsel-py` with PyO3 0.28+, maturin builds for 3.13/3.14 GIL and free-threaded, C Data Interface exchange, `@morsel.kernel`, `morsel.run`, report object, GIL detection and refusal. Gate: S8 with the wide-intermediate kernel on both builds; S2 from Python.
+Deliverables: `amoru-py` with PyO3 0.28+, maturin builds for 3.13/3.14 GIL and free-threaded, C Data Interface exchange, `@amoru.kernel`, `amoru.run`, report object, GIL detection and refusal. Gate: S8 with the wide-intermediate kernel on both builds; S2 from Python.
 
 ### Phase 5: tensors, stateful kernels and device memory
-Deliverables: `Payload::Tensor` exercised end to end; `TensorSource` (safetensors, `.npy`, aligned binary; mmap with arena copy when unaligned) and `TensorSink`; column-to-tensor and tensor-to-column pointer conversions with plan-time type checks; DLPack export and import in `morsel-py`; instance pools, affinity, retirement on error; `cuda` feature with device discovery, the device arena, pinned host arena, copy-engine promotion and demotion between `PinnedHost` and `Device`, and the device-memory probe. Gate: S13 (zero-copy crossings measured by the arena counter); S14 on a GPU host for the pinned-to-device path; S1 with torch-score (host and device budgets both respected); S6 with a stateful adversarial variant; embed-score benchmark added to S3.
+Deliverables: `Payload::Tensor` exercised end to end; `TensorSource` (safetensors, `.npy`, aligned binary; mmap with arena copy when unaligned) and `TensorSink`; column-to-tensor and tensor-to-column pointer conversions with plan-time type checks; DLPack export and import in `amoru-py`; instance pools, affinity, retirement on error; `cuda` feature with device discovery, the device arena, pinned host arena, copy-engine promotion and demotion between `PinnedHost` and `Device`, and the device-memory probe. Gate: S13 (zero-copy crossings measured by the arena counter); S14 on a GPU host for the pinned-to-device path; S1 with torch-score (host and device budgets both respected); S6 with a stateful adversarial variant; embed-score benchmark added to S3.
 
 ### Phase 6: report and profiles
 Deliverables: run report computed from trace and limits; profile store with warm start and drift override. Gate: S9 in full; S3 measured for all five kernels from the report; a second run of each benchmark shows no probe-phase throughput dip in the trace.
 
 ### Phase 7: engine bridges
-Deliverables: `morsel-polars` expression plugin wrapper; `morsel-datafusion` ScalarUDF wrapper; the normalise kernel built and run in all three hosts from one crate. Gate: S7.
+Deliverables: `amoru-polars` expression plugin wrapper; `amoru-datafusion` ScalarUDF wrapper; the normalise kernel built and run in all three hosts from one crate. Gate: S7.
 
 ### Phase 8: learned sizer (post-v1)
 Deliverables: `LearnedSizer` with online quantile regression, envelope clamping, error-triggered fallback; trained from accumulated traces; opt-in flag. Gate: S3 improves on at least three of five kernels versus `RuleSizer` with no S1 or S11 regression; fallback exercised by a test that corrupts the model.
@@ -585,7 +585,7 @@ Every phase ends with the full gate suite of all prior phases re-run in the cont
 
 ## 10. Open questions for Brackly
 
-**Q1. Name.** "Morsel" is descriptive and is also Polars' and DuckDB's internal term for the same unit, which is either a good association or a collision. A decision is needed before the crates are published.
+**Q1. Name.** Decided 2026-09-15: Amoru (Adaptive MOrsel RUntime). Crates are `amoru-kernel`, `amoru-runtime`, `amoru-py`, `amoru-polars`, `amoru-datafusion`; the Python package is `amoru`. "Morsel" remains the unit of work. Remaining checks before publishing: PyPI, GitHub namespace, trademark, domain.
 
 **Q2. Ordering default.** This document makes output unordered by default with an explicit flag for ordered sinks. If the dominant use is writing back to a lakehouse table where row order carries no meaning, unordered is right. If a meaningful share of jobs will produce sequence-dependent output, ordered-by-default with a bounded buffer is the safer surprise.
 

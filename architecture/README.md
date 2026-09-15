@@ -1,12 +1,12 @@
 # Architecture
 
-Design documents for Morsel. Code is written from these documents; a change in behaviour is a change here first.
+Design documents for Amoru. Code is written from these documents; a change in behaviour is a change here first.
 
 ## Documents
 
 | Document | Type | Status |
 |---|---|---|
-| [morsel-runtime-design.md](morsel-runtime-design.md) | Architecture design: the runtime as a system, its problems, sufficiency criteria, decisions and component map | Draft, revision 2 |
+| [amoru-runtime-design.md](amoru-runtime-design.md) | Architecture design: the runtime as a system, its problems, sufficiency criteria, decisions and component map | Draft, revision 2 |
 | sdd/00-preamble.md | SDD preamble: shared vocabulary, global invariants, process and concurrency model, configuration, crate layout, escalations, traceability | Pending |
 | sdd/01-contracts.md to sdd/12-python-surface.md | One SDD per component, each following the same schema, in build order | Pending |
 
