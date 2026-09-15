@@ -190,13 +190,18 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 | `queue.promotion_window` | 9 | count | 2 | 1 .. 32 | controller | morsels promoted ahead of the head |
 | `reactor.threads` | 6 | count | 2 | 1 .. 8 | platform | reactor thread count |
 | `reactor.object_concurrency` | 6 | count | 8 | 1 .. 64 | controller (via readahead) | in-flight object-store requests |
+| `reactor.file_depth` | 6 | count | 32 | 4 .. 256 | compile | in-flight file operations |
 | `arena.huge_pages` | 2 | bool | discovered | fixed | discovery | back arena with huge pages |
 | `arena.pin` | 2 | bool | true when a device is present and memlock allows | fixed | discovery | page-lock the arena |
 | `trace.path` | 4 | path | none (in-memory only) | writable path | user | write the trace file |
 | `trace.channel_capacity` | 4 | count | 4096 | 256 .. 65536 | compile | records buffered before the writer |
+| `trace.memory_limit` | 4 | bytes | 64 MiB | 8 MiB .. 1 GiB | compile | in-memory trace chunks before overflow to disk |
 | `errors.policy` | 10 | enum | `terminate` | `terminate`, `skip`, `budget(n)` | user | kernel error handling |
 | `ordering.required` | 8, 10 | bool | false | fixed per sink | sink | reorder buffer on |
 | `ordering.buffer_bytes` | 8 | bytes | 256 MiB | 16 MiB .. host budget/4 | compile | reorder buffer cap |
+| `sink.concurrency` | 8, 10 | count | 2 | 1 .. 8 | compile | sink writes in flight |
+| `sink.row_group_bytes` | 8 | bytes | 128 MiB | 16 MiB .. 1 GiB | user | Parquet row group target |
+| `sink.file_bytes` | 8 | bytes | 1 GiB | 64 MiB .. 16 GiB | user | output file roll size |
 | `python.allow_gil` | 12 | bool | false | fixed | user | proceed serialised under a GIL |
 | `profiles.dir` | 11 | path | `~/.amoru/profiles` | writable path or none | user, platform | profile store |
 | `sizer` | 11 | enum | `rule` | `rule`, `learned` | user | decision function |

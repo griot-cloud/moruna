@@ -9,7 +9,17 @@ Design documents for Amoru. Code is written from these documents; a change in be
 | [amoru-runtime-design.md](amoru-runtime-design.md) | Architecture design: the runtime as a system, its problems, sufficiency criteria, decisions and component map | Draft, revision 2 |
 | [sdd/00-preamble.md](sdd/00-preamble.md) | SDD preamble: purpose and component map, global vocabulary and invariants, process and concurrency model, global configuration, crate layout and build order, escalations, traceability, hand-off protocol | Draft |
 | [sdd/01-contracts.md](sdd/01-contracts.md) | Component 1: contracts crate (`amoru-kernel`), every cross-component type and interface | Draft |
-| sdd/02-arena.md to sdd/12-python.md | Components 2 to 12, one SDD each, same schema, in build order | Pending |
+| [sdd/02-arena.md](sdd/02-arena.md) | Component 2: memory arena | Draft |
+| [sdd/03-discovery.md](sdd/03-discovery.md) | Component 3: resource discovery and host profile | Draft |
+| [sdd/04-trace.md](sdd/04-trace.md) | Component 4: trace writer and run report | Draft |
+| [sdd/05-adapters.md](sdd/05-adapters.md) | Component 5: kernel adapters (Python, Polars, DataFusion) | Draft |
+| [sdd/06-reactor.md](sdd/06-reactor.md) | Component 6: IO reactor | Draft |
+| [sdd/07-sources.md](sdd/07-sources.md) | Component 7: sources (Parquet, tensor, iterator) | Draft |
+| [sdd/08-sinks.md](sdd/08-sinks.md) | Component 8: sinks (Parquet, tensor, Arrow IPC, reorder buffer) | Draft |
+| [sdd/09-placement.md](sdd/09-placement.md) | Component 9: placement engine (tiered queue), load-bearing | Draft |
+| [sdd/10-scheduler.md](sdd/10-scheduler.md) | Component 10: scheduler | Draft |
+| [sdd/11-controller.md](sdd/11-controller.md) | Component 11: resource controller | Draft |
+| [sdd/12-python.md](sdd/12-python.md) | Component 12: Python surface and runtime facade | Draft |
 
 ## Document types
 

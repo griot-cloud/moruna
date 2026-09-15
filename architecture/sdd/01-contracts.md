@@ -130,6 +130,8 @@ impl Buffer {
     pub fn device_ptr(&self) -> Option<u64>;
     /// Split off a prefix; both halves keep the arena token and are freed independently.
     pub fn split_at(self, mid: usize) -> (Buffer, Buffer);
+    /// Zero-copy conversion to an Arrow buffer whose deallocation releases to the arena (host tiers only; Device → error).
+    pub fn into_arrow_buffer(self) -> Result<arrow::buffer::Buffer>;
 }
 
 /// Allocation statistics the arena maintains; read by the controller and by CT-T tests.
@@ -140,6 +142,7 @@ pub struct AllocStats {
     pub device_in_use: [u64; 8],
     pub allocations_total: u64,
     pub payload_copies_total: u64,   // incremented by any component that copies payload bytes with the CPU; must stay 0 outside sources and sinks
+    pub boundary_copies_total: u64,  // adapters' one-time copy of a kernel's non-arena host output into the arena (05-adapters AD-I2)
 }
 
 pub trait Allocator: Send + Sync {
@@ -150,6 +153,8 @@ pub trait Allocator: Send + Sync {
     /// The page size discovery reported for this host.
     fn page_bytes(&self) -> usize;
     fn stats(&self) -> AllocStats;
+    /// True if `ptr` lies inside a region this allocator owns (used by adapters to skip the boundary copy).
+    fn contains(&self, ptr: *const u8) -> bool { let _ = ptr; false }
 }
 ```
 
@@ -709,7 +714,7 @@ Environment facts to verify before starting: `cargo --version` ≥ the 2024-edit
 
 ## m. Open items
 
-None. (E1 and E2 in the preamble cover reference hardware and version pinning.)
+None. (E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3.)
 
 ## n. Traceability
 
