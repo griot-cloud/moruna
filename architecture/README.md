@@ -7,8 +7,9 @@ Design documents for Amoru. Code is written from these documents; a change in be
 | Document | Type | Status |
 |---|---|---|
 | [amoru-runtime-design.md](amoru-runtime-design.md) | Architecture design: the runtime as a system, its problems, sufficiency criteria, decisions and component map | Draft, revision 2 |
-| sdd/00-preamble.md | SDD preamble: shared vocabulary, global invariants, process and concurrency model, configuration, crate layout, escalations, traceability | Pending |
-| sdd/01-contracts.md to sdd/12-python-surface.md | One SDD per component, each following the same schema, in build order | Pending |
+| [sdd/00-preamble.md](sdd/00-preamble.md) | SDD preamble: purpose and component map, global vocabulary and invariants, process and concurrency model, global configuration, crate layout and build order, escalations, traceability, hand-off protocol | Draft |
+| [sdd/01-contracts.md](sdd/01-contracts.md) | Component 1: contracts crate (`amoru-kernel`), every cross-component type and interface | Draft |
+| sdd/02-arena.md to sdd/12-python.md | Components 2 to 12, one SDD each, same schema, in build order | Pending |
 
 ## Document types
 
