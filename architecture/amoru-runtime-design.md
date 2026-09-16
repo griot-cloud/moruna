@@ -1,8 +1,9 @@
 # Amoru: Architecture Design
 
 **Document type:** full architecture design (not an ADR)
-**Status:** DRAFT for review · revision 2 · 2026-09-15 (revision 1: 2026-09-12)
+**Status:** DRAFT for review · revision 3 · 2026-09-16 (revision 2: 2026-09-15; revision 1: 2026-09-12)
 **Revision 2 adds:** tensor payloads alongside Arrow (DLPack), tensor sources and sinks, a pinned memory arena, tiered morsel placement across device memory, host memory and disk with hardware-direct movement between tiers, and a deferred design for weight-major execution when a model does not fit its accelerator.
+**Revision 3 adds:** recovery by lineage (a run manifest written by the placement engine, resume on the same or another node from what is already on disk plus source re-reads; section 10, S17, D13) and the reservations that let the same framework extend to many nodes without changing a signature (a remote memory tier, node identity, locality-aware admission, a shuffle-free boundary; section 11, S16, D12).
 **Scope:** a single-process runtime that runs a full pass over a dataset, tabular or tensor, larger than the process's memory budget, applying a transformation a query engine cannot express, at close to the budget's capacity, with no tuning by the user. Explicitly OUT: distributed execution, query planning or optimisation, transformations that need random access across the whole dataset (shuffles, exact pairwise, hierarchical clustering), streaming with per-record latency requirements, and the packing or reclaim policies of any host platform that runs this runtime inside a pod, VM or notebook. Griot Cloud's compute plane is a consumer of this runtime, not part of this document.
 **Companion:** none yet. A Griot Cloud compute plane design (pod sizing, packing, idle reclaim) will consume this document.
 
@@ -122,6 +123,10 @@ Each criterion is testable and each implementation gate in section 9 cites the c
 
 **S15. Spill is a tier, not a cliff.** With the throttled sink of S10, throughput after spill engages is at least 70% of throughput before, on NVMe, because spill segments are written and read with direct IO at sequential bandwidth and the queue's head is never on disk.
 
+**S16. The multi-node extension changes no signature.** The contracts crate at v1 contains every type the extension in section 11 needs (`NodeId`, `Tier::Remote`, `Locality`, the manifest), a repository lint proves no `match` on a tier uses a wildcard arm, and the extension's design document, when written, lists its changes to `01-contracts.md` as additions only. Measured by the lint and by a review of that document against this criterion.
+
+**S17. A killed run resumes, and its output is indistinguishable.** For every benchmark with a resumable sink, killing the process with SIGKILL at a random point and resuming from the manifest produces output byte-equal (ordered sink) or row-set-equal (unordered) to an uninterrupted run, re-reads from the source only the morsels the manifest lists for recomputation, and starts the controller from the profile the interrupted run had learned. On a platform that declares durable staging, the same holds when the resume happens on a different node with the staging volume attached.
+
 ---
 
 ## 4. Architecture
@@ -179,6 +184,10 @@ Three kinds of threads exist. The worker pool runs kernels and nothing else. The
 
 **D11. Weight-major execution is a separate design, not a v1 feature.** When a stateful kernel's weights exceed device memory, inverting the loop, streaming layers through the accelerator and running each over all data with activations held in the tiered queues, turns the job into the out-of-core full pass this runtime is built for (FlexGen is the existence proof). It needs the model expressed as a chain of stages and a controller that budgets activations across tiers. It is recorded here so the payload, arena and queue designs do not preclude it, and deferred to its own document (Q7).
 
+**D12. Reserve the seams for many nodes now; build them later.** The multi-node extension (section 11) needs a remote memory tier, a node identity on every origin, locality in admission, a shuffle-free boundary and a manifest that survives a node. Adding those as types and explicit `match` arms costs a few hundred lines in v1 and nothing at runtime; adding them after v1 ships means touching every crate that matches on a tier. The alternative, a clean single-node v1 and a rewrite for multi-node, is what every distributed engine's history looks like. The cost is a handful of variants that return `Unsupported` for a year, and a lint to keep them honest.
+
+**D13. Recover by lineage, not by replication.** Every morsel is a deterministic function of its origin (a split and a row range) and the kernel chain, and the placement engine already knows which morsels are on disk because pressure put them there. So the record needed to resume a run is small (what the sink has committed, what is on disk and where, where the source cursor is) and costs nothing on the normal path but a manifest write every few seconds; lost morsels are re-read from the source and re-run. The alternative, Spark-style replication or forced checkpointing of every stage's output, buys faster recovery of in-memory state at the price of writing everything twice, which on a bounded single node is exactly the bandwidth the runtime is trying to keep. Kernel state that depends on the morsels seen is the one thing lineage does not cover; a kernel declares whether a fresh `init` suffices, whether it checkpoints its own state, or whether it forbids resume.
+
 ---
 
 ## 5. Component design
@@ -195,7 +204,7 @@ pub struct Morsel {
     pub stage: StageId,        // which stage's input this is
     pub payload: Payload,      // see below
     pub bytes: usize,          // payload footprint at creation, updated when a kernel replaces it
-    pub origin: Origin,        // source split id + row/batch range; carried through stages
+    pub origin: Origin,        // source split id + row/batch range + node id; carried through stages
     pub features: MorselFeatures, // tabular: rows, per-column bytes, string lengths, null ratio
                                   // tensor: shape, dtype, batch dimension
 }
@@ -205,7 +214,7 @@ pub enum Payload {
     Tensor(ManagedTensor, Tier),       // DLPack-backed; shape, dtype, strides, data pointer
 }
 
-pub enum Tier { Device(DeviceId), PinnedHost, Host, Disk(SegmentRef) }
+pub enum Tier { Device(DeviceId), PinnedHost, Host, Disk(SegmentRef), Remote(NodeId, RemoteRef) /* reserved, section 11 */ }
 ```
 
 `Tier` is the placement engine's field (5.6): a morsel on `Disk` has no resident bytes and is loaded on demand; a morsel on `Device` has no host bytes. `bytes` is computed from Arrow's accounting or from the tensor's shape and dtype. `features` is computed by the source from metadata where available and from the payload otherwise; it is the controller's input vector and is carried unchanged into the trace. Conversion between the two payload forms is a pointer operation and is exposed as `Payload::as_tensor(column)` and `Payload::as_column(name)`, both of which fail at plan time, not run time, for types that cannot cross (strings, nested types, nullable columns). A morsel refuses to know which worker ran it or which queue it sat in; that is the trace's job.
@@ -252,6 +261,7 @@ pub trait Kernel: Send + Sync + 'static {
     fn kind(&self) -> KernelKind;
     fn hints(&self) -> KernelHints { KernelHints::default() }
     fn init(&self, ctx: &InitCtx) -> Result<Box<dyn KernelState>>;   // once per instance
+    fn restore(&self, ctx: &InitCtx, state: &[u8]) -> Result<Box<dyn KernelState>>;  // on resume, for kernels that checkpoint (section 10)
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload>;
     fn accepts(&self) -> PayloadSpec;   // Table | Tensor | Either, and the Tier it wants (Host or Device)
 }
@@ -266,6 +276,7 @@ pub struct KernelHints {
     pub uses_device_memory: bool,                // controller tracks a second budget
     pub releases_gil: Option<bool>,              // Python kernels only; None = unknown
     pub preferred_rows: Option<usize>,           // e.g. a model's optimal batch; a hint, not a rule
+    pub resume: ResumePolicy,                    // Reinit (default) | Checkpoint | Forbid; section 10
 }
 ```
 
@@ -284,11 +295,18 @@ A kernel refuses to know where its input came from, where its output goes, what 
 ```rust
 pub trait Sink: Send + Sync {
     fn open(&mut self, schema: &SchemaRef) -> Result<()>;
-    fn write(&self, batch: RecordBatch) -> BoxFuture<Result<()>>;    // runs on the IO reactor
-    fn finish(&mut self) -> Result<SinkSummary>;                       // rows, bytes, files
+    fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<Result<()>>;   // runs on the IO reactor
+    fn finish(&mut self) -> Result<SinkSummary>;                             // rows, bytes, files
     fn requires_order(&self) -> bool { false }
+    // resume support, section 10; defaults make a sink non-resumable and say so
+    fn committed_seq(&self) -> Option<Seq> { None }
+    fn skip(&self, seq: Seq) {}
+    fn checkpoint(&self) -> Result<Option<Vec<u8>>> { Ok(None) }
+    fn resume(&mut self, schema: &SchemaRef, state: &[u8], committed_seq: Option<Seq>) -> Result<()>;
 }
 ```
+
+(The normative signatures are in `sdd/01-contracts.md` d.8; this sketch follows them.)
 
 **ParquetSink** writes to object_store with a target row-group size (default 128 MB) and a target file size (default 1 GB), rolling files as needed; the writer is buffered on the IO reactor so kernel workers never wait on storage. **TensorSink** writes safetensors (for interoperability) or the runtime's own aligned binary (an 64-byte-aligned data section behind a fixed header, for files that will be memory-mapped or DMA-loaded later), and **ArrowIpcSink** writes Arrow IPC files with page-aligned buffers for the same reason. A sink that receives a device-resident payload copies it to the pinned arena by copy engine before writing; the CPU never touches the bytes. Unordered by default: morsels arrive in completion order. A sink that returns `requires_order = true` gets a reorder buffer in front of it, bounded in bytes and accounted against the budget; when the buffer is full and the missing sequence number has not arrived, the scheduler stops admitting new source work until it does. Ordering costs memory and throughput; the default is off (Q2).
 
@@ -338,6 +356,8 @@ pub struct TieredQueue {
 
 **Head stays hot.** Demotion is always from the tail, promotion always toward the head, so the consumer's next morsel is never the one being written out. This is DuckDB's buffer manager eviction order and FlexGen's schedule, restated over a FIFO.
 
+**The engine remembers what it holds.** Because the placement engine is the one component that sees every morsel from push to pop and knows which are on disk, it is also where the run's recovery record lives: a lineage index of every morsel the sink has not yet committed (its origin, its stage, its segment if any), written as a small manifest every few seconds and at every segment roll. Section 10 describes resume; the point here is that the mechanism is a by-product of placement, not an extra pass over the data. The tier set also carries a reserved fifth tier, `Remote`, for memory lent by another node of the same run (section 11); no v1 path produces it.
+
 Queues refuse to know why the controller set a budget or why a consumer wants a tier; they know only tiers, budgets and the order.
 
 ### 5.6a Memory arena
@@ -377,7 +397,7 @@ active_workers × morsel_target × A_k × safety  +  Σ queue high-water marks  
 
 `A_k` is the amplification factor for kernel k, the ratio of peak footprint during `apply` to input bytes. `safety` starts at 1.5 and tightens toward 1.2 as the measured prediction error shrinks.
 
-**Probe.** Before the first real morsel of each kernel stage, the controller runs one morsel of 16 MB (or `preferred_rows` if hinted) through the kernel on a single worker with all other workers parked, and measures the anon-memory delta at peak. That delta divided by input bytes is the initial `A_k`. If the kernel declares device memory, the same probe measures device memory and yields a second factor. The probe's output is a real morsel and proceeds downstream; nothing is wasted. When a profile exists for the kernel's fingerprint and schema (below), the probe still runs, to detect drift, but the profile's factor is used until the probe completes.
+**Probe.** Before the first real morsel of each kernel stage, the controller runs one morsel of 16 MB (or `preferred_rows` if hinted) through the kernel on a single worker with all other workers parked, and measures the anon-memory delta at peak. That delta divided by input bytes is the initial `A_k`. If the kernel declares device memory, the same probe measures device memory and yields a second factor. The probe's output is a real morsel and proceeds downstream; nothing is wasted. When a profile exists for the kernel's fingerprint and schema (below), the probe still runs, to detect drift (except on a resumed run, section 10, where the profile the interrupted run wrote a few seconds earlier is trusted and only stages without one are probed), but the profile's factor is used until the probe completes.
 
 **Sizing.** With `A_k` known, `morsel_target` follows from the working-set equation at the chosen `active_workers`, clamped to [4 MB, 512 MB]. Look-ahead: the next splits' `uncompressed_bytes` and per-column stats are known, so the source sub-splits or coalesces to hit the target in actual bytes rather than in rows. Then AIMD on measured outcomes: after each morsel, if the observed peak was below 85% of what the model allowed, raise `morsel_target` by 10%; if it exceeded the allowance, halve it and raise `safety`. Adjustments are damped to no more than one change per `active_workers` completions, which is what makes S11 achievable.
 
@@ -464,7 +484,7 @@ The runtime has to be the same library in five hosts, and the design must say wh
 
 **A GPU host.** Feature `cuda` enables device discovery through the CUDA runtime API; without the feature, kernels that declare `uses_device_memory` run with host-memory sizing only and the report warns. Device memory is a second budget with its own arena, its own probe and its own `A_k`; the morsel target is the smaller of the host- and device-derived targets. Multiple GPUs map to `max_instances` on the stateful kernel, one instance per device, with the instance's `InitCtx` naming its device. The data path on such a host is: source decodes or maps into the pinned arena; the placement engine promotes the next morsels to device memory on a copy stream while the current one computes; the kernel receives a device tensor or a device Arrow batch by pointer; its output is demoted to pinned host for the sink or kept on device for a following device kernel. With GPUDirect Storage present, disk-tier segments and aligned tensor files skip the host entirely.
 
-**A host with RDMA-capable networking and a storage peer that speaks it.** Not a v1 host. The arena is registered with the NIC at start, and an `RdmaSource` behind the Source trait receives morsels written directly into it by the peer (AIStor's S3 over RDMA is one such peer; a storage daemon that decodes Parquet on the storage side and pushes Arrow morsels is another, and would be Griot's own). On a single machine RDMA is meaningless; the equivalent, a shared-memory Arrow region between the storage process and the runtime, is a `SharedMemorySource` and is the recommended way for any co-located gate or proxy to feed the runtime without a copy.
+**A host with RDMA-capable networking.** Not a v1 host. Two uses, both through the reactor. First, a storage peer that speaks RDMA writes morsels straight into the registered arena through an `RdmaSource` behind the Source trait (AIStor's S3 over RDMA is one such peer; a storage daemon that decodes Parquet on the storage side and pushes Arrow morsels is another, and would be Griot's own). Second, other nodes running the same job lend memory and cores: the placement engine sees their registered arenas as a `Remote` tier between pinned host and disk, and the scheduler on each node runs kernels on the morsels it holds; section 11 says how and where the boundary is. On a single machine RDMA is meaningless; the equivalent, a shared-memory Arrow region between the storage process and the runtime, is a `SharedMemorySource` and is the recommended way for any co-located gate or proxy to feed the runtime without a copy.
 
 **Inside another engine.** `amoru-polars` and `amoru-datafusion` host a kernel, not the runtime. In those hosts the engine schedules, the engine sizes, and the kernel is a stateless batch function; the runtime's controller is absent. This is by design: the runtime cannot take over an engine's scheduler, and the kernel crate is what carries across.
 
@@ -505,6 +525,8 @@ The runtime has to be the same library in five hosts, and the design must say wh
 **Device out of memory.** The device arena is exhausted despite the budget, usually because the kernel's framework allocator holds more than the probe saw. The controller halves the morsel target for that stage, demotes any promoted-but-unconsumed morsels back to pinned host, and retries once; a second failure terminates with the device figures in the diagnostic. Device memory is never allowed to fragment across two arenas.
 
 **Direct IO unavailable.** O_DIRECT rejected by the filesystem, io_uring blocked by the container's seccomp profile, or GPUDirect Storage absent. Each falls back one step (buffered IO, `pread` thread pool, pinned-host bounce) and the report names the path taken, so a run that is slower than expected can be explained without a debugger.
+
+**Process or node loss.** The OOM killer (a foreign process on the host, not this one; G-I8 covers this one), a node reboot, a pod eviction, a Kubernetes node loss. Nothing is done at the moment of loss because nothing can be; the last manifest, written within `checkpoint.interval_ms`, is the recovery point. A new process with `resume=` reads it, removes the sink's uncommitted output, puts the morsels that were on disk back in their queues, re-reads the rest from the source, and continues (section 10). What is lost is bounded: the sink's file in progress, and the morsels that were in memory or in flight, each re-read once. On a platform without durable staging, resume works only on the same node; the report and the exception say which case applies.
 
 **Pinned memory refused.** The host limits locked memory (RLIMIT_MEMLOCK, or the pod lacks the capability). The arena falls back to unpinned huge pages and device transfers go through a small pinned bounce buffer; the report says so.
 
@@ -556,7 +578,7 @@ Deliverables: worker pool with parked/active split; `TieredQueue` with the `Host
 Deliverables: cgroup v2 and OS discovery; sampler; the probe; `RuleSizer` with look-ahead sizing, AIMD, damping, worker-count formula, bottleneck table; the working-set equation enforced. Gate: S1, S2, S5 in the container; S6 against the adversarial kernel (completes or diagnoses, never SIGKILL); S11 on the stationary dataset; S3 for normalise and tokenise-explode.
 
 ### Phase 3: disk tier
-Deliverables: `TieredQueue` with `Host` and `Disk` tiers; page-aligned Arrow IPC staging segments written with O_DIRECT on the IO reactor (io_uring with `pread` fallback), tail-first demotion, head promotion window, direct-IO reload into the arena with mmap fallback, disk bound from ephemeral limit or free-space rule, staging trigger in the controller, placement-miss tracing. Gate: S10 with the throttled sink; S15 (post-spill throughput at least 70% of pre-spill on NVMe); S1 re-run with the disk tier active.
+Deliverables: `TieredQueue` with `Host` and `Disk` tiers; page-aligned Arrow IPC staging segments written with O_DIRECT on the IO reactor (io_uring with `pread` fallback), tail-first demotion, head promotion window, direct-IO reload into the arena with mmap fallback, disk bound from ephemeral limit or free-space rule, staging trigger in the controller, placement-miss tracing; the run manifest and lineage index in the placement engine, sink commit tracking, and single-node resume (section 10). Gate: S10 with the throttled sink; S15 (post-spill throughput at least 70% of pre-spill on NVMe); S1 re-run with the disk tier active; S17 on the same node (kill and resume, output equal).
 
 ### Phase 4: Python surface
 Deliverables: `amoru-py` with PyO3 0.28+, maturin builds for 3.13/3.14 GIL and free-threaded, C Data Interface exchange, `@amoru.kernel`, `amoru.run`, report object, GIL detection and refusal. Gate: S8 with the wide-intermediate kernel on both builds; S2 from Python.
@@ -583,7 +605,37 @@ Every phase ends with the full gate suite of all prior phases re-run in the cont
 
 ---
 
-## 10. Open questions for Brackly
+## 10. Recovery: resume by lineage
+
+The runtime already holds, in normal operation, most of what a checkpoint would need to contain. The placement engine knows every morsel between the source cursor and the sink's last commit, and knows which of them are on disk because it put them there. The source is deterministic for a split and a row range. The kernels are a chain. So the lineage of any morsel is its origin plus the chain, and the only state that needs writing is an index of that lineage, a few numbers, and whatever a sink or a stateful kernel wants to add.
+
+**The manifest.** The placement engine writes `manifest.json` in the run's staging directory, atomically, every `checkpoint.interval_ms` (default 5 s), at every segment roll, and when a run terminates or is cancelled. It lists: the run id, the source plan's digest and the kernel fingerprints (so a manifest cannot be applied to a different job); the committed watermark, the highest sequence number below which the sink has committed everything; the source cursor, where the source drive would issue its next read; for every uncommitted morsel, its origin, its current stage and, if it is on disk, the segment reference; the sink's checkpoint (committed file names and the next index); and the checkpointed state of any kernel that declared it keeps state worth saving. A manifest for a 32 GiB budget of 64 MiB morsels is under 100 KiB. Segments referenced by the current manifest are never deleted until the next manifest no longer references them, so a crash between two writes leaves a consistent pair.
+
+**Resume.** A new process calls `run` with `resume=` naming the run id, the manifest path, or `auto`. Before anything is written: the manifest's identity is checked against the plan and the kernels (a mismatch is refused with the first difference named); the sink is opened in resume mode and removes every output above the watermark (each committed file records its sequence range in its metadata, so this is a listing and a comparison, not a scan); the placement engine rebuilds its queues, putting on-disk morsels back at their stages in sequence order; the scheduler sets its source cursor and sequence counter, restores stateful instances (fresh `init` for kernels that said reinit suffices, `restore` from the checkpoint for kernels that declared it, refusal for kernels that forbid resume), re-reads every listed morsel without a disk copy from its origin and pushes it to the first queue with its original sequence number, and then runs as usual. The controller does not read the manifest; it reads its profile store, which the interrupted run wrote as it learned, so the resumed run starts at the sizes the first run had reached rather than at the probe size.
+
+**What it costs and what it covers.** Normal path: the manifest write, two `fsync`s every few seconds on a file that does not grow with the data, and a small index in memory. Recovery: the sink's file in progress is rewritten, and every morsel that was in memory or in flight is re-read and re-run through every stage up to where it was; nothing that was on disk or committed is redone. What it does not cover: a stateful kernel whose state depends on the morsels it has seen and that neither checkpoints nor forbids; that is declared per kernel and the decorator's documentation names the rule in one sentence. Cross-node resume requires the staging directory to survive the node (a persistent volume, a detachable disk), which a platform declares through `durable_staging`; the runtime cannot probe that, so it treats an undeclared directory as local and says so.
+
+**Why this and not replication.** Spark keeps lineage too, at the granularity of a partition and a DAG, and recomputes on loss; it also offers checkpointing that writes everything. The runtime's version is the same idea at morsel granularity with the placement engine as the lineage store, and it is cheaper for one reason: the placement engine writes to disk anyway, under pressure, in the layout it reads back by DMA, so the recovery record is mostly a description of files that already exist. Replicating morsels to a second node would cost a full copy of the working set over the network for every run, to protect against an event that happens to a small fraction of runs; recomputing costs a bounded re-read only when the event happens.
+
+---
+
+## 11. Extension to many nodes
+
+This section reserves the shape of a later extension so that v1 does not preclude it. It is not a design for that extension; that is its own document, written when there is a job that needs it and a host to test it on. Its purpose here is to state what the extension is, where the boundary lies, and which types exist now because of it.
+
+**The claim.** A job that fits the runtime's model, one source, a chain of kernels, one sink, morsels independent of one another, runs on N nodes as N copies of the single-node runtime that share three things: a manifest that names every node of the run and hands out source splits, a remote memory tier through which a node under pressure lends morsels to a node with room and a node with idle cores pulls work from a node with a backlog, and the lease daemon that makes both safe. Each node keeps its own arena, reactor, placement engine, scheduler and controller; the controller's equations are unchanged because they are about one memory ceiling and one set of cores; the admission rule is unchanged except that a worker prefers the emptiest queue on its own node and, failing that, a queue whose head it can fetch cheaply. A morsel crossing nodes is one RDMA write of an Arrow buffer from arena to registered arena, no serialisation, no driver in the path.
+
+**The boundary.** The runtime does not shuffle. A cross-node join, group-by or sort needs data partitioned by key across nodes and is a query engine's job; the runtime would host such an engine's kernels as it does today, not replace the engine. This is stated so the extension does not drift into being a distributed query engine, which exists and is not the problem being solved. The work that fits, batch scoring and inference, per-row and per-batch transforms, embedding and feature computation, is the work where a distributed engine's costs (task scheduling, serialisation, executor memory management, a driver) are pure overhead, and where N small nodes running this runtime should beat the same N nodes running that engine on throughput per core and, more visibly, on memory used per node.
+
+**Fault tolerance.** Section 10 applies per node: each node's staging directory holds its manifest and segments. The run manifest names the nodes; a node that dies has its disk reattached to a replacement (or the platform's persistent volume is claimed by a new pod) and the replacement resumes that node's share. Morsels the dead node held in memory, including those it had lent to others through the remote tier, are marked lost by the lease daemon and are recomputable like any other; the replacement re-reads them. The design does not replicate.
+
+**What v1 carries for it.** In `01-contracts.md`: `NodeId` (with `LOCAL_NODE` the only v1 value), `RunId`, `Tier::Remote(NodeId, RemoteRef)` with `RemoteRef` holding the address, memory key and length an RDMA read needs, `Origin.node`, `Locality` on `Placement::pop`, `TIER_COUNT` sized for five tiers, and `AmoruError::Unsupported`. In the placement engine: a reserved `OnRemote` entry state and reserved rows in the move table. In the reactor: reserved rows in the copy dispatch table and the statement that the arena's single reservation exists so that registering it with a NIC is one call. In every crate: a lint that fails on a wildcard arm over a tier (CT-T14), so that the day the `rdma` feature is written, the compiler lists every place that needs an arm. In the preamble: E11, which forbids any v1 agent from implementing the reserved paths, and G-I11, which states the aim.
+
+**What is deliberately not reserved.** Peer discovery, the lease protocol, membership changes mid-run, the coordinator's split assignment policy, the wire format of anything: these belong to the extension's document and none of them constrains a v1 signature.
+
+---
+
+## 12. Open questions for Brackly
 
 **Q1. Name.** Decided 2026-09-15: Amoru (Adaptive MOrsel RUntime). Crates are `amoru-kernel`, `amoru-runtime`, `amoru-py`, `amoru-polars`, `amoru-datafusion`; the Python package is `amoru`. "Morsel" remains the unit of work. Remaining checks before publishing: PyPI, GitHub namespace, trademark, domain.
 
@@ -601,3 +653,6 @@ Every phase ends with the full gate suite of all prior phases re-run in the cont
 
 **Q8. Hardware baseline for the direct paths.** The direct-IO, pinned-memory and GPUDirect Storage paths each need a host to be verified on (2.2). Name the reference GPU host and the reference NVMe host the gates in Phases 3, 5 and 9 will run against; without them those gates cannot close and the fallbacks are the only tested paths.
 
+**Q9. Checkpoint cadence and disk.** The manifest write is cheap, but two `fsync`s every 5 s on a slow or shared disk are not free, and `checkpoint.interval_ms` is the trade between them and the size of the replay after a crash. Confirm 5 s as the default, and whether the Griot Cloud pod profile should set the staging directory to a persistent volume claim (declared `durable_staging=present`) by default, which is what makes cross-node resume work there.
+
+**Q10. When to write the multi-node design.** Section 11 reserves the seams and nothing else. The extension needs a job that does not fit one node, an RDMA-capable pair of hosts to test on, and a decision on whether the coordinator is a library role (the first node) or a separate small process. Confirm that this waits until after v1 ships on the reference host, or name the job that brings it forward.

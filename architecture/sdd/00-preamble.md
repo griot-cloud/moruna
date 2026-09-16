@@ -2,7 +2,7 @@
 
 **Document type:** software design document, shared preamble (read by every agent before its component SDD)
 **Status:** DRAFT · 2026-09-15
-**Parent:** `architecture/amoru-runtime-design.md` (revision 2), the architecture design; this preamble does not repeat its context or its alternatives, it decides what the architecture left open and fixes what every component shares.
+**Parent:** `architecture/amoru-runtime-design.md` (revision 3), the architecture design; this preamble does not repeat its context or its alternatives, it decides what the architecture left open and fixes what every component shares.
 **Language and repository:** Rust 2024 edition for the runtime, Python 3.13 and 3.14 for the surface, one Cargo workspace at the repository root.
 **Reference hardware:** to be named (escalation E1). Until named, benchmark gates run on the developer's machine and are reported as provisional.
 
@@ -33,8 +33,8 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 5 | Kernel adapters | `05-adapters.md` | 1 | each adapter is a `Kernel`; the Python adapter never copies payload bytes across the interpreter boundary |
 | 6 | IO reactor | `06-reactor.md` | 2, 3 | implements `Reactor`; every operation completes exactly once, into the buffer it was given, on the reactor's threads, never on a worker |
 | 7 | Sources | `07-sources.md` | 1, 2, 6 | implement `Source`; `plan` is complete before the first `read`; `read` returns a payload in the tier the allocator was asked for |
-| 8 | Sinks | `08-sinks.md` | 1, 2, 6 | implement `Sink`; `write` takes ownership of the payload; `finish` is called exactly once after the last `write` completes |
-| 9 | Placement engine | `09-placement.md` | 1, 2, 3, 6 | implements `Placement`; `pop` returns a morsel already resident in the tier the caller asked for, or blocks; `push` never blocks |
+| 8 | Sinks | `08-sinks.md` | 1, 2, 6 | implement `Sink`; `write(seq, payload)` takes ownership of the payload; `finish` is called exactly once after the last `write` completes; `committed_seq` never overstates |
+| 9 | Placement engine | `09-placement.md` | 1, 2, 3, 6 | implements `Placement`; `pop` returns a morsel already resident in the tier the caller asked for, or blocks; `push` never blocks; `checkpoint` writes a manifest from which `restore` rebuilds the queues |
 | 10 | Scheduler | `10-scheduler.md` | 1, 9 | implements `Knobs`; workers only ever run `Kernel::apply` and nothing that blocks on IO |
 | 11 | Resource controller | `11-controller.md` | 3, 4, 9, 10 | the only writer of every knob; reads stats, never morsels |
 | 12 | Python surface | `12-python.md` | all | the only component that knows what a user is |
@@ -59,7 +59,7 @@ Terms used by more than one component are defined here once. A component SDD add
 
 **Payload.** The data inside a morsel: either an Arrow `RecordBatch` (a table) or a DLPack-backed tensor, each tagged with the tier where its bytes currently are.
 
-**Tier.** Where bytes physically live: `Device(id)` (accelerator memory), `PinnedHost` (page-locked host RAM, valid DMA source and target), `Host` (ordinary host RAM), `Disk(segment)` (a staging segment on local storage; no resident bytes).
+**Tier.** Where bytes physically live: `Device(id)` (accelerator memory), `PinnedHost` (page-locked host RAM, valid DMA source and target), `Host` (ordinary host RAM), `Disk(segment)` (a staging segment on local storage; no resident bytes), and the reserved `Remote(node, ref)` (registered memory on another node of the same run; never produced in v1, always matched explicitly, CT-I11).
 
 **Stage.** One position in the linear chain source → kernel₁ → … → kernelₙ → sink. Stage 0 is the source's output; stage k is kernel k's output; the sink consumes the last stage.
 
@@ -125,13 +125,17 @@ These hold across components. Each component SDD cites the ones it upholds and a
 
 **G-I10. Zero configuration beyond the budget.** A run started with defaults and no budget inside a cgroup, or with only a budget outside one, completes every benchmark in the suite. Owner: all. Parent S2, S5.
 
+**G-I11. One framework at one node and at many.** Every type and signature the multi-node extension needs exists in the contracts now (`NodeId`, `Tier::Remote`, `Locality`, the run manifest), and every v1 `match` on them handles the general case explicitly rather than by a wildcard; adding the extension adds crates and feature-gated arms, never a signature change. Owner: contracts (CT-I11), placement, reactor, scheduler. Parent S16, D12; architecture section 11.
+
+**G-I12. Recovery is by lineage, never by replication.** A run can be resumed from what the placement engine already put on disk plus re-reading the source for the rest; no component writes a byte for the sake of recovery, and the normal path pays only the manifest (a small file every few seconds). Owner: placement (manifest), scheduler (watermark, recompute), sinks (commit tracking), controller (profile persistence). Parent S17, D13, CT-I12.
+
 ---
 
 ## 4. Process and concurrency model
 
 ### 4.1 Threads
 
-One process. Five kinds of thread, fixed at start:
+One process. Six kinds of thread, fixed at start:
 
 | Thread kind | Count | Created by | May touch | Must never |
 |---|---|---|---|---|
@@ -140,12 +144,13 @@ One process. Five kinds of thread, fixed at start:
 | Reactor | R = `reactor.threads` (default 2, section 5) | reactor | file and object-store IO, DMA copy issuance and completion, staging segment IO | run a kernel; allocate outside the arena |
 | Controller | 1 | controller | discovery sampling, placement and scheduler stats, knob writes, trace reads | touch payload bytes; block on IO |
 | Trace writer | 1 | trace | drains the trace channel to the trace file | anything else |
+| Checkpoint | 1, only when `checkpoint.enabled` | scheduler | every `checkpoint.interval_ms`: `KernelState::checkpoint` on stateful instances that declared it (acquiring each instance like a task), `Sink::checkpoint`, `Placement::checkpoint` | run `apply`; hold the stage table lock across the placement call; touch payload bytes |
 
 Kernels may use threads internally (a BLAS pool, Torch's intra-op pool) provided they are joined before `apply` returns; the scheduler cannot see them and the controller sizes for them only through observed CPU time.
 
 ### 4.2 Synchronisation and lock order
 
-Locks are acquired in this order and never in reverse: (1) scheduler stage table, (2) placement queue order, (3) placement tier accounting, (4) arena free lists, (5) trace channel. A component that needs two of these takes the lower-numbered first. No lock is held across a call into another component except (1) held across a `Placement::pop`, which is documented in `10-scheduler.md`.
+Locks are acquired in this order and never in reverse: (1) scheduler stage table, (2) placement queue order, (2b) placement lineage index, (3) placement tier accounting, (4) arena free lists, (5) trace channel. A component that needs two of these takes the lower-numbered first. No lock is held across a call into another component except (1) held across a `Placement::pop`, which is documented in `10-scheduler.md`.
 
 Lock-free paths, with the argument for each in the owning SDD: worker task pickup (scheduler, atomic stage cursor), tier byte counters (placement, atomics), arena size-class pop (arena, per-class lock-free stack or a mutex per class; the arena SDD decides and records the benchmark that justified it).
 
@@ -203,7 +208,12 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 | `sink.row_group_bytes` | 8 | bytes | 128 MiB | 16 MiB .. 1 GiB | user | Parquet row group target |
 | `sink.file_bytes` | 8 | bytes | 1 GiB | 64 MiB .. 16 GiB | user | output file roll size |
 | `python.allow_gil` | 12 | bool | false | fixed | user | proceed serialised under a GIL |
-| `profiles.dir` | 11 | path | `~/.amoru/profiles` | writable path or none | user, platform | profile store |
+| `profiles.dir` | 11 | path | `~/.amoru/profiles` | writable path or none | user, platform | profile store; place it on the durable volume with `staging.dir` for cross-node resume |
+| `checkpoint.enabled` | 9, 10, 12 | bool | true when `staging.dir` resolves | fixed per run | user | write the run manifest periodically; forced false for a non-resumable sink |
+| `checkpoint.interval_ms` | 9, 10 | ms | 5000 | 500 .. 60000 | user | manifest write cadence (also written at every segment roll, on termination and on cancel) |
+| `checkpoint.keep` | 9, 12 | bool | false | fixed per run | user | keep the run directory and final manifest after a completed run |
+| `resume` | 12 | string | none | run id, manifest path, `auto` | user | resume from a manifest instead of starting fresh |
+| `durable_staging` | 3 | guarantee | `Unknown` (treated `Absent`) | `present`, `absent` | platform | declares `staging.dir` survives the node; part of `host_profile` |
 | `sizer` | 11 | enum | `rule` | `rule`, `learned` | user | decision function |
 | `sizer.fallback_error_ratio` | 11 | f32 | 2.0 | 1.2 .. 5.0 | compile | learned → rule fallback trigger |
 | `host_profile` | 3 | struct | probed | declared via `AMORU_HOST_PROFILE` | platform | guarantees; see `03-discovery.md` |
@@ -266,7 +276,7 @@ Pinned versions (filled by the component 1 agent): _pending_.
 
 ### 6.3 Feature flags
 
-`cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration and `RdmaSource`; post-v1), `python`, `polars`, `datafusion` (adapters). Default features: none of these. `amoru-py` enables `python` and, on Linux, `uring`.
+`cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration with the NIC, the reactor's `Remote` copy rows, the placement engine's remote tier; post-v1, see architecture section 11; its reserved arms exist in every v1 build and return `Unsupported("rdma")`), `python`, `polars`, `datafusion` (adapters). Default features: none of these. `amoru-py` enables `python` and, on Linux, `uring`.
 
 ### 6.4 Test infrastructure (`amoru-testkit`)
 
@@ -285,9 +295,9 @@ Waves are the parallelism plan; the gate names the sufficiency criteria (parent 
 | 0 | 1 | 1 | crate compiles with no runtime dependency (`cargo tree`); every fake compiles against the traits; CT tests pass; trace schema hash test pinned |
 | 1 | 2, 3, 4, 5, testkit | up to 5 | AR, DS, TR, AD tests pass against fakes; G-I2 for the Python adapter (zero payload copies); S13 partial |
 | 2 | 6 (and design of 9) | 1 | RE tests pass; direct IO and fallback both exercised on the developer host; G-I7 |
-| 3 | 7, 8, 9 | 3 | SO, SI, PL tests pass; S10, S15 with `FakeSink` throttle; G-I3 |
-| 4 | 10, 11 | 2 | end-to-end with fakes and with real components: S1, S2, S4, S5, S6, S11; G-I1, G-I4, G-I5, G-I8 |
-| 5 | 12, runtime facade, bench | 1 | S3, S7, S8, S9, S12 on the reference hardware; G-I9, G-I10 |
+| 3 | 7, 8, 9 | 3 | SO, SI, PL tests pass; S10, S15 with `FakeSink` throttle; G-I3; manifest round trip and sink commit tracking (PL-T16, SI-T12, SI-T13) |
+| 4 | 10, 11 | 2 | end-to-end with fakes and with real components: S1, S2, S4, S5, S6, S11; G-I1, G-I4, G-I5, G-I8; kill-and-resume equivalence (SC-T16, PL-T17) |
+| 5 | 12, runtime facade, bench | 1 | S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-I10, G-I12 (PY-T12) |
 
 No wave starts until the previous wave's gate is green, except that wave 2's design work on component 9 runs during wave 1.
 
@@ -320,6 +330,10 @@ Decisions no agent makes on its own. Each carries the assumption the agent takes
 **E9. Any `unsafe` outside the arena, the DLPack wrapper, the C Data Interface crossing and the direct IO calls.** Assumption: not permitted; the agent stops and reports.
 
 **E10. Any new cross-component interface.** Assumption: not permitted in a component branch; it is a change to `01-contracts.md` and the contracts crate first, in its own pull request.
+
+**E11. Implementing any reserved multi-node path.** `Tier::Remote`, `Locality::Local`, the `rdma` rows of the placement move table and the reactor copy table, `NodeId` values other than `LOCAL_NODE`, and any peer, lease or queue-pair API. Assumption: out of scope for every v1 component; the arms exist and return `Unsupported("rdma")`; an agent that finds it needs more than that stops and reports. The multi-node extension is its own set of SDDs later (architecture section 11).
+
+**E12. Weakening a resume guarantee.** Any change that would make `committed_seq` overstate, a manifest reference a missing segment, a `Reinit` kernel's state be assumed safe, or the normal path write payload bytes for recovery. Assumption: not permitted; G-I12 and the invariants PL-I11 to PL-I13, SI-I8 stand; the agent stops and reports.
 
 ---
 
@@ -354,7 +368,11 @@ Filled as component SDDs land. The parent's S-ids and D-ids map to the invariant
 | D8 | SC-* | wave 4 |
 | D9 | G-I6, CT-* | wave 0 |
 | D10 | G-I2, G-I3, PL-* | wave 3 |
+| S16 | G-I11, CT-I11 | CT-T14 (lint, every wave), PL-T19 |
+| S17 | G-I12, CT-I12, PL-I11 to PL-I13, SI-I8 | wave 3 (PL-T16, SI-T12, SI-T13), wave 4 (SC-T16, PL-T17), wave 5 (PY-T12) |
 | D11 | E8 | (deferred) |
+| D12 | G-I11, E11 | CT-T14 |
+| D13 | G-I12 | wave 4 |
 
 ---
 

@@ -31,7 +31,7 @@ It refuses to know: anything a component owns. If logic appears here that is not
 
 ## c. Invariants
 
-**PY-I1. Startup order is fixed.** `Runtime::run` performs, in this order and no other: discover → arena → reactor → trace → build sources and sinks (needs reactor) → build kernels (adapters) → placement → scheduler (validates the chain, opens the sink, spawns pools) → controller `prepare` → kernel `init` via scheduler → controller `probe_all` → controller `start` → scheduler `run` → controller `stop` → trace `finish` → report. Shutdown is the reverse of what was started, always executed, including on error.
+**PY-I1. Startup order is fixed.** `Runtime::run` performs, in this order and no other: discover → arena → reactor → trace → build sources and sinks (needs reactor) → build kernels (adapters) → placement → scheduler (validates the chain, spawns pools; the sink is opened inside `run`) → controller `prepare` → kernel `init` via scheduler → controller `probe_all` → controller `start` → scheduler `run` → controller `stop` → trace `finish` → report. Shutdown is the reverse of what was started, always executed, including on error. A resumed run (f.7) differs in exactly three steps: `placement.restore` right after placement is built, `scheduler.resume` in place of `scheduler.run` (which also resumes the sink in place of opening it), and controller `probe_missing` in place of `probe_all`.
 
 **PY-I2. Every error reaches Python as one exception type with a structured payload.** `amoru.AmoruError` with `.kind` (the `AmoruError` variant name), `.message`, and `.diagnostic` (a dict with seq, stage, features, footprint, budget where present); subclasses `PlanError`, `KernelError`, `BudgetError`, `IoError`, `ConfigError`, `Cancelled` for `except` ergonomics.
 
@@ -46,6 +46,8 @@ It refuses to know: anything a component owns. If logic appears here that is not
 **PY-I7. Wheels are version-specific and thread-safe.** The module is built with `gil_used = false`, for CPython 3.13, 3.13t, 3.14, 3.14t, on `manylinux_2_28` x86_64 and aarch64 and `macosx` arm64; no abi3.
 
 **PY-I8. Nothing on the Python side allocates or touches payload bytes.** The package never imports `pandas`; it accepts and returns `pyarrow` and DLPack objects through the adapters only.
+
+**PY-I9. A run that can be resumed says so, and a resume never starts from the wrong run.** Every `Terminated` or `Cancelled` outcome with a manifest carries `.manifest` (path) and `.run_id` on the exception and the partial report; `amoru.run(..., resume=<run_id | path | "auto">)` refuses, before any write, a manifest whose run id, plan or kernels differ from what was passed (`Placement::restore`), so a user cannot resume yesterday's job over today's inputs by accident. Upholds S17.
 
 ## d. Interfaces
 
@@ -63,6 +65,9 @@ pub struct RunSpec {
     pub object_store: ObjectStoreConfig,
     pub host_profile: Option<HostProfile>,
     pub allow_gil: bool,
+    pub checkpoint: bool, pub checkpoint_interval_ms: u64, pub checkpoint_keep: bool,
+    /// None: fresh run. Some: resume from this manifest (found by run id or path; "auto" resolved by the surface to the newest under `staging_dir`).
+    pub resume: Option<PathBuf>,
 }
 
 pub struct Runtime;
@@ -79,11 +84,16 @@ impl Runtime {
 ```python
 def run(source, kernels, sink, *, budget=None, cpu=None, trace=None, staging_dir=None,
         staging_limit=None, on_error="terminate", ordered=False, sizer="rule",
-        profiles_dir=None, storage=None, host_profile=None, allow_gil=False) -> RunReport
+        profiles_dir=None, storage=None, host_profile=None, allow_gil=False,
+        checkpoint=True, checkpoint_interval=5.0, keep_checkpoint=False,
+        resume=None) -> RunReport
+    # resume: None | "auto" | run id (str) | path to a manifest.json
 
 def kernel(fn=None, *, stateful=False, instances=1, device_memory=False,
            accepts="table", tier="host", releases_gil=None,
-           expected_amplification=None, preferred_rows=None)   # decorator, usable bare or with args
+           expected_amplification=None, preferred_rows=None,
+           resume="reinit")   # "reinit" | "checkpoint" | "forbid"; "checkpoint" requires the
+                              # kernel object to define checkpoint(state) -> bytes and restore(ctx, bytes) -> state
 
 class ParquetSource:   def __init__(self, urls: str | list[str], *, columns=None, filters=None)
 class TensorSource:    def __init__(self, paths: str | list[str], *, tensors=None)
@@ -92,8 +102,9 @@ class ParquetSink:     def __init__(self, url: str, *, row_group_bytes=None, fil
 class TensorSink:      def __init__(self, path: str, *, format="amb1", one_file_per_morsel=False, name="tensor")
 class ArrowIpcSink:    def __init__(self, path: str, *, file_bytes=None)
 
-class RunReport:  # attributes per amoru_trace::RunReport; __str__; to_json(); trace_path
-class AmoruError(Exception): kind: str; message: str; diagnostic: dict
+class RunReport:  # attributes per amoru_trace::RunReport; __str__; to_json(); trace_path; run_id; manifest (None when the run completed and the checkpoint was not kept)
+class AmoruError(Exception): kind: str; message: str; diagnostic: dict; run_id: str | None; manifest: str | None
+class ResumeError(AmoruError) ...   # a manifest that cannot be used; message names the first mismatch
 class PlanError(AmoruError) ...; KernelError; BudgetError; IoError; ConfigError; Cancelled
 
 def inspect_host() -> dict            # discovered limits, resolved host profile, notes
@@ -122,7 +133,9 @@ Every crate's public constructor; `pyo3` 0.28+ with `gil_used = false`; `pyo3-ar
 | Budget | `BudgetError` (diagnostic: seq, stage, footprint, budget, features) |
 | Source, Sink, Io, Staging | `IoError` (diagnostic: op, target, split or file) |
 | Alloc | `BudgetError` |
-| Cancelled | `Cancelled` (with partial report) |
+| Cancelled | `Cancelled` (with partial report, `.manifest` when one was written) |
+| Resume | `ResumeError` |
+| Unsupported | `ConfigError` (message names the feature: "built without rdma") |
 
 ### e.3 Package layout
 
@@ -147,6 +160,8 @@ pyproject.toml                  maturin backend; wheel matrix in CI
 **f.5 `KeyboardInterrupt`.** `run` releases the interpreter (`Python::detach`) while the Rust runtime blocks, and installs a SIGINT handler through PyO3's `check_signals` polling every 100 ms from the facade's waiting thread; on signal, set the cancel token, wait, raise `Cancelled`.
 
 **f.6 `polars()` helper.** If `amoru._core` was built with the `polars` feature and the argument is a Rust plugin name, use the plugin path; otherwise wrap a Python function `lambda batch: pl.from_arrow(batch).pipe(fn).to_arrow()` as a stateless Python kernel (this path copies inside Polars on some types; the docstring says so).
+
+**f.7 Resume path.** With `resume` set: resolve it to a manifest path (`"auto"`: `PlacementEngine::find_manifest(staging_dir, None)`; a run id: `find_manifest(staging_dir, Some(id))`; a path: as given; nothing found is `ResumeError`); refuse with `ResumeError` if `source.repeatable()` is false; read the manifest header (`PlacementEngine::read_manifest_header`) and build `PlacementConfig` with its `run_id` and `node`, so the new process continues the old run's identity rather than minting a new one; run PY-I1 with the three substitutions: after placement is built, `placement.restore(&manifest, &plan, &fingerprints)` (its refusals surface as `ResumeError` before the sink is touched); `controller.probe_missing` instead of `probe_all`; `scheduler.resume(point, cancel)` instead of `run`. `checkpoint=True` is the default whenever a staging directory exists and the source is repeatable (discovery finds or creates one; `staging_dir=None` with no discoverable directory disables both staging and checkpointing with a note in the report); on `Completed`, the run directory is removed unless `keep_checkpoint`; on `Terminated` or `Cancelled`, the final manifest is written and its path is put on the exception and the partial report, and the message ends with "resumable: pass resume=\"<run_id>\"" when it is. The resume argument is the only new parameter a user meets, and only after a failure; PY-I3 holds.
 
 ## g. Concurrency within the component
 
@@ -206,6 +221,8 @@ Python tests run under the four interpreter builds in CI; Rust facade tests use 
 
 **PY-T11 speedup.** (free-threaded, 8 cores) NumPy GIL-releasing kernel: ≥ 5.6× one-worker throughput. S8.
 
+**PY-T12 resume_end_to_end.** (real components, temp staging directory) A three-kernel run to a `ParquetSink` is killed by `SIGKILL` from a subprocess harness at five points; `amoru.run(..., resume="auto")` completes each time; the output directory read back equals an uninterrupted run; the report says `resumed`; a resume with a different kernel list raises `ResumeError` naming the stage before any file is written; a resume with a `resume="forbid"` kernel raises `ResumeError`; `keep_checkpoint=True` leaves the manifest after completion. PY-I9, S17.
+
 ## l. Implementation notes for the agent
 
 Rust files: `crates/amoru-runtime/src/{lib.rs, spec.rs, run.rs (f.1), report.rs (f.2), cancel.rs}`; `crates/amoru-py/src/{lib.rs (module, gil_used = false), sources.rs, sinks.rs, kernel.rs (decorator support: a `#[pyclass] KernelSpec`), run.rs (f.3, f.4, f.5), report.rs, errors.rs (e.2), inspect.rs}`. Python files per e.3. `unsafe` not permitted outside what PyO3 generates.
@@ -230,3 +247,4 @@ Whether GPU support ships as a feature of the main wheel (larger, needs CUDA at 
 | S9 | PY-I5 | PY-T5 |
 | G-I8 | PY-I2 | PY-T2 |
 | preamble 4.3 | PY-I1, PY-I6 | PY-T1, PY-T6 |
+| S17, D13 | PY-I9, f.7 | PY-T12 |

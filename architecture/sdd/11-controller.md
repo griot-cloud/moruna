@@ -49,7 +49,7 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 
 **RC-I5. Oscillation is frozen.** If a stage's adjustments flip sign more than `controller.oscillation_flips` times in its last 100 adjustments, the target is frozen at the geometric mean of the last 10 for `controller.freeze_morsels` completions, and the event is recorded. Upholds S11.
 
-**RC-I6. The probe precedes sizing.** No stage receives a morsel target other than `morsel.probe_bytes` until its probe has completed and `A_k` is set; a profile may seed `A_k` but does not skip the probe.
+**RC-I6. The probe precedes sizing.** No stage receives a morsel target other than `morsel.probe_bytes` until its probe has completed and `A_k` is set; a profile may seed `A_k` but does not skip the probe, except on a resumed run (f.14), where the profile the interrupted run wrote is trusted for the stages it covers and only the others are probed.
 
 **RC-I7. Worker count never exceeds what memory can feed.** `active_workers ≤ floor(budget_for_workers / max_stage_allowance)`, re-evaluated at every tick.
 
@@ -72,6 +72,7 @@ pub struct ControllerConfig {
     pub fallback_error_ratio: f32,
     pub profiles_dir: Option<std::path::PathBuf>,
     pub disk_budget: u64,
+    pub checkpoint_enabled: bool,                  // periodic profile writes, f.9
 }
 
 pub struct Controller { /* private */ }
@@ -86,6 +87,9 @@ impl Controller {
     /// Synchronous hook the scheduler calls after each trace record (cheap; enqueues for the tick thread).
     pub fn on_record(&self, r: &TraceRecord);
     pub fn stop(&mut self) -> ControllerSummary;    // joins the tick thread; returns the timeline and sizer state for the report
+    /// Resume variant of `probe_all` (f.14): probes only stages without a usable profile, seeds the
+    /// rest from the profile store, and writes the profile at once so a second crash keeps it.
+    pub fn probe_missing(&mut self, run_probe: &mut dyn FnMut(StageId, u64) -> Result<ProbeResult>) -> Result<()>;
 }
 
 pub struct KernelInfo { pub stage: StageId, pub fingerprint: Fingerprint, pub schema_hash: [u8; 32], pub hints: KernelHints, pub kind: KernelKind }
@@ -176,9 +180,11 @@ The class and tick time are appended to the timeline (compressed: consecutive eq
 
 **f.8 Learned sizer fallback (RC-I2).** `LearnedSizer` proposals are subject to the same clamp; the controller tracks `prediction_error = |predicted_peak − observed_peak| / observed_peak` per record for both the active sizer and a shadow `RuleSizer`; if, after 50 records, the learned sizer's rolling error p95 exceeds `fallback_error_ratio × RuleSizer`'s, swap to `RuleSizer` for the run and record `fallback_at`.
 
-**f.9 Profile write (`stop`).** If the run completed: merge per e.3 and write atomically (temp file + rename). If `profiles_dir` is None or unwritable: skip with a note.
+**f.9 Profile write (`stop`).** If the run completed: merge per e.3 and write atomically (temp file + rename). If `profiles_dir` is None or unwritable: skip with a note. When checkpointing is on (the facade says so at `new`), the profile is also written at every checkpoint tick after the first 50 records per stage, with the same merge, so a run that dies keeps what it learned; f.14 reads it back.
 
 **f.10 Tiny dataset fast path.** If the source's total planned bytes < `host_budget / 4` (the facade passes the plan total): skip probes, set every target to `morsel_max`, `active_workers = W`, `read_ahead = min(splits, 8)`, and mark the report "small dataset: no adaptation". (Architecture section 8.)
+
+**f.14 Resume (`probe_missing`).** Called by the facade instead of `probe_all` on a resumed run, after `prepare`. For each stage: if the profile store has an entry for its fingerprint (written by f.9 during the interrupted run, or by any earlier run), seed `a_k` and `a_k_dev` from it and skip the probe; otherwise probe as in f.2. Then `start` as usual: the working-set equation runs on the seeded values, so a resumed run begins at the sizes the interrupted run had learned rather than at `probe_bytes`. The controller does not read the manifest; the profile store is its memory, keyed by kernel fingerprint, and it is deliberately node-independent (a directory the operator can place on the same durable volume as the staging directory; `profiles.dir`). The report notes "resumed: N stages seeded, M probed".
 
 ## g. Concurrency within the component
 
@@ -234,6 +240,8 @@ Tests drive the controller with `FakeKnobs`, `FakePlacement`, a scripted `Sample
 
 **RC-T13 throughput.** (reference host) Defaults reach ≥ 80% of the hand-tuned baseline for normalise, tokenise-explode and wide-intermediate. S3.
 
+**RC-T14 resume_seeds_from_profile.** With profiles for two of three stages, `probe_missing` runs exactly one probe and starts with targets computed from the seeded `a_k`s; with checkpointing on, a profile file exists after the first tick past 50 records. f.14, f.9.
+
 ## l. Implementation notes for the agent
 
 Files: `src/lib.rs`, `src/budget.rs` (f.1), `src/probe.rs` (f.2), `src/model.rs` (working set, envelope, f.3), `src/sizer/{mod.rs (trait), rule.rs (f.4), learned.rs (stub + shadow error tracking f.8)}`, `src/apply.rs` (f.5, RC-I1 check), `src/classify.rs` (f.6), `src/breach.rs` (f.7), `src/profile.rs` (e.3, f.9), `src/tick.rs` (thread, queue drain), `src/summary.rs`. No `unsafe`.
@@ -254,6 +262,7 @@ None. (The learned sizer's model is Phase 8; the stub and the shadow error track
 | S2, G-I10 | f.3 (no user parameters) | RC-T12 |
 | S3 | f.4, f.6 | RC-T13 |
 | S6, G-I8 | RC-I4, f.7 | RC-T4, RC-T12 |
+| S17 | f.9 (periodic write), f.14 | RC-T14 |
 | S11 | RC-I3, RC-I5 | RC-T3, RC-T5 |
 | D2 | RC-I8, f.6 | RC-T8, RC-T9 |
 | D3 | RC-I6, f.2 | RC-T6 |

@@ -57,6 +57,10 @@ Beyond the preamble's global vocabulary:
 
 **CT-I10. Errors carry the morsel.** Every error variant that can occur while processing a morsel carries `seq`, `stage` and, where known, `features` and the measured footprint, so a diagnostic can be produced without a debugger (G-I8).
 
+**CT-I11. Reserved variants are matched, never wildcarded.** `Tier::Remote`, `NodeId` values other than `LOCAL_NODE`, and `Locality::Local` exist in v1 so that the multi-node extension adds behaviour without changing a signature. Every `match` on `Tier` in every crate has an explicit `Remote` arm that returns `AmoruError::Unsupported("rdma")` (or handles it, once the `rdma` feature exists); no `_ =>` arm covers it. Rationale: the aim is one framework that runs at one node and at many without rework; a wildcard arm is where the rework would hide.
+
+**CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read. `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
+
 ## d. Interfaces
 
 All code below is normative: names, shapes and doc comments are binding; the implementer may add private helpers and derive macros. `Result<T>` is `core::result::Result<T, AmoruError>` throughout.
@@ -76,6 +80,17 @@ pub type SplitId = u32;
 /// Accelerator index as enumerated by discovery.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct DeviceId(pub u8);
+/// Index of a node in a run. A single-node run has exactly one node, `LOCAL_NODE`.
+/// Reserved for the multi-node extension (architecture section 11); every v1
+/// value is `LOCAL_NODE` and every v1 `match` on it handles the general case
+/// explicitly (CT-I11).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct NodeId(pub u16);
+pub const LOCAL_NODE: NodeId = NodeId(0);
+/// Identity of one run; 16 random bytes, printed as 32 lowercase hex characters.
+/// Names the staging directory and the run manifest (placement e.3, e.5).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct RunId(pub [u8; 16]);
 ```
 
 ### d.2 Tier
@@ -92,6 +107,23 @@ pub enum Tier {
     Host,
     /// A staging segment on local disk; the payload has no resident bytes.
     Disk(SegmentRef),
+    /// Registered memory on another node of the same run, reachable by one-sided
+    /// RDMA through the reactor. Reserved: no v1 component produces this variant,
+    /// and every v1 component that matches on `Tier` handles it by returning
+    /// `AmoruError::Unsupported("rdma")` rather than by a wildcard arm (CT-I11).
+    Remote(NodeId, RemoteRef),
+}
+
+/// Location of a payload in another node's registered memory. Fields are those
+/// a one-sided RDMA read needs and nothing else; the memory key is opaque here.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct RemoteRef {
+    /// Virtual address on the owning node.
+    pub addr: u64,
+    /// Remote memory key as registered with the owning node's NIC.
+    pub rkey: u32,
+    /// Byte length.
+    pub len: u64,
 }
 
 /// Location of a demoted payload inside a staging segment.
@@ -106,11 +138,15 @@ pub struct SegmentRef {
 }
 
 impl Tier {
-    /// True for Device, PinnedHost and Host.
+    /// True for Device, PinnedHost and Host; false for Disk and Remote.
     pub fn is_resident(&self) -> bool;
-    /// Ordering used by the placement engine: Device > PinnedHost > Host > Disk.
+    /// Ordering used by the placement engine: Device > PinnedHost > Host > Remote > Disk.
     pub fn rank(&self) -> u8;
+    /// Index into per-tier arrays: Device = 0, PinnedHost = 1, Host = 2, Disk = 3, Remote = 4.
+    pub fn index(&self) -> usize;
 }
+/// Length of every per-tier array in the contract (`bytes_by_tier`, water marks, reservations).
+pub const TIER_COUNT: usize = 5;
 ```
 
 ### d.3 Buffers and the allocator
@@ -246,11 +282,17 @@ impl Payload {
 ### d.5 Morsel
 
 ```rust
+/// Where a morsel's bytes came from. The lineage of every morsel in the run: a
+/// morsel at stage `s` is exactly `kernels[1..=s]` applied to
+/// `source.read(split, row_start..row_end)`, so any morsel can be re-obtained
+/// from its origin (CT-I12). This is what Q0 eviction and run resume both rely on.
 #[derive(Clone, Debug)]
 pub struct Origin {
     pub split: SplitId,
     pub row_start: u64,   // inclusive, within the split
     pub row_end: u64,     // exclusive
+    /// The node that read the split. `LOCAL_NODE` in every v1 run.
+    pub node: NodeId,
 }
 
 /// Features the controller and the trace consume. Table fields are None for tensors and vice versa.
@@ -300,10 +342,16 @@ pub struct RowRange { pub start: u64, pub end: u64 }
 
 pub trait Source: Send + Sync {
     fn schema(&self) -> SourceSchema;
-    /// All splits, in delivery order, before any read. Called once.
+    /// All splits, in delivery order, before any read. Called once per run; on a
+    /// resumed run the result must equal the plan recorded in the manifest
+    /// (checked by a digest over split ids and row counts, placement e.5; a
+    /// mismatch is `Resume`).
     fn plan(&self) -> Result<Vec<Split>>;
     /// Read a split (or a row range of it) into buffers from `alloc` in `tier`,
     /// returning a resident payload. Runs on the reactor; must not block a worker.
+    /// Deterministic for a given `(split, rows)` for the lifetime of the input
+    /// (CT-I12): the same call returns the same rows in the same order, when
+    /// `repeatable()` is true.
     fn read(
         &self,
         split: &Split,
@@ -311,6 +359,11 @@ pub trait Source: Send + Sync {
         alloc: &dyn Allocator,
         tier: Tier,
     ) -> BoxFuture<'_, Result<Payload>>;
+    /// True when `plan` and `read` satisfy CT-I12. A source that pulls from a
+    /// one-shot iterator returns false; the runtime then disables Q0 eviction
+    /// (stages Q0 instead) and refuses `resume` for the run. Default true, which
+    /// every file-backed source satisfies by construction.
+    fn repeatable(&self) -> bool { true }
 }
 ```
 
@@ -325,16 +378,38 @@ pub enum KernelKind {
     Stateful { max_instances: core::num::NonZeroUsize },
 }
 
+/// How a kernel's instances come back when a run is resumed from its manifest.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum ResumePolicy {
+    /// A fresh `init` is enough: the state does not depend on which morsels were
+    /// seen (a loaded model, a compiled expression). The default.
+    #[default] Reinit,
+    /// The state depends on morsels seen; `KernelState::checkpoint` returns it and
+    /// `Kernel::restore` rebuilds it. The scheduler checkpoints every instance at
+    /// each manifest write.
+    Checkpoint,
+    /// The kernel cannot be resumed; a resume attempt fails with `Resume` naming the stage.
+    Forbid,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct KernelHints {
     pub expected_amplification: Option<f64>,
     pub uses_device_memory: bool,
     pub releases_gil: Option<bool>,
     pub preferred_rows: Option<u64>,
+    pub resume: ResumePolicy,
 }
 
 /// Per-instance state a stateful kernel keeps between `apply` calls.
-pub trait KernelState: Send { fn as_any_mut(&mut self) -> &mut dyn core::any::Any; }
+pub trait KernelState: Send {
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+    /// Serialise the state for the run manifest. Called only when the kernel's
+    /// `ResumePolicy` is `Checkpoint`; the default returns `Ok(None)`, which the
+    /// scheduler treats as "nothing to save" for `Reinit` kernels and as an error
+    /// for `Checkpoint` kernels (a `Checkpoint` kernel must return `Some`).
+    fn checkpoint(&mut self) -> Result<Option<Vec<u8>>> { Ok(None) }
+}
 /// Unit state for stateless kernels.
 pub struct NoState;
 
@@ -354,6 +429,13 @@ pub trait Kernel: Send + Sync + 'static {
     fn output_schema(&self, input: &SourceSchema) -> Result<SourceSchema>;
     /// Once per instance, on the worker that will own the instance.
     fn init(&self, ctx: &InitCtx) -> Result<Box<dyn KernelState>>;
+    /// Rebuild an instance from bytes `KernelState::checkpoint` produced. Called
+    /// instead of `init` on resume, only for `ResumePolicy::Checkpoint` kernels.
+    /// The default refuses; a kernel that declares `Checkpoint` must override it.
+    fn restore(&self, ctx: &InitCtx, state: &[u8]) -> Result<Box<dyn KernelState>> {
+        let _ = (ctx, state);
+        Err(AmoruError::Resume("kernel declares Checkpoint but does not implement restore".into()))
+    }
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload>;
@@ -370,11 +452,36 @@ pub trait Sink: Send + Sync {
     fn open(&mut self, schema: &SourceSchema) -> Result<()>;
     fn accepts(&self) -> PayloadSpec;
     fn requires_order(&self) -> bool { false }
-    /// Takes ownership; runs on the reactor; completes when the bytes are durably
-    /// handed to the store's client (not necessarily fsynced).
-    fn write(&self, payload: Payload) -> BoxFuture<'_, Result<()>>;
+    /// Takes ownership; runs on the reactor; completes when the bytes are handed
+    /// to the store's client (not necessarily committed; see `committed_seq`).
+    /// `seq` is the morsel's sequence number, which the sink records with the
+    /// output it lands in so a resume can identify uncommitted output.
+    fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, Result<()>>;
     /// Exactly once, after the last `write` completed.
     fn finish(&mut self) -> Result<SinkSummary>;
+
+    // Resume support. A sink that leaves the defaults in place is not resumable:
+    // `Scheduler::resume` calls `Sink::resume` first, and its `Resume` names the sink.
+
+    /// Highest `seq` such that every morsel with a sequence number at or below
+    /// it is committed (visible to a reader and safe against process loss) or was
+    /// declared skipped through `skip`. `None` means nothing is committed yet, or
+    /// the sink does not track commits.
+    fn committed_seq(&self) -> Option<Seq> { None }
+    /// The scheduler will never write `seq` (error policy `skip`); the sink counts
+    /// it as committed for the watermark. Default: nothing, which is correct for
+    /// a sink that does not track commits.
+    fn skip(&self, seq: Seq) { let _ = seq; }
+    /// Opaque sink state for the run manifest (for a file sink: committed file
+    /// names and the next file index). Called at every manifest write.
+    fn checkpoint(&self) -> Result<Option<Vec<u8>>> { Ok(None) }
+    /// Called instead of `open` on resume. The sink must discard any output that
+    /// holds a sequence number above `committed_seq` (an uncommitted file, a
+    /// multipart upload) and continue numbering after the checkpointed state.
+    fn resume(&mut self, schema: &SourceSchema, state: &[u8], committed_seq: Option<Seq>) -> Result<()> {
+        let _ = (schema, state, committed_seq);
+        Err(AmoruError::Resume("sink does not support resume".into()))
+    }
 }
 ```
 
@@ -402,7 +509,7 @@ pub trait Reactor: Send + Sync {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct IoPaths { pub direct_io: bool, pub io_uring: bool, pub gds: bool, pub pinned: bool }
+pub struct IoPaths { pub direct_io: bool, pub io_uring: bool, pub gds: bool, pub pinned: bool, pub rdma: bool /* always false without feature rdma */ }
 ```
 
 ### d.10 Placement
@@ -414,7 +521,7 @@ pub struct TierBudgets { pub device: [u64; 8], pub pinned_host: u64, pub host: u
 #[derive(Clone, Debug, Default)]
 pub struct QueueStats {
     pub stage: StageId,
-    pub bytes_by_tier: [u64; 4],     // Device(sum), PinnedHost, Host, Disk
+    pub bytes_by_tier: [u64; TIER_COUNT],  // indexed by Tier::index: Device(sum), PinnedHost, Host, Disk, Remote
     pub count: u64,
     pub misses: u64,                 // pops that waited on a move
     pub miss_wait_us: u64,
@@ -424,16 +531,66 @@ pub struct QueueStats {
 #[derive(Clone, Debug, Default)]
 pub struct PlacementStats { pub queues: Vec<QueueStats>, pub in_flight_bytes: u64 }
 
+/// Which node's memory a pop may be satisfied from. Reserved for the multi-node
+/// extension; v1 callers pass `Any` and, with one node, the two are equivalent.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum Locality {
+    /// Only entries resident on the calling node.
+    Local,
+    /// Any node; the engine may issue a remote move to satisfy the pop.
+    #[default] Any,
+}
+
+/// Pieces of a checkpoint the placement engine does not own but records in the
+/// manifest on behalf of the scheduler (placement e.5).
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointExtras {
+    /// `(stage, instance, bytes)` from `KernelState::checkpoint` for `Checkpoint` kernels.
+    pub kernel_states: Vec<(StageId, usize, Vec<u8>)>,
+    /// From `Sink::checkpoint`.
+    pub sink_state: Option<Vec<u8>>,
+    /// From `Sink::committed_seq` at the moment of the checkpoint.
+    pub committed_seq: Option<Seq>,
+    /// Where the source drive is: the index into the plan and the next row within
+    /// that split, plus the next sequence number to assign.
+    pub source_cursor: SourceCursor,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SourceCursor { pub split_index: u32, pub row_offset: u64, pub next_seq: Seq }
+
+/// What `Placement::restore` hands back so the scheduler can continue the run.
+#[derive(Clone, Debug, Default)]
+pub struct ResumePoint {
+    pub extras: CheckpointExtras,
+    /// Morsels the manifest knew about that have no disk copy and are not
+    /// committed: the scheduler re-reads each from its origin and pushes it to
+    /// Q0 with its original `seq` before restarting the source drive.
+    pub to_recompute: Vec<(Seq, Origin)>,
+}
+
 pub trait Placement: Send + Sync {
     /// Never blocks. Ok(()) even if the queue is above high water; the caller
     /// consults `is_full` for admission.
     fn push(&self, stage: StageId, morsel: Morsel) -> Result<()>;
-    /// Returns the head if it is resident in a tier satisfying `want`; `Ok(None)` if the
-    /// queue is empty or the head is not yet resident. Never blocks.
-    fn pop(&self, stage: StageId, want: PayloadSpec) -> Result<Option<Morsel>>;
-    /// Blocks until the head is resident in a tier satisfying `want`, or the queue is
-    /// closed (returns Ok(None)). The only blocking call in the contract (CT-I7).
-    fn pop_blocking(&self, stage: StageId, want: PayloadSpec) -> Result<Option<Morsel>>;
+    /// Returns the head if it is resident in a tier satisfying `want` and `locality`;
+    /// `Ok(None)` if the queue is empty or the head is not yet resident. Never blocks.
+    fn pop(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> Result<Option<Morsel>>;
+    /// Blocks until the head is resident in a tier satisfying `want` and `locality`,
+    /// or the queue is closed (returns Ok(None)). The only blocking call in the contract (CT-I7).
+    fn pop_blocking(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> Result<Option<Morsel>>;
+    /// The sink has committed every morsel with a sequence number at or below `seq`.
+    /// Lets the engine forget the lineage of committed morsels (placement f.11).
+    fn set_committed(&self, seq: Seq);
+    /// Write the run manifest atomically to the staging directory (placement e.5).
+    /// Returns the manifest path. An engine without a staging directory returns
+    /// `Err(Resume("no staging directory"))`.
+    fn checkpoint(&self, extras: &CheckpointExtras) -> Result<std::path::PathBuf>;
+    /// Rebuild queues from a manifest written by `checkpoint`: entries with a disk
+    /// copy come back `OnDisk`; the rest are listed in `ResumePoint::to_recompute`.
+    /// Must be called before any `push`. Validates the manifest against the plan
+    /// and kernel fingerprints it is given.
+    fn restore(&self, manifest: &std::path::Path, plan: &[Split], fingerprints: &[Fingerprint]) -> Result<ResumePoint>;
     fn is_full(&self, stage: StageId) -> bool;
     /// Declare the consumer of a queue so promotion targets the right tier.
     fn set_consumer(&self, stage: StageId, want: PayloadSpec);
@@ -507,6 +664,14 @@ pub struct HostProfile {
     pub gds: Guarantee,
     pub rdma: Guarantee,
     pub staging_dir: Option<std::path::PathBuf>,
+    /// `Present`: `staging_dir` outlives the process and the node (a persistent
+    /// volume, a detachable disk), so a manifest written there can be resumed from
+    /// another node. `Absent`: local only (resume works after a process restart on
+    /// the same node, if the directory survived). `Unknown` is treated as `Absent`:
+    /// durability across nodes is a fact about the platform that cannot be probed,
+    /// only declared. Discovery does refuse a tmpfs or overlay staging directory
+    /// declared `Present` (DS, `Config` error).
+    pub durable_staging: Guarantee,
 }
 
 /// One sample of live resource state; produced by discovery's sampler.
@@ -573,6 +738,12 @@ pub enum AmoruError {
     #[error("convert: {0}")] Convert(ConvertError),
     #[error("config {name}: {msg}")] Config { name: &'static str, msg: String },
     #[error("cancelled")] Cancelled,
+    /// A manifest could not be written, read, validated or applied; the message
+    /// names the manifest path and the first mismatch.
+    #[error("resume: {0}")] Resume(String),
+    /// A reserved path (`rdma`, `remote`) was reached in a build that does not
+    /// implement it. Always a bug or a misconfiguration, never a runtime condition.
+    #[error("unsupported: {0}")] Unsupported(&'static str),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -589,7 +760,7 @@ pub enum ConvertError {
 
 ### e.1 Payload tier state machine
 
-A payload's tier changes only through the placement engine (promotion or demotion) or a kernel producing a new payload. Legal transitions: `Host ↔ PinnedHost` (arena re-registration or copy), `PinnedHost ↔ Device` (copy engine), `PinnedHost ↔ Disk` (direct IO), `Disk → Device` (GDS only), `Host ↔ Disk` (buffered IO fallback). Illegal: `Host → Device` directly (must stage through `PinnedHost`), `Disk → Host` when the reactor has direct IO (must land in `PinnedHost`); attempting an illegal transition is an `AmoruError::Staging` and is a bug in the placement engine, not a runtime condition.
+A payload's tier changes only through the placement engine (promotion or demotion) or a kernel producing a new payload. Legal transitions: `Host ↔ PinnedHost` (arena re-registration or copy), `PinnedHost ↔ Device` (copy engine), `PinnedHost ↔ Disk` (direct IO), `Disk → Device` (GDS only), `Host ↔ Disk` (buffered IO fallback). Illegal: `Host → Device` directly (must stage through `PinnedHost`), `Disk → Host` when the reactor has direct IO (must land in `PinnedHost`); attempting an illegal transition is an `AmoruError::Staging` and is a bug in the placement engine, not a runtime condition. Reserved (feature `rdma`, not v1): `PinnedHost ↔ Remote` by one-sided RDMA through the reactor; in a v1 build both directions are `Unsupported("rdma")`.
 
 ### e.2 Buffer provenance
 
@@ -646,7 +817,7 @@ Field order and types are exactly as in `TraceRecord` (d.13): unsigned integers 
 
 **f.5 `PayloadSpec::check`.** `Table` on `Table`: Ok. `Tensor` on `Tensor`: Ok. `Either`: Ok. `Tensor` on `Table`: every column must satisfy e.3 with nullability declared false in the schema (a nullable field fails at plan time even if it happens to contain no nulls; that is deliberate). `Table` on `Tensor`: Ok only if rank ≤ 2 and dtype convertible.
 
-**f.6 `Tier::rank`.** Device = 3, PinnedHost = 2, Host = 1, Disk = 0.
+**f.6 `Tier::rank` and `Tier::index`.** Rank (promotion order): Device = 4, PinnedHost = 3, Host = 2, Remote = 1, Disk = 0; a remote copy outranks a disk copy because an RDMA read is faster than an NVMe read, and the placement engine promotes from the highest-ranked copy it holds. Index (array position, stable for the trace and stats): Device = 0, PinnedHost = 1, Host = 2, Disk = 3, Remote = 4. The two orders differ on purpose: rank is a policy and may change; index is a schema and may not (CT-I8).
 
 ## g. Concurrency within the component
 
@@ -698,6 +869,10 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T13 fakes_compile.** `amoru-testkit` implements every trait in d.3 to d.13 and its tests exercise every method once. Proves the contract is implementable.
 
+**CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms compiles with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`bench/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
+
+**CT-T15 resume_defaults.** A kernel with the default `restore` returns `Resume`; a `KernelState` with the default `checkpoint` returns `Ok(None)`; a sink with the default `resume` returns `Resume` and `committed_seq() == None`; `ResumePolicy::default() == Reinit`. Proves the resume defaults are refusals, not silent successes (l, anti-patterns).
+
 ## l. Implementation notes for the agent
 
 Files: `src/lib.rs` (re-exports), `src/ids.rs` (d.1), `src/tier.rs` (d.2, f.6), `src/buffer.rs` (d.3; the `Buffer` type's arena token is an `Arc<dyn ArenaHandle>` trait object defined here with `fn release(&self, ptr, len, tier)` so the arena crate can implement it without a circular dependency), `src/payload.rs` (d.4, f.1, f.3, f.4, f.5), `src/tensor.rs` (the `dlpark` wrapper), `src/morsel.rs` (d.5, f.2), `src/source.rs`, `src/kernel.rs`, `src/sink.rs`, `src/reactor.rs`, `src/placement.rs`, `src/knobs.rs`, `src/limits.rs`, `src/trace.rs` (d.13, e.5), `src/amb1.rs` (e.4, reader and writer over `&[u8]`/`&mut [u8]` only; no IO), `src/error.rs`, `src/fingerprint.rs`.
@@ -714,7 +889,7 @@ Environment facts to verify before starting: `cargo --version` ≥ the 2024-edit
 
 ## m. Open items
 
-None. (E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3.)
+None. (E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `AmoruError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
 
 ## n. Traceability
 
@@ -725,6 +900,8 @@ None. (E1 and E2 in the preamble cover reference hardware and version pinning. T
 | S7 | section a boundary | CT-T12, CT-T13 |
 | S9 | CT-I8, e.5 | CT-T9 |
 | S13 | CT-I4, CT-I5 | CT-T4, CT-T5, CT-T6 |
+| S16, D12 | CT-I11 | CT-T14 |
+| S17, D13, D5 | CT-I12, resume defaults | CT-T15 |
 | G-I2 | CT-I4 | CT-T4, CT-T5 |
 | G-I6 | CT-I1 | CT-T1 |
 | G-I8 | CT-I10 | (exercised by RC and PL tests) |

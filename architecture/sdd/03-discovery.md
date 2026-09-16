@@ -100,8 +100,9 @@ pub fn parse_profile(s: &str) -> Result<HostProfile>;
 | `gds` | `present`, `absent` | `gds` |
 | `rdma` | `present`, `absent` | `rdma` |
 | `staging_dir` | absolute path | `staging_dir` |
+| `durable_staging` | `present`, `absent` | `durable_staging` (declares that `staging_dir` survives the node: a persistent volume or detachable disk; enables cross-node resume, placement f.13) |
 
-Example for a Griot Cloud pod: `AMORU_HOST_PROFILE=huge_pages=present,memlock=present,io_uring=present,direct_io=present,gds=absent,staging_dir=/scratch`.
+Example for a Griot Cloud pod: `AMORU_HOST_PROFILE=huge_pages=present,memlock=present,io_uring=present,direct_io=present,gds=absent,staging_dir=/scratch,durable_staging=present` (with `/scratch` a persistent volume claim).
 
 Other environment variables read here: `AMORU_BUDGET` (bytes, or a string with `GiB`/`MiB` suffix), `AMORU_CPU` (float), `AMORU_SPILL_DIR`, `AMORU_SPILL_LIMIT`. Constructor arguments take precedence over environment variables; both are "explicit" for DS-I1.
 
@@ -147,6 +148,7 @@ source    = Explicit | Cgroup | Os by which branch supplied the ceiling
 | `gds` | `cuFileDriverOpen` (feature `gds`) else Absent | returns success |
 | `rdma` | `ibv_get_device_list` non-empty (feature `rdma`) else Absent | at least one device |
 | `staging_dir` | if None: first writable of `$AMORU_SPILL_DIR`, `/local_disk0`, `/scratch`, `$TMPDIR`, `/tmp` | writable and ≥ 1 GiB free |
+| `durable_staging` | never probed: `Unknown` resolves to `Absent` (contracts d.12); a `Present` declaration on a `tmpfs` or `overlay` filesystem (`statfs` magic) is refused with `Config { name: "durable_staging" }` | n/a |
 
 Probes run in this order; each is bounded to 100 ms; a probe that times out resolves to `Absent` with a note.
 
@@ -174,7 +176,7 @@ Probes run in this order; each is bounded to 100 ms; a probe that times out reso
 
 **Databricks driver.** No usable cgroup limit (or one equal to the machine); explicit budget required; if absent, `discover` still succeeds with the OS value but adds a note "explicit budget recommended on this host: JVM present" when `JAVA_HOME` or a `java` process is detected via `/proc/*/comm` (best effort).
 
-**Edge cases.** `memory.high` > `memory.max` (misconfigured): ignore high, note it. `cpu.max` quota below one core (e.g. `50000 100000`): quota 0.5; the scheduler will run one worker. Explicit budget above the kill line: clamped to 0.95 × kill with a warning (DS-I1). Staging dir on a read-only filesystem: `direct_io_staging` Absent and `staging_dir` None; placement then runs without a disk tier and the report says so.
+**Edge cases.** `memory.high` > `memory.max` (misconfigured): ignore high, note it. `cpu.max` quota below one core (e.g. `50000 100000`): quota 0.5; the scheduler will run one worker. Explicit budget above the kill line: clamped to 0.95 × kill with a warning (DS-I1). Staging dir on a read-only filesystem: `direct_io_staging` Absent and `staging_dir` None; placement then runs without a disk tier, no manifest is written, and the report says so.
 
 **Failures.** Unreadable cgroup files (permissions): fall back to OS with a note. `AMORU_HOST_PROFILE` malformed: `Config` (a platform error, fail fast). Probe timeout: Absent with a note.
 

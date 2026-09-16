@@ -73,6 +73,9 @@ pub struct SchedulerConfig {
     pub sink_concurrency: u16,
     pub error_policy: ErrorPolicy,                // Terminate | Skip | Budget(u32)
     pub initial_morsel_target: u64,               // per stage, before the controller sets knobs (morsel.probe_bytes for stage 0's first read)
+    pub checkpoint_enabled: bool,                 // checkpoint.enabled and the placement engine has a staging directory
+    pub checkpoint_interval_ms: u64,              // checkpoint.interval_ms
+    pub node: NodeId,                             // LOCAL_NODE in v1; passed to Origin
 }
 
 pub struct Scheduler { /* private */ }
@@ -80,13 +83,26 @@ impl Scheduler {
     pub fn new(cfg: SchedulerConfig, pipeline: Pipeline, placement: Arc<dyn Placement>, reactor: Arc<Reactor>, alloc: Arc<dyn Allocator>, trace: Arc<dyn TraceSink>, sampler_hook: Arc<dyn Fn() -> Sample + Send + Sync>) -> Result<Scheduler>;
     /// Runs the pipeline to completion, termination or cancellation. Blocks the caller (the facade's main thread).
     pub fn run(&self, cancel: CancelToken) -> Result<RunOutcome>;
+    /// Continue a run from a `ResumePoint` the placement engine produced (f.13). Called by the
+    /// facade instead of `run`, after `Placement::restore` and before any probe; it sets the
+    /// source cursor and sequence counter, resumes the sink, restores or re-inits instances,
+    /// re-reads the recompute list, then behaves as `run`.
+    pub fn resume(&self, point: ResumePoint, cancel: CancelToken) -> Result<RunOutcome>;
+    /// Write a manifest now (f.12). Called by the checkpoint tick and by the facade on termination.
+    pub fn checkpoint(&self) -> Result<()>;
     pub fn stats(&self) -> SchedulerStats;
     /// Called by the controller to run the probe protocol for stage `stage` (see 11); the scheduler executes it with one worker.
     pub fn probe(&self, stage: StageId, morsel: Morsel) -> Result<ProbeResult>;
 }
 impl Knobs for Scheduler { /* contracts d.11 */ }
 
-pub enum RunOutcome { Completed { sink: SinkSummary }, Terminated { diagnostic: AmoruError }, Cancelled }
+pub enum RunOutcome {
+    Completed { sink: SinkSummary },
+    /// `manifest` is the path of the last manifest written, when checkpointing was on, so the
+    /// surface can tell the user the run is resumable.
+    Terminated { diagnostic: AmoruError, manifest: Option<std::path::PathBuf> },
+    Cancelled { manifest: Option<std::path::PathBuf> },
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerStats {
@@ -94,6 +110,7 @@ pub struct SchedulerStats {
     pub workers_active: u16, pub workers_busy: u16,
     pub reads_in_flight: u16, pub writes_in_flight: u16,
     pub source_exhausted: bool, pub seq_issued: Seq,
+    pub committed_seq: Option<Seq>, pub checkpoints: u64, pub last_checkpoint_us: u64, pub resumed: bool, pub recomputed: u64,
 }
 pub struct ProbeResult { pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_ns: u64, pub output: Morsel }
 ```
@@ -102,7 +119,7 @@ pub struct ProbeResult { pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_
 
 ### d.2 Consumed
 
-Contracts as listed; `amoru_placement::PlacementEngine` (`evicted`, `replace`); `amoru_sinks::ReorderBuffer` (`write_seq`, `is_stalled`, `skip`); `amoru_reactor::Reactor` (to spawn the two drive tasks); `crossbeam` (worker parking); `std::thread`.
+Contracts as listed, plus `Locality`, `NodeId`, `LOCAL_NODE`, `ResumePolicy`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`; `amoru_placement::PlacementEngine` (`evicted`, `replace`, `peek_resident`, and the contract's `set_committed`, `checkpoint`, `restore`); `amoru_sinks::ReorderBuffer` (`is_stalled`, `skip`, `next_expected`); `amoru_reactor::Reactor` (to spawn the two drive tasks and the checkpoint tick); `crossbeam` (worker parking); `std::thread`.
 
 ## e. Data model, formats and state machines
 
@@ -112,7 +129,7 @@ Contracts as listed; `amoru_placement::PlacementEngine` (`evicted`, `replace`); 
 
 ### e.2 Run state machine
 
-`Init` → (probes done) → `Running` → `Draining` (source exhausted, closing queues in order as each empties) → `Finishing` (sink `finish`) → `Completed`; from `Running` or `Draining`, `Terminating` (error under policy) → `Terminated`; `Cancelling` → `Cancelled`. In `Terminating` and `Cancelling`: source drive stops issuing; workers finish current tasks; placement `shutdown`; in-flight sink writes complete; trace `finish`.
+`Init` → (probes done, or `resume` applied) → `Running` → `Draining` (source exhausted, closing queues in order as each empties) → `Finishing` (sink `finish`) → `Completed`; from `Running` or `Draining`, `Terminating` (error under policy) → `Terminated`; `Cancelling` → `Cancelled`. In `Terminating` and `Cancelling`: source drive stops issuing; workers finish current tasks; placement `shutdown`; in-flight sink writes complete; trace `finish`.
 
 ### e.3 Stage table
 
@@ -123,7 +140,7 @@ struct InstancePool { states: Mutex<Vec<Slot>>, max: usize }   // Slot { state: 
 
 ## f. Algorithms and policies
 
-**f.1 Startup.** Validate the chain: `PayloadSpec::check` of each kernel against the upstream schema (contracts CT-I5); the sink's `accepts` against the last kernel's `output_schema`; `set_consumer` on every queue; `open` the sink; spawn `workers_max` threads parked; spawn the source drive and sink drive on the reactor; run the probe protocol per stage in order when the controller asks (the facade sequences: controller → `probe` → controller sets knobs → `run`).
+**f.1 Startup.** Validate the chain: `PayloadSpec::check` of each kernel against the upstream schema (contracts CT-I5); the sink's `accepts` against the last kernel's `output_schema`; `set_consumer` on every queue; spawn `workers_max` threads parked (the sink is opened by `run`, or resumed by `resume`, not here, so that a resumed run never opens it twice); spawn the source drive and sink drive on the reactor; run the probe protocol per stage in order when the controller asks (the facade sequences: controller → `probe` → controller sets knobs → `run`).
 
 **f.2 Worker loop.**
 
@@ -131,7 +148,7 @@ struct InstancePool { states: Mutex<Vec<Slot>>, max: usize }   // Slot { state: 
 loop:
   if !active_slot(): park(); continue
   stage = pick()                                     // f.3; None → park 1 ms, continue
-  morsel = placement.pop(stage-1, spec[stage])       // resident by construction of pick; if None (raced), continue
+  morsel = placement.pop(stage-1, spec[stage], Locality::Any)   // resident by construction of pick; if None (raced), continue
   (state, slot) = acquire_instance(stage)            // f.4; None for stateless → NoState
   t0, s0 = now(), sampler_hook()
   result = catch_unwind(|| kernel.apply(state, morsel.payload))
@@ -149,17 +166,23 @@ loop:
 
 **f.4 Instances.** `acquire_instance(stage)`: lock pool; prefer a free slot whose `owner == this worker`; else any free slot; else if `states.len() < max`, create by `kernel.init(InitCtx { instance: len, device: assigned per instance round-robin over devices when `uses_device_memory`, alloc })`; else return `None` and the worker re-picks (the stage was admissible only if a slot was free or creatable, so this is a race, not a policy). Instances are retired (dropped and re-created on next acquire) after a kernel error (adapters AD-I7 rationale).
 
-**f.5 Source drive.** On the reactor: `plan` once; iterate splits; for each, while `in_flight < read_ahead` and `!placement.is_full(0)` and not stalled by an ordered sink (`sink.is_stalled()`): compute the row range from `morsel_target[1]` (the first kernel's target) and the split's bytes per row (`uncompressed_bytes / rows`), clamp to `[morsel.min_bytes, morsel.max_bytes]`, sub-split when `sub_splittable`; issue `source.read(split, range, alloc, tier0)` where `tier0` is `PinnedHost` if the arena is pinned else `Host`; on completion, `placement.push(0, Morsel::new(seq++, 0, payload, origin))`. Also service `placement.evicted(0)` by re-issuing reads for evicted entries and calling `replace`. When the plan is exhausted and no read is in flight, `placement.close(0)` and set `source_exhausted`.
+**f.5 Source drive.** On the reactor: `plan` once; iterate splits; for each, while `in_flight < read_ahead` and `!placement.is_full(0)` and not stalled by an ordered sink (`sink.is_stalled()`): compute the row range from `morsel_target[1]` (the first kernel's target) and the split's bytes per row (`uncompressed_bytes / rows`), clamp to `[morsel.min_bytes, morsel.max_bytes]`, sub-split when `sub_splittable`; issue `source.read(split, range, alloc, tier0)` where `tier0` is `PinnedHost` if the arena is pinned else `Host`; on completion, `placement.push(0, Morsel::new(seq++, 0, payload, origin))` with `origin.node = cfg.node`. The drive keeps its position as a `SourceCursor { split_index, row_offset, next_seq }` (the next range to issue, not the last completed one) and exposes it for f.12; sequence numbers are assigned at issue in cursor order, so the cursor and the sequence counter always agree. Also service `placement.evicted(0)` by re-issuing reads for evicted entries and calling `replace`. When the plan is exhausted and no read is in flight, `placement.close(0)` and set `source_exhausted`.
 
-**f.6 Sink drive.** On the reactor: loop `placement.pop_blocking(n, sink_spec)`; on `Some(m)`: if the sink is ordered, `write_seq(m.seq, m.payload)`, else `write(m.payload)`; keep up to `sink_concurrency` writes in flight; record a trace record for stage n+1? No: the sink is not a stage; its throughput is visible through the last queue's drain rate and `SinkStats`. On `None` (closed and empty): `finish` the sink, signal completion.
+**f.6 Sink drive.** On the reactor: loop `placement.pop_blocking(n, sink_spec, Locality::Any)`; on `Some(m)`: `sink.write(m.seq, m.payload)` (the reorder buffer, when present, is the sink and orders internally); keep up to `sink_concurrency` writes in flight; after each write completes, read `sink.committed_seq()` and, when it moved, call `placement.set_committed(w)` (f.11); record a trace record for stage n+1? No: the sink is not a stage; its throughput is visible through the last queue's drain rate and `SinkStats`. On `None` (closed and empty): `finish` the sink, signal completion.
 
 **f.7 Draining and closing.** When the source is exhausted and Q0 is empty and no stage-1 task is running, `close(1)`; and so on down the chain; each queue is closed when its producer stage has no task running and its input is closed and empty. This is evaluated by whichever worker or drive observes the condition (a monotonic check, safe to evaluate concurrently).
 
-**f.8 Error policy.** `apply_policy(e)`: `Terminate` → set run state `Terminating` with `e` as the diagnostic (enriched with the morsel's seq, stage, features and the `s1` sample); `Skip` → drop the morsel, tell the reorder buffer `skip(seq)` if ordered; `Budget(n)` → `Skip` until `errors_total == n`, then `Terminate`. A kernel panic is converted to `AmoruError::Kernel { msg: "panic: ..." }` first.
+**f.8 Error policy.** `apply_policy(e)`: `Terminate` → set run state `Terminating` with `e` as the diagnostic (enriched with the morsel's seq, stage, features and the `s1` sample); `Skip` → drop the morsel and call `sink.skip(seq)` (the contract's method; a `ReorderBuffer` advances past the sequence and forwards it, a file sink counts it as committed for its watermark, SI f.7), so a skipped morsel never holds the commit watermark back; on resume a skipped sequence above the watermark is replayed like any other and may be skipped again; `Budget(n)` → `Skip` until `errors_total == n`, then `Terminate`. A kernel panic is converted to `AmoruError::Kernel { msg: "panic: ..." }` first.
 
 **f.9 Probe protocol (called by the controller).** `probe(stage, morsel)`: park all workers but one; on that worker run f.2's body once for `stage` with the given morsel, capturing `s0`, `s1` and device samples; return `ProbeResult` with the output morsel pushed to the next queue as normal (nothing is wasted) and a trace record with `Outcome::Probe`; unpark.
 
-**f.10 Cancellation.** `cancel` observed by drives and workers between tasks; state `Cancelling`; f.7 is skipped; placement `shutdown`; sink writes in flight complete; sink `finish` is not called; trace `finish`; return `Cancelled`.
+**f.10 Cancellation.** `cancel` observed by drives and workers between tasks; state `Cancelling`; f.7 is skipped; placement `shutdown`; sink writes in flight complete; a final manifest is written (f.12) when checkpointing is on; sink `finish` is not called; trace `finish`; return `Cancelled { manifest }`.
+
+**f.11 Commit watermark.** The sink drive owns the watermark `w`: after each completed write and after each `sink.skip`, `w' = sink.committed_seq()` (the sink already counts skipped sequences, SI f.7); when `w' > w`, `placement.set_committed(w')` and `stats.committed_seq = w'`. With a sink whose `committed_seq` is always `None` (not resumable), `w` never moves, the lineage index grows for the run, and `checkpoint_enabled` is forced false at startup with a `warn` naming the sink; the run is correct, only not resumable. At `Finishing`, after `sink.finish()`, `set_committed(next_seq − 1)`.
+
+**f.12 Checkpoint tick.** When `checkpoint_enabled`: a dedicated checkpoint thread (preamble 4.1; not a reactor task, because `KernelState::checkpoint` may run kernel code, and not a worker) wakes every `checkpoint_interval_ms`; the facade also calls `checkpoint()` on termination and cancellation, from the main thread. `checkpoint()`: gather `CheckpointExtras { kernel_states, sink_state, committed_seq: w, source_cursor }` where `kernel_states` comes from calling `KernelState::checkpoint` on every instance of every `ResumePolicy::Checkpoint` stage (each instance is acquired for the call like a task, so no `apply` runs concurrently on it; SC-I6), `sink_state` from `sink.checkpoint()`, and the cursor from the source drive; then `placement.checkpoint(&extras)`. A `Checkpoint` kernel whose `checkpoint` returns `Ok(None)` is a kernel bug: the run terminates with `Resume` naming the stage. Failures are counted and logged; three consecutive terminate the run (placement h). The thread never holds the stage table lock across the placement call.
+
+**f.13 Resume.** `resume(point, cancel)`, in `Init`, in this order: `sink.resume(schema, sink_state, committed_seq)` instead of `open` (a sink returning `Resume` ends the attempt with that error naming the sink; nothing has been written); then refuse if `!checkpoint_enabled` (a resumed run must be able to write its own manifests); set the source drive's cursor and sequence counter from `point.extras.source_cursor`; set `w = committed_seq`; for each `Checkpoint` stage, build instances from `kernel_states` through `kernel.restore(InitCtx, bytes)` in instance order, and for `Reinit` stages let f.4 create instances lazily as usual (`Forbid` was refused by `Placement::restore`); then, before the source drive starts issuing new reads, re-read every `(seq, origin)` in `point.to_recompute` in order through the normal source path (`source.read(split_of(origin), Some(origin.row_start..origin.row_end), alloc, tier0)`) and push each to Q0 with its original `seq` (`Morsel::new(seq, 0, payload, origin)`), counting `stats.recomputed`; the re-reads obey `read_ahead` and `is_full(0)` like any other read, so a large recompute list does not blow the budget; then continue as `run` from `Running` (the controller's `probe_missing`, RC f.14, ran before `resume` was called, in the facade's sequence, PY-I1). Sequence numbers above the cursor's `next_seq` are never reused, and the ones below it that are not in the lineage are, by construction, committed or skipped. Output equals an uninterrupted run (PL-T17).
 
 ## g. Concurrency within the component
 
@@ -175,11 +198,11 @@ Lock order: the stage table lock (position 1) is taken only during startup and s
 
 ## i. Configuration
 
-`workers.max`, `workers.active`, `readahead.splits`, `sink.concurrency`, `errors.policy`, `ordering.required`, `morsel.min_bytes`, `morsel.max_bytes` (as clamps in f.5).
+`workers.max`, `workers.active`, `readahead.splits`, `sink.concurrency`, `errors.policy`, `ordering.required`, `morsel.min_bytes`, `morsel.max_bytes` (as clamps in f.5), `checkpoint.enabled`, `checkpoint.interval_ms`.
 
 ## j. Observability
 
-`SchedulerStats`; `TraceRecord` emission (the trace is the scheduler's primary output); `tracing`: `sched.start` (info: workers, stages), `sched.probe` (info), `sched.close_stage` (debug), `sched.policy` (warn on skip, error on terminate), `sched.cancel` (info).
+`SchedulerStats`; `TraceRecord` emission (the trace is the scheduler's primary output); `tracing`: `sched.start` (info: workers, stages), `sched.probe` (info), `sched.close_stage` (debug), `sched.policy` (warn on skip, error on terminate), `sched.cancel` (info), `sched.checkpoint` (debug: committed_seq, cursor, duration_us), `sched.resume` (info: committed_seq, to_recompute, cursor), `sched.not_resumable` (warn: the sink).
 
 ## k. Tests
 
@@ -211,9 +234,15 @@ Tests use `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeTrace`.
 
 **SC-T13 evicted_replay.** With Q0 staging off and pressure, evicted entries are re-read and replaced; output equals the no-pressure run. PL-I6 interplay.
 
+**SC-T14 watermark_and_skips.** Fake sink that commits every 10 sequences and implements `skip`; `Skip` policy with failures on sequences 7, 23, 24; `sink.skip` is called for each; `set_committed` is called with exactly the model's watermark (skips do not hold it back) and never with a lower value than before. f.11, f.8.
+
+**SC-T15 checkpoint_tick.** With `checkpoint_interval_ms = 50` and a `Checkpoint` kernel: `KernelState::checkpoint` is called on every instance at each tick, on the checkpoint thread (thread-id assertion: never a worker, never a reactor thread), with no concurrent `apply` on that instance (asserted inside the fake kernel); `Placement::checkpoint` receives the cursor that equals the next range the source drive issues; a `Checkpoint` kernel returning `Ok(None)` terminates with `Resume`. f.12.
+
+**SC-T16 resume_equivalence.** Run a 3-stage pipeline with `FakeSource` (counting reads) to a fake resumable sink; kill the scheduler (drop it) after a random number of commits; build a new scheduler over a `Placement::restore`d engine and call `resume`; the sink's final row set equals an uninterrupted run; `Source::read` was called once per recomputed origin and once per new range, never for a committed sequence; a `Reinit` kernel saw `init` again, a `Checkpoint` kernel saw `restore` with the bytes it checkpointed, and a non-resumable sink made `resume` return `Resume` before any write. f.13, S17.
+
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs`, `src/pipeline.rs` (validation, f.1), `src/worker.rs` (e.1, f.2), `src/pick.rs` (f.3), `src/instances.rs` (f.4), `src/source_drive.rs` (f.5), `src/sink_drive.rs` (f.6), `src/lifecycle.rs` (e.2, f.7, f.10), `src/policy.rs` (f.8), `src/probe.rs` (f.9), `src/knobs.rs` (atomics), `src/stats.rs`. No `unsafe`. `catch_unwind` around `apply` requires kernels to be `UnwindSafe`; wrap with `AssertUnwindSafe` and document that a panicking kernel's state is retired.
+Files: `src/lib.rs`, `src/pipeline.rs` (validation, f.1), `src/worker.rs` (e.1, f.2), `src/pick.rs` (f.3), `src/instances.rs` (f.4, and the restore path of f.13), `src/source_drive.rs` (f.5, the cursor, the recompute pass of f.13), `src/sink_drive.rs` (f.6, f.11), `src/lifecycle.rs` (e.2, f.7, f.10, `resume`), `src/policy.rs` (f.8), `src/checkpoint.rs` (f.12, the checkpoint thread), `src/probe.rs` (f.9), `src/knobs.rs` (atomics), `src/stats.rs`. No `unsafe`. `catch_unwind` around `apply` requires kernels to be `UnwindSafe`; wrap with `AssertUnwindSafe` and document that a panicking kernel's state is retired.
 
 `peek_resident` is an inherent method on `PlacementEngine` (`09-placement.md` d.1); `FakePlacement` implements it too.
 
@@ -231,6 +260,8 @@ None. (`PlacementEngine::peek_resident` is in `09-placement.md` d.1.)
 | S4 | f.2, f.3 | SC-T12 |
 | S6, G-I8 | SC-I8, f.8 | SC-T7 |
 | S9, G-I4 | SC-I4 | SC-T4 |
+| S17, D13 | f.11, f.12, f.13 | SC-T14, SC-T15, SC-T16 |
+| S16, D12 | `Locality::Any` at every pop, `Origin.node` | (compile-time; CT-T14 lint) |
 | G-I5 | SC-I5 | SC-T5 |
 | G-I9 | SC-I1 | SC-T1 |
 | D8 | f.1 (linear chain) | SC-T8 |

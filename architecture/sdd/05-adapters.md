@@ -126,6 +126,9 @@ pub fn datafusion_udf<K: Kernel>(kernel: K, name: &str) -> datafusion::logical_e
 
 **f.6 DataFusion bridge.** `ScalarUDFImpl::invoke_with_args` receives `ColumnarValue`s; build a `RecordBatch`; `apply`; return the first output column as `ColumnarValue::Array`.
 
+**f.7 Resume policy for Python kernels.** The decorator's `resume=` maps to `KernelHints.resume`. For `"checkpoint"`, the Python kernel object must define `checkpoint(self, state) -> bytes` and `restore(self, ctx, data: bytes) -> state`; the adapter checks both attributes at wrap time (a `Plan` error otherwise, so the omission is found before any morsel is read) and implements `KernelState::checkpoint` and `Kernel::restore` by calling them under attachment, with the bytes copied out of the Python object before detaching. For `"reinit"` (the default) and `"forbid"` nothing is called. A stateful Python kernel that accumulates across morsels and leaves the default is a user error the documentation names in one sentence, and the resume path cannot detect; the `stateful=True` docstring says "if your state depends on the morsels seen, declare resume='checkpoint' or 'forbid'".
+
+
 ## g. Concurrency within the component
 
 `PyKernel` is `Send + Sync`; each `apply` attaches on the calling worker thread. Under a GIL build, one adapter-level mutex per `PyKernel`. Deleters (AD-I5) attach on whatever thread drops; PyO3 0.28's `Py<T>` drop is safe from any thread when attached, which the deleter hook ensures.

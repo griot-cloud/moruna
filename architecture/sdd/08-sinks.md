@@ -31,7 +31,7 @@ It refuses to know: what stage produced a morsel; when to stop (the scheduler ca
 
 ## c. Invariants
 
-**SI-I1. `write` takes ownership and completes once.** After `write(payload)` resolves, the payload's arena bytes have been released (or, for `ArrowIpcSink` local writes, handed to the reactor and released on completion); the `Completion` resolves exactly once. (Preamble 1.3 row 8.)
+**SI-I1. `write` takes ownership and completes once.** After `write(seq, payload)` resolves, the payload's arena bytes have been released (or, for `ArrowIpcSink` local writes, handed to the reactor and released on completion); the `Completion` resolves exactly once. (Preamble 1.3 row 8.)
 
 **SI-I2. `finish` is exactly once, after the last write.** Calling `write` after `finish`, or `finish` twice, is a `Sink` error; the scheduler guarantees the ordering and the sink checks it.
 
@@ -44,6 +44,8 @@ It refuses to know: what stage produced a morsel; when to stop (the scheduler ca
 **SI-I6. Sinks are host-only.** A payload arriving in `Tier::Device` is demoted by the caller (placement, on the scheduler's request) before `write`; a sink receiving a device payload returns `Sink("device payload")` rather than copying it.
 
 **SI-I7. Summary is exact.** `SinkSummary.rows` and `bytes` equal the sums over written payloads; `files` lists every committed file in order.
+
+**SI-I8. Every committed file names its sequence range, and `committed_seq` never overstates.** A committed Parquet, IPC or per-morsel AMB1 file records the lowest and highest `seq` it holds (e.2, e.3, e.4); `committed_seq()` returns the highest `seq` such that every lower sequence number is in a committed file, computed from those ranges, never from what has merely been written. On `resume`, every file whose range lies above the given `committed_seq` is removed before the first new write. Upholds S17. Rationale: resume replays everything above the watermark; a sink that kept such a file would duplicate rows.
 
 ## d. Interfaces
 
@@ -79,32 +81,36 @@ impl<S: Sink> ReorderBuffer<S> {
 impl<S: Sink> Sink for ReorderBuffer<S> { fn requires_order(&self) -> bool { true } /* ... */ }
 
 #[derive(Clone, Debug, Default)]
-pub struct SinkStats { pub writes: u64, pub encode_bytes: u64, pub files_committed: u64, pub rolls: u64, pub multipart_parts: u64, pub reorder_held_max: u64, pub stalls: u64 }
+pub struct SinkStats { pub writes: u64, pub encode_bytes: u64, pub files_committed: u64, pub rolls: u64, pub multipart_parts: u64, pub reorder_held_max: u64, pub stalls: u64, pub resumed_files_removed: u64 }
 ```
 
-`write` for `ReorderBuffer` accepts a `Morsel`-like `(seq, payload)`; since the contract's `write` takes only a `Payload`, the reorder buffer is constructed with a sequence extractor: the scheduler calls `write_seq(seq, payload)` on it (an inherent method), and the trait method `write` is a `Sink` error "use write_seq". The scheduler knows which sink kind it holds.
+`write(seq, payload)` carries the sequence number in the contract, so `ReorderBuffer` needs no side channel: it reorders on `seq` and forwards `write(seq, payload)` to the inner sink in order. `ParquetSink`, `ArrowIpcSink` and per-morsel `TensorSink` implement the four resume methods of the contract (`committed_seq`, `skip`, `checkpoint`, `resume`; e.5, f.7, f.8); run-mode and `SafeTensors` `TensorSink` leave the defaults, so a run with such a sink is not resumable and says so. `ReorderBuffer` implements the contract's `skip` by advancing its own `next_expected` past the sequence and forwarding `skip` to the inner sink, and delegates the other three to the inner sink, adding nothing to the checkpoint: on resume its `next_expected` is `committed_seq + 1`, and everything above the watermark is replayed to it in whatever order it arrives.
 
 ### d.2 Consumed
 
-`amoru_kernel::{Sink, SinkSummary, Payload, PayloadSpec, SourceSchema, Buffer, Allocator, Seq, AmoruError, amb1}`; `amoru_reactor::Reactor` (`write_object` multipart, `write_file`); `parquet` (`ArrowWriter` over an in-memory `Vec` page buffer per row group, then `write_object`; or `AsyncArrowWriter` when the parquet crate's async writer supports `object_store` multipart directly, which the agent verifies); `safetensors` (serialize header); `arrow` IPC writer for `ArrowIpcSink` (custom, page-aligned; see e.3).
+`amoru_kernel::{Sink, SinkSummary, Payload, PayloadSpec, SourceSchema, Buffer, Allocator, Seq, AmoruError, amb1}`; `serde_json` (the sink checkpoint, e.5); `amoru_reactor::Reactor` (`write_object` multipart, `write_file`); `parquet` (`ArrowWriter` over an in-memory `Vec` page buffer per row group, then `write_object`; or `AsyncArrowWriter` when the parquet crate's async writer supports `object_store` multipart directly, which the agent verifies); `safetensors` (serialize header); `arrow` IPC writer for `ArrowIpcSink` (custom, page-aligned; see e.3).
 
 ## e. Data model, formats and state machines
 
 ### e.1 Sink state machine
 
-`Created` → (`open`) → `Open` → (`write`*) → `Open` → (`finish`) → `Finished`. Any other transition is a `Sink` error. A failure during `write` moves to `Failed`; `finish` in `Failed` aborts open uploads, deletes `.tmp` files, and returns the original error.
+`Created` → (`open` | `resume`) → `Open` → (`write`*) → `Open` → (`finish`) → `Finished`. Any other transition is a `Sink` error. A failure during `write` moves to `Failed`; `finish` in `Failed` aborts open uploads, deletes `.tmp` files, and returns the original error.
 
 ### e.2 Parquet file layout
 
-Row groups of `row_group_bytes` (measured as encoded bytes; a morsel larger than the target becomes one row group); files rolled at `file_bytes`; the footer written at roll; files named `part-{index:05}.parquet`; `_SUCCESS` marker written by `finish` after all files are committed (an empty object), which is the convention downstream readers use.
+Row groups of `row_group_bytes` (measured as encoded bytes; a morsel larger than the target becomes one row group); files rolled at `file_bytes`; the footer written at roll; files named `part-{index:05}.parquet`; `_SUCCESS` marker written by `finish` after all files are committed (an empty object), which is the convention downstream readers use. Each file's footer carries key-value metadata `amoru.run_id` (hex), `amoru.seq_min` and `amoru.seq_max` (decimal), the range of sequence numbers whose rows the file holds (SI-I8); for an unordered inner sink the range may have gaps, which is why the checkpoint (e.5) lists the sequence numbers explicitly rather than the range.
 
 ### e.3 Arrow IPC (page-aligned) layout
 
-Standard Arrow IPC file format (magic `ARROW1`, schema message, record batch messages, footer) with one deviation the format permits: every buffer within a record batch message is padded to the page size rather than 8 bytes, so each buffer starts at a page boundary in the file. Standard readers accept this (padding is allowed). It is what makes reload by direct IO or GDS possible for staging (component 9 uses this writer through this crate).
+Standard Arrow IPC file format (magic `ARROW1`, schema message, record batch messages, footer) with one deviation the format permits: every buffer within a record batch message is padded to the page size rather than 8 bytes, so each buffer starts at a page boundary in the file. Standard readers accept this (padding is allowed). It is what makes reload by direct IO or GDS possible for staging (component 9 uses this writer through this crate). The schema message's custom metadata carries `amoru.run_id`, `amoru.seq_min` and `amoru.seq_max` as in e.2; files are named `part-{index:05}.arrow` and rolled at `file_bytes`.
 
 ### e.4 Tensor files
 
-`Amb1`: contracts e.4, one tensor per file, file per morsel or one file for the run (concatenated along dimension 0 with the header written at `finish` once the total is known; until then the file is `.tmp`). `SafeTensors`: header JSON per the safetensors spec, data section unaligned by the spec (noted in the report as not DMA-loadable); one file per run.
+`Amb1`: contracts e.4, one tensor per file, file per morsel or one file for the run (concatenated along dimension 0 with the header written at `finish` once the total is known; until then the file is `.tmp`). Per-morsel files are named `{name}-{seq:012}.amb1`, so the sequence number is the file name and no metadata is needed (SI-I8). `SafeTensors`: header JSON per the safetensors spec, data section unaligned by the spec (noted in the report as not DMA-loadable); one file per run.
+
+### e.5 Sink checkpoint
+
+The bytes `Sink::checkpoint` returns and `Sink::resume` receives, JSON: `{ "version": 1, "kind": "parquet" | "ipc" | "amb1_per_morsel", "next_index": u32, "committed": [ { "name": string, "seq_min": u64, "seq_max": u64, "rows": u64, "bytes": u64 } ] }`. `committed` lists committed files in index order; it is what `SinkSummary.files` is rebuilt from on resume (SI-I7 holds across a resume). `next_index` is the index the next rolled file takes, so a resumed run never reuses a name. The checkpoint reflects only committed files; the file being written is not in it, by construction, and is removed by `resume` (f.8).
 
 ## f. Algorithms and policies
 
@@ -114,15 +120,19 @@ Standard Arrow IPC file format (magic `ARROW1`, schema message, record batch mes
 
 **f.3 `TensorSink::write`.** `Amb1` per-morsel: header + `write_file` of the tensor bytes from the arena at the page-aligned data offset; run-mode: append bytes at the running offset, header at `finish`. `SafeTensors`: buffer in memory up to 64 MiB then stream; the whole file is written at `finish` (the spec's header needs all offsets).
 
-**f.4 `ReorderBuffer::write_seq`.** If `seq == next_expected`: forward to inner, advance, then drain any held consecutive sequences; else hold (`held_bytes += payload.bytes`); if `held_bytes > buffer_bytes`, set `stalled = true` (the morsel is still held; the bound is soft by one morsel, hard thereafter because the scheduler stops admitting). `stalled` clears when `held_bytes ≤ buffer_bytes / 2`.
+**f.4 `ReorderBuffer::write(seq, payload)`.** If `seq == next_expected`: forward to inner, advance, then drain any held consecutive sequences; else hold (`held_bytes += payload.bytes`); if `held_bytes > buffer_bytes`, set `stalled = true` (the morsel is still held; the bound is soft by one morsel, hard thereafter because the scheduler stops admitting). `stalled` clears when `held_bytes ≤ buffer_bytes / 2`.
 
 **f.5 Commit.** Object store: multipart complete, or single `put`; local: write to `<name>.tmp`, `fsync`, rename. `finish` writes `_SUCCESS` for Parquet after every file is committed.
 
 **f.6 Backpressure.** Sinks do not throttle; they complete when the reactor completes. A slow store manifests as reactor completions taking longer, which the placement engine sees as a growing last queue and the controller as a sink-bound classification (S10 is the placement engine's and controller's to satisfy; the sink's obligation is SI-I1 and SI-I3).
 
+**f.7 `committed_seq` and `checkpoint`.** Each file sink keeps, under its writer mutex, the list of committed files with their sequence ranges (e.5) and, for the file being written, the set of sequence numbers appended so far. `committed_seq()`: with an ordered inner stream (the sink is wrapped in `ReorderBuffer`, or the scheduler delivers in order) the ranges are contiguous and the answer is the last committed `seq_max`; in general, the sink keeps a small sorted set of sequence numbers above the last contiguous point that are either committed or declared skipped through `skip(seq)`, and advances the watermark through it (the set is bounded by the reorder distance, which `sink.concurrency` bounds, plus the skips, which the error budget bounds). A skipped sequence number therefore never holds the watermark back, and on resume it is replayed like any other uncommitted morsel (it may be skipped again). `checkpoint()` serialises e.5 under the same mutex; it does not force a roll: a file in progress stays out of the checkpoint, and its rows are replayed after a resume. A sink that wants a smaller replay rolls more often (`sink.file_bytes`), which is the user's trade to make, not the sink's.
+
+**f.8 `resume(schema, state, committed_seq)`.** Parse e.5 (refuse an unknown `version` or a `kind` that does not match this sink); list the destination prefix; remove every file whose sequence range (from the footer metadata for Parquet and IPC, from the file name for AMB1) lies entirely above `committed_seq`, and every `.tmp` file and open multipart upload under the prefix (`resumed_files_removed`); refuse with `Resume` if a file's range straddles the watermark (it cannot happen with a correct checkpoint; it means the checkpoint and the store disagree, and the user should look); restore the committed list and `next_index`; open a writer for `part-{next_index}`; move to `Open`. A store that cannot list (a write-only credential) makes `resume` fail with `Resume("cannot list destination")`, which is the honest answer.
+
 ## g. Concurrency within the component
 
-`write` may be called concurrently for different payloads (the scheduler's sink driver issues up to `sink.concurrency`); the Parquet writer is single-threaded by nature, so `ParquetSink` serialises appends with a mutex around the writer and lets encodes of different row groups overlap only at roll boundaries. `ArrowIpcSink` and per-morsel `TensorSink` are concurrent up to the reactor's file depth. `ReorderBuffer` holds a mutex across `write_seq`'s bookkeeping only, not across the inner `write`.
+`write` may be called concurrently for different payloads (the scheduler's sink driver issues up to `sink.concurrency`); the Parquet writer is single-threaded by nature, so `ParquetSink` serialises appends with a mutex around the writer and lets encodes of different row groups overlap only at roll boundaries. `ArrowIpcSink` and per-morsel `TensorSink` are concurrent up to the reactor's file depth. `ReorderBuffer` holds a mutex across `write`'s bookkeeping only, not across the inner `write`.
 
 ## h. Behaviour
 
@@ -164,9 +174,15 @@ Standard Arrow IPC file format (magic `ARROW1`, schema message, record batch mes
 
 **SI-T11 slow_store.** Fake reactor with 100 ms write latency; sink completions are slow but correct; no sink-side buffering beyond one row group. f.6.
 
+**SI-T12 committed_seq_exact.** Ordered and unordered delivery of 1,000 sequences with rolls every 50 and sequences 7, 23 and 24 declared through `skip`; after each commit, `committed_seq()` equals the model's contiguous watermark (skips counted as committed) and never exceeds it; footer metadata ranges match the rows in each file. SI-I8.
+
+**SI-T13 resume_removes_uncommitted.** Write 1,000 sequences, checkpoint at a random point, keep writing, then drop the sink without `finish`; a new sink `resume`s with that checkpoint and watermark; every file above the watermark and every `.tmp` is gone, `next_index` continues, replaying the sequences above the watermark and finishing yields files that read back equal to an uninterrupted run; a straddling file (constructed by hand) is refused. f.8, e.5, SI-I7 across resume.
+
+**SI-T14 unresumable_says_so.** Run-mode `TensorSink` and `SafeTensors`: `resume` returns `Resume("sink does not support resume")` and `committed_seq() == None`; `ReorderBuffer` over `ParquetSink` delegates all three methods. d.1.
+
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs`, `src/parquet_sink.rs` (f.1, e.2, f.5), `src/ipc_sink.rs` (f.2, e.3; the page-aligned IPC writer is a small custom encoder over `arrow::ipc` message building, not the crate's `FileWriter`, which pads to 8), `src/tensor_sink.rs` (f.3, e.4), `src/reorder.rs` (f.4), `src/commit.rs` (f.5), `src/stats.rs`. No `unsafe`.
+Files: `src/lib.rs`, `src/parquet_sink.rs` (f.1, e.2, f.5, f.7, f.8), `src/ipc_sink.rs` (f.2, e.3; the page-aligned IPC writer is a small custom encoder over `arrow::ipc` message building, not the crate's `FileWriter`, which pads to 8), `src/tensor_sink.rs` (f.3, e.4), `src/reorder.rs` (f.4), `src/commit.rs` (f.5), `src/checkpoint.rs` (e.5, the shared watermark set of f.7, used by all three file sinks), `src/stats.rs`. No `unsafe`.
 
 Verify before starting: whether the pinned `parquet` version's `AsyncArrowWriter` can target `object_store` multipart directly (if so, use it and drop the `Vec<u8>` staging; `encode_bytes` semantics unchanged).
 
@@ -185,3 +201,4 @@ None. (`sink.concurrency`, `sink.row_group_bytes` and `sink.file_bytes` are in t
 | E3 / Q2 (ordering) | SI-I5 | SI-T5 |
 | S13 (aligned formats) | e.3, e.4 | SI-T9, SI-T10 |
 | G-I8 (clean failure) | SI-I3 | SI-T3 |
+| S17, D13 | SI-I8, e.5, f.7, f.8 | SI-T12, SI-T13, SI-T14 |

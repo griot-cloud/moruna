@@ -47,6 +47,8 @@ It refuses to know: how many splits to read ahead (scheduler's `read_ahead` knob
 
 **SO-I7. Zero rows is a valid split.** A Parquet row group or tensor with zero rows plans as a split with `rows = 0` and reads as an empty payload.
 
+**SO-I8. Reads are repeatable.** For `ParquetSource` and `TensorSource`, `plan()` called twice on unchanged inputs returns equal splits, and `read(split, rows)` called twice returns equal payloads (CT-I12). `PyIteratorSource` cannot promise this: it plans one split per pulled batch and cannot re-pull, so it reports `sub_splittable = false` and `repeatable() == false`, and a run over it is not resumable and Q0 eviction is disabled for it (the placement engine's `set_staging(0, true)` is forced, so its morsels are written rather than dropped; the facade notes "iterator source: no resume, Q0 staged"). Rationale: recovery and Q0 eviction both re-read; a source that cannot must say so rather than return different rows.
+
 ## d. Interfaces
 
 ### d.1 Exposed
@@ -192,6 +194,8 @@ Uses the testkit generator for Parquet and tensor files and the in-memory object
 
 **SO-T12 bandwidth.** (reference host) Parquet from local NVMe with the identity kernel reaches ≥ 80% of the reactor's RE-T11 figure after decode (decode cost reported separately). S4, S12.
 
+**SO-T13 repeatable_reads.** For `ParquetSource` and `TensorSource`: two `plan()` calls are equal; for 50 random `(split, rows)` pairs, two `read` calls are byte-equal; for `PyIteratorSource`, `sub_splittable == false` and `repeatable() == false`. SO-I8.
+
 ## l. Implementation notes for the agent
 
 Files: `src/lib.rs`, `src/parquet/{mod.rs, plan.rs (e.1, f.1, f.2), read.rs (e.2, f.3), decode_copy.rs (f.4), reader.rs (AsyncFileReader over the reactor)}`, `src/tensor/{mod.rs, plan.rs (e.3), read.rs (e.4), safetensors.rs, npy.rs}`, `src/py_iter.rs` (feature python), `src/stats.rs`. `unsafe` permitted in `tensor/read.rs` (mmap pointer to `ManagedTensor`) with `// SAFETY:` citing that the `Arc<Mmap>` held by the deleter outlives the view.
@@ -210,6 +214,7 @@ None.
 
 | Parent id | Invariant | Test |
 |---|---|---|
+| CT-I12, S17 | SO-I8 | SO-T13 |
 | D3 (look-ahead) | SO-I2 | SO-T2 |
 | G-I2 (decode exception) | SO-I5 | SO-T5 |
 | S13 (mapped tensors) | e.4 | SO-T9 |

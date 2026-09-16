@@ -103,8 +103,9 @@ At `new`, from `profile`:
 | direct IO | `direct_io_staging == Present` | buffered IO with `posix_fadvise(DONTNEED)` after each op |
 | pinned copies | `arena.is_pinned()` and `cuda` | staged through a 64 MiB pinned bounce buffer allocated from the arena at `new` |
 | GDS | `gds == Present` and `cfg(feature = "gds")` | `Disk → PinnedHost → Device` two-step |
+| RDMA (reserved, not v1) | `rdma == Present` and `cfg(feature = "rdma")` | none: without the feature, `Remote` endpoints are `Unsupported("rdma")`, never emulated over TCP |
 
-`IoPaths` records the four booleans.
+`IoPaths` records the five booleans; `rdma` is always false in a v1 build.
 
 ### e.3 Alignment rule for direct IO
 
@@ -131,9 +132,15 @@ An operation is direct-eligible iff `buffer.host_ptr() % page_bytes == 0`, `offs
 | PinnedHost → Disk | `write_file` |
 | Disk → Device | `cuFileRead` (gds) else two-step |
 | Device → Disk | `cuFileWrite` (gds) else two-step |
+| Remote(n) → PinnedHost | reserved, feature `rdma`, not v1: one-sided `RDMA_READ` from `RemoteRef { addr, rkey, len }` on node `n` into the arena buffer, on a queue pair the reactor holds per peer; completion by the NIC's completion queue, polled by the same task that polls CUDA events; v1 returns `Unsupported("rdma")` |
+| PinnedHost → Remote(n) | reserved, feature `rdma`, not v1: one-sided `RDMA_WRITE` into a region node `n` leased to this node; v1 returns `Unsupported("rdma")` |
+| Remote(n) → Device, Device → Remote(n) | reserved: two-step through PinnedHost |
+| Remote(n) → Disk, Disk → Remote(n) | error `Io { op: "copy", msg: "remote and disk" }` (the owning node moves its own bytes; placement e.4) |
 | same tier | error `Io { op: "copy", msg: "same tier" }` |
 
-Disk endpoints are expressed by the caller as a `Buffer` in `Tier::Disk(SegmentRef)`; the reactor maps the segment number to the segment file path through a registry the placement engine fills (`register_segment(segment: u32, path: PathBuf)`, an exposed method not in the contract).
+Disk endpoints are expressed by the caller as a `Buffer` in `Tier::Disk(SegmentRef)`; the reactor maps the segment number to the segment file path through a registry the placement engine fills (`register_segment(segment: u32, path: PathBuf)`, an exposed method not in the contract). Remote endpoints, when the `rdma` feature exists, are expressed the same way as a `Buffer` in `Tier::Remote(node, RemoteRef)`, and the reactor is the only component that ever holds a queue pair, a memory key or a lease: the placement engine asks for moves, the reactor knows peers. The arena's single reservation (AR) is what makes registering the whole host tier with a NIC a one-time operation; that is the reason the reservation is one region and not many, and it is stated here so the arena agent does not "optimise" it away.
+
+The `rdma` rows and the `register_peer`/`lease` methods they will need are not in the contract's `Reactor` trait yet; they are added to it in the same pull request as the feature (E11), so that a v1 build carries the dispatch arms (CT-I11) but no dead API.
 
 **f.6 Concurrency limits.** Two semaphores: object (`object_concurrency`) and file (`file_depth`). Copies are limited by the CUDA stream queue (unbounded issue, bounded by the arena's budget through in-flight reservations held by the placement engine).
 
@@ -169,7 +176,7 @@ Tests use `FakeAllocator` buffers and a temp directory; object-store tests use t
 
 **RE-T2 no_worker_work.** Instrument thread ids; every operation's work runs on reactor or blocking-pool threads. RE-I2.
 
-**RE-T3 paths_fixed.** `IoPaths` after `new` equals the profile-derived expectation for all 16 profile combinations; injected failure mid-run on a `Present` path yields an error, on a probed path yields one fallback. RE-I3.
+**RE-T3 paths_fixed.** `IoPaths` after `new` equals the profile-derived expectation for all 16 profile combinations of the four probed paths (`rdma` is false in every v1 build and asserted so); injected failure mid-run on a `Present` path yields an error, on a probed path yields one fallback. RE-I3.
 
 **RE-T4 direct_when_aligned.** Aligned ops count as `direct_ops`, misaligned as `buffered_ops` with one warn. RE-I4.
 
