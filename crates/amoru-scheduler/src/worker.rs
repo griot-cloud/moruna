@@ -50,7 +50,7 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         }
-        let Some(stage) = crate::pick::pick(&shared) else {
+        let Some(stage) = crate::pick::pick(&shared, worker) else {
             idle(&shared, worker, &parker);
             continue;
         };

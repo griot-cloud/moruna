@@ -112,6 +112,32 @@ fn store(
     }
 }
 
+/// Whether worker `w` may be handed a slot whose home is `owner` (f.4, SC-I6).
+///
+/// A slot's home is the worker `init_instances` built it on, and it stays that worker's for the
+/// run. Another worker may borrow it only when its home cannot come for it: a slot with no home
+/// yet, or one whose home is outside the active set the controller set. Anything looser and
+/// eight workers share four instances round robin, which is the model thrash D1 accepted
+/// instance pools to avoid.
+fn borrowable(shared: &Shared, owner: Option<u16>) -> bool {
+    match owner {
+        None => true,
+        Some(home) => home >= shared.knobs.active_workers(),
+    }
+}
+
+/// True when `worker` may serve this stage: the stage is stateless, or it owns a free instance,
+/// or a free instance's home cannot come for it (f.3's admissibility for a stateful stage).
+pub(crate) fn admissible(shared: &Shared, stage_ix: usize, worker: u16) -> bool {
+    let Some(pool) = shared.stages[stage_ix].pool.as_ref() else {
+        return true;
+    };
+    let slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+    slots
+        .iter()
+        .any(|slot| !slot.in_use && (slot.owner == Some(worker) || borrowable(shared, slot.owner)))
+}
+
 /// An instance held by one worker for the length of one task (SC-I6).
 pub(crate) struct Held {
     pub(crate) index: usize,
@@ -125,12 +151,16 @@ pub(crate) fn acquire(shared: &Shared, stage_ix: usize, worker: u16) -> Result<O
         return Ok(None);
     };
     let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+    // f.4: prefer the instance this worker last held; else one whose home cannot come for it.
     let mine = slots
         .iter()
         .position(|slot| !slot.in_use && slot.owner == Some(worker));
     let chosen = match mine {
         Some(index) => index,
-        None => match slots.iter().position(|slot| !slot.in_use) {
+        None => match slots
+            .iter()
+            .position(|slot| !slot.in_use && borrowable(shared, slot.owner))
+        {
             Some(index) => index,
             None => return Ok(None),
         },
@@ -139,7 +169,12 @@ pub(crate) fn acquire(shared: &Shared, stage_ix: usize, worker: u16) -> Result<O
         return Ok(None);
     };
     slot.in_use = true;
-    slot.owner = Some(worker);
+    // A slot with no home yet takes this worker as its home; a borrow never moves one. Rewriting
+    // the home on a borrow is what made an instance wander: one borrow moved it for good and the
+    // worker that had been warming it lost the instance for the rest of the run (SC-I6, SC-T6).
+    if slot.owner.is_none() {
+        slot.owner = Some(worker);
+    }
     let retired = slot.retired;
     let taken = slot.state.take();
     drop(slots);

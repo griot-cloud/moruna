@@ -222,6 +222,7 @@ pub(crate) struct Shared {
     pub(crate) resumed: AtomicBool,
     pub(crate) recomputed: AtomicU64,
     pub(crate) shutdown_done: AtomicBool,
+    pub(crate) exit_claimed: AtomicBool,
 }
 
 /// A `RunState` or a drive mode as one atomic byte.
@@ -416,6 +417,7 @@ impl Shared {
             resumed: AtomicBool::new(false),
             recomputed: AtomicU64::new(0),
             shutdown_done: AtomicBool::new(false),
+            exit_claimed: AtomicBool::new(false),
         });
         tracing::info!(
             target: "sched.start",
@@ -461,6 +463,17 @@ impl Shared {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Claim the right to end the run. The first caller wins and is the only one that may act:
+    /// the sink drive finishes the sink only if it wins, and a terminate or a cancel that loses
+    /// is a no-op because the run had already finished (f.10, e.2).
+    ///
+    /// The claim is taken before any side effect, which is what keeps `finish` off a run that
+    /// was cancelled or terminated: deciding by who publishes first is too late, because by then
+    /// the sink has already been finished.
+    pub(crate) fn claim_exit(&self) -> bool {
+        !self.exit_claimed.swap(true, Ordering::SeqCst)
     }
 
     /// The first thread to report an exit wins; the rest are ignored (e.2).

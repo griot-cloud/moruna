@@ -14,7 +14,7 @@ use amoru_kernel::{Locality, StageId};
 use crate::shared::Shared;
 
 /// The stage this worker should serve next, or `None` when nothing is admissible (f.3).
-pub(crate) fn pick(shared: &Shared) -> Option<StageId> {
+pub(crate) fn pick(shared: &Shared, worker: u16) -> Option<StageId> {
     if shared.gate.load(Ordering::SeqCst) {
         return None;
     }
@@ -22,7 +22,7 @@ pub(crate) fn pick(shared: &Shared) -> Option<StageId> {
     let mut best: Option<(StageId, u64)> = None;
     for (index, entry) in shared.stages.iter().enumerate() {
         let stage = index as StageId + 1;
-        if !instance_free(shared, index) {
+        if !crate::instances::admissible(shared, index, worker) {
             continue;
         }
         if shared.placement.is_full(stage) {
@@ -43,14 +43,4 @@ pub(crate) fn pick(shared: &Shared) -> Option<StageId> {
         }
     }
     best.map(|(stage, _)| stage)
-}
-
-/// A stateless stage is always free; a stateful one is admissible only while a slot is free
-/// (f.3). The acquire itself may still lose the race, which f.4 calls a race, not a policy.
-fn instance_free(shared: &Shared, index: usize) -> bool {
-    let Some(pool) = shared.stages[index].pool.as_ref() else {
-        return true;
-    };
-    let slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
-    slots.iter().any(|slot| !slot.in_use)
 }

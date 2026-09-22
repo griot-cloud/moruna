@@ -203,6 +203,12 @@ pub(crate) fn update_watermark(shared: &Shared) {
 /// f.6, f.11: `finish` once the last queue is closed and drained, then the watermark moves to
 /// the last sequence number the run issued and the run is complete.
 fn finish(shared: &Shared) {
+    // f.10: `finish` runs on completion only. The claim is what makes that true: a cancel or a
+    // terminate racing this point wins or loses once, here, rather than after the sink has been
+    // finished (SC-T11 asserts `finish_calls == 0` on a cancelled run).
+    if !shared.claim_exit() {
+        return;
+    }
     shared.set_run_state(RunState::Finishing);
     let summary: Result<SinkSummary> = {
         let mut guard = shared.sink.write().unwrap_or_else(|e| e.into_inner());

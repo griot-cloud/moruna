@@ -45,7 +45,6 @@ pub(crate) fn run(
         }
         if shared.is_cancelled() {
             crate::policy::cancel(shared);
-            continue;
         }
         if shared.source_exhausted.load(Ordering::SeqCst) && shared.run_state() == RunState::Running
         {
