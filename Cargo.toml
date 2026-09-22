@@ -34,7 +34,7 @@ amoru-testkit = { path = "crates/amoru-testkit", version = "0.1.0" }
 # engine feature a component needs beyond these is set in that crate.
 arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc"] }
 parquet = { version = "=59.3.0", features = ["arrow", "async", "object_store"] }
-object_store = { version = "=0.14.2" }
+object_store = { version = "=0.13.2" }
 dlpark = { version = "=0.8.0" }
 safetensors = { version = "=0.8.0" }
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "fs", "sync"] }
