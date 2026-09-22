@@ -44,13 +44,16 @@ pub(crate) fn parse_meminfo_field(text: &str, key: &str) -> Option<u64> {
 /// The process's anonymous and file backed resident bytes outside a cgroup (f.2): from
 /// `/proc/self/statm` where there is a `/proc`, from the platform otherwise. `None` when neither
 /// answers, which leaves the sampler repeating its last sample.
+///
+/// Both halves are the DS-I4 quantity on both paths: `resident - shared` from `statm`, and
+/// `phys_footprint` from mach, never plain resident size (see `probes::platform_anon_and_file`).
 pub(crate) fn process_memory(proc_root: &Path, page: usize) -> Option<(u64, u64)> {
     if let Ok(text) = std::fs::read_to_string(proc_root.join("self/statm"))
         && let Some(pair) = parse_statm(&text, page)
     {
         return Some(pair);
     }
-    probes::platform_rss_anon().map(|anon| (anon, 0))
+    probes::platform_anon_and_file()
 }
 
 /// `/proc/self/statm` is `size resident shared text lib data dt` in pages; anonymous memory is
@@ -138,8 +141,8 @@ mod tests {
         let fallback = process_memory(&absent, 4096);
         if cfg!(target_vendor = "apple") {
             assert!(
-                fallback.is_some_and(|(anon, file)| anon > 0 && file == 0),
-                "macOS reports the resident set through proc_pidinfo"
+                fallback.is_some_and(|(anon, file)| anon > 0 && file > 0),
+                "macOS reports phys_footprint and the file backed bytes through mach"
             );
         } else {
             assert_eq!(fallback, None, "this target reads /proc and nothing else");

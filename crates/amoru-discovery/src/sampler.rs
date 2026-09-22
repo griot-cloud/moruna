@@ -373,6 +373,52 @@ mod tests {
         assert_ne!(sample.anon_bytes, 1_077_936_128, "never memory.current");
     }
 
+    /// DS-T13 anon_excludes_mapped_file: a process that maps a 256 MiB file and reads every
+    /// page of it does not see `anon_bytes` rise by the size of the file. DS-I4 makes the budget
+    /// quantity anonymous plus unevictable, and a mapped Parquet source or a loaded dylib is
+    /// evictable memory the runtime never allocated.
+    ///
+    /// This runs on every supported target, over the real host's sampler, and it is the test
+    /// that would have caught the macOS path returning `pti_resident_size`: until 2026-09-23 it
+    /// did, so every figure measured on a developer's macOS host was inflated by whatever the
+    /// process had mapped, the Parquet source included.
+    #[test]
+    fn ds_t13_anon_excludes_mapped_file() {
+        const MAPPED: usize = 256 << 20;
+        // A quarter of the mapping is a generous allowance for the page tables and the buffers
+        // the write below leaves behind, and still an order of magnitude below the file itself.
+        const ALLOWED_RISE: u64 = (MAPPED / 4) as u64;
+
+        let tmp = TempDir::new("ds-t13");
+        let path = tmp.path().join("mapped.bin");
+        std::fs::create_dir_all(tmp.path()).expect("directory");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("the file to map");
+        let block = vec![0xABu8; 1 << 20];
+        for offset in (0..MAPPED).step_by(block.len()) {
+            file.write_at(&block, offset as u64).expect("write");
+        }
+        file.sync_all().expect("sync");
+
+        let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
+        let before = sampler.sample().anon_bytes;
+        let during = crate::probes::with_mapped_file(&file, MAPPED, || sampler.sample())
+            .expect("the mapping")
+            .anon_bytes;
+
+        let rise = during.saturating_sub(before);
+        assert!(
+            rise < ALLOWED_RISE,
+            "anon_bytes rose by {rise} bytes while {MAPPED} bytes of file were mapped and read: \
+             a mapped file is not anonymous memory (DS-I4)"
+        );
+    }
+
     /// f.2: `memory.peak` supplies the peak when the kernel has it, and `reset_peak` writes it.
     #[test]
     fn reads_and_resets_the_kernel_peak() {

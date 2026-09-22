@@ -122,38 +122,185 @@ pub(crate) fn platform_total_ram() -> Option<u64> {
     }
 }
 
-/// The process's resident anonymous bytes where the platform has no `/proc/self/statm`
-/// (macOS: `proc_pidinfo`). `None` on a platform that has `/proc`.
-pub(crate) fn platform_rss_anon() -> Option<u64> {
+/// `TASK_VM_INFO` (`mach/task_info.h`), the `task_info` flavour that separates the anonymous
+/// part of a process's memory from the file backed part.
+#[cfg(target_vendor = "apple")]
+const TASK_VM_INFO: libc::task_flavor_t = 22;
+
+/// The prefix of `task_vm_info` through `phys_footprint`, which `mach/task_info.h` calls "rev1" and whose
+/// `TASK_VM_INFO_REV1_COUNT` is exactly the 38 `natural_t` words this struct is long.
+/// `task_info` fills the first `count` words and reports back how many it filled, so declaring
+/// the prefix the caller reads, and then checking the reported count, is how one asks for a
+/// stable subset of a flavour the kernel keeps extending.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TaskVmInfoRev1 {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    /// Anonymous ("internal") resident bytes.
+    internal: u64,
+    internal_peak: u64,
+    /// File backed ("external") resident bytes: mapped files and loaded images.
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    /// Anonymous bytes the compressor holds; still charged to the process.
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    /// The ledger macOS charges the process for and enforces its limits against.
+    phys_footprint: u64,
+}
+
+/// The process's `(anonymous, file backed)` resident bytes where the platform has no
+/// `/proc/self/statm` (macOS). `None` on a platform that has `/proc`.
+///
+/// The anonymous figure is `phys_footprint`: the ledger macOS charges a process for, enforces
+/// its own per-process memory limits against, and shows as "Memory" in Activity Monitor. It is
+/// the DS-I4 quantity on this platform: it counts the process's own dirty pages, including the
+/// anonymous pages the compressor has taken (the analogue of `unevictable`: still owed by the
+/// process, not reclaimable by dropping a cache), and it excludes the file backed pages a
+/// mapped Parquet file or a loaded dylib contributes. Those are `external`, returned here as
+/// the file backed half, which is what `/proc/self/statm`'s `shared` field gives on Linux.
+///
+/// The three candidate routes were measured against the same process at the same moment, with
+/// 256 MiB of touched anonymous memory and then a 512 MiB file mapped and fully read:
+/// `proc_pidinfo(PROC_PIDTASKINFO)`'s `pti_resident_size` and `mach_task_basic_info`'s
+/// `resident_size` returned byte-identical values that rose by the whole 537 MB of mapped file,
+/// while `phys_footprint` rose by 0.3 MB (page tables) and `external` took the 537 MB. Both
+/// resident routes therefore report the quantity DS-I4 forbids, and neither is used; the older
+/// `proc_pid_rusage` ledger is kept only as a fallback, since it reports the same
+/// `phys_footprint` to the byte but cannot report the file backed half.
+pub(crate) fn platform_anon_and_file() -> Option<(u64, u64)> {
     #[cfg(target_vendor = "apple")]
     {
-        // SAFETY: `proc_taskinfo` is a plain C struct of integers, for which an all zero bit
+        const WORDS: libc::mach_msg_type_number_t = (core::mem::size_of::<TaskVmInfoRev1>()
+            / core::mem::size_of::<libc::natural_t>())
+            as libc::mach_msg_type_number_t;
+        // SAFETY: `TaskVmInfoRev1` is a `repr(C)` struct of integers, for which an all zero bit
         // pattern is a valid value; it is overwritten by the call below before it is read.
-        let mut info: libc::proc_taskinfo = unsafe { core::mem::zeroed() };
-        let size = core::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-        // SAFETY: `info` is a live, zeroed `proc_taskinfo` and `size` is its exact size, which is
-        // the contract `proc_pidinfo` documents for `PROC_PIDTASKINFO`; it writes at most `size`
-        // bytes and returns the number written.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                std::process::id() as libc::c_int,
-                libc::PROC_PIDTASKINFO,
-                0,
-                (&raw mut info).cast::<libc::c_void>(),
-                size,
+        let mut info: TaskVmInfoRev1 = unsafe { core::mem::zeroed() };
+        let mut count = WORDS;
+        // SAFETY: `mach_task_self_` is a port name the dynamic loader initialises before `main`
+        // and never writes again, so this is a plain load of an initialised `mach_port_t`.
+        // `libc` deprecates it in favour of the `mach2` crate; section l makes this module the
+        // one place the crate calls `libc`, and a second FFI crate for one port name is a worse
+        // trade than reading the static the `mach_task_self()` wrapper reads.
+        #[allow(deprecated)]
+        let task = unsafe { libc::mach_task_self_ };
+        // SAFETY: `info` is a live, zeroed `TaskVmInfoRev1` and `count` is its exact length in
+        // `natural_t` words, which is the contract `task_info` documents for `TASK_VM_INFO`: it
+        // writes at most `count` words into the buffer and sets `count` to the number written.
+        let kr = unsafe {
+            libc::task_info(
+                task,
+                TASK_VM_INFO,
+                (&raw mut info).cast::<libc::integer_t>(),
+                &raw mut count,
             )
         };
-        if written == size {
-            // Anonymous memory is resident minus the file backed part the kernel reports.
-            let resident = info.pti_resident_size;
-            return Some(resident);
+        // A kernel that filled fewer words than asked did not reach `phys_footprint`, which
+        // would leave the zero this struct was created with; that is a failure, not a zero.
+        if kr == 0 && count >= WORDS {
+            return Some((info.phys_footprint, info.external));
         }
-        None
+        platform_phys_footprint_rusage().map(|anon| (anon, 0))
     }
     #[cfg(not(target_vendor = "apple"))]
     {
         None
     }
+}
+
+/// `phys_footprint` through the older `proc_pid_rusage` ledger, for a kernel whose `task_info`
+/// does not reach the field. The same number, without the file backed half.
+#[cfg(target_vendor = "apple")]
+fn platform_phys_footprint_rusage() -> Option<u64> {
+    // SAFETY: `rusage_info_v4` is a plain C struct of integers, for which an all zero bit
+    // pattern is a valid value; it is overwritten by the call below before it is read.
+    let mut info: libc::rusage_info_v4 = unsafe { core::mem::zeroed() };
+    // SAFETY: `info` is a live, zeroed `rusage_info_v4`, which is the struct
+    // `proc_pid_rusage` documents for `RUSAGE_INFO_V4`; it writes only into that buffer and
+    // returns non-zero without writing on failure.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc == 0 {
+        return Some(info.ri_phys_footprint);
+    }
+    None
+}
+
+/// What the sampler is measuring on a host where the platform answers instead of `/proc`, for
+/// `Discovered::notes`, so a run report measured on a developer's macOS host says which
+/// quantity its memory figures are (DS-I4). `None` where `/proc` answers and the note would be
+/// noise.
+pub(crate) fn platform_memory_note() -> Option<String> {
+    platform_anon_and_file()?;
+    Some(
+        "memory is measured through mach on this host: anon_bytes is the process's \
+         phys_footprint, the ledger macOS enforces its own limits against, which counts \
+         anonymous and compressed pages and excludes mapped files and loaded images (DS-I4)"
+            .to_string(),
+    )
+}
+
+/// Map `bytes` of `file` read-only, read one byte of every page so those pages become resident,
+/// call `observe` while the mapping is live, then unmap. Test-only: it exists so DS-T13 can make
+/// a large amount of file backed memory resident without an `unsafe` block outside this module
+/// (section l). `None` when the mapping could not be made.
+#[cfg(test)]
+pub(crate) fn with_mapped_file<R>(
+    file: &std::fs::File,
+    bytes: usize,
+    observe: impl FnOnce() -> R,
+) -> Option<R> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a null `addr` asks the kernel to choose the address; `bytes` is the length of the
+    // mapping and `file` is a live, readable file at least that long. The call writes nothing
+    // and returns `MAP_FAILED` on failure.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return None;
+    }
+    let mut sum: u64 = 0;
+    let mut offset = 0usize;
+    while offset < bytes {
+        // SAFETY: `offset < bytes`, and the mapping is `bytes` long and readable, so this reads
+        // one byte inside it.
+        let byte = unsafe { *addr.cast::<u8>().add(offset) };
+        sum = sum.wrapping_add(u64::from(byte));
+        offset += page_size();
+    }
+    // The sum is never used; without this the reads are dead code and the pages never fault in.
+    std::hint::black_box(sum);
+    let observed = observe();
+    // SAFETY: `addr` and `bytes` are exactly the mapping made above, which is not used again.
+    unsafe { libc::munmap(addr, bytes) };
+    Some(observed)
 }
 
 /// Free bytes available to an unprivileged process under `path`, through `statvfs`.
@@ -521,7 +668,13 @@ mod tests {
         // One of the two total RAM sources answers on every supported target.
         assert!(platform_total_ram().is_some() || std::fs::read_to_string("/proc/meminfo").is_ok());
         assert!(
-            platform_rss_anon().is_some() || std::fs::read_to_string("/proc/self/statm").is_ok()
+            platform_anon_and_file().is_some()
+                || std::fs::read_to_string("/proc/self/statm").is_ok()
+        );
+        // The note exists exactly where the platform path is the one that answers.
+        assert_eq!(
+            platform_memory_note().is_some(),
+            platform_anon_and_file().is_some()
         );
         assert!(filesystem_is_ephemeral(&std::env::temp_dir()).is_some());
         assert!(filesystem_is_ephemeral(Path::new("/amoru/definitely/absent")).is_none());

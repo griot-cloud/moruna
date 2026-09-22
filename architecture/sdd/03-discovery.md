@@ -41,7 +41,7 @@ It refuses to know: what the budget is used for (controller); how a fast path is
 
 **DS-I3. Samples are cheap and monotonic in time.** One `Sample` costs at most four file reads and no allocation beyond a fixed buffer; `at_ns` strictly increases across samples; `peak_anon_bytes` is the maximum of `anon_bytes` seen by this sampler since start, or since the last `reset_peak`, when the kernel does not provide `memory.peak`; when it does, `reset_peak` writes `memory.peak` (kernels that allow it) and otherwise falls back to the tracked peak. `sample` and `reset_peak` take `&self` and are safe to call from the controller thread and any worker at once (contracts d.12 `Sampler`).
 
-**DS-I4. Budget is anon plus unevictable.** `Sample.anon_bytes` is `anon + unevictable` from `memory.stat`, or RSS anon from `/proc/self/statm` outside a cgroup; never `memory.current`. Rationale: architecture section 8, page cache is charged but reclaimable.
+**DS-I4. Budget is anon plus unevictable.** `Sample.anon_bytes` is `anon + unevictable` from `memory.stat`, or `resident - shared` from `/proc/self/statm` outside a cgroup, or, where the platform has no `/proc` (macOS, the hosts the team develops on), mach's `phys_footprint` from `task_info(TASK_VM_INFO)`: the ledger that platform charges the process for and enforces its own limits against, which counts anonymous and compressed pages and excludes mapped files and loaded images. Never `memory.current`, and never a plain resident set on any path: `proc_pidinfo(PROC_PIDTASKINFO)` and `mach_task_basic_info` both report resident bytes and were both measured rising by the whole size of a mapped file, so neither is the budget quantity (found 2026-09-23; until then the macOS path used the first of them and every figure measured on a developer host was inflated by whatever the process had mapped). Where the platform path is the one that answers, `Discovered::notes` says so, so a run report names the quantity its memory figures are. Rationale: architecture section 8, page cache is charged but reclaimable.
 
 **DS-I5. A `Present` guarantee is verified once and never worked around.** Each `Present` path is probed once at start; a failing probe is `AmoruError::Config { name: "host_profile", msg }` and the run does not start. Upholds G-I7.
 
@@ -243,11 +243,13 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 **DS-T11 databricks_budget_required.** With `DATABRICKS_RUNTIME_VERSION=14.3` in the process environment and no budget, `discover` returns `Config { name: "budget" }` whose message names the variable; with `AMORU_BUDGET=4GiB` it succeeds with `source = Explicit`; with the variable unset and no budget the OS fallback stands with a note. DS-I8.
 
+**DS-T13 anon_excludes_mapped_file.** (runs anywhere) A process maps a 256 MiB file and reads every page of it; `Sample.anon_bytes` over the real host's sampler does not rise by the size of the file. DS-I4.
+
 **DS-T12 host_tier.** With a fake device list of one device and `memlock = Present` or `Probed(true)`, `host_tier == PinnedHost`; with no device, or with `memlock = Absent` or `Probed(false)`, `host_tier == Host` and, when a device is present, a note names the bounce path. f.1.
 
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs`, `src/env.rs` (e.1, f.3), `src/cgroup.rs` (e.2, v1 fallback, root path parameter for tests), `src/os.rs` (`/proc/meminfo`, `sysconf`), `src/probes.rs` (e.4, each probe a function returning `Guarantee` plus a note, bounded by a timeout thread), `src/devices.rs` (feature `cuda`), `src/sampler.rs` (f.2, the `amoru_kernel::Sampler` impl), `src/limits.rs` (e.3, DS-I8, `host_tier`). `unsafe` only in `probes.rs`, which is also where every other `libc` call lives, each behind a safe wrapper the rest of the crate calls: `sysconf` for the page size (d.2), `statvfs` and `statfs` for the staging directory (e.4), `mlock` and `io_uring_setup` for the probes, and on macOS `sysctl hw.memsize` and `proc_pidinfo` for the OS fallback. Every block carries a `// SAFETY:` comment. Keeping them in one module rather than spreading `unsafe` across `os.rs` and `limits.rs` is what makes E9's permitted set a single file (PM, 2026-09-22, on the component 3 agent's report).
+Files: `src/lib.rs`, `src/env.rs` (e.1, f.3), `src/cgroup.rs` (e.2, v1 fallback, root path parameter for tests), `src/os.rs` (`/proc/meminfo`, `sysconf`), `src/probes.rs` (e.4, each probe a function returning `Guarantee` plus a note, bounded by a timeout thread), `src/devices.rs` (feature `cuda`), `src/sampler.rs` (f.2, the `amoru_kernel::Sampler` impl), `src/limits.rs` (e.3, DS-I8, `host_tier`). `unsafe` only in `probes.rs`, which is also where every other `libc` call lives, each behind a safe wrapper the rest of the crate calls: `sysconf` for the page size (d.2), `statvfs` and `statfs` for the staging directory (e.4), `mlock` and `io_uring_setup` for the probes, and on macOS `sysctl hw.memsize` for the host's RAM and `task_info(TASK_VM_INFO)` (with `proc_pid_rusage` behind it) for the sampler's DS-I4 quantity, plus `mmap` for DS-T13, which needs file backed pages to be resident and must not put an `unsafe` block in `sampler.rs` to get them. Every block carries a `// SAFETY:` comment. Keeping them in one module rather than spreading `unsafe` across `os.rs` and `limits.rs` is what makes E9's permitted set a single file (PM, 2026-09-22, on the component 3 agent's report).
 
 Never cache a cgroup value across `discover` calls (preamble 1.3 row 3). Do not depend on `cgroups-rs` or `procfs` crates; parse the six files directly so the fake-directory tests are exact.
 
@@ -268,7 +270,7 @@ None.
 | S5 | DS-I1, e.3 | DS-T1, DS-T9 |
 | G-I8 | DS-I2 | DS-T2 |
 | G-I7 | DS-I5, DS-I6 | DS-T5, DS-T6 |
-| section 8 (page cache) | DS-I4 | DS-T4 |
+| section 8 (page cache) | DS-I4 | DS-T4, DS-T13 |
 | G-I10 | DS-I1 | DS-T1 |
 | E7 (Databricks) | DS-I8 | DS-T11 |
 | contracts e.1 (one host tier), d.12 `Sampler` | f.1 `host_tier`, DS-I3 | DS-T12, DS-T3 |
