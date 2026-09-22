@@ -7,13 +7,23 @@
 #   1. deny:     cargo-deny over advisories, licences, bans and sources. The
 #                policy and the reason for every rule are in deny.toml.
 #   2. audit:    cargo-audit over Cargo.lock. It overlaps the advisories half of
-#                cargo-deny and both are kept: cargo-deny reads the resolved
-#                dependency graph and applies the licence, ban and source rules
-#                that cargo-audit has no notion of, while cargo-audit reads the
-#                lock file and fails on a crate whose exact pinned version has
-#                been yanked from crates.io, which cargo-deny only warns about.
-#                The preamble 6.2 pins are exact, so a yanked pin is the failure
-#                mode that matters here and it is worth a second tool.
+#                cargo-deny and both are kept, because they read different things
+#                and neither subsumes the other:
+#                  - cargo-deny reads the resolved dependency graph, so it applies
+#                    the licence, ban and source rules cargo-audit has no notion
+#                    of, and it reports a vulnerability only in a crate some
+#                    feature actually activates.
+#                  - cargo-audit reads Cargo.lock line by line, which includes
+#                    optional dependencies of dependencies that no feature has
+#                    turned on yet. That is wider on purpose: a backend feature
+#                    of preamble 6.2 that a later wave switches on (object_store
+#                    has one per store) brings its dependencies with it, and it is
+#                    cheaper to learn about the advisory before the wave than
+#                    during it. It is also the tool that fails on a pinned version
+#                    that has been yanked from crates.io, which cargo-deny only
+#                    warns about, and the preamble 6.2 pins are exact.
+#                So a finding here that cargo-deny does not repeat is not noise:
+#                it is a crate the lock file carries and a feature flag away.
 #   3. dco:      every commit a pull request adds carries a Signed-off-by line,
 #                and an agent-authored commit is signed off by the agent identity
 #                (CONTRIBUTING.md, preamble 6.7). The rules live in
