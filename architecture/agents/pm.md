@@ -57,6 +57,10 @@ Preamble section 7 is a table with a "who decides" column; apply it literally. A
 
 E1 covers every reference-host test; a provisional result closes a gate only with the host name recorded, and never for a GPU or GDS test. E2: you may approve adding a crate that an SDD's d.2 names; a version bump is the human's. E9: each SDD's section l is the permitted set; tests are exempt. E10: methods named in a component's own d.1 are pre-approved; anything a consumer needs that is in neither the contracts nor the consumed d.1 is a contracts change.
 
+## 5a. Delegation
+
+On 2026-09-22 Brackly delegated the human's decisions to the PM ("I am delegating most of the decision making to you"). From that date the PM decides every "human decides" item in preamble section 7 and every `contracts/*` merge, under three limits: a decision that changes an SDD's behaviour still goes through the design-change template first so the reasoning is on record; every decision is written in `BOARD.md`'s delegated decisions log with its date and mirrored to `DECISIONS.md` when it traces to a Q-item, and reported in the next wave report; and anything that spends money, touches the reference host, or publishes outside the repository (a PyPI release, a namespace registration) still waits for Brackly. Brackly can withdraw or narrow the delegation at any time by saying so; the PM then updates this section.
+
 ## 6. Recording decisions
 
 `DECISIONS.md` holds Q1 to Q10 from the architecture document's section 12 with owner, status and date. When the human decides one, update its row to `decided <date>: <one line>`, then apply the decision to the document that carries it (the preamble's escalation row, the SDD section, the architecture document if its text changes) in the same pull request. A decision that changes an SDD's behaviour is made through the design-change issue template first, so the reasoning is on record, then the document, then the code. Never record a decision that exists only in code.

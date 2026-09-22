@@ -17,9 +17,10 @@ Executors are briefed from `architecture/agents/executor.md`; filled briefs live
 
 | | |
 |---|---|
-| Current wave | 0, not started; readiness report delivered 2026-09-22 |
-| Next action | Brackly reads the readiness report and the decisions D-B1 to D-B3, merges `infra/pm-wave0-prep`, pushes `main` (origin is 7 commits behind), then the PM briefs F0.1 |
-| Blocking Brackly items | D-B1 (feature-per-session on one component branch), D-B3 (reference host access for agents), E1-env-1 to E1-env-3 |
+| Current wave | 0, in progress since 2026-09-22 |
+| Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
+| Next action | F0.1 executor running (workspace skeleton, CI, lint); the PM reviews its pull request, then briefs F0.2 |
+| Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
 
@@ -29,8 +30,8 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 
 | Id | Feature | Branch | Scope (SDD sections, tests by id) | Status |
 |---|---|---|---|---|
-| F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | in review (Brackly) |
-| F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | todo |
+| F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | merged |
+| F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | in progress |
 | F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | todo |
 | F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (same PR as F0.2) | 01 d.15; CT-T13 | todo |
 | F0.4 | Wave 0 gate and wave report (PM) | `main` | pm.md sections 2, 4, 8 | todo |
@@ -42,7 +43,7 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 - [x] `DECISIONS.md` Q8 date column filled
 - [x] `BOARD.md` (this file) with every epic, feature and task
 - [x] Filled brief for component 1 in `architecture/agents/briefs/01-contracts.md`
-- [ ] Brackly accepts decisions D-B1 to D-B3 and merges the branch; `main` pushed to origin
+- [x] D-B1 and D-B2 decided under delegation, D-B3 deferred to wave 5; branch merged to `main` and pushed to origin
 
 ### F0.1 tasks
 - [ ] Environment facts verified in the PR (rustc, cargo, edition 2024; docker and MinIO reachable in CI)
@@ -340,9 +341,8 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 | F6.1 | Decisions and document status closed | `main` | `DECISIONS.md` Q2 to Q7, Q9, Q10 decided or their assumptions explicitly accepted by Brackly; every SDD HANDOFF-READY; preamble section 8 traceability table with no gap row | todo |
 | F6.2 | Sufficiency sign-off | `main` | S1 to S17 each cited to the test and the host that closed it, or listed as skipped by id with Brackly's acceptance (device and GDS parts of S14) | todo |
 | F6.3 | Packaging and publishing | `infra/release` | Q1 remainder: PyPI, crates.io and GitHub namespace checks, trademark and domain; version `0.1.0`; `CHANGELOG.md`; trusted publishing workflow for wheels and sdist; PY-O1 (GPU wheel) decided or the separate-wheel assumption accepted | todo |
-| F6.4 | User documentation | `infra/docs` | README quickstart from a wheel; `amoru.run` reference; the configuration table's user rows and environment variables (`AMORU_BUDGET`, `AMORU_SPILL_DIR`, `AMORU_SPILL_LIMIT`, `AMORU_HOST_PROFILE`); reading a run report; hosting notes per platform (architecture section 6) | todo |
 | F6.5 | Supply chain and security | `infra/release` (same PR as F6.3) | `cargo audit` and `cargo deny` (licences, advisories) in CI; `SECURITY.md` contact verified; pinned CI actions; DCO sign-off on every commit checked in CI | todo |
-| F6.6 | Release `v0.1.0` | `main` | tag, GitHub release with the wave 5 report and the bench figures (host named), wheels on PyPI for the four interpreters, `README.md` status changed from "Design" | todo |
+| F6.6 | Release `v0.1.0` | `main` | tag, GitHub release with the wave 5 report and the bench figures (host named), wheels on PyPI for the four interpreters, `README.md` status changed from "Design"; E7 complete first | todo |
 
 ### F6.1 tasks
 - [ ] Each of Q2, Q3, Q4, Q5, Q6, Q7, Q9, Q10 has a `decided <date>` row or an `assumption accepted <date>` row in `DECISIONS.md`, applied to the document that carries it in the same PR
@@ -359,17 +359,63 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 - [ ] `CHANGELOG.md`; `Cargo.toml` and `pyproject.toml` versions; release workflow builds wheels for the matrix and publishes on a tag with trusted publishing
 - [ ] PY-O1 decided; if the assumption stands, the `amoru-cuda` wheel is documented as not shipped in `0.1.0`
 
-### F6.4 tasks
-- [ ] Docs written from the SDDs and the run report, not from the code; no em dashes; every environment variable and default cites its preamble row
-- [ ] A worked example per source and sink kind (Parquet to Parquet, tensor to tensor, Python iterator)
-
 ### F6.5 tasks
 - [ ] `cargo audit` and `cargo deny check` jobs green; licence allow-list matches Apache-2.0 compatibility
 - [ ] DCO check on pull requests; actions pinned by SHA
 
 ### F6.6 tasks
+- [ ] E7 documentation epic complete and published
 - [ ] `v0.1.0` tagged from a green `main`; release notes; wheels visible on PyPI; `pip install amoru` works on a clean 3.13 and 3.14 interpreter
 - [ ] `README.md` status updated; this board's "Now" section says released
+
+---
+
+## E7. Documentation: intensive, end-of-build
+
+Written after wave 5 so it describes what shipped, from the design documents and the run report, never reverse-engineered from code. Gate: every page below exists, builds in CI, cites its SDD or preamble section for every number and default, and a reader who has never seen the repository can install a wheel and complete each tutorial. Every executor here reads the SDDs its pages cover and the merged code as evidence, and reports a mismatch as a bug (`.github/ISSUE_TEMPLATE/bug.md`), never by documenting the code's behaviour over the document's.
+
+| Id | Feature | Branch | Scope | Status |
+|---|---|---|---|---|
+| F7.1 | Docs site scaffold and CI | `docs/site` | `docs/` as an mdBook (Rust-native, no Node); a CI job that builds it, checks links and runs the em-dash and no-tabs conventions; published from `main` to GitHub Pages | todo |
+| F7.2 | User guide | `docs/user-guide` | install from a wheel per interpreter; `amoru.run` walkthrough; sources (Parquet local and object store, safetensors, NumPy, Python iterator) and sinks (Parquet, tensor, Arrow IPC); ordering and error policies; budgets and the two environment-variable families; reading the run report and the trace; cancellation and resume (`resume=`, `checkpoint.*`) | todo |
+| F7.3 | API reference | `docs/api` | Python: every public name in `python/amoru` from docstrings (the module's docstrings are the source); Rust: `cargo doc` for `amoru-kernel` with every trait's contract sentence from preamble 1.3 on its doc comment, published beside the book; the configuration table of preamble section 5 rendered with owner and range per row | todo |
+| F7.4 | Kernel author guide | `docs/kernels` | a Rust kernel against `amoru-kernel` alone; the same kernel as a Polars plugin and a DataFusion function (S7); a Python kernel, GIL and free-threading, what releases the GIL; stateful kernels, instances, `ResumePolicy`; hints and `footprint`; the zero-copy rules and what breaks them (G-I2, CT-I4) | todo |
+| F7.5 | Operator and hosting guide | `docs/hosting` | one page per host class of architecture section 6: laptop, cgroup v2 container and Kubernetes pod (memory.high, cpu.max, io_uring seccomp), Databricks single node (explicit budget, E7), Griot Cloud pod profile (`AMORU_HOST_PROFILE`, durable staging); staging disk sizing; profiles directory; diagnosing a `Budget` termination; what the direct paths need and how the report names the path taken (G-I7) | todo |
+| F7.6 | Architecture and internals for contributors | `docs/internals` | the component map and waves from the preamble; how a morsel moves (tiers, the move table, staging segments, the manifest); how the controller decides (probe, envelope, AIMD, classification); how to read an SDD and where each crate's tests map to its ids; the escalation path and the agent prompts; benchmark methodology and how to reproduce a figure on any host | todo |
+| F7.7 | Tutorials and examples | `docs/tutorials`, `examples/` | end-to-end runnable examples with generated data: score a Parquet table with a NumPy kernel; embed a text column to a tensor; kill and resume a run; run inside a container with a budget; each example is a CI smoke test | todo |
+| F7.8 | Documentation gate and release notes (PM) | `main` | every page reviewed against its cited sections; bug issues filed for mismatches; `CHANGELOG.md` and release notes for `v0.1.0` drafted from the wave reports | todo |
+
+### F7.1 tasks
+- [ ] mdBook scaffold with the page tree of F7.2 to F7.7; CI job builds it, fails on broken links, em dashes and a page with no section citation
+- [ ] Published from `main` (GitHub Pages or equivalent); `README.md` links it
+
+### F7.2 tasks
+- [ ] Every default and range cites its preamble section 5 row; every environment variable named with its owner
+- [ ] Run report and trace pages show a real report from the wave 5 run with the host named
+
+### F7.3 tasks
+- [ ] Python docstrings complete for every public name (checked by a docstring-coverage step in the gate); Rust `cargo doc --no-deps` warning-free with `#![deny(missing_docs)]` on `amoru-kernel`
+- [ ] Configuration table rendered from one source (the preamble) so it cannot drift
+
+### F7.4 tasks
+- [ ] The three-host kernel example (runtime, Polars, DataFusion) compiles and runs in CI (reuses AD-T9, AD-T10)
+- [ ] Python kernel page shows the GIL-serialised report line and the free-threaded speedup figure with host
+
+### F7.5 tasks
+- [ ] Each host class page verified by running the container example there where the wave 5 environment allows; otherwise marked "described, not verified on this class" with the reason
+- [ ] Termination diagnostics page reproduces the S6 adversarial run's diagnostic verbatim
+
+### F7.6 tasks
+- [ ] Diagrams are the preamble's and SDDs' Mermaid blocks, included, not redrawn
+- [ ] Bench methodology page reproduces one S3 figure from the wave 5 report step by step
+
+### F7.7 tasks
+- [ ] Four examples runnable from a clean interpreter with a published wheel; each a CI smoke test with a small budget
+- [ ] Resume example kills with SIGKILL and shows byte-equal output (S17)
+
+### F7.8 tasks
+- [ ] PM review of every page against its cited sections; mismatches filed as bugs, none documented around
+- [ ] `CHANGELOG.md` and `v0.1.0` release notes drafted; F6.6 unblocked
 
 ---
 
@@ -380,26 +426,37 @@ Open items the PM found while reading, routed per preamble section 7. Ids: `N-` 
 | Id | What | Where | Who decides | Status |
 |---|---|---|---|---|
 | N-1 | Preamble 6.2 listed `tracing` as used by "all", contradicting 01 section a and CT-T12 (`amoru-kernel` depends on `arrow`, `dlpark`, `thiserror`, `blake3` only) | preamble 6.2 | PM (documentation, no interface change) | fixed on `infra/pm-wave0-prep` |
-| N-2 | CT-T11 asserts "under 1 ms" and is untagged; the gate rule labels a timing figure measured off the reference host provisional, and a hard bound in a unit test is flaky on CI | 01 k, CT-T11 | Brackly (any edit to 01 is a contracts change, pm.md section 7) | proposed: tag "(reference host, E1, for the timing; the rest runs anywhere)" as DS-T3 does, assert the O(columns) property structurally on CI |
-| N-3 | Contracts d.12 cites "(DS, `Config` error)" without a section id; an executor may only read cited sections | 01 d.12, 03 (the guarantee table near line 168) | Brackly (contracts edit) | proposed: cite the 03 section id |
-| N-4 | CONTRIBUTING and the preamble say one pull request per component; a session-sized feature plan needs several sessions per large component (placement, scheduler, contracts) | this board | Brackly | see D-B1 |
+| N-2 | CT-T11 asserts "under 1 ms" and is untagged; the gate rule labels a timing figure measured off the reference host provisional, and a hard bound in a unit test is flaky on CI | 01 k, CT-T11 | PM (under delegation, 2026-09-22) | fixed on `infra/pm-wave0-prep`: tagged, timing provisional off the reference host, structural half runs everywhere |
+| N-3 | Contracts d.12 cites "(DS, `Config` error)" without a section id; an executor may only read cited sections | 01 d.12, 03 (the guarantee table near line 168) | PM (under delegation) | fixed: cites 03 e.4 |
+| N-4 | CONTRIBUTING and the preamble say one pull request per component; a session-sized feature plan needs several sessions per large component (placement, scheduler, contracts) | this board | PM | decided, D-B1 |
 | N-5 | AD-T9 and AD-T10 (integration, wave 1) need the bench `normalise` kernel from the same wave; the bench PR must merge before those two close | 05 k, preamble 6.5 | PM (sequencing) | F1.5 waits for F1.7; noted |
-| N-6 | `origin/main` is at `a972737`; the seven commits carrying the SDDs, the preamble revisions and the agents' prompts are local only; executors branch from `main` on GitHub | repository | Brackly | push `main` before F0.1 is briefed |
-| E1-env-1 | No `docker` on this machine; the container gate and the MinIO job run in CI only; an executor cannot run them locally before pushing | wave 0 environment (6.6) | Brackly | acceptable if CI is the gate host; otherwise install Docker Desktop or OrbStack |
-| E1-env-2 | `python3.13t` and `python3.14t` are absent locally (3.13.7 and 3.14.3 GIL builds present); needed to prove the matrix locally in wave 0 and for component 5 in wave 1 | wave 0 and 1 environment | Brackly | `uv python install 3.13t 3.14t` closes it; CI uses `actions/setup-python` |
-| E1-env-3 | `maturin` absent locally (wave 5) | wave 5 environment | Brackly | `uv tool install maturin` when wave 5 starts |
-| E1-ref-1 | The reference host is the Griot server in Nairobi; no access path for an agent is recorded | E1, wave 5 | Brackly | see D-B3 |
+| N-6 | `origin/main` is at `a972737`; the seven commits carrying the SDDs, the preamble revisions and the agents' prompts are local only; executors branch from `main` on GitHub | repository | PM | pushed 2026-09-22 |
+| E1-env-1 | No `docker` on this machine; the container gate and the MinIO job run in CI only; an executor cannot run them locally before pushing | wave 0 environment (6.6) | PM | accepted: CI is the gate host for the container and MinIO jobs; executors record the fact under "Environment facts verified" |
+| E1-env-2 | `python3.13t` and `python3.14t` are absent locally (3.13.7 and 3.14.3 GIL builds present); needed to prove the matrix locally in wave 0 and for component 5 in wave 1 | wave 0 and 1 environment | PM | closed 2026-09-22: installed with `uv python install 3.13t 3.14t` |
+| E1-env-3 | `maturin` absent locally (wave 5) | wave 5 environment | PM | `uv tool install maturin` when wave 5 starts |
+| E1-ref-1 | The reference host is the Griot server in Nairobi; no access path for an agent is recorded | E1, wave 5 | Brackly | deferred to wave 5 (D-B3); the only open Brackly item |
 
 ### Decisions the board needs from Brackly
 
 | Id | Decision | PM recommendation | Status |
 |---|---|---|---|
-| D-B1 | Several session-sized features per large component, all on the one component branch, one pull request reviewed against the SDD when the last feature lands (keeps "one PR per component") versus one PR per feature | the former; the PM reviews each feature's commits as they land and returns findings early, the SDD review is once, at the end | open |
-| D-B2 | Coverage floor 90% line coverage per crate, test code excluded, judged per crate, stubs not measured (as written into preamble 6.7 on this branch) | accept | open |
-| D-B3 | How an agent runs the E1-tagged suite on the reference host: SSH access for the executor session, or Brackly runs `bench/` by hand and pastes the output into the wave 5 report | SSH for a wave 5 executor, read-only elsewhere | open |
+| D-B1 | Several session-sized features per large component, all on the one component branch, one pull request reviewed against the SDD when the last feature lands (keeps "one PR per component") versus one PR per feature | the former | decided 2026-09-22 (PM, under delegation): features are sessions on one component branch; the PM reviews each feature's commits as they land; the SDD review is once, at the end |
+| D-B2 | Coverage floor 90% line coverage per crate, test code excluded, judged per crate, stubs not measured (as written into preamble 6.7 on this branch) | accept | decided 2026-09-22 (PM, under delegation) |
+| D-B3 | How an agent runs the E1-tagged suite on the reference host: SSH access for the executor session, or Brackly runs `bench/` by hand and pastes the output into the wave 5 report | SSH for a wave 5 executor, read-only elsewhere | open until wave 5; Brackly |
 
 ## Wave reports
 
 Filed here as each gate closes (pm.md section 2); the detail stays in the pull requests.
 
 - Wave 0: not yet run.
+
+### Delegated decisions log
+
+Every item the preamble routes to the human that the PM decided under the delegation of 2026-09-22, newest last. A row here is also mirrored to `DECISIONS.md` when it traces to a Q-item.
+
+| Date | Item | Decision | Where applied |
+|---|---|---|---|
+| 2026-09-22 | N-2 CT-T11 timing test | tagged (reference host, E1) for the timing; structural half everywhere | 01 k |
+| 2026-09-22 | N-3 contracts d.12 citation | cites 03 e.4 | 01 d.12 |
+| 2026-09-22 | D-B1, D-B2 | as recommended | this board, preamble 6.7 |
+| 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
