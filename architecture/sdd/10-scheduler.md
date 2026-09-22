@@ -273,6 +273,20 @@ Tests use `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeTrace`, 
 
 ## l. Implementation notes for the agent
 
+Environment facts to verify before starting: `rustc --version` matches `rust-toolchain.toml`; whether a container runtime honouring `--memory` and `--cpus` exists on this host, since SC-T12 and the wave 4 gate need one and the weekly CI job supplies it otherwise; `libc::CLOCK_THREAD_CPUTIME_ID` is present, which `cputime.rs` needs to attribute worker busy time. (Added 2026-09-22: this section had no such list, which the hand-off protocol requires of every component.)
+
+Decisions the PM took on 2026-09-22, on the component 10 agent's report:
+
+A worker pops with the contract's non-blocking `pop`, not `pop_blocking` as f.2 says. A worker's claim on its stage has to bracket the pop, or f.7's cascade closes an output queue under a morsel about to be pushed into it and the run completes with that morsel stranded, against SC-I9; holding the claim across a blocking call deadlocks the cascade instead. The agent found this through SC-T9 failing once in twenty runs, which is the kind of defect that ships when a test is run once. One consequence to know: `placement_miss_wait_us` is 0 for a worker task, because the worker no longer waits, and the engine's own `QueueStats` is where a miss is counted.
+
+`sink.concurrency` does not bound an ordered sink (f.6). A `ReorderBuffer::write` future does not resolve until the morsel's turn, so a held morsel would hold a slot and the drive could never pop the sequence the buffer is waiting for; for an ordered handle the bound is the buffer's own byte limit, reported through `is_stalled`.
+
+SC-I8 says a skipped morsel is recorded with `Outcome::Error`; contracts d.13 defines `Skipped` for exactly this and SC-T7 and SC-T14 assert it. The contracts win: a skipped morsel is `Skipped`, and SC-I8's sentence is wrong.
+
+f.8's device out of memory retry cannot be written as specified, because `Kernel::apply` takes the payload by value and an `Err` returns nothing to retry with. The scheduler records the failure so the trace keeps one record per morsel per stage (G-I4) and applies the error policy. Closing the gap properly means either dropping the retry from f.8 or having `apply` hand the payload back on error, which is a contracts change and waits for a host with a device to exercise it (E1).
+
+No knob carries the sizer to the scheduler, so `TraceRecord::sizer` is written as 0 (rule) on every record; the run report should take the sizer from the controller's summary instead, which is where it is known.
+
 Files: `src/lib.rs`, `src/pipeline.rs` (validation, f.1), `src/worker.rs` (e.1, f.2, the heartbeat writes), `src/pick.rs` (f.3), `src/instances.rs` (f.4 `init_instances`, and the restore path of f.13), `src/source_drive.rs` (f.5, the cursor, the helper requests of f.9, the recompute pass of f.13), `src/sink_drive.rs` (f.6, f.11, the heartbeat check when checkpointing is off), `src/lifecycle.rs` (e.2, f.7, f.10, `run`, `run_resumed`, `apply_resume_point`, `shutdown`), `src/policy.rs` (f.8, `terminate`), `src/checkpoint.rs` (f.12, the checkpoint thread, `checkpoint_now`, the heartbeat check when checkpointing is on), `src/heartbeat.rs` (f.14), `src/probe.rs` (f.9), `src/knobs.rs` (f.15, atomics, `snapshot`), `src/stats.rs` (`StatsSource`), `src/cputime.rs`. `unsafe` is permitted only in `cputime.rs`, for the single `libc::clock_gettime(CLOCK_THREAD_CPUTIME_ID)` call behind a safe `thread_cpu_ns()` (`// SAFETY:` a valid out-pointer to a `timespec`); nowhere else outside tests (E9). `catch_unwind` around `apply` requires kernels to be `UnwindSafe`; wrap with `AssertUnwindSafe` and document that a panicking kernel's state is retired.
 
 The drives poll the `BoxFuture`s that `Source::read` and `Sink::write` return with a minimal single-future executor (a `Waker` over the drive's `Parker`); the futures inside await `Completion`s, which implement `Future` (contracts d.9). No tokio dependency in this crate.
