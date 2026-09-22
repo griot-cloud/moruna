@@ -1,12 +1,12 @@
 # Amoru SDD: Preamble
 
 **Document type:** software design document, shared preamble (read by every agent before its component SDD)
-**Status:** DRAFT · 2026-09-15
+**Status:** DRAFT · 2026-09-22 (revised 2026-09-15 draft: component graph, run lifecycle, lock order, waves, escalation routing, hand-off)
 **Parent:** `architecture/amoru-runtime-design.md` (revision 3), the architecture design; this preamble does not repeat its context or its alternatives, it decides what the architecture left open and fixes what every component shares.
 **Language and repository:** Rust 2024 edition for the runtime, Python 3.13 and 3.14 for the surface, one Cargo workspace at the repository root.
 **Reference hardware:** to be named (escalation E1). Until named, benchmark gates run on the developer's machine and are reported as provisional.
 
-This preamble plus the contracts SDD (`01-contracts.md`) plus one component SDD is the complete brief for an agent building that component. Nothing else in the repository is required reading.
+This preamble plus the contracts SDD (`01-contracts.md`) plus one component SDD is the complete brief for an agent building that component. Nothing else in the repository is required reading; the only other text an agent may read is a section of another SDD that its own SDD cites by id (section 9).
 
 ---
 
@@ -31,21 +31,78 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 3 | Resource discovery and host profile | `03-discovery.md` | 1 | produces `Limits` and `HostProfile`; values are read from the host at call time, never cached across calls |
 | 4 | Trace writer and run report | `04-trace.md` | 1 | accepts `TraceRecord` from any thread without blocking the caller for longer than a bounded channel push; flushes on `finish` and on abort |
 | 5 | Kernel adapters | `05-adapters.md` | 1 | each adapter is a `Kernel`; the Python adapter never copies payload bytes across the interpreter boundary |
-| 6 | IO reactor | `06-reactor.md` | 2, 3 | implements `Reactor`; every operation completes exactly once, into the buffer it was given, on the reactor's threads, never on a worker |
+| 6 | IO reactor | `06-reactor.md` | 1 (2's arena arrives as `dyn Allocator`; 3's `HostProfile` arrives as a contracts value) | implements `Reactor`; every operation completes exactly once, into the buffer it was given, on the reactor's threads, never on a worker; submission never blocks the caller |
 | 7 | Sources | `07-sources.md` | 1, 2, 6 | implement `Source`; `plan` is complete before the first `read`; `read` returns a payload in the tier the allocator was asked for |
 | 8 | Sinks | `08-sinks.md` | 1, 2, 6 | implement `Sink`; `write(seq, payload)` takes ownership of the payload; `finish` is called exactly once after the last `write` completes; `committed_seq` never overstates |
-| 9 | Placement engine | `09-placement.md` | 1, 2, 3, 6 | implements `Placement`; `pop` returns a morsel already resident in the tier the caller asked for, or blocks; `push` never blocks; `checkpoint` writes a manifest from which `restore` rebuilds the queues |
-| 10 | Scheduler | `10-scheduler.md` | 1, 9 | implements `Knobs`; workers only ever run `Kernel::apply` and nothing that blocks on IO |
-| 11 | Resource controller | `11-controller.md` | 3, 4, 9, 10 | the only writer of every knob; reads stats, never morsels |
+| 9 | Placement engine | `09-placement.md` | 1 (2's arena arrives as `dyn Allocator`, 3's values as contracts types, 6's reactor as `dyn Reactor`) | implements `Placement`; `pop` returns a morsel already resident in the tier the caller asked for, or blocks; `push` never blocks; `checkpoint` writes a manifest from which `restore` rebuilds the queues |
+| 10 | Scheduler | `10-scheduler.md` | 1, 8 (`SinkHandle`, `ReorderBuffer`), 9 | implements `Knobs`, `StatsSource` and `Prober`; workers only ever run `Kernel::apply` and nothing that blocks on IO |
+| 11 | Resource controller | `11-controller.md` | 3, 4, 9, 10 (all four through contracts traits; the crate depends on `amoru-kernel` alone) | the only writer of every knob; reads stats, never morsels |
 | 12 | Python surface | `12-python.md` | all | the only component that knows what a user is |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
+The crate graph below is drawn from each SDD's section d.2: a solid edge is a concrete crate dependency in `Cargo.toml`, a dashed edge is a dependency on a trait object (`dyn`) whose concrete type the facade supplies, so the consuming crate compiles against `amoru-kernel` and is tested against a fake.
+
+```mermaid
+graph LR
+  kernel["amoru-kernel (1)"]
+  arena["amoru-arena (2)"]
+  discovery["amoru-discovery (3)"]
+  trace["amoru-trace (4)"]
+  adapters["amoru-adapters (5)"]
+  reactor["amoru-reactor (6)"]
+  sources["amoru-sources (7)"]
+  sinks["amoru-sinks (8)"]
+  placement["amoru-placement (9)"]
+  scheduler["amoru-scheduler (10)"]
+  controller["amoru-controller (11)"]
+  runtime["amoru-runtime (facade)"]
+  py["amoru-py (12)"]
+  polars["amoru-polars"]
+  datafusion["amoru-datafusion"]
+  testkit["amoru-testkit"]
+  arena --> kernel
+  discovery --> kernel
+  trace --> kernel
+  adapters --> kernel
+  testkit --> kernel
+  polars --> kernel
+  datafusion --> kernel
+  controller --> kernel
+  reactor --> kernel
+  reactor -.->|dyn Allocator| arena
+  sources --> kernel
+  sources -.->|dyn Reactor| reactor
+  sinks --> kernel
+  sinks -.->|dyn Reactor| reactor
+  placement --> kernel
+  placement -.->|dyn Allocator| arena
+  placement -.->|dyn Reactor| reactor
+  scheduler --> kernel
+  scheduler -.->|dyn Placement| placement
+  scheduler -->|SinkHandle, ReorderBuffer| sinks
+  runtime --> arena
+  runtime --> discovery
+  runtime --> trace
+  runtime --> adapters
+  runtime --> reactor
+  runtime --> sources
+  runtime --> sinks
+  runtime --> placement
+  runtime --> scheduler
+  runtime --> controller
+  py --> runtime
+```
+
+This diagram answers "which components can be built in parallel and which concrete type a fake stands in for": every crate whose only solid edge points at `amoru-kernel` can be built as soon as wave 0 lands, and every dashed edge names the fake (contracts d.15) that stands in for the concrete crate until the facade wires the real one.
+
 ### 1.4 Per-component schema
 
-Every component SDD has these thirteen sections, in this order, with the component's two-letter prefix (CT, AR, DS, TR, AD, RE, SO, SI, PL, SC, RC, PY) on every invariant and test id:
+Every component SDD has these fifteen sections, in this order, with the component's two-letter prefix (CT, AR, DS, TR, AD, RE, SO, SI, PL, SC, RC, PY) on every invariant and test id:
 
-a. Purpose and boundary. b. Vocabulary specific to the component. c. Invariants, `XX-I1..`. d. Interfaces: exposed and consumed, complete signatures. e. Data model, formats and state machines. f. Algorithms and policies. g. Concurrency within the component. h. Behaviour: normal path, edge cases, failures. i. Configuration: this component's rows of the global table. j. Observability. k. Tests, `XX-T1..`. l. Implementation notes for the agent. m. Open items (must be empty, or moved to the escalation list, before hand-off).
+a. Purpose and boundary. b. Vocabulary specific to the component. c. Invariants, `XX-I1..`. d. Interfaces: exposed and consumed, complete signatures. e. Data model, formats and state machines. f. Algorithms and policies. g. Concurrency within the component. h. Behaviour: normal path, edge cases, failures. i. Configuration: this component's rows of the global table. j. Observability. k. Tests, `XX-T1..`. l. Implementation notes for the agent. m. Open items: only items that block the build; each is either resolved or moved to the escalation list (section 7) before hand-off, so this section is empty in a hand-off-ready document. n. Traceability: parent ids to invariants to tests. o. Deferred (post-v1): items the component knows about and will not build in v1, with ids `XX-O1..` (an item that started life in section m keeps its number when it moves, so `XX-M1` becomes `XX-O1`); nothing in this section blocks hand-off, and an agent that finds it needs one of these items to meet a gate stops and reports.
+
+Every SDD carries a status line of the form `**Status:** DRAFT · <date> (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)`. The status is flipped to HANDOFF-READY by the human, not by the PM and not by an agent, once section m is empty and E1 and E2 have been answered or their assumptions explicitly accepted for that component. Test ids and invariant ids are stable: a new one is added at the end of its sequence, never inserted, and an id is never reused.
 
 The test for every sentence in a component SDD: could two competent implementers build two different things from it? If yes, it is not finished.
 
@@ -75,7 +132,13 @@ Terms used by more than one component are defined here once. A component SDD add
 
 **Amplification (`A_k`).** For kernel k, the ratio of peak working-set bytes during `apply` to input payload bytes, measured by the probe and refined per morsel.
 
-**Probe.** The first morsel of each kernel stage, run alone at a fixed small size to measure `A_k` before the controller sizes real morsels.
+**Probe.** The first morsel of each kernel stage, run alone at a fixed small size to measure `A_k` before the controller sizes real morsels. The scheduler builds it (contracts `Prober`): for stage 1 by one synchronous read at the source cursor, for a later stage by popping the previous stage's probe output; its output continues downstream as a normal morsel.
+
+**Probed.** The state of a host guarantee that the platform did not declare and discovery measured instead: `Guarantee::Probed(true)` means the path is available and may fall back on failure; `Guarantee::Present` means declared, and a failure on it is a platform bug (contracts d.12, G-I7).
+
+**Checkpoint thread.** The scheduler's thread that writes the run manifest every `checkpoint.interval_ms` while the run is `Running` or `Draining`; it does not exist while the run is being prepared, and the scheduler writes the final manifest itself on termination and cancellation (section 4.1).
+
+**Engine baseline.** The benchmark figure obtained by running the same kernel as a user-defined function inside Polars and inside DuckDB over the same files in the same container (section 6.5); reported beside the hand-tuned baseline, never a gate.
 
 **Morsel target.** The controller's current intended payload size for a stage, in bytes; sources and the placement engine split or coalesce to approach it.
 
@@ -137,36 +200,132 @@ These hold across components. Each component SDD cites the ones it upholds and a
 
 ### 4.1 Threads
 
-One process. Six kinds of thread, fixed at start:
+One process. Seven kinds of thread, fixed at start:
 
 | Thread kind | Count | Created by | May touch | Must never |
 |---|---|---|---|---|
 | Main | 1 | the caller | builds the pipeline, calls `run`, blocks until completion | run a kernel; issue IO |
-| Worker | N = discovered CPU ceiling (parked/active split managed by the scheduler) | scheduler | `Kernel::apply`, `Placement::pop` and `push`, `TraceRecord` emission, the arena | block on IO; write a knob; touch the reactor |
+| Worker | N = discovered CPU ceiling (parked/active split managed by the scheduler) | scheduler | `Kernel::apply`, `Placement::pop` and `push`, `TraceRecord` emission, the arena | block on IO; write a knob; wait on a reactor completion |
 | Reactor | R = `reactor.threads` (default 2, section 5) | reactor | file and object-store IO, DMA copy issuance and completion, staging segment IO | run a kernel; allocate outside the arena |
 | Controller | 1 | controller | discovery sampling, placement and scheduler stats, knob writes, trace reads | touch payload bytes; block on IO |
 | Trace writer | 1 | trace | drains the trace channel to the trace file | anything else |
-| Checkpoint | 1, only when `checkpoint.enabled` | scheduler | every `checkpoint.interval_ms`: `KernelState::checkpoint` on stateful instances that declared it (acquiring each instance like a task), `Sink::checkpoint`, `Placement::checkpoint` | run `apply`; hold the stage table lock across the placement call; touch payload bytes |
+| Drive | 2 (source drive, sink drive) | scheduler | `Source::read` and `Sink::write` submission, `Completion::wait`, `Placement::push`/`pop_blocking` on Q0 and Qn, `set_committed`; idle from `new`, driving from `run` | run a kernel; hold a placement lock across a wait |
+| Checkpoint | 1, only when `checkpoint.enabled`; started when the run enters `Running`, stopped when it leaves `Running` or `Draining` | scheduler | every `checkpoint.interval_ms`: `KernelState::checkpoint` on stateful instances that declared it (acquiring each instance like a task), `Sink::checkpoint`, `Placement::checkpoint`, which writes the manifest with `std::fs` (write, fsync, rename) on this thread and not through the reactor; the scheduler writes the final manifest on termination and cancellation from its own thread by the same path | run `apply`; hold the stage table lock across the placement call; touch payload bytes; issue a reactor operation |
 
 Kernels may use threads internally (a BLAS pool, Torch's intra-op pool) provided they are joined before `apply` returns; the scheduler cannot see them and the controller sizes for them only through observed CPU time.
 
 ### 4.2 Synchronisation and lock order
 
-Locks are acquired in this order and never in reverse: (1) scheduler stage table, (2) placement queue order, (2b) placement lineage index, (3) placement tier accounting, (4) arena free lists, (5) trace channel. A component that needs two of these takes the lower-numbered first. No lock is held across a call into another component except (1) held across a `Placement::pop`, which is documented in `10-scheduler.md`.
+Locks are acquired in this order and never in reverse: (1) scheduler stage table and instance pools, (2) placement queue, (2b) placement lineage index, (3) placement moves map and tier accounting, (4) arena free lists, (5) trace channel, (6) controller state. A component that needs two of these takes the lower-numbered first and releases in reverse. No lock is held across a call into another component, without exception: the scheduler releases the stage table before it calls `Placement::pop`, `pop_blocking`, `push` or `peek_resident`, the placement engine releases its queue and lineage locks before it calls the reactor or the allocator (it collects the segment references it will release under the lineage lock, drops that lock, then locks the queues; placement f.11 and f.12), and a `Completion::then` callback, which runs on a reactor thread, takes placement locks only after the reactor has released its own. A component that finds it needs to hold a lock across a boundary call has found a contracts gap and reports it (E10).
 
 Lock-free paths, with the argument for each in the owning SDD: worker task pickup (scheduler, atomic stage cursor), tier byte counters (placement, atomics), arena size-class pop (arena, per-class lock-free stack or a mutex per class; the arena SDD decides and records the benchmark that justified it).
 
-Maximum blocking: a worker blocks only in `Placement::pop` waiting for a resident head, and in `Kernel::apply` for as long as the kernel takes. The reactor never blocks on a lock held by a worker. The controller's tick is bounded at 5 ms of held locks; if a sample takes longer, it is skipped and counted.
+Maximum blocking: a worker blocks only in `Placement::pop_blocking` waiting for a resident head, and in `Kernel::apply` for as long as the kernel takes. The reactor never blocks on a lock held by a worker. The controller's tick is bounded at 5 ms of held locks; if a sample takes longer, it is skipped and counted; test RC-T17 checks the bound.
 
 ### 4.3 Shutdown and cancellation
 
-Three exits: completion (source exhausted, every queue drained, sink finished), termination by the runtime (diagnostic produced), cancellation (SIGINT or `KeyboardInterrupt` forwarded by the surface). All three follow the same sequence: the scheduler stops admitting source work; in-flight `apply` calls complete (bounded by the longest kernel); the placement engine cancels in-flight moves and releases tier accounting; the sink's `finish` runs on completion only, otherwise its completed files remain and uncommitted buffers are dropped; the trace channel drains and the writer flushes; the arena is released; the report is produced with the exit reason. Every component's SDD names what it does at each step.
+Three exits: completion (source exhausted, every queue drained, sink finished), termination by the runtime (diagnostic produced), cancellation (SIGINT or `KeyboardInterrupt` forwarded by the surface). All three follow the same sequence: the scheduler stops admitting source work; in-flight `apply` calls complete (bounded by the longest kernel); the placement engine cancels in-flight moves and releases tier accounting; the sink's `finish` runs on completion only, otherwise its completed files remain and uncommitted buffers are dropped; the trace channel drains and the writer flushes; the arena is released; the report is produced with the exit reason. Every component's SDD names what it does at each step. `Scheduler::run` and `run_resumed` return `Ok(RunOutcome)` for every run that entered `Running` and `Err` only for a failure before that; the facade maps a `Terminated` outcome to an error with the partial report attached. `Scheduler::shutdown` (also called from `Drop`) sets the cancel flag, unparks and joins the workers, aborts the drives and stops the checkpoint thread; the scheduler calls `TraceSink::flush`, and the facade calls the trace writer's `finish` exactly once.
+
+### 4.4 Run lifecycle
+
+The order in which the facade builds and starts the components is fixed, because the baseline sample, the probes and the instance pool depend on it. A fresh run: discover, arena, reactor, trace, sources and sinks built, kernels built, placement, `Scheduler::new` (validates the chain, opens the sink, spawns the workers parked; the drives and the checkpoint thread are not started), `scheduler.init_instances()` (runs `Kernel::init` eagerly for every instance up to `max_instances` of every stateful stage, on the worker that will own it; a stateless stage has no instances), controller `prepare` (the baseline is sampled here, after every `init`), controller `probe_all` (through `Prober`), controller `start`, `scheduler.run` (starts the drives and the checkpoint thread, enters `Running`), controller `stop`, trace `finish` by the facade, report. There is no lazy instance creation: the pool is full before the first probe.
+
+```mermaid
+sequenceDiagram
+  participant Facade
+  participant Discovery
+  participant Arena
+  participant Reactor
+  participant Trace
+  participant Placement
+  participant Scheduler
+  participant Worker
+  participant SourceDrive
+  participant Controller
+  participant Sink
+  Facade->>Discovery: discover(input) returns Discovered (Limits, HostProfile)
+  Facade->>Discovery: Sampler::new(&Discovered)
+  Facade->>Arena: Arena::new(cfg)
+  Facade->>Reactor: Reactor::new(cfg, alloc)
+  Facade->>Trace: TraceWriter::start(cfg)
+  Facade->>Facade: build sources, sinks, kernels
+  Facade->>Placement: PlacementEngine::new(cfg, alloc, reactor)
+  Facade->>Scheduler: Scheduler::new(cfg, pipeline, placement, alloc, trace, sampler)
+  Scheduler->>Scheduler: validate the chain
+  Scheduler->>Sink: open(schema)
+  Scheduler->>Worker: spawn parked (drives and checkpoint thread not started)
+  Facade->>Scheduler: init_instances()
+  Scheduler->>Worker: Kernel::init for every instance of every stateful stage
+  Facade->>Controller: Controller::new(cfg, knobs, stats, prober, sampler, trace_tail, placement, kernels)
+  Facade->>Scheduler: set_record_hook(hook)
+  Facade->>Controller: prepare()
+  Controller->>Discovery: sample() for the baseline, after every init
+  Facade->>Controller: probe_all()
+  loop each kernel stage k, in order
+    Controller->>Scheduler: probe(k, bytes)
+    alt k is 1
+      Scheduler->>SourceDrive: drive-side helper reads about bytes rows at the cursor (next seq)
+      SourceDrive-->>Scheduler: probe morsel
+    else k is greater than 1
+      Scheduler->>Placement: pop the head of Q(k-1), the previous probe output
+    end
+    Scheduler->>Discovery: reset_peak() then sample() as s0
+    Scheduler->>Worker: apply on one worker, every other worker parked
+    Scheduler->>Discovery: sample() as s1 (peak_delta = peak_anon_bytes - s0.anon_bytes)
+    Scheduler->>Placement: push(k, output) as a normal morsel
+    Scheduler-->>Controller: ProbeResult
+  end
+  Facade->>Controller: start()
+  Facade->>Scheduler: run(cancel)
+  Scheduler->>SourceDrive: start at the cursor (after the probe read)
+  Scheduler->>Scheduler: start the checkpoint thread, enter Running
+  Scheduler->>Sink: sink drive starts and drains Qn, probe outputs included
+  Scheduler-->>Facade: Ok(RunOutcome)
+  Facade->>Controller: stop()
+  Facade->>Trace: trace.finish() returns TraceView
+  Facade->>Facade: RunReport::compute(trace_view, limits, meta)
+```
+
+This diagram answers "who builds the probe morsel and when are instances created relative to the baseline sample": the scheduler builds the probe morsel through a drive-side helper for stage 1 and by popping the previous queue's head afterwards, and every instance exists before the controller samples the baseline.
+
+A resumed run replaces `open` with `resume`, restores the instance pool and re-reads what the manifest could not point to on disk, before any probe. The facade reads the manifest header first (for `run_id` and `node`, which go into `PlacementConfig`), then `Placement::restore`, then `Scheduler::apply_resume_point(point)` (refuses at once when `checkpoint.enabled` is false, naming the sink when the reason is a non-resumable sink, contracts d.8, and the staging directory otherwise; then `Sink::resume` instead of `open`, the cursor and sequence counter set, `Checkpoint` instances restored, `Reinit` instances re-inited eagerly, the watermark set), then controller `prepare`, `probe_missing` (only stages without a profile), `start`, then `scheduler.run_resumed(cancel)`, which re-reads `to_recompute` through the source path (obeying `read_ahead` and `is_full`) and then continues as `run`.
+
+```mermaid
+sequenceDiagram
+  participant Facade
+  participant Placement
+  participant Scheduler
+  participant Sink
+  participant Worker
+  participant SourceDrive
+  participant Controller
+  Facade->>Placement: find_manifest, read_manifest_header (run_id, node)
+  Facade->>Placement: restore(manifest, plan, fingerprints)
+  Placement-->>Facade: ResumePoint (extras, to_recompute)
+  Facade->>Scheduler: apply_resume_point(point)
+  Scheduler->>Scheduler: refuse when checkpoint is disabled, naming the sink or the staging directory
+  Scheduler->>Sink: resume(schema, state, committed_seq)
+  Scheduler->>Scheduler: set the source cursor, the sequence counter and the watermark
+  Scheduler->>Worker: restore Checkpoint instances, init Reinit instances, all eagerly
+  Facade->>Controller: prepare() (baseline after restore)
+  Facade->>Controller: probe_missing()
+  Controller->>Scheduler: probe(k, bytes) only for stages without a profile
+  Facade->>Controller: start()
+  Facade->>Scheduler: run_resumed(cancel)
+  Scheduler->>SourceDrive: re-read every to_recompute origin through the source path (read_ahead, is_full)
+  SourceDrive->>Placement: push(0, morsel) with its original seq
+  Scheduler->>SourceDrive: start at the restored cursor
+  Scheduler->>Scheduler: start the checkpoint thread, enter Running
+  Scheduler->>Sink: sink drive starts, writes above committed_seq only
+```
+
+This diagram answers "when is the sink resumed relative to the probes and the recompute reads": the sink is resumed inside `apply_resume_point`, before any probe runs and before any recompute read is issued, so a probe output or a recomputed morsel reaching the last queue always finds a sink that knows its watermark.
 
 ---
 
 ## 5. Global configuration table
 
-Every tunable in every component. Owner is who may set it at runtime: `user` (Python surface), `controller` (knob), `platform` (host profile or environment variable), `compile` (feature flag or constant). A value outside its range is clamped to the nearest bound and the clamp is reported. Component SDDs copy their rows into section i and may not add rows without adding them here.
+Every tunable in every component. Owner is who may set it at runtime: `user` (Python surface), `controller` (knob), `platform` (host profile or environment variable), `compile` (feature flag or constant). A value outside its range is clamped to the nearest bound and the clamp is reported. Clamping has one owner per row: the scheduler clamps every scheduler-side knob (`morsel_target`, `workers.active`, `readahead.splits`, `queue.high_water`, `queue.promotion_window`, the staging trigger) and counts each clamp in `SchedulerStats::knob_clamps` (contracts d.11); discovery clamps `budget.host` and `budget.device`; the facade clamps everything else once, at argument translation, and reports each clamp in the run report's `notes`. Test PY-T13 walks the whole table with one out-of-range value per row and checks the owner and the report. Component SDDs copy their rows into section i and may not add rows without adding them here.
 
 | Name | Component | Type | Default | Range | Owner | Effect |
 |---|---|---|---|---|---|---|
@@ -219,6 +378,7 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 | `sizer` | 11 | enum | `rule` | `rule`, `learned` | user | decision function |
 | `sizer.fallback_error_ratio` | 11 | f32 | 2.0 | 1.2 .. 5.0 | compile | learned → rule fallback trigger |
 | `host_profile` | 3 | struct | probed | declared via `AMORU_HOST_PROFILE` | platform | guarantees; see `03-discovery.md` |
+| `AMORU_BENCH_MORSEL_BYTES` | 11, bench | bytes | unset | `morsel.min_bytes` .. `morsel.max_bytes` | bench only (environment variable read by the bench runner; not part of the API, not documented to users) | pins the morsel target for the S12 overhead measurement so the runtime and the plain loop process identical batches; S12 itself is measured with defaults (G-I10 unchanged), and the pinned figure is reported beside it |
 
 ---
 
@@ -230,26 +390,29 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 amoru/
   Cargo.toml                 workspace; members below; shared [workspace.dependencies] with pinned versions
   crates/
-    amoru-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror only.
+    amoru-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 only.
     amoru-arena/             component 2
     amoru-discovery/         component 3
     amoru-trace/             component 4
-    amoru-adapters/          component 5 (features: python, polars, datafusion)
+    amoru-adapters/          component 5: the Python kernel adapter only (feature: python)
     amoru-reactor/           component 6
     amoru-sources/           component 7
     amoru-sinks/             component 8
     amoru-placement/         component 9
     amoru-scheduler/         component 10
     amoru-controller/        component 11
-    amoru-runtime/           facade: wires 2..11 into `Runtime::run`; no logic of its own
-    amoru-py/                component 12: PyO3 module, built by maturin
-    amoru-testkit/           fakes for every contracts interface, benchmark data generators, host probes
+    amoru-runtime/           facade: the Rust side of component 12; wires 2..11 into `Runtime::run`; no logic of its own; built in wave 4
+    amoru-py/                component 12: PyO3 module, built by maturin; depends on amoru-runtime; wave 5
+    amoru-polars/            engine bridge: hosts a kernel inside Polars; depends on amoru-kernel and polars only (feature: polars)
+    amoru-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on amoru-kernel and datafusion only (feature: datafusion)
+    amoru-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on amoru-kernel only; wave 0
   python/amoru/              Python package source (thin; the module is amoru-py)
-  bench/                     benchmark suite runner and baselines (section 6.5)
+  bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
+  tools/lint/                repository lints run by CI: `no_tier_wildcard.sh` (CT-T14)
   architecture/              this documentation
 ```
 
-Kernel authors depend on `amoru-kernel` alone. The Polars and DataFusion bridges in `amoru-adapters` depend on `amoru-kernel` alone plus the host engine.
+Kernel authors depend on `amoru-kernel` alone. The Polars and DataFusion bridges are separate thin crates, as the architecture document's section 6 lays them out, and depend on `amoru-kernel` alone plus the host engine; `amoru-adapters` keeps only the Python adapter. The workspace root, every member crate as a compiling stub with its `Cargo.toml`, and `tools/lint` are wave 0 deliverables (section 6.6).
 
 ### 6.2 Dependencies
 
@@ -264,29 +427,41 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `safetensors` | 7, 8 | model and tensor files | header parsing only; bytes are mapped, not copied |
 | `tokio` | 6 | reactor runtime | `rt-multi-thread`, `fs`, `sync` |
 | `io-uring` | 6 | direct IO on Linux | optional feature `uring`; fallback is `pread`/`pwrite` on a blocking pool |
-| `crossbeam` | 9, 10 | bounded channels, deque | |
+| `crossbeam` | 4, 9, 10 | bounded channels, deque | |
 | `cudarc` | 2, 3, 6, 9 | CUDA driver: device memory, pinned host alloc, streams, copies | feature `cuda`; absent, `Tier::Device` is unconstructible |
-| `pyo3` ≥ 0.28 | 5, 12 | Python bindings | free-threaded default; version-specific wheels, no abi3 |
-| `pyo3-arrow` | 5 | Arrow ↔ pyarrow zero-copy | |
+| `pyo3` ≥ 0.28 | 5, 7, 12 | Python bindings | free-threaded default; version-specific wheels, no abi3 |
+| `pyo3-arrow` | 5, 12 | Arrow ↔ pyarrow zero-copy | |
 | `maturin` (build) | 12 | wheels | 3.13, 3.13t, 3.14, 3.14t |
 | `thiserror` | all | error types | |
 | `tracing` | all | log events (not the morsel trace) | |
 | `mimalloc` | runtime | global allocator for non-arena allocations | returns freed memory promptly |
-| `blake3` | 1, 11 | fingerprint, trace schema hash, profile keys | |
+| `blake3` | 1, 9, 11 | fingerprint, trace schema hash, profile keys | |
+| `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
+| `serde_json` | 4, 8, 9, 11, 12 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config` | the only text format in the runtime |
+| `base64` | 8, 9 | kernel and sink state bytes inside the JSON manifest and checkpoint | |
+| `libc` | 2, 3, 6, 10 | `mmap`, `madvise`, `mlock`, `O_DIRECT`, `pread`/`pwrite`, cgroup and rlimit calls | |
+| `bytes` | 6, 7, 8 | `object_store` payloads on the write path (a `Bytes` over an arena view, no copy) | |
+| `getrandom` | runtime facade | minting `RunId` | |
+| `hostname` | 9 | the node name in the manifest identity | |
+| `polars` | `amoru-polars` | the Polars expression plugin host | feature `polars`; `pyo3-polars` deferred (12 o) |
+| `datafusion` | `amoru-datafusion` | the DataFusion `ScalarUDF` host | feature `datafusion` |
+| `tracing-subscriber` | 12, bench | log output for the Python surface and the bench runner | never in a library crate |
 
-Pinned versions (filled by the component 1 agent): _pending_.
+There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7).
+
+Pinned versions (filled by the component 1 agent in wave 0): _pending_.
 
 ### 6.3 Feature flags
 
-`cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration with the NIC, the reactor's `Remote` copy rows, the placement engine's remote tier; post-v1, see architecture section 11; its reserved arms exist in every v1 build and return `Unsupported("rdma")`), `python`, `polars`, `datafusion` (adapters). Default features: none of these. `amoru-py` enables `python` and, on Linux, `uring`.
+`cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration with the NIC, the reactor's `Remote` copy rows, the placement engine's remote tier; post-v1, see architecture section 11; its reserved arms exist in every v1 build and return `Unsupported("rdma")`), `python` (`amoru-adapters`, `amoru-sources` for `PyIteratorSource`, `amoru-py`), `polars` (`amoru-polars`), `datafusion` (`amoru-datafusion`). Default features: none of these. `amoru-py` enables `python` and, on Linux, `uring`. The two bridge crates are members of the workspace but are not dependencies of `amoru-runtime` or `amoru-py`; a user who wants them depends on them directly.
 
 ### 6.4 Test infrastructure (`amoru-testkit`)
 
-Built alongside component 1 and extended by every component. It contains, for every interface in the contracts crate, a fake with deterministic and configurable behaviour: `FakeAllocator` (counts allocations, can refuse above a limit, can return misaligned buffers when asked to, to prove callers check), `FakeReactor` (in-memory files, configurable latency and failure injection, records every operation), `FakePlacement` (tier moves are instantaneous, records misses), `FakeSource` (emits generated splits and payloads), `FakeSink` (records writes, can throttle to a rate), `FakeKernel` (identity, or configurable amplification and delay, or failure on the nth morsel), `FakeKnobs`, `FakeTrace`. It also contains the benchmark data generator (section 6.5) and the host probes (a one-line check for each direct path, used by discovery's tests and by CI to label the host).
+Built by agent 1 in wave 0, in the same pull request as the contracts crate, and not extended thereafter without a `contracts/*` pull request. Its contents are exactly the table in contracts d.15: one fake per contracts trait, each with the knobs (builder methods) and observables that table lists, and nothing else. A test in any component SDD names a fake and a knob from that table only; a test that needs a knob the table lacks is a contracts change (E10), not a local addition. The benchmark data generator, the benchmark kernels and the host probes are not in the testkit; they belong to the `bench` agent (section 6.5).
 
 ### 6.5 Benchmark suite
 
-The generator writes Parquet with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio and row-group size, to local disk and to an S3-compatible store (MinIO in a container), and writes safetensors and aligned binary tensors of controllable shape. Kernels: identity (A about 1), normalise (Rust regex over text, A about 1.5), tokenise-explode (A 5 to 10), wide-intermediate (Python NumPy, A about 20, releases the GIL), adversarial (A jumps 4× at the midpoint), embed-score (numeric columns to tensor, small matmul, back to column), torch-score (stateful GPU model, weights via TensorSource). For each, a hand-tuned baseline script (plain loop, fixed batch and threads, grid-searched) reports rows per second; that baseline is what S3 is measured against. A second baseline, the *engine baseline*, runs the same kernel as a user-defined function inside Polars (streaming engine) and inside DuckDB (Python UDF) over the same files in the same container, with each engine's defaults and then with its documented memory limit set to the budget; it is reported beside the tuned baseline for every benchmark and is not a gate, because the claim it supports (that the runtime beats what people use today on this class of work) is an external one the report should carry rather than a criterion the build closes. Every gate runs in a container with `--memory` and `--cpus` set and on the bare host; results name the machine.
+The suite is owned by a named `bench` agent that starts in wave 1 and delivers in two parts. In wave 1 it delivers, under `bench/`, the data generator and the kernels: the generator writes Parquet with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio and row-group size, to local disk and to an S3-compatible store (MinIO in a container), and writes safetensors and aligned binary tensors of controllable shape; the kernels are identity (Rust, A about 1), normalise (Rust regex over text, A about 1.5), tokenise-explode (Rust, A 5 to 10), adversarial (Rust, A jumps 4× at the midpoint), wide-intermediate (Python NumPy, A about 20, releases the GIL) and embed-score (numeric columns to tensor, small matmul, back to column); torch-score (stateful GPU model, weights via TensorSource) is added when the reference GPU host exists (E1). In wave 5 it delivers the baselines: for each kernel a hand-tuned baseline script (plain loop, fixed batch and threads, grid-searched) that reports rows per second, which is what S3 is measured against, and the *engine baseline*, which runs the same kernel as a user-defined function inside Polars (streaming engine) and inside DuckDB (Python UDF) over the same files in the same container, with each engine's defaults and then with its documented memory limit set to the budget; the engine baseline is reported beside the tuned baseline for every benchmark and is not a gate, because the claim it supports (that the runtime beats what people use today on this class of work) is an external one the report should carry rather than a criterion the build closes. Every gate runs in a container with `--memory` and `--cpus` set and on the bare host; results name the machine. The bench agent's brief is this paragraph plus sections 5 (the `AMORU_BENCH_MORSEL_BYTES` row) and 6.6; it reads no component SDD.
 
 ### 6.6 Build order and gates
 
@@ -294,50 +469,46 @@ Waves are the parallelism plan; the gate names the sufficiency criteria (parent 
 
 | Wave | Components | Agents in parallel | Gate |
 |---|---|---|---|
-| 0 | 1 | 1 | crate compiles with no runtime dependency (`cargo tree`); every fake compiles against the traits; CT tests pass; trace schema hash test pinned |
-| 1 | 2, 3, 4, 5, testkit | up to 5 | AR, DS, TR, AD tests pass against fakes; G-I2 for the Python adapter (zero payload copies); S13 partial |
-| 2 | 6 (and design of 9) | 1 | RE tests pass; direct IO and fallback both exercised on the developer host; G-I7 |
+| 0 | 1 (contracts and `amoru-testkit`), the workspace skeleton, CI, `tools/lint` | 1 | the workspace compiles with every member crate as a stub; `amoru-kernel` has no runtime dependency (`cargo tree`, CT-T12); every fake in contracts d.15 compiles against the traits and exercises every knob (CT-T13); CT tests pass; trace schema hash pinned (CT-T9); `tools/lint/no_tier_wildcard.sh` runs in CI (CT-T14); the four CI jobs are green on the stubs |
+| 1 | 2, 3, 4, 5, bench (generator and kernels) | up to 5 | AR, DS, TR, AD tests pass against fakes; G-I2 for the Python adapter (zero payload copies); S13 partial; the generator writes every dataset shape the suite names to local disk and MinIO |
+| 2 | 6 | 1 | RE tests pass; direct IO and fallback both exercised on the developer host; G-I7 |
 | 3 | 7, 8, 9 | 3 | SO, SI, PL tests pass; S10, S15 with `FakeSink` throttle; G-I3; manifest round trip and sink commit tracking (PL-T16, SI-T12, SI-T13) |
-| 4 | 10, 11 | 2 | end-to-end with fakes and with real components: S1, S2, S4, S5, S6, S11; G-I1, G-I4, G-I5, G-I8; kill-and-resume equivalence (SC-T16, PL-T17) |
-| 5 | 12, runtime facade, bench | 1 | S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-I10, G-I12 (PY-T12) |
+| 4 | 10, 11, `amoru-runtime` (the Rust facade) | 3 | end-to-end with fakes and with real components: S1, S2, S4, S5, S6, S11; G-I1, G-I4, G-I5, G-I8; kill-and-resume equivalence (SC-T16, PL-T17); the facade's lifecycle (section 4.4) driven by RC-T12 |
+| 5 | 12 (the Python package), bench (tuned baselines and the engine baseline) | 2 | S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-I10, G-I12 (PY-T12); the whole configuration table clamped (PY-T13) |
 
-No wave starts until the previous wave's gate is green, except that wave 2's design work on component 9 runs during wave 1.
+Wave 0 deliverables, all by agent 1: the Cargo workspace root; every member crate of section 6.1 as a compiling stub with its `Cargo.toml` and the pinned versions of section 6.2; `crates/amoru-testkit` per contracts d.15; `.github/workflows/ci.yml` with four jobs (`cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` on Linux; the container gate with `--memory` and `--cpus`; a MinIO job for the object-store paths; a Python matrix for 3.13, 3.13t, 3.14 and 3.14t); `tools/lint/no_tier_wildcard.sh`; and `git init` with `main` as the default branch if the repository is not yet initialised.
+
+Environment per wave. Wave 0: stable Rust with the 2024 edition (the version is pinned in `rust-toolchain.toml` in this wave), `cargo`, docker for the container job, MinIO as a container, and the four Python interpreters only to prove the matrix job runs; no GPU. Wave 1: the same, plus the four Python interpreters with NumPy and pyarrow installed for component 5 and the bench kernels, and a cgroup v2 host (a container is enough) for component 3's tests. Wave 2: the same, plus a filesystem that accepts `O_DIRECT` (ext4 or xfs on a local disk, not tmpfs or overlay) and, where the host allows, io_uring; MinIO for the object-store paths; GDS and CUDA tests are tagged for the reference host (E1). Wave 3: as wave 2, plus enough local disk for the staging tests (10 GiB free) and MinIO. Wave 4: as wave 3, plus a container runtime that honours `--memory` and `--cpus`, so the kill-and-resume and budget tests run under a real ceiling. Wave 5: as wave 4, plus maturin and the four interpreters for the wheel matrix, Polars and DuckDB installed for the engine baseline, and the reference hardware named by E1 for the timing gates.
+
+A wave gate is green when every test that is not tagged passes on the CI host, every test tagged "(reference host, E1)" has either passed on the reference host or is listed as skipped with its id in the wave's report, and every timing test that was run on another host is labelled provisional with that host's name. A component-level test that needs another real component or the reference host carries the tag "(integration, closes in wave N)" or "(reference host, E1)" in its SDD's section k and is excluded from the component pull request's gate; it closes in the wave its tag names. No wave starts until the previous wave's gate is green.
 
 ### 6.7 Conventions every agent follows
 
-Branch `component/NN-<name>`; one pull request per component; commits signed off (`-s`); `cargo fmt`, `cargo clippy -- -D warnings` clean; no `unwrap`/`expect` outside tests; every `unsafe` block has a `// SAFETY:` comment naming the invariant; tests named after the SDD ids (`ct_t3_payload_roundtrip`); benchmarks record the host in their output; no em dashes in documentation.
+Base branch `main`. Branch names: `component/NN-<slug>` with the slug the crate suffix (`component/02-arena`, `component/10-scheduler`); `infra/<topic>` for the skeleton, CI and bench work; `contracts/<topic>` for a change to `01-contracts.md` and the contracts crate. One pull request per component. Agents commit as `Amoru Agent <agents@griotdata.com>` with `git commit -s`; the DCO sign-off on those commits is made on behalf of the project by its maintainer, and `CONTRIBUTING.md` states this. The PM merges a component pull request when its gate is green (section 6.6); a human merges every `contracts/*` pull request. `cargo fmt` and `cargo clippy -- -D warnings` clean; no `unwrap`/`expect` outside tests; every `unsafe` block has a `// SAFETY:` comment naming the invariant and lives in a module the SDD's section l permits (E9); tests named after the SDD ids (`ct_t3_payload_roundtrip`); benchmarks record the host in their output; no em dashes in documentation; the pull request template's sections are all filled (section 9).
 
 ---
 
 ## 7. Escalation list
 
-Decisions no agent makes on its own. Each carries the assumption the agent takes until a human answers.
+Decisions no component agent makes on its own. Each carries the assumption the agent takes until the item is decided, and names who decides it: "agent stops and reports" means the agent halts the affected work and files the item; "PM decides" means the PM agent answers it from these documents and records the answer; "human decides" means the PM files it as an issue with the design-change template and continues other work until the human answers. An agent reports an item using the design-change issue template (`.github/ISSUE_TEMPLATE/design-change.md`), naming the document, the section, what is wrong or missing and the invariants, criteria or tests affected.
 
-**E1. Reference hardware.** Unnamed. Assumption: the developer's machine, results labelled provisional; direct-path gates that need a GPU or GDS are skipped and listed as skipped, never marked passed.
+| Id | Item | Assumption until decided | Who decides |
+|---|---|---|---|
+| E1 | Reference hardware. Unnamed; covers every test tagged "(reference host, E1)" in any SDD | the developer's machine; timing results are labelled provisional with the host name, and a provisional result closes a gate only with that name recorded; a test that needs a GPU or GDS is skipped and listed as skipped with its id, never marked passed and never closed provisionally | human decides |
+| E2 | Dependencies after wave 0. Adding a crate the section 6.2 table lacks; bumping a pinned version | stay on the pinned versions; a crate named in the requesting SDD's d.2 may be added to the table by the PM in the same pull request; a version bump is an issue for the human | PM decides an addition named in a d.2; human decides a version bump |
+| E3 | Ordering default. Parent Q2 | unordered; `ordering.required` is opt-in per sink | human decides |
+| E4 | Error policy default. Parent Q3 | `terminate` | human decides |
+| E5 | DAG support. Parent Q4 | linear chain only | agent stops and reports; human decides |
+| E6 | Profile store sharing. Parent Q5 | per-user local directory | human decides |
+| E7 | Databricks budget discovery. Parent Q6 | explicit budget required; discovery refuses to run on Databricks without one and reports `LimitSource::Explicit` | human decides |
+| E8 | Weight-major execution. Parent Q7 | out of scope; no component may add a dependency that would preclude it (a payload that is not `Tier`-tagged, a queue that cannot hold source morsels on disk) | human decides |
+| E9 | `unsafe` outside the permitted set. Each SDD's section l names the modules in which `unsafe` is permitted for that crate, with a `// SAFETY:` comment on every block; test code in any crate is exempt and may use `unsafe` to construct a state a test needs | not permitted outside the listed modules | agent stops and reports; PM decides whether the section l list is amended (a documentation change on the component branch) or the code is restructured |
+| E10 | A new cross-component interface. Methods named in a component's own d.1 are pre-approved for that component; anything a consumer needs that is neither in `01-contracts.md` nor in the consumed component's d.1 is this item | not permitted in a component branch; it is a change to `01-contracts.md` and the contracts crate first, on a `contracts/<topic>` branch, in its own pull request | agent stops and reports; PM drafts the contracts change; human merges it |
+| E11 | Implementing any reserved multi-node path: `Tier::Remote`, `Locality::Local`, the `rdma` rows of the placement move table and the reactor copy table, `NodeId` values other than `LOCAL_NODE`, and any peer, lease or queue-pair API | out of scope for every v1 component; the arms exist and return `Unsupported("rdma")`; the multi-node extension is its own set of SDDs later (architecture section 11) | agent stops and reports; human decides |
+| E12 | Weakening a resume guarantee: any change that would make `committed_seq` overstate, a manifest reference a missing segment, a `Reinit` kernel's state be assumed safe, or the normal path write payload bytes for recovery | not permitted; G-I12 and the invariants PL-I11 to PL-I13, SI-I8 stand | agent stops and reports; human decides |
+| E13 | Allocator interposition: replacing the allocator that a kernel author's libraries use (NumPy's `PyDataMem_SetHandler`, PyTorch's pluggable allocators) so that kernel-internal allocations count against the arena's budget instead of being observed by the sampler (adapters AD-O1; architecture section 8) | out of scope for v1; the guarantee for kernel-internal allocations is probe, sample, reserve and breach handling, with the cgroup as containment, and the architecture document says so | agent stops and reports; human decides |
 
-**E2. Dependency version bumps after wave 0.** Assumption: stay on the pinned versions; open an issue for a bump.
-
-**E3. Ordering default.** Parent Q2. Assumption: unordered; `ordering.required` is opt-in per sink.
-
-**E4. Error policy default.** Parent Q3. Assumption: `terminate`.
-
-**E5. DAG support.** Parent Q4. Assumption: linear chain only; an agent that finds a DAG necessary stops and reports.
-
-**E6. Profile store sharing.** Parent Q5. Assumption: per-user local directory.
-
-**E7. Databricks budget discovery.** Parent Q6. Assumption: explicit budget required; discovery reports `LimitSource::Explicit`.
-
-**E8. Weight-major execution.** Parent Q7. Assumption: out of scope; no component may add a dependency that would preclude it (a payload that is not `Tier`-tagged, a queue that cannot hold source morsels on disk).
-
-**E9. Any `unsafe` outside the arena, the DLPack wrapper, the C Data Interface crossing and the direct IO calls.** Assumption: not permitted; the agent stops and reports.
-
-**E10. Any new cross-component interface.** Assumption: not permitted in a component branch; it is a change to `01-contracts.md` and the contracts crate first, in its own pull request.
-
-**E11. Implementing any reserved multi-node path.** `Tier::Remote`, `Locality::Local`, the `rdma` rows of the placement move table and the reactor copy table, `NodeId` values other than `LOCAL_NODE`, and any peer, lease or queue-pair API. Assumption: out of scope for every v1 component; the arms exist and return `Unsupported("rdma")`; an agent that finds it needs more than that stops and reports. The multi-node extension is its own set of SDDs later (architecture section 11).
-
-**E12. Weakening a resume guarantee.** Any change that would make `committed_seq` overstate, a manifest reference a missing segment, a `Reinit` kernel's state be assumed safe, or the normal path write payload bytes for recovery. Assumption: not permitted; G-I12 and the invariants PL-I11 to PL-I13, SI-I8 stand; the agent stops and reports.
-
-**E13. Allocator interposition.** Replacing the allocator that a kernel author's libraries use (NumPy's `PyDataMem_SetHandler`, PyTorch's pluggable allocators) so that kernel-internal allocations count against the arena's budget instead of being observed by the sampler (adapters AD-M1; architecture section 8). Assumption: out of scope for v1; the guarantee for kernel-internal allocations is probe, sample, reserve and breach handling, with the cgroup as containment, and the architecture document says so; an agent that finds it needs interposition to meet a gate stops and reports.
+An agent that hits an item in this table stops the affected work, files the report, and continues with any part of its component that the item does not touch. The PM answers the items in its column at once, files the human's items as issues, and does not block a wave on a human item unless the gate needs it.
 
 ---
 
@@ -382,4 +553,12 @@ Filled as component SDDs land. The parent's S-ids and D-ids map to the invariant
 
 ## 9. Hand-off protocol
 
-An agent receives: this preamble, `01-contracts.md`, its component SDD, and the `amoru-testkit` fakes for every interface its component consumes. It works on branch `component/NN-<name>`. It is done when every test in its SDD's section k exists and passes, every invariant in section c is cited by at least one test, `cargo clippy` is clean, section m of its SDD is empty, and its pull request's description lists the invariants and tests by id. It stops and reports, rather than deciding, on anything in section 7. It does not read other components' SDDs; if it believes it needs to, that is a contracts gap and is reported.
+**What an agent is given.** A component agent receives three documents, this preamble, `01-contracts.md` and its own component SDD, plus the `amoru-testkit` fakes for every interface its component consumes, and a brief from the PM built from `architecture/agents/executor.md` naming its component number, SDD path, wave and branch. Those three documents are its reading set. It may additionally read, read-only, any specific section of another SDD that its own SDD's text cites by id (for example "SC f.12" or "09 e.5"), and nothing else in that file; a need to read more than the cited section is a contracts gap and is reported (E10). The facade agent (`amoru-runtime`, the Rust side of component 12) reads every SDD, because it wires every concrete type; the PM reads everything. It works on branch `component/NN-<slug>` from `main` (section 6.7). Before writing code it copies the "environment facts to verify before starting" from its SDD's section l into its pull request, with the command and result for each.
+
+**What an agent returns.** One pull request whose description follows `.github/PULL_REQUEST_TEMPLATE.md`: what it changes; the document and sections it traces to; the invariants and tests by id; "Environment facts verified" (each fact from section l with its command and result); "Tests skipped (id, reason)" (every test tagged "(integration, closes in wave N)" or "(reference host, E1)", and nothing untagged); "Provisional results (host)" (every timing figure obtained on a host other than the reference host, with the host name); and the checklist. It is done when every untagged test in its SDD's section k exists and passes, every invariant in section c is cited by at least one test, `cargo fmt` and `cargo clippy -- -D warnings` are clean, section m of its SDD is empty, the dependency table (section 6.2) lists every crate its `Cargo.toml` names, and every section of the template is filled. It stops and reports, rather than deciding, on anything in section 7, using the design-change issue template, and continues with the parts of its component the item does not touch.
+
+**How the PM verifies.** The PM reviews the pull request against the SDD with the checklist in `architecture/agents/pm.md` (every invariant cited, every test present and passing or tagged, no wildcard tier arms, no `unwrap` outside tests, `// SAFETY:` on every `unsafe`, no em dashes in documentation, the dependency table updated, the template complete) and applies the gate rule of section 6.6: the component gate is green when every untagged test passes on the CI host and every tagged test is listed with its id and its closing wave or its host. The PM merges a green component pull request; a human merges every `contracts/*` pull request.
+
+**How a contracts change is made mid-build.** A component agent that needs a change to `01-contracts.md` or the contracts crate stops the affected work and reports it (E10). The PM drafts the change on a `contracts/<topic>` branch: the contracts SDD, the crate, the testkit if a fake or knob changes, and every component SDD section the change touches, keeping every existing id stable. A human reviews and merges it to `main`. Every agent whose component consumes the changed interface then rebases its `component/*` branch on `main` before continuing; the PM tells each affected agent which sections changed. Nothing about a contract is changed on a component branch.
+
+Precedence when documents disagree: the contracts crate, then the preamble, then the component SDD; a disagreement is reported through E10 and the lower document is corrected.

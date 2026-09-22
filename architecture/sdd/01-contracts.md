@@ -5,7 +5,7 @@
 **Parent:** `architecture/amoru-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
 **Preamble:** `00-preamble.md` (read first)
 **Component location:** `crates/amoru-kernel`, Rust 2024 edition
-**Consumes:** nothing internal; `arrow`, `dlpark`, `thiserror` **Consumed by:** every other component
+**Consumes:** nothing internal; `arrow`, `dlpark`, `thiserror`, `blake3` **Consumed by:** every other component
 
 ---
 
@@ -137,6 +137,12 @@ pub struct SegmentRef {
     pub len: u64,
 }
 
+/// A tier without its payload (no device id, no segment, no remote ref); what a
+/// water mark, a knob or a per-tier array is keyed by. `Tier::kind()` maps to it and
+/// `TierKind::index()` equals `Tier::index()` for the corresponding tier.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum TierKind { Device, PinnedHost, Host, Disk, Remote }
+
 /// How a staging segment's records are encoded. `Raw` is the payload's in-memory
 /// layout written as is (page-aligned Arrow IPC or AMB1), moved by DMA with no CPU
 /// in the path (PL-I4). Reserved for a compressed variant (a Vortex-encoded record,
@@ -154,7 +160,9 @@ impl Tier {
     pub fn rank(&self) -> u8;
     /// Index into per-tier arrays: Device = 0, PinnedHost = 1, Host = 2, Disk = 3, Remote = 4.
     pub fn index(&self) -> usize;
+    pub fn kind(&self) -> TierKind;
 }
+impl TierKind { pub fn index(&self) -> usize; }
 /// Length of every per-tier array in the contract (`bytes_by_tier`, water marks, reservations).
 pub const TIER_COUNT: usize = 5;
 ```
@@ -176,8 +184,33 @@ impl Buffer {
     pub fn device_ptr(&self) -> Option<u64>;
     /// Split off a prefix; both halves keep the arena token and are freed independently.
     pub fn split_at(self, mid: usize) -> (Buffer, Buffer);
-    /// Zero-copy conversion to an Arrow buffer whose deallocation releases to the arena (host tiers only; Device → error).
+    /// Zero-copy conversion to an Arrow buffer whose deallocation releases to the arena
+    /// (host tiers only; Device → error). The arena token survives this conversion and
+    /// every Arrow slice of the result (slices share the allocation), so `Payload::table`
+    /// on a batch decoded over such a buffer infers the tier correctly (e.2).
     pub fn into_arrow_buffer(self) -> Result<arrow::buffer::Buffer>;
+    /// A shareable read-only view of this buffer for use as a DMA source (d.9). The
+    /// view keeps the buffer alive; the buffer is not consumed.
+    pub fn view(self: &std::sync::Arc<Buffer>) -> BufferView;
+}
+
+/// A read-only, `Send + 'static` view over bytes that a reactor operation may read
+/// after the call returns (a DMA source). It owns a reference to whatever keeps the
+/// bytes alive, so a failed operation loses nothing (RE-I1 drops the view, not the
+/// bytes). All constructors are safe; the `unsafe` is inside this crate (l).
+pub struct BufferView { /* private: ptr, len, tier, owner: Arc<dyn Any + Send + Sync> */ }
+impl BufferView {
+    pub fn len(&self) -> usize;
+    pub fn tier(&self) -> Tier;
+    pub fn host_ptr(&self) -> Option<*const u8>;
+    pub fn device_ptr(&self) -> Option<u64>;
+    /// Over an Arrow buffer whose allocation the allocator owns (`contains`); the tier
+    /// is the allocator's for that region. `Staging("not an arena buffer")` otherwise.
+    pub fn of_arrow(buf: &arrow::buffer::Buffer, alloc: &dyn Allocator) -> Result<BufferView>;
+    /// Over the whole contiguous byte range of a tensor; tier = the tensor's.
+    pub fn of_tensor(t: &std::sync::Arc<ManagedTensor>) -> Result<BufferView>;
+    /// A sub-range of this view (for writing one page-aligned piece of a record).
+    pub fn slice(&self, offset: usize, len: usize) -> BufferView;
 }
 
 /// Allocation statistics the arena maintains; read by the controller and by CT-T tests.
@@ -201,6 +234,12 @@ pub trait Allocator: Send + Sync {
     fn stats(&self) -> AllocStats;
     /// True if `ptr` lies inside a region this allocator owns (used by adapters to skip the boundary copy).
     fn contains(&self, ptr: *const u8) -> bool { let _ = ptr; false }
+    /// The tier of the region containing `ptr`, when `contains(ptr)`.
+    fn tier_of(&self, ptr: *const u8) -> Option<Tier> { let _ = ptr; None }
+    /// True when this allocator's host tier is page-locked. A run has exactly one host
+    /// tier: `PinnedHost` when true, `Host` when false; the two never coexist in one
+    /// process and no move between them exists (e.1).
+    fn is_pinned(&self) -> bool;
 }
 ```
 
@@ -232,6 +271,12 @@ impl ManagedTensor {
     pub fn into_dlpack(self) -> dlpark::ManagedTensor;
     /// Import from DLPack; the tier is read from the DLPack device field.
     pub fn from_dlpack(t: dlpark::ManagedTensor) -> Result<Self>;
+    /// Wrap the bytes of an arena buffer, starting at `byte_offset`, as a contiguous
+    /// row-major tensor of `dtype` and `shape`; the buffer is owned by the tensor and
+    /// released when it drops. Checks `byte_offset + element_count × item_size ≤ len`
+    /// and alignment; safe. Tier = the buffer's. This is how a staged tensor record
+    /// comes back from disk (placement f.6) without `unsafe` outside this crate.
+    pub fn from_buffer(buf: Buffer, byte_offset: u64, dtype: DType, shape: Vec<i64>) -> Result<Self>;
 }
 
 /// The data inside a morsel.
@@ -254,6 +299,11 @@ pub enum SourceSchema {
     Table(arrow::datatypes::SchemaRef),
     Tensor { dtype: DType, shape: Vec<i64> },   // shape[0] == -1 means "batch dimension, variable"
 }
+impl SourceSchema {
+    /// BLAKE3 over the Arrow IPC schema message bytes (Table) or over
+    /// `"tensor:" || dtype code || shape as i64 LE` (Tensor). Keys the profile store (RC e.3).
+    pub fn hash(&self) -> [u8; 32];
+}
 
 impl PayloadSpec {
     /// Plan-time check (CT-I5): Ok if every payload conforming to `schema` can be
@@ -266,6 +316,10 @@ impl Payload {
     /// Infer the tier from the batch's buffers (arena metadata); error if buffers
     /// are not arena-owned and not host memory.
     pub fn table(batch: RecordBatch) -> Result<Payload>;
+    /// As `table`, but infers the tier through `alloc.tier_of` on each buffer's pointer
+    /// rather than the arena token; for batches whose buffers were built over a
+    /// foreign pointer that happens to lie in the arena (adapters AD-I2).
+    pub fn table_with(batch: RecordBatch, alloc: &dyn Allocator) -> Result<Payload>;
     pub fn tensor(t: ManagedTensor) -> Result<Payload>;
     /// Caller asserts residency in `tier`. SAFETY: bytes must be addressable in `tier`.
     pub unsafe fn table_in(batch: RecordBatch, tier: Tier) -> Payload;
@@ -402,6 +456,10 @@ pub enum ResumePolicy {
     Forbid,
 }
 
+/// How a Python kernel's invocations run; reported per stage in the run report.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GilState { FreeThreaded, Serialised }
+
 #[derive(Clone, Debug, Default)]
 pub struct KernelHints {
     pub expected_amplification: Option<f64>,
@@ -409,6 +467,9 @@ pub struct KernelHints {
     pub releases_gil: Option<bool>,
     pub preferred_rows: Option<u64>,
     pub resume: ResumePolicy,
+    /// Bytes one instance's state is expected to hold (a model's weights); seeds the
+    /// controller's state term before the first `footprint` is observed (RC f.3).
+    pub state_bytes: Option<u64>,
 }
 
 /// Per-instance state a stateful kernel keeps between `apply` calls.
@@ -478,7 +539,7 @@ pub trait Sink: Send + Sync {
     fn finish(&mut self) -> Result<SinkSummary>;
 
     // Resume support. A sink that leaves the defaults in place is not resumable:
-    // `Scheduler::resume` calls `Sink::resume` first, and its `Resume` names the sink.
+    // `Scheduler::apply_resume_point` calls `Sink::resume` first, and its `Resume` names the sink.
 
     /// Highest `seq` such that every morsel with a sequence number at or below
     /// it is committed (visible to a reader and safe against process loss) or was
@@ -490,7 +551,10 @@ pub trait Sink: Send + Sync {
     /// a sink that does not track commits.
     fn skip(&self, seq: Seq) { let _ = seq; }
     /// Opaque sink state for the run manifest (for a file sink: committed file
-    /// names and the next file index). Called at every manifest write.
+    /// names and the next file index). Called at every manifest write, and once at
+    /// startup: a resumable sink returns `Some` even before its first write (an
+    /// empty file list), so `checkpoint()? == None` at startup is how the scheduler
+    /// detects a non-resumable sink (SC f.11).
     fn checkpoint(&self) -> Result<Option<Vec<u8>>> { Ok(None) }
     /// Called instead of `open` on resume. The sink must discard any output that
     /// holds a sequence number above `committed_seq` (an uncommitted file, a
@@ -506,28 +570,73 @@ pub trait Sink: Send + Sync {
 
 ```rust
 /// Resolves exactly once. `Completion<Buffer>` returns the same buffer the operation was given.
-pub struct Completion<T> { /* private: oneshot receiver */ }
+/// Implemented in this crate over `std` only (a `Mutex` + `Condvar` slot with a stored waker),
+/// so that the reactor, the fakes and this crate agree on one type.
+pub struct Completion<T> { /* private */ }
+pub struct CompletionSender<T> { /* private */ }
+impl<T: Send + 'static> Completion<T> {
+    /// A linked pair. The reactor (or a fake) keeps the sender and resolves it once.
+    pub fn channel() -> (CompletionSender<T>, Completion<T>);
+    /// Blocking wait; only the scheduler's source and sink drives may call it (CT-I7, RE-I2).
+    pub fn wait(self) -> Result<T>;
+    /// Run `f` on the thread that resolves the completion, at resolution (or at once if
+    /// already resolved). This is how the placement engine observes move completions
+    /// without a thread of its own (placement g); `f` must be short and must not block.
+    pub fn then(self, f: Box<dyn FnOnce(Result<T>) + Send + 'static>);
+}
 impl<T> core::future::Future for Completion<T> { type Output = Result<T>; /* ... */ }
-impl<T> Completion<T> { pub fn wait(self) -> Result<T>; /* blocking; only the scheduler/sink drivers may call it */ }
+impl<T> CompletionSender<T> { pub fn resolve(self, r: Result<T>); }
+
+/// One end of a `copy`. A `Disk` endpoint names a registered staging segment range and
+/// is legal only on the GDS rows of the reactor's copy table; everywhere else disk is
+/// reached through `read_file` and `write_file`.
+pub enum CopySrc { View(BufferView), Disk(SegmentRef) }
+pub enum CopyDst { Buffer(Buffer), Disk(SegmentRef) }
 
 pub trait Reactor: Send + Sync {
     /// Read `dst.len()` bytes from `path` at `offset` into `dst`. Direct IO when the
     /// buffer, offset and length are page-aligned and the host allows; buffered otherwise.
+    /// Exactly `dst.len()` bytes or `Io`; see `read_file_opt` for short reads.
     fn read_file(&self, path: &std::path::Path, offset: u64, dst: Buffer) -> Completion<Buffer>;
-    fn write_file(&self, path: &std::path::Path, offset: u64, src: Buffer) -> Completion<Buffer>;
+    /// As `read_file`, but a read that ends at end-of-file returns the bytes read.
+    fn read_file_opt(&self, path: &std::path::Path, offset: u64, dst: Buffer, allow_short: bool) -> Completion<(Buffer, usize)>;
+    /// Write `src.len()` bytes at `offset`. The view keeps the bytes alive; on error the
+    /// caller still holds them.
+    fn write_file(&self, path: &std::path::Path, offset: u64, src: BufferView) -> Completion<()>;
     /// Ranged object read (S3-compatible, GCS, Azure, file://) into `dst`.
     fn read_object(&self, url: &str, offset: u64, dst: Buffer) -> Completion<Buffer>;
-    fn write_object(&self, url: &str, src: Buffer) -> Completion<Buffer>;
-    /// DMA between tiers: PinnedHost<->Device via copy engine; Disk<->PinnedHost via
-    /// read_file/write_file; Disk->Device directly when GDS is present. Returns `dst`.
-    fn copy(&self, src: &Buffer, dst: Buffer) -> Completion<Buffer>;
+    fn write_object(&self, url: &str, src: BufferView) -> Completion<()>;
+    /// DMA between tiers per the reactor's copy table (06 f.5): PinnedHost<->Device via
+    /// the copy engine; Disk<->Device via GDS when present. Returns the destination
+    /// buffer when the destination is a buffer. Never a CPU copy (G-I2).
+    fn copy(&self, src: CopySrc, dst: CopyDst) -> Completion<Option<Buffer>>;
+    /// Name a staging segment file so `SegmentRef`s can be resolved by `copy`'s Disk
+    /// endpoints and so the reactor can cache its descriptor; `unregister_segment`
+    /// closes the descriptor so an unlinked file's space is actually released.
+    fn register_segment(&self, segment: u32, path: &std::path::Path) -> Result<()>;
+    fn unregister_segment(&self, segment: u32);
     /// Which direct paths this reactor selected at start (for the run report).
     fn paths(&self) -> IoPaths;
+    /// Cancel what can be cancelled; every outstanding completion resolves within the
+    /// longest single operation's duration (RE-I7). Idempotent.
+    fn shutdown(&self);
 }
+
+/// Object-store metadata for sources' `plan`. Implemented by the reactor; a source
+/// holds `Arc<dyn ObjectMetadata>` beside `Arc<dyn Reactor>` (the facade passes the
+/// same reactor for both), so a test can supply metadata without a runtime.
+pub trait ObjectMetadata: Send + Sync {
+    fn head_object(&self, url: &str) -> Completion<ObjectMeta>;
+    fn list_prefix(&self, url: &str) -> Completion<Vec<ObjectMeta>>;
+}
+#[derive(Clone, Debug)]
+pub struct ObjectMeta { pub url: String, pub size: u64, pub last_modified_ns: Option<u64>, pub e_tag: Option<String> }
 
 #[derive(Clone, Debug, Default)]
 pub struct IoPaths { pub direct_io: bool, pub io_uring: bool, pub gds: bool, pub pinned: bool, pub rdma: bool /* always false without feature rdma */ }
 ```
+
+Submission never blocks the caller: every method returns after enqueueing, and any concurrency limit is waited for on a reactor thread (RE-I6). A worker may therefore issue a reactor operation from inside `Placement::push` or `pop` (placement g) without violating preamble 4.1; what it may not do is `wait`.
 
 ### d.10 Placement
 
@@ -595,7 +704,19 @@ pub trait Placement: Send + Sync {
     fn pop(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> Result<Option<Morsel>>;
     /// Blocks until the head is resident in a tier satisfying `want` and `locality`,
     /// or the queue is closed (returns Ok(None)). The only blocking call in the contract (CT-I7).
-    fn pop_blocking(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> Result<Option<Morsel>>;
+    /// The second element is the microseconds the caller waited on a move (0 when none);
+    /// the scheduler writes it to the trace as `placement_miss_wait_us` (PL-I9).
+    fn pop_blocking(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> Result<Option<(Morsel, u64)>>;
+    /// True if the head of `stage` is resident in a tier satisfying `want` (non-consuming;
+    /// the scheduler's pick uses it so a worker never pops what it cannot run).
+    fn peek_resident(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> bool;
+    /// Entries in state `Evicted` for `stage`, oldest first; the scheduler re-reads each
+    /// from its origin and pushes the replacement with `replace`.
+    fn evicted(&self, stage: StageId) -> Vec<(Seq, Origin)>;
+    /// Replace an `Evicted` entry's bytes (same `seq`) in its original position.
+    fn replace(&self, stage: StageId, morsel: Morsel) -> Result<()>;
+    /// Cancel every in-flight move, stop planning, release reservations (preamble 4.3). Idempotent.
+    fn shutdown(&self);
     /// The sink has committed every morsel with a sequence number at or below `seq`.
     /// Lets the engine forget the lineage of committed morsels (placement f.11).
     fn set_committed(&self, seq: Seq);
@@ -612,7 +733,7 @@ pub trait Placement: Send + Sync {
     /// Declare the consumer of a queue so promotion targets the right tier.
     fn set_consumer(&self, stage: StageId, want: PayloadSpec);
     fn set_budgets(&self, budgets: TierBudgets);
-    fn set_water(&self, stage: StageId, tier: Tier, low: u64, high: u64);
+    fn set_water(&self, stage: StageId, tier: TierKind, low: u64, high: u64);
     fn set_staging(&self, stage: StageId, enabled: bool);
     fn set_promotion_window(&self, stage: StageId, morsels: u16);
     /// No more pushes will arrive for this stage; pops drain then return None.
@@ -630,14 +751,22 @@ pub enum Knob {
     ActiveWorkers(u16),
     ReadAhead(u16),
     StagingTrigger { stage: StageId, on: bool },
-    HighWater { stage: StageId, tier: Tier, bytes: u64 },
+    HighWater { stage: StageId, tier: TierKind, bytes: u64 },
     PromotionWindow { stage: StageId, morsels: u16 },
 }
 
-/// Implemented by the scheduler; the controller is the only caller (G-I5).
+/// Implemented by the scheduler; the controller is the only caller (G-I5). The
+/// scheduler forwards `StagingTrigger`, `HighWater` and `PromotionWindow` to the
+/// placement engine (`set_staging`, `set_water(low = bytes / 2, high = bytes)`,
+/// `set_promotion_window`) and keeps the others; the controller never calls a
+/// placement setter except `set_budgets`. Values outside the preamble's ranges are
+/// clamped by the scheduler and counted in `SchedulerStats::knob_clamps`.
 pub trait Knobs: Send + Sync {
     fn set(&self, knob: Knob);
     fn snapshot(&self) -> KnobSnapshot;
+    /// End the run with a diagnostic (the controller's third breach, state growth,
+    /// sampler failure). The scheduler enters `Terminating` as for a kernel error.
+    fn terminate(&self, diagnostic: AmoruError);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -646,7 +775,54 @@ pub struct KnobSnapshot {
     pub active_workers: u16,
     pub read_ahead: u16,
     pub staging: Vec<(StageId, bool)>,
+    pub high_water: Vec<(StageId, TierKind, u64)>,
+    pub promotion_window: Vec<(StageId, u16)>,
 }
+
+/// Live scheduler counters the controller classifies bottlenecks from (RC f.6).
+/// Implemented by the scheduler; read by the controller each tick.
+pub trait StatsSource: Send + Sync { fn scheduler_stats(&self) -> SchedulerStats; }
+
+#[derive(Clone, Debug, Default)]
+pub struct StageStats { pub stage: StageId, pub tasks: u64, pub busy_ns: u64, pub errors: u32, pub skipped: u32, pub instances_live: u16 }
+
+#[derive(Clone, Debug, Default)]
+pub struct SchedulerStats {
+    pub per_stage: Vec<StageStats>,
+    pub workers_active: u16, pub workers_busy: u16,
+    pub reads_in_flight: u16, pub writes_in_flight: u16, pub sink_concurrency: u16,
+    pub source_exhausted: bool, pub seq_issued: Seq,
+    pub committed_seq: Option<Seq>, pub checkpoints: u64, pub last_checkpoint_us: u64, pub resumed: bool, pub recomputed: u64,
+    pub knob_clamps: u64,
+}
+
+/// The probe protocol (RC f.2) as the controller sees it. Implemented by the scheduler.
+/// For stage 1 the scheduler issues one read of about `bytes` from the source cursor
+/// (advancing it, so the morsel has the next `seq`); for stage k > 1 it pops the head of
+/// Q(k−1), which is the previous stage's probe output. Runs on one worker with the rest
+/// parked; the output is pushed downstream as normal, nothing is wasted.
+pub trait Prober: Send + Sync { fn probe(&self, stage: StageId, bytes: u64) -> Result<ProbeResult>; }
+
+#[derive(Clone, Debug)]
+pub struct ProbeResult { pub bytes_in: u64, pub rows_in: u64, pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_ns: u64, pub cpu_ns: u64 }
+
+/// What happens after a kernel error (preamble `errors.policy`).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ErrorPolicy { Terminate, Skip, Budget(u32) }
+
+/// Which decision function sizes morsels (preamble `sizer`).
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum SizerKind { #[default] Rule, Learned }
+
+/// A clonable cancel flag set by the surface; polled by the scheduler's drives and
+/// workers between tasks.
+#[derive(Clone, Default, Debug)]
+pub struct CancelToken { /* private: Arc<AtomicBool> */ }
+impl CancelToken { pub fn new() -> Self; pub fn cancel(&self); pub fn is_cancelled(&self) -> bool; }
+
+/// A hook the facade installs so the controller sees every trace record as it is
+/// emitted (RC `on_record`); the scheduler calls it after `TraceSink::record`.
+pub type RecordHook = std::sync::Arc<dyn Fn(&TraceRecord) + Send + Sync>;
 ```
 
 ### d.12 Limits and host profile (discovery side)
@@ -668,9 +844,17 @@ pub struct Limits {
     pub source: LimitSource,
 }
 
-/// Guarantees a platform declares; `Unknown` means probe.
+/// Guarantees a platform declares; `Unknown` means probe. Discovery replaces every
+/// `Unknown` with `Probed(bool)`, so a consumer can tell a declared guarantee (which
+/// must hold: a failure is an error, G-I7) from a probed one (which may fall back).
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
-pub enum Guarantee { #[default] Unknown, Present, Absent }
+pub enum Guarantee { #[default] Unknown, Present, Absent, Probed(bool) }
+impl Guarantee {
+    /// Present or Probed(true).
+    pub fn is_available(&self) -> bool;
+    /// Present only.
+    pub fn is_guaranteed(&self) -> bool;
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct HostProfile {
@@ -689,6 +873,17 @@ pub struct HostProfile {
     /// only declared. Discovery does refuse a tmpfs or overlay staging directory
     /// declared `Present` (DS, `Config` error).
     pub durable_staging: Guarantee,
+}
+
+/// Live resource sampling. Implemented by discovery; one instance per run, shared by
+/// the controller (its tick) and the scheduler (before and after every `apply`).
+/// Cheap: a few file reads or syscalls; interior mutability for its caches.
+pub trait Sampler: Send + Sync {
+    fn sample(&self) -> Sample;
+    /// Reset the kernel's peak counter (cgroup v2 `memory.peak` is writable on
+    /// kernels ≥ 6.x; otherwise the sampler tracks its own running peak and resets
+    /// that), so a probe measures its own peak (RC f.2).
+    fn reset_peak(&self);
 }
 
 /// One sample of live resource state; produced by discovery's sampler.
@@ -713,6 +908,7 @@ pub enum Outcome { Ok, Error, Skipped, Probe }
 #[derive(Clone, Debug)]
 pub struct TraceRecord {
     pub seq: Seq, pub stage: StageId, pub worker: u16,
+    pub instance: u16,        // stateful instance index; u16::MAX for stateless
     pub t_start_ns: u64, pub t_end_ns: u64,
     pub rows_in: u64, pub bytes_in: u64, pub rows_out: u64, pub bytes_out: u64,
     pub tier_in: u8, pub tier_out: u8,
@@ -737,6 +933,12 @@ pub trait TraceSink: Send + Sync {
     /// Bounded, non-blocking beyond a channel push; drops nothing (backpressure is on the writer, not the caller).
     fn record(&self, r: TraceRecord);
     fn flush(&self) -> Result<()>;
+}
+
+/// Read-side of the trace for the controller; implemented by the trace writer.
+pub trait TraceTail: Send + Sync {
+    /// The last `n` records of `stage`, oldest first, from the in-memory chunks.
+    fn tail(&self, stage: StageId, n: usize) -> Vec<TraceRecord>;
 }
 ```
 
@@ -774,11 +976,44 @@ pub enum ConvertError {
 }
 ```
 
+### d.15 Test fakes (`amoru-testkit`)
+
+The testkit is built by this component's agent in wave 0 (preamble 6.4) because every later component's tests depend on it and CT-T13 requires it. It implements every trait above with the knobs below; a component SDD's test names a fake and a knob from this list and nothing else.
+
+| Fake | Implements | Knobs (builder methods) | Observables |
+|---|---|---|---|
+| `FakeAllocator` | `Allocator` | `with_limit(tier, bytes)`, `pinned(bool)`, `page_bytes(n)`, `fail_next(n)` | `allocations_total`, `in_use(tier)`, `AllocStats`; buffers are real heap allocations tagged with the requested tier so `Payload::table` tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work |
+| `FakeReactor` | `Reactor` | `with_latency(Duration)`, `fail_next(op: OpKind, n)`, `cancel_on_shutdown(bool)`, in-memory files keyed by path (`read_file`/`write_file` copy to and from a `Vec<u8>` per path) | `ops() -> Vec<OpRecord { kind, path_or_url, offset, len, src_tier, dst_tier, t_submit, t_resolve }>`, `in_flight()`, `shutdown_calls`, `paths()` returns whatever `with_paths(IoPaths)` set |
+| `FakePlacement` | `Placement` | `with_pressure(stage, evict_after_bytes)` (entries beyond the byte count on a stage-0 queue become `Evicted`), `with_delay(Duration)` (a pop of a fresh entry waits, counted as a miss), `with_manifest_store()` (in-memory manifests keyed by path so `checkpoint`/`restore` round-trip across engine instances) | `pushed(stage) -> Vec<Seq>`, `popped(stage)`, `committed()`, `manifests_written()`, `budgets_set() -> Vec<TierBudgets>` (every `set_budgets` argument in call order), `shutdown_calls` |
+| `FakeSource` | `Source` | `splits(n, rows_each, bytes_each)`, `schema(SourceSchema)`, `sub_splittable(bool)`, `repeatable(bool)`, `fail_split(id)` | `reads() -> Vec<(SplitId, Option<RowRange>)>`; deterministic content (row i of split s has value `s * 1_000_000 + i`) |
+| `FakeSink` | `Sink` | `commit_every(n)` (commits in blocks of n sequence numbers, so `committed_seq` advances in steps), `resumable(bool)`, `fail_at(seq)`, `latency(Duration)`, `requires_order(bool)` | `written() -> Vec<Seq>`, `skipped()`, `committed_seq()`, `open_calls`, `resume_calls`, `finish_calls`, `shutdown_calls` |
+| `FakeKernel` | `Kernel` | `amplification(f64)` (allocates `a × bytes_in` from the global allocator during `apply`, freed on return), `latency(Duration)`, `stateful(instances, state_bytes)`, `resume(ResumePolicy)`, `fail_on(seqs)`, `panic_on(seqs)`, `grow_state_by(bytes)` per apply | `applies() -> Vec<(Seq, worker, instance, thread id)>`, `init_calls`, `restore_calls`, `checkpoint_calls` |
+| `FakeSampler` | `Sampler` | `scripted(Vec<Sample>)` (returns the sequence, then repeats the last), `live()` (reads the real process) | `samples_taken`, `peak_resets` |
+| `FakeTrace` | `TraceSink`, `TraceTail` | `capacity(n)` | `records() -> Vec<TraceRecord>`, `flush_calls`, `finish_calls` |
+| `FakeKnobs` | `Knobs`, `StatsSource`, `Prober` | `stats(SchedulerStats)`, `probe_result(stage, ProbeResult)` | `writes() -> Vec<Knob>`, `terminated() -> Option<AmoruError>` |
+
+Every fake records a `shutdown_calls` counter wherever the trait it implements has a `shutdown` method, so a test can assert that shutdown ran exactly once.
+
+Also in the testkit: the data generator and the benchmark kernels of preamble 6.5 are not here; they belong to the `bench` agent (wave 1). `amoru-testkit` depends on `amoru-kernel` only.
+
 ## e. Data model, formats and state machines
 
 ### e.1 Payload tier state machine
 
-A payload's tier changes only through the placement engine (promotion or demotion) or a kernel producing a new payload. Legal transitions: `Host ↔ PinnedHost` (arena re-registration or copy), `PinnedHost ↔ Device` (copy engine), `PinnedHost ↔ Disk` (direct IO), `Disk → Device` (GDS only), `Host ↔ Disk` (buffered IO fallback). Illegal: `Host → Device` directly (must stage through `PinnedHost`), `Disk → Host` when the reactor has direct IO (must land in `PinnedHost`); attempting an illegal transition is an `AmoruError::Staging` and is a bug in the placement engine, not a runtime condition. Reserved (feature `rdma`, not v1): `PinnedHost ↔ Remote` by one-sided RDMA through the reactor; in a v1 build both directions are `Unsupported("rdma")`.
+A payload's tier changes only through the placement engine (promotion or demotion) or a kernel producing a new payload. A run has exactly one host tier, `PinnedHost` when `Allocator::is_pinned()` and `Host` otherwise (AR pins all or nothing); "host tier" below means whichever it is, and no move between `Host` and `PinnedHost` exists. This table is the single authority; the reactor's copy table (06 f.5) and the placement move table (09 e.4) cite it and add nothing.
+
+| From | To | Mechanism | Legal when |
+|---|---|---|---|
+| host tier | Device(d) | copy engine (`cuMemcpyHtoDAsync`) when pinned; through the reactor's pinned bounce buffer when not (a fallback, counted) | `cuda` |
+| Device(d) | host tier | copy engine (`cuMemcpyDtoHAsync`); bounce when unpinned | `cuda` |
+| host tier | Disk | `write_file`, direct IO when page-aligned (alignment, not pinning, is what direct IO needs); buffered otherwise | always |
+| Disk | host tier | `read_file`, same rule | always |
+| Disk | Device(d) | `copy(Disk, Buffer)` by GDS; else Disk → host tier → Device | `gds`, else two-step |
+| Device(d) | Disk | Device → host tier → Disk (GDS write not used in v1) | always |
+| host tier | Remote(n) | reserved, `rdma` | never in v1 (`Unsupported`) |
+| Remote(n) | host tier | reserved, `rdma` | never in v1 (`Unsupported`) |
+
+Illegal in every build: `Host ↔ PinnedHost` (they do not coexist), `Remote ↔ Disk` (the owning node moves its own bytes), `Device ↔ Device` across devices in v1. Attempting an illegal transition is `AmoruError::Staging` and is a bug in the placement engine, not a runtime condition.
 
 ### e.2 Buffer provenance
 
@@ -822,6 +1057,18 @@ Field order and types are exactly as in `TraceRecord` (d.13): unsigned integers 
 ### e.6 Fingerprint
 
 `Fingerprint::compute(identity: &str, config: &[u8]) -> Fingerprint` is BLAKE3 over `identity.len() as u64 LE || identity || config`. For a Rust kernel, `identity` is the crate name, version and type path; for a Python kernel, the adapters SDD defines it (qualified name plus source hash). Two kernels with equal fingerprints are assumed to have equal amplification behaviour; that is a profile-store assumption, not a correctness one.
+
+### e.7 Page-aligned Arrow IPC record encoding
+
+Used by staging segments (09 e.3) and by `ArrowIpcSink` (08 e.3); defined here, as `AMB1` is, because two components read and write it. It is the Arrow IPC stream framing with one deviation the format permits: every body buffer of a record batch is placed at a multiple of `page_bytes` rather than of 8, so each can be written from and read into an arena buffer by direct IO or GDS without a copy. One record:
+
+| Piece | Content | Placement |
+|---|---|---|
+| framing | the IPC `Schema` message and the `RecordBatch` message (flatbuffers), continuation marker and lengths as in the IPC stream format, with each `Buffer` entry's offset rewritten to the page-aligned body layout below | one arena buffer, page-rounded, zero-padded; under 64 KiB in practice, `Staging` if over 1 MiB |
+| body | each Arrow buffer of the batch, in schema order, each starting at the next page boundary after the previous | written from the batch's own buffers through `BufferView::of_arrow`; no copy |
+| tail | zero padding to the next page boundary | not written; implied by the next record's offset |
+
+`amoru_kernel::ipc` provides `encode_framing(batch, page_bytes, base_offset, alloc: &dyn Allocator) -> Result<(Buffer /* framing */, Vec<(usize /* body offset */, arrow::buffer::Buffer)>)>` (allocating only the framing buffer from `alloc`) and `decode(buf: arrow::buffer::Buffer, page_bytes) -> Result<RecordBatch>`, whose arrays point into `buf` (arrow's IPC reader over an aligned buffer; verified by pointer comparison in CT-T18). A reader validates the continuation marker, message lengths and that every body offset is a page multiple; any failure is `Io { op: "ipc" }`.
 
 ## f. Algorithms and policies
 
@@ -885,17 +1132,25 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T12 no_runtime_deps.** `cargo tree -p amoru-kernel` contains none of tokio, cudarc, pyo3, parquet, object_store. Proves the boundary in section a and S7.
 
-**CT-T13 fakes_compile.** `amoru-testkit` implements every trait in d.3 to d.13 and its tests exercise every method once. Proves the contract is implementable.
+**CT-T13 fakes_compile.** `amoru-testkit` implements every trait in d.3 to d.13 with the knobs in d.15, and its tests exercise every method and every knob once. Proves the contract is implementable.
 
-**CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms, and a `match` on `StagingCodec` with one named arm, compile with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`bench/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` or a `StagingCodec` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
+**CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms, and a `match` on `StagingCodec` with one named arm, compile with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`tools/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` or a `StagingCodec` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
+
+**CT-T16 completion_channel.** `Completion::channel`; `resolve` on another thread wakes a `wait`, a `.await`, and a `then` callback, each exactly once; `then` registered after resolution runs at once; a dropped sender resolves with `Cancelled`. Proves d.9.
+
+**CT-T17 buffer_view.** `BufferView::of_arrow` over an arrow buffer sliced from `into_arrow_buffer` reports the arena's tier and pointer; over a heap buffer returns `Staging`; `of_tensor` matches `data_ptr`; dropping the view while the source lives changes nothing; dropping the source while the view lives keeps the bytes valid (owner held). Proves d.3.
+
+**CT-T18 ipc_page_aligned.** `encode_framing` then `decode` over a page-rounded copy round-trips 20 generated batches (all e.3 types plus strings and lists); every body offset is a page multiple; decoded arrays' data pointers lie inside the input buffer (no copy); a corrupted body offset is `Io { op: "ipc" }`. Proves e.7.
+
+**CT-T19 tensor_from_buffer.** `ManagedTensor::from_buffer` over an `AMB1` body: `data_ptr == buf.host_ptr() + offset`, shape and dtype as given; a short buffer or misaligned offset is `Convert`/`Io`, not a panic. Proves d.4.
 
 **CT-T15 resume_defaults.** A kernel with the default `restore` returns `Resume`; a `KernelState` with the default `checkpoint` returns `Ok(None)`; a sink with the default `resume` returns `Resume` and `committed_seq() == None`; `ResumePolicy::default() == Reinit`. Proves the resume defaults are refusals, not silent successes (l, anti-patterns).
 
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs` (re-exports), `src/ids.rs` (d.1), `src/tier.rs` (d.2, f.6), `src/buffer.rs` (d.3; the `Buffer` type's arena token is an `Arc<dyn ArenaHandle>` trait object defined here with `fn release(&self, ptr, len, tier)` so the arena crate can implement it without a circular dependency), `src/payload.rs` (d.4, f.1, f.3, f.4, f.5), `src/tensor.rs` (the `dlpark` wrapper), `src/morsel.rs` (d.5, f.2), `src/source.rs`, `src/kernel.rs`, `src/sink.rs`, `src/reactor.rs`, `src/placement.rs`, `src/knobs.rs`, `src/limits.rs`, `src/trace.rs` (d.13, e.5), `src/amb1.rs` (e.4, reader and writer over `&[u8]`/`&mut [u8]` only; no IO), `src/error.rs`, `src/fingerprint.rs`.
+Files: `src/lib.rs` (re-exports), `src/ids.rs` (d.1), `src/tier.rs` (d.2, f.6), `src/buffer.rs` (d.3; the `Buffer` type's arena token is an `Arc<dyn ArenaHandle>` trait object defined here with `fn release(&self, ptr, len, tier)` so the arena crate can implement it without a circular dependency), `src/view.rs` (d.3 `BufferView`), `src/payload.rs` (d.4, f.1, f.3, f.4, f.5), `src/tensor.rs` (the `dlpark` wrapper, `from_buffer`), `src/morsel.rs` (d.5, f.2), `src/source.rs`, `src/kernel.rs`, `src/sink.rs`, `src/reactor.rs` (d.9 traits, `ObjectMetadata`, `ObjectMeta` and endpoints), `src/completion.rs` (d.9 `Completion`, std only), `src/placement.rs`, `src/knobs.rs` (d.11 including `StatsSource`, `Prober`, `CancelToken`, `RecordHook`), `src/limits.rs` (d.12 including `Sampler`), `src/trace.rs` (d.13, e.5, `TraceTail`), `src/amb1.rs` (e.4, reader and writer over `&[u8]`/`&mut [u8]` only; no IO), `src/ipc.rs` (e.7; `arrow` with the `ipc` feature), `src/error.rs`, `src/fingerprint.rs`. The testkit (d.15) is a sibling crate `crates/amoru-testkit` built in the same pull request.
 
-`unsafe` is permitted only in `tensor.rs` (DLPack pointer handling), `payload.rs` (building Arrow buffers over foreign pointers and the `*_in` constructors) and `buffer.rs` (pointer arithmetic in `split_at`); each block carries `// SAFETY:` naming the invariant (CT-I2 or the DLPack contract).
+`unsafe` is permitted only in `tensor.rs` (DLPack pointer handling, `from_buffer`), `payload.rs` (building Arrow buffers over foreign pointers and the `*_in` constructors), `view.rs` (constructing a view over an owner's bytes) and `buffer.rs` (pointer arithmetic in `split_at`); test code in any crate may use `unsafe` to construct a state a test needs (E9 exempts tests); each block carries `// SAFETY:` naming the invariant (CT-I2 or the DLPack contract).
 
 `BoxFuture<'a, T>` is `core::pin::Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>`, defined in `lib.rs`; do not depend on `futures`.
 
@@ -903,7 +1158,7 @@ Anti-patterns: no `Vec<u8>` copies of payload bytes anywhere in this crate; no `
 
 Pin dependency versions (preamble 6.2) and record them in the preamble's table in the same pull request. Verify `dlpark` supports DLPack 1.0's versioned `DLManagedTensorVersioned`; if it does not, wrap the unversioned struct and record the limitation in section m of this document as an escalation.
 
-Environment facts to verify before starting: `cargo --version` ≥ the 2024-edition minimum; `blake3` crate available (used for fingerprint and schema hash; add to preamble 6.2 if not present there: it is, as `blake3`, purpose "hashing", used by 1 and 11).
+Environment facts to verify before starting: `cargo --version` ≥ the 2024-edition minimum; `blake3` crate available (used for fingerprint and schema hash; add to preamble 6.2 if not present there: it is, as `blake3`, purpose "hashing", used by 1, 9 and 11).
 
 ## m. Open items
 
@@ -923,3 +1178,7 @@ None. (E1 and E2 in the preamble cover reference hardware and version pinning. T
 | G-I2 | CT-I4 | CT-T4, CT-T5 |
 | G-I6 | CT-I1 | CT-T1 |
 | G-I8 | CT-I10 | (exercised by RC and PL tests) |
+
+## o. Deferred (post-v1)
+
+None.
