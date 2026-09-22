@@ -33,6 +33,8 @@ print(report)
 
 There is no batch size, no worker count, no read ahead depth and no spill threshold, because Amoru decides all four and keeps deciding them as the data changes. Inside a container or a pod you can drop `budget=` too: Amoru reads the cgroup limit itself.
 
+If the budget is too small for what your function costs, the run does not quietly exceed it and does not get killed: it stops with a diagnostic naming the morsel, its measured footprint and the budget. A Python kernel that builds new arrays costs several times its input in memory the runtime cannot place in its own arena, so give a Python job a couple of gigabytes to work in; a Rust kernel runs in a fraction of that.
+
 ## What you get back
 
 `report` carries what the run actually did, computed from a per morsel trace rather than from estimates:
