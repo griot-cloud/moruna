@@ -46,6 +46,14 @@ pub fn charged(bytes: u64) -> u64 {
     size
 }
 
+/// Taken by every test that reserves a large region, so no two of them are resident at
+/// once: `Arena::new` touches every page of its region (f.1), and the tests in one binary
+/// otherwise run in parallel threads.
+pub fn big_region_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// xorshift64*, so a test's "random" sizes are the same on every host and in every run.
 pub struct Rng(u64);
 
