@@ -37,12 +37,14 @@ fn si_t1_ownership_once() {
     let scratch = Scratch::new("t1-parquet");
     let (mut sink, _reactor, alloc) = new_sink(&scratch, 1 << 20);
     sink.open(&table_source_schema()).expect("open");
+    // The file buffer arrives with the first payload (f.1), so the baseline is taken after it.
+    block_on(sink.write(0, arena_payload(alloc.fake(), 8, 0))).expect("the first morsel");
     let baseline = alloc.fake().in_use(Tier::Host);
 
-    let payload = arena_payload(alloc.fake(), 1_000, 0);
+    let payload = arena_payload(alloc.fake(), 1_000, 1);
     let bytes = payload.bytes();
     assert!(alloc.fake().in_use(Tier::Host) > baseline);
-    let future = sink.write(0, payload);
+    let future = sink.write(1, payload);
     assert!(block_on(future).is_ok());
     assert_eq!(
         alloc.fake().in_use(Tier::Host),
@@ -239,8 +241,8 @@ fn si_t16_parquet_encodes_into_arena() {
     sink.open(&table_source_schema()).expect("open");
     assert_eq!(
         alloc.fake().allocations_total(),
-        before + 1,
-        "open allocates exactly one file buffer"
+        before,
+        "f.1: `open` allocates nothing; the writer waits for the first payload's schema"
     );
 
     for seq in 0..24 {
@@ -262,23 +264,28 @@ fn si_t16_parquet_encodes_into_arena() {
         assert!(op.len > 0);
     }
 
-    // A host budget under one file buffer is an `Alloc` at open, not a surprise mid-run.
+    // A host budget under one row group is an `Alloc` at open, not a surprise mid-run (f.1).
     let scratch = Scratch::new("t16-budget");
-    let tight = FakeAllocator::new().with_limit(Tier::Host, 512 << 20);
+    let tight = FakeAllocator::new().with_limit(Tier::Host, 8 << 20);
+    let tight_fake = tight.clone();
     let mut sink = ParquetSink::new(
         ParquetSinkConfig {
             url: scratch.url(),
             file_bytes: 1 << 30,
+            row_group_bytes: 128 << 20,
             ..ParquetSinkConfig::default()
         },
         Arc::new(FakeReactor::new()),
         Arc::new(tight),
     )
     .expect("parquet sink");
-    let outcome = sink.open(&table_source_schema());
+    sink.open(&table_source_schema())
+        .expect("open takes no memory");
+    // The buffer arrives with the first payload (f.1), and that is where the budget is met.
+    let outcome = block_on(sink.write(0, arena_payload(&tight_fake, 8, 0)));
     assert!(
         matches!(outcome, Err(AmoruError::Alloc { .. })),
-        "the sink must refuse a budget it cannot fit a file buffer in, got {outcome:?}"
+        "a sink that cannot hold one row group cannot encode one, got {outcome:?}"
     );
 }
 
@@ -311,6 +318,8 @@ fn schema_drift_names_the_field() {
     let scratch = Scratch::new("drift");
     let (mut sink, _reactor, alloc) = new_sink(&scratch, 1 << 20);
     sink.open(&table_source_schema()).expect("open");
+    // f.1: the first morsel settles the output schema, so the drift is the second morsel's.
+    block_on(sink.write(0, arena_payload(alloc.fake(), 8, 0))).expect("the first morsel");
 
     let buffer = alloc.fake().arrow_buffer(&[0u8; 32], Tier::Host);
     let data = ArrayData::builder(DataType::Int32)
@@ -320,7 +329,7 @@ fn schema_drift_names_the_field() {
         .expect("array");
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(schema, vec![make_array(data)]).expect("batch");
-    let outcome = block_on(sink.write(0, Payload::table(batch).expect("payload")));
+    let outcome = block_on(sink.write(1, Payload::table(batch).expect("payload")));
     let Err(AmoruError::Sink(msg)) = outcome else {
         panic!("schema drift must be refused, got {outcome:?}");
     };
@@ -349,4 +358,73 @@ fn resume_refuses_a_destination_it_cannot_list() {
         panic!("a store that cannot be listed must refuse, got {outcome:?}");
     };
     assert_eq!(msg, "cannot list destination");
+}
+
+/// SI-T14. A sink with the default `file_bytes` of 1 GiB opens inside a 256 MiB arena, rolls
+/// several files and finishes: `sink.file_bytes` is an upper bound on the file, not a
+/// reservation the arena has to fit before the run can start (08 f.1).
+#[test]
+fn si_t14_opens_inside_a_small_arena() {
+    const ARENA: u64 = 256 << 20;
+    let scratch = Scratch::new("t14-small-arena");
+    let reactor = FakeReactor::new();
+    let alloc = FakeAllocator::new().with_limit(Tier::Host, ARENA);
+    let defaults = ParquetSinkConfig::default();
+    let file_bytes = defaults.file_bytes;
+    assert_eq!(file_bytes, 1 << 30, "the preamble's default");
+    let mut sink = ParquetSink::new(
+        ParquetSinkConfig {
+            url: scratch.url(),
+            // A row group small enough that several files roll in a test's worth of rows.
+            row_group_bytes: 256 << 10,
+            ..defaults
+        },
+        Arc::new(reactor.clone()),
+        Arc::new(alloc.clone()),
+    )
+    .expect("parquet sink");
+
+    // Most of the arena is morsels, as it is in a real run: the sink gets what is left, and
+    // that is what its files roll at.
+    let held = alloc
+        .alloc((248 << 20) as usize, Tier::Host)
+        .expect("morsels in flight");
+
+    sink.open(&table_source_schema())
+        .expect("open inside 256 MiB");
+    block_on(sink.write(0, arena_payload(&alloc, 8, 0))).expect("the first morsel");
+    assert!(
+        alloc.in_use(Tier::Host) < file_bytes,
+        "the sink reserved {} bytes for a {file_bytes} byte file",
+        alloc.in_use(Tier::Host)
+    );
+    let roll_bytes = sink.stats().roll_bytes;
+    assert!(
+        roll_bytes > 0 && roll_bytes < file_bytes,
+        "f.1: the file rolls at {roll_bytes}, below the {file_bytes} byte upper bound"
+    );
+
+    for seq in 1..400 {
+        block_on(sink.write(seq, arena_payload(&alloc, 8_000, seq as i64))).expect("write");
+    }
+    let summary = sink.finish().expect("finish");
+    assert!(
+        summary.files.len() > 1,
+        "several files roll at {roll_bytes} bytes each: {:?}",
+        summary.files
+    );
+    drop(held);
+    let rolls: Vec<_> = reactor
+        .ops()
+        .into_iter()
+        .filter(|op| op.kind == OpKind::WriteObject && op.path_or_url.ends_with(".parquet"))
+        .collect();
+    assert_eq!(rolls.len(), summary.files.len(), "one object per file");
+    for op in &rolls {
+        assert!(
+            op.len <= roll_bytes + (1 << 20),
+            "a file of {} bytes above the roll size {roll_bytes}",
+            op.len
+        );
+    }
 }

@@ -31,6 +31,13 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 amoru-testkit = { workspace = true }
 
+# The first program a user writes, kept at the repository root so it reads as an example and
+# not as a test; the quality gate runs it on every commit.
+[[example]]
+name = "append_column"
+path = "../../examples/append_column.rs"
+
+
 [features]
 default = []
 cuda = ["amoru-arena/cuda", "amoru-discovery/cuda", "amoru-reactor/cuda", "amoru-placement/cuda"]

@@ -36,6 +36,7 @@ fn discovered(ceiling: u64, staging: Option<std::path::PathBuf>) -> Discovered {
         },
         host_tier: TierKind::Host,
         cgroup_path: None,
+        disk_budget: 1 << 30,
         notes: vec!["a fixed host, for the tests".to_string()],
     }
 }
@@ -94,6 +95,8 @@ fn spec(
     );
     spec.staging_dir = Some(scratch.path().to_path_buf());
     spec.staging_limit = Some(1 << 30);
+    // preamble 6.7: the profile store goes in the scratch directory, never in the home one.
+    spec.profiles_dir = Some(scratch.path().join("profiles"));
     spec.notes = vec!["a note from the surface".to_string()];
     spec
 }
@@ -308,4 +311,46 @@ fn rt_t5_a_device_in_the_limits_is_passed_on() {
     let report =
         Runtime::run_with(spec, CancelToken::new(), components).expect("the run completes");
     assert_eq!(report.limits.devices.len(), 1);
+}
+
+/// PY-T15: `checkpoint.keep` on a run shorter than `checkpoint.interval_ms` still leaves a
+/// manifest, and the report names it; without it the run leaves none. 12 f.7, SC f.12.
+#[test]
+fn py_t15_a_kept_checkpoint_survives_a_short_run() {
+    let run = |keep: bool| {
+        let scratch = Scratch::new("py_t15");
+        let rig = Rig::new();
+        let components = rig.components(4 << 30, Some(scratch.path().to_path_buf()));
+        let mut spec = spec(
+            FakeSource::new().splits(2, 100, 1 << 20),
+            Vec::new(),
+            FakeSink::new().resumable(true),
+            &scratch,
+        );
+        spec.checkpoint = true;
+        // Far longer than the run, so the checkpoint thread never ticks.
+        spec.checkpoint_interval_ms = 60_000;
+        spec.checkpoint_keep = keep;
+        let report = Runtime::run_with(spec, CancelToken::new(), components)
+            .unwrap_or_else(|e| panic!("the run completes: {e}"));
+        (
+            report.manifest.clone(),
+            rig.placement.manifests_written().len(),
+        )
+    };
+
+    let (_manifest, written) = run(true);
+    assert_eq!(
+        written, 1,
+        "f.12: the scheduler wrote a final manifest for a run shorter than the interval"
+    );
+
+    let (manifest, written) = run(false);
+    assert_eq!(
+        written, 0,
+        "f.12: no final manifest without checkpoint.keep"
+    );
+    assert!(manifest.is_none(), "and the report names none");
+    // The report's `manifest` comes from `PlacementEngine::manifest_path` (12 f.2), which an
+    // injected `FakePlacement` does not have; the real path is the end-to-end suite's.
 }

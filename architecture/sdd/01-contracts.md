@@ -1192,6 +1192,8 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T13 fakes_compile.** `amoru-testkit` implements every trait in d.3 to d.13 with the knobs in d.15, and its tests exercise every method and every knob once. Proves the contract is implementable.
 
+**CT-T20 arena_token_not_leaked.** `split_at` and `into_arrow_buffer` consume a `Buffer` through `ManuallyDrop`, so each must move the arena token out rather than clone beside a field nothing will drop: after both halves of a split drop, and after the Arrow buffer drops, `Arc::strong_count` of the arena handle is what it was before. Rationale: the token is what keeps the arena's region mapped, and one leaked per morsel left a 1 GiB region resident for the life of the process, so a second `Runtime::run` was given no budget at all (PM, 2026-09-22, on the first end-to-end run; d.3, 12 f.1).
+
 **CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms, and a `match` on `StagingCodec` with one named arm, compile with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`tools/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` or a `StagingCodec` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
 
 **CT-T16 completion_channel.** `Completion::channel`; `resolve` on another thread wakes a `wait`, a `.await`, and a `then` callback, each exactly once; `then` registered after resolution runs at once; a dropped sender resolves with `Cancelled`. Proves d.9.

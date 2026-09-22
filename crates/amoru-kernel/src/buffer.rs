@@ -112,7 +112,13 @@ impl Buffer {
             self.len
         );
         let this = ManuallyDrop::new(self);
-        let arena = Arc::clone(&this.arena);
+        // The original is `ManuallyDrop`, so its `arena` field is never dropped: take it out
+        // rather than cloning beside it, or every split would leak one arena token and the
+        // region would stay mapped for the life of the process (CT-I2; found by the
+        // `infra/first-run-defects` work, 2026-09-22).
+        // SAFETY: `this` is `ManuallyDrop` and is never dropped, and the field is not read
+        // again after this point, so the value is moved out exactly once.
+        let arena = unsafe { std::ptr::read(&this.arena) };
         // SAFETY: `mid <= len`, so `ptr + mid` is within or one past the region this buffer
         // owns; the two halves partition the region and each releases only its own range.
         let tail_ptr = unsafe { this.ptr.add(mid) };
@@ -148,11 +154,16 @@ impl Buffer {
             ));
         };
         let this = ManuallyDrop::new(self);
+        // As in `split_at`: the original is never dropped, so the token moves into the owner
+        // instead of being cloned beside a field that nothing will ever release.
+        // SAFETY: `this` is `ManuallyDrop` and is never dropped, and the field is not read
+        // again after this point, so the value is moved out exactly once.
+        let arena = unsafe { std::ptr::read(&this.arena) };
         let owner = Arc::new(ArrowOwner {
             ptr: this.ptr,
             len: this.len,
             tier: this.tier,
-            arena: Arc::clone(&this.arena),
+            arena,
         });
         registry_insert(this.ptr as usize, this.len, this.tier);
         // SAFETY: the region is valid for `len` bytes (CT-I2) and stays so until `owner`
@@ -428,6 +439,45 @@ mod tests {
         assert_eq!(m.as_ref(), &[1, 2, 7]);
         assert!(format!("{m:?}").contains("Host"));
         assert!(Arc::ptr_eq(m.arena(), m.arena()));
+    }
+
+    /// CT-T20. `split_at` and `into_arrow_buffer` consume the buffer, so neither may leave an
+    /// arena token behind: the token is what keeps the arena's region mapped, and one leaked
+    /// per morsel kept a whole 1 GiB region resident for the life of the process, which left a
+    /// second `Runtime::run` no budget at all (12 f.1, 11 f.1; found 2026-09-22).
+    #[test]
+    fn the_arena_token_is_not_leaked() {
+        let arena = Arc::new(CountingArena(AtomicUsize::new(0)));
+        let before = Arc::strong_count(&arena);
+
+        let (b, _) = heap(16, Tier::Host, &arena);
+        let (h, t) = b.split_at(8);
+        assert_eq!(
+            Arc::strong_count(&arena),
+            before + 2,
+            "a split holds exactly one token per half"
+        );
+        drop(h);
+        drop(t);
+        assert_eq!(
+            Arc::strong_count(&arena),
+            before,
+            "split_at leaked an arena token"
+        );
+
+        let (b, _) = heap(16, Tier::Host, &arena);
+        let arrow = b.into_arrow_buffer().expect("a host buffer converts");
+        assert_eq!(
+            Arc::strong_count(&arena),
+            before + 1,
+            "the Arrow owner holds exactly one token"
+        );
+        drop(arrow);
+        assert_eq!(
+            Arc::strong_count(&arena),
+            before,
+            "into_arrow_buffer leaked an arena token"
+        );
     }
 
     #[test]

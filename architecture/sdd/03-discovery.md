@@ -60,6 +60,7 @@ pub struct DiscoveryInput {
     pub explicit_budget: Option<u64>,
     pub explicit_cpu: Option<f64>,
     pub explicit_staging_dir: Option<std::path::PathBuf>,
+    pub explicit_spill_limit: Option<u64>,       // `budget.disk` from the surface; f.6
     pub profile_override: Option<HostProfile>,   // from the surface; env var still parsed underneath
 }
 
@@ -72,6 +73,13 @@ pub struct Discovered {
     /// 02 d.1), which is the owner of `arena.pin`; nothing else decides pinning.
     pub host_tier: TierKind,
     pub cgroup_path: Option<std::path::PathBuf>,
+    /// `budget.disk`: the explicit `AMORU_SPILL_LIMIT` (or the surface's `staging_limit`),
+    /// else 20% of the free space in `profile.staging_dir` measured with `statvfs` (f.6),
+    /// else 0. The facade passes it straight to the placement engine; discovery is where it
+    /// is computed because discovery is the only component that reads the filesystem's free
+    /// space (added 2026-09-22: the value was parsed and discarded, so the disk tier was off
+    /// unless a user set it by hand).
+    pub disk_budget: u64,
     pub notes: Vec<String>,            // human-readable facts for the run report ("memory.high absent; using 0.9 × memory.max")
 }
 
@@ -181,6 +189,8 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 **f.3 Size string parsing.** `AMORU_BUDGET` accepts an integer (bytes) or `<number><unit>` with units `KiB`, `MiB`, `GiB`, `TiB`, `KB`, `MB`, `GB`, `TB` (decimal); anything else is `Config`.
 
+**f.6 `budget.disk`.** In order: `DiscoveryInput::explicit_spill_limit` (the surface's `staging_limit`), then `AMORU_SPILL_LIMIT` parsed by f.3's size parser, then, when a `staging_dir` resolved, 20% of the free space `statvfs` reports for it (the same call e.4's ephemeral check already makes), then 0. The result is clamped to the free space, because a cap above the disk is not a cap, and a note records which of the four it was. 0 disables the disk tier, which is what the preamble's row says it means.
+
 ## g. Concurrency within the component
 
 `discover` is called from the main thread once. `Sampler` is one instance per run, shared as `Arc<dyn amoru_kernel::Sampler>` by the controller thread (its tick) and the scheduler's workers (before and after every `apply`, SC f.2); it is `Send + Sync` through interior mutability (one mutex, never held across anything but the file reads, so a worker's sample waits at most for one other sample to finish). The mutex is outside the preamble's lock order because nothing is called while it is held.
@@ -201,13 +211,15 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 ## i. Configuration
 
-`budget.host`, `budget.device`, `workers.max` (as `cpu_quota`), `page.bytes`, `staging.dir`, `budget.disk` (parsed here, applied by placement), `arena.huge_pages`, `arena.pin` (decided here as `Discovered.host_tier`, applied by the arena), `host_profile`. Range clamping of `budget.host` is owned here (preamble section 5): a value outside the range is clamped and noted.
+`budget.host`, `budget.device`, `workers.max` (as `cpu_quota`), `page.bytes`, `staging.dir`, `budget.disk` (computed here by f.6, applied by placement), `arena.huge_pages`, `arena.pin` (decided here as `Discovered.host_tier`, applied by the arena), `host_profile`. Range clamping of `budget.host` is owned here (preamble section 5): a value outside the range is clamped and noted.
 
 ## j. Observability
 
 `Discovered.notes` is printed in the run report verbatim. `tracing`: `discovery.limits` (info, all fields), `discovery.probe` (debug, per field, result and duration), `discovery.clamp` (warn), `discovery.profile_violation` (error, before the `Config` is returned).
 
 ## k. Tests
+
+**DS-T14 disk_budget.** With `AMORU_SPILL_LIMIT=2GiB` and a staging directory, `Discovered.disk_budget` is 2 GiB (clamped to the free space when the directory has less) and a note says so; with the variable unset and a staging directory, it is 20% of what `statvfs` reports free for that directory and within a percent of that figure; with no staging directory it is 0. f.6.
 
 **DS-T1 precedence.** Matrix of explicit / env / cgroup / OS combinations for budget, CPU and staging dir; the chosen value and `LimitSource` follow DS-I1. Uses a fake cgroup directory (the parser takes a root path).
 

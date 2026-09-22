@@ -85,11 +85,13 @@ fn a_pinned_arena_gives_the_sink_pinned_buffers() {
     )
     .expect("parquet sink");
     sink.open(&table_source_schema()).expect("open");
+    // The file buffer is allocated with the first payload, not at `open` (f.1: the output
+    // schema is the first morsel's).
+    block_on(sink.write(0, arena_payload(&alloc, 64, 0))).expect("write");
     assert!(
         alloc.in_use(Tier::PinnedHost) > 0,
         "the file buffer is pinned"
     );
-    block_on(sink.write(0, arena_payload(&alloc, 64, 0))).expect("write");
     sink.finish().expect("finish");
     for op in reactor.ops() {
         assert_eq!(op.src_tier, Some(Tier::PinnedHost), "{op:?}");
@@ -215,11 +217,14 @@ fn schema_drift_names_a_missing_or_extra_field() {
     )
     .expect("parquet sink");
     sink.open(&table_source_schema()).expect("open");
+    // f.1: the first morsel settles the output schema, so drift is measured against it and
+    // not against the schema the chain guessed at `open`.
+    block_on(sink.write(0, arena_payload(&alloc, 8, 0))).expect("the first morsel");
 
     let one = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let batch = arena_batch(&alloc, 8, 0);
     let short = RecordBatch::try_new(one, vec![batch.column(0).clone()]).expect("batch");
-    let outcome = block_on(sink.write(0, Payload::table(short).expect("payload")));
+    let outcome = block_on(sink.write(1, Payload::table(short).expect("payload")));
     let Err(AmoruError::Sink(msg)) = outcome else {
         panic!("a missing field must be refused, got {outcome:?}");
     };
@@ -236,6 +241,7 @@ fn schema_drift_names_a_missing_or_extra_field() {
     )
     .expect("parquet sink");
     sink.open(&table_source_schema()).expect("open");
+    block_on(sink.write(0, arena_payload(&alloc, 8, 0))).expect("the first morsel");
     let three = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int64, false),
         Field::new("b", DataType::Int64, false),
@@ -251,7 +257,7 @@ fn schema_drift_names_a_missing_or_extra_field() {
         ],
     )
     .expect("batch");
-    let outcome = block_on(sink.write(0, Payload::table(wide).expect("payload")));
+    let outcome = block_on(sink.write(1, Payload::table(wide).expect("payload")));
     let Err(AmoruError::Sink(msg)) = outcome else {
         panic!("an extra field must be refused, got {outcome:?}");
     };

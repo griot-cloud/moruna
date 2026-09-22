@@ -1,9 +1,10 @@
 //! The size-class allocator over one region (e.2, e.3, f.3, f.4, f.5).
 //!
 //! A request rounds up to a power-of-two class from 64 KiB to 512 MiB; a class's free list
-//! is refilled by claiming a 512 MiB slab from the low end of the region, or, in the
-//! small-budget mode, by splitting a larger block buddy-style. Anything above 512 MiB is a
-//! large allocation carved from the top (`large.rs`).
+//! is refilled by claiming a slab from the low end of the region, sized to the region rather
+//! than fixed at 512 MiB (e.1), or, in the small-budget mode, by splitting a larger block
+//! buddy-style. Anything above 512 MiB is a large allocation carved from the top
+//! (`large.rs`).
 //!
 //! `unsafe` is permitted in this module for the pointer arithmetic that turns an offset
 //! into an address (section l); every block cites AR-I1 or AR-I2.
@@ -23,11 +24,31 @@ pub(crate) const CLASS_COUNT: usize = 14;
 pub(crate) const SLAB_BYTES: u64 = 512 * 1024 * 1024;
 /// Below this host budget the region is served buddy-style from one slab (e.1).
 pub(crate) const SMALL_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+/// A region gives one class at most this fraction of itself as a slab (e.1): a slab is
+/// `min(SLAB_BYTES, max(class_size, region / SLAB_SHARE))`, so a small region spreads across
+/// its classes instead of handing the first two everything.
+const SLAB_SHARE: u64 = 8;
 
 /// Granule marker: part of a large allocation.
 const MARK_LARGE: u8 = 0xFD;
 /// Granule marker: not assigned to any class yet.
 const MARK_NONE: u8 = 0xFF;
+
+/// The largest single allocation a free block of `bytes` can serve (f.5). Above a slab the
+/// large path takes the request whole; below it the request rounds up to a class, so only the
+/// largest class that fits can be served.
+fn servable(bytes: u64) -> u64 {
+    if bytes >= SLAB_BYTES {
+        return bytes;
+    }
+    let mut size = 0;
+    for c in 0..CLASS_COUNT {
+        if class_size(c) <= bytes {
+            size = class_size(c);
+        }
+    }
+    size
+}
 
 /// Bytes in class `c`.
 pub(crate) fn class_size(c: usize) -> u64 {
@@ -180,7 +201,11 @@ impl Space {
             .sum()
     }
 
-    /// The largest single allocation this region can still serve (d.1).
+    /// The largest single allocation this region can still serve (d.1, f.5).
+    ///
+    /// A free block of `n` bytes serves a request of `n` through the large path when `n` is
+    /// above `SLAB_BYTES`, and otherwise a class request of at most the largest class size
+    /// that fits it, because a class request rounds its size up.
     pub(crate) fn largest_free(&self) -> u64 {
         let mut best = (0..CLASS_COUNT)
             .filter(|c| !self.lock_free(*c).is_empty())
@@ -188,14 +213,8 @@ impl Space {
             .max()
             .unwrap_or(0);
         let top = self.lock_top();
-        let gap = top.gap();
-        if gap >= SLAB_BYTES {
-            best = best.max(gap);
-        }
-        let block = top.largest_free_block();
-        if block > SLAB_BYTES {
-            best = best.max(block);
-        }
+        best = best.max(servable(top.gap()));
+        best = best.max(servable(top.largest_free_block()));
         best
     }
 
@@ -238,10 +257,17 @@ impl Space {
             self.activate(off, requested, class_size(c));
             return Ok(off);
         }
+        // Fresh region first, then a larger class's stranded slot. The second is what keeps
+        // f.5's stranding from becoming a refusal in a region that still holds free slots of
+        // another class (e.1): a class never returns a slab to the bump area, but a slot on a
+        // larger class's free list splits down like any block in the small-budget mode.
         let off = if self.small_mode {
             self.split_down(c, &mut fl).ok_or(OutOfSpace)?
         } else {
-            self.claim_slab(c, &mut fl).ok_or(OutOfSpace)?
+            match self.claim_slab(c, &mut fl) {
+                Some(off) => off,
+                None => self.split_down(c, &mut fl).ok_or(OutOfSpace)?,
+            }
         };
         drop(fl);
         self.activate(off, requested, class_size(c));
@@ -251,15 +277,30 @@ impl Space {
     /// Claim a slab for class `c` and push every slot but the one returned (f.3). The
     /// class lock is held throughout and the bump lock is taken under it, which is the
     /// component's lock order (section g).
+    ///
+    /// The slab is `slab_bytes(c)` (e.1), and `TopArea::claim_slab` shrinks it to what the gap
+    /// can serve when the gap is smaller, down to a single slot. A fixed 512 MiB slab made a
+    /// region smaller than 512 MiB times the classes in use refuse allocations with most of
+    /// itself free, which AR-I2 and the budget arithmetic of 11 f.1 both forbid.
     fn claim_slab(&self, c: usize, fl: &mut Vec<u64>) -> Option<u64> {
-        let off = self.lock_top().claim_slab(SLAB_BYTES)?;
-        self.mark_range(off, SLAB_BYTES, c as u8);
         let size = class_size(c);
-        for i in 1..(SLAB_BYTES / size) {
+        let (off, slab) = self.lock_top().claim_slab(self.slab_bytes(c), size)?;
+        self.mark_range(off, slab, c as u8);
+        for i in 1..(slab / size) {
             fl.push(off + i * size);
         }
         self.slabs_by_class[c].fetch_add(1, Ordering::Relaxed);
         Some(off)
+    }
+
+    /// The slab size class `c` asks for in this region (e.1): `min(512 MiB,
+    /// max(class_size(c), region / SLAB_SHARE))`, rounded down to a whole number of slots.
+    /// Above about 4 GiB this is 512 MiB again, so a region large enough to have wanted the
+    /// fixed slab still gets it.
+    fn slab_bytes(&self, c: usize) -> u64 {
+        let size = class_size(c);
+        let want = (self.bytes / SLAB_SHARE).max(size).min(SLAB_BYTES);
+        (want / size * size).max(size)
     }
 
     /// Small-budget mode: split the smallest free block larger than class `c` down to `c`,
@@ -487,7 +528,8 @@ mod tests {
         let (a, charged) = h.space.alloc(MIB).expect("a");
         assert_eq!(charged, MIB);
         assert_eq!(h.space.slabs_by_class()[4], 1);
-        assert_eq!(h.space.stranded_bytes(), SLAB_BYTES - MIB);
+        // The slab is the region's eighth, not a fixed 512 MiB (e.1).
+        assert_eq!(h.space.stranded_bytes(), 2 * SLAB_BYTES / 8 - MIB);
         assert_eq!(h.space.tier(), Tier::Host);
         assert_eq!(h.space.bytes(), 2 * SLAB_BYTES);
         assert_eq!(h.space.release(a, MIB), Release::Freed);

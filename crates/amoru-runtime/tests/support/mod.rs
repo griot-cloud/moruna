@@ -243,3 +243,115 @@ impl Kernel for FailOnce {
         Ok(input)
     }
 }
+
+/// A real kernel that appends a column, which is the canonical Amoru job: a model or a
+/// tokeniser appends its output. Its `output_schema` reports its input unchanged, exactly as
+/// an opaque kernel's does (05 d.1), so the sink is opened with a schema that is not the one
+/// it will be written with (08 f.1).
+pub struct Appender {
+    fingerprint: Fingerprint,
+    column: &'static str,
+}
+
+impl Appender {
+    /// One appender, adding a boolean column of the given name.
+    pub fn new(column: &'static str) -> Appender {
+        Appender {
+            fingerprint: Fingerprint::compute("amoru-runtime::tests::Appender", column.as_bytes()),
+            column,
+        }
+    }
+}
+
+impl Kernel for Appender {
+    fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: amoru_kernel::PayloadKind::Table,
+            tier: TierPref::Host,
+        }
+    }
+
+    /// What an opaque kernel can honestly say before it has seen a batch: nothing new.
+    fn output_schema(&self, input: &SourceSchema) -> amoru_kernel::Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> amoru_kernel::Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> amoru_kernel::Result<Payload> {
+        let Payload::Table(batch, _) = &input else {
+            return Err(AmoruError::Kernel {
+                stage: 1,
+                seq: 0,
+                msg: "the appender wants a table".to_string(),
+                features: None,
+            });
+        };
+        let values = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| AmoruError::Kernel {
+                stage: 1,
+                seq: 0,
+                msg: "the batch has no Int64 value column".to_string(),
+                features: None,
+            })?;
+        let loud: arrow::array::BooleanArray =
+            values.iter().map(|v| v.map(|v| v % 3 == 0)).collect();
+        input.with_column(self.column, Arc::new(loud) as ArrayRef)
+    }
+}
+
+/// Whether every Parquet file under `dir` carries a column of this name.
+pub fn output_has_column(dir: &Path, name: &str) -> bool {
+    use parquet::file::reader::FileReader;
+    let mut seen = false;
+    let entries = std::fs::read_dir(dir).expect("the output directory is readable");
+    for entry in entries {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+            continue;
+        }
+        let file = std::fs::File::open(&path).expect("an output file");
+        let reader = parquet::file::reader::SerializedFileReader::new(file).expect("a reader");
+        let schema = reader.metadata().file_metadata().schema_descr();
+        if !(0..schema.num_columns()).any(|i| schema.column(i).name() == name) {
+            return false;
+        }
+        seen = true;
+    }
+    seen
+}
+
+/// Resident bytes of this process, or `None` where the platform's figure is not available.
+/// Used by the test that proves an arena's mapping goes back at the end of a run (AR-I3).
+pub fn resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().next()?.parse().ok()?;
+        // SAFETY: test-only; `sysconf` takes no pointers.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        Some(pages * page)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss="])
+            .arg(std::process::id().to_string())
+            .output()
+            .ok()?;
+        let kib: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        Some(kib * 1024)
+    }
+}

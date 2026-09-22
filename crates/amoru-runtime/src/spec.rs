@@ -171,7 +171,9 @@ impl RunSpec {
             error_policy: ErrorPolicy::Terminate,
             ordered: false,
             sizer: SizerKind::Rule,
-            profiles_dir: default_profiles_dir(),
+            // `None` is the preamble's default, which the facade resolves and creates
+            // (12 f.1): one owner, and a caller that wants a different store says so.
+            profiles_dir: None,
             object_store: ObjectStoreConfig::default(),
             host_profile: None,
             allow_gil: false,
@@ -185,7 +187,8 @@ impl RunSpec {
 }
 
 /// `profiles.dir`: the preamble's default is `~/.amoru/profiles`, and no directory at all on
-/// a host with no home, which disables the profile store.
+/// a host with no home, which disables the profile store. `Runtime::run` resolves and creates
+/// it for a `RunSpec` that leaves `profiles_dir` unset (12 f.1); this is the path it uses.
 pub fn default_profiles_dir() -> Option<PathBuf> {
     #[allow(deprecated)]
     std::env::home_dir().map(|home| home.join(".amoru").join("profiles"))
@@ -236,6 +239,7 @@ mod tests {
                 profile: HostProfile::default(),
                 host_tier: amoru_kernel::TierKind::Host,
                 cgroup_path: None,
+                disk_budget: 0,
                 notes: Vec::new(),
             },
             alloc: Arc::new(FakeAllocator::new()) as Arc<dyn Allocator>,
@@ -297,7 +301,10 @@ mod tests {
         assert!(spec.checkpoint);
         assert!(!spec.checkpoint_keep);
         assert!(spec.resume.is_none());
-        assert_eq!(spec.profiles_dir, default_profiles_dir());
+        assert_eq!(
+            spec.profiles_dir, None,
+            "the facade resolves the default, so a fresh spec names no store (12 f.1)"
+        );
         assert_eq!(spec.error_policy, ErrorPolicy::Terminate);
         assert_eq!(spec.sizer, SizerKind::Rule);
         assert_eq!(

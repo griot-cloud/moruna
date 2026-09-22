@@ -42,6 +42,8 @@ pub struct DiscoveryInput {
     pub explicit_cpu: Option<f64>,
     /// Where staging segments go, which beats everything discovered (DS-I1).
     pub explicit_staging_dir: Option<PathBuf>,
+    /// `budget.disk` in bytes, which beats `AMORU_SPILL_LIMIT` and the 20% default (f.6).
+    pub explicit_spill_limit: Option<u64>,
     /// A host profile from the surface; `AMORU_HOST_PROFILE` is still parsed underneath and a
     /// field this profile leaves `Unknown` is taken from the variable.
     pub profile_override: Option<HostProfile>,
@@ -61,6 +63,11 @@ pub struct Discovered {
     pub host_tier: TierKind,
     /// The cgroup directory the figures came from, when there was one.
     pub cgroup_path: Option<PathBuf>,
+    /// `budget.disk` (f.6): the explicit limit, else `AMORU_SPILL_LIMIT`, else 20% of the free
+    /// space in `profile.staging_dir`, else 0. The facade hands it to the placement engine; 0
+    /// disables the disk tier. Computed here because discovery is the only component that
+    /// reads the filesystem's free space.
+    pub disk_budget: u64,
     /// Human readable facts for the run report, printed verbatim (j).
     pub notes: Vec<String>,
 }
@@ -125,13 +132,13 @@ fn discover_with(env: &dyn EnvSource, roots: &Roots, input: &DiscoveryInput) -> 
         (None, None) => None,
     };
 
-    // The staging cap is parsed here and applied by the placement engine (section i).
-    if let Some(text) = env.get("AMORU_SPILL_LIMIT") {
-        let limit = crate::env::parse_size("budget.disk", &text)?;
-        notes.push(format!(
-            "AMORU_SPILL_LIMIT sets budget.disk to {limit} bytes"
-        ));
-    }
+    // f.6: the staging cap. The value is computed once the staging directory is known, below;
+    // the environment variable is parsed here so a malformed one fails before any probe runs.
+    let spill_limit_from_env = match env.get("AMORU_SPILL_LIMIT") {
+        Some(text) => Some(crate::env::parse_size("budget.disk", &text)?),
+        None => None,
+    };
+    let explicit_spill_limit = input.explicit_spill_limit.or(spill_limit_from_env);
 
     // e.2, e.3: the cgroup, then the limits.
     let located = cgroup::locate(&roots.cgroup, &roots.proc_dir);
@@ -213,14 +220,64 @@ fn discover_with(env: &dyn EnvSource, roots: &Roots, input: &DiscoveryInput) -> 
     profile.durable_staging = resolve_durable(&profile, &mut notes)?;
 
     let host_tier = limits::host_tier(&limits.devices, profile.memlock, &mut notes);
+    let disk_budget = disk_budget(
+        explicit_spill_limit,
+        profile.staging_dir.as_deref(),
+        &mut notes,
+    );
 
     Ok(Discovered {
         limits,
         profile,
         host_tier,
         cgroup_path,
+        disk_budget,
         notes,
     })
+}
+
+/// f.6. `budget.disk`: the explicit limit, else `AMORU_SPILL_LIMIT`, else 20% of the free space
+/// `statvfs` reports for the staging directory, else 0. An explicit cap above the free space is
+/// clamped to it, because a cap above the disk is not a cap. A note records which it was.
+fn disk_budget(explicit: Option<u64>, staging_dir: Option<&Path>, notes: &mut Vec<String>) -> u64 {
+    let free = staging_dir.and_then(probes::free_bytes);
+    match (explicit, staging_dir, free) {
+        (Some(limit), _, Some(free)) if limit > free => {
+            notes.push(format!(
+                "budget.disk was set to {limit} bytes and clamped to the {free} bytes free in \
+                 the staging directory"
+            ));
+            free
+        }
+        (Some(limit), _, _) => {
+            notes.push(format!("budget.disk is the {limit} bytes that were given"));
+            limit
+        }
+        (None, Some(dir), Some(free)) => {
+            // The note names the rule and the directory, not the figure: free space moves
+            // between two calls and DS-I7 asks for the same notes from both.
+            notes.push(format!(
+                "budget.disk defaults to 20% of the free space at {}",
+                dir.display()
+            ));
+            free / 5
+        }
+        (None, Some(dir), None) => {
+            notes.push(format!(
+                "budget.disk is 0: the free space at {} could not be read, so the disk tier is \
+                 off",
+                dir.display()
+            ));
+            0
+        }
+        (None, None, _) => {
+            notes.push(
+                "budget.disk is 0: there is no staging directory, so the disk tier is off"
+                    .to_string(),
+            );
+            0
+        }
+    }
 }
 
 /// A field the surface declares replaces the one the environment variable carried (d.1).
@@ -702,6 +759,74 @@ mod tests {
             profile.rdma,
             profile.durable_staging,
         ]
+    }
+
+    /// DS-T14 disk_budget: `budget.disk` is the explicit limit, else `AMORU_SPILL_LIMIT`, else
+    /// 20% of the free space in the staging directory, else 0, and an explicit cap above the
+    /// free space is clamped to it. f.6.
+    #[test]
+    fn ds_t14_disk_budget() {
+        let tmp = TempDir::new("ds-t14");
+        let gib = 1024u64 * 1024 * 1024;
+        proc_fixture(tmp.path(), "0::/\n", 16 * 1024 * 1024);
+        cgroup_v2(tmp.path(), &(4 * gib).to_string(), "max", "200000 100000");
+        let roots = roots_at(tmp.path());
+        let spill = staging(tmp.path());
+        let spill_str = spill.to_str().expect("utf-8");
+        let free = probes::free_bytes(&spill).expect("the staging directory has a filesystem");
+
+        // The environment variable, which the old code parsed and threw away.
+        let env = MapEnv::with(&[
+            ("AMORU_SPILL_DIR", spill_str),
+            ("AMORU_SPILL_LIMIT", "2GiB"),
+        ]);
+        let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discover");
+        let want = (2 * gib).min(free);
+        assert_eq!(found.disk_budget, want, "AMORU_SPILL_LIMIT carries through");
+        assert!(
+            found.notes.iter().any(|n| n.starts_with("budget.disk")),
+            "a note says where the cap came from: {:?}",
+            found.notes
+        );
+
+        // The documented default: 20% of the free space, measured with `statvfs`.
+        let env = MapEnv::with(&[("AMORU_SPILL_DIR", spill_str)]);
+        let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discover");
+        let now = probes::free_bytes(&spill).expect("free space");
+        let slack = now / 100;
+        assert!(
+            found.disk_budget.abs_diff(now / 5) <= slack,
+            "f.6: {} is not within a percent of a fifth of {now}",
+            found.disk_budget
+        );
+        assert!(found.disk_budget > 0, "the disk tier is on by default");
+
+        // The explicit limit beats the variable, and a cap above the disk is clamped to it.
+        let input = DiscoveryInput {
+            explicit_spill_limit: Some(u64::MAX),
+            ..DiscoveryInput::default()
+        };
+        let env = MapEnv::with(&[
+            ("AMORU_SPILL_DIR", spill_str),
+            ("AMORU_SPILL_LIMIT", "2GiB"),
+        ]);
+        let found = discover_with(&env, &roots, &input).expect("discover");
+        assert!(
+            found.disk_budget <= now + slack && found.disk_budget > 0,
+            "an explicit cap above the disk is clamped to it: {}",
+            found.disk_budget
+        );
+
+        // No staging directory: no disk tier.
+        let nowhere = tmp.path().join("no-such-dir");
+        let env = MapEnv::with(&[(
+            "AMORU_HOST_PROFILE",
+            format!("staging_dir={}", nowhere.display()).as_str(),
+        )]);
+        let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discover");
+        if found.profile.staging_dir.is_none() {
+            assert_eq!(found.disk_budget, 0, "no staging directory, no disk tier");
+        }
     }
 
     /// DS-T7 idempotent: two calls give equal `Limits` (device free bytes aside) and leave no

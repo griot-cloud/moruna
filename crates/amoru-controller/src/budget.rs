@@ -12,10 +12,14 @@ pub(crate) const PLACEMENT_SHARE: f64 = 0.5;
 /// The share of the device budget the queues get (f.1).
 const DEVICE_QUEUE_SHARE: f64 = 0.6;
 
-/// f.1. Sample the baseline once, after `Scheduler::init_instances` has run every stateful
-/// `init`, derive the host and device budgets from it and hand the placement engine the tier
-/// budgets it starts with. The only placement call the controller ever makes is
-/// `set_budgets`, here and when the state term changes (f.3, f.6).
+/// f.1. Take the arena's capacity as the host budget, derive the device budgets, and hand the
+/// placement engine the tier budgets it starts with. The only placement call the controller
+/// ever makes is `set_budgets`, here and when the state term changes (f.3, f.6).
+///
+/// The host budget is `cfg.arena_bytes` and nothing is subtracted from it: the arena is where
+/// morsels live and its accounting is what enforces G-I1, and the facade has already taken the
+/// ceiling, the pre-arena baseline, the reserve and the expected kernel state out of it
+/// (12 f.1, 02 f.1). A sample is still taken, for the tick clock and the throttling counter.
 pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
     // Sampling is a call into another component, so it happens with no lock held (RC-I10).
     let sample = ctl.peers().sampler.sample();
@@ -29,15 +33,16 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
             });
         }
         let ceiling = state.cfg.limits.memory_ceiling;
-        let baseline = sample.anon_bytes;
+        let baseline = state.cfg.baseline_bytes;
         let reserve = model::scale(ceiling, f64::from(state.cfg.reserve_fraction));
-        let host = ceiling.saturating_sub(baseline).saturating_sub(reserve);
+        let host = state.cfg.arena_bytes;
         if host <= state.cfg.morsel_min.saturating_mul(2) {
             return Err(AmoruError::Config {
                 name: "budget.host",
                 msg: format!(
-                    "ceiling {ceiling} less baseline {baseline} and reserve {reserve} leaves \
-                     {host} bytes, which is not two morsels of {}",
+                    "the arena holds {host} bytes, which is not two morsels of {}; the ceiling \
+                     is {ceiling}, the process already held {baseline} bytes before the arena \
+                     existed and the reserve is {reserve}",
                     state.cfg.morsel_min
                 ),
             });

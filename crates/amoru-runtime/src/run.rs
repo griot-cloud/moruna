@@ -162,6 +162,7 @@ fn drive(
             explicit_budget: budget,
             explicit_cpu: cpu,
             explicit_staging_dir: explicit_staging_dir.clone(),
+            explicit_spill_limit: staging_limit,
             profile_override: host_profile,
         })?,
     };
@@ -178,11 +179,22 @@ fn drive(
         None => Arc::new(DiscoverySampler::new(&discovered)?),
     };
 
-    // 2. Arena.
+    // 2. Arena. The baseline is sampled here, before the region exists (12 f.1, 02 f.1,
+    // 11 f.1): the arena touches every page at `new`, so a sample taken after it contains the
+    // arena and subtracting it later would charge the arena twice.
+    let baseline_bytes = sampler.sample().anon_bytes;
+    let arena_bytes = arena_host_bytes(
+        limits.memory_ceiling,
+        baseline_bytes,
+        config::RESERVE_FRACTION,
+        expected_kernel_state(&kernels),
+        limits.page_bytes,
+        &mut notes,
+    );
     let alloc: Arc<dyn Allocator> = match components.alloc {
         Some(alloc) => alloc,
         None => Arena::new(ArenaConfig {
-            host_bytes: arena_host_bytes(limits.memory_ceiling, &sampler, &mut notes),
+            host_bytes: arena_bytes,
             host_tier: discovered.host_tier,
             device_bytes: limits
                 .devices
@@ -280,7 +292,9 @@ fn drive(
         .collect();
 
     // 7. Placement.
-    let disk_budget = disk_budget(staging_limit, staging_dir.as_ref(), &mut notes);
+    // `budget.disk` (03 f.6): discovery computed it, from the explicit limit, the environment
+    // variable or 20% of the free space in the staging directory, and noted which.
+    let disk_budget = discovered.disk_budget;
     let checkpoint_enabled = checkpoint && staging_dir.is_some() && repeatable && disk_budget > 0;
     if checkpoint && !checkpoint_enabled {
         notes.push(
@@ -380,6 +394,7 @@ fn drive(
             morsel_max: config::MORSEL_MAX_BYTES,
             checkpoint_enabled,
             checkpoint_interval_ms,
+            checkpoint_keep,
             heartbeat_interval_ms: config::HEARTBEAT_INTERVAL_MS,
             resuming: resume.is_some(),
             node,
@@ -403,6 +418,7 @@ fn drive(
     }
 
     // 10. Controller, then the record hook, so the hook exists before any probe record.
+    let profiles_dir = resolve_profiles_dir(profiles_dir, home_dir(), &mut notes);
     let controller = Arc::new(Controller::new(
         ControllerConfig {
             limits: limits.clone(),
@@ -424,6 +440,8 @@ fn drive(
             fallback_error_ratio: config::SIZER_FALLBACK_ERROR_RATIO,
             profiles_dir,
             disk_budget,
+            arena_bytes,
+            baseline_bytes,
             checkpoint_enabled,
             checkpoint_interval_ms,
         },
@@ -436,8 +454,18 @@ fn drive(
         kernel_infos,
     )?);
     started.controller = Some(controller.clone());
-    let hooked = controller.clone();
-    scheduler.set_record_hook(Arc::new(move |record| hooked.on_record(record)));
+    // A `Weak`, not a clone: the controller holds the scheduler as its `Knobs`, `StatsSource`
+    // and `Prober`, so a hook that held the controller strongly would close a reference cycle
+    // and neither would ever be dropped. The arena went with them, and a second `Runtime::run`
+    // in the same process then sampled a baseline that still contained the first run's whole
+    // region (12 f.1, 11 f.1). The controller outlives every record: it is held here and in
+    // `started` until after the scheduler has stopped.
+    let hooked = Arc::downgrade(&controller);
+    scheduler.set_record_hook(Arc::new(move |record| {
+        if let Some(controller) = hooked.upgrade() {
+            controller.on_record(record);
+        }
+    }));
 
     // 11. prepare, probe, start, run.
     controller.prepare()?;
@@ -460,6 +488,7 @@ fn drive(
         .take()
         .map(|controller| controller.stop());
     let (view, shutdown_notes) = started.unwind();
+
     notes.extend(shutdown_notes);
     let manifest = outcome_manifest.or_else(|| match (checkpoint_keep, &engine) {
         (true, Some(engine)) => engine.manifest_path(),
@@ -534,25 +563,56 @@ fn gil_states(
     }
 }
 
-/// `ArenaConfig::host_bytes`.
+/// `ArenaConfig::host_bytes` (12 f.1, 02 f.1, 11 f.1).
 ///
-/// The preamble's `budget.host` row is the host ceiling, and 02 d.1 says the arena's host
-/// region is that budget. The arena touches every page of its region at `new` (02 f.1), so the
-/// whole region is resident by the time the controller samples the baseline, and the
-/// controller's host budget is `ceiling - baseline - reserve` (11 f.1): an arena sized at the
-/// ceiling leaves the controller nothing, whatever the ceiling is. The two models cannot both
-/// hold; until one of them is changed, the facade splits the room under the ceiling that the
-/// process is not already using, so the bytes the controller believes it may hold equal the
-/// bytes the arena can actually give it.
-fn arena_host_bytes(ceiling: u64, sampler: &Arc<dyn Sampler>, notes: &mut Vec<String>) -> u64 {
-    let before = sampler.sample().anon_bytes;
-    let reserve = (ceiling as f64 * config::RESERVE_FRACTION as f64) as u64;
-    let available = ceiling.saturating_sub(before).saturating_sub(reserve);
-    let arena = available / 2;
+/// The arena's capacity is `ceiling - baseline - reserve - expected kernel state`, rounded
+/// down to a multiple of `max(page_bytes, 64 KiB)` as 02 e.1 requires of the region. The
+/// baseline is the process's anonymous memory *before* the arena exists, because 02 f.1
+/// touches every page of the region at `new`. The same number is the controller's whole
+/// allowance (`ControllerConfig::arena_bytes`), so the bytes the controller believes it may
+/// hold are the bytes the arena can actually give it, and nothing is subtracted twice.
+fn arena_host_bytes(
+    ceiling: u64,
+    baseline: u64,
+    reserve_fraction: f32,
+    kernel_state: u64,
+    page_bytes: usize,
+    notes: &mut Vec<String>,
+) -> u64 {
+    let reserve = (ceiling as f64 * f64::from(reserve_fraction)) as u64;
+    let granule = (page_bytes as u64).max(GRANULE_BYTES);
+    let arena = ceiling
+        .saturating_sub(baseline)
+        .saturating_sub(reserve)
+        .saturating_sub(kernel_state)
+        / granule
+        * granule;
     notes.push(format!(
-        "arena sized at {arena} bytes: the ceiling {ceiling} less the {before} bytes the          process already held and the {reserve} byte reserve, halved, because the arena is          resident before the baseline is sampled"
+        "arena sized at {arena} bytes: the ceiling {ceiling} less the {baseline} bytes the \
+         process held before the arena existed, the {reserve} byte reserve and the \
+         {kernel_state} bytes the stateful kernels declare"
     ));
     arena
+}
+
+/// The smallest region granularity 02 e.1 rounds the arena down to.
+const GRANULE_BYTES: u64 = 64 << 10;
+
+/// The expected kernel state of 11 f.1: the sum of `KernelHints::state_bytes` over the
+/// stateful instances that will be created, zero where a kernel declares none. It is held
+/// outside the arena, so the arena may not be sized over it.
+fn expected_kernel_state(kernels: &[Arc<dyn amoru_kernel::Kernel>]) -> u64 {
+    kernels
+        .iter()
+        .map(|kernel| match kernel.kind() {
+            amoru_kernel::KernelKind::Stateful { max_instances } => kernel
+                .hints()
+                .state_bytes
+                .unwrap_or(0)
+                .saturating_mul(max_instances.get() as u64),
+            amoru_kernel::KernelKind::Stateless => 0,
+        })
+        .sum()
 }
 
 /// `workers.max`: the discovered CPU quota, rounded up, at least one (preamble section 5).
@@ -565,26 +625,45 @@ fn workers_from(cpu_quota: f64) -> u16 {
     }
 }
 
-/// `budget.disk`. The preamble's default is 20% of the free space in the staging directory,
-/// which needs a `statvfs` the facade cannot make (12 l permits no `unsafe`, and no crate in
-/// 12 d.2 reports free space), so an unset limit leaves the disk tier off with a note.
-fn disk_budget(
-    staging_limit: Option<u64>,
-    staging_dir: Option<&PathBuf>,
+/// `profiles.dir` (12 f.1, preamble section 5). `None` from the surface means the documented
+/// default, `<home>/.amoru/profiles`, which is created here. Without it a resumed run has no
+/// memory of the interrupted run and `probe_missing` has nothing to seed from (11 f.14). A home
+/// directory that is not set, or a directory that cannot be created, leaves the store off with
+/// a note, which is what 11 f.9 already does for an unwritable store.
+fn resolve_profiles_dir(
+    given: Option<PathBuf>,
+    home: Option<PathBuf>,
     notes: &mut Vec<String>,
-) -> u64 {
-    match (staging_limit, staging_dir) {
-        (Some(limit), _) => limit,
-        (None, Some(dir)) => {
+) -> Option<PathBuf> {
+    if let Some(dir) = given {
+        return Some(dir);
+    }
+    let Some(home) = home else {
+        notes.push(
+            "profiles.dir is off: no home directory, so nothing is remembered between runs"
+                .to_string(),
+        );
+        return None;
+    };
+    let dir = home.join(".amoru").join("profiles");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(error) => {
             notes.push(format!(
-                "budget.disk was not given and free space at {} could not be measured; the disk \
-                 tier is off",
+                "profiles.dir {} could not be created ({error}); nothing is remembered between \
+                 runs",
                 dir.display()
             ));
-            0
+            None
         }
-        (None, None) => 0,
     }
+}
+
+/// The user's home directory. A separate function so `resolve_profiles_dir` can be tested
+/// without touching the environment.
+fn home_dir() -> Option<PathBuf> {
+    #[allow(deprecated)]
+    std::env::home_dir().filter(|h| !h.as_os_str().is_empty())
 }
 
 /// What `Source::plan` adds up to, for the controller (12 f.1).
@@ -601,21 +680,6 @@ fn summarise(plan: &[amoru_kernel::Split]) -> PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amoru_kernel::Sample;
-
-    /// A sampler that reports one fixed anonymous figure.
-    struct Fixed(u64);
-
-    impl Sampler for Fixed {
-        fn sample(&self) -> Sample {
-            Sample {
-                anon_bytes: self.0,
-                ..Sample::default()
-            }
-        }
-
-        fn reset_peak(&self) {}
-    }
 
     /// `workers.max` follows the discovered quota, rounded up, and is never zero.
     #[test]
@@ -628,31 +692,69 @@ mod tests {
         assert_eq!(workers_from(1.0e9), 1024);
     }
 
-    /// `budget.disk` is the given limit, or nothing with a note naming the directory.
+    /// `profiles.dir` defaults to `<home>/.amoru/profiles` and the directory is created
+    /// (12 f.1, preamble section 5); an explicit directory is left alone and no home directory
+    /// leaves the store off with a note.
     #[test]
-    fn the_disk_budget_is_given_or_absent() {
+    fn the_profile_store_has_a_default() {
         let mut notes = Vec::new();
-        assert_eq!(disk_budget(Some(99), None, &mut notes), 99);
+        let given = PathBuf::from("/tmp/amoru-profiles-given");
+        assert_eq!(
+            resolve_profiles_dir(Some(given.clone()), None, &mut notes),
+            Some(given),
+            "an explicit directory is taken as given"
+        );
         assert!(notes.is_empty());
-        let dir = std::path::PathBuf::from("/tmp/amoru-staging");
-        assert_eq!(disk_budget(None, Some(&dir), &mut notes), 0);
-        assert_eq!(notes.len(), 1, "the note names the directory: {notes:?}");
-        assert!(notes[0].contains("amoru-staging"));
-        assert_eq!(disk_budget(None, None, &mut notes), 0);
-        assert_eq!(notes.len(), 1, "no staging directory needs no note");
+
+        let home = std::env::temp_dir().join(format!("amoru-home-{}", std::process::id()));
+        let resolved = resolve_profiles_dir(None, Some(home.clone()), &mut notes)
+            .expect("the default under a writable home");
+        assert_eq!(resolved, home.join(".amoru").join("profiles"));
+        assert!(resolved.is_dir(), "the default directory is created");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(resolve_profiles_dir(None, None, &mut notes), None);
+        assert_eq!(notes.len(), 1, "the note says nothing is remembered");
+        assert!(notes[0].contains("profiles.dir"));
     }
 
-    /// The arena is sized from the room left under the ceiling, and says so.
+    /// The arena takes the whole room left under the ceiling, and says so. Nothing is halved:
+    /// this is the controller's allowance as well (12 f.1, 11 f.1).
     #[test]
     fn the_arena_is_sized_from_what_is_left() {
         let mut notes = Vec::new();
-        let sampler: Arc<dyn Sampler> = Arc::new(Fixed(100 << 20));
-        let bytes = arena_host_bytes(1 << 30, &sampler, &mut notes);
-        // 1 GiB less 100 MiB held and the reserve, halved.
-        let reserve = ((1u64 << 30) as f64 * config::RESERVE_FRACTION as f64) as u64;
-        assert_eq!(bytes, ((1u64 << 30) - (100 << 20) - reserve) / 2);
+        let ceiling = 1u64 << 30;
+        let reserve = (ceiling as f64 * config::RESERVE_FRACTION as f64) as u64;
+        let bytes = arena_host_bytes(
+            ceiling,
+            100 << 20,
+            config::RESERVE_FRACTION,
+            0,
+            4096,
+            &mut notes,
+        );
+        let want = (ceiling - (100 << 20) - reserve) / GRANULE_BYTES * GRANULE_BYTES;
+        assert_eq!(bytes, want);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("arena sized at"));
+
+        // The declared kernel state is held outside the arena, so it comes out too.
+        let with_state = arena_host_bytes(
+            ceiling,
+            100 << 20,
+            config::RESERVE_FRACTION,
+            64 << 20,
+            4096,
+            &mut notes,
+        );
+        assert_eq!(with_state, bytes - (64 << 20));
+
+        // And the region is a multiple of the granule 02 e.1 rounds down to.
+        let odd = arena_host_bytes(ceiling + 12345, 0, 0.0, 0, 4096, &mut notes);
+        assert!(
+            odd.is_multiple_of(GRANULE_BYTES),
+            "{odd} is not a whole granule"
+        );
     }
 
     /// A process already over the ceiling leaves the arena nothing, and the controller's own
@@ -660,8 +762,32 @@ mod tests {
     #[test]
     fn an_over_full_process_leaves_the_arena_nothing() {
         let mut notes = Vec::new();
-        let sampler: Arc<dyn Sampler> = Arc::new(Fixed(4 << 30));
-        assert_eq!(arena_host_bytes(1 << 30, &sampler, &mut notes), 0);
+        assert_eq!(
+            arena_host_bytes(
+                1 << 30,
+                4 << 30,
+                config::RESERVE_FRACTION,
+                0,
+                4096,
+                &mut notes
+            ),
+            0
+        );
+    }
+
+    /// The expected kernel state sums the declared per-instance state over the instances that
+    /// will exist, and a stateless kernel contributes nothing (11 f.1).
+    #[test]
+    fn the_expected_kernel_state_counts_instances() {
+        use amoru_kernel::Kernel;
+        use amoru_testkit::FakeKernel;
+
+        let kernels: Vec<Arc<dyn Kernel>> = vec![
+            Arc::new(FakeKernel::new().stateful(2, 8 << 20)),
+            Arc::new(FakeKernel::new()),
+        ];
+        assert_eq!(expected_kernel_state(&kernels), 16 << 20);
+        assert_eq!(expected_kernel_state(&[]), 0);
     }
 
     /// The plan summary is the sum of the splits, and an empty plan is not sub-splittable.

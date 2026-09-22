@@ -64,15 +64,24 @@ impl TopArea {
         self.large_bottom.saturating_sub(self.slab_top)
     }
 
-    /// Claim `slab` bytes from the low end for a size class; `None` when the gap cannot
-    /// serve it (AR-I2).
-    pub(crate) fn claim_slab(&mut self, slab: u64) -> Option<u64> {
-        if self.gap() < slab {
+    /// Claim a slab from the low end for a size class. `want` is the slab size e.1 asks for
+    /// and `unit` the class's slot size: when the gap cannot serve `want` the claim shrinks to
+    /// the largest multiple of `unit` the gap can serve, so a region serves any allocation
+    /// that fits its free space (e.1, f.3). `None` only when not one slot fits (AR-I2).
+    /// Returns the offset and how many bytes were actually claimed.
+    pub(crate) fn claim_slab(&mut self, want: u64, unit: u64) -> Option<(u64, u64)> {
+        // Every slot must be aligned to its class size (AR-I1), and a slab whose size is not a
+        // power of two leaves the bump pointer unaligned for the next class, so the claim
+        // starts at the next multiple of `unit`. At most `unit - 1` bytes are skipped, and
+        // only where two classes with different slab sizes meet.
+        let off = self.slab_top.div_ceil(unit) * unit;
+        let gap = self.large_bottom.saturating_sub(off);
+        let slab = if gap >= want { want } else { gap / unit * unit };
+        if slab == 0 {
             return None;
         }
-        let off = self.slab_top;
-        self.slab_top += slab;
-        Some(off)
+        self.slab_top = off + slab;
+        Some((off, slab))
     }
 
     /// Carve `charged` bytes from the top, reusing a free large block when one fits
@@ -180,11 +189,11 @@ mod tests {
     #[test]
     fn slabs_and_large_meet_in_the_middle() {
         let mut t = TopArea::new(1024 * MIB);
-        assert_eq!(t.claim_slab(512 * MIB), Some(0));
+        assert_eq!(t.claim_slab(512 * MIB, MIB), Some((0, 512 * MIB)));
         assert_eq!(t.gap(), 512 * MIB);
         assert_eq!(t.alloc_large(512 * MIB, 512 * MIB), Some(512 * MIB));
         assert_eq!(t.gap(), 0);
-        assert_eq!(t.claim_slab(512 * MIB), None);
+        assert_eq!(t.claim_slab(512 * MIB, MIB), None);
         assert_eq!(t.alloc_large(MIB, MIB), None);
     }
 
@@ -192,7 +201,7 @@ mod tests {
     fn an_exhausted_top_serves_nothing() {
         let mut t = TopArea::exhausted(256 * MIB);
         assert_eq!(t.gap(), 0);
-        assert_eq!(t.claim_slab(1), None);
+        assert_eq!(t.claim_slab(1, 1), None);
         assert_eq!(t.alloc_large(1, 1), None);
     }
 

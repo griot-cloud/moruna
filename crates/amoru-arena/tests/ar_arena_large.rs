@@ -196,3 +196,101 @@ fn ar_t11_flat_footprint() {
         "the region never grows"
     );
 }
+
+// AR-T13 region_serves_its_free_space (02 k): a 1.5 GiB region takes a mixed workload across
+// many classes and the large path until an allocation genuinely cannot fit. e.1, f.3, AR-I2.
+//
+// The defect this closes: with a fixed 512 MiB slab, a 1.34 GiB region could give a slab to
+// two classes and then refused an 80,000 byte allocation with 64 MiB in use and a gigabyte of
+// the region free.
+
+#[test]
+fn ar_t13_region_serves_its_free_space() {
+    let _big = common::big_region_gate();
+    let region = 1536u64 << 20;
+    let arena = common::host_arena(region);
+    assert_eq!(arena.region_bytes(Tier::Host), region);
+
+    // The shape of the defect, first and on its own: a handful of classes in use and a small
+    // request that must not be refused.
+    let mut seed: Vec<Buffer> = Vec::new();
+    for bytes in [4 << 20usize, 16 << 20, 64 << 20] {
+        seed.push(arena.alloc(bytes, Tier::Host).expect("a seeded class"));
+    }
+    let small = arena
+        .alloc(80_000, Tier::Host)
+        .expect("80,000 bytes in a 1.5 GiB region with 84 MiB in use");
+    assert_eq!(small.len(), 80_000);
+    drop(small);
+
+    // Then the mixed workload, until the free space is genuinely gone.
+    let mut rng = common::Rng::new(0x5EED);
+    let mut live: Vec<Buffer> = std::mem::take(&mut seed);
+    let sizes = [
+        1usize << 10,
+        80_000,
+        1 << 20,
+        8 << 20,
+        64 << 20,
+        200 << 20,
+        (512 << 20) + 1,
+    ];
+    let mut refusals = 0u32;
+    for step in 0..4_000u32 {
+        let bytes = sizes[(rng.next() % sizes.len() as u64) as usize];
+        match arena.alloc(bytes, Tier::Host) {
+            Ok(b) => live.push(b),
+            Err(_) => {
+                refusals += 1;
+                // Every refusal is honest: the region cannot serve a request this size.
+                let largest = arena.largest_free(Tier::Host);
+                assert!(
+                    largest < bytes as u64,
+                    "step {step}: {bytes} bytes refused while {largest} bytes were servable \
+                     (AR-I2, e.1)"
+                );
+                // And the region really is used up, not sitting on most of itself: this is
+                // the defect, which refused 80,000 bytes in a 1.34 GiB region with 64 MiB in
+                // use.
+                let committed = arena.stats().host_in_use + arena.arena_stats().stranded_bytes;
+                assert!(
+                    committed > region / 2,
+                    "step {step}: {bytes} bytes refused with only {committed} of {region} \
+                     bytes committed (e.1)"
+                );
+                // And the bytes are accounted for: what is in use plus what the class free
+                // lists hold plus what is still free never exceeds the region.
+                let stats = arena.arena_stats();
+                let in_use = arena.stats().host_in_use;
+                assert!(
+                    in_use + stats.stranded_bytes <= region,
+                    "step {step}: {in_use} in use and {} stranded in a {region} byte region",
+                    stats.stranded_bytes
+                );
+                if live.is_empty() {
+                    break;
+                }
+                let at = (rng.next() % live.len() as u64) as usize;
+                live.swap_remove(at);
+            }
+        }
+    }
+    assert!(
+        refusals > 0,
+        "the workload must reach the end of the region for this test to mean anything"
+    );
+    let high_water = arena.stats().host_in_use;
+    assert!(
+        high_water > region / 2,
+        "the region served only {high_water} of its {region} bytes before refusing (e.1)"
+    );
+
+    // Everything back, and the region serves the same workload again.
+    drop(live);
+    assert_eq!(arena.stats().host_in_use, 0);
+    assert_eq!(arena.arena_stats().double_release, 0);
+    let again = arena
+        .alloc(80_000, Tier::Host)
+        .expect("the region serves again once its buffers are back");
+    assert_eq!(again.len(), 80_000);
+}
