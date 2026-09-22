@@ -188,6 +188,7 @@ fn drive(
         baseline_bytes,
         config::RESERVE_FRACTION,
         expected_kernel_state(&kernels),
+        expected_out_of_arena_amplification(&kernels),
         limits.page_bytes,
         &mut notes,
     );
@@ -565,34 +566,114 @@ fn gil_states(
 
 /// `ArenaConfig::host_bytes` (12 f.1, 02 f.1, 11 f.1).
 ///
-/// The arena's capacity is `ceiling - baseline - reserve - expected kernel state`, rounded
-/// down to a multiple of `max(page_bytes, 64 KiB)` as 02 e.1 requires of the region. The
-/// baseline is the process's anonymous memory *before* the arena exists, because 02 f.1
-/// touches every page of the region at `new`. The same number is the controller's whole
-/// allowance (`ControllerConfig::arena_bytes`), so the bytes the controller believes it may
-/// hold are the bytes the arena can actually give it, and nothing is subtracted twice.
+/// The *allowance* is `ceiling - baseline - reserve - expected kernel state`: the bytes the run
+/// may hold at all. The arena takes a share of it and leaves the rest as anonymous headroom for
+/// what the chain allocates outside the arena, because the controller has two inequalities to
+/// satisfy and only one of them is about the arena (11 b). An arena sized at the whole allowance
+/// leaves `budget.reserve_fraction` as the entire governed headroom for out-of-arena bytes at
+/// every budget, shared with the runtime's own reader and writer buffers, and that is why an
+/// ordinary Python job was refused below about 2 GiB: not because the budget did not fit, but
+/// because it was spent on an arena the job did not need that large (measured 2026-09-23).
+///
+/// The share follows from the two inequalities. Per byte in flight the arena needs
+/// `ARENA_INFLIGHT_COST` bytes and the process needs `a_anon` bytes outside it, so equalising
+/// the slack in both gives the arena `ARENA_INFLIGHT_COST / (ARENA_INFLIGHT_COST + a_anon)` of
+/// the allowance. A chain that declares `expected_amplification = 0.0` throughout says it
+/// allocates nothing outside the arena and gets the whole allowance, which is what this function
+/// did for every chain before. `ARENA_FLOOR_BYTES` keeps a tiny budget's arena workable, and
+/// never raises it above the allowance, so a budget with no room still reaches the controller's
+/// own refusal rather than being handed an arena that does not exist.
+///
+/// The baseline is the process's anonymous memory *before* the arena exists, because 02 f.1
+/// touches every page of the region at `new`. The arena figure is also the controller's whole
+/// arena allowance (`ControllerConfig::arena_bytes`), so the bytes the controller believes it
+/// may hold are the bytes the arena can actually give it, and nothing is subtracted twice.
 fn arena_host_bytes(
     ceiling: u64,
     baseline: u64,
     reserve_fraction: f32,
     kernel_state: u64,
+    out_of_arena_amplification: f64,
     page_bytes: usize,
     notes: &mut Vec<String>,
 ) -> u64 {
     let reserve = (ceiling as f64 * f64::from(reserve_fraction)) as u64;
     let granule = (page_bytes as u64).max(GRANULE_BYTES);
-    let arena = ceiling
+    let allowance = ceiling
         .saturating_sub(baseline)
         .saturating_sub(reserve)
-        .saturating_sub(kernel_state)
-        / granule
-        * granule;
+        .saturating_sub(kernel_state);
+    // A negative or non-finite declaration is a kernel saying nothing useful, not a licence to
+    // size the arena over the allowance.
+    let a_anon = if out_of_arena_amplification.is_finite() {
+        out_of_arena_amplification.max(0.0)
+    } else {
+        DEFAULT_OUT_OF_ARENA_AMPLIFICATION
+    };
+    let share = ARENA_INFLIGHT_COST / (ARENA_INFLIGHT_COST + a_anon);
+    let arena = (allowance as f64 * share) as u64;
+    let arena = arena.max(ARENA_FLOOR_BYTES.min(allowance)) / granule * granule;
+    let headroom = ceiling.saturating_sub(baseline).saturating_sub(arena);
     notes.push(format!(
-        "arena sized at {arena} bytes: the ceiling {ceiling} less the {baseline} bytes the \
-         process held before the arena existed, the {reserve} byte reserve and the \
-         {kernel_state} bytes the stateful kernels declare"
+        "arena sized at {arena} bytes: {share:.2} of the {allowance} byte allowance, which is \
+         the ceiling {ceiling} less the {baseline} bytes the process held before the arena \
+         existed, the {reserve} byte reserve and the {kernel_state} bytes the stateful kernels \
+         declare; the share is set by the {a_anon:.2} bytes the chain is expected to allocate \
+         outside the arena per byte in flight, and {headroom} bytes are left above the arena for \
+         it"
     ));
     arena
+}
+
+/// The arena's own cost per byte in flight. RC f.3 divides the arena in half, one half for what
+/// the workers hold and one for the queues and the read-ahead behind them, so a byte in flight
+/// costs the arena two.
+const ARENA_INFLIGHT_COST: f64 = 2.0;
+
+/// The out-of-arena amplification assumed for a kernel that declares none: the same figure the
+/// controller seeds `a_anon` with before its probe speaks (11 f.3), so the arena is sized against
+/// the cost the controller is about to assume rather than against zero.
+const DEFAULT_OUT_OF_ARENA_AMPLIFICATION: f64 = 4.0;
+
+/// The smallest arena the facade hands out, so a small budget gets a working region rather than a
+/// share of almost nothing. It is the largest single allocation a default pipeline makes: the
+/// Parquet sink's output buffer, which asks for `sink.row_group_bytes` plus a megabyte of footer
+/// headroom and will not go below `row_group_bytes` (08 f.1), so at the default 128 MiB row group
+/// it asks for 129 MiB, and 02 e.1's size classes are powers of two, so it costs 256 MiB of
+/// region. An arena below that cannot open a sink at defaults whatever the budget, which is why
+/// the floor is this figure rather than a few morsels.
+///
+/// A class that size has to be free all at once, so the floor is that class plus what the arena
+/// already holds when the sink opens its buffer, which early in a run is the read-ahead:
+/// `256 MiB + readahead.splits x morsel.probe_bytes`. Measured at a 512 MiB ceiling, the example
+/// runs with 272 MiB and the Python job of `python/tests/test_budget.py` does not, because its
+/// queues hold 18.5 MiB at the moment the sink opens and 256 MiB was then not free.
+///
+/// It is capped by the allowance, so a budget too small for it gets its whole allowance and
+/// nothing is conjured. Lowering it is a change in `amoru-sinks` and not here: one megabyte of
+/// footer headroom on a power-of-two row group is what crosses the class boundary, and a sink
+/// that asked for the class it can use would need 128 MiB and halve this floor.
+const ARENA_FLOOR_BYTES: u64 =
+    (256 << 20) + config::READAHEAD_SPLITS as u64 * config::MORSEL_PROBE_BYTES;
+
+/// The chain's expected out-of-arena cost per byte in flight (12 f.1): the largest
+/// `KernelHints::expected_amplification` any stage declares, counting a stage that declares
+/// nothing as `DEFAULT_OUT_OF_ARENA_AMPLIFICATION`. The largest rather than the sum, because the
+/// anonymous inequality's `share` is `active_workers / stages`, so what it sums to over a chain
+/// of equal stages is one stage's cost; the largest is the conservative reading of that.
+///
+/// A chain with no kernels at all is a copy, whose out-of-arena bytes are the runtime's own
+/// buffers and belong to the reserve, so it declares nothing and keeps the whole allowance.
+fn expected_out_of_arena_amplification(kernels: &[Arc<dyn amoru_kernel::Kernel>]) -> f64 {
+    kernels
+        .iter()
+        .map(|kernel| {
+            kernel
+                .hints()
+                .expected_amplification
+                .unwrap_or(DEFAULT_OUT_OF_ARENA_AMPLIFICATION)
+        })
+        .fold(0.0, f64::max)
 }
 
 /// The smallest region granularity 02 e.1 rounds the arena down to.
@@ -718,8 +799,9 @@ mod tests {
         assert!(notes[0].contains("profiles.dir"));
     }
 
-    /// The arena takes the whole room left under the ceiling, and says so. Nothing is halved:
-    /// this is the controller's allowance as well (12 f.1, 11 f.1).
+    /// A chain that declares it allocates nothing outside the arena takes the whole room left
+    /// under the ceiling, and says so. Nothing is halved: this is the controller's allowance as
+    /// well (12 f.1, 11 f.1).
     #[test]
     fn the_arena_is_sized_from_what_is_left() {
         let mut notes = Vec::new();
@@ -730,6 +812,7 @@ mod tests {
             100 << 20,
             config::RESERVE_FRACTION,
             0,
+            0.0,
             4096,
             &mut notes,
         );
@@ -744,17 +827,217 @@ mod tests {
             100 << 20,
             config::RESERVE_FRACTION,
             64 << 20,
+            0.0,
             4096,
             &mut notes,
         );
         assert_eq!(with_state, bytes - (64 << 20));
 
         // And the region is a multiple of the granule 02 e.1 rounds down to.
-        let odd = arena_host_bytes(ceiling + 12345, 0, 0.0, 0, 4096, &mut notes);
+        let odd = arena_host_bytes(ceiling + 12345, 0, 0.0, 0, 0.0, 4096, &mut notes);
         assert!(
             odd.is_multiple_of(GRANULE_BYTES),
             "{odd} is not a whole granule"
         );
+    }
+
+    /// 12 f.1: the arena's share of the allowance falls as the chain's declared out-of-arena cost
+    /// rises, and the bytes it gives up become anonymous headroom for the chain. The defect this
+    /// replaces gave the arena the whole allowance at every budget, which left
+    /// `budget.reserve_fraction` as the only governed headroom for out-of-arena bytes and refused
+    /// an ordinary Python job below about 2 GiB (measured 2026-09-23).
+    #[test]
+    fn the_arena_share_falls_as_the_chain_costs_more_outside_it() {
+        let mut notes = Vec::new();
+        // A ceiling large enough that the share governs rather than `ARENA_FLOOR_BYTES`.
+        let ceiling = 4u64 << 30;
+        let baseline = 48u64 << 20;
+        let sized = |a_anon: f64| {
+            arena_host_bytes(
+                ceiling,
+                baseline,
+                config::RESERVE_FRACTION,
+                0,
+                a_anon,
+                4096,
+                &mut Vec::new(),
+            )
+        };
+
+        let none = sized(0.0);
+        let declared = sized(4.5);
+        let greedy = sized(12.0);
+        assert!(
+            none > declared && declared > greedy,
+            "shares do not fall: {none} then {declared} then {greedy}"
+        );
+
+        // The share is the ratio the two inequalities give, not a guess: at the measured 4.5 the
+        // arena takes 2 / 6.5 of the allowance.
+        let reserve = (ceiling as f64 * config::RESERVE_FRACTION as f64) as u64;
+        let allowance = ceiling - baseline - reserve;
+        let want = ((allowance as f64 * (2.0 / 6.5)) as u64) / GRANULE_BYTES * GRANULE_BYTES;
+        assert_eq!(declared, want);
+
+        // And what the arena gives up is headroom the process can use: at 4.5 the run has more
+        // than four times the reserve above the arena, where before it had exactly the reserve
+        // plus the declared state at every budget there is.
+        let headroom = ceiling - baseline - declared;
+        assert!(
+            headroom > 4 * reserve,
+            "headroom {headroom} is not the point of the change (reserve {reserve})"
+        );
+
+        // A kernel that declares nonsense is a kernel that declared nothing.
+        assert_eq!(sized(f64::NAN), sized(DEFAULT_OUT_OF_ARENA_AMPLIFICATION));
+        assert_eq!(sized(-1.0), sized(0.0));
+
+        // One note per call, naming both the share and the headroom, so a run report says what
+        // the arena was sized from.
+        let _ = arena_host_bytes(
+            ceiling,
+            baseline,
+            config::RESERVE_FRACTION,
+            0,
+            4.5,
+            4096,
+            &mut notes,
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("outside the arena per byte in flight"),
+            "{}",
+            notes[0]
+        );
+    }
+
+    /// 12 f.1: a budget too small for a share of the allowance to be a working arena still gets
+    /// `ARENA_FLOOR_BYTES`, and a budget with nothing left still gets nothing, so the controller's
+    /// own refusal is what reports it (11 f.1).
+    #[test]
+    fn a_tiny_budget_still_gets_a_working_arena() {
+        let mut notes = Vec::new();
+        // 64 MiB with a 40 MiB baseline: the floor is larger than the whole allowance, so the
+        // arena takes all of it rather than being handed bytes that are not there.
+        let allowance = |ceiling: u64, baseline: u64| {
+            ceiling - baseline - (ceiling as f64 * config::RESERVE_FRACTION as f64) as u64
+        };
+        let tiny = arena_host_bytes(
+            64 << 20,
+            40 << 20,
+            config::RESERVE_FRACTION,
+            0,
+            DEFAULT_OUT_OF_ARENA_AMPLIFICATION,
+            4096,
+            &mut notes,
+        );
+        assert_eq!(
+            tiny,
+            allowance(64 << 20, 40 << 20) / GRANULE_BYTES * GRANULE_BYTES
+        );
+        assert!(
+            tiny > config::MORSEL_MIN_BYTES * 2,
+            "below the controller's refusal line"
+        );
+
+        // A 512 MiB ceiling: a third of the allowance is under the floor, so the floor stands,
+        // and it is the 256 MiB the Parquet sink's default buffer costs the arena.
+        let at_512 = arena_host_bytes(
+            512 << 20,
+            48 << 20,
+            config::RESERVE_FRACTION,
+            0,
+            DEFAULT_OUT_OF_ARENA_AMPLIFICATION,
+            4096,
+            &mut notes,
+        );
+        assert_eq!(at_512, ARENA_FLOOR_BYTES);
+
+        // A large enough budget is governed by the share rather than the floor.
+        let at_4g = arena_host_bytes(
+            4 << 30,
+            48 << 20,
+            config::RESERVE_FRACTION,
+            0,
+            DEFAULT_OUT_OF_ARENA_AMPLIFICATION,
+            4096,
+            &mut notes,
+        );
+        assert!(at_4g > ARENA_FLOOR_BYTES, "{at_4g} is still the floor");
+
+        // The floor never conjures bytes the budget does not have.
+        assert_eq!(
+            arena_host_bytes(
+                1 << 30,
+                4 << 30,
+                config::RESERVE_FRACTION,
+                0,
+                DEFAULT_OUT_OF_ARENA_AMPLIFICATION,
+                4096,
+                &mut notes
+            ),
+            0
+        );
+    }
+
+    /// 12 f.1: the chain's declared out-of-arena cost is the largest any stage declares, a stage
+    /// that declares nothing counts as the controller's own seed, and an empty chain declares
+    /// nothing at all.
+    #[test]
+    fn the_chain_declares_its_out_of_arena_cost() {
+        use amoru_kernel::Kernel;
+        use amoru_testkit::FakeKernel;
+
+        assert_eq!(expected_out_of_arena_amplification(&[]), 0.0);
+
+        // A kernel that overrides nothing declares nothing, which is the common case: the
+        // `examples/append_column.rs` kernel a first program is written around is one.
+        struct Silent;
+        impl Kernel for Silent {
+            fn fingerprint(&self) -> amoru_kernel::Fingerprint {
+                amoru_kernel::Fingerprint::compute("amoru::tests::silent", b"v1")
+            }
+            fn kind(&self) -> amoru_kernel::KernelKind {
+                amoru_kernel::KernelKind::Stateless
+            }
+            fn accepts(&self) -> amoru_kernel::PayloadSpec {
+                amoru_kernel::PayloadSpec {
+                    kind: amoru_kernel::PayloadKind::Table,
+                    tier: amoru_kernel::TierPref::Host,
+                }
+            }
+            fn output_schema(
+                &self,
+                input: &amoru_kernel::SourceSchema,
+            ) -> amoru_kernel::Result<amoru_kernel::SourceSchema> {
+                Ok(input.clone())
+            }
+            fn init(
+                &self,
+                _ctx: &amoru_kernel::InitCtx,
+            ) -> amoru_kernel::Result<Box<dyn amoru_kernel::KernelState>> {
+                Ok(Box::new(amoru_kernel::NoState))
+            }
+            fn apply(
+                &self,
+                _state: &mut dyn amoru_kernel::KernelState,
+                input: amoru_kernel::Payload,
+            ) -> amoru_kernel::Result<amoru_kernel::Payload> {
+                Ok(input)
+            }
+        }
+        assert_eq!(Silent.hints().expected_amplification, None);
+        let undeclared: Vec<Arc<dyn Kernel>> = vec![Arc::new(Silent)];
+        assert_eq!(
+            expected_out_of_arena_amplification(&undeclared),
+            DEFAULT_OUT_OF_ARENA_AMPLIFICATION
+        );
+
+        let mixed: Vec<Arc<dyn Kernel>> = vec![
+            Arc::new(FakeKernel::new().amplification(0.5)),
+            Arc::new(FakeKernel::new().amplification(6.0)),
+        ];
+        assert_eq!(expected_out_of_arena_amplification(&mixed), 6.0);
     }
 
     /// A process already over the ceiling leaves the arena nothing, and the controller's own
@@ -768,6 +1051,7 @@ mod tests {
                 4 << 30,
                 config::RESERVE_FRACTION,
                 0,
+                0.0,
                 4096,
                 &mut notes
             ),

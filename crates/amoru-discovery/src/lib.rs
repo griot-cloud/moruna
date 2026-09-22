@@ -155,6 +155,10 @@ fn discover_with(env: &dyn EnvSource, roots: &Roots, input: &DiscoveryInput) -> 
             None
         }
     };
+    // DS-I4: where the platform answers instead of a cgroup, the note says which quantity the
+    // memory figures in the run report are, so a figure measured on a developer's host is not
+    // read as a cgroup's `anon + unevictable` when it is mach's `phys_footprint`.
+    notes.extend(probes::platform_memory_note());
     let (device_list, device_notes) = devices::enumerate();
     notes.extend(device_notes);
     let limits = limits::derive(

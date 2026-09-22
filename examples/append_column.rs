@@ -23,7 +23,10 @@ use parquet::arrow::ArrowWriter;
 
 /// Rows the example writes and reads back.
 const ROWS: i64 = 200_000;
-/// The budget a user's first program is most likely to give: half a gigabyte.
+/// The budget a user's first program is most likely to give: half a gigabyte. `AMORU_BUDGET`
+/// overrides it, which is how the same program is measured at a second budget without a second
+/// copy of it: the example then leaves `spec.budget` unset and discovery reads the variable
+/// (DS-I1).
 const BUDGET: u64 = 512 << 20;
 
 /// The kernel: it appends a boolean column, which is what a model or a tokeniser does. Its
@@ -149,7 +152,10 @@ fn main() {
     // The whole configuration a first program needs (PY-I3): a budget. Everything else is the
     // preamble's default, including `sink.file_bytes` at 1 GiB, which is larger than this
     // budget and must not stop the run (08 f.1).
-    spec.budget = Some(BUDGET);
+    spec.budget = match std::env::var_os("AMORU_BUDGET") {
+        Some(_) => None,
+        None => Some(BUDGET),
+    };
     spec.staging_dir = Some(dir.join("staging"));
     spec.profiles_dir = Some(dir.join("profiles"));
     std::fs::create_dir_all(dir.join("staging")).expect("the staging directory");
