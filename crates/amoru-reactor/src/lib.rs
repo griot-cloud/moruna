@@ -46,8 +46,8 @@ use crate::file_blocking::{BlockingEngine, FileEngine};
 use crate::object::{ObjectBackend, ObjectLayer};
 use crate::paths::Paths;
 use crate::runtime::{
-    CopyOp, Inner, MetaOp, Queues, ReadFileOp, ReadFileOptOp, ReadObjectOp, WriteFileOp,
-    WriteObjectOp,
+    AbortMultipartOp, CopyOp, DeleteObjectOp, Inner, MetaOp, Queues, ReadFileOp, ReadFileOptOp,
+    ReadObjectOp, WriteFileOp, WriteObjectOp,
 };
 use crate::segments::{SegmentEntry, Segments};
 use crate::stats::Counters;
@@ -221,15 +221,7 @@ impl Reactor {
         if hooks.force_uring {
             paths.uring.on = cfg.profile.io_uring.is_available();
         }
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cfg.threads.max(1))
-            .thread_name("amoru-reactor")
-            .enable_all()
-            .build()
-            .map_err(|e| AmoruError::Config {
-                name: "reactor.threads",
-                msg: e.to_string(),
-            })?;
+        let rt = start_runtime(cfg.threads, None)?;
         let handle = rt.handle().clone();
 
         let blocking: Arc<dyn FileEngine> = Arc::new(BlockingEngine::new(handle.clone()));
@@ -295,6 +287,53 @@ impl Reactor {
     fn queues(&self) -> std::sync::RwLockReadGuard<'_, Option<Queues>> {
         self.queues.read().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// The reactor's tokio runtime, and the one place a thread is asked for at start.
+///
+/// A host that will not give the process a thread (the `ulimit -u` of a loaded build machine,
+/// a cgroup's pid limit) is reported as `Io`, so the runtime diagnoses the failure rather than
+/// being signalled by it (G-I8) and the caller of `Reactor::new` sees an error.
+///
+/// `tokio` does not return that failure: its multi-threaded builder panics with "OS can't spawn
+/// worker thread" from inside `build`, and a panic on the caller's thread is exactly what G-I8
+/// forbids, so it is caught here, at the one place this component asks for a thread, and turned
+/// into the error. `stack_bytes` exists so a test can make the first thread refuse to start;
+/// nothing else sets it.
+fn start_runtime(threads: usize, stack_bytes: Option<usize>) -> Result<tokio::runtime::Runtime> {
+    let threads = threads.max(1);
+    let built = std::panic::catch_unwind(move || {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(threads)
+            .thread_name("amoru-reactor")
+            .enable_all();
+        if let Some(bytes) = stack_bytes {
+            builder.thread_stack_size(bytes);
+        }
+        builder.build()
+    });
+    let failure = match built {
+        Ok(Ok(rt)) => return Ok(rt),
+        Ok(Err(e)) => e.to_string(),
+        Err(panic) => panic_message(panic.as_ref()),
+    };
+    Err(AmoruError::Io {
+        op: "reactor_start",
+        target: format!("{threads} reactor threads"),
+        msg: failure,
+    })
+}
+
+/// What a caught panic was about, for the message of the error it becomes.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = panic.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "the runtime could not be built".to_string()
 }
 
 /// The io_uring row of e.2: selected when the profile allows it and this build has it; a
@@ -494,6 +533,31 @@ impl amoru_kernel::Reactor for Reactor {
             WriteObjectOp {
                 url: url.to_string(),
                 src,
+                tx,
+            },
+        );
+        completion
+    }
+
+    fn delete_object(&self, url: &str) -> Completion<()> {
+        let (tx, completion) = Completion::channel();
+        self.send(
+            |q| &q.delete_object,
+            DeleteObjectOp {
+                url: url.to_string(),
+                tx,
+            },
+        );
+        completion
+    }
+
+    fn abort_multipart(&self, url: &str, upload_id: &str) -> Completion<()> {
+        let (tx, completion) = Completion::channel();
+        self.send(
+            |q| &q.abort_multipart,
+            AbortMultipartOp {
+                url: url.to_string(),
+                upload_id: upload_id.to_string(),
                 tx,
             },
         );

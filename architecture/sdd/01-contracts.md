@@ -649,6 +649,16 @@ pub trait Reactor: Send + Sync {
     /// closes the descriptor so an unlinked file's space is actually released.
     fn register_segment(&self, segment: u32, path: &std::path::Path) -> Result<()>;
     fn unregister_segment(&self, segment: u32);
+    /// Remove an object or a local file. Resume needs it: a sink that is resumed must
+    /// discard output above `committed_seq`, which means deleting the files it wrote
+    /// and did not commit, and without this the resume path was complete only for a
+    /// local prefix, where `std::fs` could be used directly (E10, component 8, decided
+    /// by the PM 2026-09-22). Deleting what is not there is `Ok(())`, because a resume
+    /// that runs twice must not fail the second time.
+    fn delete_object(&self, url: &str) -> Completion<()>;
+    /// Abandon an in-flight multipart upload so its parts are not billed forever. Same
+    /// reason: a killed run leaves them, and only the reactor knows the upload id.
+    fn abort_multipart(&self, url: &str, upload_id: &str) -> Completion<()>;
     /// Which direct paths this reactor selected at start (for the run report).
     fn paths(&self) -> IoPaths;
     /// Cancel what can be cancelled; every outstanding completion resolves within the
@@ -1029,7 +1039,7 @@ The testkit is built by this component's agent in wave 0 (preamble 6.4) because 
 | Fake | Implements | Knobs (builder methods) | Observables |
 |---|---|---|---|
 | `FakeAllocator` | `Allocator` | `with_limit(tier, bytes)`, `pinned(bool)`, `page_bytes(n)`, `fail_next(n)` | `allocations_total`, `in_use(tier)`, `payload_copies()` and `boundary_copies()` (what `note_payload_copy` and `note_boundary_copy` were told, added 2026-09-22: `stats()` reported a hardcoded zero and the counters had no observable, so no test could prove the one decode copy G-I2 allows), `AllocStats`; buffers are real heap allocations tagged with the requested tier so `Payload::table` tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work |
-| `FakeReactor` | `Reactor` | `with_latency(Duration)`, `fail_next(op: OpKind, n)`, `cancel_on_shutdown(bool)`, in-memory files keyed by path (`read_file`/`write_file` copy to and from a `Vec<u8>` per path) | `ops() -> Vec<OpRecord { kind, path_or_url, offset, len, src_tier, dst_tier, t_submit, t_resolve }>`, `in_flight()`, `shutdown_calls`, `paths()` returns whatever `with_paths(IoPaths)` set |
+| `FakeReactor` | `Reactor` | `with_latency(Duration)`, `fail_next(op: OpKind, n)`, `cancel_on_shutdown(bool)`, in-memory files keyed by path (`read_file`/`write_file` copy to and from a `Vec<u8>` per path) | `ops() -> Vec<OpRecord { kind, path_or_url, offset, len, src_tier, dst_tier, t_submit, t_resolve }>`, `in_flight()`, `shutdown_calls`, `paths()` returns whatever `with_paths(IoPaths)` set, `file(path)` and `object(url)` return the bytes the fake holds (the object side added 2026-09-22, so a sink's writes can be read back). The fake holds files in memory, so a component whose commit is an `fsync` and a rename through `std::fs` cannot observe it here and says so in its own tests |
 | `FakePlacement` | `Placement` | `with_pressure(stage, evict_after_bytes)` (entries beyond the byte count on a stage-0 queue become `Evicted`), `with_delay(Duration)` (a pop of a fresh entry waits, counted as a miss), `with_manifest_store()` (in-memory manifests keyed by path so `checkpoint`/`restore` round-trip across engine instances) | `pushed(stage) -> Vec<Seq>`, `popped(stage)`, `committed()`, `manifests_written()`, `budgets_set() -> Vec<TierBudgets>` (every `set_budgets` argument in call order), `shutdown_calls` |
 | `FakeSource` | `Source` | `splits(n, rows_each, bytes_each)`, `schema(SourceSchema)`, `sub_splittable(bool)`, `repeatable(bool)`, `fail_split(id)` | `reads() -> Vec<(SplitId, Option<RowRange>)>`; deterministic content (row i of split s has value `s * 1_000_000 + i`) |
 | `FakeSink` | `Sink` | `commit_every(n)` (commits in blocks of n sequence numbers, so `committed_seq` advances in steps), `resumable(bool)`, `fail_at(seq)`, `latency(Duration)`, `requires_order(bool)` | `written() -> Vec<Seq>`, `skipped()`, `committed_seq()`, `open_calls`, `resume_calls`, `finish_calls`, `shutdown_calls` |

@@ -220,6 +220,23 @@ Tests use the testkit's `FakeReactor` (contracts d.15: in-memory files keyed by 
 
 ## l. Implementation notes for the agent
 
+Decisions the PM took on 2026-09-22, on the component 8 agent's report, each because the document could not be followed as written:
+
+The run id in a footer (e.2, e.3) has no route through the `Sink` trait, so `ParquetSink` and `ArrowIpcSink` carry an inherent `with_run_id(RunId)`, which is this component's own d.1 and therefore pre-approved; unset, the footer carries the nil id. The facade sets it.
+
+`resume` (f.8) must list a destination and delete what is above the watermark. The reactor had neither, so the contracts gained `delete_object` and `abort_multipart` (contracts d.9) and a sink's constructor takes `Arc<dyn ObjectMetadata>` beside its reactor, whose `list_prefix` is the listing side. Until a sink is built with one, a non-local scheme returns `Resume("cannot list destination")`, which f.8 already calls the honest answer.
+
+`encode_framing` refuses a `base_offset` that is not page-aligned (contracts e.7), so f.2's "the first record's base is the file position after the magic" is unreachable: the magic sits at 0 and the first record's base is the first page boundary. Every later record's base is `round_up(cursor, page)`.
+
+The footer is written with `arrow::ipc::writer::FileWriter` over a template and its block entries rewritten in place, the technique `amoru_kernel::ipc` already uses, because `arrow` does not re-export `flatbuffers` and adding a crate to reach an interface is not a reason the dependency table accepts.
+
+Arrow emits an all-ones validity bitmap of its own for a column with no nulls, which is not arena memory, so `BufferView::of_arrow` refuses it; the sink stages such a buffer in a small arena buffer and counts it as an encode copy only when its address is one of the batch's own buffers, so a genuinely foreign payload buffer is still reported (SI-I4).
+
+A held morsel's `write` future does not resolve until its turn (f.4), because SI-I1 says the arena has the bytes back when it resolves; that also removes the problem that `skip` is synchronous and cannot forward held morsels itself.
+
+SI-T16 says `open` fails "with `Alloc` naming the sink in the message"; `AmoruError::Alloc` has no message field, so the test asserts the variant and the sink logs its name.
+
+
 Files: `src/lib.rs`, `src/parquet_sink.rs` (f.1, e.2, f.5, f.7, f.8; the `std::io::Write` over an arena buffer), `src/ipc_sink.rs` (f.2, e.3; records through `amoru_kernel::ipc::encode_framing`, the footer through `arrow::ipc`'s flatbuffer builders; no encoder of its own), `src/tensor_sink.rs` (f.3, e.4), `src/reorder.rs` (f.4), `src/handle.rs` (`SinkHandle`, f.9), `src/commit.rs` (f.5), `src/checkpoint.rs` (e.5, the shared watermark set of f.7, used by all three file sinks), `src/stats.rs`. No `unsafe`.
 
 Verify before starting: whether the pinned `parquet` version's `ArrowWriter` accepts a caller-supplied `Write` without an internal `Vec` staging of whole pages (it buffers a column chunk's pages before flushing a row group; that buffering is the encoder's and is counted in `encode_bytes`, but it must not hold a second copy of the whole file); whether `AsyncArrowWriter` targeting `object_store` multipart directly would avoid the whole-file buffer (if so, and if it can write from arena memory, use it and record the change in f.1; if it copies through a `Vec`, do not).

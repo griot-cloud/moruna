@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Which of the six operations of 06 b a record is; the key of the once-per-run warns.
+/// Which operation a record is; the key of the once-per-run warns. The six of 06 b, and the
+/// two removal calls contracts d.9 added on 2026-09-22 for a sink's resume.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum OpKind {
     /// `read_file`.
@@ -20,6 +21,10 @@ pub enum OpKind {
     WriteObject,
     /// `copy`.
     Copy,
+    /// `delete_object`.
+    DeleteObject,
+    /// `abort_multipart`.
+    AbortMultipart,
 }
 
 impl OpKind {
@@ -32,6 +37,8 @@ impl OpKind {
             OpKind::ReadObject => "read_object",
             OpKind::WriteObject => "write_object",
             OpKind::Copy => "copy",
+            OpKind::DeleteObject => "delete_object",
+            OpKind::AbortMultipart => "abort_multipart",
         }
     }
 }
@@ -342,6 +349,8 @@ mod tests {
         assert_eq!(OpKind::Copy.as_str(), "copy");
         assert_eq!(OpKind::ReadFileOpt.as_str(), "read_file_opt");
         assert_eq!(OpKind::WriteObject.as_str(), "write_object");
+        assert_eq!(OpKind::DeleteObject.as_str(), "delete_object");
+        assert_eq!(OpKind::AbortMultipart.as_str(), "abort_multipart");
     }
 
     #[test]
