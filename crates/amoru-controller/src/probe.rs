@@ -240,6 +240,11 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             // rows) is held at the floor, so the allowance stays conservative (h).
             let measured = result.peak_delta as f64 / result.bytes_in as f64;
             ctl.a_k = measured.max(MIN_AMPLIFICATION);
+            // The probe runs one morsel on one worker (SC f.9), so a process-wide delta over it
+            // is already the per-in-flight-morsel figure f.3's anon inequality wants, with none
+            // of the concurrency the steady-state fit in 10 f.3 has to divide back out.
+            ctl.a_anon = ctl.a_k;
+            ctl.a_anon_seed = ctl.a_k;
             if hints.uses_device_memory {
                 ctl.a_k_dev = result.dev_peak_delta as f64 / result.bytes_in as f64;
             }

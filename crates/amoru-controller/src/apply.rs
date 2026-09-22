@@ -24,19 +24,21 @@ const STEADY_WINDOW: usize = 20;
 /// costs nothing; in a test it is what turns a mistake in one of the paths that writes a target
 /// into a failure at the write rather than into a breach much later.
 ///
-/// The one set that may fail the inequality is the smallest set there is: every target at the
-/// floor and the queues at zero. That is not a controller that has written something
-/// inconsistent, it is a run whose state no longer leaves room for one morsel per worker, and
-/// f.6's StateGrowth row and f.7's third breach are the two paths that end it.
+/// The one set that may fail either inequality is the smallest set there is: every target at the
+/// floor, and for the arena's half the queues at zero as well. That is not a controller that has
+/// written something inconsistent, it is a run whose kernels no longer leave room for one morsel
+/// per worker, and f.6's StateGrowth row and f.7's termination are the paths that end it.
 pub(crate) fn assert_consistent(state: &ControllerState) {
     debug_assert!(
         {
             let targets: Vec<u64> = state.stages.iter().map(|s| s.target).collect();
-            let smallest = state.high_water == 0
-                && targets.iter().all(|target| *target <= state.cfg.morsel_min);
-            targets.is_empty() || model::fits(state, &targets) || smallest
+            let at_floor = targets.iter().all(|target| *target <= state.cfg.morsel_min);
+            let arena = model::fits_arena(state, &targets) || (at_floor && state.high_water == 0);
+            let anon = model::fits_anon(state, &targets) || at_floor;
+            targets.is_empty() || (arena && anon)
         },
-        "RC-I1: a knob set that does not satisfy the working-set inequality was about to be written"
+        "RC-I1: a knob set that does not satisfy the working-set inequalities was about to be \
+         written"
     );
 }
 

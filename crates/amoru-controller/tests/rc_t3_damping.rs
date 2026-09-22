@@ -135,7 +135,12 @@ fn rc_t3_damping_holds_for_the_rule_sizer() {
     // A stage using almost none of its allowance, which the rule grows into; then one using
     // far more of it than the rule allows, which it halves away from.
     for round in 0..2 {
-        for _ in 0..(damping * 8) {
+        // The growth round runs long enough to fill f.3's anon window (32 records) as well as to
+        // clear the damping several times over: until that window is full the probe's seed
+        // governs `a_anon`, the anon inequality holds the target at the top of its envelope, and
+        // there is nothing for the additive increase to grow into.
+        let records = damping * if round == 0 { 16 } else { 8 };
+        for _ in 0..records {
             let before = morsel_targets(&rig.writes())
                 .last()
                 .map(|(_, bytes)| *bytes)
@@ -147,6 +152,17 @@ fn rc_t3_damping_holds_for_the_rule_sizer() {
             let mark = rig.writes().len();
             rig.controller.tick_once();
             for (_, bytes) in morsel_targets(&rig.writes()[mark..]) {
+                // RC-I3 damps the sizer's adjustments. A target that goes *down* need not be one:
+                // a record that refits `a_anon` upward can leave the anon inequality of f.3
+                // unsatisfied, and RC-I1 restores it at the tick whatever the damping says --
+                // the same exception f.7's breach has, for the same reason. Every downward path
+                // there is is deliberately immediate; only the increase is damped, and that is
+                // what this asserts.
+                if bytes < before {
+                    decreases += 1;
+                    completions_since_write = 0;
+                    continue;
+                }
                 assert!(
                     completions_since_write >= damping,
                     "RC-I3: the rule sizer adjusted after only {completions_since_write} \
@@ -155,8 +171,6 @@ fn rc_t3_damping_holds_for_the_rule_sizer() {
                 completions_since_write = 0;
                 if bytes > before {
                     increases += 1;
-                } else if bytes < before {
-                    decreases += 1;
                 }
             }
         }
