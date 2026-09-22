@@ -4,7 +4,7 @@
 **Status:** DRAFT · 2026-09-22 (revised 2026-09-15 draft: component graph, run lifecycle, lock order, waves, escalation routing, hand-off)
 **Parent:** `architecture/amoru-runtime-design.md` (revision 3), the architecture design; this preamble does not repeat its context or its alternatives, it decides what the architecture left open and fixes what every component shares.
 **Language and repository:** Rust 2024 edition for the runtime, Python 3.13 and 3.14 for the surface, one Cargo workspace at the repository root.
-**Reference hardware:** to be named (escalation E1). Until named, benchmark gates run on the developer's machine and are reported as provisional.
+**Reference hardware:** the Griot bare-metal server in Nairobi (decided 2026-09-22, closing E1). It is where benchmark figures are recorded so that they are comparable between runs; it is not a target the runtime is built for. Every criterion is a ratio measured on whatever host the run is on (S3 against a baseline grid-searched on that host, S4 against that host's discovered quota and device ceiling, S12 against a plain loop on that host, S15 against the same run's own pre-spill throughput), so a different or larger machine moves both sides of every ratio and needs no change to the code, the defaults or the profiles. No GPU host is named: tests needing a device or GPUDirect Storage are skipped and listed by id.
 
 This preamble plus the contracts SDD (`01-contracts.md`) plus one component SDD is the complete brief for an agent building that component. Nothing else in the repository is required reading; the only other text an agent may read is a section of another SDD that its own SDD cites by id (section 9).
 
@@ -494,7 +494,7 @@ Decisions no component agent makes on its own. Each carries the assumption the a
 
 | Id | Item | Assumption until decided | Who decides |
 |---|---|---|---|
-| E1 | Reference hardware. Unnamed; covers every test tagged "(reference host, E1)" in any SDD | the developer's machine; timing results are labelled provisional with the host name, and a provisional result closes a gate only with that name recorded; a test that needs a GPU or GDS is skipped and listed as skipped with its id, never marked passed and never closed provisionally | human decides |
+| E1 | Reference hardware | decided 2026-09-22: the Griot bare-metal server in Nairobi, named in every report it produces (the run report records the host, so no spec sheet is kept here). A test tagged "(reference host, E1)" run elsewhere is labelled provisional with that host's name. No GPU host exists: a test needing a device or GDS is skipped and listed with its id, never marked passed | decided |
 | E2 | Dependencies after wave 0. Adding a crate the section 6.2 table lacks; bumping a pinned version | stay on the pinned versions; a crate named in the requesting SDD's d.2 may be added to the table by the PM in the same pull request; a version bump is an issue for the human | PM decides an addition named in a d.2; human decides a version bump |
 | E3 | Ordering default. Parent Q2 | unordered; `ordering.required` is opt-in per sink | human decides |
 | E4 | Error policy default. Parent Q3 | `terminate` | human decides |
