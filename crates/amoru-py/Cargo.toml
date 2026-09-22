@@ -8,20 +8,41 @@ repository.workspace = true
 publish.workspace = true
 description = "Amoru Python module"
 
+[lib]
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+amoru-kernel = { workspace = true }
+arrow = { workspace = true }
 amoru-runtime = { workspace = true }
+amoru-discovery = { workspace = true }
+amoru-sources = { workspace = true }
+amoru-sinks = { workspace = true }
+amoru-trace = { workspace = true }
+amoru-reactor = { workspace = true }
+amoru-placement = { workspace = true }
+amoru-adapters = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+parquet = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-arrow = { workspace = true, optional = true }
 
 [features]
 default = []
-# Preamble 6.3: `amoru-py` enables `python` and, on Linux, `uring`. The stub
-# keeps both off by default so `cargo build --workspace` does not build pyo3
-# (the wave 0 brief); the maturin build of wave 5 turns them on.
-python = ["dep:pyo3", "dep:pyo3-arrow", "amoru-runtime/python"]
+# Preamble 6.3: `amoru-py` enables `python` and, on Linux, `uring`. The crate's
+# Rust half (argument translation, clamping, the sink equals source rule) builds
+# and is tested without an interpreter; `python` adds the module itself.
+python = [
+  "dep:pyo3",
+  "dep:pyo3-arrow",
+  "dep:amoru-adapters",
+  "amoru-adapters/python",
+  "amoru-runtime/python",
+  "amoru-sources/python",
+]
 uring = ["amoru-runtime/uring"]
 cuda = ["amoru-runtime/cuda"]

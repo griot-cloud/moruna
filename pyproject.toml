@@ -1,0 +1,50 @@
+# The wheel build for component 12 (12 e.3, l). `python-source = "python"` makes
+# `python/amoru` the package and `crates/amoru-py` the extension inside it.
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "amoru"
+description = "A memory-aware runtime for data and tensor pipelines"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.14"
+dependencies = ["pyarrow>=17"]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/griot-cloud/amoru"
+
+[project.optional-dependencies]
+polars = ["polars>=1.0"]
+
+[tool.maturin]
+manifest-path = "crates/amoru-py/Cargo.toml"
+module-name = "amoru._core"
+python-source = "python"
+features = ["amoru-py/python"]
+# PY-I7 and preamble 6.6: CPython 3.14 in both builds, standard and free threaded, on
+# manylinux_2_28 x86_64 and aarch64 and macosx arm64. Six wheels, no abi3: PyO3 cannot use the
+# stable ABI for a free threaded build, so the two builds cannot share one wheel. The 3.13
+# interpreters are not targets.
+python-packages = ["amoru"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+pythonpath = ["python"]
+
+[tool.ruff]
+line-length = 100
+src = ["python"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "PL"]
+
+[tool.ruff.lint.per-file-ignores]
+# `run` and `kernel` have the argument lists d.2 fixes, and they are keyword-only past the
+# first three; `polars` imports polars inside the function so `import amoru` does not need it.
+"python/amoru/__init__.py" = ["PLR0913", "PLC0415"]
+# A test asserts against the numbers the design fixes (32 hexadecimal characters of a run id,
+# 40 lines of the report layout); naming each one a constant hides what is being asserted.
+"python/tests/*" = ["PLR2004"]
