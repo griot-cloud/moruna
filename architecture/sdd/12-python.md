@@ -47,7 +47,7 @@ It refuses to know: anything a component owns. If logic appears here that is not
 
 **PY-I6. Cancellation is honoured.** `KeyboardInterrupt` during `run` sets the cancel token, waits for the runtime's cancellation sequence (preamble 4.3) on the runtime thread, and re-raises as `amoru.Cancelled` with the partial report attached. The Python main thread is the only thread that ever sees the signal (f.5).
 
-**PY-I7. Wheels are version-specific and thread-safe.** The module is built with `gil_used = false`, for CPython 3.13, 3.13t, 3.14, 3.14t, on `manylinux_2_28` x86_64 and aarch64 and `macosx` arm64 (twelve wheels: four interpreters × three platforms); no abi3. Every `#[pyclass]` is `frozen`, so no Python-visible object has interior mutability the free-threaded interpreter would have to guard.
+**PY-I7. Wheels are build-specific and thread-safe.** The module is built with `gil_used = false`, for CPython 3.14 in both builds, standard and free-threaded, on `manylinux_2_28` x86_64 and aarch64 and `macosx` arm64 (six wheels: two builds by three platforms); no abi3, which is why the two builds cannot share one wheel. The 3.13 interpreters are not targets (preamble 6.6): 3.13's free-threaded build was experimental, pyarrow ships no wheel for it, and a user could not run this surface there. Adding an interpreter is a release decision at F5.2, taken when someone asks for one. Every `#[pyclass]` is `frozen`, so no Python-visible object has interior mutability the free-threaded interpreter would have to guard.
 
 **PY-I8. Nothing on the Python side allocates or touches payload bytes.** The package never imports `pandas`; it accepts and returns `pyarrow` and DLPack objects through the adapters only.
 
@@ -241,7 +241,7 @@ Python tests run under the four interpreter builds in CI; Rust facade tests use 
 
 **PY-T6 keyboard_interrupt.** Send SIGINT during a 10 s run; `Cancelled` raised within 2 s of the longest kernel; partial report attached; the signal was observed on the main thread and the cancel token set from it (thread-id assertion); a second SIGINT during cancellation is swallowed. PY-I6, f.5.
 
-**PY-T7 wheel_matrix.** CI builds the twelve wheels (four interpreters × three platforms) and imports each; `sys._is_gil_enabled()` is false on the `t` builds after import; every `amoru._core` class is frozen (setting an attribute raises). PY-I7.
+**PY-T7 wheel_matrix.** CI builds the six wheels (two builds by three platforms) and imports each; `sys._is_gil_enabled()` is false on the free-threaded build after import and true on the standard one, and true on the free-threaded build under `PYTHON_GIL=1`; every `amoru._core` class is frozen (setting an attribute raises). PY-I7.
 
 **PY-T8 no_pandas.** `import amoru` does not import pandas (checked via `sys.modules`). PY-I8.
 
