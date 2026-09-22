@@ -155,13 +155,25 @@ jobs:
         # The wave 1 environment names these for component 5 and the bench kernels.
         # Until this step existed the matrix only proved that an interpreter starts,
         # so the Python kernel was tested on a developer laptop and nowhere else
-        # (found by the F1.7 agent, 2026-09-22). Free-threaded wheels exist for both
-        # on 3.13t and 3.14t; if a wheel is missing the job fails, which is the
-        # signal we want rather than a silent skip.
+        # (found by the F1.7 agent, 2026-09-22).
+        #
+        # Wheels only, never a source build: pyarrow publishes no cp313t wheel as of
+        # 2026-09-22, and building it from source pulls libcst, whose own PyO3 refuses
+        # a free-threaded interpreter below 3.14, so the job spent thirteen minutes
+        # compiling before failing. A missing wheel is recorded and the job continues,
+        # because it is a fact about the ecosystem on that day and not a fault in this
+        # repository; the step still fails if an import breaks once a wheel installed.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy pyarrow pytest
-          python -c 'import numpy, pyarrow; print("numpy", numpy.__version__, "pyarrow", pyarrow.__version__)'
+          python -m pip install --only-binary=:all: numpy pytest
+          python -c 'import numpy; print("numpy", numpy.__version__)'
+          if python -m pip install --only-binary=:all: pyarrow; then
+            python -c 'import pyarrow; print("pyarrow", pyarrow.__version__)'
+            echo "AMORU_HAS_PYARROW=1" >> "$GITHUB_ENV"
+          else
+            echo "::notice::no pyarrow wheel for ${{ matrix.python }} on $(date -u +%Y-%m-%d); the pyarrow half of the wave 1 environment is unmet on this interpreter"
+            echo "AMORU_HAS_PYARROW=0" >> "$GITHUB_ENV"
+          fi
       - name: The Python bench kernels and their tests
         run: |
           cd bench/python
