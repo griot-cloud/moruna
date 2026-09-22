@@ -245,7 +245,7 @@ Tests use `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeTrace`, 
 
 **SC-T6 instance_affinity.** `FakeKernel::stateful(4, 0)` on 8 workers; `init_calls == 4` after `init_instances` and before any morsel; no instance used concurrently; workers reacquire their previous instance ≥ 90% of the time under steady load. SC-I6.
 
-**SC-T7 error_policies.** For `Terminate`, `Skip`, `Budget(3)`: `FakeKernel::fail_on([5, 9, 12, 20])`; outcomes match (`Budget(3)` skips 5 and 9 and terminates on 12); the sink's `skipped()` lists each skipped sequence under `Skip`; `FakeKernel::panic_on([7])` produces a `Kernel` error whose message starts with `panic:`, not a pool crash. SC-I8.
+**SC-T7 error_policies.** For `Terminate`, `Skip`, `Budget(3)`: `FakeKernel::fail_on([5, 9, 12, 20])`, which fails the 5th, 9th, 12th and 20th apply (contracts d.15: the fake counts applies, because a kernel never sees a sequence number); the assertions are on the scheduler's own record of which sequence numbers those applies carried, read from the trace, and outcomes match (`Budget(3)` skips 5 and 9 and terminates on 12); the sink's `skipped()` lists exactly the sequence numbers the trace marks `Skipped`, and no others, under `Skip`; `FakeKernel::panic_on([7])` produces a `Kernel` error whose message starts with `panic:`, not a pool crash. SC-I8.
 
 **SC-T8 completion_exact.** Random pipeline sizes and speeds; `run` returns `Ok(Completed)` with every queue empty and the sink's row count equal to the source's (identity). SC-I9.
 
@@ -259,7 +259,7 @@ Tests use `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeTrace`, 
 
 **SC-T13 evicted_replay.** `FakePlacement::with_pressure(0, evict_after_bytes)` so entries past the byte count on Q0 become `Evicted`; the source drive re-reads each (`FakeSource.reads()` shows the origin ranges again) and calls `replace`; the sink's `written()` equals the run without pressure. PL-I6 interplay.
 
-**SC-T14 watermark_and_skips.** `FakeSink::commit_every(10)` (implements `skip`, d.15); `Skip` policy with `FakeKernel::fail_on([7, 23, 24])`; `FakeSink.skipped()` is `[7, 23, 24]`; `FakePlacement.committed()` shows `set_committed` called with exactly the model's watermark (skips do not hold it back) and never with a lower value than before. f.11, f.8.
+**SC-T14 watermark_and_skips.** `FakeSink::commit_every(10)` (implements `skip`, d.15); `Skip` policy with `FakeKernel::fail_on([7, 23, 24])`, the 7th, 23rd and 24th apply; `FakeSink.skipped()` equals, exactly and in order, the three sequence numbers the trace marks `Skipped`; `FakePlacement.committed()` shows `set_committed` called with exactly the model's watermark (skips do not hold it back) and never with a lower value than before. f.11, f.8.
 
 **SC-T15 checkpoint_tick.** With `checkpoint_interval_ms = 50` and `FakeKernel::stateful(2, 0).resume(ResumePolicy::Checkpoint)`: `checkpoint_calls` grows by two per tick, on the checkpoint thread (thread-id assertion: never a worker, never a drive), with no concurrent `apply` on that instance (asserted inside the fake kernel); `FakePlacement::with_manifest_store()` receives, in `manifests_written()`, a cursor that equals the next range the source drive issues; the thread starts only at `run` (no manifest before it) and a manifest is written on termination without any call from the test; a `Checkpoint` kernel returning `Ok(None)` (a test-local `Kernel`) terminates with `Resume`. f.12.
 
