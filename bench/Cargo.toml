@@ -1,0 +1,45 @@
+# The benchmark suite's data generator (preamble 6.5, wave 1 part). Not a
+# library: nothing in the runtime depends on this crate. Every dependency is a
+# crate of the preamble's 6.2 table at the workspace-pinned version.
+[package]
+name = "amoru-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Amoru benchmark data generator (preamble 6.5)"
+
+[lib]
+name = "amoru_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amoru-bench"
+path = "src/main.rs"
+
+[dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+# The S3 backend is a feature of object_store, set here because the generator is
+# the crate that needs it (preamble 6.2: "features per backend").
+object_store = { workspace = true, features = ["aws"] }
+safetensors = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+hostname = { workspace = true }
+
+# The integration tests read the files back with the same readers a user would:
+# the Parquet reader, the safetensors parser and BLAKE3 for the manifest digest.
+[dev-dependencies]
+arrow = { workspace = true }
+blake3 = { workspace = true }
+parquet = { workspace = true }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
