@@ -80,6 +80,21 @@ if [ -f Cargo.toml ]; then
   fi
   step "cargo test"
   quiet test cargo test --workspace
+  # The feature-gated crates are invisible to a default-feature run: amoru-adapters,
+  # amoru-polars and amoru-datafusion compile to nothing without `python`, `polars`
+  # and `datafusion`, so the gate reported them as stubs and their coverage as "not
+  # measured" while they held thousands of lines (found by the component 5 agent,
+  # 2026-09-22). The engine bridges need no interpreter and are always built; the
+  # Python adapter needs an interpreter with pyarrow, so it runs when one is
+  # configured and says so plainly when it is not.
+  step "cargo test --features polars,datafusion (the engine bridges)"
+  quiet test_bridges cargo test -p amoru-polars -p amoru-datafusion --features amoru-polars/polars,amoru-datafusion/datafusion
+  if [ -n "${AMORU_PYTHON:-}" ]; then
+    step "cargo test --features python (interpreter: ${AMORU_PYTHON})"
+    PYO3_PYTHON="$AMORU_PYTHON" quiet test_python cargo test -p amoru-adapters --features python
+  else
+    step "python adapter not measured: set AMORU_PYTHON to a CPython 3.14t with pyarrow"
+  fi
   step "tests: $(grep -hE '^test result:' target/quality/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
   step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
   command -v cargo-llvm-cov >/dev/null 2>&1 \

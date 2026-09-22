@@ -42,7 +42,13 @@ case "${1:---list}" in
     git worktree list --porcelain | awk '/^worktree /{w=$2} /^branch /{print w, $2}' | while read -r w b; do
       [ "$w" = "$(git rev-parse --show-toplevel)" ] && continue
       br="${b#refs/heads/}"
-      if git merge-base --is-ancestor "$br" main 2>/dev/null; then
+      own="$(git rev-list --count "$(git merge-base main "$br")".."$br" 2>/dev/null || echo 0)"
+      if [ "$own" = "0" ]; then
+        # No commits of its own: the branch was cut and nothing has landed on it,
+        # which is "not started", not "merged", however far main has moved since.
+        # An executor is probably working in it right now.
+        echo "kept $w ($br has no commits of its own yet)"
+      elif git merge-base --is-ancestor "$br" main 2>/dev/null; then
         remove "$w" || true
       else
         echo "kept $w ($br is not merged into main)"
