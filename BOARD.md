@@ -111,8 +111,8 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 | F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | todo |
 | F1.4 | Python kernel adapter `amoru-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | todo |
 | F1.5 | Polars and DataFusion bridges `amoru-polars`, `amoru-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | todo |
-| F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | todo |
-| F1.7 | Bench kernels | `infra/bench` (same PR as F1.6) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | todo |
+| F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | merged (PR #4, 2026-09-22; 88 tests, 96.2% coverage) |
+| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | todo |
 | F1.8 | Wave 1 gate and report (PM) | `main` | | todo |
 
 ### F1.1 tasks
@@ -147,9 +147,10 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 - [ ] Both crates depend on `amoru-kernel` plus the host engine only; feature flags per 6.3; coverage; same PR as F1.4 or a follow-up commit on the branch
 
 ### F1.6 tasks
-- [ ] `bench/` generator: every dataset shape 6.5 names, deterministic by seed, to local disk and to MinIO
-- [ ] Output names the machine and the generator version; a `bench/README.md` states how to regenerate
-- [ ] Tests for the generator itself at or above 90% coverage (the bench runner is code too)
+- [x] `bench/` generator: 12 suite datasets and four ad hoc commands, deterministic by seed, local and S3
+- [x] Output names the machine and the generator version; `bench/README.md` documents every dataset, scale and variable
+- [x] 88 tests, 96.2% line coverage
+- [ ] The MinIO half runs in CI: the `minio` job does not export `AMORU_S3_BUCKET`, so the S3 test skips; one line in `.github/workflows/ci.yml`, held by the supply-chain branch until PR #3 merges, then fixed and the skip removed (closes the wave 1 gate clause "and MinIO")
 
 ### F1.7 tasks
 - [ ] Six kernels with their declared amplification classes; `wide-intermediate` in Python releasing the GIL
@@ -481,6 +482,7 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
 | 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | bench E2 route, dataset naming, kernels PR (raised by F1.6) | preamble 6.5 is the bench agent's d.2, so the PM may approve a bench-only crate; the hand-rolled parser and RNG stand rather than churn them; dataset names live in `bench/README.md` as the reference; F1.7 kernels get their own branch and pull request | preamble 6.2 and 6.5, this board |
 | 2026-09-22 | F7.1 notes: introduction pages, host-class pages (raised by F7.1) | introduction pages stay with F7.2 (same audience); the hosting guide keeps a GPU page marked described-not-verified (E1) and omits RDMA (E11, not a v1 host); Pages stays off until Brackly enables it, because publishing outward is outside the delegation | this board, F7.5 and F7.8 tasks |
 | 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |
 | 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `amoru-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |
