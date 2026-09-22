@@ -38,7 +38,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | five running: F0.3 testkit, F1.1 arena, F1.2 discovery, F1.3 trace, F1.7 bench kernels; six more (adapters, reactor, sources, sinks, placement, controller) start when the testkit merges |
+| Next action | six running in parallel: adapters, reactor, sources, sinks, placement, controller. Wave 0 and the wave 1 crates are merged; `main` carries 296 tests with every crate above 90%. Before closing the wave 1 gate the PM runs the weekly `slow` job from the Actions tab, which is what executes DS-T9 and the other container-gated tests |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -52,7 +52,7 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 | F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | merged |
 | F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | merged (PR #1, 2026-09-22) |
 | F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | merged (PR #10, 2026-09-22; 121 tests, 93.6% coverage; four E10 findings resolved first in PR #11) |
-| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | in progress |
+| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | merged 2026-09-22 (122 tests, 91.4%) |
 | F0.4 | Wave 0 gate and wave report (PM) | `main` | pm.md sections 2, 4, 8 | todo |
 
 ### F0.0 tasks
@@ -107,13 +107,13 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | in progress |
-| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | in progress |
-| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | in progress |
+| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | merged 2026-09-22 (94.3%) |
+| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | merged 2026-09-22 (96.4%) |
+| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | merged 2026-09-22 (92.2%) |
 | F1.4 | Python kernel adapter `amoru-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | todo |
 | F1.5 | Polars and DataFusion bridges `amoru-polars`, `amoru-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | todo |
 | F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | merged (PR #4, 2026-09-22; 88 tests, 96.2% coverage) |
-| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | in progress |
+| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | merged 2026-09-22 (96.9%) |
 | F1.8 | Wave 1 gate and report (PM) | `main` | | todo |
 
 ### F1.1 tasks
@@ -486,6 +486,9 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | one pull request per component, amended | a component may land in more than one pull request when an early merge unblocks other executors; the whole-SDD review and the component gate happen on the last one; the contracts crate merges before its testkit so arena, discovery and trace start a session earlier | preamble 6.7, CONTRIBUTING, this board's start ladder |
 | 2026-09-22 | bench E2 route, dataset naming, kernels PR (raised by F1.6) | preamble 6.5 is the bench agent's d.2, so the PM may approve a bench-only crate; the hand-rolled parser and RNG stand rather than churn them; dataset names live in `bench/README.md` as the reference; F1.7 kernels get their own branch and pull request | preamble 6.2 and 6.5, this board |
+| 2026-09-22 | CI cost and pull requests (Brackly) | one workflow, one job, on pushes to main: format, lints, clippy, tests, the kernel boundary, the Python kernels. Coverage leaves CI (the hook enforces it); cargo-deny, the book, MinIO and the container tests move to a weekly `slow` job that also runs on demand; cargo-audit dropped as duplicated; the Python matrix becomes one interpreter, CPython 3.14 free-threaded, with the GIL path under PYTHON_GIL=1. No pull requests: push a branch, report, the PM reviews the diff and merges | `.github/workflows/ci.yml`, preamble 6.6 and 6.7, CONTRIBUTING, pm.md, executor.md, `architecture/agents/report-template.md` |
+| 2026-09-22 | seven arena findings (raised by F1.1) | region rounds DOWN, not up to 512 MiB, which would start the process above its own ceiling; alloc(0) owns no slot; the mmap counting shim is always compiled; `Arena::arena_stats`; cudarc carries a CUDA version feature; `Allocator::note_payload_copy` and `note_boundary_copy` give the copy counters a writer | 02-arena.md, 01-contracts.md d.3, preamble 6.2, root Cargo.toml |
+| 2026-09-22 | twelve discovery and trace findings (raised by F1.2, F1.3) | `StageReport` gains state_bytes_max and state_growth; `RunReport` gains overflow_failed and late_records; `LimitsSummary` defined; TR-I3 says compute; every libc call in probes.rs behind safe wrappers; the macOS fallback named; memory.peak is a floor, not the peak, because it counts page cache; a Present guarantee without its feature and durable_staging without a directory are Config errors; mimalloc recorded as component 4's dev-dependency with its measurement | 03-discovery.md, 04-trace.md, preamble 6.2 |
 | 2026-09-22 | F7.1 notes: introduction pages, host-class pages (raised by F7.1) | introduction pages stay with F7.2 (same audience); the hosting guide keeps a GPU page marked described-not-verified (E1) and omits RDMA (E11, not a v1 host); Pages stays off until Brackly enables it, because publishing outward is outside the delegation | this board, F7.5 and F7.8 tasks |
 | 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |
 | 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `amoru-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |
