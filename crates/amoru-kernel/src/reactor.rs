@@ -100,6 +100,18 @@ pub trait Reactor: Send + Sync {
     /// Close a segment's descriptor.
     fn unregister_segment(&self, segment: u32);
     /// Which direct paths this reactor selected at start (for the run report).
+    /// Remove an object or a local file. A resumed sink must discard the output it
+    /// wrote above `committed_seq`, and without this the resume path was complete only
+    /// for a local prefix where `std::fs` could be used directly. Deleting what is not
+    /// there is `Ok(())`, because a resume that runs twice must not fail the second
+    /// time.
+    fn delete_object(&self, url: &str) -> Completion<()>;
+
+    /// Abandon an in-flight multipart upload, so a killed run does not leave parts
+    /// billed forever; only the reactor knows the upload id.
+    fn abort_multipart(&self, url: &str, upload_id: &str) -> Completion<()>;
+
+    /// Which direct paths this reactor selected at start (for the run report).
     fn paths(&self) -> IoPaths;
     /// Cancel what can be cancelled; every outstanding completion resolves within the
     /// longest single operation's duration (RE-I7). Idempotent.

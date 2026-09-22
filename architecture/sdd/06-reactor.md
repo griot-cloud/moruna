@@ -269,6 +269,17 @@ Tests use the real reactor over `FakeAllocator` buffers (testkit, contracts d.15
 
 ## l. Implementation notes for the agent
 
+Decisions the PM took on 2026-09-22, on the component 6 agent's report:
+
+A staging segment has one direct descriptor (e.4), and e.3 sends a non-page-multiple operation buffered, which an `O_DIRECT` descriptor cannot serve. Both hold: the registry keeps the segment's direct descriptor and opens a second, cached, buffered descriptor for the misaligned tail, dropped with the registration.
+
+`copy` in a build without `cuda` is `Io { op: "copy", msg: "this build has no copy engine (feature cuda)" }`, and with an unpinned arena and no `cuda` there is no bounce buffer at all, so e.2's pinned fallback does not exist and the attempt is a `Staging` error naming it. RE-I8's "segment not registered" is therefore unreachable without `gds`, because f.5 decides the disk endpoint before submission; the order in the document is the other way round and the code follows f.5.
+
+f.3 says "stream the body with bounded chunks in flight" and names `get_range`, which returns the whole range; the implementation uses `get_range` with one counted ingress copy. Section k asks for a test-local `ObjectStore`; that trait is `#[async_trait]` and its `list` returns a `futures` `BoxStream`, and `futures` is in no dependency table, so the reactor reaches `object_store` through a five-call internal seam that the test wrapper implements, and `list_prefix` walks `list_with_delimiter`.
+
+Preamble 6.2 says `Tier::Device` is unconstructible without `cudarc`; the contracts crate makes it a plain variant and `FakeAllocator` hands out device-tagged buffers, so the crate wins and the reactor refuses a device copy explicitly rather than relying on the tier being unconstructible. RE-T7 counts the reactor's own cache and registry rather than `/proc/self/fd`, because the crate's tests share one process.
+
+
 Files: `src/lib.rs`, `src/runtime.rs` (tokio setup, semaphores, submission queues and drain tasks (f.8), shutdown (f.7)), `src/paths.rs` (e.2, f.9), `src/file_uring.rs` (f.1, submission and completion threads), `src/file_blocking.rs` (f.2), `src/fdcache.rs` (per-path descriptors, sticky flags), `src/object.rs` (f.3, f.4, `ObjectStoreConfig` → `object_store` builders for s3, gcs, azure, local), `src/copy.rs` (f.5, cuda streams and events, bounce buffer), `src/gds.rs` (feature; minimal `libcufile` FFI: driver open, handle register, read, write), `src/segments.rs` (e.4 registry), `src/stats.rs`. `unsafe` permitted in `file_uring.rs`, `file_blocking.rs`, `copy.rs`, `gds.rs` with `// SAFETY:` citing RE-I1 (the bytes outlive the operation: the reactor holds the `Buffer` or the `BufferView` until completion).
 
 Do not use `tokio-uring` (it wants its own runtime); do not use `tokio::fs` for payload reads (it copies through a `Vec`). Open files with `O_DIRECT` only when the direct IO path is selected and the path is not sticky-buffered.
