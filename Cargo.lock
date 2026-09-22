@@ -178,12 +178,12 @@ name = "amoru-reactor"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
+ "amoru-testkit",
  "bytes",
  "cudarc",
  "io-uring",
  "libc",
  "object_store",
- "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3011,6 +3011,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "httparse",
  "humantime",
  "hyper",
  "itertools 0.14.0",
@@ -3021,6 +3022,7 @@ dependencies = [
  "rand 0.10.3",
  "reqwest",
  "ring",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
