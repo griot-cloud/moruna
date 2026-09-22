@@ -41,7 +41,7 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 
 ## c. Invariants
 
-**RC-I1. Knobs are consistent before they are written.** Every knob write is preceded by the working-set check; if a proposed set violates it, the controller reduces morsel targets (largest stage first) until it holds, and only then writes. Upholds G-I1.
+**RC-I1. Knobs are consistent before they are written.** Every knob write is preceded by the working-set check; if a proposed set violates it, the controller reduces morsel targets (largest stage first) until it holds, and only then writes. If reducing the targets to `morsel_min` is not enough, the queue high waters follow them down, and the one set that may still fail the inequality is the smallest set there is: every target at the floor and every queue at zero, which is not an inconsistent write but a run f.6's StateGrowth row or f.7's third breach is about to end. The check is also an obligation between writes: the `state` term of f.3 grows under the controller, so a set that fitted when it was written can stop fitting with nothing written at all, and every tick restores it before it decides anything else. Upholds G-I1.
 
 **RC-I2. The sizer never escapes the envelope.** A sizer's proposal is clamped to the envelope; the clamp is counted. The learned sizer is replaced by `RuleSizer` for the rest of the run when, after 20 proposals, more than `1 / sizer.fallback_error_ratio` of its proposals were clamped (the default ratio 2.0 means more than half), or when its rolling prediction-error p95 exceeds `sizer.fallback_error_ratio ×` the shadow rule sizer's (f.8). Upholds D7.
 
@@ -124,7 +124,36 @@ impl Controller {
     /// Resume variant of `probe_all` (f.14): probes only stages without a usable profile, seeds the
     /// rest from the profile store, and writes the profile at once so a second crash keeps it.
     pub fn probe_missing(&self) -> Result<()>;
+
+    // Added by the component 11 executor, 2026-09-22, with the reason for each. None of them
+    // changes a cross-component interface: every one is this crate's own surface (E10 does not
+    // apply), and each exists because a section k test or the phase 8 sizer cannot be written
+    // without it.
+
+    /// Install the factory that builds each stage's `Sizer`, instead of the one `cfg.sizer`
+    /// names. Must be called before `prepare`. `Sizer` is public and `new` takes no sizer, so
+    /// without this seam no sizer but the two this crate ships could ever reach the
+    /// controller: it is how RC-T2's test sizers are installed and how the phase 8 learned
+    /// sizer will be.
+    pub fn set_sizer_factory(&self, factory: SizerFactory);
+    /// Run one tick on the calling thread; the tick thread's body. Public so a test can drive
+    /// the loop deterministically (RC-T8, RC-T9, RC-T17) instead of sleeping on `tick_ms`.
+    pub fn tick_once(&self);
+    /// The summary as it stands, without stopping. `stop` is the end of the run, and a test
+    /// that asserts on the timeline or the notes mid-run needs this.
+    pub fn summary(&self) -> ControllerSummary;
+    /// The longest the controller's mutex has been held, in nanoseconds: the guard timer
+    /// RC-T17 measures RC-I10 with.
+    pub fn max_lock_held_ns(&self) -> u64;
+    /// Whether the mutex is held right now. RC-T17 wraps each fake with this to assert that no
+    /// call into another component happens under the lock.
+    pub fn lock_is_held(&self) -> bool;
 }
+
+/// Builds one `Sizer` per stage; the argument to `set_sizer_factory`.
+pub type SizerFactory = std::sync::Arc<dyn Fn(StageId) -> Box<dyn Sizer> + Send + Sync>;
+/// The lock bound of RC-I10 in milliseconds, so RC-T17 and the run report quote one number.
+pub const TICK_BOUND_MS: u64 = 5;
 
 /// `schema_hash` is `SourceSchema::hash()` (contracts d.4) of the stage's input schema, which the
 /// facade has from the chain validation.
@@ -149,6 +178,10 @@ pub struct Envelope { pub min: u64, pub max: u64 }
 pub struct Proposal { pub morsel_target: u64, pub predicted_peak: Option<u64> /* the peak the sizer expects at that target; None for RuleSizer; feeds f.8 */ }
 pub struct SizerOutcome { pub peak_delta: u64, pub bytes_in: u64, pub wall_ns: u64 }
 pub struct RuleSizer { /* f.4 */ }
+// `RuleSizer::new(target_fraction, increase_step)` and `LearnedSizer::new(..)` take those two
+// configuration values, because f.4's rule is written in terms of them and `Observation` does
+// not carry them; the alternative would break section l's rule that a sizer reads nothing but
+// its `Observation` (executor, 2026-09-22).
 pub struct LearnedSizer { /* stub in v1: returns RuleSizer's proposal with predicted_peak = None; the phase 8 implementation replaces the body without changing the trait */ }
 
 #[derive(Clone, Debug)]
@@ -211,7 +244,7 @@ One bound to keep in view throughout this section: `TraceTail::tail(stage, n)` r
 
 **f.2 Probe (`probe_all`).** For each stage in order: seed `a_k` from the profile if present (p95) else from `hints.expected_amplification` else 4.0; choose the probe size: `probe_bytes`, or `hints.preferred_rows × bytes per row` when `preferred_rows` is set (bytes per row = `plan.total_bytes / plan.total_rows` for stage 1, and `bytes_in / rows_in` of the upstream stage's `ProbeResult` for later stages), clamped to `[morsel_min, morsel_max]`; call `prober.probe(stage, bytes)` (the scheduler runs it with one worker, SC f.9); `a_k = max(peak_delta / bytes_in, 0.5)`; if a profile existed and `|a_k − profile.a_k_p95| / profile.a_k_p95 > 0.5`, note "profile drift" and use the measured value; `a_k_dev` likewise from `dev_peak_delta` when `hints.uses_device_memory`; `safety` from the evidence: with no profile, `safety_initial`; with a profile, `safety = clamp(safety_floor + k × sqrt(a_k_var) / a_k_p50 + c / sqrt(a_k_samples), safety_floor, safety_initial)` with `k = 2` and `c = 4` (so 16 samples add 1.0 to the margin and 40,000 add 0.02), which starts a well-known kernel near the floor and an unseen one at the initial value; drift (above) resets `safety` to `safety_initial` for the run. The margin never goes below `safety_floor`; the guarantee is not relaxed, only the margin shrinks with evidence. `ProbeResult.wall_ns` and `cpu_ns` seed `wall_ewma` and the first Compute/IoRead classification.
 
-**f.3 Working-set equation and initial knobs (`start`).** Let `W = workers_max`, `S` the number of kernel stages. `state(stage) = instances_live × max(hints.state_bytes, profile.state_bytes_max, max(state_bytes over the stage's last 32 records grouped by instance))`, and `state = Σ state(stage)`: the memory instances hold regardless of morsel size; it is subtracted from the budget before anything else and updated at every tick from the trace tail (the `instance` column, contracts d.13, identifies which instance grew). `budget_for_stage = (host_budget − state) / 2 / S`. `share = active_workers / S` (initially `W / S`). For each stage, `allowance = target × a_k × safety`. Solve for one common target `t` such that `Σ_stages share × t × a_k × safety ≤ (host_budget − state) / 2` and, for device stages, `share × t × a_k_dev × safety ≤ device_budget × 0.4`; then clamp per stage: `target(stage) = clamp(t, morsel_min, morsel_max)`. Set `active_workers = min(W, floor(((host_budget − state) / 2) / max_stage_allowance))` (RC-I7). `split_bytes = target[1]` when `plan.sub_splittable_all`, else `max(target[1], plan.max_split_bytes)` (a split that cannot be sub-split arrives whole). Set `read_ahead = 2`, subject to `read_ahead × split_bytes` fitting the working set (b), else lower it to what fits, floor 1. Set `promotion_window = 2`. Set high water per queue and tier from the placement half of the budget divided equally across queues (`Knob::HighWater { stage, tier, bytes }`; the scheduler derives low = high / 2, contracts d.11). Write knobs in the order: high waters, promotion windows, morsel targets, active workers, read-ahead (RC-I1 check before the batch). With zero kernels (`S = 0`, 12 h): skip probes, write `MorselTarget { stage: 0, bytes: min(morsel_max, host_budget / 2) }` (the source drive reads at it, SC f.5), `ActiveWorkers(1)`, `ReadAhead(2)`; `share = W / max(S, 1)` everywhere.
+**f.3 Working-set equation and initial knobs (`start`).** Let `W = workers_max`, `S` the number of kernel stages. `state(stage) = instances_live × max(hints.state_bytes, profile.state_bytes_max, max(state_bytes over the stage's last 32 records grouped by instance))`, and `state = Σ state(stage)`: the memory instances hold regardless of morsel size; it is subtracted from the budget before anything else and updated at every tick from the trace tail (the `instance` column, contracts d.13, identifies which instance grew). `budget_for_stage = (host_budget − state) / 2 / S`. The read-ahead's bytes are spent out of the queue half rather than on top of it (they land in Q0), so the division is `state + (host_budget − state) / 2 for the workers + (host_budget − state) / 2 for the queues and the read-ahead together`, which is what makes b's inequality an accounting of the budget rather than a hope. `share = active_workers / S` (initially `W / S`). For each stage, `allowance = target × a_k × safety`. Solve for one common target `t` such that `Σ_stages share × t × a_k × safety ≤ (host_budget − state) / 2` and, for device stages, `share × t × a_k_dev × safety ≤ device_budget × 0.4`; then clamp per stage: `target(stage) = clamp(t, morsel_min, morsel_max)`. Set `active_workers = min(W, floor(((host_budget − state) / 2) / max_stage_allowance))` (RC-I7). `split_bytes = target[1]` when `plan.sub_splittable_all`, else `max(target[1], plan.max_split_bytes)` (a split that cannot be sub-split arrives whole). Set `read_ahead = 2`, subject to `read_ahead × split_bytes` fitting the working set (b), else lower it to what fits, floor 1. Set `promotion_window = 2`. Set high water per queue and tier from the placement half of the budget divided equally across queues (`Knob::HighWater { stage, tier, bytes }`; the scheduler derives low = high / 2, contracts d.11). Write knobs in the order: high waters, promotion windows, morsel targets, active workers, read-ahead (RC-I1 check before the batch). With zero kernels (`S = 0`, 12 h): skip probes, write `MorselTarget { stage: 0, bytes: min(morsel_max, host_budget / 2) }` (the source drive reads at it, SC f.5), `ActiveWorkers(1)`, `ReadAhead(2)`; `share = W / max(S, 1)` everywhere.
 
 **f.4 `RuleSizer` (per record of stage s).** `observe`: update `peak_ewma` (α = 0.2) of `peak_delta / bytes_in`. `propose`: if `obs.completions_since_adjust < obs.damping` return `obs.target`; let `ratio = peak_ewma × safety × target / allowance_target(stage)` where `allowance_target = target_fraction × envelope.max × a_k × safety` (i.e., how much of the allowed peak the stage is using); if `ratio < 0.85` propose `target × (1 + increase_step)`; if `ratio > 1.0` propose `target / 2` (this is the AIMD; the immediate breach path in RC-I4 is separate and stronger); else propose the current target; `predicted_peak = None`. Also tighten `safety` toward `safety_floor` by 0.02 per accepted increase when the last 20 records' peak ratios have coefficient of variation under 0.15.
 
@@ -236,9 +269,9 @@ The class and tick time are appended to the timeline (compressed: consecutive eq
 
 **f.8 Learned sizer fallback (RC-I2).** `LearnedSizer` proposals are subject to the same clamp; the controller counts clamps per sizer and tracks `prediction_error = |predicted_peak − observed_peak| / observed_peak` per record for the active sizer (from `Proposal.predicted_peak`; a `None` prediction counts as an error of 1.0) and for a shadow `RuleSizer` (whose prediction is `peak_ewma × bytes_in`); after 20 proposals, if `sizer_clamps / sizer_proposals > 1 / fallback_error_ratio`, or if the learned sizer's rolling error p95 exceeds `fallback_error_ratio × RuleSizer`'s, swap to `RuleSizer` for the run, record `fallback_at`, and add a note.
 
-**f.9 Profile write (`stop`).** If the run completed: merge per e.3 and write atomically (temp file + rename). If `profiles_dir` is None or unwritable: skip with a note. When `checkpoint_enabled`, the profile is also written every `checkpoint_interval_ms` from the tick thread after the first 50 records per stage, with the same merge, so a run that dies keeps what it learned; f.14 reads it back.
+**f.9 Profile write (`stop`).** The run completed when the source is exhausted (`SchedulerStats::source_exhausted`, contracts d.11) and the controller did not terminate it; `stop` takes no argument and that is how it knows. A terminated run's figures describe a kernel that did not fit, and storing them would teach the next run the wrong lesson, so they are not stored. If the run completed: merge per e.3 and write atomically (temp file + rename). If `profiles_dir` is None or unwritable: skip with a note. When `checkpoint_enabled`, the profile is also written every `checkpoint_interval_ms` from the tick thread after the first 50 records per stage, with the same merge, so a run that dies keeps what it learned; f.14 reads it back.
 
-**f.10 Tiny dataset fast path.** If `plan.total_bytes < host_budget / 4`: skip probes, set every target to `morsel_max`, `active_workers = W`, `read_ahead = min(plan.splits, 8)`, and add the note "small dataset: no adaptation". (Architecture section 8.)
+**f.10 Tiny dataset fast path.** If `plan.total_bytes < host_budget / 4`: skip probes, set every target to `morsel_max`, `active_workers = W`, `read_ahead = min(plan.splits, 8)`, and add the note "small dataset: no adaptation". (Architecture section 8.) RC-I1 still applies to the knobs this path writes, because `morsel_max x a_k x safety` per worker can exceed the budget even when the whole dataset does not: the in-flight count per stage is `min(share, ceil(total_bytes / target))`, since a dataset of two morsels cannot put one on each of eight workers, and the working-set check runs on the result as it does everywhere else.
 
 **f.11 Device out of memory (architecture 7).** The scheduler retries an `Alloc { tier: Device(d) }` error from `apply` once on the same morsel, after the record hook has run (SC f.8). In that hook, on the first such record for a stage (`outcome == Error`, `error` names `alloc` in a `Device` tier): halve the stage's target (bypassing damping, as f.7 does), write `Knob::HighWater { stage: stage − 1, tier: TierKind::Device, bytes: 0 }` so the engine demotes promoted-but-unconsumed morsels of the input queue back to the host tier, set `device_breaches[stage] = 1`, and add the note "device OOM retry on stage k"; the next tick restores that high water from f.3. On a second such record for the same stage, `knobs.terminate(Budget { seq, stage, footprint: dev_mem_peak, budget: device_budget[d], features })` with the device figures in the diagnostic.
 
