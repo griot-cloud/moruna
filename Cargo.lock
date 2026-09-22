@@ -121,7 +121,6 @@ dependencies = [
  "amoru-kernel",
  "cudarc",
  "libc",
- "thiserror 2.0.20",
  "tracing",
 ]
 

@@ -10,7 +10,6 @@ description = "Amoru resource discovery and host profile"
 
 [dependencies]
 amoru-kernel = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 cudarc = { workspace = true, optional = true }
