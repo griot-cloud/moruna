@@ -140,6 +140,7 @@ name = "amoru-placement"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
+ "amoru-testkit",
  "arrow",
  "base64 0.23.1",
  "blake3",
