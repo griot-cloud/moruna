@@ -28,10 +28,25 @@
 # `polars` and `datafusion` each pull their own `arrow`, and an unfeatured scan
 # would never see the duplicate the bans section below exists to catch.
 all-features = true
-# `targets` is deliberately left empty, which means every target triple. A host
-# list here would be a narrowing of scope that belongs to the PM, not to this
-# file, and the preamble names no supported-target list (see the CC0-1.0 note
-# in the licences section).
+# The platforms Amoru ships, and the only ones the graph is resolved for.
+# Decided by the PM on 2026-09-22 and written into preamble 6.2 as the
+# supported-target set, so this list and that sentence are one decision in two
+# places: a target added to the preamble is added here in the same pull request.
+# Windows is not a v1 target (the runtime reads cgroup v2 and uses O_DIRECT and
+# io_uring). The narrowing is not cosmetic: it is what removes crates that only
+# ever appear on targets Amoru does not build for, and with it the graph no
+# longer contains tiny-keccak 2.0.2, whose CC0-1.0 licence is on no allow list
+# here (CC0 waives no patent rights; Fedora stopped accepting it for code in
+# 2022 and Google forbids it, while the ASF and Debian accept it, and that split
+# is not one this file resolves quietly). tiny-keccak reached the graph only
+# through ahash -> const-random -> const-random-macro on targets where ahash
+# falls back to its `compile-time-rng` feature.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
 
 [advisories]
 # cargo-deny config version 2: a vulnerability is always an error, so there is
@@ -39,9 +54,23 @@ all-features = true
 # because `cargo audit` in the same workflow reads the lock file's yanked status
 # and fails on it; the two tools split that job between them on purpose.
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# An advisory is ignored only with an id, a date and a reason on the line, and
-# only by the PM. Empty is the correct state.
-ignore = []
+# An advisory is ignored only by the PM, with the reason, the date and the event
+# that removes it written on the entry. cargo-deny 0.20.2 accepts only `id` and
+# `reason` on an ignore entry (there is no `expiration` key in this version), so
+# the deadline lives in the reason text and in issue #9, not in a field the tool
+# enforces. Somebody has to honour it by hand before the wave 2 gate.
+ignore = [
+  # object_store 0.13.2 pulls quick-xml 0.39.4, which carries RUSTSEC-2026-0194
+  # and 0195 (severity 7.5) in its AWS and Azure backends. Dormant in wave 0 and
+  # 1: no crate enables those backends yet. The fix is object_store 0.14.1, which
+  # needs parquet 60 and arrow 60, which datafusion 55.1.0 (the newest release on
+  # 2026-09-22) does not accept, and one arrow across the workspace is what S7
+  # relies on. Reviewed by the PM on 2026-09-22 with a hard deadline: this entry
+  # is removed or re-decided before the wave 2 gate closes, which is when the
+  # reactor first enables an object-store backend. See issue #9.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
+]
 
 [licenses]
 # The allow list is what a binary and a wheel distributed under Apache-2.0 may
@@ -85,19 +114,12 @@ allow = ["bzip2-1.0.6"]
 # only, which the allow list above already covers; they need no exception and
 # are named here so a reader who sees them in a report knows they were looked at.
 
-# NOT granted, on purpose: tiny-keccak 2.0.2 is CC0-1.0 only. CC0 is a public
-# domain dedication that expressly waives no patent rights, Fedora stopped
-# accepting it for code in 2022 and Google's policy forbids it, so it is not a
-# licence this file may wave through on an agent's judgement. The licences check
-# therefore fails on it until the PM decides, which is the intended behaviour
-# (an E2-adjacent finding, reported in the F6.5 pull request). Facts for that
-# decision: tiny-keccak reaches the graph only through
-# ahash -> const-random -> const-random-macro (a proc-macro, so build time, never
-# linked into a shipped wheel) and only on targets where ahash falls back to its
-# `compile-time-rng` feature; it is absent from
-# `cargo tree --all-features --target x86_64-unknown-linux-gnu`. The two ways to
-# close it are a `[graph] targets` list naming the platforms Amoru ships, or a
-# narrow exception here for tiny-keccak alone. Both are the PM's to choose.
+# Resolved, kept as a record: tiny-keccak 2.0.2 is CC0-1.0 only and was the one
+# licence this file could not wave through. It is no longer in the graph, because
+# the `[graph] targets` list above resolves only the platforms Amoru ships and
+# tiny-keccak appeared only on the others. No CC0-1.0 exception was granted, and
+# none should be: if tiny-keccak ever reappears here it means a supported target
+# was added, and the licence question comes back with it (PM, 2026-09-22).
 
 [bans]
 # The workspace is allowed to carry duplicate versions in general: the Polars and

@@ -35,8 +35,14 @@
 #                drifts or is missing hands that decision back to whoever last
 #                ran cargo, which is what the pins exist to prevent.
 #
-# Every action and every tool is pinned to an exact version, as ci.yml pins them;
-# a bump here is a reviewed change.
+# Every action is pinned to a full commit SHA with its version in a trailing
+# comment, and every tool to an exact version; ci.yml and docs.yml are pinned the
+# same way (PM, 2026-09-22, closing the F6.5 task "actions pinned by SHA"). A tag
+# can be moved by whoever owns the action, a commit SHA cannot, which is the
+# whole point of a supply-chain workflow pinning its own actions. A bump here is
+# a reviewed change: resolve the new SHA with
+#   gh api repos/<owner>/<repo>/git/ref/tags/<tag>
+# dereferencing an annotated tag through repos/<owner>/<repo>/git/tags/<sha>.
 name: supply-chain
 
 on:
@@ -56,17 +62,17 @@ jobs:
     name: cargo-deny (advisories, licences, bans, sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: |
           rustup toolchain install
           rustup show active-toolchain
           cargo --version
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: deny
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2.87.17
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny check advisories licenses bans sources
@@ -78,26 +84,38 @@ jobs:
     name: cargo-audit (advisories and yanked pins in Cargo.lock)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: audit
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2.87.17
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
           tool: cargo-audit@0.22.2
       # --deny yanked is the half cargo-deny leaves as a warning: with exact `=`
       # pins (preamble 6.2) a yanked version cannot be resolved away silently.
+      #
+      # The two ignored advisories are the ones deny.toml's [advisories] ignore
+      # list carries, repeated here because cargo-audit does not read deny.toml.
+      # The reasoning, the date and the deadline are written once, in deny.toml,
+      # beside those entries: quick-xml 0.39.4 through the pinned object_store
+      # 0.13.2, dormant until a wave 2 crate enables an object-store backend, no
+      # upgrade that keeps one arrow in the workspace, accepted by the PM on
+      # 2026-09-22 and removed or re-decided before the wave 2 gate. See issue #9.
+      # Removing them from deny.toml means removing them from this line too.
       - name: cargo audit
-        run: cargo audit --deny yanked
+        run: |
+          cargo audit --deny yanked \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
 
   dco:
     name: DCO sign-off on every commit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The whole history, so BASE..HEAD resolves for a pull request of any depth.
           fetch-depth: 0
@@ -114,10 +132,10 @@ jobs:
     name: Cargo.lock committed and in step with Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: lockfile
       - name: Cargo.lock is tracked by git
