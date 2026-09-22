@@ -1,0 +1,121 @@
+{
+  "run_id": "abababababababababababababababab",
+  "exit": "Completed",
+  "resumed": false,
+  "manifest": null,
+  "wall_s": 10.0,
+  "limits": {
+    "memory_ceiling": 8589934592,
+    "memory_kill": 10737418240,
+    "cpu_quota": 8.0,
+    "source": "Cgroup",
+    "devices": [
+      {
+        "id": 0,
+        "name": "test device",
+        "total_bytes": 17179869184,
+        "free_bytes": 16106127360
+      }
+    ]
+  },
+  "io_paths": {
+    "direct_io": true,
+    "io_uring": false,
+    "gds": false,
+    "pinned": true,
+    "rdma": false
+  },
+  "peak_anon_bytes": 9100,
+  "peak_fraction_of_ceiling": 1.0593794286251068e-6,
+  "worker_busy_fraction": 0.29,
+  "cpu_throttled_fraction": 0.025,
+  "source_bytes_per_s": 1500.0,
+  "source_bandwidth": 600.0,
+  "staging_bandwidth": 100.0,
+  "staging_bytes_written": 500,
+  "staging_engaged": true,
+  "gil": [
+    [
+      2,
+      "FreeThreaded"
+    ]
+  ],
+  "gil_serialised": false,
+  "sizer_used": "rule",
+  "sizer_fallback_at": null,
+  "bottleneck_timeline": [
+    [
+      0.0,
+      "Compute"
+    ],
+    [
+      4.0,
+      "IoRead"
+    ]
+  ],
+  "stages": [
+    {
+      "stage": 1,
+      "morsels": 3,
+      "rows_in": 600,
+      "rows_out": 480,
+      "bytes_in": 6000,
+      "bytes_out": 4800,
+      "wall_s": 4.0,
+      "kernel_busy_s": 4.0,
+      "rows_per_s": 120.0,
+      "bytes_per_s": 1200.0,
+      "amplification_p50": 2.0,
+      "amplification_p95": 3.0,
+      "placement_miss_wait_s": 1.0,
+      "errors": 0,
+      "skipped": 0,
+      "state_bytes_max": 0,
+      "state_growth": 0
+    },
+    {
+      "stage": 2,
+      "morsels": 2,
+      "rows_in": 240,
+      "rows_out": 80,
+      "bytes_in": 2400,
+      "bytes_out": 800,
+      "wall_s": 2.0,
+      "kernel_busy_s": 0.0,
+      "rows_per_s": 40.0,
+      "bytes_per_s": 400.0,
+      "amplification_p50": 0.5,
+      "amplification_p95": 0.5,
+      "placement_miss_wait_s": 0.0,
+      "errors": 1,
+      "skipped": 1,
+      "state_bytes_max": 0,
+      "state_growth": 0
+    },
+    {
+      "stage": 3,
+      "morsels": 4,
+      "rows_in": 430,
+      "rows_out": 390,
+      "bytes_in": 400,
+      "bytes_out": 3630,
+      "wall_s": 1.6,
+      "kernel_busy_s": 1.8,
+      "rows_per_s": 243.75,
+      "bytes_per_s": 2268.75,
+      "amplification_p50": 1.0,
+      "amplification_p95": 2.0,
+      "placement_miss_wait_s": 0.0,
+      "errors": 0,
+      "skipped": 0,
+      "state_bytes_max": 3000,
+      "state_growth": 2000
+    }
+  ],
+  "notes": [
+    "discovery: cgroup v2 ceiling",
+    "small dataset: no adaptation"
+  ],
+  "overflow_failed": false,
+  "late_records": 0
+}
