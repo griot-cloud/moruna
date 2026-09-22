@@ -167,7 +167,17 @@ dependencies = [
 name = "amoru-py"
 version = "0.1.0"
 dependencies = [
+ "amoru-adapters",
+ "amoru-discovery",
+ "amoru-kernel",
+ "amoru-placement",
+ "amoru-reactor",
  "amoru-runtime",
+ "amoru-sinks",
+ "amoru-sources",
+ "amoru-trace",
+ "arrow",
+ "parquet",
  "pyo3",
  "pyo3-arrow",
  "serde_json",
