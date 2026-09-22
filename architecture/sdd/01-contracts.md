@@ -15,7 +15,7 @@ The contracts crate is the set of types and interfaces that cross component boun
 
 It owns: `Morsel`, `Payload`, `Tier`, `MorselFeatures`, `Origin`, `Split`; the traits `Source`, `Kernel`, `Sink`, `Allocator`, `Reactor`, `Placement`, `Knobs`, `TraceSink`; the value types those traits exchange (`PayloadSpec`, `KernelKind`, `KernelHints`, `Limits`, `HostProfile`, `TierBudgets`, `PlacementStats`, `Knob`, `TraceRecord`, `SinkSummary`, `Completion`); the error type `AmoruError`; the constants `ALIGNMENT` and the aligned binary format `AMB1`.
 
-It refuses to know: how any trait is implemented; how the process is threaded (preamble section 4 governs implementers, not this crate); anything about Python beyond what `dlpark` and Arrow's C Data Interface already are; any policy (sizing, admission, eviction). It has no dependency on tokio, cudarc, pyo3, parquet or object_store; a kernel author's crate depending on `amoru-kernel` must not pull any of those in.
+It re-exports the two dependencies that appear in its public signatures, `pub use arrow;` and `pub use dlpark;`, so that a crate depending on `amoru-kernel` alone can name a `RecordBatch` or a DLPack capsule without adding a dependency of its own and without risking a second, incompatible version of either: the testkit (d.15) depends on `amoru-kernel` only and could not otherwise be written, and a kernel author's crate gets the same guarantee, which is what S7 rests on (added 2026-09-22 on the F0.3 agent's report). It refuses to know: how any trait is implemented; how the process is threaded (preamble section 4 governs implementers, not this crate); anything about Python beyond what `dlpark` and Arrow's C Data Interface already are; any policy (sizing, admission, eviction). It has no dependency on tokio, cudarc, pyo3, parquet or object_store; a kernel author's crate depending on `amoru-kernel` must not pull any of those in.
 
 ## b. Vocabulary
 
@@ -999,6 +999,11 @@ pub enum ConvertError {
     #[error("columns have mixed dtypes")] MixedDTypes,
     #[error("tensor is not contiguous")] NotContiguous,
     #[error("tensor rank {0} not convertible (need 1 or 2)")] Rank(usize),
+    /// A DLPack capsule whose major version this build does not implement. Added 2026-09-22
+    /// (issue #13) because d.4 requires `from_dlpack` to refuse a foreign version and no
+    /// variant said so; `Plan` was wrong (this is not a plan-time schema fact) and
+    /// `NotNumeric` was a misuse of a column error for a capsule header.
+    #[error("dlpack major version {found} is not {expected}")] Version { found: u32, expected: u32 },
 }
 ```
 
@@ -1013,12 +1018,14 @@ The testkit is built by this component's agent in wave 0 (preamble 6.4) because 
 | `FakePlacement` | `Placement` | `with_pressure(stage, evict_after_bytes)` (entries beyond the byte count on a stage-0 queue become `Evicted`), `with_delay(Duration)` (a pop of a fresh entry waits, counted as a miss), `with_manifest_store()` (in-memory manifests keyed by path so `checkpoint`/`restore` round-trip across engine instances) | `pushed(stage) -> Vec<Seq>`, `popped(stage)`, `committed()`, `manifests_written()`, `budgets_set() -> Vec<TierBudgets>` (every `set_budgets` argument in call order), `shutdown_calls` |
 | `FakeSource` | `Source` | `splits(n, rows_each, bytes_each)`, `schema(SourceSchema)`, `sub_splittable(bool)`, `repeatable(bool)`, `fail_split(id)` | `reads() -> Vec<(SplitId, Option<RowRange>)>`; deterministic content (row i of split s has value `s * 1_000_000 + i`) |
 | `FakeSink` | `Sink` | `commit_every(n)` (commits in blocks of n sequence numbers, so `committed_seq` advances in steps), `resumable(bool)`, `fail_at(seq)`, `latency(Duration)`, `requires_order(bool)` | `written() -> Vec<Seq>`, `skipped()`, `committed_seq()`, `open_calls`, `resume_calls`, `finish_calls`, `shutdown_calls` |
-| `FakeKernel` | `Kernel` | `amplification(f64)` (allocates `a × bytes_in` from the global allocator during `apply`, freed on return), `latency(Duration)`, `stateful(instances, state_bytes)`, `resume(ResumePolicy)`, `fail_on(seqs)`, `panic_on(seqs)`, `grow_state_by(bytes)` per apply | `applies() -> Vec<(Seq, worker, instance, thread id)>`, `init_calls`, `restore_calls`, `checkpoint_calls` |
+| `FakeKernel` | `Kernel` | `amplification(f64)` (allocates `a × bytes_in` from the global allocator during `apply`, freed on return), `latency(Duration)`, `stateful(instances, state_bytes)`, `resume(ResumePolicy)`, `fail_on(applies)`, `panic_on(applies)`, `grow_state_by(bytes)` per apply | `applies() -> Vec<(usize /* apply index */, usize /* instance */, std::thread::ThreadId)>`, `init_calls`, `restore_calls`, `checkpoint_calls` |
 | `FakeSampler` | `Sampler` | `scripted(Vec<Sample>)` (returns the sequence, then repeats the last), `live()` (reads the real process) | `samples_taken`, `peak_resets` |
 | `FakeTrace` | `TraceSink`, `TraceTail` | `capacity(n)` | `records() -> Vec<TraceRecord>`, `flush_calls`, `finish_calls` |
 | `FakeKnobs` | `Knobs`, `StatsSource`, `Prober` | `stats(SchedulerStats)`, `probe_result(stage, ProbeResult)` | `writes() -> Vec<Knob>`, `terminated() -> Option<AmoruError>` |
 
-Every fake records a `shutdown_calls` counter wherever the trait it implements has a `shutdown` method, so a test can assert that shutdown ran exactly once.
+`fail_on` and `panic_on` count applies, not sequence numbers, and `applies()` reports the apply index rather than a `Seq`, because `Kernel::apply` receives a `Payload` and no morsel: a kernel never learns its position in the run. That is deliberate and not a gap to close. A kernel that knew its sequence number could not be the same code inside a Polars expression or a DataFusion function, which S7 requires, and nothing in the runtime needs it: the scheduler holds the seq, attaches it to `AmoruError::Kernel` when an apply fails (CT-I10) and writes it to the trace, so every per-morsel assertion a component test wants is available from the scheduler's own output. A test that wants "morsel 7 fails" therefore asserts that the trace records an `Error` or `Skipped` outcome for whichever sequence numbers failed and that the sink's `skipped()` equals exactly those, which is the property that matters, rather than naming a number the fake cannot see (decided by the PM 2026-09-22 on the F0.3 agent's report, issue #12; SC-T7, SC-T14 and PY-T2 are worded that way).
+
+Every fake records a `shutdown_calls` counter wherever the trait it implements has a `shutdown` method, so a test can assert that shutdown ran exactly once. `Sink` and `TraceSink` have no `shutdown` in the contract, so `FakeSink::shutdown_calls` and `FakeTrace::finish_calls` count the fakes' own inherent `shutdown()` and `finish()`, which the facade calls; a test naming them is asserting about the facade's lifecycle (preamble 4.3), not about a trait method.
 
 Also in the testkit: the data generator and the benchmark kernels of preamble 6.5 are not here; they belong to the `bench` agent (wave 1). `amoru-testkit` depends on `amoru-kernel` only.
 
