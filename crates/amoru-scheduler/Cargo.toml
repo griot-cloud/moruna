@@ -16,5 +16,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 
+[dev-dependencies]
+# The fakes of contracts d.15. Every SC test drives the scheduler through them and names only
+# their knobs (10 k); a test dependency only, in no shipping crate's graph.
+amoru-testkit = { workspace = true }
+
 [features]
 default = []
