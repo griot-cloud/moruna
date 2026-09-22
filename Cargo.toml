@@ -32,8 +32,8 @@ amoru-testkit = { path = "crates/amoru-testkit", version = "0.1.0" }
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
 # engine feature a component needs beyond these is set in that crate.
-arrow = { version = "=60.0.0", default-features = false, features = ["ffi", "ipc"] }
-parquet = { version = "=60.0.0", features = ["arrow", "async", "object_store"] }
+arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc"] }
+parquet = { version = "=59.3.0", features = ["arrow", "async", "object_store"] }
 object_store = { version = "=0.14.2" }
 dlpark = { version = "=0.8.0" }
 safetensors = { version = "=0.8.0" }
