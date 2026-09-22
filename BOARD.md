@@ -4,7 +4,7 @@ The PM agent's working board. It is the one place that says what is done, what i
 
 ## How the board works
 
-- **Epic** = one wave of preamble 6.6 (E0 to E5) plus one release-readiness epic (E6). Waves are not re-planned here; a wave's gate is the preamble's.
+- **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).
 - **Feature** = one unit of work for one agent in one session: the code plus the tests that prove it, at or above 90% line coverage (preamble 6.7, `tools/quality/check.sh`). A feature is sized so an Opus executor can carry it from brief to a green gate without stopping for the PM, and so that no feature owns more than about a third of a component's invariants.
 - **Component branch and pull request.** One pull request per component (CONTRIBUTING.md). A component split into several features lands them as consecutive sessions on the same `component/NN-<slug>` branch; the pull request opens after the first feature and is reviewed against the SDD when the last feature is done (decision D-B1 below).
 - **Tasks** under a feature are the checklist the executor and the PM tick. Every feature carries the same closing tasks: the pull request template filled, the PM checklist in `architecture/agents/pm.md` section 4 green, section m of the SDD still empty.
@@ -13,13 +13,31 @@ The PM agent's working board. It is the one place that says what is done, what i
 
 Executors are briefed from `architecture/agents/executor.md`; filled briefs live in `architecture/agents/briefs/`.
 
+## Start ladder
+
+What can start when, from the solid edges of preamble 1.3 and the fakes of contracts d.15. A rung starts the moment the rung above it is merged; features on one rung run concurrently.
+
+| Rung | Starts after | Features that start together |
+|---|---|---|
+| 0 | now | F0.2 contracts (running); F1.6 bench generator (no internal dependency); F7.1 docs scaffold; F6.5 supply chain and DCO checks |
+| 1 | F0.2 merged | F0.3 testkit (implements the traits) |
+| 2 | F0.3 merged (wave 0 gate) | F1.1 arena, F1.2 discovery, F1.3 trace, F1.4 adapters, F1.7 bench kernels, F2.1 reactor, F3.1 sources, F3.3 sinks, F3.5 placement, F4.4 controller: every crate whose only solid edge is `amoru-kernel`; their integration-tagged tests close in their wave |
+| 2, same branch | the previous session of the same component | F1.5 bridges, F2.2 reactor direct paths, F3.2 tensor and iterator sources, F3.4 tensor, IPC and reorder sinks, F3.6 and F3.7 placement staging and lineage, F4.5 controller classification |
+| 3 | F3.3 and F3.4 merged (`SinkHandle`, `ReorderBuffer` are a crate dependency) | F4.1, F4.2, F4.3 scheduler |
+| 4 | every crate 2 to 11 merged | F4.6 facade, F4.7 integration closure; F5.3 bench runner and tuned baselines; F5.4 engine baseline (needs the facade for the comparison only) |
+| 5 | F4.6 merged | F5.1 Python package, F5.2 wheels and clamping walk; F7.2 to F7.7 documentation (can draft against merged crates and finish after F5.1) |
+| 6 | wave 5 gate | F5.5 reference-host campaign (D-B3); F6.1 to F6.4, F6.6 release; F7.8 doc gate |
+
+Gates still close in wave order (E0 to E5), each in its wave report, because the later gates cite the earlier ones.
+
+
 ## Now
 
 | | |
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | F0.2 executor running (the contracts crate on `component/01-contracts`); then F0.3 (testkit) on the same branch |
+| Next action | rung 0 running: F0.2 contracts, F1.6 bench generator, F7.1 docs scaffold, F6.5 supply chain; F0.3 when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -463,4 +481,5 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
 | 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |
 | 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `amoru-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |

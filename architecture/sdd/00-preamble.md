@@ -485,9 +485,9 @@ The suite is owned by a named `bench` agent that starts in wave 1 and delivers i
 
 ### 6.6 Build order and gates
 
-Waves are the parallelism plan; the gate names the sufficiency criteria (parent S-ids) and global invariants the wave must close, measured by the tests the component SDDs name.
+Waves are the gate order: a wave's gate names the sufficiency criteria (parent S-ids) and global invariants it closes, measured by the tests the component SDDs name, and gates close in wave order because each cites the ones before it. Waves are not a limit on parallelism. An executor starts as soon as every crate its `Cargo.toml` depends on (a solid edge in the section 1.3 graph) is merged to `main` and the fakes its tests name exist; a component whose only solid edge points at `amoru-kernel` starts the moment wave 0 merges, whatever wave its gate is in. The "agents in parallel" column is the count that follows from those dependencies, not a cap, and the PM runs as many executors at once as the dependency graph and the build host allow (decided by Brackly, 2026-09-22). Work is serialised only where it cannot be parallelised: the testkit after the contracts crate, the scheduler after the sinks crate, the facade after every crate it wires, the Python package after the facade, and successive sessions of one component on its own branch.
 
-| Wave | Components | Agents in parallel | Gate |
+| Wave | Components | Agents in parallel (from the dependency graph, not a cap) | Gate |
 |---|---|---|---|
 | 0 | 1 (contracts and `amoru-testkit`), the workspace skeleton, CI, `tools/lint`, the quality gate wired into CI | 1 | the workspace compiles with every member crate as a stub; `amoru-kernel` has no runtime dependency (`cargo tree`, CT-T12); every fake in contracts d.15 compiles against the traits and exercises every knob (CT-T13); CT tests pass; trace schema hash pinned (CT-T9); `tools/lint/no_tier_wildcard.sh` runs in CI (CT-T14); `tools/quality/check.sh` passes, so `amoru-kernel` and `amoru-testkit` each have at least 90% line coverage (6.7); the four CI jobs are green on the stubs |
 | 1 | 2, 3, 4, 5, bench (generator and kernels) | up to 5 | AR, DS, TR, AD tests pass against fakes; G-I2 for the Python adapter (zero payload copies); S13 partial; the generator writes every dataset shape the suite names to local disk and MinIO |
