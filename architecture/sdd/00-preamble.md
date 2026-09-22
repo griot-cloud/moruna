@@ -59,6 +59,8 @@ Terms used by more than one component are defined here once. A component SDD add
 
 **Payload.** The data inside a morsel: either an Arrow `RecordBatch` (a table) or a DLPack-backed tensor, each tagged with the tier where its bytes currently are.
 
+**Staging codec.** How a segment record's bytes are encoded on disk: `Raw` (the in-memory layout, DMA both ways) in v1; a compressed variant is reserved (contracts d.2, architecture 5.6).
+
 **Tier.** Where bytes physically live: `Device(id)` (accelerator memory), `PinnedHost` (page-locked host RAM, valid DMA source and target), `Host` (ordinary host RAM), `Disk(segment)` (a staging segment on local storage; no resident bytes), and the reserved `Remote(node, ref)` (registered memory on another node of the same run; never produced in v1, always matched explicitly, CT-I11).
 
 **Stage.** One position in the linear chain source → kernel₁ → … → kernelₙ → sink. Stage 0 is the source's output; stage k is kernel k's output; the sink consumes the last stage.
@@ -284,7 +286,7 @@ Built alongside component 1 and extended by every component. It contains, for ev
 
 ### 6.5 Benchmark suite
 
-The generator writes Parquet with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio and row-group size, to local disk and to an S3-compatible store (MinIO in a container), and writes safetensors and aligned binary tensors of controllable shape. Kernels: identity (A about 1), normalise (Rust regex over text, A about 1.5), tokenise-explode (A 5 to 10), wide-intermediate (Python NumPy, A about 20, releases the GIL), adversarial (A jumps 4× at the midpoint), embed-score (numeric columns to tensor, small matmul, back to column), torch-score (stateful GPU model, weights via TensorSource). For each, a hand-tuned baseline script (plain loop, fixed batch and threads, grid-searched) reports rows per second. Every gate runs in a container with `--memory` and `--cpus` set and on the bare host; results name the machine.
+The generator writes Parquet with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio and row-group size, to local disk and to an S3-compatible store (MinIO in a container), and writes safetensors and aligned binary tensors of controllable shape. Kernels: identity (A about 1), normalise (Rust regex over text, A about 1.5), tokenise-explode (A 5 to 10), wide-intermediate (Python NumPy, A about 20, releases the GIL), adversarial (A jumps 4× at the midpoint), embed-score (numeric columns to tensor, small matmul, back to column), torch-score (stateful GPU model, weights via TensorSource). For each, a hand-tuned baseline script (plain loop, fixed batch and threads, grid-searched) reports rows per second; that baseline is what S3 is measured against. A second baseline, the *engine baseline*, runs the same kernel as a user-defined function inside Polars (streaming engine) and inside DuckDB (Python UDF) over the same files in the same container, with each engine's defaults and then with its documented memory limit set to the budget; it is reported beside the tuned baseline for every benchmark and is not a gate, because the claim it supports (that the runtime beats what people use today on this class of work) is an external one the report should carry rather than a criterion the build closes. Every gate runs in a container with `--memory` and `--cpus` set and on the bare host; results name the machine.
 
 ### 6.6 Build order and gates
 
@@ -334,6 +336,8 @@ Decisions no agent makes on its own. Each carries the assumption the agent takes
 **E11. Implementing any reserved multi-node path.** `Tier::Remote`, `Locality::Local`, the `rdma` rows of the placement move table and the reactor copy table, `NodeId` values other than `LOCAL_NODE`, and any peer, lease or queue-pair API. Assumption: out of scope for every v1 component; the arms exist and return `Unsupported("rdma")`; an agent that finds it needs more than that stops and reports. The multi-node extension is its own set of SDDs later (architecture section 11).
 
 **E12. Weakening a resume guarantee.** Any change that would make `committed_seq` overstate, a manifest reference a missing segment, a `Reinit` kernel's state be assumed safe, or the normal path write payload bytes for recovery. Assumption: not permitted; G-I12 and the invariants PL-I11 to PL-I13, SI-I8 stand; the agent stops and reports.
+
+**E13. Allocator interposition.** Replacing the allocator that a kernel author's libraries use (NumPy's `PyDataMem_SetHandler`, PyTorch's pluggable allocators) so that kernel-internal allocations count against the arena's budget instead of being observed by the sampler (adapters AD-M1; architecture section 8). Assumption: out of scope for v1; the guarantee for kernel-internal allocations is probe, sample, reserve and breach handling, with the cgroup as containment, and the architecture document says so; an agent that finds it needs interposition to meet a gate stops and reports.
 
 ---
 

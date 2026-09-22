@@ -35,7 +35,9 @@ The engine is also the seam for the multi-node extension (architecture section 1
 
 **Reservation.** Bytes claimed against a destination tier's budget for a move in flight, released when the move completes or fails.
 
-**Recomputable.** An entry whose bytes can be re-obtained from the source (Q0 entries); demoting it may drop the bytes instead of writing them, marking the entry `Evicted`, which the scheduler resolves by re-reading.
+**Recomputable.** An entry whose bytes can be re-obtained from its origin (CT-I12). In v1 only Q0 entries are treated as recomputable (D5); the lineage index makes every entry recomputable in principle, and `DemotionPolicy` below reserves the choice.
+
+**Demotion policy.** Per queue: `Write` (demote by writing a segment record; the v1 behaviour for every queue but Q0) or `Evict` (demote by dropping the bytes and listing the entry for recomputation from its origin through stages 1..k; reserved, the v1 behaviour of Q0 only, selected for other queues by a later controller when the cost of re-running the chain up to stage k is below the cost of writing and reading the bytes). The enum exists now so that the entry state machine and `evicted()` are written once for any stage, not for stage zero. `set_staging(stage, on)` is the run-time switch between the two (`on` selects `Write`); `PlacementConfig::demotion` is the initial value, and in v1 the scheduler only ever flips Q0 (PL-I6).
 
 **Segment.** A staging file, `staging.segment_bytes` in size, append-only, holding whole payload records; one active segment per queue.
 
@@ -89,6 +91,8 @@ pub struct PlacementConfig {
     pub durable_staging: bool,                    // profile.durable_staging == Present; recorded in the manifest
     pub disk_budget: u64,                         // budget.disk
     pub segment_bytes: u64,                       // staging.segment_bytes
+    pub codec: StagingCodec,                      // Raw in v1 (contracts d.2); recorded in every segment record header
+    pub demotion: Vec<DemotionPolicy>,            // per queue; v1: Evict for Q0, Write for the rest
     pub page_bytes: usize,
     pub gds: bool,                                // profile.gds == Present && feature gds
     pub pinned: bool,                             // arena.is_pinned()
@@ -118,12 +122,15 @@ impl PlacementEngine {
 }
 impl Placement for PlacementEngine { /* contracts d.10, including set_committed, checkpoint, restore */ }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum DemotionPolicy { Write, Evict }
+
 pub struct ManifestHeader { pub version: u32, pub run_id: RunId, pub node: NodeId, pub hostname: String, pub written_ns: u64 }
 ```
 
 ### d.2 Consumed
 
-`amoru_kernel::{Placement, Morsel, Payload, PayloadSpec, PayloadKind, TierPref, Tier, TIER_COUNT, SegmentRef, RemoteRef, DeviceId, NodeId, LOCAL_NODE, RunId, Locality, Origin, Split, Fingerprint, CheckpointExtras, SourceCursor, ResumePoint, TierBudgets, QueueStats, PlacementStats, Buffer, Allocator, Reactor as ReactorTrait, Completion, AmoruError}`; `amoru_arena::Arena` (`alloc`, `contains`, `is_pinned`); `amoru_reactor::Reactor` (`copy`, `write_file`, `read_file`, `register_segment`); `amoru_sinks::ipc` (the page-aligned IPC record encoder for table payloads; see e.3); `crossbeam` (`Parker`/`Unparker` for `pop_blocking`); `serde_json` (the manifest, e.5; the only text format in this crate).
+`amoru_kernel::{Placement, Morsel, Payload, PayloadSpec, PayloadKind, TierPref, Tier, TIER_COUNT, StagingCodec, SegmentRef, RemoteRef, DeviceId, NodeId, LOCAL_NODE, RunId, Locality, Origin, Split, Fingerprint, CheckpointExtras, SourceCursor, ResumePoint, TierBudgets, QueueStats, PlacementStats, Buffer, Allocator, Reactor as ReactorTrait, Completion, AmoruError}`; `amoru_arena::Arena` (`alloc`, `contains`, `is_pinned`); `amoru_reactor::Reactor` (`copy`, `write_file`, `read_file`, `register_segment`); `amoru_sinks::ipc` (the page-aligned IPC record encoder for table payloads; see e.3); `crossbeam` (`Parker`/`Unparker` for `pop_blocking`); `serde_json` (the manifest, e.5; the only text format in this crate).
 
 ## e. Data model, formats and state machines
 
@@ -187,7 +194,8 @@ Segment files live at `staging_dir/amoru-<run_id>/q<stage>-<segment:06>.seg`, cr
 | 8 | 8 | seq |
 | 16 | 2 | stage |
 | 18 | 1 | kind (0 table, 1 tensor) |
-| 19 | 5 | reserved zero |
+| 19 | 1 | codec (`StagingCodec`: 0 raw; a reader rejects an unknown value with `Unsupported("codec")`) |
+| 20 | 4 | reserved zero |
 | 24 | 8 | payload_len (bytes of the payload body) |
 | 32 | 8 | body_offset (absolute in file; page-aligned) |
 | 40 | 24 | reserved zero |
@@ -245,7 +253,7 @@ The manifest is small by construction: `lineage` holds only morsels between the 
 
 ## f. Algorithms and policies
 
-**f.1 `push(stage, morsel)`.** Lock queue; append `Entry { state: Resident(morsel.payload.tier()), recomputable: stage == 0 }`; add bytes to the tier counter; unlock; update the lineage record for `morsel.seq` (create on first sight; else set `stage`, clear `disk` and `consumed`; e.2); unpark one waiter; call `plan(stage)`. A push whose payload tier is `Remote` is `Unsupported("rdma")` in v1.
+**f.1 `push(stage, morsel)`.** Lock queue; append `Entry { state: Resident(morsel.payload.tier()), recomputable: cfg.demotion[stage] == Evict }`; add bytes to the tier counter; unlock; update the lineage record for `morsel.seq` (create on first sight; else set `stage`, clear `disk` and `consumed`; e.2); unpark one waiter; call `plan(stage)`. A push whose payload tier is `Remote` is `Unsupported("rdma")` in v1.
 
 **f.2 `plan(stage)`.** Runs after every push, pop, move completion and knob change, under the queue lock, in this order:
 
@@ -344,7 +352,7 @@ Unit tests use `FakeReactor` (instantaneous or delayed moves, failure injection)
 
 **PL-T18 lineage_bounded.** With a committed watermark advancing at the sink's rate, `lineage_len` never exceeds the number of morsels admitted above the watermark, and drops to zero at the end of a run; with the watermark held, it grows exactly as fast as admission. PL-I11.
 
-**PL-T19 remote_unsupported.** A `push` of a `Remote`-tier payload, a `pop` on a queue whose head is (unsafely constructed in the test) `OnRemote`, and every move-table row that names `Remote` return `Unsupported("rdma")` in a build without the `rdma` feature; the `no_tier_wildcard` lint (CT-T14) passes on this crate. CT-I11.
+**PL-T19 remote_unsupported.** A segment record with codec byte 1 is rejected with `Unsupported("codec")`; a `push` of a `Remote`-tier payload, a `pop` on a queue whose head is (unsafely constructed in the test) `OnRemote`, and every move-table row that names `Remote` return `Unsupported("rdma")` in a build without the `rdma` feature; the `no_tier_wildcard` lint (CT-T14) passes on this crate. CT-I11.
 
 ## l. Implementation notes for the agent
 

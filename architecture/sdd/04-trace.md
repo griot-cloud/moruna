@@ -148,6 +148,7 @@ Overflow: Arrow IPC stream format, one message per chunk, in `staging_dir/trace-
 - `cpu_throttled_fraction` = Σ`throttled_delta_us` / (W × `limits.cpu_quota` × 1e6).
 - `source_bytes_per_s` = Σ`bytes_in` for stage 1 (the first kernel's input, i.e. what the source produced) / `wall_s(stage 1)`.
 - `staging_bytes_written` = Σ max(`staging_bytes_delta`, 0); `staging_engaged` = that > 0.
+- `state_bytes_max` per stage = max(`state_bytes`); `state_growth` per stage = last `state_bytes` − first non-zero `state_bytes` (reported so a stateful kernel whose state grows with morsels seen is visible in the report; RC f.6 StateGrowth).
 
 **f.3 `tail(stage, n)`.** Walk in-memory chunks from newest; filter by stage; stop at n. Does not read the overflow file (the controller's window is recent by definition; a `tail` larger than what is in memory returns fewer records and says so through `len()`).
 

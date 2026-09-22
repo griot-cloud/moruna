@@ -160,7 +160,7 @@ loop:
   loop
 ```
 
-`record` builds the `TraceRecord` (contracts d.13) from `morsel` (features, bytes_in), `out` (bytes_out, rows_out, tier_out), timings, `s0`/`s1` (mem before, peak, throttled delta, device), the knob snapshot, and the miss wait the placement engine left in the thread-local (PL f.4).
+`record` builds the `TraceRecord` (contracts d.13) from `morsel` (features, bytes_in), `out` (bytes_out, rows_out, tier_out), timings, `s0`/`s1` (mem before, peak, throttled delta, device), the knob snapshot, `state.footprint().unwrap_or(0)` read right after `apply` while the instance is still held (`state_bytes`; 0 for stateless), and the miss wait the placement engine left in the thread-local (PL f.4).
 
 **f.3 `pick`.** Snapshot `placement.stats()` output bytes per queue (cached per 1 ms to avoid contention; the cache is refreshed by whichever worker finds it stale); for stages 1..=n: admissible iff the input queue's head is resident (`placement.pop` would succeed; checked with a non-consuming `peek_resident(stage-1, spec)` the placement engine exposes as an inherent method) and `!placement.is_full(stage)` and (stateless or an instance is free or creatable); choose the admissible stage with the smallest output bytes, ties to the higher stage; return it. Cost: O(stages) per pick with no lock except the peek.
 

@@ -187,7 +187,11 @@ Contracts this document relies on: `AllocStats.boundary_copies_total` and `Alloc
 
 ## m. Open items
 
-None. (`AllocStats.boundary_copies_total` and `Allocator::contains` are in `01-contracts.md` d.3.)
+(`AllocStats.boundary_copies_total` and `Allocator::contains` are in `01-contracts.md` d.3.) Two post-v1 items recorded here because this is the crate they land in:
+
+**AD-M1. Allocator interposition (E13).** Today a Python kernel's own allocations (NumPy arrays, Torch tensors made inside `apply`) are outside the arena: the sampler sees them, the controller sizes around them, the reserve absorbs mistakes, and the cgroup is the containment (architecture section 8, "observed, not governed"). NumPy (`PyDataMem_SetHandler`) and PyTorch (`CUDAPluggableAllocator`, and the host allocator hooks) both allow the allocator to be replaced. Pointing them at the arena would make kernel-internal allocations count against the budget and fail cleanly at the line instead of being observed after the fact. Deferred because it changes what the kernel author's libraries do underneath them, which needs its own design and its own opt-in; the seam is `Allocator` (contracts d.3), and nothing in v1 precludes it.
+
+**AD-M2. `AmoruMemoryPool` for the DataFusion bridge.** DataFusion operators reserve memory from a `MemoryPool`; a DataFusion-bridged kernel running inside Amoru currently reserves from DataFusion's own pool, invisible to the budget. An implementation of DataFusion's `MemoryPool` trait over the arena (`try_grow` becomes an arena reservation against the host budget; a refusal makes the operator spill, which is DataFusion's existing behaviour) closes that gap for the one engine whose accounting contract makes it possible. Small; Phase 7.
 
 ## n. Traceability
 

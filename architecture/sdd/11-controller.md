@@ -144,9 +144,13 @@ struct StageCtl {
 ```json
 { "version": 1, "fingerprint": "...", "schema_hash": "...", "updated": "2026-09-15T18:00:00Z",
   "a_k_p50": 4.2, "a_k_p95": 5.9, "a_k_dev_p95": 0.0,
+  "a_k_samples": 41200, "a_k_var": 0.31,
+  "state_bytes_max": 0,
   "final_target": 67108864, "final_workers": 8, "final_safety": 1.25,
   "runs": 3, "prediction_error_p95": 0.18 }
 ```
+
+`a_k_samples` is the number of trace records the statistics were computed from, summed across runs; `a_k_var` is the running variance of per-record `peak_delta / bytes_in` (Welford, merged across runs); `state_bytes_max` is the largest `state_bytes` any instance reported. These three are what make the safety margin a function of evidence (f.2) rather than a constant: a kernel seen forty thousand times and a kernel seen once do not deserve the same margin.
 
 Unknown `version` → ignored with a note. Written at `stop` when the run completed (not on termination), merging with the existing file by EWMA (weight 0.3 to the new run).
 
@@ -154,9 +158,9 @@ Unknown `version` → ignored with a note. Written at `stop` when the run comple
 
 **f.1 Budgets (`prepare`).** Sample once after kernel init: `baseline = sample.anon_bytes`. `reserve = reserve_fraction × limits.memory_ceiling`. `host_budget = limits.memory_ceiling − baseline − reserve`; if ≤ `morsel_min × 2`, `Config { name: "budget.host", msg }`. Device: `device_budget[d] = 0.9 × devices[d].free_bytes` after init (kernel weights are loaded). Split for placement: `TierBudgets { host: 0.5 × host_budget, pinned_host: (pinned ? same : 0), device: 0.6 × device_budget, disk: disk_budget }`; the other half of host budget is the workers' in-flight allowance. This split is the initial one; f.6 adjusts the queue share.
 
-**f.2 Probe (`probe_all`).** For each stage in order: seed `a_k` from the profile if present (p95) else from `hints.expected_amplification` else 4.0; run the probe at `probe_bytes` with one worker; `a_k = max(peak_delta / bytes_in, 0.5)`; if a profile existed and `|a_k − profile.a_k_p95| / profile.a_k_p95 > 0.5`, note "profile drift" and use the measured value; `a_k_dev` likewise from `dev_peak_delta` when `hints.uses_device_memory`; `safety = safety_initial`.
+**f.2 Probe (`probe_all`).** For each stage in order: seed `a_k` from the profile if present (p95) else from `hints.expected_amplification` else 4.0; run the probe at `probe_bytes` with one worker; `a_k = max(peak_delta / bytes_in, 0.5)`; if a profile existed and `|a_k − profile.a_k_p95| / profile.a_k_p95 > 0.5`, note "profile drift" and use the measured value; `a_k_dev` likewise from `dev_peak_delta` when `hints.uses_device_memory`; `safety` from the evidence: with no profile, `safety_initial`; with a profile, `safety = clamp(safety_floor + k × sqrt(a_k_var) / a_k_p50 + c / sqrt(a_k_samples), safety_floor, safety_initial)` with `k = 2` and `c = 4` (so 16 samples add 1.0 to the margin and 40,000 add 0.02), which starts a well-known kernel near the floor and an unseen one at the initial value; drift (above) resets `safety` to `safety_initial` for the run. The margin never goes below `safety_floor`; the guarantee is not relaxed, only the margin shrinks with evidence.
 
-**f.3 Working-set equation and initial knobs (`start`).** Let `W = workers.max`, `S` the stages. Assume equal worker share per stage initially: `share = W / S`. For each stage, `allowance = target × a_k × safety`. Choose `target` per stage as the largest value in `[morsel_min, morsel_max]` such that `Σ share × allowance ≤ host_budget / 2` (the in-flight half) and, for device stages, `share × target × a_k_dev × safety ≤ device_budget × 0.4`. Set `active_workers = min(W, floor((host_budget / 2) / max_stage_allowance))` (RC-I7). Set `read_ahead = 2`. Set `promotion_window = 2`. Set high water per queue and tier from the placement half of the budget divided equally across queues, low = high / 2. Write knobs in the order: high waters, promotion windows, morsel targets, active workers, read-ahead (RC-I1 check before the batch).
+**f.3 Working-set equation and initial knobs (`start`).** Let `W = workers.max`, `S` the stages. Assume equal worker share per stage initially: `share = W / S`. For each stage, `allowance = target × a_k × safety`. Let `state = Σ over stateful stages of instances × max(state_bytes_max from the profile, hints-declared state, 0)`, the memory that instances hold regardless of morsel size; it is subtracted from the budget before anything else and updated at every tick from the latest `state_bytes` in the trace. Choose `target` per stage as the largest value in `[morsel_min, morsel_max]` such that `Σ share × allowance ≤ (host_budget − state) / 2` (the in-flight half) and, for device stages, `share × target × a_k_dev × safety ≤ device_budget × 0.4`. Set `active_workers = min(W, floor((host_budget / 2) / max_stage_allowance))` (RC-I7). Set `read_ahead = 2`. Set `promotion_window = 2`. Set high water per queue and tier from the placement half of the budget divided equally across queues, low = high / 2. Write knobs in the order: high waters, promotion windows, morsel targets, active workers, read-ahead (RC-I1 check before the batch).
 
 **f.4 `RuleSizer` (per record of stage s).** `observe`: update `peak_ewma` (α = 0.2) of `peak_delta / bytes_in`. `propose`: if `completions_since_adjust < damping` return the current target; let `ratio = peak_ewma × safety × target / allowance_target(stage)` where `allowance_target = target_fraction × envelope.max × a_k × safety` (i.e., how much of the allowed peak the stage is using); if `ratio < 0.85` propose `target × (1 + increase_step)`; if `ratio > 1.0` propose `target / 2` (this is the AIMD; the immediate breach path in RC-I4 is separate and stronger); else propose the current target. Also tighten `safety` toward `safety_floor` by 0.02 per accepted increase when the last 20 records' peak ratios have coefficient of variation under 0.15.
 
@@ -166,6 +170,7 @@ Unknown `version` → ignored with a note. Written at `stop` when the run comple
 
 | Condition (evaluated in order) | Class | Action (one only) |
 |---|---|---|
+| anon ≥ ceiling − reserve × 0.5 and `state` grew by more than 10% since the last tick | StateGrowth | re-run f.3 with the new `state` (targets and workers shrink to fund it); if `state` alone exceeds `host_budget / 2`, terminate with `Budget` naming the stage and its `state_bytes` (a kernel whose state grows without bound is not sizeable) |
 | anon ≥ ceiling − reserve × 0.5 | Memory | halve the largest stage target; raise its safety; `set_staging(qn, true)` if not already |
 | throttled_delta / tick > 10% | CpuQuota | `ActiveWorkers −1` (min 1) |
 | busy < 0.7 and q0_bytes < low(q0) and reads_in_flight == read_ahead | IoRead | `ReadAhead +1` (max 64) if the working set allows; else shrink queue high waters by 10% to fund it |
@@ -242,6 +247,10 @@ Tests drive the controller with `FakeKnobs`, `FakePlacement`, a scripted `Sample
 
 **RC-T14 resume_seeds_from_profile.** With profiles for two of three stages, `probe_missing` runs exactly one probe and starts with targets computed from the seeded `a_k`s; with checkpointing on, a profile file exists after the first tick past 50 records. f.14, f.9.
 
+**RC-T15 safety_from_evidence.** With no profile, `safety == safety_initial`; with a profile of 16 samples and low variance, `safety` is near the initial value; with 40,000 samples and low variance, near the floor; with 40,000 samples and high variance, well above the floor; drift resets it. f.2.
+
+**RC-T16 state_growth.** A fake stateful kernel whose `footprint` grows by 64 MiB per morsel: the `StateGrowth` class fires, targets shrink to fund the state, and the run terminates with `Budget` naming the stage once state alone exceeds half the budget; peak anon never exceeds the ceiling. f.3, f.6.
+
 ## l. Implementation notes for the agent
 
 Files: `src/lib.rs`, `src/budget.rs` (f.1), `src/probe.rs` (f.2), `src/model.rs` (working set, envelope, f.3), `src/sizer/{mod.rs (trait), rule.rs (f.4), learned.rs (stub + shadow error tracking f.8)}`, `src/apply.rs` (f.5, RC-I1 check), `src/classify.rs` (f.6), `src/breach.rs` (f.7), `src/profile.rs` (e.3, f.9), `src/tick.rs` (thread, queue drain), `src/summary.rs`. No `unsafe`.
@@ -263,6 +272,8 @@ None. (The learned sizer's model is Phase 8; the stub and the shadow error track
 | S3 | f.4, f.6 | RC-T13 |
 | S6, G-I8 | RC-I4, f.7 | RC-T4, RC-T12 |
 | S17 | f.9 (periodic write), f.14 | RC-T14 |
+| S1, S6 (stateful kernels) | f.3 `state`, f.6 StateGrowth | RC-T16 |
+| S3, S11 (margin from evidence) | f.2 safety derivation | RC-T15 |
 | S11 | RC-I3, RC-I5 | RC-T3, RC-T5 |
 | D2 | RC-I8, f.6 | RC-T8, RC-T9 |
 | D3 | RC-I6, f.2 | RC-T6 |

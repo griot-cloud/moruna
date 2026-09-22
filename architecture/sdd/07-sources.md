@@ -208,7 +208,7 @@ Verify before starting: parquet crate `RowSelection` behaviour for selections th
 
 ## m. Open items
 
-None.
+**SO-M1. `VortexSource` (Phase 7).** A fourth source over the Vortex file format (compressed Arrow arrays with lightweight cascading encodings; lazy layouts bound to a segment source; zone-map statistics every 8k rows by default). Two properties matter to this runtime and are the reason to build it: `plan` gets per-zone statistics at 8k-row granularity rather than per-row-group, so look-ahead features are finer and sub-splitting to a morsel target is exact; and Vortex's segment source abstraction lets reads land in arena buffers directly, so columns in canonical (Arrow-layout) encodings arrive with no decode copy, removing for those columns the exception G-I2 grants Parquet. Compressed columns are canonicalised at read (the decode copy, as for Parquet), unless the consumer accepts Vortex arrays, which no v1 kernel does. Tensors are out of scope (Vortex has no tensor payload; AMB1 stays). The `vortex` crate enters the dependency table (preamble 6.2) in the pull request that builds this source, under E2, not before. Architecture 5.6 records the further step where Vortex on local disk serves as Q0's staging tier.
 
 ## n. Traceability
 

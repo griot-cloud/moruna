@@ -57,7 +57,7 @@ Beyond the preamble's global vocabulary:
 
 **CT-I10. Errors carry the morsel.** Every error variant that can occur while processing a morsel carries `seq`, `stage` and, where known, `features` and the measured footprint, so a diagnostic can be produced without a debugger (G-I8).
 
-**CT-I11. Reserved variants are matched, never wildcarded.** `Tier::Remote`, `NodeId` values other than `LOCAL_NODE`, and `Locality::Local` exist in v1 so that the multi-node extension adds behaviour without changing a signature. Every `match` on `Tier` in every crate has an explicit `Remote` arm that returns `AmoruError::Unsupported("rdma")` (or handles it, once the `rdma` feature exists); no `_ =>` arm covers it. Rationale: the aim is one framework that runs at one node and at many without rework; a wildcard arm is where the rework would hide.
+**CT-I11. Reserved variants are matched, never wildcarded.** `Tier::Remote`, `NodeId` values other than `LOCAL_NODE`, `Locality::Local` and `StagingCodec` exist in v1 so that the multi-node extension adds behaviour without changing a signature. Every `match` on `Tier` in every crate has an explicit `Remote` arm that returns `AmoruError::Unsupported("rdma")` (or handles it, once the `rdma` feature exists); no `_ =>` arm covers it. Rationale: the aim is one framework that runs at one node and at many without rework; a wildcard arm is where the rework would hide.
 
 **CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read. `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
 
@@ -136,6 +136,16 @@ pub struct SegmentRef {
     /// Byte length of the payload as written.
     pub len: u64,
 }
+
+/// How a staging segment's records are encoded. `Raw` is the payload's in-memory
+/// layout written as is (page-aligned Arrow IPC or AMB1), moved by DMA with no CPU
+/// in the path (PL-I4). Reserved for a compressed variant (a Vortex-encoded record,
+/// architecture 5.6) that trades CPU on the demotion path for disk bytes when the
+/// controller decides the run is disk-bound with idle cores; every v1 `match`
+/// handles the enum explicitly (CT-I11) and the segment record header carries
+/// the codec byte, so adding the variant changes no layout.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub enum StagingCodec { #[default] Raw }
 
 impl Tier {
     /// True for Device, PinnedHost and Host; false for Disk and Remote.
@@ -409,6 +419,13 @@ pub trait KernelState: Send {
     /// scheduler treats as "nothing to save" for `Reinit` kernels and as an error
     /// for `Checkpoint` kernels (a `Checkpoint` kernel must return `Some`).
     fn checkpoint(&mut self) -> Result<Option<Vec<u8>>> { Ok(None) }
+    /// Bytes this instance's state holds right now (a loaded model, an accumulator).
+    /// `None` means unknown, and the default is `None`. Read by the scheduler after
+    /// every `apply` into `TraceRecord::state_bytes`, so the controller can see
+    /// state that grows with morsels seen and budget for it (RC f.3); a kernel
+    /// whose state accumulates should implement it, because the linear model
+    /// `a_k × bytes_in` does not describe it and the alternative is a breach.
+    fn footprint(&self) -> Option<u64> { None }
 }
 /// Unit state for stateless kernels.
 pub struct NoState;
@@ -705,6 +722,7 @@ pub struct TraceRecord {
     pub cpu_time_us: u64, pub throttled_delta_us: u64,
     pub q_bytes_before: Vec<u64>, pub q_bytes_after: Vec<u64>,
     pub staging_bytes_delta: i64, pub placement_miss_wait_us: u64,
+    pub state_bytes: u64,     // KernelState::footprint after apply; 0 when None or stateless
     pub sizer: u8,            // 0 rule, 1 learned
     pub outcome: Outcome, pub error: Option<String>,
 }
@@ -869,7 +887,7 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T13 fakes_compile.** `amoru-testkit` implements every trait in d.3 to d.13 and its tests exercise every method once. Proves the contract is implementable.
 
-**CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms compiles with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`bench/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
+**CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms, and a `match` on `StagingCodec` with one named arm, compile with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`bench/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` or a `StagingCodec` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
 
 **CT-T15 resume_defaults.** A kernel with the default `restore` returns `Resume`; a `KernelState` with the default `checkpoint` returns `Ok(None)`; a sink with the default `resume` returns `Resume` and `committed_seq() == None`; `ResumePolicy::default() == Reinit`. Proves the resume defaults are refusals, not silent successes (l, anti-patterns).
 
@@ -889,7 +907,7 @@ Environment facts to verify before starting: `cargo --version` ≥ the 2024-edit
 
 ## m. Open items
 
-None. (E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `AmoruError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
+None. (E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, the staging reservation `StagingCodec`, the state seam `KernelState::footprint` with `TraceRecord::state_bytes`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `AmoruError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
 
 ## n. Traceability
 
