@@ -1,0 +1,6 @@
+# Wave 0 pin (preamble 6.6): the stable toolchain every build and CI job uses.
+# A bump is an E2 item for a human (preamble section 7).
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+profile = "minimal"

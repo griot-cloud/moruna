@@ -1,0 +1,21 @@
+[package]
+name = "amoru-arena"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru memory arena"
+
+[dependencies]
+amoru-kernel = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+rdma = []

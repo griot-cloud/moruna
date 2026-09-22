@@ -451,7 +451,25 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7).
 
-Pinned versions (filled by the component 1 agent in wave 0): _pending_.
+Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22; the toolchain is `rust-toolchain.toml`, Rust 1.98.1 stable, edition 2024). Every entry is an exact `=` pin in the root `Cargo.toml`'s `[workspace.dependencies]` and was the latest stable, non-yanked release on crates.io that day:
+
+| Crate | Version | Crate | Version |
+|---|---|---|---|
+| `arrow` | 60.0.0 | `thiserror` | 2.0.20 |
+| `parquet` | 60.0.0 | `tracing` | 0.1.44 |
+| `object_store` | 0.14.2 | `mimalloc` | 0.1.52 |
+| `dlpark` | 0.8.0 | `blake3` | 1.8.7 |
+| `safetensors` | 0.8.0 | `serde` | 1.0.229 |
+| `tokio` | 1.53.1 | `serde_json` | 1.0.151 |
+| `io-uring` | 0.7.15 | `base64` | 0.23.1 |
+| `crossbeam` | 0.8.5 | `libc` | 0.2.189 |
+| `cudarc` | 0.19.9 | `bytes` | 1.12.1 |
+| `pyo3` | 0.29.2 | `getrandom` | 0.4.3 |
+| `pyo3-arrow` | 0.19.0 | `hostname` | 0.4.2 |
+| `maturin` (build tool, not a Cargo dependency; pinned by the wave 5 `pyproject.toml` and the wheel job) | 1.15.0 | `polars` | 0.55.2 |
+| `datafusion` | 55.1.0 | `tracing-subscriber` | 0.3.23 |
+
+Known at pinning time, escalated as E2 in the F0.1 pull request rather than decided there: `datafusion` 55.1.0 and `pyo3-arrow` 0.19.0 both require `arrow` 59, so a build with the `datafusion` feature or of `amoru-py` carries two `arrow` versions (59.3.0 and 60.0.0) whose `RecordBatch` types do not interoperate until the human chooses which side moves.
 
 ### 6.3 Feature flags
 

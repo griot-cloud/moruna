@@ -1,0 +1,29 @@
+[package]
+name = "amoru-reactor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru IO reactor"
+
+[dependencies]
+amoru-kernel = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+bytes = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+uring = ["dep:io-uring"]
+gds = ["cuda"]
+rdma = []

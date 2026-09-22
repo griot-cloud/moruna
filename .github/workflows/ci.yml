@@ -1,0 +1,135 @@
+# Amoru CI (preamble 6.6, wave 0). Four jobs:
+#   1. quality:   tools/quality/check.sh, the same gate the pre-commit hook runs
+#                 (em dashes, fmt, clippy -D warnings, the CT-T14 lint, tests,
+#                 per-crate coverage), plus the CT-T12 boundary check on
+#                 `cargo tree -p amoru-kernel` until F0.2 makes it a test.
+#   2. container: the test suite under `docker run --memory=2g --cpus=1.5`, the
+#                 ceiling the budget and kill-and-resume tests of later waves run under.
+#   3. minio:     a MinIO container reachable on 127.0.0.1:9000 for the
+#                 object-store paths (sources, sinks, reactor; from wave 2).
+#   4. python:    a matrix over 3.13, 3.13t, 3.14 and 3.14t proving each
+#                 interpreter starts and imports the placeholder package.
+# Every action and image is pinned to a version; a bump is a reviewed change.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.98.1"
+
+jobs:
+  quality:
+    name: quality gate (tools/quality/check.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: quality
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2.87.17
+        with:
+          tool: cargo-llvm-cov@0.8.5
+      - name: Run the quality gate
+        run: tools/quality/check.sh
+      - name: CT-T12 boundary, amoru-kernel has no runtime dependency
+        run: |
+          cargo tree -p amoru-kernel > kernel-tree.txt
+          cat kernel-tree.txt
+          if grep -E -i '\b(tokio|cudarc|pyo3|parquet|object_store)\b' kernel-tree.txt; then
+            echo "amoru-kernel must not depend on tokio, cudarc, pyo3, parquet or object_store (01 section a, CT-T12)" >&2
+            exit 1
+          fi
+          echo "CT-T12 boundary holds"
+
+  container:
+    name: container gate (--memory=2g --cpus=1.5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Cargo registry cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: container-registry-${{ hashFiles('Cargo.lock') }}
+      - name: Test suite under a memory and CPU ceiling
+        run: |
+          mkdir -p "$HOME/.cargo/registry"
+          docker run --rm \
+            --memory=2g --cpus=1.5 \
+            -e CARGO_BUILD_JOBS=2 \
+            -e CARGO_INCREMENTAL=0 \
+            -e CARGO_TERM_COLOR=always \
+            -v "$PWD:/work" -w /work \
+            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
+            rust:${RUST_TOOLCHAIN}-slim-bookworm \
+            sh -ec 'rustup show active-toolchain; cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace'
+
+  minio:
+    name: object store (MinIO)
+    runs-on: ubuntu-latest
+    env:
+      AMORU_S3_ENDPOINT: http://127.0.0.1:9000
+      AWS_ACCESS_KEY_ID: amoru
+      AWS_SECRET_ACCESS_KEY: amoru-ci-secret
+      AWS_REGION: us-east-1
+      AWS_ALLOW_HTTP: "true"
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 1 30); do
+            if curl -sf "$AMORU_S3_ENDPOINT/minio/health/live" >/dev/null; then
+              echo "MinIO is live after $i s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become live" >&2; docker logs minio; exit 1
+      - name: Create the bucket the object-store tests use
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_ci="http://$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY@127.0.0.1:9000" \
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb ci/amoru-ci
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: minio
+      - name: Test suite with the object store reachable
+        run: cargo test --workspace
+
+  python:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.13t", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Interpreter starts and reports its GIL state
+        run: |
+          python -c 'import sys, sysconfig; print(sys.version); print("free-threaded build:", bool(sysconfig.get_config_var("Py_GIL_DISABLED"))); print("gil enabled now:", sys._is_gil_enabled())'
+      - name: Placeholder package imports
+        run: |
+          PYTHONPATH=python python -c 'import amoru; print("amoru", amoru.__version__)'

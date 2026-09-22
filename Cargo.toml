@@ -1,0 +1,59 @@
+# Amoru workspace root (preamble 6.1). Every member crate is listed under
+# crates/; shared dependency versions are pinned exactly in
+# [workspace.dependencies] (preamble 6.2) and a bump is an E2 item.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/griot-cloud/amoru"
+publish = false
+
+[workspace.dependencies]
+# Workspace crates (preamble 6.1; the crate graph is preamble 1.3).
+amoru-kernel = { path = "crates/amoru-kernel", version = "0.1.0" }
+amoru-arena = { path = "crates/amoru-arena", version = "0.1.0" }
+amoru-discovery = { path = "crates/amoru-discovery", version = "0.1.0" }
+amoru-trace = { path = "crates/amoru-trace", version = "0.1.0" }
+amoru-adapters = { path = "crates/amoru-adapters", version = "0.1.0" }
+amoru-reactor = { path = "crates/amoru-reactor", version = "0.1.0" }
+amoru-sources = { path = "crates/amoru-sources", version = "0.1.0" }
+amoru-sinks = { path = "crates/amoru-sinks", version = "0.1.0" }
+amoru-placement = { path = "crates/amoru-placement", version = "0.1.0" }
+amoru-scheduler = { path = "crates/amoru-scheduler", version = "0.1.0" }
+amoru-controller = { path = "crates/amoru-controller", version = "0.1.0" }
+amoru-runtime = { path = "crates/amoru-runtime", version = "0.1.0" }
+amoru-testkit = { path = "crates/amoru-testkit", version = "0.1.0" }
+
+# External crates, the preamble 6.2 table, pinned to the latest stable on
+# 2026-09-22. Feature lists are the table's "Notes" column; a backend or
+# engine feature a component needs beyond these is set in that crate.
+arrow = { version = "=60.0.0", default-features = false, features = ["ffi", "ipc"] }
+parquet = { version = "=60.0.0", features = ["arrow", "async", "object_store"] }
+object_store = { version = "=0.14.2" }
+dlpark = { version = "=0.8.0" }
+safetensors = { version = "=0.8.0" }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "fs", "sync"] }
+io-uring = { version = "=0.7.15" }
+crossbeam = { version = "=0.8.5" }
+cudarc = { version = "=0.19.9" }
+pyo3 = { version = "=0.29.2" }
+pyo3-arrow = { version = "=0.19.0" }
+thiserror = { version = "=2.0.20" }
+tracing = { version = "=0.1.44" }
+mimalloc = { version = "=0.1.52" }
+blake3 = { version = "=1.8.7" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151" }
+base64 = { version = "=0.23.1" }
+libc = { version = "=0.2.189" }
+bytes = { version = "=1.12.1" }
+getrandom = { version = "=0.4.3" }
+hostname = { version = "=0.4.2" }
+polars = { version = "=0.55.2" }
+datafusion = { version = "=55.1.0" }
+tracing-subscriber = { version = "=0.3.23" }

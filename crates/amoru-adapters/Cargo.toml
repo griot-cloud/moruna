@@ -1,0 +1,22 @@
+[package]
+name = "amoru-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru kernel adapters"
+
+[dependencies]
+amoru-kernel = { workspace = true }
+arrow = { workspace = true }
+dlpark = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-arrow = { workspace = true, optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:pyo3-arrow"]

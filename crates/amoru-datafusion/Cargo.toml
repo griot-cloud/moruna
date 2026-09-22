@@ -1,0 +1,17 @@
+[package]
+name = "amoru-datafusion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru DataFusion bridge"
+
+[dependencies]
+amoru-kernel = { workspace = true }
+datafusion = { workspace = true, optional = true }
+
+[features]
+default = []
+datafusion = ["dep:datafusion"]

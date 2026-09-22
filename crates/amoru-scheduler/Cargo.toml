@@ -1,0 +1,20 @@
+[package]
+name = "amoru-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru scheduler"
+
+[dependencies]
+amoru-kernel = { workspace = true }
+amoru-sinks = { workspace = true }
+crossbeam = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+[features]
+default = []

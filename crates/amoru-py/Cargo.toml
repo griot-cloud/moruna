@@ -1,0 +1,27 @@
+[package]
+name = "amoru-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru Python module"
+
+[dependencies]
+amoru-runtime = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-arrow = { workspace = true, optional = true }
+
+[features]
+default = []
+# Preamble 6.3: `amoru-py` enables `python` and, on Linux, `uring`. The stub
+# keeps both off by default so `cargo build --workspace` does not build pyo3
+# (the wave 0 brief); the maturin build of wave 5 turns them on.
+python = ["dep:pyo3", "dep:pyo3-arrow", "amoru-runtime/python"]
+uring = ["amoru-runtime/uring"]
+cuda = ["amoru-runtime/cuda"]

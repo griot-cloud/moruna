@@ -1,0 +1,18 @@
+[package]
+name = "amoru-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru contracts: the types and traits every component shares"
+
+[dependencies]
+arrow = { workspace = true }
+dlpark = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+
+[features]
+default = []
