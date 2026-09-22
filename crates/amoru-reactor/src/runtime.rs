@@ -108,6 +108,19 @@ pub(crate) struct WriteObjectOp {
     pub(crate) tx: CompletionSender<()>,
 }
 
+/// `delete_object`.
+pub(crate) struct DeleteObjectOp {
+    pub(crate) url: String,
+    pub(crate) tx: CompletionSender<()>,
+}
+
+/// `abort_multipart`.
+pub(crate) struct AbortMultipartOp {
+    pub(crate) url: String,
+    pub(crate) upload_id: String,
+    pub(crate) tx: CompletionSender<()>,
+}
+
 /// `copy`, already planned on the caller's thread (f.5).
 pub(crate) struct CopyOp {
     pub(crate) plan: copy::Plan,
@@ -138,6 +151,8 @@ pub(crate) struct Queues {
     pub(crate) write_file: UnboundedSender<WriteFileOp>,
     pub(crate) read_object: UnboundedSender<ReadObjectOp>,
     pub(crate) write_object: UnboundedSender<WriteObjectOp>,
+    pub(crate) delete_object: UnboundedSender<DeleteObjectOp>,
+    pub(crate) abort_multipart: UnboundedSender<AbortMultipartOp>,
     pub(crate) copy: UnboundedSender<CopyOp>,
     pub(crate) meta: UnboundedSender<MetaOp>,
 }
@@ -180,6 +195,10 @@ pub(crate) fn start(inner: &Arc<Inner>, object_concurrency: usize, file_depth: u
     drain(inner, rx, Arc::clone(&objects), run_read_object);
     let (write_object, rx) = unbounded_channel();
     drain(inner, rx, Arc::clone(&objects), run_write_object);
+    let (delete_object, rx) = unbounded_channel();
+    drain(inner, rx, Arc::clone(&objects), run_delete_object);
+    let (abort_multipart, rx) = unbounded_channel();
+    drain(inner, rx, Arc::clone(&objects), run_abort_multipart);
     let (copy_tx, rx) = unbounded_channel();
     drain(inner, rx, copies, run_copy);
     let (meta, rx) = unbounded_channel();
@@ -191,6 +210,8 @@ pub(crate) fn start(inner: &Arc<Inner>, object_concurrency: usize, file_depth: u
         write_file,
         read_object,
         write_object,
+        delete_object,
+        abort_multipart,
         copy: copy_tx,
         meta,
     }
@@ -233,32 +254,62 @@ fn descriptor(
 }
 
 /// Run one file request on an engine and wait for its callback.
-async fn once(engine: &Arc<dyn FileEngine>, req: FileReq) -> std::io::Result<usize> {
+/// Run one request on an engine and wait for it.
+///
+/// `owner` is whatever keeps the operation's bytes alive: the `Buffer` of a read, the
+/// `BufferView` of a write. It is moved into the engine's completion callback, not held in this
+/// future, because this future can be dropped while the syscall is still running: `shutdown`
+/// drops the runtime, which drops every task that is awaiting, and a blocking `pread` already
+/// under way would then be writing into a buffer whose last owner had just been dropped. With
+/// the owner in the callback the bytes outlive the syscall whether or not anyone is still
+/// waiting for the answer (RE-I1). It comes back with the result so a read can return its
+/// buffer; `None` means the engine dropped the callback without calling it, and then the bytes
+/// are already gone.
+async fn once<O: Send + 'static>(
+    engine: &Arc<dyn FileEngine>,
+    req: FileReq,
+    owner: O,
+) -> (std::io::Result<usize>, Option<O>) {
     let (tx, rx) = oneshot::channel();
     engine.submit(
         req,
         Box::new(move |r| {
-            let _ = tx.send(r.map_err(|e| e.to_string()));
+            let _ = tx.send((r.map_err(|e| e.to_string()), owner));
         }),
     );
     match rx.await {
-        Ok(Ok(n)) => Ok(n),
-        Ok(Err(msg)) => Err(std::io::Error::other(msg)),
-        Err(_) => Err(std::io::Error::other("the io engine stopped")),
+        Ok((Ok(n), owner)) => (Ok(n), Some(owner)),
+        Ok((Err(msg), owner)) => (Err(std::io::Error::other(msg)), Some(owner)),
+        Err(_) => (Err(std::io::Error::other("the io engine stopped")), None),
     }
 }
 
 /// One whole file operation: pick the descriptor, count the path, run it, and take the io_uring
 /// row's one per-operation fallback when it is available (f.9).
-async fn file_op(
-    inner: &Arc<Inner>,
+/// One file operation as the runner describes it, so `file_op` takes the work and the bytes
+/// and nothing else.
+struct FileWork {
     kind: OpKind,
     path: PathBuf,
     offset: u64,
     ptr: usize,
     len: usize,
     verb: Verb,
-) -> Result<usize> {
+}
+
+async fn file_op<O: Send + 'static>(
+    inner: &Arc<Inner>,
+    work: FileWork,
+    owner: O,
+) -> (Result<usize>, Option<O>) {
+    let FileWork {
+        kind,
+        path,
+        offset,
+        ptr,
+        len,
+        verb,
+    } = work;
     let aligned = inner.paths.direct.on && eligible(inner, ptr, offset, len);
     let held = {
         let inner = Arc::clone(inner);
@@ -267,9 +318,13 @@ async fn file_op(
             Verb::Read => Mode::Read,
             Verb::Write => Mode::Write,
         };
-        tokio::task::spawn_blocking(move || descriptor(&inner, kind, &owned, mode, aligned))
+        match tokio::task::spawn_blocking(move || descriptor(&inner, kind, &owned, mode, aligned))
             .await
-            .map_err(|e| join_error(kind, &path, &e))??
+            .map_err(|e| join_error(kind, &path, &e))
+        {
+            Ok(Ok(held)) => held,
+            Ok(Err(e)) | Err(e) => return (Err(e), Some(owner)),
+        }
     };
     let (fd, direct) = held;
     inner.counters.note_direct(direct);
@@ -283,9 +338,16 @@ async fn file_op(
     if inner.paths.uring.on {
         inner.counters.note_uring();
     }
-    let first = once(&inner.engine, req(&fd)).await;
-    let Err(e) = first else {
-        return first.map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e));
+    let (first, owner) = once(&inner.engine, req(&fd), owner).await;
+    let e = match first {
+        Ok(n) => return (Ok(n), owner),
+        Err(e) => e,
+    };
+    let Some(owner) = owner else {
+        return (
+            Err(crate::fdcache::io_error(kind.as_str(), &path, &e)),
+            None,
+        );
     };
     // One per-operation fallback, and only on a path the host merely probed (f.9, RE-I3): the
     // blocking pool for the io_uring row, a buffered descriptor for the direct IO row.
@@ -294,9 +356,11 @@ async fn file_op(
         inner
             .counters
             .warn_fallback(kind, P_URING, &format!("{}: {e}", inner.engine.name()));
-        return once(&inner.fallback, req(&fd))
-            .await
-            .map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e));
+        let (result, owner) = once(&inner.fallback, req(&fd), owner).await;
+        return (
+            result.map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e)),
+            owner,
+        );
     }
     if direct && inner.paths.direct.may_fall_back() {
         inner.counters.note_fallback();
@@ -308,16 +372,25 @@ async fn file_op(
                 Verb::Read => Mode::Read,
                 Verb::Write => Mode::Write,
             };
-            tokio::task::spawn_blocking(move || inner.fds.acquire_buffered(&owned, mode))
+            match tokio::task::spawn_blocking(move || inner.fds.acquire_buffered(&owned, mode))
                 .await
-                .map_err(|e| join_error(kind, &path, &e))??
+                .map_err(|e| join_error(kind, &path, &e))
+            {
+                Ok(Ok(fd)) => fd,
+                Ok(Err(e)) | Err(e) => return (Err(e), Some(owner)),
+            }
         };
         inner.counters.note_direct(false);
-        return once(&inner.engine, req(&buffered))
-            .await
-            .map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e));
+        let (result, owner) = once(&inner.engine, req(&buffered), owner).await;
+        return (
+            result.map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e)),
+            owner,
+        );
     }
-    Err(crate::fdcache::io_error(kind.as_str(), &path, &e))
+    (
+        Err(crate::fdcache::io_error(kind.as_str(), &path, &e)),
+        Some(owner),
+    )
 }
 
 fn join_error(kind: OpKind, path: &Path, e: &tokio::task::JoinError) -> AmoruError {
@@ -368,25 +441,32 @@ async fn run_read_file(inner: Arc<Inner>, op: ReadFileOp, _permit: OwnedSemaphor
         return;
     }
     let len = dst.len();
-    let result = match host_ptr_of(&dst) {
-        Ok(ptr) => {
-            file_op(
-                &inner,
-                OpKind::ReadFile,
-                path.clone(),
-                offset,
-                ptr,
-                len,
-                Verb::Read,
-            )
-            .await
+    let ptr = match host_ptr_of(&dst) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            inner.resolve(tx, Err(e));
+            return;
         }
-        Err(e) => Err(e),
     };
-    match result {
-        Ok(n) if n == len => inner.resolve(tx, Ok(dst)),
-        Ok(n) => inner.resolve(tx, Err(short_read(OpKind::ReadFile, &path, n, len))),
-        Err(e) => inner.resolve(tx, Err(e)),
+    // The buffer travels with the request: it is the engine's callback that holds it until the
+    // syscall is over, not this task, which `shutdown` may drop (RE-I1, `once`).
+    let (result, dst) = file_op(
+        &inner,
+        FileWork {
+            kind: OpKind::ReadFile,
+            path: path.clone(),
+            offset,
+            ptr,
+            len,
+            verb: Verb::Read,
+        },
+        dst,
+    )
+    .await;
+    match (result, dst) {
+        (Ok(n), Some(dst)) if n == len => inner.resolve(tx, Ok(dst)),
+        (Ok(n), _) => inner.resolve(tx, Err(short_read(OpKind::ReadFile, &path, n, len))),
+        (Err(e), _) => inner.resolve(tx, Err(e)),
     }
 }
 
@@ -403,25 +483,30 @@ async fn run_read_file_opt(inner: Arc<Inner>, op: ReadFileOptOp, _permit: OwnedS
         return;
     }
     let len = dst.len();
-    let result = match host_ptr_of(&dst) {
-        Ok(ptr) => {
-            file_op(
-                &inner,
-                OpKind::ReadFileOpt,
-                path.clone(),
-                offset,
-                ptr,
-                len,
-                Verb::Read,
-            )
-            .await
+    let ptr = match host_ptr_of(&dst) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            inner.resolve(tx, Err(e));
+            return;
         }
-        Err(e) => Err(e),
     };
-    match result {
-        Ok(n) if n == len || allow_short => inner.resolve(tx, Ok((dst, n))),
-        Ok(n) => inner.resolve(tx, Err(short_read(OpKind::ReadFileOpt, &path, n, len))),
-        Err(e) => inner.resolve(tx, Err(e)),
+    let (result, dst) = file_op(
+        &inner,
+        FileWork {
+            kind: OpKind::ReadFileOpt,
+            path: path.clone(),
+            offset,
+            ptr,
+            len,
+            verb: Verb::Read,
+        },
+        dst,
+    )
+    .await;
+    match (result, dst) {
+        (Ok(n), Some(dst)) if n == len || allow_short => inner.resolve(tx, Ok((dst, n))),
+        (Ok(n), _) => inner.resolve(tx, Err(short_read(OpKind::ReadFileOpt, &path, n, len))),
+        (Err(e), _) => inner.resolve(tx, Err(e)),
     }
 }
 
@@ -437,22 +522,28 @@ async fn run_write_file(inner: Arc<Inner>, op: WriteFileOp, _permit: OwnedSemaph
         return;
     }
     let len = src.len();
-    let result = match host_ptr_of_view(&src) {
-        Ok(ptr) => {
-            file_op(
-                &inner,
-                OpKind::WriteFile,
-                path.clone(),
-                offset,
-                ptr,
-                len,
-                Verb::Write,
-            )
-            .await
+    let ptr = match host_ptr_of_view(&src) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            inner.resolve(tx, Err(e));
+            return;
         }
-        Err(e) => Err(e),
     };
-    // The view is dropped either way; the bytes it was over are still the caller's (RE-I1).
+    // The view travels with the request and is dropped by the engine's callback, after the
+    // syscall; the bytes it was over are still the caller's either way (RE-I1).
+    let (result, src) = file_op(
+        &inner,
+        FileWork {
+            kind: OpKind::WriteFile,
+            path: path.clone(),
+            offset,
+            ptr,
+            len,
+            verb: Verb::Write,
+        },
+        src,
+    )
+    .await;
     drop(src);
     match result {
         Ok(_) => inner.resolve(tx, Ok(())),
@@ -532,6 +623,32 @@ async fn run_write_object(inner: Arc<Inner>, op: WriteObjectOp, _permit: OwnedSe
     }
     let result = crate::object::write(&inner.objects, &url, &src).await;
     drop(src);
+    inner.resolve(tx, result);
+}
+
+/// The two removal calls d.9 added for a sink's resume. They take an object permit like every
+/// other object operation, and each has a queue of its own (f.8).
+async fn run_delete_object(inner: Arc<Inner>, op: DeleteObjectOp, _permit: OwnedSemaphorePermit) {
+    let DeleteObjectOp { url, tx } = op;
+    if inner.cancelled() {
+        inner.resolve(tx, Err(AmoruError::Cancelled));
+        return;
+    }
+    let result = crate::object::delete(&inner.objects, &url).await;
+    inner.resolve(tx, result);
+}
+
+async fn run_abort_multipart(
+    inner: Arc<Inner>,
+    op: AbortMultipartOp,
+    _permit: OwnedSemaphorePermit,
+) {
+    let AbortMultipartOp { url, upload_id, tx } = op;
+    if inner.cancelled() {
+        inner.resolve(tx, Err(AmoruError::Cancelled));
+        return;
+    }
+    let result = crate::object::abort_multipart(&inner.objects, &url, &upload_id).await;
     inner.resolve(tx, result);
 }
 

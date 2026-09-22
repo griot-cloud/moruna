@@ -264,6 +264,80 @@ fn fake_reactor() {
     let patient = FakeReactor::new().cancel_on_shutdown(false);
     patient.shutdown();
     assert_eq!(patient.shutdown_calls(), 1);
+
+    // The two removal calls d.9 added for a sink's resume (contracts d.15, 2026-09-22).
+    let resuming = FakeReactor::new();
+    let alloc = FakeAllocator::new();
+    let mut buf = alloc.buffer(8, Tier::Host);
+    buf.copy_from_slice(&[7u8; 8]);
+    let owned = std::sync::Arc::new(buf);
+    resuming
+        .delete_object("s3://bucket/never-written")
+        .wait()
+        .expect("deleting what is not there is Ok");
+    resuming
+        .write_object("s3://bucket/uncommitted", owned.view())
+        .wait()
+        .expect("write");
+    assert_eq!(
+        resuming.object("s3://bucket/uncommitted"),
+        Some(vec![7u8; 8]),
+        "object(url) reads back what a sink wrote"
+    );
+    resuming
+        .delete_object("s3://bucket/uncommitted")
+        .wait()
+        .expect("delete");
+    assert_eq!(
+        resuming.object("s3://bucket/uncommitted"),
+        None,
+        "what the resume discarded is gone"
+    );
+    let gone = resuming
+        .read_object("s3://bucket/uncommitted", 0, alloc.buffer(8, Tier::Host))
+        .wait();
+    assert!(matches!(gone, Err(AmoruError::Io { .. })), "got {gone:?}");
+    // A delete also removes the file of the same name, because the fake keys both maps by the
+    // string it was given and a sink may have written through `write_file`.
+    let files = FakeReactor::new().with_file("/out/part-0", vec![1u8; 4]);
+    files
+        .delete_object("/out/part-0")
+        .wait()
+        .expect("delete a file by its name");
+    assert_eq!(files.file("/out/part-0"), None);
+
+    // An abort is recorded and never removes an object that was completed.
+    resuming
+        .write_object("s3://bucket/done", owned.view())
+        .wait()
+        .expect("write");
+    resuming
+        .abort_multipart("s3://bucket/done", "upload-1")
+        .wait()
+        .expect("abort");
+    assert_eq!(
+        resuming.object("s3://bucket/done"),
+        Some(vec![7u8; 8]),
+        "an abort abandons parts, not a finished object"
+    );
+    let ops = resuming.ops();
+    assert!(
+        ops.iter().any(
+            |op| op.kind == OpKind::DeleteObject && op.path_or_url == "s3://bucket/uncommitted"
+        )
+    );
+    assert!(
+        ops.iter()
+            .any(|op| op.kind == OpKind::AbortMultipart && op.path_or_url == "s3://bucket/done")
+    );
+    let refused = resuming
+        .fail_next(OpKind::DeleteObject, 1)
+        .delete_object("s3://bucket/done")
+        .wait();
+    assert!(
+        matches!(refused, Err(AmoruError::Io { .. })),
+        "fail_next reaches the new calls too: {refused:?}"
+    );
 }
 
 /// `FakePlacement`: knobs `with_pressure`, `with_delay`, `with_manifest_store`; observables

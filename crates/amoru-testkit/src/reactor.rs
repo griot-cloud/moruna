@@ -24,6 +24,10 @@ pub enum OpKind {
     WriteObject,
     /// `copy` between tiers.
     Copy,
+    /// `delete_object`.
+    DeleteObject,
+    /// `abort_multipart`.
+    AbortMultipart,
     /// `head_object`.
     HeadObject,
     /// `list_prefix`.
@@ -76,7 +80,8 @@ struct Inner {
 ///
 /// Knobs: `with_latency(Duration)`, `fail_next(OpKind, n)`, `cancel_on_shutdown(bool)`,
 /// `with_paths(IoPaths)`, and the in-memory files themselves (`with_file`).
-/// Observables: `ops()`, `in_flight()`, `shutdown_calls()`, `paths()`.
+/// Observables: `ops()`, `in_flight()`, `shutdown_calls()`, `paths()`, `file(path)` and
+/// `object(url)`.
 #[derive(Clone)]
 pub struct FakeReactor {
     inner: Arc<Inner>,
@@ -156,6 +161,12 @@ impl FakeReactor {
     /// Observable: the bytes an in-memory file holds.
     pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.lock().files.get(path).cloned()
+    }
+
+    /// Observable: the bytes an in-memory object holds (d.15, added 2026-09-22 so a sink's
+    /// writes, and what a resumed sink deleted, can be read back).
+    pub fn object(&self, url: &str) -> Option<Vec<u8>> {
+        self.lock().objects.get(url).cloned()
     }
 
     /// Observable: the segment numbers `register_segment` named and has not unregistered.
@@ -457,6 +468,40 @@ impl Reactor for FakeReactor {
                     msg: format!("a {:?} view has no host bytes to write", src.tier()),
                 }),
             }
+        };
+        self.resolve(index, sender, outcome);
+        completion
+    }
+
+    /// Remove an in-memory object, and the file of the same name: the fake keys both maps by
+    /// the string it was given, and `with_file` seeds both, so a resumed sink that deletes what
+    /// it wrote sees it gone whichever call wrote it. Deleting what is not there is `Ok(())`
+    /// (contracts d.9).
+    fn delete_object(&self, url: &str) -> Completion<()> {
+        let (index, failing) = self.submit(OpKind::DeleteObject, url, 0, 0, None, None);
+        let (sender, completion) = Completion::channel();
+        let outcome = if failing {
+            Err(FakeReactor::io_error("delete_object", url))
+        } else {
+            let mut state = self.lock();
+            state.objects.remove(url);
+            state.files.remove(url);
+            Ok(())
+        };
+        self.resolve(index, sender, outcome);
+        completion
+    }
+
+    /// The fake has no multipart uploads: `write_object` is one step, so there are never parts
+    /// to abandon. The call is recorded in `ops()` so a sink's resume can be seen to have made
+    /// it, and it never removes a completed object.
+    fn abort_multipart(&self, url: &str, _upload_id: &str) -> Completion<()> {
+        let (index, failing) = self.submit(OpKind::AbortMultipart, url, 0, 0, None, None);
+        let (sender, completion) = Completion::channel();
+        let outcome = if failing {
+            Err(FakeReactor::io_error("abort_multipart", url))
+        } else {
+            Ok(())
         };
         self.resolve(index, sender, outcome);
         completion

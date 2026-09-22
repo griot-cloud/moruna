@@ -47,6 +47,11 @@ pub(crate) trait ObjectBackend: Send + Sync {
         &self,
         prefix: Option<OsPath>,
     ) -> BoxFut<object_store::Result<(Vec<ObjectMeta>, Vec<OsPath>)>>;
+    /// Remove one object (d.9, `delete_object`).
+    fn delete(&self, path: &OsPath) -> BoxFut<object_store::Result<()>>;
+    /// Abandon one multipart upload by its id (d.9, `abort_multipart`). `None` from a backend
+    /// that has no multipart uploads at all, which is the local filesystem.
+    fn abort_by_id(&self, path: &OsPath, id: &str) -> Option<BoxFut<object_store::Result<()>>>;
 }
 
 /// One multipart upload in progress.
@@ -60,11 +65,19 @@ pub(crate) trait MultipartSink: Send {
 /// The shipping implementation: the `object_store` crate.
 pub(crate) struct StoreBackend {
     store: Arc<dyn ObjectStore>,
+    /// The same client again as the crate's `MultipartStore`, which is the only way to reach
+    /// an upload that this process did not start: `MultipartUpload` (what `put_multipart`
+    /// hands back) can abort only the upload it holds, and it does not survive a crash.
+    /// `None` for the local filesystem, which has no multipart uploads.
+    multipart: Option<Arc<dyn object_store::multipart::MultipartStore>>,
 }
 
 impl StoreBackend {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>) -> StoreBackend {
-        StoreBackend { store }
+    pub(crate) fn new(
+        store: Arc<dyn ObjectStore>,
+        multipart: Option<Arc<dyn object_store::multipart::MultipartStore>>,
+    ) -> StoreBackend {
+        StoreBackend { store, multipart }
     }
 }
 
@@ -108,6 +121,19 @@ impl ObjectBackend for StoreBackend {
                 .collect();
             Ok((objects, listed.common_prefixes))
         })
+    }
+
+    fn delete(&self, path: &OsPath) -> BoxFut<object_store::Result<()>> {
+        let (store, path) = (Arc::clone(&self.store), path.clone());
+        Box::pin(async move { store.delete(&path).await })
+    }
+
+    fn abort_by_id(&self, path: &OsPath, id: &str) -> Option<BoxFut<object_store::Result<()>>> {
+        let multipart = Arc::clone(self.multipart.as_ref()?);
+        let (path, id) = (path.clone(), id.to_string());
+        Some(Box::pin(async move {
+            multipart.abort_multipart(&path, &id).await
+        }))
     }
 }
 
@@ -271,14 +297,21 @@ impl ObjectLayer {
     }
 
     fn build(&self, located: &Located) -> Result<Arc<dyn ObjectBackend>> {
-        let store: Arc<dyn ObjectStore> = match located.scheme {
+        // Each client is built once and held twice: as the `ObjectStore` every operation uses
+        // and, where the backend has multipart uploads, as the `MultipartStore` that
+        // `abort_multipart` needs. The local filesystem has no second face.
+        let (store, multipart): (
+            Arc<dyn ObjectStore>,
+            Option<Arc<dyn object_store::multipart::MultipartStore>>,
+        ) = match located.scheme {
             Scheme::S3 => {
                 let s3 = self
                     .cfg
                     .s3
                     .as_ref()
                     .ok_or_else(|| config("no s3 configuration"))?;
-                Arc::new(build_s3(s3, &located.container, self.cfg.allow_http)?)
+                let client = Arc::new(build_s3(s3, &located.container, self.cfg.allow_http)?);
+                (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::Gcs => {
                 let gcs = self
@@ -286,7 +319,8 @@ impl ObjectLayer {
                     .gcs
                     .as_ref()
                     .ok_or_else(|| config("no gcs configuration"))?;
-                Arc::new(build_gcs(gcs, &located.container)?)
+                let client = Arc::new(build_gcs(gcs, &located.container)?);
+                (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::Azure => {
                 let azure = self
@@ -294,17 +328,19 @@ impl ObjectLayer {
                     .azure
                     .as_ref()
                     .ok_or_else(|| config("no azure configuration"))?;
-                Arc::new(build_azure(azure, &located.container, self.cfg.allow_http)?)
+                let client = Arc::new(build_azure(azure, &located.container, self.cfg.allow_http)?);
+                (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
-            Scheme::File => match &self.cfg.local_root {
-                Some(root) => Arc::new(
-                    object_store::local::LocalFileSystem::new_with_prefix(root)
+            Scheme::File => {
+                let local = match &self.cfg.local_root {
+                    Some(root) => object_store::local::LocalFileSystem::new_with_prefix(root)
                         .map_err(|e| config(&format!("local_root {}: {e}", root.display())))?,
-                ),
-                None => Arc::new(object_store::local::LocalFileSystem::new()),
-            },
+                    None => object_store::local::LocalFileSystem::new(),
+                };
+                (Arc::new(local), None)
+            }
         };
-        Ok(Arc::new(StoreBackend::new(store)))
+        Ok(Arc::new(StoreBackend::new(store, multipart)))
     }
 }
 
@@ -445,6 +481,52 @@ async fn join_one(
             msg: e.to_string(),
         }),
     }
+}
+
+/// `delete_object` (d.9): remove one object, or one file under a `file://` url.
+///
+/// An object that is not there is `Ok(())`: a resumed sink deletes what it wrote above
+/// `committed_seq`, and a resume that runs twice must not fail the second time.
+pub(crate) async fn delete(layer: &ObjectLayer, url: &str) -> Result<()> {
+    let (backend, path) = layer.resolve(url)?;
+    match backend.delete(&path).await {
+        Ok(()) => Ok(()),
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(io(crate::stats::OpKind::DeleteObject.as_str(), url, &e)),
+    }
+}
+
+/// `abort_multipart` (d.9): abandon an upload by its id, so a killed run does not leave parts
+/// billed forever.
+///
+/// An upload the store no longer knows is `Ok(())`, for the same reason `delete` is. A
+/// `file://` url is `Unsupported`: the local filesystem has no multipart uploads, so an id for
+/// one cannot exist and a caller that passes one is asking for something that never happened.
+pub(crate) async fn abort_multipart(layer: &ObjectLayer, url: &str, upload_id: &str) -> Result<()> {
+    let (backend, path) = layer.resolve(url)?;
+    let Some(fut) = backend.abort_by_id(&path, upload_id) else {
+        return Err(AmoruError::Unsupported(
+            "abort_multipart: this backend has no multipart uploads",
+        ));
+    };
+    match fut.await {
+        Ok(()) => Ok(()),
+        Err(e) if is_missing_upload(&e) => Ok(()),
+        Err(e) => Err(io(crate::stats::OpKind::AbortMultipart.as_str(), url, &e)),
+    }
+}
+
+/// True for the "this store has never heard of that upload" answers, which an abort treats as
+/// success: a resume that runs twice must not fail the second time. S3 answers an unknown
+/// upload id with a 404, which the crate reports as `NotFound`; the crate's own in-memory store
+/// reports it as a `Generic` naming the upload, so the text is read as well, the way
+/// `is_transport_error` below reads it.
+fn is_missing_upload(e: &object_store::Error) -> bool {
+    if matches!(e, object_store::Error::NotFound { .. }) {
+        return true;
+    }
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("upload") && text.contains("not found")
 }
 
 /// The `Config { name: "object_store" }` of d.1.
@@ -608,7 +690,20 @@ mod store_tests {
     use super::*;
 
     fn store() -> StoreBackend {
-        StoreBackend::new(Arc::new(object_store::memory::InMemory::new()))
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        StoreBackend::new(
+            Arc::clone(&memory) as Arc<dyn ObjectStore>,
+            Some(memory as Arc<dyn object_store::multipart::MultipartStore>),
+        )
+    }
+
+    /// The local filesystem has no multipart uploads, so the seam hands back no future for one
+    /// and `abort_multipart` is `Unsupported` rather than a silent success.
+    #[test]
+    fn a_local_store_has_no_multipart_to_abort() {
+        let local: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+        let backend = StoreBackend::new(local, None);
+        assert!(backend.abort_by_id(&OsPath::from("x"), "1").is_none());
     }
 
     fn rt() -> tokio::runtime::Runtime {

@@ -99,7 +99,6 @@ pub trait Reactor: Send + Sync {
     fn register_segment(&self, segment: u32, path: &Path) -> crate::Result<()>;
     /// Close a segment's descriptor.
     fn unregister_segment(&self, segment: u32);
-    /// Which direct paths this reactor selected at start (for the run report).
     /// Remove an object or a local file. A resumed sink must discard the output it
     /// wrote above `committed_seq`, and without this the resume path was complete only
     /// for a local prefix where `std::fs` could be used directly. Deleting what is not

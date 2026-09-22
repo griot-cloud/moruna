@@ -108,6 +108,10 @@ struct BackendCounts {
 /// in flight, an optional latency, an injectable transport failure and a part that fails.
 pub(crate) struct TestBackend {
     inner: StoreBackend,
+    /// The same in-memory store the seam wraps, so a test can start a multipart upload and
+    /// hold its id, which no reactor call hands out (the id is the store's, not the
+    /// reactor's).
+    memory: Arc<object_store::memory::InMemory>,
     counts: Mutex<BackendCounts>,
     latency: Mutex<Duration>,
     fail_part: Mutex<Option<usize>>,
@@ -120,8 +124,15 @@ pub(crate) struct TestBackend {
 
 impl TestBackend {
     fn new() -> Arc<TestBackend> {
+        // The in-memory store is both the `ObjectStore` and the `MultipartStore`, so a test can
+        // abort an upload by its id the way a resumed sink does.
+        let memory = Arc::new(object_store::memory::InMemory::new());
         Arc::new(TestBackend {
-            inner: StoreBackend::new(Arc::new(object_store::memory::InMemory::new())),
+            inner: StoreBackend::new(
+                Arc::clone(&memory) as Arc<dyn object_store::ObjectStore>,
+                Some(Arc::clone(&memory) as Arc<dyn object_store::multipart::MultipartStore>),
+            ),
+            memory,
             counts: Mutex::new(BackendCounts::default()),
             latency: Mutex::new(Duration::ZERO),
             fail_part: Mutex::new(None),
@@ -226,6 +237,20 @@ impl ObjectBackend for Arc<TestBackend> {
         prefix: Option<OsPath>,
     ) -> BoxFut<object_store::Result<(Vec<ObjectMeta>, Vec<OsPath>)>> {
         self.inner.list_one_level(prefix)
+    }
+
+    fn delete(&self, path: &OsPath) -> BoxFut<object_store::Result<()>> {
+        let me = Arc::clone(self);
+        let inner = self.inner.delete(path);
+        me.enter();
+        Box::pin(async move {
+            let _guard = InFlight(Arc::clone(&me));
+            inner.await
+        })
+    }
+
+    fn abort_by_id(&self, path: &OsPath, id: &str) -> Option<BoxFut<object_store::Result<()>>> {
+        self.inner.abort_by_id(path, id)
     }
 }
 
@@ -1321,6 +1346,130 @@ fn object_metadata_answers_head_and_list() {
     reactor.shutdown();
 }
 
+/// `delete_object` (d.9), which a resumed sink uses to discard what it wrote above
+/// `committed_seq`: a delete makes the object unreadable, and deleting what is not there is
+/// `Ok(())`, so a resume that runs twice does not fail the second time.
+#[test]
+fn deleting_an_object_removes_it_and_an_absent_one_is_ok() {
+    let alloc = FakeAllocator::new();
+    let (reactor, _backend) = reactor(&alloc);
+    let mut buf = alloc.buffer(128, Tier::Host);
+    buf.copy_from_slice(&pattern(128, 0x5a));
+    let owned = Arc::new(buf);
+    reactor
+        .delete_object("s3://bucket/never-written")
+        .wait()
+        .expect("deleting what is not there is Ok");
+    reactor
+        .write_object("s3://bucket/gone", owned.view())
+        .wait()
+        .expect("put");
+    assert_eq!(
+        reactor
+            .head_object("s3://bucket/gone")
+            .wait()
+            .expect("head")
+            .size,
+        128
+    );
+    reactor
+        .delete_object("s3://bucket/gone")
+        .wait()
+        .expect("delete");
+    let after = reactor
+        .read_object("s3://bucket/gone", 0, alloc.buffer(128, Tier::Host))
+        .wait();
+    assert!(matches!(after, Err(AmoruError::Io { .. })), "{after:?}");
+    reactor
+        .delete_object("s3://bucket/gone")
+        .wait()
+        .expect("the second delete is Ok as well");
+    let bad = reactor.delete_object("ftp://host/key").wait();
+    assert!(matches!(bad, Err(AmoruError::Config { .. })), "{bad:?}");
+    reactor.shutdown();
+}
+
+/// `abort_multipart` (d.9): the parts a killed run left are abandoned, and no object appears
+/// at the upload's url. The upload is started on the store directly, because the id belongs to
+/// the store and no reactor call hands one out.
+#[test]
+fn an_aborted_multipart_leaves_no_object() {
+    let alloc = FakeAllocator::new();
+    let (reactor, backend) = reactor(&alloc);
+    let path = OsPath::from("staged");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime for the store calls this test makes itself");
+    let store = Arc::clone(&backend.memory);
+    let id = rt.block_on(async {
+        let id = object_store::multipart::MultipartStore::create_multipart(&*store, &path)
+            .await
+            .expect("create");
+        object_store::multipart::MultipartStore::put_part(
+            &*store,
+            &path,
+            &id,
+            0,
+            PutPayload::from_static(b"a part that was never completed"),
+        )
+        .await
+        .expect("part");
+        id
+    });
+    reactor
+        .abort_multipart("s3://bucket/staged", &id)
+        .wait()
+        .expect("abort");
+    let head = reactor.head_object("s3://bucket/staged").wait();
+    assert!(
+        matches!(head, Err(AmoruError::Io { .. })),
+        "an aborted upload leaves no object: {head:?}"
+    );
+    reactor
+        .abort_multipart("s3://bucket/staged", &id)
+        .wait()
+        .expect("aborting an upload the store has forgotten is Ok as well");
+    let completed = rt.block_on(object_store::multipart::MultipartStore::complete_multipart(
+        &*store,
+        &path,
+        &id,
+        Vec::new(),
+    ));
+    assert!(completed.is_err(), "the parts are gone, not merely hidden");
+    reactor.shutdown();
+}
+
+/// The same two calls over a `file://` url, which is a real local store and not the test
+/// backend: a delete unlinks the file, and an abort is `Unsupported`, because a local store
+/// has no multipart uploads and so no id for one can exist.
+#[test]
+fn a_file_url_is_deleted_on_disk_and_has_no_multipart() {
+    let dir = scratch_dir("delete");
+    let victim = dir.join("part-0.parquet");
+    write_file(&victim, &pattern(64, 3));
+    let alloc = FakeAllocator::new();
+    let mut cfg = config(profile(Guarantee::Probed(true)));
+    cfg.object_store.local_root = Some(dir.clone());
+    let reactor = build(cfg, &alloc, Hooks::default());
+    reactor
+        .delete_object("file:///part-0.parquet")
+        .wait()
+        .expect("delete");
+    assert!(!victim.exists(), "the file is gone from the filesystem");
+    reactor
+        .delete_object("file:///part-0.parquet")
+        .wait()
+        .expect("the second delete is Ok as well");
+    let aborted = reactor
+        .abort_multipart("file:///part-0.parquet", "1")
+        .wait();
+    assert!(
+        matches!(aborted, Err(AmoruError::Unsupported(_))),
+        "{aborted:?}"
+    );
+    reactor.shutdown();
+}
+
 /// A device buffer is not a file destination, and an unconfigured backend is a `Config` error;
 /// both are decided without touching the filesystem.
 #[test]
@@ -1436,6 +1585,112 @@ impl FileEngine for SilentEngine {
     fn name(&self) -> &'static str {
         "silent"
     }
+}
+
+/// G-I8 at start: a host that will not give the reactor a thread is diagnosed, not signalled.
+///
+/// The build machine reaches its thread limit when several test binaries run at once, and a
+/// reactor that panicked there would take the process down instead of failing its run. The
+/// thread is asked for in one place, and a refusal is an `Io` naming the operation; the stack
+/// size here is the cheapest way to make the host refuse.
+#[test]
+fn a_host_that_will_not_start_a_thread_is_an_error_and_not_a_panic() {
+    let refused = crate::start_runtime(2, Some(usize::MAX));
+    match refused {
+        Err(AmoruError::Io { op, ref msg, .. }) => {
+            assert_eq!(op, "reactor_start");
+            assert!(!msg.is_empty(), "the host's reason is carried");
+        }
+        other => panic!("a refused thread must be an Io error: {other:?}"),
+    }
+    // The ordinary path still builds, so the check is of the failure and not of the builder.
+    assert!(crate::start_runtime(1, None).is_ok());
+}
+
+/// A file engine that keeps every request and its callback until a test lets them go, so a
+/// test can hold an operation "in flight" for as long as it likes.
+#[derive(Default)]
+struct HoldingEngine {
+    held: Mutex<Vec<(FileReq, Done)>>,
+}
+
+impl HoldingEngine {
+    fn held(&self) -> usize {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Drop the requests and their callbacks, as an engine whose driver went away would.
+    fn drop_all(&self) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+impl FileEngine for HoldingEngine {
+    fn submit(&self, req: FileReq, done: Done) {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req, done));
+    }
+
+    fn name(&self) -> &'static str {
+        "holding"
+    }
+}
+
+/// RE-I1 through a shutdown: an operation the engine still holds owns its buffer until the
+/// engine answers, and `shutdown` must not free those bytes under the syscall.
+///
+/// `shutdown` drops the runtime, which drops every task that is awaiting a completion. Until
+/// 2026-09-22 the destination buffer was a local of that task, so dropping it returned the
+/// bytes to the arena while a `pread` on the blocking pool was still writing into them; the
+/// corruption surfaced later as a trap inside an unrelated allocation, and it made this
+/// binary fail perhaps a third of the time. The buffer now travels in the engine's completion
+/// callback, so it is alive until the engine is done with it, whoever is still waiting.
+#[test]
+fn an_operation_the_engine_still_holds_keeps_its_buffer_through_shutdown() {
+    let dir = scratch_dir("holding");
+    let source = dir.join("source");
+    write_file(&source, &pattern(8192, 0x5c));
+    let alloc = FakeAllocator::new();
+    let engine = Arc::new(HoldingEngine::default());
+    let reactor = build(
+        config(profile(Guarantee::Probed(true))),
+        &alloc,
+        Hooks {
+            engine: Some(Arc::clone(&engine) as Arc<dyn FileEngine>),
+            ..Hooks::default()
+        },
+    );
+    let dst = alloc.buffer(4096, Tier::Host);
+    let completion = reactor.read_file(&source, 0, dst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while engine.held() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(engine.held(), 1, "the engine has the request");
+    assert_eq!(
+        alloc.in_use(Tier::Host),
+        4096,
+        "the buffer is the operation's while the engine holds it"
+    );
+    reactor.shutdown();
+    assert_eq!(
+        alloc.in_use(Tier::Host),
+        4096,
+        "shutdown does not hand the bytes back under a syscall that is still running"
+    );
+    let answer = completion.wait();
+    assert!(
+        matches!(answer, Err(AmoruError::Cancelled)),
+        "the caller is told the operation was cancelled, not left waiting: {answer:?}"
+    );
+    engine.drop_all();
+    assert_eq!(
+        alloc.in_use(Tier::Host),
+        0,
+        "the bytes go back when the engine is done with them, and only then"
+    );
 }
 
 /// The io_uring row's per-operation fallback is the blocking pool (e.2, f.9). The ring cannot
