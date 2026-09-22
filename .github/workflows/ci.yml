@@ -83,6 +83,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AMORU_S3_ENDPOINT: http://127.0.0.1:9000
+      # The bucket the next step creates; the bench generator and the object-store
+      # tests refuse to invent one, so without this the S3 half silently skips
+      # (found by the F1.6 agent, 2026-09-22).
+      AMORU_S3_BUCKET: amoru-ci
       AWS_ACCESS_KEY_ID: amoru
       AWS_SECRET_ACCESS_KEY: amoru-ci-secret
       AWS_REGION: us-east-1

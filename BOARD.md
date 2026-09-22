@@ -37,7 +37,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | rung 0: F0.2 contracts and F1.6 bench generator running, F6.5 supply chain running, F7.1 merged; F0.3 when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
+| Next action | F0.2 contracts (PR #10) in review and F1.7 bench kernels running; F0.3 testkit when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -150,7 +150,7 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 - [x] `bench/` generator: 12 suite datasets and four ad hoc commands, deterministic by seed, local and S3
 - [x] Output names the machine and the generator version; `bench/README.md` documents every dataset, scale and variable
 - [x] 88 tests, 96.2% line coverage
-- [ ] The MinIO half runs in CI: the `minio` job does not export `AMORU_S3_BUCKET`, so the S3 test skips; one line in `.github/workflows/ci.yml`, held by the supply-chain branch until PR #3 merges, then fixed and the skip removed (closes the wave 1 gate clause "and MinIO")
+- [x] The MinIO half runs in CI: the `minio` job now exports `AMORU_S3_BUCKET=amoru-ci` (fixed by the PM after PR #3 merged), so the S3 test no longer skips; the wave 1 gate clause "and MinIO" closes when the next run on `main` is green
 
 ### F1.7 tasks
 - [ ] Six kernels with their declared amplification classes; `wide-intermediate` in Python releasing the GIL
@@ -361,7 +361,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 | F6.1 | Decisions and document status closed | `main` | `DECISIONS.md` Q2 to Q7, Q9, Q10 decided or their assumptions explicitly accepted by Brackly; every SDD HANDOFF-READY; preamble section 8 traceability table with no gap row | todo |
 | F6.2 | Sufficiency sign-off | `main` | S1 to S17 each cited to the test and the host that closed it, or listed as skipped by id with Brackly's acceptance (device and GDS parts of S14) | todo |
 | F6.3 | Packaging and publishing | `infra/release` | Q1 remainder: PyPI, crates.io and GitHub namespace checks, trademark and domain; version `0.1.0`; `CHANGELOG.md`; trusted publishing workflow for wheels and sdist; PY-O1 (GPU wheel) decided or the separate-wheel assumption accepted | todo |
-| F6.5 | Supply chain and security | `infra/release` (same PR as F6.3) | `cargo audit` and `cargo deny` (licences, advisories) in CI; `SECURITY.md` contact verified; pinned CI actions; DCO sign-off on every commit checked in CI | todo |
+| F6.5 | Supply chain and security | `infra/supply-chain` | `cargo audit` and `cargo deny` (licences, advisories, bans, sources) in CI; `SECURITY.md` improved; every action pinned by SHA; DCO sign-off checked in CI; `Cargo.lock` freshness | merged (PR #3, 2026-09-22) |
 | F6.6 | Release `v0.1.0` | `main` | tag, GitHub release with the wave 5 report and the bench figures (host named), wheels on PyPI for the four interpreters, `README.md` status changed from "Design"; E7 complete first | todo |
 
 ### F6.1 tasks
@@ -380,8 +380,9 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 - [ ] PY-O1 decided; if the assumption stands, the `amoru-cuda` wheel is documented as not shipped in `0.1.0`
 
 ### F6.5 tasks
-- [ ] `cargo audit` and `cargo deny check` jobs green; licence allow-list matches Apache-2.0 compatibility
-- [ ] DCO check on pull requests; actions pinned by SHA
+- [x] `cargo audit` and `cargo deny check advisories licenses bans sources` green; allow list is Apache-2.0, MIT, BSD-2, BSD-3, ISC, Zlib, Unicode-3.0 and Apache-2.0 WITH LLVM-exception, with two documented exceptions (BSL-1.0 via polars, bzip2-1.0.6 via datafusion); `[graph] targets` names the four supported platforms, which removes the CC0 crate honestly rather than by exception
+- [x] DCO check with `tools/quality/check_dco.sh` and a ten-fixture self-test; 23 action references across three workflows pinned by 40-character SHA; `Cargo.lock` freshness checked
+- [ ] Before the wave 2 gate: remove or re-decide the RUSTSEC-2026-0194 and 0195 ignores in `deny.toml` and the matching `cargo-audit --ignore` flags, per DECISIONS.md S1 and issue #9; cargo-deny's `advisory-not-detected` warning is the tripwire, and there is no machine-enforced expiry because cargo-deny 0.20.2 has no `expiration` key
 
 ### F6.6 tasks
 - [ ] E7 documentation epic complete and published
