@@ -39,7 +39,7 @@ It refuses to know: what a morsel is beyond its record; why a knob changed; anyt
 
 **TR-I2. Order is per stage and per sequence.** The final trace, read back, sorted by `(stage, seq)`, has no gaps within a stage for sequences that entered that stage, and each `(stage, seq)` appears exactly once.
 
-**TR-I3. The report is a pure function.** `RunReport::from(trace, limits, exit)` is deterministic; two calls on the same inputs produce equal structs. Upholds S9.
+**TR-I3. The report is a pure function.** `RunReport::compute(trace, limits, meta)` is deterministic (d.1 and 12 f.2 name it `compute`, and this invariant said `from`; the name is `compute`, PM 2026-09-22); two calls on the same inputs produce equal structs. Upholds S9.
 
 **TR-I4. Memory is bounded.** In-memory chunks never exceed `trace.memory_limit` (64 MiB default); beyond it, older chunks are written to the overflow file and freed.
 
@@ -113,6 +113,23 @@ pub struct StageReport {
     pub rows_per_s: f64, pub bytes_per_s: f64,
     pub amplification_p50: f64, pub amplification_p95: f64,
     pub placement_miss_wait_s: f64, pub errors: u64, pub skipped: u64,
+    /// The largest `TraceRecord::state_bytes` seen for this stage, and the difference
+    /// between the last and the first. f.2 computes both and the text says they are
+    /// reported; d.1 omitted them (PM, 2026-09-22, on the component 4 agent's report).
+    /// A stage whose state grows with morsels seen is what RC f.3 budgets for.
+    pub state_bytes_max: u64, pub state_growth: i64,
+}
+
+/// The discovered limits as the report carries them. Named by d.1 and never defined
+/// until now (PM, 2026-09-22); the report is read by people and by the bench runner,
+/// so it carries values rather than the `Limits` struct's shape.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LimitsSummary {
+    pub memory_ceiling: u64,
+    pub memory_kill: Option<u64>,
+    pub cpu_quota: f64,
+    pub source: String,              // LimitSource: "cgroup", "os" or "explicit"
+    pub devices: Vec<String>,        // one line per device: id, name, total bytes
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -122,7 +139,14 @@ pub struct RunReport {
     pub resumed: bool,                        // meta.resumed
     pub manifest: Option<String>,             // meta.manifest, when the run is resumable
     pub wall_s: f64,
-    pub limits: LimitsSummary,                // ceiling, kill, cpu quota, source, devices
+    pub limits: LimitsSummary,                // defined below
+    /// A trace record that could not reach the file because the overflow path failed
+    /// (h), and a record that arrived after `finish` (e.1). Both are conditions the
+    /// report must surface, because G-I4 says every morsel leaves exactly one record
+    /// and these are how that stops being true; TR-T9 asserts them. Added to d.1 on
+    /// 2026-09-22 (PM), which named neither while h and e.1 required them.
+    pub overflow_failed: bool,
+    pub late_records: u64,
     pub io_paths: IoPaths,                    // paths taken (meta.io_paths)
     pub peak_anon_bytes: u64,
     pub peak_fraction_of_ceiling: f64,        // S1

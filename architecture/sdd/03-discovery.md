@@ -133,7 +133,7 @@ Resolved from `/proc/self/cgroup` (the line `0::<path>`) under `/sys/fs/cgroup<p
 | `memory.high` | ceiling if set |
 | `memory.stat` | `anon`, `file`, `unevictable` for samples |
 | `memory.current` | reported in notes only |
-| `memory.peak` | `peak_anon_bytes` when present (kernel ≥ 5.19; verify per architecture 2.2) |
+| `memory.peak` | `peak_anon_bytes` when present (kernel ≥ 5.19; verify per architecture 2.2). Note that `memory.peak` is the peak of `memory.current`, which includes page cache, while DS-I4 defines the budget as `anon + unevictable`; the sampler therefore maintains its own running peak of the DS-I4 quantity regardless, and uses the kernel's value only as a floor. The difference is page cache the kernel can reclaim, so treating it as the peak would size morsels down for memory that was never the run's (PM, 2026-09-22) |
 | `cpu.max` | `quota period` or `max` |
 | `cpu.stat` | `throttled_usec` |
 
@@ -235,9 +235,13 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs`, `src/env.rs` (e.1, f.3), `src/cgroup.rs` (e.2, v1 fallback, root path parameter for tests), `src/os.rs` (`/proc/meminfo`, `sysconf`), `src/probes.rs` (e.4, each probe a function returning `Guarantee` plus a note, bounded by a timeout thread), `src/devices.rs` (feature `cuda`), `src/sampler.rs` (f.2, the `amoru_kernel::Sampler` impl), `src/limits.rs` (e.3, DS-I8, `host_tier`). `unsafe` only in `probes.rs` for `mlock`/`io_uring_setup` via `libc`, with `// SAFETY:` comments.
+Files: `src/lib.rs`, `src/env.rs` (e.1, f.3), `src/cgroup.rs` (e.2, v1 fallback, root path parameter for tests), `src/os.rs` (`/proc/meminfo`, `sysconf`), `src/probes.rs` (e.4, each probe a function returning `Guarantee` plus a note, bounded by a timeout thread), `src/devices.rs` (feature `cuda`), `src/sampler.rs` (f.2, the `amoru_kernel::Sampler` impl), `src/limits.rs` (e.3, DS-I8, `host_tier`). `unsafe` only in `probes.rs`, which is also where every other `libc` call lives, each behind a safe wrapper the rest of the crate calls: `sysconf` for the page size (d.2), `statvfs` and `statfs` for the staging directory (e.4), `mlock` and `io_uring_setup` for the probes, and on macOS `sysctl hw.memsize` and `proc_pidinfo` for the OS fallback. Every block carries a `// SAFETY:` comment. Keeping them in one module rather than spreading `unsafe` across `os.rs` and `limits.rs` is what makes E9's permitted set a single file (PM, 2026-09-22, on the component 3 agent's report).
 
 Never cache a cgroup value across `discover` calls (preamble 1.3 row 3). Do not depend on `cgroups-rs` or `procfs` crates; parse the six files directly so the fake-directory tests are exact.
+
+The OS fallback is written for Linux (`/proc/meminfo`, `/proc/self/statm`, `sysconf`) and must also work on macOS, because the whole team develops there and `cargo test` has to pass on a laptop: `sysctl hw.memsize` for total memory and `proc_pidinfo` for the process's resident bytes (PM, 2026-09-22, on the component 3 agent's report, which implemented both). A host with neither cgroup nor `/proc` reports `LimitSource::Os` from those calls; nothing about the budget derivation changes.
+
+Two silences the component 3 agent filled and the PM confirmed on 2026-09-22. A `gds` or `rdma` guarantee declared `Present` in a build without the feature is a `Config` error at `discover`, not a silent `Absent`: e.4's "Absent without the feature" describes a probe, and DS-I5 governs a declaration, which must be verified or refused (G-I7). And `durable_staging=present` with no staging directory is a `Config { name: "durable_staging" }` error, because the declaration is about a directory that must then exist.
 
 Verify before starting: `memory.peak` presence on the reference host (`uname -r`); whether the CI container runtime blocks io_uring (`DS-T5` needs a way to force failure: use a profile flag `AMORU_TEST_FAIL_PROBE=io_uring` honoured only under `cfg(test)`).
 

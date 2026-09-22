@@ -422,7 +422,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 
 | Crate | Used by | Purpose | Notes |
 |---|---|---|---|
-| `arrow` (arrow-rs) | 1, 5, 7, 8, 9 | in-memory format, C Data Interface, IPC | features: `ffi`, `ipc` |
+| `arrow` (arrow-rs) | 1, 4, 5, 7, 8, 9 | in-memory format, C Data Interface, IPC | features: `ffi`, `ipc`; component 4 builds the trace batches with it |
 | `parquet` | 7, 8 | reader with footer metadata, projection, row selection; writer | features: `arrow`, `async`, `object_store` |
 | `object_store` | 6, 7, 8 | S3-compatible, GCS, Azure, local | features per backend behind runtime features |
 | `dlpark` | 1, 5 | DLPack `DLManagedTensor` safe wrapper | verify v1.0 versioned struct support |
@@ -436,7 +436,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `maturin` (build) | 12 | wheels | CPython 3.14, free-threaded and standard (6.6) |
 | `thiserror` | all | error types | |
 | `tracing` | all except 1 | log events (not the morsel trace) | `amoru-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a) |
-| `mimalloc` | runtime | global allocator for non-arena allocations | returns freed memory promptly |
+| `mimalloc` | runtime, 4 (dev only) | global allocator for non-arena allocations | returns freed memory promptly. Component 4 takes it as a dev-dependency for TR-T4, whose claim is about the runtime's process, which sets `mimalloc` globally (12 l); under the system allocator the same run plateaus 22 to 25 MiB above baseline through allocator retention alone, which is bounded but above TR-T4's limit, so testing under the system allocator would measure the allocator rather than the trace writer (E2, PM, 2026-09-22) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
 | `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
 | `serde_json` | 4, 8, 9, 11, 12 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config` | the only text format in the runtime |
