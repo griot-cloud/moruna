@@ -13,6 +13,26 @@ The PM agent's working board. It is the one place that says what is done, what i
 
 Executors are briefed from `architecture/agents/executor.md`; filled briefs live in `architecture/agents/briefs/`.
 
+## Critical path
+
+The one question this section answers: what stands between today and a process that runs a full pass over a dataset larger than its budget. Everything else on this board is either on this path, or is support that the documents require, or is work that can wait. When the two are in tension the critical path wins, and a feature that is not on it does not start before one that is (Brackly, 2026-09-22, after finding the bench suite had been built before anything could use it).
+
+| Step | Crate | State |
+|---|---|---|
+| 1. The types every component speaks | `amoru-kernel` | merged |
+| 2. Memory, limits, the trace | `amoru-arena`, `amoru-discovery`, `amoru-trace` | merged |
+| 3. IO that never blocks a worker | `amoru-reactor` | merged |
+| 4. Bytes in and out | `amoru-sources`, `amoru-sinks` | merged |
+| 5. The queue that makes disk a tier | `amoru-placement` | in progress |
+| 6. The thing that runs the work | `amoru-scheduler` | in progress |
+| 7. The thing that decides the sizes | `amoru-controller` | merged |
+| 8. The facade that wires 2 to 7 into `Runtime::run` | `amoru-runtime` | **not started; nothing runs end to end until it exists** |
+| 9. The surface a user touches | `amoru-py`, `python/amoru` | not started |
+
+Steps 5, 6 and 8 are the whole of what is left before Amoru runs. Step 8 is the one to watch: every part exists and none of them is wired, so the first end-to-end run is also the first time the lifecycle of preamble 4.4 is exercised, and that is where the surprises will be.
+
+Support the documents require, which is not on the path and is judged separately: the testkit (contracts d.15, and every component's tests name its fakes, so parallel building depends on it) and the bench suite (preamble 6.5, needed by criterion S3 in wave 5, and built earlier than it should have been).
+
 ## Start ladder
 
 What can start when, from the solid edges of preamble 1.3 and the fakes of contracts d.15. A rung starts the moment the rung above it is merged; features on one rung run concurrently.
