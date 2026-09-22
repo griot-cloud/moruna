@@ -44,7 +44,7 @@ step "tools/quality/no_stubs.sh (nothing in a shipping crate is a stub)"
 # The two crates still to be written are declared here by name, so that "done" cannot
 # be claimed while either is empty and the list is visible to anyone reading the gate.
 # Delete a name the day its crate has code; when the list is empty, delete the variable.
-AMORU_STUB_CRATES_OK="amoru-runtime,amoru-py" quiet no_stubs tools/quality/no_stubs.sh
+AMORU_STUB_CRATES_OK="amoru-py" quiet no_stubs tools/quality/no_stubs.sh
 
 if [ -d docs ] && [ -x tools/docs/check_docs.py ]; then
   step "tools/docs/check_docs.py (docs conventions, links, SUMMARY, citations)"
