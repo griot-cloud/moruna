@@ -1,0 +1,6 @@
+Author: Brackly Murunga <brackly@griotdata.com>
+Contributing: explain the sign-off rule
+
+The paragraph now says that every contributor uses Signed-off-by: with
+their own name and address, which is a mention of the trailer and not a
+trailer, so this commit is still unsigned.

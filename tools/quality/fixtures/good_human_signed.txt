@@ -1,0 +1,4 @@
+Author: Brackly Murunga <brackly@griotdata.com>
+Docs: fix a broken link in the hosting guide
+
+Signed-off-by: Brackly Murunga <brackly@griotdata.com>

@@ -471,6 +471,8 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across amoru-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 
+Supported targets, the set `deny.toml` resolves the graph for: x86_64 and aarch64 Linux (gnu) and x86_64 and aarch64 macOS. Windows is not a target for v1 (the runtime reads cgroup v2 and uses O_DIRECT and io_uring); a target added here is added to `deny.toml` in the same pull request. Decided by the PM 2026-09-22.
+
 ### 6.3 Feature flags
 
 `cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration with the NIC, the reactor's `Remote` copy rows, the placement engine's remote tier; post-v1, see architecture section 11; its reserved arms exist in every v1 build and return `Unsupported("rdma")`), `python` (`amoru-adapters`, `amoru-sources` for `PyIteratorSource`, `amoru-py`), `polars` (`amoru-polars`), `datafusion` (`amoru-datafusion`). Default features: none of these. `amoru-py` enables `python` and, on Linux, `uring`. The two bridge crates are members of the workspace but are not dependencies of `amoru-runtime` or `amoru-py`; a user who wants them depends on them directly.

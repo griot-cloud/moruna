@@ -1,0 +1,5 @@
+Author: Amoru Agent <agents@griotdata.com>
+Reactor: direct IO fallback to pread on a filesystem without O_DIRECT
+
+The commit is real work but nobody ran git commit -s, so no DCO assertion
+was made for it.

@@ -4,7 +4,9 @@
 # file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
 # StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab,
 # an unlisted page or a placeholder with no citation under docs/
-# (tools/docs/check_docs.py, F7.1); a failing test; line
+# (tools/docs/check_docs.py, F7.1); a commit-message rule the DCO self-test
+# rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
+# when cargo-deny is installed (F6.5); a failing test; line
 # coverage below AMORU_COVERAGE_MIN (default 90) in any workspace crate that has
 # instrumented lines (a stub crate with no code is not measured). Python checks
 # run once python/pyproject.toml exists (wave 5).
@@ -38,6 +40,9 @@ if [ -d docs ] && [ -x tools/docs/check_docs.py ]; then
   quiet docs tools/docs/check_docs.py
 fi
 
+step "tools/quality/check_dco.sh --self-test"
+quiet dco tools/quality/check_dco.sh --self-test
+
 if [ -f Cargo.toml ]; then
   step "cargo fmt --check"
   quiet fmt cargo fmt --all -- --check
@@ -48,6 +53,25 @@ if [ -f Cargo.toml ]; then
     quiet lint tools/lint/no_tier_wildcard.sh
   else
     step "tools/lint/no_tier_wildcard.sh not present yet (wave 0 deliverable); skipped"
+  fi
+  # Supply-chain policy (deny.toml, board F6.5). cargo-deny is a CI tool, not a
+  # workspace dependency, so a machine without it still passes this gate.
+  # Locally only the offline, deterministic halves are fatal: `bans` (one arrow,
+  # parquet, object_store and tokio) and `sources` (crates.io only). `advisories`
+  # needs to fetch the RustSec database, which a pre-commit hook must not do, and
+  # `licenses` is reported rather than enforced here because it currently carries
+  # an open decision for the PM (see the CC0-1.0 note in deny.toml). The
+  # supply-chain workflow runs all four and fails on any of them.
+  if command -v cargo-deny >/dev/null 2>&1; then
+    step "cargo deny check bans sources"
+    quiet deny cargo deny check bans sources
+    if cargo deny check licenses >/dev/null 2>&1; then
+      step "cargo deny check licenses: clean"
+    else
+      step "cargo deny check licenses: open finding, see deny.toml; the supply-chain workflow fails on it"
+    fi
+  else
+    step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml not checked here, the supply-chain workflow checks it"
   fi
   step "cargo test"
   quiet test cargo test --workspace

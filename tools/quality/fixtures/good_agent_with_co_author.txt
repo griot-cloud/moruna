@@ -1,0 +1,8 @@
+Author: Amoru Agent <agents@griotdata.com>
+Placement: manifest round trip (PL-T16)
+
+The agent identity signs off, and a second sign-off from the reviewer is
+present as well. One matching line is enough.
+
+Signed-off-by: Amoru Agent <agents@griotdata.com>
+Signed-off-by: Brackly Murunga <brackly@griotdata.com>
