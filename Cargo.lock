@@ -100,10 +100,9 @@ name = "amoru-controller"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
- "blake3",
+ "amoru-testkit",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
  "tracing",
 ]
 
