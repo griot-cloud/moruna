@@ -475,13 +475,64 @@ pub(crate) struct Peers {
     pub placement: Arc<dyn Placement>,
 }
 
-/// Instrumentation of the single mutex: how long it was held at most, and whether it is held
-/// right now. RC-T17 reads both, and `held` is what lets a test assert that no call into
-/// another component happens while the lock is taken.
-#[derive(Default)]
+/// Instrumentation of the single mutex (RC-I10): the distribution of how long it was held, the
+/// longest it was ever held, and whether it is held right now. `held` is what lets a test
+/// assert that no call into another component happens while the lock is taken.
+///
+/// The distribution is kept as well as the maximum because the maximum is a wall-clock figure,
+/// and a wall clock on a host with more runnable threads than cores measures the scheduler as
+/// much as the controller: a thread holding the lock for twenty microseconds of arithmetic can
+/// be descheduled in the middle of it and wake milliseconds later. The histogram is a bucket
+/// per power of two nanoseconds, which costs one atomic add per release and is enough to read
+/// a percentile off.
 pub(crate) struct LockMeter {
     max_held_ns: AtomicU64,
     held: AtomicBool,
+    /// Bucket `k` counts holds of under `2^k` nanoseconds.
+    buckets: [AtomicU64; 64],
+}
+
+impl Default for LockMeter {
+    fn default() -> LockMeter {
+        LockMeter {
+            max_held_ns: AtomicU64::new(0),
+            held: AtomicBool::new(false),
+            buckets: [const { AtomicU64::new(0) }; 64],
+        }
+    }
+}
+
+impl LockMeter {
+    fn record(&self, held_ns: u64) {
+        self.max_held_ns.fetch_max(held_ns, Ordering::SeqCst);
+        let bucket = (u64::BITS - held_ns.leading_zeros()) as usize;
+        if let Some(slot) = self.buckets.get(bucket.min(63)) {
+            slot.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The upper edge of the bucket the given quantile falls in, in nanoseconds; zero when
+    /// nothing has been measured.
+    fn quantile_ns(&self, quantile: f64) -> u64 {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|slot| slot.load(Ordering::SeqCst))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let want = (total as f64 * quantile).ceil() as u64;
+        let mut seen = 0u64;
+        for (bucket, count) in counts.iter().enumerate() {
+            seen += count;
+            if seen >= want {
+                return 1u64 << bucket.min(63);
+            }
+        }
+        u64::MAX
+    }
 }
 
 /// A guard over the controller's state that meters how long the lock was held (RC-I10).
@@ -507,7 +558,7 @@ impl std::ops::DerefMut for Held<'_> {
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         let held = self.at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        self.meter.max_held_ns.fetch_max(held, Ordering::SeqCst);
+        self.meter.record(held);
         self.meter.held.store(false, Ordering::SeqCst);
     }
 }
@@ -765,7 +816,21 @@ impl Controller {
         summary::stop(&self.inner)
     }
 
+    /// The given quantile of how long the mutex has been held, in nanoseconds, rounded up to
+    /// the next power of two (RC-I10, RC-T17).
+    ///
+    /// This is the figure that describes the controller rather than the machine it ran on: an
+    /// implementation that does unbounded work under the lock moves the whole distribution,
+    /// while a scheduler that preempts a holder moves only the tail.
+    pub fn lock_held_quantile_ns(&self, quantile: f64) -> u64 {
+        self.inner.meter.quantile_ns(quantile)
+    }
+
     /// The longest the controller's mutex has been held, in nanoseconds (RC-I10, RC-T17).
+    ///
+    /// A wall-clock figure, so on a host with more runnable threads than cores it includes
+    /// whatever time the holder spent descheduled. Report it; assert on
+    /// [`Controller::lock_held_quantile_ns`].
     pub fn max_lock_held_ns(&self) -> u64 {
         self.inner.meter.max_held_ns.load(Ordering::SeqCst)
     }

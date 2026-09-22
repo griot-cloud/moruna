@@ -73,3 +73,43 @@ fn rc_t6_probe_first() {
     );
     rig.controller.stop();
 }
+
+/// RC-I6 from the other side: `start` refuses a controller that has not probed. The order in
+/// preamble 4.4 is fixed, but a controller that would size on a hint if the order were not kept
+/// is upholding the invariant by convention rather than by construction.
+#[test]
+fn rc_t6_start_refuses_before_the_probe() {
+    let cfg = config(8 * common::GIB, 4);
+    let probe_bytes = cfg.probe_bytes;
+    let rig = common::Rig::new(
+        cfg,
+        vec![kernel(1, KernelHints::default())],
+        FakeKnobs::new().probe_result(1, probe(probe_bytes, 3.0)),
+        FakeSampler::new().scripted(steady(400 * MIB, 4)),
+    );
+    rig.controller.prepare().expect("prepare");
+
+    let error = rig
+        .controller
+        .start()
+        .expect_err("RC-I6: sizing before the probe is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("probe_all or probe_missing must run first"),
+        "RC-I6: and the error says what is missing: {message}"
+    );
+    assert!(
+        morsel_targets(&rig.writes()).is_empty(),
+        "RC-I6: and nothing was written on the way out"
+    );
+
+    // The same controller, once probed, starts.
+    rig.controller.probe_all().expect("probe_all");
+    rig.controller.start().expect("start");
+    assert_eq!(
+        morsel_targets(&rig.writes()).len(),
+        1,
+        "sized after the probe"
+    );
+    rig.controller.stop();
+}

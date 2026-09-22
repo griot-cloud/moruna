@@ -19,8 +19,10 @@ use crate::{
 const SHADOW_ALPHA: f64 = 0.2;
 /// Records folded into the per-stage state under one acquisition of the controller's mutex
 /// (RC-I10). The queue holds up to `RECORD_QUEUE_CAPACITY` of them, so the drain is cut into
-/// pieces of this size rather than held as one.
-const ABSORB_PER_LOCK: usize = 64;
+/// pieces of this size rather than held as one. Sixteen is a hundred microseconds of work on a
+/// quiet host and a few hundred under coverage instrumentation, which leaves the 5 ms bound an
+/// order of magnitude of room for a scheduler that has other things to run.
+const ABSORB_PER_LOCK: usize = 16;
 
 /// One tick (f.6, f.5, f.9).
 pub(crate) fn tick(ctl: &Inner) {

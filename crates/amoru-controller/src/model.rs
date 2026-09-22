@@ -325,10 +325,18 @@ fn read_ahead(state: &ControllerState, queue_half: u64, split_bytes: u64) -> u16
 pub(crate) fn start(ctl: &Inner) -> Result<()> {
     let actions = {
         let mut state = ctl.held();
-        if state.phase != Phase::Probed && state.phase != Phase::Prepared {
+        // RC-I6 is the controller's own rule and not the facade's good manners: a caller that
+        // skipped `probe_all` would be sized from a hint or from 4.0, which is exactly the
+        // guess the probe exists to replace. Both probe entry points reach `Probed`, including
+        // on the tiny-dataset and zero-kernel paths that have nothing to probe for.
+        if state.phase != Phase::Probed {
             return Err(amoru_kernel::AmoruError::Config {
                 name: "controller",
-                msg: format!("start called in phase {:?}", state.phase),
+                msg: format!(
+                    "start called in phase {:?}: probe_all or probe_missing must run first \
+                     (RC-I6)",
+                    state.phase
+                ),
             });
         }
         state.active_workers = state.cfg.workers_max.max(1);
