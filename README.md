@@ -24,6 +24,8 @@ Not a distributed engine, not a query planner, not a streaming system with per-r
 
 Design. See [`architecture/README.md`](architecture/README.md) for the document index and the order in which components are being designed and built.
 
+Documentation: the site is built from [`docs/`](docs/) by `.github/workflows/docs.yml` and published from `main` to [griot-cloud.github.io/amoru](https://griot-cloud.github.io/amoru/) once GitHub Pages is enabled; its pages are placeholders until epic E7 fills them.
+
 ## Licence
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
