@@ -37,7 +37,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | rung 0 running: F0.2 contracts, F1.6 bench generator, F7.1 docs scaffold, F6.5 supply chain; F0.3 when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
+| Next action | rung 0: F0.2 contracts and F1.6 bench generator running, F6.5 supply chain running, F7.1 merged; F0.3 when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -395,7 +395,7 @@ Written after wave 5 so it describes what shipped, from the design documents and
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F7.1 | Docs site scaffold and CI | `docs/site` | `docs/` as an mdBook (Rust-native, no Node); a CI job that builds it, checks links and runs the em-dash and no-tabs conventions; published from `main` to GitHub Pages | todo |
+| F7.1 | Docs site scaffold and CI | `docs/site` | `docs/` as an mdBook (Rust-native, no Node); a CI job that builds it, checks links and runs the em-dash and no-tabs conventions; published from `main` to GitHub Pages | merged (PR #2, 2026-09-22) |
 | F7.2 | User guide | `docs/user-guide` | install from a wheel per interpreter; `amoru.run` walkthrough; sources (Parquet local and object store, safetensors, NumPy, Python iterator) and sinks (Parquet, tensor, Arrow IPC); ordering and error policies; budgets and the two environment-variable families; reading the run report and the trace; cancellation and resume (`resume=`, `checkpoint.*`) | todo |
 | F7.3 | API reference | `docs/api` | Python: every public name in `python/amoru` from docstrings (the module's docstrings are the source); Rust: `cargo doc` for `amoru-kernel` with every trait's contract sentence from preamble 1.3 on its doc comment, published beside the book; the configuration table of preamble section 5 rendered with owner and range per row | todo |
 | F7.4 | Kernel author guide | `docs/kernels` | a Rust kernel against `amoru-kernel` alone; the same kernel as a Polars plugin and a DataFusion function (S7); a Python kernel, GIL and free-threading, what releases the GIL; stateful kernels, instances, `ResumePolicy`; hints and `footprint`; the zero-copy rules and what breaks them (G-I2, CT-I4) | todo |
@@ -405,8 +405,8 @@ Written after wave 5 so it describes what shipped, from the design documents and
 | F7.8 | Documentation gate and release notes (PM) | `main` | every page reviewed against its cited sections; bug issues filed for mismatches; `CHANGELOG.md` and release notes for `v0.1.0` drafted from the wave reports | todo |
 
 ### F7.1 tasks
-- [ ] mdBook scaffold with the page tree of F7.2 to F7.7; CI job builds it, fails on broken links, em dashes and a page with no section citation
-- [ ] Published from `main` (GitHub Pages or equivalent); `README.md` links it
+- [x] mdBook scaffold, 54 pages, each naming its feature and the sections it must cite; `tools/docs/check_docs.py` (links, anchors, SUMMARY completeness, tabs, em dashes, missing citations) with a nine-fixture self-test, wired into the gate and into `.github/workflows/docs.yml`
+- [ ] Published from `main`: the deploy job exists and is gated on the repository variable `DOCS_PAGES_ENABLED`; publishing is outward-facing, so it waits for Brackly to enable Pages (Settings, Pages, Source = GitHub Actions) and set that variable, at F7.8 or earlier if he wants a preview; `README.md` already links it
 
 ### F7.2 tasks
 - [ ] Every default and range cites its preamble section 5 row; every environment variable named with its owner
@@ -481,5 +481,6 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
 | 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | F7.1 notes: introduction pages, host-class pages (raised by F7.1) | introduction pages stay with F7.2 (same audience); the hosting guide keeps a GPU page marked described-not-verified (E1) and omits RDMA (E11, not a v1 host); Pages stays off until Brackly enables it, because publishing outward is outside the delegation | this board, F7.5 and F7.8 tasks |
 | 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |
 | 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `amoru-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |
