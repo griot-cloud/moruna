@@ -24,7 +24,12 @@ quiet() {
   mkdir -p target/quality
   if [ "${AMORU_QUALITY_VERBOSE:-0}" = "1" ]; then "$@"; return; fi
   if ! "$@" >"target/quality/$name.log" 2>&1; then
-    cat "target/quality/$name.log" >&2
+    # The interesting lines, not the whole run: a workspace test log is thousands
+    # of "ok" lines and the failure is the last thing anyone wants to scroll for.
+    grep -E 'FAILED|panicked at|^error|^warning: unused|test result: FAILED' \
+      "target/quality/$name.log" | head -40 >&2 || true
+    echo "--- last 20 lines of target/quality/$name.log ---" >&2
+    tail -20 "target/quality/$name.log" >&2
     fail "$name (full log: target/quality/$name.log)"
   fi
 }
