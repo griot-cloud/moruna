@@ -27,7 +27,7 @@ The one question this section answers: what stands between today and a process t
 | 6. The thing that runs the work | `amoru-scheduler` | merged (91.0%) |
 | 7. The thing that decides the sizes | `amoru-controller` | merged |
 | 8. The facade that wires 2 to 7 into `Runtime::run` | `amoru-runtime` | merged (94.6%). **Amoru runs**: `rt_t1` takes a real Parquet file through real components to a real Parquet file inside a real budget and asserts 40,000 rows in the report and again by reading the output back; `rt_t6` kills a run and resumes it from its own manifest |
-| 9. The surface a user touches | `amoru-py`, `python/amoru` | in progress |
+| 9. The surface a user touches | `amoru-py`, `python/amoru` | merged (97.8%), and `amoru.run(source, kernels, sink)` completes a pass with no other argument. But a Python kernel is about a thousand times slower than the same kernel in Rust, so the surface exists and is not yet usable: F4.10 |
 
 Amoru ran for the first time on 2026-09-22. What is left is step 9 and the defects that first run exposed, which are tracked as F4.9 below: it runs at test sizes and not yet at a realistic budget, and saying otherwise would be the kind of claim this board exists to prevent. The surprises did land where this paragraph predicted, in the wiring rather than in the components.
 
@@ -387,6 +387,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 |---|---|---|---|---|
 | F6.1 | Decisions and document status closed | `main` | `DECISIONS.md` Q2 to Q7, Q9, Q10 decided or their assumptions explicitly accepted by Brackly; every SDD HANDOFF-READY; preamble section 8 traceability table with no gap row | todo |
 | F6.2 | Sufficiency sign-off | `main` | S1 to S17 each cited to the test and the host that closed it, or listed as skipped by id with Brackly's acceptance (device and GDS parts of S14) | todo |
+| F4.10 | **The Python kernel boundary is about a thousand times too slow.** Same job, same data, same budget: a Rust kernel does 200,000 rows in 0.95 s and a Python kernel does not finish 20,000 rows in 400 s. The runtime is not the problem; the adapter boundary is. It makes S8 false in practice and it is the last thing between here and a package worth installing | `infra/python-kernel-speed` | 05 f.1 to f.5, 12 f.3; S8 | **blocking, not started** |
 | F6.3 | Packaging and publishing | `infra/release` | Q1 remainder: PyPI, crates.io and GitHub namespace checks, trademark and domain; version `0.1.0`; `CHANGELOG.md`; trusted publishing workflow for wheels and sdist; PY-O1 (GPU wheel) decided or the separate-wheel assumption accepted | todo |
 | F6.5 | Supply chain and security | `infra/supply-chain` | `cargo audit` and `cargo deny` (licences, advisories, bans, sources) in CI; `SECURITY.md` improved; every action pinned by SHA; DCO sign-off checked in CI; `Cargo.lock` freshness | merged |
 | F6.6 | Release `v0.1.0` | `main` | tag, GitHub release with the wave 5 report and the bench figures (host named), wheels on PyPI for the four interpreters, `README.md` status changed from "Design"; E7 complete first | todo |

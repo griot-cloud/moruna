@@ -121,3 +121,41 @@ jobs:
             -e AWS_SECRET_ACCESS_KEY -e AWS_REGION -e AWS_ALLOW_HTTP \
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
+
+  # Publishing. A tag is the only trigger: nothing reaches PyPI from a push to main,
+  # and the job builds the wheels itself rather than trusting an artefact from
+  # elsewhere. Authentication is PyPI's trusted publishing (OpenID Connect), so there
+  # is no token in this repository and nothing to leak; the publisher is configured
+  # once on PyPI against this repository, this workflow file and this environment.
+  publish:
+    name: publish to PyPI (tags only)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14t"
+      - name: Build the wheels
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --out dist --interpreter python3.14 python3.14t
+          ls -la dist
+      - name: The wheel installs and runs before it is published
+        # A wheel that has never been imported is not a release candidate.
+        run: |
+          python -m pip install --only-binary=:all: pyarrow
+          python -m pip install --no-index --find-links dist amoru
+          python -c "import amoru; print(amoru.__version__); print(amoru.inspect_host()['limits'])"
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.14.0
+        with:
+          packages-dir: dist
+          skip-existing: true
