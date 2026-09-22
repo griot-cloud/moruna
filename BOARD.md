@@ -36,9 +36,12 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 
 | | |
 |---|---|
-| Current wave | 0, in progress since 2026-09-22 |
+| Where the code is | ten crates merged to `main`: contracts, testkit, arena, discovery, trace, adapters, the two engine bridges, reactor, sources, sinks, controller, and the bench suite. 470 tests pass, every crate above 90% line coverage |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | six running in parallel: adapters, reactor, sources, sinks, placement, controller. Wave 0 and the wave 1 crates are merged; `main` carries 296 tests with every crate above 90%. Before closing the wave 1 gate the PM runs the weekly `slow` job from the Actions tab, which is what executes DS-T9 and the other container-gated tests |
+| In flight | F3.5 to F3.7, the placement engine (one executor, the last component of waves 1 to 3) |
+| Next to start | F4.1 to F4.3, the scheduler: its crate dependency is `amoru-sinks`, which is merged, so it starts now against `FakePlacement` |
+| Then | F4.6 the facade and F4.7 integration, once placement and the scheduler are in; after those, wave 5 (the Python package, the baselines) and E7 documentation |
+| Gates still to close | wave 1, 2 and 3 reports, each needing one run of the weekly `slow` job from the Actions tab, which is what executes DS-T9 and the other container-gated tests. The crates are merged; the gate reports are the paperwork that says so |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -50,9 +53,9 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 | Id | Feature | Branch | Scope (SDD sections, tests by id) | Status |
 |---|---|---|---|---|
 | F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | merged |
-| F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | merged (PR #1, 2026-09-22) |
-| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | merged (PR #10, 2026-09-22; 121 tests, 93.6% coverage; four E10 findings resolved first in PR #11) |
-| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | merged 2026-09-22 (122 tests, 91.4%) |
+| F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | merged |
+| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | merged (121 tests, 93.6%) |
+| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | merged (91.6%) |
 | F0.4 | Wave 0 gate and wave report (PM) | `main` | pm.md sections 2, 4, 8 | todo |
 
 ### F0.0 tasks
@@ -87,14 +90,14 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 - [x] Coverage at or above 90% for `amoru-kernel`; PR template complete
 
 ### F0.3 tasks
-- [ ] Every fake of d.15 (`FakeAllocator`, `FakeReactor`, `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeSampler`, `FakeTrace`, `FakeKnobs`) with exactly the knobs and observables the table lists, and a `shutdown_calls` counter wherever the trait has `shutdown`
-- [ ] `FakeAllocator` buffers are real heap allocations tagged with the tier so tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work
-- [ ] `FakePlacement::with_manifest_store` round-trips `checkpoint`/`restore` across engine instances
-- [ ] CT-T13: every method and every knob exercised once
-- [ ] `amoru-testkit` depends on `amoru-kernel` only; coverage at or above 90%; same PR as F0.2
+- [x] Every fake of d.15 (`FakeAllocator`, `FakeReactor`, `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeSampler`, `FakeTrace`, `FakeKnobs`) with exactly the knobs and observables the table lists, and a `shutdown_calls` counter wherever the trait has `shutdown`
+- [x] `FakeAllocator` buffers are real heap allocations tagged with the tier so tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work
+- [x] `FakePlacement::with_manifest_store` round-trips `checkpoint`/`restore` across engine instances
+- [x] CT-T13: every method and every knob exercised once
+- [x] `amoru-testkit` depends on `amoru-kernel` only; coverage at or above 90%; same PR as F0.2
 
 ### F0.4 tasks
-- [ ] PM review of F0.1 and F0.2+F0.3 against pm.md section 4, lines 1 to 11
+- [x] PM review of F0.1 and F0.2+F0.3 against pm.md section 4, lines 1 to 11
 - [ ] Wave 0 report: tests run, tests skipped by id, provisional figures with host names, escalations opened
 - [ ] E1 environment items for wave 1 recorded (Python interpreters with NumPy and pyarrow, cgroup v2 host)
 - [ ] SDD 01 listed for Brackly to flip to HANDOFF-READY once E1 and E2 assumptions are accepted
@@ -107,45 +110,45 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | merged 2026-09-22 (94.3%) |
-| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | merged 2026-09-22 (96.4%) |
-| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | merged 2026-09-22 (92.2%) |
-| F1.4 | Python kernel adapter `amoru-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | todo |
-| F1.5 | Polars and DataFusion bridges `amoru-polars`, `amoru-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | todo |
-| F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | merged (PR #4, 2026-09-22; 88 tests, 96.2% coverage) |
-| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | merged 2026-09-22 (96.9%) |
+| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | merged (93.4%) |
+| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | merged (96.3%) |
+| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | merged (92.2%) |
+| F1.4 | Python kernel adapter `amoru-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | merged (95.0%) |
+| F1.5 | Polars and DataFusion bridges `amoru-polars`, `amoru-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | merged (polars 94.5%, datafusion 98.8%) |
+| F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | merged (96.9%) |
+| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | merged |
 | F1.8 | Wave 1 gate and report (PM) | `main` | | todo |
 
 ### F1.1 tasks
-- [ ] Environment facts from 02 section l verified; `unsafe` only in the modules 02 section l names
-- [ ] `Allocator` implemented per 1.3's edge contract: 64-byte alignment, page alignment above a page, tier honoured or the call fails; `is_pinned` all or nothing
-- [ ] Size classes, free lists and the lock-free versus mutex decision recorded with the benchmark that justified it (preamble 4.2)
-- [ ] `contains`, `tier_of`, `AllocStats` exact; small-budget mode; large coalescing
-- [ ] AR-T1 to AR-T12 under SDD names; every AR-I cited; coverage at or above 90%; PR template complete
+- [x] Environment facts from 02 section l verified; `unsafe` only in the modules 02 section l names
+- [x] `Allocator` implemented per 1.3's edge contract: 64-byte alignment, page alignment above a page, tier honoured or the call fails; `is_pinned` all or nothing
+- [x] Size classes, free lists and the lock-free versus mutex decision recorded with the benchmark that justified it (preamble 4.2)
+- [x] `contains`, `tier_of`, `AllocStats` exact; small-budget mode; large coalescing
+- [x] AR-T1 to AR-T12 under SDD names; every AR-I cited; coverage at or above 90%; PR template complete
 
 ### F1.2 tasks
-- [ ] Environment facts from 03 section l verified (cgroup v2 paths in a container, `memory.peak` presence)
-- [ ] `discover`: precedence explicit, cgroup, OS; ceiling below kill; `LimitSource`; size strings; Databricks refusal (E7 assumption)
-- [ ] `HostProfile` parsing from `AMORU_HOST_PROFILE`; every `Unknown` becomes `Probed`; `Present` on tmpfs or overlay staging refused
-- [ ] `Sampler` with `reset_peak`, anon not current, idempotent, sample cost measured and labelled with the host
-- [ ] DS-T1 to DS-T12; DS-T9 wired into the CI container job; every DS-I cited; coverage; PR template
+- [x] Environment facts from 03 section l verified (cgroup v2 paths in a container, `memory.peak` presence)
+- [x] `discover`: precedence explicit, cgroup, OS; ceiling below kill; `LimitSource`; size strings; Databricks refusal (E7 assumption)
+- [x] `HostProfile` parsing from `AMORU_HOST_PROFILE`; every `Unknown` becomes `Probed`; `Present` on tmpfs or overlay staging refused
+- [x] `Sampler` with `reset_peak`, anon not current, idempotent, sample cost measured and labelled with the host
+- [x] DS-T1 to DS-T12; DS-T9 wired into the CI container job; every DS-I cited; coverage; PR template
 
 ### F1.3 tasks
-- [ ] Environment facts from 04 section l verified
-- [ ] Bounded channel, writer thread, in-memory chunks with `trace.memory_limit` overflow to disk, flush on `finish` and on abort, `TraceTail`
-- [ ] Run report as a pure function of the trace and the limits (formulas of 04), staging versus source bandwidth, disk-full handling
-- [ ] TR-T1 to TR-T11; every TR-I cited; coverage; PR template
+- [x] Environment facts from 04 section l verified
+- [x] Bounded channel, writer thread, in-memory chunks with `trace.memory_limit` overflow to disk, flush on `finish` and on abort, `TraceTail`
+- [x] Run report as a pure function of the trace and the limits (formulas of 04), staging versus source bandwidth, disk-full handling
+- [x] TR-T1 to TR-T11; every TR-I cited; coverage; PR template
 
 ### F1.4 tasks
-- [ ] Environment facts from 05 section l verified (the four interpreters, NumPy, pyarrow, pyo3 at or above 0.28)
-- [ ] Python callable as `Kernel`: zero-copy crossing both ways, one boundary copy of non-arena output (AD-I2, `boundary_copies_total`), deleter attaches to the interpreter, exception context, fingerprint from qualified name plus source hash, class-kernel shape
-- [ ] GIL detection and flip reported per stage (`GilState`)
-- [ ] AD-T1, T2, T4 to T8, T12 pass; AD-T3 and AD-T11 exist, ignored with the E1 reason, listed; every AD-I cited; coverage; PR template
+- [x] Environment facts from 05 section l verified (the four interpreters, NumPy, pyarrow, pyo3 at or above 0.28)
+- [x] Python callable as `Kernel`: zero-copy crossing both ways, one boundary copy of non-arena output (AD-I2, `boundary_copies_total`), deleter attaches to the interpreter, exception context, fingerprint from qualified name plus source hash, class-kernel shape
+- [x] GIL detection and flip reported per stage (`GilState`)
+- [x] AD-T1, T2, T4 to T8, T12 pass; AD-T3 and AD-T11 exist, ignored with the E1 reason, listed; every AD-I cited; coverage; PR template
 
 ### F1.5 tasks
-- [ ] `amoru-polars`: a kernel as a Polars expression plugin, no kernel logic in the wrapper; `amoru-datafusion`: a kernel as a `ScalarUDF`
-- [ ] AD-T9, AD-T10 against the bench `normalise` kernel (after F1.7 merges); S7 closed for the two hosts
-- [ ] Both crates depend on `amoru-kernel` plus the host engine only; feature flags per 6.3; coverage; same PR as F1.4 or a follow-up commit on the branch
+- [x] `amoru-polars`: a kernel as a Polars expression plugin, no kernel logic in the wrapper; `amoru-datafusion`: a kernel as a `ScalarUDF`
+- [x] AD-T9, AD-T10 against the bench `normalise` kernel (after F1.7 merges); S7 closed for the two hosts
+- [x] Both crates depend on `amoru-kernel` plus the host engine only; feature flags per 6.3; coverage; same PR as F1.4 or a follow-up commit on the branch
 
 ### F1.6 tasks
 - [x] `bench/` generator: 12 suite datasets and four ad hoc commands, deterministic by seed, local and S3
@@ -154,9 +157,9 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 - [x] The MinIO half runs in CI: the `minio` job now exports `AMORU_S3_BUCKET=amoru-ci` (fixed by the PM after PR #3 merged), so the S3 test no longer skips; the wave 1 gate clause "and MinIO" closes when the next run on `main` is green
 
 ### F1.7 tasks
-- [ ] Six kernels with their declared amplification classes; `wide-intermediate` in Python releasing the GIL
-- [ ] Each kernel usable by AD-T9/T10 and by the wave 4 end-to-end tests
-- [ ] Tests and coverage; PR with F1.6
+- [x] Six kernels with their declared amplification classes; `wide-intermediate` in Python releasing the GIL
+- [x] Each kernel usable by AD-T9/T10 and by the wave 4 end-to-end tests
+- [x] Tests and coverage; PR with F1.6
 
 ### F1.8 tasks
 - [ ] PM reviews five PRs against pm.md section 4; merges; wave 1 report; E1 items for wave 2 (an `O_DIRECT` filesystem, io_uring where allowed)
@@ -170,21 +173,21 @@ Gate (6.6, wave 2): RE tests pass; direct IO and the fallback both exercised on 
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F2.1 | Reactor core: completions, file and object IO, concurrency bounds, shutdown | `component/06-reactor` | 06 d, f (except f.5), g, h; RE-T1, T2, T3, T6, T7, T8, T9, T13, T14, T15 | todo |
-| F2.2 | Reactor direct paths: direct IO, io_uring, sticky fallback, copy table with `cuda`/`gds`/`rdma` arms | `component/06-reactor` (same PR) | 06 f.5, section l FFI notes; RE-T4, T10, T12; RE-T5 (E1, skipped and listed); RE-T11 (E1, provisional with host name) | todo |
+| F2.1 | Reactor core: completions, file and object IO, concurrency bounds, shutdown | `component/06-reactor` | 06 d, f (except f.5), g, h; RE-T1, T2, T3, T6, T7, T8, T9, T13, T14, T15 | merged (93.3%) |
+| F2.2 | Reactor direct paths: direct IO, io_uring, sticky fallback, copy table with `cuda`/`gds`/`rdma` arms | `component/06-reactor` (same PR) | 06 f.5, section l FFI notes; RE-T4, T10, T12; RE-T5 (E1, skipped and listed); RE-T11 (E1, provisional with host name) | merged (same branch) |
 | F2.3 | Wave 2 gate and report (PM) | `main` | | todo |
 
 ### F2.1 tasks
-- [ ] Environment facts from 06 section l verified (filesystem accepts `O_DIRECT`, io_uring probe result, MinIO reachable)
-- [ ] tokio reactor with `reactor.threads`; every operation completes exactly once into the buffer it was given, on a reactor thread; submission never blocks; `then` runs on the reactor thread
-- [ ] `read_file`, `read_file_opt`, `write_file`, `read_object`, `write_object`, multipart, `ObjectMetadata`, segment registry, `paths()`, `shutdown` within the longest operation
-- [ ] RE-T1, T2, T3, T6, T7, T8, T9, T13, T14, T15; every RE-I cited; coverage; PR template
+- [x] Environment facts from 06 section l verified (filesystem accepts `O_DIRECT`, io_uring probe result, MinIO reachable)
+- [x] tokio reactor with `reactor.threads`; every operation completes exactly once into the buffer it was given, on a reactor thread; submission never blocks; `then` runs on the reactor thread
+- [x] `read_file`, `read_file_opt`, `write_file`, `read_object`, `write_object`, multipart, `ObjectMetadata`, segment registry, `paths()`, `shutdown` within the longest operation
+- [x] RE-T1, T2, T3, T6, T7, T8, T9, T13, T14, T15; every RE-I cited; coverage; PR template
 
 ### F2.2 tasks
-- [ ] Direct IO when aligned, buffered otherwise; io_uring path behind `uring` with byte-equal fallback; sticky fallback after a failure; `Probed` versus `Present` behaviour (G-I7)
-- [ ] Copy table f.5 with every arm named: `cuda` copy engine rows, `gds` rows over the minimal `libcufile` FFI (section l), `rdma` rows returning `Unsupported("rdma")`
-- [ ] RE-T4, T10, T12 pass; RE-T5 skipped and listed; RE-T11 measured and labelled provisional with the host name
-- [ ] Coverage for the non-device paths; PR template; same PR as F2.1
+- [x] Direct IO when aligned, buffered otherwise; io_uring path behind `uring` with byte-equal fallback; sticky fallback after a failure; `Probed` versus `Present` behaviour (G-I7)
+- [x] Copy table f.5 with every arm named: `cuda` copy engine rows, `gds` rows over the minimal `libcufile` FFI (section l), `rdma` rows returning `Unsupported("rdma")`
+- [x] RE-T4, T10, T12 pass; RE-T5 skipped and listed; RE-T11 measured and labelled provisional with the host name
+- [x] Coverage for the non-device paths; PR template; same PR as F2.1
 
 ### F2.3 tasks
 - [ ] PM review, merge, wave 2 report; E1 items for wave 3 (10 GiB free local disk, MinIO)
@@ -198,34 +201,34 @@ Gate (6.6, wave 3): SO, SI, PL tests pass; S10 and S15 with `FakeSink` throttle;
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F3.1 | `ParquetSource` over local paths and object stores | `component/07-sources` | 07 a to h for Parquet; SO-T1 to T8, T11, T13 to T16; SO-T12 (E1, provisional) | todo |
-| F3.2 | `TensorSource` (safetensors, AMB1) and `PyIteratorSource` | `component/07-sources` (same PR) | 07 tensor and iterator sections; SO-T9; SO-T10 (integration, wave 3; `python`) | todo |
-| F3.3 | `ParquetSink`, `SinkHandle`, commit tracking and resume | `component/08-sinks` | 08 a to h for Parquet, e.5, resume; SI-T1 to T4, T7, T11 to T16; SI-T8 (integration, wave 3) | todo |
-| F3.4 | `TensorSink`, `ArrowIpcSink`, `ReorderBuffer` | `component/08-sinks` (same PR) | 08 e.3, reorder; SI-T5, T9; SI-T10 (integration, wave 3); SI-T6 (E1, skipped and listed) | todo |
-| F3.5 | Placement core: queues, accounting, admission, head hot, promotion window, move table | `component/09-placement` | 09 c, d, e.1, e.4, f (promotion and demotion), g; PL-T1 to T4, T8, T9, T11, T19 to T21, T24 | todo |
-| F3.6 | Placement staging: segments, record format, disk bound, Q0 eviction and replace, move failures | `component/09-placement` (same PR) | 09 e.2, e.3, f.5 to f.10, h; PL-T5 to T7, T10, T12, T14, T15; PL-T13 (E1, provisional) | todo |
-| F3.7 | Placement lineage and manifest: checkpoint, restore, lineage index, lock order, shutdown | `component/09-placement` (same PR) | 09 e.5, f.11, f.12; PL-T16, T18, T22, T23; PL-T17 (integration, wave 4) | todo |
+| F3.1 | `ParquetSource` over local paths and object stores | `component/07-sources` | 07 a to h for Parquet; SO-T1 to T8, T11, T13 to T16; SO-T12 (E1, provisional) | merged (91.7%) |
+| F3.2 | `TensorSource` (safetensors, AMB1) and `PyIteratorSource` | `component/07-sources` (same PR) | 07 tensor and iterator sections; SO-T9; SO-T10 (integration, wave 3; `python`) | merged (same branch) |
+| F3.3 | `ParquetSink`, `SinkHandle`, commit tracking and resume | `component/08-sinks` | 08 a to h for Parquet, e.5, resume; SI-T1 to T4, T7, T11 to T16; SI-T8 (integration, wave 3) | merged (93.8%) |
+| F3.4 | `TensorSink`, `ArrowIpcSink`, `ReorderBuffer` | `component/08-sinks` (same PR) | 08 e.3, reorder; SI-T5, T9; SI-T10 (integration, wave 3); SI-T6 (E1, skipped and listed) | merged (same branch) |
+| F3.5 | Placement core: queues, accounting, admission, head hot, promotion window, move table | `component/09-placement` | 09 c, d, e.1, e.4, f (promotion and demotion), g; PL-T1 to T4, T8, T9, T11, T19 to T21, T24 | in progress |
+| F3.6 | Placement staging: segments, record format, disk bound, Q0 eviction and replace, move failures | `component/09-placement` (same PR) | 09 e.2, e.3, f.5 to f.10, h; PL-T5 to T7, T10, T12, T14, T15; PL-T13 (E1, provisional) | in progress |
+| F3.7 | Placement lineage and manifest: checkpoint, restore, lineage index, lock order, shutdown | `component/09-placement` (same PR) | 09 e.5, f.11, f.12; PL-T16, T18, T22, T23; PL-T17 (integration, wave 4) | in progress |
 | F3.8 | Wave 3 gate and report (PM) | `main` | | todo |
 
 ### F3.1 tasks
-- [ ] Environment facts from 07 section l verified; bench generator files available in test setup (F1.6)
-- [ ] `plan` complete before the first `read`, exact metadata from the footer, row-group sub-splitting with `RowSelection`, pruning, one decode copy into the arena in the requested tier, zero-row and oversized-row handling, schema mismatch, read failure paths, local paths through `read_file` only
-- [ ] SO-T1 to T8, T11, T13 to T16 pass; SO-T12 provisional with host name; every SO-I cited; coverage; PR template
+- [x] Environment facts from 07 section l verified; bench generator files available in test setup (F1.6)
+- [x] `plan` complete before the first `read`, exact metadata from the footer, row-group sub-splitting with `RowSelection`, pruning, one decode copy into the arena in the requested tier, zero-row and oversized-row handling, schema mismatch, read failure paths, local paths through `read_file` only
+- [x] SO-T1 to T8, T11, T13 to T16 pass; SO-T12 provisional with host name; every SO-I cited; coverage; PR template
 
 ### F3.2 tasks
-- [ ] `TensorSource`: safetensors header parse, mapped bytes, aligned copy only when the offset is unaligned (architecture 2.2 row), AMB1 read; `PyIteratorSource` with `repeatable() == false`
-- [ ] SO-T9 passes; SO-T10 under the `python` feature; coverage; same PR as F3.1
+- [x] `TensorSource`: safetensors header parse, mapped bytes, aligned copy only when the offset is unaligned (architecture 2.2 row), AMB1 read; `PyIteratorSource` with `repeatable() == false`
+- [x] SO-T9 passes; SO-T10 under the `python` feature; coverage; same PR as F3.1
 
 ### F3.3 tasks
-- [ ] Environment facts from 08 section l verified
-- [ ] `ParquetSink`: ownership once, encode-only copy into the arena, row-group and file roll targets, `finish` exactly once, no partial final file, `SinkSummary` exact, `sink.concurrency`, slow store behaviour
-- [ ] `committed_seq` never overstates (SI-I8), `skip`, `checkpoint` returns `Some` from open, `resume` discards uncommitted output; the non-resumable path says so (SI-T14)
-- [ ] `SinkHandle` for the scheduler (SI-T15)
-- [ ] SI-T1 to T4, T7, T11 to T16 pass; SI-T8 closes when `ParquetSource` merges; every SI-I cited; coverage; PR template
+- [x] Environment facts from 08 section l verified
+- [x] `ParquetSink`: ownership once, encode-only copy into the arena, row-group and file roll targets, `finish` exactly once, no partial final file, `SinkSummary` exact, `sink.concurrency`, slow store behaviour
+- [x] `committed_seq` never overstates (SI-I8), `skip`, `checkpoint` returns `Some` from open, `resume` discards uncommitted output; the non-resumable path says so (SI-T14)
+- [x] `SinkHandle` for the scheduler (SI-T15)
+- [x] SI-T1 to T4, T7, T11 to T16 pass; SI-T8 closes when `ParquetSource` merges; every SI-I cited; coverage; PR template
 
 ### F3.4 tasks
-- [ ] `TensorSink` writing AMB1 and safetensors; `ArrowIpcSink` writing the page-aligned IPC of contracts e.7; `ReorderBuffer` bounded by `ordering.buffer_bytes`
-- [ ] SI-T5, T9 pass; SI-T10 closes with `TensorSource`; SI-T6 skipped and listed; coverage; same PR as F3.3
+- [x] `TensorSink` writing AMB1 and safetensors; `ArrowIpcSink` writing the page-aligned IPC of contracts e.7; `ReorderBuffer` bounded by `ordering.buffer_bytes`
+- [x] SI-T5, T9 pass; SI-T10 closes with `TensorSource`; SI-T6 skipped and listed; coverage; same PR as F3.3
 
 ### F3.5 tasks
 - [ ] Environment facts from 09 section l verified; `unsafe` only where 09 section l permits
@@ -258,8 +261,8 @@ Gate (6.6, wave 4): end-to-end with fakes and with real components: S1, S2, S4, 
 | F4.1 | Scheduler core: chain validation, worker pool, pick and admission, instance pools, trace emission, knobs, heartbeat | `component/10-scheduler` | 10 c, d, e, f.1 to f.4, g; SC-T1 to T6, T8, T17, T18, T19 | todo |
 | F4.2 | Scheduler drives, probe protocol, error policies, cancellation, evicted replay | `component/10-scheduler` (same PR) | 10 f.5 to f.10, h; SC-T7, T9, T10, T11, T13; SC-T12 (E1, provisional) | todo |
 | F4.3 | Scheduler checkpoint thread, watermark, `apply_resume_point`, `run_resumed` | `component/10-scheduler` (same PR) | 10 f.11 onward, resume; SC-T14, T15; SC-T16 (integration, wave 4) | todo |
-| F4.4 | Controller sizing: prepare, probe, envelope, rule sizer, AIMD, damping, oscillation freeze, breach, state growth, tick bound | `component/11-controller` | 11 c, d, f.1 to f.5; RC-T1 to T8, T11, T15 to T18 | todo |
-| F4.5 | Controller classification, profile store, resume seeding, learned-sizer stub with shadow error | `component/11-controller` (same PR) | 11 f.6 onward, e.3; RC-T9, T10, T14; RC-T13 (E1); RC-T12 (integration, wave 4) | todo |
+| F4.4 | Controller sizing: prepare, probe, envelope, rule sizer, AIMD, damping, oscillation freeze, breach, state growth, tick bound | `component/11-controller` | 11 c, d, f.1 to f.5; RC-T1 to T8, T11, T15 to T18 | merged (92.6%) |
+| F4.5 | Controller classification, profile store, resume seeding, learned-sizer stub with shadow error | `component/11-controller` (same PR) | 11 f.6 onward, e.3; RC-T9, T10, T14; RC-T13 (E1); RC-T12 (integration, wave 4) | merged (same branch) |
 | F4.6 | Rust facade `amoru-runtime`: lifecycle 4.4, `RunSpec`, report, cancel, mimalloc | `component/12-runtime` | 12 sections for the facade (f.1, f.2, f.7, section l Rust files); the lifecycle of preamble 4.4 fresh and resumed | todo |
 | F4.7 | Wave 4 integration closure with real components | `component/12-runtime` (same PR) or `infra/wave4-integration` | RC-T12 in a container, SC-T16, PL-T17; S1, S2, S4, S5, S6, S11 evidence | todo |
 | F4.8 | Wave 4 gate and report (PM) | `main` | | todo |
@@ -283,14 +286,14 @@ Gate (6.6, wave 4): end-to-end with fakes and with real components: S1, S2, S4, 
 - [ ] SC-T14, T15 pass; SC-T16 written and tagged; every SC-I1 to SC-I11 cited; PR template complete
 
 ### F4.4 tasks
-- [ ] Environment facts from 11 section l verified
-- [ ] `prepare` (baseline after every init), `probe_all` and `probe_missing`, envelope from budget and probe, rule sizer with AIMD, `damping_completions`, oscillation freeze (S11), breach handling with the G-I8 diagnostic through `Knobs::terminate`, workers bounded by memory, one action per tick, tiny dataset, tick lock bound (RC-T17), state growth, device OOM retry
-- [ ] Every knob written only by the controller (G-I5); `set_budgets` the only placement setter it calls
-- [ ] RC-T1 to T8, T11, T15 to T18 pass; coverage
+- [x] Environment facts from 11 section l verified
+- [x] `prepare` (baseline after every init), `probe_all` and `probe_missing`, envelope from budget and probe, rule sizer with AIMD, `damping_completions`, oscillation freeze (S11), breach handling with the G-I8 diagnostic through `Knobs::terminate`, workers bounded by memory, one action per tick, tiny dataset, tick lock bound (RC-T17), state growth, device OOM retry
+- [x] Every knob written only by the controller (G-I5); `set_budgets` the only placement setter it calls
+- [x] RC-T1 to T8, T11, T15 to T18 pass; coverage
 
 ### F4.5 tasks
-- [ ] Bottleneck classification table (f.6) from `SchedulerStats`, placement stats and samples; profile store keyed by fingerprint and schema hash (e.3) in `profiles.dir`; resume seeds the profile; learned sizer stub with shadow error tracking and `sizer.fallback_error_ratio` fallback
-- [ ] RC-T9, T10, T14 pass; RC-T13 tagged E1; RC-T12 tagged integration; every RC-I1 to RC-I10 cited; PR template
+- [x] Bottleneck classification table (f.6) from `SchedulerStats`, placement stats and samples; profile store keyed by fingerprint and schema hash (e.3) in `profiles.dir`; resume seeds the profile; learned sizer stub with shadow error tracking and `sizer.fallback_error_ratio` fallback
+- [x] RC-T9, T10, T14 pass; RC-T13 tagged E1; RC-T12 tagged integration; every RC-I1 to RC-I10 cited; PR template
 
 ### F4.6 tasks
 - [ ] Facade executor briefed with "reads every SDD" (preamble 9); environment facts verified
@@ -362,7 +365,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 | F6.1 | Decisions and document status closed | `main` | `DECISIONS.md` Q2 to Q7, Q9, Q10 decided or their assumptions explicitly accepted by Brackly; every SDD HANDOFF-READY; preamble section 8 traceability table with no gap row | todo |
 | F6.2 | Sufficiency sign-off | `main` | S1 to S17 each cited to the test and the host that closed it, or listed as skipped by id with Brackly's acceptance (device and GDS parts of S14) | todo |
 | F6.3 | Packaging and publishing | `infra/release` | Q1 remainder: PyPI, crates.io and GitHub namespace checks, trademark and domain; version `0.1.0`; `CHANGELOG.md`; trusted publishing workflow for wheels and sdist; PY-O1 (GPU wheel) decided or the separate-wheel assumption accepted | todo |
-| F6.5 | Supply chain and security | `infra/supply-chain` | `cargo audit` and `cargo deny` (licences, advisories, bans, sources) in CI; `SECURITY.md` improved; every action pinned by SHA; DCO sign-off checked in CI; `Cargo.lock` freshness | merged (PR #3, 2026-09-22) |
+| F6.5 | Supply chain and security | `infra/supply-chain` | `cargo audit` and `cargo deny` (licences, advisories, bans, sources) in CI; `SECURITY.md` improved; every action pinned by SHA; DCO sign-off checked in CI; `Cargo.lock` freshness | merged |
 | F6.6 | Release `v0.1.0` | `main` | tag, GitHub release with the wave 5 report and the bench figures (host named), wheels on PyPI for the four interpreters, `README.md` status changed from "Design"; E7 complete first | todo |
 
 ### F6.1 tasks
@@ -398,7 +401,7 @@ Written after wave 5 so it describes what shipped, from the design documents and
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F7.1 | Docs site scaffold and CI | `docs/site` | `docs/` as an mdBook (Rust-native, no Node); a CI job that builds it, checks links and runs the em-dash and no-tabs conventions; published from `main` to GitHub Pages | merged (PR #2, 2026-09-22) |
+| F7.1 | Docs site scaffold and CI | `docs/site` | `docs/` as an mdBook (Rust-native, no Node); a CI job that builds it, checks links and runs the em-dash and no-tabs conventions; published from `main` to GitHub Pages | merged |
 | F7.2 | User guide | `docs/user-guide` | install from a wheel per interpreter; `amoru.run` walkthrough; sources (Parquet local and object store, safetensors, NumPy, Python iterator) and sinks (Parquet, tensor, Arrow IPC); ordering and error policies; budgets and the two environment-variable families; reading the run report and the trace; cancellation and resume (`resume=`, `checkpoint.*`) | todo |
 | F7.3 | API reference | `docs/api` | Python: every public name in `python/amoru` from docstrings (the module's docstrings are the source); Rust: `cargo doc` for `amoru-kernel` with every trait's contract sentence from preamble 1.3 on its doc comment, published beside the book; the configuration table of preamble section 5 rendered with owner and range per row | todo |
 | F7.4 | Kernel author guide | `docs/kernels` | a Rust kernel against `amoru-kernel` alone; the same kernel as a Polars plugin and a DataFusion function (S7); a Python kernel, GIL and free-threading, what releases the GIL; stateful kernels, instances, `ResumePolicy`; hints and `footprint`; the zero-copy rules and what breaks them (G-I2, CT-I4) | todo |
