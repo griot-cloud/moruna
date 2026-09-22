@@ -226,15 +226,13 @@ name = "amoru-sinks"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
+ "amoru-testkit",
  "arrow",
- "base64 0.23.1",
  "bytes",
- "object_store",
  "parquet",
  "safetensors",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
  "tracing",
 ]
 
