@@ -1,0 +1,17 @@
+[package]
+name = "amoru-polars"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Amoru Polars bridge"
+
+[dependencies]
+amoru-kernel = { workspace = true }
+polars = { workspace = true, optional = true }
+
+[features]
+default = []
+polars = ["dep:polars"]

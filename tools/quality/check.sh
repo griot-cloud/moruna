@@ -36,8 +36,22 @@ if [ -f Cargo.toml ]; then
   command -v cargo-llvm-cov >/dev/null 2>&1 \
     || fail "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview"
   mkdir -p target/llvm-cov
-  cargo llvm-cov --workspace --json --summary-only --output-path target/llvm-cov/summary.json >/dev/null
-  python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
+  # A workspace in which no crate has an instrumented line (every member a
+  # stub, wave 0 before F0.2 lands) yields no profile at all, and llvm-cov
+  # reports "no coverage data found" instead of an empty summary. That is the
+  # "stub, not measured" case of preamble 6.7, not a failure; any other error
+  # from cargo-llvm-cov still fails the gate.
+  if ! cargo llvm-cov --workspace --json --summary-only --output-path target/llvm-cov/summary.json \
+      >/dev/null 2>target/llvm-cov/stderr.log; then
+    if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
+      step "no instrumented lines in any crate (all stubs); coverage not measured"
+    else
+      cat target/llvm-cov/stderr.log >&2
+      fail "cargo llvm-cov failed"
+    fi
+  else
+    python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
+  fi
 else
   step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"
 fi
