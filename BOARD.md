@@ -24,7 +24,7 @@ The one question this section answers: what stands between today and a process t
 | 3. IO that never blocks a worker | `amoru-reactor` | merged |
 | 4. Bytes in and out | `amoru-sources`, `amoru-sinks` | merged |
 | 5. The queue that makes disk a tier | `amoru-placement` | merged (90.8%) |
-| 6. The thing that runs the work | `amoru-scheduler` | in progress, the last executor of this session |
+| 6. The thing that runs the work | `amoru-scheduler` | merged (91.0%) |
 | 7. The thing that decides the sizes | `amoru-controller` | merged |
 | 8. The facade that wires 2 to 7 into `Runtime::run` | `amoru-runtime` | **not started; nothing runs end to end until it exists** |
 | 9. The surface a user touches | `amoru-py`, `python/amoru` | not started |
@@ -58,8 +58,10 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Where the code is | ten crates merged to `main`: contracts, testkit, arena, discovery, trace, adapters, the two engine bridges, reactor, sources, sinks, controller, and the bench suite. 470 tests pass, every crate above 90% line coverage |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| In flight | F4.1 to F4.3, the scheduler. It is the last executor of this session: Brackly called a halt on 2026-09-22 after it, so nothing new starts until he says otherwise |
-| Next to start, when work resumes | F4.6, the facade `amoru-runtime`: it wires steps 2 to 7 into `Runtime::run` and is the first time anything runs end to end. Its executor reads every SDD (preamble 9), and it needs the scheduler merged, which is the session's last piece |
+| In flight | nothing. Brackly called a halt on 2026-09-22 once the scheduler landed, so no executor is running and none starts until he says otherwise |
+| Next to start, when work resumes | F4.6, the facade `amoru-runtime`. Every crate it wires is now merged, so it is unblocked: it turns twelve parts into `Runtime::run` and is the first time anything runs end to end. Its executor reads every SDD (preamble 9) |
+| After that | F4.7 integration closure (RC-T12, SC-T16, PL-T17 with real components, which is what closes the wave 4 gate), then wave 5 (the Python package, the tuned and engine baselines) and E7 documentation |
+| Paperwork owed | the wave 1, 2, 3 and 4 gate reports. Each needs one run of the weekly `slow` job from the Actions tab, which is what executes DS-T9, PL-T6 and the other container-gated tests; the crates are merged and green, the reports are what record it |
 | Then | F4.6 the facade and F4.7 integration, once placement and the scheduler are in; after those, wave 5 (the Python package, the baselines) and E7 documentation |
 | Gates still to close | wave 1, 2 and 3 reports, each needing one run of the weekly `slow` job from the Actions tab, which is what executes DS-T9 and the other container-gated tests. The crates are merged; the gate reports are the paperwork that says so |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
@@ -278,9 +280,9 @@ Gate (6.6, wave 4): end-to-end with fakes and with real components: S1, S2, S4, 
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F4.1 | Scheduler core: chain validation, worker pool, pick and admission, instance pools, trace emission, knobs, heartbeat | `component/10-scheduler` | 10 c, d, e, f.1 to f.4, g; SC-T1 to T6, T8, T17, T18, T19 | in progress |
-| F4.2 | Scheduler drives, probe protocol, error policies, cancellation, evicted replay | `component/10-scheduler` (same PR) | 10 f.5 to f.10, h; SC-T7, T9, T10, T11, T13; SC-T12 (E1, provisional) | in progress |
-| F4.3 | Scheduler checkpoint thread, watermark, `apply_resume_point`, `run_resumed` | `component/10-scheduler` (same PR) | 10 f.11 onward, resume; SC-T14, T15; SC-T16 (integration, wave 4) | in progress |
+| F4.1 | Scheduler core: chain validation, worker pool, pick and admission, instance pools, trace emission, knobs, heartbeat | `component/10-scheduler` | 10 c, d, e, f.1 to f.4, g; SC-T1 to T6, T8, T17, T18, T19 | merged (91.0%) |
+| F4.2 | Scheduler drives, probe protocol, error policies, cancellation, evicted replay | `component/10-scheduler` (same PR) | 10 f.5 to f.10, h; SC-T7, T9, T10, T11, T13; SC-T12 (E1, provisional) | merged (same branch) |
+| F4.3 | Scheduler checkpoint thread, watermark, `apply_resume_point`, `run_resumed` | `component/10-scheduler` (same PR) | 10 f.11 onward, resume; SC-T14, T15; SC-T16 (integration, wave 4) | merged (same branch) |
 | F4.4 | Controller sizing: prepare, probe, envelope, rule sizer, AIMD, damping, oscillation freeze, breach, state growth, tick bound | `component/11-controller` | 11 c, d, f.1 to f.5; RC-T1 to T8, T11, T15 to T18 | merged (92.6%) |
 | F4.5 | Controller classification, profile store, resume seeding, learned-sizer stub with shadow error | `component/11-controller` (same PR) | 11 f.6 onward, e.3; RC-T9, T10, T14; RC-T13 (E1); RC-T12 (integration, wave 4) | merged (same branch) |
 | F4.6 | Rust facade `amoru-runtime`: lifecycle 4.4, `RunSpec`, report, cancel, mimalloc | `component/12-runtime` | 12 sections for the facade (f.1, f.2, f.7, section l Rust files); the lifecycle of preamble 4.4 fresh and resumed | todo |
@@ -493,7 +495,8 @@ Open items the PM found while reading, routed per preamble section 7. Ids: `N-` 
 
 Filed here as each gate closes (pm.md section 2); the detail stays in the pull requests.
 
-- Wave 0: not yet run.
+- Wave 0: the contracts crate, the testkit, the workspace, CI and the lint are merged and green. CT-T1 to CT-T19 pass except CT-T11's timing half, which is tagged for the reference host. Gate report not yet written.
+- Waves 1 to 4: every component crate is merged and green on the developer host: arena, discovery, trace, adapters and the two bridges, the reactor, sources, sinks, placement, the scheduler and the controller. 573 tests pass, 15 are ignored and every one of those carries its tag's reason, and every crate is above 90% line coverage. What the reports still need is a run of the container job, which is where the tagged integration tests close, and the reference host, which is where every timing figure belongs (E1, D-B3).
 
 ### Delegated decisions log
 
