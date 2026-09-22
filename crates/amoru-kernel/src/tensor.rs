@@ -173,13 +173,10 @@ impl ManagedTensor {
         let version = t.version();
         if version.major != dlpark::ffi::DLPACK_MAJOR_VERSION {
             // d.4: a capsule whose major version is not DLPack's is `Convert`, never accepted.
-            // `ConvertError` has no variant for an ABI version, so this carries the closest one
-            // with a message that names the versions; reported as an escalation.
-            return Err(AmoruError::Convert(ConvertError::NotNumeric(format!(
-                "a DLPack capsule of major version {}, which this build does not speak (it speaks {})",
-                version.major,
-                dlpark::ffi::DLPACK_MAJOR_VERSION
-            ))));
+            return Err(AmoruError::Convert(ConvertError::Version {
+                found: version.major,
+                expected: dlpark::ffi::DLPACK_MAJOR_VERSION,
+            }));
         }
         let tensor = t.tensor();
         let tier = tier_of(tensor.device)?;

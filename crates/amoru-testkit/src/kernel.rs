@@ -10,14 +10,14 @@ use amoru_kernel::{
     PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
 };
 
-/// One `apply`, as the fake could observe it.
+/// One `apply`: its index, the instance that ran it and the thread it ran on (d.15).
 ///
 /// `Kernel::apply` is handed a `Payload` (d.7), which carries no sequence number and no worker
-/// id, so the first element is the apply call index, counted from zero, and the worker is
-/// reported as `u16::MAX`, unknown. d.15 asks for `(Seq, worker, instance, thread id)`; this is
-/// the closest thing the contract permits, and it is the escalation on the pull request that
-/// adds this crate.
-pub type ApplyRecord = (u64, u16, usize, ThreadId);
+/// id, and that is deliberate: a kernel that knew its position in the run could not be the same
+/// code inside a Polars expression or a DataFusion function (S7). The scheduler holds the
+/// sequence number, attaches it to `AmoruError::Kernel` and writes it to the trace, so a test
+/// that wants "morsel 7 failed" asserts on the trace and on the sink's `skipped()`.
+pub type ApplyRecord = (usize, usize, ThreadId);
 
 /// The state one `FakeKernel` instance keeps.
 pub struct FakeState {
@@ -59,8 +59,8 @@ struct Inner {
     instances: usize,
     state_bytes: u64,
     resume: ResumePolicy,
-    fail_on: Vec<u64>,
-    panic_on: Vec<u64>,
+    fail_on: Vec<usize>,
+    panic_on: Vec<usize>,
     grow_state_by: u64,
     init_calls: AtomicU64,
     restore_calls: AtomicU64,
@@ -71,7 +71,7 @@ struct Inner {
 /// controller and the scheduler are sized against.
 ///
 /// Knobs: `amplification(f64)`, `latency(Duration)`, `stateful(instances, state_bytes)`,
-/// `resume(ResumePolicy)`, `fail_on(calls)`, `panic_on(calls)`, `grow_state_by(bytes)`.
+/// `resume(ResumePolicy)`, `fail_on(applies)`, `panic_on(applies)`, `grow_state_by(bytes)`.
 /// Observables: `applies()`, `init_calls()`, `restore_calls()`, `checkpoint_calls()`.
 #[derive(Clone)]
 pub struct FakeKernel {
@@ -129,16 +129,17 @@ impl FakeKernel {
         self.rebuild(|b| b.resume = resume)
     }
 
-    /// Knob: these apply calls, by index, fail with `Kernel`.
-    pub fn fail_on(self, calls: &[u64]) -> FakeKernel {
-        let calls = calls.to_vec();
-        self.rebuild(|b| b.fail_on = calls)
+    /// Knob: these applies, by index, fail with `Kernel` (d.15: the fake counts applies,
+    /// because a kernel never sees a sequence number).
+    pub fn fail_on(self, applies: &[usize]) -> FakeKernel {
+        let applies = applies.to_vec();
+        self.rebuild(|b| b.fail_on = applies)
     }
 
-    /// Knob: these apply calls, by index, panic, so a test can prove a worker survives one.
-    pub fn panic_on(self, calls: &[u64]) -> FakeKernel {
-        let calls = calls.to_vec();
-        self.rebuild(|b| b.panic_on = calls)
+    /// Knob: these applies, by index, panic, so a test can prove a worker survives one.
+    pub fn panic_on(self, applies: &[usize]) -> FakeKernel {
+        let applies = applies.to_vec();
+        self.rebuild(|b| b.panic_on = applies)
     }
 
     /// Knob: the instance's state grows by this many bytes on every apply, so the controller
@@ -219,8 +220,8 @@ struct Builder {
     instances: usize,
     state_bytes: u64,
     resume: ResumePolicy,
-    fail_on: Vec<u64>,
-    panic_on: Vec<u64>,
+    fail_on: Vec<usize>,
+    panic_on: Vec<usize>,
     grow_state_by: u64,
 }
 
@@ -288,14 +289,14 @@ impl Kernel for FakeKernel {
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         let call = {
             let mut recorded = self.lock();
-            let call = recorded.applies.len() as u64;
+            let call = recorded.applies.len();
             let instance = state
                 .as_any_mut()
                 .downcast_mut::<FakeState>()
                 .map_or(usize::MAX, |fake| fake.instance);
             recorded
                 .applies
-                .push((call, u16::MAX, instance, std::thread::current().id()));
+                .push((call, instance, std::thread::current().id()));
             call
         };
         if self.inner.panic_on.contains(&call) {
@@ -313,7 +314,7 @@ impl Kernel for FakeKernel {
         if self.inner.fail_on.contains(&call) {
             return Err(AmoruError::Kernel {
                 stage: 0,
-                seq: call,
+                seq: call as u64,
                 msg: format!("FakeKernel::fail_on({call})"),
                 features: None,
             });

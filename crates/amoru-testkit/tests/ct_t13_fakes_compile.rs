@@ -592,14 +592,9 @@ fn fake_kernel() {
     assert_eq!(state.footprint(), Some(1024 + 16), "grow_state_by(16)");
     let applies = kernel.applies();
     assert_eq!(applies.len(), 1);
-    assert_eq!(applies[0].0, 0, "the apply call index");
-    assert_eq!(
-        applies[0].1,
-        u16::MAX,
-        "the worker is not visible inside apply"
-    );
-    assert_eq!(applies[0].2, 0, "the instance");
-    assert_eq!(applies[0].3, std::thread::current().id());
+    assert_eq!(applies[0].0, 0, "the apply index");
+    assert_eq!(applies[0].1, 0, "the instance");
+    assert_eq!(applies[0].2, std::thread::current().id());
 
     // checkpoint and restore round-trip the instance's state.
     let bytes = state
@@ -617,7 +612,7 @@ fn fake_kernel() {
     assert!(reinit.restore(&ctx, &bytes).is_err());
 
     // fail_on and panic_on key on the apply call index.
-    let failing = FakeKernel::new().fail_on(&[0]);
+    let failing = FakeKernel::new().fail_on(&[0usize]);
     let mut state = failing.init(&ctx).expect("an instance");
     let payload = morsel(&alloc, 1, 0).payload;
     let err = failing
@@ -625,7 +620,7 @@ fn fake_kernel() {
         .expect_err("fail_on(0)");
     assert!(matches!(err, AmoruError::Kernel { .. }), "got {err}");
 
-    let panicking = FakeKernel::new().panic_on(&[0]);
+    let panicking = FakeKernel::new().panic_on(&[0usize]);
     let mut state = panicking.init(&ctx).expect("an instance");
     let payload = morsel(&alloc, 2, 0).payload;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -209,8 +209,15 @@ fn ct_t19_tensor_from_buffer() {
         dlpark::ManagedBox::new_unchecked(raw)
     };
     let err = ManagedTensor::from_dlpack(foreign).expect_err("a foreign major version");
-    assert!(matches!(err, AmoruError::Convert(_)), "got {err}");
-    assert!(err.to_string().contains("major version"));
+    let expected = dlpark::ffi::DLPACK_MAJOR_VERSION;
+    assert!(
+        matches!(
+            err,
+            AmoruError::Convert(amoru_kernel::ConvertError::Version { found, expected: want })
+                if found == expected + 1 && want == expected
+        ),
+        "got {err}"
+    );
 
     // A DLPack tensor this build cannot describe is refused by name, never assumed.
     let err = ManagedTensor::from_dlpack(dlpack_with(

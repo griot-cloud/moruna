@@ -116,6 +116,14 @@ pub enum ConvertError {
     /// The tensor's rank is not 1 or 2.
     #[error("tensor rank {0} not convertible (need 1 or 2)")]
     Rank(usize),
+    /// A DLPack capsule of an ABI major version this build does not speak.
+    #[error("dlpack major version {found} is not {expected}")]
+    Version {
+        /// The major version the capsule declares.
+        found: u32,
+        /// The major version this build speaks.
+        expected: u32,
+    },
 }
 
 #[cfg(test)]
