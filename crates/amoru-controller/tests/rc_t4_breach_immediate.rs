@@ -2,6 +2,15 @@
 //! inside `on_record`, on the worker that recorded it, without waiting for a tick; and a stage
 //! that is already at the floor with one worker left produces the diagnostic the runtime
 //! terminates itself with rather than waiting to be killed. Proves RC-I4 and G-I8.
+//!
+//! Two figures here changed on 2026-09-23 and both were wrong in the same direction: they let a
+//! run finish over budget. The line was `baseline + arena + reserve`, which is the ceiling, so
+//! the first signal the controller got was S1 already broken; it now sits at half the headroom
+//! the arena left, where a halving still has somewhere to land. And termination was three floor
+//! breaches with one worker, a count that needs `workers_max + 3` breaching records to reach:
+//! the first program measured had ten morsels and ten workers and completed at 1.11 x its
+//! ceiling. It is now the model's verdict -- the floor on one worker does not satisfy the anon
+//! inequality of f.3 -- so a ten-morsel run ends on the same evidence as a ten-million one.
 
 mod common;
 
@@ -15,10 +24,12 @@ fn rc_t4_breach_immediate() {
     let probe_bytes = cfg.probe_bytes;
     let morsel_min = cfg.morsel_min;
     let ceiling = cfg.limits.memory_ceiling;
-    let reserve = (ceiling as f64 * f64::from(cfg.reserve_fraction)) as u64;
-    // f.7: the breach line is what the arena and the process already hold plus the reserve,
-    // capped at the ceiling; the arena itself sits a whole reserve below it.
-    let line = (cfg.baseline_bytes + cfg.arena_bytes + reserve).min(ceiling);
+    // f.7: the process's resting anonymous memory is the baseline plus the arena, every page of
+    // which the arena touches at `new`; the line sits half of what is left above it, and the
+    // other half is the cushion the reaction works in.
+    let resting = cfg.baseline_bytes + cfg.arena_bytes;
+    let headroom = ceiling - resting;
+    let line = (resting + headroom / 2).min(ceiling);
     let rig = common::Rig::new(
         cfg,
         vec![kernel(1, KernelHints::default())],
@@ -49,8 +60,9 @@ fn rc_t4_breach_immediate() {
         "RC-I4: the breaching stage is halved at once"
     );
 
-    // Keep breaching. Once the target is at the floor, exactly three more breaches with one
-    // worker left produce the diagnostic (f.7).
+    // Keep breaching. The refit each breach performs drives `a_anon` up, so once the target is at
+    // the floor the model can say that the floor on one worker does not fit, and that is the
+    // record the run ends on (f.7).
     let mut seq = 2u64;
     let mut at_floor = None;
     for _ in 0..64 {
@@ -79,19 +91,35 @@ fn rc_t4_breach_immediate() {
         diagnostic.contains("stage 1"),
         "the diagnostic names the stage: {diagnostic}"
     );
+    // The two figures the message compares are the same kind of number: the out-of-arena bytes
+    // the smallest set of knobs would cost, against the bytes the process has above the arena.
+    // A per-morsel delta against an absolute line, which is what it used to carry, read as
+    // "footprint 835584 exceeds budget 536818484".
     assert!(
-        diagnostic.contains(&format!("exceeds budget {line}")),
-        "the diagnostic carries the budget it exceeded: {diagnostic}"
+        diagnostic.contains(&format!("exceeds budget {headroom}")),
+        "the diagnostic carries the headroom the footprint did not fit: {diagnostic}"
+    );
+    let footprint: u64 = diagnostic
+        .split("footprint ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|bytes| bytes.parse().ok())
+        .expect("a footprint in the diagnostic");
+    assert!(
+        footprint > headroom,
+        "the footprint is the larger of the two, or the sentence does not mean anything: \
+         {diagnostic}"
     );
     let first_floor = at_floor.expect("the target reached the floor");
     assert_eq!(
         seq - first_floor,
-        3,
-        "f.7: three breaches at the floor with one worker terminate the run"
+        1,
+        "f.7: the first breach at the floor with one worker ends it, because the model can \
+         already say the floor does not fit and no further record will change that"
     );
     let summary = rig.controller.stop();
     assert!(
-        summary.breaches >= 3,
+        summary.breaches >= 2,
         "every breach is counted: {}",
         summary.breaches
     );

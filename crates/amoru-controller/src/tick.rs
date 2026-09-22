@@ -194,6 +194,11 @@ pub(crate) fn absorb_queue(ctl: &Inner) {
         for summary in chunk {
             absorb(&mut state, summary);
         }
+        // The records just folded in moved `a_anon`, which is a term of the envelope (f.3), and
+        // a stale envelope is not a harmless one: it clamps the sizer to the target it was
+        // computed from, so a stage whose measured cost has come down would be held at the size
+        // it had when the probe spoke and f.4's increase would never be accepted.
+        model::refresh_envelopes(&mut state);
     }
 }
 
@@ -203,6 +208,8 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
         return;
     };
     let morsel_target = state.stages[at].target;
+    let in_flight_morsels = crate::model::share(state, morsel_target);
+    let resting = crate::model::resting_anon(state);
     let stage = summary.stage;
     let mut over_target = false;
     {
@@ -220,6 +227,31 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
         }
         if summary.bytes_in > 0 {
             let ratio = summary.peak_delta as f64 / summary.bytes_in as f64;
+            // f.3's anon fit. Two readings of the same record, and the model takes the larger,
+            // because the inequality it feeds has to bound a peak and not track a mean:
+            //
+            //   * `peak_delta`, the process's growth across this morsel.
+            //   * `mem_anon_peak` itself, above the resting figure. This is the reading the
+            //     delta cannot give: allocator retention, a sink's buffers and anything else
+            //     that is resident at the peak without being attributable to one morsel. It is
+            //     the quantity S1 measures, which is why f.3 is fitted to it.
+            //
+            // Both are divided by the bytes the model believes were in flight, which is the unit
+            // the inequality multiplies back: `share x target x a_anon x safety`. Dividing by
+            // `bytes_in` instead, as `a_k` does, would be right only where a morsel arrives at
+            // its target -- a row group of a megabyte against a four megabyte target reads four
+            // times too expensive, which at a 1 GiB budget was the difference between a run that
+            // fitted on one worker and a run that terminated on the first record.
+            //
+            // The fit is a maximum over a window of records (`observe_anon`), not over the run: a
+            // fit that could only rise would leave a kernel sized for its worst morsel forever
+            // and f.4's margin, which tightens only on an accepted increase, would never tighten.
+            let in_flight_bytes =
+                (in_flight_morsels.max(1.0) * morsel_target.max(summary.bytes_in) as f64).max(1.0);
+            let from_delta = summary.peak_delta as f64 / in_flight_bytes;
+            let excess = summary.mem_anon_peak.saturating_sub(resting);
+            let from_peak = excess as f64 / in_flight_bytes;
+            ctl.observe_anon(from_delta.max(from_peak));
             ctl.peak_ratios.push_back(ratio);
             while ctl.peak_ratios.len() > WINDOW {
                 ctl.peak_ratios.pop_front();

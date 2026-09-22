@@ -12,6 +12,27 @@
 //! The read-ahead's bytes land in Q0, so they are spent out of the queue half rather than on
 //! top of it; that is what makes the inequality of b hold as an equality of the budget rather
 //! than as a hope, and it is why f.3 lowers the read-ahead when its bytes do not fit.
+//!
+//! That division is an accounting of the *arena*, and the arena is not the quantity S1 measures.
+//! 02 f.1 touches every page of the region at `new`, so the process holds `baseline +
+//! arena_bytes` of anonymous memory from the moment the arena exists, and every byte a kernel
+//! allocates for itself inside `apply` is added on top of that, not carved out of it. A model
+//! that charges those bytes against the arena's capacity permits a process anonymous peak of
+//! `baseline + arena_bytes + (arena_bytes - state) / 2`, which is over the ceiling by
+//! construction: that is the defect measured on 2026-09-23 (a Python kernel at a 512 MiB budget
+//! reached 1.11 x the ceiling while the controller shed a worker on every record).
+//!
+//! So there are two inequalities and a knob set has to satisfy both:
+//!
+//! ```text
+//! arena:  S share x target x a_k x safety + S high_water + read_ahead x split_bytes <= arena_bytes
+//! anon:   baseline + arena_bytes + state + S share x target x a_anon x safety      <= ceiling
+//! ```
+//!
+//! The second is fitted to `TraceRecord::mem_anon_peak` (10 f.3), which is the figure S1 is
+//! measured from, so a kernel whose Python objects cost three times its input is sized for what
+//! it actually costs the process. Where the floor of `morsel.min_bytes` on one worker still does
+//! not satisfy it, f.7 ends the run with the diagnostic rather than let it finish over budget.
 
 use amoru_kernel::{Knob, TierKind};
 
@@ -106,6 +127,62 @@ pub(crate) fn queue_half(state: &ControllerState) -> u64 {
     available(state) - worker_half(state)
 }
 
+/// The process's resting anonymous memory: what it held before the arena, plus the arena, every
+/// page of which 02 f.1 touches at `new` (f.3).
+///
+/// This is the floor of the quantity S1 measures and the controller cannot move it: the arena's
+/// size is the facade's decision and its pages are resident whether the runtime is using them
+/// or not. What the controller can move is everything above it.
+pub(crate) fn resting_anon(state: &ControllerState) -> u64 {
+    state.budgets.baseline.saturating_add(state.budgets.host)
+}
+
+/// The anonymous bytes the run may add above the resting figure before the ceiling S1 measures
+/// against is reached (f.3).
+///
+/// With the arena sized at `ceiling - baseline - reserve - declared kernel state`, this is the
+/// reserve plus that declared state: the allowance architecture section 8 names for what a
+/// kernel allocates outside the arena, now a term in the model rather than a hope about it.
+pub(crate) fn anon_headroom(state: &ControllerState) -> u64 {
+    state
+        .cfg
+        .limits
+        .memory_ceiling
+        .saturating_sub(resting_anon(state))
+}
+
+/// The part of the headroom left for morsels once the instances' state is funded (f.3).
+pub(crate) fn anon_for_kernels(state: &ControllerState) -> u64 {
+    anon_headroom(state).saturating_sub(state.state_total)
+}
+
+/// What one in-flight morsel of a stage costs the process outside the arena (f.3): the anon
+/// analogue of `allowance`.
+pub(crate) fn anon_allowance(state: &ControllerState, at: usize, target: u64) -> u64 {
+    let ctl = &state.stages[at];
+    scale(
+        target,
+        ctl.a_anon.max(MIN_AMPLIFICATION) * f64::from(ctl.safety),
+    )
+}
+
+/// The anonymous footprint a proposed set of targets would reach, above the resting figure.
+pub(crate) fn anon_footprint(state: &ControllerState, targets: &[u64]) -> u64 {
+    let mut total = state.state_total;
+    for (at, target) in targets.iter().enumerate() {
+        let allowance = anon_allowance(state, at, *target);
+        total = total.saturating_add(scale(allowance, share(state, *target)));
+    }
+    total
+}
+
+/// The anon half of RC-I1: whether a proposed set of targets keeps the process under the
+/// ceiling. This is the inequality S1 is measured against and the one that was missing.
+pub(crate) fn fits_anon(state: &ControllerState, targets: &[u64]) -> bool {
+    resting_anon(state).saturating_add(anon_footprint(state, targets))
+        <= state.cfg.limits.memory_ceiling
+}
+
 /// How many morsels of one stage may be in flight at once: one per worker's share of the
 /// stages, but never more morsels than the dataset has at that target.
 pub(crate) fn share(state: &ControllerState, target: u64) -> f64 {
@@ -119,19 +196,33 @@ pub(crate) fn share(state: &ControllerState, target: u64) -> f64 {
 }
 
 /// The envelope of b: the closed interval of morsel targets the sizer may propose for a stage.
+///
+/// Both inequalities of the module header bound it. The arena's bound was the only one here
+/// until 2026-09-23, and a sizer proposing up to it could be written a target the anon
+/// inequality had already refused -- RC-I2 held against an envelope that was not the whole
+/// envelope.
 pub(crate) fn envelope(state: &ControllerState, at: usize) -> Envelope {
     let stages = state.stage_count().max(1) as u64;
     let budget_for_stage = worker_half(state) / stages;
+    let anon_for_stage = anon_for_kernels(state) / stages;
     let ctl = &state.stages[at];
-    let per_byte = share(state, ctl.target) * ctl.a_k * f64::from(ctl.safety);
+    let in_flight = share(state, ctl.target);
+    let per_byte = in_flight * ctl.a_k * f64::from(ctl.safety);
     let from_budget = if per_byte <= 0.0 {
         state.cfg.morsel_max
     } else {
         scale(budget_for_stage, 1.0 / per_byte)
     };
+    let per_anon_byte = in_flight * ctl.a_anon.max(MIN_AMPLIFICATION) * f64::from(ctl.safety);
+    let from_anon = if per_anon_byte <= 0.0 {
+        state.cfg.morsel_max
+    } else {
+        scale(anon_for_stage, 1.0 / per_anon_byte)
+    };
     Envelope {
         min: state.cfg.morsel_min,
         max: from_budget
+            .min(from_anon)
             .min(state.cfg.morsel_max)
             .max(state.cfg.morsel_min),
     }
@@ -159,8 +250,16 @@ pub(crate) fn working_set(state: &ControllerState, targets: &[u64]) -> u64 {
     total
 }
 
-/// RC-I1: whether a proposed set of targets fits the budget.
+/// RC-I1: whether a proposed set of targets fits the budget -- both of the budgets in the
+/// module header, because a set that fits the arena and not the ceiling is the set that broke
+/// S1 and a set that fits the ceiling and not the arena cannot be allocated.
 pub(crate) fn fits(state: &ControllerState, targets: &[u64]) -> bool {
+    fits_arena(state, targets) && fits_anon(state, targets)
+}
+
+/// The arena half of RC-I1: whether the runtime's own bytes fit the region it allocates from.
+/// This is the half the queue high waters are in, so it is the half `fit_scalars` answers to.
+pub(crate) fn fits_arena(state: &ControllerState, targets: &[u64]) -> bool {
     working_set(state, targets) <= state.budgets.host
 }
 
@@ -217,7 +316,13 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
     let target = if state.tiny {
         // f.10. A dataset smaller than a quarter of the budget cannot fill the pipeline, so
         // there is nothing to adapt to: take the largest morsel allowed and stop moving.
-        state.cfg.morsel_max
+        //
+        // The anon inequality is not an adaptation, though, and this path does not escape it: a
+        // small dataset does not make a greedy kernel cheap, and the ceiling S1 measures against
+        // is the process's either way. Capping the target here rather than leaving it to the
+        // worker count is what keeps the workers: a 512 MiB morsel guessed at four times its
+        // input funds one worker, and the same headroom funds all of them at 34 MiB.
+        state.cfg.morsel_max.min(anon_target(state))
     } else {
         common_target(state, worker_half)
     };
@@ -232,15 +337,25 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
         .map(|(ctl, target)| ctl.allowance(*target))
         .max()
         .unwrap_or(0);
-    // RC-I7: no more workers than the budget can feed one morsel each.
-    let active_workers = match worker_half.checked_div(max_allowance) {
-        Some(allowed) if !state.tiny => u16::try_from(allowed)
-            .unwrap_or(u16::MAX)
-            .clamp(1, state.cfg.workers_max.max(1)),
-        // A dataset that needs no adaptation, or a stage with no allowance yet to divide by,
-        // gets every worker the host has (f.10, f.3).
-        _ => state.cfg.workers_max.max(1),
-    };
+    let max_anon_allowance = (0..state.stages.len())
+        .map(|at| anon_allowance(state, at, targets[at]))
+        .max()
+        .unwrap_or(0);
+    // RC-I7: no more workers than either budget can feed one morsel each. The arena cap is
+    // skipped on the tiny path (f.10), which has nothing to adapt to; the anon cap never is,
+    // because a small dataset does not make a greedy kernel cheap and the process's peak is
+    // what S1 measures either way.
+    let workers_max = state.cfg.workers_max.max(1);
+    let mut allowed = workers_max;
+    if !state.tiny
+        && let Some(arena_cap) = worker_half.checked_div(max_allowance)
+    {
+        allowed = allowed.min(u16::try_from(arena_cap).unwrap_or(u16::MAX));
+    }
+    if let Some(anon_cap) = anon_for_kernels(state).checked_div(max_anon_allowance) {
+        allowed = allowed.min(u16::try_from(anon_cap).unwrap_or(u16::MAX));
+    }
+    let active_workers = allowed.clamp(1, workers_max);
 
     let split_bytes = split_bytes(
         state,
@@ -281,6 +396,10 @@ fn common_target(state: &ControllerState, worker_half: u64) -> u64 {
     } else {
         scale(worker_half, 1.0 / (share_each * sum_amplified))
     };
+    // The anon inequality of the module header. The arena's capacity bounds what the runtime
+    // may hold; the ceiling bounds what the process may hold, and the second is the one S1 is
+    // measured against, so whichever binds first is the target.
+    target = target.min(anon_target(state));
     // The device is a second budget, not a second opinion: a stage that allocates on the
     // device is held to whichever of the two budgets binds first.
     for ctl in &state.stages {
@@ -294,6 +413,28 @@ fn common_target(state: &ControllerState, worker_half: u64) -> u64 {
         }
     }
     target
+}
+
+/// The largest common target the anon inequality of the module header allows at the worker count
+/// as it stands: `anon_for_kernels / (share x S a_anon x safety)`.
+///
+/// This is the bound S1 is measured against, expressed as a morsel size. It is applied on every
+/// path that writes a target, the tiny-dataset path of f.10 included.
+fn anon_target(state: &ControllerState) -> u64 {
+    let stages = state.stage_count();
+    if stages == 0 {
+        return state.cfg.morsel_max;
+    }
+    let share_each = f64::from(state.active_workers) / stages as f64;
+    let sum_anon: f64 = state
+        .stages
+        .iter()
+        .map(|ctl| ctl.a_anon.max(MIN_AMPLIFICATION) * f64::from(ctl.safety))
+        .sum();
+    if share_each <= 0.0 || sum_anon <= 0.0 {
+        return state.cfg.morsel_max;
+    }
+    scale(anon_for_kernels(state), 1.0 / (share_each * sum_anon))
 }
 
 /// The bytes one read-ahead slot holds: the stage 1 target when the source can be read in row
@@ -437,14 +578,19 @@ pub(crate) fn is_tiny(state: &ControllerState) -> bool {
         && state.cfg.plan.total_bytes < state.budgets.host / TINY_FRACTION
 }
 
-/// Shrink the queue high waters until the working set fits (RC-I1).
+/// Shrink the queue high waters until the arena's half of the working set fits (RC-I1).
 ///
-/// The queues are the first thing to give when the budget tightens: a smaller queue costs
+/// The queues are the first thing to give when the arena tightens: a smaller queue costs
 /// throughput, and a morsel target that does not fit costs the process. This runs after the
 /// targets have been enforced, so it only ever has to make up what the targets could not.
+///
+/// It answers to `fits_arena` and not to `fits`, because the queues live in the arena and the
+/// arena's pages are resident either way: emptying them gives the process's anonymous peak back
+/// nothing at all. An anon inequality that does not hold is answered by the morsel targets, the
+/// worker count, and failing those, f.7.
 pub(crate) fn fit_scalars(state: &mut ControllerState, targets: &[u64]) {
     for _ in 0..64 {
-        if fits(state, targets) || state.high_water == 0 {
+        if fits_arena(state, targets) || state.high_water == 0 {
             return;
         }
         state.high_water /= 2;

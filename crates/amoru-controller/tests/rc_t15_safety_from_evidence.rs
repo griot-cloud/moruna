@@ -44,13 +44,18 @@ fn write_profile(dir: &std::path::Path, p95: f64, samples: u64, variance: f64) {
     std::fs::write(dir, serde_json::to_string(&stored).expect("json")).expect("write");
 }
 
-/// The safety the controller must have used, read back out of the target it solved for: f.3
-/// gives `target = worker_half / (W x a_k x safety)`, so the margin is what is left over.
+/// The safety the controller must have used, read back out of the target it solved for.
+///
+/// f.3 solves two inequalities and the target is the smaller of the two answers. The binding one
+/// here is the anon inequality, `target = anon_headroom / (W x a_anon x safety)`: the arena is
+/// `ceiling - baseline - reserve`, so what the process has above it is the reserve, and at this
+/// ceiling that is 819 MiB against a worker half of 3.5 GiB. The margin is what is left over
+/// either way; only the numerator changes.
 fn implied_safety(target: u64) -> f64 {
     let reserve = (CEILING as f64 * 0.10) as u64;
-    let host = CEILING - BASELINE - reserve;
-    let worker_half = (host / 2) as f64;
-    worker_half / (f64::from(WORKERS) * AMPLIFICATION * target as f64)
+    let arena = CEILING - BASELINE - reserve;
+    let anon_headroom = (CEILING - BASELINE - arena) as f64;
+    anon_headroom / (f64::from(WORKERS) * AMPLIFICATION * target as f64)
 }
 
 fn target_with(profile: Option<(f64, u64, f64)>, probed: f64) -> u64 {

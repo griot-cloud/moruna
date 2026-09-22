@@ -72,6 +72,13 @@ pub(crate) const SAFETY_CAP: f32 = 3.0;
 /// The lowest amplification the controller will believe (h, edge cases).
 pub(crate) const MIN_AMPLIFICATION: f64 = 0.5;
 
+/// The share of the anonymous headroom (f.3) a run may spend before RC-I4 calls it a breach.
+///
+/// A breach has to be a warning and not a post-mortem: the line it is measured against sits
+/// inside the headroom, so the halving still has somewhere to land before the ceiling S1
+/// measures against. Half agrees with f.6's memory rows, which fire at the same place.
+pub(crate) const BREACH_SHARE: f64 = 0.5;
+
 /// What the facade learned from `Source::plan` (12 f.1); the controller never sees the splits.
 #[derive(Clone, Debug, Default)]
 pub struct PlanSummary {
@@ -229,6 +236,25 @@ pub(crate) enum Phase {
 pub(crate) struct StageCtl {
     pub stage: StageId,
     pub a_k: f64,
+    /// The out-of-arena amplification of f.3: anonymous bytes the kernel adds to the process
+    /// per byte of morsel *in flight*, fitted to `TraceRecord::mem_anon_peak`.
+    ///
+    /// It is the same measurement as `a_k` and starts at the same value, because the probe runs
+    /// one morsel on one worker (SC f.9) and a process-wide delta over one in-flight morsel is
+    /// already a per-morsel figure. They part company under load: `peak_delta` is the whole
+    /// process's growth, so with `n` morsels in flight it is `n` kernels' cost and `a_k` reads
+    /// `n` times too high, which is why the fit in 10 f.3 divides by the morsels in flight.
+    ///
+    /// It is the largest of `anon_ratios` and, until that window is full, of `a_anon_seed` too:
+    /// a maximum because the inequality it feeds has to bound a peak rather than track a mean,
+    /// and a window because a run that could only ever learn that a kernel costs more would
+    /// never grow a morsel again once the probe had spoken, and f.4's margin, which tightens
+    /// only on an accepted increase, would never tighten either.
+    pub a_anon: f64,
+    /// What the probe measured, which governs until the window of f.3 has filled.
+    pub a_anon_seed: f64,
+    /// The fitted out-of-arena ratio per record, newest last, bounded by `WINDOW`.
+    pub anon_ratios: VecDeque<f64>,
     pub a_k_dev: f64,
     pub safety: f32,
     pub target: u64,
@@ -277,10 +303,35 @@ pub(crate) struct StageCtl {
 }
 
 impl StageCtl {
+    /// Fold one fitted ratio into the window and recompute `a_anon` from it (f.3).
+    pub(crate) fn observe_anon(&mut self, ratio: f64) {
+        if !ratio.is_finite() || ratio < 0.0 {
+            return;
+        }
+        self.anon_ratios.push_back(ratio);
+        while self.anon_ratios.len() > WINDOW {
+            self.anon_ratios.pop_front();
+        }
+        let windowed = self
+            .anon_ratios
+            .iter()
+            .copied()
+            .fold(0.0f64, |acc, seen| acc.max(seen));
+        self.a_anon = if self.anon_ratios.len() >= WINDOW {
+            windowed
+        } else {
+            windowed.max(self.a_anon_seed)
+        }
+        .max(MIN_AMPLIFICATION);
+    }
+
     fn new(stage: StageId, cfg: &ControllerConfig, sizer: Box<dyn Sizer>) -> StageCtl {
         StageCtl {
             stage,
             a_k: 4.0,
+            a_anon: 4.0,
+            a_anon_seed: 4.0,
+            anon_ratios: VecDeque::new(),
             a_k_dev: 0.0,
             safety: cfg.safety_initial,
             target: cfg.probe_bytes,
@@ -333,6 +384,10 @@ pub(crate) struct RecordSummary {
     pub bytes_in: u64,
     pub rows_in: u64,
     pub peak_delta: u64,
+    /// The process's anonymous memory at this morsel's peak: the quantity S1 measures, carried
+    /// as an absolute figure and not only as a delta, because the working-set model of f.3 is
+    /// fitted to it.
+    pub mem_anon_peak: u64,
     pub wall_ns: u64,
     pub state_bytes: u64,
     pub column_bytes: Vec<u64>,
@@ -362,6 +417,7 @@ impl RecordSummary {
             bytes_in: r.bytes_in,
             rows_in: r.rows_in,
             peak_delta: r.mem_anon_peak.saturating_sub(r.mem_anon_before),
+            mem_anon_peak: r.mem_anon_peak,
             wall_ns: r.t_end_ns.saturating_sub(r.t_start_ns),
             state_bytes: r.state_bytes,
             column_bytes: r.feat_column_bytes.clone(),
@@ -435,20 +491,22 @@ impl ControllerState {
         }
     }
 
-    /// The line a breach is measured against (RC-I4): the arena, plus what the process already
-    /// held before it, plus the reserve.
+    /// The line a breach is measured against (RC-I4): the resting anonymous memory plus half
+    /// the headroom the arena left above it.
     ///
     /// The arena is `ceiling - baseline - reserve - kernel state` and 02 f.1 touches every page
-    /// of it at `new` (f.1), so `baseline + arena` is the process's resting anonymous memory
-    /// and a line at `ceiling - reserve` would sit exactly on it: every run would breach on its
-    /// first record. The reserve is the allowance for what a kernel allocates outside the
-    /// arena, so a breach is the reserve being spent, and the expected kernel state is what is
-    /// left between that and the ceiling.
+    /// of it at `new` (f.1), so `baseline + arena` is the process's resting anonymous memory:
+    /// a line at `ceiling - reserve` sits exactly on it and every run breaches on its first
+    /// record. A line at `baseline + arena + reserve` is the ceiling, which is worse in the
+    /// other direction: it is the first signal the controller gets, and by the time it arrives
+    /// S1 has already failed, so the halving is a post-mortem rather than a guard. The line
+    /// therefore sits inside the headroom, at `BREACH_SHARE` of it, which leaves the rest as
+    /// the cushion the reaction has to work in and agrees with f.6's memory rows.
     pub(crate) fn breach_line(&self) -> u64 {
-        self.budgets
-            .baseline
-            .saturating_add(self.budgets.host)
-            .saturating_add(self.budgets.reserve)
+        let resting = self.budgets.baseline.saturating_add(self.budgets.host);
+        let headroom = self.cfg.limits.memory_ceiling.saturating_sub(resting);
+        resting
+            .saturating_add(model::scale(headroom, BREACH_SHARE))
             .min(self.cfg.limits.memory_ceiling)
     }
 
