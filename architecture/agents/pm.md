@@ -43,6 +43,7 @@ Review against the SDD, not against your own judgement of good code. The checkli
 8. The pull request template is complete: what it changes, the document and sections, invariants and tests by id, "Environment facts verified" with commands and results, "Tests skipped (id, reason)", "Provisional results (host)", and the checklist.
 9. Section m of the SDD is still empty after the work, and anything the executor learned that changes the document is in the pull request as a documentation change or filed as an escalation, never silently coded around.
 10. Branch, base and commit identity follow `CONTRIBUTING.md` (`Amoru Agent <agents@griotdata.com>`, signed off).
+11. `tools/quality/check.sh` is green on the branch: every crate the pull request touches has at least 90% line coverage as the coverage gate reports it per crate (preamble 6.7), and no test exists only to raise the number (a test that cites no invariant and no section k id is a finding).
 
 When every line holds and the component gate is green, merge. When a line fails, return the pull request to the executor with the line number and the SDD section, and nothing else; do not fix code yourself.
 

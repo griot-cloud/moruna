@@ -33,6 +33,7 @@ Read these three documents in full before writing anything, in this order: `arch
 8. Every invariant in your SDD's section c is cited by at least one test; every test in section k exists under its SDD name (`{{PREFIX_LOWER}}_tN_...`) and passes, unless it is tagged "(integration, closes in wave N)" or "(reference host, E1)", in which case it exists, is marked ignored with the tag's reason, and is listed in the pull request.
 9. Commit as `Amoru Agent <agents@griotdata.com>` with `git commit -s`, on `{{BRANCH}}` from `main`; `cargo fmt` and `cargo clippy -- -D warnings` clean; no em dashes in any documentation or doc comment.
 10. Timing figures measured on this host are provisional unless this host is the reference host (E1); label them with the host name.
+11. Run `tools/hooks/install.sh` before your first commit and never bypass the hook. `tools/quality/check.sh` (preamble 6.7) must be green on your branch: your crate reaches at least 90% line coverage, judged per crate with test code excluded, through the tests section k names and the invariants section c requires, never through tests that exist only to raise the number.
 
 ## 3. Stop-and-report items
 

@@ -34,3 +34,4 @@
 - [ ] No wildcard arm over `Tier` or `StagingCodec` (`tools/lint/no_tier_wildcard.sh` passes)
 - [ ] Every crate this PR adds to a `Cargo.toml` is in the preamble's dependency table (section 6.2)
 - [ ] No em dashes in documentation
+- [ ] `tools/quality/check.sh` passes: every crate this PR touches has at least 90% line coverage, judged per crate
