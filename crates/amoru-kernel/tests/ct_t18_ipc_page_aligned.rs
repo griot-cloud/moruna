@@ -250,7 +250,7 @@ fn ct_t18_ipc_page_aligned() {
     ));
 
     // A pinned arena puts the framing buffer in the run's pinned host tier (e.1).
-    let pinned = FakeAllocator::pinned();
+    let pinned = FakeAllocator::new().pinned(true);
     let (framing, _) = encode_framing(batch, PAGE, 0, &pinned).expect("encode with a pinned arena");
     assert_eq!(framing.tier(), Tier::PinnedHost);
 

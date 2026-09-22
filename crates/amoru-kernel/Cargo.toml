@@ -14,5 +14,10 @@ dlpark = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 
+[dev-dependencies]
+# The fakes of contracts d.15. A dev-dependency on a crate that depends on this one is not a
+# cycle for the library target, and Cargo resolves it: only the tests link the testkit.
+amoru-testkit = { workspace = true }
+
 [features]
 default = []

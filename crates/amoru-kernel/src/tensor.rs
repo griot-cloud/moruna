@@ -13,7 +13,7 @@ use dlpark::metadata::CopiedSlice;
 use dlpark::{Builder, DlpackFlags};
 
 use crate::buffer::Buffer;
-use crate::error::AmoruError;
+use crate::error::{AmoruError, ConvertError};
 use crate::ids::DeviceId;
 use crate::payload::DType;
 use crate::tier::Tier;
@@ -172,11 +172,11 @@ impl ManagedTensor {
     pub fn from_dlpack(t: Dlpack) -> crate::Result<Self> {
         let version = t.version();
         if version.major != dlpark::ffi::DLPACK_MAJOR_VERSION {
-            return Err(AmoruError::Plan(format!(
-                "unsupported DLPack major version {} (this build speaks {})",
-                version.major,
-                dlpark::ffi::DLPACK_MAJOR_VERSION
-            )));
+            // d.4: a capsule whose major version is not DLPack's is `Convert`, never accepted.
+            return Err(AmoruError::Convert(ConvertError::Version {
+                found: version.major,
+                expected: dlpark::ffi::DLPACK_MAJOR_VERSION,
+            }));
         }
         let tensor = t.tensor();
         let tier = tier_of(tensor.device)?;
