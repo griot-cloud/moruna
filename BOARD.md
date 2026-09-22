@@ -21,7 +21,8 @@ What can start when, from the solid edges of preamble 1.3 and the fakes of contr
 |---|---|---|
 | 0 | now | F0.2 contracts (running); F1.6 bench generator (no internal dependency); F7.1 docs scaffold; F6.5 supply chain and DCO checks |
 | 1 | F0.2 merged | F0.3 testkit (implements the traits) |
-| 2 | F0.3 merged (wave 0 gate) | F1.1 arena, F1.2 discovery, F1.3 trace, F1.4 adapters, F1.7 bench kernels, F2.1 reactor, F3.1 sources, F3.3 sinks, F3.5 placement, F4.4 controller: every crate whose only solid edge is `amoru-kernel`; their integration-tagged tests close in their wave |
+| 2a | F0.2 merged (the contracts crate; the testkit need not wait) | F1.1 arena, F1.2 discovery, F1.3 trace: their software design documents name no fake, so the crate alone is enough (verified by grep, 2026-09-22) |
+| 2b | F0.3 merged (the fakes) | F1.4 adapters and F2.1 reactor (`FakeAllocator`), F3.1 sources, F3.3 sinks, F3.5 placement, F4.4 controller (`FakeKnobs`, `FakePlacement`, `FakeSampler`, `FakeTrace`); their integration-tagged tests close in their wave |
 | 2, same branch | the previous session of the same component | F1.5 bridges, F2.2 reactor direct paths, F3.2 tensor and iterator sources, F3.4 tensor, IPC and reorder sinks, F3.6 and F3.7 placement staging and lineage, F4.5 controller classification |
 | 3 | F3.3 and F3.4 merged (`SinkHandle`, `ReorderBuffer` are a crate dependency) | F4.1, F4.2, F4.3 scheduler |
 | 4 | every crate 2 to 11 merged | F4.6 facade, F4.7 integration closure; F5.3 bench runner and tuned baselines; F5.4 engine baseline (needs the facade for the comparison only) |
@@ -461,7 +462,7 @@ Open items the PM found while reading, routed per preamble section 7. Ids: `N-` 
 
 | Id | Decision | PM recommendation | Status |
 |---|---|---|---|
-| D-B1 | Several session-sized features per large component, all on the one component branch, one pull request reviewed against the SDD when the last feature lands (keeps "one PR per component") versus one PR per feature | the former | decided 2026-09-22 (PM, under delegation): features are sessions on one component branch; the PM reviews each feature's commits as they land; the SDD review is once, at the end |
+| D-B1 | Several session-sized features per large component, all on the one component branch; one pull request reviewed against the SDD when the last feature lands, except that a self-contained part may merge early when it unblocks other executors (amended 2026-09-22 after finding that arena, discovery and trace need the contracts crate but no fake) | the former | decided 2026-09-22 (PM, under delegation): features are sessions on one component branch; the PM reviews each feature's commits as they land; the SDD review is once, at the end |
 | D-B2 | Coverage floor 90% line coverage per crate, test code excluded, judged per crate, stubs not measured (as written into preamble 6.7 on this branch) | accept | decided 2026-09-22 (PM, under delegation) |
 | D-B3 | How an agent runs the E1-tagged suite on the reference host: SSH access for the executor session, or Brackly runs `bench/` by hand and pastes the output into the wave 5 report | SSH for a wave 5 executor, read-only elsewhere | open until wave 5; Brackly |
 
@@ -483,6 +484,7 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
 | 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | one pull request per component, amended | a component may land in more than one pull request when an early merge unblocks other executors; the whole-SDD review and the component gate happen on the last one; the contracts crate merges before its testkit so arena, discovery and trace start a session earlier | preamble 6.7, CONTRIBUTING, this board's start ladder |
 | 2026-09-22 | bench E2 route, dataset naming, kernels PR (raised by F1.6) | preamble 6.5 is the bench agent's d.2, so the PM may approve a bench-only crate; the hand-rolled parser and RNG stand rather than churn them; dataset names live in `bench/README.md` as the reference; F1.7 kernels get their own branch and pull request | preamble 6.2 and 6.5, this board |
 | 2026-09-22 | F7.1 notes: introduction pages, host-class pages (raised by F7.1) | introduction pages stay with F7.2 (same audience); the hosting guide keeps a GPU page marked described-not-verified (E1) and omits RDMA (E11, not a v1 host); Pages stays off until Brackly enables it, because publishing outward is outside the delegation | this board, F7.5 and F7.8 tasks |
 | 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |
