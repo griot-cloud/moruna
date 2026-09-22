@@ -3,7 +3,7 @@
 # [workspace.dependencies] (preamble 6.2) and a bump is an E2 item.
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["bench", "crates/*"]
 
 [workspace.package]
 version = "0.1.0"
