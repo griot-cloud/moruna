@@ -205,9 +205,13 @@ dependencies = [
  "amoru-scheduler",
  "amoru-sinks",
  "amoru-sources",
+ "amoru-testkit",
  "amoru-trace",
+ "arrow",
  "getrandom 0.4.3",
  "mimalloc",
+ "parquet",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
 ]

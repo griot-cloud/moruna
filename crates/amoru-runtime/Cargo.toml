@@ -20,10 +20,16 @@ amoru-sinks = { workspace = true }
 amoru-placement = { workspace = true }
 amoru-scheduler = { workspace = true }
 amoru-controller = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 mimalloc = { workspace = true }
 getrandom = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+amoru-testkit = { workspace = true }
 
 [features]
 default = []
