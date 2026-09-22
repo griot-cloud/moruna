@@ -57,3 +57,13 @@ hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 tracing-subscriber = { version = "=0.3.23" }
+
+# Test binaries statically link arrow and parquet, and a workspace of a dozen
+# crates with full debug info in every test binary filled a 90 GB disk while six
+# executors built in parallel (2026-09-22). Line tables are what a backtrace and
+# coverage need; the rest was bytes nobody read.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"

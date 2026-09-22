@@ -444,13 +444,19 @@ pub trait Source: Send + Sync {
     /// Deterministic for a given `(split, rows)` for the lifetime of the input
     /// (CT-I12): the same call returns the same rows in the same order, when
     /// `repeatable()` is true.
-    fn read(
-        &self,
-        split: &Split,
+    /// The allocator is borrowed for the whole life of the future, not just the call.
+    /// With the elided lifetime the future could not capture `alloc`, so a source that
+    /// learns its sizes only after decoding (Parquet does: the footer gives bytes, not
+    /// the arrow layout) had to do its whole read synchronously and return a resolved
+    /// future, which loses exactly the concurrency `readahead.splits` exists to buy
+    /// (E10, component 7, decided by the PM 2026-09-22).
+    fn read<'a>(
+        &'a self,
+        split: &'a Split,
         rows: Option<RowRange>,
-        alloc: &dyn Allocator,
+        alloc: &'a dyn Allocator,
         tier: Tier,
-    ) -> BoxFuture<'_, Result<Payload>>;
+    ) -> BoxFuture<'a, Result<Payload>>;
     /// True when `plan` and `read` satisfy CT-I12. A source that pulls from a
     /// one-shot iterator returns false; the runtime then disables Q0 eviction
     /// (stages Q0 instead) and refuses `resume` for the run. Default true, which
@@ -1022,7 +1028,7 @@ The testkit is built by this component's agent in wave 0 (preamble 6.4) because 
 
 | Fake | Implements | Knobs (builder methods) | Observables |
 |---|---|---|---|
-| `FakeAllocator` | `Allocator` | `with_limit(tier, bytes)`, `pinned(bool)`, `page_bytes(n)`, `fail_next(n)` | `allocations_total`, `in_use(tier)`, `AllocStats`; buffers are real heap allocations tagged with the requested tier so `Payload::table` tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work |
+| `FakeAllocator` | `Allocator` | `with_limit(tier, bytes)`, `pinned(bool)`, `page_bytes(n)`, `fail_next(n)` | `allocations_total`, `in_use(tier)`, `payload_copies()` and `boundary_copies()` (what `note_payload_copy` and `note_boundary_copy` were told, added 2026-09-22: `stats()` reported a hardcoded zero and the counters had no observable, so no test could prove the one decode copy G-I2 allows), `AllocStats`; buffers are real heap allocations tagged with the requested tier so `Payload::table` tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work |
 | `FakeReactor` | `Reactor` | `with_latency(Duration)`, `fail_next(op: OpKind, n)`, `cancel_on_shutdown(bool)`, in-memory files keyed by path (`read_file`/`write_file` copy to and from a `Vec<u8>` per path) | `ops() -> Vec<OpRecord { kind, path_or_url, offset, len, src_tier, dst_tier, t_submit, t_resolve }>`, `in_flight()`, `shutdown_calls`, `paths()` returns whatever `with_paths(IoPaths)` set |
 | `FakePlacement` | `Placement` | `with_pressure(stage, evict_after_bytes)` (entries beyond the byte count on a stage-0 queue become `Evicted`), `with_delay(Duration)` (a pop of a fresh entry waits, counted as a miss), `with_manifest_store()` (in-memory manifests keyed by path so `checkpoint`/`restore` round-trip across engine instances) | `pushed(stage) -> Vec<Seq>`, `popped(stage)`, `committed()`, `manifests_written()`, `budgets_set() -> Vec<TierBudgets>` (every `set_budgets` argument in call order), `shutdown_calls` |
 | `FakeSource` | `Source` | `splits(n, rows_each, bytes_each)`, `schema(SourceSchema)`, `sub_splittable(bool)`, `repeatable(bool)`, `fail_split(id)` | `reads() -> Vec<(SplitId, Option<RowRange>)>`; deterministic content (row i of split s has value `s * 1_000_000 + i`) |

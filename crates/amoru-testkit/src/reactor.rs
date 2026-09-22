@@ -291,8 +291,12 @@ impl FakeReactor {
                 msg: "no such file".to_string(),
             });
         };
-        let start = offset as usize;
-        let available = bytes.len().saturating_sub(start);
+        // Clamp the start as well as the length: an offset past the end must read
+        // zero bytes, and `bytes[start..start]` panics when `start` exceeds the
+        // length, so a truncated-file test used to panic instead of reading short
+        // (found by the component 7 agent, 2026-09-22).
+        let start = (offset as usize).min(bytes.len());
+        let available = bytes.len() - start;
         let taken = available.min(dst.len());
         dst[..taken].copy_from_slice(&bytes[start..start + taken]);
         Ok(taken)

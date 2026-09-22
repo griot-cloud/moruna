@@ -30,6 +30,8 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     allocations_total: AtomicU64,
+    payload_copies: AtomicU64,
+    boundary_copies: AtomicU64,
     limits: BTreeMap<usize, u64>,
     page_bytes: usize,
     pinned: bool,
@@ -59,6 +61,8 @@ impl FakeAllocator {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::default()),
                 allocations_total: AtomicU64::new(0),
+                payload_copies: AtomicU64::new(0),
+                boundary_copies: AtomicU64::new(0),
                 limits: BTreeMap::new(),
                 page_bytes: 4096,
                 pinned: false,
@@ -93,6 +97,21 @@ impl FakeAllocator {
     }
 
     /// Observable: allocations made since this allocator was created.
+    /// Payload bytes copied with the CPU, as `Allocator::note_payload_copy` was told.
+    /// A source decoding Parquet and a sink encoding it are the only callers G-I2
+    /// allows, so a test asserting "one decode copy per morsel and none for tensors"
+    /// reads this (added 2026-09-22; `stats()` reported a hardcoded zero and the
+    /// counter had no observable at all).
+    pub fn payload_copies(&self) -> u64 {
+        self.inner.payload_copies.load(Ordering::Relaxed)
+    }
+
+    /// Bytes an adapter copied once at the kernel boundary (05 AD-I2).
+    pub fn boundary_copies(&self) -> u64 {
+        self.inner.boundary_copies.load(Ordering::Relaxed)
+    }
+
+    /// Every successful `alloc` since this allocator was built.
     pub fn allocations_total(&self) -> u64 {
         self.inner.allocations_total.load(Ordering::SeqCst)
     }
@@ -160,6 +179,8 @@ impl FakeAllocator {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
                 allocations_total: AtomicU64::new(self.allocations_total()),
+                payload_copies: AtomicU64::new(self.payload_copies()),
+                boundary_copies: AtomicU64::new(self.boundary_copies()),
                 limits: builder.limits,
                 page_bytes: builder.page_bytes,
                 pinned: builder.pinned,
@@ -281,6 +302,18 @@ impl Allocator for FakeAllocator {
         Ok(unsafe { Buffer::from_raw(ptr, len, tier, handle) })
     }
 
+    fn note_payload_copy(&self, bytes: u64) {
+        self.inner
+            .payload_copies
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn note_boundary_copy(&self, bytes: u64) {
+        self.inner
+            .boundary_copies
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     fn page_bytes(&self) -> usize {
         self.inner.page_bytes
     }
@@ -292,8 +325,8 @@ impl Allocator for FakeAllocator {
             pinned_in_use: state.pinned_in_use,
             device_in_use: state.device_in_use,
             allocations_total: self.allocations_total(),
-            payload_copies_total: 0,
-            boundary_copies_total: 0,
+            payload_copies_total: self.payload_copies(),
+            boundary_copies_total: self.boundary_copies(),
         }
     }
 

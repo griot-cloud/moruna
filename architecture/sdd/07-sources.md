@@ -43,7 +43,7 @@ It refuses to know: how many splits to read ahead (scheduler's `read_ahead` knob
 
 **SO-I4. Sub-splitting is exact.** `read(split, Some(range))` returns exactly `range.end - range.start` rows from the split's rows in order; consecutive ranges concatenate to the whole split.
 
-**SO-I5. Decode is the only CPU copy.** Per morsel, payload bytes are copied by the CPU at most once, from decoder output into the arena (Parquet) or from a Python-owned batch into the arena (the iterator source, whose "decoder" is the interpreter); counted in `decode_bytes`; `AllocStats.payload_copies_total` is not incremented (the decode counter is separate and is the permitted exception). A tensor read copies nothing: the reactor's DMA lands the bytes in the arena and the tensor is a view. Upholds G-I2.
+**SO-I5. Decode is the only CPU copy.** Per morsel, payload bytes are copied by the CPU at most once, from decoder output into the arena (Parquet) or from a Python-owned batch into the arena (the iterator source, whose "decoder" is the interpreter); counted in `decode_bytes` and reported through `Allocator::note_payload_copy`, which is what raises `AllocStats.payload_copies_total` (contracts d.3; this sentence used to say the opposite, and the counter then had no writer at all, so nothing could prove the exception was taken once and only once, PM 2026-09-22). A tensor read copies nothing: the reactor's DMA lands the bytes in the arena and the tensor is a view. Upholds G-I2.
 
 **SO-I6. Sources are stateless across reads.** Two reads of the same split and range return equal payloads; no read depends on a prior read (the scheduler may issue them in any order within read-ahead).
 
@@ -51,7 +51,7 @@ It refuses to know: how many splits to read ahead (scheduler's `read_ahead` knob
 
 **SO-I8. Reads are repeatable.** For `ParquetSource` and `TensorSource`, `plan()` called twice on unchanged inputs returns equal splits, and `read(split, rows)` called twice returns equal payloads (CT-I12). `PyIteratorSource` cannot promise this: it plans one split per pulled batch and cannot re-pull, so it reports `sub_splittable = false` and `repeatable() == false`, and a run over it is not resumable and Q0 eviction is disabled for it (the facade calls the placement engine's `set_staging(0, true)` before the first push, so its morsels are written rather than dropped, PL-I6; the facade notes "iterator source: no resume, Q0 staged"). Rationale: recovery and Q0 eviction both re-read; a source that cannot must say so rather than return different rows.
 
-**SO-I9. A row is never split.** `read` returns whole rows: a single row (a long text row, a wide tensor row) larger than the scheduler's morsel maximum is returned at its natural size as a one-row payload, never truncated and never refused for being large; the scheduler decides what to do with an oversized morsel (SC-T17), the source only reports the size truthfully in `Payload::bytes`. Rationale: architecture section 7's "single row larger than the maximum morsel" case must degrade to one large morsel, not to an error at morsel 40,000.
+**SO-I9. A row is never split.** `read` returns whole rows: a single row (a long text row, a wide tensor row) larger than the scheduler's morsel maximum is returned at its natural size as a one-row payload, never truncated and never refused for being large; the scheduler decides what to do with an oversized morsel (SC-T17), the source only reports the size truthfully in `Payload::bytes`. A source is never told the current morsel target, so "oversized" for the counter means at or above 64 MiB, the lowest value `morsel.max_bytes` may take (preamble section 5), which is the largest threshold a source can apply without knowing a knob it cannot read (PM, 2026-09-22). Rationale: architecture section 7's "single row larger than the maximum morsel" case must degrade to one large morsel, not to an error at morsel 40,000.
 
 ## d. Interfaces
 
@@ -104,7 +104,7 @@ impl Source for PyIteratorSource { /* plan returns one Split per pulled batch, p
 pub struct SourceStats {
     pub splits: u64, pub bytes_planned: u64, pub reads: u64, pub decode_bytes: u64,
     pub tensor_direct_reads: u64, pub tensor_buffered_reads: u64, pub footer_reads: u64, pub groups_skipped: u64,
-    pub oversized_rows: u64,                // one-row payloads above the range's target (SO-I9)
+    pub oversized_rows: u64,                // one-row payloads at or above 64 MiB (SO-I9)
 }
 
 /// Row-group statistics predicate; only min/max pruning in v1.
@@ -136,7 +136,7 @@ Split ids are assigned in file order then row-group order. The plan is cached in
 
 ### e.2 Parquet read
 
-Given `(split, rows)`: build a `ParquetRecordBatchStreamBuilder` over an `AsyncFileReader` whose `get_bytes(range)` calls `reactor.read_object` (or `read_file` for a local path) into an arena buffer of the range's length (page-rounded up, direct-eligible) allocated from the `alloc` the read received, and returns a `Bytes` over it without copying; set projection; set `RowSelection` to the row range when given; set the batch size to the whole range so exactly one batch is produced; drive the stream to its single batch; perform the decode copy of each column buffer into arena buffers of `tier`; assemble the `RecordBatch`; return `Payload::table`. Compressed page bytes are released as soon as the decoder consumes them. A range of one row whose bytes exceed any target is decoded and returned as is (SO-I9, `oversized_rows += 1`).
+Given `(split, rows)`: read the ranges the reader needs through `reactor.read_object` (or `read_file` for a local path) into arena buffers of the range's length (page-rounded up, direct-eligible) allocated from the `alloc` the read received, then build the synchronous `ParquetRecordBatchReaderBuilder` over a `ChunkReader` on `Bytes::from_owner` of those buffers, which copies nothing before decode. The asynchronous builder is not used: its `AsyncFileReader` returns `futures::future::BoxFuture` and `futures` is in neither the preamble's dependency table nor this component's d.2, and adding a crate to reach an interface is not a reason the table accepts (PM, 2026-09-22); set projection; set `RowSelection` to the row range when given; set the batch size to the whole range so exactly one batch is produced; drive the stream to its single batch; perform the decode copy of each column buffer into arena buffers of `tier`; assemble the `RecordBatch`; return `Payload::table`. Compressed page bytes are released as soon as the decoder consumes them. A range of one row whose bytes exceed any target is decoded and returned as is (SO-I9, `oversized_rows += 1`).
 
 ### e.3 Tensor plan
 
@@ -188,7 +188,7 @@ Splits are immutable after plan; the source keeps no per-split state (SO-I6).
 
 ## k. Tests
 
-Files come from the bench generator (preamble 6.5) written to a temp directory in the test's setup. Tests over local paths use the testkit's `FakeReactor` (contracts d.15: in-memory files keyed by path, so the test writes the generated file bytes into the fake through `write_file` and reads them back through `read_file`/`read_file_opt`; `with_latency`, `fail_next(op, n)` for the failure cases) and `FakeAllocator` (`pinned(bool)`, `with_limit`, `page_bytes(n)`, `fail_next(n)`); tests over object URLs use the real reactor with `ObjectStoreConfig::local_root` and are tagged "(integration, closes in wave 3)"; the MinIO variants are the CI job. Python tests need an interpreter with pyarrow and are tagged "(integration, closes in wave 3)" as well, because they run under the `python` feature only.
+Files are written by the tests themselves with `arrow`, `parquet`, `safetensors` and the contracts' `AMB1` writer, in the shapes the bench generator produces, because `bench` is build machinery and may not enter a shipping crate's dependency graph; each test writes to a scratch directory unique to its process (PM, 2026-09-22). Tests over local paths use the testkit's `FakeReactor` (contracts d.15: in-memory files keyed by path, so the test writes the generated file bytes into the fake through `write_file` and reads them back through `read_file`/`read_file_opt`; `with_latency`, `fail_next(op, n)` for the failure cases) and `FakeAllocator` (`pinned(bool)`, `with_limit`, `page_bytes(n)`, `fail_next(n)`); tests over object URLs use the real reactor with `ObjectStoreConfig::local_root` and are tagged "(integration, closes in wave 3)"; the MinIO variants are the CI job. Python tests need an interpreter with pyarrow and are tagged "(integration, closes in wave 3)" as well, because they run under the `python` feature only.
 
 **SO-T1 plan_before_read.** `read` with an unplanned id errors; every planned id reads. SO-I1.
 

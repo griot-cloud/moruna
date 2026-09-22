@@ -92,6 +92,12 @@ struct Inner {
     huge_pages_active: bool,
     allocations: AtomicU64,
     foreign: AtomicU64,
+    /// Payload bytes a source decoded or a sink encoded with the CPU, and bytes an
+    /// adapter copied once at the kernel boundary. The arena owns `AllocStats`, so it
+    /// owns the counters; the components that do the copying report them through
+    /// `Allocator::note_payload_copy` and `note_boundary_copy` (contracts d.3).
+    payload_copies: AtomicU64,
+    boundary_copies: AtomicU64,
 }
 
 /// The memory arena (d.1).
@@ -193,6 +199,8 @@ impl Arena {
                 huge_pages_active: host.huge_pages_active,
                 allocations: AtomicU64::new(0),
                 foreign: AtomicU64::new(0),
+                payload_copies: AtomicU64::new(0),
+                boundary_copies: AtomicU64::new(0),
             }),
         }))
     }
@@ -326,6 +334,17 @@ impl Inner {
 /// Contracts d.3. The arena overrides every method, including the three with defaults
 /// (d.1).
 impl Allocator for Arena {
+    fn note_payload_copy(&self, bytes: u64) {
+        self.inner
+            .payload_copies
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note_boundary_copy(&self, bytes: u64) {
+        self.inner
+            .boundary_copies
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
     fn alloc(&self, bytes: usize, tier: Tier) -> Result<Buffer> {
         if let Tier::Remote(_, _) = tier {
             // Reserved for the multi-node extension; no v1 component produces it (CT-I11).

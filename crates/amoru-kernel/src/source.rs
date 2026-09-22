@@ -48,13 +48,18 @@ pub trait Source: Send + Sync {
     /// Deterministic for a given `(split, rows)` for the lifetime of the input
     /// (CT-I12): the same call returns the same rows in the same order, when
     /// `repeatable()` is true.
-    fn read(
-        &self,
-        split: &Split,
+    /// The allocator is borrowed for the future's whole life, not just for the call:
+    /// a source that learns its sizes only after decoding (Parquet does) must allocate
+    /// after an await, and with the elided lifetime it could not, which forced the
+    /// whole read to be synchronous and cost the concurrency `readahead.splits` exists
+    /// to buy (E10, component 7, 2026-09-22).
+    fn read<'a>(
+        &'a self,
+        split: &'a Split,
         rows: Option<RowRange>,
-        alloc: &dyn Allocator,
+        alloc: &'a dyn Allocator,
         tier: Tier,
-    ) -> BoxFuture<'_, crate::Result<Payload>>;
+    ) -> BoxFuture<'a, crate::Result<Payload>>;
     /// True when `plan` and `read` satisfy CT-I12. A source that pulls from a
     /// one-shot iterator returns false; the runtime then disables Q0 eviction
     /// (stages Q0 instead) and refuses `resume` for the run. Default true, which

@@ -42,8 +42,12 @@ impl Inner {
             pinned_in_use: if self.pinned { host } else { 0 },
             device_in_use,
             allocations_total: self.allocations.load(std::sync::atomic::Ordering::Relaxed),
-            payload_copies_total: 0,
-            boundary_copies_total: 0,
+            payload_copies_total: self
+                .payload_copies
+                .load(std::sync::atomic::Ordering::Relaxed),
+            boundary_copies_total: self
+                .boundary_copies
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
