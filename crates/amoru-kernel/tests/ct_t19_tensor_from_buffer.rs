@@ -193,6 +193,25 @@ fn ct_t19_tensor_from_buffer() {
         8
     );
 
+    // A capsule of a foreign DLPack major version is refused, never read past its deleter
+    // (d.4, and the DLPack spec's own rule).
+    let foreign = dlpack_with(
+        dlpark::ffi::DLDataType::of::<f32>(),
+        dlpark::ffi::DLDevice::CPU,
+        vec![2i64],
+        vec![1i64],
+    );
+    let raw = foreign.into_raw();
+    // SAFETY: test-only; `raw` came from `into_raw` and is handed straight back to a
+    // `ManagedBox`, which calls dlpark's own deleter, so only the version field changes.
+    let foreign = unsafe {
+        (*raw).version.major = dlpark::ffi::DLPACK_MAJOR_VERSION + 1;
+        dlpark::ManagedBox::new_unchecked(raw)
+    };
+    let err = ManagedTensor::from_dlpack(foreign).expect_err("a foreign major version");
+    assert!(matches!(err, AmoruError::Convert(_)), "got {err}");
+    assert!(err.to_string().contains("major version"));
+
     // A DLPack tensor this build cannot describe is refused by name, never assumed.
     let err = ManagedTensor::from_dlpack(dlpack_with(
         dlpark::ffi::DLDataType {

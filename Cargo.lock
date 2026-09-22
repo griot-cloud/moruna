@@ -129,6 +129,7 @@ dependencies = [
 name = "amoru-kernel"
 version = "0.1.0"
 dependencies = [
+ "amoru-testkit",
  "arrow",
  "blake3",
  "dlpark",

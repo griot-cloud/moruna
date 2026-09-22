@@ -33,6 +33,13 @@ pub mod tier;
 pub mod trace;
 pub mod view;
 
+// The contract is written in terms of `arrow` and `dlpark` types, so every consumer must see
+// exactly the versions this crate was built against (preamble 6.2: one arrow in the workspace).
+// Re-exporting them here is how a crate that depends on `amoru-kernel` alone, the testkit of
+// d.15 among them, names a `RecordBatch` or a DLPack capsule.
+pub use arrow;
+pub use dlpark;
+
 pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
 pub use completion::{Completion, CompletionSender};
 pub use error::{AmoruError, ConvertError};
@@ -55,7 +62,7 @@ pub use placement::{
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
 pub use sink::{Sink, SinkSummary};
 pub use source::{RowRange, Source, Split};
-pub use tensor::{DeleterHook, ManagedTensor};
+pub use tensor::{DeleterHook, Dlpack, ManagedTensor};
 pub use tier::{RemoteRef, SegmentRef, StagingCodec, TIER_COUNT, Tier, TierKind};
 pub use trace::{Outcome, TraceRecord, TraceSink, TraceTail};
 pub use view::BufferView;
