@@ -128,7 +128,15 @@ mod tests {
     use crate::dtype::DType;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("amoru-bench-dataset-{name}"));
+        const PREFIX: &str = "amoru-bench-dataset";
+        // Unique per process and per call: several executors run the gate at the same
+        // time on one machine, and a fixed name under the system temp directory made two
+        // runs delete each other's files (three generator tests failed that way on
+        // 2026-09-22, green in isolation and red under a concurrent gate).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{}-{}-{}-{}", PREFIX, std::process::id(), n, name));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -233,8 +241,9 @@ mod tests {
 
     #[test]
     fn writing_into_an_impossible_directory_is_an_error_not_a_panic() {
-        let dir = std::env::temp_dir().join("amoru-bench-dataset-file/out");
-        let file = std::env::temp_dir().join("amoru-bench-dataset-file");
+        let base = tmp("file");
+        let dir = base.join("out");
+        let file = base;
         let _ = std::fs::remove_dir_all(&file);
         std::fs::write(&file, b"x").expect("fixture");
         let err = Dataset {

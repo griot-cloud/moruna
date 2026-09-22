@@ -58,6 +58,22 @@ pub fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// A scratch directory unique to this process and call; see the note in
+    /// `dataset.rs`, several gates run at once on one machine.
+    fn tmp(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "amoru-bench-manifest-{}-{}-{}",
+            std::process::id(),
+            n,
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
 
     fn written() -> Vec<Written> {
         vec![Written {
@@ -94,7 +110,7 @@ mod tests {
 
     #[test]
     fn the_manifest_is_written_as_json_with_a_trailing_newline() {
-        let dir = std::env::temp_dir().join("amoru-bench-manifest");
+        let dir = tmp("manifest");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = write(&dir, 1, "full", &written()).expect("write");
@@ -107,7 +123,7 @@ mod tests {
 
     #[test]
     fn writing_into_a_missing_directory_is_an_error() {
-        let dir = std::env::temp_dir().join("amoru-bench-manifest-missing/deeper");
+        let dir = tmp("manifest-missing").join("deeper");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(
             write(&dir, 1, "full", &written()),
