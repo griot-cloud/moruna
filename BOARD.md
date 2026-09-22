@@ -38,7 +38,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | F0.2 contracts (PR #10) in review and F1.7 bench kernels running; F0.3 testkit when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
+| Next action | five running: F0.3 testkit, F1.1 arena, F1.2 discovery, F1.3 trace, F1.7 bench kernels; six more (adapters, reactor, sources, sinks, placement, controller) start when the testkit merges |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -51,8 +51,8 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 |---|---|---|---|---|
 | F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | merged |
 | F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | merged (PR #1, 2026-09-22) |
-| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | in progress |
-| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (same PR as F0.2) | 01 d.15; CT-T13 | todo |
+| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | merged (PR #10, 2026-09-22; 121 tests, 93.6% coverage; four E10 findings resolved first in PR #11) |
+| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | in progress |
 | F0.4 | Wave 0 gate and wave report (PM) | `main` | pm.md sections 2, 4, 8 | todo |
 
 ### F0.0 tasks
@@ -75,16 +75,16 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 - [x] PR template complete; PM checklist green; merged
 
 ### F0.2 tasks
-- [ ] Environment facts from 01 section l verified and recorded (cargo version, `blake3`, `dlpark` versioned-struct support)
-- [ ] `src/` files exactly as 01 section l lists them; `unsafe` only in `tensor.rs`, `payload.rs`, `view.rs`, `buffer.rs` with `// SAFETY:` on every block
-- [ ] d.1 to d.3: ids, `Tier`, `TierKind`, `StagingCodec`, `Buffer`, `BufferView`, `Allocator`, `AllocStats`
-- [ ] d.4 to d.5: `DType`, `ManagedTensor` (dlpark wrapper, `from_buffer`), `Payload`, `PayloadSpec::check`, `SourceSchema::hash`, `Morsel`, `MorselFeatures` (f.2 O(columns))
-- [ ] d.6 to d.8: `Source`, `Kernel`, `KernelState`, `Sink` with the resume defaults that refuse
-- [ ] d.9: `Completion` over std, `Reactor`, `ObjectMetadata`, copy endpoints; d.10 `Placement` and the resume types; d.11 `Knobs`, `StatsSource`, `Prober`, `CancelToken`, `RecordHook`; d.12 `Limits`, `HostProfile`, `Sampler`; d.13 `TraceRecord`, `SCHEMA_HASH`, `TraceSink`, `TraceTail`; d.14 errors
-- [ ] e.4 `AMB1` reader and writer over slices; e.7 page-aligned IPC `encode_framing` and `decode`; e.6 `Fingerprint::compute`
-- [ ] Tests CT-T1 to CT-T12 and CT-T14 to CT-T19 under their SDD names; CT-T9 pins the hash value in the test; CT-T11 timing reported with the host name (see finding N-2)
-- [ ] Every CT invariant CT-I1 to CT-I12 cited by at least one test in the PR
-- [ ] Coverage at or above 90% for `amoru-kernel`; PR template complete
+- [x] Environment facts from 01 section l verified and recorded (cargo version, `blake3`, `dlpark` versioned-struct support)
+- [x] `src/` files exactly as 01 section l lists them; `unsafe` only in `tensor.rs`, `payload.rs`, `view.rs`, `buffer.rs` with `// SAFETY:` on every block
+- [x] d.1 to d.3: ids, `Tier`, `TierKind`, `StagingCodec`, `Buffer`, `BufferView`, `Allocator`, `AllocStats`
+- [x] d.4 to d.5: `DType`, `ManagedTensor` (dlpark wrapper, `from_buffer`), `Payload`, `PayloadSpec::check`, `SourceSchema::hash`, `Morsel`, `MorselFeatures` (f.2 O(columns))
+- [x] d.6 to d.8: `Source`, `Kernel`, `KernelState`, `Sink` with the resume defaults that refuse
+- [x] d.9: `Completion` over std, `Reactor`, `ObjectMetadata`, copy endpoints; d.10 `Placement` and the resume types; d.11 `Knobs`, `StatsSource`, `Prober`, `CancelToken`, `RecordHook`; d.12 `Limits`, `HostProfile`, `Sampler`; d.13 `TraceRecord`, `SCHEMA_HASH`, `TraceSink`, `TraceTail`; d.14 errors
+- [x] e.4 `AMB1` reader and writer over slices; e.7 page-aligned IPC `encode_framing` and `decode`; e.6 `Fingerprint::compute`
+- [x] Tests CT-T1 to CT-T12 and CT-T14 to CT-T19 under their SDD names; CT-T9 pins the hash value in the test; CT-T11 timing reported with the host name (see finding N-2)
+- [x] Every CT invariant CT-I1 to CT-I12 cited by at least one test in the PR
+- [x] Coverage at or above 90% for `amoru-kernel`; PR template complete
 
 ### F0.3 tasks
 - [ ] Every fake of d.15 (`FakeAllocator`, `FakeReactor`, `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeSampler`, `FakeTrace`, `FakeKnobs`) with exactly the knobs and observables the table lists, and a `shutdown_calls` counter wherever the trait has `shutdown`
@@ -107,13 +107,13 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | todo |
-| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | todo |
-| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | todo |
+| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | in progress |
+| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | in progress |
+| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | in progress |
 | F1.4 | Python kernel adapter `amoru-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | todo |
 | F1.5 | Polars and DataFusion bridges `amoru-polars`, `amoru-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | todo |
 | F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | merged (PR #4, 2026-09-22; 88 tests, 96.2% coverage) |
-| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | todo |
+| F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | in progress |
 | F1.8 | Wave 1 gate and report (PM) | `main` | | todo |
 
 ### F1.1 tasks
