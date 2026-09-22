@@ -361,7 +361,7 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 | `arena.pin` | 2 | bool | true when a device is present and memlock allows | fixed | discovery | page-lock the arena |
 | `trace.path` | 4 | path | none (in-memory only) | writable path | user | write the trace file |
 | `trace.channel_capacity` | 4 | count | 4096 | 256 .. 65536 | compile | records buffered before the writer |
-| `trace.memory_limit` | 4 | bytes | 64 MiB | 8 MiB .. 1 GiB | compile | in-memory trace chunks before overflow to disk |
+| `trace.memory_limit` | 4, 11 | bytes | 64 MiB | 8 MiB .. 1 GiB | compile | in-memory trace chunks before overflow to disk. It also bounds the controller: `TraceTail::tail` reads the in-memory chunks only (04 f.3), so a window larger than this holds returns fewer records rather than reading the overflow file. The controller must therefore ask for a window it can be given, and treat a short answer as a short answer rather than as a quiet stage (PM, 2026-09-22, on the component 4 agent's closing note; the two knobs were related and nowhere said so) |
 | `errors.policy` | 10 | enum | `terminate` | `terminate`, `skip`, `budget(n)` | user | kernel error handling |
 | `ordering.required` | 8, 10 | bool | false | fixed per sink | sink | reorder buffer on |
 | `ordering.buffer_bytes` | 8 | bytes | 256 MiB | 16 MiB .. host budget/4 | compile | reorder buffer cap |
