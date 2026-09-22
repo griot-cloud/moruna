@@ -228,7 +228,13 @@ fn finish(shared: &Shared) {
             }
             shared.publish_exit(Exit::Completed(summary));
         }
-        Err(e) => crate::policy::terminate(shared, e),
+        // This thread already holds the exit claim, so `policy::terminate` would find it taken
+        // and publish nothing: the run would wait for ever on a sink that has already failed.
+        // The claim holder publishes its own exit, exactly as the `Ok` arm does.
+        Err(e) => {
+            shared.set_run_state(RunState::Terminating);
+            shared.publish_exit(Exit::Terminated(e));
+        }
     }
     shared.unpark_all();
 }

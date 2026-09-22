@@ -5,7 +5,7 @@
 //! configuration table whose owner is `user`, so they are clamped here, once, and each clamp is
 //! carried as a note into the run report (PY-I10, f.3).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use amoru_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorFormat, TensorSinkConfig};
 use parquet::basic::{Compression, ZstdLevel};
@@ -15,6 +15,31 @@ use pyo3::types::{PyAny, PyModule};
 use crate::handles::SinkSpec;
 use crate::sources::type_name;
 use crate::translate::{SizeArg, clamp_file_bytes, clamp_row_group_bytes};
+
+/// A sink URL with a scheme, from what the user wrote (d.2).
+///
+/// A user writes the destination the way they write it for `pathlib` or `pyarrow`: a bare
+/// filesystem path. The reactor reads a string with no `://` as a bare key in the default S3
+/// bucket (06 d.1), so a bare path reaches it as an object nobody configured a bucket for and
+/// every write fails. The source side already treats a bare path as local (07 util `is_local`),
+/// so the surface owes the sink side the same reading, and it belongs here, once, rather than in
+/// every caller. A string that already carries a scheme is passed through untouched, so
+/// `s3://bucket/out` and `file:///data/out` mean what they say.
+fn local_url(url: String) -> String {
+    if url.contains("://") {
+        return url;
+    }
+    let path = Path::new(&url);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    format!("file://{}", absolute.display())
+}
 
 /// A sink that writes Parquet files under a prefix.
 #[pyclass(frozen, module = "amoru._core", name = "ParquetSink")]
@@ -44,7 +69,7 @@ impl PyParquetSink {
         };
         Ok(PyParquetSink {
             cfg: ParquetSinkConfig {
-                url,
+                url: local_url(url),
                 row_group_bytes,
                 file_bytes,
                 compression: parse_compression(compression)?,
