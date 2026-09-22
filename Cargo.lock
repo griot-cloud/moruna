@@ -243,13 +243,14 @@ name = "amoru-sources"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
+ "amoru-testkit",
  "arrow",
  "bytes",
- "object_store",
  "parquet",
  "pyo3",
+ "pyo3-arrow",
  "safetensors",
- "thiserror 2.0.20",
+ "serde_json",
  "tracing",
 ]
 
