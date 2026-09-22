@@ -26,10 +26,10 @@ The one question this section answers: what stands between today and a process t
 | 5. The queue that makes disk a tier | `amoru-placement` | merged (90.8%) |
 | 6. The thing that runs the work | `amoru-scheduler` | merged (91.0%) |
 | 7. The thing that decides the sizes | `amoru-controller` | merged |
-| 8. The facade that wires 2 to 7 into `Runtime::run` | `amoru-runtime` | **not started; nothing runs end to end until it exists** |
-| 9. The surface a user touches | `amoru-py`, `python/amoru` | not started |
+| 8. The facade that wires 2 to 7 into `Runtime::run` | `amoru-runtime` | merged (94.6%). **Amoru runs**: `rt_t1` takes a real Parquet file through real components to a real Parquet file inside a real budget and asserts 40,000 rows in the report and again by reading the output back; `rt_t6` kills a run and resumes it from its own manifest |
+| 9. The surface a user touches | `amoru-py`, `python/amoru` | in progress |
 
-Steps 5, 6 and 8 are the whole of what is left before Amoru runs. Step 8 is the one to watch: every part exists and none of them is wired, so the first end-to-end run is also the first time the lifecycle of preamble 4.4 is exercised, and that is where the surprises will be.
+Amoru ran for the first time on 2026-09-22. What is left is step 9 and the defects that first run exposed, which are tracked as F4.9 below: it runs at test sizes and not yet at a realistic budget, and saying otherwise would be the kind of claim this board exists to prevent. The surprises did land where this paragraph predicted, in the wiring rather than in the components.
 
 Support the documents require, which is not on the path and is judged separately: the testkit (contracts d.15, and every component's tests name its fakes, so parallel building depends on it) and the bench suite (preamble 6.5, needed by criterion S3 in wave 5, and built earlier than it should have been).
 
@@ -58,7 +58,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Where the code is | ten crates merged to `main`: contracts, testkit, arena, discovery, trace, adapters, the two engine bridges, reactor, sources, sinks, controller, and the bench suite. 470 tests pass, every crate above 90% line coverage |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| In flight | nothing. Brackly called a halt on 2026-09-22 once the scheduler landed, so no executor is running and none starts until he says otherwise |
+| In flight | F5.1, the Python surface, and F4.9, the six defects the first real run exposed |
 | Next to start, when work resumes | F4.6, the facade `amoru-runtime`. Every crate it wires is now merged, so it is unblocked: it turns twelve parts into `Runtime::run` and is the first time anything runs end to end. Its executor reads every SDD (preamble 9) |
 | After that | F4.7 integration closure (RC-T12, SC-T16, PL-T17 with real components, which is what closes the wave 4 gate), then wave 5 (the Python package, the tuned and engine baselines) and E7 documentation |
 | Paperwork owed | the wave 1, 2, 3 and 4 gate reports. Each needs one run of the weekly `slow` job from the Actions tab, which is what executes DS-T9, PL-T6 and the other container-gated tests; the crates are merged and green, the reports are what record it |
@@ -285,7 +285,8 @@ Gate (6.6, wave 4): end-to-end with fakes and with real components: S1, S2, S4, 
 | F4.3 | Scheduler checkpoint thread, watermark, `apply_resume_point`, `run_resumed` | `component/10-scheduler` (same PR) | 10 f.11 onward, resume; SC-T14, T15; SC-T16 (integration, wave 4) | merged (same branch) |
 | F4.4 | Controller sizing: prepare, probe, envelope, rule sizer, AIMD, damping, oscillation freeze, breach, state growth, tick bound | `component/11-controller` | 11 c, d, f.1 to f.5; RC-T1 to T8, T11, T15 to T18 | merged (92.6%) |
 | F4.5 | Controller classification, profile store, resume seeding, learned-sizer stub with shadow error | `component/11-controller` (same PR) | 11 f.6 onward, e.3; RC-T9, T10, T14; RC-T13 (E1); RC-T12 (integration, wave 4) | merged (same branch) |
-| F4.6 | Rust facade `amoru-runtime`: lifecycle 4.4, `RunSpec`, report, cancel, mimalloc | `component/12-runtime` | 12 sections for the facade (f.1, f.2, f.7, section l Rust files); the lifecycle of preamble 4.4 fresh and resumed | todo |
+| F4.6 | Rust facade `amoru-runtime`: lifecycle 4.4, `RunSpec`, report, cancel, mimalloc | `component/12-runtime` | 12 sections for the facade (f.1, f.2, f.7, section l Rust files); the lifecycle of preamble 4.4 fresh and resumed | merged (94.6%); Amoru runs end to end |
+| F4.9 | Defects the first real run exposed: the budget arithmetic (the arena was subtracted from the controller's allowance twice, and the facade papered over it with `available / 2`), the arena refusing allocations a region should serve, `ParquetSink` reserving a whole file in arena memory, `budget.disk` never computed, no manifest on a completed run, resume unable to probe | `infra/first-run-defects` | 02 f.1 and e.2, 08 f.1 and f.2, 11 f.1, 12 f.1 and f.7, 03 e.4 | in progress |
 | F4.7 | Wave 4 integration closure with real components | `component/12-runtime` (same PR) or `infra/wave4-integration` | RC-T12 in a container, SC-T16, PL-T17; S1, S2, S4, S5, S6, S11 evidence | todo |
 | F4.8 | Wave 4 gate and report (PM) | `main` | | todo |
 
