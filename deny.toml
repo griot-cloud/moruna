@@ -1,0 +1,134 @@
+# Amoru supply-chain policy for `cargo-deny` (board E6, feature F6.5).
+#
+# Four checks, each here for a stated reason:
+#
+#   advisories  a known vulnerability anywhere in the graph fails the build.
+#   licenses    only licences a project distributed under Apache-2.0 may carry;
+#               an unlisted licence fails, it never warns.
+#   bans        one version of `arrow`, `parquet`, `object_store` and `tokio`
+#               across the workspace. A second version of any of them is how the
+#               S7 portability claim and the S13 zero-copy claim break: two
+#               incompatible `RecordBatch` types cannot be handed between the
+#               kernel crate, the Polars and DataFusion bridges and the Python
+#               surface without a copy, and the compiler reports it as a type
+#               mismatch nobody can read. Decided by the PM on 2026-09-22
+#               (preamble 6.2, the paragraph under the pinned version table).
+#   sources     crates come from crates.io and from nowhere else.
+#
+# Run it exactly as CI does:
+#   cargo deny check advisories licenses bans sources
+#
+# This file never relaxes preamble 6.2. It does not pin or bump a version; the
+# pins live in the root `Cargo.toml`'s `[workspace.dependencies]` and a bump is
+# an E2 escalation for the human (preamble section 7).
+
+[graph]
+# Every optional feature is resolved, so the `cuda`, `uring`, `python`, `polars`
+# and `datafusion` graphs are policed too. The two bridge crates are the reason:
+# `polars` and `datafusion` each pull their own `arrow`, and an unfeatured scan
+# would never see the duplicate the bans section below exists to catch.
+all-features = true
+# `targets` is deliberately left empty, which means every target triple. A host
+# list here would be a narrowing of scope that belongs to the PM, not to this
+# file, and the preamble names no supported-target list (see the CC0-1.0 note
+# in the licences section).
+
+[advisories]
+# cargo-deny config version 2: a vulnerability is always an error, so there is
+# no knob here that could soften it. `yanked` stays at its default (a warning)
+# because `cargo audit` in the same workflow reads the lock file's yanked status
+# and fails on it; the two tools split that job between them on purpose.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# An advisory is ignored only with an id, a date and a reason on the line, and
+# only by the PM. Empty is the correct state.
+ignore = []
+
+[licenses]
+# The allow list is what a binary and a wheel distributed under Apache-2.0 may
+# carry: permissive, no reciprocal obligation, no source-disclosure trigger.
+# `unused-allowed-license` stays at its default (a warning), so an entry that
+# the graph has not reached yet is visible without failing the build; an
+# unlisted licence is always an error, never a warning.
+allow = [
+  "Apache-2.0",                     # the project's own licence (LICENSE, NOTICE)
+  "Apache-2.0 WITH LLVM-exception", # Apache-2.0 plus an extra permission, so strictly more permissive
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",                    # the ICU crates under `icu_*`, reached through `idna` and `url`
+]
+# A crate whose licence text has to be matched rather than read from an SPDX
+# expression is only accepted at a high confidence.
+confidence-threshold = 0.93
+
+# Exceptions: a licence granted to one named crate and to nothing else. Each one
+# says which crate and why. Anything not listed here and not in `allow` fails.
+
+# xxhash-rust is BSL-1.0 only (Boost Software License 1.0): permissive, OSI
+# approved, no attribution requirement, compatible with Apache-2.0 distribution.
+# It arrives through polars-core, so it is in the `polars` bridge only.
+[[licenses.exceptions]]
+crate = "xxhash-rust"
+allow = ["BSL-1.0"]
+
+# libbz2-rs-sys is bzip2-1.0.6 only: the bzip2 and libbzip2 licence, a BSD-style
+# permissive licence with a no-endorsement clause and no reciprocal obligation.
+# It arrives through datafusion's `compression` feature, so it is in the
+# `datafusion` bridge only.
+[[licenses.exceptions]]
+crate = "libbz2-rs-sys"
+allow = ["bzip2-1.0.6"]
+
+# ar_archive_writer and target-lexicon are "Apache-2.0 WITH LLVM-exception"
+# only, which the allow list above already covers; they need no exception and
+# are named here so a reader who sees them in a report knows they were looked at.
+
+# NOT granted, on purpose: tiny-keccak 2.0.2 is CC0-1.0 only. CC0 is a public
+# domain dedication that expressly waives no patent rights, Fedora stopped
+# accepting it for code in 2022 and Google's policy forbids it, so it is not a
+# licence this file may wave through on an agent's judgement. The licences check
+# therefore fails on it until the PM decides, which is the intended behaviour
+# (an E2-adjacent finding, reported in the F6.5 pull request). Facts for that
+# decision: tiny-keccak reaches the graph only through
+# ahash -> const-random -> const-random-macro (a proc-macro, so build time, never
+# linked into a shipped wheel) and only on targets where ahash falls back to its
+# `compile-time-rng` feature; it is absent from
+# `cargo tree --all-features --target x86_64-unknown-linux-gnu`. The two ways to
+# close it are a `[graph] targets` list naming the platforms Amoru ships, or a
+# narrow exception here for tiny-keccak alone. Both are the PM's to choose.
+
+[bans]
+# The workspace is allowed to carry duplicate versions in general: the Polars and
+# DataFusion bridges are separate crates a user opts into, and forbidding every
+# duplicate would turn an unrelated transitive bump into a stop-the-world event.
+multiple-versions = "allow"
+# A `*` version requirement defeats the exact pins of preamble 6.2.
+wildcards = "deny"
+# The four crates that must be one version each. A duplicate of any of them is an
+# error: `arrow` and `parquet` carry the `RecordBatch` and the reader and writer
+# types that cross every component boundary, `object_store` carries the store
+# trait the reactor, the sources and the sinks share, and `tokio` carries the
+# runtime the reactor's completions belong to. Two versions of any of them means
+# two incompatible copies of a type that preamble 1.3 says is one type.
+[[bans.deny]]
+crate = "arrow"
+deny-multiple-versions = true
+[[bans.deny]]
+crate = "parquet"
+deny-multiple-versions = true
+[[bans.deny]]
+crate = "object_store"
+deny-multiple-versions = true
+[[bans.deny]]
+crate = "tokio"
+deny-multiple-versions = true
+
+[sources]
+# Everything comes from the crates.io registry. A git dependency or a private
+# registry would be a supply-chain path no pin and no advisory database covers.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

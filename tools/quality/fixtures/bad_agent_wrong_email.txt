@@ -1,0 +1,4 @@
+Author: Amoru Agent <agents@griotdata.com>
+Sinks: committed_seq never overstates (SI-I4)
+
+Signed-off-by: Amoru Agent <amoru-agent@example.com>

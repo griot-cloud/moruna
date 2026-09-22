@@ -1,0 +1,4 @@
+Author: Amoru Agent <agents@griotdata.com>
+Trace: bounded channel push never blocks the caller (TR-I3)
+
+Signed-off-by: Amoru Agent <agents@griotdata.com> 

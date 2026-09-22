@@ -1,0 +1,127 @@
+# Amoru supply chain and sign-off checks (board E6, feature F6.5). Separate from
+# ci.yml on purpose: ci.yml is the wave gate over the code (preamble 6.6), this
+# file is policy over the dependency graph and over the commits themselves, and
+# it depends on no component crate, so it stays green as the crates gain code.
+#
+# Four jobs:
+#   1. deny:     cargo-deny over advisories, licences, bans and sources. The
+#                policy and the reason for every rule are in deny.toml.
+#   2. audit:    cargo-audit over Cargo.lock. It overlaps the advisories half of
+#                cargo-deny and both are kept: cargo-deny reads the resolved
+#                dependency graph and applies the licence, ban and source rules
+#                that cargo-audit has no notion of, while cargo-audit reads the
+#                lock file and fails on a crate whose exact pinned version has
+#                been yanked from crates.io, which cargo-deny only warns about.
+#                The preamble 6.2 pins are exact, so a yanked pin is the failure
+#                mode that matters here and it is worth a second tool.
+#   3. dco:      every commit a pull request adds carries a Signed-off-by line,
+#                and an agent-authored commit is signed off by the agent identity
+#                (CONTRIBUTING.md, preamble 6.7). The rules live in
+#                tools/quality/check_dco.sh so a human runs them locally with the
+#                same line CI runs.
+#   4. lockfile: Cargo.lock is committed and agrees with Cargo.toml. Preamble 6.2
+#                pins every dependency with an exact `=` requirement and calls a
+#                version bump an E2 escalation for the human; a lock file that
+#                drifts or is missing hands that decision back to whoever last
+#                ran cargo, which is what the pins exist to prevent.
+#
+# Every action and every tool is pinned to an exact version, as ci.yml pins them;
+# a bump here is a reviewed change.
+name: supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  deny:
+    name: cargo-deny (advisories, licences, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo --version
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: deny
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2.87.17
+        with:
+          tool: cargo-deny@0.20.2
+      - name: cargo deny check advisories licenses bans sources
+        # Scope, features and every rule come from deny.toml, so this line and
+        # the local gate ask exactly the same question.
+        run: cargo deny check advisories licenses bans sources
+
+  audit:
+    name: cargo-audit (advisories and yanked pins in Cargo.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: audit
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2.87.17
+        with:
+          tool: cargo-audit@0.22.2
+      # --deny yanked is the half cargo-deny leaves as a warning: with exact `=`
+      # pins (preamble 6.2) a yanked version cannot be resolved away silently.
+      - name: cargo audit
+        run: cargo audit --deny yanked
+
+  dco:
+    name: DCO sign-off on every commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The whole history, so BASE..HEAD resolves for a pull request of any depth.
+          fetch-depth: 0
+      - name: Self-test the rules against the fixtures
+        run: tools/quality/check_dco.sh --self-test
+      - name: Every commit this pull request adds is signed off
+        if: github.event_name == 'pull_request'
+        run: |
+          tools/quality/check_dco.sh \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}"
+
+  lockfile:
+    name: Cargo.lock committed and in step with Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: lockfile
+      - name: Cargo.lock is tracked by git
+        run: |
+          if ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "Cargo.lock is not committed; the exact pins of preamble 6.2 are only reproducible with it" >&2
+            exit 1
+          fi
+          echo "Cargo.lock is tracked"
+      # --locked fails rather than rewriting the lock file, so this is exactly
+      # the question "would cargo have to change Cargo.lock to build this tree".
+      - name: Cargo.lock agrees with Cargo.toml
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          echo "Cargo.lock is in step with Cargo.toml"
+      - name: Cargo.lock is unchanged by the check
+        run: git diff --exit-code -- Cargo.lock
