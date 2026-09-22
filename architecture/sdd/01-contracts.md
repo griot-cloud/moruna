@@ -170,12 +170,26 @@ pub const TIER_COUNT: usize = 5;
 ### d.3 Buffers and the allocator
 
 ```rust
+/// The arena token every `Buffer` carries: the object that receives the bytes back when the
+/// buffer drops. Defined here so the arena crate implements it without a circular dependency
+/// (section l). `release` is called once per `Buffer`, so twice per allocation after a
+/// `split_at`, once per half with that half's own pointer and length.
+pub trait ArenaHandle: Send + Sync {
+    fn release(&self, ptr: *mut u8, len: usize, tier: Tier);
+}
+
 /// An owned, aligned region in one tier, returned to its arena on drop.
 /// Deref to `[u8]` is provided only for Host and PinnedHost buffers;
 /// a Device buffer exposes `device_ptr()` and panics on `as_ref()`.
 pub struct Buffer { /* private: ptr, len, tier, arena token */ }
 
 impl Buffer {
+    /// Wrap a region the arena owns; the arena crate and a test allocator are the only callers.
+    /// SAFETY: `ptr` is valid for `len` bytes in `tier` until `arena.release(ptr, len, tier)`,
+    /// which this buffer calls exactly once on drop (CT-I2, the tier tag is truthful).
+    pub unsafe fn from_raw(ptr: *mut u8, len: usize, tier: Tier, arena: std::sync::Arc<dyn ArenaHandle>) -> Buffer;
+    /// The token this buffer releases to.
+    pub fn arena(&self) -> &std::sync::Arc<dyn ArenaHandle>;
     pub fn len(&self) -> usize;
     pub fn tier(&self) -> Tier;
     /// Host-visible pointer; `None` for Device buffers.
@@ -253,8 +267,12 @@ pub enum DType { I8, I16, I32, I64, U8, U16, U32, U64, F16, BF16, F32, F64, Bool
 
 impl DType { pub fn item_size(&self) -> usize; }
 
-/// A DLPack-backed tensor with ownership. Wraps `dlpark::ManagedTensor`;
-/// the wrapper adds tier tracking and Amoru's contiguity checks.
+/// A DLPack-backed tensor with ownership. Wraps `dlpark::versioned::Dlpack`, which is
+/// `ManagedBox<DLManagedTensorVersioned>`, the DLPack 1.x versioned struct; `dlpark` 0.8.0 has
+/// no type named `ManagedTensor`, and the versioned struct is what section l asked the agent to
+/// verify, so the alias `pub type Dlpack = dlpark::versioned::Dlpack` is the exported name and
+/// `into_dlpack` and `from_dlpack` speak it. The wrapper adds tier tracking and Amoru's
+/// contiguity checks, and `from_dlpack` rejects a capsule whose major version is not DLPack's.
 pub struct ManagedTensor { /* private */ }
 
 impl ManagedTensor {
@@ -268,9 +286,10 @@ impl ManagedTensor {
     /// Raw data pointer plus byte offset, as DLPack defines them.
     pub fn data_ptr(&self) -> (*mut u8, u64);
     /// Export as a DLPack capsule the caller owns; consumes self.
-    pub fn into_dlpack(self) -> dlpark::ManagedTensor;
-    /// Import from DLPack; the tier is read from the DLPack device field.
-    pub fn from_dlpack(t: dlpark::ManagedTensor) -> Result<Self>;
+    pub fn into_dlpack(self) -> Dlpack;
+    /// Import from DLPack; the tier is read from the DLPack device field. A capsule whose
+    /// major version is not `dlpark::ffi::DLPACK_MAJOR_VERSION` is `Convert`, never accepted.
+    pub fn from_dlpack(t: Dlpack) -> Result<Self>;
     /// Wrap the bytes of an arena buffer, starting at `byte_offset`, as a contiguous
     /// row-major tensor of `dtype` and `shape`; the buffer is owned by the tensor and
     /// released when it drops. Checks `byte_offset + element_count × item_size ≤ len`
@@ -925,8 +944,15 @@ pub struct TraceRecord {
 
 impl TraceRecord {
     pub fn arrow_schema() -> arrow::datatypes::SchemaRef;
-    /// BLAKE3 of the canonical field list "name:type,..." (CT-I8).
+    /// The canonical field list "name:type,..." in schema order; the string the hash is over.
+    pub const SCHEMA_FIELDS: &'static str;
+    /// BLAKE3 of `SCHEMA_FIELDS` (CT-I8), pinned as a literal because BLAKE3 cannot be evaluated
+    /// in a constant expression (blake3 1.8.7 has no const hashing). CT-T9 recomputes the digest
+    /// from `SCHEMA_FIELDS` and asserts this constant, so a schema change that does not update
+    /// the literal fails the test rather than passing silently, which is what CT-I8 asks.
     pub const SCHEMA_HASH: [u8; 32];
+    /// The digest recomputed from `SCHEMA_FIELDS` at run time; equal to `SCHEMA_HASH`.
+    pub fn schema_hash() -> [u8; 32];
 }
 
 pub trait TraceSink: Send + Sync {
@@ -1094,7 +1120,7 @@ The crate has no threads. All types are `Send`; `Payload`, `Morsel`, `Buffer`, `
 
 **Edge cases.** Empty batch (0 rows): valid; bytes may be non-zero (buffers exist); features have `rows = 0`. Zero-dimensional tensor: element count 1. A `FixedSizeList` with list size 0: `NotNumeric`. A batch with mixed-tier buffers: `Plan` error at construction. `as_tensor` on `Tier::Disk`: `Convert(NotContiguous)` is wrong; it is `Staging("payload not resident")`. `split_at` at 0 or at len: allowed, one half is empty.
 
-**Failures.** All errors are values; nothing in this crate panics on input. `Buffer::as_ref` on a device buffer panics because it is a programming error, not an input condition, and the panic message names the tier.
+**Failures.** All errors are values; nothing in this crate panics on input. `Buffer::as_ref` on a device buffer panics because it is a programming error, not an input condition, and the panic message names the tier. Rust has no per-value trait implementation, so `AsRef<[u8]>` and `Deref` are implemented for every `Buffer` and both panic on a `Device` buffer rather than being absent for it; section l's "no `impl Deref` on device buffers" means no device buffer may be dereferenced, not that the implementation can be withheld from the type (E10, resolved by the PM 2026-09-22).
 
 ## i. Configuration
 
@@ -1162,7 +1188,7 @@ Environment facts to verify before starting: `cargo --version` ≥ the 2024-edit
 
 ## m. Open items
 
-None. (E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, the staging reservation `StagingCodec`, the state seam `KernelState::footprint` with `TraceRecord::state_bytes`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `AmoruError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
+None. (Four E10 items the wave 0 agent raised, issues #5 to #8, were resolved by the PM on 2026-09-22 and are written into d.3, d.4, d.13 and h above: `SCHEMA_FIELDS` beside a pinned `SCHEMA_HASH` with `schema_hash()` to recompute it, because BLAKE3 has no const evaluation; `dlpark::versioned::Dlpack` as the DLPack type, because `dlpark` 0.8.0 has no `ManagedTensor`; `ArenaHandle` and `unsafe Buffer::from_raw`, without which component 2 cannot construct a buffer at all; and `AsRef`/`Deref` implemented for every buffer and panicking on `Device`, because Rust has no per-value implementation. E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, the staging reservation `StagingCodec`, the state seam `KernelState::footprint` with `TraceRecord::state_bytes`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `AmoruError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
 
 ## n. Traceability
 
