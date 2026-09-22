@@ -165,6 +165,10 @@ fn rt_t6_resume_after_a_termination() {
     let input = scratch.path().join("in.parquet");
     let out_dir = scratch.path().join("out");
     let staging = scratch.path().join("staging");
+    // One profile store for both passes, so the second pass resumes with a profile the first
+    // pass wrote: a resumed run must not fail because a profile exists, any more than because
+    // it does not (11 f.14).
+    let profiles = scratch.path().join("profiles");
     std::fs::create_dir_all(&out_dir).expect("the output directory");
     std::fs::create_dir_all(&staging).expect("the staging directory");
     let rows: u64 = 1_000_000;
@@ -172,7 +176,15 @@ fn rt_t6_resume_after_a_termination() {
 
     let first_kernel: Arc<dyn Kernel> = Arc::new(FailOnce::new(2));
     let error = Runtime::run(
-        resume_spec(&input, &out_dir, &staging, true, None, vec![first_kernel]),
+        resume_spec(
+            &input,
+            &out_dir,
+            &staging,
+            &profiles,
+            true,
+            None,
+            vec![first_kernel],
+        ),
         CancelToken::new(),
     )
     .expect_err("the failing kernel terminates the run");
@@ -193,6 +205,7 @@ fn rt_t6_resume_after_a_termination() {
             &input,
             &out_dir,
             &staging,
+            &profiles,
             false,
             Some(manifest),
             vec![second_kernel],
@@ -207,6 +220,16 @@ fn rt_t6_resume_after_a_termination() {
     // runs again in the same process, over the same input and the same profile store, and
     // must behave identically. It did not: the first pass wrote a profile, and a resumed run
     // that *found* one failed the same way a resumed run that found none did.
+    // The completed resume wrote a profile (11 f.9), which is what makes the repeat below a
+    // resume that *finds* one rather than a resume that finds none.
+    let stored = std::fs::read_dir(&profiles)
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
+    assert!(
+        stored > 0,
+        "the completed run left a profile in {profiles:?}"
+    );
+
     let again = Scratch::new("rt_t6-again");
     let out_dir = again.path().join("out");
     let staging = again.path().join("staging");
@@ -214,7 +237,15 @@ fn rt_t6_resume_after_a_termination() {
     std::fs::create_dir_all(&staging).expect("the staging directory");
     let kernel: Arc<dyn Kernel> = Arc::new(FailOnce::new(2));
     let error = Runtime::run(
-        resume_spec(&input, &out_dir, &staging, true, None, vec![kernel]),
+        resume_spec(
+            &input,
+            &out_dir,
+            &staging,
+            &profiles,
+            true,
+            None,
+            vec![kernel],
+        ),
         CancelToken::new(),
     )
     .expect_err("the second pass terminates the same way");
@@ -228,6 +259,7 @@ fn rt_t6_resume_after_a_termination() {
             &input,
             &out_dir,
             &staging,
+            &profiles,
             false,
             Some(manifest),
             vec![kernel],
@@ -304,6 +336,7 @@ fn resume_spec(
     input: &std::path::Path,
     out_dir: &std::path::Path,
     staging: &std::path::Path,
+    profiles: &std::path::Path,
     keep: bool,
     resume: Option<std::path::PathBuf>,
     kernels: Vec<Arc<dyn Kernel>>,
@@ -342,7 +375,7 @@ fn resume_spec(
     spec.staging_dir = Some(staging.to_path_buf());
     spec.staging_limit = Some(1 << 30);
     spec.checkpoint_keep = keep;
-    spec.profiles_dir = Some(staging.join("profiles"));
+    spec.profiles_dir = Some(profiles.to_path_buf());
     spec.checkpoint_interval_ms = 500;
     spec.resume = resume;
     spec
