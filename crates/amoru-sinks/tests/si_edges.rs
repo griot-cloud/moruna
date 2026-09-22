@@ -302,10 +302,14 @@ fn a_sink_accepts_one_shape_of_payload() {
     ipc.open(&table_source_schema()).expect("open");
     let outcome = block_on(ipc.write(0, arena_tensor(&alloc, 4, 4, 0.0)));
     assert!(matches!(outcome, Err(AmoruError::Sink(_))), "{outcome:?}");
-    let outcome = block_on(ipc.write(
+    // f.1: the first morsel settles the output schema, so a wider batch is accepted when it
+    // is the first one and refused when it follows a narrower one.
+    block_on(ipc.write(
         0,
         Payload::table(arena_wide_batch(&alloc, 8)).expect("payload"),
-    ));
+    ))
+    .expect("the first morsel settles the schema");
+    let outcome = block_on(ipc.write(1, arena_payload(&alloc, 8, 0)));
     let Err(AmoruError::Sink(msg)) = outcome else {
         panic!("schema drift must be refused, got {outcome:?}");
     };

@@ -393,15 +393,19 @@ impl ArrowIpcSink {
         }
     }
 
-    fn check_schema(&self, inner: &Inner, batch: &RecordBatch) -> Result<()> {
+    /// f.1: the output schema is the first payload's, not the one `open` was given, because
+    /// the chain cannot see through an opaque kernel (05 d.1) and a kernel that appends a
+    /// column is the canonical job. Every later payload is checked against the first.
+    fn check_schema(&self, inner: &mut Inner, batch: &RecordBatch) -> Result<()> {
         let Some(schema) = inner.schema.as_ref() else {
-            return Err(AmoruError::Sink("the sink has no schema".into()));
+            inner.schema = Some(batch.schema());
+            return Ok(());
         };
         if schema.fields() == batch.schema().fields() {
             return Ok(());
         }
         Err(AmoruError::Sink(format!(
-            "schema drift: the batch schema {:?} is not the schema the sink opened with",
+            "schema drift: the batch schema {:?} is not the first morsel's",
             batch.schema().fields()
         )))
     }
@@ -562,7 +566,10 @@ impl Sink for ArrowIpcSink {
         };
         let mut inner = self.lock();
         inner.phase.require_created()?;
-        inner.schema = Some(Arc::clone(schema));
+        // f.1: the schema the chain computed is provisional; the first payload settles it.
+        // The file itself carries no schema until a record is written, so `open_file` (the
+        // magic bytes) is unaffected.
+        let _ = schema;
         self.open_file(&mut inner)?;
         inner.phase = Phase::Open;
         Ok(())
