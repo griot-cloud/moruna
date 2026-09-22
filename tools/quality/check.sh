@@ -12,6 +12,18 @@ MIN="${AMORU_COVERAGE_MIN:-90}"
 
 fail() { printf 'quality: FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf 'quality: %s\n' "$*"; }
+# Run a step quietly: its output goes to target/quality/<name>.log and is shown
+# only when the step fails (or when AMORU_QUALITY_VERBOSE=1), so a passing gate
+# prints one line per step and a failing one prints the evidence.
+quiet() {
+  local name="$1"; shift
+  mkdir -p target/quality
+  if [ "${AMORU_QUALITY_VERBOSE:-0}" = "1" ]; then "$@"; return; fi
+  if ! "$@" >"target/quality/$name.log" 2>&1; then
+    cat "target/quality/$name.log" >&2
+    fail "$name (full log: target/quality/$name.log)"
+  fi
+}
 
 step "em dashes"
 EM="$(printf '\xe2\x80\x94')"
@@ -21,17 +33,18 @@ fi
 
 if [ -f Cargo.toml ]; then
   step "cargo fmt --check"
-  cargo fmt --all -- --check
+  quiet fmt cargo fmt --all -- --check
   step "cargo clippy -D warnings"
-  cargo clippy --workspace --all-targets -- -D warnings
+  quiet clippy cargo clippy --workspace --all-targets -- -D warnings
   if [ -x tools/lint/no_tier_wildcard.sh ]; then
     step "tools/lint/no_tier_wildcard.sh"
-    tools/lint/no_tier_wildcard.sh
+    quiet lint tools/lint/no_tier_wildcard.sh
   else
     step "tools/lint/no_tier_wildcard.sh not present yet (wave 0 deliverable); skipped"
   fi
   step "cargo test"
-  cargo test --workspace
+  quiet test cargo test --workspace
+  step "tests: $(grep -hE '^test result:' target/quality/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
   step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
   command -v cargo-llvm-cov >/dev/null 2>&1 \
     || fail "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview"
