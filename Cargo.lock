@@ -57,6 +57,7 @@ name = "amoru-adapters"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
+ "amoru-testkit",
  "arrow",
  "dlpark",
  "pyo3",
@@ -112,6 +113,7 @@ version = "0.1.0"
 dependencies = [
  "amoru-kernel",
  "datafusion",
+ "tokio",
 ]
 
 [[package]]
@@ -158,6 +160,7 @@ version = "0.1.0"
 dependencies = [
  "amoru-kernel",
  "polars",
+ "polars-arrow",
 ]
 
 [[package]]
@@ -1855,6 +1858,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bd97fa454fe3ac1084b82998586e43f118eaa24988e9e6f1a23d60c7a3e171e"
 dependencies = [
  "bitflags",
+ "pyo3",
  "snafu",
 ]
 
