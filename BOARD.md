@@ -19,7 +19,7 @@ Executors are briefed from `architecture/agents/executor.md`; filled briefs live
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | F0.1 executor running (workspace skeleton, CI, lint); the PM reviews its pull request, then briefs F0.2 |
+| Next action | F0.2 executor running (the contracts crate on `component/01-contracts`); then F0.3 (testkit) on the same branch |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -31,8 +31,8 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 | Id | Feature | Branch | Scope (SDD sections, tests by id) | Status |
 |---|---|---|---|---|
 | F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | merged |
-| F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | in progress |
-| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | todo |
+| F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | merged (PR #1, 2026-09-22) |
+| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | in progress |
 | F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (same PR as F0.2) | 01 d.15; CT-T13 | todo |
 | F0.4 | Wave 0 gate and wave report (PM) | `main` | pm.md sections 2, 4, 8 | todo |
 
@@ -46,14 +46,14 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 - [x] D-B1 and D-B2 decided under delegation, D-B3 deferred to wave 5; branch merged to `main` and pushed to origin
 
 ### F0.1 tasks
-- [ ] Environment facts verified in the PR (rustc, cargo, edition 2024; docker and MinIO reachable in CI)
-- [ ] `rust-toolchain.toml` pins stable; `Cargo.toml` workspace with every member of preamble 6.1; `[workspace.dependencies]` pinned; the versions recorded in the preamble 6.2 table (replaces `_pending_`)
-- [ ] Every crate of 6.1 as a compiling stub with its `Cargo.toml`, feature flags per 6.3, and a one-line `lib.rs` doc comment naming its SDD
-- [ ] `python/amoru/` and `bench/` placeholders that the later waves fill
-- [ ] `tools/lint/no_tier_wildcard.sh` (CT-T14 lint) with a self-test fixture
-- [ ] `.github/workflows/ci.yml`: job 1 `tools/quality/check.sh` on Linux; job 2 container gate with `--memory` and `--cpus`; job 3 MinIO service for the object-store paths; job 4 Python matrix 3.13, 3.13t, 3.14, 3.14t (proves the matrix runs)
-- [ ] `cargo tree -p amoru-kernel` is free of tokio, cudarc, pyo3, parquet, object_store (CT-T12 as a CI step until F0.2 makes it a test)
-- [ ] PR template complete; PM checklist green; merged
+- [x] Environment facts verified in the PR (rustc, cargo, edition 2024; docker and MinIO reachable in CI)
+- [x] `rust-toolchain.toml` pins stable; `Cargo.toml` workspace with every member of preamble 6.1; `[workspace.dependencies]` pinned; the versions recorded in the preamble 6.2 table (replaces `_pending_`)
+- [x] Every crate of 6.1 as a compiling stub with its `Cargo.toml`, feature flags per 6.3, and a one-line `lib.rs` doc comment naming its SDD
+- [x] `python/amoru/` and `bench/` placeholders that the later waves fill
+- [x] `tools/lint/no_tier_wildcard.sh` (CT-T14 lint) with a self-test fixture
+- [x] `.github/workflows/ci.yml`: job 1 `tools/quality/check.sh` on Linux; job 2 container gate with `--memory` and `--cpus`; job 3 MinIO service for the object-store paths; job 4 Python matrix 3.13, 3.13t, 3.14, 3.14t (proves the matrix runs)
+- [x] `cargo tree -p amoru-kernel` is free of tokio, cudarc, pyo3, parquet, object_store (CT-T12 as a CI step until F0.2 makes it a test)
+- [x] PR template complete; PM checklist green; merged
 
 ### F0.2 tasks
 - [ ] Environment facts from 01 section l verified and recorded (cargo version, `blake3`, `dlpark` versioned-struct support)
@@ -304,6 +304,7 @@ Gate (6.6, wave 5): S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-
 
 ### F5.1 tasks
 - [ ] Environment facts from 12 section l verified (maturin, the four interpreters, pyo3-arrow)
+- [ ] `amoru-py` `Cargo.toml` enables `python` and, on Linux, `uring` by default (preamble 6.3); the wave 0 stub left it at `default = []`
 - [ ] `amoru.run(source, kernels, sink, ...)` and the source, kernel and sink wrappers; exception mapping from `AmoruError`; the report object; `KeyboardInterrupt` forwarded as cancel; GIL refusal unless `python.allow_gil`; no pandas dependency; re-entrancy
 - [ ] PY-T1, T2, T4, T5, T6, T8, T9, T14 pass; every PY-I cited; Python tests at or above 90% coverage (`ruff` and `pytest --cov` in the gate); PR template
 
@@ -460,3 +461,6 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | N-3 contracts d.12 citation | cites 03 e.4 | 01 d.12 |
 | 2026-09-22 | D-B1, D-B2 | as recommended | this board, preamble 6.7 |
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
+| 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `amoru-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |
