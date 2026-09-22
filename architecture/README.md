@@ -23,6 +23,8 @@ Design documents for Amoru. Code is written from these documents; a change in be
 | [agents/pm.md](agents/pm.md) | Agent prompt: the PM agent that drives the build (reading order, waves, gate rule, review checklist, escalation routing, decisions) | Draft |
 | [agents/executor.md](agents/executor.md) | Agent prompt template: filled per component by the PM for the executor agent that builds it | Draft |
 | [../DECISIONS.md](../DECISIONS.md) | Decision log: the architecture document's open questions Q1 to Q10 with owner, status and date; the PM updates it | Living |
+| [../BOARD.md](../BOARD.md) | Build board: one epic per wave plus release readiness, session-sized features with their tests by id, findings and the decisions the board needs; the PM updates it | Living |
+| [agents/briefs/](agents/briefs/) | Filled executor briefs, one file per component, produced from `agents/executor.md` by the PM | Living |
 
 ## Document types
 

@@ -43,6 +43,7 @@ Review against the SDD, not against your own judgement of good code. The checkli
 8. The pull request template is complete: what it changes, the document and sections, invariants and tests by id, "Environment facts verified" with commands and results, "Tests skipped (id, reason)", "Provisional results (host)", and the checklist.
 9. Section m of the SDD is still empty after the work, and anything the executor learned that changes the document is in the pull request as a documentation change or filed as an escalation, never silently coded around.
 10. Branch, base and commit identity follow `CONTRIBUTING.md` (`Amoru Agent <agents@griotdata.com>`, signed off).
+11. `tools/quality/check.sh` is green on the branch: every crate the pull request touches has at least 90% line coverage as the coverage gate reports it per crate (preamble 6.7), and no test exists only to raise the number (a test that cites no invariant and no section k id is a finding).
 
 When every line holds and the component gate is green, merge. When a line fails, return the pull request to the executor with the line number and the SDD section, and nothing else; do not fix code yourself.
 
@@ -55,6 +56,10 @@ Preamble section 7 is a table with a "who decides" column; apply it literally. A
 - "agent stops and reports": the executor has already stopped the affected work; decide or file as above.
 
 E1 covers every reference-host test; a provisional result closes a gate only with the host name recorded, and never for a GPU or GDS test. E2: you may approve adding a crate that an SDD's d.2 names; a version bump is the human's. E9: each SDD's section l is the permitted set; tests are exempt. E10: methods named in a component's own d.1 are pre-approved; anything a consumer needs that is in neither the contracts nor the consumed d.1 is a contracts change.
+
+## 5a. Delegation
+
+On 2026-09-22 Brackly delegated the human's decisions to the PM ("I am delegating most of the decision making to you"). From that date the PM decides every "human decides" item in preamble section 7 and every `contracts/*` merge, under three limits: a decision that changes an SDD's behaviour still goes through the design-change template first so the reasoning is on record; every decision is written in `BOARD.md`'s delegated decisions log with its date and mirrored to `DECISIONS.md` when it traces to a Q-item, and reported in the next wave report; and anything that spends money, touches the reference host, or publishes outside the repository (a PyPI release, a namespace registration) still waits for Brackly. Brackly can withdraw or narrow the delegation at any time by saying so; the PM then updates this section.
 
 ## 6. Recording decisions
 

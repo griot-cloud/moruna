@@ -871,7 +871,7 @@ pub struct HostProfile {
     /// the same node, if the directory survived). `Unknown` is treated as `Absent`:
     /// durability across nodes is a fact about the platform that cannot be probed,
     /// only declared. Discovery does refuse a tmpfs or overlay staging directory
-    /// declared `Present` (DS, `Config` error).
+    /// declared `Present` (03 e.4, `Config` error).
     pub durable_staging: Guarantee,
 }
 
@@ -1128,7 +1128,7 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T10 fingerprint_stability.** Same inputs → same fingerprint across processes (golden value); one byte of config change → different fingerprint. Proves e.6.
 
-**CT-T11 features_cost.** `MorselFeatures::from_payload` on a 10 M-row string batch runs in under 1 ms (it must not iterate rows). Proves f.2.
+**CT-T11 features_cost.** (reference host, E1, for the timing; the structural half runs anywhere) `MorselFeatures::from_payload` on a 10 M-row string batch runs in under 1 ms on the reference host, provisional with the host name elsewhere; on every host the test also proves the O(columns) property structurally: the batch is built over a values buffer whose bytes are never read (a `FakeAllocator` buffer left uninitialised is fine) and the string total equals the offsets buffer's last value. Proves f.2.
 
 **CT-T12 no_runtime_deps.** `cargo tree -p amoru-kernel` contains none of tokio, cudarc, pyo3, parquet, object_store. Proves the boundary in section a and S7.
 

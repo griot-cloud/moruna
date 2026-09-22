@@ -22,6 +22,7 @@ Thank you for considering a contribution. Amoru is designed before it is built, 
 - No `unwrap` or `expect` outside tests; errors are typed and propagate.
 - `unsafe` blocks carry a `// SAFETY:` comment stating the invariant that makes them sound, and are limited to the modules the SDD permits.
 - Tests are named after the SDD test specification in snake case, prefix, id and a short slug (for example `pl_t4_fifo` for PL-T4), so review can map them.
+- Every crate with code has at least 90% line coverage (`cargo llvm-cov`, test code excluded), judged per crate. `tools/quality/check.sh` is the gate; run `tools/hooks/install.sh` once per clone so the pre-commit hook runs it, and do not bypass the hook. CI runs the same script.
 - Benchmarks state the machine they were measured on.
 
 ## Documents
