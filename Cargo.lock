@@ -265,7 +265,9 @@ name = "amoru-trace"
 version = "0.1.0"
 dependencies = [
  "amoru-kernel",
+ "arrow",
  "crossbeam",
+ "mimalloc",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
