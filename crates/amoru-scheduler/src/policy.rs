@@ -45,6 +45,11 @@ pub(crate) fn apply_policy(
 /// controller's thread, and the heartbeat checker's dead worker all arrive here (f.8, f.14).
 /// The first diagnostic wins; later ones are dropped, so the report names the first cause.
 pub(crate) fn terminate(shared: &Shared, diagnostic: AmoruError) {
+    // f.10: a terminate that loses the claim arrives after the sink drive has already finished
+    // the run, so there is nothing left to end.
+    if !shared.claim_exit() {
+        return;
+    }
     if shared.run_state().is_live() || shared.run_state() == RunState::Init {
         shared.set_run_state(RunState::Terminating);
     }
@@ -55,6 +60,10 @@ pub(crate) fn terminate(shared: &Shared, diagnostic: AmoruError) {
 
 /// The surface's cancel, observed between tasks (f.10).
 pub(crate) fn cancel(shared: &Shared) {
+    // A cancel that arrives after the last morsel was committed is a no-op: the run is done.
+    if !shared.claim_exit() {
+        return;
+    }
     if shared.run_state().is_live() {
         shared.set_run_state(RunState::Cancelling);
     }

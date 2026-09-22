@@ -51,6 +51,33 @@ fn sc_t6_instance_affinity() {
         "workers reacquired their previous instance only {:.1}% of the time",
         affinity * 100.0
     );
+    // What "affinity is preferred" means when there are more workers than instances and every
+    // worker is active, as here: an instance has one home for the run and no other worker is
+    // handed it, because none of the four homes (workers 0 to 3) is ever outside the active set
+    // of eight. Without this the figure above passes at 90.1% while an instance wanders between
+    // all eight workers, which is what it did: one borrow used to move an instance's home for
+    // good and the worker that had been warming it lost it for the rest of the run.
+    let mut homes: std::collections::BTreeMap<
+        usize,
+        std::collections::HashSet<std::thread::ThreadId>,
+    > = std::collections::BTreeMap::new();
+    for (instance, thread) in kernel
+        .applies
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        homes.entry(*instance).or_default().insert(*thread);
+    }
+    assert_eq!(homes.len(), 4, "every instance did work");
+    for (instance, threads) in &homes {
+        assert_eq!(
+            threads.len(),
+            1,
+            "instance {instance} was run by {} workers, so its model was warmed more than once",
+            threads.len()
+        );
+    }
     // The default hints of a `FakeKernel` are the ones the pool is sized from.
     let _ = KernelHints::default();
     let _ = FakeKernel::new();

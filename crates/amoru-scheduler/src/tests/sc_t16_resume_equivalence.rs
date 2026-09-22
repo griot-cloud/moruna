@@ -106,6 +106,7 @@ fn sc_t16_resume_equivalence() {
             Err(e) => panic!("restore: {e}"),
         };
     let committed = point.extras.committed_seq;
+    let point_next_seq = point.extras.source_cursor.next_seq;
     let to_recompute = point.to_recompute.len();
 
     assert!(
@@ -187,12 +188,22 @@ fn sc_t16_resume_equivalence() {
             "sequence {seq} is at or below the watermark and was lost"
         );
     }
-    assert!(
-        missing.len() < want.len() / 4,
-        "the resumed run lost {} of {} sequence numbers",
-        missing.len(),
-        want.len()
-    );
+    // The loss window, exactly. A morsel the resumed run cannot produce is one that, at the
+    // moment of the last manifest, was in no queue (so the manifest's lineage does not name it)
+    // and had already been issued (so the cursor, which is the next range to issue, does not
+    // point at it). Its sequence number therefore lies strictly between the watermark and the
+    // cursor's `next_seq`. Two things put a morsel there: one written but not yet committed,
+    // which the real engine keeps in its lineage until `set_committed` and `FakePlacement` does
+    // not (09 f.11, PL-I11); and one whose source read was still in flight, which nothing
+    // records. The second is a gap in the design, reported to the PM, not an artefact of the
+    // fake. What this test proves is that nothing outside that window is lost.
+    let issued = point_next_seq;
+    for seq in &missing {
+        assert!(
+            *seq > watermark && *seq < issued,
+            "sequence {seq} is missing from outside the loss window ({watermark}, {issued})"
+        );
+    }
 
     // Nothing at or below the watermark was read again, and every recomputed origin was.
     let reads = second.source.reads();
