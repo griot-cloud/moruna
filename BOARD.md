@@ -21,7 +21,8 @@ What can start when, from the solid edges of preamble 1.3 and the fakes of contr
 |---|---|---|
 | 0 | now | F0.2 contracts (running); F1.6 bench generator (no internal dependency); F7.1 docs scaffold; F6.5 supply chain and DCO checks |
 | 1 | F0.2 merged | F0.3 testkit (implements the traits) |
-| 2 | F0.3 merged (wave 0 gate) | F1.1 arena, F1.2 discovery, F1.3 trace, F1.4 adapters, F1.7 bench kernels, F2.1 reactor, F3.1 sources, F3.3 sinks, F3.5 placement, F4.4 controller: every crate whose only solid edge is `amoru-kernel`; their integration-tagged tests close in their wave |
+| 2a | F0.2 merged (the contracts crate; the testkit need not wait) | F1.1 arena, F1.2 discovery, F1.3 trace: their software design documents name no fake, so the crate alone is enough (verified by grep, 2026-09-22) |
+| 2b | F0.3 merged (the fakes) | F1.4 adapters and F2.1 reactor (`FakeAllocator`), F3.1 sources, F3.3 sinks, F3.5 placement, F4.4 controller (`FakeKnobs`, `FakePlacement`, `FakeSampler`, `FakeTrace`); their integration-tagged tests close in their wave |
 | 2, same branch | the previous session of the same component | F1.5 bridges, F2.2 reactor direct paths, F3.2 tensor and iterator sources, F3.4 tensor, IPC and reorder sinks, F3.6 and F3.7 placement staging and lineage, F4.5 controller classification |
 | 3 | F3.3 and F3.4 merged (`SinkHandle`, `ReorderBuffer` are a crate dependency) | F4.1, F4.2, F4.3 scheduler |
 | 4 | every crate 2 to 11 merged | F4.6 facade, F4.7 integration closure; F5.3 bench runner and tuned baselines; F5.4 engine baseline (needs the facade for the comparison only) |
@@ -37,7 +38,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 |---|---|
 | Current wave | 0, in progress since 2026-09-22 |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
-| Next action | rung 0: F0.2 contracts and F1.6 bench generator running, F6.5 supply chain running, F7.1 merged; F0.3 when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
+| Next action | F0.2 contracts (PR #10) in review and F1.7 bench kernels running; F0.3 testkit when F0.2 merges; rung 2 (ten executors) when F0.3 merges |
 | Blocking Brackly items | none; D-B3 (reference host access) is needed at wave 5 |
 
 ---
@@ -150,7 +151,7 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 - [x] `bench/` generator: 12 suite datasets and four ad hoc commands, deterministic by seed, local and S3
 - [x] Output names the machine and the generator version; `bench/README.md` documents every dataset, scale and variable
 - [x] 88 tests, 96.2% line coverage
-- [ ] The MinIO half runs in CI: the `minio` job does not export `AMORU_S3_BUCKET`, so the S3 test skips; one line in `.github/workflows/ci.yml`, held by the supply-chain branch until PR #3 merges, then fixed and the skip removed (closes the wave 1 gate clause "and MinIO")
+- [x] The MinIO half runs in CI: the `minio` job now exports `AMORU_S3_BUCKET=amoru-ci` (fixed by the PM after PR #3 merged), so the S3 test no longer skips; the wave 1 gate clause "and MinIO" closes when the next run on `main` is green
 
 ### F1.7 tasks
 - [ ] Six kernels with their declared amplification classes; `wide-intermediate` in Python releasing the GIL
@@ -361,7 +362,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 | F6.1 | Decisions and document status closed | `main` | `DECISIONS.md` Q2 to Q7, Q9, Q10 decided or their assumptions explicitly accepted by Brackly; every SDD HANDOFF-READY; preamble section 8 traceability table with no gap row | todo |
 | F6.2 | Sufficiency sign-off | `main` | S1 to S17 each cited to the test and the host that closed it, or listed as skipped by id with Brackly's acceptance (device and GDS parts of S14) | todo |
 | F6.3 | Packaging and publishing | `infra/release` | Q1 remainder: PyPI, crates.io and GitHub namespace checks, trademark and domain; version `0.1.0`; `CHANGELOG.md`; trusted publishing workflow for wheels and sdist; PY-O1 (GPU wheel) decided or the separate-wheel assumption accepted | todo |
-| F6.5 | Supply chain and security | `infra/release` (same PR as F6.3) | `cargo audit` and `cargo deny` (licences, advisories) in CI; `SECURITY.md` contact verified; pinned CI actions; DCO sign-off on every commit checked in CI | todo |
+| F6.5 | Supply chain and security | `infra/supply-chain` | `cargo audit` and `cargo deny` (licences, advisories, bans, sources) in CI; `SECURITY.md` improved; every action pinned by SHA; DCO sign-off checked in CI; `Cargo.lock` freshness | merged (PR #3, 2026-09-22) |
 | F6.6 | Release `v0.1.0` | `main` | tag, GitHub release with the wave 5 report and the bench figures (host named), wheels on PyPI for the four interpreters, `README.md` status changed from "Design"; E7 complete first | todo |
 
 ### F6.1 tasks
@@ -380,8 +381,9 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 - [ ] PY-O1 decided; if the assumption stands, the `amoru-cuda` wheel is documented as not shipped in `0.1.0`
 
 ### F6.5 tasks
-- [ ] `cargo audit` and `cargo deny check` jobs green; licence allow-list matches Apache-2.0 compatibility
-- [ ] DCO check on pull requests; actions pinned by SHA
+- [x] `cargo audit` and `cargo deny check advisories licenses bans sources` green; allow list is Apache-2.0, MIT, BSD-2, BSD-3, ISC, Zlib, Unicode-3.0 and Apache-2.0 WITH LLVM-exception, with two documented exceptions (BSL-1.0 via polars, bzip2-1.0.6 via datafusion); `[graph] targets` names the four supported platforms, which removes the CC0 crate honestly rather than by exception
+- [x] DCO check with `tools/quality/check_dco.sh` and a ten-fixture self-test; 23 action references across three workflows pinned by 40-character SHA; `Cargo.lock` freshness checked
+- [ ] Before the wave 2 gate: remove or re-decide the RUSTSEC-2026-0194 and 0195 ignores in `deny.toml` and the matching `cargo-audit --ignore` flags, per DECISIONS.md S1 and issue #9; cargo-deny's `advisory-not-detected` warning is the tripwire, and there is no machine-enforced expiry because cargo-deny 0.20.2 has no `expiration` key
 
 ### F6.6 tasks
 - [ ] E7 documentation epic complete and published
@@ -460,7 +462,7 @@ Open items the PM found while reading, routed per preamble section 7. Ids: `N-` 
 
 | Id | Decision | PM recommendation | Status |
 |---|---|---|---|
-| D-B1 | Several session-sized features per large component, all on the one component branch, one pull request reviewed against the SDD when the last feature lands (keeps "one PR per component") versus one PR per feature | the former | decided 2026-09-22 (PM, under delegation): features are sessions on one component branch; the PM reviews each feature's commits as they land; the SDD review is once, at the end |
+| D-B1 | Several session-sized features per large component, all on the one component branch; one pull request reviewed against the SDD when the last feature lands, except that a self-contained part may merge early when it unblocks other executors (amended 2026-09-22 after finding that arena, discovery and trace need the contracts crate but no fake) | the former | decided 2026-09-22 (PM, under delegation): features are sessions on one component branch; the PM reviews each feature's commits as they land; the SDD review is once, at the end |
 | D-B2 | Coverage floor 90% line coverage per crate, test code excluded, judged per crate, stubs not measured (as written into preamble 6.7 on this branch) | accept | decided 2026-09-22 (PM, under delegation) |
 | D-B3 | How an agent runs the E1-tagged suite on the reference host: SSH access for the executor session, or Brackly runs `bench/` by hand and pastes the output into the wave 5 report | SSH for a wave 5 executor, read-only elsewhere | open until wave 5; Brackly |
 
@@ -482,6 +484,7 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
 | 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | one pull request per component, amended | a component may land in more than one pull request when an early merge unblocks other executors; the whole-SDD review and the component gate happen on the last one; the contracts crate merges before its testkit so arena, discovery and trace start a session earlier | preamble 6.7, CONTRIBUTING, this board's start ladder |
 | 2026-09-22 | bench E2 route, dataset naming, kernels PR (raised by F1.6) | preamble 6.5 is the bench agent's d.2, so the PM may approve a bench-only crate; the hand-rolled parser and RNG stand rather than churn them; dataset names live in `bench/README.md` as the reference; F1.7 kernels get their own branch and pull request | preamble 6.2 and 6.5, this board |
 | 2026-09-22 | F7.1 notes: introduction pages, host-class pages (raised by F7.1) | introduction pages stay with F7.2 (same audience); the hosting guide keeps a GPU page marked described-not-verified (E1) and omits RDMA (E11, not a v1 host); Pages stays off until Brackly enables it, because publishing outward is outside the delegation | this board, F7.5 and F7.8 tasks |
 | 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |

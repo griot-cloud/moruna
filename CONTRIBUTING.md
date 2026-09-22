@@ -12,7 +12,7 @@ Thank you for considering a contribution. Amoru is designed before it is built, 
 
 1. Read `architecture/README.md` and the SDD for the component you are touching.
 2. Open an issue describing the change and which SDD sections it affects, unless the change is a typo or a documentation fix.
-3. Keep pull requests to one component. A change that crosses components changes the contracts crate first, in its own pull request.
+3. Keep pull requests to one component. A component may span more than one pull request on its branch when an early merge unblocks other work; the review against its whole design document happens on the last one. A change that crosses components changes the contracts crate first, in its own pull request.
 4. Branch from `main`. Branch names: `component/NN-<slug>` with the slug the crate suffix (`component/02-arena`), `infra/<topic>` for the workspace skeleton, CI and bench work, `contracts/<topic>` for a change to `architecture/sdd/01-contracts.md` and the contracts crate. Component pull requests are merged by the PM agent when their gate is green (preamble section 6.6); every `contracts/*` pull request is merged by a human.
 5. Fill every section of the pull request template, including "Environment facts verified", "Tests skipped (id, reason)" and "Provisional results (host)"; an empty section is a review finding.
 

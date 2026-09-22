@@ -1,0 +1,156 @@
+# Amoru supply-chain policy for `cargo-deny` (board E6, feature F6.5).
+#
+# Four checks, each here for a stated reason:
+#
+#   advisories  a known vulnerability anywhere in the graph fails the build.
+#   licenses    only licences a project distributed under Apache-2.0 may carry;
+#               an unlisted licence fails, it never warns.
+#   bans        one version of `arrow`, `parquet`, `object_store` and `tokio`
+#               across the workspace. A second version of any of them is how the
+#               S7 portability claim and the S13 zero-copy claim break: two
+#               incompatible `RecordBatch` types cannot be handed between the
+#               kernel crate, the Polars and DataFusion bridges and the Python
+#               surface without a copy, and the compiler reports it as a type
+#               mismatch nobody can read. Decided by the PM on 2026-09-22
+#               (preamble 6.2, the paragraph under the pinned version table).
+#   sources     crates come from crates.io and from nowhere else.
+#
+# Run it exactly as CI does:
+#   cargo deny check advisories licenses bans sources
+#
+# This file never relaxes preamble 6.2. It does not pin or bump a version; the
+# pins live in the root `Cargo.toml`'s `[workspace.dependencies]` and a bump is
+# an E2 escalation for the human (preamble section 7).
+
+[graph]
+# Every optional feature is resolved, so the `cuda`, `uring`, `python`, `polars`
+# and `datafusion` graphs are policed too. The two bridge crates are the reason:
+# `polars` and `datafusion` each pull their own `arrow`, and an unfeatured scan
+# would never see the duplicate the bans section below exists to catch.
+all-features = true
+# The platforms Amoru ships, and the only ones the graph is resolved for.
+# Decided by the PM on 2026-09-22 and written into preamble 6.2 as the
+# supported-target set, so this list and that sentence are one decision in two
+# places: a target added to the preamble is added here in the same pull request.
+# Windows is not a v1 target (the runtime reads cgroup v2 and uses O_DIRECT and
+# io_uring). The narrowing is not cosmetic: it is what removes crates that only
+# ever appear on targets Amoru does not build for, and with it the graph no
+# longer contains tiny-keccak 2.0.2, whose CC0-1.0 licence is on no allow list
+# here (CC0 waives no patent rights; Fedora stopped accepting it for code in
+# 2022 and Google forbids it, while the ASF and Debian accept it, and that split
+# is not one this file resolves quietly). tiny-keccak reached the graph only
+# through ahash -> const-random -> const-random-macro on targets where ahash
+# falls back to its `compile-time-rng` feature.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
+[advisories]
+# cargo-deny config version 2: a vulnerability is always an error, so there is
+# no knob here that could soften it. `yanked` stays at its default (a warning)
+# because `cargo audit` in the same workflow reads the lock file's yanked status
+# and fails on it; the two tools split that job between them on purpose.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# An advisory is ignored only by the PM, with the reason, the date and the event
+# that removes it written on the entry. cargo-deny 0.20.2 accepts only `id` and
+# `reason` on an ignore entry (there is no `expiration` key in this version), so
+# the deadline lives in the reason text and in issue #9, not in a field the tool
+# enforces. Somebody has to honour it by hand before the wave 2 gate.
+ignore = [
+  # object_store 0.13.2 pulls quick-xml 0.39.4, which carries RUSTSEC-2026-0194
+  # and 0195 (severity 7.5) in its AWS and Azure backends. Dormant in wave 0 and
+  # 1: no crate enables those backends yet. The fix is object_store 0.14.1, which
+  # needs parquet 60 and arrow 60, which datafusion 55.1.0 (the newest release on
+  # 2026-09-22) does not accept, and one arrow across the workspace is what S7
+  # relies on. Reviewed by the PM on 2026-09-22 with a hard deadline: this entry
+  # is removed or re-decided before the wave 2 gate closes, which is when the
+  # reactor first enables an object-store backend. See issue #9.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
+]
+
+[licenses]
+# The allow list is what a binary and a wheel distributed under Apache-2.0 may
+# carry: permissive, no reciprocal obligation, no source-disclosure trigger.
+# `unused-allowed-license` stays at its default (a warning), so an entry that
+# the graph has not reached yet is visible without failing the build; an
+# unlisted licence is always an error, never a warning.
+allow = [
+  "Apache-2.0",                     # the project's own licence (LICENSE, NOTICE)
+  "Apache-2.0 WITH LLVM-exception", # Apache-2.0 plus an extra permission, so strictly more permissive
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",                    # the ICU crates under `icu_*`, reached through `idna` and `url`
+]
+# A crate whose licence text has to be matched rather than read from an SPDX
+# expression is only accepted at a high confidence.
+confidence-threshold = 0.93
+
+# Exceptions: a licence granted to one named crate and to nothing else. Each one
+# says which crate and why. Anything not listed here and not in `allow` fails.
+
+# xxhash-rust is BSL-1.0 only (Boost Software License 1.0): permissive, OSI
+# approved, no attribution requirement, compatible with Apache-2.0 distribution.
+# It arrives through polars-core, so it is in the `polars` bridge only.
+[[licenses.exceptions]]
+crate = "xxhash-rust"
+allow = ["BSL-1.0"]
+
+# libbz2-rs-sys is bzip2-1.0.6 only: the bzip2 and libbzip2 licence, a BSD-style
+# permissive licence with a no-endorsement clause and no reciprocal obligation.
+# It arrives through datafusion's `compression` feature, so it is in the
+# `datafusion` bridge only.
+[[licenses.exceptions]]
+crate = "libbz2-rs-sys"
+allow = ["bzip2-1.0.6"]
+
+# ar_archive_writer and target-lexicon are "Apache-2.0 WITH LLVM-exception"
+# only, which the allow list above already covers; they need no exception and
+# are named here so a reader who sees them in a report knows they were looked at.
+
+# Resolved, kept as a record: tiny-keccak 2.0.2 is CC0-1.0 only and was the one
+# licence this file could not wave through. It is no longer in the graph, because
+# the `[graph] targets` list above resolves only the platforms Amoru ships and
+# tiny-keccak appeared only on the others. No CC0-1.0 exception was granted, and
+# none should be: if tiny-keccak ever reappears here it means a supported target
+# was added, and the licence question comes back with it (PM, 2026-09-22).
+
+[bans]
+# The workspace is allowed to carry duplicate versions in general: the Polars and
+# DataFusion bridges are separate crates a user opts into, and forbidding every
+# duplicate would turn an unrelated transitive bump into a stop-the-world event.
+multiple-versions = "allow"
+# A `*` version requirement defeats the exact pins of preamble 6.2.
+wildcards = "deny"
+# The four crates that must be one version each. A duplicate of any of them is an
+# error: `arrow` and `parquet` carry the `RecordBatch` and the reader and writer
+# types that cross every component boundary, `object_store` carries the store
+# trait the reactor, the sources and the sinks share, and `tokio` carries the
+# runtime the reactor's completions belong to. Two versions of any of them means
+# two incompatible copies of a type that preamble 1.3 says is one type.
+[[bans.deny]]
+crate = "arrow"
+deny-multiple-versions = true
+[[bans.deny]]
+crate = "parquet"
+deny-multiple-versions = true
+[[bans.deny]]
+crate = "object_store"
+deny-multiple-versions = true
+[[bans.deny]]
+crate = "tokio"
+deny-multiple-versions = true
+
+[sources]
+# Everything comes from the crates.io registry. A git dependency or a private
+# registry would be a supply-chain path no pin and no advisory database covers.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
