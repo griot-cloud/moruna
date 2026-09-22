@@ -133,6 +133,21 @@ else
   step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"
 fi
 
+if [ -d python/tests ]; then
+  # The package's own tests. This used to be gated on python/pyproject.toml, which lives
+  # at the repository root, so 32 tests including the one guarding the surface's
+  # throughput were run by nothing at all: that is the structural reason a wheel whose
+  # first user program hung for ever passed a green gate (found 2026-09-23).
+  if [ -n "${AMORU_PYTHON:-}" ]; then
+    step "python/tests on ${AMORU_PYTHON}"
+    # A stale python/amoru/_core*.so shadows an installed wheel, so the suite must run
+    # against a build made now, not whatever was left in the tree.
+    quiet python_tests env AMORU_PYTHON="$AMORU_PYTHON" tools/quality/python_tests.sh
+  else
+    step "python/tests not run: set AMORU_PYTHON to a CPython 3.14t with pyarrow"
+  fi
+fi
+
 if [ -f python/pyproject.toml ]; then
   step "ruff and pytest with coverage >= ${MIN}%"
   command -v ruff >/dev/null 2>&1 || fail "ruff is not installed"
