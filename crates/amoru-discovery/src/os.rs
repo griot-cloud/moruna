@@ -95,17 +95,20 @@ mod tests {
     /// With no `/proc` (this development host) the platform interface answers instead.
     #[test]
     fn falls_back_to_the_platform_for_total_ram() {
+        // The real host answers on every supported target: `/proc/meminfo` where there is one,
+        // the platform's own interface where there is not.
+        assert!(total_ram_bytes(Path::new("/proc")).is_some_and(|bytes| bytes > 0));
+
+        // Pointed at a root with no `meminfo`, only a platform with its own interface answers.
         let tmp = TempDir::new("no-proc");
         let absent = tmp.path().join("absent");
-        let total = total_ram_bytes(&absent);
+        assert_eq!(total_ram_bytes(&absent), probes::platform_total_ram());
         if cfg!(target_vendor = "apple") {
             assert!(
-                total.is_some_and(|bytes| bytes > 0),
+                total_ram_bytes(&absent).is_some_and(|bytes| bytes > 0),
                 "macOS reports hw.memsize"
             );
         }
-        // On every target either the fallback answers or there is a real /proc.
-        assert!(total.is_some() || std::fs::read_to_string("/proc/meminfo").is_err());
     }
 
     /// f.2: `statm` gives anonymous and file backed bytes; the platform answers where it does not.
@@ -126,9 +129,15 @@ mod tests {
         assert_eq!(parse_statm("1000 many 100", 4096), None);
         assert_eq!(parse_statm("", 4096), None);
 
+        // The real host answers on every supported target.
+        assert!(process_memory(Path::new("/proc"), page_bytes()).is_some_and(|(anon, _)| anon > 0));
+
+        // Pointed at a root with no `self/statm`, only the platform interface answers.
         let absent = tmp.path().join("absent");
-        let fallback = process_memory(&absent, 4096);
-        assert!(fallback.is_some() || std::fs::read_to_string("/proc/self/statm").is_err());
+        assert_eq!(
+            process_memory(&absent, 4096),
+            probes::platform_rss_anon().map(|anon| (anon, 0))
+        );
     }
 
     /// The two `sysconf` values the limits derivation needs.

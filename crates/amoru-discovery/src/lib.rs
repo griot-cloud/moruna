@@ -579,18 +579,30 @@ mod tests {
             other => panic!("expected Config, got {other:?}"),
         }
 
-        // The same declaration with a working probe is kept as `Present`, not rewritten.
+        // Without the forcing flag the same declaration is decided by the host: kept as
+        // `Present` where the probe agrees, refused where it does not. Both are DS-I5.
         let env = MapEnv::with(&[
             ("AMORU_HOST_PROFILE", "memlock=present"),
             ("AMORU_SPILL_DIR", spill.to_str().expect("utf-8")),
         ]);
-        let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
-        assert_eq!(found.profile.memlock, Guarantee::Present);
+        match discover_with(&env, &roots, &DiscoveryInput::default()) {
+            Ok(found) => assert_eq!(found.profile.memlock, Guarantee::Present),
+            Err(err) => assert!(
+                matches!(
+                    err,
+                    amoru_kernel::AmoruError::Config {
+                        name: "host_profile",
+                        ..
+                    }
+                ),
+                "expected Config, got {err:?}"
+            ),
+        }
     }
 
     /// DS-T6 no_unknown_after_discover: an all-`Unknown` profile resolves to `Probed(_)`
-    /// everywhere; a declared field stays declared; `is_available` and `is_guaranteed` agree with
-    /// the field values. DS-I6.
+    /// everywhere; a declared field stays declared and is never rewritten as `Probed`;
+    /// `is_available` and `is_guaranteed` agree with the field values. DS-I6.
     #[test]
     fn ds_t6_no_unknown_after_discover() {
         let tmp = TempDir::new("ds-t6");
@@ -598,6 +610,7 @@ mod tests {
         let roots = roots_at(tmp.path());
         let spill = staging(tmp.path());
 
+        // Nothing declared: every field comes back probed.
         let env = MapEnv::with(&[("AMORU_SPILL_DIR", spill.to_str().expect("utf-8"))]);
         let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
         for field in every_guarantee(&found.profile) {
@@ -607,27 +620,15 @@ mod tests {
             );
         }
 
+        // A declared field stays declared, and the rest are still probed. `gds=absent` is a
+        // declaration every v1 build honours, because no v1 build has the gds feature (6.3).
         let env = MapEnv::with(&[
-            ("AMORU_HOST_PROFILE", "io_uring=present"),
+            ("AMORU_HOST_PROFILE", "gds=absent"),
             ("AMORU_SPILL_DIR", spill.to_str().expect("utf-8")),
         ]);
-        // The io_uring probe only succeeds on Linux, so force the declaration to hold elsewhere
-        // by declaring what this host can do instead when the probe would refuse.
-        let found = match discover_with(&env, &roots, &DiscoveryInput::default()) {
-            Ok(found) => found,
-            Err(_) => {
-                let env = MapEnv::with(&[
-                    ("AMORU_HOST_PROFILE", "gds=absent"),
-                    ("AMORU_SPILL_DIR", spill.to_str().expect("utf-8")),
-                ]);
-                let found =
-                    discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
-                assert_eq!(found.profile.gds, Guarantee::Absent);
-                assert!(!found.profile.gds.is_available());
-                assert!(!found.profile.gds.is_guaranteed());
-                found
-            }
-        };
+        let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
+        assert_eq!(found.profile.gds, Guarantee::Absent);
+        assert!(matches!(found.profile.huge_pages, Guarantee::Probed(_)));
         for field in every_guarantee(&found.profile) {
             assert_ne!(field, Guarantee::Unknown, "DS-I6: no Unknown survives");
             assert_eq!(
@@ -636,7 +637,58 @@ mod tests {
             );
             assert_eq!(field.is_guaranteed(), field == Guarantee::Present);
         }
-        assert!(found.profile.io_uring == Guarantee::Present || cfg!(not(target_os = "linux")));
+
+        // The four arms of e.4, with the probe's answer supplied rather than taken from the
+        // host, so the rule is proved the same way on a laptop, in a container and on the
+        // reference host: a declared `Present` that holds stays `Present` and is never
+        // rewritten as `Probed(true)`; one that does not hold stops the run (DS-I5); an
+        // `Unknown` becomes `Probed(_)`; and `Absent` is never probed at all.
+        let env = MapEnv::default();
+        let mut notes = Vec::new();
+        let works = || ProbeReport {
+            available: true,
+            note: None,
+        };
+        let refuses = || ProbeReport {
+            available: false,
+            note: Some("the probe refused".to_string()),
+        };
+        assert_eq!(
+            resolve(&env, "io_uring", Guarantee::Present, works, &mut notes).expect("it holds"),
+            Guarantee::Present
+        );
+        assert!(resolve(&env, "io_uring", Guarantee::Present, refuses, &mut notes).is_err());
+        assert_eq!(
+            resolve(&env, "io_uring", Guarantee::Unknown, works, &mut notes).expect("probed"),
+            Guarantee::Probed(true)
+        );
+        assert_eq!(
+            resolve(&env, "io_uring", Guarantee::Unknown, refuses, &mut notes).expect("probed"),
+            Guarantee::Probed(false)
+        );
+        assert_eq!(
+            resolve(
+                &env,
+                "io_uring",
+                Guarantee::Absent,
+                || panic!("an Absent field is never probed"),
+                &mut notes
+            )
+            .expect("absent"),
+            Guarantee::Absent
+        );
+        assert_eq!(
+            resolve(
+                &env,
+                "io_uring",
+                Guarantee::Probed(true),
+                || panic!("an already probed field is not probed again"),
+                &mut notes
+            )
+            .expect("kept"),
+            Guarantee::Probed(true)
+        );
+        assert!(notes.iter().any(|note| note.contains("io_uring")));
     }
 
     /// Every guarantee of a profile, in one array.

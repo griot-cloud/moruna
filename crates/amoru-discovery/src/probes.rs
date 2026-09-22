@@ -182,6 +182,9 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
 
 /// Whether `path` is on a filesystem that cannot outlive the node (`tmpfs`, `overlay`, `ramfs`).
 /// `None` when the filesystem cannot be identified, which is not the same as "durable".
+// `statfs::f_type` is `i64` on 64 bit Linux and narrower elsewhere, so the cast is kept even
+// where it is the identity.
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn filesystem_is_ephemeral(path: &Path) -> Option<bool> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     // SAFETY: `c_path` is a live NUL terminated string and `buf` is a live, zeroed `statfs`;
