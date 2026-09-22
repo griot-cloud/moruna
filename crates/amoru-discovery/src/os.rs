@@ -132,12 +132,18 @@ mod tests {
         // The real host answers on every supported target.
         assert!(process_memory(Path::new("/proc"), page_bytes()).is_some_and(|(anon, _)| anon > 0));
 
-        // Pointed at a root with no `self/statm`, only the platform interface answers.
+        // Pointed at a root with no `self/statm`, only a platform with its own interface
+        // answers. The figure itself moves between calls, so only its presence is asserted.
         let absent = tmp.path().join("absent");
-        assert_eq!(
-            process_memory(&absent, 4096),
-            probes::platform_rss_anon().map(|anon| (anon, 0))
-        );
+        let fallback = process_memory(&absent, 4096);
+        if cfg!(target_vendor = "apple") {
+            assert!(
+                fallback.is_some_and(|(anon, file)| anon > 0 && file == 0),
+                "macOS reports the resident set through proc_pidinfo"
+            );
+        } else {
+            assert_eq!(fallback, None, "this target reads /proc and nothing else");
+        }
     }
 
     /// The two `sysconf` values the limits derivation needs.

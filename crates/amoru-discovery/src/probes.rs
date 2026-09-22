@@ -230,19 +230,23 @@ pub(crate) fn filesystem_is_ephemeral(path: &Path) -> Option<bool> {
 pub(crate) fn probe_huge_pages(sys_root: &Path, proc_root: &Path) -> ProbeReport {
     let thp = sys_root.join("kernel/mm/transparent_hugepage/enabled");
     let meminfo = proc_root.join("meminfo");
-    timed("huge_pages", move || {
-        if let Ok(text) = std::fs::read_to_string(&thp)
-            && (text.contains("[always]") || text.contains("[madvise]"))
-        {
-            return ProbeReport::yes();
-        }
-        if let Ok(text) = std::fs::read_to_string(&meminfo)
-            && crate::os::parse_meminfo_field(&text, "HugePages_Total").is_some_and(|n| n > 0)
-        {
-            return ProbeReport::yes();
-        }
-        ProbeReport::no("transparent huge pages are not enabled and none are reserved")
-    })
+    timed("huge_pages", move || huge_pages_decision(&thp, &meminfo))
+}
+
+/// The `huge_pages` decision itself, without the timeout around it. The tests assert this, so the
+/// rule the e.4 table states is proved independently of how fast a host runs the probe.
+fn huge_pages_decision(thp: &Path, meminfo: &Path) -> ProbeReport {
+    if let Ok(text) = std::fs::read_to_string(thp)
+        && (text.contains("[always]") || text.contains("[madvise]"))
+    {
+        return ProbeReport::yes();
+    }
+    if let Ok(text) = std::fs::read_to_string(meminfo)
+        && crate::os::parse_meminfo_field(&text, "HugePages_Total").is_some_and(|n| n > 0)
+    {
+        return ProbeReport::yes();
+    }
+    ProbeReport::no("transparent huge pages are not enabled and none are reserved")
 }
 
 /// `memlock`: `mlock` one page of a temporary anonymous mapping, then `munlock`.
@@ -344,7 +348,7 @@ pub(crate) fn probe_direct_io(staging_dir: Option<PathBuf>) -> ProbeReport {
 #[cfg(target_os = "linux")]
 fn direct_io_roundtrip(dir: &Path) -> ProbeReport {
     let page = page_size();
-    let path = dir.join(format!("amoru-direct-io-probe-{}", std::process::id()));
+    let path = dir.join(format!("amoru-direct-io-probe-{}", unique_tag()));
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return ProbeReport::no("the staging directory path is not a valid C string");
     };
@@ -403,13 +407,25 @@ pub(crate) fn probe_rdma() -> ProbeReport {
     ProbeReport::no("built without the rdma feature, so RDMA is absent")
 }
 
+/// A name no other probe in this process, and no other process, is using at the same moment.
+/// Several tests probe one directory at once, and so will several runs on one host.
+fn unique_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Whether a directory exists, is writable and has at least 1 GiB free (e.4, `staging_dir`).
 pub(crate) fn staging_dir_is_usable(dir: &Path) -> bool {
     const ONE_GIB: u64 = 1024 * 1024 * 1024;
     if !dir.is_dir() {
         return false;
     }
-    let probe = dir.join(format!("amoru-staging-probe-{}", std::process::id()));
+    let probe = dir.join(format!("amoru-staging-probe-{}", unique_tag()));
     if std::fs::write(&probe, b"amoru").is_err() {
         return false;
     }
@@ -429,6 +445,8 @@ mod tests {
         let sys = tmp.path().join("sys");
         let proc_dir = tmp.path().join("proc");
         std::fs::create_dir_all(&proc_dir).expect("proc");
+        let thp = sys.join("kernel/mm/transparent_hugepage/enabled");
+        let meminfo = proc_dir.join("meminfo");
 
         // Neither source says yes.
         write(
@@ -441,7 +459,7 @@ mod tests {
             "meminfo",
             "MemTotal: 100 kB\nHugePages_Total: 0\n",
         );
-        assert!(!probe_huge_pages(&sys, &proc_dir).available);
+        assert!(!huge_pages_decision(&thp, &meminfo).available);
 
         // Transparent huge pages are on.
         write(
@@ -449,13 +467,13 @@ mod tests {
             "kernel/mm/transparent_hugepage/enabled",
             "[always] madvise never\n",
         );
-        assert!(probe_huge_pages(&sys, &proc_dir).available);
+        assert!(huge_pages_decision(&thp, &meminfo).available);
         write(
             &sys,
             "kernel/mm/transparent_hugepage/enabled",
             "always [madvise] never\n",
         );
-        assert!(probe_huge_pages(&sys, &proc_dir).available);
+        assert!(huge_pages_decision(&thp, &meminfo).available);
 
         // Or explicit huge pages are reserved.
         write(
@@ -464,13 +482,17 @@ mod tests {
             "always [never]\n",
         );
         write(&proc_dir, "meminfo", "HugePages_Total: 512\n");
-        assert!(probe_huge_pages(&sys, &proc_dir).available);
+        assert!(huge_pages_decision(&thp, &meminfo).available);
 
         // Neither file exists: not available, with a note.
         let absent = tmp.path().join("absent");
-        let report = probe_huge_pages(&absent, &absent);
+        let report = huge_pages_decision(&absent.join("thp"), &absent.join("meminfo"));
         assert!(!report.available);
         assert!(report.note.is_some());
+
+        // And through the bounded wrapper, which answers either way.
+        let report = probe_huge_pages(&sys, &proc_dir);
+        assert!(report.available || report.note.is_some());
     }
 
     /// The probes that touch the host run, are bounded, and say why when they say no.

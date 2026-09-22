@@ -728,14 +728,25 @@ mod tests {
         assert_eq!(first.cgroup_path, second.cgroup_path);
         assert_eq!(first.notes, second.notes);
 
-        let leftovers: Vec<String> = std::fs::read_dir(&spill)
-            .expect("staging")
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect();
+        // Every probe deletes its own file. A probe that ran into the e.4 timeout is still
+        // finishing on its own thread when `discover` returns, so give it a moment before
+        // concluding that a file was left behind: the invariant is that none survives, not that
+        // none exists while a probe is still running.
+        let leftovers = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .expect("staging")
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !leftovers(&spill).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let remaining = leftovers(&spill);
         assert!(
-            leftovers.is_empty(),
-            "probe files left behind: {leftovers:?}"
+            remaining.is_empty(),
+            "probe files left behind: {remaining:?}"
         );
     }
 
