@@ -56,7 +56,7 @@ fn the_whole_suite_is_byte_identical_between_two_runs() {
         second.display()
     ));
     let datasets = suite::datasets(Scale::Small).expect("suite");
-    assert_eq!(datasets.len(), 12);
+    assert_eq!(datasets.len(), 13);
     for dataset in &datasets {
         let name = dataset.file_name();
         let a = read(&first.join(&name));
