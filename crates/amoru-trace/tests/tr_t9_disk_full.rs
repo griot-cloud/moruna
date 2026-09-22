@@ -3,9 +3,11 @@
 //!
 //! The SDD puts the overflow directory on a 1 MiB tmpfs. A 1 MiB filesystem cannot be
 //! mounted on the development host (macOS arm64) without administrator rights, and the test
-//! must run on both hosts, so the condition is simulated at the same boundary a full disk
-//! reaches: the writer's attempt to create or extend the overflow file fails. Two
-//! independent simulations are used, and each must produce the same behaviour.
+//! must run on the Linux CI host as well, so the condition is simulated at the same boundary
+//! a full disk reaches: the writer's attempt to create the overflow file fails. Two
+//! independent simulations are used, each with a different errno, and each must produce the
+//! same behaviour. Neither relies on file permissions, because the container gate runs as
+//! root, for which a directory that refuses writes refuses nothing.
 
 mod common;
 
@@ -64,25 +66,20 @@ fn tr_t9_disk_full_by_an_unopenable_path() {
     assert_survived_a_full_disk(&writer);
 }
 
-/// Simulation two: the staging directory itself refuses new files, which is what a
-/// filesystem with no free space and no free inodes does to the same call.
+/// Simulation two: the staging directory is not a directory, so the overflow file cannot be
+/// created there at all. This reaches the same boundary as simulation one through a
+/// different errno (`ENOTDIR` rather than `EISDIR`), and neither can be bypassed by a
+/// process running as root, which the container gate does.
 #[test]
-fn tr_t9_disk_full_by_a_read_only_staging_dir() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = TempDir::new("t9-ro");
+fn tr_t9_disk_full_by_a_staging_path_that_is_not_a_directory() {
+    let dir = TempDir::new("t9-notdir");
     let staging = dir.path().join("staging");
-    std::fs::create_dir_all(&staging).expect("staging dir");
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555))
-        .expect("make the staging directory refuse new files");
+    std::fs::write(&staging, b"this is a file, not a directory").expect("the blocking file");
 
     let mut cfg = config(&staging);
     cfg.memory_limit = LIMIT;
     let writer = TraceWriter::start(cfg).expect("start");
     assert_survived_a_full_disk(&writer);
-
-    // Give the directory back so the temporary directory can be removed.
-    let _ = std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755));
 }
 
 /// h, failures: a final file that cannot be created is refused at start, with the path in
