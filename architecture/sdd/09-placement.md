@@ -397,6 +397,18 @@ Unit tests use the testkit's `FakeReactor` (contracts d.15: `with_latency(Durati
 
 ## l. Implementation notes for the agent
 
+Decisions the PM took on 2026-09-22, on the component 9 agent's report, each because the document could not be followed as written:
+
+Preamble 4.2 beats f.5. f.5 lays a staging record out under the queue lock, which calls the allocator with a lock held, and no lock is held across a call into another component. The engine drafts the record outside the lock, encoding at base offset 0 (the layout is offset-invariant), and takes the lock again only to record the move.
+
+PL-I14 beats f.13. f.13's segment-length check "through the reactor" needs `Completion::wait`, which only the scheduler's drives may call; the engine uses the manifest's own arithmetic and the file's length, and both refusal cases of PL-T16 still fire.
+
+Arrow 59.3.0's IPC encoder allocates its own validity bitmap even for a non-null column whose bitmap is arena-backed, so e.3's "the pieces are the batch's own buffers" is false for that one buffer: the engine copies it into the arena per record and declares it through `note_payload_copy`, and the data buffers still move by DMA from their own bytes. The body is also not readable by arrow's own stream reader, because `bodyLength` is not rewritten; `amoru_kernel::ipc::decode` is the reader, which is what e.7 provides.
+
+A record that lands while its entry has moved into the promotion window keeps its resident copy rather than becoming `OnDisk`, so the head never waits on a read of bytes that are already in memory (PL-I1, G-I3); and `close(stage)` retires the queue's active segment so PL-I8 can reclaim it.
+
+A device move of a table is refused with `Staging` naming the item: rebuilding a `RecordBatch` over engine-allocated buffers needs either `unsafe` in this crate, which section l forbids, or a safe constructor the contracts do not have. Tensors take every device row. This is an E10 item left open deliberately, because no host in the project has a device to exercise it on (E1), and the contracts change should be made when there is one.
+
 Files: `src/lib.rs`, `src/queue.rs` (e.2, f.1, f.3, f.4, f.14, f.16), `src/plan.rs` (f.2, f.8, f.9), `src/moves.rs` (e.4, issue and `then` completion, f.10), `src/staging/{mod.rs, segment.rs (e.3, f.7, the global counter and the segments map), write.rs (f.5), read.rs (f.6)}`, `src/lineage.rs` (e.2 lineage index, f.11), `src/manifest.rs` (e.5, f.12, f.13, `find_manifest`, `read_manifest_header`; `serde` derive structs mirror the table exactly and nothing else is serialised; `std::fs` lives here and in `segment.rs` for `fallocate` and `remove_file` only), `src/stats.rs`, `src/shutdown.rs` (f.15). `unsafe` is not permitted in this crate; the IPC-over-buffer decode in f.6 is `amoru_kernel::ipc::decode` over `Buffer::into_arrow_buffer` (contracts d.3, e.7), the tensor view is `ManagedTensor::from_buffer` (d.4), and every DMA source is a `BufferView` from a safe constructor (d.3).
 
 The planner must be written as a pure function from a queue snapshot to a list of moves, and tested as such (PL-T1 drives it); issuing is a thin layer over it. The reactor is reached only through `Arc<dyn Reactor>` and the contract's methods (`copy`, `write_file`, `read_file`, `read_file_opt`, `register_segment`, `unregister_segment`, `paths`); the arena only through `Arc<dyn Allocator>` (`alloc`, `page_bytes`, `is_pinned`, `contains`, `tier_of`). Nothing of `amoru-reactor`, `amoru-arena` or `amoru-sinks` is named in this crate.

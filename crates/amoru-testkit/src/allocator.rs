@@ -16,6 +16,10 @@ struct Region {
     len: usize,
     layout: Layout,
     tier: Tier,
+    /// Bytes released so far. A region goes back to the system only when every byte
+    /// of it has been released, because `Buffer::split_at` hands two owners into one
+    /// allocation and contracts d.3 frees them independently.
+    released: usize,
 }
 
 #[derive(Default)]
@@ -218,12 +222,31 @@ impl ArenaHandle for Inner {
             }
             Tier::Disk(_) | Tier::Remote(_, _) => {}
         }
-        // A `split_at` half releases part of a region; the half holding the region's first byte
-        // frees it, and the other half only adjusts the accounting.
-        if let Some(region) = state.regions.remove(&(ptr as usize)) {
-            // SAFETY: the region was allocated with this layout in `alloc` below, is owned by
-            // the buffer that is releasing it, and is freed exactly once.
-            unsafe { dealloc(ptr, region.layout) };
+        // A `split_at` half releases only its own part of a region, and contracts d.3 says
+        // both halves are freed independently, so the region goes back to the system only
+        // when every byte of it has been released. Freeing on the half that happens to hold
+        // the first byte, which is what this did until 2026-09-22, left the other half
+        // pointing into freed memory: a use-after-free that the component 9 agent hit for
+        // real and worked around by not using `split_at`.
+        let base = state
+            .regions
+            .range(..=(ptr as usize))
+            .next_back()
+            .filter(|(start, region)| (ptr as usize) < **start + region.layout.size())
+            .map(|(start, _)| *start);
+        if let Some(base) = base {
+            let done = {
+                let region = state.regions.get_mut(&base).expect("the region just found");
+                region.released += len.max(1);
+                region.released >= region.layout.size()
+            };
+            if done {
+                let region = state.regions.remove(&base).expect("the region just found");
+                // SAFETY: every byte of this region has now been released, the layout is the
+                // one `alloc` used, and the entry is removed before the free so no later
+                // release can reach it a second time.
+                unsafe { dealloc(base as *mut u8, region.layout) };
+            }
         }
     }
 }
@@ -285,9 +308,15 @@ impl Allocator for FakeAllocator {
         }
         // SAFETY: the region was just allocated, so writing zeros initialises every byte of it.
         unsafe { std::ptr::write_bytes(ptr, 0, len) };
-        state
-            .regions
-            .insert(ptr as usize, Region { len, layout, tier });
+        state.regions.insert(
+            ptr as usize,
+            Region {
+                len,
+                layout,
+                tier,
+                released: 0,
+            },
+        );
         match tier {
             Tier::Host => state.host_in_use += len as u64,
             Tier::PinnedHost => state.pinned_in_use += len as u64,

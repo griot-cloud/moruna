@@ -95,7 +95,9 @@ fn pl_t3_no_cpu_bytes() {
             | OpKind::ReadObject
             | OpKind::WriteObject
             | OpKind::HeadObject
-            | OpKind::ListPrefix => {
+            | OpKind::ListPrefix
+            | OpKind::DeleteObject
+            | OpKind::AbortMultipart => {
                 panic!(
                     "a host-only run issued {:?}, which is not a row of e.4",
                     op.kind
