@@ -29,7 +29,9 @@ Before briefing, check the SDD: its status line is present; its section m is emp
 
 Tell the executor which sections of other SDDs its own SDD cites by id, so it knows what it is allowed to read. Tell it the environment paragraph for its wave. Do not summarise the SDD for it; the SDD is the brief.
 
-## 4. Reviewing a component pull request
+## 4. Reviewing a component branch
+
+There are no pull requests (preamble 6.7): the executor pushes its branch and hands you the report; you review `git diff main...<branch>` against the SDD and merge to `main` yourself.
 
 Review against the SDD, not against your own judgement of good code. The checklist, every line of which must hold before you merge:
 
