@@ -332,6 +332,24 @@ pub trait Allocator: Send + Sync {
         let _ = ptr;
         None
     }
+    /// Record that a component copied `bytes` of payload with the CPU, which only a
+    /// source decoding a non-layout-preserving format or a sink encoding to one may
+    /// do (G-I2).
+    ///
+    /// Without this and [`Allocator::note_boundary_copy`], the two counters in
+    /// [`AllocStats`] have no writer: the arena owns the struct and no other method
+    /// can raise them. The default does nothing, so a fake that does not count is
+    /// still a valid allocator.
+    fn note_payload_copy(&self, bytes: u64) {
+        let _ = bytes;
+    }
+
+    /// Record that an adapter copied `bytes` of a kernel's non-arena output into the
+    /// arena, once, at the kernel boundary (05 AD-I2).
+    fn note_boundary_copy(&self, bytes: u64) {
+        let _ = bytes;
+    }
+
     /// True when this allocator's host tier is page-locked. A run has exactly one host
     /// tier: `PinnedHost` when true, `Host` when false; the two never coexist in one
     /// process and no move between them exists (e.1).

@@ -430,7 +430,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `tokio` | 6, bench | reactor runtime | `rt-multi-thread`, `fs`, `sync` |
 | `io-uring` | 6 | direct IO on Linux | optional feature `uring`; fallback is `pread`/`pwrite` on a blocking pool |
 | `crossbeam` | 4, 9, 10 | bounded channels, deque | |
-| `cudarc` | 2, 3, 6, 9 | CUDA driver: device memory, pinned host alloc, streams, copies | feature `cuda`; absent, `Tier::Device` is unconstructible |
+| `cudarc` | 2, 3, 6, 9 | CUDA driver: device memory, pinned host alloc, streams, copies | feature `cuda`; absent, `Tier::Device` is unconstructible. The dependency carries `features = ["cuda-12060"]`: cudarc's build script refuses to compile without a CUDA version feature, so `--features cuda` failed everywhere, including on hosts with no CUDA at all (PM, 2026-09-22, on the component 2 agent's report; a feature selection, not a version bump, so E2 leaves it with the PM) |
 | `pyo3` ≥ 0.28 | 5, 7, 12 | Python bindings | free-threaded default; version-specific wheels, no abi3 |
 | `pyo3-arrow` | 5, 12 | Arrow ↔ pyarrow zero-copy | |
 | `maturin` (build) | 12 | wheels | CPython 3.14, free-threaded and standard (6.6) |

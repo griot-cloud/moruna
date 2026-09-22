@@ -250,6 +250,15 @@ pub trait Allocator: Send + Sync {
     fn contains(&self, ptr: *const u8) -> bool { let _ = ptr; false }
     /// The tier of the region containing `ptr`, when `contains(ptr)`.
     fn tier_of(&self, ptr: *const u8) -> Option<Tier> { let _ = ptr; None }
+    /// Record that a component copied `bytes` of payload with the CPU, which only a
+    /// source decoding a non-layout-preserving format or a sink encoding to one may do
+    /// (G-I2), and that an adapter copied `bytes` of a kernel's non-arena output into
+    /// the arena once at the boundary (05 AD-I2). Without these the two counters in
+    /// `AllocStats` have no writer: the arena owns the struct and no other method can
+    /// raise them (added 2026-09-22 on the component 2 agent's report). Default: no-op,
+    /// so a fake that does not count is still a valid allocator.
+    fn note_payload_copy(&self, bytes: u64) { let _ = bytes; }
+    fn note_boundary_copy(&self, bytes: u64) { let _ = bytes; }
     /// True when this allocator's host tier is page-locked. A run has exactly one host
     /// tier: `PinnedHost` when true, `Host` when false; the two never coexist in one
     /// process and no move between them exists (e.1).

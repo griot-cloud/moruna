@@ -59,7 +59,7 @@ pub struct ArenaConfig {
     pub page_bytes: usize,               // from Limits
     pub huge_pages: Guarantee,           // from HostProfile; Present, Absent or Probed(_) (DS-I6), never Unknown
     pub memlock: Guarantee,
-    pub register_rdma: bool,             // feature rdma only
+    pub register_rdma: bool,             // feature rdma only; E11, never true in v1
 }
 
 pub struct Arena { /* private */ }
@@ -74,6 +74,9 @@ impl Arena {
     pub fn largest_free(&self, tier: Tier) -> u64;
     /// Registered memory region handle for RDMA peers (feature rdma); None otherwise.
     pub fn rdma_region(&self) -> Option<RdmaRegion>;
+    /// The `ArenaStats` of section j, which `Allocator::stats` has no room for.
+    /// Added 2026-09-22: section j named the struct and no method exposed it.
+    pub fn arena_stats(&self) -> ArenaStats;
 }
 
 /// Contracts d.3. The arena overrides every method, including the three with
@@ -110,13 +113,13 @@ With feature `cuda`: `cudarc::driver::{CudaDevice, CudaSlice, sys::cuMemHostRegi
 ### e.1 Region layout
 
 ```
-host region (host_bytes, aligned to 512 MiB up)
+host region (host_bytes, rounded DOWN to max(page.bytes, 64 KiB))
 ┌────────────────────────────────────────────────────────────────────┐
 │ slabs (class-assigned, grow upward) │ free │ large allocs (grow downward) │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-Slabs are 512 MiB each and are claimed from the low end when a class's free list is empty; large allocations are carved from the high end. The two meet at the `free` gap; when the gap cannot satisfy a slab claim or a large request, the allocation fails (AR-I2). A host region smaller than 512 MiB (budget below that) uses one slab equal to the whole region and serves every class from it by splitting (buddy-style) rather than by dedicated slabs; this is the small-budget mode and is selected when `host_bytes < 1 GiB`.
+The region is rounded down, never up: rounding `host_bytes` up to a 512 MiB boundary would reserve as much as 511 MiB above the host budget, and f.1 touches every page, so the process would sit above the ceiling before the first morsel was read, which G-I1 and AR-I2 forbid. The preamble wins over this document where they disagree (preamble section 9), so the region is `host_bytes` rounded down to a multiple of `max(page.bytes, 64 KiB)` (PM, 2026-09-22, on the component 2 agent's report). Slabs are 512 MiB each and are claimed from the low end when a class's free list is empty; large allocations are carved from the high end. The two meet at the `free` gap; when the gap cannot satisfy a slab claim or a large request, the allocation fails (AR-I2). A host region smaller than 512 MiB (budget below that) uses one slab equal to the whole region and serves every class from it by splitting (buddy-style) rather than by dedicated slabs; this is the small-budget mode and is selected when `host_bytes < 1 GiB`.
 
 ### e.2 Size classes
 
@@ -162,7 +165,7 @@ Per-class mutex (one per class per tier), one bump lock per region, atomics for 
 
 **Normal path.** `Arena::new` at run start; sources and placement call `alloc` per morsel; kernels' outputs are copied into arena buffers by the adapters; `release` on drop; at run end the arena is dropped, which unregisters, unpins and unmaps once.
 
-**Edge cases.** `alloc(0)`: returns a class-0 buffer with `len() == 0` (never a null pointer). `alloc` larger than the region: `Alloc` immediately. `split_at` on a large allocation: allowed; both halves release into the large table as separate blocks. Budget below 64 KiB: `Config` error at `new`. More than 8 devices: `Config` error (contracts `AllocStats` has 8 slots).
+**Edge cases.** `alloc(0)`: returns a buffer with `len() == 0` and a non-null pointer, which is charged nothing and owns no class-0 slot. It cannot own one: a release carries the buffer's own length, so a zero-length release cannot retire a slot, and `split_at(0)` would otherwise hand the zero-length half a slot that the other half is still using. It counts in `allocations_total` (PM, 2026-09-22). `alloc` larger than the region: `Alloc` immediately. `split_at` on a large allocation: allowed; both halves release into the large table as separate blocks. Budget below 64 KiB: `Config` error at `new`. More than 8 devices: `Config` error (contracts `AllocStats` has 8 slots).
 
 **Failures.** `mmap` failure: `Config` with errno. `mlock` failure under `Guarantee::Probed(true)`: fall back to `Host`, set `is_pinned = false`, log at warn; under `Present`: `Config`. `cuMemHostRegister` failure: same rule. Device `cuMemAlloc` failure: f.2. Double release (a bug): debug assertion in tests; in release builds the second release is ignored and counted in a `double_release` diagnostic counter surfaced in the report.
 
@@ -180,7 +183,7 @@ Per-class mutex (one per class per tier), one bump lock per region, atomics for 
 
 **AR-T2 budget_enforced.** Allocate until failure; sum of charged sizes ≤ region; the failure is `Alloc` with correct `in_use`. AR-I2.
 
-**AR-T3 allocated_once.** `strace`-style test using a counting shim around `mmap`/`mlock` (feature `test-shim`): exactly one `mmap` and at most one `mlock` per run. AR-I3.
+**AR-T3 allocated_once.** A counting shim around `mmap`/`mlock`: exactly one `mmap` and at most one `mlock` per run. AR-I3. The shim is two atomic counters and an accessor, always compiled rather than behind an off-by-default feature, because a feature nothing enables means the gate never runs this test and AR-I3 goes unproved (PM, 2026-09-22).
 
 **AR-T4 release_o1.** 1 M alloc/release pairs from 16 threads; p99 latency under 1 µs on the reference host (provisional elsewhere). AR-I4.
 
