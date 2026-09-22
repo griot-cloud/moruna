@@ -78,9 +78,14 @@ fn finalize(shared: &Arc<Shared>, exit: Exit) -> crate::RunOutcome {
     join_drives(shared);
 
     // f.12: on termination and cancellation the scheduler writes the final manifest itself,
-    // from the thread that drives the exit, before the checkpoint thread is stopped.
+    // from the thread that drives the exit, before the checkpoint thread is stopped, and on
+    // completion as well when `checkpoint.keep` is set. Without that last case a run shorter
+    // than one `checkpoint.interval_ms` had no tick, so `checkpoint.keep` kept an empty
+    // directory and 12 f.7's promise that the report names a manifest was false.
     checkpoint::stop(shared);
-    if shared.checkpoint_enabled() && !matches!(exit, Exit::Completed(_)) {
+    let final_manifest = shared.checkpoint_enabled()
+        && (!matches!(exit, Exit::Completed(_)) || shared.cfg.checkpoint_keep);
+    if final_manifest {
         let _ = checkpoint::checkpoint_now(shared);
     }
     let manifest = shared

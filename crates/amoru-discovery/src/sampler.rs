@@ -275,6 +275,7 @@ mod tests {
             profile: HostProfile::default(),
             host_tier: TierKind::Host,
             cgroup_path,
+            disk_budget: 0,
             notes: Vec::new(),
         }
     }

@@ -52,6 +52,7 @@ pub fn cfg() -> SchedulerConfig {
         morsel_max: 1 << 30,
         checkpoint_enabled: false,
         checkpoint_interval_ms: 50,
+        checkpoint_keep: false,
         heartbeat_interval_ms: 1000,
         resuming: false,
         node: amoru_kernel::LOCAL_NODE,

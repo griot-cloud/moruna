@@ -8,9 +8,7 @@ mod common;
 
 use amoru_kernel::{KernelHints, StageId};
 use amoru_testkit::{FakeKnobs, FakeSampler};
-use common::{
-    GIB, MIB, active_workers, config, kernel, morsel_targets, probe, read_aheads, steady,
-};
+use common::{GIB, MIB, active_workers, kernel, morsel_targets, probe, read_aheads, steady};
 
 /// A deterministic generator, so a failure is reproducible from the seed alone.
 struct Lcg(u64);
@@ -41,7 +39,7 @@ fn rc_t1_consistent_knobs() {
             .map(|_| rng.in_range(1, 200) as f64 / 10.0)
             .collect();
 
-        let cfg = config(ceiling, workers);
+        let cfg = common::config_with_baseline(ceiling, workers, baseline);
         let probe_bytes = cfg.probe_bytes;
         let mut knobs = FakeKnobs::new();
         for (at, amplification) in amplifications.iter().enumerate() {

@@ -25,8 +25,11 @@ use crate::commit::{ObjectPrefix, TMP_SUFFIX};
 use crate::stats::SinkStats;
 use crate::{Phase, host_tier, part_name, require_host};
 
-/// Room above `file_bytes` for the footer the writer appends at close (f.1).
+/// Room above the roll size for the footer the writer appends at close (f.1).
 const FOOTER_HEADROOM: u64 = 1 << 20;
+
+/// The smallest file buffer worth asking for: the arena's own smallest class (02 e.2).
+const GRANULE: u64 = 64 << 10;
 
 /// The message a buffer overflow carries out of the encoder, so `write` can turn a
 /// `std::io::Error` back into the `Sink` error section h names.
@@ -121,10 +124,17 @@ struct Pending {
 
 struct Inner {
     phase: Phase,
+    /// The schema the sink was opened with: the chain's, which for an opaque kernel is only
+    /// the source's (f.1). Used when the run writes nothing, and never for the writer.
+    declared: Option<SchemaRef>,
+    /// The output schema, adopted from the first payload that arrives (f.1).
     schema: Option<SchemaRef>,
     current: Option<Current>,
     ledger: Ledger,
     stats: SinkStats,
+    /// The byte count the open file rolls at (f.1): `file_bytes`, or the smaller buffer the
+    /// arena could serve.
+    roll_bytes: u64,
 }
 
 /// A sink that writes Arrow batches as Parquet files under a prefix (e.2).
@@ -162,10 +172,12 @@ impl ParquetSink {
             run_id: RunId([0; 16]),
             inner: Mutex::new(Inner {
                 phase: Phase::Created,
+                declared: None,
                 schema: None,
                 current: None,
                 ledger: Ledger::new(KIND),
                 stats: SinkStats::default(),
+                roll_bytes: 0,
             }),
         })
     }
@@ -186,19 +198,48 @@ impl ParquetSink {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Allocate the next file's buffer and its writer. `min_bytes` is `file_bytes`, or twice a
-    /// single oversized morsel's bytes when one is on its way in (section h).
+    /// The file buffer and the roll size it implies (f.1). A morsel that needs more than
+    /// `file_bytes` gets the buffer it needs or nothing; an ordinary file takes the largest
+    /// buffer the arena will give between `file_bytes` and `row_group_bytes`.
+    fn alloc_file_buf(&self, min_bytes: u64) -> Result<(Buffer, u64)> {
+        let floor = self.cfg.row_group_bytes.max(min_bytes).max(GRANULE);
+        let mut want = self.cfg.file_bytes.max(floor);
+        loop {
+            let capacity = want + FOOTER_HEADROOM;
+            let fits = usize::try_from(capacity).ok();
+            if let Some(capacity) = fits {
+                match self.alloc.alloc(capacity, host_tier(&*self.alloc)) {
+                    Ok(buf) => return Ok((buf, want)),
+                    // Below the floor the error stands: a sink that cannot hold one row group
+                    // cannot encode one.
+                    Err(e) if want <= floor => return Err(e),
+                    Err(_) => {}
+                }
+            } else if want <= floor {
+                return Err(AmoruError::Sink(format!(
+                    "a file buffer of {capacity} bytes does not fit this platform"
+                )));
+            }
+            want = (want / 2).max(floor);
+        }
+    }
+
+    /// Allocate the next file's buffer and its writer, and settle the byte count the file will
+    /// roll at. `min_bytes` is 0 for an ordinary file and twice a single oversized morsel's
+    /// bytes when one is on its way in (section h).
+    ///
+    /// f.1: the buffer is not `file_bytes` reserved in advance. The sink asks for
+    /// `file_bytes + footer`, halves on `Alloc` down to `row_group_bytes + footer`, and rolls
+    /// at whatever it got, so `sink.file_bytes` is an upper bound on the file and the arena's
+    /// free space is the other. A 1 GiB default that reserved a gigabyte could not open inside
+    /// any budget below about 1.2 GiB, which is most of them.
     fn open_file(&self, inner: &mut Inner, min_bytes: u64) -> Result<()> {
         let Some(schema) = inner.schema.clone() else {
             return Err(AmoruError::Sink("the sink has no schema".into()));
         };
-        let capacity = min_bytes.max(self.cfg.file_bytes) + FOOTER_HEADROOM;
-        let Ok(capacity) = usize::try_from(capacity) else {
-            return Err(AmoruError::Sink(format!(
-                "a file buffer of {capacity} bytes does not fit this platform"
-            )));
-        };
-        let buf = self.alloc.alloc(capacity, host_tier(&*self.alloc))?;
+        let (buf, roll_bytes) = self.alloc_file_buf(min_bytes)?;
+        inner.roll_bytes = roll_bytes;
+        inner.stats.roll_bytes = roll_bytes;
         let shared = Arc::new(Mutex::new(FileBuf {
             buf: Some(buf),
             used: 0,
@@ -309,10 +350,25 @@ impl ParquetSink {
                 "the parquet sink accepts a table payload".into(),
             ));
         };
-        self.check_schema(inner, &batch)?;
+        // f.1: the first payload settles the output schema; every later one is checked
+        // against it, so a kernel that appends a column is written as it is and a kernel that
+        // drifts between morsels is still an error.
+        let first = inner.schema.is_none();
+        if first {
+            inner.schema = Some(batch.schema());
+        } else {
+            self.check_schema(inner, &batch)?;
+        }
         // Validation is done: from here a failure is the encoder's or the store's, and it moves
         // the sink to `Failed` (e.1), where `finish` reports it and the committed files stand.
-        let out = self.encode_checked(inner, seq, batch, rows, bytes);
+        let out = if first {
+            match self.open_file(inner, 0) {
+                Ok(()) => self.encode_checked(inner, seq, batch, rows, bytes),
+                Err(e) => Err(e),
+            }
+        } else {
+            self.encode_checked(inner, seq, batch, rows, bytes)
+        };
         if let Err(e) = &out {
             inner.phase = Phase::Failed(e.to_string());
             inner.current = None;
@@ -335,7 +391,7 @@ impl ParquetSink {
             ),
             None => return Err(AmoruError::Sink("the sink has no open file".into())),
         };
-        let pending = if started && so_far + bytes > self.cfg.file_bytes {
+        let pending = if started && so_far + bytes > inner.roll_bytes {
             // A morsel larger than `file_bytes` gets a file of its own, sized for it (h).
             Some(self.roll(inner, bytes.saturating_mul(2), true)?)
         } else {
@@ -419,7 +475,7 @@ fn differing_field(expected: &SchemaRef, found: &SchemaRef) -> String {
             Some(other) if other == field => {}
             Some(other) => {
                 return format!(
-                    "schema drift: field {} is {:?}, the sink opened with {:?}",
+                    "schema drift: field {} is {:?}, the first morsel had {:?}",
                     field.name(),
                     other.data_type(),
                     field.data_type()
@@ -443,8 +499,11 @@ impl Sink for ParquetSink {
         };
         let mut inner = self.lock();
         inner.phase.require_created()?;
-        inner.schema = Some(Arc::clone(schema));
-        self.open_file(&mut inner, self.cfg.file_bytes)?;
+        // f.1: the schema `open` is given is the chain's, and a kernel the chain cannot see
+        // through (a Python kernel, 05 d.1) reports its input schema as its output. The real
+        // output schema is the first payload's, so the writer is built there and this one is
+        // kept only for a run that writes nothing.
+        inner.declared = Some(Arc::clone(schema));
         inner.phase = Phase::Open;
         Ok(())
     }
@@ -512,6 +571,12 @@ impl Sink for ParquetSink {
         }
         let pending = {
             let mut inner = self.lock();
+            // A run that wrote nothing never adopted a schema, so the one `open` was given is
+            // what the empty file carries (h).
+            if inner.current.is_none() {
+                inner.schema = inner.declared.clone();
+                self.open_file(&mut inner, 0)?;
+            }
             self.roll(&mut inner, 0, false)?
         };
         let Pending {
@@ -581,8 +646,9 @@ impl Sink for ParquetSink {
         }
         inner.ledger = ledger;
         inner.stats.resumed_files_removed = removed;
-        inner.schema = Some(Arc::clone(schema));
-        self.open_file(&mut inner, self.cfg.file_bytes)?;
+        // As in `open` (f.1): the writer waits for the first payload's schema, which on a
+        // resumed run is the same one the interrupted run wrote.
+        inner.declared = Some(Arc::clone(schema));
         inner.phase = Phase::Open;
         Ok(())
     }

@@ -6,7 +6,8 @@
 # an unlisted page or a placeholder with no citation under docs/
 # (tools/docs/check_docs.py, F7.1); a commit-message rule the DCO self-test
 # rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
-# when cargo-deny is installed (F6.5); a failing test; line
+# when cargo-deny is installed (F6.5); a failing test; a failing
+# examples/append_column.rs, which is the first program a user writes; line
 # coverage below AMORU_COVERAGE_MIN (default 90) in any workspace crate that has
 # instrumented lines (a stub crate with no code is not measured). Python checks
 # run once python/pyproject.toml exists (wave 5).
@@ -93,6 +94,12 @@ if [ -f Cargo.toml ]; then
   # 2026-09-22). The engine bridges need no interpreter and are always built; the
   # Python adapter needs an interpreter with pyarrow, so it runs when one is
   # configured and says so plainly when it is not.
+  # The first program a user writes, run for real: a Parquet file in, a kernel that appends a
+  # column, a Parquet file out, at a 512 MiB budget and otherwise nothing but defaults. Four
+  # defects reached a built wheel while the suite was green, and every one of them would have
+  # failed this (PM, 2026-09-22).
+  step "cargo run --example append_column (examples/append_column.rs)"
+  quiet example cargo run -p amoru-runtime --example append_column
   step "cargo test --features polars,datafusion (the engine bridges)"
   quiet test_bridges cargo test -p amoru-polars -p amoru-datafusion --features amoru-polars/polars,amoru-datafusion/datafusion
   if [ -n "${AMORU_PYTHON:-}" ]; then

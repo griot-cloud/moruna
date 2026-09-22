@@ -109,10 +109,14 @@ fn sc_t15_checkpoint_tick() {
 #[test]
 fn sc_t15_checkpoint_kernel_that_saves_nothing_terminates() {
     let _guard = manifest_lock();
+    // The latency is what makes the test deterministic: without it the run could finish
+    // before the first checkpoint tick, and then nothing asks the kernel to save anything.
+    // It was flaky on `main` for that reason (observed 2026-09-22).
     let kernel = Arc::new(
         StatefulKernel::new(1)
             .checkpointing()
-            .checkpoint_returns_none(),
+            .checkpoint_returns_none()
+            .latency(Duration::from_millis(5)),
     );
     let rig = RigBuilder::new()
         .cfg(|cfg| {

@@ -224,7 +224,13 @@ impl PlacementEngine {
             host_tier: self.host_tier,
             water,
             bytes,
-            staging_enabled: queue.staging_enabled,
+            // A disk budget of zero means the run has no disk tier at all (preamble section 5:
+            // "0 disables the disk tier"), so no queue may plan a demotion to it. Without this
+            // the planner demoted, the segment roll refused the charge, and a run on a host
+            // with no writable staging directory died mid pass with `Staging` instead of
+            // running without spill (PM, 2026-09-22; PL-I7, f.2 step 4).
+            staging_enabled: queue.staging_enabled
+                && self.disk_budget.load(std::sync::atomic::Ordering::Acquire) > 0,
             window: queue.promotion_window,
         }
     }

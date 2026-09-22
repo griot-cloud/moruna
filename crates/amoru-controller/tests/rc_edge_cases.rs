@@ -16,13 +16,14 @@ use common::{
 /// is a configuration error at `prepare`, not a run that fails on morsel forty thousand.
 #[test]
 fn rc_h_budget_too_small_is_a_config_error() {
-    let mut cfg = config(256 * MIB, 4);
+    // A baseline that takes almost the whole ceiling, so the arena the facade could size is
+    // smaller than two morsels (11 f.1).
+    let mut cfg = common::config_with_baseline(256 * MIB, 4, 240 * MIB);
     cfg.limits = limits(256 * MIB);
     let rig = common::Rig::new(
         cfg,
         vec![kernel(1, KernelHints::default())],
         FakeKnobs::new(),
-        // A baseline that takes almost the whole ceiling.
         FakeSampler::new().scripted(steady(240 * MIB, 2)),
     );
     let error = rig

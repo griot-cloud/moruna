@@ -10,7 +10,7 @@ mod common;
 
 use amoru_kernel::{KernelHints, SchedulerStats, StageStats};
 use amoru_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, config, morsel_targets, probe, record, sample, stateful_kernel};
+use common::{GIB, MIB, morsel_targets, probe, record, sample, stateful_kernel};
 
 const CEILING: u64 = 8 * GIB;
 /// What one instance holds when the first record arrives. It grows by half again on every
@@ -22,11 +22,11 @@ const INITIAL_STATE: u64 = 64 * MIB;
 
 #[test]
 fn rc_t16_state_growth() {
-    let cfg = config(CEILING, 4);
+    let baseline = 400 * MIB;
+    let cfg = common::config_with_baseline(CEILING, 4, baseline);
     let probe_bytes = cfg.probe_bytes;
     let morsel_min = cfg.morsel_min;
     let reserve = (CEILING as f64 * f64::from(cfg.reserve_fraction)) as u64;
-    let baseline = 400 * MIB;
     let host_budget = CEILING - baseline - reserve;
     // Anonymous memory rises with the state, which is what the memory rows of f.6 look at.
     let over_the_line = CEILING - reserve / 2 + MIB;

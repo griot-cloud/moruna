@@ -70,7 +70,23 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
             seeded += 1;
             continue;
         };
-        let result = ctl.peers().prober.probe(stage, bytes)?;
+        let result = match ctl.peers().prober.probe(stage, bytes) {
+            Ok(result) => result,
+            // f.14: a resumed run whose plan the interrupted run consumed has nothing left to
+            // probe with. That is not a failure of this run: seed the stage as f.2 would
+            // without a probe and say so. On a fresh run the error stands.
+            Err(e) if resuming && is_exhausted_plan(&e) => {
+                let mut state = ctl.held();
+                state.stages[at].seeded = true;
+                state.note(format!(
+                    "resumed: stage {stage} could not be probed, the plan is exhausted; seeded \
+                     from hints"
+                ));
+                seeded += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         probed += 1;
         {
             let mut state = ctl.held();
@@ -101,6 +117,13 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
         profile::write_all(ctl);
     }
     Ok(())
+}
+
+/// Whether a probe failed because the source plan has nothing left to read (f.14). The
+/// scheduler's helper answers with this `Plan` error when the cursor is at the end of the plan
+/// (SC f.9); a resumed run reaches it whenever the interrupted run consumed the plan.
+fn is_exhausted_plan(e: &amoru_kernel::AmoruError) -> bool {
+    matches!(e, amoru_kernel::AmoruError::Plan(msg) if msg.contains("nothing to probe with"))
 }
 
 /// Read the profile store once, per stage (e.3). A file that cannot be parsed is ignored with

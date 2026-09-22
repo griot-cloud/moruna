@@ -228,7 +228,7 @@ Three exits: completion (source exhausted, every queue drained, sink finished), 
 
 ### 4.4 Run lifecycle
 
-The order in which the facade builds and starts the components is fixed, because the baseline sample, the probes and the instance pool depend on it. A fresh run: discover, arena, reactor, trace, sources and sinks built, kernels built, placement, `Scheduler::new` (validates the chain, opens the sink, spawns the workers parked; the drives and the checkpoint thread are not started), `scheduler.init_instances()` (runs `Kernel::init` eagerly for every instance up to `max_instances` of every stateful stage, on the worker that will own it; a stateless stage has no instances), controller `prepare` (the baseline is sampled here, after every `init`), controller `probe_all` (through `Prober`), controller `start`, `scheduler.run` (starts the drives and the checkpoint thread, enters `Running`), controller `stop`, trace `finish` by the facade, report. There is no lazy instance creation: the pool is full before the first probe.
+The order in which the facade builds and starts the components is fixed, because the baseline sample, the probes and the instance pool depend on it. A fresh run: discover, arena, reactor, trace, sources and sinks built, kernels built, placement, `Scheduler::new` (validates the chain, opens the sink, spawns the workers parked; the drives and the checkpoint thread are not started), `scheduler.init_instances()` (runs `Kernel::init` eagerly for every instance up to `max_instances` of every stateful stage, on the worker that will own it; a stateless stage has no instances), controller `prepare` (the budgets are computed here, from the arena's capacity and the baseline the facade sampled before the arena existed; 11 f.1, 02 f.1), controller `probe_all` (through `Prober`), controller `start`, `scheduler.run` (starts the drives and the checkpoint thread, enters `Running`), controller `stop`, trace `finish` by the facade, report. There is no lazy instance creation: the pool is full before the first probe.
 
 ```mermaid
 sequenceDiagram
@@ -245,7 +245,8 @@ sequenceDiagram
   participant Sink
   Facade->>Discovery: discover(input) returns Discovered (Limits, HostProfile)
   Facade->>Discovery: Sampler::new(&Discovered)
-  Facade->>Arena: Arena::new(cfg)
+  Facade->>Discovery: Sampler::sample (the baseline, before the arena exists)
+  Facade->>Arena: Arena::new(cfg) sized ceiling - baseline - reserve - kernel state
   Facade->>Reactor: Reactor::new(cfg, alloc)
   Facade->>Trace: TraceWriter::start(cfg)
   Facade->>Facade: build sources, sinks, kernels

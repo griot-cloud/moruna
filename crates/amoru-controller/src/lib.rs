@@ -128,6 +128,17 @@ pub struct ControllerConfig {
     pub profiles_dir: Option<std::path::PathBuf>,
     /// `budget.disk`, passed through to the placement engine's staging cap.
     pub disk_budget: u64,
+    /// The arena's host capacity, which is the controller's whole host allowance (f.1).
+    ///
+    /// The facade sizes the arena at `ceiling - baseline - reserve - expected kernel state`
+    /// and passes the same number here, so the bytes the controller believes it may hold are
+    /// the bytes the arena can actually give it. Subtracting the baseline again would charge
+    /// the arena twice: 02 f.1 touches every page of the region at `new`, so the arena is part
+    /// of the process's anonymous memory from the moment it exists.
+    pub arena_bytes: u64,
+    /// The process's anonymous memory sampled *before* the arena was created (f.1). Reported
+    /// in `Budgets` and never subtracted from `arena_bytes`.
+    pub baseline_bytes: u64,
     /// `checkpoint.enabled`; turns on the periodic profile writes of f.9.
     pub checkpoint_enabled: bool,
     /// `checkpoint.interval_ms`; the cadence of those writes.
@@ -165,6 +176,8 @@ impl Default for ControllerConfig {
             fallback_error_ratio: 2.0,
             profiles_dir: None,
             disk_budget: 0,
+            arena_bytes: 0,
+            baseline_bytes: 0,
             checkpoint_enabled: false,
             checkpoint_interval_ms: 5000,
         }
@@ -191,11 +204,12 @@ pub struct KernelInfo {
 /// The budget arithmetic of f.1, as `prepare` computed it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Budgets {
-    /// `memory_ceiling - baseline - reserve`: the bytes the runtime may hold on the host.
+    /// The arena's capacity: the bytes the runtime may hold on the host (f.1).
     pub host: u64,
     /// Per device, `0.9 x free_bytes` measured after every `Kernel::init`.
     pub device: [u64; 8],
-    /// Anonymous host bytes of the process after every `init` and before the first morsel.
+    /// Anonymous host bytes of the process before the arena was created (f.1). Reported, not
+    /// subtracted: the arena's capacity already has it taken out.
     pub baseline: u64,
     /// `reserve_fraction x memory_ceiling`: the headroom never allocated.
     pub reserve: u64,
@@ -421,12 +435,21 @@ impl ControllerState {
         }
     }
 
-    /// The host ceiling less the reserve: the line a breach is measured against (RC-I4).
+    /// The line a breach is measured against (RC-I4): the arena, plus what the process already
+    /// held before it, plus the reserve.
+    ///
+    /// The arena is `ceiling - baseline - reserve - kernel state` and 02 f.1 touches every page
+    /// of it at `new` (f.1), so `baseline + arena` is the process's resting anonymous memory
+    /// and a line at `ceiling - reserve` would sit exactly on it: every run would breach on its
+    /// first record. The reserve is the allowance for what a kernel allocates outside the
+    /// arena, so a breach is the reserve being spent, and the expected kernel state is what is
+    /// left between that and the ceiling.
     pub(crate) fn breach_line(&self) -> u64 {
-        self.cfg
-            .limits
-            .memory_ceiling
-            .saturating_sub(self.budgets.reserve)
+        self.budgets
+            .baseline
+            .saturating_add(self.budgets.host)
+            .saturating_add(self.budgets.reserve)
+            .min(self.cfg.limits.memory_ceiling)
     }
 
     /// The hints of one stage, which seed amplification and state before anything is measured.

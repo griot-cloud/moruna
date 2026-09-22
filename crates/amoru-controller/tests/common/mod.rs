@@ -61,11 +61,23 @@ pub fn plan() -> PlanSummary {
 }
 
 /// The preamble section 5 defaults, with the limits, the plan and the worker count a test sets.
+/// The arena is sized as the facade sizes it (12 f.1): the ceiling less the reserve, with a
+/// baseline of nothing. `config_with_baseline` is the variant for a test that scripts one.
 pub fn config(ceiling: u64, workers: u16) -> ControllerConfig {
+    config_with_baseline(ceiling, workers, 0)
+}
+
+/// `config` for a test whose sampler reports `baseline` anonymous bytes before the arena: the
+/// arena is `ceiling - baseline - reserve` and that is the controller's whole allowance
+/// (11 f.1).
+pub fn config_with_baseline(ceiling: u64, workers: u16, baseline: u64) -> ControllerConfig {
+    let reserve = (ceiling as f64 * f64::from(ControllerConfig::default().reserve_fraction)) as u64;
     ControllerConfig {
         limits: limits(ceiling),
         plan: plan(),
         workers_max: workers,
+        arena_bytes: ceiling.saturating_sub(baseline).saturating_sub(reserve),
+        baseline_bytes: baseline,
         // A tick a test never waits for: every test drives `tick_once` itself, so the thread
         // `start` spawns must not race it.
         tick_ms: 3_600_000,
@@ -241,6 +253,8 @@ pub fn staging_triggers(writes: &[Knob]) -> Vec<(StageId, bool)> {
 pub struct RecordingProber {
     inner: FakeKnobs,
     calls: Mutex<Vec<(StageId, u64)>>,
+    /// When set, every probe fails with this `Plan` message instead of answering.
+    fails_with: Option<String>,
 }
 
 impl RecordingProber {
@@ -248,6 +262,17 @@ impl RecordingProber {
         Arc::new(RecordingProber {
             inner,
             calls: Mutex::new(Vec::new()),
+            fails_with: None,
+        })
+    }
+
+    /// A prober that refuses every probe with a `Plan` error carrying `msg`, which is what the
+    /// scheduler's helper answers when the source plan has nothing left to read (SC f.9).
+    pub fn failing(inner: FakeKnobs, msg: &str) -> Arc<RecordingProber> {
+        Arc::new(RecordingProber {
+            inner,
+            calls: Mutex::new(Vec::new()),
+            fails_with: Some(msg.to_string()),
         })
     }
 
@@ -263,6 +288,9 @@ impl Prober for RecordingProber {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((stage, bytes));
+        if let Some(msg) = &self.fails_with {
+            return Err(amoru_kernel::AmoruError::Plan(msg.clone()));
+        }
         self.inner.probe(stage, bytes)
     }
 }
@@ -287,9 +315,21 @@ impl Rig {
         knobs: FakeKnobs,
         sampler: FakeSampler,
     ) -> Rig {
+        let prober = RecordingProber::new(knobs.clone());
+        Rig::with_prober(cfg, kernels, knobs, sampler, prober)
+    }
+
+    /// `new` with a `Prober` of the test's own, for a test that needs a probe to fail
+    /// (`FakeKnobs` only ever succeeds).
+    pub fn with_prober(
+        cfg: ControllerConfig,
+        kernels: Vec<KernelInfo>,
+        knobs: FakeKnobs,
+        sampler: FakeSampler,
+        prober: Arc<RecordingProber>,
+    ) -> Rig {
         let trace = FakeTrace::new();
         let placement = FakePlacement::new();
-        let prober = RecordingProber::new(knobs.clone());
         let controller = Controller::new(
             cfg,
             Arc::new(knobs.clone()),

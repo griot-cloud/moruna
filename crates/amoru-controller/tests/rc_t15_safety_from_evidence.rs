@@ -55,7 +55,9 @@ fn implied_safety(target: u64) -> f64 {
 
 fn target_with(profile: Option<(f64, u64, f64)>, probed: f64) -> u64 {
     let scratch = Scratch::new("safety");
-    let mut cfg = config(CEILING, WORKERS);
+    // The arena the facade would size for this ceiling and this baseline, which is the
+    // controller's whole allowance (11 f.1).
+    let mut cfg = common::config_with_baseline(CEILING, WORKERS, BASELINE);
     if let Some((p95, samples, variance)) = profile {
         write_profile(&profile_path(scratch.path()), p95, samples, variance);
         cfg.profiles_dir = Some(scratch.path().to_path_buf());

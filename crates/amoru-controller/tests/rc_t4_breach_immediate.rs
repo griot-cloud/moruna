@@ -7,16 +7,18 @@ mod common;
 
 use amoru_kernel::KernelHints;
 use amoru_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, config, kernel, morsel_targets, probe, record, steady};
+use common::{GIB, MIB, kernel, morsel_targets, probe, record, steady};
 
 #[test]
 fn rc_t4_breach_immediate() {
-    let cfg = config(8 * GIB, 1);
+    let cfg = common::config_with_baseline(8 * GIB, 1, 400 * MIB);
     let probe_bytes = cfg.probe_bytes;
     let morsel_min = cfg.morsel_min;
     let ceiling = cfg.limits.memory_ceiling;
     let reserve = (ceiling as f64 * f64::from(cfg.reserve_fraction)) as u64;
-    let line = ceiling - reserve;
+    // f.7: the breach line is what the arena and the process already hold plus the reserve,
+    // capped at the ceiling; the arena itself sits a whole reserve below it.
+    let line = (cfg.baseline_bytes + cfg.arena_bytes + reserve).min(ceiling);
     let rig = common::Rig::new(
         cfg,
         vec![kernel(1, KernelHints::default())],

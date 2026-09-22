@@ -40,6 +40,9 @@ pub struct SchedulerConfig {
     pub checkpoint_enabled: bool,
     /// `checkpoint.interval_ms`.
     pub checkpoint_interval_ms: u64,
+    /// `checkpoint.keep`: the run directory and the final manifest survive a completed run, so
+    /// the scheduler writes a final manifest on completion as well (f.12).
+    pub checkpoint_keep: bool,
     /// How often the heartbeat table is checked (f.14).
     pub heartbeat_interval_ms: u64,
     /// True when the facade will call `apply_resume_point`; `new` then skips `open`.
@@ -61,6 +64,7 @@ impl Default for SchedulerConfig {
             morsel_max: 512 * 1024 * 1024,
             checkpoint_enabled: false,
             checkpoint_interval_ms: 5000,
+            checkpoint_keep: false,
             heartbeat_interval_ms: 1000,
             resuming: false,
             node: amoru_kernel::LOCAL_NODE,
