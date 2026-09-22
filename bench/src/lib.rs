@@ -19,6 +19,11 @@
 //!    configured.
 //! 3. Every run names the machine and the generator version in its output, as
 //!    preamble 6.7 asks of a benchmark.
+//!
+//! The second wave 1 deliverable, the benchmark kernels, is `kernels`: the six
+//! preamble 6.5 names, each a struct whose `apply` has the shape contracts d.7
+//! gives `Kernel::apply`, with the amplification each declares proved against a
+//! generated dataset in `bench/tests/kernels.rs`.
 
 #![deny(missing_docs)]
 
@@ -28,6 +33,7 @@ pub mod dataset;
 pub mod dtype;
 pub mod error;
 pub mod host;
+pub mod kernels;
 pub mod manifest;
 pub mod parquet_out;
 pub mod rng;
@@ -67,6 +73,24 @@ pub fn execute(plan: &Plan, out: &mut dyn Write) -> Result<()> {
                     dataset.detail()
                 )
                 .map_err(stdout_error)?;
+            }
+        }
+        Action::Measure(run) => {
+            let measurement = kernels::runner::measure(
+                &run.kernel,
+                &run.dataset,
+                &plan.out,
+                run.weights.as_deref(),
+            )?;
+            writeln!(out, "  {}", measurement.line()).map_err(stdout_error)?;
+            if !measurement.in_band() {
+                return Err(error::BenchError::Kernel {
+                    kernel: kernels::runner::band_name(&run.kernel),
+                    detail: format!(
+                        "measured amplification {:.3} is outside the declared band",
+                        measurement.amplification()
+                    ),
+                });
             }
         }
         Action::Write(datasets) => {
@@ -214,6 +238,7 @@ mod tests {
             "wide-mixed",
             "small-row-groups",
             "embed-weights",
+            "embed-weights-numeric",
             "embed-weights-half",
             "embed-weights-amb1",
             "score-bias-amb1",

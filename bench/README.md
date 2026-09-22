@@ -7,9 +7,10 @@ in two parts. This document covers the part that exists today.
   controllable row count, column mix, null ratio and row group size, and
   safetensors and `AMB1` aligned binary tensors of controllable shape and dtype,
   to a local directory and to an S3 compatible store.
-- Wave 1 (next): the kernels (identity, normalise, tokenise-explode,
-  adversarial, wide-intermediate, embed-score; torch-score once a reference GPU
-  host exists, E1).
+- Wave 1 (here now): the kernels (identity, normalise, tokenise-explode,
+  adversarial, wide-intermediate, embed-score), in `bench/src/kernels/` and
+  `bench/python/`. torch-score is not built: it needs the reference GPU host and
+  none exists (escalation E1, decided 2026-09-22).
 - Wave 5: the hand tuned baselines (what S3 is measured against) and the engine
   baseline (the same kernel as a user defined function inside Polars and DuckDB),
   reported beside every benchmark and never a gate.
@@ -85,7 +86,8 @@ in total.
 | `nulls-heavy` | 500,000 rows, every column type, 35 percent nulls | the null path of every kernel | `amoru-bench dataset nulls-heavy --out bench/data` |
 | `wide-mixed` | 200,000 rows, 74 columns, snappy | wide-intermediate (about 20) | `amoru-bench dataset wide-mixed --out bench/data` |
 | `small-row-groups` | 100,000 rows, 1024 rows per row group (98 row groups) | adversarial | `amoru-bench dataset small-row-groups --out bench/data` |
-| `embed-weights` | safetensors: `weight` f32 [128,64], `bias` f32 [64] | embed-score weights | `amoru-bench dataset embed-weights --out bench/data` |
+| `embed-weights` | safetensors: `weight` f32 [128,64], `bias` f32 [64] | a 128 wide feature vector | `amoru-bench dataset embed-weights --out bench/data` |
+| `embed-weights-numeric` | safetensors: `weight` f32 [18,64], `bias` f32 [64] | embed-score over `numeric-embed`, whose 2 i64 and 16 f64 make 18 numeric columns | `amoru-bench dataset embed-weights-numeric --out bench/data` |
 | `embed-weights-half` | safetensors: `weight` f16 [256,128], `bias` bf16 [128] | half precision weights | `amoru-bench dataset embed-weights-half --out bench/data` |
 | `embed-weights-amb1` | `AMB1` f32 [128,64] | `TensorSource` | `amoru-bench dataset embed-weights-amb1 --out bench/data` |
 | `score-bias-amb1` | `AMB1` f64 [64] | `TensorSource` | `amoru-bench dataset score-bias-amb1 --out bench/data` |
@@ -160,9 +162,137 @@ AWS_ACCESS_KEY_ID=amoru AWS_SECRET_ACCESS_KEY=amoru-ci-secret \
   header test is written against the table in that section rather than against
   another implementation.
 
+## The kernels
+
+Preamble section 6.5 names seven kernels and describes each by its amplification
+class, which is output bytes over input bytes. Six are here; torch-score is not,
+because it is a stateful GPU model and escalation E1 records that no GPU host
+exists (decided 2026-09-22). Each kernel is a struct in `bench/src/kernels/`
+implementing the crate local `BenchKernel` trait, whose `init` and `apply` have
+the shape `architecture/sdd/01-contracts.md` section d.7 gives `Kernel`, so the
+wave 4 facade can wrap them unchanged; `BenchPayload` mirrors that document's
+section d.4 `Payload`, and which Arrow types count as numeric is its section e.3.
+
+| Kernel | Language | Amplification class (preamble 6.5) | Declared band | Dataset | Run it |
+|---|---|---|---|---|---|
+| `identity` | Rust | about 1 | 1.00 exactly | `identity-mixed` | `amoru-bench kernel identity --out bench/data` |
+| `normalise` | Rust | about 1.5 | 1.25 to 1.75 | `text-normalise` | `amoru-bench kernel normalise --out bench/data` |
+| `tokenise-explode` | Rust | 5 to 10 | 5.00 to 10.00 | `text-explode` | `amoru-bench kernel tokenise-explode --out bench/data` |
+| `adversarial` | Rust | jumps 4x at the midpoint | 1.00 before, 4.00 after, 2.40 to 2.60 over the whole dataset | `small-row-groups` | `amoru-bench kernel adversarial --out bench/data` |
+| `wide-intermediate` | Python, NumPy | about 20, releases the GIL | 15.0 to 25.0 | `wide-mixed` | see "The Python kernel" below |
+| `embed-score` | Rust | not stated; `1 + out_dim / in_dim` on an all numeric table | that figure plus or minus a tenth | `numeric-embed` with `embed-weights-numeric` | `amoru-bench kernel embed-score --out bench/data` |
+| `torch-score` | not built | stateful GPU model, weights via `TensorSource` | | | needs the reference GPU host (E1) |
+
+Each kernel declares its own band in `hints()`, which is the local mirror of
+contracts d.7's `KernelHints`, and `bench/tests/kernels.rs` reads a generated
+dataset back through the Parquet reader, runs the kernel over it one morsel at a
+time and asserts the measured ratio falls inside that band. `amoru-bench kernel`
+does the same thing from the command line and fails when the ratio leaves the
+band. Write the data first:
+
+```
+cargo run --release -p amoru-bench -- suite --scale small --local-only --out bench/data
+cargo run --release -p amoru-bench -- kernel tokenise-explode --out bench/data
+```
+
+Every run opens with the machine, because a benchmark figure without its host is
+not a figure (preamble 6.7). A figure taken anywhere but the reference host of
+escalation E1 is provisional and the printed host is what says so.
+
+`--dataset <name>` runs a kernel over a dataset other than its own, and
+`--weights <file>` chooses the safetensors file `embed-score` loads.
+
+### What each one does
+
+- **identity** returns its input payload unchanged, so the ratio is exactly one
+  and what a run measures is the runtime and the reader.
+- **normalise** appends `text_0_normalised`: the text of `text_0` lowercased,
+  with runs of whitespace collapsed to one space and the punctuation stripped
+  from each end of each token. A null stays null. Preamble 6.5 calls this
+  kernel "Rust regex over text", but the preamble's dependency table (6.2) holds
+  no regex crate and adding one is escalation E2, so the pass is hand rolled in
+  `normalise_text`, one pass over `&str`. That is also the better benchmark: a
+  regex engine's literal prefilters, DFA cache and allocation behaviour would sit
+  between the measurement and the thing measured. A later benchmark that wants to
+  compare the runtime against a user's regex workload rather than against text
+  work in general should raise `regex` for `bench/` as an E2 item.
+- **tokenise-explode** splits `text_0` on whitespace and emits one row per token,
+  carrying every other input column and adding `row_id`, `token_index`,
+  `token_start`, `token_end` and `token`. `row_id` counts input rows across
+  morsels, so it lives in the kernel's state.
+- **adversarial** is told the dataset's row count when it is built. Its state
+  counts input rows; a row below `rows / 2` is emitted once and a row at or above
+  it four times. The jump is therefore a property of the data seen and of nothing
+  else: the same dataset fed as one morsel, as a thousand, or one row at a time
+  gives the same output rows in the same order, which is what
+  `the_adversarial_jump_lands_on_the_midpoint_row_at_every_morsel_size` proves.
+  This is the kernel criterion S6 is measured against.
+- **embed-score** takes every numeric column of the input in schema order, forms
+  the `rows x in_dim` matrix they make, multiplies it by the `in_dim x out_dim`
+  weight, adds the bias and appends the result as `score`: a `Float64` column
+  when `out_dim` is one and a `FixedSizeList(Float64, out_dim)` above it, which
+  is the mapping of contracts e.3. Weights come from the generator's own
+  safetensors files and every dtype it writes is widened to f64, `f16` and
+  `bf16` included, so `embed-weights-half` loads too. A null in a numeric column
+  is an error, as it is for `Payload::as_tensor`.
+
+### The Python kernel
+
+`wide-intermediate` is the one of the six that is not Rust, because preamble 6.5
+asks for one that is not: the suite needs a kernel whose cost and whose GIL
+behaviour are a Python extension's. Its body is
+`bench/python/amoru_bench_kernels/wide_intermediate.py`, which takes a morsel as
+a mapping of column name to NumPy array, stacks the numeric columns into an
+`n x k` float64 matrix and returns the degree two expansion of each row: the
+upper triangle, diagonal included, of the row's outer product with itself, so `k`
+features become `k (k + 1) / 2`. On `wide-mixed` that is 64 numeric columns to
+2080 values, and the amplification is about 20.
+
+**Which call releases the GIL:** `numpy.matmul`, applied in `expand` to the
+stacked `n x k x 1` by `n x 1 x k` batch. NumPy's matmul is a generalised ufunc
+whose inner loop runs between `NPY_BEGIN_THREADS` and `NPY_END_THREADS` and
+dispatches to the BLAS `dgemm` for float64, so the interpreter lock is not held
+while the arithmetic runs. `test_the_expansion_releases_the_gil` measures it: a
+monitor thread keeps being scheduled throughout the call, and the longest gap
+between two of its observations stays well under the call's own duration, which
+could not happen if the lock were held for the call.
+
+**The Rust side does not run it.** `bench/src/kernels/wide_intermediate.rs`
+declares the kernel and its hints and returns `BenchError::NotWired` from
+`apply`, naming the module that holds the body. The thing that would run it is
+the runtime's Python adapter, component 5, which does not exist yet
+(`crates/amoru-adapters` is a wave 0 stub and `pyo3` enters the workspace through
+it). A binding written here would be a second Python path beside the one
+component 5 is specified to build, measured in wave 5 against a baseline it does
+not share; an honest refusal is smaller and fails where a reader looks.
+
+**Running its tests**, from `bench/python`, in one line:
+
+```
+uv run --python 3.14 --with numpy --with pyarrow --with pytest pytest
+```
+
+and again with `--python 3.14t` for the free threaded interpreter. Both are
+expected to pass. There is no `python/pyproject.toml` in the repository yet (it
+arrives in wave 5 with the Python package) and this suite adds no repository wide
+pytest configuration: `bench/python/conftest.py` puts that directory on
+`sys.path` and nothing else. `uv run --python 3.14` resolves to whichever 3.14
+interpreter the host offers first, so on a host that has both, name the GIL build
+by its path to be sure which one ran; the test
+`test_the_interpreter_reports_its_gil_state` prints which it was under `-s`.
+
+The amplification test over the generated file needs the file. Write the suite
+first, as above; with `bench/data/wide-mixed.parquet` absent that one test skips
+with its reason printed, the same rule the generator's S3 test follows, and the
+test over a `wide-mixed` shaped morsel built in the test runs everywhere.
+
+
 ## Tests
 
-`cargo test -p amoru-bench` covers determinism by seed, the null ratio and the
+`cargo test -p amoru-bench` covers the kernels in `bench/tests/kernels.rs` (every
+declared amplification measured on its dataset, the adversarial jump at six
+morsel sizes, determinism, and the weights `embed-score` will and will not
+accept) and, for the generator, determinism by seed, the null ratio and the
 text length statistics read back out of the written file, the row group size, the
 `AMB1` header byte for byte against contracts e.4, and the safetensors round trip
 through the `safetensors` crate. The S3 test is skipped, with its reason printed,

@@ -9,11 +9,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Amoru benchmark data generator (preamble 6.5)"
+description = "Amoru benchmark data generator and kernels (preamble 6.5)"
+# One integration test binary rather than one per file under tests/. Each such
+# binary links the whole of arrow, parquet and object_store, and under
+# `cargo llvm-cov` each is instrumented as well, so every extra one costs about
+# ninety megabytes of build output and one more concurrent link. The generator's
+# tests and the kernels' tests are modules of `tests/main.rs` instead.
+autotests = false
 
 [lib]
 name = "amoru_bench"
 path = "src/lib.rs"
+
+[[test]]
+name = "bench"
+path = "tests/main.rs"
 
 [[bin]]
 name = "amoru-bench"

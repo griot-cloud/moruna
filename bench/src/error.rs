@@ -45,6 +45,25 @@ pub enum BenchError {
     /// The tokio runtime that drives the object store could not be built.
     #[error("runtime: {0}")]
     Runtime(std::io::Error),
+    /// A kernel refused its input: the payload arm, a column it needs, a dtype
+    /// it cannot read or a shape that does not match its weights.
+    #[error("kernel {kernel}: {detail}")]
+    Kernel {
+        /// The kernel's name as preamble 6.5 gives it.
+        kernel: &'static str,
+        /// What the kernel wanted and what it was given.
+        detail: String,
+    },
+    /// A kernel exists but the binding that would let this crate call it does
+    /// not. The one case is `wide-intermediate`, whose body is Python and whose
+    /// caller is the runtime's Python adapter (component 5), not yet built.
+    #[error("kernel {kernel} is not wired: {detail}")]
+    NotWired {
+        /// The kernel's name as preamble 6.5 gives it.
+        kernel: &'static str,
+        /// What is missing and where the body of the kernel lives meanwhile.
+        detail: String,
+    },
 }
 
 impl BenchError {
@@ -89,6 +108,28 @@ mod tests {
                 .to_string()
                 .contains("ndim 9")
         );
+    }
+
+    #[test]
+    fn a_kernel_error_names_the_kernel() {
+        let err = BenchError::Kernel {
+            kernel: "embed-score",
+            detail: "weight has 128 rows, the input has 18 numeric columns".to_string(),
+        };
+        let text = err.to_string();
+        assert!(text.starts_with("kernel embed-score:"), "{text}");
+        assert!(text.contains("18 numeric columns"), "{text}");
+    }
+
+    #[test]
+    fn a_not_wired_error_says_what_is_missing() {
+        let err = BenchError::NotWired {
+            kernel: "wide-intermediate",
+            detail: "the Python adapter (component 5) does not exist yet".to_string(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("is not wired"), "{text}");
+        assert!(text.contains("component 5"), "{text}");
     }
 
     #[test]

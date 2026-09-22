@@ -31,6 +31,20 @@ pub enum Action {
     List,
     /// Write these datasets.
     Write(Vec<Dataset>),
+    /// Run one kernel over one already written dataset and report its
+    /// amplification (preamble 6.5).
+    Measure(KernelRun),
+}
+
+/// One run of one kernel over one dataset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KernelRun {
+    /// The kernel's name, one of `kernels::KERNEL_NAMES`.
+    pub kernel: String,
+    /// The dataset it reads, without the `.parquet` suffix.
+    pub dataset: String,
+    /// The safetensors weights file, which `embed-score` needs.
+    pub weights: Option<PathBuf>,
 }
 
 /// A parsed command line.
@@ -62,6 +76,8 @@ commands:
   parquet                   write one Parquet file from the options below
   safetensors               write one safetensors file from the options below
   amb1                      write one AMB1 tensor file (contracts e.4)
+  kernel <name>             run one kernel over its dataset and report the
+                            amplification; names: {kernels}
   version                   print the generator version and this machine
   help                      print this text
 
@@ -85,6 +101,12 @@ parquet options:
   --row-group-rows <n>      rows per row group (default 8192)
   --compression <codec>     uncompressed or snappy (default uncompressed)
 
+kernel options:
+  --dataset <name>          the dataset to read (default: the one bench/README.md
+                            pairs with the kernel)
+  --weights <file>          the safetensors weights embed-score loads (default
+                            <out>/{weights}.safetensors)
+
 tensor options (safetensors and amb1):
   --dtype <name>            one of i8 i16 i32 i64 u8 u16 u32 u64 f16 bf16 f32 f64 bool
   --shape <d0,d1,..>        up to 8 dimensions; empty is a scalar
@@ -92,7 +114,9 @@ tensor options (safetensors and amb1):
 
 The S3 compatible half writes the same files to {}, under AMORU_S3_PREFIX
 (default bench). With any of those unset the upload is skipped with a note.",
-        crate::s3::REQUIRED.join(", ")
+        crate::s3::REQUIRED.join(", "),
+        kernels = crate::kernels::KERNEL_NAMES.join(", "),
+        weights = crate::kernels::runner::DEFAULT_WEIGHTS,
     )
 }
 
@@ -324,6 +348,32 @@ pub fn parse(args: &[String]) -> Result<Plan> {
                 kind: DatasetKind::Amb1(spec),
             }])
         }
+        "kernel" => {
+            if flags.positionals.len() != 1 {
+                return Err(BenchError::Usage(format!(
+                    "kernel takes exactly one name, one of: {}",
+                    crate::kernels::KERNEL_NAMES.join(", ")
+                )));
+            }
+            let kernel = flags.positionals.remove(0);
+            let dataset = match flags.take("dataset")? {
+                Some(dataset) => dataset,
+                None => crate::kernels::runner::default_dataset(&kernel)?.to_string(),
+            };
+            let weights = match flags.take("weights")? {
+                Some(path) => Some(PathBuf::from(path)),
+                None if kernel == "embed-score" => Some(out.join(format!(
+                    "{}.safetensors",
+                    crate::kernels::runner::DEFAULT_WEIGHTS
+                ))),
+                None => None,
+            };
+            Action::Measure(KernelRun {
+                kernel,
+                dataset,
+                weights,
+            })
+        }
         other => {
             return Err(BenchError::Usage(format!(
                 "unknown command {other}; run amoru-bench help"
@@ -382,6 +432,54 @@ mod tests {
     }
 
     #[test]
+    fn the_kernel_command_names_a_kernel_its_dataset_and_its_weights() {
+        let run = match plan("kernel identity").action {
+            Action::Measure(run) => run,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(run.kernel, "identity");
+        assert_eq!(run.dataset, "identity-mixed");
+        assert_eq!(run.weights, None);
+
+        // embed-score is the one kernel that needs weights, so it gets the
+        // default path under --out when none is given.
+        let run = match plan("kernel embed-score --out /tmp/x").action {
+            Action::Measure(run) => run,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(run.dataset, "numeric-embed");
+        assert_eq!(
+            run.weights,
+            Some(PathBuf::from(format!(
+                "/tmp/x/{}.safetensors",
+                crate::kernels::runner::DEFAULT_WEIGHTS
+            )))
+        );
+
+        // Both overrides are read.
+        let run = match plan("kernel normalise --dataset nulls-heavy --weights /tmp/w.safetensors")
+            .action
+        {
+            Action::Measure(run) => run,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(run.dataset, "nulls-heavy");
+        assert_eq!(run.weights, Some(PathBuf::from("/tmp/w.safetensors")));
+    }
+
+    #[test]
+    fn the_kernel_command_refuses_no_name_two_names_and_an_unknown_name() {
+        for line in ["kernel", "kernel identity normalise"] {
+            let err = parse(&args(line)).expect_err(line);
+            assert!(err.to_string().contains("exactly one name"), "{err}");
+        }
+        let err = parse(&args("kernel torch-score")).expect_err("not built");
+        assert!(err.to_string().contains("no kernel named"), "{err}");
+        assert!(usage().contains("kernel <name>"), "{}", usage());
+        assert!(usage().contains("--weights"), "{}", usage());
+    }
+
+    #[test]
     fn the_common_options_have_the_documented_defaults() {
         let listed = plan("list");
         assert_eq!(listed.out, PathBuf::from(DEFAULT_OUT));
@@ -407,7 +505,7 @@ mod tests {
     #[test]
     fn the_suite_and_one_dataset_resolve_to_datasets() {
         match plan("suite --scale small").action {
-            Action::Write(datasets) => assert_eq!(datasets.len(), 12),
+            Action::Write(datasets) => assert_eq!(datasets.len(), 13),
             other => panic!("{other:?}"),
         }
         match plan("dataset text-explode --scale small").action {
