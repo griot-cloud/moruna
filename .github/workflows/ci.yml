@@ -1,24 +1,31 @@
-# One pipeline, four stages, chained. A stage runs only if the one before it
-# passed, so a formatting slip does not burn a container run, and the whole
-# thing is one file rather than one file per concern.
+# One workflow, one job, on pushes to main. Minutes are paid for, so this runs
+# what only a clean machine can prove and nothing the pre-commit hook already
+# proved on the way in.
 #
-#   gate       fmt, clippy, the repository lints, the docs checker, sign-off,
-#              tests with a locked lockfile, per-crate coverage, cargo-deny.
-#              This is tools/quality/check.sh, the same script the pre-commit
-#              hook runs, plus the checks that need the network.
-#   container  the same tests under a real cgroup v2 ceiling (--memory=2g
-#              --cpus=1.5), including the ignored integration tests, which is
-#              what closes DS-T9 and every later container-gated test, with
-#              MinIO beside it for the object-store paths.
-#   python     one interpreter, CPython 3.14 free-threaded (preamble 6.6).
-#   docs       the book builds and its links resolve; published from main when
-#              the repository variable DOCS_PAGES_ENABLED is set.
+# What is deliberately NOT here:
+#   coverage      tools/quality/check.sh enforces 90% per crate in the hook,
+#                 before every commit. Running cargo-llvm-cov again in CI
+#                 doubles the build for a number we already have.
+#   cargo-deny    licences and advisories change with the world, not with a
+#                 commit, so they run weekly and on demand, below.
+#   the container the cgroup ceiling and MinIO matter at a wave gate, not on
+#                 every push: a full rebuild inside a container is the most
+#                 expensive thing here. Run it from the Actions tab, or let
+#                 the weekly run do it, before closing a gate that cites it
+#                 (preamble 6.6: DS-T9 and every later container-gated test).
 name: ci
 
 on:
   push:
     branches: [main]
-  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      container:
+        description: "Also run the container and MinIO stage"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -28,47 +35,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  gate:
-    name: gate
+  ci:
+    name: build, test, lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
       - name: Install the pinned toolchain (rust-toolchain.toml)
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          key: gate
-      - name: Install the tools the gate needs
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
-        with:
-          tool: cargo-llvm-cov@0.8.5,cargo-deny@0.20.2
-      - name: Free disk space before the coverage build
-        # cargo-llvm-cov instruments every crate and the linker needs room; the
-        # runner's preinstalled Android, .NET and Haskell trees take tens of
-        # gigabytes and a stub crate once failed to link without this.
+          # One interpreter: CPython 3.14 free-threaded, which is what S8 is
+          # about. The GIL path is the same interpreter under PYTHON_GIL=1.
+          python-version: "3.14t"
+      - name: Format, lints and the documentation checker
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
-          df -h /
-      - name: Sign-off on every commit this branch adds
-        run: |
-          tools/quality/check_dco.sh --self-test
-          tools/quality/check_dco.sh "${{ github.event.pull_request.base.sha || github.event.before }}" "${{ github.sha }}"
-      - name: The gate (fmt, clippy, lints, docs checker, tests, coverage)
-        env:
-          # Line tables are enough for coverage mapping and cost a fraction of
-          # the disk that full debug info does.
-          CARGO_PROFILE_TEST_DEBUG: line-tables-only
-        run: tools/quality/check.sh
-      - name: Advisories, licences, bans and sources
-        # cargo-deny alone: its advisories check reads the same RustSec database
-        # cargo-audit does, so running both was duplicated work.
-        run: cargo deny check advisories licenses bans sources
-      - name: The lockfile is committed and in step with Cargo.toml
-        run: cargo metadata --locked --format-version 1 > /dev/null
+          cargo fmt --all -- --check
+          tools/lint/no_tier_wildcard.sh
+          tools/docs/check_docs.py
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
       - name: CT-T12 boundary, amoru-kernel has no runtime dependency
         run: |
           cargo tree -p amoru-kernel > kernel-tree.txt
@@ -76,11 +64,20 @@ jobs:
             echo "amoru-kernel must not depend on tokio, cudarc, pyo3, parquet or object_store (01 section a, CT-T12)" >&2
             exit 1
           fi
-          echo "CT-T12 boundary holds"
+      - name: The Python kernels
+        run: |
+          python -c 'import sys, sysconfig; print(sys.version); print("free-threaded:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")), "gil now:", sys._is_gil_enabled())'
+          PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled()'
+          python -m pip install --quiet --only-binary=:all: numpy pytest
+          PYTHONPATH=python python -c 'import amoru; print("amoru", amoru.__version__)'
+          cd bench/python && python -m pytest -q
 
-  container:
-    name: container (--memory=2g --cpus=1.5)
-    needs: gate
+  # Weekly and on demand: the checks that answer to the outside world rather
+  # than to a commit, and the ones that need a real cgroup ceiling.
+  slow:
+    name: supply chain, container, book
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.container)
+    needs: ci
     runs-on: ubuntu-latest
     env:
       AMORU_S3_ENDPOINT: http://127.0.0.1:9000
@@ -91,30 +88,30 @@ jobs:
       AWS_ALLOW_HTTP: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start MinIO and create the bucket
-        # An S3-compatible store for the object-store paths of the reactor,
-        # the sources, the sinks and the bench generator (preamble 6.5), so
-        # those paths are tested with no cloud account and no credentials.
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Advisories, licences, bans and sources
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: cargo-deny@0.20.2,mdbook@0.5.4
+      - run: cargo deny check advisories licenses bans sources
+      - name: The book builds
+        run: mdbook build docs
+      - name: MinIO for the object-store paths
         run: |
           docker run -d --name minio --network host \
             -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
             -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
             quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           for i in $(seq 1 30); do
-            if curl -sf "$AMORU_S3_ENDPOINT/minio/health/live" >/dev/null; then break; fi
+            curl -sf "$AMORU_S3_ENDPOINT/minio/health/live" >/dev/null && break
             sleep 1
           done
           docker run --rm --network host \
             -e MC_HOST_ci="http://$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY@127.0.0.1:9000" \
             quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb "ci/$AMORU_S3_BUCKET"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: container-${{ hashFiles('Cargo.lock') }}
-      - name: Tests under a real cgroup v2 ceiling, ignored ones included
+      - name: Tests under a real cgroup ceiling, ignored ones included
         run: |
           docker run --rm --network host \
             --memory=2g --memory-swap=2g --cpus=1.5 \
@@ -124,68 +121,3 @@ jobs:
             -e AWS_SECRET_ACCESS_KEY -e AWS_REGION -e AWS_ALLOW_HTTP \
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
-
-  python:
-    name: python 3.14t
-    needs: gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          # One interpreter: the free-threaded build of CPython 3.14, which is
-          # what S8 is about. The GIL path is the same interpreter with
-          # PYTHON_GIL=1, so a second interpreter would prove nothing a flag
-          # does not (preamble 6.6).
-          python-version: "3.14t"
-      - name: The interpreter reports its GIL state, free-threaded and forced
-        run: |
-          python -c 'import sys, sysconfig; print(sys.version); print("free-threaded build:", bool(sysconfig.get_config_var("Py_GIL_DISABLED"))); print("gil enabled now:", sys._is_gil_enabled())'
-          PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled(); print("gil re-enabled by PYTHON_GIL=1")'
-      - name: NumPy, and pyarrow when a wheel exists
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --only-binary=:all: numpy pytest
-          python -c 'import numpy; print("numpy", numpy.__version__)'
-          if python -m pip install --only-binary=:all: pyarrow; then
-            python -c 'import pyarrow; print("pyarrow", pyarrow.__version__)'
-          else
-            echo "::notice::no pyarrow wheel for this interpreter on $(date -u +%Y-%m-%d)"
-          fi
-      - name: The placeholder package imports and the Python kernels pass
-        run: |
-          PYTHONPATH=python python -c 'import amoru; print("amoru", amoru.__version__)'
-          cd bench/python && python -m pytest -q
-
-  docs:
-    name: docs
-    needs: gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install mdBook
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
-        with:
-          tool: mdbook@0.5.4
-      - name: Build the book
-        run: mdbook build docs
-      - name: Package the book for Pages
-        if: github.ref == 'refs/heads/main' && vars.DOCS_PAGES_ENABLED == 'true'
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: docs/book
-
-  publish-docs:
-    name: publish the book (main, when Pages is enabled)
-    needs: docs
-    if: github.ref == 'refs/heads/main' && vars.DOCS_PAGES_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - id: deploy
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

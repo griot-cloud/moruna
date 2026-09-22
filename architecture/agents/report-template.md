@@ -1,3 +1,7 @@
+# Executor report template
+
+What an executor hands the PM when its feature is done. It was the pull request template; the project does not open pull requests (preamble 6.7), so the same content is the report, and the PM reviews the branch diff against it before merging to `main`.
+
 ## What this changes
 
 ## Which design document and section it traces to
