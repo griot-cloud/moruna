@@ -18,6 +18,9 @@ venv/
 *.so
 *.pyd
 
+# Documentation site build output (mdBook)
+/docs/book/
+
 # Benchmarks and traces
 /bench/data/
 *.trace.arrow

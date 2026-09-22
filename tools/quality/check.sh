@@ -2,9 +2,11 @@
 # Amoru quality gate. Run by the pre-commit hook (tools/hooks/pre-commit) and by
 # the first CI job (preamble 6.6). It fails on: an em dash in any tracked text
 # file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
-# StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a commit-message rule
-# the DCO self-test rejects (tools/quality/check_dco.sh); a supply-chain rule of
-# deny.toml when cargo-deny is installed; a failing test; line
+# StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab,
+# an unlisted page or a placeholder with no citation under docs/
+# (tools/docs/check_docs.py, F7.1); a commit-message rule the DCO self-test
+# rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
+# when cargo-deny is installed (F6.5); a failing test; line
 # coverage below AMORU_COVERAGE_MIN (default 90) in any workspace crate that has
 # instrumented lines (a stub crate with no code is not measured). Python checks
 # run once python/pyproject.toml exists (wave 5).
@@ -31,6 +33,11 @@ step "em dashes"
 EM="$(printf '\xe2\x80\x94')"
 if git ls-files -z | xargs -0 grep -In -e "$EM" -- 2>/dev/null; then
   fail "em dash found; use a comma, a colon or parentheses (architecture/README.md, conventions)"
+fi
+
+if [ -d docs ] && [ -x tools/docs/check_docs.py ]; then
+  step "tools/docs/check_docs.py (docs conventions, links, SUMMARY, citations)"
+  quiet docs tools/docs/check_docs.py
 fi
 
 step "tools/quality/check_dco.sh --self-test"

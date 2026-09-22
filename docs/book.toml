@@ -1,0 +1,29 @@
+# The Amoru documentation site (BOARD.md epic E7, feature F7.1).
+#
+# mdBook is the builder because it is Rust-native and needs no Node toolchain.
+# The version is pinned in .github/workflows/docs.yml; keep the two in step.
+# Every page under src/ is a placeholder until the feature named on it (F7.2 to
+# F7.7) fills it. tools/docs/check_docs.py checks the conventions of
+# architecture/README.md over this directory and is part of
+# tools/quality/check.sh.
+
+[book]
+title = "Amoru"
+description = "A single-node, adaptive batch runtime for out-of-core workloads."
+authors = ["The Amoru maintainers"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/amoru/"
+git-repository-url = "https://github.com/griot-cloud/amoru"
+edit-url-template = "https://github.com/griot-cloud/amoru/edit/main/docs/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
