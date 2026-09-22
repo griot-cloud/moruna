@@ -21,6 +21,10 @@ base64 = { workspace = true }
 hostname = { workspace = true }
 cudarc = { workspace = true, optional = true }
 
+[dev-dependencies]
+# The fakes of contracts d.15; every PL test is written against them (k).
+amoru-testkit = { workspace = true }
+
 [features]
 default = []
 cuda = ["dep:cudarc"]
