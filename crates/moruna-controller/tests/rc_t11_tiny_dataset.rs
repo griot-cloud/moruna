@@ -5,7 +5,8 @@
 //! `morsel_max` is not the target here and f.10 never promised it would be: the path skips the
 //! probe and the adaptation, not RC-I1. With no probe the amplification is the 4.0 default, so
 //! one 512 MiB morsel is charged 3 GiB of anonymous memory against the 1.6 GiB this ceiling
-//! leaves above the arena, and the largest target that fits on all eight workers is 34 MiB. The
+//! leaves above the arena, of which the kernels may be planned into 0.6, and the largest target
+//! that fits on all eight workers is 20 MiB. The
 //! run that made this explicit reached 1.11 x its ceiling on a tiny dataset with every worker
 //! running at the maximum morsel (PM, 2026-09-23).
 
@@ -40,9 +41,11 @@ fn rc_t11_tiny_dataset() {
         "f.10: a tiny dataset is not probed"
     );
     let writes = rig.writes();
-    // 1.6 GiB of headroom above the arena, eight workers on one stage, the 4.0 default
-    // amplification and the 1.5 initial safety: `1.6 GiB / (8 x 4 x 1.5)`.
-    let allowed = 1_717_986_918u64 / 48;
+    // 1.6 GiB of headroom above the arena, of which the kernels may be planned into 0.6 (11
+    // f.3: the rest is what the runtime allocates outside the arena and never declared), eight
+    // workers on one stage, the 4.0 default amplification and the 1.5 initial safety:
+    // `0.6 x 1.6 GiB / (8 x 4 x 1.5)`.
+    let allowed = (1_717_986_918f64 * 0.6) as u64 / 48;
     assert_eq!(
         morsel_targets(&writes),
         vec![(1, allowed)],
