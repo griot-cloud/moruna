@@ -26,8 +26,15 @@
 //!
 //! ```text
 //! arena:  S share x target x a_k x safety + S high_water + read_ahead x split_bytes <= arena_bytes
-//! anon:   baseline + arena_bytes + state + S (c_anon + share x target x a_anon x safety) <= ceiling
+//! anon:   S (c_anon + share x target x a_anon x safety) <= for_kernels
+//!         where for_kernels = KERNEL_ANON_SHARE x (ceiling - baseline - arena_bytes - state)
 //! ```
+//!
+//! The share in the second is the runtime's own out-of-arena bytes, which are not a morsel and not
+//! in the fit: a Parquet encoder, the Arrow builders a batch crosses through, the interpreter's own
+//! growth. Planning morsels into the whole headroom spends the reserve twice and what the runtime
+//! then takes comes out of the ceiling, which is how runs satisfying every inequality here still
+//! sat at 0.98 of it and two Linux runs passed it (2026-09-23).
 //!
 //! The second is fitted to `TraceRecord::mem_anon_peak` (10 f.3), which is the figure S1 is
 //! measured from, so a kernel whose Python objects cost three times its input is sized for what
@@ -43,6 +50,9 @@ use crate::{
 
 /// The share of the device budget one stage's in-flight morsels may hold (f.3).
 const DEVICE_WORKER_SHARE: f64 = 0.4;
+/// The share of the headroom above the arena the kernels may be planned into, the rest being what
+/// the runtime itself allocates outside the arena and never declared (f.3).
+const KERNEL_ANON_SHARE: f64 = 0.6;
 /// The most of the queue half the read-ahead may take before f.3 lowers it.
 const READ_AHEAD_SHARE: f64 = 0.5;
 /// The read-ahead depth f.3 starts from (`readahead.splits`).
@@ -156,7 +166,9 @@ pub(crate) fn anon_headroom(state: &ControllerState) -> u64 {
 ///
 /// It is charged once, like `state_total` and for the same reason: it does not scale with the
 /// morsel, so dividing it by the bytes in flight and multiplying it back is not an accounting of
-/// it but a way of making it move when the morsel does.
+/// it but a way of making it move when the morsel does. It is also measured that way (f.3 reads it
+/// from `mem_anon_before`, which is a figure for the whole process), so charging it per morsel in
+/// flight would count the same bytes as many times as there are workers.
 pub(crate) fn anon_fixed(state: &ControllerState) -> u64 {
     state
         .stages
@@ -164,12 +176,28 @@ pub(crate) fn anon_fixed(state: &ControllerState) -> u64 {
         .fold(0u64, |total, ctl| total.saturating_add(ctl.c_anon))
 }
 
-/// The part of the headroom left for morsels once the instances' state and the chain's fixed
-/// out-of-arena cost are funded (f.3).
+/// The part of the headroom the kernels may have: what is left once the instances' state is
+/// funded, less the share the runtime keeps for its own bytes outside the arena (f.3).
+///
+/// Not everything above the arena belongs to the kernels. A Parquet writer's encoder, the Arrow
+/// builders a batch is converted through, the interpreter's own growth: none of it is a morsel and
+/// none of it is in the fit, and all of it is in the figure S1 measures. Handing the kernels the
+/// whole headroom spends the reserve twice, once as the margin the arena was sized to leave and
+/// again as the allowance the model divides among morsels, and what the runtime then takes comes
+/// out of the ceiling. Measured on the Parquet to Python to Parquet job at a 512 MiB ceiling, that
+/// unmodelled remainder is about a fifth of the headroom; the kernels get `KERNEL_ANON_SHARE` of
+/// it and the rest is nobody's to plan with (2026-09-23).
 pub(crate) fn anon_for_kernels(state: &ControllerState) -> u64 {
-    anon_headroom(state)
-        .saturating_sub(state.state_total)
-        .saturating_sub(anon_fixed(state))
+    for_kernels(state).saturating_sub(anon_fixed(state))
+}
+
+/// The headroom the kernels may be planned into at all, fixed term included: `KERNEL_ANON_SHARE`
+/// of what the arena left above itself, less the bytes the instances hold.
+pub(crate) fn for_kernels(state: &ControllerState) -> u64 {
+    scale(
+        anon_headroom(state).saturating_sub(state.state_total),
+        KERNEL_ANON_SHARE,
+    )
 }
 
 /// What one in-flight morsel of a stage costs the process outside the arena (f.3): the anon
@@ -195,11 +223,18 @@ pub(crate) fn anon_footprint(state: &ControllerState, targets: &[u64]) -> u64 {
     total
 }
 
-/// The anon half of RC-I1: whether a proposed set of targets keeps the process under the
-/// ceiling. This is the inequality S1 is measured against and the one that was missing.
+/// The anon half of RC-I1: whether a proposed set of targets keeps the kernels inside the
+/// allowance the headroom leaves them. This is the inequality S1 is measured against.
+///
+/// It answers to `anon_for_kernels` rather than to the ceiling directly, so the share the runtime
+/// keeps for its own out-of-arena bytes is not a plan the model may spend. That share is also the
+/// cushion f.7's breach line assumes: reacting to a breach takes a record, a record arrives after
+/// the `apply` that produced it, and whatever that morsel cost above its prediction is already in
+/// the process by then. A plan allowed to fill the headroom exactly leaves that surprise nowhere
+/// to land, which is how runs satisfying every inequality here still reached 0.99 of the ceiling
+/// and on one host passed it (2026-09-23).
 pub(crate) fn fits_anon(state: &ControllerState, targets: &[u64]) -> bool {
-    resting_anon(state).saturating_add(anon_footprint(state, targets))
-        <= state.cfg.limits.memory_ceiling
+    anon_footprint(state, targets) <= state.state_total.saturating_add(for_kernels(state))
 }
 
 /// How many morsels of one stage may be in flight at once: one per worker's share of the
@@ -223,8 +258,6 @@ pub(crate) fn share(state: &ControllerState, target: u64) -> f64 {
 pub(crate) fn envelope(state: &ControllerState, at: usize) -> Envelope {
     let stages = state.stage_count().max(1) as u64;
     let budget_for_stage = worker_half(state) / stages;
-    // `anon_for_kernels` has already funded every stage's fixed term (f.3), so what is divided
-    // here is what the morsels may have and the divisor is the slope alone.
     let anon_for_stage = anon_for_kernels(state) / stages;
     let ctl = &state.stages[at];
     let in_flight = share(state, ctl.target);
@@ -234,6 +267,8 @@ pub(crate) fn envelope(state: &ControllerState, at: usize) -> Envelope {
     } else {
         scale(budget_for_stage, 1.0 / per_byte)
     };
+    // `anon_for_kernels` has already funded every stage's fixed term (f.3), so what is divided
+    // here is what the morsels may have and the divisor is the slope alone.
     let per_anon_byte = in_flight * ctl.a_anon.max(MIN_AMPLIFICATION) * f64::from(ctl.safety);
     let from_anon = if per_anon_byte <= 0.0 {
         state.cfg.morsel_max
@@ -269,6 +304,24 @@ pub(crate) fn working_set(state: &ControllerState, targets: &[u64]) -> u64 {
     total = total.saturating_add(state.high_water.saturating_mul(queues));
     total = total.saturating_add(u64::from(state.read_ahead).saturating_mul(state.split_bytes));
     total
+}
+
+/// The anon half of RC-I1 read without the fixed term: what the targets cost if every byte the
+/// probe saw scales with the morsel.
+///
+/// One probe cannot tell a kernel that holds a fixed 160 MB from one that holds ten bytes per
+/// byte, so f.3 funds the fixed term and plans small until a record separates them. That is the
+/// right way to be wrong about a morsel target. It is the wrong way to be wrong about whether a
+/// run may start at all: the fixed reading of a steep probe exceeds many a ceiling on its own,
+/// and refusing on it would refuse runs whose second record would have shown the cost scaling.
+/// So the refusal at `start` answers to this reading, and the plan answers to the other one.
+///
+/// It answers to the ceiling, too, and not to `for_kernels`: the share withheld there is a margin
+/// the runtime keeps for its own bytes, and a plan that overruns a margin is a plan to tighten,
+/// not a run to refuse.
+pub(crate) fn fits_anon_optimistically(state: &ControllerState, targets: &[u64]) -> bool {
+    let scaling = anon_footprint(state, targets).saturating_sub(anon_fixed(state));
+    resting_anon(state).saturating_add(scaling) <= state.cfg.limits.memory_ceiling
 }
 
 /// RC-I1: whether a proposed set of targets fits the budget -- both of the budgets in the
@@ -437,7 +490,8 @@ fn common_target(state: &ControllerState, worker_half: u64) -> u64 {
 }
 
 /// The largest common target the anon inequality of the module header allows at the worker count
-/// as it stands: `anon_for_kernels / (share x S a_anon x safety)`.
+/// as it stands: what is left of `anon_for_kernels` once the fixed term of every morsel in flight
+/// is funded, over `share x S a_anon x safety`.
 ///
 /// This is the bound S1 is measured against, expressed as a morsel size. It is applied on every
 /// path that writes a target, the tiny-dataset path of f.10 included.
@@ -502,7 +556,7 @@ pub(crate) fn start(ctl: &Inner) -> Result<()> {
             });
         }
         state.active_workers = state.cfg.workers_max.max(1);
-        initial_knobs(&mut state)
+        initial_knobs(&mut state)?
     };
     ctl.perform(actions);
     // e.2: the records that arrived before `Running` (the probes' own) are processed here, so
@@ -513,7 +567,7 @@ pub(crate) fn start(ctl: &Inner) -> Result<()> {
 
 /// The knob set f.3 writes at `start`, in the order f.3 fixes: high waters, promotion windows,
 /// morsel targets, active workers, read-ahead, with the RC-I1 check before the batch.
-pub(crate) fn initial_knobs(state: &mut ControllerState) -> Actions {
+pub(crate) fn initial_knobs(state: &mut ControllerState) -> Result<Actions> {
     recompute_state(state);
     let mut actions = Actions::default();
 
@@ -527,7 +581,7 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Actions {
         actions.knobs.push(Knob::ActiveWorkers(1));
         actions.knobs.push(Knob::ReadAhead(READ_AHEAD_INITIAL));
         state.phase = Phase::Running;
-        return actions;
+        return Ok(actions);
     }
 
     let solution = solve(state);
@@ -541,6 +595,29 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Actions {
     // written. A set of targets that does not fit is never a set of knobs that was written.
     let targets = enforce(state, &solution.targets);
     fit_scalars(state, &targets);
+    // And a floor that still does not fit is not a run to start. `enforce` halves until the
+    // targets fit or reach `morsel_min`, and the floor reaching it without fitting was left to
+    // f.7: the run began, one morsel ran, and the breach path reported the footprint it had
+    // already reached. That report is true and it is too late, because the morsel's own growth
+    // is what passed the ceiling. Measured: a Python kernel at a 512 MiB ceiling on a host whose
+    // interpreter rests at 406 MB was refused at its third morsel with the peak at 1.005 of the
+    // ceiling, so S1 was broken by the diagnostic rather than saved by it (2026-09-23). The
+    // arithmetic is known here, before a morsel exists.
+    //
+    // The reading it refuses on is the optimistic one: the slope alone, without the fixed term
+    // the probe's single measurement cannot distinguish from it. Planning stays conservative
+    // (the fixed term is funded above, which is what keeps the first morsel small), but refusing
+    // a run on a term that one observation only *might* support would turn every kernel with a
+    // steep probe into a budget error, and the evidence for that is not in yet. What is not
+    // arguable is the slope: it is the probe's own ratio, and a floor morsel that does not fit
+    // even at that has nowhere to run.
+    // The anon half only. A working set that still does not fit the arena is answered by the
+    // queues (`fit_scalars` above), by the read-ahead and in the end by backpressure: the arena
+    // hands out what it has and a morsel waits for a token. The ceiling has no such answer, and
+    // it is the one S1 is measured against.
+    if !fits_anon_optimistically(state, &targets) {
+        return Err(cannot_be_sized(state, &targets));
+    }
     for (at, target) in targets.iter().enumerate() {
         state.stages[at].target = *target;
         state.stages[at].recent_targets.push_back(*target);
@@ -589,7 +666,36 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Actions {
     state.tier_budgets = actions.budgets.clone().unwrap_or_default();
     state.phase = Phase::Running;
     apply::assert_consistent(state);
-    actions
+    Ok(actions)
+}
+
+/// The refusal of f.3 when the floor does not fit: a budget this job cannot be run inside, said
+/// before anything runs rather than after a morsel has proved it.
+///
+/// Every figure it names is one the caller can act on: what the process was already holding, what
+/// the arena took, what the smallest morsel the runtime can form is predicted to cost outside it,
+/// and the ceiling all of that has to sit under. `Config` rather than `Budget`, because nothing
+/// ran: `Budget` is the diagnostic for a morsel that was admitted and cost more than it was
+/// planned for, and there is no morsel here.
+fn cannot_be_sized(state: &ControllerState, targets: &[u64]) -> moruna_kernel::MorunaError {
+    let ceiling = state.cfg.limits.memory_ceiling;
+    let resting = resting_anon(state);
+    let predicted = anon_footprint(state, targets).saturating_sub(anon_fixed(state));
+    let msg = format!(
+        "this budget cannot hold this job on this host: the ceiling is {ceiling} bytes, the \
+             process held {} bytes before the arena existed, the arena took {} more, and the \
+             smallest morsel the runtime can form is measured to cost {predicted} bytes outside \
+             it, which is {} bytes past the ceiling. Give the run a budget of about {} bytes, or \
+             a kernel that holds less of each morsel",
+        state.budgets.baseline,
+        state.budgets.host,
+        resting.saturating_add(predicted).saturating_sub(ceiling),
+        resting.saturating_add(predicted),
+    );
+    moruna_kernel::MorunaError::Config {
+        name: "budget",
+        msg,
+    }
 }
 
 /// f.10: a dataset smaller than a quarter of the host budget needs no adaptation.

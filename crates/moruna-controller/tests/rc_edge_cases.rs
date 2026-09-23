@@ -37,6 +37,52 @@ fn rc_h_budget_too_small_is_a_config_error() {
     );
 }
 
+/// f.3: a kernel the probe measured as too expensive for the ceiling is refused at `start`,
+/// before a morsel of it has run.
+///
+/// The refusal used to wait for f.7: the run began, one morsel ran, the record came back over the
+/// breach line and the diagnostic named a footprint the process was already holding. The figures
+/// are all known at `start`, and a diagnostic that arrives after the ceiling has been passed is a
+/// post-mortem rather than a guard, which is what took a Linux run to 1.005 of its budget while
+/// every inequality in the model held (2026-09-23). What is refused on is the probe's slope, not
+/// its fixed reading: one probe cannot tell a kernel that holds a fixed cost from one whose cost
+/// scales, and the second reading is the one that cannot be argued with.
+#[test]
+fn rc_f3_a_floor_morsel_that_cannot_fit_is_refused_at_start() {
+    let mut cfg = common::config_with_baseline(GIB, 8, 400 * MIB);
+    // The floor is the whole of what the ceiling leaves above the arena, several times over: at
+    // this amplification one morsel of `morsel_min` on one worker costs more than the headroom.
+    cfg.morsel_min = 64 * MIB;
+    let probe_bytes = cfg.probe_bytes;
+    let rig = common::Rig::new(
+        cfg,
+        vec![kernel(1, KernelHints::default())],
+        FakeKnobs::new().probe_result(1, probe(probe_bytes, 40.0)),
+        FakeSampler::new().scripted(steady(400 * MIB, 8)),
+    );
+    rig.controller.prepare().expect("prepare");
+    rig.controller.probe_all().expect("probe_all");
+    let error = rig
+        .controller
+        .start()
+        .expect_err("a floor morsel that does not fit is not a run");
+    let message = error.to_string();
+    assert!(
+        message.starts_with("config budget:"),
+        "f.3: the refusal names the budget: {message}"
+    );
+    for figure in ["ceiling is", "before the arena existed", "past the ceiling"] {
+        assert!(
+            message.contains(figure),
+            "f.3: the refusal names the arithmetic it refused on ({figure}): {message}"
+        );
+    }
+    assert!(
+        morsel_targets(&rig.writes()).is_empty(),
+        "f.3: a run that was refused wrote no knobs, so nothing ran"
+    );
+}
+
 /// h, edge cases: a kernel that allocates device memory on a host with no device cannot be
 /// sized, and that is knowable at `prepare`.
 #[test]

@@ -53,7 +53,13 @@ try:
               "ceiling": report.limits["memory_ceiling"],
               "peak": report.peak_anon_bytes,
               "fraction": report.peak_fraction_of_ceiling,
-              "rows_out": report.stages[0]["rows_out"]}
+              "rows_out": report.stages[0]["rows_out"],
+              # The whole report travels with the result. A run that passed its ceiling on a
+              # host none of us can log into is a question about arithmetic (what baseline,
+              # what arena, what amplification), and the report is a pure function of the
+              # trace, so carrying it here is the difference between a diagnosis and another
+              # pipeline run spent asking (2026-09-23).
+              "report": json.loads(report.to_json())}
 except moruna.ConfigError as err:
     # The budget cannot be honoured in this process at all (see the skip in the test).
     result = {"exit": "NoRoom", "diagnostic": str(err)}
@@ -64,7 +70,8 @@ except moruna.BudgetError as err:
     if err.report is not None:
         result |= {"peak": err.report.peak_anon_bytes,
                    "ceiling": err.report.limits["memory_ceiling"],
-                   "fraction": err.report.peak_fraction_of_ceiling}
+                   "fraction": err.report.peak_fraction_of_ceiling,
+                   "report": json.loads(err.report.to_json())}
 print(json.dumps(result))
 """
 
@@ -80,6 +87,29 @@ def _run(scratch: pathlib.Path, budget: str) -> dict:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _arithmetic(result: dict) -> str:
+    """The figures a breach has to be explained by, for a host we cannot log into.
+
+    The run report is a pure function of the trace, so everything needed to say why a ceiling
+    was passed is already in it: what the process rested at before the arena existed, how the
+    allowance was split, and how much the chain actually allocated per byte in flight against
+    what was planned for. Printing it with the assertion is what makes a red pipeline on a
+    runner a diagnosis rather than another run spent asking (2026-09-23).
+    """
+    report = result.get("report")
+    if not report:
+        return "no report came back with the result"
+    lines = [f"exit: {report.get('exit')}"]
+    for stage in report.get("stages", []):
+        lines.append(
+            f"stage {stage['stage']}: {stage['morsels']} morsels, {stage['bytes_in']} bytes in, "
+            f"amplification p50 {stage['amplification_p50']:.1f}, "
+            f"p95 {stage['amplification_p95']:.1f}"
+        )
+    lines += [note for note in report.get("notes", []) if "arena sized at" in note or "cgroup" in note]
+    return "\n".join(lines)
 
 
 def test_s1_a_tight_budget_is_never_exceeded(scratch: pathlib.Path) -> None:
@@ -118,7 +148,8 @@ def test_s1_a_tight_budget_is_never_exceeded(scratch: pathlib.Path) -> None:
     if "fraction" in result:
         assert result["fraction"] <= 1.0, (
             f"S1: peak anonymous memory {result['peak']} exceeded the ceiling "
-            f"{result['ceiling']} at {result['fraction']:.3f} of it"
+            f"{result['ceiling']} at {result['fraction']:.3f} of it\n"
+            f"{_arithmetic(result)}"
         )
 
 

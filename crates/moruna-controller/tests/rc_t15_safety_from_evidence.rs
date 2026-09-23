@@ -51,25 +51,36 @@ fn write_profile(dir: &std::path::Path, p95: f64, samples: u64, variance: f64) {
 /// `ceiling - baseline - reserve`, so what the process has above it is the reserve, and at this
 /// ceiling that is 819 MiB against a worker half of 3.5 GiB. The margin is what is left over
 /// either way; only the numerator changes.
-fn implied_safety(target: u64) -> f64 {
+fn implied_safety((target, workers): (u64, u16)) -> f64 {
     let reserve = (CEILING as f64 * 0.10) as u64;
     let arena = CEILING - BASELINE - reserve;
-    // The anonymous inequality funds each stage's fixed term before dividing the rest among
-    // the morsels (11 f.3), and the probe seeds that term with the whole of its own growth
-    // until a real record can separate the two. So the headroom this inversion may attribute
-    // to the slope is what is left after the fixed term, and reading it without subtracting
-    // the term recovers a safety that was never used (2026-09-23).
-    // `ControllerConfig::default`'s probe size, which `target_with` uses below.
-    let fixed = ((16u64 << 20) as f64 * AMPLIFICATION) as u64;
-    let anon_headroom = (CEILING - BASELINE - arena).saturating_sub(fixed) as f64;
-    anon_headroom / (f64::from(WORKERS) * AMPLIFICATION * target as f64)
+    // Every morsel in flight carries the fit's fixed term with it (11 f.3), and the probe seeds
+    // that term with the whole of its own growth until a real record can separate the two. So
+    // the headroom this inversion may attribute to the slope is what is left once the fixed term
+    // has been funded for each of the workers, and reading it without subtracting them recovers
+    // a safety that was never used (2026-09-23). The probe size is `ControllerConfig::default`'s,
+    // which is what `target_with` probes at.
+    let fixed = (MIB as f64 * AMPLIFICATION) as u64;
+    // And only `KERNEL_ANON_SHARE` of that headroom is the kernels' to be planned into (11 f.3);
+    // the rest is what the runtime allocates outside the arena, which is not a term the model
+    // may spend on morsels.
+    let for_kernels = ((CEILING - BASELINE - arena) as f64 * 0.6) as u64;
+    let anon_headroom = for_kernels.saturating_sub(fixed) as f64;
+    anon_headroom / (f64::from(workers) * AMPLIFICATION * target as f64)
 }
 
-fn target_with(profile: Option<(f64, u64, f64)>, probed: f64) -> u64 {
+fn target_with(profile: Option<(f64, u64, f64)>, probed: f64) -> (u64, u16) {
     let scratch = Scratch::new("safety");
     // The arena the facade would size for this ceiling and this baseline, which is the
     // controller's whole allowance (11 f.1).
     let mut cfg = common::config_with_baseline(CEILING, WORKERS, BASELINE);
+    // A probe of a megabyte rather than the default sixteen. The probe's whole growth seeds the
+    // fit's fixed term and that term is charged per morsel in flight (11 f.3), so a sixteen
+    // megabyte probe at this amplification funds 512 MiB of fixed cost across eight workers and
+    // leaves the slope so little of the headroom that every target lands on `morsel_min`. A
+    // target at the floor is a target the margin cannot be read out of, and the margin is what
+    // this test is about.
+    cfg.probe_bytes = MIB;
     if let Some((p95, samples, variance)) = profile {
         write_profile(&profile_path(scratch.path()), p95, samples, variance);
         cfg.profiles_dir = Some(scratch.path().to_path_buf());
@@ -82,12 +93,17 @@ fn target_with(profile: Option<(f64, u64, f64)>, probed: f64) -> u64 {
         FakeSampler::new().scripted(steady(BASELINE, 8)),
     );
     rig.run_up();
-    let target = morsel_targets(&rig.writes())
+    let writes = rig.writes();
+    let target = morsel_targets(&writes)
         .last()
         .map(|(_, bytes)| *bytes)
         .expect("a target after start");
+    let workers = common::active_workers(&writes)
+        .last()
+        .copied()
+        .expect("a worker count after start");
     rig.controller.stop();
-    target
+    (target, workers)
 }
 
 fn close(got: f64, want: f64, what: &str) {
