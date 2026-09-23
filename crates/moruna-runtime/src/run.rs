@@ -661,8 +661,18 @@ const DEFAULT_OUT_OF_ARENA_AMPLIFICATION: f64 = 4.0;
 /// the *default* row group and not the configured one is a limitation of `SinkSpec`, which is a
 /// built sink or a factory and cannot be asked what it will allocate before it exists: a run with
 /// a 16 MiB row group still pays the default's floor.
+/// Revised 2026-09-23. The first term was 128 MiB because the sink demanded one whole size
+/// class of that size before it would open, which was the configured row group's class. That
+/// requirement is gone (08 f.1: a row group is a target, not a requirement), so the floor no
+/// longer has to carry it, and carrying it did real harm: at a 512 MiB ceiling on a host whose
+/// resting footprint is larger than this laptop's, the floor exceeded the whole allowance, the
+/// arena took all of it, and the only governed headroom left for a Python kernel's own objects
+/// was the reserve, so the controller refused morsel 2 with a 115 MB footprint against a 53 MB
+/// budget. The floor is now one smallest class for the sink plus the read-ahead slots, which is
+/// what the arena needs in order to be useful rather than what the sink once needed in order to
+/// open.
 const ARENA_FLOOR_BYTES: u64 =
-    (128 << 20) + (config::READAHEAD_SPLITS as u64 + 1) * config::MORSEL_PROBE_BYTES;
+    (16 << 20) + (config::READAHEAD_SPLITS as u64 + 1) * config::MORSEL_PROBE_BYTES;
 
 /// The chain's expected out-of-arena cost per byte in flight (12 f.1): the largest
 /// `KernelHints::expected_amplification` any stage declares, counting a stage that declares
@@ -948,8 +958,12 @@ mod tests {
             "below the controller's refusal line"
         );
 
-        // A 512 MiB ceiling: a third of the allowance is under the floor, so the floor stands,
-        // and it is the 256 MiB the Parquet sink's default buffer costs the arena.
+        // A 512 MiB ceiling is governed by the share, not the floor, since the sink stopped
+        // demanding its row group's whole size class (08 f.1): the arena takes a third of the
+        // allowance and the other two thirds stay available for what a kernel allocates
+        // outside it. That is the whole point of the share, and while the floor was 128 MiB
+        // plus read-ahead the floor won here instead, which left a Python kernel nothing but
+        // the reserve on any host with a resting footprint larger than this laptop's.
         let at_512 = arena_host_bytes(
             512 << 20,
             48 << 20,
@@ -959,7 +973,16 @@ mod tests {
             4096,
             &mut notes,
         );
-        assert_eq!(at_512, ARENA_FLOOR_BYTES);
+        assert!(
+            at_512 > ARENA_FLOOR_BYTES,
+            "the share governs at 512 MiB, not the floor: {at_512} against {ARENA_FLOOR_BYTES}"
+        );
+        let reserve_512 = ((512u64 << 20) as f64 * config::RESERVE_FRACTION as f64) as u64;
+        let allowance_512 = (512u64 << 20) - (48 << 20) - reserve_512;
+        assert!(
+            at_512 < allowance_512 / 2,
+            "and it leaves most of the allowance for out-of-arena bytes: {at_512} of {allowance_512}"
+        );
 
         // A large enough budget is governed by the share rather than the floor.
         let at_4g = arena_host_bytes(
