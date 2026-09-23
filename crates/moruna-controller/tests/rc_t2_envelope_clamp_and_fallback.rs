@@ -18,14 +18,17 @@ use moruna_controller::{Envelope, Observation, Proposal, Sizer, SizerOutcome};
 use moruna_kernel::{KernelHints, SizerKind};
 use moruna_testkit::{FakeKnobs, FakeSampler};
 
-/// Asks for ten times the top of the envelope, every time.
+/// Asks for ten times the top of the envelope, every time, and records the envelope it was
+/// shown so the test can bound the written targets by it.
 struct Greedy {
     calls: Arc<AtomicU64>,
+    widest: Arc<AtomicU64>,
 }
 
 impl Sizer for Greedy {
     fn propose(&mut self, _obs: &Observation, envelope: &Envelope) -> Proposal {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.widest.fetch_max(envelope.max, Ordering::SeqCst);
         Proposal {
             morsel_target: envelope.max.saturating_mul(10),
             predicted_peak: Some(envelope.max),
@@ -89,24 +92,31 @@ fn rig_with(sizer: impl Fn() -> Box<dyn Sizer> + Send + Sync + 'static) -> commo
 fn rc_t2_clamped_sizer_is_replaced() {
     let calls = Arc::new(AtomicU64::new(0));
     let counter = calls.clone();
+    let widest = Arc::new(AtomicU64::new(0));
+    let seen = widest.clone();
     let rig = rig_with(move || {
         Box::new(Greedy {
             calls: counter.clone(),
+            widest: seen.clone(),
         })
     });
     rig.run_up();
-    let envelope_top = morsel_targets(&rig.writes())
+    let first_target = morsel_targets(&rig.writes())
         .last()
         .map(|(_, bytes)| *bytes)
         .expect("a target after start");
 
     for seq in 1..=30u64 {
-        rig.feed(&record(seq, 1, envelope_top, envelope_top * 4));
+        rig.feed(&record(seq, 1, first_target, first_target * 4));
         rig.controller.tick_once();
     }
 
     // RC-I2: the clamp holds on every single proposal, so no written target ever exceeds what
-    // the budget and the probe allow.
+    // the budget and the probe allow. The bound is the widest envelope the controller ever
+    // handed the sizer, not the first one: the envelope legitimately widens as records replace
+    // the probe's seed (f.3), and holding the run to the seed's envelope would assert the
+    // model never learns rather than that the clamp holds.
+    let envelope_top = widest.load(Ordering::SeqCst);
     for (_, bytes) in morsel_targets(&rig.writes()) {
         assert!(
             bytes <= envelope_top,
