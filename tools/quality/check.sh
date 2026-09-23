@@ -103,6 +103,26 @@ if [ -f Cargo.toml ]; then
   step "cargo test --features polars,datafusion (the engine bridges)"
   quiet test_bridges cargo test -p amoru-polars -p amoru-datafusion --features amoru-polars/polars,amoru-datafusion/datafusion
   if [ -n "${AMORU_PYTHON:-}" ]; then
+    # The adapter's fixtures import pyarrow and numpy inside the embedded interpreter, so
+    # AMORU_PYTHON has to be able to find both. A uv-managed interpreter is externally managed
+    # and cannot have them installed into it, so the usual answer is a venv on that same
+    # interpreter with PYTHONPATH naming its site-packages:
+    #
+    #   uv venv --python "$AMORU_PYTHON" /tmp/amoru-py && \
+    #     uv pip install --python /tmp/amoru-py numpy pyarrow && \
+    #     export PYTHONPATH="$(/tmp/amoru-py/bin/python -c \
+    #       'import sysconfig;print(sysconfig.get_paths()["purelib"])')"
+    #
+    # Checked here rather than left to the tests: without it seven crossing-rule tests fail on
+    # `ModuleNotFoundError` apiece, which reads as a broken adapter and is a missing module
+    # (found 2026-09-23).
+    if missing="$(PYTHONPATH="${PYTHONPATH:-}" "$AMORU_PYTHON" -c '
+import importlib.util, sys
+absent = [m for m in ("pyarrow", "numpy") if importlib.util.find_spec(m) is None]
+sys.stdout.write(", ".join(absent))
+' 2>/dev/null)" && [ -n "$missing" ]; then
+      fail "AMORU_PYTHON ($AMORU_PYTHON) cannot import: $missing; put them on PYTHONPATH (see the comment above this check in tools/quality/check.sh)"
+    fi
     step "cargo test --features python (interpreter: ${AMORU_PYTHON})"
     PYO3_PYTHON="$AMORU_PYTHON" quiet test_python cargo test -p amoru-adapters --features python
   else

@@ -637,24 +637,25 @@ const DEFAULT_OUT_OF_ARENA_AMPLIFICATION: f64 = 4.0;
 
 /// The smallest arena the facade hands out, so a small budget gets a working region rather than a
 /// share of almost nothing. It is the largest single allocation a default pipeline makes: the
-/// Parquet sink's output buffer, which asks for `sink.row_group_bytes` plus a megabyte of footer
-/// headroom and will not go below `row_group_bytes` (08 f.1), so at the default 128 MiB row group
-/// it asks for 129 MiB, and 02 e.1's size classes are powers of two, so it costs 256 MiB of
-/// region. An arena below that cannot open a sink at defaults whatever the budget, which is why
-/// the floor is this figure rather than a few morsels.
+/// Parquet sink's output buffer, which asks for one whole size class of 02 e.2 and spends its
+/// footer headroom inside it (08 f.1), so at the default 128 MiB row group it asks for the
+/// 128 MiB class. An arena below that cannot open a sink at defaults whatever the budget, which
+/// is why the floor is this figure rather than a few morsels.
 ///
 /// A class that size has to be free all at once, so the floor is that class plus what the arena
 /// already holds when the sink opens its buffer, which early in a run is the read-ahead:
-/// `256 MiB + readahead.splits x morsel.probe_bytes`. Measured at a 512 MiB ceiling, the example
-/// runs with 272 MiB and the Python job of `python/tests/test_budget.py` does not, because its
-/// queues hold 18.5 MiB at the moment the sink opens and 256 MiB was then not free.
+/// `128 MiB + readahead.splits x morsel.probe_bytes`. This is half what it was until
+/// 2026-09-23, when the sink asked for `row_group_bytes + 1 MiB of footer`: 129 MiB at the
+/// default, which 02 e.2 serves out of the 256 MiB class, so the sink reserved twice what it
+/// wanted and the Python job of `python/tests/test_budget.py` could not open it at a 512 MiB
+/// ceiling at all (its queues hold 18.5 MiB when the sink opens, and 256 MiB was then not free).
+/// With the footer inside the class that job completes inside 512 MiB.
 ///
 /// It is capped by the allowance, so a budget too small for it gets its whole allowance and
-/// nothing is conjured. Lowering it is a change in `amoru-sinks` and not here: one megabyte of
-/// footer headroom on a power-of-two row group is what crosses the class boundary, and a sink
-/// that asked for the class it can use would need 128 MiB and halve this floor.
+/// nothing is conjured. Lowering it further is a change in `amoru-sinks` and not here: the figure
+/// is whatever class the sink's file buffer asks for at the default row group.
 const ARENA_FLOOR_BYTES: u64 =
-    (256 << 20) + config::READAHEAD_SPLITS as u64 * config::MORSEL_PROBE_BYTES;
+    (128 << 20) + config::READAHEAD_SPLITS as u64 * config::MORSEL_PROBE_BYTES;
 
 /// The chain's expected out-of-arena cost per byte in flight (12 f.1): the largest
 /// `KernelHints::expected_amplification` any stage declares, counting a stage that declares

@@ -72,31 +72,31 @@ def _run(scratch: pathlib.Path, budget: str) -> dict:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-def test_s1_a_greedy_python_kernel_never_exceeds_its_budget(scratch: pathlib.Path) -> None:
-    """S1, G-I1, G-I8: at the budget that broke it, the run fits or it fails.
+def test_s1_a_greedy_python_kernel_fits_inside_512_mib(scratch: pathlib.Path) -> None:
+    """S1, G-I1: 512 MiB holds this job, so it completes inside 512 MiB.
 
     This is the measurement of 2026-09-23, to the row group: 200,000 rows at 20,000 to a group,
-    a 512 MiB budget, `peak_fraction_of_ceiling` 1.11 and a completed run. The arena takes
-    `ceiling - baseline - reserve` and touches every page of it at `new`, so what this kernel has
-    to allocate in is the reserve, about 51 MiB, and the runtime's own reader and writer buffers
-    are in there with it. There may be no worker count and no morsel size that fits, and if there
-    is not, that is a refusal with a diagnostic and not a run that finishes over the ceiling.
+    a 512 MiB budget, `peak_fraction_of_ceiling` 1.11 and a completed run. The arena takes a
+    share of `ceiling - baseline - reserve - declared kernel state` and touches every page of it
+    at `new` (11 f.3, 02 f.1), so what this kernel has to allocate in is the rest of the
+    allowance, which at this ceiling is about 328 MiB with a 160 MiB arena, and the runtime's own
+    reader and writer buffers are in there with it.
+
+    It is asserted as a completion and not as "fits or refuses", because both halves have been
+    measured and 512 MiB holds the job: the run reaches 0.50 to 0.64 of the ceiling over repeated
+    runs. What stopped it was not the budget but `ParquetSink`, which asked the arena for
+    `row_group_bytes + 1 MiB of footer`, 129 MiB at the default row group, which 02 e.2 serves
+    out of the 256 MiB class and which has to be free all at once: the sink reserved twice what
+    it wanted and failed with `alloc 135266304 bytes in Host: budget 167772160 in use 15597568`.
+    The sink now asks for one whole class with the footer inside it (08 f.1). A refusal here is
+    therefore a regression in that allocation and not a legitimate S6 termination, so it fails.
     """
     result = _run(scratch, "512MiB")
 
-    if result["exit"] == "Budget":
-        # A legitimate termination under S6 and G-I8: shrinking to `morsel.min_bytes` on one
-        # worker still would not fit. It has to name the morsel, its stage, its footprint and the
-        # budget, and the two figures it compares have to be the same kind of number.
-        diagnostic = result["diagnostic"]
-        assert diagnostic.startswith("budget: morsel "), diagnostic
-        assert "stage 1" in diagnostic, diagnostic
-        footprint = int(diagnostic.split("footprint ")[1].split(" ")[0])
-        budget = int(diagnostic.split("exceeds budget ")[1].split(" ")[0])
-        assert footprint > budget, diagnostic
-        return
-
-    assert result["exit"] == "Completed", result
+    assert result["exit"] == "Completed", (
+        "512 MiB holds this job (measured 2026-09-23 at 0.50 to 0.64 of the ceiling); a refusal "
+        f"means the sink is over-reserving again (08 f.1): {result}"
+    )
     assert result["rows_out"] == 200_000, result
     assert result["fraction"] <= 1.0, (
         f"S1: peak anonymous memory {result['peak']} exceeded the ceiling "
