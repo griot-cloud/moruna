@@ -8,10 +8,10 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use common::{GIB, MIB, config, kernel, morsel_targets, probe, record, steady};
 use moruna_controller::{Envelope, Observation, Proposal, Sizer, SizerOutcome};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, config, kernel, morsel_targets, probe, record, steady};
 
 /// A sizer that alternates: twice the target, then half of it, for ever. The alternation is
 /// produced here rather than hoped for out of the rule sizer's smoothing, because what RC-I5 is

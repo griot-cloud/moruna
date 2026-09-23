@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use moruna_kernel::{MorunaError, Guarantee, HostProfile, Result};
+use moruna_kernel::{Guarantee, HostProfile, MorunaError, Result};
 
 /// Where the crate reads environment variables from.
 pub(crate) trait EnvSource {

@@ -9,9 +9,9 @@
 
 mod common;
 
+use common::{GIB, MIB, Scratch, config, kernel, probe, record, steady};
 use moruna_kernel::{Fingerprint, KernelHints, SchedulerStats, StageStats};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, Scratch, config, kernel, probe, record, steady};
 use serde_json::Value;
 
 /// The file e.3 names for one kernel: its fingerprint and its input schema hash.

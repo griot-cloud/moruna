@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use moruna_kernel::{MorunaError, RunId, StageId, TraceRecord, TraceSink, TraceTail};
 use arrow::array::{
     ArrayBuilder, Float32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder,
     UInt8Builder, UInt16Builder, UInt64Builder,
@@ -16,6 +15,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::ipc::writer::{FileWriter, StreamWriter};
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use moruna_kernel::{MorunaError, RunId, StageId, TraceRecord, TraceSink, TraceTail};
 
 use crate::view::{ChunkSet, TraceView, record_at};
 use crate::{CHUNK_ROWS, DRAIN_INTERVAL_MS, Result, lock, run_id_hex};

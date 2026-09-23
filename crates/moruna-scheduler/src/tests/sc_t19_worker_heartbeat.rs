@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use moruna_kernel::{MorunaError, CancelToken};
+use moruna_kernel::{CancelToken, MorunaError};
 use moruna_testkit::{FakeKernel, FakePlacement, FakeSink, FakeSource};
 
 use super::common::{RigBuilder, manifest_lock, wait_for};

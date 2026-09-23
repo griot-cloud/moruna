@@ -12,12 +12,12 @@ mod common;
 use std::sync::Arc;
 use std::time::Instant;
 
-use moruna_kernel::{MorselFeatures, Payload, Tier};
 use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::buffer::Buffer as ArrowBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::FakeAllocator;
+use moruna_kernel::{MorselFeatures, Payload, Tier};
 
 /// A `Utf8` column of `rows` strings of `width` bytes each, whose values buffer is an arena
 /// region of `values_bytes` bytes: far more than the strings occupy, so only the offsets can

@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use moruna_kernel::{MorunaError, DeviceId, KernelState, Result, ResumePolicy};
+use moruna_kernel::{DeviceId, KernelState, MorunaError, Result, ResumePolicy};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 

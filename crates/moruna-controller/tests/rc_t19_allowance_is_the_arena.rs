@@ -11,9 +11,9 @@
 
 mod common;
 
+use common::{GIB, MIB, config_with_baseline, kernel, morsel_targets, probe, steady};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, config_with_baseline, kernel, morsel_targets, probe, steady};
 
 const CEILING: u64 = 8 * GIB;
 const BASELINE: u64 = 400 * MIB;

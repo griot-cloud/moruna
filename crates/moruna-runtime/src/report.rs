@@ -114,7 +114,7 @@ pub fn compute(view: &TraceView, limits: &Limits, meta: &RunMeta) -> RunReport {
 mod tests {
     use super::*;
     use moruna_controller::ControllerSummary;
-    use moruna_kernel::{MorunaError, KnobSnapshot};
+    use moruna_kernel::{KnobSnapshot, MorunaError};
 
     /// Every outcome maps to its exit reason, and a terminated one carries its manifest.
     #[test]

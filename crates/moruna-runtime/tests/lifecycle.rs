@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use moruna_discovery::Discovered;
 use moruna_kernel::{
-    Allocator, MorunaError, CancelToken, Device, DeviceId, Guarantee, HostProfile, Kernel,
-    LimitSource, Limits, Placement, Reactor, RunId, Sampler, Sink, Source, TierKind, TraceSink,
-    TraceTail,
+    Allocator, CancelToken, Device, DeviceId, Guarantee, HostProfile, Kernel, LimitSource, Limits,
+    MorunaError, Placement, Reactor, RunId, Sampler, Sink, Source, TierKind, TraceSink, TraceTail,
 };
 use moruna_runtime::{Components, RunSpec, Runtime, SinkSpec, SourceSpec};
 use moruna_testkit::{

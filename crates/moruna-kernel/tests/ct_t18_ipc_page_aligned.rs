@@ -7,8 +7,6 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::ipc::{decode, encode_framing};
-use moruna_kernel::{MorunaError, DType, Tier};
 use arrow::array::{
     Array, ArrayData, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, make_array,
@@ -16,6 +14,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::FakeAllocator;
+use moruna_kernel::ipc::{decode, encode_framing};
+use moruna_kernel::{DType, MorunaError, Tier};
 
 const PAGE: usize = 4096;
 
@@ -205,14 +205,20 @@ fn ct_t18_ipc_page_aligned() {
     bytes[entry..entry + 8].copy_from_slice(&corrupt.to_le_bytes());
     let corrupted = arrow::buffer::Buffer::from(bytes);
     let err = decode(corrupted, PAGE).expect_err("a misaligned body offset must be rejected");
-    assert!(matches!(err, MorunaError::Io { op: "ipc", .. }), "got {err}");
+    assert!(
+        matches!(err, MorunaError::Io { op: "ipc", .. }),
+        "got {err}"
+    );
 
     // So is a record whose continuation marker is gone, and a zero page size.
     let (record, _) = assemble(&alloc, batch);
     let mut bytes = record.as_slice().to_vec();
     bytes[0] = 0;
     let err = decode(arrow::buffer::Buffer::from(bytes), PAGE).expect_err("no continuation");
-    assert!(matches!(err, MorunaError::Io { op: "ipc", .. }), "got {err}");
+    assert!(
+        matches!(err, MorunaError::Io { op: "ipc", .. }),
+        "got {err}"
+    );
     assert!(decode(record, 0).is_err());
     assert!(encode_framing(batch, 0, 0, &alloc).is_err());
     // and a base offset that is not page aligned.

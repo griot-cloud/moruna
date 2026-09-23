@@ -11,7 +11,7 @@
 
 mod common;
 
-use moruna_kernel::{MorunaError, DeviceId, Locality, Placement, Tier, TierKind};
+use moruna_kernel::{DeviceId, Locality, MorunaError, Placement, Tier, TierKind};
 use moruna_placement::state::State;
 use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
 

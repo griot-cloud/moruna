@@ -7,7 +7,7 @@
 //! cannot be written; that is reported as an escalation and this is the plan-time metadata
 //! read d.1 already grants local paths for size and listing. No payload byte is read here.
 
-use moruna_kernel::{MorunaError, DType, Result, SourceSchema, Split, SplitId};
+use moruna_kernel::{DType, MorunaError, Result, SourceSchema, Split, SplitId};
 
 use super::Entry;
 use crate::util::plan_err;

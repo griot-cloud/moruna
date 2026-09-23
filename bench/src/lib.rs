@@ -27,7 +27,6 @@
 
 #![deny(missing_docs)]
 
-pub mod mrb1;
 pub mod cli;
 pub mod dataset;
 pub mod dtype;
@@ -35,6 +34,7 @@ pub mod error;
 pub mod host;
 pub mod kernels;
 pub mod manifest;
+pub mod mrb1;
 pub mod parquet_out;
 pub mod rng;
 pub mod s3;

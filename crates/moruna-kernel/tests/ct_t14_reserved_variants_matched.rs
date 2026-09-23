@@ -5,7 +5,7 @@
 //! runs in CI and in the quality gate.
 
 use moruna_kernel::{
-    MorunaError, DeviceId, LOCAL_NODE, NodeId, RemoteRef, SegmentRef, StagingCodec, TIER_COUNT,
+    DeviceId, LOCAL_NODE, MorunaError, NodeId, RemoteRef, SegmentRef, StagingCodec, TIER_COUNT,
     Tier, TierKind,
 };
 

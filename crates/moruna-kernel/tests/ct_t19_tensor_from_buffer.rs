@@ -4,9 +4,9 @@
 
 mod common;
 
-use moruna_kernel::mrb1::{Header, record_len};
-use moruna_kernel::{MorunaError, DType, ManagedTensor, Payload, Tier};
 use common::FakeAllocator;
+use moruna_kernel::mrb1::{Header, record_len};
+use moruna_kernel::{DType, ManagedTensor, MorunaError, Payload, Tier};
 
 const PAGE: u64 = 4096;
 

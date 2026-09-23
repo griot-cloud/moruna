@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_kernel::{MorunaError, Guarantee, Result};
+use moruna_kernel::{Guarantee, MorunaError, Result};
 
 /// `mmap` calls made through this module since the process started.
 static MMAP_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -137,10 +137,11 @@ pub(crate) fn new_host(
     huge_pages: Guarantee,
     memlock: Guarantee,
 ) -> Result<HostRegion> {
-    let raw_len = usize::try_from(bytes.saturating_add(align)).map_err(|_| MorunaError::Config {
-        name: "budget.host",
-        msg: format!("host region of {bytes} bytes does not fit this address space"),
-    })?;
+    let raw_len =
+        usize::try_from(bytes.saturating_add(align)).map_err(|_| MorunaError::Config {
+            name: "budget.host",
+            msg: format!("host region of {bytes} bytes does not fit this address space"),
+        })?;
     #[cfg(target_os = "linux")]
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
     // MAP_NORESERVE is a Linux flag; on macOS an anonymous private mapping is already

@@ -11,9 +11,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 
+use common::{TempDir, config, lean_record, resident_bytes};
 use moruna_kernel::TraceSink;
 use moruna_trace::TraceWriter;
-use common::{TempDir, config, lean_record, resident_bytes};
 
 /// The record count the SDD names. A long run must not grow the process without limit, so
 /// this test is the one that proves the bound at the scale the design claims it holds at.

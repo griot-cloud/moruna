@@ -13,10 +13,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use common::{GIB, MIB, config, kernel, morsel_targets, probe, record, steady};
 use moruna_controller::{Envelope, Observation, Proposal, Sizer, SizerOutcome};
 use moruna_kernel::{KernelHints, SizerKind};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, config, kernel, morsel_targets, probe, record, steady};
 
 /// Asks for ten times the top of the envelope, every time.
 struct Greedy {

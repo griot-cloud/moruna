@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use moruna_kernel::{MorunaError, CancelToken, Result, ResumePoint, ResumePolicy, Sink, StageId};
+use moruna_kernel::{CancelToken, MorunaError, Result, ResumePoint, ResumePolicy, Sink, StageId};
 
 use crate::checkpoint;
 use crate::shared::{DRIVE_DRIVING, DRIVE_STOP, Exit, RunState, Shared, WorkerJob};

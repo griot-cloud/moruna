@@ -8,7 +8,7 @@
 
 mod common;
 
-use moruna_kernel::{MorunaError, Locality, Placement, TierKind};
+use moruna_kernel::{Locality, MorunaError, Placement, TierKind};
 use moruna_testkit::{FakeAllocator, FakeReactor};
 
 #[test]

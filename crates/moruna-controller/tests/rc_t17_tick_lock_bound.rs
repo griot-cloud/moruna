@@ -20,10 +20,10 @@ mod common;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use common::{GIB, MIB, WatchedPlacement, Watcher, config, kernel, probe, record, sample};
 use moruna_controller::{Controller, TICK_BOUND_MS};
 use moruna_kernel::{KernelHints, SchedulerStats, StageStats, TraceSink};
 use moruna_testkit::{FakeKnobs, FakePlacement, FakeSampler, FakeTrace};
-use common::{GIB, MIB, WatchedPlacement, Watcher, config, kernel, probe, record, sample};
 
 /// The window the SDD names: a hundred thousand records in the trace and a thousand ticks over
 /// them.

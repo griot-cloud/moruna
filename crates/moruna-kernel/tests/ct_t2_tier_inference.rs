@@ -5,11 +5,11 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{MorunaError, Payload, Tier};
 use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::{FakeAllocator, int_batch_in, mixed_batch};
+use moruna_kernel::{MorunaError, Payload, Tier};
 
 fn heap_int_column(values: &[i32]) -> ArrayRef {
     Arc::new(arrow::array::Int32Array::from_iter_values(

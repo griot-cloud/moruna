@@ -11,12 +11,12 @@ mod common;
 
 use std::sync::Arc;
 
+use datafusion::prelude::{SessionContext, col};
 use moruna_datafusion::datafusion_udf;
 use moruna_kernel::arrow::array::{Array, ArrayRef, StringArray};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{Kernel, NoState, Payload};
-use datafusion::prelude::{SessionContext, col};
 
 use common::{Normalise, ROWS};
 
@@ -129,8 +129,9 @@ fn ad_t10_datafusion_bridge_carries_refusals() {
     let empty = datafusion_udf(common::NoColumns, "moruna_empty");
     assert!(empty.return_type(&[DataType::Int64]).is_err());
 
-    let column: ArrayRef =
-        StdArc::new(moruna_kernel::arrow::array::Int64Array::from(vec![1_i64, 2]));
+    let column: ArrayRef = StdArc::new(moruna_kernel::arrow::array::Int64Array::from(vec![
+        1_i64, 2,
+    ]));
     let args = |name: &str| ScalarFunctionArgs {
         args: vec![ColumnarValue::Array(StdArc::clone(&column))],
         arg_fields: vec![StdArc::new(Field::new(name, DataType::Int64, false))],

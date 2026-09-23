@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use moruna_kernel::{
-    MorunaError, Buffer, BufferView, CopyDst, CopySrc, MorselFeatures, Payload, PayloadKind,
+    Buffer, BufferView, CopyDst, CopySrc, MorselFeatures, MorunaError, Payload, PayloadKind,
     SegmentRef, Seq, StageId, Tier, TierKind,
 };
 

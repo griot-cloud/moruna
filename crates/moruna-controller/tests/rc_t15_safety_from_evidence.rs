@@ -7,9 +7,9 @@
 
 mod common;
 
+use common::{GIB, MIB, Scratch, config, kernel, morsel_targets, probe, steady};
 use moruna_kernel::{Fingerprint, KernelHints};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, Scratch, config, kernel, morsel_targets, probe, steady};
 
 const CEILING: u64 = 8 * GIB;
 const BASELINE: u64 = 400 * MIB;

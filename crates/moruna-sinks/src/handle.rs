@@ -1,6 +1,8 @@
 //! `SinkHandle`, the one type the scheduler drives (08 f.9, d.1).
 
-use moruna_kernel::{BoxFuture, Payload, PayloadSpec, Result, Seq, Sink, SinkSummary, SourceSchema};
+use moruna_kernel::{
+    BoxFuture, Payload, PayloadSpec, Result, Seq, Sink, SinkSummary, SourceSchema,
+};
 
 use crate::reorder::ReorderBuffer;
 

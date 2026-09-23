@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use moruna_kernel::{MorunaError, Knob, Sample, SchedulerStats};
+use moruna_kernel::{Knob, MorunaError, Sample, SchedulerStats};
 
 use crate::{Actions, ControllerState, SAFETY_CAP, model, summary::Bottleneck};
 

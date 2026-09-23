@@ -13,7 +13,7 @@ use dlpark::metadata::CopiedSlice;
 use dlpark::{Builder, DlpackFlags};
 
 use crate::buffer::Buffer;
-use crate::error::{MorunaError, ConvertError};
+use crate::error::{ConvertError, MorunaError};
 use crate::ids::DeviceId;
 use crate::payload::DType;
 use crate::tier::Tier;

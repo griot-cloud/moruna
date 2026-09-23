@@ -5,9 +5,9 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{TempDir, config, record};
 use moruna_kernel::TraceSink;
 use moruna_trace::TraceWriter;
-use common::{TempDir, config, record};
 
 const STAGES: u16 = 4;
 const PER_STAGE: u64 = 5_000;

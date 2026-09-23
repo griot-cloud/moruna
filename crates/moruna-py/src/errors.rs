@@ -5,7 +5,7 @@
 //! `.manifest` and `.report` when the run produced them. The subclasses exist for `except`
 //! ergonomics and are exactly e.2's table.
 
-use moruna_kernel::{MorunaError as RsError, MorselFeatures};
+use moruna_kernel::{MorselFeatures, MorunaError as RsError};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;

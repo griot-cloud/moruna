@@ -13,7 +13,7 @@ use moruna_adapters::python::cross::export;
 use moruna_adapters::python::{PyKernel, PyKernelSpec};
 use moruna_adapters::{python_build_info, python_gil_enabled};
 use moruna_kernel::{
-    Allocator, MorunaError, DeviceId, InitCtx, Kernel, KernelKind, NoState, Payload, PayloadKind,
+    Allocator, DeviceId, InitCtx, Kernel, KernelKind, MorunaError, NoState, Payload, PayloadKind,
     PayloadSpec, ResumePolicy, SourceSchema, Tier, TierPref,
 };
 use moruna_testkit::FakeAllocator;

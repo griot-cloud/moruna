@@ -6,7 +6,7 @@
 mod common;
 
 use moruna_kernel::{
-    MorunaError, DeviceId, LOCAL_NODE, Locality, Morsel, NodeId, Payload, Placement, RemoteRef,
+    DeviceId, LOCAL_NODE, Locality, Morsel, MorunaError, NodeId, Payload, Placement, RemoteRef,
     SegmentRef, StagingCodec, Tier, TierKind, TierPref,
 };
 use moruna_placement::plan::one_tier_down;

@@ -7,9 +7,9 @@ mod common;
 
 use std::sync::{Arc, Barrier};
 
+use common::{TempDir, config, lean_record};
 use moruna_kernel::TraceSink;
 use moruna_trace::TraceWriter;
-use common::{TempDir, config, lean_record};
 
 const THREADS: u64 = 4;
 const PER_THREAD: u64 = 100_000;

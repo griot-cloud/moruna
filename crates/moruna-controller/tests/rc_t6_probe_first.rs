@@ -5,9 +5,9 @@
 
 mod common;
 
+use common::{MIB, config, kernel, morsel_targets, probe, steady};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{MIB, config, kernel, morsel_targets, probe, steady};
 
 #[test]
 fn rc_t6_probe_first() {

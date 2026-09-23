@@ -11,7 +11,7 @@ mod common;
 
 use moruna_arena::{Arena, ArenaConfig};
 use moruna_kernel::{
-    ALIGNMENT, Allocator, MorunaError, Buffer, BufferView, Guarantee, Tier, TierKind,
+    ALIGNMENT, Allocator, Buffer, BufferView, Guarantee, MorunaError, Tier, TierKind,
 };
 
 // AR-T1 alignment (02 k): 10,000 random-size allocations across tiers (host only in CI);

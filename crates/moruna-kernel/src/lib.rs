@@ -12,7 +12,6 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub mod mrb1;
 pub mod buffer;
 pub mod completion;
 pub mod error;
@@ -23,6 +22,7 @@ pub mod kernel;
 pub mod knobs;
 pub mod limits;
 pub mod morsel;
+pub mod mrb1;
 pub mod payload;
 pub mod placement;
 pub mod reactor;
@@ -42,7 +42,7 @@ pub use dlpark;
 
 pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
 pub use completion::{Completion, CompletionSender};
-pub use error::{MorunaError, ConvertError};
+pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{

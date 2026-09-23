@@ -10,7 +10,7 @@
 //! `unsafe` is permitted here (section l) for the CUDA driver calls; every block cites RE-I1,
 //! which is what makes the pointers valid for the life of the operation.
 
-use moruna_kernel::{MorunaError, Buffer, CopyDst, CopySrc, DeviceId, Result, SegmentRef, Tier};
+use moruna_kernel::{Buffer, CopyDst, CopySrc, DeviceId, MorunaError, Result, SegmentRef, Tier};
 
 use crate::stats::CopyDirection;
 

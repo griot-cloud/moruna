@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use moruna_kernel::{
-    Allocator, MorunaError, BoxFuture, Buffer, BufferView, Completion, DType, ManagedTensor,
+    Allocator, BoxFuture, Buffer, BufferView, Completion, DType, ManagedTensor, MorunaError,
     Payload, PayloadKind, PayloadSpec, Reactor, Result, Seq, Sink, SinkSummary, SourceSchema,
     TierPref, mrb1,
 };

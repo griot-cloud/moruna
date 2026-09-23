@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 
 use moruna_kernel::{
-    MorunaError, BoxFuture, Payload, PayloadSpec, Result, Seq, Sink, SinkSummary, SourceSchema,
+    BoxFuture, MorunaError, Payload, PayloadSpec, Result, Seq, Sink, SinkSummary, SourceSchema,
 };
 
 use crate::stats::SinkStats;

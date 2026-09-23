@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use moruna_kernel::{
-    MorunaError, Buffer, CopyDst, CopySrc, DeviceId, Guarantee, HostProfile, ObjectMeta,
+    Buffer, CopyDst, CopySrc, DeviceId, Guarantee, HostProfile, MorunaError, ObjectMeta,
     ObjectMetadata, Reactor as ReactorTrait, SegmentRef, Tier,
 };
 use moruna_testkit::FakeAllocator;
-use bytes::Bytes;
 use object_store::PutPayload;
 use object_store::path::Path as OsPath;
 

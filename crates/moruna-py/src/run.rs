@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use moruna_adapters::{PyKernel, python_gil_enabled};
-use moruna_kernel::{MorunaError, CancelToken, DType, Kernel, SourceSchema};
+use moruna_kernel::{CancelToken, DType, Kernel, MorunaError, SourceSchema};
 use moruna_placement::PlacementEngine;
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 use moruna_runtime::{RunSpec, Runtime};

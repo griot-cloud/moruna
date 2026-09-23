@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moruna_kernel::{
-    AllocStats, Allocator, MorunaError, Buffer, DeviceId, Guarantee, Result, Tier, TierKind,
+    AllocStats, Allocator, Buffer, DeviceId, Guarantee, MorunaError, Result, Tier, TierKind,
 };
 
 use crate::classes::{GRANULE, SMALL_BUDGET_BYTES, Space};

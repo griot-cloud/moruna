@@ -17,9 +17,9 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use moruna_kernel::{MorunaError, BoxFuture, Locality, Result, Seq, Sink, SinkSummary};
-use moruna_sinks::SinkHandle;
 use crossbeam::sync::{Parker, Unparker};
+use moruna_kernel::{BoxFuture, Locality, MorunaError, Result, Seq, Sink, SinkSummary};
+use moruna_sinks::SinkHandle;
 
 use crate::shared::{DRIVE_DRIVING, DRIVE_STOP, Exit, RunState, Shared};
 

@@ -1,8 +1,8 @@
 //! CT-T9 trace_schema_hash: `TraceRecord::SCHEMA_HASH` equals the pinned constant;
 //! `arrow_schema()` field names and types match d.13 in order. Proves CT-I8.
 
-use moruna_kernel::{Outcome, TraceRecord};
 use arrow::datatypes::DataType;
+use moruna_kernel::{Outcome, TraceRecord};
 
 /// The pinned value (e.5): the BLAKE3 digest of the canonical field list, computed once by the
 /// component 1 agent and asserted here, so a schema change is a deliberate edit of this test

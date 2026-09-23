@@ -14,9 +14,9 @@
 
 mod common;
 
+use common::{GIB, MIB, kernel, morsel_targets, probe, record, steady};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, kernel, morsel_targets, probe, record, steady};
 
 #[test]
 fn rc_t4_breach_immediate() {

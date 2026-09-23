@@ -6,7 +6,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use moruna_kernel::{
-    MorunaError, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, Payload,
+    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError, Payload,
     PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
 };
 

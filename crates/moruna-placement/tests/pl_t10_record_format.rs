@@ -13,7 +13,7 @@
 mod common;
 
 use moruna_kernel::arrow::buffer::Buffer as ArrowBuffer;
-use moruna_kernel::{Locality, Placement, StagingCodec, TierKind, mrb1, ipc};
+use moruna_kernel::{Locality, Placement, StagingCodec, TierKind, ipc, mrb1};
 use moruna_testkit::{FakeAllocator, FakeReactor};
 
 /// The header page of e.3, parsed by hand so the test does not borrow the engine's reader.

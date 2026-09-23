@@ -11,10 +11,10 @@
 
 mod common;
 
+use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, read_aheads, steady};
 use moruna_controller::PlanSummary;
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, read_aheads, steady};
 
 #[test]
 fn rc_t11_tiny_dataset() {

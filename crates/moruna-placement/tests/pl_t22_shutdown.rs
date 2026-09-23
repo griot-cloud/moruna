@@ -3,7 +3,7 @@
 
 mod common;
 
-use moruna_kernel::{MorunaError, Locality, Placement, Reactor, TIER_COUNT, TierKind};
+use moruna_kernel::{Locality, MorunaError, Placement, Reactor, TIER_COUNT, TierKind};
 use moruna_placement::state::State;
 use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
 use std::time::{Duration, Instant};

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use moruna_kernel::arrow::array::ArrayRef;
 use moruna_kernel::arrow::datatypes::{Field, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
-use moruna_kernel::{MorunaError, Kernel, NoState, Payload};
+use moruna_kernel::{Kernel, MorunaError, NoState, Payload};
 use polars::prelude::{PlSmallStr, PolarsError, PolarsResult, Series};
 
 use crate::ffi;

@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
-use moruna_bench::mrb1;
 use moruna_bench::cli;
 use moruna_bench::dataset::{Dataset, DatasetKind};
 use moruna_bench::dtype::DType;
+use moruna_bench::mrb1;
 use moruna_bench::parquet_out::ParquetSpec;
 use moruna_bench::s3;
 use moruna_bench::suite::{self, Scale};

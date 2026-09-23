@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use moruna_kernel::{
-    MorunaError, ErrorPolicy, Kernel, NodeId, PayloadSpec, Result, Sink, Source, SourceSchema,
+    ErrorPolicy, Kernel, MorunaError, NodeId, PayloadSpec, Result, Sink, Source, SourceSchema,
 };
 use moruna_sinks::SinkHandle;
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moruna_kernel::{
-    MorunaError, CancelToken, ErrorPolicy, Knob, Knobs, PayloadKind, PayloadSpec, Prober,
+    CancelToken, ErrorPolicy, Knob, Knobs, MorunaError, PayloadKind, PayloadSpec, Prober,
     ResumePoint, SourceSchema, StatsSource, TierPref,
 };
 use moruna_sinks::SinkHandle;
@@ -257,13 +257,13 @@ fn sc_f1_chain_validation() {
         }
     }
 
-    let strings = SourceSchema::Table(Arc::new(moruna_kernel::arrow::datatypes::Schema::new(vec![
-        moruna_kernel::arrow::datatypes::Field::new(
+    let strings = SourceSchema::Table(Arc::new(moruna_kernel::arrow::datatypes::Schema::new(
+        vec![moruna_kernel::arrow::datatypes::Field::new(
             "text",
             moruna_kernel::arrow::datatypes::DataType::Utf8,
             false,
-        ),
-    ])));
+        )],
+    )));
     let outcome = RigBuilder::new()
         .source(FakeSource::new().schema(strings))
         .kernel(Arc::new(TensorKernel))

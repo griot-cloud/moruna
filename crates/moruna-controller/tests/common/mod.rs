@@ -568,7 +568,9 @@ impl Placement for WatchedPlacement {
         _fingerprints: &[Fingerprint],
     ) -> Result<moruna_kernel::ResumePoint> {
         self.other();
-        Err(moruna_kernel::MorunaError::Resume("not a resumed run".into()))
+        Err(moruna_kernel::MorunaError::Resume(
+            "not a resumed run".into(),
+        ))
     }
 
     fn is_full(&self, _stage: StageId) -> bool {

@@ -6,9 +6,9 @@
 
 mod common;
 
+use common::{GIB, MIB, active_workers, kernel, morsel_targets, probe, read_aheads, steady};
 use moruna_kernel::{KernelHints, StageId};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, active_workers, kernel, morsel_targets, probe, read_aheads, steady};
 
 /// A deterministic generator, so a failure is reproducible from the seed alone.
 struct Lcg(u64);

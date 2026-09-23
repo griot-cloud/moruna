@@ -3,9 +3,9 @@
 
 mod common;
 
+use common::{TempDir, config, limits, meta, record};
 use moruna_kernel::{TraceRecord, TraceSink};
 use moruna_trace::{ExitReason, RunReport, TraceWriter};
-use common::{TempDir, config, limits, meta, record};
 
 const RECORDS: u64 = 12_000;
 

@@ -4,21 +4,21 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{
+    Scratch, arena_batch, arena_payload, arena_tensor, arena_tensor_of, arena_wide_batch, block_on,
+    materialise, table_schema, table_source_schema, tensor_source_schema, wide_source_schema,
+    written,
+};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    MorunaError, DType, Payload, RunId, SegmentRef, Sink, SourceSchema, Tier, TierPref,
+    DType, MorunaError, Payload, RunId, SegmentRef, Sink, SourceSchema, Tier, TierPref,
 };
 use moruna_sinks::{
     ArrowIpcSink, ArrowIpcSinkConfig, ParquetSink, ParquetSinkConfig, ReorderBuffer, SinkHandle,
     SinkStats, TensorFormat, TensorSink, TensorSinkConfig,
 };
 use moruna_testkit::{FakeAllocator, FakeReactor, FakeSink, OpKind};
-use common::{
-    Scratch, arena_batch, arena_payload, arena_tensor, arena_tensor_of, arena_wide_batch, block_on,
-    materialise, table_schema, table_source_schema, tensor_source_schema, wide_source_schema,
-    written,
-};
 
 /// A payload whose bytes are not resident in a host tier is refused rather than copied,
 /// whichever tier it names. SI-I6.
@@ -445,7 +445,10 @@ fn a_tensor_sink_refuses_drift_and_reports_failure() {
     sink.open(&tensor_source_schema(4)).expect("open");
     let reactor = reactor.fail_next(OpKind::WriteFile, 2);
     let outcome = block_on(sink.write(0, arena_tensor(&alloc, 4, 4, 0.0)));
-    assert!(matches!(outcome, Err(MorunaError::Io { .. })), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(MorunaError::Io { .. })),
+        "{outcome:?}"
+    );
     let _ = reactor;
     let outcome = sink.finish();
     let Err(MorunaError::Sink(msg)) = outcome else {
@@ -701,7 +704,10 @@ fn a_sink_url_names_a_destination() {
     )
     .expect("parquet sink");
     let outcome = sink.resume(&table_source_schema(), state, None);
-    assert!(matches!(outcome, Err(MorunaError::Io { .. })), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(MorunaError::Io { .. })),
+        "{outcome:?}"
+    );
 }
 
 /// A run-mode sink refuses `finish` before it is open, and clears the temporary files an

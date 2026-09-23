@@ -20,7 +20,7 @@
 //!     ends there (S6, G-I8). The counter stays as the backstop for the other case: a model that
 //!     says the set fits and a process that says otherwise.
 
-use moruna_kernel::{MorunaError, Knob, TraceRecord};
+use moruna_kernel::{Knob, MorunaError, TraceRecord};
 
 use crate::{Actions, BREACH_SHARE, ControllerState, SAFETY_CAP, features_of, model};
 

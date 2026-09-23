@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use moruna_kernel::{
-    MorunaError, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, Result, SchedulerStats, StageId,
+    Knob, KnobSnapshot, Knobs, MorunaError, ProbeResult, Prober, Result, SchedulerStats, StageId,
     StatsSource, TierKind,
 };
 

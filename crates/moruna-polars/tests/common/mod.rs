@@ -15,7 +15,7 @@ use moruna_kernel::arrow::array::{Array, ArrayRef, StringArray, StringBuilder};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    MorunaError, Fingerprint, InitCtx, Kernel, KernelKind, KernelState, NoState, Payload,
+    Fingerprint, InitCtx, Kernel, KernelKind, KernelState, MorunaError, NoState, Payload,
     PayloadKind, PayloadSpec, Result, SourceSchema, TierPref,
 };
 

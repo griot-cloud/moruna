@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    MorunaError, ManagedTensor, Morsel, MorselFeatures, NodeId, Origin, Payload, PayloadKind,
+    ManagedTensor, Morsel, MorselFeatures, MorunaError, NodeId, Origin, Payload, PayloadKind,
     PayloadSpec, RemoteRef, SegmentRef, Seq, StageId, Tier, TierPref,
 };
 

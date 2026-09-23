@@ -8,9 +8,9 @@
 
 mod common;
 
+use common::{GIB, MIB, morsel_targets, probe, record, sample, stateful_kernel};
 use moruna_kernel::{KernelHints, SchedulerStats, StageStats};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, morsel_targets, probe, record, sample, stateful_kernel};
 
 const CEILING: u64 = 8 * GIB;
 /// What one instance holds when the first record arrives. It grows by half again on every

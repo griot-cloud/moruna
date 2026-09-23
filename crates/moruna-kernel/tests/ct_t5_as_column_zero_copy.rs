@@ -5,11 +5,11 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{DType, ManagedTensor, Payload, Tier};
 use arrow::array::{Array, ArrayData, ArrayRef, FixedSizeListArray, Int32Array, make_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::{FakeAllocator, arrow_dtypes};
+use moruna_kernel::{DType, ManagedTensor, Payload, Tier};
 
 #[test]
 fn ct_t5_as_column_zero_copy() {

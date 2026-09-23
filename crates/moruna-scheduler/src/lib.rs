@@ -28,8 +28,8 @@
 use std::sync::Arc;
 
 use moruna_kernel::{
-    Allocator, MorunaError, CancelToken, Kernel, NodeId, Placement, RecordHook, Result, ResumePoint,
-    Sampler, TraceSink,
+    Allocator, CancelToken, Kernel, MorunaError, NodeId, Placement, RecordHook, Result,
+    ResumePoint, Sampler, TraceSink,
 };
 
 mod checkpoint;
@@ -195,7 +195,11 @@ impl moruna_kernel::StatsSource for Scheduler {
 }
 
 impl moruna_kernel::Prober for Scheduler {
-    fn probe(&self, stage: moruna_kernel::StageId, bytes: u64) -> Result<moruna_kernel::ProbeResult> {
+    fn probe(
+        &self,
+        stage: moruna_kernel::StageId,
+        bytes: u64,
+    ) -> Result<moruna_kernel::ProbeResult> {
         probe::probe(&self.shared, stage, bytes)
     }
 }

@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 
-use moruna_kernel::{MorunaError, DeviceId, InitCtx, KernelState, Result};
+use moruna_kernel::{DeviceId, InitCtx, KernelState, MorunaError, Result};
 
 use crate::shared::{JobOutput, Shared, WorkerJob};
 

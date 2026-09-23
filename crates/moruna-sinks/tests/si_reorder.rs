@@ -6,10 +6,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use common::{arena_payload, block_on, table_source_schema};
 use moruna_kernel::{MorunaError, Seq, Sink, SourceSchema};
 use moruna_sinks::{ReorderBuffer, SinkHandle};
 use moruna_testkit::{FakeAllocator, FakeSink};
-use common::{arena_payload, block_on, table_source_schema};
 
 /// A deterministic shuffle, so a failure is reproducible without a random number generator.
 fn shuffled(n: u64, seed: u64) -> Vec<Seq> {
@@ -191,7 +191,10 @@ fn si_t15_sink_handle() {
     assert_eq!(ordered.committed_seq(), inner.committed_seq());
     assert!(ordered.checkpoint().expect("checkpoint").is_none());
     let refused = ordered.resume(&table_source_schema(), b"", Some(1));
-    assert!(matches!(refused, Err(MorunaError::Resume(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(MorunaError::Resume(_))),
+        "{refused:?}"
+    );
     ordered.finish().expect("finish");
     assert_eq!(inner.finish_calls(), 1);
 }

@@ -3,13 +3,13 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
-use moruna_kernel::arrow::record_batch::RecordBatch;
-use moruna_kernel::{MorunaError, Kernel, NoState, Payload, SourceSchema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
+use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+use moruna_kernel::arrow::record_batch::RecordBatch;
+use moruna_kernel::{Kernel, MorunaError, NoState, Payload, SourceSchema};
 
 /// A kernel as a DataFusion scalar function.
 ///

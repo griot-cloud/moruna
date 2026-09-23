@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use common::{Scratch, arena_payload, table_source_schema};
 use moruna_kernel::{Reactor, Sink};
 use moruna_sinks::{ParquetSink, ParquetSinkConfig};
 use moruna_testkit::{FakeAllocator, FakeReactor};
-use common::{Scratch, arena_payload, table_source_schema};
 
 /// The file buffer a sink of this size holds: `file_bytes` plus room for the footer (f.1).
 const FILE_BYTES: u64 = 32 << 10;

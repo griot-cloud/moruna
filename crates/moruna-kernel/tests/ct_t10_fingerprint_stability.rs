@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use moruna_kernel::{DType, Fingerprint, SourceSchema};
 use arrow::datatypes::{DataType, Field, Schema};
+use moruna_kernel::{DType, Fingerprint, SourceSchema};
 
 /// The golden schema hashes: a table schema's is BLAKE3 over its Arrow IPC schema message, a
 /// tensor schema's over `"tensor:" || dtype code || shape` (d.4). The profile store keys

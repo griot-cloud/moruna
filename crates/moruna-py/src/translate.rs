@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use moruna_kernel::{MorunaError, ErrorPolicy, Result, SizerKind};
+use moruna_kernel::{ErrorPolicy, MorunaError, Result, SizerKind};
 
 use crate::handles::{SinkSpec, SourceSpec};
 use crate::size::parse_size;

@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
-use moruna_kernel::{MorunaError, Completion};
+use moruna_kernel::{Completion, MorunaError};
 
 /// A waker that counts how many times the future asked to be woken.
 struct CountingWaker(AtomicUsize);
@@ -125,7 +125,10 @@ fn ct_t16_completion_channel() {
 
     // An already resolved completion, for a reactor that failed at submission.
     let ready = Completion::<u64>::resolved(Err(MorunaError::Unsupported("rdma")));
-    assert!(matches!(ready.wait(), Err(MorunaError::Unsupported("rdma"))));
+    assert!(matches!(
+        ready.wait(),
+        Err(MorunaError::Unsupported("rdma"))
+    ));
 
     // A completion that is dropped before the sender resolves it costs nothing.
     let (sender, completion) = Completion::<u64>::channel();

@@ -6,12 +6,12 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use moruna_kernel::{MorunaError, Outcome, StageId, TraceRecord};
 use arrow::array::{
     Array, Float32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
     UInt64Array,
 };
 use arrow::ipc::reader::{FileReader, StreamReader};
+use moruna_kernel::{MorunaError, Outcome, StageId, TraceRecord};
 
 use crate::Result;
 use crate::writer::Shared;

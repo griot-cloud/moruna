@@ -9,8 +9,8 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use moruna_kernel::{MorunaError, ProbeResult, Result, StageId};
 use crossbeam::channel::unbounded;
+use moruna_kernel::{MorunaError, ProbeResult, Result, StageId};
 
 use crate::shared::{HelperRequest, JobOutput, Shared, WorkerJob};
 

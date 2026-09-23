@@ -5,12 +5,12 @@
 
 mod common;
 
-use moruna_kernel::{KernelHints, Knob};
-use moruna_testkit::{FakeKnobs, FakeSampler};
 use common::{
     GIB, MIB, active_workers, config, kernel, limits, morsel_targets, probe, read_aheads, record,
     sample, steady,
 };
+use moruna_kernel::{KernelHints, Knob};
+use moruna_testkit::{FakeKnobs, FakeSampler};
 
 /// h, failures: a ceiling that leaves less than two morsels after the baseline and the reserve
 /// is a configuration error at `prepare`, not a run that fails on morsel forty thousand.

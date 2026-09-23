@@ -9,7 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::buffer::{Allocator, arena_tier_of};
-use crate::error::{MorunaError, ConvertError};
+use crate::error::{ConvertError, MorunaError};
 use crate::tensor::ManagedTensor;
 use crate::tier::Tier;
 

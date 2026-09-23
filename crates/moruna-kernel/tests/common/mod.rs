@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use moruna_kernel::{ArenaHandle, Buffer, DType, Tier};
-pub use moruna_testkit::FakeAllocator;
 use arrow::array::{ArrayRef, Float32Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use moruna_kernel::{ArenaHandle, Buffer, DType, Tier};
+pub use moruna_testkit::FakeAllocator;
 
 /// A batch of `rows` with an int column, a float column and a string column, over ordinary
 /// heap buffers.

@@ -4,9 +4,9 @@
 
 mod common;
 
+use common::{GIB, MIB, active_workers, config, kernel, probe, read_aheads, record, sample};
 use moruna_kernel::{KernelHints, Sample, SchedulerStats, StageStats, TraceRecord};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, active_workers, config, kernel, probe, read_aheads, record, sample};
 
 const CEILING: u64 = 8 * GIB;
 const BASELINE: u64 = 400 * MIB;

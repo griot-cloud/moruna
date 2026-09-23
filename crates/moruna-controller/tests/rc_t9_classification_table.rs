@@ -5,13 +5,13 @@
 
 mod common;
 
-use moruna_controller::Bottleneck;
-use moruna_kernel::{KernelHints, Sample, SchedulerStats, StageStats, TierKind, TraceRecord};
-use moruna_testkit::{FakeKnobs, FakeSampler};
 use common::{
     GIB, MIB, active_workers, config, high_waters, kernel, morsel_targets, probe, read_aheads,
     record, sample, staging_triggers, stateful_kernel,
 };
+use moruna_controller::Bottleneck;
+use moruna_kernel::{KernelHints, Sample, SchedulerStats, StageStats, TierKind, TraceRecord};
+use moruna_testkit::{FakeKnobs, FakeSampler};
 
 const CEILING: u64 = 8 * GIB;
 const BASELINE: u64 = 400 * MIB;

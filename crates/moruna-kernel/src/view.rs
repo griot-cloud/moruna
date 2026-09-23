@@ -6,7 +6,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::buffer::Allocator;
-use crate::error::{MorunaError, ConvertError};
+use crate::error::{ConvertError, MorunaError};
 use crate::tensor::ManagedTensor;
 use crate::tier::Tier;
 

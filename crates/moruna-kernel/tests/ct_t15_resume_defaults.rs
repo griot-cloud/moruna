@@ -7,12 +7,12 @@ mod common;
 
 use std::sync::Arc;
 
+use common::FakeAllocator;
 use moruna_kernel::{
-    MorunaError, BoxFuture, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState,
+    BoxFuture, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError,
     NoState, Payload, PayloadKind, PayloadSpec, ResumePolicy, Seq, Sink, SinkSummary, Source,
     SourceSchema, TierPref,
 };
-use common::FakeAllocator;
 
 /// A kernel that takes every default: it declares nothing about resume, so `restore` refuses.
 struct DefaultKernel;
@@ -36,7 +36,11 @@ impl Kernel for DefaultKernel {
     fn init(&self, _ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
         Ok(Box::new(NoState))
     }
-    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
         Ok(input)
     }
 }

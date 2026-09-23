@@ -11,11 +11,11 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use moruna_kernel::{
-    MorunaError, BoxFuture, Morsel, Origin, Payload, Result, RowRange, Seq, Split, Tier,
-};
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::{Parker, Unparker};
+use moruna_kernel::{
+    BoxFuture, Morsel, MorunaError, Origin, Payload, Result, RowRange, Seq, Split, Tier,
+};
 
 use crate::shared::{DRIVE_DRIVING, DRIVE_STOP, HelperRequest, Shared};
 

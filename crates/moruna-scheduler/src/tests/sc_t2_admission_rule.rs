@@ -28,7 +28,8 @@ fn morsel(alloc: &FakeAllocator, seq: u64, stage: u16, bytes: usize) -> Morsel {
             false,
         ),
     ]));
-    let batch = match moruna_kernel::arrow::record_batch::RecordBatch::try_new(schema, vec![array]) {
+    let batch = match moruna_kernel::arrow::record_batch::RecordBatch::try_new(schema, vec![array])
+    {
         Ok(batch) => batch,
         Err(e) => panic!("batch: {e}"),
     };

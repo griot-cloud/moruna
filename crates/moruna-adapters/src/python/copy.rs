@@ -14,7 +14,7 @@ use std::sync::Arc;
 use moruna_kernel::arrow::array::{Array, ArrayData, ArrayRef, make_array};
 use moruna_kernel::arrow::buffer::{BooleanBuffer, Buffer as ArrowBuffer, NullBuffer};
 use moruna_kernel::arrow::record_batch::RecordBatch;
-use moruna_kernel::{Allocator, MorunaError, ManagedTensor, Payload, Result, Tier};
+use moruna_kernel::{Allocator, ManagedTensor, MorunaError, Payload, Result, Tier};
 
 use super::cross::{Imported, host_tensor_bytes};
 

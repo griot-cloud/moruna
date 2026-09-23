@@ -7,10 +7,10 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, probe, record, steady};
 use moruna_controller::{Envelope, Observation, Proposal, Sizer, SizerOutcome};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, probe, record, steady};
 
 /// A sizer that always wants the target halved, so that every tick would adjust if the
 /// controller let it.

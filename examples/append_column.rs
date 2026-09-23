@@ -12,13 +12,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::{
-    MorunaError, CancelToken, Fingerprint, InitCtx, Kernel, KernelKind, KernelState, NoState,
+    CancelToken, Fingerprint, InitCtx, Kernel, KernelKind, KernelState, MorunaError, NoState,
     Payload, PayloadKind, PayloadSpec, SourceSchema, TierPref,
 };
 use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 
 /// Rows the example writes and reads back.
@@ -59,7 +59,11 @@ impl Kernel for Appender {
         Ok(Box::new(NoState))
     }
 
-    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
         let Payload::Table(batch, _) = &input else {
             return Err(MorunaError::Kernel {
                 stage: 1,

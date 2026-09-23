@@ -18,8 +18,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use moruna_kernel::{
-    Allocator, MorunaError, BoxFuture, CheckpointExtras, ErrorPolicy, Fingerprint, InitCtx, Kernel,
-    KernelHints, KernelKind, KernelState, Locality, Morsel, Origin, Payload, PayloadKind,
+    Allocator, BoxFuture, CheckpointExtras, ErrorPolicy, Fingerprint, InitCtx, Kernel, KernelHints,
+    KernelKind, KernelState, Locality, Morsel, MorunaError, Origin, Payload, PayloadKind,
     PayloadSpec, Placement, PlacementStats, Result, ResumePoint, ResumePolicy, RowRange, Seq, Sink,
     SinkSummary, Source, SourceSchema, Split, StageId, TierBudgets, TierKind, TierPref,
 };

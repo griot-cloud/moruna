@@ -5,6 +5,10 @@ mod common;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use common::{
+    Scratch, arena_batch, arena_payload, block_on, materialise, table_source_schema,
+    tensor_source_schema, written,
+};
 use moruna_kernel::arrow::ipc::reader::FileReader;
 use moruna_kernel::arrow::ipc::root_as_footer;
 use moruna_kernel::arrow::record_batch::RecordBatch;
@@ -14,10 +18,6 @@ use moruna_sinks::{
     TensorSink, TensorSinkConfig,
 };
 use moruna_testkit::{FakeAllocator, FakeReactor};
-use common::{
-    Scratch, arena_batch, arena_payload, block_on, materialise, table_source_schema,
-    tensor_source_schema, written,
-};
 
 const ROWS: usize = 32;
 

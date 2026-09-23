@@ -4,14 +4,14 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{
+    CountingAlloc, Scratch, arena_batch, arena_payload, block_on, table_source_schema, written,
+};
 use moruna_kernel::arrow::ipc::reader::FileReader;
 use moruna_kernel::arrow::ipc::root_as_footer;
 use moruna_kernel::{Allocator, MorunaError, Sink, Tier, ipc};
 use moruna_sinks::{ArrowIpcSink, ArrowIpcSinkConfig};
 use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
-use common::{
-    CountingAlloc, Scratch, arena_batch, arena_payload, block_on, table_source_schema, written,
-};
 
 const PAGE: u64 = 4096;
 
@@ -230,7 +230,10 @@ fn a_failed_ipc_write_is_reported_by_finish() {
     .expect("arrow ipc sink");
     // The magic write at `open` is the first refusal.
     let outcome = sink.open(&table_source_schema());
-    assert!(matches!(outcome, Err(MorunaError::Io { .. })), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(MorunaError::Io { .. })),
+        "{outcome:?}"
+    );
 
     let scratch = Scratch::new("ipc-fail-write");
     let reactor = FakeReactor::new();
@@ -246,7 +249,10 @@ fn a_failed_ipc_write_is_reported_by_finish() {
     sink.open(&table_source_schema()).expect("open");
     let reactor = reactor.fail_next(OpKind::WriteFile, 1);
     let outcome = block_on(sink.write(0, arena_payload(&alloc, 64, 0)));
-    assert!(matches!(outcome, Err(MorunaError::Io { .. })), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(MorunaError::Io { .. })),
+        "{outcome:?}"
+    );
     let _ = reactor;
     let outcome = sink.finish();
     let Err(MorunaError::Sink(msg)) = outcome else {

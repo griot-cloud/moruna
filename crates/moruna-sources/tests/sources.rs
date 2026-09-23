@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use moruna_kernel::arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use moruna_kernel::{
-    Allocator, MorunaError, ObjectMetadata, Payload, Reactor, RowRange, Source, SourceSchema, Split,
-    Tier,
+    Allocator, MorunaError, ObjectMetadata, Payload, Reactor, RowRange, Source, SourceSchema,
+    Split, Tier,
 };
 use moruna_sources::{
     ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue, TensorSource, TensorSourceConfig,
@@ -579,14 +579,13 @@ fn so_t10_iterator_source() {
             .call0()
             .expect("the generator")
             .unbind();
-        let schema =
-            SourceSchema::Table(Arc::new(moruna_kernel::arrow::datatypes::Schema::new(vec![
-                moruna_kernel::arrow::datatypes::Field::new(
-                    "value",
-                    moruna_kernel::arrow::datatypes::DataType::Int64,
-                    true,
-                ),
-            ])));
+        let schema = SourceSchema::Table(Arc::new(moruna_kernel::arrow::datatypes::Schema::new(
+            vec![moruna_kernel::arrow::datatypes::Field::new(
+                "value",
+                moruna_kernel::arrow::datatypes::DataType::Int64,
+                true,
+            )],
+        )));
         (iter, schema)
     });
     let source = PyIteratorSource::new(

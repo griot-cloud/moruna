@@ -388,9 +388,9 @@ impl BenchKernel for EmbedScore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mrb1::TensorSpec;
     use crate::dtype::DType;
     use crate::kernels::table_bytes;
+    use crate::mrb1::TensorSpec;
     use arrow::array::{Int64Array, StringArray};
 
     fn weights(in_dim: usize, out_dim: usize) -> Weights {

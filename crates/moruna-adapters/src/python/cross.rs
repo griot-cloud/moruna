@@ -10,7 +10,7 @@
 //! copy a tensor a kernel allocated outside the arena.
 
 use moruna_kernel::arrow::record_batch::RecordBatch;
-use moruna_kernel::{MorunaError, Dlpack, ManagedTensor, Payload, Result, Tier};
+use moruna_kernel::{Dlpack, ManagedTensor, MorunaError, Payload, Result, Tier};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_arrow::PyRecordBatch;

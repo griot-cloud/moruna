@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use moruna_kernel::{
-    MorunaError, Buffer, BufferView, Completion, CompletionSender, CopyDst, CopySrc, IoPaths,
+    Buffer, BufferView, Completion, CompletionSender, CopyDst, CopySrc, IoPaths, MorunaError,
     ObjectMeta, ObjectMetadata, Reactor, Result, SegmentRef, Tier,
 };
 

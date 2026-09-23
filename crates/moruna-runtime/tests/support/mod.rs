@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_kernel::{
-    MorunaError, DType, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, NoState,
-    Payload, PayloadSpec, SourceSchema, TierPref,
-};
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
+use moruna_kernel::{
+    DType, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError,
+    NoState, Payload, PayloadSpec, SourceSchema, TierPref,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -149,7 +149,11 @@ impl Kernel for Doubler {
         Ok(Box::new(NoState))
     }
 
-    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
         let kernel_error = |msg: &str| MorunaError::Kernel {
             stage: 1,
             seq: 0,
@@ -230,7 +234,11 @@ impl Kernel for FailOnce {
         Ok(Box::new(NoState))
     }
 
-    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
         let at = self.applies.fetch_add(1, Ordering::SeqCst) + 1;
         if at == self.fail_at.load(Ordering::SeqCst) {
             return Err(MorunaError::Kernel {
@@ -288,7 +296,11 @@ impl Kernel for Appender {
         Ok(Box::new(NoState))
     }
 
-    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
         let Payload::Table(batch, _) = &input else {
             return Err(MorunaError::Kernel {
                 stage: 1,

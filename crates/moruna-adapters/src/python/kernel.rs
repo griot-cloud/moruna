@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use moruna_kernel::{
-    Allocator, MorunaError, Fingerprint, GilState, InitCtx, Kernel, KernelHints, KernelKind,
-    KernelState, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, Seq,
+    Allocator, Fingerprint, GilState, InitCtx, Kernel, KernelHints, KernelKind, KernelState,
+    MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, Seq,
     SourceSchema, StageId, TierPref,
 };
 use pyo3::prelude::*;

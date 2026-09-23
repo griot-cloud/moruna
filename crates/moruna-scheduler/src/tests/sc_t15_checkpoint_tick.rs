@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use moruna_kernel::{MorunaError, CancelToken, Knobs};
+use moruna_kernel::{CancelToken, Knobs, MorunaError};
 use moruna_testkit::{FakePlacement, FakeSink, FakeSource};
 
 use super::common::{RigBuilder, StatefulKernel, manifest_lock, wait_for};

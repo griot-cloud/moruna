@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use moruna_kernel::{
-    MorunaError, Fingerprint, KernelHints, KernelKind, KnobSnapshot, Knobs, Limits, Placement,
+    Fingerprint, KernelHints, KernelKind, KnobSnapshot, Knobs, Limits, MorunaError, Placement,
     Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, TraceRecord, TraceTail,
 };
 

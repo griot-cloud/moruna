@@ -8,8 +8,8 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{MorunaError, BufferView, DType, ManagedTensor, Tier};
 use common::FakeAllocator;
+use moruna_kernel::{BufferView, DType, ManagedTensor, MorunaError, Tier};
 
 #[test]
 fn ct_t17_buffer_view() {

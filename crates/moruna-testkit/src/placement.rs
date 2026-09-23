@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use moruna_kernel::{
-    MorunaError, CheckpointExtras, Fingerprint, Locality, Morsel, Origin, PayloadSpec, Placement,
+    CheckpointExtras, Fingerprint, Locality, Morsel, MorunaError, Origin, PayloadSpec, Placement,
     PlacementStats, QueueStats, Result, ResumePoint, Seq, Split, StageId, TierBudgets, TierKind,
 };
 

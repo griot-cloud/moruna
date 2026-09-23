@@ -4,10 +4,10 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{CountingAlloc, Scratch, arena_payload, block_on, object_bytes, table_source_schema};
 use moruna_kernel::{Allocator, MorunaError, Sink, Tier};
 use moruna_sinks::{ParquetSink, ParquetSinkConfig};
 use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
-use common::{CountingAlloc, Scratch, arena_payload, block_on, object_bytes, table_source_schema};
 
 fn config(scratch: &Scratch, file_bytes: u64) -> ParquetSinkConfig {
     ParquetSinkConfig {

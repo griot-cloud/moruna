@@ -45,7 +45,8 @@ impl BuildCtx {
 }
 
 /// A source builder, run at the lifecycle's "sources built" step.
-pub type SourceFactory = Box<dyn FnOnce(&BuildCtx) -> moruna_kernel::Result<Arc<dyn Source>> + Send>;
+pub type SourceFactory =
+    Box<dyn FnOnce(&BuildCtx) -> moruna_kernel::Result<Arc<dyn Source>> + Send>;
 /// A sink builder, run at the lifecycle's "sinks built" step.
 pub type SinkFactory = Box<dyn FnOnce(&BuildCtx) -> moruna_kernel::Result<Box<dyn Sink>> + Send>;
 

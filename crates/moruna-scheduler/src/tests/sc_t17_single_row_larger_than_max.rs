@@ -2,7 +2,7 @@
 //! time and passes at its natural size; a row larger than the budget fails the read with
 //! `Alloc` and ends the run naming the split and the row range. f.5, h (architecture 7).
 
-use moruna_kernel::{MorunaError, CancelToken, Tier};
+use moruna_kernel::{CancelToken, MorunaError, Tier};
 use moruna_testkit::{FakeAllocator, FakeSource};
 
 use super::common::RigBuilder;

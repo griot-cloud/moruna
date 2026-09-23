@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use moruna_kernel::{MorunaError, CancelToken, ErrorPolicy, Outcome, Seq};
+use moruna_kernel::{CancelToken, ErrorPolicy, MorunaError, Outcome, Seq};
 use moruna_testkit::{FakeKernel, FakeSource};
 
 use super::common::RigBuilder;

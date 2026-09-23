@@ -6,7 +6,7 @@ use moruna_kernel::arrow::array::{ArrayData, ArrayRef, make_array};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    Allocator, MorunaError, BoxFuture, DType, ManagedTensor, Payload, Result, RowRange, Source,
+    Allocator, BoxFuture, DType, ManagedTensor, MorunaError, Payload, Result, RowRange, Source,
     SourceSchema, Split, SplitId, Tier,
 };
 

@@ -14,7 +14,7 @@ use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use moruna_adapters::python::{PyKernel, PyKernelSpec};
-use moruna_kernel::{Allocator, MorunaError, InitCtx, Kernel, KernelKind, Payload, ResumePolicy};
+use moruna_kernel::{Allocator, InitCtx, Kernel, KernelKind, MorunaError, Payload, ResumePolicy};
 use moruna_testkit::FakeAllocator;
 
 /// A class kernel whose state counts the morsels it has seen and whose output is the instance

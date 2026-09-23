@@ -14,7 +14,7 @@ use moruna_kernel::arrow::datatypes::SchemaRef;
 use moruna_kernel::arrow::ipc::writer::FileWriter;
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    Allocator, MorunaError, BoxFuture, Buffer, BufferView, Completion, Payload, PayloadKind,
+    Allocator, BoxFuture, Buffer, BufferView, Completion, MorunaError, Payload, PayloadKind,
     PayloadSpec, Reactor, Result, RunId, Seq, Sink, SinkSummary, SourceSchema, TierPref, ipc,
 };
 

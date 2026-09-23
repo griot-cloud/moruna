@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use moruna_kernel::{
-    Allocator, MorunaError, CheckpointExtras, DeviceId, Fingerprint, Locality, Morsel, NodeId,
+    Allocator, CheckpointExtras, DeviceId, Fingerprint, Locality, Morsel, MorunaError, NodeId,
     PayloadKind, PayloadSpec, Placement, PlacementStats, Reactor, ResumePoint, ResumePolicy, RunId,
     Seq, Split, StageId, StagingCodec, TIER_COUNT, Tier, TierBudgets, TierKind, TierPref,
 };

@@ -3,7 +3,7 @@
 //! The arrays of a decoded table point into the buffer the reactor read into, and a tensor
 //! is built over that buffer directly, so nothing here copies payload bytes either (PL-I4).
 
-use moruna_kernel::{MorunaError, Buffer, Payload, PayloadKind, mrb1, ipc};
+use moruna_kernel::{Buffer, MorunaError, Payload, PayloadKind, ipc, mrb1};
 
 use super::segment::RecordHeader;
 
@@ -24,8 +24,9 @@ pub struct Record {
 /// keep the whole allocation alive, which is what both readers need anyway. Reported as a
 /// finding against d.15.
 pub fn decode_record(buf: Buffer, page: u64) -> moruna_kernel::Result<Record> {
-    let page_usize = usize::try_from(page)
-        .map_err(|_| MorunaError::Staging(format!("page size {page} does not fit this platform")))?;
+    let page_usize = usize::try_from(page).map_err(|_| {
+        MorunaError::Staging(format!("page size {page} does not fit this platform"))
+    })?;
     if buf.len() < page_usize {
         return Err(MorunaError::Staging(format!(
             "a record read of {} bytes is short of its header page",

@@ -6,11 +6,11 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{DType, Payload, Tier};
 use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::{FakeAllocator, arrow_dtypes};
+use moruna_kernel::{DType, Payload, Tier};
 
 /// A one-column batch whose values buffer is an arena region of `alloc`, filled with `rows`
 /// elements of `dtype` (the bytes themselves do not matter to a pointer test).

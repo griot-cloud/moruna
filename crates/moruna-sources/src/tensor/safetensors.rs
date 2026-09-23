@@ -6,7 +6,7 @@
 //! `serde_json` over the header bytes alone; the tensor entries are exactly the crate's own
 //! `dtype`, `shape` and `data_offsets` fields. Reported as an escalation.
 
-use moruna_kernel::{MorunaError, DType, Result};
+use moruna_kernel::{DType, MorunaError, Result};
 
 use super::Entry;
 use crate::tensor::plan::read_prefix;

@@ -18,8 +18,8 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use moruna_kernel::{MorunaError, ObjectMeta, Result};
 use bytes::Bytes;
+use moruna_kernel::{MorunaError, ObjectMeta, Result};
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
@@ -604,7 +604,10 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(l.parse("s3:///k"), Err(MorunaError::Config { .. })));
+        assert!(matches!(
+            l.parse("s3:///k"),
+            Err(MorunaError::Config { .. })
+        ));
         let empty = ObjectLayer::new(ObjectStoreConfig::default(), None);
         assert!(matches!(
             empty.parse("bare-key"),

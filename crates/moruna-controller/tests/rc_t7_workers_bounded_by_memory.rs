@@ -5,9 +5,9 @@
 
 mod common;
 
+use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, probe, steady};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, probe, steady};
 
 #[test]
 fn rc_t7_workers_bounded_by_memory() {

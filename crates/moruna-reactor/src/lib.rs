@@ -37,8 +37,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use moruna_kernel::{
-    Allocator, MorunaError, Buffer, BufferView, Completion, CopyDst, CopySrc, DeviceId, HostProfile,
-    IoPaths, ObjectMeta, ObjectMetadata, Result,
+    Allocator, Buffer, BufferView, Completion, CopyDst, CopySrc, DeviceId, HostProfile, IoPaths,
+    MorunaError, ObjectMeta, ObjectMetadata, Result,
 };
 
 use crate::fdcache::{FdCache, Mode, Opener, SysOpener};

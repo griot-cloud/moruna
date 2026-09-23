@@ -7,10 +7,10 @@
 //! of two scales: `full`, the sizes a benchmark run uses, and `small`, the same
 //! shapes at a few thousand rows, which is what a test or a smoke run writes.
 
-use crate::mrb1::TensorSpec;
 use crate::dataset::{Dataset, DatasetKind};
 use crate::dtype::DType;
 use crate::error::{BenchError, Result};
+use crate::mrb1::TensorSpec;
 use crate::parquet_out::{Codec, ParquetSpec};
 
 /// How large the suite is written.

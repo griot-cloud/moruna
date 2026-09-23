@@ -510,7 +510,10 @@ mod tests {
     fn device_buffer_cannot_become_arrow() {
         let arena = Arc::new(CountingArena(AtomicUsize::new(0)));
         let (b, _) = heap(4, Tier::Device(crate::ids::DeviceId(1)), &arena);
-        assert!(matches!(b.into_arrow_buffer(), Err(MorunaError::Staging(_))));
+        assert!(matches!(
+            b.into_arrow_buffer(),
+            Err(MorunaError::Staging(_))
+        ));
         let seg = crate::tier::SegmentRef {
             segment: 0,
             offset: 0,

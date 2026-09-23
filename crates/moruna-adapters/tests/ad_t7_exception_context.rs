@@ -9,7 +9,7 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{Allocator, MorunaError, Kernel, NoState, Payload};
+use moruna_kernel::{Allocator, Kernel, MorunaError, NoState, Payload};
 use moruna_testkit::FakeAllocator;
 
 const RAISER: &str = r#"

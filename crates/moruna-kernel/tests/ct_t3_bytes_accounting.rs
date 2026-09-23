@@ -3,8 +3,8 @@
 
 mod common;
 
-use moruna_kernel::{DType, ManagedTensor, Morsel, NodeId, Origin, Payload, Tier};
 use common::{FakeAllocator, mixed_batch};
+use moruna_kernel::{DType, ManagedTensor, Morsel, NodeId, Origin, Payload, Tier};
 
 fn origin() -> Origin {
     Origin {

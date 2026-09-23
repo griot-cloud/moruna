@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use moruna_kernel::arrow::buffer::Buffer as ArrowBuffer;
-use moruna_kernel::{Allocator, MorunaError, Buffer, BufferView, ManagedTensor, Tier, mrb1, ipc};
+use moruna_kernel::{Allocator, Buffer, BufferView, ManagedTensor, MorunaError, Tier, ipc, mrb1};
 
 use crate::state::PayloadRef;
 

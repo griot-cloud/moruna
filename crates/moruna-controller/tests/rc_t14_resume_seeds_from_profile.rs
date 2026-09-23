@@ -6,9 +6,9 @@
 
 mod common;
 
+use common::{GIB, MIB, Scratch, config, kernel, morsel_targets, probe, record, steady};
 use moruna_kernel::{Fingerprint, KernelHints, SchedulerStats, StageStats};
 use moruna_testkit::{FakeKnobs, FakeSampler};
-use common::{GIB, MIB, Scratch, config, kernel, morsel_targets, probe, record, steady};
 
 fn profile_path(dir: &std::path::Path, stage: u16) -> std::path::PathBuf {
     let fingerprint = Fingerprint::compute(&format!("test kernel {stage}"), b"");

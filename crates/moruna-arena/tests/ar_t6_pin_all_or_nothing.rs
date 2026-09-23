@@ -9,7 +9,7 @@
 //! process wide.
 
 use moruna_arena::{Arena, ArenaConfig};
-use moruna_kernel::{Allocator, MorunaError, Guarantee, TierKind};
+use moruna_kernel::{Allocator, Guarantee, MorunaError, TierKind};
 
 fn cfg(host_tier: TierKind, memlock: Guarantee) -> ArenaConfig {
     ArenaConfig {
@@ -105,7 +105,9 @@ fn ar_t6_pin_all_or_nothing() {
     let e = arena
         .alloc(4096, moruna_kernel::Tier::PinnedHost)
         .expect_err("nothing is pinned in this run");
-    assert!(matches!(e, MorunaError::Alloc { tier, .. } if tier == moruna_kernel::Tier::PinnedHost));
+    assert!(
+        matches!(e, MorunaError::Alloc { tier, .. } if tier == moruna_kernel::Tier::PinnedHost)
+    );
     assert!(!arena.arena_stats().pinned);
     drop(host);
     drop(arena);

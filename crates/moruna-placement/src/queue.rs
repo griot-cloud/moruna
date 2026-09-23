@@ -5,11 +5,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use moruna_kernel::{
-    MorunaError, Locality, Morsel, Origin, PayloadKind, PayloadSpec, Seq, StageId, TIER_COUNT, Tier,
-    TierPref,
-};
 use crossbeam::sync::{Parker, Unparker};
+use moruna_kernel::{
+    Locality, Morsel, MorunaError, Origin, PayloadKind, PayloadSpec, Seq, StageId, TIER_COUNT,
+    Tier, TierPref,
+};
 
 use crate::PlacementEngine;
 use crate::state::{Entry, State, kind_satisfies, satisfies};

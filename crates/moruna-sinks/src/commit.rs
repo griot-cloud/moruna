@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use moruna_kernel::{MorunaError, BufferView, Completion, Reactor, Result};
+use moruna_kernel::{BufferView, Completion, MorunaError, Reactor, Result};
 
 /// The suffix an incomplete local file carries until it is committed.
 pub(crate) const TMP_SUFFIX: &str = ".tmp";

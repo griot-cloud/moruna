@@ -4,10 +4,10 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{Allocator, MorunaError, DType, Sink, Tier, mrb1};
+use common::{CountingAlloc, Scratch, arena_tensor, block_on, tensor_source_schema, written};
+use moruna_kernel::{Allocator, DType, MorunaError, Sink, Tier, mrb1};
 use moruna_sinks::{TensorFormat, TensorSink, TensorSinkConfig};
 use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
-use common::{CountingAlloc, Scratch, arena_tensor, block_on, tensor_source_schema, written};
 
 fn new_sink(
     scratch: &Scratch,

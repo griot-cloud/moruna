@@ -786,7 +786,10 @@ mod tests {
         ]);
         let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discover");
         let want = (2 * gib).min(free);
-        assert_eq!(found.disk_budget, want, "MORUNA_SPILL_LIMIT carries through");
+        assert_eq!(
+            found.disk_budget, want,
+            "MORUNA_SPILL_LIMIT carries through"
+        );
         assert!(
             found.notes.iter().any(|n| n.starts_with("budget.disk")),
             "a note says where the cap came from: {:?}",

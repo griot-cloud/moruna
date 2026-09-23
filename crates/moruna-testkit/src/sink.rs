@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moruna_kernel::{
-    MorunaError, BoxFuture, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary,
+    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary,
     SourceSchema, TierPref,
 };
 

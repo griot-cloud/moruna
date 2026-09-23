@@ -3,8 +3,8 @@
 
 mod common;
 
-use moruna_kernel::{Payload, PayloadKind, Tier};
 use common::{FakeAllocator, mixed_batch};
+use moruna_kernel::{Payload, PayloadKind, Tier};
 
 /// The exhaustiveness assertion: this function names both variants and no wildcard, so adding
 /// a third variant to `Payload` stops the crate compiling (CT-I1, G-I6).

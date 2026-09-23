@@ -6,14 +6,14 @@ mod common;
 
 use std::sync::Arc;
 
-use moruna_kernel::{
-    MorunaError, ConvertError, DType, ManagedTensor, Payload, PayloadKind, PayloadSpec,
-    SourceSchema, Tier, TierPref,
-};
 use arrow::array::{ArrayRef, BooleanArray, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::FakeAllocator;
+use moruna_kernel::{
+    ConvertError, DType, ManagedTensor, MorunaError, Payload, PayloadKind, PayloadSpec,
+    SourceSchema, Tier, TierPref,
+};
 
 fn batch(field: Field, column: ArrayRef) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![field]));

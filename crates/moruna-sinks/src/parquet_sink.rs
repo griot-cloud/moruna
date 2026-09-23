@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use moruna_kernel::arrow::datatypes::SchemaRef;
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    Allocator, MorunaError, BoxFuture, Buffer, Completion, Payload, PayloadKind, PayloadSpec,
+    Allocator, BoxFuture, Buffer, Completion, MorunaError, Payload, PayloadKind, PayloadSpec,
     Reactor, Result, RunId, Seq, Sink, SinkSummary, SourceSchema, TierPref,
 };
 use parquet::arrow::ArrowWriter;

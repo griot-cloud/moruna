@@ -3,9 +3,9 @@
 
 mod common;
 
+use common::{TempDir, config, limits, meta, synthetic_trace};
 use moruna_kernel::TraceSink;
 use moruna_trace::{ExitReason, RunReport, TraceWriter};
-use common::{TempDir, config, limits, meta, synthetic_trace};
 
 /// The report a previous process computed from `synthetic_trace`, `limits` and
 /// `meta(Completed)`. Regenerate it deliberately with `MORUNA_UPDATE_GOLDEN=1`, never to make

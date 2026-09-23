@@ -5,9 +5,9 @@
 
 mod common;
 
+use common::{TempDir, config, limits, meta, record};
 use moruna_kernel::{TraceRecord, TraceSink};
 use moruna_trace::{ExitReason, RunReport, TraceWriter};
-use common::{TempDir, config, limits, meta, record};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// 204.8 MiB/s, the figure the SDD names: 2 GiB over 10 s.

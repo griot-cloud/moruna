@@ -4,7 +4,7 @@
 mod common;
 
 use moruna_kernel::{
-    MorunaError, CheckpointExtras, Fingerprint, Locality, Placement, ResumePolicy, RunId,
+    CheckpointExtras, Fingerprint, Locality, MorunaError, Placement, ResumePolicy, RunId,
     SourceCursor, TierKind,
 };
 use moruna_placement::manifest::Manifest;
@@ -335,8 +335,12 @@ fn pl_t16_every_refusal_is_named() {
 #[test]
 fn pl_t16_find_manifest_takes_the_newest() {
     let scratch = common::Scratch::new("t16c");
-    let older = scratch.path().join("moruna-".to_string() + &"aa".repeat(16));
-    let newer = scratch.path().join("moruna-".to_string() + &"bb".repeat(16));
+    let older = scratch
+        .path()
+        .join("moruna-".to_string() + &"aa".repeat(16));
+    let newer = scratch
+        .path()
+        .join("moruna-".to_string() + &"bb".repeat(16));
     for (dir, written, id) in [(&older, 10u64, "aa"), (&newer, 20u64, "bb")] {
         std::fs::create_dir_all(dir).expect("dir");
         let manifest = serde_json::json!({

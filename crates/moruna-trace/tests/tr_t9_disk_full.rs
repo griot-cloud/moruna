@@ -11,9 +11,9 @@
 
 mod common;
 
+use common::{TempDir, config, record};
 use moruna_kernel::TraceSink;
 use moruna_trace::TraceWriter;
-use common::{TempDir, config, record};
 
 const RECORDS: u64 = 30_000;
 const LIMIT: u64 = 128 * 1024;

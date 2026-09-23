@@ -6,12 +6,12 @@
 
 mod common;
 
-use moruna_kernel::{KernelHints, Outcome, TierKind};
-use moruna_testkit::{FakeKnobs, FakeSampler};
 use common::{
     GIB, MIB, config, high_waters, kernel, limits_with_device, morsel_targets, probe, record,
     steady,
 };
+use moruna_kernel::{KernelHints, Outcome, TierKind};
+use moruna_testkit::{FakeKnobs, FakeSampler};
 
 #[test]
 fn rc_t18_device_oom_retry() {

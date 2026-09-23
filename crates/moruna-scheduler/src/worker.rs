@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crossbeam::channel::Receiver;
+use crossbeam::sync::Parker;
 use moruna_kernel::{
-    MorunaError, KernelState, Locality, Morsel, MorselFeatures, NoState, Outcome, Payload,
+    KernelState, Locality, Morsel, MorselFeatures, MorunaError, NoState, Outcome, Payload,
     PayloadSpec, PlacementStats, ProbeResult, Result, Sample, Seq, StageId, TIER_COUNT, Tier,
     TraceRecord,
 };
-use crossbeam::channel::Receiver;
-use crossbeam::sync::Parker;
 
 use crate::cputime::{now_ns, thread_cpu_ns};
 use crate::instances;

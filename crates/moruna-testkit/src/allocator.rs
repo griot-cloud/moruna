@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use moruna_kernel::arrow;
 use moruna_kernel::{
-    ALIGNMENT, AllocStats, Allocator, MorunaError, ArenaHandle, Buffer, Result, Tier,
+    ALIGNMENT, AllocStats, Allocator, ArenaHandle, Buffer, MorunaError, Result, Tier,
 };
 
 /// A region this allocator handed out.

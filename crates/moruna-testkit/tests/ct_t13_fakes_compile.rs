@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::{
-    Allocator, MorunaError, BufferView, CheckpointExtras, Completion, CopyDst, CopySrc, DType,
-    DeviceId, Fingerprint, InitCtx, IoPaths, Kernel, KernelKind, Knob, Knobs, Locality, Morsel,
+    Allocator, BufferView, CheckpointExtras, Completion, CopyDst, CopySrc, DType, DeviceId,
+    Fingerprint, InitCtx, IoPaths, Kernel, KernelKind, Knob, Knobs, Locality, Morsel, MorunaError,
     NodeId, ObjectMetadata, Origin, Outcome, Payload, PayloadKind, PayloadSpec, Placement,
     ProbeResult, Prober, Reactor, ResumePolicy, RowRange, Sample, Sampler, SchedulerStats,
     SegmentRef, Sink, Source, SourceCursor, SourceSchema, StageStats, StatsSource, Tier,

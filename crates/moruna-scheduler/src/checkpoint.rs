@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use moruna_kernel::{MorunaError, CheckpointExtras, Result, ResumePolicy, Sink, StageId};
+use moruna_kernel::{CheckpointExtras, MorunaError, Result, ResumePolicy, Sink, StageId};
 
 use crate::instances;
 use crate::shared::Shared;

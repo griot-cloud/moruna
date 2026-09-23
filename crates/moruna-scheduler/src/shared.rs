@@ -6,14 +6,14 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crossbeam::channel::{Receiver, Sender, unbounded};
+use crossbeam::sync::{Parker, Unparker};
 use moruna_kernel::{
-    Allocator, MorunaError, CancelToken, Kernel, KernelKind, KernelState, PayloadSpec, Placement,
+    Allocator, CancelToken, Kernel, KernelKind, KernelState, MorunaError, PayloadSpec, Placement,
     PlacementStats, RecordHook, Result, Sampler, Seq, Sink, SinkSummary, Source, SourceSchema,
     Split, StageId, TraceSink,
 };
 use moruna_sinks::SinkHandle;
-use crossbeam::channel::{Receiver, Sender, unbounded};
-use crossbeam::sync::{Parker, Unparker};
 
 use crate::heartbeat::HeartbeatTable;
 use crate::knobs::KnobState;

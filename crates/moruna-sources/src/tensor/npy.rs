@@ -4,7 +4,7 @@
 //! keys the format defines are read: `descr`, `fortran_order` and `shape`. A Fortran-ordered
 //! file is a `Plan` error at `new`: the tensor would be non-contiguous (contracts b).
 
-use moruna_kernel::{MorunaError, DType, Result};
+use moruna_kernel::{DType, MorunaError, Result};
 
 use super::Entry;
 use crate::tensor::plan::read_prefix;

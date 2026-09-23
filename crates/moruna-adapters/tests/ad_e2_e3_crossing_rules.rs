@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use moruna_adapters::python::cross::export;
 use moruna_adapters::python::tensor_obj::PyTensor;
-use moruna_kernel::{Allocator, MorunaError, DType, Kernel, ManagedTensor, NoState, Payload, Tier};
+use moruna_kernel::{Allocator, DType, Kernel, ManagedTensor, MorunaError, NoState, Payload, Tier};
 use moruna_testkit::FakeAllocator;
 use pyo3::prelude::*;
 

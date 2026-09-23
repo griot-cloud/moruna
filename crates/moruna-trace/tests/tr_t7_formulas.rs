@@ -3,9 +3,9 @@
 
 mod common;
 
+use common::{TempDir, config, limits, meta, record, synthetic_trace};
 use moruna_kernel::{Outcome, TraceRecord, TraceSink};
 use moruna_trace::{ExitReason, RunReport, TraceWriter};
-use common::{TempDir, config, limits, meta, record, synthetic_trace};
 
 fn close(a: f64, b: f64, what: &str) {
     assert!(

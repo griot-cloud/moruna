@@ -1,8 +1,8 @@
 //! The Parquet read (e.2) and its byte ranges (f.3).
 
+use bytes::Bytes;
 use moruna_kernel::arrow::array::RecordBatch;
 use moruna_kernel::{Allocator, BoxFuture, Payload, Result, RowRange, Split, Tier};
-use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,

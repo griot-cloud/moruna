@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::mrb1::{self, TensorSpec};
 use crate::error::{BenchError, Result};
+use crate::mrb1::{self, TensorSpec};
 use crate::parquet_out::{self, ParquetSpec};
 use crate::safetensors_out;
 

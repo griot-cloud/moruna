@@ -7,10 +7,10 @@
 
 use std::path::PathBuf;
 
-use crate::mrb1::TensorSpec;
 use crate::dataset::{Dataset, DatasetKind};
 use crate::dtype::DType;
 use crate::error::{BenchError, Result};
+use crate::mrb1::TensorSpec;
 use crate::parquet_out::{Codec, ParquetSpec};
 use crate::suite::{self, Scale};
 

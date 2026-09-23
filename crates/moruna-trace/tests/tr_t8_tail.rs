@@ -6,9 +6,9 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{TempDir, config, record};
 use moruna_kernel::{TraceSink, TraceTail};
 use moruna_trace::TraceWriter;
-use common::{TempDir, config, record};
 
 #[test]
 fn tr_t8_tail() {

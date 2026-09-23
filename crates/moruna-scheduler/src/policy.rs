@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
-use moruna_kernel::{MorunaError, ErrorPolicy, Outcome, Seq, Sink};
+use moruna_kernel::{ErrorPolicy, MorunaError, Outcome, Seq, Sink};
 
 use crate::shared::{Exit, RunState, Shared};
 

@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use moruna_kernel::{
-    MorunaError, CheckpointExtras, Fingerprint, NodeId, Origin, PayloadKind, ResumePoint,
+    CheckpointExtras, Fingerprint, MorunaError, NodeId, Origin, PayloadKind, ResumePoint,
     ResumePolicy, RunId, SegmentRef, Seq, SourceCursor, Split, StageId,
 };
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::PlacementEngine;

@@ -3,7 +3,7 @@
 //! payload is each rejected with `Io { op: "mrb1" }`. Proves e.4.
 
 use moruna_kernel::mrb1::{Header, MAGIC, MAX_NDIM, VERSION, record_len};
-use moruna_kernel::{MorunaError, DType};
+use moruna_kernel::{DType, MorunaError};
 
 const PAGE: u64 = 4096;
 

@@ -7,7 +7,7 @@
 //! engine demotes what it had promoted but not yet handed over. The next tick puts the high
 //! water back.
 
-use moruna_kernel::{MorunaError, Knob, Outcome, TierKind, TraceRecord};
+use moruna_kernel::{Knob, MorunaError, Outcome, TierKind, TraceRecord};
 
 use crate::{Actions, ControllerState, features_of};
 

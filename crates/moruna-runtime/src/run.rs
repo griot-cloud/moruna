@@ -9,7 +9,7 @@ use moruna_arena::{Arena, ArenaConfig};
 use moruna_controller::{Controller, ControllerConfig, KernelInfo, PlanSummary};
 use moruna_discovery::{Discovered, DiscoveryInput, Sampler as DiscoverySampler};
 use moruna_kernel::{
-    Allocator, MorunaError, CancelToken, Kernel, Knobs, ObjectMetadata, Placement, Prober, Reactor,
+    Allocator, CancelToken, Kernel, Knobs, MorunaError, ObjectMetadata, Placement, Prober, Reactor,
     RunId, Sampler, SourceSchema, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
 };
 use moruna_placement::{PlacementConfig, PlacementEngine, manifest::plan_digest};
