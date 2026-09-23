@@ -85,7 +85,13 @@ jobs:
           maturin build --release --out dist
           python -m pip install --no-index --find-links dist moruna
           python -c 'import moruna; print("moruna", moruna.__version__)'
-          python -m pytest -q python/tests
+          # From outside the tree, always. pytest puts the test's own root on sys.path,
+          # so running python/tests in place lets python/moruna (the source package,
+          # with no compiled _core) shadow the wheel that was just installed, and the
+          # suite then tests something that cannot work while reporting on something
+          # that can.
+          cp -R python/tests /tmp/moruna-tests
+          cd /tmp && python -m pytest -q /tmp/moruna-tests
 
   # Weekly and on demand: the checks that answer to the outside world rather
   # than to a commit, and the ones that need a real cgroup ceiling.
