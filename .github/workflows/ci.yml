@@ -155,6 +155,11 @@ jobs:
   # once on PyPI against this repository, this workflow file and this environment.
   publish:
     name: publish to PyPI (tags only)
+    # The gate first, always. Without this the job ran beside `ci` rather than after it, and
+    # on the v0.1.0 tag it published the Linux wheel while the test job was failing: a
+    # release went out from a red pipeline because the condition guarding it only asked
+    # whether this was a tag, never whether the code was good (2026-09-23).
+    needs: ci
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     strategy:
