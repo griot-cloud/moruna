@@ -17,8 +17,10 @@ pub struct ArenaStats {
     pub largest_free: u64,
     /// Host bytes on class free lists: charged to a class, held by no buffer (f.5).
     pub stranded_bytes: u64,
-    /// Releases that found nothing live at the address, summed over every region: a double
-    /// release, or a release of a tier this arena never hands out (h).
+    /// Releases the arena refused, summed over every region: bytes whose allocation had
+    /// already gone back, bytes outside the allocation the release named, more bytes than it
+    /// still had outstanding, a release with no allocation token at all, or a release of a
+    /// tier this arena never hands out (h).
     pub double_release: u64,
     /// True when the host region is backed by transparent huge pages (f.1).
     pub huge_pages_active: bool,
@@ -55,9 +57,10 @@ impl Inner {
     /// are the host region's, which is the region the report is about.
     pub(crate) fn arena_stats(&self) -> ArenaStats {
         let mut double_release = self.host.space.double_releases()
+            + self.host.space.untagged_releases()
             + self.foreign.load(std::sync::atomic::Ordering::Relaxed);
         for region in &self.devices {
-            double_release += region.space.double_releases();
+            double_release += region.space.double_releases() + region.space.untagged_releases();
         }
         ArenaStats {
             slabs_by_class: self.host.space.slabs_by_class(),

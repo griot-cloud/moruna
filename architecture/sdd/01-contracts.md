@@ -174,9 +174,26 @@ pub const TIER_COUNT: usize = 5;
 /// buffer drops. Defined here so the arena crate implements it without a circular dependency
 /// (section l). `release` is called once per `Buffer`, so twice per allocation after a
 /// `split_at`, once per half with that half's own pointer and length.
+///
+/// An arena must not work out which allocation a release belongs to from the address. An
+/// address says only which bytes, never which incarnation of them: a freed allocation's
+/// address is handed out again, so a release that arrives late or twice can fall inside a
+/// *different* live allocation and retire it under its owner. That is one buffer's bytes
+/// handed to two owners, and in an arena that really frees (the testkit's fake) it is a
+/// use-after-free. The allocation is named by the token the buffer carries, which is
+/// generational: a stale token matches nothing and the release is refused and counted, never
+/// credited elsewhere. Found 2026-09-23 in `moruna-arena`'s `release_large` and in the
+/// testkit fake, both of which inferred the allocation by a range query over live blocks.
 pub trait ArenaHandle: Send + Sync {
     fn release(&self, ptr: *mut u8, len: usize, tier: Tier);
+    /// Return the bytes, naming the allocation they came from. `token` is what the arena put
+    /// in `from_raw_tagged`; `NO_TOKEN` means the buffer carries no identity. The default
+    /// forwards to `release`, for a handle that owns one allocation or keeps no bookkeeping.
+    fn release_token(&self, ptr: *mut u8, len: usize, tier: Tier, token: u64) { self.release(ptr, len, tier) }
 }
+
+/// The token of a buffer whose arena gave it no identity.
+pub const NO_TOKEN: u64 = 0;
 
 /// An owned, aligned region in one tier, returned to its arena on drop.
 /// Deref to `[u8]` is provided only for Host and PinnedHost buffers;
@@ -188,8 +205,13 @@ impl Buffer {
     /// SAFETY: `ptr` is valid for `len` bytes in `tier` until `arena.release(ptr, len, tier)`,
     /// which this buffer calls exactly once on drop (CT-I2, the tier tag is truthful).
     pub unsafe fn from_raw(ptr: *mut u8, len: usize, tier: Tier, arena: std::sync::Arc<dyn ArenaHandle>) -> Buffer;
+    /// As `from_raw`, with the arena's own name for the allocation these bytes are part of.
+    /// SAFETY: as `from_raw`, and `token` names the allocation covering `[ptr, ptr + len)`.
+    pub unsafe fn from_raw_tagged(ptr: *mut u8, len: usize, tier: Tier, arena: std::sync::Arc<dyn ArenaHandle>, token: u64) -> Buffer;
     /// The token this buffer releases to.
     pub fn arena(&self) -> &std::sync::Arc<dyn ArenaHandle>;
+    /// The arena's name for the allocation these bytes belong to; `NO_TOKEN` if it gave none.
+    pub fn token(&self) -> u64;
     pub fn len(&self) -> usize;
     pub fn tier(&self) -> Tier;
     /// Host-visible pointer; `None` for Device buffers.
@@ -1038,7 +1060,7 @@ The testkit is built by this component's agent in wave 0 (preamble 6.4) because 
 
 | Fake | Implements | Knobs (builder methods) | Observables |
 |---|---|---|---|
-| `FakeAllocator` | `Allocator` | `with_limit(tier, bytes)`, `pinned(bool)`, `page_bytes(n)`, `fail_next(n)` | `allocations_total`, `in_use(tier)`, `payload_copies()` and `boundary_copies()` (what `note_payload_copy` and `note_boundary_copy` were told, added 2026-09-22: `stats()` reported a hardcoded zero and the counters had no observable, so no test could prove the one decode copy G-I2 allows), `AllocStats`; buffers are real heap allocations tagged with the requested tier so `Payload::table` tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work |
+| `FakeAllocator` | `Allocator` | `with_limit(tier, bytes)`, `pinned(bool)`, `page_bytes(n)`, `fail_next(n)` | `allocations_total`, `in_use(tier)`, `payload_copies()` and `boundary_copies()` (what `note_payload_copy` and `note_boundary_copy` were told, added 2026-09-22: `stats()` reported a hardcoded zero and the counters had no observable, so no test could prove the one decode copy G-I2 allows), `AllocStats`, `refused_releases()` and `live_regions()` (added 2026-09-23); buffers are real heap allocations tagged with the requested tier so `Payload::table` tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work. The fake really calls `dealloc`, so its addresses recycle: it attributes a release by the buffer's token (d.3) and refuses one it cannot place, because inferring the region from the address let a stale release free a live buffer's region |
 | `FakeReactor` | `Reactor` | `with_latency(Duration)`, `fail_next(op: OpKind, n)`, `cancel_on_shutdown(bool)`, in-memory files keyed by path (`read_file`/`write_file` copy to and from a `Vec<u8>` per path) | `ops() -> Vec<OpRecord { kind, path_or_url, offset, len, src_tier, dst_tier, t_submit, t_resolve }>`, `in_flight()`, `shutdown_calls`, `paths()` returns whatever `with_paths(IoPaths)` set, `file(path)` and `object(url)` return the bytes the fake holds (the object side added 2026-09-22, so a sink's writes can be read back). The fake holds files in memory, so a component whose commit is an `fsync` and a rename through `std::fs` cannot observe it here and says so in its own tests |
 | `FakePlacement` | `Placement` | `with_pressure(stage, evict_after_bytes)` (entries beyond the byte count on a stage-0 queue become `Evicted`), `with_delay(Duration)` (a pop of a fresh entry waits, counted as a miss), `with_manifest_store()` (in-memory manifests keyed by path so `checkpoint`/`restore` round-trip across engine instances) | `pushed(stage) -> Vec<Seq>`, `popped(stage)`, `committed()`, `manifests_written()`, `budgets_set() -> Vec<TierBudgets>` (every `set_budgets` argument in call order), `shutdown_calls` |
 | `FakeSource` | `Source` | `splits(n, rows_each, bytes_each)`, `schema(SourceSchema)`, `sub_splittable(bool)`, `repeatable(bool)`, `fail_split(id)` | `reads() -> Vec<(SplitId, Option<RowRange>)>`; deterministic content (row i of split s has value `s * 1_000_000 + i`) |

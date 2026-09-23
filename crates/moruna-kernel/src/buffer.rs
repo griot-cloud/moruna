@@ -19,7 +19,28 @@ use crate::view::BufferView;
 pub trait ArenaHandle: Send + Sync {
     /// Return `len` bytes at `ptr` in `tier` to the arena.
     fn release(&self, ptr: *mut u8, len: usize, tier: Tier);
+
+    /// Return `len` bytes at `ptr` in `tier`, naming the allocation they came from.
+    ///
+    /// `token` is whatever the arena put in `Buffer::from_raw_tagged`; `NO_TOKEN` means the
+    /// buffer carries no identity and the arena must fall back to an address lookup. An
+    /// arena that can be given a token must not infer the allocation from the address:
+    /// addresses recycle, so a release that arrives late or twice can fall inside a
+    /// *different* live allocation and retire it under its owner, which is one buffer's
+    /// bytes handed to two owners (h). A token is generational, so a stale one matches
+    /// nothing and is refused.
+    ///
+    /// The default ignores it, for a handle that owns exactly one allocation or has no
+    /// bookkeeping to protect.
+    fn release_token(&self, ptr: *mut u8, len: usize, tier: Tier, token: u64) {
+        let _ = token;
+        self.release(ptr, len, tier);
+    }
 }
+
+/// The token of a buffer whose arena gave it no identity: `Buffer::from_raw` sets it, and an
+/// arena that sees it has nothing but the address to go on.
+pub const NO_TOKEN: u64 = 0;
 
 /// An owned, aligned region in one tier, returned to its arena on drop.
 /// Deref to `[u8]` is provided only for Host and PinnedHost buffers;
@@ -29,6 +50,10 @@ pub struct Buffer {
     len: usize,
     tier: Tier,
     arena: Arc<dyn ArenaHandle>,
+    /// Which allocation of `arena` these bytes belong to, or `NO_TOKEN`. Copied to both
+    /// halves of a `split_at` and carried into `into_arrow_buffer`'s owner, because both
+    /// hand out bytes of the same allocation.
+    token: u64,
 }
 
 // SAFETY: a `Buffer` is the unique owner of its region (CT-I2: the region is addressable in
@@ -57,7 +82,38 @@ impl Buffer {
             len,
             tier,
             arena,
+            token: NO_TOKEN,
         }
+    }
+
+    /// As `from_raw`, with the arena's own name for the allocation these bytes are part of.
+    /// An arena that keeps per-allocation bookkeeping passes a generational token here and
+    /// reads it back in `ArenaHandle::release_token`, so a release is attributed with
+    /// certainty rather than inferred from an address that may have been reused.
+    ///
+    /// # Safety
+    /// As `from_raw`, and `token` must be the arena's identity for the allocation that
+    /// covers `[ptr, ptr + len)`.
+    pub unsafe fn from_raw_tagged(
+        ptr: *mut u8,
+        len: usize,
+        tier: Tier,
+        arena: Arc<dyn ArenaHandle>,
+        token: u64,
+    ) -> Buffer {
+        Buffer {
+            ptr,
+            len,
+            tier,
+            arena,
+            token,
+        }
+    }
+
+    /// The arena's name for the allocation these bytes belong to; `NO_TOKEN` when it gave
+    /// none.
+    pub fn token(&self) -> u64 {
+        self.token
     }
 
     /// Byte length.
@@ -127,12 +183,14 @@ impl Buffer {
             len: mid,
             tier: this.tier,
             arena: Arc::clone(&arena),
+            token: this.token,
         };
         let tail = Buffer {
             ptr: tail_ptr,
             len: this.len - mid,
             tier: this.tier,
             arena,
+            token: this.token,
         };
         (head, tail)
     }
@@ -164,6 +222,7 @@ impl Buffer {
             len: this.len,
             tier: this.tier,
             arena,
+            token: this.token,
         });
         registry_insert(this.ptr as usize, this.len, this.tier);
         // SAFETY: the region is valid for `len` bytes (CT-I2) and stays so until `owner`
@@ -214,7 +273,8 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        self.arena.release(self.ptr, self.len, self.tier);
+        self.arena
+            .release_token(self.ptr, self.len, self.tier, self.token);
     }
 }
 
@@ -265,6 +325,7 @@ struct ArrowOwner {
     len: usize,
     tier: Tier,
     arena: Arc<dyn ArenaHandle>,
+    token: u64,
 }
 
 // SAFETY: as for `Buffer`; the owner never reads or writes the region, it only releases it.
@@ -276,7 +337,8 @@ impl std::panic::RefUnwindSafe for ArrowOwner {}
 impl Drop for ArrowOwner {
     fn drop(&mut self) {
         registry_remove(self.ptr as usize);
-        self.arena.release(self.ptr, self.len, self.tier);
+        self.arena
+            .release_token(self.ptr, self.len, self.tier, self.token);
     }
 }
 

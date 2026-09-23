@@ -40,7 +40,7 @@ pub mod view;
 pub use arrow;
 pub use dlpark;
 
-pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
+pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer, NO_TOKEN};
 pub use completion::{Completion, CompletionSender};
 pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;

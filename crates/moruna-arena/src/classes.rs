@@ -95,11 +95,18 @@ pub(crate) struct Space {
     /// held by a `Buffer`. `split_at` partitions the bytes, so the slot returns to the free
     /// list when the count reaches zero and not before (e.3).
     outstanding: Box<[AtomicU64]>,
+    /// Per 64 KiB granule, meaningful at an allocation's first granule: which incarnation of
+    /// that slot or block is live. It is bumped every time the allocation is freed, so the
+    /// token a `Buffer` carries stops matching the moment its bytes go back on a free list
+    /// and a release that arrives after that is refused instead of being credited to
+    /// whatever holds the address now (h, AR-I5).
+    generation: Box<[AtomicU32]>,
     free: [Mutex<Vec<u64>>; CLASS_COUNT],
     slabs_by_class: [AtomicU32; CLASS_COUNT],
     top: Mutex<TopArea>,
     in_use: AtomicU64,
     double_release: AtomicU64,
+    untagged_release: AtomicU64,
 }
 
 // SAFETY: `base` is the region's address, which the `Mapping` beside this `Space` owns for
@@ -118,6 +125,9 @@ impl Space {
         let granules = (bytes / GRANULE) as usize;
         let mark: Box<[AtomicU8]> = (0..granules).map(|_| AtomicU8::new(MARK_NONE)).collect();
         let outstanding: Box<[AtomicU64]> = (0..granules).map(|_| AtomicU64::new(0)).collect();
+        // Generation 0 is never handed out, so `NO_TOKEN` cannot be mistaken for a token of
+        // the region's first granule.
+        let generation: Box<[AtomicU32]> = (0..granules).map(|_| AtomicU32::new(1)).collect();
         let space = Space {
             base,
             bytes,
@@ -125,6 +135,7 @@ impl Space {
             small_mode,
             mark,
             outstanding,
+            generation,
             free: std::array::from_fn(|_| Mutex::new(Vec::new())),
             slabs_by_class: std::array::from_fn(|_| AtomicU32::new(0)),
             top: Mutex::new(if small_mode {
@@ -134,6 +145,7 @@ impl Space {
             }),
             in_use: AtomicU64::new(0),
             double_release: AtomicU64::new(0),
+            untagged_release: AtomicU64::new(0),
         };
         if small_mode {
             space.seed_small_mode();
@@ -176,9 +188,24 @@ impl Space {
         self.in_use.load(Ordering::Relaxed)
     }
 
-    /// Releases that found nothing live at the address (section j).
+    /// Releases that named no live allocation, or named one whose incarnation has gone, or
+    /// more bytes than it still had outstanding (section j).
     pub(crate) fn double_releases(&self) -> u64 {
         self.double_release.load(Ordering::Relaxed)
+    }
+
+    /// Releases that carried no token. Every buffer this region hands out carries one, so
+    /// such a release cannot have come from one of them and is refused rather than guessed
+    /// at (section j).
+    pub(crate) fn untagged_releases(&self) -> u64 {
+        self.untagged_release.load(Ordering::Relaxed)
+    }
+
+    /// Count a release that arrived without a token, and refuse it.
+    pub(crate) fn refuse_untagged(&self) -> Release {
+        self.untagged_release.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(target: "arena.release_untagged", "a release with no allocation token; the arena will not guess which allocation it belongs to");
+        Release::Double
     }
 
     /// True when `ptr` is inside this region (f.7).
@@ -219,12 +246,15 @@ impl Space {
     }
 
     /// Serve `bytes` (f.3). Returns the address and what it was charged.
-    pub(crate) fn alloc(&self, bytes: u64) -> Result<(*mut u8, u64), OutOfSpace> {
+    /// Serve `bytes`: the address, what it cost the budget, and the token that names this
+    /// allocation for its release (AR-I5).
+    pub(crate) fn alloc(&self, bytes: u64) -> Result<(*mut u8, u64, u64), OutOfSpace> {
         // A zero-length request owns nothing: it is served from the region's first byte,
         // charged nothing, and its release is a no-op, so it can never free a live slot
-        // (h: `alloc(0)` returns a buffer with `len() == 0` and never a null pointer).
+        // (h: `alloc(0)` returns a buffer with `len() == 0` and never a null pointer). It
+        // gets no token, because there is no allocation for one to name.
         if bytes == 0 {
-            return Ok((self.base, 0));
+            return Ok((self.base, 0, moruna_kernel::NO_TOKEN));
         }
         let offset = match class_for(bytes) {
             Some(c) => self.alloc_class(c, bytes)?,
@@ -236,7 +266,23 @@ impl Space {
         Ok((
             unsafe { self.base.add(offset as usize) },
             self.charged(bytes),
+            self.token_for(offset),
         ))
+    }
+
+    /// The token for the allocation whose first granule holds `offset`: which granule, and
+    /// which incarnation of it. The granule is stored plus one so that no valid token is
+    /// `NO_TOKEN`.
+    fn token_for(&self, offset: u64) -> u64 {
+        let g = (offset / GRANULE) as usize;
+        let generation = u64::from(self.generation[g].load(Ordering::Acquire));
+        (generation << 32) | (g as u64 + 1)
+    }
+
+    /// Retire the incarnation of the allocation at granule `g`, so every token naming it
+    /// stops matching and a release that arrives afterwards is refused.
+    fn retire(&self, g: usize) {
+        self.generation[g].fetch_add(1, Ordering::AcqRel);
     }
 
     /// What a request of `bytes` costs against the budget (e.2).
@@ -345,36 +391,60 @@ impl Space {
         self.in_use.fetch_add(charged, Ordering::Relaxed);
     }
 
-    /// Return `len` bytes at `ptr` (f.4). A zero-length buffer owns nothing and returns
-    /// nothing, which is what makes `alloc(0)` and a zero half of `split_at` safe.
-    pub(crate) fn release(&self, ptr: *mut u8, len: u64) -> Release {
+    /// Return `len` bytes at `ptr` to the allocation `token` names (f.4). A zero-length
+    /// buffer owns nothing and returns nothing, which is what makes `alloc(0)` and a zero
+    /// half of `split_at` safe.
+    ///
+    /// The allocation is named by the token, not worked out from `ptr`. An address says which
+    /// granule it is in and nothing about which incarnation of that granule is live, and the
+    /// region is never unmapped mid-run (AR-I3), so addresses recycle freely: a release
+    /// credited by address alone can take down a block a live `Buffer` still points at, which
+    /// is the same bytes handed to two owners with nothing reported. The token carries the
+    /// incarnation, so a release of bytes that have already gone back matches nothing and is
+    /// refused (h, AR-I5).
+    pub(crate) fn release(&self, ptr: *mut u8, len: u64, token: u64) -> Release {
         if len == 0 {
             return Release::Partial;
         }
+        if token == moruna_kernel::NO_TOKEN {
+            return self.refuse_untagged();
+        }
+        let g = ((token & 0xFFFF_FFFF) - 1) as usize;
+        let generation = (token >> 32) as u32;
+        if g >= self.generation.len() || self.generation[g].load(Ordering::Acquire) != generation {
+            self.double_release.fetch_add(1, Ordering::Relaxed);
+            return Release::Double;
+        }
         let off = (ptr as usize - self.base as usize) as u64;
-        let g = (off / GRANULE) as usize;
+        let base = g as u64 * GRANULE;
         match self.mark[g].load(Ordering::Acquire) {
             MARK_NONE => {
                 self.double_release.fetch_add(1, Ordering::Relaxed);
                 Release::Double
             }
-            MARK_LARGE => self.release_large(off, len),
-            mark => self.release_class(off, len, mark as usize),
+            MARK_LARGE => self.release_large(g, base, off, len),
+            mark => self.release_class(g, base, off, len, mark as usize),
         }
     }
 
-    fn release_class(&self, off: u64, len: u64, c: usize) -> Release {
+    fn release_class(&self, g: usize, slot: u64, off: u64, len: u64, c: usize) -> Release {
         let size = class_size(c);
-        let slot = off & !(size - 1);
-        let sg = (slot / GRANULE) as usize;
+        // The released range has to lie inside the slot the token named. A pointer that has
+        // drifted out of its own slot is not a release of that slot.
+        if off < slot || off.saturating_add(len) > slot + size {
+            self.double_release.fetch_add(1, Ordering::Relaxed);
+            return Release::Double;
+        }
         loop {
-            let cur = self.outstanding[sg].load(Ordering::Acquire);
-            if cur == 0 {
+            let cur = self.outstanding[g].load(Ordering::Acquire);
+            // More bytes than the slot still has outstanding is an over-release, refused
+            // rather than saturated: saturating here freed the slot while another `Buffer`
+            // held the rest of it.
+            let Some(next) = cur.checked_sub(len) else {
                 self.double_release.fetch_add(1, Ordering::Relaxed);
                 return Release::Double;
-            }
-            let next = cur.saturating_sub(len);
-            if self.outstanding[sg]
+            };
+            if self.outstanding[g]
                 .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
@@ -383,15 +453,17 @@ impl Space {
             if next > 0 {
                 return Release::Partial;
             }
+            self.retire(g);
             self.lock_free(c).push(slot);
             self.in_use.fetch_sub(size, Ordering::Relaxed);
             return Release::Freed;
         }
     }
 
-    fn release_large(&self, off: u64, len: u64) -> Release {
-        match self.lock_top().release_large(off, len) {
+    fn release_large(&self, g: usize, base: u64, off: u64, len: u64) -> Release {
+        match self.lock_top().release_large_at(base, off, len) {
             LargeRelease::Freed { offset, charged } => {
+                self.retire(g);
                 self.mark_range(offset, charged, MARK_NONE);
                 self.in_use.fetch_sub(charged, Ordering::Relaxed);
                 Release::Freed
@@ -462,25 +534,27 @@ mod tests {
     #[test]
     fn a_zero_length_request_owns_nothing() {
         let h = heap(4 * MIB, true);
-        let (ptr, charged) = h.space.alloc(0).expect("zero");
+        let (ptr, charged, token) = h.space.alloc(0).expect("zero");
         assert_eq!(charged, 0);
+        assert_eq!(token, moruna_kernel::NO_TOKEN);
         assert!(h.space.contains(ptr));
         assert_eq!(h.space.in_use(), 0);
-        assert_eq!(h.space.release(ptr, 0), Release::Partial);
+        assert_eq!(h.space.release(ptr, 0, token), Release::Partial);
         assert_eq!(h.space.double_releases(), 0);
+        assert_eq!(h.space.untagged_releases(), 0);
     }
 
     #[test]
     fn small_mode_splits_and_returns() {
         let h = heap(4 * MIB, true);
-        let (a, charged) = h.space.alloc(1000).expect("a");
+        let (a, charged, ta) = h.space.alloc(1000).expect("a");
         assert_eq!(charged, GRANULE);
         assert_eq!(h.space.in_use(), GRANULE);
         assert_eq!(a as usize % GRANULE as usize, 0);
-        let (b, _) = h.space.alloc(GRANULE + 1).expect("b");
+        let (b, _, tb) = h.space.alloc(GRANULE + 1).expect("b");
         assert_eq!(h.space.in_use(), GRANULE + 2 * GRANULE);
-        assert_eq!(h.space.release(a, 1000), Release::Freed);
-        assert_eq!(h.space.release(b, GRANULE + 1), Release::Freed);
+        assert_eq!(h.space.release(a, 1000, ta), Release::Freed);
+        assert_eq!(h.space.release(b, GRANULE + 1, tb), Release::Freed);
         assert_eq!(h.space.in_use(), 0);
         assert!(h.space.stranded_bytes() > 0);
     }
@@ -488,19 +562,32 @@ mod tests {
     #[test]
     fn a_split_slot_returns_once_both_halves_do() {
         let h = heap(4 * MIB, true);
-        let (a, _) = h.space.alloc(GRANULE).expect("a");
-        assert_eq!(h.space.release(a, 16), Release::Partial);
+        let (a, _, t) = h.space.alloc(GRANULE).expect("a");
+        assert_eq!(h.space.release(a, 16, t), Release::Partial);
         // SAFETY: test-only; the second half of a live slot.
         let mid = unsafe { a.add(16) };
-        assert_eq!(h.space.release(mid, GRANULE - 16), Release::Freed);
-        assert_eq!(h.space.release(a, 1), Release::Double);
+        assert_eq!(h.space.release(mid, GRANULE - 16, t), Release::Freed);
+        // The slot has gone back, so the token names an incarnation that is over and the
+        // release is refused rather than credited to whoever holds the slot next.
+        assert_eq!(h.space.release(a, 1, t), Release::Double);
         assert_eq!(h.space.double_releases(), 1);
+        // A release with no token at all is refused too: every buffer this region hands out
+        // carries one, so the arena has nothing to attribute it to.
+        assert_eq!(
+            h.space.release(a, 1, moruna_kernel::NO_TOKEN),
+            Release::Double
+        );
+        assert_eq!(h.space.untagged_releases(), 1);
     }
 
     #[test]
     fn an_unassigned_address_is_a_double_release() {
         let h = heap(4 * MIB, false);
-        assert_eq!(h.space.release(h.space.base, 1), Release::Double);
+        // Granule 0, incarnation 1: the token an allocation there would have carried.
+        assert_eq!(
+            h.space.release(h.space.base, 1, (1 << 32) | 1),
+            Release::Double
+        );
         assert_eq!(h.space.double_releases(), 1);
     }
 
@@ -508,15 +595,15 @@ mod tests {
     fn a_small_region_runs_out() {
         let h = heap(4 * MIB, true);
         let mut live = Vec::new();
-        while let Ok((p, c)) = h.space.alloc(MIB) {
-            live.push((p, c));
+        while let Ok((p, c, t)) = h.space.alloc(MIB) {
+            live.push((p, c, t));
         }
         assert_eq!(live.len(), 4);
         assert_eq!(h.space.in_use(), 4 * MIB);
         assert_eq!(h.space.alloc(SLAB_BYTES + 1), Err(OutOfSpace));
         assert_eq!(h.space.largest_free(), 0);
-        for (p, _) in live {
-            assert_eq!(h.space.release(p, MIB), Release::Freed);
+        for (p, _, t) in live {
+            assert_eq!(h.space.release(p, MIB, t), Release::Freed);
         }
         assert_eq!(h.space.largest_free(), MIB);
     }
@@ -525,14 +612,14 @@ mod tests {
     fn big_mode_claims_slabs() {
         let h = heap(2 * SLAB_BYTES, false);
         assert_eq!(h.space.largest_free(), 2 * SLAB_BYTES);
-        let (a, charged) = h.space.alloc(MIB).expect("a");
+        let (a, charged, t) = h.space.alloc(MIB).expect("a");
         assert_eq!(charged, MIB);
         assert_eq!(h.space.slabs_by_class()[4], 1);
         // The slab is the region's eighth, not a fixed 512 MiB (e.1).
         assert_eq!(h.space.stranded_bytes(), 2 * SLAB_BYTES / 8 - MIB);
         assert_eq!(h.space.tier(), Tier::Host);
         assert_eq!(h.space.bytes(), 2 * SLAB_BYTES);
-        assert_eq!(h.space.release(a, MIB), Release::Freed);
+        assert_eq!(h.space.release(a, MIB, t), Release::Freed);
         assert_eq!(h.space.charged(SLAB_BYTES + 1), SLAB_BYTES + GRANULE);
     }
 }

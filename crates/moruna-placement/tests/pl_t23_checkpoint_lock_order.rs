@@ -56,7 +56,7 @@ fn pl_t23_checkpoint_lock_order() {
 
 /// The default number of body runs. 20 on `infra/pl-t23-segv` while the segfault is being
 /// measured; 1 is the figure the gate wants and the figure this returns to.
-const REPEATS_DEFAULT: u64 = 20;
+const REPEATS_DEFAULT: u64 = 40;
 
 fn once(seconds: u64) {
     let scratch = common::Scratch::new("t23");

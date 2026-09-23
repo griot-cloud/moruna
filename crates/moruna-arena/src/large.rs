@@ -22,7 +22,9 @@ pub(crate) enum LargeRelease {
     Freed { offset: u64, charged: u64 },
     /// Some bytes of the block are still held by another `Buffer`.
     Partial,
-    /// No live block covers this pointer: a double release (h).
+    /// The release names no live block, or names bytes outside the block it names, or more
+    /// bytes than the block still has outstanding: a double release (h). Nothing is
+    /// credited, so a block is never retired under a live owner.
     Unknown,
 }
 
@@ -119,19 +121,27 @@ impl TopArea {
         Some(off)
     }
 
-    /// Release `len` bytes at `off` from whichever live block covers it, coalescing and
+    /// Release `len` bytes at `off` from the block whose base is `base`, coalescing and
     /// retreating the top when the block is wholly free (f.4).
-    pub(crate) fn release_large(&mut self, off: u64, len: u64) -> LargeRelease {
-        let Some((base, live)) = self
-            .live
-            .range(..=off)
-            .next_back()
-            .map(|(b, l)| (*b, *l))
-            .filter(|(b, l)| off < b + l.charged)
-        else {
+    ///
+    /// The base is named, never inferred from `off`. Inferring it was the defect this
+    /// replaces: the lookup was `live.range(..=off).next_back()` filtered by the block's
+    /// charged range, and offsets recycle, so a release that arrived late or twice could
+    /// fall inside a *different* live block, take its outstanding count down and retire it
+    /// while a `Buffer` still pointed at those bytes. The arena hands nothing back to the OS
+    /// mid-run (AR-I3), so the symptom was not a crash: it was the same bytes carved out for
+    /// a second owner, with nothing said. `saturating_sub` is gone with it, because an
+    /// over-release must be refused rather than absorbed.
+    pub(crate) fn release_large_at(&mut self, base: u64, off: u64, len: u64) -> LargeRelease {
+        let Some(live) = self.live.get(&base).copied() else {
             return LargeRelease::Unknown;
         };
-        let rest = live.outstanding.saturating_sub(len);
+        if off < base || off.saturating_add(len) > base + live.charged {
+            return LargeRelease::Unknown;
+        }
+        let Some(rest) = live.outstanding.checked_sub(len) else {
+            return LargeRelease::Unknown;
+        };
         if rest > 0 {
             self.live.insert(
                 base,
@@ -216,7 +226,7 @@ mod tests {
         assert_eq!(t.gap(), region - 1800 * MIB);
         // free the middle, then the ends
         assert_eq!(
-            t.release_large(b, 600 * MIB),
+            t.release_large_at(b, b, 600 * MIB),
             LargeRelease::Freed {
                 offset: b,
                 charged: 600 * MIB
@@ -224,7 +234,7 @@ mod tests {
         );
         assert_eq!(t.largest_free_block(), 600 * MIB);
         assert_eq!(
-            t.release_large(a, 600 * MIB),
+            t.release_large_at(a, a, 600 * MIB),
             LargeRelease::Freed {
                 offset: a,
                 charged: 600 * MIB
@@ -232,7 +242,7 @@ mod tests {
         );
         assert_eq!(t.largest_free_block(), 1200 * MIB);
         assert_eq!(
-            t.release_large(c, 600 * MIB),
+            t.release_large_at(c, c, 600 * MIB),
             LargeRelease::Freed {
                 offset: c,
                 charged: 600 * MIB
@@ -247,7 +257,7 @@ mod tests {
         let mut t = TopArea::new(2048 * MIB);
         let a = t.alloc_large(600 * MIB, 600 * MIB).expect("a");
         let _b = t.alloc_large(600 * MIB, 600 * MIB).expect("b");
-        t.release_large(a, 600 * MIB);
+        t.release_large_at(a, a, 600 * MIB);
         let c = t.alloc_large(520 * MIB, 520 * MIB).expect("c");
         assert_eq!(c, a);
         assert_eq!(t.largest_free_block(), 80 * MIB);
@@ -257,15 +267,15 @@ mod tests {
     fn a_split_block_returns_only_when_both_halves_do() {
         let mut t = TopArea::new(2048 * MIB);
         let a = t.alloc_large(600 * MIB, 600 * MIB).expect("a");
-        assert_eq!(t.release_large(a, 200 * MIB), LargeRelease::Partial);
+        assert_eq!(t.release_large_at(a, a, 200 * MIB), LargeRelease::Partial);
         assert_eq!(
-            t.release_large(a + 200 * MIB, 400 * MIB),
+            t.release_large_at(a, a + 200 * MIB, 400 * MIB),
             LargeRelease::Freed {
                 offset: a,
                 charged: 600 * MIB
             }
         );
-        assert_eq!(t.release_large(a, 1), LargeRelease::Unknown);
-        assert_eq!(t.release_large(0, 1), LargeRelease::Unknown);
+        assert_eq!(t.release_large_at(a, a, 1), LargeRelease::Unknown);
+        assert_eq!(t.release_large_at(0, 0, 1), LargeRelease::Unknown);
     }
 }

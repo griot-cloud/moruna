@@ -13,18 +13,32 @@ use moruna_kernel::{
 /// A region this allocator handed out.
 #[derive(Copy, Clone, Debug)]
 struct Region {
+    base: usize,
     len: usize,
     layout: Layout,
     tier: Tier,
-    /// Bytes released so far. A region goes back to the system only when every byte
-    /// of it has been released, because `Buffer::split_at` hands two owners into one
-    /// allocation and contracts d.3 frees them independently.
-    released: usize,
+    /// Bytes not yet released. A region goes back to the system when this reaches zero and
+    /// not before, because `Buffer::split_at` hands two owners into one allocation and
+    /// contracts d.3 frees them independently.
+    outstanding: usize,
 }
 
 #[derive(Default)]
 struct State {
-    regions: BTreeMap<usize, Region>,
+    /// Live regions by the token their buffers carry, which is what a release is attributed
+    /// by. Keying this by address and finding the region with a range query is what it used
+    /// to do, and that is unsound: this allocator really does hand memory back to the system,
+    /// so addresses recycle, and a release that arrives after its region has gone can land
+    /// inside a *different* live region, free it under its owner and turn the next read of
+    /// those bytes into a use-after-free.
+    regions: BTreeMap<u64, Region>,
+    /// Base address to token, for `contains` and `tier_of`, which are given an address and
+    /// nothing else. A lookup here is a question about live regions only and frees nothing.
+    by_addr: BTreeMap<usize, u64>,
+    next_token: u64,
+    /// Releases this allocator would not honour: no such region, bytes outside the region the
+    /// token named, more bytes than it still had outstanding, or no token at all.
+    refused: u64,
     host_in_use: u64,
     pinned_in_use: u64,
     device_in_use: [u64; 8],
@@ -120,6 +134,19 @@ impl FakeAllocator {
         self.inner.allocations_total.load(Ordering::SeqCst)
     }
 
+    /// Observable: releases this allocator refused because it could not attribute them with
+    /// certainty. Zero is the only acceptable value; anything else is a buffer's bytes being
+    /// handed back twice, or after their region has gone, and the message on stderr says
+    /// which (d.15, h).
+    pub fn refused_releases(&self) -> u64 {
+        self.lock().refused
+    }
+
+    /// Observable: regions this allocator has handed out and not yet taken back.
+    pub fn live_regions(&self) -> usize {
+        self.lock().regions.len()
+    }
+
     /// Observable: bytes in use in one tier.
     pub fn in_use(&self, tier: Tier) -> u64 {
         let state = self.lock();
@@ -208,9 +235,94 @@ struct InnerBuilder {
     pinned: bool,
 }
 
-/// Report an accounting anomaly straight to stderr, past libtest's output capture, so the
-/// line survives a crash of this process. The first few carry a backtrace; the rest are
-/// counted by their text alone, because a loop that has gone wrong can produce thousands.
+impl ArenaHandle for Inner {
+    /// A release with no token. Every buffer this allocator hands out carries one, so this
+    /// can only be bytes released by hand; it is counted and refused rather than attributed
+    /// to whichever region happens to cover the address now.
+    fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
+        self.release_token(ptr, len, tier, moruna_kernel::NO_TOKEN);
+    }
+
+    /// Return `len` bytes at `ptr` to the region `token` names.
+    ///
+    /// A `split_at` half releases only its own part of a region, and contracts d.3 says both
+    /// halves are freed independently, so the region goes back to the system only when every
+    /// byte of it has been released. Which region that is comes from the token the buffer
+    /// carries, never from the address: this allocator calls `dealloc`, so an address that
+    /// has been freed can be handed back by the system as part of a later, larger region, and
+    /// a stale release credited by address would then retire a region a live buffer still
+    /// points into. That is a use-after-free, and it is what a SIGSEGV looks like.
+    fn release_token(&self, ptr: *mut u8, len: usize, tier: Tier, token: u64) {
+        // A zero-length buffer owns no bytes: it returns nothing and can free nothing. This
+        // is the half a `split_at` at 0 or at `len` leaves behind, and it may well outlive
+        // its region.
+        if len == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if token == moruna_kernel::NO_TOKEN {
+            state.refused += 1;
+            report(&format!(
+                "untagged release ptr={ptr:?} len={len} tier={tier:?}"
+            ));
+            return;
+        }
+        let Some(region) = state.regions.get(&token).copied() else {
+            state.refused += 1;
+            report(&format!(
+                "release of a region that has gone: token={token} ptr={ptr:?} len={len} tier={tier:?}"
+            ));
+            return;
+        };
+        // `wrapping_sub` makes a pointer below the base come out enormous, so one
+        // comparison covers both ends of the region.
+        let offset = (ptr as usize).wrapping_sub(region.base);
+        if offset.saturating_add(len) > region.len {
+            state.refused += 1;
+            report(&format!(
+                "release outside its region: token={token} ptr={ptr:?} base={:#x} len={len} region={}",
+                region.base, region.len
+            ));
+            return;
+        }
+        let Some(outstanding) = region.outstanding.checked_sub(len) else {
+            state.refused += 1;
+            report(&format!(
+                "release of more bytes than the region has left: token={token} len={len} outstanding={}",
+                region.outstanding
+            ));
+            return;
+        };
+        match tier {
+            Tier::Host => state.host_in_use = state.host_in_use.saturating_sub(len as u64),
+            Tier::PinnedHost => {
+                state.pinned_in_use = state.pinned_in_use.saturating_sub(len as u64)
+            }
+            Tier::Device(id) => {
+                let slot = &mut state.device_in_use[id.0 as usize];
+                *slot = slot.saturating_sub(len as u64);
+            }
+            Tier::Disk(_) | Tier::Remote(_, _) => {}
+        }
+        if outstanding > 0 {
+            if let Some(entry) = state.regions.get_mut(&token) {
+                entry.outstanding = outstanding;
+            }
+            return;
+        }
+        state.regions.remove(&token);
+        state.by_addr.remove(&region.base);
+        // SAFETY: every byte of this region has now been released, the layout is the one
+        // `alloc` used, and both index entries are removed before the free, so no later
+        // lookup can reach it and no second release can be attributed to it.
+        unsafe { dealloc(region.base as *mut u8, region.layout) };
+    }
+}
+
+/// Report an accounting anomaly straight to stderr, past a test harness's output capture, so
+/// the line survives a crash of the process. The first few carry a backtrace; the rest are
+/// counted by `FakeAllocator::refused_releases` alone, because a loop that has gone wrong can
+/// produce thousands.
 fn report(what: &str) {
     use std::io::Write;
     static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -224,77 +336,6 @@ fn report(what: &str) {
         let _ = writeln!(err, "{}", std::backtrace::Backtrace::force_capture());
     }
     let _ = err.flush();
-}
-
-impl ArenaHandle for Inner {
-    fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        match tier {
-            Tier::Host => state.host_in_use = state.host_in_use.saturating_sub(len as u64),
-            Tier::PinnedHost => {
-                state.pinned_in_use = state.pinned_in_use.saturating_sub(len as u64)
-            }
-            Tier::Device(id) => {
-                let slot = &mut state.device_in_use[id.0 as usize];
-                *slot = slot.saturating_sub(len as u64);
-            }
-            Tier::Disk(_) | Tier::Remote(_, _) => {}
-        }
-        // A `split_at` half releases only its own part of a region, and contracts d.3 says
-        // both halves are freed independently, so the region goes back to the system only
-        // when every byte of it has been released. Freeing on the half that happens to hold
-        // the first byte, which is what this did until 2026-09-22, left the other half
-        // pointing into freed memory: a use-after-free that the component 9 agent hit for
-        // real and worked around by not using `split_at`.
-        let base = state
-            .regions
-            .range(..=(ptr as usize))
-            .next_back()
-            .filter(|(start, region)| (ptr as usize) < **start + region.layout.size())
-            .map(|(start, _)| *start);
-        // The three ways this lookup can be wrong, reported before the accounting acts on
-        // it. A release of a pointer no live region covers is a stale or foreign token; a
-        // release whose pointer is not a region's base is a `split_at` half (legitimate) or
-        // a pointer that has drifted; a release that would carry `released` past the
-        // layout's size means the region's bytes have been handed back more than once.
-        // Any of the three is the shape of the use-after-free behind the Linux SIGSEGV of
-        // run 35836, so each says so on stderr rather than being credited in silence.
-        match base {
-            None => report(&format!(
-                "foreign release ptr={ptr:?} len={len} tier={tier:?}"
-            )),
-            Some(start) => {
-                let region = &state.regions[&start];
-                if start != ptr as usize {
-                    report(&format!(
-                        "interior release ptr={ptr:?} base={start:#x} len={len} size={}",
-                        region.layout.size()
-                    ));
-                }
-                if region.released + len.max(1) > region.layout.size() {
-                    report(&format!(
-                        "over-release ptr={ptr:?} base={start:#x} len={len} released={} size={}",
-                        region.released,
-                        region.layout.size()
-                    ));
-                }
-            }
-        }
-        if let Some(base) = base {
-            let done = {
-                let region = state.regions.get_mut(&base).expect("the region just found");
-                region.released += len.max(1);
-                region.released >= region.layout.size()
-            };
-            if done {
-                let region = state.regions.remove(&base).expect("the region just found");
-                // SAFETY: every byte of this region has now been released, the layout is the
-                // one `alloc` used, and the entry is removed before the free so no later
-                // release can reach it a second time.
-                unsafe { dealloc(base as *mut u8, region.layout) };
-            }
-        }
-    }
 }
 
 impl Allocator for FakeAllocator {
@@ -354,15 +395,19 @@ impl Allocator for FakeAllocator {
         }
         // SAFETY: the region was just allocated, so writing zeros initialises every byte of it.
         unsafe { std::ptr::write_bytes(ptr, 0, len) };
+        state.next_token += 1;
+        let token = state.next_token;
         state.regions.insert(
-            ptr as usize,
+            token,
             Region {
+                base: ptr as usize,
                 len,
                 layout,
                 tier,
-                released: 0,
+                outstanding: len,
             },
         );
+        state.by_addr.insert(ptr as usize, token);
         match tier {
             Tier::Host => state.host_in_use += len as u64,
             Tier::PinnedHost => state.pinned_in_use += len as u64,
@@ -373,8 +418,9 @@ impl Allocator for FakeAllocator {
         self.inner.allocations_total.fetch_add(1, Ordering::SeqCst);
         let handle: Arc<dyn ArenaHandle> = Arc::clone(&self.inner) as Arc<_>;
         // SAFETY: the region is valid for `len` bytes in `tier` and is released to this
-        // allocator exactly once, when the buffer (or each half of a split) drops.
-        Ok(unsafe { Buffer::from_raw(ptr, len, tier, handle) })
+        // allocator exactly once, when the buffer (or each half of a split) drops; `token`
+        // names the region, so that release is attributed to it and to nothing else.
+        Ok(unsafe { Buffer::from_raw_tagged(ptr, len, tier, handle, token) })
     }
 
     fn note_payload_copy(&self, bytes: u64) {
@@ -412,12 +458,9 @@ impl Allocator for FakeAllocator {
     fn tier_of(&self, ptr: *const u8) -> Option<Tier> {
         let address = ptr as usize;
         let state = self.lock();
-        state
-            .regions
-            .range(..=address)
-            .next_back()
-            .filter(|(base, region)| address < *base + region.len)
-            .map(|(_, region)| region.tier)
+        let (base, token) = state.by_addr.range(..=address).next_back()?;
+        let region = state.regions.get(token)?;
+        (address < base + region.len).then_some(region.tier)
     }
 
     fn is_pinned(&self) -> bool {

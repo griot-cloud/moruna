@@ -360,14 +360,16 @@ impl Allocator for Arena {
             });
         };
         match space.alloc(bytes as u64) {
-            Ok((ptr, _charged)) => {
+            Ok((ptr, _charged, token)) => {
                 inner.allocations.fetch_add(1, Ordering::Relaxed);
                 let handle: Arc<dyn moruna_kernel::ArenaHandle> = Arc::clone(inner) as Arc<_>;
                 // SAFETY: `ptr` is `bytes` bytes inside the region this arena reserved for
                 // `tier` and holds for the life of the run (AR-I3), the allocator will not
                 // hand the same bytes out again until they are released, and the buffer
-                // releases them to this same arena exactly once on drop (CT-I2).
-                Ok(unsafe { Buffer::from_raw(ptr, bytes, space.tier(), handle) })
+                // releases them to this same arena exactly once on drop (CT-I2). `token` is
+                // this region's name for the allocation, which is what makes that release
+                // attributable rather than inferred from the address (AR-I5).
+                Ok(unsafe { Buffer::from_raw_tagged(ptr, bytes, space.tier(), handle, token) })
             }
             Err(_) => {
                 let in_use = space.in_use();

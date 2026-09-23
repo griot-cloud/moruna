@@ -12,18 +12,26 @@ use moruna_kernel::{ArenaHandle, Tier};
 use crate::Inner;
 
 impl ArenaHandle for Inner {
+    /// A release with no token. Every buffer this arena hands out carries one, so this can
+    /// only be a caller releasing bytes by hand; the arena counts it and returns the bytes to
+    /// nothing rather than guessing which allocation they belong to. Guessing was the defect:
+    /// see `Space::release`.
     fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
+        self.release_token(ptr, len, tier, moruna_kernel::NO_TOKEN);
+    }
+
+    fn release_token(&self, ptr: *mut u8, len: usize, tier: Tier, token: u64) {
         match tier {
             Tier::Host | Tier::PinnedHost => {
                 if self.host_tier == tier && self.host.space.contains(ptr) {
-                    self.host.space.release(ptr, len as u64);
+                    self.host.space.release(ptr, len as u64, token);
                 } else {
                     self.foreign(tier);
                 }
             }
             Tier::Device(id) => match self.device(id) {
                 Some(space) if space.contains(ptr) => {
-                    space.release(ptr, len as u64);
+                    space.release(ptr, len as u64, token);
                 }
                 Some(_) | None => self.foreign(tier),
             },
