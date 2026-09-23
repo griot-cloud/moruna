@@ -148,13 +148,17 @@ jobs:
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
 
-  # Publishing. A tag is the only trigger: nothing reaches PyPI from a push to main,
-  # and the job builds the wheels itself rather than trusting an artefact from
-  # elsewhere. Authentication is PyPI's trusted publishing (OpenID Connect), so there
-  # is no token in this repository and nothing to leak; the publisher is configured
-  # once on PyPI against this repository, this workflow file and this environment.
-  publish:
-    name: publish to PyPI (tags only)
+  # Publishing, in two jobs because it has to be. A tag is the only trigger: nothing
+  # reaches PyPI from a push to main. The wheels are built on each platform we ship for
+  # and handed to one job that uploads them, because the PyPI publishing action refuses
+  # to run anywhere but Linux: on the v0.1.0 tag the macOS leg built its wheel, imported
+  # it, and then failed at the upload step ("fail-fast in unsupported environments"), so
+  # 0.1.0 went out Linux-only (2026-09-23). Authentication is PyPI's trusted publishing
+  # (OpenID Connect), so there is no token in this repository and nothing to leak; the
+  # publisher is configured once on PyPI against this repository, this workflow file and
+  # the `pypi` environment.
+  wheels:
+    name: build the wheels (tags only)
     # The gate first, always. Without this the job ran beside `ci` rather than after it, and
     # on the v0.1.0 tag it published the Linux wheel while the test job was failing: a
     # release went out from a red pipeline because the condition guarding it only asked
@@ -165,9 +169,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-14]
-    environment: pypi
-    permissions:
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
@@ -185,6 +186,28 @@ jobs:
           python -m pip install --only-binary=:all: pyarrow
           python -m pip install --no-index --find-links dist moruna
           python -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI (tags only)
+    needs: wheels
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Every wheel that was built is here
+        run: ls -la dist
       - name: Publish
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.14.0
         with:
