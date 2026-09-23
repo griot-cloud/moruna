@@ -11,12 +11,54 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Write one line straight to the process's stderr, past libtest's output capture, so the
+/// line survives a crash of this process. `eprintln!` goes through the capture and is lost
+/// when the harness never gets to print the test's output (infra/pl-t23-segv).
+fn note(line: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "PL-T23 {line}");
+    let _ = err.flush();
+}
+
+/// Resident set size in kilobytes where the host publishes it; `None` elsewhere, which is
+/// every host but Linux.
+fn rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+}
+
 #[test]
 fn pl_t23_checkpoint_lock_order() {
     let seconds: u64 = match std::env::var("MORUNA_PL_T23_SECONDS") {
         Ok(value) => value.parse().unwrap_or(3),
         Err(_) => 3,
     };
+    // How many times to run the body. One is the gate's figure; the soak this knob exists
+    // for is how the Linux-only SIGSEGV of run 35836 is measured, because a rate needs more
+    // than one sample and the crash takes the whole process with it.
+    let repeats: u64 = match std::env::var("MORUNA_PL_T23_REPEATS") {
+        Ok(value) => value.parse().unwrap_or(REPEATS_DEFAULT),
+        Err(_) => REPEATS_DEFAULT,
+    };
+    for iteration in 1..=repeats {
+        note(&format!("iteration {iteration}/{repeats} start"));
+        once(seconds);
+        note(&format!(
+            "iteration {iteration}/{repeats} ok rss_kb={:?}",
+            rss_kb()
+        ));
+    }
+}
+
+/// The default number of body runs. 20 on `infra/pl-t23-segv` while the segfault is being
+/// measured; 1 is the figure the gate wants and the figure this returns to.
+const REPEATS_DEFAULT: u64 = 20;
+
+fn once(seconds: u64) {
     let scratch = common::Scratch::new("t23");
     let alloc = FakeAllocator::new();
     let reactor = FakeReactor::new().with_latency(Duration::from_micros(200));
@@ -32,6 +74,7 @@ fn pl_t23_checkpoint_lock_order() {
     drop(sample);
     engine.set_water(0, TierKind::Host, bytes * 16, bytes * 32);
     let manifest = engine.manifest_path().expect("a manifest path");
+    note("engine up");
 
     let stop = Arc::new(AtomicBool::new(false));
     let next = Arc::new(AtomicU64::new(0));
@@ -144,7 +187,15 @@ fn pl_t23_checkpoint_lock_order() {
             std::thread::sleep(Duration::from_millis(20));
         }
         stop.store(true, Ordering::Relaxed);
+        note("stop set, joining");
     });
+    note(&format!(
+        "joined allocations={} host_in_use={} ops={} violations={}",
+        alloc.allocations_total(),
+        alloc.in_use(alloc.host_tier()),
+        reactor.ops().len(),
+        moruna_placement::locks::violations()
+    ));
 
     assert!(
         manifests.load(Ordering::Relaxed) > 1,
@@ -164,6 +215,7 @@ fn pl_t23_checkpoint_lock_order() {
         "a lock was taken out of order (preamble 4.2, f.11, f.12)"
     );
     engine.shutdown();
+    note("shutdown returned");
 }
 
 #[test]

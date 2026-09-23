@@ -208,6 +208,24 @@ struct InnerBuilder {
     pinned: bool,
 }
 
+/// Report an accounting anomaly straight to stderr, past libtest's output capture, so the
+/// line survives a crash of this process. The first few carry a backtrace; the rest are
+/// counted by their text alone, because a loop that has gone wrong can produce thousands.
+fn report(what: &str) {
+    use std::io::Write;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen >= 64 {
+        return;
+    }
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "FAKEALLOC {what}");
+    if seen < 3 {
+        let _ = writeln!(err, "{}", std::backtrace::Backtrace::force_capture());
+    }
+    let _ = err.flush();
+}
+
 impl ArenaHandle for Inner {
     fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,6 +252,34 @@ impl ArenaHandle for Inner {
             .next_back()
             .filter(|(start, region)| (ptr as usize) < **start + region.layout.size())
             .map(|(start, _)| *start);
+        // The three ways this lookup can be wrong, reported before the accounting acts on
+        // it. A release of a pointer no live region covers is a stale or foreign token; a
+        // release whose pointer is not a region's base is a `split_at` half (legitimate) or
+        // a pointer that has drifted; a release that would carry `released` past the
+        // layout's size means the region's bytes have been handed back more than once.
+        // Any of the three is the shape of the use-after-free behind the Linux SIGSEGV of
+        // run 35836, so each says so on stderr rather than being credited in silence.
+        match base {
+            None => report(&format!(
+                "foreign release ptr={ptr:?} len={len} tier={tier:?}"
+            )),
+            Some(start) => {
+                let region = &state.regions[&start];
+                if start != ptr as usize {
+                    report(&format!(
+                        "interior release ptr={ptr:?} base={start:#x} len={len} size={}",
+                        region.layout.size()
+                    ));
+                }
+                if region.released + len.max(1) > region.layout.size() {
+                    report(&format!(
+                        "over-release ptr={ptr:?} base={start:#x} len={len} released={} size={}",
+                        region.released,
+                        region.layout.size()
+                    ));
+                }
+            }
+        }
         if let Some(base) = base {
             let done = {
                 let region = state.regions.get_mut(&base).expect("the region just found");

@@ -288,12 +288,33 @@ static REGISTRY: Mutex<BTreeMap<usize, (usize, Tier)>> = Mutex::new(BTreeMap::ne
 
 fn registry_insert(base: usize, len: usize, tier: Tier) {
     let mut map = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(base, (len, tier));
+    if let Some((old_len, old_tier)) = map.insert(base, (len, tier)) {
+        // Two live `ArrowOwner`s over one base means the region will be released twice.
+        // Reported rather than hidden while the Linux SIGSEGV of run 35836 is being found.
+        registry_report(&format!(
+            "double insert base={base:#x} len={len} tier={tier:?}              displaced len={old_len} tier={old_tier:?}"
+        ));
+    }
 }
 
 fn registry_remove(base: usize) {
     let mut map = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(&base);
+    if map.remove(&base).is_none() {
+        registry_report(&format!("remove of an absent base={base:#x}"));
+    }
+}
+
+/// Report a provenance-registry anomaly straight to stderr, past a test harness's output
+/// capture, so the line survives a crash of the process.
+fn registry_report(what: &str) {
+    use std::io::Write;
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 64 {
+        return;
+    }
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "REGISTRY {what}");
+    let _ = err.flush();
 }
 
 /// The tier of the arena region an Arrow buffer (or any slice of it) was built over by
