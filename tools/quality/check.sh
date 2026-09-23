@@ -176,3 +176,13 @@ if [ -f python/pyproject.toml ]; then
 fi
 
 step "OK"
+# What this gate cannot tell you, said out loud rather than assumed: it compiles and
+# runs for the host it is on. Amoru's target is Linux (cgroup v2, O_DIRECT, io_uring),
+# and a developer host here is macOS, so a Linux-only branch behind a cfg is never
+# compiled locally and its errors appear only in CI. On 2026-09-23 exactly that
+# happened: a test helper's Linux arm used libc without the dev-dependency, the gate
+# was green for days and CI was red. Cross-checking needs a Linux linker that is not
+# installed here, so after a push to main, read the CI run.
+if [ "$(uname -s)" != "Linux" ]; then
+  step "note: this host is $(uname -s); Linux-only code paths are compiled in CI, not here"
+fi

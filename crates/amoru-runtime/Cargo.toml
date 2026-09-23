@@ -30,6 +30,10 @@ getrandom = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 amoru-testkit = { workspace = true }
+# The Linux branch of tests/support/mod.rs reads /proc/self/statm and needs the page
+# size. A developer host is macOS, where that branch is not compiled, so its absence
+# only ever showed up on CI, on the platform this runtime is actually built for.
+libc = { workspace = true }
 
 # The first program a user writes, kept at the repository root so it reads as an example and
 # not as a test; the quality gate runs it on every commit.

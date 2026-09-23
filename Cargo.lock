@@ -219,6 +219,7 @@ dependencies = [
  "amoru-trace",
  "arrow",
  "getrandom 0.4.3",
+ "libc",
  "mimalloc",
  "parquet",
  "serde_json",
