@@ -482,6 +482,7 @@ fn re_t2_no_worker_work() {
     );
     let caller = std::thread::current().id();
     let elsewhere = Arc::new(AtomicUsize::new(0));
+    let resolved = Arc::new(AtomicUsize::new(0));
     let mut submit_ns = Vec::with_capacity(OPS);
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     for _ in 0..OPS {
@@ -491,14 +492,28 @@ fn re_t2_no_worker_work() {
         submit_ns.push(start.elapsed().as_nanos() as u64);
         let seen = Arc::clone(&elsewhere);
         let tx = tx.clone();
+        let done = Arc::clone(&resolved);
         completion.then(Box::new(move |r| {
             r.expect("read_file");
             if std::thread::current().id() != caller {
                 seen.fetch_add(1, Ordering::SeqCst);
             }
+            done.fetch_add(1, Ordering::SeqCst);
             tx.send(()).ok();
         }));
     }
+    // RE-I6 structurally, and on any host: `file_depth` is 1 above, so if submission waited
+    // for a permit each of the thousand submissions would have to wait for the previous
+    // operation to finish, and the loop could not have outrun the completions. It did, so
+    // submission did not wait. This replaces a nanosecond threshold, which on a shared CI
+    // runner measured the runner (p99 22 us against a 20 us bound, 2026-09-23) rather than
+    // the property, and which the preamble reserves for the reference host in any case.
+    let outstanding = OPS - resolved.load(Ordering::SeqCst);
+    assert!(
+        outstanding > 1,
+        "submission waited for a permit: the submit loop left only {outstanding} of {OPS} \
+         operations outstanding at a file depth of 1 (RE-I6, 06 RE-T2)"
+    );
     drop(tx);
     for _ in 0..OPS {
         rx.recv_timeout(Duration::from_secs(60))
@@ -506,12 +521,15 @@ fn re_t2_no_worker_work() {
     }
     submit_ns.sort_unstable();
     let p99 = submit_ns[(OPS * 99) / 100];
-    // Provisional on any host but the reference one (preamble E1); the report names the host.
+    // Provisional on any host but the reference one (preamble E1); the report names the host,
+    // and only the reference host asserts the figure.
     println!("re_t2 submission p99: {p99} ns");
-    assert!(
-        p99 < 20_000,
-        "submission must not wait for a permit: p99 was {p99} ns (06 RE-T2)"
-    );
+    if std::env::var_os("MORUNA_REFERENCE_HOST").is_some() {
+        assert!(
+            p99 < 20_000,
+            "submission must not wait for a permit: p99 was {p99} ns (06 RE-T2)"
+        );
+    }
     assert_eq!(
         elsewhere.load(Ordering::SeqCst),
         OPS,
