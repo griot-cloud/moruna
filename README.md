@@ -1,6 +1,13 @@
-# Moruna
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/moruna-dark.png">
+    <img src="docs/assets/moruna-light.png" alt="Moruna: big data, smaller batches" width="360">
+  </picture>
+</p>
 
-Moruna runs a Python function over a dataset bigger than your memory, without you choosing a batch size.
+<p align="center">
+  <strong>Moruna runs a Python function over a dataset bigger than your memory, without you choosing a batch size.</strong>
+</p>
 
 You have a few hundred gigabytes in Parquet and a function that a SQL engine cannot express: a model, a tokenizer, a rule set. The usual answer is a hand written loop with a guessed batch size and a guessed worker count, which either gets killed by the out of memory killer or runs at a fraction of the machine you are paying for. Moruna replaces that loop. It reads the limits of the process it is in, looks ahead at what the source is about to deliver, measures how much your function expands its input, and adjusts batch size, worker count, read ahead and spill continuously, so the pass finishes inside the budget.
 

@@ -19,6 +19,8 @@ build-dir = "book"
 create-missing = false
 
 [output.html]
+# The mark alone, which reads at 32 pixels where the full lockup does not.
+favicon = "src/assets/moruna-icon.png"
 site-url = "/moruna/"
 git-repository-url = "https://github.com/griot-cloud/moruna"
 edit-url-template = "https://github.com/griot-cloud/moruna/edit/main/docs/{path}"
