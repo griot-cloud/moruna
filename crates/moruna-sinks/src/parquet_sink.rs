@@ -230,13 +230,34 @@ impl ParquetSink {
             0 => 0,
             need => class_ceil(need.saturating_add(footer_for(need))),
         };
-        let floor = soft.max(hard);
+        // A row group is a target, not a requirement: `sink.row_group_bytes` says how large
+        // a row group should be, and nothing in the format says a file cannot hold smaller
+        // ones. The floor used to be that target's own size class, which made the default
+        // 128 MiB row group demand a 128 MiB contiguous class, a quarter of a 512 MiB
+        // budget. On a host whose resting footprint was a few megabytes larger than the
+        // author's laptop, the arena then had 121 MiB and an ordinary job was refused
+        // rather than run: a coin flip on baseline, decided somewhere nobody was looking
+        // (found on a Linux CI runner, 2026-09-23). The floor is now what the format and
+        // the morsel in hand actually require, so a tight budget writes smaller row groups
+        // and completes, which is what S6 asks of every other knob: degrade, never refuse
+        // what can still be done.
+        let floor = hard.max(class_ceil(GRANULE));
         let mut want = class_ceil(self.cfg.file_bytes).max(floor);
         loop {
             match usize::try_from(want) {
                 Ok(capacity) => match self.alloc.alloc(capacity, host_tier(&*self.alloc)) {
                     // The footer is spent out of the class, so the file rolls below it.
-                    Ok(buf) => return Ok((buf, want - footer_for(want))),
+                    Ok(buf) => {
+                        if want < soft {
+                            tracing::info!(
+                                target: "moruna::sink",
+                                requested_row_group_bytes = self.cfg.row_group_bytes,
+                                file_buffer_bytes = want,
+                                "the arena cannot hold this row group target; writing smaller row groups"
+                            );
+                        }
+                        return Ok((buf, want - footer_for(want)));
+                    }
                     // Below the floor the error stands: a sink that cannot hold one row group
                     // cannot encode one.
                     Err(e) if want <= floor => return Err(e),

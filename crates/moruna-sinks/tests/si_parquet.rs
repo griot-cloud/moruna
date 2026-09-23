@@ -264,7 +264,9 @@ fn si_t16_parquet_encodes_into_arena() {
         assert!(op.len > 0);
     }
 
-    // A host budget under one row group is an `Alloc` at open, not a surprise mid-run (f.1).
+    // A host budget under the configured row group degrades to smaller row groups rather
+    // than refusing the job (f.1, and S6's rule for every other knob). An 8 MiB arena
+    // cannot hold the 128 MiB target, and the write still succeeds.
     let scratch = Scratch::new("t16-budget");
     let tight = FakeAllocator::new().with_limit(Tier::Host, 8 << 20);
     let tight_fake = tight.clone();
@@ -284,8 +286,34 @@ fn si_t16_parquet_encodes_into_arena() {
     // The buffer arrives with the first payload (f.1), and that is where the budget is met.
     let outcome = block_on(sink.write(0, arena_payload(&tight_fake, 8, 0)));
     assert!(
+        outcome.is_ok(),
+        "a row group is a target, not a requirement: a budget below it writes smaller row \
+         groups rather than refusing the job, got {outcome:?}"
+    );
+    sink.finish().expect("finish");
+
+    // What is still refused: an arena that cannot hold even the smallest class plus its
+    // footer. The floor is real, it is simply the format's and not the configuration's.
+    let scratch = Scratch::new("t16-floor");
+    let starved = FakeAllocator::new().with_limit(Tier::Host, 32 << 10);
+    let starved_fake = starved.clone();
+    let mut sink = ParquetSink::new(
+        ParquetSinkConfig {
+            url: scratch.url(),
+            file_bytes: 1 << 30,
+            row_group_bytes: 128 << 20,
+            ..ParquetSinkConfig::default()
+        },
+        Arc::new(FakeReactor::new()),
+        Arc::new(starved),
+    )
+    .expect("parquet sink");
+    sink.open(&table_source_schema())
+        .expect("open takes no memory");
+    let outcome = block_on(sink.write(0, arena_payload(&starved_fake, 8, 0)));
+    assert!(
         matches!(outcome, Err(MorunaError::Alloc { .. })),
-        "a sink that cannot hold one row group cannot encode one, got {outcome:?}"
+        "below the format's own floor the error stands, got {outcome:?}"
     );
 }
 

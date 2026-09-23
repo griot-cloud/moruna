@@ -222,6 +222,8 @@ Tests use the testkit's `FakeReactor` (contracts d.15: in-memory files keyed by 
 
 ## l. Implementation notes for the agent
 
+A row group is a target, not a requirement (PM, 2026-09-23). `sink.row_group_bytes` says how large a row group should be, and nothing in the Parquet format says a file may not hold smaller ones, so the file buffer's floor is what the format and the morsel in hand require, not the configured target's own size class. It used to be the target's class, which made the default 128 MiB row group demand a 128 MiB contiguous allocation, a quarter of a 512 MiB budget: on a host whose resting footprint was a few megabytes larger than the author's laptop the arena then held 121 MiB and an ordinary job was refused rather than run, which made the budget a coin flip on baseline and was found on a Linux CI runner rather than anywhere it was being watched. A tight budget now writes smaller row groups and completes, with an `info` event naming the target it could not honour, which is what S6 asks of every other knob: degrade rather than refuse what can still be done. The floor that remains is the smallest size class plus its footer, and below that the `Alloc` error stands, because a sink that cannot hold one page cannot encode anything.
+
 Decisions the PM took on 2026-09-22, on the component 8 agent's report, each because the document could not be followed as written:
 
 The run id in a footer (e.2, e.3) has no route through the `Sink` trait, so `ParquetSink` and `ArrowIpcSink` carry an inherent `with_run_id(RunId)`, which is this component's own d.1 and therefore pre-approved; unset, the footer carries the nil id. The facade sets it.
