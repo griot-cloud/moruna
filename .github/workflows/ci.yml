@@ -1,4 +1,4 @@
-# One workflow, one job, on pushes to main. Minutes are paid for, so this runs
+# One workflow, one job, on every pull request into main. Minutes are paid for, so this runs
 # what only a clean machine can prove and nothing the pre-commit hook already
 # proved on the way in.
 #
@@ -16,8 +16,16 @@
 name: ci
 
 on:
-  push:
+  # Pull requests, because that is the only way into `main` now: the branch is protected
+  # and takes this workflow's `build, test, lint` as its required check, so a workflow that
+  # ran only on pushes to `main` would leave every pull request waiting for a check that
+  # could never report. Pushes to `main` are deliberately not a trigger as well: the
+  # protection requires a branch to be up to date before it merges, and history is linear,
+  # so the tree this runs against is the tree that lands, and running it again afterwards
+  # would buy a second opinion on the same commit for twice the minutes.
+  pull_request:
     branches: [main]
+  push:
     # Without this the workflow never runs on a tag, so the publish job below could not
     # fire however correct its own condition was: v0.1.0 was tagged and nothing happened
     # (2026-09-23). A tag runs the whole pipeline, and publishing is the last job of it,
