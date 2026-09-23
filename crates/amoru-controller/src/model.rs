@@ -26,7 +26,7 @@
 //!
 //! ```text
 //! arena:  S share x target x a_k x safety + S high_water + read_ahead x split_bytes <= arena_bytes
-//! anon:   baseline + arena_bytes + state + S share x target x a_anon x safety      <= ceiling
+//! anon:   baseline + arena_bytes + state + S (c_anon + share x target x a_anon x safety) <= ceiling
 //! ```
 //!
 //! The second is fitted to `TraceRecord::mem_anon_peak` (10 f.3), which is the figure S1 is
@@ -151,9 +151,25 @@ pub(crate) fn anon_headroom(state: &ControllerState) -> u64 {
         .saturating_sub(resting_anon(state))
 }
 
-/// The part of the headroom left for morsels once the instances' state is funded (f.3).
+/// The fixed term of f.3's fit summed over the stages: anonymous bytes the chain holds above the
+/// resting figure and above its funded state whatever the morsel is.
+///
+/// It is charged once, like `state_total` and for the same reason: it does not scale with the
+/// morsel, so dividing it by the bytes in flight and multiplying it back is not an accounting of
+/// it but a way of making it move when the morsel does.
+pub(crate) fn anon_fixed(state: &ControllerState) -> u64 {
+    state
+        .stages
+        .iter()
+        .fold(0u64, |total, ctl| total.saturating_add(ctl.c_anon))
+}
+
+/// The part of the headroom left for morsels once the instances' state and the chain's fixed
+/// out-of-arena cost are funded (f.3).
 pub(crate) fn anon_for_kernels(state: &ControllerState) -> u64 {
-    anon_headroom(state).saturating_sub(state.state_total)
+    anon_headroom(state)
+        .saturating_sub(state.state_total)
+        .saturating_sub(anon_fixed(state))
 }
 
 /// What one in-flight morsel of a stage costs the process outside the arena (f.3): the anon
@@ -166,12 +182,15 @@ pub(crate) fn anon_allowance(state: &ControllerState, at: usize, target: u64) ->
     )
 }
 
-/// The anonymous footprint a proposed set of targets would reach, above the resting figure.
+/// The anonymous footprint a proposed set of targets would reach, above the resting figure: the
+/// funded state, each stage's fixed term, and each stage's morsels (f.3).
 pub(crate) fn anon_footprint(state: &ControllerState, targets: &[u64]) -> u64 {
     let mut total = state.state_total;
     for (at, target) in targets.iter().enumerate() {
         let allowance = anon_allowance(state, at, *target);
-        total = total.saturating_add(scale(allowance, share(state, *target)));
+        total = total
+            .saturating_add(state.stages[at].c_anon)
+            .saturating_add(scale(allowance, share(state, *target)));
     }
     total
 }
@@ -204,6 +223,8 @@ pub(crate) fn share(state: &ControllerState, target: u64) -> f64 {
 pub(crate) fn envelope(state: &ControllerState, at: usize) -> Envelope {
     let stages = state.stage_count().max(1) as u64;
     let budget_for_stage = worker_half(state) / stages;
+    // `anon_for_kernels` has already funded every stage's fixed term (f.3), so what is divided
+    // here is what the morsels may have and the divisor is the slope alone.
     let anon_for_stage = anon_for_kernels(state) / stages;
     let ctl = &state.stages[at];
     let in_flight = share(state, ctl.target);

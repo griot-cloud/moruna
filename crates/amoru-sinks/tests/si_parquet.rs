@@ -289,6 +289,47 @@ fn si_t16_parquet_encodes_into_arena() {
     );
 }
 
+/// SI-T16, f.1. The file buffer is one whole size class of 02 e.2 with the footer inside it, so
+/// a default sink opens in the 128 MiB class and not the 256 MiB one.
+///
+/// Until 2026-09-23 it asked for `row_group_bytes + 1 MiB of footer`, which is 129 MiB at the
+/// default and is served out of the 256 MiB class: the sink reserved twice what it wanted, that
+/// class had to be free all at once, and no 512 MiB budget could open it (PM, 2026-09-23).
+#[test]
+fn si_t16_the_file_buffer_is_one_size_class() {
+    let scratch = Scratch::new("t16-class");
+    let row_group: u64 = 128 << 20;
+    // Exactly the 129 MiB the sink used to ask for, so a sink that still asked for
+    // `row_group_bytes + footer` could not open here once the payload is in hand.
+    let limit = FakeAllocator::new().with_limit(Tier::Host, row_group + (1 << 20));
+    let fake = limit.clone();
+    let mut sink = ParquetSink::new(
+        ParquetSinkConfig {
+            url: scratch.url(),
+            file_bytes: 1 << 30,
+            row_group_bytes: row_group,
+            ..ParquetSinkConfig::default()
+        },
+        Arc::new(FakeReactor::new()),
+        Arc::new(limit),
+    )
+    .expect("parquet sink");
+    sink.open(&table_source_schema()).expect("open");
+    block_on(sink.write(0, arena_payload(&fake, 8, 0))).expect("the class fits, so the sink opens");
+
+    let roll = sink.stats().roll_bytes;
+    let requested = roll + (1 << 20);
+    assert_eq!(
+        requested, row_group,
+        "f.1: the request is the {row_group} byte class with the footer inside it, not {requested}"
+    );
+    assert!(
+        requested.is_power_of_two(),
+        "{requested} is not a size class"
+    );
+    sink.finish().expect("finish");
+}
+
 /// Zero writes then `finish` still produces one file with the schema and the marker (h).
 #[test]
 fn empty_run_writes_one_file_and_the_marker() {

@@ -31,6 +31,21 @@ const FOOTER_HEADROOM: u64 = 1 << 20;
 /// The smallest file buffer worth asking for: the arena's own smallest class (02 e.2).
 const GRANULE: u64 = 64 << 10;
 
+/// The size class 02 e.2 will charge for `n` bytes: a power of two, no smaller than the 64 KiB
+/// granule. The arena charges the class and not the request (AR-I5), so a sink that asks for
+/// anything else pays for the difference and needs the whole class free at once.
+fn class_ceil(n: u64) -> u64 {
+    n.max(GRANULE).next_power_of_two()
+}
+
+/// The footer's share of a `want` byte class (f.1): `FOOTER_HEADROOM`, or half the class when
+/// that is smaller, because a small file's footer is small and a buffer that is all footer can
+/// hold no row group. A file with a `want / 2` roll size can hold at most one row group per
+/// `row_group_bytes`, so half the class is ample for its footer.
+fn footer_for(want: u64) -> u64 {
+    FOOTER_HEADROOM.min(want.max(2) / 2)
+}
+
 /// The message a buffer overflow carries out of the encoder, so `write` can turn a
 /// `std::io::Error` back into the `Sink` error section h names.
 const TOO_LARGE: &str = "morsel too large to encode";
@@ -200,25 +215,39 @@ impl ParquetSink {
 
     /// The file buffer and the roll size it implies (f.1). A morsel that needs more than
     /// `file_bytes` gets the buffer it needs or nothing; an ordinary file takes the largest
-    /// buffer the arena will give between `file_bytes` and `row_group_bytes`.
+    /// buffer the arena will give between `file_bytes` and the class its row group needs.
+    ///
+    /// Every request is a whole size class and the footer headroom lives *inside* it (f.1).
+    /// Asking for `row_group_bytes + footer` asked for 129 MiB at the default row group, and
+    /// 02 e.2 serves that out of the 256 MiB class, which has to be free all at once: the
+    /// sink reserved twice what it wanted and no 512 MiB budget could open it (PM, 2026-09-23).
     fn alloc_file_buf(&self, min_bytes: u64) -> Result<(Buffer, u64)> {
-        let floor = self.cfg.row_group_bytes.max(min_bytes).max(GRANULE);
-        let mut want = self.cfg.file_bytes.max(floor);
+        // `row_group_bytes` is a flush threshold and an upper bound, so the footer may come out
+        // of its class; `min_bytes` is a morsel that has to fit, so its class is sized above the
+        // footer as well as above the morsel.
+        let soft = class_ceil(self.cfg.row_group_bytes.max(GRANULE));
+        let hard = match min_bytes {
+            0 => 0,
+            need => class_ceil(need.saturating_add(footer_for(need))),
+        };
+        let floor = soft.max(hard);
+        let mut want = class_ceil(self.cfg.file_bytes).max(floor);
         loop {
-            let capacity = want + FOOTER_HEADROOM;
-            let fits = usize::try_from(capacity).ok();
-            if let Some(capacity) = fits {
-                match self.alloc.alloc(capacity, host_tier(&*self.alloc)) {
-                    Ok(buf) => return Ok((buf, want)),
+            match usize::try_from(want) {
+                Ok(capacity) => match self.alloc.alloc(capacity, host_tier(&*self.alloc)) {
+                    // The footer is spent out of the class, so the file rolls below it.
+                    Ok(buf) => return Ok((buf, want - footer_for(want))),
                     // Below the floor the error stands: a sink that cannot hold one row group
                     // cannot encode one.
                     Err(e) if want <= floor => return Err(e),
                     Err(_) => {}
+                },
+                Err(_) if want <= floor => {
+                    return Err(AmoruError::Sink(format!(
+                        "a file buffer of {want} bytes does not fit this platform"
+                    )));
                 }
-            } else if want <= floor {
-                return Err(AmoruError::Sink(format!(
-                    "a file buffer of {capacity} bytes does not fit this platform"
-                )));
+                Err(_) => {}
             }
             want = (want / 2).max(floor);
         }
@@ -410,7 +439,11 @@ impl ParquetSink {
         drop(batch);
         current.rows += rows;
         current.seqs.push(seq);
-        if current.writer.in_progress_size() as u64 >= self.cfg.row_group_bytes {
+        // The footer shares the buffer, so a row group may not be allowed to grow past the roll
+        // size: `row_group_bytes` is a target, and `roll_bytes` is what the arena agreed to.
+        if current.writer.in_progress_size() as u64
+            >= self.cfg.row_group_bytes.min(inner.roll_bytes)
+        {
             current
                 .writer
                 .flush()

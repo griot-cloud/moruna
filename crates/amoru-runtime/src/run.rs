@@ -637,24 +637,32 @@ const DEFAULT_OUT_OF_ARENA_AMPLIFICATION: f64 = 4.0;
 
 /// The smallest arena the facade hands out, so a small budget gets a working region rather than a
 /// share of almost nothing. It is the largest single allocation a default pipeline makes: the
-/// Parquet sink's output buffer, which asks for `sink.row_group_bytes` plus a megabyte of footer
-/// headroom and will not go below `row_group_bytes` (08 f.1), so at the default 128 MiB row group
-/// it asks for 129 MiB, and 02 e.1's size classes are powers of two, so it costs 256 MiB of
-/// region. An arena below that cannot open a sink at defaults whatever the budget, which is why
-/// the floor is this figure rather than a few morsels.
+/// Parquet sink's output buffer, which asks for one whole size class of 02 e.2 and spends its
+/// footer headroom inside it (08 f.1), so at the default 128 MiB row group it asks for the
+/// 128 MiB class. An arena below that cannot open a sink at defaults whatever the budget, which
+/// is why the floor is this figure rather than a few morsels.
 ///
-/// A class that size has to be free all at once, so the floor is that class plus what the arena
-/// already holds when the sink opens its buffer, which early in a run is the read-ahead:
-/// `256 MiB + readahead.splits x morsel.probe_bytes`. Measured at a 512 MiB ceiling, the example
-/// runs with 272 MiB and the Python job of `python/tests/test_budget.py` does not, because its
-/// queues hold 18.5 MiB at the moment the sink opens and 256 MiB was then not free.
+/// That class has to be free all at once and one buffer of it is live for as long as a file is
+/// open, so the floor is that class plus the slots the source drive needs behind it. The
+/// read-ahead holds `readahead.splits` of them from the first split, and the drive has to be able
+/// to read the *next* split while they are full, so the floor is
+/// `128 MiB + (readahead.splits + 1) x morsel.probe_bytes`.
+///
+/// The `+ 1` is not a margin. A floor of exactly `128 MiB + readahead.splits x
+/// morsel.probe_bytes` is 160 MiB, and the sink's 128 MiB class plus two 16 MiB read-ahead slots
+/// is 160 MiB to the byte: the job of `python/tests/test_budget.py` filled its arena to
+/// 167247872 of 167772160 bytes and then failed to allocate 780000 bytes for the next split
+/// (2026-09-23). The figure this replaces, `256 MiB + readahead`, was the same knife edge one
+/// class up, and was reached by asking only what the sink needs in order to *open*.
 ///
 /// It is capped by the allowance, so a budget too small for it gets its whole allowance and
-/// nothing is conjured. Lowering it is a change in `amoru-sinks` and not here: one megabyte of
-/// footer headroom on a power-of-two row group is what crosses the class boundary, and a sink
-/// that asked for the class it can use would need 128 MiB and halve this floor.
+/// nothing is conjured. Changing the first term is a change in `amoru-sinks` and not here: it is
+/// whatever class the sink's file buffer asks for at the default row group (08 f.1). That it is
+/// the *default* row group and not the configured one is a limitation of `SinkSpec`, which is a
+/// built sink or a factory and cannot be asked what it will allocate before it exists: a run with
+/// a 16 MiB row group still pays the default's floor.
 const ARENA_FLOOR_BYTES: u64 =
-    (256 << 20) + config::READAHEAD_SPLITS as u64 * config::MORSEL_PROBE_BYTES;
+    (128 << 20) + (config::READAHEAD_SPLITS as u64 + 1) * config::MORSEL_PROBE_BYTES;
 
 /// The chain's expected out-of-arena cost per byte in flight (12 f.1): the largest
 /// `KernelHints::expected_amplification` any stage declares, counting a stage that declares

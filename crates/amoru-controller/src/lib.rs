@@ -72,6 +72,148 @@ pub(crate) const SAFETY_CAP: f32 = 3.0;
 /// The lowest amplification the controller will believe (h, edge cases).
 pub(crate) const MIN_AMPLIFICATION: f64 = 0.5;
 
+/// Readings f.3's two-term fit needs before it believes a slope rather than the probe's seed.
+///
+/// Four, not eight: a run of ten morsels is an ordinary run, and the spread in the bytes in
+/// flight that the fit needs does not appear until something has moved a target, which on the
+/// breach path is the fourth or fifth record. At eight the fit could not engage before such a run
+/// ended, and the job it exists for is exactly that size (PM, 2026-09-23). Four readings with a
+/// spread of `ANON_SPREAD` is still a line through two clusters rather than through noise, and
+/// `c_anon` lifts to bound every one of them whatever the slope comes out as.
+pub(crate) const MIN_ANON_POINTS: usize = 4;
+
+/// The relative spread in bytes in flight f.3's fit needs before it believes a slope. Below it
+/// the window is one morsel size measured many times, which says nothing about the slope.
+pub(crate) const ANON_SPREAD: f64 = 0.05;
+
+/// One record's reading for f.3's out-of-arena fit.
+///
+/// The two memory columns of a trace record answer two different questions, and separating them
+/// is what makes the fit identifiable. `mem_anon_before` is the process's anonymous residency
+/// *before* this morsel's `apply`, so whatever of it stands above the resting figure and the
+/// funded state was not caused by this morsel: that is the fixed term, measured and not inferred.
+/// `mem_anon_peak - mem_anon_before` is the growth across the morsel, which is the term that
+/// scales. The sum of the two is `mem_anon_peak - resting_anon - state`, the quantity S1 is
+/// measured from, so a pair that bounds both bounds it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnonReading {
+    /// The bytes the model believed were in flight: `share x max(target, bytes_in)`.
+    pub(crate) x: f64,
+    /// Anonymous bytes resident before `apply`, above the resting figure and the funded state.
+    pub(crate) fixed: f64,
+    /// Anonymous bytes the process grew by across `apply`.
+    pub(crate) growth: f64,
+}
+
+/// Both terms of f.3's out-of-arena fit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AnonFit {
+    /// Anonymous bytes the stage holds whatever the morsel is, charged once.
+    pub(crate) c: u64,
+    /// Anonymous bytes per byte in flight, charged per morsel.
+    pub(crate) a: f64,
+}
+
+/// Fit `fixed + growth <= c_anon + a_anon x x` over a window of readings (f.3).
+///
+/// The slope is fitted to the **growth** alone, because that is the part of the reading a morsel
+/// caused: least squares over the window when it holds `MIN_ANON_POINTS` readings and a spread of
+/// `ANON_SPREAD` in `x`, and otherwise the largest `growth / x` in it, which is the conservative
+/// reading of a window that cannot resolve a line. The floor is `MIN_AMPLIFICATION`, so a morsel
+/// is never free.
+///
+/// The constant is then the larger of two things at every reading: the residency measured before
+/// `apply`, which no morsel size can remove, and whatever the reading needs above the slope's
+/// line. So the pair bounds every point in the window, which is what RC-I1 asks of the sizing,
+/// and it never prices the fixed part below what the process was actually holding.
+///
+/// Rationale (PM, 2026-09-23). The fit was one term: the whole of `mem_anon_peak - resting_anon`
+/// divided by the bytes in flight. A Python job's 92 MiB of allocator and interpreter retention
+/// was therefore charged to every morsel byte, `a_anon x safety` reached about 42, and
+/// `floor_footprint` became 176 MB for a 4 MiB morsel. Halving the target halves `x` while that
+/// numerator does not move, so **the refusal threshold rose as the morsel shrank**: the
+/// controller's only remedy made its own estimate worse. Fitting a line to the whole reading
+/// instead was tried and rejected: within one run every record arrives at the same target and the
+/// same worker count, so `x` does not vary and the two terms are not identifiable at all, and the
+/// job this exists for is ten morsels long and sits at `morsel_min` from its first record, so no
+/// spread ever appears. `mem_anon_before` needs no spread, because it is the fixed term measured
+/// directly. Measured on that job's trace over sixteen configurations of budget and CPU quota,
+/// 160 records: this fit's mean relative error over a held-out configuration is 0.42 against the
+/// one-term form's 1.76 and its median 0.44 against 1.11, both bounding the held-out peak in 15
+/// of 16 cases; and predicting each record from the ones before it inside a single run, which is
+/// what the controller actually does, it bounds the next morsel's peak in 117 of 144 cases
+/// against the one-term form's 45.
+pub(crate) fn fit_anon(points: &VecDeque<AnonReading>, seed: f64) -> AnonFit {
+    if points.is_empty() {
+        return AnonFit {
+            c: 0,
+            a: seed.max(MIN_AMPLIFICATION),
+        };
+    }
+    let a = match fitted_slope(points) {
+        Some(slope) => slope,
+        None => {
+            let steepest = points.iter().fold(0.0f64, |acc, r| acc.max(r.growth / r.x));
+            if points.len() < MIN_ANON_POINTS {
+                steepest.max(seed)
+            } else {
+                steepest
+            }
+        }
+    }
+    .max(MIN_AMPLIFICATION);
+    let c = points.iter().fold(0.0f64, |acc, r| {
+        acc.max(r.fixed).max(r.fixed + r.growth - a * r.x)
+    });
+    AnonFit {
+        // Rounded up, not truncated: a fit one byte short of the window is not a bound.
+        c: if c >= 0.0 { c.ceil() as u64 } else { 0 },
+        a,
+    }
+}
+
+/// The least-squares slope of the growth against the bytes in flight, or `None` when the window
+/// cannot support one.
+///
+/// Two conditions have to hold. `MIN_ANON_POINTS` readings, because a line through three points of
+/// a noisy measurement is not evidence; and a spread in `x`, because every reading taken at one
+/// morsel target and one worker count has the same `x` and a window of those carries no slope at
+/// all. Neither is a problem for the constant, which is measured rather than fitted.
+fn fitted_slope(points: &VecDeque<AnonReading>) -> Option<f64> {
+    if points.len() < MIN_ANON_POINTS {
+        return None;
+    }
+    let (lo, hi) = points
+        .iter()
+        .fold((f64::MAX, 0.0f64), |(lo, hi), r| (lo.min(r.x), hi.max(r.x)));
+    if hi - lo <= lo * ANON_SPREAD {
+        return None;
+    }
+    let n = points.len() as f64;
+    let (sx, sy, sxx, sxy) =
+        points
+            .iter()
+            .fold((0.0f64, 0.0f64, 0.0f64, 0.0f64), |(sx, sy, sxx, sxy), r| {
+                (
+                    sx + r.x,
+                    sy + r.growth,
+                    sxx + r.x * r.x,
+                    sxy + r.x * r.growth,
+                )
+            });
+    let den = n * sxx - sx * sx;
+    if den <= 0.0 || !den.is_finite() {
+        return None;
+    }
+    let slope = (n * sxy - sx * sy) / den;
+    if !slope.is_finite() {
+        return None;
+    }
+    // A negative slope is the data saying the growth does not scale with the morsel. Zero is the
+    // honest reading of that; `MIN_AMPLIFICATION` is the floor the caller puts under it.
+    Some(slope.max(0.0))
+}
+
 /// The share of the anonymous headroom (f.3) a run may spend before RC-I4 calls it a breach.
 ///
 /// A breach has to be a warning and not a post-mortem: the line it is measured against sits
@@ -245,16 +387,24 @@ pub(crate) struct StageCtl {
     /// process's growth, so with `n` morsels in flight it is `n` kernels' cost and `a_k` reads
     /// `n` times too high, which is why the fit in 10 f.3 divides by the morsels in flight.
     ///
-    /// It is the largest of `anon_ratios` and, until that window is full, of `a_anon_seed` too:
-    /// a maximum because the inequality it feeds has to bound a peak rather than track a mean,
-    /// and a window because a run that could only ever learn that a kernel costs more would
-    /// never grow a morsel again once the probe had spoken, and f.4's margin, which tightens
-    /// only on an accepted increase, would never tighten either.
+    /// It is the *slope* of f.3's two-term fit and nothing else: the fixed part of the process's
+    /// residency is `c_anon`. Dividing the whole of it by the bytes in flight charged a Python
+    /// job's 92 MiB of allocator and interpreter retention to every morsel byte, which made
+    /// `a_anon x safety` rise as the morsel shrank: halving the target halves the bytes in
+    /// flight and so doubles a ratio whose numerator did not move, and `floor_footprint` rose
+    /// with it. The controller's only remedy made its own estimate worse (PM, 2026-09-23).
     pub a_anon: f64,
-    /// What the probe measured, which governs until the window of f.3 has filled.
+    /// What the probe measured, which governs the slope until the window can support one.
     pub a_anon_seed: f64,
-    /// The fitted out-of-arena ratio per record, newest last, bounded by `WINDOW`.
-    pub anon_ratios: VecDeque<f64>,
+    /// The fixed term of f.3's two-term fit: anonymous bytes this stage holds above the resting
+    /// figure and above its funded state whatever the morsel is. It is the same kind of quantity
+    /// as `state_bytes`, which `KernelHints` and `TraceRecord` carry for a kernel that can
+    /// declare it; this is the part no one declared, fitted from the trace. It is charged once
+    /// per stage and never multiplied by a morsel or a worker count.
+    pub c_anon: u64,
+    /// One `AnonReading` per record, newest last, bounded by `WINDOW`. Both terms of f.3 come
+    /// from it.
+    pub anon_points: VecDeque<AnonReading>,
     pub a_k_dev: f64,
     pub safety: f32,
     pub target: u64,
@@ -303,26 +453,25 @@ pub(crate) struct StageCtl {
 }
 
 impl StageCtl {
-    /// Fold one fitted ratio into the window and recompute `a_anon` from it (f.3).
-    pub(crate) fn observe_anon(&mut self, ratio: f64) {
-        if !ratio.is_finite() || ratio < 0.0 {
+    /// Fold one record's reading into the window and refit both terms of f.3 from it.
+    ///
+    /// `x` is the bytes the model believed were in flight, `fixed` the anonymous bytes the
+    /// process held before `apply` above the resting figure and this stage's funded state, and
+    /// `growth` what it grew by across `apply`. `fit_anon` separates the two terms from them.
+    pub(crate) fn observe_anon(&mut self, x: f64, fixed: f64, growth: f64) {
+        if !x.is_finite() || x <= 0.0 {
             return;
         }
-        self.anon_ratios.push_back(ratio);
-        while self.anon_ratios.len() > WINDOW {
-            self.anon_ratios.pop_front();
+        if !fixed.is_finite() || fixed < 0.0 || !growth.is_finite() || growth < 0.0 {
+            return;
         }
-        let windowed = self
-            .anon_ratios
-            .iter()
-            .copied()
-            .fold(0.0f64, |acc, seen| acc.max(seen));
-        self.a_anon = if self.anon_ratios.len() >= WINDOW {
-            windowed
-        } else {
-            windowed.max(self.a_anon_seed)
+        self.anon_points.push_back(AnonReading { x, fixed, growth });
+        while self.anon_points.len() > WINDOW {
+            self.anon_points.pop_front();
         }
-        .max(MIN_AMPLIFICATION);
+        let fit = fit_anon(&self.anon_points, self.a_anon_seed);
+        self.a_anon = fit.a;
+        self.c_anon = fit.c;
     }
 
     fn new(stage: StageId, cfg: &ControllerConfig, sizer: Box<dyn Sizer>) -> StageCtl {
@@ -331,7 +480,8 @@ impl StageCtl {
             a_k: 4.0,
             a_anon: 4.0,
             a_anon_seed: 4.0,
-            anon_ratios: VecDeque::new(),
+            c_anon: 0,
+            anon_points: VecDeque::new(),
             a_k_dev: 0.0,
             safety: cfg.safety_initial,
             target: cfg.probe_bytes,
@@ -971,5 +1121,197 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         self.join_tick();
+    }
+}
+
+#[cfg(test)]
+mod anon_fit_tests {
+    use super::{AnonFit, AnonReading, MIN_AMPLIFICATION, WINDOW, fit_anon};
+    use std::collections::VecDeque;
+
+    const MIB: f64 = (1024 * 1024) as f64;
+    /// The shape the Python job of `python/tests/test_budget.py` actually has, fitted from its
+    /// trace over sixteen configurations of budget and CPU quota: about 86 MiB the process holds
+    /// whatever the morsel is, and a little under one byte of growth per byte in flight.
+    const FIXED: f64 = 86.5 * MIB;
+    const SLOPE: f64 = 0.9;
+
+    /// Readings of that job at the given morsel sizes: the fixed residency is there before the
+    /// morsel, and the growth is what the morsel adds.
+    fn window(xs: &[f64]) -> VecDeque<AnonReading> {
+        xs.iter()
+            .map(|&x| AnonReading {
+                x,
+                fixed: FIXED,
+                growth: SLOPE * x,
+            })
+            .collect()
+    }
+
+    fn says(fit: AnonFit, x: f64) -> f64 {
+        fit.c as f64 + fit.a * x
+    }
+    fn truth(x: f64) -> f64 {
+        FIXED + SLOPE * x
+    }
+
+    /// RC-T21. Both terms come out, and the pair bounds every reading in the window.
+    #[test]
+    fn the_fit_separates_the_fixed_cost_from_the_scaling_one() {
+        let points = window(&[4.0 * MIB, 8.0 * MIB, 16.0 * MIB, 64.0 * MIB].repeat(2));
+        let fit = fit_anon(&points, 4.0);
+        assert!(
+            (fit.a - SLOPE).abs() < 0.01,
+            "the slope is fitted to the growth alone: {} against {SLOPE}",
+            fit.a
+        );
+        assert!(
+            (fit.c as f64 - FIXED).abs() < MIB,
+            "the constant is the residency measured before `apply`: {} against {FIXED}",
+            fit.c
+        );
+        for r in &points {
+            assert!(
+                says(fit, r.x) >= r.fixed + r.growth,
+                "RC-I1: the fit has to bound the window; at {} it says {} against {}",
+                r.x,
+                says(fit, r.x),
+                r.fixed + r.growth
+            );
+        }
+    }
+
+    /// RC-T21. The constant needs no spread in the bytes in flight, which is the whole reason it
+    /// is read off `mem_anon_before` rather than fitted with the slope. Every record of a run that
+    /// sits at one morsel target has the same `x`, and the job this exists for never leaves
+    /// `morsel_min`.
+    #[test]
+    fn the_fixed_term_survives_a_window_with_no_spread() {
+        let floor = 4.0 * MIB;
+        let flat = window(&[floor; WINDOW]);
+        let fit = fit_anon(&flat, 4.0);
+        assert!(
+            (fit.c as f64 - FIXED).abs() < MIB,
+            "the fixed term is measured, not inferred: {} against {FIXED}",
+            fit.c
+        );
+        assert!(
+            says(fit, floor) >= truth(floor),
+            "and the pair still bounds the reading it was taken from"
+        );
+    }
+
+    /// RC-T21. The defect itself. With one term the whole reading is charged per byte in flight,
+    /// so the per-byte figure is read off whatever morsel size the window holds: it rises as the
+    /// morsel shrinks, and what the model says the *floor* morsel costs rises with it. That made
+    /// halving the target, the controller's only remedy, raise the threshold it was trying to get
+    /// under.
+    #[test]
+    fn shrinking_the_morsel_no_longer_raises_the_estimate() {
+        let floor = 4.0 * MIB;
+        let large = 64.0 * MIB;
+        // The one-term form, as it stood: `a = max((fixed + growth) / x)`, no constant.
+        let one_term = |xs: &[f64]| {
+            let a = window(xs)
+                .iter()
+                .fold(0.0f64, |acc, r| acc.max((r.fixed + r.growth) / r.x));
+            AnonFit { c: 0, a }
+        };
+        let small_1 = one_term(&[floor; WINDOW]);
+        let big_1 = one_term(&[large; WINDOW]);
+        assert!(
+            says(small_1, floor) > says(big_1, floor) * 5.0,
+            "the defect: a window of small morsels prices the floor at {} and a window of large \
+             ones at {}, for the same morsel",
+            says(small_1, floor),
+            says(big_1, floor)
+        );
+        assert!(
+            says(small_1, large) > truth(large) * 3.0,
+            "and prices a large morsel at {} against {}, which is the refusal",
+            says(small_1, large),
+            truth(large)
+        );
+
+        // Two terms, from windows at the same two sizes. The floor is priced from the residency
+        // it actually costs, whichever window the fit came from.
+        let small_2 = fit_anon(&window(&[floor; WINDOW]), 4.0);
+        let big_2 = fit_anon(&window(&[large; WINDOW]), 4.0);
+        for fit in [small_2, big_2] {
+            assert!(
+                (fit.c as f64 - FIXED).abs() < MIB,
+                "the same fixed term either way: {}",
+                fit.c
+            );
+            assert!(says(fit, floor) >= truth(floor), "and it bounds the floor");
+        }
+        assert!(
+            says(small_2, floor) < says(big_2, floor) * 1.5
+                && says(big_2, floor) < says(small_2, floor) * 1.5,
+            "the floor costs the same from either window: {} and {}",
+            says(small_2, floor),
+            says(big_2, floor)
+        );
+
+        // And with the spread one halving produces, the slope is fitted too and the pair answers
+        // at any morsel size.
+        let mut mixed = window(&[large; WINDOW / 2]);
+        mixed.extend(window(&[floor; WINDOW / 2]));
+        let fit = fit_anon(&mixed, 4.0);
+        assert!(
+            (fit.a - SLOPE).abs() < 0.01,
+            "the slope is fitted: {}",
+            fit.a
+        );
+        for x in [floor, large, 16.0 * MIB, 256.0 * MIB] {
+            assert!(
+                (says(fit, x) - truth(x)).abs() < MIB,
+                "at {x} bytes in flight it says {} against {}",
+                says(fit, x),
+                truth(x)
+            );
+        }
+    }
+
+    /// The fallbacks: too few readings, no growth at all, and an empty window. Each still bounds
+    /// what it was given, and the slope never reaches zero.
+    #[test]
+    fn a_window_the_fit_cannot_use_falls_back_and_still_bounds() {
+        // Fewer readings than the slope needs: the probe's seed governs the slope, and the
+        // constant is still the measured residency.
+        let short = window(&[4.0 * MIB, 64.0 * MIB]);
+        let fit = fit_anon(&short, 7.0);
+        assert_eq!(
+            fit.a, 7.0,
+            "the seed governs the slope until there is evidence"
+        );
+        assert!((fit.c as f64 - FIXED).abs() < MIB, "{}", fit.c);
+
+        // A cost that is entirely fixed: the slope fits at zero and the floor holds it up.
+        let flat: VecDeque<AnonReading> = [4.0 * MIB, 8.0 * MIB, 16.0 * MIB, 64.0 * MIB]
+            .repeat(2)
+            .iter()
+            .map(|&x| AnonReading {
+                x,
+                fixed: FIXED,
+                growth: 0.0,
+            })
+            .collect();
+        let fit = fit_anon(&flat, 4.0);
+        assert_eq!(fit.a, MIN_AMPLIFICATION, "a morsel is never free");
+        for r in &flat {
+            assert!(says(fit, r.x) >= r.fixed + r.growth, "bounds at {}", r.x);
+        }
+
+        // An empty window is the state before the first record, and the seed answers for it.
+        let empty: VecDeque<AnonReading> = VecDeque::new();
+        assert_eq!(fit_anon(&empty, 6.0), AnonFit { c: 0, a: 6.0 });
+        assert_eq!(
+            fit_anon(&empty, 0.0),
+            AnonFit {
+                c: 0,
+                a: MIN_AMPLIFICATION
+            }
+        );
     }
 }
