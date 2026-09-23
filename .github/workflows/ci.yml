@@ -73,9 +73,19 @@ jobs:
           # back with no copy. It publishes cp314t manylinux wheels, so --only-binary
           # is satisfiable; if that ever stops being true this step fails loudly, which
           # is what we want, because the Python surface would not work on Linux.
-          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow
-          PYTHONPATH=python python -c 'import moruna; print("moruna", moruna.__version__)'
+          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin
           cd bench/python && python -m pytest -q
+      - name: The wheel builds, installs and runs on Linux
+        # The check that matters for a release: not "does the source tree import", which
+        # cannot work without the compiled extension, but "does the artefact we would
+        # publish work on the platform we publish it for". python/tests drives a real
+        # pass through the installed wheel, so this is also where a Linux-only runtime
+        # defect would surface (2026-09-23; before this, nothing proved either).
+        run: |
+          maturin build --release --out dist
+          python -m pip install --no-index --find-links dist moruna
+          python -c 'import moruna; print("moruna", moruna.__version__)'
+          python -m pytest -q python/tests
 
   # Weekly and on demand: the checks that answer to the outside world rather
   # than to a commit, and the ones that need a real cgroup ceiling.
