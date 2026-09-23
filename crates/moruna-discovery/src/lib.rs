@@ -858,7 +858,22 @@ mod tests {
         assert!((first.limits.cpu_quota - second.limits.cpu_quota).abs() < f64::EPSILON);
         assert_eq!(first.host_tier, second.host_tier);
         assert_eq!(first.cgroup_path, second.cgroup_path);
-        assert_eq!(first.notes, second.notes);
+        // The notes, with the probes' own timing set aside. DS-I7 asks for equal `Limits` and no
+        // persistent side effect, and this is the stronger claim the test used to make: that two
+        // discoveries say exactly the same things. A probe that does not answer within the e.4
+        // timeout says so in a note, and whether a 100 ms filesystem probe answers in time is a
+        // fact about how busy the host is, not about discovery. On a CI runner the first call's
+        // `direct_io` probe answered and the second's did not, and the run failed as though
+        // discovery were not idempotent (2026-09-23). Everything a probe timing out cannot reach
+        // is still compared, and it is the part the document is about.
+        let settled = |notes: &[String]| -> Vec<String> {
+            notes
+                .iter()
+                .filter(|note| !note.contains("did not finish within"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(settled(&first.notes), settled(&second.notes));
 
         // Every probe deletes its own file. A probe that ran into the e.4 timeout is still
         // finishing on its own thread when `discover` returns, so give it a moment before
