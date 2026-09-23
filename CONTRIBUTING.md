@@ -1,46 +1,41 @@
 # Contributing to Moruna
 
-Thank you for considering a contribution. Moruna is designed before it is built, so the most valuable contributions at this stage are to the design documents, and code contributions are expected to trace back to them.
+Thanks for your interest. Moruna makes hard promises about memory, so a change has to hold on machines that are not yours. Everything below exists to make that checkable.
 
-## How the project works
+## Getting a change in
 
-- The documents in `architecture/` are authoritative. If a change in behaviour is not in a design document, it is not a change we can merge; open a pull request against the document first.
-- Each component has a software design document (SDD) with numbered invariants and a test specification. Code for a component is reviewed against its SDD: every invariant must hold, every listed test must exist and pass.
-- The runtime is Rust; the user surface is Python through PyO3. Kernel authors write against `moruna-kernel` only.
+1. Fork, branch from `main`, open a pull request. `main` is protected: it takes pull requests with a green pipeline.
+2. Run `tools/hooks/install.sh` once in your clone. The pre-commit hook runs the same gate CI runs, so a commit that would fail CI fails locally first.
+3. Keep the crate you touch at 90% line coverage or better. The gate judges coverage per crate.
 
-## Before you merge
+## What we look for
 
-The project does not use pull requests: one maintainer and a set of coding agents work here, and a pull request with no second reviewer is ceremony that also costs a CI run. An agent pushes its branch and reports; the PM agent reviews the branch's diff against `architecture/agents/report-template.md` and the checklist in `architecture/agents/pm.md`, then merges to `main`. An outside contributor opens a pull request as usual, and the same review applies.
+**Behaviour is specified before it is written.** [`architecture/`](architecture/) is the specification: [the architecture document](architecture/moruna-runtime-design.md) for the system, and [`architecture/sdd/`](architecture/sdd/) for each component in enough detail to rebuild it. If your change alters what the runtime does, update the document in the same pull request and say which section. If the code and a document disagree, that is a bug in one of them, and the fix starts with deciding which.
 
-1. Read `architecture/README.md` and the SDD for the component you are touching.
-2. Open an issue describing the change and which SDD sections it affects, unless the change is a typo or a documentation fix.
-3. Keep a branch to one component. A change that crosses components changes the contracts crate first, on its own branch.
-4. Branch from `main`. Branch names: `component/NN-<slug>` with the slug the crate suffix (`component/02-arena`), `infra/<topic>` for the workspace skeleton, CI and bench work, `contracts/<topic>` for a change to `architecture/sdd/01-contracts.md` and the contracts crate. A component branch is merged by the PM agent when its gate is green (preamble section 6.6).
-5. Fill every section of `architecture/agents/report-template.md`, including "Environment facts verified", "Tests skipped (id, reason)" and "Provisional results (host)"; an empty section is a review finding.
+**A test should prove a property, not a machine.** An assertion like "this finishes in 20 microseconds" or "this run fits in 512 MiB" describes the laptop it was written on, and it fails for the next person without telling them anything true. Prefer assertions that hold anywhere: that submission returned before the work finished, that the peak never passed the ceiling, that the sink wrote exactly the sequence numbers the trace says were committed. Where a figure genuinely needs particular hardware, tag it for the reference host so it reports instead of asserting.
 
-## Code expectations
+**A budget assertion needs a cgroup of its own.** Moruna sizes a run against the memory its own cgroup already holds, which is the run itself in a pod and the whole machine on a shared CI runner. Tests that assert a budget therefore run in the container stage, where the cgroup belongs to the test.
+
+**No stubs in shipping source.** `tools/quality/no_stubs.sh` refuses `todo!`, `unimplemented!`, a panic whose message admits it, `NotImplementedError`, or a crate with no code. Tests are exempt, since a test tagged for hardware we do not have is meant to exist without running.
+
+## House rules
 
 - `cargo fmt` and `cargo clippy -- -D warnings` clean.
 - No `unwrap` or `expect` outside tests; errors are typed and propagate.
-- `unsafe` blocks carry a `// SAFETY:` comment stating the invariant that makes them sound, and are limited to the modules the SDD permits.
-- Tests are named after the SDD test specification in snake case, prefix, id and a short slug (for example `pl_t4_fifo` for PL-T4), so review can map them.
-- Every crate with code has at least 90% line coverage (`cargo llvm-cov`, test code excluded), judged per crate. `tools/quality/check.sh` is the gate; run `tools/hooks/install.sh` once per clone so the pre-commit hook runs it, and do not bypass the hook. CI runs the same script.
-- Benchmarks state the machine they were measured on.
+- Every `unsafe` block carries a `// SAFETY:` comment naming the invariant that makes it sound, in a module its component's design document permits.
+- Tests are named after the design document's test specification, prefix and id and a short slug (`pl_t4_fifo` for PL-T4), so a reviewer can map them.
+- Tests write only to a scratch directory unique to the running process, never a fixed path.
 
-## Documents
+## Reporting a problem
 
-- No em dashes; use commas, colons or parentheses.
-- Prose between tables; a document that is only tables is not a design.
-- Every current-state claim names where it was verified or the command that would verify it.
+Please include the host, the budget you gave the run, and what the run report said. The report is a pure function of the per morsel trace, so `report.to_json()` (and the trace file, where you can share it) usually answers the question outright. For anything with a security angle, follow [`SECURITY.md`](SECURITY.md) rather than opening a public issue.
 
-## Licence
+## Licence and sign-off
 
-By contributing you agree that your contributions are licensed under the Apache License 2.0, and you confirm you have the right to contribute them (the Developer Certificate of Origin, https://developercertificate.org/). Sign off your commits with `git commit -s`.
+By contributing you agree your contributions are licensed under the Apache License 2.0, and you confirm you have the right to contribute them ([the Developer Certificate of Origin](https://developercertificate.org/)). Sign off your commits with `git commit -s`.
 
-## Agent identity and sign-off
-
-Much of the code is written by coding agents driven from the documents in `architecture/` (the prompts are in `architecture/agents/`). Agents commit as `Moruna Agent <agents@griotdata.com>` and sign off with `git commit -s`. That sign-off is made on behalf of the project by its maintainer, who takes responsibility under the Developer Certificate of Origin for what the agents commit, reviews every agent pull request against its design document, and merges or delegates the merge as the preamble's section 6.7 states. A human contributor signs off in their own name as usual.
+Much of this codebase was written by coding agents working from the documents in `architecture/`, committing as `Moruna Agent <agents@griotdata.com>`. The maintainer takes DCO responsibility for those commits and reviews them against their design documents. Human contributors sign off in their own name as usual.
 
 ## Conduct
 
-This project follows the Contributor Covenant; see `CODE_OF_CONDUCT.md`.
+This project follows the Contributor Covenant; see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
