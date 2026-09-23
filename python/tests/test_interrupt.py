@@ -40,6 +40,13 @@ try:
               moruna.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB"),
               staging_dir=str(d / "staging"), staging_limit="2GiB")
 except moruna.Cancelled as e:
+    # moruna.run turned the signal into Cancelled, but CPython may still have a
+    # KeyboardInterrupt pending from the same SIGINT and will raise it at the next bytecode
+    # boundary, which lands inside this handler. That is Python's semantics and not the
+    # runtime's: the test is about the run raising Cancelled with its report, so ignore
+    # further interrupts while reporting (2026-09-23; it failed here one run in several).
+    import signal as _signal
+    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
     print(json.dumps({
         "cancelled": True,
         "seconds": time.monotonic() - started,

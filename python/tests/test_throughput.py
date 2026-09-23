@@ -57,7 +57,13 @@ started = time.perf_counter()
 report = moruna.run(moruna.ParquetSource(str(src / "part-0.parquet")),
                    append_upper,
                    moruna.ParquetSink(str(out), row_group_bytes="16MiB", file_bytes="64MiB"),
-                   budget="512MiB")
+                   # 2 GiB, not 512 MiB: this test is about wall clock, and the budget has to
+                   # be one that holds the job on any host running it. On a Linux runner the
+                   # interpreter, pyarrow and this script's own 200,000 rows already hold more
+                   # than 512 MiB before the run starts, so that budget measured the host
+                   # rather than the throughput (2026-09-23). What happens at a budget too
+                   # small is test_budget.py's subject, not this one's.
+                   budget="2GiB")
 run_s = time.perf_counter() - started
 back = pq.read_table(str(out))
 print(json.dumps({

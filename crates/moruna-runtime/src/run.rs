@@ -192,6 +192,25 @@ fn drive(
         limits.page_bytes,
         &mut notes,
     );
+    // The arena's own error for a zero-byte region says only "host budget 0", which tells a
+    // user nothing about why. Everything needed to explain it is here, so say it here: the
+    // budget, what the process was already holding before the arena existed, and the reserve.
+    // A CI runner hit this at a 512 MiB budget where the interpreter, pyarrow and the test's
+    // own data already held more than that (2026-09-23), and the message sent the reader to
+    // the arena rather than to their own budget.
+    if arena_bytes < (64 << 10) {
+        let reserve = (limits.memory_ceiling as f64 * config::RESERVE_FRACTION as f64) as u64;
+        return Err(MorunaError::Config {
+            name: "budget.host",
+            msg: format!(
+                "the budget of {} bytes leaves nothing to run in: this process already held {} \
+                 bytes before the arena existed, and {} bytes are held back as reserve. Give the \
+                 run a larger budget, or start it in a process that holds less.",
+                limits.memory_ceiling, baseline_bytes, reserve
+            ),
+        }
+        .into());
+    }
     let alloc: Arc<dyn Allocator> = match components.alloc {
         Some(alloc) => alloc,
         None => Arena::new(ArenaConfig {
