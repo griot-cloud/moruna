@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-adapters"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "dlpark",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-arena"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cudarc",
  "libc",
@@ -2655,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-bench"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "blake3",
@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-controller"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "moruna-kernel",
  "moruna-testkit",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-datafusion"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "datafusion",
  "moruna-kernel",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-discovery"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cudarc",
  "libc",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernel"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "blake3",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-placement"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-polars"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "moruna-kernel",
  "polars",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "moruna-adapters",
@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-reactor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "cudarc",
@@ -2779,7 +2779,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "getrandom 0.4.3",
@@ -2805,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-scheduler"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossbeam",
  "libc",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sinks"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "bytes",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sources"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "bytes",
@@ -2849,14 +2849,14 @@ dependencies = [
 
 [[package]]
 name = "moruna-testkit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "moruna-kernel",
 ]
 
 [[package]]
 name = "moruna-trace"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "crossbeam",

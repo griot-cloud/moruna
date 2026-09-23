@@ -1,8 +1,10 @@
 # Changelog
 
-## 0.1.1
+## 0.1.2
 
 Fixes S1 for tight budgets. **0.1.0 is yanked and should not be used.**
+
+0.1.1 was tagged and never published: the release pipeline refused it, and the test that refused it was a test of how busy the runner was rather than of the runtime (a filesystem probe that answers within 100 ms on one call and not the next made discovery look as though it were not idempotent). That test now asks what the document asks. Everything below is what 0.1.1 would have carried.
 
 - **The memory bound holds at a tight ceiling.** The controller planned morsels into the whole of the headroom the arena leaves above itself, and the morsels are not the only thing there: a Parquet writer's encoder, the Arrow builders a batch is converted through and the interpreter's own growth are all outside the arena, none of them in the model, and every one of them in the figure S1 is measured from. A Python kernel at a 512 MiB budget on a host with a large resting footprint reached 1.005 and 1.012 of its ceiling. The kernels are now planned into a share of that headroom and the rest is held back (11 f.3), and the same job peaks at 0.976 across resting footprints from 0 to 380 MB.
 - **A kernel's fixed cost is funded before its first morsel.** One probe cannot tell a kernel that holds a fixed cost from one whose cost scales with the morsel, and the model read its whole measurement as the scaling term, which under-predicted a constant-cost kernel by the ratio of the morsel sizes. The probe now seeds both terms until a record separates them.
