@@ -83,13 +83,17 @@ def test_s1_a_greedy_python_kernel_fits_inside_512_mib(scratch: pathlib.Path) ->
     reader and writer buffers are in there with it.
 
     It is asserted as a completion and not as "fits or refuses", because both halves have been
-    measured and 512 MiB holds the job: the run reaches 0.50 to 0.64 of the ceiling over repeated
-    runs. What stopped it was not the budget but `ParquetSink`, which asked the arena for
-    `row_group_bytes + 1 MiB of footer`, 129 MiB at the default row group, which 02 e.2 serves
-    out of the 256 MiB class and which has to be free all at once: the sink reserved twice what
-    it wanted and failed with `alloc 135266304 bytes in Host: budget 167772160 in use 15597568`.
-    The sink now asks for one whole class with the footer inside it (08 f.1). A refusal here is
-    therefore a regression in that allocation and not a legitimate S6 termination, so it fails.
+    measured and 512 MiB holds the job: the run reaches 0.645 to 0.674 of the ceiling over eight
+    runs. Two things stopped it, neither of them the budget. `ParquetSink` asked the arena for
+    `row_group_bytes + 1 MiB of footer`, 129 MiB at the default row group, which 02 e.2 serves out
+    of the 256 MiB class and which has to be free all at once: the sink reserved twice what it
+    wanted and failed with `alloc 135266304 bytes in Host: budget 167772160 in use 15597568`. It
+    now asks for one whole class with the footer inside it (08 f.1). And the controller charged
+    the 86 MiB of allocator and interpreter retention this kernel holds regardless of the morsel
+    to every morsel byte, so it refused the job with `footprint 186002119 exceeds budget
+    152665344` where the real cost is about 85 MB; the fit now has a term for it (11 f.3). A
+    refusal here is therefore a regression in one of those two and not a legitimate S6
+    termination, so it fails.
     """
     result = _run(scratch, "512MiB")
 

@@ -642,20 +642,27 @@ const DEFAULT_OUT_OF_ARENA_AMPLIFICATION: f64 = 4.0;
 /// 128 MiB class. An arena below that cannot open a sink at defaults whatever the budget, which
 /// is why the floor is this figure rather than a few morsels.
 ///
-/// A class that size has to be free all at once, so the floor is that class plus what the arena
-/// already holds when the sink opens its buffer, which early in a run is the read-ahead:
-/// `128 MiB + readahead.splits x morsel.probe_bytes`. This is half what it was until
-/// 2026-09-23, when the sink asked for `row_group_bytes + 1 MiB of footer`: 129 MiB at the
-/// default, which 02 e.2 serves out of the 256 MiB class, so the sink reserved twice what it
-/// wanted and the Python job of `python/tests/test_budget.py` could not open it at a 512 MiB
-/// ceiling at all (its queues hold 18.5 MiB when the sink opens, and 256 MiB was then not free).
-/// With the footer inside the class that job completes inside 512 MiB.
+/// That class has to be free all at once and one buffer of it is live for as long as a file is
+/// open, so the floor is that class plus the slots the source drive needs behind it. The
+/// read-ahead holds `readahead.splits` of them from the first split, and the drive has to be able
+/// to read the *next* split while they are full, so the floor is
+/// `128 MiB + (readahead.splits + 1) x morsel.probe_bytes`.
+///
+/// The `+ 1` is not a margin. A floor of exactly `128 MiB + readahead.splits x
+/// morsel.probe_bytes` is 160 MiB, and the sink's 128 MiB class plus two 16 MiB read-ahead slots
+/// is 160 MiB to the byte: the job of `python/tests/test_budget.py` filled its arena to
+/// 167247872 of 167772160 bytes and then failed to allocate 780000 bytes for the next split
+/// (2026-09-23). The figure this replaces, `256 MiB + readahead`, was the same knife edge one
+/// class up, and was reached by asking only what the sink needs in order to *open*.
 ///
 /// It is capped by the allowance, so a budget too small for it gets its whole allowance and
-/// nothing is conjured. Lowering it further is a change in `amoru-sinks` and not here: the figure
-/// is whatever class the sink's file buffer asks for at the default row group.
+/// nothing is conjured. Changing the first term is a change in `amoru-sinks` and not here: it is
+/// whatever class the sink's file buffer asks for at the default row group (08 f.1). That it is
+/// the *default* row group and not the configured one is a limitation of `SinkSpec`, which is a
+/// built sink or a factory and cannot be asked what it will allocate before it exists: a run with
+/// a 16 MiB row group still pays the default's floor.
 const ARENA_FLOOR_BYTES: u64 =
-    (128 << 20) + config::READAHEAD_SPLITS as u64 * config::MORSEL_PROBE_BYTES;
+    (128 << 20) + (config::READAHEAD_SPLITS as u64 + 1) * config::MORSEL_PROBE_BYTES;
 
 /// The chain's expected out-of-arena cost per byte in flight (12 f.1): the largest
 /// `KernelHints::expected_amplification` any stage declares, counting a stage that declares

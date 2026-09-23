@@ -38,12 +38,17 @@ fn refit_anon(state: &mut ControllerState, at: usize, r: &TraceRecord) {
     let target = state.stages[at].target;
     let in_flight = model::share(state, target).max(1.0);
     let resting = model::resting_anon(state);
-    // The same two readings and the same unit as the tick thread's fit (10 f.3): the bytes the
-    // model believed were in flight, which is what the inequality multiplies back.
+    let funded = state.state_total;
+    // The same reading and the same unit as the tick thread's fit (11 f.3): the bytes the model
+    // believed were in flight, the residency before `apply` above the resting figure and the
+    // state the inequality has already funded, and the growth across `apply`.
     let in_flight_bytes = (in_flight * target.max(r.bytes_in) as f64).max(1.0);
-    let from_peak = r.mem_anon_peak.saturating_sub(resting) as f64 / in_flight_bytes;
-    let from_delta = r.mem_anon_peak.saturating_sub(r.mem_anon_before) as f64 / in_flight_bytes;
-    state.stages[at].observe_anon(from_peak.max(from_delta));
+    let fixed = r
+        .mem_anon_before
+        .saturating_sub(resting)
+        .saturating_sub(funded) as f64;
+    let growth = r.mem_anon_peak.saturating_sub(r.mem_anon_before) as f64;
+    state.stages[at].observe_anon(in_flight_bytes, fixed, growth);
 }
 
 /// The workers the anon inequality of f.3 allows at the targets as they now stand, floor 1.
@@ -64,8 +69,14 @@ fn anon_workers(state: &ControllerState) -> u16 {
 /// smallest set of knobs the controller has to offer. It is also the footprint the diagnostic
 /// names, against the headroom it has to fit in, so the two figures the message compares are
 /// the same kind of number -- which a per-morsel delta against an absolute line was not.
+///
+/// Both terms of f.3 are in it, and the fixed one is what makes it a floor at all: it is the
+/// cost that shrinking the morsel cannot remove. When the fixed term rode in the slope this
+/// figure moved with the morsel in the wrong direction, so halving the target -- the
+/// controller's only remedy -- raised the refusal threshold instead of lowering it
+/// (PM, 2026-09-23).
 fn floor_footprint(state: &ControllerState) -> u64 {
-    let mut footprint = state.state_total;
+    let mut footprint = state.state_total.saturating_add(model::anon_fixed(state));
     for at in 0..state.stages.len() {
         footprint =
             footprint.saturating_add(model::anon_allowance(state, at, state.cfg.morsel_min));
