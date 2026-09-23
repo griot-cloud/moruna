@@ -12,6 +12,14 @@ use moruna_testkit::{FakePlacement, FakeSink, FakeSource};
 
 use super::common::{RigBuilder, StatefulKernel, manifest_lock, wait_for};
 
+/// The run is paced by the sink, not by the kernel. The test has to terminate a run that is
+/// still going, and what it waits for first is two checkpoint ticks; while the workers are busy
+/// the checkpoint thread has to take each instance from them, so the ticks are the slow half and
+/// a run whose length is set by the kernel can finish first. It did, on a two core runner, and
+/// the test failed reading `Completed` where it wanted `Terminated` (observed 2026-09-23). A slow
+/// sink instead holds the pipeline at a sleep no host can hurry: the queue backs up, the workers
+/// idle between morsels, an instance is there for the asking, and the run's floor is the sink's
+/// eight hundred writes at two milliseconds apiece against the two ticks' hundred.
 #[test]
 fn sc_t15_checkpoint_tick() {
     let _guard = manifest_lock();
@@ -26,10 +34,14 @@ fn sc_t15_checkpoint_tick() {
             cfg.workers_active = 2;
             cfg.initial_morsel_target = 8;
             cfg.checkpoint_enabled = true;
-            cfg.checkpoint_interval_ms = 50;
+            cfg.checkpoint_interval_ms = 20;
         })
-        .source(FakeSource::new().splits(4, 400, 3_200))
-        .sink(FakeSink::new().resumable(true))
+        .source(FakeSource::new().splits(4, 200, 1_600))
+        .sink(
+            FakeSink::new()
+                .resumable(true)
+                .latency(Duration::from_millis(2)),
+        )
         .placement(FakePlacement::new().with_manifest_store())
         .kernel(kernel.clone())
         .go();
