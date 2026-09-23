@@ -68,7 +68,12 @@ jobs:
         run: |
           python -c 'import sys, sysconfig; print(sys.version); print("free-threaded:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")), "gil now:", sys._is_gil_enabled())'
           PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled()'
-          python -m pip install --quiet --only-binary=:all: numpy pytest
+          # pyarrow is not optional: python/moruna/__init__.py refuses to import
+          # without it, because it is the format the runtime hands a kernel and takes
+          # back with no copy. It publishes cp314t manylinux wheels, so --only-binary
+          # is satisfiable; if that ever stops being true this step fails loudly, which
+          # is what we want, because the Python surface would not work on Linux.
+          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow
           PYTHONPATH=python python -c 'import moruna; print("moruna", moruna.__version__)'
           cd bench/python && python -m pytest -q
 
