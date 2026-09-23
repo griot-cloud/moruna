@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use amoru_kernel::{AmoruError, CancelToken, Fingerprint, Placement, ResumePoint, Sink, Source};
-use amoru_testkit::{FakeKernel, FakePlacement, FakeSink, FakeSource};
+use amoru_testkit::{FakePlacement, FakeSink, FakeSource};
 
 use super::common::{Latch, RigBuilder, StatefulKernel, manifest_lock, wait_for};
 
@@ -135,7 +135,9 @@ fn sc_t16_resume_equivalence() {
         .placement(resumed_placement)
         .kernel(second_checkpointing.clone())
         .kernel(second_reinit.clone())
-        .kernel(Arc::new(FakeKernel::new()))
+        // The same chain the killed run had, latch and all: the latch of the first run is open
+        // by now and holds nothing.
+        .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
         .go();
     if let Err(e) = second.scheduler.apply_resume_point(point) {
         panic!("apply_resume_point: {e}");
