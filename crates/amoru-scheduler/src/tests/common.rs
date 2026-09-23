@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use amoru_kernel::{
@@ -595,6 +595,89 @@ pub struct StatefulKernel {
     pub overlap: Arc<AtomicBool>,
     pub applies: Arc<Mutex<Vec<(usize, std::thread::ThreadId)>>>,
     busy: Arc<Mutex<Vec<bool>>>,
+    latch: Option<Latch>,
+}
+
+/// A latch a test closes in front of a kernel.
+///
+/// A test that means to interrupt a run mid-flight has to know that the run is still mid-flight
+/// when it interrupts it. Pacing the pipeline with a kernel latency only makes that likely: a
+/// short run on a fast host finishes first and the test then asserts about the wrong outcome
+/// (SC-T16). The latch makes it certain: `apply` stops at it after a chosen number of calls and
+/// the run cannot progress past that stage until the test opens it.
+#[derive(Clone)]
+pub struct Latch {
+    inner: Arc<(Mutex<LatchState>, Condvar)>,
+    /// Calls let through before the latch holds one.
+    after: u64,
+}
+
+#[derive(Default)]
+struct LatchState {
+    open: bool,
+    /// Calls that reached the latch, whether or not they waited.
+    arrived: u64,
+    /// Calls waiting at it now.
+    waiting: u64,
+    /// Calls that waited and were let through.
+    held: u64,
+}
+
+impl Latch {
+    /// A latch that lets `after` calls through and holds the rest.
+    pub fn after(after: u64) -> Latch {
+        Latch {
+            inner: Arc::new((Mutex::new(LatchState::default()), Condvar::new())),
+            after,
+        }
+    }
+
+    /// From the kernel: return at once for the first `after` calls, then wait for `open`.
+    fn pass(&self) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.arrived += 1;
+        if state.open || state.arrived <= self.after {
+            return;
+        }
+        state.waiting += 1;
+        condvar.notify_all();
+        while !state.open {
+            let (next, _) = condvar
+                .wait_timeout(state, Duration::from_secs(30))
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+        state.waiting -= 1;
+        state.held += 1;
+    }
+
+    /// From the test: wait until a call is being held, so the run is demonstrably not finished.
+    /// False on timeout, which is a failure the caller reports, never a retry.
+    pub fn wait_holding(&self, timeout: Duration) -> bool {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + timeout;
+        while state.waiting == 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let (next, _) = condvar
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+        true
+    }
+
+    /// From the test: let everything through, now and from now on.
+    pub fn open(&self) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.open = true;
+        condvar.notify_all();
+    }
 }
 
 impl StatefulKernel {
@@ -612,7 +695,14 @@ impl StatefulKernel {
             overlap: Arc::new(AtomicBool::new(false)),
             applies: Arc::new(Mutex::new(Vec::new())),
             busy: Arc::new(Mutex::new(vec![false; instances])),
+            latch: None,
         }
+    }
+
+    /// Hold `apply` at `latch` once it has let its quota through (SC-T16).
+    pub fn gated(mut self, latch: Latch) -> StatefulKernel {
+        self.latch = Some(latch);
+        self
     }
 
     pub fn fail_init_for(mut self, instance: usize) -> StatefulKernel {
@@ -763,6 +853,9 @@ impl Kernel for StatefulKernel {
         if !self.latency.is_zero() {
             std::thread::sleep(self.latency);
         }
+        if let Some(latch) = self.latch.as_ref() {
+            latch.pass();
+        }
         {
             let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slot) = busy.get_mut(instance) {
@@ -790,4 +883,30 @@ pub fn wait_for(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool 
 /// A sampler whose scripted samples give the probe a peak to report (SC-T10).
 pub fn scripted_sampler(samples: Vec<amoru_kernel::Sample>) -> FakeSampler {
     FakeSampler::new().scripted(samples)
+}
+
+/// Silence the deliberate `FakeKernel::panic_on` panic and nothing else.
+///
+/// The panic hook is process wide, so a test that swaps in a no-op hook for the length of its
+/// own run also swallows the assertion message of every other test panicking in that window,
+/// and the tests of this crate run in parallel in one process: a real failure elsewhere then
+/// reports "FAILED" with no message at all, which is how a defect stays a "known flake". This
+/// installs, once per process and for good, a hook that drops only the fake kernel's own panic
+/// and delegates everything else to the hook that was there before it.
+pub fn quiet_kernel_panics() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let deliberate = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .is_some_and(|text| text.starts_with("FakeKernel::panic_on("));
+            if !deliberate {
+                previous(info);
+            }
+        }));
+    });
 }

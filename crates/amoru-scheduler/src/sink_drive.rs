@@ -185,13 +185,31 @@ fn advance(shared: &Shared, sink: &SinkHandle) {
     let Some(next) = sink.committed_seq() else {
         return;
     };
-    let mut held = shared.committed.lock().unwrap_or_else(|e| e.into_inner());
-    if held.is_some_and(|current| next <= current) {
-        return;
+    publish(shared, next);
+}
+
+/// Hand the watermark to the engine, at most one thread at a time and never out of order.
+///
+/// Two threads arrive here (f.11): the sink drive after a write completes, and a worker after
+/// `Sink::skip` (f.8). The claim is what orders them. Reading the watermark and then calling
+/// with the lock already released, as this did, lets the thread holding the *lower* value make
+/// the later call: the engine then sees the watermark go backwards, which placement f.11
+/// ignores with a `debug_assert` because it is a caller bug. No lock is held across the call
+/// into placement (preamble 4.2); the loop publishes whatever arrived while the call ran.
+fn publish(shared: &Shared, next: Seq) {
+    let mut claimed = shared
+        .committed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .claim(next);
+    while let Some(seq) = claimed {
+        shared.placement.set_committed(seq);
+        claimed = shared
+            .committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release();
     }
-    *held = Some(next);
-    drop(held);
-    shared.placement.set_committed(next);
 }
 
 /// The same from a worker, which calls `Sink::skip` under the error policy (f.8, f.11).
@@ -218,13 +236,7 @@ fn finish(shared: &Shared) {
         Ok(summary) => {
             let next_seq = crate::source_drive::cursor(shared).next_seq;
             if next_seq > 0 {
-                let last = next_seq - 1;
-                let mut held = shared.committed.lock().unwrap_or_else(|e| e.into_inner());
-                if held.is_none_or(|current| last > current) {
-                    *held = Some(last);
-                    drop(held);
-                    shared.placement.set_committed(last);
-                }
+                publish(shared, next_seq - 1);
             }
             shared.publish_exit(Exit::Completed(summary));
         }

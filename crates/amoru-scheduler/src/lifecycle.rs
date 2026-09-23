@@ -175,7 +175,11 @@ pub(crate) fn apply_resume_point(shared: &Arc<Shared>, point: ResumePoint) -> Re
         sink.resume(&schema, &state, committed)?;
     }
     source_drive::set_cursor(shared, point.extras.source_cursor);
-    *shared.committed.lock().unwrap_or_else(|e| e.into_inner()) = committed;
+    shared
+        .committed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resumed_at(committed);
 
     restore_instances(shared, &point)?;
 
