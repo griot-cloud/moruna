@@ -1,12 +1,12 @@
-# Contributing to Amoru
+# Contributing to Moruna
 
-Thank you for considering a contribution. Amoru is designed before it is built, so the most valuable contributions at this stage are to the design documents, and code contributions are expected to trace back to them.
+Thank you for considering a contribution. Moruna is designed before it is built, so the most valuable contributions at this stage are to the design documents, and code contributions are expected to trace back to them.
 
 ## How the project works
 
 - The documents in `architecture/` are authoritative. If a change in behaviour is not in a design document, it is not a change we can merge; open a pull request against the document first.
 - Each component has a software design document (SDD) with numbered invariants and a test specification. Code for a component is reviewed against its SDD: every invariant must hold, every listed test must exist and pass.
-- The runtime is Rust; the user surface is Python through PyO3. Kernel authors write against `amoru-kernel` only.
+- The runtime is Rust; the user surface is Python through PyO3. Kernel authors write against `moruna-kernel` only.
 
 ## Before you merge
 
@@ -39,7 +39,7 @@ By contributing you agree that your contributions are licensed under the Apache 
 
 ## Agent identity and sign-off
 
-Much of the code is written by coding agents driven from the documents in `architecture/` (the prompts are in `architecture/agents/`). Agents commit as `Amoru Agent <agents@griotdata.com>` and sign off with `git commit -s`. That sign-off is made on behalf of the project by its maintainer, who takes responsibility under the Developer Certificate of Origin for what the agents commit, reviews every agent pull request against its design document, and merges or delegates the merge as the preamble's section 6.7 states. A human contributor signs off in their own name as usual.
+Much of the code is written by coding agents driven from the documents in `architecture/` (the prompts are in `architecture/agents/`). Agents commit as `Moruna Agent <agents@griotdata.com>` and sign off with `git commit -s`. That sign-off is made on behalf of the project by its maintainer, who takes responsibility under the Developer Certificate of Origin for what the agents commit, reviews every agent pull request against its design document, and merges or delegates the merge as the preamble's section 6.7 states. A human contributor signs off in their own name as usual.
 
 ## Conduct
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Amoru quality gate. Run by the pre-commit hook (tools/hooks/pre-commit) and by
+# Moruna quality gate. Run by the pre-commit hook (tools/hooks/pre-commit) and by
 # the first CI job (preamble 6.6). It fails on: an em dash in any tracked text
 # file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
 # StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab,
@@ -8,22 +8,22 @@
 # rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
 # when cargo-deny is installed (F6.5); a failing test; a failing
 # examples/append_column.rs, which is the first program a user writes; line
-# coverage below AMORU_COVERAGE_MIN (default 90) in any workspace crate that has
+# coverage below MORUNA_COVERAGE_MIN (default 90) in any workspace crate that has
 # instrumented lines (a stub crate with no code is not measured). Python checks
 # run once python/pyproject.toml exists (wave 5).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-MIN="${AMORU_COVERAGE_MIN:-90}"
+MIN="${MORUNA_COVERAGE_MIN:-90}"
 
 fail() { printf 'quality: FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf 'quality: %s\n' "$*"; }
 # Run a step quietly: its output goes to target/quality/<name>.log and is shown
-# only when the step fails (or when AMORU_QUALITY_VERBOSE=1), so a passing gate
+# only when the step fails (or when MORUNA_QUALITY_VERBOSE=1), so a passing gate
 # prints one line per step and a failing one prints the evidence.
 quiet() {
   local name="$1"; shift
   mkdir -p target/quality
-  if [ "${AMORU_QUALITY_VERBOSE:-0}" = "1" ]; then "$@"; return; fi
+  if [ "${MORUNA_QUALITY_VERBOSE:-0}" = "1" ]; then "$@"; return; fi
   if ! "$@" >"target/quality/$name.log" 2>&1; then
     # The interesting lines, not the whole run: a workspace test log is thousands
     # of "ok" lines and the failure is the last thing anyone wants to scroll for.
@@ -43,7 +43,7 @@ fi
 
 step "tools/quality/no_stubs.sh (nothing in a shipping crate is a stub)"
 # The allowance list is empty: every crate of preamble 6.1 has code, the last of them
-# `amoru-py` (component 12, 2026-09-22). The variable is gone with it, which is what the
+# `moruna-py` (component 12, 2026-09-22). The variable is gone with it, which is what the
 # comment it replaces asked for.
 quiet no_stubs tools/quality/no_stubs.sh
 
@@ -87,8 +87,8 @@ if [ -f Cargo.toml ]; then
   fi
   step "cargo test"
   quiet test cargo test --workspace
-  # The feature-gated crates are invisible to a default-feature run: amoru-adapters,
-  # amoru-polars and amoru-datafusion compile to nothing without `python`, `polars`
+  # The feature-gated crates are invisible to a default-feature run: moruna-adapters,
+  # moruna-polars and moruna-datafusion compile to nothing without `python`, `polars`
   # and `datafusion`, so the gate reported them as stubs and their coverage as "not
   # measured" while they held thousands of lines (found by the component 5 agent,
   # 2026-09-22). The engine bridges need no interpreter and are always built; the
@@ -99,34 +99,34 @@ if [ -f Cargo.toml ]; then
   # defects reached a built wheel while the suite was green, and every one of them would have
   # failed this (PM, 2026-09-22).
   step "cargo run --example append_column (examples/append_column.rs)"
-  quiet example cargo run -p amoru-runtime --example append_column
+  quiet example cargo run -p moruna-runtime --example append_column
   step "cargo test --features polars,datafusion (the engine bridges)"
-  quiet test_bridges cargo test -p amoru-polars -p amoru-datafusion --features amoru-polars/polars,amoru-datafusion/datafusion
-  if [ -n "${AMORU_PYTHON:-}" ]; then
+  quiet test_bridges cargo test -p moruna-polars -p moruna-datafusion --features moruna-polars/polars,moruna-datafusion/datafusion
+  if [ -n "${MORUNA_PYTHON:-}" ]; then
     # The adapter's fixtures import pyarrow and numpy inside the embedded interpreter, so
-    # AMORU_PYTHON has to be able to find both. A uv-managed interpreter is externally managed
+    # MORUNA_PYTHON has to be able to find both. A uv-managed interpreter is externally managed
     # and cannot have them installed into it, so the usual answer is a venv on that same
     # interpreter with PYTHONPATH naming its site-packages:
     #
-    #   uv venv --python "$AMORU_PYTHON" /tmp/amoru-py && \
-    #     uv pip install --python /tmp/amoru-py numpy pyarrow && \
-    #     export PYTHONPATH="$(/tmp/amoru-py/bin/python -c \
+    #   uv venv --python "$MORUNA_PYTHON" /tmp/moruna-py && \
+    #     uv pip install --python /tmp/moruna-py numpy pyarrow && \
+    #     export PYTHONPATH="$(/tmp/moruna-py/bin/python -c \
     #       'import sysconfig;print(sysconfig.get_paths()["purelib"])')"
     #
     # Checked here rather than left to the tests: without it seven crossing-rule tests fail on
     # `ModuleNotFoundError` apiece, which reads as a broken adapter and is a missing module
     # (found 2026-09-23).
-    if missing="$(PYTHONPATH="${PYTHONPATH:-}" "$AMORU_PYTHON" -c '
+    if missing="$(PYTHONPATH="${PYTHONPATH:-}" "$MORUNA_PYTHON" -c '
 import importlib.util, sys
 absent = [m for m in ("pyarrow", "numpy") if importlib.util.find_spec(m) is None]
 sys.stdout.write(", ".join(absent))
 ' 2>/dev/null)" && [ -n "$missing" ]; then
-      fail "AMORU_PYTHON ($AMORU_PYTHON) cannot import: $missing; put them on PYTHONPATH (see the comment above this check in tools/quality/check.sh)"
+      fail "MORUNA_PYTHON ($MORUNA_PYTHON) cannot import: $missing; put them on PYTHONPATH (see the comment above this check in tools/quality/check.sh)"
     fi
-    step "cargo test --features python (interpreter: ${AMORU_PYTHON})"
-    PYO3_PYTHON="$AMORU_PYTHON" quiet test_python cargo test -p amoru-adapters --features python
+    step "cargo test --features python (interpreter: ${MORUNA_PYTHON})"
+    PYO3_PYTHON="$MORUNA_PYTHON" quiet test_python cargo test -p moruna-adapters --features python
   else
-    step "python adapter not measured: set AMORU_PYTHON to a CPython 3.14t with pyarrow"
+    step "python adapter not measured: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
   fi
   step "tests: $(grep -hE '^test result:' target/quality/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
   step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
@@ -158,13 +158,13 @@ if [ -d python/tests ]; then
   # at the repository root, so 32 tests including the one guarding the surface's
   # throughput were run by nothing at all: that is the structural reason a wheel whose
   # first user program hung for ever passed a green gate (found 2026-09-23).
-  if [ -n "${AMORU_PYTHON:-}" ]; then
-    step "python/tests on ${AMORU_PYTHON}"
-    # A stale python/amoru/_core*.so shadows an installed wheel, so the suite must run
+  if [ -n "${MORUNA_PYTHON:-}" ]; then
+    step "python/tests on ${MORUNA_PYTHON}"
+    # A stale python/moruna/_core*.so shadows an installed wheel, so the suite must run
     # against a build made now, not whatever was left in the tree.
-    quiet python_tests env AMORU_PYTHON="$AMORU_PYTHON" tools/quality/python_tests.sh
+    quiet python_tests env MORUNA_PYTHON="$MORUNA_PYTHON" tools/quality/python_tests.sh
   else
-    step "python/tests not run: set AMORU_PYTHON to a CPython 3.14t with pyarrow"
+    step "python/tests not run: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
   fi
 fi
 
@@ -172,12 +172,12 @@ if [ -f python/pyproject.toml ]; then
   step "ruff and pytest with coverage >= ${MIN}%"
   command -v ruff >/dev/null 2>&1 || fail "ruff is not installed"
   ruff check python
-  ( cd python && python3 -m pytest -q --cov=amoru --cov-fail-under="$MIN" )
+  ( cd python && python3 -m pytest -q --cov=moruna --cov-fail-under="$MIN" )
 fi
 
 step "OK"
 # What this gate cannot tell you, said out loud rather than assumed: it compiles and
-# runs for the host it is on. Amoru's target is Linux (cgroup v2, O_DIRECT, io_uring),
+# runs for the host it is on. Moruna's target is Linux (cgroup v2, O_DIRECT, io_uring),
 # and a developer host here is macOS, so a Linux-only branch behind a cfg is never
 # compiled locally and its errors appear only in CI. On 2026-09-23 exactly that
 # happened: a test helper's Linux arm used libc without the dev-dependency, the gate

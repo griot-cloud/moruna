@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 
-import amoru
+import moruna
 
 
 def test_py_t9_reentrancy(
@@ -20,7 +20,7 @@ def test_py_t9_reentrancy(
     second_out = scratch / "out2"
     second_out.mkdir()
 
-    @amoru.kernel
+    @moruna.kernel
     def slow(batch):  # noqa: ANN001, ANN202
         time.sleep(0.5)
         return batch
@@ -32,14 +32,14 @@ def test_py_t9_reentrancy(
     def go(out: str) -> None:
         try:
             completions.append(
-                amoru.run(amoru.ParquetSource(src_url), slow, small_sink(out), **staging)
+                moruna.run(moruna.ParquetSource(src_url), slow, small_sink(out), **staging)
             )
-        except amoru.ConfigError as e:  # the re-entrancy refusal
+        except moruna.ConfigError as e:  # the re-entrancy refusal
             if "already active" in e.message:
                 refusals.append(e)
             else:
                 others.append(e)
-        except amoru.AmoruError as e:
+        except moruna.MorunaError as e:
             others.append(e)
 
     threads = [

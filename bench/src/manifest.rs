@@ -31,10 +31,10 @@ pub fn build(seed: u64, scale: &str, written: &[Written]) -> Value {
         })
         .collect();
     json!({
-        "generator": "amoru-bench",
+        "generator": "moruna-bench",
         "version": crate::GENERATOR_VERSION,
         "format": crate::GENERATOR_FORMAT,
-        "traces_to": "architecture/sdd/00-preamble.md section 6.5; AMB1 from 01-contracts.md section e.4",
+        "traces_to": "architecture/sdd/00-preamble.md section 6.5; MRB1 from 01-contracts.md section e.4",
         "seed": seed,
         "scale": scale,
         "machine": host::machine(),
@@ -66,7 +66,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "amoru-bench-manifest-{}-{}-{}",
+            "moruna-bench-manifest-{}-{}-{}",
             std::process::id(),
             n,
             name
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn the_manifest_names_the_generator_the_seed_and_the_machine() {
         let value = build(7, "small", &written());
-        assert_eq!(value["generator"], "amoru-bench");
+        assert_eq!(value["generator"], "moruna-bench");
         assert_eq!(value["version"], crate::GENERATOR_VERSION);
         assert_eq!(value["format"], crate::GENERATOR_FORMAT);
         assert_eq!(value["seed"], 7);

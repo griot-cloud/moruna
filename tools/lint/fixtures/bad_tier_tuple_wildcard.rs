@@ -2,7 +2,7 @@
 // tiers, where the wildcard would silently cover every Remote row. The lint
 // must reject this file (CT-T14). The block body of the first arm also
 // contains a `_ =>` inside a nested, unrelated match, which alone would be fine.
-fn legal(from: Tier, to: Tier) -> Result<(), AmoruError> {
+fn legal(from: Tier, to: Tier) -> Result<(), MorunaError> {
     match (from, to) {
         (Tier::Host, Tier::Disk(_)) => {
             match 1u8 {
@@ -10,6 +10,6 @@ fn legal(from: Tier, to: Tier) -> Result<(), AmoruError> {
                 _ => Ok(()),
             }
         }
-        _ => Err(AmoruError::Staging("illegal".into())),
+        _ => Err(MorunaError::Staging("illegal".into())),
     }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "moruna-datafusion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna DataFusion bridge"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+datafusion = { workspace = true, optional = true }
+
+[dev-dependencies]
+# AD-T10 drives a real DataFusion session, whose API is asynchronous.
+tokio = { workspace = true }
+
+[features]
+default = []
+datafusion = ["dep:datafusion"]
+
+[[test]]
+name = "ad_t10_datafusion_bridge"
+path = "tests/ad_t10_datafusion_bridge.rs"
+required-features = ["datafusion"]

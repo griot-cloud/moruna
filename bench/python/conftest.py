@@ -1,4 +1,4 @@
-"""Make ``amoru_bench_kernels`` importable when pytest is run from ``bench/python``.
+"""Make ``moruna_bench_kernels`` importable when pytest is run from ``bench/python``.
 
 There is no ``python/pyproject.toml`` in the repository yet (it arrives in wave 5
 with the Python package), and this branch does not add a repository wide pytest

@@ -10,7 +10,7 @@ fn is_resident(t: &Tier) -> bool {
     }
 }
 
-fn read(t: Tier) -> Result<u8, AmoruError> {
+fn read(t: Tier) -> Result<u8, MorunaError> {
     match t {
         Tier::Device(d) => Ok(d.0),
         Tier::PinnedHost => Ok(1),
@@ -22,8 +22,8 @@ fn read(t: Tier) -> Result<u8, AmoruError> {
                 _ => Ok(4),
             }
         }
-        Tier::Remote(node, _) if node == LOCAL_NODE => Err(AmoruError::Unsupported("rdma")),
-        Tier::Remote(_, _) => Err(AmoruError::Unsupported("rdma")),
+        Tier::Remote(node, _) if node == LOCAL_NODE => Err(MorunaError::Unsupported("rdma")),
+        Tier::Remote(_, _) => Err(MorunaError::Unsupported("rdma")),
     }
 }
 

@@ -12,13 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
-use amoru_bench::error::Result;
-use amoru_bench::host;
-use amoru_bench::kernels::adversarial::{Adversarial, JUMP};
-use amoru_bench::kernels::runner::{self, Measurement};
-use amoru_bench::kernels::wide_intermediate::WideIntermediate;
-use amoru_bench::kernels::{BenchKernel, BenchPayload, KERNEL_NAMES, NOT_BUILT};
-use amoru_bench::suite::{self, Scale};
+use moruna_bench::error::Result;
+use moruna_bench::host;
+use moruna_bench::kernels::adversarial::{Adversarial, JUMP};
+use moruna_bench::kernels::runner::{self, Measurement};
+use moruna_bench::kernels::wide_intermediate::WideIntermediate;
+use moruna_bench::kernels::{BenchKernel, BenchPayload, KERNEL_NAMES, NOT_BUILT};
+use moruna_bench::suite::{self, Scale};
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -26,7 +26,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 const SEED: u64 = 20_260_922;
 
 fn scratch(name: &str) -> PathBuf {
-    const PREFIX: &str = "amoru-bench-kernels";
+    const PREFIX: &str = "moruna-bench-kernels";
     // Unique per process and per call: several executors run the gate at the same
     // time on one machine, and a fixed name under the system temp directory made two
     // runs delete each other's files (three generator tests failed that way on
@@ -322,9 +322,9 @@ fn the_kernel_command_reports_the_machine_with_the_measurement() -> Result<()> {
         .map(str::to_string)
         .collect();
     let mut out: Vec<u8> = Vec::new();
-    amoru_bench::run(&args, &mut out)?;
+    moruna_bench::run(&args, &mut out)?;
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.starts_with("amoru-bench "), "{text}");
+    assert!(text.starts_with("moruna-bench "), "{text}");
     assert!(text.contains(&host::machine()), "{text}");
     assert!(text.contains("amplification 1.000"), "{text}");
     assert!(text.contains("inside"), "{text}");
@@ -342,7 +342,7 @@ fn the_kernel_command_reports_the_machine_with_the_measurement() -> Result<()> {
     let mut out: Vec<u8> = Vec::new();
     // identity is exactly 1.0 on every dataset, so it stays inside; the check is
     // that the pairing runs at all and reports the other dataset by name.
-    amoru_bench::run(&args, &mut out)?;
+    moruna_bench::run(&args, &mut out)?;
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("text-explode.parquet"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);

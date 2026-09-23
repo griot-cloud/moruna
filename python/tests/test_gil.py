@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-import amoru
+import moruna
 
 REFUSAL = (
     "Python kernels require a free-threaded interpreter (python3.13t or python3.14t); "
@@ -23,35 +23,35 @@ REFUSAL = (
 SCRIPT = """
 import os, pathlib, sys, json
 import pyarrow as pa, pyarrow.parquet as pq
-import amoru
+import moruna
 
 assert sys._is_gil_enabled(), "this subprocess is meant to have a GIL"
-d = pathlib.Path(os.environ["AMORU_TEST_DIR"])
+d = pathlib.Path(os.environ["MORUNA_TEST_DIR"])
 src, out = d / "in", d / "out"
 src.mkdir(exist_ok=True); out.mkdir(exist_ok=True)
 pq.write_table(pa.table({"id": pa.array(range(1000), pa.int64())}), src / "p.parquet")
 
-@amoru.kernel
+@moruna.kernel
 def identity(batch):
     return batch
 
-source = lambda: amoru.ParquetSource(f"file://{src}/p.parquet")
-sink = lambda: amoru.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB")
+source = lambda: moruna.ParquetSource(f"file://{src}/p.parquet")
+sink = lambda: moruna.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB")
 
 try:
-    amoru.run(source(), identity, sink())
-except amoru.ConfigError as e:
+    moruna.run(source(), identity, sink())
+except moruna.ConfigError as e:
     print(json.dumps({"refused": True, "message": e.message, "kind": e.kind}))
 else:
     print(json.dumps({"refused": False}))
 
-report = amoru.run(source(), identity, sink(), allow_gil=True)
+report = moruna.run(source(), identity, sink(), allow_gil=True)
 print(json.dumps({"gil_serialised": report.gil_serialised, "gil": report.gil}))
 """
 
 
 def _under_a_gil(tmp: str) -> list[dict]:
-    env = dict(os.environ, PYTHON_GIL="1", AMORU_TEST_DIR=tmp)
+    env = dict(os.environ, PYTHON_GIL="1", MORUNA_TEST_DIR=tmp)
     out = subprocess.run(  # noqa: S603
         [sys.executable, "-c", SCRIPT], capture_output=True, text=True, env=env, check=False
     )
@@ -77,14 +77,14 @@ def test_a_free_threaded_interpreter_is_not_refused(
         pytest.skip("this interpreter has a GIL; the refusal path is the subprocess test")
     src_url, out_url, _ = dataset
 
-    @amoru.kernel
+    @moruna.kernel
     def identity(batch):  # noqa: ANN001, ANN202
         return batch
 
-    report = amoru.run(
-        amoru.ParquetSource(src_url),
+    report = moruna.run(
+        moruna.ParquetSource(src_url),
         identity,
-        amoru.ParquetSink(out_url, row_group_bytes="16MiB", file_bytes="64MiB"),
+        moruna.ParquetSink(out_url, row_group_bytes="16MiB", file_bytes="64MiB"),
         **staging,
     )
     assert report.gil_serialised is False

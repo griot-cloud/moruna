@@ -1,10 +1,10 @@
-# Amoru SDD 02: Memory arena (`amoru-arena`)
+# Moruna SDD 02: Memory arena (`moruna-arena`)
 
 **Document type:** software design document, component 2 of 12
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
-**Parent:** `architecture/amoru-runtime-design.md` section 5.6a; decisions D10; criteria S1, S13, S14
+**Parent:** `architecture/moruna-runtime-design.md` section 5.6a; decisions D10; criteria S1, S13, S14
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` (d.3 `Buffer`, `BufferView`, `Allocator`, `AllocStats`; d.12 `Limits`, `HostProfile`, `Guarantee`; e.1 one host tier per run)
-**Component location:** `crates/amoru-arena`, Rust
+**Component location:** `crates/moruna-arena`, Rust
 **Consumes:** contracts (1). Feature `cuda` adds `cudarc`. **Consumed by:** reactor (6), sources (7), sinks (8), placement (9), adapters (5)
 
 **Decisions worth your eye:** (1) size-class allocation with powers of two from 64 KiB and a large-object path above 512 MiB, accepting up to 2× internal fragmentation in exchange for O(1) alloc and free; (2) transparent huge pages by `madvise` rather than hugetlbfs, so the arena works without a boot-time reservation and gets faster when one exists; (3) the host arena is pinned only when a device is present and memlock allows, never on a CPU-only host.
@@ -35,7 +35,7 @@ It refuses to know: what a buffer contains; which tier a caller *should* ask for
 
 **AR-I1. Every buffer is aligned.** Returned pointers are multiples of `ALIGNMENT`, and multiples of `page_bytes` when the class size is ≥ `page_bytes` (true for every class, since class 0 is 64 KiB). Proves the contract in preamble 1.3 row 2.
 
-**AR-I2. Budget is enforced at allocation.** `alloc` fails with `AmoruError::Alloc` rather than exceeding the tier's budget; the sum of live buffer bytes per tier, including internal fragmentation, never exceeds the region size. Upholds G-I1.
+**AR-I2. Budget is enforced at allocation.** `alloc` fails with `MorunaError::Alloc` rather than exceeding the tier's budget; the sum of live buffer bytes per tier, including internal fragmentation, never exceeds the region size. Upholds G-I1.
 
 **AR-I3. The region is allocated once.** After `Arena::new` returns, no further `mmap`, `cudaMalloc`, `cudaHostAlloc` or `mlock` call is made for the run; a request that cannot be served from the region fails. Rationale: the flat memory footprint (architecture 5.6a) and the pod's cgroup accounting depend on this, and so does the reactor: registering the host tier with a NIC (feature `rdma`, 06 f.5) is one call only because the host region is one mapping and not many. The reservation is one region for that reason and must not be split into several mappings as an optimisation.
 
@@ -100,7 +100,7 @@ impl Allocator for Arena {
 
 ### d.2 Consumed
 
-`amoru_kernel::{Allocator, Buffer, AllocStats, Tier, TierKind, DeviceId, Guarantee, AmoruError, ALIGNMENT}` and the `ArenaHandle` trait from `buffer.rs`:
+`moruna_kernel::{Allocator, Buffer, AllocStats, Tier, TierKind, DeviceId, Guarantee, MorunaError, ALIGNMENT}` and the `ArenaHandle` trait from `buffer.rs`:
 
 ```rust
 pub trait ArenaHandle: Send + Sync { fn release(&self, ptr: *mut u8, len: usize, tier: Tier); }
@@ -143,7 +143,7 @@ Per device: one `cuMemAlloc` of `device_bytes`, the same slab and class structur
 
 ## f. Algorithms and policies
 
-**f.1 Reservation (host).** `mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`; then `madvise(MADV_HUGEPAGE)` if `huge_pages != Absent`; then, if `host_tier == PinnedHost`: with `cuda`, `cuMemHostRegister(ptr, size, CU_MEMHOSTREGISTER_PORTABLE)`, else `mlock(ptr, size)`. `Present` guarantees turn a failure into `AmoruError::Config { name: "host_profile", msg }` (platform bug); `Probed(true)` turns a failure into a fallback (`Host` tier, `huge_pages_active = false`) recorded for the report (contracts d.12: a probed guarantee may fall back, a declared one may not); `Absent` and `Probed(false)` skip the step. `Unknown` never reaches the arena (DS-I6) and is a `Config` error if it does. The fallback from `PinnedHost` to `Host` happens inside `new`, before any buffer exists, so it never becomes a tier move: after `new` returns, `is_pinned()` is final for the run (AR-I6). Touch every page once (`memset` in 2 MiB strides) so the cgroup charge happens at start, not on first use; this is what makes the footprint flat from the first morsel. The region's size is therefore not the run's memory ceiling and never was: it is the ceiling less what the process already held before the arena existed, less the reserve, less the state the stateful kernels are expected to hold outside the arena. The facade computes it by that rule and samples the baseline before this call (12 f.1); the controller then takes this region's size as its whole allowance rather than subtracting the baseline a second time (11 f.1). An arena sized at the ceiling leaves the controller nothing, because f.1's touch makes the arena part of the baseline the moment it exists. With `MAP_NORESERVE` the touch is what commits memory; do the touch before `mlock`.
+**f.1 Reservation (host).** `mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`; then `madvise(MADV_HUGEPAGE)` if `huge_pages != Absent`; then, if `host_tier == PinnedHost`: with `cuda`, `cuMemHostRegister(ptr, size, CU_MEMHOSTREGISTER_PORTABLE)`, else `mlock(ptr, size)`. `Present` guarantees turn a failure into `MorunaError::Config { name: "host_profile", msg }` (platform bug); `Probed(true)` turns a failure into a fallback (`Host` tier, `huge_pages_active = false`) recorded for the report (contracts d.12: a probed guarantee may fall back, a declared one may not); `Absent` and `Probed(false)` skip the step. `Unknown` never reaches the arena (DS-I6) and is a `Config` error if it does. The fallback from `PinnedHost` to `Host` happens inside `new`, before any buffer exists, so it never becomes a tier move: after `new` returns, `is_pinned()` is final for the run (AR-I6). Touch every page once (`memset` in 2 MiB strides) so the cgroup charge happens at start, not on first use; this is what makes the footprint flat from the first morsel. The region's size is therefore not the run's memory ceiling and never was: it is the ceiling less what the process already held before the arena existed, less the reserve, less the state the stateful kernels are expected to hold outside the arena. The facade computes it by that rule and samples the baseline before this call (12 f.1); the controller then takes this region's size as its whole allowance rather than subtracting the baseline a second time (11 f.1). An arena sized at the ceiling leaves the controller nothing, because f.1's touch makes the arena part of the baseline the moment it exists. With `MAP_NORESERVE` the touch is what commits memory; do the touch before `mlock`.
 
 **f.2 Reservation (device).** `cuMemAlloc` of the device budget; on failure, retry once at 90% and report the reduced size; below that, `Config` error.
 
@@ -209,7 +209,7 @@ Per-class mutex (one per class per tier), one bump lock per region, atomics for 
 
 Files: `src/lib.rs`, `src/region.rs` (f.1, f.2, f.7, mmap and cuda), `src/classes.rs` (e.2, f.3, f.4), `src/large.rs` (large table and coalescing), `src/handle.rs` (`ArenaHandle` impl), `src/stats.rs`, `src/rdma.rs` (feature). `unsafe` permitted in `region.rs` (syscalls, cuda) and `classes.rs`/`large.rs` (pointer arithmetic), each with `// SAFETY:` citing AR-I1 or AR-I2.
 
-Use `libc` for `mmap`, `madvise`, `mlock`; do not use `memmap2` here (no crate maps files; sources read into the arena through the reactor). Do not use `alloc::alloc` for arena memory. The global allocator for the process is `mimalloc`, set in `amoru-runtime`, not here.
+Use `libc` for `mmap`, `madvise`, `mlock`; do not use `memmap2` here (no crate maps files; sources read into the arena through the reactor). Do not use `alloc::alloc` for arena memory. The global allocator for the process is `mimalloc`, set in `moruna-runtime`, not here.
 
 Anti-patterns: no per-allocation syscalls; no `Vec<u8>` behind `Buffer`; no growth of the region after `new`; no silent fallback under a `Present` guarantee.
 

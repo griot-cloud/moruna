@@ -1,6 +1,6 @@
-# Amoru build board
+# Moruna build board
 
-The PM agent's working board. It is the one place that says what is done, what is next and who is waiting on whom; the documents in `architecture/` remain the specification and this board never restates them. When every box on this board is ticked, `amoru` is a production-ready package: every wave gate of preamble 6.6 is green, every sufficiency criterion S1 to S17 is closed on the reference host or listed as skipped by id with Brackly's acceptance, every decision Q1 to Q10 is decided or its assumption is explicitly accepted, and wheels for the four interpreters are published from a tagged release.
+The PM agent's working board. It is the one place that says what is done, what is next and who is waiting on whom; the documents in `architecture/` remain the specification and this board never restates them. When every box on this board is ticked, `moruna` is a production-ready package: every wave gate of preamble 6.6 is green, every sufficiency criterion S1 to S17 is closed on the reference host or listed as skipped by id with Brackly's acceptance, every decision Q1 to Q10 is decided or its assumption is explicitly accepted, and wheels for the four interpreters are published from a tagged release.
 
 ## How the board works
 
@@ -19,17 +19,17 @@ The one question this section answers: what stands between today and a process t
 
 | Step | Crate | State |
 |---|---|---|
-| 1. The types every component speaks | `amoru-kernel` | merged |
-| 2. Memory, limits, the trace | `amoru-arena`, `amoru-discovery`, `amoru-trace` | merged |
-| 3. IO that never blocks a worker | `amoru-reactor` | merged |
-| 4. Bytes in and out | `amoru-sources`, `amoru-sinks` | merged |
-| 5. The queue that makes disk a tier | `amoru-placement` | merged (90.8%) |
-| 6. The thing that runs the work | `amoru-scheduler` | merged (91.0%) |
-| 7. The thing that decides the sizes | `amoru-controller` | merged |
-| 8. The facade that wires 2 to 7 into `Runtime::run` | `amoru-runtime` | merged (94.6%). **Amoru runs**: `rt_t1` takes a real Parquet file through real components to a real Parquet file inside a real budget and asserts 40,000 rows in the report and again by reading the output back; `rt_t6` kills a run and resumes it from its own manifest |
-| 9. The surface a user touches | `amoru-py`, `python/amoru` | merged (97.8%). **A user's first program works from a wheel and honours its budget**: 200,000 rows, a Python kernel appending a column, `budget="512MiB"`, peak 0.669 of the ceiling, verified by the PM against a built wheel on 2026-09-23 |
+| 1. The types every component speaks | `moruna-kernel` | merged |
+| 2. Memory, limits, the trace | `moruna-arena`, `moruna-discovery`, `moruna-trace` | merged |
+| 3. IO that never blocks a worker | `moruna-reactor` | merged |
+| 4. Bytes in and out | `moruna-sources`, `moruna-sinks` | merged |
+| 5. The queue that makes disk a tier | `moruna-placement` | merged (90.8%) |
+| 6. The thing that runs the work | `moruna-scheduler` | merged (91.0%) |
+| 7. The thing that decides the sizes | `moruna-controller` | merged |
+| 8. The facade that wires 2 to 7 into `Runtime::run` | `moruna-runtime` | merged (94.6%). **Moruna runs**: `rt_t1` takes a real Parquet file through real components to a real Parquet file inside a real budget and asserts 40,000 rows in the report and again by reading the output back; `rt_t6` kills a run and resumes it from its own manifest |
+| 9. The surface a user touches | `moruna-py`, `python/moruna` | merged (97.8%). **A user's first program works from a wheel and honours its budget**: 200,000 rows, a Python kernel appending a column, `budget="512MiB"`, peak 0.669 of the ceiling, verified by the PM against a built wheel on 2026-09-23 |
 
-Amoru ran for the first time on 2026-09-22. What is left is step 9 and the defects that first run exposed, which are tracked as F4.9 below: it runs at test sizes and not yet at a realistic budget, and saying otherwise would be the kind of claim this board exists to prevent. The surprises did land where this paragraph predicted, in the wiring rather than in the components.
+Moruna ran for the first time on 2026-09-22. What is left is step 9 and the defects that first run exposed, which are tracked as F4.9 below: it runs at test sizes and not yet at a realistic budget, and saying otherwise would be the kind of claim this board exists to prevent. The surprises did land where this paragraph predicted, in the wiring rather than in the components.
 
 Support the documents require, which is not on the path and is judged separately: the testkit (contracts d.15, and every component's tests name its fakes, so parallel building depends on it) and the bench suite (preamble 6.5, needed by criterion S3 in wave 5, and built earlier than it should have been).
 
@@ -59,7 +59,7 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 | Where the code is | ten crates merged to `main`: contracts, testkit, arena, discovery, trace, adapters, the two engine bridges, reactor, sources, sinks, controller, and the bench suite. 470 tests pass, every crate above 90% line coverage |
 | Delegation | Brackly delegated decision making to the PM on 2026-09-22 ("with great power comes great responsibility"); the PM now decides every item the preamble's table routes to the human, records each in this board's decisions table with the date, and reports it in the wave report; a decision that changes an SDD's behaviour still goes through the design-change template first |
 | In flight | F5.1, the Python surface, and F4.9, the six defects the first real run exposed |
-| Next to start, when work resumes | F4.6, the facade `amoru-runtime`. Every crate it wires is now merged, so it is unblocked: it turns twelve parts into `Runtime::run` and is the first time anything runs end to end. Its executor reads every SDD (preamble 9) |
+| Next to start, when work resumes | F4.6, the facade `moruna-runtime`. Every crate it wires is now merged, so it is unblocked: it turns twelve parts into `Runtime::run` and is the first time anything runs end to end. Its executor reads every SDD (preamble 9) |
 | After that | F4.7 integration closure (RC-T12, SC-T16, PL-T17 with real components, which is what closes the wave 4 gate), then wave 5 (the Python package, the tuned and engine baselines) and E7 documentation |
 | Paperwork owed | the wave 1, 2, 3 and 4 gate reports. Each needs one run of the weekly `slow` job from the Actions tab, which is what executes DS-T9, PL-T6 and the other container-gated tests; the crates are merged and green, the reports are what record it |
 | Then | F4.6 the facade and F4.7 integration, once placement and the scheduler are in; after those, wave 5 (the Python package, the baselines) and E7 documentation |
@@ -70,14 +70,14 @@ Gates still close in wave order (E0 to E5), each in its wave report, because the
 
 ## E0. Wave 0: contracts, testkit, workspace, CI, quality gate
 
-Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a stub; `amoru-kernel` has no runtime dependency (CT-T12); every fake in contracts d.15 compiles and exercises every knob (CT-T13); CT tests pass; the trace schema hash is pinned (CT-T9); `tools/lint/no_tier_wildcard.sh` runs in CI (CT-T14); `tools/quality/check.sh` is green; the four CI jobs are green on the stubs.
+Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a stub; `moruna-kernel` has no runtime dependency (CT-T12); every fake in contracts d.15 compiles and exercises every knob (CT-T13); CT tests pass; the trace schema hash is pinned (CT-T9); `tools/lint/no_tier_wildcard.sh` runs in CI (CT-T14); `tools/quality/check.sh` is green; the four CI jobs are green on the stubs.
 
 | Id | Feature | Branch | Scope (SDD sections, tests by id) | Status |
 |---|---|---|---|---|
 | F0.0 | PM preparation: quality gate, hook, board, brief for component 1 | `infra/pm-wave0-prep` | preamble 6.1, 6.6, 6.7 edits; `tools/quality`, `tools/hooks`; this board | merged |
 | F0.1 | Workspace skeleton, CI with four jobs, `tools/lint`, pinned versions | `infra/workspace` | preamble 6.1, 6.2, 6.3, 6.6; CT-T12, CT-T14 (the lint half) | merged |
-| F0.2 | Contracts crate `amoru-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | merged (121 tests, 93.6%) |
-| F0.3 | Testkit `amoru-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | merged (91.6%) |
+| F0.2 | Contracts crate `moruna-kernel` | `component/01-contracts` | 01 d.1 to d.14, e.1 to e.7, f.1 to f.6; CT-T1 to CT-T12, CT-T14 to CT-T19 | merged (121 tests, 93.6%) |
+| F0.3 | Testkit `moruna-testkit` | `component/01-contracts` (its own PR, per the amended 6.7) | 01 d.15; CT-T13 | merged (91.6%) |
 | F0.4 | Wave 0 gate and wave report (PM) | `main` | pm.md sections 2, 4, 8 | todo |
 
 ### F0.0 tasks
@@ -93,10 +93,10 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 - [x] Environment facts verified in the PR (rustc, cargo, edition 2024; docker and MinIO reachable in CI)
 - [x] `rust-toolchain.toml` pins stable; `Cargo.toml` workspace with every member of preamble 6.1; `[workspace.dependencies]` pinned; the versions recorded in the preamble 6.2 table (replaces `_pending_`)
 - [x] Every crate of 6.1 as a compiling stub with its `Cargo.toml`, feature flags per 6.3, and a one-line `lib.rs` doc comment naming its SDD
-- [x] `python/amoru/` and `bench/` placeholders that the later waves fill
+- [x] `python/moruna/` and `bench/` placeholders that the later waves fill
 - [x] `tools/lint/no_tier_wildcard.sh` (CT-T14 lint) with a self-test fixture
 - [x] `.github/workflows/ci.yml`: job 1 `tools/quality/check.sh` on Linux; job 2 container gate with `--memory` and `--cpus`; job 3 MinIO service for the object-store paths; job 4 Python matrix 3.13, 3.13t, 3.14, 3.14t (proves the matrix runs)
-- [x] `cargo tree -p amoru-kernel` is free of tokio, cudarc, pyo3, parquet, object_store (CT-T12 as a CI step until F0.2 makes it a test)
+- [x] `cargo tree -p moruna-kernel` is free of tokio, cudarc, pyo3, parquet, object_store (CT-T12 as a CI step until F0.2 makes it a test)
 - [x] PR template complete; PM checklist green; merged
 
 ### F0.2 tasks
@@ -106,17 +106,17 @@ Gate (preamble 6.6, wave 0): the workspace compiles with every member crate as a
 - [x] d.4 to d.5: `DType`, `ManagedTensor` (dlpark wrapper, `from_buffer`), `Payload`, `PayloadSpec::check`, `SourceSchema::hash`, `Morsel`, `MorselFeatures` (f.2 O(columns))
 - [x] d.6 to d.8: `Source`, `Kernel`, `KernelState`, `Sink` with the resume defaults that refuse
 - [x] d.9: `Completion` over std, `Reactor`, `ObjectMetadata`, copy endpoints; d.10 `Placement` and the resume types; d.11 `Knobs`, `StatsSource`, `Prober`, `CancelToken`, `RecordHook`; d.12 `Limits`, `HostProfile`, `Sampler`; d.13 `TraceRecord`, `SCHEMA_HASH`, `TraceSink`, `TraceTail`; d.14 errors
-- [x] e.4 `AMB1` reader and writer over slices; e.7 page-aligned IPC `encode_framing` and `decode`; e.6 `Fingerprint::compute`
+- [x] e.4 `MRB1` reader and writer over slices; e.7 page-aligned IPC `encode_framing` and `decode`; e.6 `Fingerprint::compute`
 - [x] Tests CT-T1 to CT-T12 and CT-T14 to CT-T19 under their SDD names; CT-T9 pins the hash value in the test; CT-T11 timing reported with the host name (see finding N-2)
 - [x] Every CT invariant CT-I1 to CT-I12 cited by at least one test in the PR
-- [x] Coverage at or above 90% for `amoru-kernel`; PR template complete
+- [x] Coverage at or above 90% for `moruna-kernel`; PR template complete
 
 ### F0.3 tasks
 - [x] Every fake of d.15 (`FakeAllocator`, `FakeReactor`, `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeSampler`, `FakeTrace`, `FakeKnobs`) with exactly the knobs and observables the table lists, and a `shutdown_calls` counter wherever the trait has `shutdown`
 - [x] `FakeAllocator` buffers are real heap allocations tagged with the tier so tier inference, `into_arrow_buffer` and `BufferView::of_arrow` work
 - [x] `FakePlacement::with_manifest_store` round-trips `checkpoint`/`restore` across engine instances
 - [x] CT-T13: every method and every knob exercised once
-- [x] `amoru-testkit` depends on `amoru-kernel` only; coverage at or above 90%; same PR as F0.2
+- [x] `moruna-testkit` depends on `moruna-kernel` only; coverage at or above 90%; same PR as F0.2
 
 ### F0.4 tasks
 - [x] PM review of F0.1 and F0.2+F0.3 against pm.md section 4, lines 1 to 11
@@ -132,11 +132,11 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F1.1 | Memory arena `amoru-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | merged (93.4%) |
-| F1.2 | Resource discovery `amoru-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | merged (96.3%) |
-| F1.3 | Trace writer and run report `amoru-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | merged (92.2%) |
-| F1.4 | Python kernel adapter `amoru-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | merged (95.0%) |
-| F1.5 | Polars and DataFusion bridges `amoru-polars`, `amoru-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | merged (polars 94.5%, datafusion 98.8%) |
+| F1.1 | Memory arena `moruna-arena` | `component/02-arena` | 02 in full; AR-T1 to AR-T12; `cuda` arms present, device tests listed | merged (93.4%) |
+| F1.2 | Resource discovery `moruna-discovery` | `component/03-discovery` | 03 in full; DS-T1 to DS-T12; DS-T3 timing provisional (E1); DS-T9 (integration, wave 1: the CI container job) | merged (96.3%) |
+| F1.3 | Trace writer and run report `moruna-trace` | `component/04-trace` | 04 in full; TR-T1 to TR-T11 | merged (92.2%) |
+| F1.4 | Python kernel adapter `moruna-adapters` | `component/05-adapters` | 05 in full except the bridges; AD-T1, T2, T4 to T8, T12; AD-T3, AD-T11 (E1, skipped and listed) | merged (95.0%) |
+| F1.5 | Polars and DataFusion bridges `moruna-polars`, `moruna-datafusion` | `component/05-adapters` (same PR) | 05 bridge sections; AD-T9, AD-T10 (integration, wave 1; need F1.7's `normalise` kernel) | merged (polars 94.5%, datafusion 98.8%) |
 | F1.6 | Bench data generator | `infra/bench` | preamble 6.5: Parquet with controllable rows, column mix, null ratio, row-group size, to local disk and MinIO; safetensors and aligned binary tensors | merged (96.9%) |
 | F1.7 | Bench kernels | `infra/bench-kernels` (its own PR; bench is not a component, so the one-pull-request-per-component rule does not bind it) | preamble 6.5: identity, normalise, tokenise-explode, adversarial, wide-intermediate (Python, releases the GIL), embed-score; torch-score deferred (no GPU host, E1) | merged |
 | F1.8 | Wave 1 gate and report (PM) | `main` | | todo |
@@ -151,7 +151,7 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 ### F1.2 tasks
 - [x] Environment facts from 03 section l verified (cgroup v2 paths in a container, `memory.peak` presence)
 - [x] `discover`: precedence explicit, cgroup, OS; ceiling below kill; `LimitSource`; size strings; Databricks refusal (E7 assumption)
-- [x] `HostProfile` parsing from `AMORU_HOST_PROFILE`; every `Unknown` becomes `Probed`; `Present` on tmpfs or overlay staging refused
+- [x] `HostProfile` parsing from `MORUNA_HOST_PROFILE`; every `Unknown` becomes `Probed`; `Present` on tmpfs or overlay staging refused
 - [x] `Sampler` with `reset_peak`, anon not current, idempotent, sample cost measured and labelled with the host
 - [x] DS-T1 to DS-T12; DS-T9 wired into the CI container job; every DS-I cited; coverage; PR template
 
@@ -168,15 +168,15 @@ Gate (6.6, wave 1): AR, DS, TR, AD tests pass against fakes; G-I2 for the Python
 - [x] AD-T1, T2, T4 to T8, T12 pass; AD-T3 and AD-T11 exist, ignored with the E1 reason, listed; every AD-I cited; coverage; PR template
 
 ### F1.5 tasks
-- [x] `amoru-polars`: a kernel as a Polars expression plugin, no kernel logic in the wrapper; `amoru-datafusion`: a kernel as a `ScalarUDF`
+- [x] `moruna-polars`: a kernel as a Polars expression plugin, no kernel logic in the wrapper; `moruna-datafusion`: a kernel as a `ScalarUDF`
 - [x] AD-T9, AD-T10 against the bench `normalise` kernel (after F1.7 merges); S7 closed for the two hosts
-- [x] Both crates depend on `amoru-kernel` plus the host engine only; feature flags per 6.3; coverage; same PR as F1.4 or a follow-up commit on the branch
+- [x] Both crates depend on `moruna-kernel` plus the host engine only; feature flags per 6.3; coverage; same PR as F1.4 or a follow-up commit on the branch
 
 ### F1.6 tasks
 - [x] `bench/` generator: 12 suite datasets and four ad hoc commands, deterministic by seed, local and S3
 - [x] Output names the machine and the generator version; `bench/README.md` documents every dataset, scale and variable
 - [x] 88 tests, 96.2% line coverage
-- [x] The MinIO half runs in CI: the `minio` job now exports `AMORU_S3_BUCKET=amoru-ci` (fixed by the PM after PR #3 merged), so the S3 test no longer skips; the wave 1 gate clause "and MinIO" closes when the next run on `main` is green
+- [x] The MinIO half runs in CI: the `minio` job now exports `MORUNA_S3_BUCKET=moruna-ci` (fixed by the PM after PR #3 merged), so the S3 test no longer skips; the wave 1 gate clause "and MinIO" closes when the next run on `main` is green
 
 ### F1.7 tasks
 - [x] Six kernels with their declared amplification classes; `wide-intermediate` in Python releasing the GIL
@@ -224,7 +224,7 @@ Gate (6.6, wave 3): SO, SI, PL tests pass; S10 and S15 with `FakeSink` throttle;
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
 | F3.1 | `ParquetSource` over local paths and object stores | `component/07-sources` | 07 a to h for Parquet; SO-T1 to T8, T11, T13 to T16; SO-T12 (E1, provisional) | merged (91.7%) |
-| F3.2 | `TensorSource` (safetensors, AMB1) and `PyIteratorSource` | `component/07-sources` (same PR) | 07 tensor and iterator sections; SO-T9; SO-T10 (integration, wave 3; `python`) | merged (same branch) |
+| F3.2 | `TensorSource` (safetensors, MRB1) and `PyIteratorSource` | `component/07-sources` (same PR) | 07 tensor and iterator sections; SO-T9; SO-T10 (integration, wave 3; `python`) | merged (same branch) |
 | F3.3 | `ParquetSink`, `SinkHandle`, commit tracking and resume | `component/08-sinks` | 08 a to h for Parquet, e.5, resume; SI-T1 to T4, T7, T11 to T16; SI-T8 (integration, wave 3) | merged (93.8%) |
 | F3.4 | `TensorSink`, `ArrowIpcSink`, `ReorderBuffer` | `component/08-sinks` (same PR) | 08 e.3, reorder; SI-T5, T9; SI-T10 (integration, wave 3); SI-T6 (E1, skipped and listed) | merged (same branch) |
 | F3.5 | Placement core: queues, accounting, admission, head hot, promotion window, move table | `component/09-placement` | 09 c, d, e.1, e.4, f (promotion and demotion), g; PL-T1 to T4, T8, T9, T11, T19 to T21, T24 | merged (90.8%) |
@@ -238,7 +238,7 @@ Gate (6.6, wave 3): SO, SI, PL tests pass; S10 and S15 with `FakeSink` throttle;
 - [x] SO-T1 to T8, T11, T13 to T16 pass; SO-T12 provisional with host name; every SO-I cited; coverage; PR template
 
 ### F3.2 tasks
-- [x] `TensorSource`: safetensors header parse, mapped bytes, aligned copy only when the offset is unaligned (architecture 2.2 row), AMB1 read; `PyIteratorSource` with `repeatable() == false`
+- [x] `TensorSource`: safetensors header parse, mapped bytes, aligned copy only when the offset is unaligned (architecture 2.2 row), MRB1 read; `PyIteratorSource` with `repeatable() == false`
 - [x] SO-T9 passes; SO-T10 under the `python` feature; coverage; same PR as F3.1
 
 ### F3.3 tasks
@@ -249,7 +249,7 @@ Gate (6.6, wave 3): SO, SI, PL tests pass; S10 and S15 with `FakeSink` throttle;
 - [x] SI-T1 to T4, T7, T11 to T16 pass; SI-T8 closes when `ParquetSource` merges; every SI-I cited; coverage; PR template
 
 ### F3.4 tasks
-- [x] `TensorSink` writing AMB1 and safetensors; `ArrowIpcSink` writing the page-aligned IPC of contracts e.7; `ReorderBuffer` bounded by `ordering.buffer_bytes`
+- [x] `TensorSink` writing MRB1 and safetensors; `ArrowIpcSink` writing the page-aligned IPC of contracts e.7; `ReorderBuffer` bounded by `ordering.buffer_bytes`
 - [x] SI-T5, T9 pass; SI-T10 closes with `TensorSource`; SI-T6 skipped and listed; coverage; same PR as F3.3
 
 ### F3.5 tasks
@@ -285,7 +285,7 @@ Gate (6.6, wave 4): end-to-end with fakes and with real components: S1, S2, S4, 
 | F4.3 | Scheduler checkpoint thread, watermark, `apply_resume_point`, `run_resumed` | `component/10-scheduler` (same PR) | 10 f.11 onward, resume; SC-T14, T15; SC-T16 (integration, wave 4) | merged (same branch) |
 | F4.4 | Controller sizing: prepare, probe, envelope, rule sizer, AIMD, damping, oscillation freeze, breach, state growth, tick bound | `component/11-controller` | 11 c, d, f.1 to f.5; RC-T1 to T8, T11, T15 to T18 | merged (92.6%) |
 | F4.5 | Controller classification, profile store, resume seeding, learned-sizer stub with shadow error | `component/11-controller` (same PR) | 11 f.6 onward, e.3; RC-T9, T10, T14; RC-T13 (E1); RC-T12 (integration, wave 4) | merged (same branch) |
-| F4.6 | Rust facade `amoru-runtime`: lifecycle 4.4, `RunSpec`, report, cancel, mimalloc | `component/12-runtime` | 12 sections for the facade (f.1, f.2, f.7, section l Rust files); the lifecycle of preamble 4.4 fresh and resumed | merged (94.6%); Amoru runs end to end |
+| F4.6 | Rust facade `moruna-runtime`: lifecycle 4.4, `RunSpec`, report, cancel, mimalloc | `component/12-runtime` | 12 sections for the facade (f.1, f.2, f.7, section l Rust files); the lifecycle of preamble 4.4 fresh and resumed | merged (94.6%); Moruna runs end to end |
 | F4.9 | Defects the first real run exposed: the budget arithmetic (the arena was subtracted from the controller's allowance twice, and the facade papered over it with `available / 2`), the arena refusing allocations a region should serve, `ParquetSink` reserving a whole file in arena memory, `budget.disk` never computed, no manifest on a completed run, resume unable to probe | `infra/first-run-defects` | 02 f.1 and e.2, 08 f.1 and f.2, 11 f.1, 12 f.1 and f.7, 03 e.4 | in progress |
 | F4.7 | Wave 4 integration closure with real components | `component/12-runtime` (same PR) or `infra/wave4-integration` | RC-T12 in a container, SC-T16, PL-T17; S1, S2, S4, S5, S6, S11 evidence | todo |
 | F4.8 | Wave 4 gate and report (PM) | `main` | | todo |
@@ -341,21 +341,21 @@ Gate (6.6, wave 5): S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-
 
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
-| F5.1 | `amoru-py` module and `python/amoru` package | `component/12-python` | 12 a to h; PY-T1 (Python side), T2, T4, T5, T6, T8, T9, T14 | todo |
+| F5.1 | `moruna-py` module and `python/moruna` package | `component/12-python` | 12 a to h; PY-T1 (Python side), T2, T4, T5, T6, T8, T9, T14 | todo |
 | F5.2 | Wheel matrix, configuration clamping walk, end-to-end in a container | `component/12-python` (same PR) | 12 section l packaging; PY-T7, PY-T13; PY-T3 and PY-T12 (integration, wave 5) | todo |
-| F5.3 | Bench runner and hand-tuned baselines | `infra/bench` | preamble 6.5 wave 5 part: grid-searched plain loop per kernel, rows per second, host named; `AMORU_BENCH_MORSEL_BYTES` for S12 | todo |
+| F5.3 | Bench runner and hand-tuned baselines | `infra/bench` | preamble 6.5 wave 5 part: grid-searched plain loop per kernel, rows per second, host named; `MORUNA_BENCH_MORSEL_BYTES` for S12 | todo |
 | F5.4 | Engine baseline (Polars streaming, DuckDB UDF) | `infra/bench` (same PR) | preamble 6.5: same kernel, same files, same container, defaults and then the documented memory limit; reported beside the tuned baseline, never a gate | todo |
 | F5.5 | Reference-host campaign | `infra/reference-host` | every test tagged `(reference host, E1)` run on the Griot server in Nairobi: DS-T3, AD-T11, RE-T11, SO-T12, PL-T13, SC-T12, RC-T13, PY-T10, PY-T11; the device and GDS tests (AD-T3, RE-T5, SI-T6) listed as skipped by id | blocked (D-B3: agent access to the reference host) |
 | F5.6 | Wave 5 gate and report (PM) | `main` | | todo |
 
 ### F5.1 tasks
 - [ ] Environment facts from 12 section l verified (maturin, the four interpreters, pyo3-arrow)
-- [ ] `amoru-py` `Cargo.toml` enables `python` and, on Linux, `uring` by default (preamble 6.3); the wave 0 stub left it at `default = []`
-- [ ] `amoru.run(source, kernels, sink, ...)` and the source, kernel and sink wrappers; exception mapping from `AmoruError`; the report object; `KeyboardInterrupt` forwarded as cancel; GIL refusal unless `python.allow_gil`; no pandas dependency; re-entrancy
+- [ ] `moruna-py` `Cargo.toml` enables `python` and, on Linux, `uring` by default (preamble 6.3); the wave 0 stub left it at `default = []`
+- [ ] `moruna.run(source, kernels, sink, ...)` and the source, kernel and sink wrappers; exception mapping from `MorunaError`; the report object; `KeyboardInterrupt` forwarded as cancel; GIL refusal unless `python.allow_gil`; no pandas dependency; re-entrancy
 - [ ] PY-T1, T2, T4, T5, T6, T8, T9, T14 pass; every PY-I cited; Python tests at or above 90% coverage (`ruff` and `pytest --cov` in the gate); PR template
 
 ### F5.2 tasks
-- [ ] CI wheel matrix 3.13, 3.13t, 3.14, 3.14t (PY-T7); version-specific wheels, no abi3; `amoru-py` enables `python` and, on Linux, `uring`
+- [ ] CI wheel matrix 3.13, 3.13t, 3.14, 3.14t (PY-T7); version-specific wheels, no abi3; `moruna-py` enables `python` and, on Linux, `uring`
 - [ ] PY-T13 walks the whole preamble section 5 table with one out-of-range value per row, checks the clamp owner and the report note
 - [ ] PY-T3 in the container job; PY-T12 three-stage resume end to end with real components (G-I12)
 
@@ -379,7 +379,7 @@ Gate (6.6, wave 5): S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-
 
 ---
 
-## E6. Release readiness: a production-ready `amoru`
+## E6. Release readiness: a production-ready `moruna`
 
 No preamble gate; this epic is what "done" means beyond the waves. Nothing here changes a design document without going through the escalation path.
 
@@ -387,7 +387,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 |---|---|---|---|---|
 | F6.1 | Decisions and document status closed | `main` | `DECISIONS.md` Q2 to Q7, Q9, Q10 decided or their assumptions explicitly accepted by Brackly; every SDD HANDOFF-READY; preamble section 8 traceability table with no gap row | todo |
 | F6.2 | Sufficiency sign-off | `main` | S1 to S17 each cited to the test and the host that closed it, or listed as skipped by id with Brackly's acceptance (device and GDS parts of S14) | todo |
-| F4.10 | A user's first program hung for ever. **The PM diagnosed this as "the Python boundary is a thousand times too slow" and that was wrong**: the boundary is fine, at one crossing per morsel and about 90 ns per row of genuine interpreter work. The cause was two defects with nothing to do with Python: `ParquetSink` passed a schemeless path through, which `amoru-sinks` reads as a local directory and the reactor reads as a bare S3 key, so every write failed; and `sink_drive::finish` took the exit claim and then handed its error to `policy::terminate`, which claims again and published nothing, so any sink failing at finish hung the run silently in any language. 200,000 rows now runs in 0.11 s of `amoru.run` | `infra/python-kernel-speed` | 12 f.3, 10 f.6; PY-T16 | merged 2026-09-23 |
+| F4.10 | A user's first program hung for ever. **The PM diagnosed this as "the Python boundary is a thousand times too slow" and that was wrong**: the boundary is fine, at one crossing per morsel and about 90 ns per row of genuine interpreter work. The cause was two defects with nothing to do with Python: `ParquetSink` passed a schemeless path through, which `moruna-sinks` reads as a local directory and the reactor reads as a bare S3 key, so every write failed; and `sink_drive::finish` took the exit claim and then handed its error to `policy::terminate`, which claims again and published nothing, so any sink failing at finish hung the run silently in any language. 200,000 rows now runs in 0.11 s of `moruna.run` | `infra/python-kernel-speed` | 12 f.3, 10 f.6; PY-T16 | merged 2026-09-23 |
 | F4.11 | **A user's first program exceeds its own budget by 13 percent.** Ceiling 536,870,912 bytes, peak anonymous 606,797,824, `peak_fraction_of_ceiling` 1.13, measured from a wheel with `budget="512MiB"` and a Python kernel. S1 says the budget is never exceeded and G-I1 says it at every sample, so this is the first criterion of the whole design failing on the first program anyone would write. The runtime reports it honestly rather than hiding it, which is how it was found. Architecture section 8 already concedes that a kernel's own allocations are observed rather than governed, with the reserve absorbing them and the cgroup containing them, so the question is whether 10 percent of reserve is simply too little for a Python kernel, whether the controller should have reacted within a morsel and did not, or whether S1 needs restating to match what section 8 admits. It is the last blocker before a wheel is worth publishing | not started | S1, G-I1, G-I8, 11 f.1 and f.7, architecture section 8, E13 | `infra/budget-overshoot` | merged 2026-09-23: the PM's framing was wrong twice. The controller was not blind and it did react, shedding a worker on every record with the morsel target already at its floor, but the inequality it fed compared the kernel's measured anonymous growth against the arena's capacity, which the arena already occupies in full, so the bound was about 1.2 times the ceiling by construction. f.3 is now two inequalities and the second bounds the quantity S1 measures. The same job: refused at 512 MiB and 1 GiB with a diagnostic naming morsel, stage, footprint and budget; 0.55 of the ceiling at 2 GiB; 0.40 at 4 GiB; the Rust kernel unchanged at 0.92 |
 | F4.12 | Two defects the budget work uncovered, both outside its remit. **`Sample::anon_bytes` on Apple hosts returns resident memory including file-backed pages, against its own comment**, so every S1 figure measured on a developer host is inflated by the mmapped source and the loaded dylibs, and the run-to-run spread we treated as noise is partly that. And **the facade gives the arena the whole allowance**, leaving the ten percent reserve as the only governed headroom for everything outside it, about 20 MiB of which the runtime's own reader and writer buffers already take at a 512 MiB ceiling: that, and not the job's real cost, is why an ordinary job is refused below about 2 GiB | `infra/arena-share-and-anon` | 03 DS-I4 and probes, 12 f.1; S1 | `infra/arena-share-and-anon` | merged 2026-09-23. The sampler correction moved the project's figures **mostly up**, not down: a mapped file was inflating them but compressed anonymous pages were missing from them, and the second was larger, so the 2 GiB figures the PM had been quoting were understated by 22 and 34 points. `anon_bytes` is now `phys_footprint` and `file_bytes` is `external`, proven by measuring all three routes on one process at one moment, and DS-T13 fails by 268 MB against the old code. The arena now takes `2/(2 + a_anon)` of the allowance rather than all of it |
 | F4.13 | The sink asked the arena for 129 MiB and was charged a 256 MiB class, which was the whole reason an ordinary job would not fit in 512 MiB; and the controller divided **absolute** retention by bytes in flight, so a Python job's fixed 170 MB of interpreter overhead was charged per morsel byte and the refusal threshold **rose as the morsel shrank**, which is the opposite of a control loop | `infra/sink-class-and-fit` | 08 f.1, 11 f.3 and f.7, 12 f.1 | merged 2026-09-23. The sink takes one whole size class with the footer inside it; the arena floor is 176 MiB, measured rather than guessed, after the byte-exact 160 MiB failed. The fit is two terms, with the constant read from `mem_anon_before` and the slope from the growth, chosen over least squares on the whole reading because within a run the bytes in flight do not vary and the two terms are not identifiable. Held-out mean relative error 0.42 against the one-term form's 1.76, and it bounds the next morsel's peak 117 times in 144 against 45 |
@@ -409,7 +409,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 ### F6.3 tasks
 - [ ] Namespace checks run and recorded (Q1 remainder); names reserved where needed
 - [ ] `CHANGELOG.md`; `Cargo.toml` and `pyproject.toml` versions; release workflow builds wheels for the matrix and publishes on a tag with trusted publishing
-- [ ] PY-O1 decided; if the assumption stands, the `amoru-cuda` wheel is documented as not shipped in `0.1.0`
+- [ ] PY-O1 decided; if the assumption stands, the `moruna-cuda` wheel is documented as not shipped in `0.1.0`
 
 ### F6.5 tasks
 - [x] `cargo audit` and `cargo deny check advisories licenses bans sources` green; allow list is Apache-2.0, MIT, BSD-2, BSD-3, ISC, Zlib, Unicode-3.0 and Apache-2.0 WITH LLVM-exception, with two documented exceptions (BSL-1.0 via polars, bzip2-1.0.6 via datafusion); `[graph] targets` names the four supported platforms, which removes the CC0 crate honestly rather than by exception
@@ -418,7 +418,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 
 ### F6.6 tasks
 - [ ] E7 documentation epic complete and published
-- [ ] `v0.1.0` tagged from a green `main`; release notes; wheels visible on PyPI; `pip install amoru` works on a clean 3.13 and 3.14 interpreter
+- [ ] `v0.1.0` tagged from a green `main`; release notes; wheels visible on PyPI; `pip install moruna` works on a clean 3.13 and 3.14 interpreter
 - [ ] `README.md` status updated; this board's "Now" section says released
 
 ---
@@ -430,10 +430,10 @@ Written after wave 5 so it describes what shipped, from the design documents and
 | Id | Feature | Branch | Scope | Status |
 |---|---|---|---|---|
 | F7.1 | Docs site scaffold and CI | `docs/site` | `docs/` as an mdBook (Rust-native, no Node); a CI job that builds it, checks links and runs the em-dash and no-tabs conventions; published from `main` to GitHub Pages | merged |
-| F7.2 | User guide | `docs/user-guide` | install from a wheel per interpreter; `amoru.run` walkthrough; sources (Parquet local and object store, safetensors, NumPy, Python iterator) and sinks (Parquet, tensor, Arrow IPC); ordering and error policies; budgets and the two environment-variable families; reading the run report and the trace; cancellation and resume (`resume=`, `checkpoint.*`) | todo |
-| F7.3 | API reference | `docs/api` | Python: every public name in `python/amoru` from docstrings (the module's docstrings are the source); Rust: `cargo doc` for `amoru-kernel` with every trait's contract sentence from preamble 1.3 on its doc comment, published beside the book; the configuration table of preamble section 5 rendered with owner and range per row | todo |
-| F7.4 | Kernel author guide | `docs/kernels` | a Rust kernel against `amoru-kernel` alone; the same kernel as a Polars plugin and a DataFusion function (S7); a Python kernel, GIL and free-threading, what releases the GIL; stateful kernels, instances, `ResumePolicy`; hints and `footprint`; the zero-copy rules and what breaks them (G-I2, CT-I4) | todo |
-| F7.5 | Operator and hosting guide | `docs/hosting` | one page per host class of architecture section 6: laptop, cgroup v2 container and Kubernetes pod (memory.high, cpu.max, io_uring seccomp), Databricks single node (explicit budget, E7), Griot Cloud pod profile (`AMORU_HOST_PROFILE`, durable staging); staging disk sizing; profiles directory; diagnosing a `Budget` termination; what the direct paths need and how the report names the path taken (G-I7) | todo |
+| F7.2 | User guide | `docs/user-guide` | install from a wheel per interpreter; `moruna.run` walkthrough; sources (Parquet local and object store, safetensors, NumPy, Python iterator) and sinks (Parquet, tensor, Arrow IPC); ordering and error policies; budgets and the two environment-variable families; reading the run report and the trace; cancellation and resume (`resume=`, `checkpoint.*`) | todo |
+| F7.3 | API reference | `docs/api` | Python: every public name in `python/moruna` from docstrings (the module's docstrings are the source); Rust: `cargo doc` for `moruna-kernel` with every trait's contract sentence from preamble 1.3 on its doc comment, published beside the book; the configuration table of preamble section 5 rendered with owner and range per row | todo |
+| F7.4 | Kernel author guide | `docs/kernels` | a Rust kernel against `moruna-kernel` alone; the same kernel as a Polars plugin and a DataFusion function (S7); a Python kernel, GIL and free-threading, what releases the GIL; stateful kernels, instances, `ResumePolicy`; hints and `footprint`; the zero-copy rules and what breaks them (G-I2, CT-I4) | todo |
+| F7.5 | Operator and hosting guide | `docs/hosting` | one page per host class of architecture section 6: laptop, cgroup v2 container and Kubernetes pod (memory.high, cpu.max, io_uring seccomp), Databricks single node (explicit budget, E7), Griot Cloud pod profile (`MORUNA_HOST_PROFILE`, durable staging); staging disk sizing; profiles directory; diagnosing a `Budget` termination; what the direct paths need and how the report names the path taken (G-I7) | todo |
 | F7.6 | Architecture and internals for contributors | `docs/internals` | the component map and waves from the preamble; how a morsel moves (tiers, the move table, staging segments, the manifest); how the controller decides (probe, envelope, AIMD, classification); how to read an SDD and where each crate's tests map to its ids; the escalation path and the agent prompts; benchmark methodology and how to reproduce a figure on any host | todo |
 | F7.7 | Tutorials and examples | `docs/tutorials`, `examples/` | end-to-end runnable examples with generated data: score a Parquet table with a NumPy kernel; embed a text column to a tensor; kill and resume a run; run inside a container with a budget; each example is a CI smoke test | todo |
 | F7.8 | Documentation gate and release notes (PM) | `main` | every page reviewed against its cited sections; bug issues filed for mismatches; `CHANGELOG.md` and release notes for `v0.1.0` drafted from the wave reports | todo |
@@ -447,7 +447,7 @@ Written after wave 5 so it describes what shipped, from the design documents and
 - [ ] Run report and trace pages show a real report from the wave 5 run with the host named
 
 ### F7.3 tasks
-- [ ] Python docstrings complete for every public name (checked by a docstring-coverage step in the gate); Rust `cargo doc --no-deps` warning-free with `#![deny(missing_docs)]` on `amoru-kernel`
+- [ ] Python docstrings complete for every public name (checked by a docstring-coverage step in the gate); Rust `cargo doc --no-deps` warning-free with `#![deny(missing_docs)]` on `moruna-kernel`
 - [ ] Configuration table rendered from one source (the preamble) so it cannot drift
 
 ### F7.4 tasks
@@ -478,7 +478,7 @@ Open items the PM found while reading, routed per preamble section 7. Ids: `N-` 
 
 | Id | What | Where | Who decides | Status |
 |---|---|---|---|---|
-| N-1 | Preamble 6.2 listed `tracing` as used by "all", contradicting 01 section a and CT-T12 (`amoru-kernel` depends on `arrow`, `dlpark`, `thiserror`, `blake3` only) | preamble 6.2 | PM (documentation, no interface change) | fixed on `infra/pm-wave0-prep` |
+| N-1 | Preamble 6.2 listed `tracing` as used by "all", contradicting 01 section a and CT-T12 (`moruna-kernel` depends on `arrow`, `dlpark`, `thiserror`, `blake3` only) | preamble 6.2 | PM (documentation, no interface change) | fixed on `infra/pm-wave0-prep` |
 | N-2 | CT-T11 asserts "under 1 ms" and is untagged; the gate rule labels a timing figure measured off the reference host provisional, and a hard bound in a unit test is flaky on CI | 01 k, CT-T11 | PM (under delegation, 2026-09-22) | fixed on `infra/pm-wave0-prep`: tagged, timing provisional off the reference host, structural half runs everywhere |
 | N-3 | Contracts d.12 cites "(DS, `Config` error)" without a section id; an executor may only read cited sections | 01 d.12, 03 (the guarantee table near line 168) | PM (under delegation) | fixed: cites 03 e.4 |
 | N-4 | CONTRIBUTING and the preamble say one pull request per component; a session-sized feature plan needs several sessions per large component (placement, scheduler, contracts) | this board | PM | decided, D-B1 |
@@ -514,7 +514,7 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | N-3 contracts d.12 citation | cites 03 e.4 | 01 d.12 |
 | 2026-09-22 | D-B1, D-B2 | as recommended | this board, preamble 6.7 |
 | 2026-09-22 | E1-env-1 | CI is the gate host for docker-dependent jobs | this board |
-| 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across amoru-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
+| 2026-09-22 | E2, arrow major (raised by F0.1) | one arrow in the workspace: arrow and parquet pinned to the 59 line, the version datafusion 55.1.0 and pyo3-arrow 0.19.0 require, because S7 and S13 need one RecordBatch type across moruna-kernel, the bridges and the Python surface | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | E2, object_store major (raised by F0.1) | pinned to the 0.13 line, the version parquet 59 and datafusion 55.1 use, for the same one-type reason | preamble 6.2, root Cargo.toml (F0.1 PR) |
 | 2026-09-22 | one pull request per component, amended | a component may land in more than one pull request when an early merge unblocks other executors; the whole-SDD review and the component gate happen on the last one; the contracts crate merges before its testkit so arena, discovery and trace start a session earlier | preamble 6.7, CONTRIBUTING, this board's start ladder |
 | 2026-09-22 | bench E2 route, dataset naming, kernels PR (raised by F1.6) | preamble 6.5 is the bench agent's d.2, so the PM may approve a bench-only crate; the hand-rolled parser and RNG stand rather than churn them; dataset names live in `bench/README.md` as the reference; F1.7 kernels get their own branch and pull request | preamble 6.2 and 6.5, this board |
@@ -523,4 +523,4 @@ Every item the preamble routes to the human that the PM decided under the delega
 | 2026-09-22 | twelve discovery and trace findings (raised by F1.2, F1.3) | `StageReport` gains state_bytes_max and state_growth; `RunReport` gains overflow_failed and late_records; `LimitsSummary` defined; TR-I3 says compute; every libc call in probes.rs behind safe wrappers; the macOS fallback named; memory.peak is a floor, not the peak, because it counts page cache; a Present guarantee without its feature and durable_staging without a directory are Config errors; mimalloc recorded as component 4's dev-dependency with its measurement | 03-discovery.md, 04-trace.md, preamble 6.2 |
 | 2026-09-22 | F7.1 notes: introduction pages, host-class pages (raised by F7.1) | introduction pages stay with F7.2 (same audience); the hosting guide keeps a GPU page marked described-not-verified (E1) and omits RDMA (E11, not a v1 host); Pages stays off until Brackly enables it, because publishing outward is outside the delegation | this board, F7.5 and F7.8 tasks |
 | 2026-09-22 | parallelism rule (Brackly) | executors start when their dependencies are merged, not when their wave opens; one agent at a time only where a dependency forces it; separate worktrees | preamble 6.6, pm.md section 2, this board's start ladder |
-| 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `amoru-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |
+| 2026-09-22 | preamble 6.3 reading (raised by F0.1) | `moruna-py` enables `python` and `uring` as the shipped module's features, set by F5.1 when the crate has code; the wave 0 stub keeps `default = []` so pyo3 never builds in `cargo build --workspace` | this board, F5.1 tasks |

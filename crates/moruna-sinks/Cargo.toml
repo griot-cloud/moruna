@@ -1,0 +1,27 @@
+[package]
+name = "moruna-sinks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna sinks"
+
+# The crates 08 d.2 names and this crate uses. The reactor and the arena arrive as
+# `Arc<dyn Reactor>` and `Arc<dyn Allocator>`, so neither is a dependency (preamble 1.3).
+[dependencies]
+moruna-kernel = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+moruna-testkit = { workspace = true }
+safetensors = { workspace = true }
+bytes = { workspace = true }
+
+[features]
+default = []

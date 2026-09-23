@@ -1,10 +1,10 @@
-# Amoru SDD 05: Kernel adapters (`amoru-adapters`)
+# Moruna SDD 05: Kernel adapters (`moruna-adapters`)
 
 **Document type:** software design document, component 5 of 12
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
-**Parent:** `architecture/amoru-runtime-design.md` section 5.3 (Python kernels, portability), 6 (inside another engine); decisions D4, D9; criteria S7, S8, S13; global invariants G-I2, G-I9
+**Parent:** `architecture/moruna-runtime-design.md` section 5.3 (Python kernels, portability), 6 (inside another engine); decisions D4, D9; criteria S7, S8, S13; global invariants G-I2, G-I9
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.3 (`Allocator::contains`, `AllocStats`), d.4, d.7 (`Kernel`, `KernelState`, `KernelHints`, `ResumePolicy`), e.2, e.6
-**Component location:** `crates/amoru-adapters` (the Python adapter, feature `python`); `crates/amoru-polars` and `crates/amoru-datafusion` (the two engine bridges, thin crates, preamble 6.1)
+**Component location:** `crates/moruna-adapters` (the Python adapter, feature `python`); `crates/moruna-polars` and `crates/moruna-datafusion` (the two engine bridges, thin crates, preamble 6.1)
 **Consumes:** contracts (1) only. **Consumed by:** python surface (12), scheduler (10, as `Kernel` objects), external Polars and DataFusion users
 
 **Decisions worth your eye:** (1) a Python kernel's output that was allocated by pyarrow or Torch on the host is copied once into the arena at the boundary, counted as a boundary copy, because downstream DMA needs arena buffers; device tensors are wrapped, not copied; (2) under a GIL build the adapter serialises Python kernels with its own mutex rather than relying on the interpreter, so the scheduler's accounting sees the serialisation; (3) a Python kernel's fingerprint is the qualified name plus a hash of its source text, so editing the function invalidates its profile; (4) a stateful Python kernel's state is whatever `setup` returned, passed back to `__call__` explicitly, so the adapter never copies or clones Python objects to make instances.
@@ -45,16 +45,16 @@ It refuses to know: scheduling (which worker runs what); sizing; anything about 
 
 **AD-I5. Deleters attach.** A `ManagedTensor` or Arrow buffer whose bytes are owned by a Python object is dropped by first attaching to the interpreter, from whatever thread drops it.
 
-**AD-I6. Bridges are pure wrappers.** `amoru-polars` and `amoru-datafusion` contain no kernel logic; each converts its host's batch representation to `Payload` and back, calls `Kernel::apply` with `NoState`, and returns. Upholds S7.
+**AD-I6. Bridges are pure wrappers.** `moruna-polars` and `moruna-datafusion` contain no kernel logic; each converts its host's batch representation to `Payload` and back, calls `Kernel::apply` with `NoState`, and returns. Upholds S7.
 
-**AD-I7. Exceptions become errors with context.** A Python exception in `apply` becomes `AmoruError::Kernel { stage, seq, msg, features }` with `msg` exactly `"<type>: <message>\n<traceback>"` (the exception's qualified type name, `str(exc)`, a newline, then `traceback.format_exception` joined); the worker never sees a panic. The same format is used for an exception in `setup`, `checkpoint`, `restore` or `footprint`.
+**AD-I7. Exceptions become errors with context.** A Python exception in `apply` becomes `MorunaError::Kernel { stage, seq, msg, features }` with `msg` exactly `"<type>: <message>\n<traceback>"` (the exception's qualified type name, `str(exc)`, a newline, then `traceback.format_exception` joined); the worker never sees a panic. The same format is used for an exception in `setup`, `checkpoint`, `restore` or `footprint`.
 
 ## d. Interfaces
 
 ### d.1 Exposed
 
 ```rust
-// crate amoru-adapters, feature "python"
+// crate moruna-adapters, feature "python"
 pub struct PyKernelSpec {
     pub callable: pyo3::Py<pyo3::PyAny>,    // the plain callable (stateless) or the class instance (stateful), b
     pub stateful: bool,
@@ -84,16 +84,16 @@ impl PyKernel {
 }
 impl Kernel for PyKernel { /* contracts d.7; kind = Stateless or Stateful { max_instances: spec.instances } */ }
 
-/// `GilState { FreeThreaded, Serialised }` is `amoru_kernel::GilState` (contracts d.7), the type the report carries.
-pub use amoru_kernel::GilState;
+/// `GilState { FreeThreaded, Serialised }` is `moruna_kernel::GilState` (contracts d.7), the type the report carries.
+pub use moruna_kernel::GilState;
 
 pub fn python_gil_enabled() -> bool;        // sys._is_gil_enabled(); true on any interpreter without the attribute (f.4)
 pub fn python_build_info() -> String;       // version, free-threaded flag, for the report
 
-// crate amoru-polars
+// crate moruna-polars
 pub fn polars_plugin<K: Kernel>(kernel: K) -> impl Fn(&[polars::prelude::Series]) -> polars::prelude::PolarsResult<polars::prelude::Series>;
 
-// crate amoru-datafusion
+// crate moruna-datafusion
 pub fn datafusion_udf<K: Kernel>(kernel: K, name: &str) -> datafusion::logical_expr::ScalarUDF;
 ```
 
@@ -101,7 +101,7 @@ pub fn datafusion_udf<K: Kernel>(kernel: K, name: &str) -> datafusion::logical_e
 
 ### d.2 Consumed
 
-`amoru_kernel::{Kernel, KernelKind, KernelHints, KernelState, NoState, InitCtx, ResumePolicy, GilState, Payload, PayloadSpec, ManagedTensor, Fingerprint, Allocator, AllocStats, AmoruError}`; `pyo3` (0.28+, free-threaded default), `pyo3-arrow` (RecordBatch ↔ `pyarrow.RecordBatch` via C Data Interface), `dlpark` (DLPack capsules); `polars` in `amoru-polars` and `datafusion` in `amoru-datafusion`.
+`moruna_kernel::{Kernel, KernelKind, KernelHints, KernelState, NoState, InitCtx, ResumePolicy, GilState, Payload, PayloadSpec, ManagedTensor, Fingerprint, Allocator, AllocStats, MorunaError}`; `pyo3` (0.28+, free-threaded default), `pyo3-arrow` (RecordBatch ↔ `pyarrow.RecordBatch` via C Data Interface), `dlpark` (DLPack capsules); `polars` in `moruna-polars` and `datafusion` in `moruna-datafusion`.
 
 ## e. Data model, formats and state machines
 
@@ -189,7 +189,7 @@ Python tests run under both a GIL and a free-threaded interpreter in CI (matrix)
 
 **AD-T8 fingerprint_source.** Editing one character of the kernel's source changes the fingerprint; same source, different decorator arg, different fingerprint. e.4.
 
-**AD-T9 polars_bridge.** (integration, closes in wave 1) The `normalise` Rust kernel from the bench agent runs as a Polars plugin and inside Amoru with identical output on the same input. AD-I6, S7.
+**AD-T9 polars_bridge.** (integration, closes in wave 1) The `normalise` Rust kernel from the bench agent runs as a Polars plugin and inside Moruna with identical output on the same input. AD-I6, S7.
 
 **AD-T10 datafusion_bridge.** (integration, closes in wave 1) Same for DataFusion. AD-I6, S7.
 
@@ -199,7 +199,7 @@ Python tests run under both a GIL and a free-threaded interpreter in CI (matrix)
 
 ## l. Implementation notes for the agent
 
-Files: `crates/amoru-adapters/src/lib.rs`, `src/python/{mod.rs, kernel.rs (f.1, f.2, d.1 `PyKernel`), state.rs (e.1 `PyState`, f.7), cross.rs (e.2, e.3), copy.rs (f.3), gil.rs (f.4), fingerprint.rs (e.4), tensor_obj.rs (the `__dlpack__` class), ctx.rs (the `ctx` object)}`; `crates/amoru-polars/src/lib.rs` (f.5); `crates/amoru-datafusion/src/lib.rs` (f.6). `unsafe` permitted in `cross.rs` (C Data Interface and DLPack capsule handling) with `// SAFETY:` citing the Arrow and DLPack ownership rules; nowhere else in these three crates outside tests (E9).
+Files: `crates/moruna-adapters/src/lib.rs`, `src/python/{mod.rs, kernel.rs (f.1, f.2, d.1 `PyKernel`), state.rs (e.1 `PyState`, f.7), cross.rs (e.2, e.3), copy.rs (f.3), gil.rs (f.4), fingerprint.rs (e.4), tensor_obj.rs (the `__dlpack__` class), ctx.rs (the `ctx` object)}`; `crates/moruna-polars/src/lib.rs` (f.5); `crates/moruna-datafusion/src/lib.rs` (f.6). `unsafe` permitted in `cross.rs` (C Data Interface and DLPack capsule handling) with `// SAFETY:` citing the Arrow and DLPack ownership rules; nowhere else in these three crates outside tests (E9).
 
 PyO3: modules declare `gil_used = false` (0.28 default); use `Python::attach` and `Python::detach`; never hold `Python<'py>` across the boundary copy.
 
@@ -227,4 +227,4 @@ Two items recorded here because this is the crate they land in.
 
 **AD-O1. Allocator interposition (E13).** Today a Python kernel's own allocations (NumPy arrays, Torch tensors made inside `apply`) are outside the arena: the sampler sees them, the controller sizes around them, the reserve absorbs mistakes, and the cgroup is the containment (architecture section 8, "observed, not governed"). NumPy (`PyDataMem_SetHandler`) and PyTorch (`CUDAPluggableAllocator`, and the host allocator hooks) both allow the allocator to be replaced. Pointing them at the arena would make kernel-internal allocations count against the budget and fail cleanly at the line instead of being observed after the fact. Deferred because it changes what the kernel author's libraries do underneath them, which needs its own design and its own opt-in; the seam is `Allocator` (contracts d.3), and nothing in v1 precludes it.
 
-**AD-O2. `AmoruMemoryPool` for the DataFusion bridge.** DataFusion operators reserve memory from a `MemoryPool`; a DataFusion-bridged kernel running inside Amoru currently reserves from DataFusion's own pool, invisible to the budget. An implementation of DataFusion's `MemoryPool` trait over the arena (`try_grow` becomes an arena reservation against the host budget; a refusal makes the operator spill, which is DataFusion's existing behaviour) closes that gap for the one engine whose accounting contract makes it possible. Small; Phase 7.
+**AD-O2. `MorunaMemoryPool` for the DataFusion bridge.** DataFusion operators reserve memory from a `MemoryPool`; a DataFusion-bridged kernel running inside Moruna currently reserves from DataFusion's own pool, invisible to the budget. An implementation of DataFusion's `MemoryPool` trait over the arena (`try_grow` becomes an arena reservation against the host budget; a refusal makes the operator spill, which is DataFusion's existing behaviour) closes that gap for the one engine whose accounting contract makes it possible. Small; Phase 7.

@@ -8,7 +8,7 @@ Run them from ``bench/python``::
 The amplification test over the generated dataset needs the dataset. Write it
 first::
 
-    cargo run --release -p amoru-bench -- suite --scale small --local-only --out bench/data
+    cargo run --release -p moruna-bench -- suite --scale small --local-only --out bench/data
 
 With the file absent the test is skipped with that reason printed, never failed,
 which is the same rule the generator's S3 test follows.
@@ -25,13 +25,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from amoru_bench_kernels import wide_intermediate as kernel
+from moruna_bench_kernels import wide_intermediate as kernel
 
 #: The band preamble 6.5's "about 20" is taken to mean, the same band the Rust
 #: side declares in ``WideIntermediate::hints``.
 BAND = (15.0, 25.0)
 
-#: Where ``amoru-bench suite`` writes by default: ``bench/data``, two levels up.
+#: Where ``moruna-bench suite`` writes by default: ``bench/data``, two levels up.
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
 #: The dataset ``bench/README.md`` pairs with this kernel.
@@ -139,7 +139,7 @@ def test_the_amplification_on_the_generated_wide_mixed_is_about_twenty():
     if not path.exists():
         pytest.skip(
             f"{path} does not exist; write it with "
-            "`cargo run --release -p amoru-bench -- suite --scale small --local-only --out bench/data`"
+            "`cargo run --release -p moruna-bench -- suite --scale small --local-only --out bench/data`"
         )
     table = pyarrow_parquet.read_table(path)
     columns = {

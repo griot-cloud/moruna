@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::amb1::TensorSpec;
+use crate::mrb1::TensorSpec;
 use crate::error::Result;
 
 /// One tensor's bytes, ready for the `safetensors` writer.
@@ -43,7 +43,7 @@ impl safetensors::View for OwnedView {
 /// header is byte stable.
 pub fn provenance(dataset: &str, seed: u64) -> String {
     format!(
-        "generator=amoru-bench version={} format={} dataset={dataset} seed={seed}",
+        "generator=moruna-bench version={} format={} dataset={dataset} seed={seed}",
         crate::GENERATOR_VERSION,
         crate::GENERATOR_FORMAT
     )
@@ -63,7 +63,7 @@ pub fn encode(dataset: &str, specs: &[TensorSpec], seed: u64) -> Result<Vec<u8>>
         ));
     }
     let mut info: HashMap<String, String> = HashMap::with_capacity(1);
-    info.insert("amoru_bench".to_string(), provenance(dataset, seed));
+    info.insert("moruna_bench".to_string(), provenance(dataset, seed));
     Ok(safetensors::serialize(tensors, Some(info))?)
 }
 
@@ -109,8 +109,8 @@ mod tests {
         let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("read_metadata");
         let info = metadata.metadata().as_ref().expect("metadata present");
         assert_eq!(info.len(), 1, "more than one key is not byte stable");
-        let line = info.get("amoru_bench").expect("provenance");
-        assert!(line.contains("amoru-bench"), "{line}");
+        let line = info.get("moruna_bench").expect("provenance");
+        assert!(line.contains("moruna-bench"), "{line}");
         assert!(line.contains("dataset=embed-weights"), "{line}");
         assert!(line.contains("seed=99"), "{line}");
         assert!(line.contains(crate::GENERATOR_VERSION), "{line}");

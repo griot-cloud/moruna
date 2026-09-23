@@ -1,0 +1,25 @@
+[package]
+name = "moruna-arena"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna memory arena"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+[features]
+# `test-shim` is the counting shim AR-T3 reads (section k). It is on by default so that
+# AR-T3 runs in the `cargo test --workspace` gate the preamble's section 6.7 requires; it
+# adds two atomic counters and one accessor and nothing else.
+default = ["test-shim"]
+cuda = ["dep:cudarc"]
+rdma = []
+test-shim = []

@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::amb1::TensorSpec;
+use crate::mrb1::TensorSpec;
 use crate::dataset::{Dataset, DatasetKind};
 use crate::dtype::DType;
 use crate::error::{BenchError, Result};
@@ -65,9 +65,9 @@ pub struct Plan {
 /// The usage text, printed by `help` and beside every usage error.
 pub fn usage() -> String {
     format!(
-        "amoru-bench, the Amoru benchmark data generator (preamble 6.5)
+        "moruna-bench, the Moruna benchmark data generator (preamble 6.5)
 
-usage: amoru-bench <command> [options]
+usage: moruna-bench <command> [options]
 
 commands:
   suite                     write every dataset of the suite
@@ -75,7 +75,7 @@ commands:
   list                      print the suite without writing
   parquet                   write one Parquet file from the options below
   safetensors               write one safetensors file from the options below
-  amb1                      write one AMB1 tensor file (contracts e.4)
+  mrb1                      write one MRB1 tensor file (contracts e.4)
   kernel <name>             run one kernel over its dataset and report the
                             amplification; names: {kernels}
   version                   print the generator version and this machine
@@ -107,12 +107,12 @@ kernel options:
   --weights <file>          the safetensors weights embed-score loads (default
                             <out>/{weights}.safetensors)
 
-tensor options (safetensors and amb1):
+tensor options (safetensors and mrb1):
   --dtype <name>            one of i8 i16 i32 i64 u8 u16 u32 u64 f16 bf16 f32 f64 bool
   --shape <d0,d1,..>        up to 8 dimensions; empty is a scalar
   --tensor <name:dtype:shape>  one tensor of a safetensors file, repeatable
 
-The S3 compatible half writes the same files to {}, under AMORU_S3_PREFIX
+The S3 compatible half writes the same files to {}, under MORUNA_S3_PREFIX
 (default bench). With any of those unset the upload is skipped with a note.",
         crate::s3::REQUIRED.join(", "),
         kernels = crate::kernels::KERNEL_NAMES.join(", "),
@@ -340,7 +340,7 @@ pub fn parse(args: &[String]) -> Result<Plan> {
                 kind: DatasetKind::SafeTensors(specs),
             }])
         }
-        "amb1" => {
+        "mrb1" => {
             let dataset_name = name.clone().unwrap_or_else(|| "adhoc-tensor".to_string());
             let spec = single_tensor(&mut flags, &dataset_name)?;
             Action::Write(vec![Dataset {
@@ -376,7 +376,7 @@ pub fn parse(args: &[String]) -> Result<Plan> {
         }
         other => {
             return Err(BenchError::Usage(format!(
-                "unknown command {other}; run amoru-bench help"
+                "unknown command {other}; run moruna-bench help"
             )));
         }
     };
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(plan("version").action, Action::Version);
         assert_eq!(plan("-V").action, Action::Version);
         let text = usage();
-        assert!(text.contains("AMORU_S3_ENDPOINT"), "{text}");
+        assert!(text.contains("MORUNA_S3_ENDPOINT"), "{text}");
         assert!(text.contains("--row-group-rows"), "{text}");
         assert!(text.contains("contracts e.4"), "{text}");
     }
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn tensors_are_parsed_from_one_pair_or_from_repeated_specs() {
-        match plan("amb1 --name t --dtype i16 --shape 2,3,4").action {
+        match plan("mrb1 --name t --dtype i16 --shape 2,3,4").action {
             Action::Write(datasets) => match &datasets[0].kind {
                 DatasetKind::Amb1(spec) => {
                     assert_eq!(spec.dtype, DType::I16);
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_scalar_shape_and_the_tensor_defaults() {
-        match plan("amb1 --shape=").action {
+        match plan("mrb1 --shape=").action {
             Action::Write(datasets) => match &datasets[0].kind {
                 DatasetKind::Amb1(spec) => assert!(spec.shape.is_empty()),
                 other => panic!("{other:?}"),
@@ -634,12 +634,12 @@ mod tests {
             "dataset not-a-dataset",
             "parquet --null-ratio 4",
             "parquet --row-group-rows 0",
-            "amb1 --dtype f128",
-            "amb1 --shape 1,x",
-            "amb1 --shape 1,2,3,4,5,6,7,8,9",
+            "mrb1 --dtype f128",
+            "mrb1 --shape 1,x",
+            "mrb1 --shape 1,2,3,4,5,6,7,8,9",
             "safetensors --tensor w",
             "safetensors --tensor",
-            "amb1 --shape",
+            "mrb1 --shape",
             "suite --local-only --local-only",
             "list extra",
         ] {
@@ -650,6 +650,6 @@ mod tests {
 
     #[test]
     fn a_negative_dimension_is_refused() {
-        assert!(parse(&args("amb1 --shape=-1,4")).is_err());
+        assert!(parse(&args("mrb1 --shape=-1,4")).is_err());
     }
 }

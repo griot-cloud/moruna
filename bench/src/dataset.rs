@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::amb1::{self, TensorSpec};
+use crate::mrb1::{self, TensorSpec};
 use crate::error::{BenchError, Result};
 use crate::parquet_out::{self, ParquetSpec};
 use crate::safetensors_out;
@@ -14,7 +14,7 @@ pub enum DatasetKind {
     Parquet(ParquetSpec),
     /// A safetensors file holding one or more tensors.
     SafeTensors(Vec<TensorSpec>),
-    /// A single `AMB1` tensor file (contracts e.4).
+    /// A single `MRB1` tensor file (contracts e.4).
     Amb1(TensorSpec),
 }
 
@@ -51,7 +51,7 @@ impl Dataset {
         match self.kind {
             DatasetKind::Parquet(_) => format!("{}.parquet", self.name),
             DatasetKind::SafeTensors(_) => format!("{}.safetensors", self.name),
-            DatasetKind::Amb1(_) => format!("{}.amb1", self.name),
+            DatasetKind::Amb1(_) => format!("{}.mrb1", self.name),
         }
     }
 
@@ -79,7 +79,7 @@ impl Dataset {
                 format!("safetensors: {}", parts.join(", "))
             }
             DatasetKind::Amb1(spec) => {
-                format!("amb1: {} {}", spec.dtype.name(), spec.shape_text())
+                format!("mrb1: {} {}", spec.dtype.name(), spec.shape_text())
             }
         }
     }
@@ -101,7 +101,7 @@ impl Dataset {
                 self.detail()
             }
             DatasetKind::Amb1(spec) => {
-                let bytes = amb1::encode(spec, seed);
+                let bytes = mrb1::encode(spec, seed);
                 write_bytes(&path, &bytes)?;
                 self.detail()
             }
@@ -128,7 +128,7 @@ mod tests {
     use crate::dtype::DType;
 
     fn tmp(name: &str) -> PathBuf {
-        const PREFIX: &str = "amoru-bench-dataset";
+        const PREFIX: &str = "moruna-bench-dataset";
         // Unique per process and per call: several executors run the gate at the same
         // time on one machine, and a fixed name under the system temp directory made two
         // runs delete each other's files (three generator tests failed that way on
@@ -164,7 +164,7 @@ mod tests {
             name: "t".into(),
             kind: DatasetKind::Amb1(tensor("t", DType::F32, vec![2])),
         };
-        assert_eq!(amb.file_name(), "t.amb1");
+        assert_eq!(amb.file_name(), "t.mrb1");
     }
 
     #[test]
@@ -196,7 +196,7 @@ mod tests {
             kind: DatasetKind::Amb1(tensor("t", DType::I64, vec![8])),
         }
         .detail();
-        assert_eq!(amb, "amb1: i64 [8]");
+        assert_eq!(amb, "mrb1: i64 [8]");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Tensor element types, their `AMB1` codes and their deterministic payloads.
+//! Tensor element types, their `MRB1` codes and their deterministic payloads.
 //!
 //! The codes and the item sizes are exactly the `dtype` row of the aligned
 //! binary format table in `architecture/sdd/01-contracts.md` section e.4, the one
@@ -12,35 +12,35 @@ use crate::rng::Rng;
 /// An element type of a generated tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
-    /// Signed 8 bit integer, `AMB1` code 0.
+    /// Signed 8 bit integer, `MRB1` code 0.
     I8,
-    /// Signed 16 bit integer, `AMB1` code 1.
+    /// Signed 16 bit integer, `MRB1` code 1.
     I16,
-    /// Signed 32 bit integer, `AMB1` code 2.
+    /// Signed 32 bit integer, `MRB1` code 2.
     I32,
-    /// Signed 64 bit integer, `AMB1` code 3.
+    /// Signed 64 bit integer, `MRB1` code 3.
     I64,
-    /// Unsigned 8 bit integer, `AMB1` code 4.
+    /// Unsigned 8 bit integer, `MRB1` code 4.
     U8,
-    /// Unsigned 16 bit integer, `AMB1` code 5.
+    /// Unsigned 16 bit integer, `MRB1` code 5.
     U16,
-    /// Unsigned 32 bit integer, `AMB1` code 6.
+    /// Unsigned 32 bit integer, `MRB1` code 6.
     U32,
-    /// Unsigned 64 bit integer, `AMB1` code 7.
+    /// Unsigned 64 bit integer, `MRB1` code 7.
     U64,
-    /// Half precision float, `AMB1` code 8.
+    /// Half precision float, `MRB1` code 8.
     F16,
-    /// Brain float, `AMB1` code 9.
+    /// Brain float, `MRB1` code 9.
     BF16,
-    /// Single precision float, `AMB1` code 10.
+    /// Single precision float, `MRB1` code 10.
     F32,
-    /// Double precision float, `AMB1` code 11.
+    /// Double precision float, `MRB1` code 11.
     F64,
-    /// Boolean, one byte per element, `AMB1` code 12.
+    /// Boolean, one byte per element, `MRB1` code 12.
     Bool,
 }
 
-/// Every type the generator writes, in `AMB1` code order.
+/// Every type the generator writes, in `MRB1` code order.
 pub const ALL: [DType; 13] = [
     DType::I8,
     DType::I16,
@@ -58,7 +58,7 @@ pub const ALL: [DType; 13] = [
 ];
 
 impl DType {
-    /// The `AMB1` dtype code (contracts e.4).
+    /// The `MRB1` dtype code (contracts e.4).
     pub fn code(self) -> u8 {
         match self {
             DType::I8 => 0,
@@ -190,7 +190,7 @@ fn finite_half(rng: &mut Rng, exp_bits: u32, mant_bits: u32, exp_lo: u32, exp_hi
 }
 
 /// The number of elements a shape holds. An empty shape is one scalar, which is
-/// what a product over no dimensions means and what `AMB1` `ndim` 0 encodes.
+/// what a product over no dimensions means and what `MRB1` `ndim` 0 encodes.
 pub fn element_count(shape: &[i64]) -> u64 {
     shape.iter().map(|d| *d as u64).product()
 }

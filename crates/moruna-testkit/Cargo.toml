@@ -1,0 +1,15 @@
+[package]
+name = "moruna-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna test fakes for every contracts interface"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+
+[features]
+default = []

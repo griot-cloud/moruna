@@ -1,0 +1,35 @@
+[package]
+name = "moruna-reactor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna IO reactor"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+# The backends a URL may name (06 d.1 ObjectStoreConfig, d.2).
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+# `time` for the uring submission batching and the copy-event poll (06 f.1, f.5).
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+libc = { workspace = true }
+bytes = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
+
+[dev-dependencies]
+moruna-testkit = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+uring = ["dep:io-uring"]
+gds = ["cuda"]
+rdma = []

@@ -1,21 +1,21 @@
-# Amoru SDD 01: Contracts crate (`amoru-kernel`)
+# Moruna SDD 01: Contracts crate (`moruna-kernel`)
 
 **Document type:** software design document, component 1 of 12
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
-**Parent:** `architecture/amoru-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
+**Parent:** `architecture/moruna-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
 **Preamble:** `00-preamble.md` (read first)
-**Component location:** `crates/amoru-kernel`, Rust 2024 edition
+**Component location:** `crates/moruna-kernel`, Rust 2024 edition
 **Consumes:** nothing internal; `arrow`, `dlpark`, `thiserror`, `blake3` **Consumed by:** every other component
 
 ---
 
 ## a. Purpose and boundary
 
-The contracts crate is the set of types and interfaces that cross component boundaries, in one place, with one owner, frozen before any other component is built. It has almost no behaviour of its own: the exceptions are the pointer conversions between a table column and a tensor, byte accounting for payloads, the kernel fingerprint, and the definitions of the two file formats that more than one component reads and writes (the Amoru aligned binary format and the trace record schema). Everything else in it is a signature.
+The contracts crate is the set of types and interfaces that cross component boundaries, in one place, with one owner, frozen before any other component is built. It has almost no behaviour of its own: the exceptions are the pointer conversions between a table column and a tensor, byte accounting for payloads, the kernel fingerprint, and the definitions of the two file formats that more than one component reads and writes (the Moruna aligned binary format and the trace record schema). Everything else in it is a signature.
 
-It owns: `Morsel`, `Payload`, `Tier`, `MorselFeatures`, `Origin`, `Split`; the traits `Source`, `Kernel`, `Sink`, `Allocator`, `Reactor`, `Placement`, `Knobs`, `TraceSink`; the value types those traits exchange (`PayloadSpec`, `KernelKind`, `KernelHints`, `Limits`, `HostProfile`, `TierBudgets`, `PlacementStats`, `Knob`, `TraceRecord`, `SinkSummary`, `Completion`); the error type `AmoruError`; the constants `ALIGNMENT` and the aligned binary format `AMB1`.
+It owns: `Morsel`, `Payload`, `Tier`, `MorselFeatures`, `Origin`, `Split`; the traits `Source`, `Kernel`, `Sink`, `Allocator`, `Reactor`, `Placement`, `Knobs`, `TraceSink`; the value types those traits exchange (`PayloadSpec`, `KernelKind`, `KernelHints`, `Limits`, `HostProfile`, `TierBudgets`, `PlacementStats`, `Knob`, `TraceRecord`, `SinkSummary`, `Completion`); the error type `MorunaError`; the constants `ALIGNMENT` and the aligned binary format `MRB1`.
 
-It re-exports the two dependencies that appear in its public signatures, `pub use arrow;` and `pub use dlpark;`, so that a crate depending on `amoru-kernel` alone can name a `RecordBatch` or a DLPack capsule without adding a dependency of its own and without risking a second, incompatible version of either: the testkit (d.15) depends on `amoru-kernel` only and could not otherwise be written, and a kernel author's crate gets the same guarantee, which is what S7 rests on (added 2026-09-22 on the F0.3 agent's report). It refuses to know: how any trait is implemented; how the process is threaded (preamble section 4 governs implementers, not this crate); anything about Python beyond what `dlpark` and Arrow's C Data Interface already are; any policy (sizing, admission, eviction). It has no dependency on tokio, cudarc, pyo3, parquet or object_store; a kernel author's crate depending on `amoru-kernel` must not pull any of those in.
+It re-exports the two dependencies that appear in its public signatures, `pub use arrow;` and `pub use dlpark;`, so that a crate depending on `moruna-kernel` alone can name a `RecordBatch` or a DLPack capsule without adding a dependency of its own and without risking a second, incompatible version of either: the testkit (d.15) depends on `moruna-kernel` only and could not otherwise be written, and a kernel author's crate gets the same guarantee, which is what S7 rests on (added 2026-09-22 on the F0.3 agent's report). It refuses to know: how any trait is implemented; how the process is threaded (preamble section 4 governs implementers, not this crate); anything about Python beyond what `dlpark` and Arrow's C Data Interface already are; any policy (sizing, admission, eviction). It has no dependency on tokio, cudarc, pyo3, parquet or object_store; a kernel author's crate depending on `moruna-kernel` must not pull any of those in.
 
 ## b. Vocabulary
 
@@ -57,18 +57,18 @@ Beyond the preamble's global vocabulary:
 
 **CT-I10. Errors carry the morsel.** Every error variant that can occur while processing a morsel carries `seq`, `stage` and, where known, `features` and the measured footprint, so a diagnostic can be produced without a debugger (G-I8).
 
-**CT-I11. Reserved variants are matched, never wildcarded.** `Tier::Remote`, `NodeId` values other than `LOCAL_NODE`, `Locality::Local` and `StagingCodec` exist in v1 so that the multi-node extension adds behaviour without changing a signature. Every `match` on `Tier` in every crate has an explicit `Remote` arm that returns `AmoruError::Unsupported("rdma")` (or handles it, once the `rdma` feature exists); no `_ =>` arm covers it. Rationale: the aim is one framework that runs at one node and at many without rework; a wildcard arm is where the rework would hide.
+**CT-I11. Reserved variants are matched, never wildcarded.** `Tier::Remote`, `NodeId` values other than `LOCAL_NODE`, `Locality::Local` and `StagingCodec` exist in v1 so that the multi-node extension adds behaviour without changing a signature. Every `match` on `Tier` in every crate has an explicit `Remote` arm that returns `MorunaError::Unsupported("rdma")` (or handles it, once the `rdma` feature exists); no `_ =>` arm covers it. Rationale: the aim is one framework that runs at one node and at many without rework; a wildcard arm is where the rework would hide.
 
 **CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read. `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
 
 ## d. Interfaces
 
-All code below is normative: names, shapes and doc comments are binding; the implementer may add private helpers and derive macros. `Result<T>` is `core::result::Result<T, AmoruError>` throughout.
+All code below is normative: names, shapes and doc comments are binding; the implementer may add private helpers and derive macros. `Result<T>` is `core::result::Result<T, MorunaError>` throughout.
 
 ### d.1 Identifiers and constants
 
 ```rust
-/// Cache-line alignment for every buffer and file layout in Amoru.
+/// Cache-line alignment for every buffer and file layout in Moruna.
 pub const ALIGNMENT: usize = 64;
 
 /// Stage index in the linear chain. Stage 0 is the source's output.
@@ -110,7 +110,7 @@ pub enum Tier {
     /// Registered memory on another node of the same run, reachable by one-sided
     /// RDMA through the reactor. Reserved: no v1 component produces this variant,
     /// and every v1 component that matches on `Tier` handles it by returning
-    /// `AmoruError::Unsupported("rdma")` rather than by a wildcard arm (CT-I11).
+    /// `MorunaError::Unsupported("rdma")` rather than by a wildcard arm (CT-I11).
     Remote(NodeId, RemoteRef),
 }
 
@@ -144,7 +144,7 @@ pub struct SegmentRef {
 pub enum TierKind { Device, PinnedHost, Host, Disk, Remote }
 
 /// How a staging segment's records are encoded. `Raw` is the payload's in-memory
-/// layout written as is (page-aligned Arrow IPC or AMB1), moved by DMA with no CPU
+/// layout written as is (page-aligned Arrow IPC or MRB1), moved by DMA with no CPU
 /// in the path (PL-I4). Reserved for a compressed variant (a Vortex-encoded record,
 /// architecture 5.6) that trades CPU on the demotion path for disk bytes when the
 /// controller decides the run is disk-bound with idle cores; every v1 `match`
@@ -240,7 +240,7 @@ pub struct AllocStats {
 
 pub trait Allocator: Send + Sync {
     /// Allocate `bytes` in `tier`, aligned to ALIGNMENT and to the page size when
-    /// `bytes >= page size`. Fails with `AmoruError::Alloc` if the tier's budget
+    /// `bytes >= page size`. Fails with `MorunaError::Alloc` if the tier's budget
     /// would be exceeded; never blocks.
     fn alloc(&self, bytes: usize, tier: Tier) -> Result<Buffer>;
     /// The page size discovery reported for this host.
@@ -280,7 +280,7 @@ impl DType { pub fn item_size(&self) -> usize; }
 /// `ManagedBox<DLManagedTensorVersioned>`, the DLPack 1.x versioned struct; `dlpark` 0.8.0 has
 /// no type named `ManagedTensor`, and the versioned struct is what section l asked the agent to
 /// verify, so the alias `pub type Dlpack = dlpark::versioned::Dlpack` is the exported name and
-/// `into_dlpack` and `from_dlpack` speak it. The wrapper adds tier tracking and Amoru's
+/// `into_dlpack` and `from_dlpack` speak it. The wrapper adds tier tracking and Moruna's
 /// contiguity checks, and `from_dlpack` rejects a capsule whose major version is not DLPack's.
 pub struct ManagedTensor { /* private */ }
 
@@ -546,7 +546,7 @@ pub trait Kernel: Send + Sync + 'static {
     /// The default refuses; a kernel that declares `Checkpoint` must override it.
     fn restore(&self, ctx: &InitCtx, state: &[u8]) -> Result<Box<dyn KernelState>> {
         let _ = (ctx, state);
-        Err(AmoruError::Resume("kernel declares Checkpoint but does not implement restore".into()))
+        Err(MorunaError::Resume("kernel declares Checkpoint but does not implement restore".into()))
     }
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
@@ -595,7 +595,7 @@ pub trait Sink: Send + Sync {
     /// multipart upload) and continue numbering after the checkpointed state.
     fn resume(&mut self, schema: &SourceSchema, state: &[u8], committed_seq: Option<Seq>) -> Result<()> {
         let _ = (schema, state, committed_seq);
-        Err(AmoruError::Resume("sink does not support resume".into()))
+        Err(MorunaError::Resume("sink does not support resume".into()))
     }
 }
 ```
@@ -810,7 +810,7 @@ pub trait Knobs: Send + Sync {
     fn snapshot(&self) -> KnobSnapshot;
     /// End the run with a diagnostic (the controller's third breach, state growth,
     /// sampler failure). The scheduler enters `Terminating` as for a kernel error.
-    fn terminate(&self, diagnostic: AmoruError);
+    fn terminate(&self, diagnostic: MorunaError);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -997,7 +997,7 @@ pub trait TraceTail: Send + Sync {
 
 ```rust
 #[derive(thiserror::Error, Debug)]
-pub enum AmoruError {
+pub enum MorunaError {
     #[error("plan: {0}")] Plan(String),
     #[error("source split {split}: {msg}")] Source { split: SplitId, msg: String },
     #[error("kernel stage {stage} morsel {seq}: {msg}")] Kernel { stage: StageId, seq: Seq, msg: String, features: Option<MorselFeatures> },
@@ -1032,7 +1032,7 @@ pub enum ConvertError {
 }
 ```
 
-### d.15 Test fakes (`amoru-testkit`)
+### d.15 Test fakes (`moruna-testkit`)
 
 The testkit is built by this component's agent in wave 0 (preamble 6.4) because every later component's tests depend on it and CT-T13 requires it. It implements every trait above with the knobs below; a component SDD's test names a fake and a knob from this list and nothing else.
 
@@ -1046,13 +1046,13 @@ The testkit is built by this component's agent in wave 0 (preamble 6.4) because 
 | `FakeKernel` | `Kernel` | `amplification(f64)` (allocates `a × bytes_in` from the global allocator during `apply`, freed on return), `latency(Duration)`, `stateful(instances, state_bytes)`, `resume(ResumePolicy)`, `fail_on(applies)`, `panic_on(applies)`, `grow_state_by(bytes)` per apply | `applies() -> Vec<(usize /* apply index */, usize /* instance */, std::thread::ThreadId)>`, `init_calls`, `restore_calls`, `checkpoint_calls` |
 | `FakeSampler` | `Sampler` | `scripted(Vec<Sample>)` (returns the sequence, then repeats the last), `live()` (reads the real process) | `samples_taken`, `peak_resets` |
 | `FakeTrace` | `TraceSink`, `TraceTail` | `capacity(n)` | `records() -> Vec<TraceRecord>`, `flush_calls`, `finish_calls` |
-| `FakeKnobs` | `Knobs`, `StatsSource`, `Prober` | `stats(SchedulerStats)`, `probe_result(stage, ProbeResult)` | `writes() -> Vec<Knob>`, `terminated() -> Option<AmoruError>` |
+| `FakeKnobs` | `Knobs`, `StatsSource`, `Prober` | `stats(SchedulerStats)`, `probe_result(stage, ProbeResult)` | `writes() -> Vec<Knob>`, `terminated() -> Option<MorunaError>` |
 
-`fail_on` and `panic_on` count applies, not sequence numbers, and `applies()` reports the apply index rather than a `Seq`, because `Kernel::apply` receives a `Payload` and no morsel: a kernel never learns its position in the run. That is deliberate and not a gap to close. A kernel that knew its sequence number could not be the same code inside a Polars expression or a DataFusion function, which S7 requires, and nothing in the runtime needs it: the scheduler holds the seq, attaches it to `AmoruError::Kernel` when an apply fails (CT-I10) and writes it to the trace, so every per-morsel assertion a component test wants is available from the scheduler's own output. A test that wants "morsel 7 fails" therefore asserts that the trace records an `Error` or `Skipped` outcome for whichever sequence numbers failed and that the sink's `skipped()` equals exactly those, which is the property that matters, rather than naming a number the fake cannot see (decided by the PM 2026-09-22 on the F0.3 agent's report, issue #12; SC-T7, SC-T14 and PY-T2 are worded that way).
+`fail_on` and `panic_on` count applies, not sequence numbers, and `applies()` reports the apply index rather than a `Seq`, because `Kernel::apply` receives a `Payload` and no morsel: a kernel never learns its position in the run. That is deliberate and not a gap to close. A kernel that knew its sequence number could not be the same code inside a Polars expression or a DataFusion function, which S7 requires, and nothing in the runtime needs it: the scheduler holds the seq, attaches it to `MorunaError::Kernel` when an apply fails (CT-I10) and writes it to the trace, so every per-morsel assertion a component test wants is available from the scheduler's own output. A test that wants "morsel 7 fails" therefore asserts that the trace records an `Error` or `Skipped` outcome for whichever sequence numbers failed and that the sink's `skipped()` equals exactly those, which is the property that matters, rather than naming a number the fake cannot see (decided by the PM 2026-09-22 on the F0.3 agent's report, issue #12; SC-T7, SC-T14 and PY-T2 are worded that way).
 
 Every fake records a `shutdown_calls` counter wherever the trait it implements has a `shutdown` method, so a test can assert that shutdown ran exactly once. `Sink` and `TraceSink` have no `shutdown` in the contract, so `FakeSink::shutdown_calls` and `FakeTrace::finish_calls` count the fakes' own inherent `shutdown()` and `finish()`, which the facade calls; a test naming them is asserting about the facade's lifecycle (preamble 4.3), not about a trait method.
 
-Also in the testkit: the data generator and the benchmark kernels of preamble 6.5 are not here; they belong to the `bench` agent (wave 1). `amoru-testkit` depends on `amoru-kernel` only.
+Also in the testkit: the data generator and the benchmark kernels of preamble 6.5 are not here; they belong to the `bench` agent (wave 1). `moruna-testkit` depends on `moruna-kernel` only.
 
 ## e. Data model, formats and state machines
 
@@ -1071,7 +1071,7 @@ A payload's tier changes only through the placement engine (promotion or demotio
 | host tier | Remote(n) | reserved, `rdma` | never in v1 (`Unsupported`) |
 | Remote(n) | host tier | reserved, `rdma` | never in v1 (`Unsupported`) |
 
-Illegal in every build: `Host ↔ PinnedHost` (they do not coexist), `Remote ↔ Disk` (the owning node moves its own bytes), `Device ↔ Device` across devices in v1. Attempting an illegal transition is `AmoruError::Staging` and is a bug in the placement engine, not a runtime condition.
+Illegal in every build: `Host ↔ PinnedHost` (they do not coexist), `Remote ↔ Disk` (the owning node moves its own bytes), `Device ↔ Device` across devices in v1. Attempting an illegal transition is `MorunaError::Staging` and is a bug in the placement engine, not a runtime condition.
 
 ### e.2 Buffer provenance
 
@@ -1091,13 +1091,13 @@ Every `Buffer` carries an arena token; `Payload::table` reads the token from the
 
 `as_tensor(None)` on a table with k numeric columns of one dtype and no nulls returns a 2-D tensor of shape `[rows, k]` **only if** the columns are already adjacent in one buffer, which Arrow does not guarantee; otherwise it returns `NotContiguous` and the caller (adapters) requests a single column or a `FixedSizeList`. This is stated so no implementer "helpfully" copies.
 
-### e.4 Amoru aligned binary format (`AMB1`)
+### e.4 Moruna aligned binary format (`MRB1`)
 
 Used by `TensorSink`, `TensorSource`, and staging segments for tensor payloads. Little-endian throughout.
 
 | Offset | Size | Field | Value |
 |---|---|---|---|
-| 0 | 4 | magic | ASCII `AMB1` |
+| 0 | 4 | magic | ASCII `MRB1` |
 | 4 | 2 | version | 1 |
 | 6 | 1 | dtype | `DType` code: I8=0, I16=1, I32=2, I64=3, U8=4, U16=5, U32=6, U64=7, F16=8, BF16=9, F32=10, F64=11, Bool=12 |
 | 7 | 1 | ndim | 0..=8 |
@@ -1106,7 +1106,7 @@ Used by `TensorSink`, `TensorSource`, and staging segments for tensor payloads. 
 | data_offset | element_count × item_size | payload | row-major, contiguous |
 | after payload | to next 64 | padding | zeros |
 
-A reader validates magic, version, ndim, that `data_offset` is a multiple of 4096 and ≥ the header end, and that the file length ≥ `data_offset + payload_len`; any failure is `AmoruError::Io { op: "amb1" }`. An unknown version is rejected, not skipped.
+A reader validates magic, version, ndim, that `data_offset` is a multiple of 4096 and ≥ the header end, and that the file length ≥ `data_offset + payload_len`; any failure is `MorunaError::Io { op: "mrb1" }`. An unknown version is rejected, not skipped.
 
 ### e.5 Trace record Arrow schema
 
@@ -1118,7 +1118,7 @@ Field order and types are exactly as in `TraceRecord` (d.13): unsigned integers 
 
 ### e.7 Page-aligned Arrow IPC record encoding
 
-Used by staging segments (09 e.3) and by `ArrowIpcSink` (08 e.3); defined here, as `AMB1` is, because two components read and write it. It is the Arrow IPC stream framing with one deviation the format permits: every body buffer of a record batch is placed at a multiple of `page_bytes` rather than of 8, so each can be written from and read into an arena buffer by direct IO or GDS without a copy. One record:
+Used by staging segments (09 e.3) and by `ArrowIpcSink` (08 e.3); defined here, as `MRB1` is, because two components read and write it. It is the Arrow IPC stream framing with one deviation the format permits: every body buffer of a record batch is placed at a multiple of `page_bytes` rather than of 8, so each can be written from and read into an arena buffer by direct IO or GDS without a copy. One record:
 
 | Piece | Content | Placement |
 |---|---|---|
@@ -1126,7 +1126,7 @@ Used by staging segments (09 e.3) and by `ArrowIpcSink` (08 e.3); defined here, 
 | body | each Arrow buffer of the batch, in schema order, each starting at the next page boundary after the previous | written from the batch's own buffers through `BufferView::of_arrow`; no copy |
 | tail | zero padding to the next page boundary | not written; implied by the next record's offset |
 
-`amoru_kernel::ipc` provides `encode_framing(batch, page_bytes, base_offset, alloc: &dyn Allocator) -> Result<(Buffer /* framing */, Vec<(usize /* body offset */, arrow::buffer::Buffer)>)>` (allocating only the framing buffer from `alloc`) and `decode(buf: arrow::buffer::Buffer, page_bytes) -> Result<RecordBatch>`, whose arrays point into `buf` (arrow's IPC reader over an aligned buffer; verified by pointer comparison in CT-T18). A reader validates the continuation marker, message lengths and that every body offset is a page multiple; any failure is `Io { op: "ipc" }`.
+`moruna_kernel::ipc` provides `encode_framing(batch, page_bytes, base_offset, alloc: &dyn Allocator) -> Result<(Buffer /* framing */, Vec<(usize /* body offset */, arrow::buffer::Buffer)>)>` (allocating only the framing buffer from `alloc`) and `decode(buf: arrow::buffer::Buffer, page_bytes) -> Result<RecordBatch>`, whose arrays point into `buf` (arrow's IPC reader over an aligned buffer; verified by pointer comparison in CT-T18). A reader validates the continuation marker, message lengths and that every body offset is a page multiple; any failure is `Io { op: "ipc" }`.
 
 ## f. Algorithms and policies
 
@@ -1164,7 +1164,7 @@ None emitted. This crate defines `TraceRecord` and `AllocStats`; it emits nothin
 
 ## k. Tests
 
-Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
+Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T1 payload_variants.** A `match` on `Payload` with two arms compiles with no wildcard (a compile-time assertion via a helper function). Proves CT-I1.
 
@@ -1180,7 +1180,7 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T7 send_sync.** Static assertions that every trait object is `Send + Sync` and every value type is `Send`. Proves CT-I6.
 
-**CT-T8 amb1_roundtrip.** Write every dtype and ndim 0..8 through a reference writer in the test, read back, byte-equal; corrupt magic, version, data_offset alignment, truncated payload each rejected with `Io { op: "amb1" }`. Proves e.4.
+**CT-T8 amb1_roundtrip.** Write every dtype and ndim 0..8 through a reference writer in the test, read back, byte-equal; corrupt magic, version, data_offset alignment, truncated payload each rejected with `Io { op: "mrb1" }`. Proves e.4.
 
 **CT-T9 trace_schema_hash.** `TraceRecord::SCHEMA_HASH` equals the pinned constant; `arrow_schema()` field names and types match d.13 in order. Proves CT-I8.
 
@@ -1188,9 +1188,9 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T11 features_cost.** (reference host, E1, for the timing; the structural half runs anywhere) `MorselFeatures::from_payload` on a 10 M-row string batch runs in under 1 ms on the reference host, provisional with the host name elsewhere; on every host the test also proves the O(columns) property structurally: the batch is built over a values buffer whose bytes are never read (a `FakeAllocator` buffer left uninitialised is fine) and the string total equals the offsets buffer's last value. Proves f.2.
 
-**CT-T12 no_runtime_deps.** `cargo tree -p amoru-kernel` contains none of tokio, cudarc, pyo3, parquet, object_store. Proves the boundary in section a and S7.
+**CT-T12 no_runtime_deps.** `cargo tree -p moruna-kernel` contains none of tokio, cudarc, pyo3, parquet, object_store. Proves the boundary in section a and S7.
 
-**CT-T13 fakes_compile.** `amoru-testkit` implements every trait in d.3 to d.13 with the knobs in d.15, and its tests exercise every method and every knob once. Proves the contract is implementable.
+**CT-T13 fakes_compile.** `moruna-testkit` implements every trait in d.3 to d.13 with the knobs in d.15, and its tests exercise every method and every knob once. Proves the contract is implementable.
 
 **CT-T20 arena_token_not_leaked.** `split_at` and `into_arrow_buffer` consume a `Buffer` through `ManuallyDrop`, so each must move the arena token out rather than clone beside a field nothing will drop: after both halves of a split drop, and after the Arrow buffer drops, `Arc::strong_count` of the arena handle is what it was before. Rationale: the token is what keeps the arena's region mapped, and one leaked per morsel left a 1 GiB region resident for the life of the process, so a second `Runtime::run` was given no budget at all (PM, 2026-09-22, on the first end-to-end run; d.3, 12 f.1).
 
@@ -1202,13 +1202,13 @@ Unit tests in `crates/amoru-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T18 ipc_page_aligned.** `encode_framing` then `decode` over a page-rounded copy round-trips 20 generated batches (all e.3 types plus strings and lists); every body offset is a page multiple; decoded arrays' data pointers lie inside the input buffer (no copy); a corrupted body offset is `Io { op: "ipc" }`. Proves e.7.
 
-**CT-T19 tensor_from_buffer.** `ManagedTensor::from_buffer` over an `AMB1` body: `data_ptr == buf.host_ptr() + offset`, shape and dtype as given; a short buffer or misaligned offset is `Convert`/`Io`, not a panic. Proves d.4.
+**CT-T19 tensor_from_buffer.** `ManagedTensor::from_buffer` over an `MRB1` body: `data_ptr == buf.host_ptr() + offset`, shape and dtype as given; a short buffer or misaligned offset is `Convert`/`Io`, not a panic. Proves d.4.
 
 **CT-T15 resume_defaults.** A kernel with the default `restore` returns `Resume`; a `KernelState` with the default `checkpoint` returns `Ok(None)`; a sink with the default `resume` returns `Resume` and `committed_seq() == None`; `ResumePolicy::default() == Reinit`. Proves the resume defaults are refusals, not silent successes (l, anti-patterns).
 
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs` (re-exports), `src/ids.rs` (d.1), `src/tier.rs` (d.2, f.6), `src/buffer.rs` (d.3; the `Buffer` type's arena token is an `Arc<dyn ArenaHandle>` trait object defined here with `fn release(&self, ptr, len, tier)` so the arena crate can implement it without a circular dependency), `src/view.rs` (d.3 `BufferView`), `src/payload.rs` (d.4, f.1, f.3, f.4, f.5), `src/tensor.rs` (the `dlpark` wrapper, `from_buffer`), `src/morsel.rs` (d.5, f.2), `src/source.rs`, `src/kernel.rs`, `src/sink.rs`, `src/reactor.rs` (d.9 traits, `ObjectMetadata`, `ObjectMeta` and endpoints), `src/completion.rs` (d.9 `Completion`, std only), `src/placement.rs`, `src/knobs.rs` (d.11 including `StatsSource`, `Prober`, `CancelToken`, `RecordHook`), `src/limits.rs` (d.12 including `Sampler`), `src/trace.rs` (d.13, e.5, `TraceTail`), `src/amb1.rs` (e.4, reader and writer over `&[u8]`/`&mut [u8]` only; no IO), `src/ipc.rs` (e.7; `arrow` with the `ipc` feature), `src/error.rs`, `src/fingerprint.rs`. The testkit (d.15) is a sibling crate `crates/amoru-testkit` built in the same pull request.
+Files: `src/lib.rs` (re-exports), `src/ids.rs` (d.1), `src/tier.rs` (d.2, f.6), `src/buffer.rs` (d.3; the `Buffer` type's arena token is an `Arc<dyn ArenaHandle>` trait object defined here with `fn release(&self, ptr, len, tier)` so the arena crate can implement it without a circular dependency), `src/view.rs` (d.3 `BufferView`), `src/payload.rs` (d.4, f.1, f.3, f.4, f.5), `src/tensor.rs` (the `dlpark` wrapper, `from_buffer`), `src/morsel.rs` (d.5, f.2), `src/source.rs`, `src/kernel.rs`, `src/sink.rs`, `src/reactor.rs` (d.9 traits, `ObjectMetadata`, `ObjectMeta` and endpoints), `src/completion.rs` (d.9 `Completion`, std only), `src/placement.rs`, `src/knobs.rs` (d.11 including `StatsSource`, `Prober`, `CancelToken`, `RecordHook`), `src/limits.rs` (d.12 including `Sampler`), `src/trace.rs` (d.13, e.5, `TraceTail`), `src/mrb1.rs` (e.4, reader and writer over `&[u8]`/`&mut [u8]` only; no IO), `src/ipc.rs` (e.7; `arrow` with the `ipc` feature), `src/error.rs`, `src/fingerprint.rs`. The testkit (d.15) is a sibling crate `crates/moruna-testkit` built in the same pull request.
 
 `unsafe` is permitted only in `tensor.rs` (DLPack pointer handling, `from_buffer`), `payload.rs` (building Arrow buffers over foreign pointers and the `*_in` constructors), `view.rs` (constructing a view over an owner's bytes) and `buffer.rs` (pointer arithmetic in `split_at`); test code in any crate may use `unsafe` to construct a state a test needs (E9 exempts tests); each block carries `// SAFETY:` naming the invariant (CT-I2 or the DLPack contract).
 
@@ -1222,7 +1222,7 @@ Environment facts to verify before starting: `cargo --version` ≥ the 2024-edit
 
 ## m. Open items
 
-None. (Four E10 items the wave 0 agent raised, issues #5 to #8, were resolved by the PM on 2026-09-22 and are written into d.3, d.4, d.13 and h above: `SCHEMA_FIELDS` beside a pinned `SCHEMA_HASH` with `schema_hash()` to recompute it, because BLAKE3 has no const evaluation; `dlpark::versioned::Dlpack` as the DLPack type, because `dlpark` 0.8.0 has no `ManagedTensor`; `ArenaHandle` and `unsafe Buffer::from_raw`, without which component 2 cannot construct a buffer at all; and `AsRef`/`Deref` implemented for every buffer and panicking on `Device`, because Rust has no per-value implementation. E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, the staging reservation `StagingCodec`, the state seam `KernelState::footprint` with `TraceRecord::state_bytes`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `AmoruError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
+None. (Four E10 items the wave 0 agent raised, issues #5 to #8, were resolved by the PM on 2026-09-22 and are written into d.3, d.4, d.13 and h above: `SCHEMA_FIELDS` beside a pinned `SCHEMA_HASH` with `schema_hash()` to recompute it, because BLAKE3 has no const evaluation; `dlpark::versioned::Dlpack` as the DLPack type, because `dlpark` 0.8.0 has no `ManagedTensor`; `ArenaHandle` and `unsafe Buffer::from_raw`, without which component 2 cannot construct a buffer at all; and `AsRef`/`Deref` implemented for every buffer and panicking on `Device`, because Rust has no per-value implementation. E1 and E2 in the preamble cover reference hardware and version pinning. The additions requested by components 5 and 9, `AllocStats.boundary_copies_total`, `Allocator::contains` and `Buffer::into_arrow_buffer`, are already in d.3. The multi-node reservations, `NodeId`, `RunId`, `Tier::Remote`, `RemoteRef`, `Locality`, `TIER_COUNT`, the staging reservation `StagingCodec`, the state seam `KernelState::footprint` with `TraceRecord::state_bytes`, and the resume seams, `ResumePolicy`, `KernelState::checkpoint`, `Kernel::restore`, `Sink::{committed_seq, checkpoint, resume}`, `Placement::{set_committed, checkpoint, restore}`, `CheckpointExtras`, `SourceCursor`, `ResumePoint`, `HostProfile::durable_staging`, `MorunaError::{Resume, Unsupported}`, are in d.1 to d.14 by decision of the architecture document's sections 10 and 11; they are not open.)
 
 ## n. Traceability
 

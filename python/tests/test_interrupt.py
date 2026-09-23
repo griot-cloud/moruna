@@ -1,4 +1,4 @@
-"""PY-T6 keyboard_interrupt: SIGINT during a run raises `amoru.Cancelled` with the partial report
+"""PY-T6 keyboard_interrupt: SIGINT during a run raises `moruna.Cancelled` with the partial report
 attached, and the signal is seen on the main thread (PY-I6, f.5).
 
 The run is driven in a subprocess so a real SIGINT can be delivered to it; the subprocess prints
@@ -18,9 +18,9 @@ import time
 SCRIPT = """
 import json, os, pathlib, sys, threading, time
 import pyarrow as pa, pyarrow.parquet as pq
-import amoru
+import moruna
 
-d = pathlib.Path(os.environ["AMORU_TEST_DIR"])
+d = pathlib.Path(os.environ["MORUNA_TEST_DIR"])
 src, out = d / "in", d / "out"
 src.mkdir(exist_ok=True); out.mkdir(exist_ok=True); (d / "staging").mkdir(exist_ok=True)
 pq.write_table(pa.table({"id": pa.array(range(200_000), pa.int64())}),
@@ -28,7 +28,7 @@ pq.write_table(pa.table({"id": pa.array(range(200_000), pa.int64())}),
 
 main_thread = threading.main_thread().ident
 
-@amoru.kernel
+@moruna.kernel
 def slow(batch):
     time.sleep(1.0)
     return batch
@@ -36,10 +36,10 @@ def slow(batch):
 print(json.dumps({"ready": True, "main_thread": main_thread}), flush=True)
 started = time.monotonic()
 try:
-    amoru.run(amoru.ParquetSource(f"file://{src}/p.parquet"), slow,
-              amoru.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB"),
+    moruna.run(moruna.ParquetSource(f"file://{src}/p.parquet"), slow,
+              moruna.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB"),
               staging_dir=str(d / "staging"), staging_limit="2GiB")
-except amoru.Cancelled as e:
+except moruna.Cancelled as e:
     print(json.dumps({
         "cancelled": True,
         "seconds": time.monotonic() - started,
@@ -56,7 +56,7 @@ else:
 
 
 def test_py_t6_keyboard_interrupt(scratch: pathlib.Path) -> None:
-    env = dict(os.environ, AMORU_TEST_DIR=str(scratch))
+    env = dict(os.environ, MORUNA_TEST_DIR=str(scratch))
     proc = subprocess.Popen(  # noqa: S603
         [sys.executable, "-u", "-c", SCRIPT],
         stdout=subprocess.PIPE,
@@ -93,7 +93,7 @@ def test_py_t6_keyboard_interrupt(scratch: pathlib.Path) -> None:
     # f.5: the signal is seen on the main thread, which is where `run` is.
     assert result["signal_thread"] == ready["main_thread"]
     # The second interrupt was swallowed with a message rather than raised.
-    assert "amoru: cancelling the run" in err
+    assert "moruna: cancelling the run" in err
     # f.5: the second interrupt is swallowed. CPython sets one flag for both signals and the
     # main thread reads it every 100 ms, so the two may be collapsed into one and the second
     # message is not guaranteed; what is guaranteed, and asserted, is that no interrupt escaped

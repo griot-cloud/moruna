@@ -17,15 +17,15 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-import amoru
+import moruna
 
 
-@amoru.kernel
+@moruna.kernel
 def identity(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch
 
 
-@amoru.kernel
+@moruna.kernel
 def normalise(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Lower case the text column, which is the shape of real work without its cost."""
     text = pc.utf8_lower(batch.column("text"))
@@ -35,23 +35,23 @@ def normalise(batch: pa.RecordBatch) -> pa.RecordBatch:
 SCRIPT = """
 import json, os, pathlib, sys
 import pyarrow as pa, pyarrow.parquet as pq
-import amoru
+import moruna
 
-d = pathlib.Path(os.environ["AMORU_TEST_DIR"])
+d = pathlib.Path(os.environ["MORUNA_TEST_DIR"])
 src, out = d / "in", d / "out"
 rows = 10_000
 pq.write_table(pa.table({"id": pa.array(range(rows), pa.int64()),
                          "text": pa.array([f"row {i}" for i in range(rows)])}),
                src / "part-0.parquet", row_group_size=2_000)
 
-@amoru.kernel
+@moruna.kernel
 def identity(batch):
     return batch
 
 # S2, PY-I3: no parameters beyond the budget, and here not even that.
-report = amoru.run(amoru.ParquetSource(f"file://{src}/part-0.parquet"),
+report = moruna.run(moruna.ParquetSource(f"file://{src}/part-0.parquet"),
                    identity,
-                   amoru.ParquetSink(f"file://{out}"))
+                   moruna.ParquetSink(f"file://{out}"))
 back = pq.read_table(str(out))
 print(json.dumps({
     "exit": report.exit,
@@ -66,15 +66,15 @@ print(json.dumps({
 
 
 def test_py_t3_no_parameters(scratch: pathlib.Path) -> None:
-    """`amoru.run(source, kernels, sink)` and nothing else completes a real pass (PY-I3, S2).
+    """`moruna.run(source, kernels, sink)` and nothing else completes a real pass (PY-I3, S2).
 
-    Driven in a subprocess with no `AMORU_BUDGET`, so the ceiling is the one the host gives a
+    Driven in a subprocess with no `MORUNA_BUDGET`, so the ceiling is the one the host gives a
     caller who passed nothing: this is the call the product promises, made exactly as promised.
     """
     (scratch / "in").mkdir()
     (scratch / "out").mkdir()
-    env = {k: v for k, v in os.environ.items() if k != "AMORU_BUDGET"}
-    env["AMORU_TEST_DIR"] = str(scratch)
+    env = {k: v for k, v in os.environ.items() if k != "MORUNA_BUDGET"}
+    env["MORUNA_TEST_DIR"] = str(scratch)
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-c", SCRIPT], capture_output=True, text=True, env=env, check=False
     )
@@ -97,8 +97,8 @@ def test_py_t3_normalise(
 ) -> None:  # noqa: ANN001
     """The same pass with a kernel that changes the data, and the change is in the output."""
     src_url, out_url, rows = dataset
-    report = amoru.run(
-        amoru.ParquetSource(src_url), [normalise], small_sink(out_url), **staging
+    report = moruna.run(
+        moruna.ParquetSource(src_url), [normalise], small_sink(out_url), **staging
     )
 
     assert report.exit == "Completed", report.notes
@@ -113,8 +113,8 @@ def test_a_plain_function_is_wrapped(
 ) -> None:  # noqa: ANN001
     """f.3: a plain callable passed as a kernel is wrapped as if decorated with defaults."""
     src_url, out_url, rows = dataset
-    report = amoru.run(
-        amoru.ParquetSource(src_url), lambda batch: batch, small_sink(out_url), **staging
+    report = moruna.run(
+        moruna.ParquetSource(src_url), lambda batch: batch, small_sink(out_url), **staging
     )
     assert report.exit == "Completed", report.notes
     assert report.stages[0]["rows_out"] == rows
@@ -125,7 +125,7 @@ def test_no_kernels_is_a_copy(
 ) -> None:  # noqa: ANN001
     """h: `kernels=[]` is allowed; the pipeline is source to sink."""
     src_url, out_url, rows = dataset
-    report = amoru.run(amoru.ParquetSource(src_url), [], small_sink(out_url), **staging)
+    report = moruna.run(moruna.ParquetSource(src_url), [], small_sink(out_url), **staging)
     assert report.exit == "Completed", report.notes
     out = pathlib.Path(out_url.removeprefix("file://"))
     assert pq.read_table(str(out)).num_rows == rows

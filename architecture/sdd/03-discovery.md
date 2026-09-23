@@ -1,10 +1,10 @@
-# Amoru SDD 03: Resource discovery and host profile (`amoru-discovery`)
+# Moruna SDD 03: Resource discovery and host profile (`moruna-discovery`)
 
 **Document type:** software design document, component 3 of 12
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
-**Parent:** `architecture/amoru-runtime-design.md` sections 5.7, 6; criteria S5; global invariant G-I7
+**Parent:** `architecture/moruna-runtime-design.md` sections 5.7, 6; criteria S5; global invariant G-I7
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.12 (`Limits`, `Device`, `LimitSource`, `Guarantee`, `HostProfile`, `Sampler`, `Sample`), d.2 (`TierKind`)
-**Component location:** `crates/amoru-discovery`, Rust
+**Component location:** `crates/moruna-discovery`, Rust
 **Consumes:** contracts (1). Feature `cuda` adds `cudarc`. **Consumed by:** arena (2, via config), reactor (6), placement (9), controller (11), python surface (12)
 
 **Decisions worth your eye:** (1) the host profile is one environment variable in `key=value` form, not a file, so a pod spec carries it; (2) under a declared `Present` guarantee the probe is still run once at start and a failure is a `Config` error naming the platform, never a fallback, while a probed result is recorded as `Probed(bool)` so every consumer can tell the two apart; (3) the budget against which the controller works is anonymous memory plus unevictable, read from `memory.stat`, not `memory.current`, because file-backed pages are reclaimable; (4) on a Databricks driver discovery refuses to run without an explicit budget, because the JVM's share of the machine is invisible to it.
@@ -35,7 +35,7 @@ It refuses to know: what the budget is used for (controller); how a fast path is
 
 ## c. Invariants
 
-**DS-I1. Explicit beats discovered, and discovered beats default.** For each of memory, CPU and staging dir: an explicit value (constructor argument or `AMORU_*` environment variable) is used as given, clamped to the cgroup kill line if one exists and the explicit value exceeds it, with a warning naming both numbers; else the cgroup value; else the OS value.
+**DS-I1. Explicit beats discovered, and discovered beats default.** For each of memory, CPU and staging dir: an explicit value (constructor argument or `MORUNA_*` environment variable) is used as given, clamped to the cgroup kill line if one exists and the explicit value exceeds it, with a warning naming both numbers; else the cgroup value; else the OS value.
 
 **DS-I2. The ceiling is below the kill line.** `Limits.memory_ceiling < Limits.memory_kill` whenever the latter exists, by at least 5% of the kill line. Upholds G-I8.
 
@@ -43,13 +43,13 @@ It refuses to know: what the budget is used for (controller); how a fast path is
 
 **DS-I4. Budget is anon plus unevictable.** `Sample.anon_bytes` is `anon + unevictable` from `memory.stat`, or `resident - shared` from `/proc/self/statm` outside a cgroup, or, where the platform has no `/proc` (macOS, the hosts the team develops on), mach's `phys_footprint` from `task_info(TASK_VM_INFO)`: the ledger that platform charges the process for and enforces its own limits against, which counts anonymous and compressed pages and excludes mapped files and loaded images. Never `memory.current`, and never a plain resident set on any path: `proc_pidinfo(PROC_PIDTASKINFO)` and `mach_task_basic_info` both report resident bytes and were both measured rising by the whole size of a mapped file, so neither is the budget quantity (found 2026-09-23; until then the macOS path used the first of them and every figure measured on a developer host was inflated by whatever the process had mapped). Where the platform path is the one that answers, `Discovered::notes` says so, so a run report names the quantity its memory figures are. Rationale: architecture section 8, page cache is charged but reclaimable.
 
-**DS-I5. A `Present` guarantee is verified once and never worked around.** Each `Present` path is probed once at start; a failing probe is `AmoruError::Config { name: "host_profile", msg }` and the run does not start. Upholds G-I7.
+**DS-I5. A `Present` guarantee is verified once and never worked around.** Each `Present` path is probed once at start; a failing probe is `MorunaError::Config { name: "host_profile", msg }` and the run does not start. Upholds G-I7.
 
 **DS-I6. An `Unknown` guarantee resolves to a fact before the run starts.** After `discover()` returns, every `HostProfile` field is `Present`, `Absent` or `Probed(bool)`; no component ever sees `Unknown`. A declared value is never rewritten as `Probed`, so the field itself says whether a consumer may fall back (contracts d.12; the reactor's RE-I3 and the arena's f.1 read it that way).
 
 **DS-I7. Discovery is idempotent and re-runnable.** Calling `discover()` twice in one process returns equal `Limits` (modulo `devices[].free_bytes`) and performs no persistent side effect (the probe files it creates are deleted).
 
-**DS-I8. A Databricks driver needs an explicit budget.** When `DATABRICKS_RUNTIME_VERSION` is set in the environment and neither a constructor budget nor `AMORU_BUDGET` is given, `discover` returns `Config { name: "budget", msg }` naming the variable and the two ways to set the budget; it does not fall back to the OS value. Rationale: the driver's cgroup limit, when there is one, is the machine's, and the JVM already holds most of it; an OS-derived ceiling is a number the process cannot use (preamble E7).
+**DS-I8. A Databricks driver needs an explicit budget.** When `DATABRICKS_RUNTIME_VERSION` is set in the environment and neither a constructor budget nor `MORUNA_BUDGET` is given, `discover` returns `Config { name: "budget", msg }` naming the variable and the two ways to set the budget; it does not fall back to the OS value. Rationale: the driver's cgroup limit, when there is one, is the machine's, and the JVM already holds most of it; an OS-derived ceiling is a number the process cannot use (preamble E7).
 
 ## d. Interfaces
 
@@ -73,7 +73,7 @@ pub struct Discovered {
     /// 02 d.1), which is the owner of `arena.pin`; nothing else decides pinning.
     pub host_tier: TierKind,
     pub cgroup_path: Option<std::path::PathBuf>,
-    /// `budget.disk`: the explicit `AMORU_SPILL_LIMIT` (or the surface's `staging_limit`),
+    /// `budget.disk`: the explicit `MORUNA_SPILL_LIMIT` (or the surface's `staging_limit`),
     /// else 20% of the free space in `profile.staging_dir` measured with `statvfs` (f.6),
     /// else 0. The facade passes it straight to the placement engine; discovery is where it
     /// is computed because discovery is the only component that reads the filesystem's free
@@ -88,33 +88,33 @@ pub fn discover(input: &DiscoveryInput) -> Result<Discovered>;
 
 /// The contract's `Sampler` (d.12), implemented over the cgroup files with interior
 /// mutability (a `Mutex` around the open file handles, the fixed read buffer and the
-/// running peak). One instance per run, shared as `Arc<dyn amoru_kernel::Sampler>`
+/// running peak). One instance per run, shared as `Arc<dyn moruna_kernel::Sampler>`
 /// by the controller and the scheduler.
 pub struct Sampler { /* private: Mutex<{ file handles, read buffer, last sample, running peak }>, read_errors: AtomicU64 */ }
 impl Sampler {
     pub fn new(d: &Discovered) -> Result<Sampler>;
     pub fn read_errors(&self) -> u64;
 }
-impl amoru_kernel::Sampler for Sampler {
+impl moruna_kernel::Sampler for Sampler {
     /// DS-I3. Never fails after `new`; a transient read error repeats the last sample and increments `read_errors`.
     fn sample(&self) -> Sample;
     /// DS-I3. Writes `memory.peak` when the kernel allows, else resets the running peak to the current `anon_bytes`.
     fn reset_peak(&self);
 }
 
-/// Parse `AMORU_HOST_PROFILE`; exposed for tests and for the surface's validation.
+/// Parse `MORUNA_HOST_PROFILE`; exposed for tests and for the surface's validation.
 pub fn parse_profile(s: &str) -> Result<HostProfile>;
 ```
 
 ### d.2 Consumed
 
-`amoru_kernel::{Limits, Device, DeviceId, LimitSource, Guarantee, HostProfile, Sampler as SamplerTrait, Sample, TierKind, AmoruError}`; `std::fs`; `libc::sysconf` for page size and core count; with `cuda`, `cudarc::driver::CudaDevice::{count, new}` and `mem_get_info`.
+`moruna_kernel::{Limits, Device, DeviceId, LimitSource, Guarantee, HostProfile, Sampler as SamplerTrait, Sample, TierKind, MorunaError}`; `std::fs`; `libc::sysconf` for page size and core count; with `cuda`, `cudarc::driver::CudaDevice::{count, new}` and `mem_get_info`.
 
 ## e. Data model, formats and state machines
 
 ### e.1 Host profile environment variable
 
-`AMORU_HOST_PROFILE` is a comma-separated list of `key=value` pairs; unknown keys are an error (`Config`), missing keys are `Unknown`. Keys and values:
+`MORUNA_HOST_PROFILE` is a comma-separated list of `key=value` pairs; unknown keys are an error (`Config`), missing keys are `Unknown`. Keys and values:
 
 | Key | Values | Field |
 |---|---|---|
@@ -127,9 +127,9 @@ pub fn parse_profile(s: &str) -> Result<HostProfile>;
 | `staging_dir` | absolute path | `staging_dir` |
 | `durable_staging` | `present`, `absent` | `durable_staging` (declares that `staging_dir` survives the node: a persistent volume or detachable disk; enables cross-node resume, placement f.13) |
 
-Example for a Griot Cloud pod: `AMORU_HOST_PROFILE=huge_pages=present,memlock=present,io_uring=present,direct_io=present,gds=absent,staging_dir=/scratch,durable_staging=present` (with `/scratch` a persistent volume claim).
+Example for a Griot Cloud pod: `MORUNA_HOST_PROFILE=huge_pages=present,memlock=present,io_uring=present,direct_io=present,gds=absent,staging_dir=/scratch,durable_staging=present` (with `/scratch` a persistent volume claim).
 
-Other environment variables read here: `AMORU_BUDGET` (bytes, or a string with `GiB`/`MiB` suffix), `AMORU_CPU` (float), `AMORU_SPILL_DIR`, `AMORU_SPILL_LIMIT`. Constructor arguments take precedence over environment variables; both are "explicit" for DS-I1.
+Other environment variables read here: `MORUNA_BUDGET` (bytes, or a string with `GiB`/`MiB` suffix), `MORUNA_CPU` (float), `MORUNA_SPILL_DIR`, `MORUNA_SPILL_LIMIT`. Constructor arguments take precedence over environment variables; both are "explicit" for DS-I1.
 
 ### e.2 Cgroup v2 file map
 
@@ -172,7 +172,7 @@ source    = Explicit | Cgroup | Os by which branch supplied the ceiling
 | `direct_io_staging` | open a temp file in the staging dir with `O_DIRECT`, write one page from an aligned buffer, read it back, delete | all succeed |
 | `gds` | `cuFileDriverOpen` (feature `gds`) else Absent | returns success |
 | `rdma` | `ibv_get_device_list` non-empty (feature `rdma`) else Absent | at least one device |
-| `staging_dir` | if None: first writable of `$AMORU_SPILL_DIR`, `/local_disk0`, `/scratch`, `$TMPDIR`, `/tmp` | writable and ≥ 1 GiB free |
+| `staging_dir` | if None: first writable of `$MORUNA_SPILL_DIR`, `/local_disk0`, `/scratch`, `$TMPDIR`, `/tmp` | writable and ≥ 1 GiB free |
 | `durable_staging` | never probed: `Unknown` resolves to `Probed(false)` (contracts d.12 treats it as `Absent`); a `Present` declaration on a `tmpfs` or `overlay` filesystem (`statfs` magic) is refused with `Config { name: "durable_staging" }` | n/a |
 
 Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the result is recorded as `Probed(true)` or `Probed(false)`; a probe that times out resolves to `Probed(false)` with a note. For a `Present` field the same probe runs and its failure is `Config` (DS-I5); the field stays `Present`. `staging_dir` is not a `Guarantee`: a probe that finds no writable directory leaves it `None`.
@@ -187,13 +187,13 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 **f.2 `sample`.** Reads `memory.stat` (parse `anon`, `file`, `unevictable` lines only), `memory.peak` if present, `cpu.stat` `throttled_usec`; outside a cgroup, `/proc/self/statm` (RSS anon = `resident - shared` pages × page size) and `throttled_us = 0`. Keep file handles open and `pread` at offset 0 each time to avoid path lookups. Maintain the running peak when `memory.peak` is absent. All of this happens under the sampler's one mutex, held for the duration of the reads only; `reset_peak` takes the same mutex, writes `"reset"` to `memory.peak` when the file is writable (the write fails on older kernels, in which case the sampler notes it once and uses the running peak), and sets the running peak to the current `anon_bytes`.
 
-**f.3 Size string parsing.** `AMORU_BUDGET` accepts an integer (bytes) or `<number><unit>` with units `KiB`, `MiB`, `GiB`, `TiB`, `KB`, `MB`, `GB`, `TB` (decimal); anything else is `Config`.
+**f.3 Size string parsing.** `MORUNA_BUDGET` accepts an integer (bytes) or `<number><unit>` with units `KiB`, `MiB`, `GiB`, `TiB`, `KB`, `MB`, `GB`, `TB` (decimal); anything else is `Config`.
 
-**f.6 `budget.disk`.** In order: `DiscoveryInput::explicit_spill_limit` (the surface's `staging_limit`), then `AMORU_SPILL_LIMIT` parsed by f.3's size parser, then, when a `staging_dir` resolved, 20% of the free space `statvfs` reports for it (the same call e.4's ephemeral check already makes), then 0. The result is clamped to the free space, because a cap above the disk is not a cap, and a note records which of the four it was. 0 disables the disk tier, which is what the preamble's row says it means.
+**f.6 `budget.disk`.** In order: `DiscoveryInput::explicit_spill_limit` (the surface's `staging_limit`), then `MORUNA_SPILL_LIMIT` parsed by f.3's size parser, then, when a `staging_dir` resolved, 20% of the free space `statvfs` reports for it (the same call e.4's ephemeral check already makes), then 0. The result is clamped to the free space, because a cap above the disk is not a cap, and a note records which of the four it was. 0 disables the disk tier, which is what the preamble's row says it means.
 
 ## g. Concurrency within the component
 
-`discover` is called from the main thread once. `Sampler` is one instance per run, shared as `Arc<dyn amoru_kernel::Sampler>` by the controller thread (its tick) and the scheduler's workers (before and after every `apply`, SC f.2); it is `Send + Sync` through interior mutability (one mutex, never held across anything but the file reads, so a worker's sample waits at most for one other sample to finish). The mutex is outside the preamble's lock order because nothing is called while it is held.
+`discover` is called from the main thread once. `Sampler` is one instance per run, shared as `Arc<dyn moruna_kernel::Sampler>` by the controller thread (its tick) and the scheduler's workers (before and after every `apply`, SC f.2); it is `Send + Sync` through interior mutability (one mutex, never held across anything but the file reads, so a worker's sample waits at most for one other sample to finish). The mutex is outside the preamble's lock order because nothing is called while it is held.
 
 ## h. Behaviour
 
@@ -203,11 +203,11 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 **Normal path (GPU pod).** One device enumerated and `memlock = Present`: `host_tier = PinnedHost`; the arena pins the whole host region (AR-I6) and every host payload of the run is `PinnedHost`.
 
-**Databricks driver.** `DATABRICKS_RUNTIME_VERSION` is set; with an explicit budget (constructor or `AMORU_BUDGET`) discovery proceeds as on a laptop with `source = Explicit`, clamped to the kill line if one exists; without one it returns `Config { name: "budget" }` (DS-I8) and the run does not start. Elsewhere, a JVM detected through `JAVA_HOME` or a `java` process in `/proc/*/comm` (best effort) adds the note "explicit budget recommended on this host: JVM present" and the OS fallback stands.
+**Databricks driver.** `DATABRICKS_RUNTIME_VERSION` is set; with an explicit budget (constructor or `MORUNA_BUDGET`) discovery proceeds as on a laptop with `source = Explicit`, clamped to the kill line if one exists; without one it returns `Config { name: "budget" }` (DS-I8) and the run does not start. Elsewhere, a JVM detected through `JAVA_HOME` or a `java` process in `/proc/*/comm` (best effort) adds the note "explicit budget recommended on this host: JVM present" and the OS fallback stands.
 
 **Edge cases.** `memory.high` > `memory.max` (misconfigured): ignore high, note it. `cpu.max` quota below one core (e.g. `50000 100000`): quota 0.5; the scheduler will run one worker. Explicit budget above the kill line: clamped to 0.95 × kill with a warning (DS-I1). Staging dir on a read-only filesystem: `direct_io_staging` `Probed(false)` (or `Config` if declared `Present`) and `staging_dir` None; placement then runs without a disk tier, no manifest is written, and the report says so. A device present with `memlock = Absent` or `Probed(false)`: `host_tier = Host`, a note says device copies will bounce (06 e.2), and the run proceeds.
 
-**Failures.** Unreadable cgroup files (permissions): fall back to OS with a note. `AMORU_HOST_PROFILE` malformed: `Config` (a platform error, fail fast). Probe timeout: `Probed(false)` with a note. Databricks without a budget: `Config { name: "budget" }` (DS-I8).
+**Failures.** Unreadable cgroup files (permissions): fall back to OS with a note. `MORUNA_HOST_PROFILE` malformed: `Config` (a platform error, fail fast). Probe timeout: `Probed(false)` with a note. Databricks without a budget: `Config { name: "budget" }` (DS-I8).
 
 ## i. Configuration
 
@@ -219,7 +219,7 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 ## k. Tests
 
-**DS-T14 disk_budget.** With `AMORU_SPILL_LIMIT=2GiB` and a staging directory, `Discovered.disk_budget` is 2 GiB (clamped to the free space when the directory has less) and a note says so; with the variable unset and a staging directory, it is 20% of what `statvfs` reports free for that directory and within a percent of that figure; with no staging directory it is 0. f.6.
+**DS-T14 disk_budget.** With `MORUNA_SPILL_LIMIT=2GiB` and a staging directory, `Discovered.disk_budget` is 2 GiB (clamped to the free space when the directory has less) and a note says so; with the variable unset and a staging directory, it is 20% of what `statvfs` reports free for that directory and within a percent of that figure; with no staging directory it is 0. f.6.
 
 **DS-T1 precedence.** Matrix of explicit / env / cgroup / OS combinations for budget, CPU and staging dir; the chosen value and `LimitSource` follow DS-I1. Uses a fake cgroup directory (the parser takes a root path).
 
@@ -241,7 +241,7 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 **DS-T10 size_strings.** `8GiB`, `8GB`, `8589934592`, `8 GiB` (space: error), `8gib` (case: accept). f.3.
 
-**DS-T11 databricks_budget_required.** With `DATABRICKS_RUNTIME_VERSION=14.3` in the process environment and no budget, `discover` returns `Config { name: "budget" }` whose message names the variable; with `AMORU_BUDGET=4GiB` it succeeds with `source = Explicit`; with the variable unset and no budget the OS fallback stands with a note. DS-I8.
+**DS-T11 databricks_budget_required.** With `DATABRICKS_RUNTIME_VERSION=14.3` in the process environment and no budget, `discover` returns `Config { name: "budget" }` whose message names the variable; with `MORUNA_BUDGET=4GiB` it succeeds with `source = Explicit`; with the variable unset and no budget the OS fallback stands with a note. DS-I8.
 
 **DS-T13 anon_excludes_mapped_file.** (runs anywhere) A process maps a 256 MiB file and reads every page of it; `Sample.anon_bytes` over the real host's sampler does not rise by the size of the file. DS-I4.
 
@@ -249,7 +249,7 @@ Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the 
 
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs`, `src/env.rs` (e.1, f.3), `src/cgroup.rs` (e.2, v1 fallback, root path parameter for tests), `src/os.rs` (`/proc/meminfo`, `sysconf`), `src/probes.rs` (e.4, each probe a function returning `Guarantee` plus a note, bounded by a timeout thread), `src/devices.rs` (feature `cuda`), `src/sampler.rs` (f.2, the `amoru_kernel::Sampler` impl), `src/limits.rs` (e.3, DS-I8, `host_tier`). `unsafe` only in `probes.rs`, which is also where every other `libc` call lives, each behind a safe wrapper the rest of the crate calls: `sysconf` for the page size (d.2), `statvfs` and `statfs` for the staging directory (e.4), `mlock` and `io_uring_setup` for the probes, and on macOS `sysctl hw.memsize` for the host's RAM and `task_info(TASK_VM_INFO)` (with `proc_pid_rusage` behind it) for the sampler's DS-I4 quantity, plus `mmap` for DS-T13, which needs file backed pages to be resident and must not put an `unsafe` block in `sampler.rs` to get them. Every block carries a `// SAFETY:` comment. Keeping them in one module rather than spreading `unsafe` across `os.rs` and `limits.rs` is what makes E9's permitted set a single file (PM, 2026-09-22, on the component 3 agent's report).
+Files: `src/lib.rs`, `src/env.rs` (e.1, f.3), `src/cgroup.rs` (e.2, v1 fallback, root path parameter for tests), `src/os.rs` (`/proc/meminfo`, `sysconf`), `src/probes.rs` (e.4, each probe a function returning `Guarantee` plus a note, bounded by a timeout thread), `src/devices.rs` (feature `cuda`), `src/sampler.rs` (f.2, the `moruna_kernel::Sampler` impl), `src/limits.rs` (e.3, DS-I8, `host_tier`). `unsafe` only in `probes.rs`, which is also where every other `libc` call lives, each behind a safe wrapper the rest of the crate calls: `sysconf` for the page size (d.2), `statvfs` and `statfs` for the staging directory (e.4), `mlock` and `io_uring_setup` for the probes, and on macOS `sysctl hw.memsize` for the host's RAM and `task_info(TASK_VM_INFO)` (with `proc_pid_rusage` behind it) for the sampler's DS-I4 quantity, plus `mmap` for DS-T13, which needs file backed pages to be resident and must not put an `unsafe` block in `sampler.rs` to get them. Every block carries a `// SAFETY:` comment. Keeping them in one module rather than spreading `unsafe` across `os.rs` and `limits.rs` is what makes E9's permitted set a single file (PM, 2026-09-22, on the component 3 agent's report).
 
 Never cache a cgroup value across `discover` calls (preamble 1.3 row 3). Do not depend on `cgroups-rs` or `procfs` crates; parse the six files directly so the fake-directory tests are exact.
 
@@ -257,7 +257,7 @@ The OS fallback is written for Linux (`/proc/meminfo`, `/proc/self/statm`, `sysc
 
 Two silences the component 3 agent filled and the PM confirmed on 2026-09-22. A `gds` or `rdma` guarantee declared `Present` in a build without the feature is a `Config` error at `discover`, not a silent `Absent`: e.4's "Absent without the feature" describes a probe, and DS-I5 governs a declaration, which must be verified or refused (G-I7). And `durable_staging=present` with no staging directory is a `Config { name: "durable_staging" }` error, because the declaration is about a directory that must then exist.
 
-Verify before starting: `memory.peak` presence on the reference host (`uname -r`); whether the CI container runtime blocks io_uring (`DS-T5` needs a way to force failure: use a profile flag `AMORU_TEST_FAIL_PROBE=io_uring` honoured only under `cfg(test)`).
+Verify before starting: `memory.peak` presence on the reference host (`uname -r`); whether the CI container runtime blocks io_uring (`DS-T5` needs a way to force failure: use a profile flag `MORUNA_TEST_FAIL_PROBE=io_uring` honoured only under `cfg(test)`).
 
 ## m. Open items
 

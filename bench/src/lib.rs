@@ -1,11 +1,11 @@
-//! The Amoru benchmark data generator.
+//! The Moruna benchmark data generator.
 //!
 //! Preamble section 6.5: in wave 1 the bench agent delivers, under `bench/`, a
 //! generator that "writes Parquet with controllable row count, column mix (ints,
 //! floats, short strings, long text with configurable mean length and variance),
 //! null ratio and row-group size, to local disk and to an S3-compatible store
 //! (MinIO in a container), and writes safetensors and aligned binary tensors of
-//! controllable shape". The aligned binary format is `AMB1`, defined in
+//! controllable shape". The aligned binary format is `MRB1`, defined in
 //! `architecture/sdd/01-contracts.md` section e.4, the one section of that
 //! document this crate reads.
 //!
@@ -27,7 +27,7 @@
 
 #![deny(missing_docs)]
 
-pub mod amb1;
+pub mod mrb1;
 pub mod cli;
 pub mod dataset;
 pub mod dtype;
@@ -185,7 +185,7 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u
     match run(args, out) {
         Ok(()) => 0,
         Err(error) => {
-            let _ = writeln!(err, "amoru-bench: {error}");
+            let _ = writeln!(err, "moruna-bench: {error}");
             1
         }
     }
@@ -197,7 +197,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp(name: &str) -> PathBuf {
-        const PREFIX: &str = "amoru-bench-lib";
+        const PREFIX: &str = "moruna-bench-lib";
         // Unique per process and per call: several executors run the gate at the same
         // time on one machine, and a fixed name under the system temp directory made two
         // runs delete each other's files (three generator tests failed that way on
@@ -221,7 +221,7 @@ mod tests {
     fn every_run_opens_with_the_machine_and_the_generator_version() {
         let (text, result) = run_line("version");
         assert!(result.is_ok());
-        assert!(text.starts_with("amoru-bench "), "{text}");
+        assert!(text.starts_with("moruna-bench "), "{text}");
         assert!(text.contains(GENERATOR_VERSION), "{text}");
         assert!(text.contains(&host::machine()), "{text}");
     }
@@ -230,7 +230,7 @@ mod tests {
     fn help_prints_the_usage() {
         let (text, result) = run_line("help");
         assert!(result.is_ok());
-        assert!(text.contains("usage: amoru-bench"), "{text}");
+        assert!(text.contains("usage: moruna-bench"), "{text}");
     }
 
     #[test]
@@ -248,9 +248,9 @@ mod tests {
             "embed-weights",
             "embed-weights-numeric",
             "embed-weights-half",
-            "embed-weights-amb1",
-            "score-bias-amb1",
-            "token-blocks-amb1",
+            "embed-weights-mrb1",
+            "score-bias-mrb1",
+            "token-blocks-mrb1",
         ] {
             assert!(text.contains(name), "{name} missing from {text}");
         }
@@ -261,14 +261,14 @@ mod tests {
     fn writing_one_dataset_reports_it_and_leaves_a_manifest() {
         let dir = temp("one");
         let (text, result) = run_line(&format!(
-            "dataset score-bias-amb1 --scale small --local-only --out {}",
+            "dataset score-bias-mrb1 --scale small --local-only --out {}",
             dir.display()
         ));
         assert!(result.is_ok(), "{text}");
-        assert!(text.contains("score-bias-amb1.amb1"), "{text}");
+        assert!(text.contains("score-bias-mrb1.mrb1"), "{text}");
         assert!(text.contains("blake3"), "{text}");
         assert!(text.contains("S3 upload skipped: --local-only"), "{text}");
-        assert!(dir.join("score-bias-amb1.amb1").exists());
+        assert!(dir.join("score-bias-mrb1.mrb1").exists());
         assert!(dir.join(manifest::FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -283,7 +283,7 @@ mod tests {
         let mut err: Vec<u8> = Vec::new();
         assert_eq!(main_with(&["nonsense".to_string()], &mut out, &mut err), 1);
         let text = String::from_utf8_lossy(&err).into_owned();
-        assert!(text.starts_with("amoru-bench: usage:"), "{text}");
+        assert!(text.starts_with("moruna-bench: usage:"), "{text}");
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let plan = cli::parse(&[
             "dataset".to_string(),
-            "score-bias-amb1".to_string(),
+            "score-bias-mrb1".to_string(),
             "--out".to_string(),
             dir.display().to_string(),
         ])

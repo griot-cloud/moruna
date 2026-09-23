@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Amoru pre-commit hook. Installed by tools/hooks/install.sh, which points
+# Moruna pre-commit hook. Installed by tools/hooks/install.sh, which points
 # core.hooksPath at tools/hooks. It runs the same quality gate as the first CI
 # job, so a commit that would fail CI fails here first. An agent never bypasses
-# it (no --no-verify, no AMORU_SKIP_QUALITY); the variable exists for a human
+# it (no --no-verify, no MORUNA_SKIP_QUALITY); the variable exists for a human
 # committing documentation on a machine without the Rust toolchain, and CI
 # re-runs the gate regardless.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-if [ "${AMORU_SKIP_QUALITY:-0}" = "1" ]; then
-  echo "pre-commit: quality gate skipped by AMORU_SKIP_QUALITY=1 (humans only; CI still runs it)"
+if [ "${MORUNA_SKIP_QUALITY:-0}" = "1" ]; then
+  echo "pre-commit: quality gate skipped by MORUNA_SKIP_QUALITY=1 (humans only; CI still runs it)"
   exit 0
 fi
 exec tools/quality/check.sh

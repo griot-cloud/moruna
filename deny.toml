@@ -1,4 +1,4 @@
-# Amoru supply-chain policy for `cargo-deny` (board E6, feature F6.5).
+# Moruna supply-chain policy for `cargo-deny` (board E6, feature F6.5).
 #
 # Four checks, each here for a stated reason:
 #
@@ -28,13 +28,13 @@
 # `polars` and `datafusion` each pull their own `arrow`, and an unfeatured scan
 # would never see the duplicate the bans section below exists to catch.
 all-features = true
-# The platforms Amoru ships, and the only ones the graph is resolved for.
+# The platforms Moruna ships, and the only ones the graph is resolved for.
 # Decided by the PM on 2026-09-22 and written into preamble 6.2 as the
 # supported-target set, so this list and that sentence are one decision in two
 # places: a target added to the preamble is added here in the same pull request.
 # Windows is not a v1 target (the runtime reads cgroup v2 and uses O_DIRECT and
 # io_uring). The narrowing is not cosmetic: it is what removes crates that only
-# ever appear on targets Amoru does not build for, and with it the graph no
+# ever appear on targets Moruna does not build for, and with it the graph no
 # longer contains tiny-keccak 2.0.2, whose CC0-1.0 licence is on no allow list
 # here (CC0 waives no patent rights; Fedora stopped accepting it for code in
 # 2022 and Google forbids it, while the ASF and Debian accept it, and that split
@@ -116,7 +116,7 @@ allow = ["bzip2-1.0.6"]
 
 # Resolved, kept as a record: tiny-keccak 2.0.2 is CC0-1.0 only and was the one
 # licence this file could not wave through. It is no longer in the graph, because
-# the `[graph] targets` list above resolves only the platforms Amoru ships and
+# the `[graph] targets` list above resolves only the platforms Moruna ships and
 # tiny-keccak appeared only on the others. No CC0-1.0 exception was granted, and
 # none should be: if tiny-keccak ever reappears here it means a supported target
 # was added, and the licence question comes back with it (PM, 2026-09-22).

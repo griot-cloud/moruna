@@ -336,7 +336,7 @@ fn batch(
 /// dataset are a function of the generator alone.
 pub fn created_by() -> String {
     format!(
-        "amoru-bench {} (generator format {})",
+        "moruna-bench {} (generator format {})",
         crate::GENERATOR_VERSION,
         crate::GENERATOR_FORMAT
     )
@@ -345,22 +345,22 @@ pub fn created_by() -> String {
 fn key_value_metadata(dataset: &str, seed: u64, spec: &ParquetSpec) -> Vec<KeyValue> {
     // A fixed order, so the footer bytes do not move between runs.
     vec![
-        KeyValue::new("amoru_bench.dataset".to_string(), dataset.to_string()),
-        KeyValue::new("amoru_bench.seed".to_string(), seed.to_string()),
+        KeyValue::new("moruna_bench.dataset".to_string(), dataset.to_string()),
+        KeyValue::new("moruna_bench.seed".to_string(), seed.to_string()),
         KeyValue::new(
-            "amoru_bench.version".to_string(),
+            "moruna_bench.version".to_string(),
             crate::GENERATOR_VERSION.to_string(),
         ),
         KeyValue::new(
-            "amoru_bench.format".to_string(),
+            "moruna_bench.format".to_string(),
             crate::GENERATOR_FORMAT.to_string(),
         ),
         KeyValue::new(
-            "amoru_bench.null_ratio".to_string(),
+            "moruna_bench.null_ratio".to_string(),
             format!("{:.6}", spec.null_ratio),
         ),
         KeyValue::new(
-            "amoru_bench.row_group_rows".to_string(),
+            "moruna_bench.row_group_rows".to_string(),
             spec.row_group_rows.to_string(),
         ),
     ]
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn created_by_names_the_generator_and_not_the_parquet_library() {
         let text = created_by();
-        assert!(text.starts_with("amoru-bench "), "{text}");
+        assert!(text.starts_with("moruna-bench "), "{text}");
         assert!(text.contains(crate::GENERATOR_VERSION), "{text}");
     }
 
@@ -517,12 +517,12 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "amoru_bench.dataset",
-                "amoru_bench.seed",
-                "amoru_bench.version",
-                "amoru_bench.format",
-                "amoru_bench.null_ratio",
-                "amoru_bench.row_group_rows",
+                "moruna_bench.dataset",
+                "moruna_bench.seed",
+                "moruna_bench.version",
+                "moruna_bench.format",
+                "moruna_bench.null_ratio",
+                "moruna_bench.row_group_rows",
             ]
         );
     }

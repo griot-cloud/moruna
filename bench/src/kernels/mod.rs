@@ -10,7 +10,7 @@
 //!
 //! # The shape of a kernel
 //!
-//! The runtime that will host these kernels is not built yet: `amoru-kernel` is
+//! The runtime that will host these kernels is not built yet: `moruna-kernel` is
 //! a wave 0 stub, so there is no `Kernel` trait to implement and no `Payload` to
 //! carry. The trait below is therefore local to this crate, but its method shape
 //! is the one `architecture/sdd/01-contracts.md` section d.7 gives `Kernel`: an
@@ -27,7 +27,7 @@
 //! 1. `BenchPayload` carries no `Tier`: tiering is the arena's, and nothing here
 //!    allocates outside the host heap.
 //! 2. `BenchTensor` owns a `Vec<u8>` rather than wrapping a DLPack tensor,
-//!    because `dlpark` enters through `amoru-kernel` and this crate does not
+//!    because `dlpark` enters through `moruna-kernel` and this crate does not
 //!    depend on it.
 //! 3. `BenchKernelHints` carries an `amplification_band` that `KernelHints` does
 //!    not. The band is what preamble 6.5 states in words ("about 1.5", "5 to
@@ -261,7 +261,7 @@ impl BenchKernelState for NoState {
 /// `apply` has the shape contracts d.7 gives `Kernel::apply`: the instance's
 /// state, an input payload, and a `Result` holding the output payload. The
 /// methods a runtime needs and this crate cannot answer (`fingerprint`, which
-/// hashes over `amoru-kernel`'s types, and `output_schema`, which returns a
+/// hashes over `moruna-kernel`'s types, and `output_schema`, which returns a
 /// `SourceSchema`) are left to the wave 4 facade that wraps these structs.
 pub trait BenchKernel: Send + Sync {
     /// The kernel's name, which is the name preamble 6.5 gives it.

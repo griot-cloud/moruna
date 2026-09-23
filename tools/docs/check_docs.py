@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conventions and link checker for the Amoru documentation book (BOARD.md F7.1).
+"""Conventions and link checker for the Moruna documentation book (BOARD.md F7.1).
 
 mdBook has no built-in link check, so this script is the one. It is run by
 tools/quality/check.sh and by .github/workflows/docs.yml, and it enforces the
@@ -365,7 +365,7 @@ def self_test(fixtures: Path) -> int:
         raise DocsError(f"no fixtures in {fixtures}")
     failures: list[str] = []
     rejected = accepted = 0
-    with tempfile.TemporaryDirectory(prefix="amoru-check-docs-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="moruna-check-docs-") as tmp:
         for case in cases:
             expect_file = case / "expect"
             if not (case / "docs").is_dir():

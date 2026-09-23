@@ -55,6 +55,6 @@ fi
 if python3 "$scanner" "${files[@]}"; then
   echo "no_tier_wildcard: ok (${#files[@]} files, no wildcard arm over Tier or StagingCodec)"
 else
-  echo "no_tier_wildcard: FAIL (CT-I11: name every variant; Remote returns AmoruError::Unsupported(\"rdma\"))" >&2
+  echo "no_tier_wildcard: FAIL (CT-I11: name every variant; Remote returns MorunaError::Unsupported(\"rdma\"))" >&2
   exit 1
 fi

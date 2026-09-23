@@ -1,0 +1,96 @@
+[package]
+name = "moruna-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna kernel adapters"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+arrow = { workspace = true }
+dlpark = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-arrow = { workspace = true, optional = true }
+
+[dev-dependencies]
+moruna-testkit = { workspace = true }
+# The tests embed an interpreter, so they need pyo3 to initialise one; a library
+# never asks for `auto-initialize` itself (an extension module must not), which is
+# why it is set here and not in the `python` feature.
+pyo3 = { workspace = true, features = ["auto-initialize"] }
+
+[features]
+default = []
+# `dlpark/pyo3` gives `Dlpack` its `FromPyObject` and `IntoPyObject`, which is how
+# e.2 and e.3 cross a tensor without this crate touching a capsule by hand. A
+# feature selection on a pinned crate, not a version bump (preamble 6.2, cudarc
+# precedent); reported as an E2 note.
+python = ["dep:pyo3", "dep:pyo3-arrow", "dlpark/pyo3"]
+
+# Every test target needs the interpreter, so none of them is built when the
+# `python` feature is off (preamble 6.3: none of these features is on by default).
+[[test]]
+name = "ad_t1_crossing_zero_copy"
+path = "tests/ad_t1_crossing_zero_copy.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t2_boundary_copy_once"
+path = "tests/ad_t2_boundary_copy_once.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t3_device_no_copy"
+path = "tests/ad_t3_device_no_copy.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t4_gil_detected"
+path = "tests/ad_t4_gil_detected.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t5_gil_flip"
+path = "tests/ad_t5_gil_flip.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t6_deleter_attach"
+path = "tests/ad_t6_deleter_attach.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t7_exception_context"
+path = "tests/ad_t7_exception_context.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t8_fingerprint_source"
+path = "tests/ad_t8_fingerprint_source.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t11_speedup"
+path = "tests/ad_t11_speedup.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_t12_class_kernel_shape"
+path = "tests/ad_t12_class_kernel_shape.rs"
+required-features = ["python"]
+
+
+[[test]]
+name = "ad_e2_e3_crossing_rules"
+path = "tests/ad_e2_e3_crossing_rules.rs"
+required-features = ["python"]
+
+[[test]]
+name = "ad_h_edge_cases"
+path = "tests/ad_h_edge_cases.rs"
+required-features = ["python"]

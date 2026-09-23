@@ -1,11 +1,11 @@
-# Amoru benchmark suite
+# Moruna benchmark suite
 
 This directory is owned by the `bench` agent (preamble section 6.5) and is filled
 in two parts. This document covers the part that exists today.
 
-- Wave 1 (here now): the data generator, `amoru-bench`. It writes Parquet with a
+- Wave 1 (here now): the data generator, `moruna-bench`. It writes Parquet with a
   controllable row count, column mix, null ratio and row group size, and
-  safetensors and `AMB1` aligned binary tensors of controllable shape and dtype,
+  safetensors and `MRB1` aligned binary tensors of controllable shape and dtype,
   to a local directory and to an S3 compatible store.
 - Wave 1 (here now): the kernels (identity, normalise, tokenise-explode,
   adversarial, wide-intermediate, embed-score), in `bench/src/kernels/` and
@@ -17,13 +17,13 @@ in two parts. This document covers the part that exists today.
 
 Every gate runs in a container with `--memory` and `--cpus` set and on the bare
 host; results name the machine. Generated data goes under `bench/data/`, which is
-ignored by git. `AMORU_BENCH_MORSEL_BYTES` (preamble section 5) is read by the
+ignored by git. `MORUNA_BENCH_MORSEL_BYTES` (preamble section 5) is read by the
 wave 5 runner alone, not by the generator.
 
 ## The generator in one line
 
 ```
-cargo run --release -p amoru-bench -- suite --out bench/data
+cargo run --release -p moruna-bench -- suite --out bench/data
 ```
 
 That writes the whole suite, prints one line per file and leaves a
@@ -31,7 +31,7 @@ That writes the whole suite, prints one line per file and leaves a
 the machine, for example:
 
 ```
-amoru-bench 0.1.0 (generator format 1) on some-host (linux/x86_64, 16 logical cpus)
+moruna-bench 0.1.0 (generator format 1) on some-host (linux/x86_64, 16 logical cpus)
 ```
 
 The version is the crate version; the **generator format** is a separate number
@@ -62,8 +62,8 @@ It also records a BLAKE3 digest per file, so two runs can be compared without
 keeping both copies:
 
 ```
-cargo run --release -p amoru-bench -- suite --seed 20260922 --out /tmp/a
-cargo run --release -p amoru-bench -- suite --seed 20260922 --out /tmp/b
+cargo run --release -p moruna-bench -- suite --seed 20260922 --out /tmp/a
+cargo run --release -p moruna-bench -- suite --seed 20260922 --out /tmp/b
 diff <(jq -S '.files' /tmp/a/manifest.json) <(jq -S '.files' /tmp/b/manifest.json)
 ```
 
@@ -72,49 +72,49 @@ The test `the_whole_suite_is_byte_identical_between_two_runs` in
 
 ## Regenerating every dataset
 
-`cargo run -p amoru-bench -- list` prints the suite. `--scale small` writes the
+`cargo run -p moruna-bench -- list` prints the suite. `--scale small` writes the
 same shapes at a few thousand rows, which is what the tests use and what a smoke
 run wants; `--scale full` (the default) writes the benchmark sizes, about 1.3 GB
 in total.
 
 | Dataset | Shape | The kernel it feeds | One command |
 |---|---|---|---|
-| `identity-mixed` | 2,000,000 rows, 4 i64, 4 f64, 2 short string, no nulls, 65536 rows per row group | identity (amplification about 1) | `amoru-bench dataset identity-mixed --out bench/data` |
-| `text-normalise` | 400,000 rows, 2 text columns of mean 512 bytes, stddev 192, 5 percent nulls | normalise (a regex over text, about 1.5) | `amoru-bench dataset text-normalise --out bench/data` |
-| `text-explode` | 200,000 rows, 1 text column of mean 2048 bytes, stddev 1024 | tokenise-explode (5 to 10) | `amoru-bench dataset text-explode --out bench/data` |
-| `numeric-embed` | 1,000,000 rows, 2 i64 and 16 f64, no nulls | embed-score | `amoru-bench dataset numeric-embed --out bench/data` |
-| `nulls-heavy` | 500,000 rows, every column type, 35 percent nulls | the null path of every kernel | `amoru-bench dataset nulls-heavy --out bench/data` |
-| `wide-mixed` | 200,000 rows, 74 columns, snappy | wide-intermediate (about 20) | `amoru-bench dataset wide-mixed --out bench/data` |
-| `small-row-groups` | 100,000 rows, 1024 rows per row group (98 row groups) | adversarial | `amoru-bench dataset small-row-groups --out bench/data` |
-| `embed-weights` | safetensors: `weight` f32 [128,64], `bias` f32 [64] | a 128 wide feature vector | `amoru-bench dataset embed-weights --out bench/data` |
-| `embed-weights-numeric` | safetensors: `weight` f32 [18,64], `bias` f32 [64] | embed-score over `numeric-embed`, whose 2 i64 and 16 f64 make 18 numeric columns | `amoru-bench dataset embed-weights-numeric --out bench/data` |
-| `embed-weights-half` | safetensors: `weight` f16 [256,128], `bias` bf16 [128] | half precision weights | `amoru-bench dataset embed-weights-half --out bench/data` |
-| `embed-weights-amb1` | `AMB1` f32 [128,64] | `TensorSource` | `amoru-bench dataset embed-weights-amb1 --out bench/data` |
-| `score-bias-amb1` | `AMB1` f64 [64] | `TensorSource` | `amoru-bench dataset score-bias-amb1 --out bench/data` |
-| `token-blocks-amb1` | `AMB1` i64 [32,16,8] | rank 3 tensors | `amoru-bench dataset token-blocks-amb1 --out bench/data` |
+| `identity-mixed` | 2,000,000 rows, 4 i64, 4 f64, 2 short string, no nulls, 65536 rows per row group | identity (amplification about 1) | `moruna-bench dataset identity-mixed --out bench/data` |
+| `text-normalise` | 400,000 rows, 2 text columns of mean 512 bytes, stddev 192, 5 percent nulls | normalise (a regex over text, about 1.5) | `moruna-bench dataset text-normalise --out bench/data` |
+| `text-explode` | 200,000 rows, 1 text column of mean 2048 bytes, stddev 1024 | tokenise-explode (5 to 10) | `moruna-bench dataset text-explode --out bench/data` |
+| `numeric-embed` | 1,000,000 rows, 2 i64 and 16 f64, no nulls | embed-score | `moruna-bench dataset numeric-embed --out bench/data` |
+| `nulls-heavy` | 500,000 rows, every column type, 35 percent nulls | the null path of every kernel | `moruna-bench dataset nulls-heavy --out bench/data` |
+| `wide-mixed` | 200,000 rows, 74 columns, snappy | wide-intermediate (about 20) | `moruna-bench dataset wide-mixed --out bench/data` |
+| `small-row-groups` | 100,000 rows, 1024 rows per row group (98 row groups) | adversarial | `moruna-bench dataset small-row-groups --out bench/data` |
+| `embed-weights` | safetensors: `weight` f32 [128,64], `bias` f32 [64] | a 128 wide feature vector | `moruna-bench dataset embed-weights --out bench/data` |
+| `embed-weights-numeric` | safetensors: `weight` f32 [18,64], `bias` f32 [64] | embed-score over `numeric-embed`, whose 2 i64 and 16 f64 make 18 numeric columns | `moruna-bench dataset embed-weights-numeric --out bench/data` |
+| `embed-weights-half` | safetensors: `weight` f16 [256,128], `bias` bf16 [128] | half precision weights | `moruna-bench dataset embed-weights-half --out bench/data` |
+| `embed-weights-mrb1` | `MRB1` f32 [128,64] | `TensorSource` | `moruna-bench dataset embed-weights-mrb1 --out bench/data` |
+| `score-bias-mrb1` | `MRB1` f64 [64] | `TensorSource` | `moruna-bench dataset score-bias-mrb1 --out bench/data` |
+| `token-blocks-mrb1` | `MRB1` i64 [32,16,8] | rank 3 tensors | `moruna-bench dataset token-blocks-mrb1 --out bench/data` |
 
 Any shape outside the suite is written directly:
 
 ```
 # Parquet with every knob preamble 6.5 names
-amoru-bench parquet --name my-shape --rows 1_000_000 \
+moruna-bench parquet --name my-shape --rows 1_000_000 \
   --int-cols 4 --float-cols 4 --string-cols 2 --text-cols 1 \
   --text-mean-len 512 --text-len-stddev 192 --null-ratio 0.1 \
   --row-group-rows 32768 --compression snappy --out bench/data
 
 # the same text length given as a variance instead of a deviation
-amoru-bench parquet --text-mean-len 512 --text-len-variance 36864 --out bench/data
+moruna-bench parquet --text-mean-len 512 --text-len-variance 36864 --out bench/data
 
 # a safetensors file of several tensors
-amoru-bench safetensors --name model --tensor weight:f32:512,256 \
+moruna-bench safetensors --name model --tensor weight:f32:512,256 \
   --tensor bias:bf16:256 --out bench/data
 
-# one AMB1 tensor (contracts e.4), any dtype, up to 8 dimensions
-amoru-bench amb1 --name weights --dtype f32 --shape 128,64 --out bench/data
+# one MRB1 tensor (contracts e.4), any dtype, up to 8 dimensions
+moruna-bench mrb1 --name weights --dtype f32 --shape 128,64 --out bench/data
 ```
 
 `--seed <u64>` (default 20260922) selects the corpus, `--out <dir>` the
-directory, `--local-only` skips the upload, and `amoru-bench help` prints every
+directory, `--local-only` skips the upload, and `moruna-bench help` prints every
 option.
 
 ## The S3 compatible half
@@ -125,11 +125,11 @@ set:
 
 | Variable | Meaning |
 |---|---|
-| `AMORU_S3_ENDPOINT` | the base URL, for example `http://127.0.0.1:9000` |
-| `AMORU_S3_BUCKET` | the bucket to write into |
+| `MORUNA_S3_ENDPOINT` | the base URL, for example `http://127.0.0.1:9000` |
+| `MORUNA_S3_BUCKET` | the bucket to write into |
 | `AWS_ACCESS_KEY_ID` | the access key |
 | `AWS_SECRET_ACCESS_KEY` | the secret key |
-| `AMORU_S3_PREFIX` | optional key prefix, `bench` by default |
+| `MORUNA_S3_PREFIX` | optional key prefix, `bench` by default |
 | `AWS_REGION` | optional region, `us-east-1` by default |
 
 With any of the four unset, the upload is skipped with a printed note naming the
@@ -139,9 +139,9 @@ what MinIO and every other self hosted store expects, and plain HTTP is allowed
 for an `http://` endpoint.
 
 ```
-AMORU_S3_ENDPOINT=http://127.0.0.1:9000 AMORU_S3_BUCKET=amoru-ci \
-AWS_ACCESS_KEY_ID=amoru AWS_SECRET_ACCESS_KEY=amoru-ci-secret \
-  cargo run --release -p amoru-bench -- suite --out bench/data
+MORUNA_S3_ENDPOINT=http://127.0.0.1:9000 MORUNA_S3_BUCKET=moruna-ci \
+AWS_ACCESS_KEY_ID=moruna AWS_SECRET_ACCESS_KEY=moruna-ci-secret \
+  cargo run --release -p moruna-bench -- suite --out bench/data
 ```
 
 ## What the files are
@@ -155,9 +155,9 @@ AWS_ACCESS_KEY_ID=amoru AWS_SECRET_ACCESS_KEY=amoru-ci-secret \
   row group but the last holds exactly that many.
 - **safetensors.** Written by the `safetensors` crate itself, so what the
   generator writes is what that crate reads back.
-- **`AMB1`.** The aligned binary format of `architecture/sdd/01-contracts.md`
+- **`MRB1`.** The aligned binary format of `architecture/sdd/01-contracts.md`
   section e.4, written here by a small writer of this crate's own
-  (`src/amb1.rs`). It does not depend on `amoru-kernel`: a generator that shared
+  (`src/mrb1.rs`). It does not depend on `moruna-kernel`: a generator that shared
   the runtime's code could not catch a disagreement between the two, so the
   header test is written against the table in that section rather than against
   another implementation.
@@ -175,24 +175,24 @@ section d.4 `Payload`, and which Arrow types count as numeric is its section e.3
 
 | Kernel | Language | Amplification class (preamble 6.5) | Declared band | Dataset | Run it |
 |---|---|---|---|---|---|
-| `identity` | Rust | about 1 | 1.00 exactly | `identity-mixed` | `amoru-bench kernel identity --out bench/data` |
-| `normalise` | Rust | about 1.5 | 1.25 to 1.75 | `text-normalise` | `amoru-bench kernel normalise --out bench/data` |
-| `tokenise-explode` | Rust | 5 to 10 | 5.00 to 10.00 | `text-explode` | `amoru-bench kernel tokenise-explode --out bench/data` |
-| `adversarial` | Rust | jumps 4x at the midpoint | 1.00 before, 4.00 after, 2.40 to 2.60 over the whole dataset | `small-row-groups` | `amoru-bench kernel adversarial --out bench/data` |
+| `identity` | Rust | about 1 | 1.00 exactly | `identity-mixed` | `moruna-bench kernel identity --out bench/data` |
+| `normalise` | Rust | about 1.5 | 1.25 to 1.75 | `text-normalise` | `moruna-bench kernel normalise --out bench/data` |
+| `tokenise-explode` | Rust | 5 to 10 | 5.00 to 10.00 | `text-explode` | `moruna-bench kernel tokenise-explode --out bench/data` |
+| `adversarial` | Rust | jumps 4x at the midpoint | 1.00 before, 4.00 after, 2.40 to 2.60 over the whole dataset | `small-row-groups` | `moruna-bench kernel adversarial --out bench/data` |
 | `wide-intermediate` | Python, NumPy | about 20, releases the GIL | 15.0 to 25.0 | `wide-mixed` | see "The Python kernel" below |
-| `embed-score` | Rust | not stated; `1 + out_dim / in_dim` on an all numeric table | that figure plus or minus a tenth | `numeric-embed` with `embed-weights-numeric` | `amoru-bench kernel embed-score --out bench/data` |
+| `embed-score` | Rust | not stated; `1 + out_dim / in_dim` on an all numeric table | that figure plus or minus a tenth | `numeric-embed` with `embed-weights-numeric` | `moruna-bench kernel embed-score --out bench/data` |
 | `torch-score` | not built | stateful GPU model, weights via `TensorSource` | | | needs the reference GPU host (E1) |
 
 Each kernel declares its own band in `hints()`, which is the local mirror of
 contracts d.7's `KernelHints`, and `bench/tests/kernels.rs` reads a generated
 dataset back through the Parquet reader, runs the kernel over it one morsel at a
-time and asserts the measured ratio falls inside that band. `amoru-bench kernel`
+time and asserts the measured ratio falls inside that band. `moruna-bench kernel`
 does the same thing from the command line and fails when the ratio leaves the
 band. Write the data first:
 
 ```
-cargo run --release -p amoru-bench -- suite --scale small --local-only --out bench/data
-cargo run --release -p amoru-bench -- kernel tokenise-explode --out bench/data
+cargo run --release -p moruna-bench -- suite --scale small --local-only --out bench/data
+cargo run --release -p moruna-bench -- kernel tokenise-explode --out bench/data
 ```
 
 Every run opens with the machine, because a benchmark figure without its host is
@@ -241,7 +241,7 @@ escalation E1 is provisional and the printed host is what says so.
 `wide-intermediate` is the one of the six that is not Rust, because preamble 6.5
 asks for one that is not: the suite needs a kernel whose cost and whose GIL
 behaviour are a Python extension's. Its body is
-`bench/python/amoru_bench_kernels/wide_intermediate.py`, which takes a morsel as
+`bench/python/moruna_bench_kernels/wide_intermediate.py`, which takes a morsel as
 a mapping of column name to NumPy array, stacks the numeric columns into an
 `n x k` float64 matrix and returns the degree two expansion of each row: the
 upper triangle, diagonal included, of the row's outer product with itself, so `k`
@@ -261,7 +261,7 @@ could not happen if the lock were held for the call.
 declares the kernel and its hints and returns `BenchError::NotWired` from
 `apply`, naming the module that holds the body. The thing that would run it is
 the runtime's Python adapter, component 5, which does not exist yet
-(`crates/amoru-adapters` is a wave 0 stub and `pyo3` enters the workspace through
+(`crates/moruna-adapters` is a wave 0 stub and `pyo3` enters the workspace through
 it). A binding written here would be a second Python path beside the one
 component 5 is specified to build, measured in wave 5 against a baseline it does
 not share; an honest refusal is smaller and fails where a reader looks.
@@ -289,12 +289,12 @@ test over a `wide-mixed` shaped morsel built in the test runs everywhere.
 
 ## Tests
 
-`cargo test -p amoru-bench` covers the kernels in `bench/tests/kernels.rs` (every
+`cargo test -p moruna-bench` covers the kernels in `bench/tests/kernels.rs` (every
 declared amplification measured on its dataset, the adversarial jump at six
 morsel sizes, determinism, and the weights `embed-score` will and will not
 accept) and, for the generator, determinism by seed, the null ratio and the
 text length statistics read back out of the written file, the row group size, the
-`AMB1` header byte for byte against contracts e.4, and the safetensors round trip
+`MRB1` header byte for byte against contracts e.4, and the safetensors round trip
 through the `safetensors` crate. The S3 test is skipped, with its reason printed,
 on a host with no store configured; it runs in CI's MinIO job.
 

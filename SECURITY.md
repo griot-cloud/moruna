@@ -1,6 +1,6 @@
 # Security policy
 
-Amoru is a runtime that reads files, allocates pinned memory, issues direct IO, and executes user-supplied kernels. Bugs in those paths can have security consequences, and we want to hear about them privately first.
+Moruna is a runtime that reads files, allocates pinned memory, issues direct IO, and executes user-supplied kernels. Bugs in those paths can have security consequences, and we want to hear about them privately first.
 
 ## Reporting
 
@@ -14,7 +14,7 @@ We work to coordinated disclosure. After the acknowledgement and the plan, we ai
 
 ## How a fix reaches you
 
-Amoru is distributed as wheels on PyPI and as crates on crates.io. A security fix ships as a new release of both, announced in a GitHub security advisory for this repository, in the release notes and in `CHANGELOG.md`. A wheel is never patched in place: upgrade to the fixed version. Watch the repository's releases, or the advisory feed, if you want to hear about these without asking.
+Moruna is distributed as wheels on PyPI and as crates on crates.io. A security fix ships as a new release of both, announced in a GitHub security advisory for this repository, in the release notes and in `CHANGELOG.md`. A wheel is never patched in place: upgrade to the fixed version. Watch the repository's releases, or the advisory feed, if you want to hear about these without asking.
 
 ## Scope
 

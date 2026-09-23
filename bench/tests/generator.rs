@@ -7,20 +7,20 @@
 
 use std::path::{Path, PathBuf};
 
-use amoru_bench::amb1;
-use amoru_bench::cli;
-use amoru_bench::dataset::{Dataset, DatasetKind};
-use amoru_bench::dtype::DType;
-use amoru_bench::parquet_out::ParquetSpec;
-use amoru_bench::s3;
-use amoru_bench::suite::{self, Scale};
+use moruna_bench::mrb1;
+use moruna_bench::cli;
+use moruna_bench::dataset::{Dataset, DatasetKind};
+use moruna_bench::dtype::DType;
+use moruna_bench::parquet_out::ParquetSpec;
+use moruna_bench::s3;
+use moruna_bench::suite::{self, Scale};
 
 use arrow::array::Array;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 fn scratch(name: &str) -> PathBuf {
-    const PREFIX: &str = "amoru-bench-it";
+    const PREFIX: &str = "moruna-bench-it";
     // Unique per process and per call: several executors run the gate at the same
     // time on one machine, and a fixed name under the system temp directory made two
     // runs delete each other's files (three generator tests failed that way on
@@ -36,7 +36,7 @@ fn scratch(name: &str) -> PathBuf {
 fn run(line: &str) -> String {
     let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
     let mut out: Vec<u8> = Vec::new();
-    match amoru_bench::run(&args, &mut out) {
+    match moruna_bench::run(&args, &mut out) {
         Ok(()) => String::from_utf8_lossy(&out).into_owned(),
         Err(err) => panic!("{line}: {err}\n{}", String::from_utf8_lossy(&out)),
     }
@@ -216,19 +216,19 @@ fn the_row_group_size_is_honoured() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An `AMB1` file on disk matches the table of contracts e.4 byte for byte, and
+/// An `MRB1` file on disk matches the table of contracts e.4 byte for byte, and
 /// passes the four checks that section says a reader makes.
 #[test]
 fn an_amb1_file_on_disk_matches_contracts_e4() {
-    let dir = scratch("amb1");
+    let dir = scratch("mrb1");
     run(&format!(
-        "amb1 --name weights --dtype f32 --shape 128,64 --local-only --seed 5 --out {}",
+        "mrb1 --name weights --dtype f32 --shape 128,64 --local-only --seed 5 --out {}",
         dir.display()
     ));
-    let bytes = read(&dir.join("weights.amb1"));
+    let bytes = read(&dir.join("weights.mrb1"));
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"AMB1");
+    expected.extend_from_slice(b"MRB1");
     expected.extend_from_slice(&1u16.to_le_bytes());
     expected.push(10); // F32
     expected.push(2); // ndim
@@ -243,11 +243,11 @@ fn an_amb1_file_on_disk_matches_contracts_e4() {
     let data_offset = u64::from_le_bytes([
         bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
     ]);
-    assert_eq!(data_offset % amb1::PAGE_BYTES, 0);
-    assert!(data_offset >= amb1::header_end(2));
+    assert_eq!(data_offset % mrb1::PAGE_BYTES, 0);
+    assert!(data_offset >= mrb1::header_end(2));
     let payload_len = 128 * 64 * 4;
     assert!(bytes.len() as u64 >= data_offset + payload_len);
-    assert_eq!(bytes.len() as u64 % amb1::TAIL_ALIGN, 0);
+    assert_eq!(bytes.len() as u64 % mrb1::TAIL_ALIGN, 0);
     assert!(
         bytes[(data_offset + payload_len) as usize..]
             .iter()
@@ -255,7 +255,7 @@ fn an_amb1_file_on_disk_matches_contracts_e4() {
     );
 
     // The payload is the tensor's own bytes, at data_offset, row major.
-    let spec = amb1::TensorSpec::new("weights", DType::F32, vec![128, 64]).expect("spec");
+    let spec = mrb1::TensorSpec::new("weights", DType::F32, vec![128, 64]).expect("spec");
     assert_eq!(
         &bytes[data_offset as usize..(data_offset + payload_len) as usize],
         spec.payload(5).as_slice()
@@ -305,7 +305,7 @@ fn one_dataset_matches_what_the_whole_suite_writes() {
         "suite --scale small --seed 77 --local-only --out {}",
         all.display()
     ));
-    for name in ["numeric-embed", "embed-weights", "token-blocks-amb1"] {
+    for name in ["numeric-embed", "embed-weights", "token-blocks-mrb1"] {
         run(&format!(
             "dataset {name} --scale small --seed 77 --local-only --out {}",
             one.display()
@@ -326,11 +326,11 @@ fn the_manifest_records_the_run() {
         "dataset embed-weights --scale small --seed 3 --local-only --out {}",
         dir.display()
     ));
-    assert!(report.starts_with("amoru-bench "), "{report}");
+    assert!(report.starts_with("moruna-bench "), "{report}");
     let text = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
     let value: serde_json::Value = serde_json::from_str(&text).expect("json");
     assert_eq!(value["seed"], 3);
-    assert_eq!(value["generator"], "amoru-bench");
+    assert_eq!(value["generator"], "moruna-bench");
     assert!(value["machine"].as_str().unwrap_or_default().len() > 3);
     let files = value["files"].as_array().expect("files");
     assert_eq!(files.len(), 1);
@@ -392,7 +392,7 @@ fn the_same_datasets_reach_the_s3_compatible_store() {
     let dir = scratch("s3");
     let dataset = Dataset {
         name: "s3-probe".to_string(),
-        kind: DatasetKind::Amb1(amb1::TensorSpec::new("probe", DType::I64, vec![8]).expect("spec")),
+        kind: DatasetKind::Amb1(mrb1::TensorSpec::new("probe", DType::I64, vec![8]).expect("spec")),
     };
     let written = dataset.write(&dir, 21).expect("write");
     let mut out: Vec<u8> = Vec::new();
@@ -422,7 +422,7 @@ fn a_refused_command_line_writes_nothing() {
     .map(str::to_string)
     .collect();
     let mut out: Vec<u8> = Vec::new();
-    assert!(amoru_bench::run(&args, &mut out).is_err());
+    assert!(moruna_bench::run(&args, &mut out).is_err());
     assert!(!dir.exists());
     assert!(cli::parse(&args).is_err());
 }

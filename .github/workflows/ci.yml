@@ -57,11 +57,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
-      - name: CT-T12 boundary, amoru-kernel has no runtime dependency
+      - name: CT-T12 boundary, moruna-kernel has no runtime dependency
         run: |
-          cargo tree -p amoru-kernel > kernel-tree.txt
+          cargo tree -p moruna-kernel > kernel-tree.txt
           if grep -E -i '\b(tokio|cudarc|pyo3|parquet|object_store)\b' kernel-tree.txt; then
-            echo "amoru-kernel must not depend on tokio, cudarc, pyo3, parquet or object_store (01 section a, CT-T12)" >&2
+            echo "moruna-kernel must not depend on tokio, cudarc, pyo3, parquet or object_store (01 section a, CT-T12)" >&2
             exit 1
           fi
       - name: The Python kernels
@@ -69,7 +69,7 @@ jobs:
           python -c 'import sys, sysconfig; print(sys.version); print("free-threaded:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")), "gil now:", sys._is_gil_enabled())'
           PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled()'
           python -m pip install --quiet --only-binary=:all: numpy pytest
-          PYTHONPATH=python python -c 'import amoru; print("amoru", amoru.__version__)'
+          PYTHONPATH=python python -c 'import moruna; print("moruna", moruna.__version__)'
           cd bench/python && python -m pytest -q
 
   # Weekly and on demand: the checks that answer to the outside world rather
@@ -80,10 +80,10 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     env:
-      AMORU_S3_ENDPOINT: http://127.0.0.1:9000
-      AMORU_S3_BUCKET: amoru-ci
-      AWS_ACCESS_KEY_ID: amoru
-      AWS_SECRET_ACCESS_KEY: amoru-ci-secret
+      MORUNA_S3_ENDPOINT: http://127.0.0.1:9000
+      MORUNA_S3_BUCKET: moruna-ci
+      AWS_ACCESS_KEY_ID: moruna
+      AWS_SECRET_ACCESS_KEY: moruna-ci-secret
       AWS_REGION: us-east-1
       AWS_ALLOW_HTTP: "true"
     steps:
@@ -105,19 +105,19 @@ jobs:
             -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
             quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           for i in $(seq 1 30); do
-            curl -sf "$AMORU_S3_ENDPOINT/minio/health/live" >/dev/null && break
+            curl -sf "$MORUNA_S3_ENDPOINT/minio/health/live" >/dev/null && break
             sleep 1
           done
           docker run --rm --network host \
             -e MC_HOST_ci="http://$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY@127.0.0.1:9000" \
-            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb "ci/$AMORU_S3_BUCKET"
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb "ci/$MORUNA_S3_BUCKET"
       - name: Tests under a real cgroup ceiling, ignored ones included
         run: |
           docker run --rm --network host \
             --memory=2g --memory-swap=2g --cpus=1.5 \
             -v "$PWD":/w -w /w \
             -v "$HOME/.cargo/registry":/root/.cargo/registry \
-            -e AMORU_S3_ENDPOINT -e AMORU_S3_BUCKET -e AWS_ACCESS_KEY_ID \
+            -e MORUNA_S3_ENDPOINT -e MORUNA_S3_BUCKET -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY -e AWS_REGION -e AWS_ALLOW_HTTP \
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
@@ -152,8 +152,8 @@ jobs:
         # A wheel that has never been imported is not a release candidate.
         run: |
           python -m pip install --only-binary=:all: pyarrow
-          python -m pip install --no-index --find-links dist amoru
-          python -c "import amoru; print(amoru.__version__); print(amoru.inspect_host()['limits'])"
+          python -m pip install --no-index --find-links dist moruna
+          python -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
       - name: Publish
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.14.0
         with:

@@ -1,4 +1,4 @@
-Author: Amoru Agent <agents@griotdata.com>
+Author: Moruna Agent <agents@griotdata.com>
 Arena: page-aligned allocation for buffers over a page (AR-I2)
 
-Signed-off-by: Amoru Agent <agents@griotdata.com>
+Signed-off-by: Moruna Agent <agents@griotdata.com>

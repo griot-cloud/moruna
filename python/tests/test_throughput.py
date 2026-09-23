@@ -37,26 +37,26 @@ TIMEOUT_S = 180.0
 SCRIPT = """
 import json, os, pathlib, time
 import pyarrow as pa, pyarrow.compute as pc, pyarrow.parquet as pq
-import amoru
+import moruna
 
-d = pathlib.Path(os.environ["AMORU_TEST_DIR"])
+d = pathlib.Path(os.environ["MORUNA_TEST_DIR"])
 src, out = d / "in", d / "out"
 src.mkdir(exist_ok=True); out.mkdir(exist_ok=True)
-rows = int(os.environ["AMORU_TEST_ROWS"])
+rows = int(os.environ["MORUNA_TEST_ROWS"])
 pq.write_table(pa.table({"id": pa.array(range(rows), pa.int64()),
                          "text": pa.array([f"row-{i}" for i in range(rows)])}),
                src / "part-0.parquet", row_group_size=20_000)
 
-@amoru.kernel
+@moruna.kernel
 def append_upper(batch):
     return batch.append_column("upper", pc.utf8_upper(batch.column("text")))
 
 # The destination is a bare filesystem path, which is how a user writes one. A `file://` URL is
 # the other spelling and both must work.
 started = time.perf_counter()
-report = amoru.run(amoru.ParquetSource(str(src / "part-0.parquet")),
+report = moruna.run(moruna.ParquetSource(str(src / "part-0.parquet")),
                    append_upper,
-                   amoru.ParquetSink(str(out), row_group_bytes="16MiB", file_bytes="64MiB"),
+                   moruna.ParquetSink(str(out), row_group_bytes="16MiB", file_bytes="64MiB"),
                    budget="512MiB")
 run_s = time.perf_counter() - started
 back = pq.read_table(str(out))
@@ -77,8 +77,8 @@ def test_a_python_kernel_over_200k_rows_finishes_inside_a_wall_clock_bound(
     scratch: pathlib.Path,
 ) -> None:
     env = dict(os.environ)
-    env["AMORU_TEST_DIR"] = str(scratch)
-    env["AMORU_TEST_ROWS"] = str(ROWS)
+    env["MORUNA_TEST_DIR"] = str(scratch)
+    env["MORUNA_TEST_ROWS"] = str(ROWS)
     started = time.perf_counter()
     try:
         proc = subprocess.run(  # noqa: S603

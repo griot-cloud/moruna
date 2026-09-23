@@ -1,0 +1,25 @@
+[package]
+name = "moruna-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna scheduler"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+moruna-sinks = { workspace = true }
+crossbeam = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# The fakes of contracts d.15. Every SC test drives the scheduler through them and names only
+# their knobs (10 k); a test dependency only, in no shipping crate's graph.
+moruna-testkit = { workspace = true }
+
+[features]
+default = []

@@ -25,7 +25,7 @@ pub fn machine() -> String {
 /// machine.
 pub fn banner() -> String {
     format!(
-        "amoru-bench {} (generator format {}) on {}",
+        "moruna-bench {} (generator format {}) on {}",
         crate::GENERATOR_VERSION,
         crate::GENERATOR_FORMAT,
         machine()
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn the_banner_names_the_generator_version_and_the_machine() {
         let line = banner();
-        assert!(line.starts_with("amoru-bench "), "{line}");
+        assert!(line.starts_with("moruna-bench "), "{line}");
         assert!(line.contains(crate::GENERATOR_VERSION), "{line}");
         assert!(line.contains("generator format"), "{line}");
         assert!(line.contains(&machine()), "{line}");

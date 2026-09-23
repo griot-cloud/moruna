@@ -39,8 +39,8 @@ while IFS= read -r toml; do
   name="$(basename "$crate")"
   lines="$(find "$crate/src" -name '*.rs' -exec cat {} + 2>/dev/null | grep -vcE '^\s*(//|$)' || true)"
   if [ "${lines:-0}" -lt 50 ]; then
-    if [ -n "${AMORU_STUB_CRATES_OK:-}" ] && printf '%s' "$AMORU_STUB_CRATES_OK" | tr ',' '\n' | grep -qx "$name"; then
-      printf 'no_stubs: %s is an empty crate, allowed for now by AMORU_STUB_CRATES_OK\n' "$name"
+    if [ -n "${MORUNA_STUB_CRATES_OK:-}" ] && printf '%s' "$MORUNA_STUB_CRATES_OK" | tr ',' '\n' | grep -qx "$name"; then
+      printf 'no_stubs: %s is an empty crate, allowed for now by MORUNA_STUB_CRATES_OK\n' "$name"
     else
       printf 'no_stubs: %s has %s lines of code, which is a stub crate\n' "$name" "${lines:-0}" >&2
       fail=1

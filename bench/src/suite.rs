@@ -7,7 +7,7 @@
 //! of two scales: `full`, the sizes a benchmark run uses, and `small`, the same
 //! shapes at a few thousand rows, which is what a test or a smoke run writes.
 
-use crate::amb1::TensorSpec;
+use crate::mrb1::TensorSpec;
 use crate::dataset::{Dataset, DatasetKind};
 use crate::dtype::DType;
 use crate::error::{BenchError, Result};
@@ -211,17 +211,17 @@ pub fn datasets(scale: Scale) -> Result<Vec<Dataset>> {
         },
         // the same weights again in the aligned binary format of contracts e.4.
         Dataset {
-            name: "embed-weights-amb1".to_string(),
+            name: "embed-weights-mrb1".to_string(),
             kind: DatasetKind::Amb1(tensor("weight", DType::F32, vec![128, 64])?),
         },
         Dataset {
-            name: "score-bias-amb1".to_string(),
+            name: "score-bias-mrb1".to_string(),
             kind: DatasetKind::Amb1(tensor("bias", DType::F64, vec![64])?),
         },
         // a rank 3 integer tensor: the tokenise-explode kernel's identifier
         // blocks, and the generator's proof that ndim above 2 writes.
         Dataset {
-            name: "token-blocks-amb1".to_string(),
+            name: "token-blocks-mrb1".to_string(),
             kind: DatasetKind::Amb1(tensor("tokens", DType::I64, vec![32, 16, 8])?),
         },
     ])
@@ -262,7 +262,7 @@ mod tests {
         let all = datasets(Scale::Small).expect("suite");
         let mut parquet = 0;
         let mut safetensors = 0;
-        let mut amb1 = 0;
+        let mut mrb1 = 0;
         let mut with_text = 0;
         let mut with_nulls = 0;
         let mut compressed = 0;
@@ -285,12 +285,12 @@ mod tests {
                     safetensors += 1;
                     assert!(!specs.is_empty());
                 }
-                DatasetKind::Amb1(_) => amb1 += 1,
+                DatasetKind::Amb1(_) => mrb1 += 1,
             }
         }
         assert_eq!(parquet, 7);
         assert_eq!(safetensors, 3);
-        assert_eq!(amb1, 3);
+        assert_eq!(mrb1, 3);
         assert!(with_text >= 4);
         assert!(with_nulls >= 3);
         assert_eq!(compressed, 1);

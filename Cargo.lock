@@ -53,246 +53,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "amoru-adapters"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-testkit",
- "arrow",
- "dlpark",
- "pyo3",
- "pyo3-arrow",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "amoru-arena"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "cudarc",
- "libc",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "amoru-bench"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "blake3",
- "bytes",
- "hostname",
- "object_store",
- "parquet",
- "safetensors",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "amoru-controller"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-testkit",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "amoru-datafusion"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "datafusion",
- "tokio",
-]
-
-[[package]]
-name = "amoru-discovery"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "cudarc",
- "libc",
- "tracing",
-]
-
-[[package]]
-name = "amoru-kernel"
-version = "0.1.0"
-dependencies = [
- "amoru-testkit",
- "arrow",
- "blake3",
- "dlpark",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "amoru-placement"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-testkit",
- "arrow",
- "base64 0.23.1",
- "blake3",
- "crossbeam",
- "cudarc",
- "hostname",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "amoru-polars"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "polars",
- "polars-arrow",
-]
-
-[[package]]
-name = "amoru-py"
-version = "0.1.0"
-dependencies = [
- "amoru-adapters",
- "amoru-discovery",
- "amoru-kernel",
- "amoru-placement",
- "amoru-reactor",
- "amoru-runtime",
- "amoru-sinks",
- "amoru-sources",
- "amoru-trace",
- "arrow",
- "parquet",
- "pyo3",
- "pyo3-arrow",
- "serde_json",
- "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "amoru-reactor"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-testkit",
- "bytes",
- "cudarc",
- "io-uring",
- "libc",
- "object_store",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "amoru-runtime"
-version = "0.1.0"
-dependencies = [
- "amoru-adapters",
- "amoru-arena",
- "amoru-controller",
- "amoru-discovery",
- "amoru-kernel",
- "amoru-placement",
- "amoru-reactor",
- "amoru-scheduler",
- "amoru-sinks",
- "amoru-sources",
- "amoru-testkit",
- "amoru-trace",
- "arrow",
- "getrandom 0.4.3",
- "libc",
- "mimalloc",
- "parquet",
- "serde_json",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "amoru-scheduler"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-sinks",
- "amoru-testkit",
- "crossbeam",
- "libc",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "amoru-sinks"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-testkit",
- "arrow",
- "bytes",
- "parquet",
- "safetensors",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "amoru-sources"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "amoru-testkit",
- "arrow",
- "bytes",
- "parquet",
- "pyo3",
- "pyo3-arrow",
- "safetensors",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "amoru-testkit"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
-]
-
-[[package]]
-name = "amoru-trace"
-version = "0.1.0"
-dependencies = [
- "amoru-kernel",
- "arrow",
- "crossbeam",
- "mimalloc",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2866,6 +2626,246 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moruna-adapters"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "dlpark",
+ "moruna-kernel",
+ "moruna-testkit",
+ "pyo3",
+ "pyo3-arrow",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-arena"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "libc",
+ "moruna-kernel",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-bench"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "blake3",
+ "bytes",
+ "hostname",
+ "object_store",
+ "parquet",
+ "safetensors",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "moruna-controller"
+version = "0.1.0"
+dependencies = [
+ "moruna-kernel",
+ "moruna-testkit",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-datafusion"
+version = "0.1.0"
+dependencies = [
+ "datafusion",
+ "moruna-kernel",
+ "tokio",
+]
+
+[[package]]
+name = "moruna-discovery"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "libc",
+ "moruna-kernel",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-kernel"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "blake3",
+ "dlpark",
+ "moruna-testkit",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "moruna-placement"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.23.1",
+ "blake3",
+ "crossbeam",
+ "cudarc",
+ "hostname",
+ "moruna-kernel",
+ "moruna-testkit",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-polars"
+version = "0.1.0"
+dependencies = [
+ "moruna-kernel",
+ "polars",
+ "polars-arrow",
+]
+
+[[package]]
+name = "moruna-py"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "moruna-adapters",
+ "moruna-discovery",
+ "moruna-kernel",
+ "moruna-placement",
+ "moruna-reactor",
+ "moruna-runtime",
+ "moruna-sinks",
+ "moruna-sources",
+ "moruna-trace",
+ "parquet",
+ "pyo3",
+ "pyo3-arrow",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "moruna-reactor"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cudarc",
+ "io-uring",
+ "libc",
+ "moruna-kernel",
+ "moruna-testkit",
+ "object_store",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-runtime"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "getrandom 0.4.3",
+ "libc",
+ "mimalloc",
+ "moruna-adapters",
+ "moruna-arena",
+ "moruna-controller",
+ "moruna-discovery",
+ "moruna-kernel",
+ "moruna-placement",
+ "moruna-reactor",
+ "moruna-scheduler",
+ "moruna-sinks",
+ "moruna-sources",
+ "moruna-testkit",
+ "moruna-trace",
+ "parquet",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-scheduler"
+version = "0.1.0"
+dependencies = [
+ "crossbeam",
+ "libc",
+ "moruna-kernel",
+ "moruna-sinks",
+ "moruna-testkit",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-sinks"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "moruna-kernel",
+ "moruna-testkit",
+ "parquet",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-sources"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "moruna-kernel",
+ "moruna-testkit",
+ "parquet",
+ "pyo3",
+ "pyo3-arrow",
+ "safetensors",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "moruna-testkit"
+version = "0.1.0"
+dependencies = [
+ "moruna-kernel",
+]
+
+[[package]]
+name = "moruna-trace"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "crossbeam",
+ "mimalloc",
+ "moruna-kernel",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

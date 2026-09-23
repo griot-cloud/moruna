@@ -2,7 +2,7 @@
 //! releases the GIL).
 //!
 //! The body of this kernel is Python, and it lives in
-//! `bench/python/amoru_bench_kernels/wide_intermediate.py`. It is the only one of
+//! `bench/python/moruna_bench_kernels/wide_intermediate.py`. It is the only one of
 //! the six that is not Rust, because preamble 6.5 asks for one that is not: the
 //! suite needs a kernel whose cost and whose GIL behaviour are a Python
 //! extension's, so that the runtime's Python adapter is measured and not a Rust
@@ -11,7 +11,7 @@
 //! # Why this struct refuses
 //!
 //! The thing that would let a Rust caller run that function is the runtime's
-//! Python adapter, component 5, which does not exist: `crates/amoru-adapters` is
+//! Python adapter, component 5, which does not exist: `crates/moruna-adapters` is
 //! a wave 0 stub and `pyo3` enters the workspace through it. This struct
 //! therefore declares what the kernel is, reports the hints a scheduler would
 //! read, and returns `BenchError::NotWired` from `apply`, naming the module that
@@ -46,7 +46,7 @@ use crate::kernels::{
 };
 
 /// The Python module that holds the body of this kernel.
-pub const PYTHON_MODULE: &str = "amoru_bench_kernels.wide_intermediate";
+pub const PYTHON_MODULE: &str = "moruna_bench_kernels.wide_intermediate";
 
 /// The function inside that module.
 pub const PYTHON_FUNCTION: &str = "wide_intermediate";
@@ -148,14 +148,14 @@ mod tests {
         assert!(text.contains("wide-intermediate is not wired"), "{text}");
         assert!(text.contains("component 5"), "{text}");
         assert!(
-            text.contains("bench/python/amoru_bench_kernels/wide_intermediate.py"),
+            text.contains("bench/python/moruna_bench_kernels/wide_intermediate.py"),
             "{text}"
         );
     }
 
     #[test]
     fn the_module_the_body_lives_in_is_named_and_so_is_the_call_that_releases_the_gil() {
-        assert_eq!(PYTHON_MODULE, "amoru_bench_kernels.wide_intermediate");
+        assert_eq!(PYTHON_MODULE, "moruna_bench_kernels.wide_intermediate");
         assert_eq!(PYTHON_FUNCTION, "wide_intermediate");
         assert_eq!(GIL_RELEASING_CALL, "numpy.matmul");
         assert!(WideIntermediate::why_not_wired().contains("pytest"));

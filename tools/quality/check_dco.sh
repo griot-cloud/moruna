@@ -7,7 +7,7 @@
 #   1. The commit message carries a `Signed-off-by: Name <email>` line. This is
 #      what `git commit -s` writes and what the DCO (https://developercertificate.org/)
 #      is asserted with.
-#   2. A commit authored by `Amoru Agent <agents@griotdata.com>` is signed off by
+#   2. A commit authored by `Moruna Agent <agents@griotdata.com>` is signed off by
 #      that same identity. An agent commit signed off by somebody else, or by an
 #      agent identity with a different address, is the case CONTRIBUTING.md's
 #      sign-off paragraph is about: the maintainer takes DCO responsibility for
@@ -26,7 +26,7 @@
 #   tools/quality/check_dco.sh origin/main HEAD
 set -euo pipefail
 
-AGENT_NAME="Amoru Agent"
+AGENT_NAME="Moruna Agent"
 AGENT_EMAIL="agents@griotdata.com"
 AGENT_IDENT="$AGENT_NAME <$AGENT_EMAIL>"
 

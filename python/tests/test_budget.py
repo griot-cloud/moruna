@@ -24,9 +24,9 @@ import sys
 SCRIPT = """
 import json, os, pathlib
 import pyarrow as pa, pyarrow.parquet as pq
-import amoru
+import moruna
 
-d = pathlib.Path(os.environ["AMORU_TEST_DIR"])
+d = pathlib.Path(os.environ["MORUNA_TEST_DIR"])
 src, out = d / "in", d / "out"
 rows = 200_000
 # 20,000 rows to a row group, so one morsel is one Python list of 20,000 strings.
@@ -35,7 +35,7 @@ pq.write_table(
               "text": pa.array([f"row-{i:08d}-abcdefghijklmnopqrstuvwxyz" for i in range(rows)])}),
     src / "part-0.parquet", row_group_size=20_000)
 
-@amoru.kernel
+@moruna.kernel
 def greedy(batch):
     # Every byte here is outside the arena: a Python str per row, a list of them, and a pyarrow
     # array built from that. It costs several times the morsel it was given, which is the class
@@ -45,15 +45,15 @@ def greedy(batch):
 
 result = {}
 try:
-    report = amoru.run(amoru.ParquetSource(f"file://{src}/part-0.parquet"), [greedy],
-                       amoru.ParquetSink(f"file://{out}"),
-                       budget=os.environ["AMORU_TEST_BUDGET"])
+    report = moruna.run(moruna.ParquetSource(f"file://{src}/part-0.parquet"), [greedy],
+                       moruna.ParquetSink(f"file://{out}"),
+                       budget=os.environ["MORUNA_TEST_BUDGET"])
     result = {"exit": str(report.exit),
               "ceiling": report.limits["memory_ceiling"],
               "peak": report.peak_anon_bytes,
               "fraction": report.peak_fraction_of_ceiling,
               "rows_out": report.stages[0]["rows_out"]}
-except amoru.BudgetError as err:
+except moruna.BudgetError as err:
     result = {"exit": "Budget", "diagnostic": str(err)}
 print(json.dumps(result))
 """
@@ -62,9 +62,9 @@ print(json.dumps(result))
 def _run(scratch: pathlib.Path, budget: str) -> dict:
     (scratch / "in").mkdir(exist_ok=True)
     (scratch / "out").mkdir(exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if k != "AMORU_BUDGET"}
-    env["AMORU_TEST_DIR"] = str(scratch)
-    env["AMORU_TEST_BUDGET"] = budget
+    env = {k: v for k, v in os.environ.items() if k != "MORUNA_BUDGET"}
+    env["MORUNA_TEST_DIR"] = str(scratch)
+    env["MORUNA_TEST_BUDGET"] = budget
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-c", SCRIPT], capture_output=True, text=True, env=env, check=False
     )

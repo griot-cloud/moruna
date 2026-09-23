@@ -1,10 +1,10 @@
-# Amoru SDD 04: Trace writer and run report (`amoru-trace`)
+# Moruna SDD 04: Trace writer and run report (`moruna-trace`)
 
 **Document type:** software design document, component 4 of 12
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
-**Parent:** `architecture/amoru-runtime-design.md` section 5.9; criteria S9; global invariant G-I4
+**Parent:** `architecture/moruna-runtime-design.md` section 5.9; criteria S9; global invariant G-I4
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.1 (`RunId`), d.13 (`TraceRecord`, `TraceSink`, `TraceTail`, `Outcome`), e.5 (schema)
-**Component location:** `crates/amoru-trace`, Rust
+**Component location:** `crates/moruna-trace`, Rust
 **Consumes:** contracts (1). **Consumed by:** scheduler (10, emits and flushes), controller (11, reads through `TraceTail`), runtime facade (12, `finish` and the report)
 
 **Decisions worth your eye:** (1) the trace is kept in memory as Arrow batches up to a limit and then overflows to a file in the staging directory, so a run with no trace path still produces a complete report; (2) the report's numbers are defined here as formulas over trace columns, so two implementations of the report agree; (3) the writer never drops a record; backpressure is on the writer thread, not on workers; (4) the writer is the contract's `TraceTail`, so the controller reads the recent window through a trait and never sees this crate's types.
@@ -81,10 +81,10 @@ impl TraceView {
     pub fn to_ipc_file(&self, path: &std::path::Path) -> Result<()>;
 }
 
-/// The effective interpreter state of one Python stage is `amoru_kernel::GilState`
+/// The effective interpreter state of one Python stage is `moruna_kernel::GilState`
 /// (contracts d.7), as the adapter observed it (05 d.1 `PyKernel::gil_state`); this
 /// crate serialises it by name (`"FreeThreaded"`, `"Serialised"`) and defines no type of its own.
-use amoru_kernel::GilState;
+use moruna_kernel::GilState;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum ExitReason { Completed, Terminated { diagnostic: String }, Cancelled }
@@ -176,7 +176,7 @@ impl core::fmt::Display for RunReport { /* section e.3 layout */ }
 
 ### d.2 Consumed
 
-`amoru_kernel::{TraceRecord, TraceSink, TraceTail, Outcome, Limits, IoPaths, RunId, StageId, Seq, AmoruError}`; `arrow` (builders, IPC stream writer and reader); `crossbeam_channel::bounded`; `serde_json`.
+`moruna_kernel::{TraceRecord, TraceSink, TraceTail, Outcome, Limits, IoPaths, RunId, StageId, Seq, MorunaError}`; `arrow` (builders, IPC stream writer and reader); `crossbeam_channel::bounded`; `serde_json`.
 
 ## e. Data model, formats and state machines
 

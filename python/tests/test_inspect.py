@@ -1,12 +1,12 @@
-"""`amoru.inspect_host()` (d.2, j): what the runtime would discover here, without starting it."""
+"""`moruna.inspect_host()` (d.2, j): what the runtime would discover here, without starting it."""
 
 from __future__ import annotations
 
-import amoru
+import moruna
 
 
 def test_inspect_host_reports_limits_and_profile() -> None:
-    host = amoru.inspect_host()
+    host = moruna.inspect_host()
     assert set(host) >= {"limits", "host_profile", "notes"}
 
     limits = host["limits"]

@@ -1,17 +1,17 @@
 # Summary
 
-[Amoru](README.md)
+[Moruna](README.md)
 
 # Introduction
 
-- [What Amoru is](introduction/what-amoru-is.md)
-- [What Amoru is not](introduction/what-it-is-not.md)
+- [What Moruna is](introduction/what-moruna-is.md)
+- [What Moruna is not](introduction/what-it-is-not.md)
 - [How a pass runs](introduction/how-a-pass-runs.md)
 
 # User guide
 
 - [Install](guide/install.md)
-- [First run with amoru.run](guide/first-run.md)
+- [First run with moruna.run](guide/first-run.md)
 - [Sources](guide/sources.md)
   - [Parquet, local and object store](guide/sources-parquet.md)
   - [Tensor files: safetensors and NumPy](guide/sources-tensor.md)
@@ -30,13 +30,13 @@
 
 - [API reference](api/README.md)
   - [Python API](api/python.md)
-  - [Rust API: amoru-kernel](api/rust.md)
+  - [Rust API: moruna-kernel](api/rust.md)
   - [Configuration table](api/configuration.md)
 
 # Kernel author guide
 
 - [Kernel author guide](kernels/README.md)
-  - [A Rust kernel against amoru-kernel](kernels/rust-kernel.md)
+  - [A Rust kernel against moruna-kernel](kernels/rust-kernel.md)
   - [The same kernel as a Polars plugin](kernels/polars.md)
   - [The same kernel as a DataFusion function](kernels/datafusion.md)
   - [A Python kernel](kernels/python-kernel.md)

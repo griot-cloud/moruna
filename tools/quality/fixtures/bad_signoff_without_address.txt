@@ -1,4 +1,4 @@
-Author: Amoru Agent <agents@griotdata.com>
+Author: Moruna Agent <agents@griotdata.com>
 Discovery: read the cgroup at call time, never cached (DS-I1)
 
-Signed-off-by: Amoru Agent
+Signed-off-by: Moruna Agent

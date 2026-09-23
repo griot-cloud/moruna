@@ -1,6 +1,6 @@
 //! Running a kernel over a generated dataset and reporting its amplification.
 //!
-//! This is what `amoru-bench kernel <name>` does and what
+//! This is what `moruna-bench kernel <name>` does and what
 //! `bench/tests/kernels.rs` measures with: read a Parquet file the generator
 //! wrote, feed it to a kernel one morsel at a time, and report bytes in, bytes
 //! out and the ratio, beside the band the kernel declares. Preamble 6.7 asks a
@@ -205,7 +205,7 @@ pub fn measure(
     let path = data_dir.join(format!("{dataset}.parquet"));
     if !path.exists() {
         return Err(BenchError::Usage(format!(
-            "{} does not exist; write it first with `amoru-bench dataset {dataset} --out {}`",
+            "{} does not exist; write it first with `moruna-bench dataset {dataset} --out {}`",
             path.display(),
             data_dir.display()
         )));
@@ -222,7 +222,7 @@ mod tests {
     use crate::parquet_out::ParquetSpec;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("amoru-bench-runner-{name}"));
+        let dir = std::env::temp_dir().join(format!("moruna-bench-runner-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

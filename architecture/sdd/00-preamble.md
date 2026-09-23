@@ -1,8 +1,8 @@
-# Amoru SDD: Preamble
+# Moruna SDD: Preamble
 
 **Document type:** software design document, shared preamble (read by every agent before its component SDD)
 **Status:** DRAFT · 2026-09-22 (revised 2026-09-15 draft: component graph, run lifecycle, lock order, waves, escalation routing, hand-off)
-**Parent:** `architecture/amoru-runtime-design.md` (revision 3), the architecture design; this preamble does not repeat its context or its alternatives, it decides what the architecture left open and fixes what every component shares.
+**Parent:** `architecture/moruna-runtime-design.md` (revision 3), the architecture design; this preamble does not repeat its context or its alternatives, it decides what the architecture left open and fixes what every component shares.
 **Language and repository:** Rust 2024 edition for the runtime, CPython 3.14 for the surface, in both the standard and the free-threaded build (6.6), one Cargo workspace at the repository root.
 **Reference hardware:** the Griot bare-metal server in Nairobi (decided 2026-09-22, closing E1). It is where benchmark figures are recorded so that they are comparable between runs; it is not a target the runtime is built for. Every criterion is a ratio measured on whatever host the run is on (S3 against a baseline grid-searched on that host, S4 against that host's discovered quota and device ceiling, S12 against a plain loop on that host, S15 against the same run's own pre-spill throughput), so a different or larger machine moves both sides of every ratio and needs no change to the code, the defaults or the profiles. No GPU host is named: tests needing a device or GPUDirect Storage are skipped and listed by id.
 
@@ -14,7 +14,7 @@ This preamble plus the contracts SDD (`01-contracts.md`) plus one component SDD 
 
 ### 1.1 What the runtime is
 
-Amoru runs a full pass over a dataset larger than the memory budget of the process it lives in, applying a transformation a query engine cannot express, and writes the result out, at close to the budget's capacity, without the user choosing a batch size, a worker count, a read-ahead depth or a spill threshold. The dataset is tabular (Parquet, delivered as Arrow record batches) or tensor (safetensors, NumPy, aligned binary, delivered as DLPack tensors). The budget is discovered from the host (a cgroup, the machine) or given explicitly. The unit of everything is a morsel: one Arrow batch or one tensor with a header, moved between memory tiers by DMA, never copied by the CPU after it has been decoded once.
+Moruna runs a full pass over a dataset larger than the memory budget of the process it lives in, applying a transformation a query engine cannot express, and writes the result out, at close to the budget's capacity, without the user choosing a batch size, a worker count, a read-ahead depth or a spill threshold. The dataset is tabular (Parquet, delivered as Arrow record batches) or tensor (safetensors, NumPy, aligned binary, delivered as DLPack tensors). The budget is discovered from the host (a cgroup, the machine) or given explicitly. The unit of everything is a morsel: one Arrow batch or one tensor with a header, moved between memory tiers by DMA, never copied by the CPU after it has been decoded once.
 
 ### 1.2 What the runtime refuses to be
 
@@ -36,31 +36,31 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 8 | Sinks | `08-sinks.md` | 1, 2, 6 | implement `Sink`; `write(seq, payload)` takes ownership of the payload; `finish` is called exactly once after the last `write` completes; `committed_seq` never overstates |
 | 9 | Placement engine | `09-placement.md` | 1 (2's arena arrives as `dyn Allocator`, 3's values as contracts types, 6's reactor as `dyn Reactor`) | implements `Placement`; `pop` returns a morsel already resident in the tier the caller asked for, or blocks; `push` never blocks; `checkpoint` writes a manifest from which `restore` rebuilds the queues |
 | 10 | Scheduler | `10-scheduler.md` | 1, 8 (`SinkHandle`, `ReorderBuffer`), 9 | implements `Knobs`, `StatsSource` and `Prober`; workers only ever run `Kernel::apply` and nothing that blocks on IO |
-| 11 | Resource controller | `11-controller.md` | 3, 4, 9, 10 (all four through contracts traits; the crate depends on `amoru-kernel` alone) | the only writer of every knob; reads stats, never morsels |
+| 11 | Resource controller | `11-controller.md` | 3, 4, 9, 10 (all four through contracts traits; the crate depends on `moruna-kernel` alone) | the only writer of every knob; reads stats, never morsels |
 | 12 | Python surface | `12-python.md` | all | the only component that knows what a user is |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
-The crate graph below is drawn from each SDD's section d.2: a solid edge is a concrete crate dependency in `Cargo.toml`, a dashed edge is a dependency on a trait object (`dyn`) whose concrete type the facade supplies, so the consuming crate compiles against `amoru-kernel` and is tested against a fake.
+The crate graph below is drawn from each SDD's section d.2: a solid edge is a concrete crate dependency in `Cargo.toml`, a dashed edge is a dependency on a trait object (`dyn`) whose concrete type the facade supplies, so the consuming crate compiles against `moruna-kernel` and is tested against a fake.
 
 ```mermaid
 graph LR
-  kernel["amoru-kernel (1)"]
-  arena["amoru-arena (2)"]
-  discovery["amoru-discovery (3)"]
-  trace["amoru-trace (4)"]
-  adapters["amoru-adapters (5)"]
-  reactor["amoru-reactor (6)"]
-  sources["amoru-sources (7)"]
-  sinks["amoru-sinks (8)"]
-  placement["amoru-placement (9)"]
-  scheduler["amoru-scheduler (10)"]
-  controller["amoru-controller (11)"]
-  runtime["amoru-runtime (facade)"]
-  py["amoru-py (12)"]
-  polars["amoru-polars"]
-  datafusion["amoru-datafusion"]
-  testkit["amoru-testkit"]
+  kernel["moruna-kernel (1)"]
+  arena["moruna-arena (2)"]
+  discovery["moruna-discovery (3)"]
+  trace["moruna-trace (4)"]
+  adapters["moruna-adapters (5)"]
+  reactor["moruna-reactor (6)"]
+  sources["moruna-sources (7)"]
+  sinks["moruna-sinks (8)"]
+  placement["moruna-placement (9)"]
+  scheduler["moruna-scheduler (10)"]
+  controller["moruna-controller (11)"]
+  runtime["moruna-runtime (facade)"]
+  py["moruna-py (12)"]
+  polars["moruna-polars"]
+  datafusion["moruna-datafusion"]
+  testkit["moruna-testkit"]
   arena --> kernel
   discovery --> kernel
   trace --> kernel
@@ -94,7 +94,7 @@ graph LR
   py --> runtime
 ```
 
-This diagram answers "which components can be built in parallel and which concrete type a fake stands in for": every crate whose only solid edge points at `amoru-kernel` can be built as soon as wave 0 lands, and every dashed edge names the fake (contracts d.15) that stands in for the concrete crate until the facade wires the real one.
+This diagram answers "which components can be built in parallel and which concrete type a fake stands in for": every crate whose only solid edge points at `moruna-kernel` can be built as soon as wave 0 lands, and every dashed edge names the fake (contracts d.15) that stands in for the concrete crate until the facade wires the real one.
 
 ### 1.4 Per-component schema
 
@@ -150,7 +150,7 @@ Terms used by more than one component are defined here once. A component SDD add
 
 **Head stays hot.** The invariant that the next morsel a consumer will pop is never the one being demoted.
 
-**Staging segment.** A file on local disk holding one or more demoted morsels in their in-memory layout (Arrow IPC or Amoru aligned binary), page-aligned, written with direct IO.
+**Staging segment.** A file on local disk holding one or more demoted morsels in their in-memory layout (Arrow IPC or Moruna aligned binary), page-aligned, written with direct IO.
 
 **Direct IO.** Reads and writes that bypass the page cache (`O_DIRECT`), so bytes move between disk and a runtime buffer without an intermediate kernel copy; requires aligned buffers, offsets and lengths.
 
@@ -330,11 +330,11 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 
 | Name | Component | Type | Default | Range | Owner | Effect |
 |---|---|---|---|---|---|---|
-| `budget.host` | 3, 11 | bytes | discovered: `memory.high`, else 0.9 × `memory.max`, else 0.9 × total RAM | 256 MiB .. host | user, platform (`AMORU_BUDGET`) | host ceiling |
+| `budget.host` | 3, 11 | bytes | discovered: `memory.high`, else 0.9 × `memory.max`, else 0.9 × total RAM | 256 MiB .. host | user, platform (`MORUNA_BUDGET`) | host ceiling |
 | `budget.reserve_fraction` | 11 | f32 | 0.10 | 0.02 .. 0.30 | platform | headroom never allocated |
 | `budget.device` | 3, 11 | bytes per device | discovered free device memory × 0.9 | 64 MiB .. device | user | device ceiling |
-| `budget.disk` | 9 | bytes | 20% of free space in staging dir, or pod ephemeral limit | 0 .. free | user, platform (`AMORU_SPILL_LIMIT`) | staging cap; 0 disables the disk tier |
-| `staging.dir` | 9 | path | platform scratch (`/tmp`, pod ephemeral volume, `/local_disk0`) | existing writable dir | user, platform (`AMORU_SPILL_DIR`) | where segments go |
+| `budget.disk` | 9 | bytes | 20% of free space in staging dir, or pod ephemeral limit | 0 .. free | user, platform (`MORUNA_SPILL_LIMIT`) | staging cap; 0 disables the disk tier |
+| `staging.dir` | 9 | path | platform scratch (`/tmp`, pod ephemeral volume, `/local_disk0`) | existing writable dir | user, platform (`MORUNA_SPILL_DIR`) | where segments go |
 | `staging.segment_bytes` | 9 | bytes | 128 MiB | 64 MiB .. 256 MiB | compile | segment file size |
 | `morsel.min_bytes` | 11 | bytes | 4 MiB | 1 MiB .. 64 MiB | compile | lower clamp on morsel target |
 | `morsel.max_bytes` | 11 | bytes | 512 MiB | 64 MiB .. 2 GiB | compile | upper clamp on morsel target |
@@ -370,7 +370,7 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 | `sink.row_group_bytes` | 8 | bytes | 128 MiB | 16 MiB .. 1 GiB | user | Parquet row group target |
 | `sink.file_bytes` | 8 | bytes | 1 GiB | 64 MiB .. 16 GiB | user | output file roll size |
 | `python.allow_gil` | 12 | bool | false | fixed | user | proceed serialised under a GIL |
-| `profiles.dir` | 11 | path | `~/.amoru/profiles` | writable path or none | user, platform | profile store; place it on the durable volume with `staging.dir` for cross-node resume |
+| `profiles.dir` | 11 | path | `~/.moruna/profiles` | writable path or none | user, platform | profile store; place it on the durable volume with `staging.dir` for cross-node resume |
 | `checkpoint.enabled` | 9, 10, 12 | bool | true when `staging.dir` resolves | fixed per run | user | write the run manifest periodically; forced false for a non-resumable sink |
 | `checkpoint.interval_ms` | 9, 10 | ms | 5000 | 500 .. 60000 | user | manifest write cadence (also written at every segment roll, on termination and on cancel) |
 | `checkpoint.keep` | 9, 12 | bool | false | fixed per run | user | keep the run directory and final manifest after a completed run |
@@ -378,8 +378,8 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 | `durable_staging` | 3 | guarantee | `Unknown` (treated `Absent`) | `present`, `absent` | platform | declares `staging.dir` survives the node; part of `host_profile` |
 | `sizer` | 11 | enum | `rule` | `rule`, `learned` | user | decision function |
 | `sizer.fallback_error_ratio` | 11 | f32 | 2.0 | 1.2 .. 5.0 | compile | learned → rule fallback trigger |
-| `host_profile` | 3 | struct | probed | declared via `AMORU_HOST_PROFILE` | platform | guarantees; see `03-discovery.md` |
-| `AMORU_BENCH_MORSEL_BYTES` | 11, bench | bytes | unset | `morsel.min_bytes` .. `morsel.max_bytes` | bench only (environment variable read by the bench runner; not part of the API, not documented to users) | pins the morsel target for the S12 overhead measurement so the runtime and the plain loop process identical batches; S12 itself is measured with defaults (G-I10 unchanged), and the pinned figure is reported beside it |
+| `host_profile` | 3 | struct | probed | declared via `MORUNA_HOST_PROFILE` | platform | guarantees; see `03-discovery.md` |
+| `MORUNA_BENCH_MORSEL_BYTES` | 11, bench | bytes | unset | `morsel.min_bytes` .. `morsel.max_bytes` | bench only (environment variable read by the bench runner; not part of the API, not documented to users) | pins the morsel target for the S12 overhead measurement so the runtime and the plain loop process identical batches; S12 itself is measured with defaults (G-I10 unchanged), and the pinned figure is reported beside it |
 
 ---
 
@@ -388,26 +388,26 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 ### 6.1 Workspace
 
 ```
-amoru/
+moruna/
   Cargo.toml                 workspace; members below; shared [workspace.dependencies] with pinned versions
   crates/
-    amoru-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 only.
-    amoru-arena/             component 2
-    amoru-discovery/         component 3
-    amoru-trace/             component 4
-    amoru-adapters/          component 5: the Python kernel adapter only (feature: python)
-    amoru-reactor/           component 6
-    amoru-sources/           component 7
-    amoru-sinks/             component 8
-    amoru-placement/         component 9
-    amoru-scheduler/         component 10
-    amoru-controller/        component 11
-    amoru-runtime/           facade: the Rust side of component 12; wires 2..11 into `Runtime::run`; no logic of its own; built in wave 4
-    amoru-py/                component 12: PyO3 module, built by maturin; depends on amoru-runtime; wave 5
-    amoru-polars/            engine bridge: hosts a kernel inside Polars; depends on amoru-kernel and polars only (feature: polars)
-    amoru-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on amoru-kernel and datafusion only (feature: datafusion)
-    amoru-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on amoru-kernel only; wave 0
-  python/amoru/              Python package source (thin; the module is amoru-py)
+    moruna-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 only.
+    moruna-arena/             component 2
+    moruna-discovery/         component 3
+    moruna-trace/             component 4
+    moruna-adapters/          component 5: the Python kernel adapter only (feature: python)
+    moruna-reactor/           component 6
+    moruna-sources/           component 7
+    moruna-sinks/             component 8
+    moruna-placement/         component 9
+    moruna-scheduler/         component 10
+    moruna-controller/        component 11
+    moruna-runtime/           facade: the Rust side of component 12; wires 2..11 into `Runtime::run`; no logic of its own; built in wave 4
+    moruna-py/                component 12: PyO3 module, built by maturin; depends on moruna-runtime; wave 5
+    moruna-polars/            engine bridge: hosts a kernel inside Polars; depends on moruna-kernel and polars only (feature: polars)
+    moruna-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on moruna-kernel and datafusion only (feature: datafusion)
+    moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
+  python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
   tools/lint/                repository lints run by CI: `no_tier_wildcard.sh` (CT-T14)
   tools/quality/             the quality gate: `check.sh` (fmt, clippy, the lint, tests, coverage) and `coverage_gate.py`; run by the pre-commit hook and by the first CI job (6.7)
@@ -415,7 +415,7 @@ amoru/
   architecture/              this documentation
 ```
 
-Kernel authors depend on `amoru-kernel` alone. The Polars and DataFusion bridges are separate thin crates, as the architecture document's section 6 lays them out, and depend on `amoru-kernel` alone plus the host engine; `amoru-adapters` keeps only the Python adapter. The workspace root, every member crate as a compiling stub with its `Cargo.toml`, and `tools/lint` are wave 0 deliverables (section 6.6).
+Kernel authors depend on `moruna-kernel` alone. The Polars and DataFusion bridges are separate thin crates, as the architecture document's section 6 lays them out, and depend on `moruna-kernel` alone plus the host engine; `moruna-adapters` keeps only the Python adapter. The workspace root, every member crate as a compiling stub with its `Cargo.toml`, and `tools/lint` are wave 0 deliverables (section 6.6).
 
 ### 6.2 Dependencies
 
@@ -426,7 +426,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `arrow` (arrow-rs) | 1, 4, 5, 7, 8, 9 | in-memory format, C Data Interface, IPC | features: `ffi`, `ipc`; component 4 builds the trace batches with it |
 | `parquet` | 7, 8 | reader with footer metadata, projection, row selection; writer | features: `arrow`, `async`, `object_store` |
 | `object_store` | 6, 7, 8 | S3-compatible, GCS, Azure, local | features per backend behind runtime features |
-| `dlpark` | 1, 5, 7 | DLPack safe wrapper (`versioned::Dlpack`, the 1.x versioned struct) | component 7 enables its `pyo3` feature under `python` so `PyIteratorSource` imports a capsule without `unsafe`; `amoru-kernel` never does, which is what keeps pyo3 out of the contracts crate (CT-T12) |
+| `dlpark` | 1, 5, 7 | DLPack safe wrapper (`versioned::Dlpack`, the 1.x versioned struct) | component 7 enables its `pyo3` feature under `python` so `PyIteratorSource` imports a capsule without `unsafe`; `moruna-kernel` never does, which is what keeps pyo3 out of the contracts crate (CT-T12) |
 | `safetensors` | 7, 8 | model and tensor files | header parsing only; bytes are mapped, not copied |
 | `tokio` | 6, bench | reactor runtime | `rt-multi-thread`, `fs`, `sync` |
 | `io-uring` | 6 | direct IO on Linux | optional feature `uring`; fallback is `pread`/`pwrite` on a blocking pool |
@@ -436,7 +436,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `pyo3-arrow` | 5, 7, 12 | Arrow ↔ pyarrow zero-copy | |
 | `maturin` (build) | 12 | wheels | CPython 3.14, free-threaded and standard (6.6) |
 | `thiserror` | all | error types | |
-| `tracing` | all except 1 | log events (not the morsel trace) | `amoru-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a) |
+| `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a) |
 | `mimalloc` | runtime, 4 (dev only) | global allocator for non-arena allocations | returns freed memory promptly. Component 4 takes it as a dev-dependency for TR-T4, whose claim is about the runtime's process, which sets `mimalloc` globally (12 l); under the system allocator the same run plateaus 22 to 25 MiB above baseline through allocator retention alone, which is bounded but above TR-T4's limit, so testing under the system allocator would measure the allocator rather than the trace writer (E2, PM, 2026-09-22) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
 | `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
@@ -446,8 +446,8 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `bytes` | 6, 7, 8, bench | `object_store` payloads on the write path (a `Bytes` over an arena view, no copy) | |
 | `getrandom` | runtime facade | minting `RunId` | |
 | `hostname` | 9, bench | the node name in the manifest identity | |
-| `polars` | `amoru-polars` | the Polars expression plugin host | feature `polars`; `pyo3-polars` deferred (12 o) |
-| `datafusion` | `amoru-datafusion` | the DataFusion `ScalarUDF` host | feature `datafusion` |
+| `polars` | `moruna-polars` | the Polars expression plugin host | feature `polars`; `pyo3-polars` deferred (12 o) |
+| `datafusion` | `moruna-datafusion` | the DataFusion `ScalarUDF` host | feature `datafusion` |
 | `tracing-subscriber` | 12, bench | log output for the Python surface and the bench runner | never in a library crate |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
@@ -470,36 +470,36 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `maturin` (build tool, not a Cargo dependency; pinned by the wave 5 `pyproject.toml` and the wheel job) | 1.15.0 | `polars` | 0.55.2 |
 | `datafusion` | 55.1.0 | `tracing-subscriber` | 0.3.23 |
 
-arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across amoru-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
+arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 
 Supported targets, the set `deny.toml` resolves the graph for: x86_64 and aarch64 Linux (gnu) and x86_64 and aarch64 macOS. Windows is not a target for v1 (the runtime reads cgroup v2 and uses O_DIRECT and io_uring); a target added here is added to `deny.toml` in the same pull request. Decided by the PM 2026-09-22.
 
 ### 6.3 Feature flags
 
-`cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration with the NIC, the reactor's `Remote` copy rows, the placement engine's remote tier; post-v1, see architecture section 11; its reserved arms exist in every v1 build and return `Unsupported("rdma")`), `python` (`amoru-adapters`, `amoru-sources` for `PyIteratorSource`, `amoru-py`), `polars` (`amoru-polars`), `datafusion` (`amoru-datafusion`). Default features: none of these. `amoru-py` enables `python` and, on Linux, `uring`. The two bridge crates are members of the workspace but are not dependencies of `amoru-runtime` or `amoru-py`; a user who wants them depends on them directly.
+`cuda` (device tiers, pinned memory, copy engines), `uring` (io_uring path), `gds` (GPUDirect Storage; implies `cuda`), `rdma` (arena registration with the NIC, the reactor's `Remote` copy rows, the placement engine's remote tier; post-v1, see architecture section 11; its reserved arms exist in every v1 build and return `Unsupported("rdma")`), `python` (`moruna-adapters`, `moruna-sources` for `PyIteratorSource`, `moruna-py`), `polars` (`moruna-polars`), `datafusion` (`moruna-datafusion`). Default features: none of these. `moruna-py` enables `python` and, on Linux, `uring`. The two bridge crates are members of the workspace but are not dependencies of `moruna-runtime` or `moruna-py`; a user who wants them depends on them directly.
 
-### 6.4 Test infrastructure (`amoru-testkit`)
+### 6.4 Test infrastructure (`moruna-testkit`)
 
 Built by agent 1 in wave 0, in the same pull request as the contracts crate, and not extended thereafter without a `contracts/*` pull request. Its contents are exactly the table in contracts d.15: one fake per contracts trait, each with the knobs (builder methods) and observables that table lists, and nothing else. A test in any component SDD names a fake and a knob from that table only; a test that needs a knob the table lacks is a contracts change (E10), not a local addition. The benchmark data generator, the benchmark kernels and the host probes are not in the testkit; they belong to the `bench` agent (section 6.5).
 
 ### 6.5 Benchmark suite
 
-The suite is owned by a named `bench` agent that starts in wave 1 and delivers in two parts. In wave 1 it delivers, under `bench/`, the data generator and the kernels: the generator writes Parquet with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio and row-group size, to local disk and to an S3-compatible store (MinIO in a container), and writes safetensors and aligned binary tensors of controllable shape; the kernels are identity (Rust, A about 1), normalise (Rust, a hand-rolled one-pass normalisation over text, A about 1.5; the table in 6.2 has no regex crate and the bench agent hand-rolled the pass rather than add one, which the PM accepted on 2026-09-22 because a regex engine's prefilters and DFA cache sit between the measurement and the thing measured), tokenise-explode (Rust, A 5 to 10), adversarial (Rust, A jumps 4× at the midpoint), wide-intermediate (Python NumPy, A about 20, releases the GIL) and embed-score (numeric columns to tensor, small matmul, back to column; its amplification is `1 + out_dim / in_dim`, exact on an all-numeric table of 8-byte columns, declared by the bench agent and accepted by the PM on 2026-09-22 because 6.5 stated none); torch-score (stateful GPU model, weights via TensorSource) is added when the reference GPU host exists (E1). In wave 5 it delivers the baselines: for each kernel a hand-tuned baseline script (plain loop, fixed batch and threads, grid-searched) that reports rows per second, which is what S3 is measured against, and the *engine baseline*, which runs the same kernel as a user-defined function inside Polars (streaming engine) and inside DuckDB (Python UDF) over the same files in the same container, with each engine's defaults and then with its documented memory limit set to the budget; the engine baseline is reported beside the tuned baseline for every benchmark and is not a gate, because the claim it supports (that the runtime beats what people use today on this class of work) is an external one the report should carry rather than a criterion the build closes. Every gate runs in a container with `--memory` and `--cpus` set and on the bare host; results name the machine. This paragraph names the shapes, not the datasets: the generator's dataset names, its two scales, the `AMORU_S3_*` and `AWS_*` variables it reads and the manifest it writes are recorded in `bench/README.md`, which is the reference every later bench feature and every benchmark report cites (decided by the PM 2026-09-22 on the F1.6 agent's report; a change to that set is a change to that file, not to this section). The bench agent's brief is this paragraph plus sections 5 (the `AMORU_BENCH_MORSEL_BYTES` row) and 6.6; it reads no component SDD.
+The suite is owned by a named `bench` agent that starts in wave 1 and delivers in two parts. In wave 1 it delivers, under `bench/`, the data generator and the kernels: the generator writes Parquet with controllable row count, column mix (ints, floats, short strings, long text with configurable mean length and variance), null ratio and row-group size, to local disk and to an S3-compatible store (MinIO in a container), and writes safetensors and aligned binary tensors of controllable shape; the kernels are identity (Rust, A about 1), normalise (Rust, a hand-rolled one-pass normalisation over text, A about 1.5; the table in 6.2 has no regex crate and the bench agent hand-rolled the pass rather than add one, which the PM accepted on 2026-09-22 because a regex engine's prefilters and DFA cache sit between the measurement and the thing measured), tokenise-explode (Rust, A 5 to 10), adversarial (Rust, A jumps 4× at the midpoint), wide-intermediate (Python NumPy, A about 20, releases the GIL) and embed-score (numeric columns to tensor, small matmul, back to column; its amplification is `1 + out_dim / in_dim`, exact on an all-numeric table of 8-byte columns, declared by the bench agent and accepted by the PM on 2026-09-22 because 6.5 stated none); torch-score (stateful GPU model, weights via TensorSource) is added when the reference GPU host exists (E1). In wave 5 it delivers the baselines: for each kernel a hand-tuned baseline script (plain loop, fixed batch and threads, grid-searched) that reports rows per second, which is what S3 is measured against, and the *engine baseline*, which runs the same kernel as a user-defined function inside Polars (streaming engine) and inside DuckDB (Python UDF) over the same files in the same container, with each engine's defaults and then with its documented memory limit set to the budget; the engine baseline is reported beside the tuned baseline for every benchmark and is not a gate, because the claim it supports (that the runtime beats what people use today on this class of work) is an external one the report should carry rather than a criterion the build closes. Every gate runs in a container with `--memory` and `--cpus` set and on the bare host; results name the machine. This paragraph names the shapes, not the datasets: the generator's dataset names, its two scales, the `MORUNA_S3_*` and `AWS_*` variables it reads and the manifest it writes are recorded in `bench/README.md`, which is the reference every later bench feature and every benchmark report cites (decided by the PM 2026-09-22 on the F1.6 agent's report; a change to that set is a change to that file, not to this section). The bench agent's brief is this paragraph plus sections 5 (the `MORUNA_BENCH_MORSEL_BYTES` row) and 6.6; it reads no component SDD.
 
 ### 6.6 Build order and gates
 
-Waves are the gate order: a wave's gate names the sufficiency criteria (parent S-ids) and global invariants it closes, measured by the tests the component SDDs name, and gates close in wave order because each cites the ones before it. Waves are not a limit on parallelism. An executor starts as soon as every crate its `Cargo.toml` depends on (a solid edge in the section 1.3 graph) is merged to `main` and the fakes its tests name exist; a component whose only solid edge points at `amoru-kernel` starts the moment wave 0 merges, whatever wave its gate is in. The "agents in parallel" column is the count that follows from those dependencies, not a cap, and the PM runs as many executors at once as the dependency graph and the build host allow (decided by Brackly, 2026-09-22). Work is serialised only where it cannot be parallelised: the testkit after the contracts crate, the scheduler after the sinks crate, the facade after every crate it wires, the Python package after the facade, and successive sessions of one component on its own branch.
+Waves are the gate order: a wave's gate names the sufficiency criteria (parent S-ids) and global invariants it closes, measured by the tests the component SDDs name, and gates close in wave order because each cites the ones before it. Waves are not a limit on parallelism. An executor starts as soon as every crate its `Cargo.toml` depends on (a solid edge in the section 1.3 graph) is merged to `main` and the fakes its tests name exist; a component whose only solid edge points at `moruna-kernel` starts the moment wave 0 merges, whatever wave its gate is in. The "agents in parallel" column is the count that follows from those dependencies, not a cap, and the PM runs as many executors at once as the dependency graph and the build host allow (decided by Brackly, 2026-09-22). Work is serialised only where it cannot be parallelised: the testkit after the contracts crate, the scheduler after the sinks crate, the facade after every crate it wires, the Python package after the facade, and successive sessions of one component on its own branch.
 
 | Wave | Components | Agents in parallel (from the dependency graph, not a cap) | Gate |
 |---|---|---|---|
-| 0 | 1 (contracts and `amoru-testkit`), the workspace skeleton, CI, `tools/lint`, the quality gate wired into CI | 1 | the workspace compiles with every member crate as a stub; `amoru-kernel` has no runtime dependency (`cargo tree`, CT-T12); every fake in contracts d.15 compiles against the traits and exercises every knob (CT-T13); CT tests pass; trace schema hash pinned (CT-T9); `tools/lint/no_tier_wildcard.sh` runs in CI (CT-T14); `tools/quality/check.sh` passes, so `amoru-kernel` and `amoru-testkit` each have at least 90% line coverage (6.7); the pipeline is green on the stubs |
+| 0 | 1 (contracts and `moruna-testkit`), the workspace skeleton, CI, `tools/lint`, the quality gate wired into CI | 1 | the workspace compiles with every member crate as a stub; `moruna-kernel` has no runtime dependency (`cargo tree`, CT-T12); every fake in contracts d.15 compiles against the traits and exercises every knob (CT-T13); CT tests pass; trace schema hash pinned (CT-T9); `tools/lint/no_tier_wildcard.sh` runs in CI (CT-T14); `tools/quality/check.sh` passes, so `moruna-kernel` and `moruna-testkit` each have at least 90% line coverage (6.7); the pipeline is green on the stubs |
 | 1 | 2, 3, 4, 5, bench (generator and kernels) | up to 5 | AR, DS, TR, AD tests pass against fakes; G-I2 for the Python adapter (zero payload copies); S13 partial; the generator writes every dataset shape the suite names to local disk and MinIO |
 | 2 | 6 | 1 | RE tests pass; direct IO and fallback both exercised on the developer host; G-I7 |
 | 3 | 7, 8, 9 | 3 | SO, SI, PL tests pass; S10, S15 with `FakeSink` throttle; G-I3; manifest round trip and sink commit tracking (PL-T16, SI-T12, SI-T13) |
-| 4 | 10, 11, `amoru-runtime` (the Rust facade) | 3 | end-to-end with fakes and with real components: S1, S2, S4, S5, S6, S11; G-I1, G-I4, G-I5, G-I8; kill-and-resume equivalence (SC-T16, PL-T17); the facade's lifecycle (section 4.4) driven by RC-T12 |
+| 4 | 10, 11, `moruna-runtime` (the Rust facade) | 3 | end-to-end with fakes and with real components: S1, S2, S4, S5, S6, S11; G-I1, G-I4, G-I5, G-I8; kill-and-resume equivalence (SC-T16, PL-T17); the facade's lifecycle (section 4.4) driven by RC-T12 |
 | 5 | 12 (the Python package), bench (tuned baselines and the engine baseline) | 2 | S3, S7, S8, S9, S12, S17 on the reference hardware; G-I9, G-I10, G-I12 (PY-T12); the whole configuration table clamped (PY-T13) |
 
-Wave 0 deliverables, all by agent 1: the Cargo workspace root; every member crate of section 6.1 as a compiling stub with its `Cargo.toml` and the pinned versions of section 6.2; `crates/amoru-testkit` per contracts d.15; `.github/workflows/ci.yml`, one workflow with one job on pushes to `main`: format, the repository lints, the documentation checker, clippy, `cargo test --locked`, the CT-T12 boundary and the Python kernels on one interpreter. A second job, `slow`, runs weekly and on demand, and carries what only answers to the outside world or needs a real ceiling: `cargo deny`, the book build, MinIO and the container tests with the ignored set included. Coverage is not in CI at all, because the pre-commit hook enforces 90% per crate before every commit and instrumenting the workspace a second time doubles the build for a number already in hand. Runner minutes are paid for, so a check earns its place or it is not there (decided by Brackly, 2026-09-22); `tools/lint/no_tier_wildcard.sh`; the first CI job running `tools/quality/check.sh` (already in the repository, with `tools/hooks`), so that CI and the pre-commit hook apply one gate; and `git init` with `main` as the default branch if the repository is not yet initialised.
+Wave 0 deliverables, all by agent 1: the Cargo workspace root; every member crate of section 6.1 as a compiling stub with its `Cargo.toml` and the pinned versions of section 6.2; `crates/moruna-testkit` per contracts d.15; `.github/workflows/ci.yml`, one workflow with one job on pushes to `main`: format, the repository lints, the documentation checker, clippy, `cargo test --locked`, the CT-T12 boundary and the Python kernels on one interpreter. A second job, `slow`, runs weekly and on demand, and carries what only answers to the outside world or needs a real ceiling: `cargo deny`, the book build, MinIO and the container tests with the ignored set included. Coverage is not in CI at all, because the pre-commit hook enforces 90% per crate before every commit and instrumenting the workspace a second time doubles the build for a number already in hand. Runner minutes are paid for, so a check earns its place or it is not there (decided by Brackly, 2026-09-22); `tools/lint/no_tier_wildcard.sh`; the first CI job running `tools/quality/check.sh` (already in the repository, with `tools/hooks`), so that CI and the pre-commit hook apply one gate; and `git init` with `main` as the default branch if the repository is not yet initialised.
 
 Environment per wave. Wave 0: stable Rust with the 2024 edition (the version is pinned in `rust-toolchain.toml` in this wave), `cargo`, docker for the container stage, MinIO as a container, and one Python interpreter to prove the Python stage runs; no GPU.
 
@@ -509,7 +509,7 @@ Before closing a wave gate whose tests need a real ceiling or an object store, t
 
 ### 6.7 Conventions every agent follows
 
-Base branch `main`. Branch names: `component/NN-<slug>` with the slug the crate suffix (`component/02-arena`, `component/10-scheduler`); `infra/<topic>` for the skeleton, CI and bench work; `contracts/<topic>` for a change to `01-contracts.md` and the contracts crate. No pull requests: one human and a set of agents work here, so an executor pushes its branch and hands the PM the report in `architecture/agents/report-template.md`, the PM reviews the branch's diff against that report with the checklist in `agents/pm.md`, and merges to `main` itself. A component may merge in more than one piece when a self-contained part unblocks other executors (the contracts crate before its testkit, for instance, because the arena, discovery and trace SDDs name no fake and need only the crate); the review against the whole SDD, and the component's gate, happen on the last piece (decided by Brackly, 2026-09-22: pull requests, their templates and their per-branch CI runs are ceremony for a repository with no second reviewer). Agents commit as `Amoru Agent <agents@griotdata.com>` with `git commit -s`; the DCO sign-off on those commits is made on behalf of the project by its maintainer, and `CONTRIBUTING.md` states this. The PM merges a component pull request when its gate is green (section 6.6); a human merges every `contracts/*` pull request. `cargo fmt` and `cargo clippy -- -D warnings` clean; no `unwrap`/`expect` outside tests; every `unsafe` block has a `// SAFETY:` comment naming the invariant and lives in a module the SDD's section l permits (E9); tests named after the SDD ids (`ct_t3_payload_roundtrip`); benchmarks record the host in their output; no em dashes in documentation; the pull request template's sections are all filled (section 9). A test writes only to a scratch directory unique to its own process (the process id and a counter in the name, under the system temp directory or a `staging.dir` the test was given), never to a fixed path: several executors run the gate on one machine at the same time, and a fixed name made two runs delete each other's files, which fails as a wrong result rather than as a conflict (found and fixed 2026-09-22). Coverage: every crate that has code reaches at least 90% line coverage as `cargo llvm-cov` measures it with test code excluded (`AMORU_COVERAGE_MIN`, default 90, a compile-time constant of the gate, not a runtime tunable), judged per crate so a well-tested crate cannot carry an untested one; a compiling stub with no instrumented lines is not measured. The gate is one script, `tools/quality/check.sh` (em dashes, `cargo fmt`, `cargo clippy -- -D warnings`, `tools/lint/no_tier_wildcard.sh`, `tools/quality/no_stubs.sh`, `cargo test`, coverage), run by the pre-commit hook and by the first CI job. The stub check is what stops a crate looking finished and not being: no `todo!`, no `unimplemented!`, no panic whose message admits it, no `NotImplementedError`, no FIXME in any shipping crate's `src/` or in the Python package, and no workspace crate with less than fifty lines of code unless it is named in the gate's own allowance list, which is visible there and shrinks to nothing (added 2026-09-22 at Brackly's insistence: a coverage gate cannot catch a stub, because an untested stub is merely uncovered and an unreachable one is covered by the test that asserts it panics). Test code is exempt, because a test tagged for the reference host or for a later wave is required to exist and not run, and `unimplemented!()` carrying the tag's reason is how that is written. It also builds and tests the feature-gated crates, because a default-feature run compiles `amoru-adapters`, `amoru-polars` and `amoru-datafusion` to nothing and the gate reported them as stubs with their coverage "not measured" while they held thousands of lines (found by the component 5 agent, 2026-09-22): the two engine bridges need no interpreter and are always built, and the Python adapter is built when `AMORU_PYTHON` names a CPython 3.14 free-threaded interpreter with pyarrow, with a printed line saying so when it does not, because a check that silently measures nothing is worse than one that is absent; every clone runs `tools/hooks/install.sh` before its first commit, and an agent never bypasses the hook (`--no-verify` and `AMORU_SKIP_QUALITY` are for a human committing documentation without a toolchain; CI runs the gate regardless). A test exists to prove an invariant or a section k test id, never to raise the number: coverage is the floor, the SDD's section k is the specification.
+Base branch `main`. Branch names: `component/NN-<slug>` with the slug the crate suffix (`component/02-arena`, `component/10-scheduler`); `infra/<topic>` for the skeleton, CI and bench work; `contracts/<topic>` for a change to `01-contracts.md` and the contracts crate. No pull requests: one human and a set of agents work here, so an executor pushes its branch and hands the PM the report in `architecture/agents/report-template.md`, the PM reviews the branch's diff against that report with the checklist in `agents/pm.md`, and merges to `main` itself. A component may merge in more than one piece when a self-contained part unblocks other executors (the contracts crate before its testkit, for instance, because the arena, discovery and trace SDDs name no fake and need only the crate); the review against the whole SDD, and the component's gate, happen on the last piece (decided by Brackly, 2026-09-22: pull requests, their templates and their per-branch CI runs are ceremony for a repository with no second reviewer). Agents commit as `Moruna Agent <agents@griotdata.com>` with `git commit -s`; the DCO sign-off on those commits is made on behalf of the project by its maintainer, and `CONTRIBUTING.md` states this. The PM merges a component pull request when its gate is green (section 6.6); a human merges every `contracts/*` pull request. `cargo fmt` and `cargo clippy -- -D warnings` clean; no `unwrap`/`expect` outside tests; every `unsafe` block has a `// SAFETY:` comment naming the invariant and lives in a module the SDD's section l permits (E9); tests named after the SDD ids (`ct_t3_payload_roundtrip`); benchmarks record the host in their output; no em dashes in documentation; the pull request template's sections are all filled (section 9). A test writes only to a scratch directory unique to its own process (the process id and a counter in the name, under the system temp directory or a `staging.dir` the test was given), never to a fixed path: several executors run the gate on one machine at the same time, and a fixed name made two runs delete each other's files, which fails as a wrong result rather than as a conflict (found and fixed 2026-09-22). Coverage: every crate that has code reaches at least 90% line coverage as `cargo llvm-cov` measures it with test code excluded (`MORUNA_COVERAGE_MIN`, default 90, a compile-time constant of the gate, not a runtime tunable), judged per crate so a well-tested crate cannot carry an untested one; a compiling stub with no instrumented lines is not measured. The gate is one script, `tools/quality/check.sh` (em dashes, `cargo fmt`, `cargo clippy -- -D warnings`, `tools/lint/no_tier_wildcard.sh`, `tools/quality/no_stubs.sh`, `cargo test`, coverage), run by the pre-commit hook and by the first CI job. The stub check is what stops a crate looking finished and not being: no `todo!`, no `unimplemented!`, no panic whose message admits it, no `NotImplementedError`, no FIXME in any shipping crate's `src/` or in the Python package, and no workspace crate with less than fifty lines of code unless it is named in the gate's own allowance list, which is visible there and shrinks to nothing (added 2026-09-22 at Brackly's insistence: a coverage gate cannot catch a stub, because an untested stub is merely uncovered and an unreachable one is covered by the test that asserts it panics). Test code is exempt, because a test tagged for the reference host or for a later wave is required to exist and not run, and `unimplemented!()` carrying the tag's reason is how that is written. It also builds and tests the feature-gated crates, because a default-feature run compiles `moruna-adapters`, `moruna-polars` and `moruna-datafusion` to nothing and the gate reported them as stubs with their coverage "not measured" while they held thousands of lines (found by the component 5 agent, 2026-09-22): the two engine bridges need no interpreter and are always built, and the Python adapter is built when `MORUNA_PYTHON` names a CPython 3.14 free-threaded interpreter with pyarrow, with a printed line saying so when it does not, because a check that silently measures nothing is worse than one that is absent; every clone runs `tools/hooks/install.sh` before its first commit, and an agent never bypasses the hook (`--no-verify` and `MORUNA_SKIP_QUALITY` are for a human committing documentation without a toolchain; CI runs the gate regardless). A test exists to prove an invariant or a section k test id, never to raise the number: coverage is the floor, the SDD's section k is the specification.
 
 ---
 
@@ -578,7 +578,7 @@ Filled as component SDDs land. The parent's S-ids and D-ids map to the invariant
 
 ## 9. Hand-off protocol
 
-**What an agent is given.** A component agent receives three documents, this preamble, `01-contracts.md` and its own component SDD, plus the `amoru-testkit` fakes for every interface its component consumes, and a brief from the PM built from `architecture/agents/executor.md` naming its component number, SDD path, wave and branch. Those three documents are its reading set. It may additionally read, read-only, any specific section of another SDD that its own SDD's text cites by id (for example "SC f.12" or "09 e.5"), and nothing else in that file; a need to read more than the cited section is a contracts gap and is reported (E10). The facade agent (`amoru-runtime`, the Rust side of component 12) reads every SDD, because it wires every concrete type; the PM reads everything. It works on branch `component/NN-<slug>` from `main` (section 6.7). Before writing code it copies the "environment facts to verify before starting" from its SDD's section l into its pull request, with the command and result for each.
+**What an agent is given.** A component agent receives three documents, this preamble, `01-contracts.md` and its own component SDD, plus the `moruna-testkit` fakes for every interface its component consumes, and a brief from the PM built from `architecture/agents/executor.md` naming its component number, SDD path, wave and branch. Those three documents are its reading set. It may additionally read, read-only, any specific section of another SDD that its own SDD's text cites by id (for example "SC f.12" or "09 e.5"), and nothing else in that file; a need to read more than the cited section is a contracts gap and is reported (E10). The facade agent (`moruna-runtime`, the Rust side of component 12) reads every SDD, because it wires every concrete type; the PM reads everything. It works on branch `component/NN-<slug>` from `main` (section 6.7). Before writing code it copies the "environment facts to verify before starting" from its SDD's section l into its pull request, with the command and result for each.
 
 **What an agent returns.** One pull request whose description follows `.github/PULL_REQUEST_TEMPLATE.md`: what it changes; the document and sections it traces to; the invariants and tests by id; "Environment facts verified" (each fact from section l with its command and result); "Tests skipped (id, reason)" (every test tagged "(integration, closes in wave N)" or "(reference host, E1)", and nothing untagged); "Provisional results (host)" (every timing figure obtained on a host other than the reference host, with the host name); and the checklist. It is done when every untagged test in its SDD's section k exists and passes, every invariant in section c is cited by at least one test, `cargo fmt` and `cargo clippy -- -D warnings` are clean, section m of its SDD is empty, the dependency table (section 6.2) lists every crate its `Cargo.toml` names, and every section of the template is filled. It stops and reports, rather than deciding, on anything in section 7, using the design-change issue template, and continues with the parts of its component the item does not touch.
 

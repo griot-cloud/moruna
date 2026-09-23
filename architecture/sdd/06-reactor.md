@@ -1,10 +1,10 @@
-# Amoru SDD 06: IO reactor (`amoru-reactor`)
+# Moruna SDD 06: IO reactor (`moruna-reactor`)
 
 **Document type:** software design document, component 6 of 12
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
-**Parent:** `architecture/amoru-runtime-design.md` sections 4.2 (threads), 5.2 (local direct IO), 5.6 (tier moves), 6 (hosting); criteria S14, S15; global invariants G-I2, G-I7
+**Parent:** `architecture/moruna-runtime-design.md` sections 4.2 (threads), 5.2 (local direct IO), 5.6 (tier moves), 6 (hosting); criteria S14, S15; global invariants G-I2, G-I7
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.9 (`Reactor`, `Completion`, `CompletionSender`, `CopySrc`, `CopyDst`, `IoPaths`), d.3 (`Buffer`, `BufferView`, `Allocator`), d.2 (`Tier`, `SegmentRef`), d.12 (`HostProfile`, `Guarantee`), e.1 (tier transitions)
-**Component location:** `crates/amoru-reactor`, Rust; features `uring`, `cuda`, `gds`
+**Component location:** `crates/moruna-reactor`, Rust; features `uring`, `cuda`, `gds`
 **Consumes:** contracts (1); the arena (2) as `Arc<dyn Allocator>` and discovery's (3) `HostProfile` as a value, neither as a crate. **Consumed by:** sources (7), sinks (8), placement (9)
 
 **Decisions worth your eye:** (1) a tokio runtime is the reactor, with io_uring used for file IO through a dedicated submission thread rather than tokio-uring, so the same runtime serves object storage and files; (2) the reactor selects every path once at start from the host profile and never re-probes, and a fallback taken because a filesystem refused `O_DIRECT` at open sticks to that path for the run; (3) object-store reads land in the arena with one copy from the HTTP body, which is the ingress boundary, counted separately from payload copies; (4) every trait method enqueues and returns, so a worker may submit from inside a placement call, and the only blocking anywhere is `Completion::wait` in the scheduler's drives.
@@ -119,14 +119,14 @@ impl Reactor {
 /// Contracts d.9 `ObjectMetadata`, for sources' `plan` (07 e.1): `head` and `list`
 /// of `object_store` through f.3's client cache; both complete on a reactor thread
 /// and enqueue like every other operation (f.8). the reactor fills
-/// `amoru_kernel::ObjectMeta` from `object_store::ObjectMeta`; no `object_store` type
+/// `moruna_kernel::ObjectMeta` from `object_store::ObjectMeta`; no `object_store` type
 /// is re-exported.
-impl amoru_kernel::ObjectMetadata for Reactor { /* contracts d.9 */ }
+impl moruna_kernel::ObjectMetadata for Reactor { /* contracts d.9 */ }
 /// Contracts d.9, every method: `read_file`, `read_file_opt`, `write_file`,
 /// `read_object`, `write_object`, `copy`, `register_segment`, `unregister_segment`,
 /// `paths`, `shutdown`. Consumers hold `Arc<dyn Reactor>`; sources also hold
 /// `Arc<dyn ObjectMetadata>`, which the facade makes from the same `Arc<Reactor>`.
-impl amoru_kernel::Reactor for Reactor { /* contracts d.9 */ }
+impl moruna_kernel::Reactor for Reactor { /* contracts d.9 */ }
 
 #[derive(Clone, Debug, Default)]
 pub struct ReactorStats {
@@ -142,7 +142,7 @@ pub struct ReactorStats {
 
 ### d.2 Consumed
 
-`amoru_kernel::{Reactor as ReactorTrait, Completion, CompletionSender, CopySrc, CopyDst, IoPaths, Buffer, BufferView, Allocator, Tier, TierKind, SegmentRef, HostProfile, Guarantee, DeviceId, AmoruError}` (the arena arrives as `Arc<dyn Allocator>`; no `amoru_arena` dependency); `tokio` (`rt-multi-thread`, `sync::Semaphore`, `task::spawn_blocking`); `io-uring` (feature); `object_store` (`get_range`, `put`, `head`, `list`, multipart; the `aws`, `gcp`, `azure` features; `ObjectMeta` re-exported); `cudarc` (streams, events, memcpy async); `cufile` bindings (feature `gds`; the agent writes a minimal FFI over `libcufile`, no crate); `libc` (`open`, `pread`, `pwrite`, `posix_fadvise`).
+`moruna_kernel::{Reactor as ReactorTrait, Completion, CompletionSender, CopySrc, CopyDst, IoPaths, Buffer, BufferView, Allocator, Tier, TierKind, SegmentRef, HostProfile, Guarantee, DeviceId, MorunaError}` (the arena arrives as `Arc<dyn Allocator>`; no `moruna_arena` dependency); `tokio` (`rt-multi-thread`, `sync::Semaphore`, `task::spawn_blocking`); `io-uring` (feature); `object_store` (`get_range`, `put`, `head`, `list`, multipart; the `aws`, `gcp`, `azure` features; `ObjectMeta` re-exported); `cudarc` (streams, events, memcpy async); `cufile` bindings (feature `gds`; the agent writes a minimal FFI over `libcufile`, no crate); `libc` (`open`, `pread`, `pwrite`, `posix_fadvise`).
 
 ## e. Data model, formats and state machines
 

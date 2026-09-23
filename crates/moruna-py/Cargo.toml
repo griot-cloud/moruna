@@ -1,0 +1,48 @@
+[package]
+name = "moruna-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna Python module"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+moruna-kernel = { workspace = true }
+arrow = { workspace = true }
+moruna-runtime = { workspace = true }
+moruna-discovery = { workspace = true }
+moruna-sources = { workspace = true }
+moruna-sinks = { workspace = true }
+moruna-trace = { workspace = true }
+moruna-reactor = { workspace = true }
+moruna-placement = { workspace = true }
+moruna-adapters = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+parquet = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-arrow = { workspace = true, optional = true }
+
+[features]
+default = []
+# Preamble 6.3: `moruna-py` enables `python` and, on Linux, `uring`. The crate's
+# Rust half (argument translation, clamping, the sink equals source rule) builds
+# and is tested without an interpreter; `python` adds the module itself.
+python = [
+  "dep:pyo3",
+  "dep:pyo3-arrow",
+  "dep:moruna-adapters",
+  "moruna-adapters/python",
+  "moruna-runtime/python",
+  "moruna-sources/python",
+]
+uring = ["moruna-runtime/uring"]
+cuda = ["moruna-runtime/cuda"]

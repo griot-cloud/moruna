@@ -6,11 +6,11 @@
 //!
 //! | Variable | Meaning |
 //! |---|---|
-//! | `AMORU_S3_ENDPOINT` | the store's base URL, for example `http://127.0.0.1:9000` |
-//! | `AMORU_S3_BUCKET` | the bucket to write into |
+//! | `MORUNA_S3_ENDPOINT` | the store's base URL, for example `http://127.0.0.1:9000` |
+//! | `MORUNA_S3_BUCKET` | the bucket to write into |
 //! | `AWS_ACCESS_KEY_ID` | the access key |
 //! | `AWS_SECRET_ACCESS_KEY` | the secret key |
-//! | `AMORU_S3_PREFIX` | optional key prefix, `bench` by default |
+//! | `MORUNA_S3_PREFIX` | optional key prefix, `bench` by default |
 //! | `AWS_REGION` | optional region, `us-east-1` by default |
 //!
 //! When the four required variables are not all set the upload is skipped with a
@@ -29,8 +29,8 @@ use crate::error::{BenchError, Result};
 
 /// The environment variables the upload needs.
 pub const REQUIRED: [&str; 4] = [
-    "AMORU_S3_ENDPOINT",
-    "AMORU_S3_BUCKET",
+    "MORUNA_S3_ENDPOINT",
+    "MORUNA_S3_BUCKET",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
 ];
@@ -78,7 +78,7 @@ pub fn discover(lookup: impl Fn(&str) -> Option<String>) -> Discovery {
         bucket: found[1].clone(),
         access_key_id: found[2].clone(),
         secret_access_key: found[3].clone(),
-        prefix: lookup("AMORU_S3_PREFIX")
+        prefix: lookup("MORUNA_S3_PREFIX")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "bench".to_string()),
         region: lookup("AWS_REGION")
@@ -190,9 +190,9 @@ mod tests {
 
     fn full() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("AMORU_S3_ENDPOINT", "http://127.0.0.1:9000"),
-            ("AMORU_S3_BUCKET", "amoru-ci"),
-            ("AWS_ACCESS_KEY_ID", "amoru"),
+            ("MORUNA_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            ("MORUNA_S3_BUCKET", "moruna-ci"),
+            ("AWS_ACCESS_KEY_ID", "moruna"),
             ("AWS_SECRET_ACCESS_KEY", "secret"),
         ]
     }
@@ -201,7 +201,7 @@ mod tests {
     fn a_complete_environment_configures_the_target() {
         match discover(env(&full())) {
             Discovery::Configured(target) => {
-                assert_eq!(target.bucket, "amoru-ci");
+                assert_eq!(target.bucket, "moruna-ci");
                 assert_eq!(target.prefix, "bench");
                 assert_eq!(target.region, "us-east-1");
                 assert_eq!(target.endpoint, "http://127.0.0.1:9000");
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn the_optional_variables_override_their_defaults() {
         let mut pairs = full();
-        pairs.push(("AMORU_S3_PREFIX", "/runs/2026/"));
+        pairs.push(("MORUNA_S3_PREFIX", "/runs/2026/"));
         pairs.push(("AWS_REGION", "eu-west-1"));
         match discover(env(&pairs)) {
             Discovery::Configured(target) => {
@@ -222,7 +222,7 @@ mod tests {
                 assert_eq!(target.key("a/b.parquet"), "runs/2026/a/b.parquet");
                 assert_eq!(
                     target.url("a/b.parquet"),
-                    "s3://amoru-ci/runs/2026/a/b.parquet"
+                    "s3://moruna-ci/runs/2026/a/b.parquet"
                 );
             }
             Discovery::Missing(missing) => panic!("missing {missing:?}"),
@@ -232,9 +232,9 @@ mod tests {
     #[test]
     fn an_empty_prefix_writes_at_the_bucket_root() {
         let mut pairs = full();
-        pairs.push(("AMORU_S3_PREFIX", "/"));
+        pairs.push(("MORUNA_S3_PREFIX", "/"));
         match discover(env(&pairs)) {
-            Discovery::Configured(target) => assert_eq!(target.key("x.amb1"), "x.amb1"),
+            Discovery::Configured(target) => assert_eq!(target.key("x.mrb1"), "x.mrb1"),
             Discovery::Missing(missing) => panic!("missing {missing:?}"),
         }
     }
