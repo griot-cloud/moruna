@@ -245,6 +245,17 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             // of the concurrency the steady-state fit in 10 f.3 has to divide back out.
             ctl.a_anon = ctl.a_k;
             ctl.a_anon_seed = ctl.a_k;
+            // And the whole of the probe's growth is seeded as the fixed term, until a real
+            // record lets `fit_anon` separate the two (11 f.3). One observation cannot tell a
+            // kernel that costs 160 MB whatever the morsel from one that costs ten bytes per
+            // byte, and the two attributions differ by a factor of the morsel size: with
+            // `c_anon` left at zero, a constant-cost kernel planned for a morsel smaller than
+            // the probe is under-predicted by exactly that ratio, which is how a run reached
+            // 1.012 of its ceiling on Linux before the controller could refuse it and broke
+            // S1, the criterion the whole design exists for (2026-09-23). Attributing it all
+            // to the constant is the conservative reading: it can cost a morsel size at the
+            // start of a run, and it cannot cost a breach.
+            ctl.c_anon = ctl.c_anon.max(result.peak_delta);
             if hints.uses_device_memory {
                 ctl.a_k_dev = result.dev_peak_delta as f64 / result.bytes_in as f64;
             }

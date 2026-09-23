@@ -54,7 +54,14 @@ fn write_profile(dir: &std::path::Path, p95: f64, samples: u64, variance: f64) {
 fn implied_safety(target: u64) -> f64 {
     let reserve = (CEILING as f64 * 0.10) as u64;
     let arena = CEILING - BASELINE - reserve;
-    let anon_headroom = (CEILING - BASELINE - arena) as f64;
+    // The anonymous inequality funds each stage's fixed term before dividing the rest among
+    // the morsels (11 f.3), and the probe seeds that term with the whole of its own growth
+    // until a real record can separate the two. So the headroom this inversion may attribute
+    // to the slope is what is left after the fixed term, and reading it without subtracting
+    // the term recovers a safety that was never used (2026-09-23).
+    // `ControllerConfig::default`'s probe size, which `target_with` uses below.
+    let fixed = ((16u64 << 20) as f64 * AMPLIFICATION) as u64;
+    let anon_headroom = (CEILING - BASELINE - arena).saturating_sub(fixed) as f64;
     anon_headroom / (f64::from(WORKERS) * AMPLIFICATION * target as f64)
 }
 
