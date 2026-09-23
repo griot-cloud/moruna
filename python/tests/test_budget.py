@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import pytest
 import subprocess
 import sys
 
@@ -53,6 +54,9 @@ try:
               "peak": report.peak_anon_bytes,
               "fraction": report.peak_fraction_of_ceiling,
               "rows_out": report.stages[0]["rows_out"]}
+except moruna.ConfigError as err:
+    # The budget cannot be honoured in this process at all (see the skip in the test).
+    result = {"exit": "NoRoom", "diagnostic": str(err)}
 except moruna.BudgetError as err:
     # A refusal carries the partial report (PY-I2), so S1 can be checked on this path too:
     # the point of refusing is that the ceiling was never passed.
@@ -97,6 +101,13 @@ def test_s1_a_tight_budget_is_never_exceeded(scratch: pathlib.Path) -> None:
     """
     result = _run(scratch, "512MiB")
 
+    if result["exit"] == "NoRoom":
+        pytest.skip(
+            "this process cannot be given a 512 MiB budget: Moruna sizes a run against the "
+            "memory its own cgroup already holds, which is the run itself in a pod and the "
+            "whole machine on a shared CI runner. The runtime says so rather than pretending: "
+            f"{result['diagnostic']}"
+        )
     assert result["exit"] in ("Completed", "Budget"), result
     if result["exit"] == "Completed":
         assert result["rows_out"] == 200_000, result

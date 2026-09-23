@@ -54,7 +54,8 @@ def append_upper(batch):
 # The destination is a bare filesystem path, which is how a user writes one. A `file://` URL is
 # the other spelling and both must work.
 started = time.perf_counter()
-report = moruna.run(moruna.ParquetSource(str(src / "part-0.parquet")),
+try:
+    report = moruna.run(moruna.ParquetSource(str(src / "part-0.parquet")),
                    append_upper,
                    moruna.ParquetSink(str(out), row_group_bytes="16MiB", file_bytes="64MiB"),
                    # 2 GiB, not 512 MiB: this test is about wall clock, and the budget has to
@@ -64,6 +65,11 @@ report = moruna.run(moruna.ParquetSource(str(src / "part-0.parquet")),
                    # rather than the throughput (2026-09-23). What happens at a budget too
                    # small is test_budget.py's subject, not this one's.
                    budget="2GiB")
+except moruna.ConfigError as err:
+    # This process cannot be given the budget at all: its cgroup already holds more. That is
+    # a fact about the host, not about throughput, so say so and let the test skip.
+    print(json.dumps({"exit": "NoRoom", "diagnostic": str(err)}))
+    raise SystemExit(0)
 run_s = time.perf_counter() - started
 back = pq.read_table(str(out))
 print(json.dumps({
@@ -103,6 +109,13 @@ def test_a_python_kernel_over_200k_rows_finishes_inside_a_wall_clock_bound(
     total_s = time.perf_counter() - started
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    if result.get("exit") == "NoRoom":
+        pytest.skip(
+            "this process cannot be given a 2 GiB budget: Moruna sizes a run against the memory "
+            "its own cgroup already holds, which is the run itself in a pod and the whole "
+            f"machine on a shared CI runner: {result['diagnostic']}"
+        )
 
     # Printed whether or not the assertion fires: a human reading CI output sees the figure.
     print(
