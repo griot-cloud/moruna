@@ -103,7 +103,7 @@ A kernel written for Moruna is a plain function of a batch, so the same code run
 
 ## Status
 
-Alpha, and honest about it. The runtime is complete and runs end to end; the published performance claims are not yet measured, the reference host figures are not yet recorded, and the wheel is not yet on PyPI. See [BOARD.md](BOARD.md) for exactly what is done and what is not.
+Alpha, and honest about it. The runtime is complete and runs end to end, and the wheels are on PyPI for Linux and macOS; the published performance claims are not yet measured and the reference host figures are not yet recorded. See [BOARD.md](BOARD.md) for exactly what is done and what is not, and [CHANGELOG.md](CHANGELOG.md) for what each release changed.
 
 ## How it works
 

@@ -6,7 +6,7 @@ resolver = "3"
 members = ["bench", "crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -15,19 +15,19 @@ publish = false
 
 [workspace.dependencies]
 # Workspace crates (preamble 6.1; the crate graph is preamble 1.3).
-moruna-kernel = { path = "crates/moruna-kernel", version = "0.1.0" }
-moruna-arena = { path = "crates/moruna-arena", version = "0.1.0" }
-moruna-discovery = { path = "crates/moruna-discovery", version = "0.1.0" }
-moruna-trace = { path = "crates/moruna-trace", version = "0.1.0" }
-moruna-adapters = { path = "crates/moruna-adapters", version = "0.1.0" }
-moruna-reactor = { path = "crates/moruna-reactor", version = "0.1.0" }
-moruna-sources = { path = "crates/moruna-sources", version = "0.1.0" }
-moruna-sinks = { path = "crates/moruna-sinks", version = "0.1.0" }
-moruna-placement = { path = "crates/moruna-placement", version = "0.1.0" }
-moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.1.0" }
-moruna-controller = { path = "crates/moruna-controller", version = "0.1.0" }
-moruna-runtime = { path = "crates/moruna-runtime", version = "0.1.0" }
-moruna-testkit = { path = "crates/moruna-testkit", version = "0.1.0" }
+moruna-kernel = { path = "crates/moruna-kernel", version = "0.1.1" }
+moruna-arena = { path = "crates/moruna-arena", version = "0.1.1" }
+moruna-discovery = { path = "crates/moruna-discovery", version = "0.1.1" }
+moruna-trace = { path = "crates/moruna-trace", version = "0.1.1" }
+moruna-adapters = { path = "crates/moruna-adapters", version = "0.1.1" }
+moruna-reactor = { path = "crates/moruna-reactor", version = "0.1.1" }
+moruna-sources = { path = "crates/moruna-sources", version = "0.1.1" }
+moruna-sinks = { path = "crates/moruna-sinks", version = "0.1.1" }
+moruna-placement = { path = "crates/moruna-placement", version = "0.1.1" }
+moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.1.1" }
+moruna-controller = { path = "crates/moruna-controller", version = "0.1.1" }
+moruna-runtime = { path = "crates/moruna-runtime", version = "0.1.1" }
+moruna-testkit = { path = "crates/moruna-testkit", version = "0.1.1" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
