@@ -40,21 +40,25 @@ try:
               moruna.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB"),
               staging_dir=str(d / "staging"), staging_limit="2GiB")
 except moruna.Cancelled as e:
-    # moruna.run turned the signal into Cancelled, but CPython may still have a
-    # KeyboardInterrupt pending from the same SIGINT and will raise it at the next bytecode
-    # boundary, which lands inside this handler. That is Python's semantics and not the
-    # runtime's: the test is about the run raising Cancelled with its report, so ignore
-    # further interrupts while reporting (2026-09-23; it failed here one run in several).
-    import signal as _signal
-    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
-    print(json.dumps({
-        "cancelled": True,
-        "seconds": time.monotonic() - started,
-        "kind": e.kind,
-        "has_report": e.report is not None,
-        "exit": e.report.exit if e.report is not None else None,
-        "signal_thread": threading.current_thread().ident,
-    }), flush=True)
+    # moruna.run turned the signal into Cancelled, but CPython may still hold a
+    # KeyboardInterrupt from the same SIGINT and raises it at the next bytecode boundary,
+    # which lands inside this handler. Installing SIG_IGN here is too late: the interrupt
+    # fires inside that very call. It fires once, so the reporting is retried through it.
+    # That is Python's semantics and not the runtime's (12 f.5a).
+    while True:
+        try:
+            _payload = {
+                "cancelled": True,
+                "seconds": time.monotonic() - started,
+                "kind": e.kind,
+                "has_report": e.report is not None,
+                "exit": e.report.exit if e.report is not None else None,
+                "signal_thread": threading.current_thread().ident,
+            }
+            print(json.dumps(_payload), flush=True)
+            break
+        except KeyboardInterrupt:
+            continue
 except BaseException as e:
     print(json.dumps({"cancelled": False, "raised": type(e).__name__}), flush=True)
 else:
