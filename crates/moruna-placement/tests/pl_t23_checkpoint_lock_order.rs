@@ -54,9 +54,16 @@ fn pl_t23_checkpoint_lock_order() {
     }
 }
 
-/// The default number of body runs. 20 on `infra/pl-t23-segv` while the segfault is being
-/// measured; 1 is the figure the gate wants and the figure this returns to.
-const REPEATS_DEFAULT: u64 = 40;
+/// The default number of body runs. One, because the gate and CI run this on every commit
+/// and each run is three seconds.
+///
+/// `MORUNA_PL_T23_REPEATS` is the instrument for the next time this test dies on Linux. Run
+/// 35835788742 (main at 2d0b77f) killed the binary with SIGSEGV 0.61 seconds into it. Sixty
+/// further runs of the same body on the same runner image, twenty before the release
+/// accounting was corrected and forty after, did not reproduce it, and no accounting anomaly
+/// was reported during any of them. The cause is not known, so the knob stays: raise it,
+/// dispatch ci.yml on the branch, and read the per-iteration markers the body writes.
+const REPEATS_DEFAULT: u64 = 1;
 
 fn once(seconds: u64) {
     let scratch = common::Scratch::new("t23");

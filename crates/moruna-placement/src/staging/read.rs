@@ -17,12 +17,14 @@ pub struct Record {
 
 /// Decode a record read into one buffer starting at the record's header page.
 ///
-/// The buffer is never split: `Buffer::split_at` hands out two halves that the arena frees
-/// independently (contracts d.3), but the testkit's `FakeAllocator` frees the whole region
-/// when the half holding its first byte drops, and the header page is that half. An Arrow
-/// slice and `ManagedTensor::from_buffer`'s byte offset reach the body without splitting and
-/// keep the whole allocation alive, which is what both readers need anyway. Reported as a
-/// finding against d.15.
+/// The buffer is never split. `Buffer::split_at` hands out two halves that the arena frees
+/// independently (contracts d.3), and both allocators now hold that: the fake credits each
+/// half's own bytes against the region the buffer's token names, and returns the region only
+/// when every byte is back. There is still no reason to split here, because an Arrow slice
+/// and `ManagedTensor::from_buffer`'s byte offset reach the body without splitting and keep
+/// the whole allocation alive, which is what both readers need anyway. The two findings this
+/// comment used to carry are closed: the fake freeing the whole region from the half holding
+/// its first byte (2026-09-22) and its crediting a release by address (2026-09-23).
 pub fn decode_record(buf: Buffer, page: u64) -> moruna_kernel::Result<Record> {
     let page_usize = usize::try_from(page).map_err(|_| {
         MorunaError::Staging(format!("page size {page} does not fit this platform"))
