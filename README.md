@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/moruna-dark.png">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/moruna-light.png">
     <img src="docs/assets/moruna-light.png" alt="Moruna: big data, smaller batches" width="360">
   </picture>
 </p>
