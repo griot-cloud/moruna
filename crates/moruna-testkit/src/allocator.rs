@@ -202,6 +202,19 @@ impl FakeAllocator {
     }
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (base, region) in std::mem::take(&mut state.regions) {
+            // SAFETY: this allocator is being dropped, so every `Buffer` it handed out is
+            // gone (each holds an `Arc` of this `Inner` and could not outlive it), the
+            // layout is the one `alloc` used, and each region is freed exactly once
+            // because the map is drained.
+            unsafe { dealloc(base as *mut u8, region.layout) };
+        }
+    }
+}
+
 struct InnerBuilder {
     limits: BTreeMap<usize, u64>,
     page_bytes: usize,
@@ -235,19 +248,21 @@ impl ArenaHandle for Inner {
             .filter(|(start, region)| (ptr as usize) < **start + region.layout.size())
             .map(|(start, _)| *start);
         if let Some(base) = base {
-            let done = {
-                let region = state.regions.get_mut(&base).expect("the region just found");
-                region.released += len.max(1);
-                region.released >= region.layout.size()
-            };
-            if done {
-                let region = state.regions.remove(&base).expect("the region just found");
-                // SAFETY: every byte of this region has now been released, the layout is the
-                // one `alloc` used, and the entry is removed before the free so no later
-                // release can reach it a second time.
-                unsafe { dealloc(base as *mut u8, region.layout) };
-            }
+            let region = state.regions.get_mut(&base).expect("the region just found");
+            region.released += len.max(1);
         }
+        // Deliberately not freed here. A region is identified by the address of the
+        // pointer being released, because `Buffer::split_at` divides one allocation
+        // between two owners without telling this allocator, so there is nothing else to
+        // key on. That inference is only sound while no address is ever reused: free a
+        // region here and the system may hand the same address to the next `alloc`, after
+        // which a release belonging to the dead region credits the live one, retires it,
+        // and leaves a live `Buffer` pointing into freed memory. This allocator therefore
+        // holds every region until it is dropped, which is the end of a test, and frees
+        // them all at once. The byte counters are still exact, so `in_use` and the
+        // `AllocStats` a test asserts on are unaffected; what is given up is the reuse of
+        // a few megabytes inside one test, which is worth nothing, against a class of
+        // undefined behaviour that is worth a great deal (2026-09-23).
     }
 }
 
@@ -370,7 +385,10 @@ impl Allocator for FakeAllocator {
             .regions
             .range(..=address)
             .next_back()
-            .filter(|(base, region)| address < *base + region.len)
+            // A region whose bytes have all been released is logically gone, even though
+            // this allocator physically holds it until it drops (see `release`), so
+            // `contains` and `tier_of` answer about ownership and not about the map.
+            .filter(|(base, region)| address < *base + region.len && region.released < region.len)
             .map(|(_, region)| region.tier)
     }
 
