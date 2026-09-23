@@ -7,9 +7,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use amoru_kernel::{AmoruError, CancelToken, Fingerprint, Placement, ResumePoint, Sink, Source};
-use amoru_testkit::{FakeKernel, FakePlacement, FakeSink, FakeSource};
+use amoru_testkit::{FakePlacement, FakeSink, FakeSource};
 
-use super::common::{RigBuilder, StatefulKernel, manifest_lock, wait_for};
+use super::common::{Latch, RigBuilder, StatefulKernel, manifest_lock, wait_for};
 
 const SPLITS: u32 = 4;
 const ROWS: u64 = 60;
@@ -44,13 +44,14 @@ fn sc_t16_resume_equivalence() {
     // path, so the resumed engine finds this run's manifest.
     let placement = FakePlacement::new().with_manifest_store();
     let sink = FakeSink::new().resumable(true).commit_every(10);
-    // Slow enough that the kill lands in the middle of the run whatever the host's mood: the
-    // point of the test is a resume from a manifest, not a race with the fakes.
-    let checkpointing = Arc::new(
-        StatefulKernel::new(2)
-            .checkpointing()
-            .latency(Duration::from_millis(5)),
-    );
+    // The kill lands in the middle of the run because the run cannot get past the latch, not
+    // because the host was slow enough: a kernel latency only made a completed first run
+    // unlikely, and this test asserted `Cancelled` about it. The latch sits at the last stage,
+    // so the morsels it lets through reach the sink and move the watermark, and the ones behind
+    // it are what the resume has to recompute. Stages 1 and 2 keep their instances free, so the
+    // checkpoint thread can still take them for `KernelState::checkpoint` (f.12).
+    let gate = Latch::after(20);
+    let checkpointing = Arc::new(StatefulKernel::new(2).checkpointing());
     let reinit = Arc::new(StatefulKernel::new(2));
     let first = RigBuilder::new()
         .cfg(|cfg| {
@@ -65,7 +66,7 @@ fn sc_t16_resume_equivalence() {
         .placement(placement.clone())
         .kernel(checkpointing.clone())
         .kernel(reinit.clone())
-        .kernel(Arc::new(FakeKernel::new()))
+        .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
         .go();
     if let Err(e) = first.scheduler.init_instances() {
         panic!("init_instances: {e}");
@@ -81,7 +82,12 @@ fn sc_t16_resume_equivalence() {
             }),
             "the first run never committed anything"
         );
+        assert!(
+            gate.wait_holding(Duration::from_secs(30)),
+            "the latch never held a morsel, so the run was not still in flight"
+        );
         cancel.cancel();
+        gate.open();
         match handle.join() {
             Ok(Ok(crate::RunOutcome::Cancelled { .. })) => {}
             other => panic!("the first run was meant to be cancelled mid-flight, got {other:?}"),
@@ -129,7 +135,9 @@ fn sc_t16_resume_equivalence() {
         .placement(resumed_placement)
         .kernel(second_checkpointing.clone())
         .kernel(second_reinit.clone())
-        .kernel(Arc::new(FakeKernel::new()))
+        // The same chain the killed run had, latch and all: the latch of the first run is open
+        // by now and holds nothing.
+        .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
         .go();
     if let Err(e) = second.scheduler.apply_resume_point(point) {
         panic!("apply_resume_point: {e}");

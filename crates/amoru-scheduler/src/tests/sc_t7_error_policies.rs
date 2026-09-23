@@ -116,10 +116,10 @@ fn sc_t7_error_policies_panic_is_a_kernel_error() {
         .source(FakeSource::new().splits(1, 20, 160))
         .kernel(Arc::new(FakeKernel::new().panic_on(&[7])))
         .go();
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    // The hook is process wide and these tests run in parallel: suppress this kernel's own
+    // panic only, so a concurrent test's assertion message is not swallowed with it.
+    super::common::quiet_kernel_panics();
     let outcome = rig.scheduler.run(CancelToken::new());
-    std::panic::set_hook(hook);
     let Ok(crate::RunOutcome::Completed { .. }) = outcome else {
         panic!("a panicking kernel must not stop the pool: {outcome:?}");
     };

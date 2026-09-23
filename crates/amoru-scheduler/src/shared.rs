@@ -152,6 +152,63 @@ pub(crate) const DRIVE_IDLE: u8 = 0;
 pub(crate) const DRIVE_DRIVING: u8 = 1;
 pub(crate) const DRIVE_STOP: u8 = 2;
 
+/// The commit watermark of f.11 and who is publishing it.
+///
+/// f.11 gives the watermark one owner, but two threads reach it: the sink drive after a write
+/// completes, and a worker after `Sink::skip` under a skipping error policy (f.8). Placement
+/// f.11 requires its caller to present a value that never decreases (a lower one is ignored
+/// there with a `debug_assert`), so the right to call `set_committed` is claimed here and held
+/// for the length of the call: without the claim the thread that reads the higher value can
+/// lose the race to the call and the engine sees the watermark go backwards.
+#[derive(Default)]
+pub(crate) struct Watermark {
+    /// The highest value any thread has read from the sink; what the stats and a checkpoint
+    /// report (f.11, f.12).
+    pub(crate) reached: Option<Seq>,
+    /// The highest value already handed to the placement engine.
+    published: Option<Seq>,
+    /// Set while one thread is inside `Placement::set_committed`.
+    publishing: bool,
+}
+
+impl Watermark {
+    /// Record `next` and say whether this thread is the one that must publish it, and up to
+    /// what value. `None` means another thread holds the claim and will pick this value up.
+    pub(crate) fn claim(&mut self, next: Seq) -> Option<Seq> {
+        if self.reached.is_none_or(|reached| next > reached) {
+            self.reached = Some(next);
+        }
+        self.take_claim()
+    }
+
+    /// Hand the claim back, and say what is still unpublished (the caller keeps the claim when
+    /// something arrived while it was inside the engine).
+    pub(crate) fn release(&mut self) -> Option<Seq> {
+        self.publishing = false;
+        self.take_claim()
+    }
+
+    fn take_claim(&mut self) -> Option<Seq> {
+        if self.publishing {
+            return None;
+        }
+        let reached = self.reached?;
+        if self.published.is_some_and(|published| reached <= published) {
+            return None;
+        }
+        self.published = Some(reached);
+        self.publishing = true;
+        Some(reached)
+    }
+
+    /// A resume starts from the manifest's watermark, which the engine restored itself
+    /// (f.13): nothing is published for it.
+    pub(crate) fn resumed_at(&mut self, committed: Option<Seq>) {
+        self.reached = committed;
+        self.published = committed;
+    }
+}
+
 /// Everything the workers, the drives, the checkpoint thread and the controller's calls share.
 pub(crate) struct Shared {
     pub(crate) cfg: SchedulerConfig,
@@ -171,8 +228,12 @@ pub(crate) struct Shared {
     /// f.7 runs; never across a call into another component, and never by the checkpoint
     /// thread, which is the deadlock preamble 4.2 exists to prevent.
     pub(crate) stage_table: Mutex<()>,
-    /// Queue `k` has been closed; index 0..=n.
+    /// Queue `k` has been closed *in the engine*; index 0..=n. Published only after
+    /// `Placement::close` has returned, so `is_closed(k)` means no push into queue `k` can
+    /// succeed any more, which is what the close cascade's arithmetic rests on (f.7).
     pub(crate) closed: Vec<AtomicBool>,
+    /// One thread has taken on closing queue `k`; the close itself then happens once.
+    closing: Vec<AtomicBool>,
 
     pub(crate) state: AtomicU8Cell,
     pub(crate) exit: Mutex<Option<Exit>>,
@@ -186,7 +247,7 @@ pub(crate) struct Shared {
 
     pub(crate) cursor: Mutex<Cursor>,
     pub(crate) to_recompute: Mutex<Vec<(Seq, amoru_kernel::Origin)>>,
-    pub(crate) committed: Mutex<Option<Seq>>,
+    pub(crate) committed: Mutex<Watermark>,
     pub(crate) last_manifest: Mutex<Option<std::path::PathBuf>>,
 
     pub(crate) jobs: Vec<Sender<JobRequest>>,
@@ -368,6 +429,7 @@ impl Shared {
             schemas,
             stage_table: Mutex::new(()),
             closed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
+            closing: (0..queues).map(|_| AtomicBool::new(false)).collect(),
             state: AtomicU8Cell::new(RunState::Init.code()),
             exit: Mutex::new(None),
             exit_signal: Condvar::new(),
@@ -382,7 +444,7 @@ impl Shared {
                 next_seq: 0,
             }),
             to_recompute: Mutex::new(Vec::new()),
-            committed: Mutex::new(None),
+            committed: Mutex::new(Watermark::default()),
             last_manifest: Mutex::new(None),
             jobs,
             job_inbox: Mutex::new(inbox),
@@ -589,69 +651,114 @@ impl Shared {
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
-    /// Mark a queue closed once, without calling into the engine; returns true for the call that
-    /// did it (f.7). Kept separate from `close_queue` so the flag can be flipped under the stage
-    /// table lock and the engine told afterwards, with no lock held.
-    fn mark_closed(&self, stage: StageId) -> bool {
-        self.closed.get(stage as usize).is_some_and(|flag| {
+    /// Take on closing a queue; true for the call that won it (f.7). The claim is separate from
+    /// `closed` because `closed` is published only once the engine has really closed the queue:
+    /// a flag flipped before the call would tell another thread the queue was sealed while a
+    /// push into it could still succeed, and the cascade would close the queue below a morsel.
+    fn claim_close(&self, stage: StageId) -> bool {
+        self.closing.get(stage as usize).is_some_and(|flag| {
             flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         })
     }
 
+    /// True once a thread has taken the close on, whether or not the engine knows yet.
+    fn close_claimed(&self, stage: StageId) -> bool {
+        self.closing
+            .get(stage as usize)
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// Tell the engine, then publish the flag: in that order, always.
+    fn close_in_engine(&self, stage: StageId) {
+        self.placement.close(stage);
+        if let Some(flag) = self.closed.get(stage as usize) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        tracing::debug!(target: "sched.close_stage", stage, "queue closed");
+    }
+
     /// Close a queue once, in order, and say whether this call did it (f.7).
     pub(crate) fn close_queue(&self, stage: StageId) -> bool {
-        if !self.mark_closed(stage) {
+        if !self.claim_close(stage) {
             return false;
         }
-        self.placement.close(stage);
-        tracing::debug!(target: "sched.close_stage", stage, "queue closed");
+        self.close_in_engine(stage);
         true
     }
 
     /// The close cascade of f.7, evaluated by whichever worker or drive observes the condition.
     /// Monotonic, so it is safe to run concurrently.
     ///
-    /// The one `placement.stats()` read happens before the stage table lock is taken and the
-    /// `placement.close` calls happen after it is released: no lock of this component is ever
-    /// held across a call into another one, which is what preamble 4.2 requires and the deadlock
-    /// it exists to prevent.
+    /// One queue per pass, and the three reads in one order: the queue below is sealed in the
+    /// engine, *then* its count, *then* `running`. That order is the whole argument. Because the
+    /// queue below is sealed, nothing can be pushed into it, so its count is final; because
+    /// `running` is read after the count, a morsel in flight is caught by one read or the other
+    /// (a worker takes its claim before it pops, worker.rs f.7). This used to read one
+    /// `placement.stats()` snapshot before the loop and close every stage the cascade allowed
+    /// against it: for the second stage onwards the count predated the close of the queue below
+    /// it, so a morsel pushed in between was not counted, the cascade closed that queue and the
+    /// ones after it, and the sink then found its own queue closed and empty and completed the
+    /// run without the morsel (SC-I9, SC-T8's row count; ~1 run in 100 of a 3-stage chain).
+    ///
+    /// `placement.stats()` and `placement.close` stay outside the stage table lock: no lock of
+    /// this component is ever held across a call into another one, which is what preamble 4.2
+    /// requires and the deadlock it exists to prevent.
     pub(crate) fn advance_closes(&self) {
         if !self.source_exhausted.load(Ordering::SeqCst) {
             return;
         }
-        let stats = self.placement.stats();
-        let mut closing: Vec<StageId> = Vec::new();
+        while self.close_one() {}
+    }
+
+    /// One step of the cascade: close the lowest queue that may be closed, and say whether it
+    /// closed one, so the caller can look for the next.
+    fn close_one(&self) -> bool {
+        let Some(stage) = self.next_closable() else {
+            return false;
+        };
+        // The queue below is sealed, so this count can no longer rise.
+        if self.queue_count(stage - 1) != 0 {
+            return false;
+        }
         {
             let _guard = self.stage_table.lock().unwrap_or_else(|e| e.into_inner());
-            for index in 0..self.stages.len() {
-                let stage = index as StageId + 1;
-                if self.is_closed(stage) {
-                    continue;
-                }
-                if !self.is_closed(stage - 1) {
-                    break;
-                }
-                let count = stats
-                    .queues
-                    .iter()
-                    .find(|queue| queue.stage == stage - 1)
-                    .map_or(0, |queue| queue.count);
-                if count != 0 {
-                    break;
-                }
-                if self.stages[index].running.load(Ordering::SeqCst) != 0 {
-                    break;
-                }
-                if self.mark_closed(stage) {
-                    closing.push(stage);
-                }
+            // After the count, never before it.
+            if self.stages[stage as usize - 1]
+                .running
+                .load(Ordering::SeqCst)
+                != 0
+            {
+                return false;
+            }
+            if !self.claim_close(stage) {
+                return false;
             }
         }
-        for stage in closing {
-            self.placement.close(stage);
-            tracing::debug!(target: "sched.close_stage", stage, "queue closed");
+        self.close_in_engine(stage);
+        true
+    }
+
+    /// The lowest queue whose producer stage may be able to close it: the queue below it is
+    /// sealed in the engine and the stage has no task running. `None` when the cascade cannot
+    /// move, including while another thread is closing a queue (that thread carries the cascade
+    /// on from there).
+    fn next_closable(&self) -> Option<StageId> {
+        let _guard = self.stage_table.lock().unwrap_or_else(|e| e.into_inner());
+        for index in 0..self.stages.len() {
+            let stage = index as StageId + 1;
+            if self.is_closed(stage) {
+                continue;
+            }
+            if self.close_claimed(stage) || !self.is_closed(stage - 1) {
+                return None;
+            }
+            if self.stages[index].running.load(Ordering::SeqCst) != 0 {
+                return None;
+            }
+            return Some(stage);
         }
+        None
     }
 }
 

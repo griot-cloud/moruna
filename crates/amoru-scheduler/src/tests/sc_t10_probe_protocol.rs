@@ -8,13 +8,12 @@
 //! reported rather than worked around in the testkit.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
 
 use amoru_kernel::{Prober, Sample, StatsSource};
-use amoru_testkit::FakeSource;
+use amoru_testkit::{FakeKernel, FakeSource};
 
-use super::common::{RigBuilder, scripted_sampler};
+use super::common::{Latch, RigBuilder, StatefulKernel, scripted_sampler};
 
 fn sample(anon: u64, peak: u64) -> Sample {
     Sample {
@@ -32,6 +31,12 @@ fn sc_t10_probe_protocol() {
         sample(200, 200),
         sample(700, 700),
     ]);
+    // The probe's own `apply` is held at a latch, so the count below is read at a moment that is
+    // inside the probe by construction. Sampling the count in a loop and taking the minimum, as
+    // this did, asserts that a polling thread was scheduled at least once inside a window it
+    // does not control: under a loaded host it never runs there and the test reports the initial
+    // `u16::MAX`, which says nothing about the scheduler (f.9).
+    let gate = Latch::after(0);
     let rig = RigBuilder::new()
         .cfg(|cfg| {
             cfg.workers_max = 4;
@@ -40,41 +45,41 @@ fn sc_t10_probe_protocol() {
         })
         .source(FakeSource::new().splits(1, 64, 512))
         .sampler(sampler)
-        .stages(2)
+        .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
+        .kernel(Arc::new(FakeKernel::new()))
         .go();
 
-    // Watch the count the controller would read while the probe runs.
-    let stop = Arc::new(AtomicBool::new(false));
-    let seen = Arc::new(AtomicU16::new(u16::MAX));
     let first = amoru_kernel::StatsSource::scheduler_stats(&rig.scheduler).workers_active;
     assert_eq!(first, 4, "four workers are active before the probe");
 
-    let one = {
-        let stop = Arc::clone(&stop);
-        let seen = Arc::clone(&seen);
+    let (one, seen) = {
         let scheduler = &rig.scheduler;
+        let gate = &gate;
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while !stop.load(Ordering::SeqCst) {
-                    let active = scheduler.scheduler_stats().workers_active;
-                    seen.fetch_min(active, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_micros(200));
-                }
+            let watcher = scope.spawn(move || {
+                // The count the controller would read, read while the probe is inside `apply`.
+                let held = gate.wait_holding(Duration::from_secs(30));
+                let active = scheduler.scheduler_stats().workers_active;
+                gate.open();
+                (held, active)
             });
             let result = scheduler.probe(1, 16);
-            stop.store(true, Ordering::SeqCst);
-            result
+            let seen = match watcher.join() {
+                Ok(seen) => seen,
+                Err(_) => panic!("the watching thread panicked"),
+            };
+            (result, seen)
         })
     };
     let one = match one {
         Ok(result) => result,
         Err(e) => panic!("probe(1): {e}"),
     };
-    assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
-        "the probe runs with exactly one worker active"
+    assert!(
+        seen.0,
+        "the probe never reached the kernel, so the count was never read inside it"
     );
+    assert_eq!(seen.1, 1, "the probe runs with exactly one worker active");
     assert_eq!(
         rig.source.reads().len(),
         1,

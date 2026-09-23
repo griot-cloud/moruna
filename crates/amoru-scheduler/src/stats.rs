@@ -42,7 +42,11 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
             .unwrap_or_else(|e| e.into_inner())
             .next_seq
             .saturating_sub(1),
-        committed_seq: *shared.committed.lock().unwrap_or_else(|e| e.into_inner()),
+        committed_seq: shared
+            .committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reached,
         checkpoints: shared.checkpoints.load(Ordering::SeqCst),
         last_checkpoint_us: shared.last_checkpoint_us.load(Ordering::SeqCst),
         resumed: shared.resumed.load(Ordering::SeqCst),

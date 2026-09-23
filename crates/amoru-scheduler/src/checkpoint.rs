@@ -90,7 +90,11 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
         let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
         sink.checkpoint()?
     };
-    let committed_seq = *shared.committed.lock().unwrap_or_else(|e| e.into_inner());
+    let committed_seq = shared
+        .committed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reached;
     let source_cursor = crate::source_drive::cursor(shared);
     let extras = CheckpointExtras {
         kernel_states,

@@ -37,6 +37,7 @@ fn pl_t23_checkpoint_lock_order() {
     let next = Arc::new(AtomicU64::new(0));
     let committed = Arc::new(AtomicU64::new(0));
     let manifests = Arc::new(AtomicU64::new(0));
+    let commits = Arc::new(AtomicU64::new(0));
     let reads = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(seconds);
 
@@ -63,14 +64,37 @@ fn pl_t23_checkpoint_lock_order() {
             scope.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match engine.pop(0, common::want_host(), Locality::Any) {
+                        // A consumer records what it consumed; it does not commit. f.11 gives
+                        // the watermark one owner (10 f.11: the sink drive owns it) and ignores
+                        // a value below it with a `debug_assert`, so eight threads reading the
+                        // maximum and then calling `set_committed` would be a caller bug: the
+                        // thread holding the lower value can make the later call.
                         Ok(Some(morsel)) => {
-                            // `set_committed` runs beside `checkpoint` (f.11, f.12).
-                            let seen = committed.fetch_max(morsel.seq, Ordering::AcqRel);
-                            engine.set_committed(seen.max(morsel.seq));
+                            committed.fetch_max(morsel.seq, Ordering::AcqRel);
                         }
                         Ok(None) => std::thread::yield_now(),
                         Err(_) => break,
                     }
+                }
+            });
+        }
+        // The watermark's one owner: `set_committed` runs beside `checkpoint`, the producers and
+        // the consumers (f.11, f.12), in the increasing order the engine is promised.
+        {
+            let engine = Arc::clone(&engine);
+            let stop = Arc::clone(&stop);
+            let committed = Arc::clone(&committed);
+            let commits = Arc::clone(&commits);
+            scope.spawn(move || {
+                let mut published: Option<u64> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let reached = committed.load(Ordering::Acquire);
+                    if published.is_none_or(|last| reached > last) {
+                        engine.set_committed(reached);
+                        published = Some(reached);
+                        commits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::yield_now();
                 }
             });
         }
@@ -129,6 +153,10 @@ fn pl_t23_checkpoint_lock_order() {
     assert!(
         reads.load(Ordering::Relaxed) > 1,
         "and read while being written"
+    );
+    assert!(
+        commits.load(Ordering::Relaxed) > 1,
+        "and the watermark moved beside them, so `set_committed` was under the detector too"
     );
     assert_eq!(
         amoru_placement::locks::violations(),
