@@ -1,6 +1,21 @@
-# One workflow, one job, on every pull request into main. Minutes are paid for, so this runs
-# what only a clean machine can prove and nothing the pre-commit hook already
-# proved on the way in.
+# One workflow, and each part of it answers to a different event. Minutes are paid
+# for, so nothing runs twice for the same answer:
+#
+#   a pull request       the gate: fmt, clippy, tests, and the wheel built, installed
+#                        and driven through python/tests. This is the required check
+#                        that lets a pull request into main, and the only place the
+#                        tests run.
+#   a merge to main      the release path, and only when the version changed: the
+#                        wheels for every platform we ship, the upload to PyPI, and
+#                        then the tag. No tests, because the tree that merged is the
+#                        tree that was just tested: protection requires a branch to be
+#                        up to date with main and keeps history linear.
+#   weekly and on demand the checks that answer to the outside world rather than to a
+#                        commit, and the ones that need a real cgroup ceiling.
+#
+# Nobody creates a tag. A version bump merged to main is the release, the tag is made
+# here once PyPI has accepted the upload, and a tag therefore always marks something
+# that shipped. Pushing one by hand triggers nothing at all.
 #
 # What is deliberately NOT here:
 #   coverage      tools/quality/check.sh enforces 90% per crate in the hook,
@@ -16,21 +31,13 @@
 name: ci
 
 on:
-  # Pull requests, because that is the only way into `main` now: the branch is protected
-  # and takes this workflow's `build, test, lint` as its required check, so a workflow that
-  # ran only on pushes to `main` would leave every pull request waiting for a check that
-  # could never report. Pushes to `main` are deliberately not a trigger as well: the
-  # protection requires a branch to be up to date before it merges, and history is linear,
-  # so the tree this runs against is the tree that lands, and running it again afterwards
-  # would buy a second opinion on the same commit for twice the minutes.
   pull_request:
     branches: [main]
+  # A merge to main, which is the only way a commit reaches it: the branch is
+  # protected and takes pull requests. This is the release path's trigger, and it
+  # does nothing unless the version in Cargo.toml has no tag yet.
   push:
-    # Without this the workflow never runs on a tag, so the publish job below could not
-    # fire however correct its own condition was: v0.1.0 was tagged and nothing happened
-    # (2026-09-23). A tag runs the whole pipeline, and publishing is the last job of it,
-    # so nothing reaches PyPI that has not just built, tested and imported here.
-    tags: ["v*"]
+    branches: [main]
   schedule:
     - cron: "17 4 * * 1"
   workflow_dispatch:
@@ -45,11 +52,17 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A superseded pull request run is waste; a superseded release is a half published
+  # one, so only the former is cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
     name: build, test, lint
+    # Not on the merge: this job's whole output is the required check on the pull
+    # request, and running it again on the other side of the merge buys a second
+    # opinion on the same commit for twice the minutes.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,7 +151,7 @@ jobs:
             -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
             -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
             quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             curl -sf "$MORUNA_S3_ENDPOINT/minio/health/live" >/dev/null && break
             sleep 1
           done
@@ -156,23 +169,43 @@ jobs:
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
 
-  # Publishing, in two jobs because it has to be. A tag is the only trigger: nothing
-  # reaches PyPI from a push to main. The wheels are built on each platform we ship for
-  # and handed to one job that uploads them, because the PyPI publishing action refuses
-  # to run anywhere but Linux: on the v0.1.0 tag the macOS leg built its wheel, imported
-  # it, and then failed at the upload step ("fail-fast in unsupported environments"), so
-  # 0.1.0 went out Linux-only (2026-09-23). Authentication is PyPI's trusted publishing
-  # (OpenID Connect), so there is no token in this repository and nothing to leak; the
-  # publisher is configured once on PyPI against this repository, this workflow file and
-  # the `pypi` environment.
+  # The release path: a merge to main, and only when the version changed. Three jobs
+  # because each needs something the others must not have: `version` reads the tree and
+  # nothing else, `wheels` runs on every platform we ship, and `release` alone holds the
+  # tokens that can write to PyPI and to this repository.
+  version:
+    name: a version to release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tags, because their absence is the question this job answers.
+          fetch-depth: 0
+      - id: check
+        name: Is the version in Cargo.toml already released?
+        run: |
+          version="$(awk '/^\[workspace.package\]/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "no version found under [workspace.package] in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is tagged already, so this merge is not a release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version has no tag, so this merge releases it"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   wheels:
-    name: build the wheels (tags only)
-    # The gate first, always. Without this the job ran beside `ci` rather than after it, and
-    # on the v0.1.0 tag it published the Linux wheel while the test job was failing: a
-    # release went out from a red pipeline because the condition guarding it only asked
-    # whether this was a tag, never whether the code was good (2026-09-23).
-    needs: ci
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: build the wheels
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -189,7 +222,8 @@ jobs:
           maturin build --release --out dist --interpreter python3.14 python3.14t
           ls -la dist
       - name: The wheel installs and runs before it is published
-        # A wheel that has never been imported is not a release candidate.
+        # A wheel that has never been imported is not a release candidate. The tests
+        # themselves ran on the pull request; this is the artefact, on this platform.
         run: |
           python -m pip install --only-binary=:all: pyarrow
           python -m pip install --no-index --find-links dist moruna
@@ -200,15 +234,18 @@ jobs:
           path: dist
           if-no-files-found: error
 
-  publish:
-    name: publish to PyPI (tags only)
-    needs: wheels
-    if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    name: publish to PyPI and tag
+    needs: [version, wheels]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      # The OpenID Connect token PyPI's trusted publishing wants, so there is no token
+      # in this repository and nothing to leak, and write access for the tag below.
       id-token: write
+      contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: wheels-*
@@ -221,3 +258,20 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+      - name: Tag what was published
+        # After the upload and not before it. A tag made first is a tag that survives a
+        # failed publish, which is how v0.1.1 and v0.1.2 came to name releases that do
+        # not exist and had to be deleted by hand (2026-09-23). Made here, a tag always
+        # marks something that shipped.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          notes="$(awk -v v="## $VERSION" '$0 == v {f=1; next} f && /^## /{exit} f' CHANGELOG.md)"
+          if [ -z "$notes" ]; then
+            notes="See CHANGELOG.md"
+          fi
+          gh release create "v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes "$notes"
