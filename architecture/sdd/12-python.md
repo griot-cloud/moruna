@@ -137,7 +137,7 @@ class MorunaError(Exception): kind: str; message: str; diagnostic: dict; run_id:
 class ResumeError(MorunaError) ...   # a manifest that cannot be used; message names the first mismatch
 class PlanError(MorunaError) ...; KernelError; BudgetError; IoError; ConfigError; Cancelled
 
-def inspect_host() -> dict    # {"limits": {...}, "host_profile": {...}, "notes": [...]}: Limits and HostProfile field by field, discovery notes
+def inspect_host() -> dict    # {"limits": {...}, "host_profile": {...}, "anon_bytes": n, "notes": [...]}: Limits and HostProfile field by field, what the process already holds (through the same sampler a run would use, 03 f.7), discovery notes
 def polars(fn, *, accepts="table")  # wraps a function from a Polars DataFrame to a Polars DataFrame as a stateless Python kernel (f.6)
 __version__: str
 ```

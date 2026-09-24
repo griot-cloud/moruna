@@ -1,21 +1,30 @@
 //! `moruna.inspect_host()` (d.2, j): what the runtime would discover on this host, without
 //! starting anything.
 
-use moruna_kernel::{Guarantee, Limits};
+use moruna_kernel::{Guarantee, Limits, Sampler as _};
 use moruna_runtime::{DiscoveryInput, Runtime};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::errors::{Attachments, to_py_err};
 
-/// `{"limits": {...}, "host_profile": {...}, "notes": [...]}`: `Limits` and `HostProfile` field by
-/// field, and discovery's notes verbatim.
+/// `{"limits": {...}, "host_profile": {...}, "anon_bytes": n, "notes": [...]}`: `Limits` and
+/// `HostProfile` field by field, what the process is already holding, and discovery's notes
+/// verbatim.
 #[pyfunction]
 pub fn inspect_host(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let discovered = Runtime::inspect(&DiscoveryInput::default())
         .map_err(|e| to_py_err(py, &e.error, Attachments::default()))?;
     let out = PyDict::new(py);
     out.set_item("limits", limits_dict(py, &discovered.limits)?)?;
+    // What the process holds now, through the same sampler a run would use (03 f.7). A budget is
+    // a ceiling for the whole process and the arena is sized from what was already there, so a
+    // caller choosing one needs this figure and had no way to ask for it: the interpreter, pyarrow
+    // and numpy rest at 90 MB on one host and 430 MB on another, and 512 MiB means something
+    // different on each (2026-09-23).
+    let sampler = moruna_discovery::Sampler::new(&discovered)
+        .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
+    out.set_item("anon_bytes", sampler.sample().anon_bytes)?;
 
     let p = &discovered.profile;
     let profile = PyDict::new(py);

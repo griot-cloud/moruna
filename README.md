@@ -39,6 +39,8 @@ There is no batch size, no worker count, no read ahead depth and no spill thresh
 
 If the budget is too small for what your function costs, the run does not quietly exceed it and does not get killed: it stops with a diagnostic naming the morsel, its measured footprint and the budget.
 
+The budget is a ceiling for the whole process, not an allowance on top of what it is already using, so what the interpreter and your libraries are holding counts against it. `moruna.inspect_host()["anon_bytes"]` is that figure, measured the way the runtime measures it: on one machine Python with pyarrow rests at 90 MB, on another at 430 MB, and a budget has to leave room above whichever it is.
+
 For a sense of scale: 200,000 rows of text through a Python kernel that builds a new column, inside `budget="512MiB"`, peaks at about two thirds of that ceiling on a laptop. A Python function that allocates its own arrays costs several times its input in memory Moruna cannot place in its arena, and Moruna measures that rather than guessing it, so it sizes the work to fit.
 
 ## What you get back
