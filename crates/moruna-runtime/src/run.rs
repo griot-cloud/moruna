@@ -204,8 +204,12 @@ fn drive(
             name: "budget.host",
             msg: format!(
                 "the budget of {} bytes leaves nothing to run in: this process already held {} \
-                 bytes before the arena existed, and {} bytes are held back as reserve. Give the \
-                 run a larger budget, or start it in a process that holds less.",
+                 bytes before the arena existed, and {} bytes are held back as reserve. That \
+                 figure is what the process has resident, which counts pages an allocator is \
+                 holding for its own reuse as well as pages in use, so a caller that has just \
+                 built and freed a dataset may be holding far more than it is using and can hand \
+                 it back. Otherwise give the run a larger budget, or start it in a process that \
+                 holds less.",
                 limits.memory_ceiling, baseline_bytes, reserve
             ),
         }

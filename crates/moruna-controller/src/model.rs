@@ -685,8 +685,10 @@ fn cannot_be_sized(state: &ControllerState, targets: &[u64]) -> moruna_kernel::M
         "this budget cannot hold this job on this host: the ceiling is {ceiling} bytes, the \
              process held {} bytes before the arena existed, the arena took {} more, and the \
              smallest morsel the runtime can form is measured to cost {predicted} bytes outside \
-             it, which is {} bytes past the ceiling. Give the run a budget of about {} bytes, or \
-             a kernel that holds less of each morsel",
+             it, which is {} bytes past the ceiling. The figure the process held is what it has \
+             resident, which counts pages an allocator holds for its own reuse as well as pages in \
+             use. Otherwise give the run a budget of about {} bytes, or a kernel that holds less \
+             of each morsel",
         state.budgets.baseline,
         state.budgets.host,
         resting.saturating_add(predicted).saturating_sub(ceiling),
