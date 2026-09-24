@@ -26,6 +26,14 @@ Thanks for your interest. Moruna makes hard promises about memory, so a change h
 - Tests are named after the design document's test specification, prefix and id and a short slug (`pl_t4_fifo` for PL-T4), so a reviewer can map them.
 - Tests write only to a scratch directory unique to the running process, never a fixed path.
 
+## Releases
+
+A release is a pull request that bumps the version in `Cargo.toml` and adds its section to
+[CHANGELOG.md](CHANGELOG.md). Merging it is the release: CI builds the wheels for every platform,
+publishes them to PyPI, and creates the tag afterwards, so a tag always names something that
+shipped. Nobody creates tags by hand, and a merge that does not change the version publishes
+nothing.
+
 ## Reporting a problem
 
 Please include the host, the budget you gave the run, and what the run report said. The report is a pure function of the per morsel trace, so `report.to_json()` (and the trace file, where you can share it) usually answers the question outright. For anything with a security angle, follow [`SECURITY.md`](SECURITY.md) rather than opening a public issue.
