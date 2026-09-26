@@ -97,6 +97,21 @@ pub struct CursorRow {
     pub next_seq: u64,
 }
 
+/// One read the source drive had issued and not yet pushed to Q0 (e.5, MH 4.7).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssuedRow {
+    /// The sequence number the read was given.
+    pub seq: u64,
+    /// Its split.
+    pub split: u32,
+    /// First row, inclusive.
+    pub row_start: u64,
+    /// Last row, exclusive.
+    pub row_end: u64,
+    /// The node that issued it.
+    pub node: u16,
+}
+
 /// One stateful kernel instance's checkpoint (e.5).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KernelStateRow {
@@ -137,6 +152,11 @@ pub struct Manifest {
     pub committed_seq: Option<u64>,
     /// Where the source drive is.
     pub source_cursor: CursorRow,
+    /// Reads issued behind the cursor that had not reached Q0, ascending `seq`. Absent from a
+    /// manifest written before F8.4, which reads as empty: such a manifest loses a read in
+    /// flight exactly as it always did, and nothing else.
+    #[serde(default)]
+    pub issued: Vec<IssuedRow>,
     /// Base64 of `Sink::checkpoint`.
     pub sink_state: Option<String>,
     /// `Checkpoint` kernels only.
@@ -258,6 +278,111 @@ pub fn find_manifest(
     Ok(best.map(|(_, path)| path))
 }
 
+/// What a manifest must agree with for `resume = "auto"` to pick it (MH 4.7): the same kernel
+/// fingerprints, stage by stage, and, when the caller knows them, the same plan digest and the
+/// same job document digest (`config["spec.digest"]`, written by a run built from a job
+/// document). A field left `None` is not compared, and `restore` still checks every one of them.
+#[derive(Clone, Debug, Default)]
+pub struct ManifestMatch<'a> {
+    /// The run's kernel fingerprints, stages 1..n.
+    pub fingerprints: &'a [Fingerprint],
+    /// The run's plan digest (e.5), when its source is already built.
+    pub plan_digest: Option<[u8; 32]>,
+    /// The run's job document digest, when it was built from one.
+    pub spec_digest: Option<&'a str>,
+}
+
+impl ManifestMatch<'_> {
+    /// Why `manifest` cannot be this run's, or `None` when it can.
+    fn refuses(&self, manifest: &Manifest, here: &str) -> Option<String> {
+        if manifest.version != MANIFEST_VERSION {
+            return Some(format!("version {}", manifest.version));
+        }
+        let given: Vec<String> = self.fingerprints.iter().map(Fingerprint::to_hex).collect();
+        if manifest.kernels != given {
+            return Some("kernel fingerprints differ".into());
+        }
+        if let Some(digest) = &self.plan_digest
+            && manifest.plan_digest != hex(digest)
+        {
+            return Some("plan digest differs".into());
+        }
+        if let Some(digest) = self.spec_digest {
+            let theirs = manifest.config.get("spec.digest").and_then(|v| v.as_str());
+            if theirs != Some(digest) {
+                return Some("job document digest differs".into());
+            }
+        }
+        if manifest
+            .resume_policy
+            .iter()
+            .any(|policy| policy == "forbid")
+        {
+            return Some("a stage forbids resume".into());
+        }
+        if !manifest.durable_staging && manifest.hostname != here {
+            return Some(format!(
+                "written on {} and its staging is not durable",
+                manifest.hostname
+            ));
+        }
+        None
+    }
+}
+
+/// `resume = "auto"` (MH 4.7): among `staging_dir/moruna-*/manifest.json`, the newest by
+/// `written_ns` that `want` accepts. A directory that does not exist, or holds nothing that
+/// matches, is `Ok(None)`: the caller starts fresh. Each manifest passed over is logged with
+/// the reason, so a host that expected a resume can see why it did not get one.
+pub fn find_resumable_manifest(
+    staging_dir: &Path,
+    want: &ManifestMatch<'_>,
+) -> moruna_kernel::Result<Option<PathBuf>> {
+    let entries = match std::fs::read_dir(staging_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(MorunaError::Io {
+                op: "read_dir",
+                target: staging_dir.display().to_string(),
+                msg: e.to_string(),
+            });
+        }
+    };
+    let here = hostname::get()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let is_run_dir = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("moruna-"));
+        let candidate = entry.path().join("manifest.json");
+        if !is_run_dir || !candidate.is_file() {
+            continue;
+        }
+        let manifest = match read_manifest(&candidate) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::info!(target: "placement.resume_auto", path = %candidate.display(), reason = %e, "passed over");
+                continue;
+            }
+        };
+        if let Some(reason) = want.refuses(&manifest, &here) {
+            tracing::info!(target: "placement.resume_auto", path = %candidate.display(), %reason, "passed over");
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(written, _)| manifest.written_ns > *written)
+        {
+            best = Some((manifest.written_ns, candidate));
+        }
+    }
+    Ok(best.map(|(_, path)| path))
+}
+
 impl PlacementEngine {
     /// `checkpoint` (f.12). Runs on the caller's thread, never under a queue lock, and the
     /// lineage lock is held only for the snapshot.
@@ -269,7 +394,8 @@ impl PlacementEngine {
         let Some(dir) = self.run_dir.clone() else {
             return Err(MorunaError::Resume("no staging directory".into()));
         };
-        let snapshot = self.lineage_snapshot();
+        let committed_seq = extras.committed_seq.or_else(|| self.committed_seq());
+        let snapshot = self.lineage_snapshot(committed_seq);
         let mut referenced: HashSet<u32> = HashSet::new();
         let mut lineage = Vec::with_capacity(snapshot.len());
         for (seq, record) in snapshot {
@@ -335,11 +461,28 @@ impl PlacementEngine {
                 .map(|policy| policy_name(*policy).to_string())
                 .collect(),
             stages: self.cfg.stages,
-            committed_seq: extras.committed_seq.or_else(|| self.committed_seq()),
+            committed_seq,
             source_cursor: CursorRow {
                 split_index: extras.source_cursor.split_index,
                 row_offset: extras.source_cursor.row_offset,
                 next_seq: extras.source_cursor.next_seq,
+            },
+            issued: {
+                let mut rows: Vec<IssuedRow> = extras
+                    .issued
+                    .iter()
+                    .filter(|(seq, _)| committed_seq.is_none_or(|watermark| *seq > watermark))
+                    .map(|(seq, origin)| IssuedRow {
+                        seq: *seq,
+                        split: origin.split,
+                        row_start: origin.row_start,
+                        row_end: origin.row_end,
+                        node: origin.node.0,
+                    })
+                    .collect();
+                rows.sort_by_key(|row| row.seq);
+                rows.dedup_by_key(|row| row.seq);
+                rows
             },
             sink_state: extras
                 .sink_state
@@ -539,7 +682,12 @@ impl PlacementEngine {
         {
             let mut lineage = self.lock_lineage();
             lineage.clear();
-            for row in &manifest.lineage {
+            let covered = |seq: u64| {
+                manifest
+                    .committed_seq
+                    .is_some_and(|watermark| seq <= watermark)
+            };
+            for row in manifest.lineage.iter().filter(|row| !covered(row.seq)) {
                 let Some(kind) = kind_of_name(&row.kind) else {
                     return Err(resume(path, format!("unknown payload kind {}", row.kind)));
                 };
@@ -563,6 +711,7 @@ impl PlacementEngine {
                         bytes: row.bytes,
                         disk,
                         consumed: false,
+                        committed: false,
                     },
                 );
                 match disk {
@@ -578,7 +727,38 @@ impl PlacementEngine {
             }
         }
         restored.sort_by_key(|(_, entry)| entry.seq);
+        // MH 4.7: a read in flight at the write is behind the cursor and in no queue; it is
+        // read again unless the lineage caught it too (the drive pushes, then forgets, so a
+        // read that landed between the two snapshots is in both).
+        let known: HashSet<u64> = manifest.lineage.iter().map(|row| row.seq).collect();
+        let issued: Vec<(Seq, Origin)> = manifest
+            .issued
+            .iter()
+            .filter(|row| {
+                manifest
+                    .committed_seq
+                    .is_none_or(|watermark| row.seq > watermark)
+            })
+            .map(|row| {
+                (
+                    row.seq,
+                    Origin {
+                        split: row.split,
+                        row_start: row.row_start,
+                        row_end: row.row_end,
+                        node: NodeId(row.node),
+                    },
+                )
+            })
+            .collect();
+        to_recompute.extend(
+            issued
+                .iter()
+                .filter(|(seq, _)| !known.contains(seq))
+                .cloned(),
+        );
         to_recompute.sort_by_key(|(seq, _)| *seq);
+        to_recompute.dedup_by_key(|(seq, _)| *seq);
         {
             let mut staging = self.lock_staging();
             staging.segments.clear();
@@ -657,6 +837,7 @@ impl PlacementEngine {
                 row_offset: manifest.source_cursor.row_offset,
                 next_seq: manifest.source_cursor.next_seq,
             },
+            issued,
         };
         Ok(ResumePoint {
             extras,

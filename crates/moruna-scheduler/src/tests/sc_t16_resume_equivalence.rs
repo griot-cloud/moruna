@@ -113,6 +113,18 @@ fn sc_t16_resume_equivalence() {
         };
     let committed = point.extras.committed_seq;
     let point_next_seq = point.extras.source_cursor.next_seq;
+    let issued_at_kill: Vec<u64> = point.extras.issued.iter().map(|(seq, _)| *seq).collect();
+    for seq in &issued_at_kill {
+        assert!(
+            *seq < point_next_seq,
+            "an issued read is behind the cursor, which is why the cursor cannot name it"
+        );
+        assert!(
+            committed.is_none_or(|watermark| *seq > watermark)
+                == point.to_recompute.iter().any(|(s, _)| s == seq),
+            "restore hands back every issued read above the watermark, and only those (MH 4.7)"
+        );
+    }
     let to_recompute = point.to_recompute.len();
 
     assert!(
@@ -200,16 +212,20 @@ fn sc_t16_resume_equivalence() {
     // moment of the last manifest, was in no queue (so the manifest's lineage does not name it)
     // and had already been issued (so the cursor, which is the next range to issue, does not
     // point at it). Its sequence number therefore lies strictly between the watermark and the
-    // cursor's `next_seq`. Two things put a morsel there: one written but not yet committed,
-    // which the real engine keeps in its lineage until `set_committed` and `FakePlacement` does
-    // not (09 f.11, PL-I11); and one whose source read was still in flight, which nothing
-    // records. The second is a gap in the design, reported to the PM, not an artefact of the
-    // fake. What this test proves is that nothing outside that window is lost.
+    // cursor's `next_seq`. One thing still puts a morsel there under this fake: one written but
+    // not yet committed, which the real engine keeps in its lineage until `set_committed` and
+    // `FakePlacement` does not (09 f.11, PL-I11). A read that was still in flight used to be the
+    // other, and is no longer: the manifest records it as issued and restore hands it back
+    // (MH 4.7, 10 l), which the loop below proves by name.
     let issued = point_next_seq;
     for seq in &missing {
         assert!(
             *seq > watermark && *seq < issued,
             "sequence {seq} is missing from outside the loss window ({watermark}, {issued})"
+        );
+        assert!(
+            !issued_at_kill.contains(seq),
+            "sequence {seq} was an issued read at the kill and was not read again"
         );
     }
 

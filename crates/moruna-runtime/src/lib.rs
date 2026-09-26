@@ -21,6 +21,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod cancel;
+pub mod checkpoint;
 pub mod config;
 pub mod elastic;
 pub mod error;
@@ -31,6 +32,7 @@ pub mod report;
 pub mod run;
 pub mod spec;
 
+pub use checkpoint::CheckpointHandle;
 pub use elastic::ElasticBudget;
 pub use error::{Result, RunError};
 pub use job::JobSpec;

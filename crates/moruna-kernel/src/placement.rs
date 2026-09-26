@@ -74,6 +74,12 @@ pub struct CheckpointExtras {
     /// Where the source drive is: the index into the plan and the next row within
     /// that split, plus the next sequence number to assign.
     pub source_cursor: SourceCursor,
+    /// Reads the source drive has issued and not yet pushed to Q0, ascending `seq`: behind the
+    /// cursor, so the cursor does not name them, and in no queue, so the lineage does not
+    /// either. `restore` hands each back in `ResumePoint::to_recompute` unless the lineage
+    /// already holds it (placement e.5, MH 4.7). Re-reading one is safe because `read` is
+    /// deterministic for a repeatable source (CT-I12).
+    pub issued: Vec<(Seq, Origin)>,
 }
 
 /// Where the source drive is in the plan.
@@ -93,8 +99,9 @@ pub struct ResumePoint {
     /// The pieces the scheduler put in the manifest.
     pub extras: CheckpointExtras,
     /// Morsels the manifest knew about that have no disk copy and are not
-    /// committed: the scheduler re-reads each from its origin and pushes it to
-    /// Q0 with its original `seq` before restarting the source drive.
+    /// committed, and the reads `CheckpointExtras::issued` named that the lineage does
+    /// not hold: the scheduler re-reads each from its origin and pushes it to Q0 with its
+    /// original `seq` before restarting the source drive. Ascending `seq`, no duplicates.
     pub to_recompute: Vec<(Seq, Origin)>,
 }
 

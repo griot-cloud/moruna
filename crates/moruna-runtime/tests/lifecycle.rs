@@ -79,6 +79,7 @@ impl Rig {
             run_id: Some(RunId([7; 16])),
             limits_source: None,
             limits_subscribers: Vec::new(),
+            checkpoint: None,
             observer: None,
         }
     }
