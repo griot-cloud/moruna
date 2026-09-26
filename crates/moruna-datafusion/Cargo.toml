@@ -11,16 +11,36 @@ description = "Moruna DataFusion bridge"
 [dependencies]
 moruna-kernel = { workspace = true }
 datafusion = { workspace = true, optional = true }
+# peql: the arena copy, the Tokio runtime a plan runs on, and the engine itself.
+moruna-sources = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+peql = { workspace = true, optional = true }
 
 [dev-dependencies]
 # AD-T10 drives a real DataFusion session, whose API is asynchronous.
 tokio = { workspace = true }
+moruna-testkit = { workspace = true }
+moruna-sources = { workspace = true }
 
 [features]
 default = []
 datafusion = ["dep:datafusion"]
+# `PlanSource` over a DataFusion plan and peQL's governed plans, `PeqlSink` over peQL's
+# contract writes (MH 4.5).
+peql = ["datafusion", "dep:moruna-sources", "dep:tokio", "dep:futures", "dep:peql"]
 
 [[test]]
 name = "ad_t10_datafusion_bridge"
 path = "tests/ad_t10_datafusion_bridge.rs"
 required-features = ["datafusion"]
+
+[[test]]
+name = "plan_source"
+path = "tests/plan_source.rs"
+required-features = ["peql"]
+
+[[test]]
+name = "peql_bridge"
+path = "tests/peql_bridge.rs"
+required-features = ["peql"]

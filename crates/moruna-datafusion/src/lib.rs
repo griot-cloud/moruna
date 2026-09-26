@@ -1,4 +1,6 @@
-//! Moruna engine bridge: hosts a kernel inside DataFusion (05-adapters f.6, AD-I6).
+//! Moruna engine bridge: hosts a kernel inside DataFusion (05-adapters f.6, AD-I6), and, with
+//! the `peql` feature, reads a DataFusion plan as a source and writes under a peQL contract as a
+//! sink (MH 4.5).
 //!
 //! Design: `architecture/sdd/05-adapters.md` f.6. The bridge is a pure wrapper: it converts
 //! DataFusion's `ColumnarValue`s into a [`Payload`], calls [`Kernel::apply`] with [`NoState`],
@@ -20,3 +22,16 @@ mod udf;
 
 #[cfg(feature = "datafusion")]
 pub use udf::{KernelUdf, datafusion_udf};
+
+#[cfg(feature = "peql")]
+mod peql;
+#[cfg(feature = "peql")]
+mod plan_source;
+
+/// The engine the `peql` constructors take, re-exported so a caller names one version of it.
+#[cfg(feature = "peql")]
+pub use ::peql as engine;
+#[cfg(feature = "peql")]
+pub use peql::{PeqlRead, PeqlSink};
+#[cfg(feature = "peql")]
+pub use plan_source::{PlanSource, SPLIT_BYTES};

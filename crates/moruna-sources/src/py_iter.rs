@@ -216,7 +216,7 @@ impl PyIteratorSource {
                 }
             },
         };
-        let (batch, copied) = crate::parquet::decode_copy_for_iterator(&batch, alloc, tier)?;
+        let (batch, copied) = crate::parquet::decode_copy::copy_batch(&batch, alloc, tier)?;
         Counters::add(&self.counters.decode_bytes, copied);
         // The interpreter is this source's decoder, so its copy into the arena is the decode
         // copy G-I2 grants (SO-I5).
@@ -241,6 +241,6 @@ fn empty(schema: &SourceSchema, alloc: &dyn Allocator, tier: Tier) -> Result<Pay
         &arrow::array::RecordBatchOptions::new().with_row_count(Some(0)),
     )
     .map_err(|e| plan_err(format!("an empty batch: {e}")))?;
-    let (batch, _) = crate::parquet::decode_copy_for_iterator(&batch, alloc, tier)?;
+    let (batch, _) = crate::parquet::decode_copy::copy_batch(&batch, alloc, tier)?;
     Payload::table(batch)
 }

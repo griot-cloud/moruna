@@ -18,6 +18,7 @@ use moruna_sources::{
 };
 use parquet::basic::{Compression, ZstdLevel};
 
+use super::governed;
 use super::translate::{self, ResumeArg};
 use super::{
     ErrorPolicyDoc, FilterDoc, GuaranteeDoc, HostProfileDoc, JobSpec, KernelDoc, KernelKindDoc,
@@ -175,8 +176,9 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         None => None,
     };
 
-    let (source, source_targets) = source_of(&job.source, loader)?;
-    let (sink, sink_target) = sink_of(&job.sink, &mut notes)?;
+    let engines = governed::Engines::default();
+    let (source, source_targets) = source_of(&job.source, loader, &engines)?;
+    let (sink, sink_target) = sink_of(&job.sink, &mut notes, &engines)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;
 
     // Each entry is loaded and its pin checked on its own; adjacent standard kernels are then
@@ -368,7 +370,11 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
 }
 
 /// The source's builder and the URLs it reads, for the sink equals source rule.
-fn source_of(doc: &SourceDoc, loader: &dyn KernelLoader) -> Result<(SourceSpec, Vec<String>)> {
+fn source_of(
+    doc: &SourceDoc,
+    loader: &dyn KernelLoader,
+    engines: &governed::Engines,
+) -> Result<(SourceSpec, Vec<String>)> {
     match doc {
         SourceDoc::Parquet { url, options } => {
             if url.0.is_empty() {
@@ -423,6 +429,12 @@ fn source_of(doc: &SourceDoc, loader: &dyn KernelLoader) -> Result<(SourceSpec, 
             ))
         }
         SourceDoc::Iterator => Ok((loader.iterator_source()?, Vec::new())),
+        SourceDoc::Datafusion {
+            root,
+            contract,
+            sql,
+            caller,
+        } => governed::source(root, contract, sql, caller, engines),
     }
 }
 
@@ -465,7 +477,11 @@ fn row_filter(index: usize, doc: &FilterDoc) -> Result<RowFilter> {
 }
 
 /// The sink's builder and where it writes.
-fn sink_of(doc: &SinkDoc, notes: &mut Vec<String>) -> Result<(SinkSpec, String)> {
+fn sink_of(
+    doc: &SinkDoc,
+    notes: &mut Vec<String>,
+    engines: &governed::Engines,
+) -> Result<(SinkSpec, String)> {
     match doc {
         SinkDoc::Parquet { url, options } => {
             let url = translate::local_url(url);
@@ -540,6 +556,12 @@ fn sink_of(doc: &SinkDoc, notes: &mut Vec<String>) -> Result<(SinkSpec, String)>
                 url.clone(),
             ))
         }
+        SinkDoc::Peql {
+            root,
+            contract,
+            caller,
+            mode,
+        } => governed::sink(root, contract, caller, mode, engines),
     }
 }
 

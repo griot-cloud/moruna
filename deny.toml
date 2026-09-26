@@ -153,4 +153,9 @@ deny-multiple-versions = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# peQL, the contract-native engine of MH 4.5, and parcel, its contract compiler, are the
+# project's own and are consumed at a pinned commit (F8.5).
+allow-git = [
+  "https://github.com/griot-cloud/peQL",
+  "https://github.com/griot-cloud/parcel",
+]

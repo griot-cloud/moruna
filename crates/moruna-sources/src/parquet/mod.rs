@@ -8,7 +8,7 @@
 //! reactor, decodes one batch, and copies the decoded Arrow buffers into arena buffers of the
 //! requested tier: that copy is the one exception G-I2 grants (SO-I5).
 
-mod decode_copy;
+pub(crate) mod decode_copy;
 mod plan;
 mod read;
 mod reader;
@@ -196,15 +196,4 @@ impl Source for ParquetSource {
     ) -> BoxFuture<'_, Result<Payload>> {
         read::read(self, split, rows, alloc, tier)
     }
-}
-
-/// The decode copy, for the iterator source (f.5): the interpreter is its decoder, so the copy
-/// of a Python-owned batch into the arena is the same one copy SO-I5 counts.
-#[cfg(feature = "python")]
-pub(crate) fn decode_copy_for_iterator(
-    batch: &moruna_kernel::arrow::array::RecordBatch,
-    alloc: &dyn Allocator,
-    tier: Tier,
-) -> Result<(moruna_kernel::arrow::array::RecordBatch, u64)> {
-    decode_copy::copy_batch(batch, alloc, tier)
 }

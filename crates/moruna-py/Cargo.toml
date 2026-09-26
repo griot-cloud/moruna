@@ -53,4 +53,7 @@ python = [
   "moruna-sources/python",
 ]
 uring = ["moruna-runtime/uring"]
+# A governed plan as the source and a contract write as the sink (MH 4.5); what the guest
+# binary is built with.
+peql = ["moruna-runtime/peql"]
 cuda = ["moruna-runtime/cuda"]

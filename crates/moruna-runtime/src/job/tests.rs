@@ -595,6 +595,85 @@ fn hints_are_listed() {
     assert_eq!(doc.hints_set().len(), 10);
 }
 
+/// MH 4.5: the governed ends of a run. The document reads and writes them, refuses a malformed
+/// one naming the field, and a build without the bridge refuses them by kind.
+#[test]
+fn governed_sources_and_sinks_are_documents() {
+    let text = r#"{"moruna_spec":1,
+        "source":{"kind":"datafusion","root":"/disk","contract":"demo/big",
+                  "caller":{"id":"gus","tenant":"partner","purpose":"analytics"}},
+        "sink":{"kind":"peql","root":"file:///disk","contract":"demo/copy","mode":"overwrite",
+                "caller":{"id":"ana","tenant":"demo","purpose":"analytics"}}}"#;
+    let job = JobSpec::from_json(text).expect("parses");
+    let again = JobSpec::from_json(&job.canonical_json()).expect("canonical parses");
+    assert_eq!(again, job);
+    assert!(job.canonical_json().contains(r#""kind":"datafusion""#));
+
+    let refusal = |job: &JobSpec| match build::build(job, &NoKernels, opts(false, &no_env)) {
+        Err(MorunaError::Config { msg, .. }) => msg,
+        Err(other) => panic!("not a document refusal: {other}"),
+        Ok(_) => panic!("built"),
+    };
+    let caller: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"id":"a","tenant":"demo","purpose":"analytics"}"#).unwrap();
+    let with_source = |contract: Option<&str>, sql: Option<&str>, root: &str| {
+        let mut j = job.clone();
+        j.source = SourceDoc::Datafusion {
+            root: root.into(),
+            contract: contract.map(Into::into),
+            sql: sql.map(Into::into),
+            caller: caller.clone(),
+        };
+        j
+    };
+    for bad in [
+        with_source(Some("a"), Some("SELECT 1"), "/disk"),
+        with_source(None, None, "/disk"),
+        with_source(Some(""), None, "/disk"),
+    ] {
+        assert!(refusal(&bad).contains("exactly one of `contract` and `sql`"));
+    }
+    assert!(refusal(&with_source(Some("a"), None, " ")).contains("source.root"));
+    let with_sink = |contract: &str, mode: Option<&str>, root: &str| {
+        let mut j = job.clone();
+        j.source = minimal("/out").source;
+        j.sink = SinkDoc::Peql {
+            root: root.into(),
+            contract: contract.into(),
+            caller: caller.clone(),
+            mode: mode.map(Into::into),
+        };
+        j
+    };
+    assert!(refusal(&with_sink("", None, "/disk")).contains("sink.contract"));
+    assert!(refusal(&with_sink("c", Some("upsert"), "/disk")).contains("unknown mode"));
+    assert!(refusal(&with_sink("c", None, "")).contains("sink.root"));
+
+    #[cfg(not(feature = "peql"))]
+    {
+        assert!(refusal(&job).contains("source.kind: this build of moruna has no peQL bridge"));
+        let mut parquet_source = job.clone();
+        parquet_source.source = minimal("/out").source;
+        assert!(refusal(&parquet_source).contains("sink.kind"));
+    }
+    #[cfg(feature = "peql")]
+    {
+        let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("builds");
+        assert!(built.spec.spec_digest.is_some());
+        let mut not_a_caller = job.clone();
+        not_a_caller.sink = SinkDoc::Peql {
+            root: "/disk".into(),
+            contract: "demo/copy".into(),
+            caller: serde_json::Map::new(),
+            mode: None,
+        };
+        assert!(refusal(&not_a_caller).contains("sink.caller: not a caller"));
+        let mut bad_sql = job.clone();
+        bad_sql.source = with_source(None, Some("SELEC"), "/disk").source;
+        assert!(refusal(&bad_sql).contains("source.sql"));
+    }
+}
+
 /// MH 4.1 and 4.9: `{"kind": "std", "name", "args"}` round-trips, builds without a loader,
 /// fuses adjacent standard kernels, and honours a pinned fingerprint.
 #[test]

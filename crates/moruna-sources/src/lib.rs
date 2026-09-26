@@ -30,6 +30,7 @@ pub mod py_iter;
 
 mod util;
 
+pub use crate::parquet::decode_copy::copy_batch;
 pub use crate::parquet::{ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue};
 pub use crate::tensor::{TensorSource, TensorSourceConfig};
 pub use stats::SourceStats;
