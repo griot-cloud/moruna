@@ -1,12 +1,18 @@
-//! The Python kernel fingerprint (e.4).
+//! The Python kernel fingerprint (e.4, as amended by MH 4.9).
 //!
-//! A Python kernel's identity is its qualified name; its configuration is the text of its source
-//! plus the decorator's arguments. Editing the function therefore invalidates the profile the
-//! controller keyed on it, which is the point: the same name with a different body is a different
-//! kernel, and a profile that survived the edit would size the wrong thing.
+//! `sha256(canonical source || lockfile bytes, when given || Moruna ABI version)` (MH 4.9),
+//! where the canonical source is the kernel's qualified name, its source text normalised, and
+//! its declaration: the decorator's arguments and its schemas as canonical JSON. Editing the
+//! function, its decorator, its schemas or its locked dependencies therefore changes the
+//! fingerprint and invalidates the profile keyed on it, which is the point: the same name with a
+//! different body is a different kernel. The module name is deliberately not part of it, so
+//! `moruna check kernels.py` and a program that imports the same file under another name agree,
+//! and the profile row the check writes is the one the run reads.
 
+use moruna_kernel::declare::ABI_VERSION;
 use moruna_kernel::{Fingerprint, PayloadKind, ResumePolicy, TierPref};
 use pyo3::prelude::*;
+use sha2::Digest;
 
 use super::kernel::PyKernelSpec;
 
@@ -19,31 +25,37 @@ pub struct Fingerprinted {
     pub source_available: bool,
 }
 
-/// Compute a Python kernel's fingerprint (e.4).
-///
-/// `identity` is `py:<module>.<qualname>` of the callable, or of the class for a class kernel.
-/// `config` is a 32 byte digest of the source text followed by the decorator arguments as
-/// canonical JSON.
-///
-/// The digest is `Fingerprint::compute("py:source", source)` rather than a bare BLAKE3 of the
-/// source, because `blake3` is not a dependency of this crate and adding one is an E2 item; the
-/// digest is BLAKE3 over the source either way, and AD-T8 holds.
+/// Compute a Python kernel's fingerprint (MH 4.9).
 pub fn compute(py: Python<'_>, spec: &PyKernelSpec) -> Fingerprinted {
     let target = fingerprint_target(py, spec);
-    let identity = identity_of(py, &target);
+    let qualname = qualname_of(&target);
     let (source, source_available) = source_of(py, &target);
-    let digest = Fingerprint::compute("py:source", source.as_bytes()).0;
-    let mut config = Vec::with_capacity(digest.len() + 128);
-    config.extend_from_slice(&digest);
-    config.extend_from_slice(config_json(spec).as_bytes());
+    let canonical = format!(
+        "py:{qualname}\n{source}\n{}{}",
+        config_json(spec),
+        spec.declared.canonical_json()
+    );
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"moruna-kernel\0");
+    hasher.update(canonical.as_bytes());
+    hasher.update(b"\0");
+    if let Some(lockfile) = &spec.lockfile {
+        hasher.update(lockfile);
+    }
+    hasher.update(b"\0abi:");
+    hasher.update(ABI_VERSION.to_string().as_bytes());
     Fingerprinted {
-        fingerprint: Fingerprint::compute(&identity, &config),
+        fingerprint: Fingerprint(hasher.finalize().into()),
         source_available,
     }
 }
 
-/// What the fingerprint is taken of: the callable itself, or the class of a class kernel (b).
+/// What the fingerprint is taken of: the function the author wrote (`origin`, for a Polars
+/// kernel the decorator wrapped), the callable itself, or the class of a class kernel (b).
 fn fingerprint_target<'py>(py: Python<'py>, spec: &PyKernelSpec) -> Bound<'py, PyAny> {
+    if let Some(origin) = &spec.origin {
+        return origin.bind(py).clone();
+    }
     let callable = spec.callable.bind(py).clone();
     if spec.stateful {
         callable.get_type().into_any()
@@ -52,32 +64,52 @@ fn fingerprint_target<'py>(py: Python<'py>, spec: &PyKernelSpec) -> Bound<'py, P
     }
 }
 
-fn identity_of(py: Python<'_>, target: &Bound<'_, PyAny>) -> String {
-    let module = attr_string(py, target, "__module__").unwrap_or_else(|| "<unknown>".to_string());
-    let qualname = attr_string(py, target, "__qualname__")
-        .or_else(|| attr_string(py, target, "__name__"))
-        .unwrap_or_else(|| "<anonymous>".to_string());
-    format!("py:{module}.{qualname}")
+fn qualname_of(target: &Bound<'_, PyAny>) -> String {
+    attr_string(target, "__qualname__")
+        .or_else(|| attr_string(target, "__name__"))
+        .unwrap_or_else(|| "<anonymous>".to_string())
 }
 
-fn attr_string(py: Python<'_>, target: &Bound<'_, PyAny>, name: &str) -> Option<String> {
-    let _ = py;
+fn attr_string(target: &Bound<'_, PyAny>, name: &str) -> Option<String> {
     target
         .getattr(name)
         .ok()
         .and_then(|value| value.extract::<String>().ok())
 }
 
-/// The source text of the callable, or the code object's bytes and constants when the source is
-/// not available (e.4).
+/// The source text of the target, normalised (MH 4.9), or the code object's bytes and constants
+/// when the source is not available (e.4).
 fn source_of(py: Python<'_>, target: &Bound<'_, PyAny>) -> (String, bool) {
     if let Ok(inspect) = py.import("inspect")
         && let Ok(source) = inspect.call_method1("getsource", (target,))
         && let Ok(text) = source.extract::<String>()
     {
-        return (text, true);
+        let dedented = py
+            .import("textwrap")
+            .and_then(|t| t.call_method1("dedent", (text.as_str(),)))
+            .and_then(|d| d.extract::<String>())
+            .unwrap_or(text);
+        return (normalise(&dedented), true);
     }
     (code_identity(target), false)
+}
+
+/// `\r\n` as `\n`, trailing whitespace stripped from every line, leading and trailing blank
+/// lines removed (MH 4.9).
+pub fn normalise(source: &str) -> String {
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|line| line.trim_end_matches(['\r', ' ', '\t']))
+        .collect();
+    let first = lines
+        .iter()
+        .position(|l| !l.is_empty())
+        .unwrap_or(lines.len());
+    let last = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(first, |i| i + 1);
+    lines[first..last.max(first)].join("\n")
 }
 
 /// `co_code` plus the repr of `co_consts`, the stand in e.4 names for a callable whose source
@@ -108,8 +140,8 @@ fn code_identity(target: &Bound<'_, PyAny>) -> String {
     out
 }
 
-/// Every `PyKernelSpec` field except the callable, as JSON with the keys in one fixed order, so
-/// that two specs are equal exactly when their JSON is (e.4).
+/// Every `PyKernelSpec` decorator argument, as JSON with the keys in one fixed order, so that two
+/// specs are equal exactly when their JSON is (e.4).
 fn config_json(spec: &PyKernelSpec) -> String {
     format!(
         concat!(
@@ -172,5 +204,20 @@ fn optional_bool(value: Option<bool>) -> String {
     match value {
         Some(v) => v.to_string(),
         None => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalise;
+
+    #[test]
+    fn normalise_strips_what_an_editor_changes() {
+        assert_eq!(
+            normalise("\n\ndef f(b):  \r\n    return b\t\n\n"),
+            "def f(b):\n    return b"
+        );
+        assert_eq!(normalise(""), "");
+        assert_eq!(normalise("\n \n"), "");
     }
 }

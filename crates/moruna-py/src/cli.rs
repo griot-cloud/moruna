@@ -82,6 +82,9 @@ impl KernelLoader for ModuleLoader {
                 doc.preferred_rows,
                 doc.resume.as_deref().unwrap_or("reinit"),
                 doc.state_bytes,
+                moruna_kernel::declare::Declared::default(),
+                None,
+                None,
             )
             .map_err(|e| SpecError::new(format!("kernels[{index}]"), e.to_string()))?;
             let kernel = handle.kernel;

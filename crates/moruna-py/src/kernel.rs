@@ -9,6 +9,7 @@ use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use moruna_adapters::{PyKernel, PyKernelSpec};
+use moruna_kernel::declare::{ColumnDecl, Declared, SchemaDecl, parse_type};
 use moruna_kernel::{PayloadKind, PayloadSpec, ResumePolicy, TierPref};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
@@ -90,6 +91,9 @@ pub fn build(
     preferred_rows: Option<u64>,
     resume: &str,
     state_bytes: Option<u64>,
+    declared: Declared,
+    lockfile: Option<Vec<u8>>,
+    origin: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyKernelHandle> {
     if !obj.is_callable() && !stateful {
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -110,6 +114,9 @@ pub fn build(
         preferred_rows,
         resume: resume_policy(resume)?,
         state_bytes,
+        declared,
+        lockfile,
+        origin: origin.map(|o| o.clone().unbind()),
     };
     let kernel = PyKernel::new(spec).map_err(|e| to_py_err(py, &e, Attachments::default()))?;
     Ok(PyKernelHandle {
@@ -156,9 +163,17 @@ fn resume_policy(resume: &str) -> PyResult<ResumePolicy> {
     })
 }
 
+/// One stage of a run as the surface was given it: a Python kernel, or a standard one.
+pub enum Stage {
+    /// A Python kernel (`@moruna.kernel`, or a plain callable).
+    Py(Arc<PyKernel>),
+    /// A standard kernel (`moruna.std.<name>`), which may fuse with its neighbours.
+    Std(Box<moruna_kernels::StdKernel>),
+}
+
 /// The kernels of one run, in stage order, from whatever `moruna.run` was given: one kernel, a
-/// list, a decorated object or a plain callable (f.3).
-pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Arc<PyKernel>>> {
+/// list, a decorated object, a standard kernel or a plain callable (f.3), one per entry.
+pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stage>> {
     let items: Vec<Bound<'_, PyAny>> = if value.is_instance_of::<pyo3::types::PyList>()
         || value.is_instance_of::<pyo3::types::PyTuple>()
     {
@@ -166,26 +181,82 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Arc<
     } else {
         vec![value.clone()]
     };
-    let mut out = Vec::with_capacity(items.len());
+    let mut out: Vec<Stage> = Vec::with_capacity(items.len());
     for item in items {
         if let Ok(handle) = item.cast::<PyKernelHandle>() {
-            out.push(Arc::clone(&handle.get().kernel));
+            out.push(Stage::Py(Arc::clone(&handle.get().kernel)));
+            continue;
+        }
+        if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
+            // Fusion happens where the job document is built, so every entry stays an entry.
+            out.push(Stage::Std(Box::new(std.get().kernel.clone())));
             continue;
         }
         if item.is_callable() {
             // "a plain function passed as a kernel is wrapped as if decorated with defaults" (f.3).
             let handle = build(
-                py, &item, false, 1, false, "table", "host", None, None, None, "reinit", None,
+                py,
+                &item,
+                false,
+                1,
+                false,
+                "table",
+                "host",
+                None,
+                None,
+                None,
+                "reinit",
+                None,
+                Declared::default(),
+                None,
+                None,
             )?;
-            out.push(handle.kernel);
+            out.push(Stage::Py(handle.kernel));
             continue;
         }
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "a kernel must be produced by @moruna.kernel or be callable, and {} is neither",
+            "a kernel must be produced by @moruna.kernel or moruna.std, or be callable, and {} is \
+             none of these",
             type_name(&item)
         )));
     }
     Ok(out)
+}
+
+/// A declaration from the tuple `moruna._declare.declaration` builds (MH 4.9): `("exact",
+/// cols)`, `("subset", cols)` or `("relative", adds, drops, changes)`, a column being
+/// `(name, type, nullable)`.
+fn declaration(py: Python<'_>, value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<SchemaDecl>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    let columns = |v: &Bound<'_, PyAny>| -> PyResult<Vec<ColumnDecl>> {
+        let raw: Vec<(String, String, bool)> = v.extract()?;
+        raw.into_iter()
+            .map(|(name, ty, nullable)| {
+                let ty = parse_type(&ty).map_err(|e| to_py_err(py, &e, Attachments::default()))?;
+                Ok(ColumnDecl { name, ty, nullable })
+            })
+            .collect()
+    };
+    let kind: String = value.get_item(0)?.extract()?;
+    Ok(Some(match kind.as_str() {
+        "exact" => SchemaDecl::Exact(columns(&value.get_item(1)?)?),
+        "subset" => SchemaDecl::Subset(columns(&value.get_item(1)?)?),
+        "relative" => SchemaDecl::Relative {
+            adds: columns(&value.get_item(1)?)?,
+            drops: value.get_item(2)?.extract()?,
+            changes: columns(&value.get_item(3)?)?,
+        },
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown declaration kind `{other}`"
+            )));
+        }
+    }))
 }
 
 /// The decorator's Rust half, exposed as `_core.build_kernel`; `moruna.kernel` applies it.
@@ -193,7 +264,8 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Arc<
 #[pyo3(signature = (obj, *, stateful = false, instances = 1, device_memory = false,
                     accepts = "table", tier = "host", releases_gil = None,
                     expected_amplification = None, preferred_rows = None,
-                    resume = "reinit", state_bytes = None))]
+                    resume = "reinit", state_bytes = None, input_schema = None,
+                    output_schema = None, lockfile = None, origin = None))]
 #[allow(clippy::too_many_arguments)]
 pub fn build_kernel(
     py: Python<'_>,
@@ -208,7 +280,16 @@ pub fn build_kernel(
     preferred_rows: Option<u64>,
     resume: &str,
     state_bytes: Option<u64>,
+    input_schema: Option<&Bound<'_, PyAny>>,
+    output_schema: Option<&Bound<'_, PyAny>>,
+    lockfile: Option<&Bound<'_, pyo3::types::PyBytes>>,
+    origin: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyKernelHandle> {
+    let lockfile = lockfile.map(|b| b.as_bytes().to_vec());
+    let declared = Declared {
+        input: declaration(py, input_schema)?,
+        output: declaration(py, output_schema)?,
+    };
     build(
         py,
         obj,
@@ -222,6 +303,9 @@ pub fn build_kernel(
         preferred_rows,
         resume,
         state_bytes,
+        declared,
+        lockfile,
+        origin,
     )
 }
 
