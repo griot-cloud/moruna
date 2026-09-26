@@ -172,8 +172,7 @@ pub enum Stage {
 }
 
 /// The kernels of one run, in stage order, from whatever `moruna.run` was given: one kernel, a
-/// list, a decorated object, a standard kernel or a plain callable (f.3). Adjacent standard
-/// kernels are fused where their combination is one stage (MH 4.9).
+/// list, a decorated object, a standard kernel or a plain callable (f.3), one per entry.
 pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stage>> {
     let items: Vec<Bound<'_, PyAny>> = if value.is_instance_of::<pyo3::types::PyList>()
         || value.is_instance_of::<pyo3::types::PyTuple>()
@@ -189,15 +188,8 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stag
             continue;
         }
         if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
-            let kernel = std.get().kernel.clone();
-            if let Some(Stage::Std(last)) = out.last()
-                && let Some(fused) = moruna_kernels::fuse(last, &kernel)
-            {
-                let len = out.len();
-                out[len - 1] = Stage::Std(Box::new(fused));
-            } else {
-                out.push(Stage::Std(Box::new(kernel)));
-            }
+            // Fusion happens where the job document is built, so every entry stays an entry.
+            out.push(Stage::Std(Box::new(std.get().kernel.clone())));
             continue;
         }
         if item.is_callable() {

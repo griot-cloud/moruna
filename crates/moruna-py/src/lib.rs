@@ -23,6 +23,8 @@ pub mod translate;
 #[cfg(feature = "python")]
 pub mod check;
 #[cfg(feature = "python")]
+pub mod cli;
+#[cfg(feature = "python")]
 pub mod errors;
 #[cfg(feature = "python")]
 pub mod inspect;
@@ -41,4 +43,4 @@ pub mod sources;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "python")]
-mod module;
+pub mod module;

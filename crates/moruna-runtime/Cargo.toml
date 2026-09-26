@@ -21,15 +21,21 @@ moruna-placement = { workspace = true }
 moruna-scheduler = { workspace = true }
 moruna-controller = { workspace = true }
 moruna-kernels = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 mimalloc = { workspace = true }
 getrandom = { workspace = true }
 
+# The vsock transport of `moruna serve` (MH 4.3) is Linux only: AF_VSOCK has no other home.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 arrow = { workspace = true }
-parquet = { workspace = true }
 moruna-testkit = { workspace = true }
 # The Linux branch of tests/support/mod.rs reads /proc/self/statm and needs the page
 # size. A developer host is macOS, where that branch is not compiled, so its absence

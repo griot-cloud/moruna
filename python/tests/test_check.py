@@ -143,12 +143,11 @@ def test_ck_t9_kernel_selection_and_no_kernels(tmp_path: Path) -> None:
     assert "RuntimeError: nope" in json.loads(out)["error"]
 
 
-def test_main_usage() -> None:
+def test_main_dispatches_check_and_leaves_the_rest_to_the_rust_command() -> None:
     from moruna.__main__ import main  # noqa: PLC0415, importing it is what is tested
 
-    assert main([]) == 2
-    assert main(["--help"]) == 0
-    assert main(["frobnicate"]) == 2
+    assert main(["check", "no_such_module_anywhere"]) == 2
+    assert main(["--version"]) == 0
 
 
 def test_the_check_is_seeded(tmp_path: Path) -> None:

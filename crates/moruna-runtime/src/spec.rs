@@ -147,6 +147,9 @@ pub struct RunSpec {
     pub resume: Option<PathBuf>,
     /// Clamps and translations the surface reports (12 f.3).
     pub notes: Vec<String>,
+    /// The job document's content address (MH 4.1), when the run was built from one. Recorded
+    /// in the manifest as `spec.digest`; a resume whose document has another digest is refused.
+    pub spec_digest: Option<String>,
 }
 
 impl RunSpec {
@@ -183,6 +186,7 @@ impl RunSpec {
             checkpoint_keep: false,
             resume: None,
             notes: Vec::new(),
+            spec_digest: None,
         }
     }
 }
@@ -257,6 +261,9 @@ pub struct Components {
     pub placement: Option<Arc<dyn Placement>>,
     /// Uses this run id instead of minting one.
     pub run_id: Option<RunId>,
+    /// A window onto the run for a host (MH 4.3); the facade attaches to it and detaches when
+    /// the run ends.
+    pub observer: Option<Arc<crate::observe::RunObserver>>,
 }
 
 /// The cancel token a run is driven with, re-exported so a caller needs one import.
@@ -367,6 +374,7 @@ mod tests {
         assert!(components.sampler.is_none());
         assert!(components.placement.is_none());
         assert!(components.run_id.is_none());
+        assert!(components.observer.is_none());
         let _: Cancel = Cancel::new();
     }
 }

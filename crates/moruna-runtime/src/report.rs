@@ -36,7 +36,7 @@ pub fn exit_of(outcome: &RunOutcome) -> (ExitReason, Option<PathBuf>) {
 }
 
 /// The bottleneck names the report prints, one per `Bottleneck` variant.
-fn bottleneck_name(b: Bottleneck) -> String {
+pub(crate) fn bottleneck_name(b: Bottleneck) -> String {
     match b {
         Bottleneck::IoRead => "IoRead",
         Bottleneck::Memory => "Memory",
