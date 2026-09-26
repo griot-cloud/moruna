@@ -257,7 +257,11 @@ fn stale_records_and_drains_are_not_breaches() {
         !morsel_targets(&rig.writes()[from..]).is_empty(),
         "a record from after the change is a breach"
     );
-    assert!(rig.knobs.terminated().is_none(), "{:?}", rig.knobs.terminated());
+    assert!(
+        rig.knobs.terminated().is_none(),
+        "{:?}",
+        rig.knobs.terminated()
+    );
 
     // Draining: breaches at the floor on one worker shed and do not terminate.
     let now = epoch_ns() + 2_000_000_000;
