@@ -179,25 +179,46 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     let (sink, sink_target) = sink_of(&job.sink, &mut notes)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;
 
-    let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(job.kernels.len());
-    #[cfg(feature = "python")]
-    let mut py_kernels = Vec::new();
+    // Each entry is loaded and its pin checked on its own; adjacent standard kernels are then
+    // fused where their combination is one stage (MH 4.9), and stage ids are counted after that.
+    enum Stage {
+        Std(Box<moruna_kernels::StdKernel>),
+        Loaded(LoadedKernel),
+    }
+    let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
     for (index, doc) in job.kernels.iter().enumerate() {
-        if doc.kind == KernelKindDoc::Rust {
-            return Err(SpecError::new(
-                format!("kernels[{index}].kind"),
-                "rust kernels are reserved in moruna_spec 1",
-            )
-            .into());
-        }
-        let loaded = loader.load(index, doc)?;
+        let stage = match doc.kind {
+            KernelKindDoc::Rust => {
+                return Err(SpecError::new(
+                    format!("kernels[{index}].kind"),
+                    "rust kernels are reserved in moruna_spec 1",
+                )
+                .into());
+            }
+            KernelKindDoc::Std => {
+                let name = doc.name.as_deref().ok_or_else(|| {
+                    SpecError::new(
+                        format!("kernels[{index}].name"),
+                        "a std kernel needs a name",
+                    )
+                })?;
+                let args = doc.args.clone().unwrap_or(serde_json::Value::Null);
+                let kernel = moruna_kernels::StdKernel::new(name, &args)
+                    .map_err(|e| SpecError::new(format!("kernels[{index}]"), e.to_string()))?;
+                Stage::Std(Box::new(kernel))
+            }
+            KernelKindDoc::Python => Stage::Loaded(loader.load(index, doc)?),
+        };
         if let Some(pinned) = &doc.fingerprint {
             let want = pinned
                 .rsplit(':')
                 .next()
                 .unwrap_or(pinned)
                 .to_ascii_lowercase();
-            let have = loaded.kernel.fingerprint().to_hex();
+            let have = match &stage {
+                Stage::Std(k) => k.fingerprint().to_hex(),
+                Stage::Loaded(l) => l.kernel.fingerprint().to_hex(),
+            };
             if want != have {
                 return Err(SpecError::new(
                     format!("kernels[{index}].fingerprint"),
@@ -206,11 +227,31 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
                 .into());
             }
         }
-        #[cfg(feature = "python")]
-        if let Some(py) = loaded.python {
-            py_kernels.push(((index + 1) as moruna_kernel::StageId, py));
+        if let (Some(Stage::Std(last)), Stage::Std(next)) = (stages.last(), &stage)
+            && let Some(fused) = moruna_kernels::fuse(last, next)
+        {
+            let len = stages.len();
+            stages[len - 1] = Stage::Std(Box::new(fused));
+            continue;
         }
-        kernels.push(loaded.kernel);
+        stages.push(stage);
+    }
+    let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
+    #[cfg(feature = "python")]
+    let mut py_kernels = Vec::new();
+    for (at, stage) in stages.into_iter().enumerate() {
+        match stage {
+            Stage::Std(k) => kernels.push(Arc::new(*k) as Arc<dyn Kernel>),
+            Stage::Loaded(loaded) => {
+                #[cfg(feature = "python")]
+                if let Some(py) = loaded.python {
+                    py_kernels.push(((at + 1) as moruna_kernel::StageId, py));
+                }
+                #[cfg(not(feature = "python"))]
+                let _ = at;
+                kernels.push(loaded.kernel);
+            }
+        }
     }
 
     let checkpoint_interval_ms = translate::clamp(

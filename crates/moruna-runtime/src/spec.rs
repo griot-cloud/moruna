@@ -205,6 +205,47 @@ impl RunSpec {
     }
 }
 
+/// One entry of the job document's `kernels[]` (MH 4.1), as far as this build knows it (MH 4.9).
+///
+/// The Rust variant only: the JSON field, its serde and the `kernels[].fingerprint` check at
+/// load are F8.1's, which serialises this enum; `fingerprint` is the value a document pins.
+#[derive(Clone, Debug)]
+pub enum KernelEntry {
+    /// `{ "kind": "std", "name": ..., "args": {...} }`: a standard kernel by arguments.
+    Std(moruna_kernels::StdKernel),
+}
+
+impl KernelEntry {
+    /// A standard kernel entry; an unknown name or a bad argument is a `Plan` error naming it.
+    pub fn std(name: &str, args: serde_json::Value) -> moruna_kernel::Result<KernelEntry> {
+        Ok(KernelEntry::Std(moruna_kernels::StdKernel::new(
+            name, &args,
+        )?))
+    }
+
+    /// The fingerprint a job document pins for this entry (MH 4.9).
+    pub fn fingerprint(&self) -> moruna_kernel::Fingerprint {
+        match self {
+            KernelEntry::Std(kernel) => kernel.fingerprint(),
+        }
+    }
+}
+
+/// The kernels a list of entries runs as, in stage order, with adjacent standard kernels fused
+/// where their combination is one stage (MH 4.9).
+pub fn build_kernels(entries: Vec<KernelEntry>) -> Vec<Arc<dyn Kernel>> {
+    let std: Vec<moruna_kernels::StdKernel> = entries
+        .into_iter()
+        .map(|entry| match entry {
+            KernelEntry::Std(kernel) => kernel,
+        })
+        .collect();
+    moruna_kernels::fuse_chain(std)
+        .into_iter()
+        .map(|kernel| Arc::new(kernel) as Arc<dyn Kernel>)
+        .collect()
+}
+
 /// `profiles.dir`: the preamble's default is `~/.moruna/profiles`, and no directory at all on
 /// a host with no home, which disables the profile store. `Runtime::run` resolves and creates
 /// it for a `RunSpec` that leaves `profiles_dir` unset (12 f.1); this is the path it uses.

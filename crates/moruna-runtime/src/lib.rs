@@ -21,6 +21,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod cancel;
+pub mod check;
 pub mod checkpoint;
 pub mod config;
 pub mod error;

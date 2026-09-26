@@ -29,6 +29,7 @@ moruna-controller = { path = "crates/moruna-controller", version = "0.1.1" }
 moruna-runtime = { path = "crates/moruna-runtime", version = "0.1.1" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.1.1" }
 moruna-vmm = { path = "crates/moruna-vmm", version = "0.1.1" }
+moruna-kernels = { path = "crates/moruna-kernels", version = "0.1.1" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or

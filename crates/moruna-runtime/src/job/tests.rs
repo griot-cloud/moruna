@@ -595,3 +595,49 @@ fn hints_are_listed() {
     doc.state_bytes = Some(1);
     assert_eq!(doc.hints_set().len(), 10);
 }
+
+/// MH 4.1 and 4.9: `{"kind": "std", "name", "args"}` round-trips, builds without a loader,
+/// fuses adjacent standard kernels, and honours a pinned fingerprint.
+#[test]
+fn std_kernels_in_a_document() {
+    let mut job = minimal("/out");
+    job.kernels.push(KernelDoc::std(
+        "cast",
+        serde_json::json!({"columns": {"a": "double"}}),
+    ));
+    job.kernels.push(KernelDoc::std(
+        "select",
+        serde_json::json!({"columns": ["a"]}),
+    ));
+    job.kernels.push(KernelDoc::python("m", "k"));
+    job.kernels.push(KernelDoc::std(
+        "drop",
+        serde_json::json!({"columns": ["a"]}),
+    ));
+    let text = job.to_json_pretty();
+    assert!(text.contains("\"kind\": \"std\""), "{text}");
+    assert_eq!(JobSpec::from_json(&text).expect("parses"), job);
+    let built = build::build(&job, &Fakes, opts(false, &no_env)).expect("builds");
+    assert_eq!(
+        built.spec.kernels.len(),
+        3,
+        "cast and select fuse into one stage"
+    );
+    assert!(built.spec.kernels[0].declared().is_checkable());
+
+    let pinned = crate::spec::KernelEntry::std("drop", serde_json::json!({"columns": ["a"]}))
+        .expect("entry")
+        .fingerprint()
+        .to_hex();
+    job.kernels[3].fingerprint = Some(format!("sha256:{pinned}"));
+    assert!(build::build(&job, &Fakes, opts(false, &no_env)).is_ok());
+    job.kernels[3].fingerprint = Some("sha256:00".into());
+    assert_refused(&job, "kernels[3].fingerprint");
+
+    let mut job = minimal("/out");
+    job.kernels
+        .push(KernelDoc::std("nope", serde_json::Value::Null));
+    assert_refused(&job, "kernels[0]");
+    job.kernels[0].name = None;
+    assert_refused(&job, "kernels[0].name");
+}

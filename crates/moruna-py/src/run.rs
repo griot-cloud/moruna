@@ -27,7 +27,7 @@ use pyo3::types::{PyAny, PyDict};
 
 use crate::errors::{Attachments, to_py_err};
 use crate::handles::{IteratorSchema, SinkSpec, SourceSpec};
-use crate::kernel::{PyKernelHandle, kernels_of};
+use crate::kernel::{PyKernelHandle, Stage, kernels_of};
 use crate::report::PyRunReport;
 use crate::sources::type_name;
 use crate::translate::{
@@ -105,7 +105,8 @@ pub fn run(
 
     let source_spec = sources::spec_of(source)?;
     let (sink_spec, sink_notes) = sinks::spec_of(sink)?;
-    let py_kernels = kernels_of(py, kernels)?;
+    let stages = kernels_of(py, kernels)?;
+    let any_python = stages.iter().any(|s| matches!(s, Stage::Py(_)));
 
     let raw = RawArgs {
         budget: match budget {
@@ -136,7 +137,7 @@ pub fn run(
     map(py, check_sink_not_source(&sink_spec, &source_spec))?;
 
     // f.4, PY-I4: before any Rust component starts.
-    if !py_kernels.is_empty() && python_gil_enabled() && !translated.allow_gil {
+    if any_python && python_gil_enabled() && !translated.allow_gil {
         return Err(map_err(
             py,
             &MorunaError::Config {
@@ -175,7 +176,13 @@ pub fn run(
         object_store,
     );
     let loader = LibraryLoader {
-        kernels: py_kernels,
+        kernels: stages
+            .into_iter()
+            .map(|s| match s {
+                Stage::Py(k) => Some(k),
+                Stage::Std(_) => None,
+            })
+            .collect(),
         iterator: Mutex::new(match (&source_spec, iterator) {
             (SourceSpec::Iterator { schema }, Some(object)) => {
                 Some((object, map(py, source_schema(clone_schema(schema)))?))
@@ -324,6 +331,10 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KernelD
     Ok(items
         .iter()
         .map(|item| {
+            if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
+                let kernel = &std.get().kernel;
+                return KernelDoc::std(kernel.name(), kernel.args().clone());
+            }
             let target = match item.cast::<PyKernelHandle>() {
                 Ok(handle) => handle.get().callable.bind(py).clone(),
                 Err(_) => item.clone(),
@@ -336,13 +347,14 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KernelD
 /// The library's loader: the kernels and the iterable are objects `moruna.run` already holds,
 /// so loading is handing them back in stage order.
 struct LibraryLoader {
-    kernels: Vec<Arc<PyKernel>>,
+    /// Entry by entry; `None` for a standard kernel, which the build makes itself.
+    kernels: Vec<Option<Arc<PyKernel>>>,
     iterator: Mutex<Option<(Py<PyAny>, SourceSchema)>>,
 }
 
 impl KernelLoader for LibraryLoader {
     fn load(&self, index: usize, _doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        let kernel = self.kernels.get(index).cloned().ok_or_else(|| {
+        let kernel = self.kernels.get(index).cloned().flatten().ok_or_else(|| {
             MorunaError::Plan(format!("kernels[{index}]: no such kernel was passed"))
         })?;
         Ok(LoadedKernel {
