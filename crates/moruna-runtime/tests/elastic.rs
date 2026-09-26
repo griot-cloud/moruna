@@ -363,11 +363,12 @@ fn memory_follows_the_machine() {
 fn cpus_follow_the_machine() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("rt_t10");
-    let machine = Machine::new(256 * MIB, 2.0);
+    let machine = Machine::new(512 * MIB, 2.0);
     let ceiling = machine.ceiling();
     let kernel = Arc::new(Spinner::new(Duration::from_millis(20)));
     let applies = Arc::clone(&kernel.applies);
-    let mut spec = spec(&scratch, kernel.clone(), 250);
+    let watched = Arc::clone(&kernel);
+    let mut spec = spec(&scratch, kernel.clone(), 600);
     spec.elastic = ElasticBudget {
         memory_max_bytes: None,
         cpu_max: Some(6),
@@ -381,9 +382,16 @@ fn cpus_follow_the_machine() {
         }
         script.set(reading(ceiling, 6.0));
         let raised_at = Instant::now();
+        // Lower again once the raise has been seen to take effect (or the run ended, which the
+        // assertions below then report), plus a few more applies at six.
+        if !script.wait("more than two workers at six CPUs", || {
+            watched.max_concurrent_after(raised_at) > 2
+        }) {
+            return;
+        }
         let raised = applies.load(Ordering::SeqCst);
         if !script.wait("work at six CPUs", || {
-            applies.load(Ordering::SeqCst) >= raised + 80
+            applies.load(Ordering::SeqCst) >= raised + 30
         }) {
             return;
         }
