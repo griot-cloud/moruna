@@ -1523,7 +1523,8 @@ fn plan_and_read_failures_are_named() {
     .unwrap_err();
     assert!(error.to_string().contains("outside the split"), "{error}");
 
-    // An object url is refused at plan time with the escalation named.
+    // An object url, on a source built without an allocator, is refused at plan time naming
+    // the constructor that can read it.
     let reactor = FakeReactor::new().with_file("s3://bucket/a.parquet", vec![0u8; 8]);
     let error = err(ParquetSource::new(
         ParquetSourceConfig {
@@ -1533,9 +1534,9 @@ fn plan_and_read_failures_are_named() {
         Arc::new(reactor.clone()) as Arc<dyn Reactor>,
         Arc::new(reactor) as Arc<dyn ObjectMetadata>,
     ));
-    assert!(error.to_string().contains("E10"), "{error}");
+    assert!(error.to_string().contains("with_allocator"), "{error}");
 
-    // A prefix with nothing under it heads the object and still reports the escalation.
+    // A prefix with nothing under it heads the object and still says so.
     let bare = FakeReactor::new().with_file("s3://empty/a", vec![0u8; 1]);
     let error = err(ParquetSource::new(
         ParquetSourceConfig {
