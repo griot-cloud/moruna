@@ -284,7 +284,8 @@ fn spawn(job: &Job) -> Child {
         .expect("a child process")
 }
 
-/// How long a child that is meant to finish may take. A resume that lost a morsel under an
+/// How long a child that is meant to finish, or to reach the moment a test waits for, may take:
+/// a watchdog for a hung child, never the window a test's event must land in. A resume that lost a morsel under an
 /// ordered sink does not fail, it waits for ever for the sequence number it will never see,
 /// which is exactly the in-flight read gap this feature closes (10 l); the watchdog turns that
 /// into a failure with the child's output rather than a hung suite.
@@ -478,8 +479,7 @@ fn kill_and_resume(
     };
     let mut child = spawn(&job);
     assert!(
-        wait_until(Duration::from_secs(30), || !manifests(&job.staging, false)
-            .is_empty()
+        wait_until(CHILD_LIMIT, || !manifests(&job.staging, false).is_empty()
             || !matches!(child.try_wait(), Ok(None))),
         "point {point}: the first manifest never appeared"
     );
@@ -487,8 +487,11 @@ fn kill_and_resume(
     match when {
         When::After(ms) => std::thread::sleep(Duration::from_millis(ms)),
         When::MidCheckpoint => {
-            mid_checkpoint = wait_until(Duration::from_secs(5), || {
-                !manifests(&job.staging, true).is_empty()
+            // The temporary file exists for the length of one manifest write; waiting on it, or
+            // on the child ending, is waiting on the event itself rather than on a window a
+            // loaded host may not give the child in time.
+            mid_checkpoint = wait_until(CHILD_LIMIT, || {
+                !manifests(&job.staging, true).is_empty() || !matches!(child.try_wait(), Ok(None))
             });
         }
     }
