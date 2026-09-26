@@ -367,3 +367,61 @@ pub fn resident_bytes() -> Option<u64> {
         Some(kib * 1024)
     }
 }
+
+/// A real kernel that takes its time and changes nothing, so a test can act while the run is
+/// in flight (MH 4.7: a kill, or a host's on-demand checkpoint).
+pub struct Slow {
+    fingerprint: Fingerprint,
+    millis: u64,
+}
+
+impl Slow {
+    /// One kernel sleeping `millis` per morsel.
+    pub fn new(millis: u64) -> Slow {
+        Slow {
+            fingerprint: Fingerprint::compute("moruna-runtime::tests::Slow", b"v1"),
+            millis,
+        }
+    }
+}
+
+impl Kernel for Slow {
+    fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn hints(&self) -> KernelHints {
+        KernelHints {
+            expected_amplification: Some(1.0),
+            ..Default::default()
+        }
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: moruna_kernel::PayloadKind::Table,
+            tier: TierPref::Host,
+        }
+    }
+
+    fn output_schema(&self, input: &SourceSchema) -> moruna_kernel::Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
+        std::thread::sleep(std::time::Duration::from_millis(self.millis));
+        Ok(input)
+    }
+}

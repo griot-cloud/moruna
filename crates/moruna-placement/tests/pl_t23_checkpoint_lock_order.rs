@@ -111,6 +111,7 @@ fn pl_t23_checkpoint_lock_order() {
                         sink_state: None,
                         committed_seq: None,
                         source_cursor: SourceCursor::default(),
+                        issued: Vec::new(),
                     };
                     if engine.checkpoint(&extras).is_ok() {
                         manifests.fetch_add(1, Ordering::Relaxed);

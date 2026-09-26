@@ -455,12 +455,28 @@ impl Placement for FakePlacement {
                 manifest.display()
             )));
         }
-        let to_recompute: Vec<(Seq, Origin)> = found
+        let mut to_recompute: Vec<(Seq, Origin)> = found
             .lineage
             .iter()
             .filter(|(_, _, _, on_disk)| !on_disk)
             .map(|(seq, origin, _, _)| (*seq, origin.clone()))
             .collect();
+        // Placement f.13 as amended by MH 4.7: a read the scheduler had issued and not pushed
+        // is read again unless the queues held it too, and nothing the watermark covers is.
+        let committed = found.extras.committed_seq;
+        let known: std::collections::HashSet<Seq> =
+            found.lineage.iter().map(|(seq, _, _, _)| *seq).collect();
+        to_recompute.extend(
+            found
+                .extras
+                .issued
+                .iter()
+                .filter(|(seq, _)| !known.contains(seq))
+                .cloned(),
+        );
+        to_recompute.retain(|(seq, _)| committed.is_none_or(|watermark| *seq > watermark));
+        to_recompute.sort_by_key(|(seq, _)| *seq);
+        to_recompute.dedup_by_key(|(seq, _)| *seq);
         Ok(ResumePoint {
             extras: found.extras,
             to_recompute,

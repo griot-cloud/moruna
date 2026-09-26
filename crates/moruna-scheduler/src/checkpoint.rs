@@ -29,6 +29,11 @@ pub(crate) fn thread(shared: Arc<Shared>) {
             if shared.checkpoint_stop.load(Ordering::SeqCst) {
                 return;
             }
+            // MH 4.3 `checkpoint`: a request ends the wait at once, so a host about to destroy
+            // the machine gets a manifest now rather than at the end of the interval.
+            if requested(&shared) {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(1).min(interval));
         }
         if shared.checkpoint_stop.load(Ordering::SeqCst) {
@@ -38,8 +43,16 @@ pub(crate) fn thread(shared: Arc<Shared>) {
         if !shared.run_state().is_live() {
             continue;
         }
+        // Read before the write starts, so a request that arrives during it is served by the
+        // next one and never by a manifest whose snapshot is older than the request.
+        let serving = shared.checkpoint_requested.load(Ordering::SeqCst);
         match checkpoint_now(&shared) {
-            Ok(_) => failures = 0,
+            Ok(_) => {
+                failures = 0;
+                shared
+                    .checkpoint_served
+                    .fetch_max(serving, Ordering::SeqCst);
+            }
             Err(MorunaError::Cancelled) => return,
             Err(e) => {
                 failures += 1;
@@ -51,6 +64,52 @@ pub(crate) fn thread(shared: Arc<Shared>) {
             }
         }
     }
+}
+
+/// True when an on-demand manifest has been asked for and not yet written.
+fn requested(shared: &Shared) -> bool {
+    shared.checkpoint_requested.load(Ordering::SeqCst)
+        > shared.checkpoint_served.load(Ordering::SeqCst)
+}
+
+/// Ask for a manifest now and return the request's number (MH 4.3 `checkpoint`). The write
+/// happens on the checkpoint thread, as every other one does (f.12), so the lock order and the
+/// "never a worker" rule are unchanged; `None` when this run writes no manifests.
+pub(crate) fn request(shared: &Shared) -> Option<u64> {
+    if !shared.checkpoint_enabled() {
+        return None;
+    }
+    Some(shared.checkpoint_requested.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+/// Request a manifest and wait until one started after the request is on disk (MH 4.7): the
+/// entry point the host protocol's `checkpoint` message calls through the facade. Refuses when
+/// the run writes no manifests, and gives up after `timeout` naming why: a run that is not in
+/// `Running` has no checkpoint thread to serve it, and one whose writes fail has said so on
+/// its own already (f.12).
+pub(crate) fn checkpoint_and_wait(shared: &Shared, timeout: Duration) -> Result<PathBuf> {
+    let Some(ticket) = request(shared) else {
+        return Err(MorunaError::Resume(
+            "checkpointing is off for this run".into(),
+        ));
+    };
+    let deadline = Instant::now() + timeout;
+    while shared.checkpoint_served.load(Ordering::SeqCst) < ticket {
+        if Instant::now() >= deadline {
+            return Err(MorunaError::Resume(format!(
+                "no manifest was written within {} ms of the request; the run is {:?}",
+                timeout.as_millis(),
+                shared.run_state()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    shared
+        .last_manifest
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or_else(|| MorunaError::Resume("the manifest path was not recorded".into()))
 }
 
 /// Gather the pieces the placement engine does not own and write the manifest (f.12).
@@ -86,21 +145,26 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
             kernel_states.push((entry.stage, instance, bytes));
         }
     }
-    let sink_state = {
-        let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
-        sink.checkpoint()?
-    };
+    // The watermark is read before the sink's state, so the state holds at least every file
+    // at or below it: a file the sink commits in between is in the state and above the
+    // watermark, which resume deletes and recomputes. Read the other way round, a file
+    // committed in between was in neither, and its morsels were lost (MH 4.7, H5).
     let committed_seq = shared
         .committed
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .reached;
-    let source_cursor = crate::source_drive::cursor(shared);
+    let sink_state = {
+        let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
+        sink.checkpoint()?
+    };
+    let (source_cursor, issued) = crate::source_drive::cursor(shared);
     let extras = CheckpointExtras {
         kernel_states,
         sink_state,
         committed_seq,
         source_cursor,
+        issued,
     };
     // Nothing of this component is locked here, which is what preamble 4.2 requires.
     let path = shared.placement.checkpoint(&extras)?;

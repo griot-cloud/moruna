@@ -160,6 +160,22 @@ impl Scheduler {
         self.shared.checkpoint_enabled()
     }
 
+    /// Ask the checkpoint thread for a manifest now rather than at the end of its interval
+    /// (MH 4.3 `checkpoint`: the host is about to destroy the machine). Returns false when the
+    /// run is not checkpointing, in which case nothing is written. The manifest is written on
+    /// the checkpoint thread, as every other one is (f.12), so the lock order is unchanged.
+    pub fn request_checkpoint(&self) -> bool {
+        checkpoint::request(&self.shared).is_some()
+    }
+
+    /// [`Scheduler::request_checkpoint`], then wait until a manifest started after the request
+    /// is on disk and return its path (MH 4.7). `Resume` when the run writes no manifests or
+    /// none was written within `timeout`. Blocks the caller, which is never a worker or a drive:
+    /// the facade's `CheckpointHandle` calls it from the host's thread.
+    pub fn checkpoint_now(&self, timeout: std::time::Duration) -> Result<std::path::PathBuf> {
+        checkpoint::checkpoint_and_wait(&self.shared, timeout)
+    }
+
     /// The shared state, for the tests that assert on the stage table and the pick rule.
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<Shared> {

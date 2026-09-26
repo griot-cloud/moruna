@@ -456,3 +456,84 @@ fn rt_t8_twenty_runs_leave_no_arena_behind() {
         }
     }
 }
+
+/// MH 4.7: a host's on-demand `checkpoint` reaches a real run through the handle, writes the
+/// manifest now and names it; `resume_auto` over an empty staging directory starts fresh and
+/// says so; `staging_durable` lands in the manifest.
+#[test]
+fn rt_t9_checkpoint_on_demand_and_resume_auto() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("rt_t9");
+    let input = scratch.path().join("in.parquet");
+    let out_dir = scratch.path().join("out");
+    // Under the target directory: `/tmp` may be a tmpfs, which discovery refuses to call
+    // durable (03 e.4).
+    let staging = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("moruna-rt_t9-staging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    let profiles = scratch.path().join("profiles");
+    std::fs::create_dir_all(&out_dir).expect("the output directory");
+    std::fs::create_dir_all(&staging).expect("the staging directory");
+    write_parquet(&input, 400_000, 16);
+
+    let handle = moruna_runtime::CheckpointHandle::new();
+    assert!(!handle.is_attached(), "nothing is attached before the run");
+    let kernel: Arc<dyn Kernel> = Arc::new(support::Slow::new(20));
+    let mut spec = resume_spec(
+        &input,
+        &out_dir,
+        &staging,
+        &profiles,
+        false,
+        None,
+        vec![kernel],
+    );
+    spec.checkpoint_interval_ms = 600_000;
+    spec.resume_auto = true;
+    spec.staging_durable = true;
+    let components = moruna_runtime::Components {
+        checkpoint: Some(handle.clone()),
+        ..moruna_runtime::Components::default()
+    };
+    let asker = handle.clone();
+    let (report, asked) = std::thread::scope(|scope| {
+        let asked = scope.spawn(move || {
+            let start = std::time::Instant::now();
+            while !asker.is_attached() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(60),
+                    "the run never attached the handle"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // Attached as soon as the scheduler exists; the checkpoint thread starts at `run`,
+            // so the first requests may wait for it.
+            let path = asker
+                .checkpoint_within(std::time::Duration::from_secs(60))
+                .expect("a manifest on demand");
+            let text = std::fs::read_to_string(&path).expect("the manifest is on disk");
+            let doc: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+            (path, doc["durable_staging"].as_bool())
+        });
+        let report = Runtime::run_with(spec, CancelToken::new(), components);
+        (report, asked.join().expect("the asking thread"))
+    });
+    let report = report.expect("the run completes");
+    assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
+    assert!(!report.resumed, "nothing to resume: a fresh run");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("resume auto: no manifest")),
+        "and it says so: {:?}",
+        report.notes
+    );
+    let (path, durable) = asked;
+    assert!(path.ends_with("manifest.json"));
+    assert_eq!(durable, Some(true), "staging.durable is recorded");
+    assert!(!handle.is_attached(), "detached when the run ended");
+    assert!(handle.checkpoint_now().is_err(), "and says there is no run");
+    assert_eq!(read_back_rows(&out_dir), 400_000);
+    let _ = std::fs::remove_dir_all(&staging);
+}
