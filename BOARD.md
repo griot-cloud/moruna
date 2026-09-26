@@ -418,6 +418,7 @@ No preamble gate; this epic is what "done" means beyond the waves. Nothing here 
 
 ### F6.6 tasks
 - [ ] E7 documentation epic complete and published
+- [ ] E8 hosted-engine epic complete: H1 to H13 closed on the reference host, `moruna-vmm` released
 - [ ] `v0.1.0` tagged from a green `main`; release notes; wheels visible on PyPI; `pip install moruna` works on a clean 3.13 and 3.14 interpreter
 - [ ] `README.md` status updated; this board's "Now" section says released
 
@@ -469,6 +470,23 @@ Written after wave 5 so it describes what shipped, from the design documents and
 ### F7.8 tasks
 - [ ] PM review of every page against its cited sections; mismatches filed as bugs, none documented around
 - [ ] `CHANGELOG.md` and `v0.1.0` release notes drafted; F6.6 unblocked
+
+## E8. Hosted engine: the job document, elasticity, the checkable kernel, the monitor
+
+Designed in `architecture/moruna-hosted-engine.md` (MH). What Moruna must become to be the programming model a platform biases every author toward, and the microVM that platform runs. Gate: MH H1 to H13 closed on the reference host, `moruna-vmm` boots the guest image with a disk attached and resizes it, and a Griot run (`griot-cloud/BOARD.md` F2.7) completes inside it. Rules as for every epic: one executor per feature, one pull request, 90% coverage, no more than five executors in progress across both repositories, Opus 5.5.
+
+| Id | Feature | Branch | Scope | Status |
+|---|---|---|---|---|
+| F8.1 | The job document and the host protocol | `hosted/spec-protocol` | `RunSpec` serde and the JSON format of MH 4.1 with precedence and strict mode; `moruna run` with the exit codes of MH 4.2; `moruna serve` and the newline-JSON protocol of MH 4.3 (`hello`, `heartbeat`, `limits_changed`, `report`, `exit`; `spec`, `cancel`, `checkpoint`); the report file always written; SDD `13-host.md` byte-exact and `12-python.md` amended so `moruna.run(...)` builds the same struct. Tests: H1, H2, H8 over a Unix socket; peer-gone continuation | todo |
+| F8.2 | The budget follows the machine | `hosted/elastic` | `LimitsWatch` publishing `Limits` per tick with the guest sources (`/proc/meminfo`, `cpu/online`) and the cgroup sources; parked threads to `cpu_max` with `active` bounded by the current limit; arena `grow`/`shrink` by region with the draining state and the sizing arithmetic re-run on change; `limits_timeline` in the report and `peak_fraction_of_ceiling` against the ceiling in force; SDD 02, 03, 04, 10, 11 amended. Tests: H3, H4 under a cgroup whose limits are rewritten mid-run; H12 later under F8.7's guest | todo |
+| F8.3 | The kernel is checkable; Polars as syntax; standard kernels | `hosted/check` | `input_schema`/`output_schema` on the decorator and the `Kernel` trait (absolute, or `adds`/`drops`/`changes`); the fingerprint; the Polars-signature acceptance path through `moruna-polars`, zero-copy; `moruna check` (load, seeded synthetic batch, run, compare, profile row, fingerprint, JSON report, exit codes) and SDD `15-check.md`; the `moruna-kernels` crate of standard kernels by arguments (`cast`, `rename`, `select`, `drop`, `filter`, `fill_null`, `dedupe`, `hash`, `mask`, `explode`, `concat_str`, `date_trunc`) with declared schemas, profiles and adjacent fusion; `RunSpec.kernels[]` kind `std`; SDD 05 amended. Tests: H13; every standard kernel passes `moruna check` | todo |
+| F8.4 | Resume on a surviving disk | `hosted/resume` | F4.7 closed (SC-T16, PL-T17 SIGKILL resume); issued splits in the manifest and re-issued on resume; `--resume auto`; `staging.durable` in the spec setting `durable_staging=present`; the `checkpoint` message honoured. Tests: H5 | todo |
+| F8.5 | A plan is a source, a contract write is a sink | `hosted/datafusion-peql` | `PlanSource` over a peQL `Engine::view` `LogicalPlan` in `moruna-datafusion` behind a `peql` feature, one split per output partition, the `repeatable()` rule; `PeqlSink` over `Engine::write` with the manifest refreshed on `finish`; SDD 07 amended. Depends on peQL exposing `Engine::view` (griot-cloud F2.6). Tests: H6 with a gated plan and a write both larger than the budget | todo |
+| F8.6 | No network | `hosted/socket-object-store` | `unix://` and `vsock://` endpoints in `ObjectStoreConfig` with a custom connector speaking HTTP/1.1 over the socket; no change to sources or sinks. Tests: H7 under `unshare -n` | todo |
+| F8.7 | `moruna-vmm` | `hosted/vmm` | The monitor of MH 4.8 on the rust-vmm crates: the device-model trait; `virtio-blk`, `virtio-vsock`, serial over `virtio-mmio`; KVM setup, memory map, vCPU threads; boot with `linux-loader`; the guest image recipe (pinned kernel with `memhp_default_state=online_movable`, Moruna as init, CPython 3.14t, `pyarrow`, the wheel); `virtio-mem` and vCPU hot-add; the control socket and `resize`; `moruna run --vm`; exit codes; SDD `14-vmm.md`; release artefacts (two Linux binaries, guest image as OCI by digest, cosign, SBOM). No network device and no field for one. Tests: H10, H11, H12 on the reference host; a Raspberry Pi 5 boot or a written finding | todo |
+| F8.8 | Hosted-engine gate report and docs | `hosted/gate` | H1 to H13 evidence on the reference host; `docs/hosting` pages for the spec, the protocol, `moruna check`, the standard kernels and the monitor (F7.5 amended); `DECISIONS.md` rows for H-Q1 to H-Q8 | todo |
+
+Start order: F8.1 and F8.3 now, in parallel; F8.2 after F8.1; F8.4, F8.5, F8.6 after F8.1 (F8.5 also after griot-cloud F2.6); F8.7 after F8.1; F8.8 last. Executors are briefed from `architecture/agents/executor.md` with MH as the parent document.
 
 ---
 
