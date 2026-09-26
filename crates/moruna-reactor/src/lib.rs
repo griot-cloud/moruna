@@ -27,6 +27,7 @@ mod object;
 mod paths;
 mod runtime;
 mod segments;
+mod socket;
 mod stats;
 #[cfg(test)]
 mod tests;
@@ -117,7 +118,9 @@ pub struct ObjectStoreConfig {
 /// S3 and S3-compatible credentials and endpoints.
 #[derive(Clone, Debug, Default)]
 pub struct S3Config {
-    /// Custom endpoint (MinIO, R2); `None` is AWS.
+    /// Custom endpoint (MinIO, R2); `None` is AWS. `unix:///path` or `vsock://cid:port` names
+    /// a socket a host proxies (MH 4.6): the client speaks plain HTTP/1.1 over it, path-style,
+    /// for a machine with no network interface.
     pub endpoint: Option<String>,
     /// Region.
     pub region: Option<String>,

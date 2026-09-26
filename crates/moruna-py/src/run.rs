@@ -378,10 +378,12 @@ fn source_factory(
     Ok(match source {
         SourceSpec::Parquet(cfg) => moruna_runtime::SourceSpec::Build(Box::new(move |ctx| {
             let meta = ctx.object_metadata()?;
-            Ok(Arc::new(ParquetSource::new(
+            // With the arena, so an object URL's footer can be read at plan time (MH 4.6).
+            Ok(Arc::new(ParquetSource::with_allocator(
                 cfg,
                 ctx.reactor.clone(),
                 meta,
+                ctx.alloc.clone(),
             )?))
         })),
         SourceSpec::Tensor(cfg) => moruna_runtime::SourceSpec::Build(Box::new(move |ctx| {

@@ -34,6 +34,13 @@ moruna-testkit = { workspace = true }
 # size. A developer host is macOS, where that branch is not compiled, so its absence
 # only ever showed up on CI, on the platform this runtime is actually built for.
 libc = { workspace = true }
+# H7 (MH 4.6): a small S3-compatible server bound to a Unix socket, the only way the run in
+# `tests/no_network.rs` reaches its object store.
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 # The first program a user writes, kept at the repository root so it reads as an example and
 # not as a test; the quality gate runs it on every commit.
