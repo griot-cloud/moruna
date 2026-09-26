@@ -2,7 +2,7 @@
 
 use moruna_kernel::{MorunaError, TierBudgets};
 
-use crate::{Budgets, Inner, Phase, Result, model};
+use crate::{Actions, Budgets, Inner, Phase, Result, elastic, model};
 
 /// The fraction of free device memory the runtime may hold (f.1).
 const DEVICE_FRACTION: f64 = 0.9;
@@ -32,6 +32,9 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
                 msg: format!("prepare called in phase {:?}", state.phase),
             });
         }
+        // The limits the sampler carries are the ones in force now; before the run they
+        // are what discovery found, so this changes nothing but the CPU bound's starting value.
+        elastic::follow_sample(&mut state, &sample, &mut Actions::default());
         let ceiling = state.cfg.limits.memory_ceiling;
         let baseline = state.cfg.baseline_bytes;
         let reserve = model::scale(ceiling, f64::from(state.cfg.reserve_fraction));

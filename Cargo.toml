@@ -57,6 +57,9 @@ hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 tracing-subscriber = { version = "=0.3.23" }
+# Added by F8.2: the one-writer, many-reader cell the limits watcher publishes
+# into and the sampler reads on every sample. E2 table addition, preamble 6.2.
+arc-swap = { version = "=1.9.1" }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six

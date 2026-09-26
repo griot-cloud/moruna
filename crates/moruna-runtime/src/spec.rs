@@ -117,6 +117,10 @@ pub struct RunSpec {
     pub budget: Option<u64>,
     /// An explicit CPU quota in cores; discovery clamps it.
     pub cpu: Option<f64>,
+    /// How far the run follows the machine up while it is in progress. The
+    /// default is the starting figures: an inelastic run never grows, and every run follows the
+    /// machine down. The JSON spec's `budget.elastic` (MH 4.1) maps onto it; F8.1 adds that serde.
+    pub elastic: crate::elastic::ElasticBudget,
     /// Where the trace file goes; `None` keeps the trace in memory.
     pub trace_path: Option<PathBuf>,
     /// Where staging segments go; `None` lets discovery resolve one.
@@ -166,6 +170,7 @@ impl RunSpec {
             sink: sink.into(),
             budget: None,
             cpu: None,
+            elastic: crate::elastic::ElasticBudget::default(),
             trace_path: None,
             staging_dir: None,
             staging_limit: None,
@@ -216,6 +221,12 @@ pub struct Components {
     pub placement: Option<Arc<dyn Placement>>,
     /// Uses this run id instead of minting one.
     pub run_id: Option<RunId>,
+    /// Where the limits watcher reads the machine from; `None` is the host's own files.
+    /// A test scripts a machine here; a host that knows its own figures could push them.
+    pub limits_source: Option<Arc<dyn moruna_discovery::LimitsSource>>,
+    /// Called once per limits change the watcher accepts, after it is published. This
+    /// is the seam the host protocol's `limits_changed` message hangs on (MH 4.3, F8.1).
+    pub limits_subscribers: Vec<moruna_discovery::LimitsSubscriber>,
 }
 
 /// The cancel token a run is driven with, re-exported so a caller needs one import.
@@ -236,6 +247,7 @@ mod tests {
                     page_bytes: 4096,
                     devices: Vec::new(),
                     source: moruna_kernel::LimitSource::Explicit,
+                    observed_at: 0,
                 },
                 profile: HostProfile::default(),
                 host_tier: moruna_kernel::TierKind::Host,
@@ -326,6 +338,8 @@ mod tests {
         assert!(components.sampler.is_none());
         assert!(components.placement.is_none());
         assert!(components.run_id.is_none());
+        assert!(components.limits_source.is_none());
+        assert!(components.limits_subscribers.is_empty());
         let _: Cancel = Cancel::new();
     }
 }

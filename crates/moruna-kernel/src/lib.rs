@@ -64,7 +64,7 @@ pub use sink::{Sink, SinkSummary};
 pub use source::{RowRange, Source, Split};
 pub use tensor::{DeleterHook, Dlpack, ManagedTensor};
 pub use tier::{RemoteRef, SegmentRef, StagingCodec, TIER_COUNT, Tier, TierKind};
-pub use trace::{Outcome, TraceRecord, TraceSink, TraceTail};
+pub use trace::{LimitsChangeReason, LimitsChanged, Outcome, TraceRecord, TraceSink, TraceTail};
 pub use view::BufferView;
 
 /// `core::result::Result<T, MorunaError>`; every fallible contract returns it.

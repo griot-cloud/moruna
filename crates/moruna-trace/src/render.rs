@@ -82,23 +82,42 @@ impl fmt::Display for RunReport {
         writeln!(
             f,
             "limits: ceiling {}, kill {}, cpu {}, source {}{}",
-            bytes_binary(self.limits.memory_ceiling),
-            self.limits
+            bytes_binary(self.limits_initial.memory_ceiling),
+            self.limits_initial
                 .memory_kill
                 .map_or_else(|| "none".to_string(), bytes_binary),
-            sig3(self.limits.cpu_quota),
-            self.limits.source,
-            if self.limits.devices.is_empty() {
+            sig3(self.limits_initial.cpu_quota),
+            self.limits_initial.source,
+            if self.limits_initial.devices.is_empty() {
                 String::new()
             } else {
-                format!(", devices {}", self.limits.devices.len())
+                format!(", devices {}", self.limits_initial.devices.len())
             }
         )?;
+        // e.3: one line for the timeline when the machine moved, naming the last limits and how
+        // many changes led there; the JSON carries every entry.
+        if let Some((at_ms, last)) = self.limits_timeline.last() {
+            writeln!(
+                f,
+                "limits moved {} times: ceiling {}, cpu {} from {} s{}",
+                self.limits_timeline.len(),
+                bytes_binary(last.memory_ceiling),
+                sig3(last.cpu_quota),
+                sig3(*at_ms as f64 / 1000.0),
+                match self.drains.last() {
+                    Some(drain) => match drain.drain_ms {
+                        Some(ms) => format!(", last drain {} s", sig3(ms as f64 / 1000.0)),
+                        None => ", a drain still running at the end".to_string(),
+                    },
+                    None => String::new(),
+                }
+            )?;
+        }
         writeln!(
             f,
             "memory: peak {} of ceiling {} ({} of ceiling)",
             bytes_binary(self.peak_anon_bytes),
-            bytes_binary(self.limits.memory_ceiling),
+            bytes_binary(self.peak_ceiling_bytes),
             percent(self.peak_fraction_of_ceiling)
         )?;
         writeln!(

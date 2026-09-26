@@ -15,10 +15,31 @@ impl ArenaHandle for Inner {
     fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
         match tier {
             Tier::Host | Tier::PinnedHost => {
-                if self.host_tier == tier && self.host.space.contains(ptr) {
-                    self.host.space.release(ptr, len as u64);
-                } else {
+                if self.host_tier != tier {
                     self.foreign(tier);
+                    return;
+                }
+                let retire = {
+                    let host = self.read_host();
+                    match host.iter().find(|r| r.space.contains(ptr)) {
+                        Some(region) => {
+                            let released = region.space.release(ptr, len as u64);
+                            // A draining region whose last buffer just came home is unmapped
+                            //; that needs the write lock, taken once this one is gone.
+                            matches!(released, crate::classes::Release::Freed)
+                                && region.draining.load(Ordering::SeqCst)
+                                && region.space.in_use() == 0
+                        }
+                        None => {
+                            drop(host);
+                            self.foreign(tier);
+                            return;
+                        }
+                    }
+                };
+                if retire {
+                    let mut host = self.write_host();
+                    self.retire_drained(&mut host);
                 }
             }
             Tier::Device(id) => match self.device(id) {

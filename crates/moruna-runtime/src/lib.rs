@@ -22,16 +22,20 @@
 
 pub mod cancel;
 pub mod config;
+pub mod elastic;
 pub mod error;
 pub mod report;
 pub mod run;
 pub mod spec;
 
+pub use elastic::ElasticBudget;
 pub use error::{Result, RunError};
 pub use run::Runtime;
 pub use spec::{BuildCtx, Components, RunSpec, SinkSpec, SourceSpec};
 
-pub use moruna_discovery::{Discovered, DiscoveryInput};
+pub use moruna_discovery::{
+    Discovered, DiscoveryInput, LimitsReading, LimitsSource, LimitsSubscriber, ManualLimitsSource,
+};
 pub use moruna_kernel::{CancelToken, ErrorPolicy, RunId, SizerKind};
 pub use moruna_trace::{ExitReason, RunReport};
 
