@@ -180,3 +180,97 @@ fn rc_t10_drift_is_detected() {
         summary.notes
     );
 }
+
+/// A stored row for kernel 1 under the given input schema, as `moruna check` writes one: the
+/// controller's fields plus the harness's own, which the controller ignores.
+fn check_row(dir: &std::path::Path, schema: &str, a_k: f64) -> std::path::PathBuf {
+    let fingerprint = Fingerprint::compute("test kernel 1", b"");
+    let row = serde_json::json!({
+        "version": 1,
+        "fingerprint": fingerprint.to_hex(),
+        "schema_hash": schema,
+        "updated": "2026-09-26T00:00:00Z",
+        "a_k_p50": a_k,
+        "a_k_p95": a_k,
+        "a_k_dev_p95": 0.0,
+        "a_k_samples": 40_000,
+        "a_k_var": 0.0,
+        "state_bytes_max": 0,
+        "final_target": 64 * MIB,
+        "final_workers": 4,
+        "final_safety": 1.2,
+        "runs": 1,
+        "prediction_error_p95": 0.0,
+        "wall_ns_per_row": 12.5,
+        "gil": "none"
+    });
+    let path = dir.join(format!("{}-{schema}.json", fingerprint.to_hex()));
+    std::fs::write(&path, serde_json::to_string(&row).expect("json")).expect("write");
+    path
+}
+
+/// The notes of a run of kernel 1 over the store, probed at `probed`.
+fn seeded_notes(dir: &std::path::Path, probed: f64) -> Vec<String> {
+    let mut cfg = config(8 * GIB, 2);
+    cfg.profiles_dir = Some(dir.to_path_buf());
+    let probe_bytes = cfg.probe_bytes;
+    let rig = common::Rig::new(
+        cfg,
+        vec![kernel(1, KernelHints::default())],
+        FakeKnobs::new().probe_result(1, probe(probe_bytes, probed)),
+        FakeSampler::new().scripted(steady(400 * MIB, 8)),
+    );
+    rig.run_up();
+    rig.controller.stop().notes
+}
+
+/// A kernel checked against a declared column subset has its first row under that subset's
+/// schema. A later run of the same kernel over a wider source has no exact row, so the newest row
+/// with the same fingerprint seeds it: the probe is judged against it (drift when they disagree),
+/// and a note names the schema it came from. An exact row, when there is one, wins.
+#[test]
+fn rc_t10_a_subset_check_row_seeds_a_wider_run() {
+    let scratch = Scratch::new("profile-subset");
+    let subset: String = "ab".repeat(32);
+    check_row(scratch.path(), &subset, 1.0);
+
+    let notes = seeded_notes(scratch.path(), 1.0);
+    assert!(
+        notes.iter().any(
+            |note| note.contains("seeded from the same kernel's row") && note.contains(&subset)
+        ),
+        "the subset row seeds the wider run: {notes:?}"
+    );
+    let notes = seeded_notes(scratch.path(), 4.0);
+    assert!(
+        notes.iter().any(|note| note == "profile drift on stage 1"),
+        "the probe is judged against the subset row, which proves it was loaded: {notes:?}"
+    );
+
+    // Of two rows under other schemas, the newest seeds.
+    let older = check_row(scratch.path(), &"cd".repeat(32), 1.0);
+    let old = std::fs::File::options()
+        .write(true)
+        .open(&older)
+        .expect("open");
+    old.set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .expect("backdate");
+    let notes = seeded_notes(scratch.path(), 1.0);
+    assert!(
+        notes.iter().any(|note| note.contains(&subset)),
+        "the newest row seeds: {notes:?}"
+    );
+
+    // An exact row wins over any other, and no note is made.
+    let exact = profile_path(scratch.path(), 1);
+    let exact_schema: String = (0..32).map(|_| "01".to_string()).collect();
+    check_row(scratch.path(), &exact_schema, 1.0);
+    assert!(exact.exists());
+    let notes = seeded_notes(scratch.path(), 1.0);
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.contains("seeded from the same kernel's row")),
+        "the exact row is used: {notes:?}"
+    );
+}

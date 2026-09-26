@@ -106,6 +106,66 @@ pub(crate) fn load(dir: &Path, fingerprint: &Fingerprint, schema_hash: &[u8; 32]
     Loaded::Found(profile)
 }
 
+/// Read the profile for a stage: the exact `(fingerprint, input schema)` file when there is
+/// one, and otherwise the newest file for the same fingerprint under any schema, with the
+/// schema hash it was written for. A kernel checked against a declared column subset
+/// (`moruna check`) writes its first row under that subset's schema, and a run over a wider
+/// source would otherwise never see it. The newest is the one last modified; an unreadable
+/// candidate is skipped.
+pub(crate) fn load_nearest(
+    dir: &Path,
+    fingerprint: &Fingerprint,
+    schema_hash: &[u8; 32],
+) -> (Loaded, Option<String>) {
+    match load(dir, fingerprint, schema_hash) {
+        Loaded::Missing => {}
+        exact => return (exact, None),
+    }
+    let prefix = format!("{}-", fingerprint.to_hex());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (Loaded::Missing, None);
+    };
+    let mut newest: Option<(std::time::SystemTime, Profile)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(schema) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if schema.len() != 64 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(profile) = serde_json::from_str::<Profile>(&text) else {
+            continue;
+        };
+        if profile.version != VERSION {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(at, _)| modified > *at) {
+            newest = Some((modified, profile));
+        }
+    }
+    match newest {
+        Some((_, profile)) => {
+            let schema = profile.schema_hash.clone();
+            (Loaded::Found(profile), Some(schema))
+        }
+        None => (Loaded::Missing, None),
+    }
+}
+
 /// Merge a new run's figures into the stored ones with the exponential weight of e.3, so a
 /// long history moves slowly and a first run is taken as it stands.
 pub(crate) fn merge(stored: &Profile, fresh: &Profile) -> Profile {
