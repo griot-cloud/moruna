@@ -14,6 +14,7 @@
 
 pub mod build;
 pub mod canonical;
+mod governed;
 pub mod translate;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -169,6 +170,23 @@ pub enum SourceDoc {
     /// A Python iterable. Library only: the iterable is an object in the caller's process and
     /// cannot be named in a file, so a document from a file or a socket is refused (MH 4.1).
     Iterator,
+    /// A governed DataFusion plan (MH 4.5): what peQL, opened on the disk at `root`, plans for
+    /// `caller` over one contract or over SQL in which every table is a contract. Exactly one of
+    /// `contract` and `sql`. Needs a build with the `peql` feature.
+    Datafusion {
+        /// The engine's root: the disk, with peQL's store, manifests, ledger and audit log under
+        /// `<root>/_peql/`.
+        root: String,
+        /// One contract, every row and column the caller may see.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contract: Option<String>,
+        /// SQL in which every table is a contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sql: Option<String>,
+        /// The caller, as peQL reads it: `id`, `tenant`, `purpose`, and optionally `tier`,
+        /// `clearance`, `classification`, `roles`, `now` and `other`.
+        caller: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 /// `source.options` for `parquet`.
@@ -222,6 +240,19 @@ pub enum SinkDoc {
         /// Sizes.
         #[serde(default)]
         options: ArrowIpcSinkOptions,
+    },
+    /// A write under a peQL contract (MH 4.5), by `caller`, who must be the contract's owner.
+    /// The manifest is refreshed when the run finishes. Needs a build with the `peql` feature.
+    Peql {
+        /// The engine's root: the disk.
+        root: String,
+        /// The contract written under.
+        contract: String,
+        /// The writer, as peQL reads a caller.
+        caller: serde_json::Map<String, serde_json::Value>,
+        /// `append` (absent) or `overwrite`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
 }
 

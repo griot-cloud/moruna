@@ -100,8 +100,14 @@ if [ -f Cargo.toml ]; then
   # failed this (PM, 2026-09-22).
   step "cargo run --example append_column (examples/append_column.rs)"
   quiet example cargo run -p moruna-runtime --example append_column
-  step "cargo test --features polars,datafusion (the engine bridges)"
-  quiet test_bridges cargo test -p moruna-polars -p moruna-datafusion --features moruna-polars/polars,moruna-datafusion/datafusion
+  step "cargo test --features polars,datafusion,peql (the engine bridges)"
+  quiet test_bridges cargo test -p moruna-polars -p moruna-datafusion --features moruna-polars/polars,moruna-datafusion/datafusion,moruna-datafusion/peql
+  # The peQL ends of a run (MH 4.5, H6): the bridge and the job document's datafusion and peql
+  # kinds, which a default-feature build refuses by kind and never compiles.
+  step "cargo clippy -D warnings --features peql (the governed ends of a run)"
+  quiet clippy_peql cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets --features moruna-datafusion/peql,moruna-runtime/peql -- -D warnings
+  step "cargo test --features peql (H6: a governed plan is a source, a contract write a sink)"
+  quiet test_peql cargo test -p moruna-runtime --features peql
   if [ -n "${MORUNA_PYTHON:-}" ]; then
     # The adapter's fixtures import pyarrow and numpy inside the embedded interpreter, so
     # MORUNA_PYTHON has to be able to find both. A uv-managed interpreter is externally managed

@@ -20,6 +20,8 @@ moruna-sinks = { workspace = true }
 moruna-placement = { workspace = true }
 moruna-scheduler = { workspace = true }
 moruna-controller = { workspace = true }
+# The peQL ends of a run (MH 4.5), feature `peql`.
+moruna-datafusion = { workspace = true, optional = true }
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,6 +37,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+# The governed tests drive a peQL engine, whose API is asynchronous.
+tokio = { workspace = true }
 moruna-testkit = { workspace = true }
 # The Linux branch of tests/support/mod.rs reads /proc/self/statm and needs the page
 # size. A developer host is macOS, where that branch is not compiled, so its absence
@@ -43,6 +47,11 @@ libc = { workspace = true }
 
 # The first program a user writes, kept at the repository root so it reads as an example and
 # not as a test; the quality gate runs it on every commit.
+[[test]]
+name = "governed"
+path = "tests/governed.rs"
+required-features = ["peql"]
+
 [[example]]
 name = "append_column"
 path = "../../examples/append_column.rs"
@@ -55,3 +64,5 @@ uring = ["moruna-reactor/uring"]
 gds = ["cuda", "moruna-reactor/gds"]
 rdma = ["moruna-arena/rdma", "moruna-reactor/rdma", "moruna-placement/rdma"]
 python = ["moruna-adapters/python", "moruna-sources/python"]
+# `"kind": "datafusion"` sources and `"kind": "peql"` sinks in the job document (MH 4.5).
+peql = ["dep:moruna-datafusion", "moruna-datafusion/peql"]

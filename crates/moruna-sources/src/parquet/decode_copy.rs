@@ -18,8 +18,9 @@ use moruna_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
 use moruna_kernel::{Allocator, MorunaError, Result, Tier};
 
 /// Copy every buffer of `batch` into the arena and rebuild it. Returns the new batch and the
-/// bytes copied.
-pub(crate) fn copy_batch(
+/// bytes copied. A source whose decoder is not its own (the iterator source's interpreter, a
+/// DataFusion plan) makes this its one copy into the arena.
+pub fn copy_batch(
     batch: &RecordBatch,
     alloc: &dyn Allocator,
     tier: Tier,
