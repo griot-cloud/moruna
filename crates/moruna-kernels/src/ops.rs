@@ -1,4 +1,4 @@
-//! What each standard kernel does to a batch, and what it does to a schema (15 e.6).
+//! What each standard kernel does to a batch, and what it does to a schema (MH 4.9).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ fn batch_of(
     .map_err(arrow(kernel))
 }
 
-/// One step of a projection: `cast`, `rename`, `select` or `drop` (15 e.6). A chain of them is
+/// One step of a projection: `cast`, `rename`, `select` or `drop` (MH 4.9). A chain of them is
 /// one projection, which is what makes `select` after `cast` one stage.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
@@ -382,7 +382,7 @@ pub(crate) fn hash_schema(columns: &[String], output: &str, input: &Schema) -> R
 }
 
 /// `hash`: a hex digest per row over the named columns, each encoded as a presence byte, then
-/// for a present value its length as a little-endian u64 and its bytes (15 e.6).
+/// for a present value its length as a little-endian u64 and its bytes (MH 4.9).
 pub(crate) fn hash(
     columns: &[String],
     algo: Algo,

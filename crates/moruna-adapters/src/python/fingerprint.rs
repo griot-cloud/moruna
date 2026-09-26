@@ -1,4 +1,4 @@
-//! The Python kernel fingerprint (e.4, as amended by 15 e.7).
+//! The Python kernel fingerprint (e.4, as amended by MH 4.9).
 //!
 //! `sha256(canonical source || lockfile bytes, when given || Moruna ABI version)` (MH 4.9),
 //! where the canonical source is the kernel's qualified name, its source text normalised, and
@@ -25,7 +25,7 @@ pub struct Fingerprinted {
     pub source_available: bool,
 }
 
-/// Compute a Python kernel's fingerprint (15 e.7).
+/// Compute a Python kernel's fingerprint (MH 4.9).
 pub fn compute(py: Python<'_>, spec: &PyKernelSpec) -> Fingerprinted {
     let target = fingerprint_target(py, spec);
     let qualname = qualname_of(&target);
@@ -77,7 +77,7 @@ fn attr_string(target: &Bound<'_, PyAny>, name: &str) -> Option<String> {
         .and_then(|value| value.extract::<String>().ok())
 }
 
-/// The source text of the target, normalised (15 e.7), or the code object's bytes and constants
+/// The source text of the target, normalised (MH 4.9), or the code object's bytes and constants
 /// when the source is not available (e.4).
 fn source_of(py: Python<'_>, target: &Bound<'_, PyAny>) -> (String, bool) {
     if let Ok(inspect) = py.import("inspect")
@@ -95,7 +95,7 @@ fn source_of(py: Python<'_>, target: &Bound<'_, PyAny>) -> (String, bool) {
 }
 
 /// `\r\n` as `\n`, trailing whitespace stripped from every line, leading and trailing blank
-/// lines removed (15 e.7).
+/// lines removed (MH 4.9).
 pub fn normalise(source: &str) -> String {
     let lines: Vec<&str> = source
         .split('\n')

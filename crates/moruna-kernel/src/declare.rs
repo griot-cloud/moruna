@@ -1,4 +1,4 @@
-//! Declared schemas: what a kernel says it takes and what it gives back (05 e.5, 15 e.2).
+//! Declared schemas: what a kernel says it takes and what it gives back (MH 4.9).
 //!
 //! A declaration is optional. A kernel that declares its input and its output is *checkable*:
 //! `moruna check` generates batches from the input declaration and refuses a kernel whose
@@ -27,13 +27,13 @@ pub const ABI_VERSION: u32 = 1;
 pub enum TypeDecl {
     /// Exactly this Arrow type.
     Exact(DataType),
-    /// Any type. `moruna check` generates `Int64` for such a column (15 f.1); the comparison
+    /// Any type. `moruna check` generates `Int64` for such a column (MH 4.9); the comparison
     /// accepts whatever is produced.
     Any,
 }
 
 impl TypeDecl {
-    /// The declared type as the type grammar spells it (15 e.1): `any`, or the canonical name of
+    /// The declared type as the type grammar spells it (MH 4.9): `any`, or the canonical name of
     /// the Arrow type.
     pub fn spelling(&self) -> String {
         match self {
@@ -58,7 +58,7 @@ pub struct ColumnDecl {
     /// Its type.
     pub ty: TypeDecl,
     /// Whether the column may hold nulls. Generation honours it (a non-nullable column is never
-    /// null in a synthetic batch); the comparison does not read it (15 f.3).
+    /// null in a synthetic batch); the comparison does not read it (MH 4.9).
     pub nullable: bool,
 }
 
@@ -117,7 +117,7 @@ impl SchemaDecl {
         )
     }
 
-    /// The input schema `moruna check` generates batches for (15 f.1): the declared columns in
+    /// The input schema `moruna check` generates batches for (MH 4.9): the declared columns in
     /// declaration order, `Any` as `Int64`. A relative declaration describes no input and is a
     /// `Plan` error here.
     pub fn synthetic_schema(&self) -> crate::Result<SchemaRef> {
@@ -142,7 +142,7 @@ impl SchemaDecl {
         Ok(Arc::new(Schema::new(fields)))
     }
 
-    /// The expected output for a concrete input (15 f.3): an exact or subset declaration stands
+    /// The expected output for a concrete input (MH 4.9): an exact or subset declaration stands
     /// as it is; a relative one is resolved against `input` into an exact one, with every column
     /// not named keeping the input's type and position and the added columns after them. A
     /// relative declaration that drops or changes a column the input does not have is a `Plan`
@@ -208,7 +208,7 @@ pub struct Expected {
     pub closed: bool,
 }
 
-/// Why a produced column disagrees with its declaration (15 f.3).
+/// Why a produced column disagrees with its declaration (MH 4.9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disagreement {
     /// Declared and produced with different types.
@@ -256,7 +256,7 @@ impl Disagreement {
         }
     }
 
-    /// The reason code of the JSON report (15 e.3).
+    /// The reason code of the JSON report (MH 4.9).
     pub fn reason(&self) -> &'static str {
         match self {
             Disagreement::Type { .. } => "type",
@@ -298,7 +298,7 @@ impl core::fmt::Display for Disagreement {
 
 impl Expected {
     /// Every way `produced` disagrees with this expectation, in the declared columns' order and
-    /// then the produced columns' order; empty when they agree (15 f.3).
+    /// then the produced columns' order; empty when they agree (MH 4.9).
     pub fn compare(&self, produced: &Schema) -> Vec<Disagreement> {
         let mut out = Vec::new();
         for (at, column) in self.columns.iter().enumerate() {
@@ -421,7 +421,7 @@ pub fn json_string(s: &str) -> String {
     out
 }
 
-/// The canonical spelling of an Arrow type in the type grammar (15 e.1). It is pyarrow's
+/// The canonical spelling of an Arrow type in the type grammar (MH 4.9). It is pyarrow's
 /// `str(type)` for every type the grammar has, so a declaration written in either language reads
 /// the same in a report.
 pub fn type_name(dt: &DataType) -> String {
@@ -479,7 +479,7 @@ fn parse_unit(s: &str) -> Option<TimeUnit> {
     })
 }
 
-/// Parse a type in the grammar of 15 e.1: pyarrow's `str(type)` spellings (`int64`, `double`,
+/// Parse a type in the grammar of MH 4.9: pyarrow's `str(type)` spellings (`int64`, `double`,
 /// `string`, `timestamp[us, tz=UTC]`, `list<item: int64>`, `decimal128(10, 2)`), the aliases
 /// `boolean`, `float32`, `float64`, `utf8`, `large_utf8`, `str`, `date32`, `date64`,
 /// `list<int64>`, and `any`. An unknown spelling is a `Plan` error naming it.

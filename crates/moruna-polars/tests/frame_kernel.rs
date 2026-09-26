@@ -1,4 +1,4 @@
-//! CK-T8, the Rust half (05 f.9, MH 4.9): a function from a Polars frame to a Polars frame is a
+//! CK-T8, the Rust half (MH 4.9): a function from a Polars frame to a Polars frame is a
 //! kernel through `moruna-polars`, its fixed-width columns cross by pointer, the view and large
 //! types Polars keeps come back as the plain ones, and its declaration is what it declares.
 

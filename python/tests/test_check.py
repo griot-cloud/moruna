@@ -1,6 +1,6 @@
-"""SDD 15 k through the package: ``python -m moruna check`` (CK-T5, CK-T8, CK-T9), the schema
-declarations on ``@moruna.kernel`` (05 e.5), the Python fingerprint (15 e.7), and the Polars
-signature (05 f.9)."""
+"""MH 4.9 through the package: ``python -m moruna check`` (CK-T5, CK-T8, CK-T9), the schema
+declarations on ``@moruna.kernel`` (MH 4.9), the Python fingerprint (MH 4.9), and the Polars
+signature (MH 4.9)."""
 
 from __future__ import annotations
 

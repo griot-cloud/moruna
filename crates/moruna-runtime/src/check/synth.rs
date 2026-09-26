@@ -1,4 +1,4 @@
-//! Synthetic batches from a declared input schema, byte-exact from a seed (15 f.1).
+//! Synthetic batches from a declared input schema, byte-exact from a seed (MH 4.9).
 //!
 //! Every value below is a function of the seed, the batch index and the column index alone, so
 //! two runs of `moruna check` with one seed hand a kernel the same bytes, on any host.
@@ -17,7 +17,7 @@ use moruna_kernel::arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 use moruna_kernel::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use moruna_kernel::{MorunaError, Result};
 
-/// The five batches of 15 f.1, in the order they are run.
+/// The five batches of MH 4.9, in the order they are run.
 pub const BATCHES: [&str; 5] = ["empty", "one_row", "preferred", "all_null", "edges"];
 /// Rows of the `preferred` batch when the kernel names no `preferred_rows`.
 pub const DEFAULT_PREFERRED_ROWS: u64 = 1024;
@@ -36,7 +36,7 @@ const DAY_MAX: i32 = 2_932_896;
 const SECOND_MIN: i64 = -62_135_596_800;
 const SECOND_MAX: i64 = 253_402_300_799;
 
-/// SplitMix64 (Steele, Lea and Flood 2014), the generator of 15 f.1.
+/// SplitMix64 (Steele, Lea and Flood 2014), the generator of MH 4.9.
 pub struct Rng(u64);
 
 impl Rng {
@@ -74,7 +74,7 @@ enum Fill {
 /// How a batch chooses the fill of each column.
 type FillFor = Box<dyn Fn(&Field) -> Fill>;
 
-/// The rows of the `preferred` batch (15 f.1).
+/// The rows of the `preferred` batch (MH 4.9).
 pub fn preferred_rows(hint: Option<u64>) -> u64 {
     hint.unwrap_or(DEFAULT_PREFERRED_ROWS)
         .clamp(1, MAX_PREFERRED_ROWS)
@@ -130,7 +130,7 @@ pub fn batch(schema: &SchemaRef, index: usize, seed: u64, preferred: u64) -> Res
     .map_err(|e| MorunaError::Plan(format!("building a synthetic batch: {e}")))
 }
 
-/// How many edge values a type has (15 f.1); the `edges` batch has as many rows as the longest.
+/// How many edge values a type has (MH 4.9); the `edges` batch has as many rows as the longest.
 fn edges_len(dt: &DataType) -> usize {
     match dt {
         DataType::Boolean => 2,

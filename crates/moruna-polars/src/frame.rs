@@ -1,5 +1,5 @@
 //! Polars as syntax for a Rust kernel: a function from a `DataFrame` to a `DataFrame` as an
-//! Moruna [`Kernel`] (05 f.9, MH 4.9).
+//! Moruna [`Kernel`] (MH 4.9).
 //!
 //! The batch crosses into Polars column by column through the Arrow C Data Interface
 //! ([`crate::ffi`]), so fixed-width columns are handed over by pointer, and the result crosses

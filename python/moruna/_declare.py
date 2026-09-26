@@ -1,4 +1,4 @@
-"""Schema declarations and the Polars signature, translated for ``moruna._core`` (05 e.5, e.6).
+"""Schema declarations and the Polars signature, translated for ``moruna._core`` (MH 4.9).
 
 Nothing here touches a payload. A declaration becomes a small tuple the Rust half reads; a
 function whose annotated signature is ``pl.DataFrame -> pl.DataFrame`` (or ``pl.LazyFrame``)
@@ -19,7 +19,7 @@ from typing import Any
 _RELATIVE_KEYS = frozenset({"adds", "drops", "changes"})
 _FRAME = re.compile(r"(?:^|\.)(DataFrame|LazyFrame)$")
 
-# Python and Polars types a declaration may name, as the type grammar of 15 e.1 spells them.
+# Python and Polars types a declaration may name, as the type grammar of MH 4.9 spells them.
 _PYTHON_TYPES: dict[Any, str] = {int: "int64", float: "double", str: "string", bool: "bool"}
 _POLARS_NAMES = {
     "Int8": "int8",
@@ -164,7 +164,7 @@ def _plain(dtype: Any, pa: Any) -> Any:
 
 
 def polars_callable(fn: Any, kind: str) -> Any:
-    """``fn`` over Polars frames as a callable over ``pyarrow.RecordBatch`` (05 f.9).
+    """``fn`` over Polars frames as a callable over ``pyarrow.RecordBatch`` (MH 4.9).
 
     The batch enters Polars through the Arrow PyCapsule stream, which is the C data interface:
     no copy for fixed-width columns. The result leaves through ``to_arrow``, the same interface,

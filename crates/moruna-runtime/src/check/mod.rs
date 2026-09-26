@@ -1,11 +1,11 @@
-//! `moruna check`: is this a kernel, and what does it cost (15, MH 4.9).
+//! `moruna check`: is this a kernel, and what does it cost (MH 4.9).
 //!
 //! The harness every surface calls: the Python `moruna check` (through `moruna-py`), the Rust
 //! `moruna` binary when it lands (F8.1), and a Rust author's own test. It takes any
-//! [`Kernel`], reads its declarations, generates the synthetic batches of 15 f.1 from the input
+//! [`Kernel`], reads its declarations, generates the synthetic batches of MH 4.9 from the input
 //! declaration, runs each through the kernel in process with an arena and a trace exactly as a
-//! run would, compares every produced schema with the output declaration (15 f.3), and writes
-//! the first profile-store row for the kernel's fingerprint (15 e.4) so the first real run sizes
+//! run would, compares every produced schema with the output declaration (MH 4.9), and writes
+//! the first profile-store row for the kernel's fingerprint (MH 4.9) so the first real run sizes
 //! from evidence rather than from the default amplification.
 //!
 //! It is not a test framework and not a guarantee about real data: it is the guarantee that the
@@ -39,7 +39,7 @@ const PROFILE_VERSION: u32 = 1;
 const SAFETY_INITIAL: f32 = 1.5;
 
 /// Batches smaller than this give no amplification sample: their fixed costs (buffer alignment,
-/// validity bitmaps) are the whole of their output (15 f.4).
+/// validity bitmaps) are the whole of their output (MH 4.9).
 pub const MIN_SAMPLE_BYTES: u64 = 4096;
 
 /// Distinguishes the scratch directories of concurrent checks in one process.
@@ -48,7 +48,7 @@ static SCRATCH: AtomicU64 = AtomicU64::new(0);
 /// A hook the harness calls once with its arena (`CheckOptions::bind`).
 pub type Bind = Box<dyn FnOnce(Arc<dyn Allocator>) + Send>;
 
-/// What the caller tells the harness about the kernel beyond the trait (15 d.1).
+/// What the caller tells the harness about the kernel beyond the trait (MH 4.9).
 pub struct CheckOptions {
     /// The name the report gives the kernel.
     pub name: String,
@@ -58,7 +58,7 @@ pub struct CheckOptions {
     /// (`sha256` for Python and standard kernels, whose fingerprints MH 4.9 defines; `blake3`
     /// for a Rust kernel's `Fingerprint::compute`, contracts e.6).
     pub fingerprint_scheme: &'static str,
-    /// The seed of the synthetic batches (15 f.1).
+    /// The seed of the synthetic batches (MH 4.9).
     pub seed: u64,
     /// Where the profile row goes; `None` writes none.
     pub profiles_dir: Option<PathBuf>,
@@ -84,7 +84,7 @@ impl CheckOptions {
     }
 }
 
-/// The outcome of a check (15 e.3).
+/// The outcome of a check (MH 4.9).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Every batch ran and every produced schema agreed with the declaration.
@@ -110,7 +110,7 @@ impl Verdict {
 /// One synthetic batch through the kernel.
 #[derive(Clone, Debug)]
 pub struct BatchOutcome {
-    /// Its name in 15 f.1.
+    /// Its name in MH 4.9.
     pub name: &'static str,
     /// Rows in.
     pub rows_in: u64,
@@ -122,7 +122,7 @@ pub struct BatchOutcome {
     pub bytes_out: u64,
     /// Wall nanoseconds inside `apply`.
     pub wall_ns: u64,
-    /// `peak_delta / bytes_in` (15 f.4); `None` for an empty batch or a failed one.
+    /// `peak_delta / bytes_in` (MH 4.9); `None` for an empty batch or a failed one.
     pub amplification: Option<f64>,
     /// The kernel's error, when it failed.
     pub error: Option<String>,
@@ -130,7 +130,7 @@ pub struct BatchOutcome {
     pub disagreements: Vec<Disagreement>,
 }
 
-/// The profile row a check writes (15 e.4).
+/// The profile row a check writes (MH 4.9).
 #[derive(Clone, Debug)]
 pub struct ProfileRow {
     /// The file, when a directory was given.
@@ -155,7 +155,7 @@ pub struct ProfileRow {
     pub gil: &'static str,
 }
 
-/// What `moruna check` says about one kernel (15 e.3).
+/// What `moruna check` says about one kernel (MH 4.9).
 #[derive(Clone, Debug)]
 pub struct CheckReport {
     /// The kernel's name.
@@ -174,14 +174,14 @@ pub struct CheckReport {
     pub profile: Option<ProfileRow>,
     /// The seed.
     pub seed: u64,
-    /// Trace records written, one per batch run (15 f.2).
+    /// Trace records written, one per batch run (MH 4.9).
     pub trace_records: u64,
     /// Anything else worth saying.
     pub notes: Vec<String>,
 }
 
 impl CheckReport {
-    /// 0 for an agreeing kernel, 2 otherwise (15 e.5).
+    /// 0 for an agreeing kernel, 2 otherwise (MH 4.9).
     pub fn exit_code(&self) -> i32 {
         match self.verdict {
             Verdict::Agreed => 0,
@@ -198,7 +198,7 @@ impl CheckReport {
             .collect()
     }
 
-    /// The JSON report of 15 e.3.
+    /// The JSON report of MH 4.9.
     pub fn to_json(&self) -> Value {
         let batches: Vec<Value> = self
             .batches
@@ -271,7 +271,7 @@ impl CheckReport {
         })
     }
 
-    /// The human summary of 15 e.3: one line naming the verdict and the fingerprint, then one
+    /// The human summary of MH 4.9: one line naming the verdict and the fingerprint, then one
     /// line per refusal or failure, then the profile.
     pub fn summary(&self) -> String {
         let mut out = format!(
@@ -314,7 +314,7 @@ impl CheckReport {
     }
 }
 
-/// Check one kernel (15 f.1 to f.5). `Err` only when the harness itself cannot start (no arena,
+/// Check one kernel (MH 4.9 to f.5). `Err` only when the harness itself cannot start (no arena,
 /// no trace); everything the kernel does wrong is in the report.
 pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport> {
     let CheckOptions {
@@ -431,7 +431,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         if let Some(footprint) = state.footprint() {
             state_bytes_max = state_bytes_max.max(footprint);
         }
-        // 4. Compare (15 f.3).
+        // 4. Compare (MH 4.9).
         if let Some(produced) = outcome.produced.take() {
             outcome.batch.disagreements = expected.compare(&produced);
         }
@@ -449,7 +449,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
     }
     report.verdict = Verdict::Agreed;
 
-    // 5. Profile (15 f.4, e.4).
+    // 5. Profile (MH 4.9).
     let row = profile_row(&report.batches, state_bytes_max, gil, &source_schema.hash());
     let row = match profiles_dir {
         None => row,
@@ -583,7 +583,7 @@ impl Harness {
                 outcome.bytes_out = out.get_array_memory_size() as u64;
                 tier_out = tier;
                 if bytes_in >= MIN_SAMPLE_BYTES {
-                    // 15 f.4: the bytes the kernel allocated for its output outside the arena,
+                    // MH 4.9: the bytes the kernel allocated for its output outside the arena,
                     // per input byte. The process's anonymous growth is in the trace record and
                     // not in the figure: at a check's batch sizes it is allocator noise, and a
                     // noisy seed is worse than a low one, which the first probe corrects.
@@ -742,7 +742,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-/// The row of 15 e.4 from the batches that produced a measurement.
+/// The row of MH 4.9 from the batches that produced a measurement.
 fn profile_row(
     batches: &[BatchOutcome],
     state_bytes_max: u64,

@@ -173,7 +173,7 @@ pub enum Stage {
 
 /// The kernels of one run, in stage order, from whatever `moruna.run` was given: one kernel, a
 /// list, a decorated object, a standard kernel or a plain callable (f.3). Adjacent standard
-/// kernels are fused where their combination is one stage (15 f.6).
+/// kernels are fused where their combination is one stage (MH 4.9).
 pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stage>> {
     let items: Vec<Bound<'_, PyAny>> = if value.is_instance_of::<pyo3::types::PyList>()
         || value.is_instance_of::<pyo3::types::PyTuple>()
@@ -231,7 +231,7 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stag
     Ok(out)
 }
 
-/// A declaration from the tuple `moruna._declare.declaration` builds (05 e.5): `("exact",
+/// A declaration from the tuple `moruna._declare.declaration` builds (MH 4.9): `("exact",
 /// cols)`, `("subset", cols)` or `("relative", adds, drops, changes)`, a column being
 /// `(name, type, nullable)`.
 fn declaration(py: Python<'_>, value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<SchemaDecl>> {

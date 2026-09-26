@@ -210,7 +210,7 @@ def kernel(
 
 
 def polars(fn: Any, *, accepts: str = "table", **declarations: Any) -> KernelSpec:
-    """Wrap a function from a Polars frame to a Polars frame as a stateless kernel (05 f.9).
+    """Wrap a function from a Polars frame to a Polars frame as a stateless kernel (MH 4.9).
 
     The same path the decorator takes for a function annotated ``pl.DataFrame ->
     pl.DataFrame``, for a function that carries no annotations: the batch enters Polars through

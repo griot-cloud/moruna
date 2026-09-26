@@ -1,5 +1,5 @@
 //! CK-T6 std_output_schema_is_exact, and each standard kernel's behaviour on a batch whose
-//! answer is written out by hand (15 e.6, CK-I6).
+//! answer is written out by hand (MH 4.9, CK-I6).
 
 #![allow(clippy::result_large_err)]
 

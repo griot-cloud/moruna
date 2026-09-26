@@ -1,4 +1,4 @@
-"""``python -m moruna <command>``: the package's command line (12 d.2, 15 d.1).
+"""``python -m moruna <command>``: the package's command line (12 d.2, MH 4.9).
 
 One command today, ``check``; the job-document commands of MH 4.2 are the ``moruna`` binary's.
 """

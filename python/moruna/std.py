@@ -1,4 +1,4 @@
-"""Moruna's standard kernels, constructed by arguments rather than written (15 e.6).
+"""Moruna's standard kernels, constructed by arguments rather than written (MH 4.9).
 
 Each function returns a kernel object ``moruna.run`` takes wherever it takes a decorated one::
 

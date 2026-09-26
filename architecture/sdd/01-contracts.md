@@ -535,9 +535,6 @@ pub trait Kernel: Send + Sync + 'static {
     fn fingerprint(&self) -> Fingerprint;
     fn kind(&self) -> KernelKind;
     fn hints(&self) -> KernelHints { KernelHints::default() }
-    /// Declared input and output schemas (amended 2026-09-26, F8.3, MH 4.9; types in
-    /// `moruna_kernel::declare`, rules in 05 e.5 and 15 e.2 and f.3). Default: nothing declared.
-    fn declared(&self) -> Declared { Declared::default() }
     /// What this kernel wants delivered.
     fn accepts(&self) -> PayloadSpec;
     /// Output schema for the given input schema; errors are plan-time errors.

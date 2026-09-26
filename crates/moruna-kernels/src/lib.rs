@@ -1,5 +1,5 @@
 //! Moruna's standard kernels: the common transformations, constructed by arguments rather than
-//! written (MH 4.9, SDD 15 e.6).
+//! written (MH 4.9).
 //!
 //! `cast`, `rename`, `select`, `drop`, `filter(expr)`, `fill_null`, `dedupe(keys)`,
 //! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str` and `date_trunc`, each a
@@ -11,7 +11,7 @@
 //! projection; `filter` after `fill_null` is one pass). A chain that is all standard kernels
 //! never enters the interpreter, which is where a host optimises.
 //!
-//! The fingerprint is `sha256(name, canonical args, crate version)` (15 e.6), so a host can
+//! The fingerprint is `sha256(name, canonical args, crate version)` (MH 4.9), so a host can
 //! pin a standard kernel in a job document without shipping any code.
 
 #![deny(missing_docs)]
@@ -109,7 +109,7 @@ pub struct StdKernel {
     amplification: f64,
 }
 
-/// The fingerprint of 15 e.6: SHA-256 over `"moruna-std\0" || name || "\0" || canonical args ||
+/// The fingerprint of MH 4.9: SHA-256 over `"moruna-std\0" || name || "\0" || canonical args ||
 /// "\0" || crate version`.
 pub fn std_fingerprint(name: &str, args: &Value) -> Fingerprint {
     let mut hasher = sha2::Sha256::new();
@@ -139,7 +139,7 @@ fn anys(names: &[String]) -> Vec<ColumnDecl> {
 }
 
 impl StdKernel {
-    /// Build `name` from `args` (15 e.6). An unknown name, an unknown argument, a missing one or
+    /// Build `name` from `args` (MH 4.9). An unknown name, an unknown argument, a missing one or
     /// one of the wrong shape is a `Plan` error naming the kernel and the argument.
     pub fn new(name: &str, args: &Value) -> Result<StdKernel> {
         let (op, declared, amplification) = match name {
@@ -484,7 +484,7 @@ impl StdKernel {
     }
 }
 
-/// Fuse `first` then `second` into one stage when their combination is one operation (15 f.6):
+/// Fuse `first` then `second` into one stage when their combination is one operation (MH 4.9):
 /// any two projections (`cast`, `rename`, `select`, `drop`, or projections already fused), and
 /// `filter` after `fill_null`. `None` when they are not fusable.
 pub fn fuse(first: &StdKernel, second: &StdKernel) -> Option<StdKernel> {
@@ -558,7 +558,7 @@ fn fused_declaration(first: &StdKernel, second: &StdKernel, fused: &StdKernel) -
     Declared { input, output }
 }
 
-/// Fuse every adjacent fusable pair of a chain, left to right (15 f.6). The result computes
+/// Fuse every adjacent fusable pair of a chain, left to right (MH 4.9). The result computes
 /// exactly what the chain computes, in fewer stages.
 pub fn fuse_chain(chain: Vec<StdKernel>) -> Vec<StdKernel> {
     let mut out: Vec<StdKernel> = Vec::with_capacity(chain.len());

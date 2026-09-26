@@ -113,9 +113,9 @@ pub trait Kernel: Send + Sync + 'static {
     fn hints(&self) -> KernelHints {
         KernelHints::default()
     }
-    /// The kernel's declared input and output schemas (MH 4.9, 05 e.5). Optional: the default
+    /// The kernel's declared input and output schemas (MH 4.9). Optional: the default
     /// declares nothing, which leaves the kernel runnable and not checkable. The runtime never
-    /// reads it on the library path; `moruna check` (15) does.
+    /// reads it on the library path; `moruna check` (MH 4.9) does.
     fn declared(&self) -> Declared {
         Declared::default()
     }

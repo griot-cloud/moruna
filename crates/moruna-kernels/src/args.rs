@@ -1,4 +1,4 @@
-//! Reading a standard kernel's arguments (15 e.6) and writing them canonically.
+//! Reading a standard kernel's arguments (MH 4.9) and writing them canonically.
 
 use moruna_kernel::arrow::datatypes::DataType;
 use moruna_kernel::declare::{TypeDecl, json_string, parse_type};
@@ -140,7 +140,7 @@ pub(crate) fn mapping<'a>(
     }
 }
 
-/// A type spelling that must be exact (15 e.1).
+/// A type spelling that must be exact (MH 4.9).
 pub(crate) fn exact_type(kernel: &str, value: &Value) -> Result<DataType> {
     let spelled = value
         .as_str()
@@ -156,7 +156,7 @@ pub(crate) fn exact_type(kernel: &str, value: &Value) -> Result<DataType> {
 }
 
 /// `value` as canonical JSON: object keys sorted by their UTF-8 bytes at every depth, no
-/// whitespace, numbers as `serde_json` writes them (15 e.6). Written here rather than left to
+/// whitespace, numbers as `serde_json` writes them (MH 4.9). Written here rather than left to
 /// `serde_json::to_string`, whose key order depends on a feature another crate in the build may
 /// switch on.
 pub fn canonical(value: &Value) -> String {

@@ -1,4 +1,4 @@
-//! `moruna check` and the standard kernels, as the module exposes them (15 d.1).
+//! `moruna check` and the standard kernels, as the module exposes them (MH 4.9).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::errors::{Attachments, to_py_err};
 use crate::kernel::PyKernelHandle;
 use crate::sources::type_name;
 
-/// A standard kernel (15 e.6): what `moruna.std.<name>(...)` returns and `moruna.run` takes.
+/// A standard kernel (MH 4.9): what `moruna.std.<name>(...)` returns and `moruna.run` takes.
 #[pyclass(frozen, module = "moruna._core", name = "StdKernel")]
 pub struct PyStdKernel {
     pub(crate) kernel: StdKernel,
@@ -33,7 +33,7 @@ impl PyStdKernel {
         moruna_kernels::args::canonical(self.kernel.args())
     }
 
-    /// The fingerprint as 64 lowercase hexadecimal characters (15 e.6).
+    /// The fingerprint as 64 lowercase hexadecimal characters (MH 4.9).
     #[getter]
     fn fingerprint(&self) -> String {
         self.kernel.fingerprint().to_hex()
@@ -57,7 +57,7 @@ pub fn std_kernel(py: Python<'_>, name: &str, args_json: &str) -> PyResult<PyStd
 }
 
 /// `_core.check_kernel(kernel, *, name, seed, profiles_dir)`: the harness of 15 over one
-/// kernel object; the JSON report of 15 e.3 plus its `summary`.
+/// kernel object; the JSON report of MH 4.9 plus its `summary`.
 #[pyfunction]
 #[pyo3(signature = (kernel, *, name = None, seed = 0, profiles_dir = None))]
 pub fn check_kernel(

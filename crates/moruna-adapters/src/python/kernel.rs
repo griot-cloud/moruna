@@ -94,11 +94,11 @@ pub struct PyKernelSpec {
     pub resume: ResumePolicy,
     /// Bytes one instance's state is expected to hold (RC f.3).
     pub state_bytes: Option<u64>,
-    /// `input_schema=` and `output_schema=` (05 e.5); part of the fingerprint.
+    /// `input_schema=` and `output_schema=` (MH 4.9); part of the fingerprint.
     pub declared: Declared,
-    /// `lockfile=`: the bytes of the author's lockfile, part of the fingerprint (15 e.7).
+    /// `lockfile=`: the bytes of the author's lockfile, part of the fingerprint (MH 4.9).
     pub lockfile: Option<Vec<u8>>,
-    /// The function the author wrote, when `callable` wraps it (a Polars kernel, 05 f.9): its
+    /// The function the author wrote, when `callable` wraps it (a Polars kernel, MH 4.9): its
     /// name and source are what the fingerprint takes.
     pub origin: Option<Py<PyAny>>,
 }

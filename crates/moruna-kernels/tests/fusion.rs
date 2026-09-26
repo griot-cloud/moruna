@@ -1,5 +1,5 @@
 //! CK-T7 fusion_is_invisible: a fused chain produces exactly what the unfused chain produces
-//! (15 f.6, CK-I7), in fewer stages.
+//! (MH 4.9, CK-I7), in fewer stages.
 
 #![allow(clippy::result_large_err)]
 

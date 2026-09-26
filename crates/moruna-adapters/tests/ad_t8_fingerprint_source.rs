@@ -98,7 +98,7 @@ fn ad_t8_fingerprint_without_source() {
     assert!(!kernel.stats().source_available);
 }
 
-/// 15 e.7: the declaration and the lockfile are part of the fingerprint, the module name is not,
+/// MH 4.9: the declaration and the lockfile are part of the fingerprint, the module name is not,
 /// and a wrapped function is fingerprinted as the function its author wrote.
 #[test]
 fn ad_t8_declaration_lockfile_origin_and_module() {

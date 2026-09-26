@@ -1,4 +1,4 @@
-//! The expression language of `moruna.std.filter` (15 e.6).
+//! The expression language of `moruna.std.filter` (MH 4.9).
 //!
 //! Small on purpose: comparisons of a column with a literal or with another column, `is_null`
 //! and `is_not_null`, and `and`, `or`, `not` and parentheses. Anything richer belongs in a

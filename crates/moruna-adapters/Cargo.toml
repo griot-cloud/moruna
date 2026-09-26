@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-arrow = { workspace = true, optional = true }
-# The Python kernel fingerprint is SHA-256 (MH 4.9, 15 e.7). E2: a table addition.
+# The Python kernel fingerprint is SHA-256 (MH 4.9). E2: a table addition.
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]

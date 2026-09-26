@@ -1,11 +1,11 @@
-"""``python -m moruna check``: is this a kernel, and what does it cost (SDD 15).
+"""``python -m moruna check``: is this a kernel, and what does it cost (MH 4.9).
 
 Loads a module or a file, finds its kernels (decorated functions, standard kernels, and plain
 functions whose annotated signature is Polars frame to Polars frame), runs each through the
 check harness of ``moruna-runtime`` on synthetic batches from its declared input schema, and
 reports: the verdict, the fingerprint, every refusal naming the column and the types, and the
 profile row it wrote for the first run to size from. Exit 0 when every kernel checked agrees
-with its declaration, 2 otherwise (15 e.5).
+with its declaration, 2 otherwise (MH 4.9).
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ EXIT_REFUSED = 2
 
 
 def _load(target: str) -> Any:
-    """Import ``target``: a path to a ``.py`` file, or a dotted module name (15 f.2)."""
+    """Import ``target``: a path to a ``.py`` file, or a dotted module name (MH 4.9)."""
     path = Path(target)
     if target.endswith(".py") or path.is_file():
         name = path.stem
@@ -46,7 +46,7 @@ def _load(target: str) -> Any:
 def kernels_of(module: Any, only: str | None = None) -> list[tuple[str, Any]]:
     """The module's kernels, in definition order: every ``KernelSpec``, every standard kernel,
     and every function defined in the module whose signature is a Polars frame to a frame,
-    which is wrapped as ``@moruna.kernel`` would wrap it (15 f.2)."""
+    which is wrapped as ``@moruna.kernel`` would wrap it (MH 4.9)."""
     from moruna import kernel  # noqa: PLC0415, the package imports this module
 
     found: list[tuple[str, Any]] = []
@@ -65,7 +65,7 @@ def kernels_of(module: Any, only: str | None = None) -> list[tuple[str, Any]]:
 
 
 def check_one(name: str, value: Any, seed: int, profiles_dir: str | None) -> dict[str, Any]:
-    """One kernel through the harness; the JSON report of 15 e.3 as a dict."""
+    """One kernel through the harness; the JSON report of MH 4.9 as a dict."""
     return json.loads(_core.check_kernel(value, name=name, seed=seed, profiles_dir=profiles_dir))
 
 
