@@ -378,7 +378,10 @@ fn memory_follows_the_machine() {
 fn cpus_follow_the_machine() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("rt_t10");
-    let machine = Machine::new(512 * MIB, 2.0);
+    // Room for six workers' morsels whatever the process's own footprint is (an instrumented
+    // coverage build holds a good deal more), so what bounds the workers here is the CPU limit
+    // and not RC-I7's memory bound.
+    let machine = Machine::new(1024 * MIB, 2.0);
     let ceiling = machine.ceiling();
     let kernel = Arc::new(Spinner::new(Duration::from_millis(20)));
     let applies = Arc::clone(&kernel.applies);
@@ -417,7 +420,12 @@ fn cpus_follow_the_machine() {
 
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     let (raised_at, lowered_at) = *marks.lock().unwrap_or_else(|e| e.into_inner());
-    let (raised_at, lowered_at) = (raised_at.expect("raised"), lowered_at.expect("lowered"));
+    let (Some(raised_at), Some(lowered_at)) = (raised_at, lowered_at) else {
+        panic!(
+            "the run ended before the raise took effect: {:?}, notes {:?}, timeline {:?}",
+            report.bottleneck_timeline, report.notes, report.limits_timeline
+        );
+    };
     let before = kernel
         .starts
         .lock()
