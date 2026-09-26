@@ -203,11 +203,21 @@ fn run_on(
     machine: &Machine,
     spec: RunSpec,
     script: impl FnOnce(&Script) + Send,
-) -> (RunReport, u64) {
+) -> (RunReport, u64, Vec<(Instant, u64)>) {
     let start_ns = epoch_ns();
+    // When the watcher published each change: a test that asserts on what follows a change
+    // measures from here, not from when the script asked, so a slow tick on a loaded host is not
+    // mistaken for a runtime that did not follow.
+    let changes = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&changes);
     let components = Components {
         discovered: Some(machine.discovered.clone()),
         limits_source: Some(Arc::new(machine.source.clone())),
+        limits_subscribers: vec![Box::new(move |change| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((Instant::now(), change.at_ns));
+        })],
         ..Components::default()
     };
     let done = Arc::new(AtomicBool::new(false));
@@ -223,7 +233,11 @@ fn run_on(
         done.store(true, Ordering::SeqCst);
         driver.join().expect("the script thread");
         match outcome {
-            Ok(report) => (report, start_ns),
+            Ok(report) => (
+                report,
+                start_ns,
+                changes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            ),
             Err(error) => panic!(
                 "the run did not complete: {error}; notes: {:?}",
                 error.shutdown_notes
@@ -287,7 +301,7 @@ fn memory_follows_the_machine() {
     };
     spec.trace_path = Some(scratch.path().join("trace.arrow"));
 
-    let (report, start_ns) = run_on(&machine, spec, move |script| {
+    let (report, _, changes) = run_on(&machine, spec, move |script| {
         if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
             return;
         }
@@ -331,9 +345,10 @@ fn memory_follows_the_machine() {
         .expect("the drain completed before the run ended");
 
     // Once the drain was complete the process was back under the lowered ceiling: every record
-    // that started after it. The test's start is at or before the run's, so a margin covers the
-    // difference.
-    let after_drain_ns = start_ns + (drain.at_ms + drain_ms + 50) * 1_000_000;
+    // that started after it. The run's own start is recovered from the first change, whose
+    // time the watcher reported and whose offset the report carries (to the millisecond).
+    let run_start_ns = changes[0].1 - report.limits_timeline[0].0 * 1_000_000 - 1_000_000;
+    let after_drain_ns = run_start_ns + (drain.at_ms + drain_ms + 5) * 1_000_000;
     let records = read_trace(&scratch.path().join("trace.arrow"));
     let late: Vec<_> = records
         .iter()
@@ -376,7 +391,7 @@ fn cpus_follow_the_machine() {
 
     let marks = Arc::new(Mutex::new((None::<Instant>, None::<Instant>)));
     let marked = Arc::clone(&marks);
-    let (report, _) = run_on(&machine, spec, move |script| {
+    let (report, _, changes) = run_on(&machine, spec, move |script| {
         if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
             return;
         }
@@ -430,7 +445,9 @@ fn cpus_follow_the_machine() {
         "H4: with six CPUs, more than the starting two ran at once and no more than six: {during}"
     );
     // One tick to see the change and one pick for a worker to park, then at most one runs.
-    let settled = lowered_at + Duration::from_millis(600);
+    // The workers above the limit park at their next pick after the watcher published it.
+    assert_eq!(changes.len(), 2, "raised and lowered");
+    let settled = changes[1].0 + Duration::from_millis(200);
     assert!(
         kernel.max_concurrent_after(settled) <= 1,
         "the workers above the lowered limit were parked"
@@ -461,7 +478,7 @@ fn an_inelastic_run_is_as_before() {
     let applies = Arc::clone(&kernel.applies);
     let spec = spec(&scratch, kernel.clone(), 200);
 
-    let (report, _) = run_on(&machine, spec, move |script| {
+    let (report, _, _) = run_on(&machine, spec, move |script| {
         if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 10) {
             return;
         }
@@ -504,14 +521,11 @@ fn an_inelastic_run_is_followed_down() {
     let kernel = Arc::new(Spinner::new(Duration::from_millis(10)));
     let applies = Arc::clone(&kernel.applies);
     let spec = spec(&scratch, kernel.clone(), 140);
-    let lowered_at = Arc::new(Mutex::new(None::<Instant>));
-    let lowered = Arc::clone(&lowered_at);
-    let (report, _) = run_on(&machine, spec, move |script| {
+    let (report, _, changes) = run_on(&machine, spec, move |script| {
         if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
             return;
         }
         script.set(reading(lower, 1.0));
-        *lowered.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     });
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     assert_eq!(
@@ -521,11 +535,7 @@ fn an_inelastic_run_is_followed_down() {
         report.limits_timeline
     );
     assert!(report.limits_timeline[0].1.memory_ceiling < start);
-    let lowered_at = lowered_at
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .expect("lowered");
-    assert!(kernel.max_concurrent_after(lowered_at + Duration::from_millis(600)) <= 1);
+    assert!(kernel.max_concurrent_after(changes[0].0 + Duration::from_millis(200)) <= 1);
 }
 
 /// The inelastic default with the host's own files: nothing is injected but the discovery
