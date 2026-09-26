@@ -234,7 +234,7 @@ fn finish(shared: &Shared) {
     };
     match summary {
         Ok(summary) => {
-            let next_seq = crate::source_drive::cursor(shared).next_seq;
+            let next_seq = crate::source_drive::cursor(shared).0.next_seq;
             if next_seq > 0 {
                 publish(shared, next_seq - 1);
             }

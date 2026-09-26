@@ -13,14 +13,21 @@ moruna-kernel = { workspace = true }
 # The backends a URL may name (06 d.1 ObjectStoreConfig, d.2).
 object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 # `time` for the uring submission batching and the copy-event poll (06 f.1, f.5).
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "net"] }
 tracing = { workspace = true }
 libc = { workspace = true }
 bytes = { workspace = true }
 cudarc = { workspace = true, optional = true }
+# `unix://` and `vsock://` object-store endpoints (MH 4.6): HTTP/1.1 over the socket.
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true, optional = true }
+# A `vsock://` endpoint's connection, made without `unsafe` (MH 4.6).
+socket2 = { workspace = true, features = ["all"] }
 
 [dev-dependencies]
 moruna-testkit = { workspace = true }

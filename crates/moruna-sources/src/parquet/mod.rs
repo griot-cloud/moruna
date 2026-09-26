@@ -92,8 +92,36 @@ impl ParquetSource {
         reactor: Arc<dyn Reactor>,
         meta: Arc<dyn ObjectMetadata>,
     ) -> Result<ParquetSource> {
+        ParquetSource::build(cfg, reactor, meta, None)
+    }
+
+    /// [`ParquetSource::new`], able to read objects as well as local files: an `s3://`, `gs://`
+    /// or `az://` URL's footer is read through `read_object` into a buffer from `alloc` at
+    /// plan time, and each split's column chunks through `read_object` at read time (e.1, f.3;
+    /// MH 4.6). `alloc` is used during construction only; reads allocate from the allocator
+    /// `read` is given, as every read does (SO-I3).
+    pub fn with_allocator(
+        cfg: ParquetSourceConfig,
+        reactor: Arc<dyn Reactor>,
+        meta: Arc<dyn ObjectMetadata>,
+        alloc: Arc<dyn Allocator>,
+    ) -> Result<ParquetSource> {
+        ParquetSource::build(cfg, reactor, meta, Some(alloc))
+    }
+
+    fn build(
+        cfg: ParquetSourceConfig,
+        reactor: Arc<dyn Reactor>,
+        meta: Arc<dyn ObjectMetadata>,
+        alloc: Option<Arc<dyn Allocator>>,
+    ) -> Result<ParquetSource> {
         let counters = Counters::default();
-        let files = plan::files(&cfg, &meta, &counters)?;
+        let files = plan::files(
+            &cfg,
+            &meta,
+            &counters,
+            alloc.as_ref().map(|alloc| (&reactor, alloc)),
+        )?;
         let (entries, splits, skipped) = plan::splits(&cfg, &files, &counters)?;
         let schema = plan::schema(&files)?;
         Counters::add(&counters.splits, splits.len() as u64);

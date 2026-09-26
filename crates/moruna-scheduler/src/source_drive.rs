@@ -68,7 +68,8 @@ fn target_stage(shared: &Shared) -> moruna_kernel::StageId {
 }
 
 /// The next range to issue, and the cursor advanced past it (f.5). `None` when the plan is
-/// exhausted.
+/// exhausted. The range is recorded as issued under the same lock that advances the cursor, so
+/// a checkpoint never sees the cursor past a read it cannot find (MH 4.7).
 fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRange, Seq, bool)> {
     let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
     loop {
@@ -97,8 +98,28 @@ fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRan
             cursor.split_index += 1;
             cursor.row_offset = 0;
         }
+        let origin = Origin {
+            split: split.id,
+            row_start: start,
+            row_end: end,
+            node: shared.cfg.node,
+        };
+        cursor.issued.insert(seq, origin);
         return Some((index, RowRange { start, end }, seq, whole));
     }
+}
+
+/// A read recorded by `take_next_range` (or by a resume's recompute list) has reached Q0, so
+/// the lineage holds it from here on and the manifest no longer needs to name it as issued.
+/// Called after the push, never before: between the two the morsel may be named twice, which
+/// `restore` resolves, and never zero times.
+fn pushed(shared: &Shared, seq: Seq) {
+    shared
+        .cursor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .issued
+        .remove(&seq);
 }
 
 /// Rows that hold about `target` bytes, never fewer than one: a single row larger than the
@@ -286,10 +307,14 @@ fn poll_inflight(
                                 shared.placement.push(0, morsel)
                             }
                         };
-                        if let Err(e) = outcome
-                            && !matches!(e, MorunaError::Cancelled)
-                        {
-                            crate::policy::terminate(shared, e);
+                        match outcome {
+                            Ok(()) => {
+                                if entry.kind != ReadKind::Replacement {
+                                    pushed(shared, entry.seq);
+                                }
+                            }
+                            Err(MorunaError::Cancelled) => {}
+                            Err(e) => crate::policy::terminate(shared, e),
                         }
                     }
                     Err(e) => {
@@ -372,9 +397,15 @@ fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: 
     let result = block_on(&mut future, parker, cx);
     shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
     let answer = match result {
-        Ok(payload) => shared
-            .placement
-            .push(0, Morsel::new(seq, 0, payload, origin)),
+        Ok(payload) => {
+            let pushed_ok = shared
+                .placement
+                .push(0, Morsel::new(seq, 0, payload, origin));
+            if pushed_ok.is_ok() {
+                pushed(shared, seq);
+            }
+            pushed_ok
+        }
         Err(e) => Err(source_diagnostic(e, split.id, rows)),
     };
     let _ = reply.send(answer);
@@ -443,6 +474,7 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
                     crate::policy::terminate(shared, e);
                     return;
                 }
+                pushed(shared, seq);
                 shared.recomputed.fetch_add(1, Ordering::SeqCst);
             }
             Err(e) => {
@@ -463,20 +495,34 @@ fn block_on<T>(future: &mut BoxFuture<'_, T>, parker: &Parker, cx: &mut Context<
     }
 }
 
-/// f.13: the cursor a resumed run starts from, and the sequence counter that goes with it.
-pub(crate) fn set_cursor(shared: &Shared, cursor: moruna_kernel::SourceCursor) {
+/// f.13: the cursor a resumed run starts from, and the sequence counter that goes with it. The
+/// morsels the resume will re-read first are recorded as issued, so a manifest written while
+/// the recompute pass is still reading them names them rather than losing them.
+pub(crate) fn set_cursor(
+    shared: &Shared,
+    cursor: moruna_kernel::SourceCursor,
+    recompute: &[(Seq, Origin)],
+) {
     let mut slot = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
     slot.split_index = cursor.split_index;
     slot.row_offset = cursor.row_offset;
     slot.next_seq = cursor.next_seq;
+    slot.issued = recompute.iter().cloned().collect();
 }
 
-/// The cursor as f.12 records it: the next range to issue, never the last completed one.
-pub(crate) fn cursor(shared: &Shared) -> moruna_kernel::SourceCursor {
+/// The cursor as f.12 records it, the next range to issue, never the last completed one; and,
+/// in the same snapshot, every read issued behind it that has not reached Q0 (MH 4.7).
+pub(crate) fn cursor(shared: &Shared) -> (moruna_kernel::SourceCursor, Vec<(Seq, Origin)>) {
     let slot = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
-    moruna_kernel::SourceCursor {
-        split_index: slot.split_index,
-        row_offset: slot.row_offset,
-        next_seq: slot.next_seq,
-    }
+    (
+        moruna_kernel::SourceCursor {
+            split_index: slot.split_index,
+            row_offset: slot.row_offset,
+            next_seq: slot.next_seq,
+        },
+        slot.issued
+            .iter()
+            .map(|(seq, origin)| (*seq, origin.clone()))
+            .collect(),
+    )
 }

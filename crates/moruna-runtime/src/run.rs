@@ -111,6 +111,7 @@ fn drive(
         trace_path,
         staging_dir: explicit_staging_dir,
         staging_limit,
+        staging_durable,
         error_policy,
         ordered,
         sizer,
@@ -122,9 +123,12 @@ fn drive(
         checkpoint_interval_ms,
         checkpoint_keep,
         resume,
+        resume_auto,
         notes: spec_notes,
         spec_digest,
     } = spec;
+    let checkpoint_handle = components.checkpoint.clone();
+    let _detach = crate::checkpoint::DetachOnDrop(checkpoint_handle.clone());
     let observer = components.observer.clone();
 
     // f.4: the GIL refusal comes before any Rust component starts (PY-I4).
@@ -142,7 +146,46 @@ fn drive(
 
     let mut notes: Vec<String> = Vec::new();
 
-    // f.7: the manifest header first, so the new process continues the old run's identity.
+    // MH 4.7: `staging.durable` is `durable_staging=present` spelled where a host thinks of it.
+    // It goes in through the profile override, so discovery's own refusal of an ephemeral
+    // staging directory declared durable still applies (03 e.4).
+    let host_profile = durable_profile(host_profile, staging_durable)?;
+
+    // 1. Discover.
+    let discovered = match components.discovered {
+        Some(discovered) => discovered,
+        None => moruna_discovery::discover(&DiscoveryInput {
+            explicit_budget: budget,
+            explicit_cpu: cpu,
+            explicit_staging_dir: explicit_staging_dir.clone(),
+            explicit_spill_limit: staging_limit,
+            profile_override: host_profile,
+        })?,
+    };
+
+    // f.7: the manifest header before anything takes the run id, so the new process continues
+    // the old run's identity. `resume_auto` looks for one here (MH 4.7), after discovery,
+    // because the staging directory it looks in is discovery's answer.
+    let resume = match (resume, resume_auto) {
+        (Some(path), _) => Some(path),
+        (None, false) => None,
+        (None, true) => {
+            let found = auto_manifest(
+                discovered.profile.staging_dir.as_deref(),
+                &kernels,
+                &source_spec,
+                spec_digest.as_deref(),
+            )?;
+            match &found {
+                Some(path) => notes.push(format!("resume auto: resuming {}", path.display())),
+                None => notes.push(
+                    "resume auto: no manifest of this job in the staging directory; a fresh run"
+                        .to_string(),
+                ),
+            }
+            found
+        }
+    };
     let header = match &resume {
         Some(path) => Some(PlacementEngine::read_manifest_header(path)?),
         None => None,
@@ -160,18 +203,6 @@ fn drive(
     let node = match &header {
         Some(header) => header.node,
         None => moruna_kernel::LOCAL_NODE,
-    };
-
-    // 1. Discover.
-    let discovered = match components.discovered {
-        Some(discovered) => discovered,
-        None => moruna_discovery::discover(&DiscoveryInput {
-            explicit_budget: budget,
-            explicit_cpu: cpu,
-            explicit_staging_dir: explicit_staging_dir.clone(),
-            explicit_spill_limit: staging_limit,
-            profile_override: host_profile,
-        })?,
     };
     notes.extend(discovered.notes.iter().cloned());
     notes.extend(spec_notes);
@@ -447,6 +478,9 @@ fn drive(
         sampler.clone(),
     )?);
     started.scheduler = Some(scheduler.clone());
+    if let Some(handle) = &checkpoint_handle {
+        handle.attach(&scheduler);
+    }
 
     // 9. Instances: eagerly, before the baseline is sampled.
     match resume_point {
@@ -587,6 +621,63 @@ fn drive(
             .with_report(Some(computed))
             .with_manifest(manifest)),
     }
+}
+
+/// `staging.durable` as the profile override discovery is handed (MH 4.7, 03 d.1). A caller's
+/// profile that already declares `durable_staging` must agree with it.
+fn durable_profile(
+    profile: Option<moruna_kernel::HostProfile>,
+    durable: bool,
+) -> Result<Option<moruna_kernel::HostProfile>> {
+    use moruna_kernel::Guarantee;
+    if !durable {
+        return Ok(profile);
+    }
+    let mut profile = profile.unwrap_or_default();
+    match profile.durable_staging {
+        Guarantee::Unknown | Guarantee::Present => {}
+        Guarantee::Absent | Guarantee::Probed(_) => {
+            return Err(RunError::bare(MorunaError::Config {
+                name: "staging.durable",
+                msg: format!(
+                    "staging.durable is set and host_profile.durable_staging is {:?}; the two \
+                     must agree",
+                    profile.durable_staging
+                ),
+            }));
+        }
+    }
+    profile.durable_staging = Guarantee::Present;
+    Ok(Some(profile))
+}
+
+/// `resume = "auto"` (MH 4.7): the newest manifest in the staging directory that this run could
+/// resume, judged by the kernels, the job document's digest when the run has one, and, when
+/// the source is already built, the plan. A source
+/// still to be built cannot be asked for its plan before the run id exists (PY-I1 builds it
+/// after the trace), so for one the plan is left to `restore`, which refuses a mismatch by
+/// name. No staging directory is no manifest.
+fn auto_manifest(
+    staging_dir: Option<&std::path::Path>,
+    kernels: &[Arc<dyn Kernel>],
+    source: &crate::spec::SourceSpec,
+    spec_digest: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let Some(dir) = staging_dir else {
+        return Ok(None);
+    };
+    let fingerprints: Vec<moruna_kernel::Fingerprint> =
+        kernels.iter().map(|k| k.fingerprint()).collect();
+    let plan_digest = match source {
+        crate::spec::SourceSpec::Built(source) => Some(plan_digest(&source.plan()?)),
+        crate::spec::SourceSpec::Build(_) => None,
+    };
+    let want = moruna_placement::manifest::ManifestMatch {
+        fingerprints: &fingerprints,
+        plan_digest,
+        spec_digest,
+    };
+    Ok(PlacementEngine::find_resumable_manifest(dir, &want)?)
 }
 
 /// Detaches an observer when the run's lifecycle function returns, by any path.
@@ -874,6 +965,77 @@ fn summarise(plan: &[moruna_kernel::Split]) -> PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MH 4.7: `staging.durable` declares `durable_staging=present`, over a profile or none,
+    /// and refuses a profile that says otherwise.
+    #[test]
+    fn staging_durable_is_a_declared_profile() {
+        use moruna_kernel::{Guarantee, HostProfile};
+        assert!(durable_profile(None, false).expect("off").is_none());
+        let kept = durable_profile(
+            Some(HostProfile {
+                memlock: Guarantee::Absent,
+                ..HostProfile::default()
+            }),
+            false,
+        )
+        .expect("off")
+        .expect("the caller's profile");
+        assert_eq!(kept.durable_staging, Guarantee::Unknown);
+        let made = durable_profile(None, true).expect("on").expect("a profile");
+        assert_eq!(made.durable_staging, Guarantee::Present);
+        let merged = durable_profile(
+            Some(HostProfile {
+                memlock: Guarantee::Absent,
+                durable_staging: Guarantee::Present,
+                ..HostProfile::default()
+            }),
+            true,
+        )
+        .expect("agrees")
+        .expect("a profile");
+        assert_eq!(merged.memlock, Guarantee::Absent, "the rest of it is kept");
+        assert_eq!(merged.durable_staging, Guarantee::Present);
+        let refused = durable_profile(
+            Some(HostProfile {
+                durable_staging: Guarantee::Absent,
+                ..HostProfile::default()
+            }),
+            true,
+        );
+        match refused {
+            Err(error) => assert!(error.to_string().contains("staging.durable"), "{error}"),
+            Ok(_) => panic!("a profile declaring the staging not durable is refused"),
+        }
+    }
+
+    /// MH 4.7: with no staging directory, or none that holds a manifest of this job, `resume
+    /// auto` finds nothing; a built source's plan is read to compare digests.
+    #[test]
+    fn resume_auto_finds_nothing_where_there_is_nothing() {
+        use moruna_testkit::FakeSource;
+        let built = crate::spec::SourceSpec::Built(
+            Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>
+        );
+        assert_eq!(
+            auto_manifest(None, &[], &built, None).expect("no dir"),
+            None
+        );
+        let dir = std::env::temp_dir().join(format!("moruna-auto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(
+            auto_manifest(Some(&dir), &[], &built, None).expect("empty"),
+            None
+        );
+        let later = crate::spec::SourceSpec::Build(Box::new(|_| {
+            Ok(Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>)
+        }));
+        assert_eq!(
+            auto_manifest(Some(&dir), &[], &later, None).expect("empty"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `workers.max` follows the discovered quota, rounded up, and is never zero.
     #[test]

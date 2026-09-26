@@ -492,6 +492,15 @@ fn build_refusals() {
         Err(MorunaError::Resume(_))
     ));
     assert_eq!(build::resume_shape(&job), Some(translate::ResumeArg::Auto));
+    // With a staging directory, "auto" is left to the facade, which picks this job's newest
+    // manifest after discovery or starts fresh (MH 4.7).
+    let staging = std::env::temp_dir().join(format!("moruna-job-auto-{}", std::process::id()));
+    std::fs::create_dir_all(&staging).expect("staging");
+    job.staging.dir = Some(staging.display().to_string());
+    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("auto builds");
+    assert!(built.spec.resume_auto);
+    assert!(built.spec.resume.is_none());
+    let _ = std::fs::remove_dir_all(&staging);
 }
 
 /// Every sink kind builds, and the sink sizes are clamped with the library's notes.

@@ -145,6 +145,11 @@ pub(crate) struct Cursor {
     pub(crate) split_index: u32,
     pub(crate) row_offset: u64,
     pub(crate) next_seq: Seq,
+    /// Reads taken from the cursor (or from a resume's recompute list) and not yet pushed to
+    /// Q0, by sequence number. Kept under the cursor's own lock so a checkpoint sees the cursor
+    /// and what lies behind it in one snapshot (f.12, MH 4.7): a read in flight is in neither
+    /// the manifest's lineage nor the cursor's future, and this is where the manifest finds it.
+    pub(crate) issued: std::collections::BTreeMap<Seq, moruna_kernel::Origin>,
 }
 
 /// The two drive threads are idle until `run` starts them driving (f.1).
@@ -268,9 +273,6 @@ pub(crate) struct Shared {
 
     pub(crate) checkpoint_on: AtomicBool,
     pub(crate) checkpoint_stop: AtomicBool,
-    /// Set by `Scheduler::request_checkpoint`: the checkpoint thread writes a manifest at once
-    /// rather than at the end of its interval (MH 4.3 `checkpoint`).
-    pub(crate) checkpoint_request: AtomicBool,
     pub(crate) checkpoint_handle: Mutex<Option<JoinHandle<()>>>,
 
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
@@ -283,6 +285,11 @@ pub(crate) struct Shared {
     pub(crate) errors_total: AtomicU32,
     pub(crate) checkpoints: AtomicU64,
     pub(crate) last_checkpoint_us: AtomicU64,
+    /// On-demand manifests (MH 4.3 `checkpoint`, 4.7): each request takes the next number, and
+    /// the checkpoint thread records the highest number a manifest it wrote was started after.
+    /// A requester whose number is served knows a manifest newer than its request is on disk.
+    pub(crate) checkpoint_requested: AtomicU64,
+    pub(crate) checkpoint_served: AtomicU64,
     pub(crate) resumed: AtomicBool,
     pub(crate) recomputed: AtomicU64,
     pub(crate) shutdown_done: AtomicBool,
@@ -445,6 +452,7 @@ impl Shared {
                 split_index: 0,
                 row_offset: 0,
                 next_seq: 0,
+                issued: std::collections::BTreeMap::new(),
             }),
             to_recompute: Mutex::new(Vec::new()),
             committed: Mutex::new(Watermark::default()),
@@ -465,7 +473,6 @@ impl Shared {
             sink_unparker: Mutex::new(None),
             checkpoint_on: AtomicBool::new(checkpoint_enabled),
             checkpoint_stop: AtomicBool::new(false),
-            checkpoint_request: AtomicBool::new(false),
             checkpoint_handle: Mutex::new(None),
             record_hook: RwLock::new(None),
             stats_cache: Mutex::new(StatsCache {
@@ -480,6 +487,8 @@ impl Shared {
             errors_total: AtomicU32::new(0),
             checkpoints: AtomicU64::new(0),
             last_checkpoint_us: AtomicU64::new(0),
+            checkpoint_requested: AtomicU64::new(0),
+            checkpoint_served: AtomicU64::new(0),
             resumed: AtomicBool::new(false),
             recomputed: AtomicU64::new(0),
             shutdown_done: AtomicBool::new(false),
