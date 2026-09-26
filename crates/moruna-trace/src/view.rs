@@ -75,6 +75,12 @@ impl TraceView {
         self.late_records
     }
 
+    /// Every limits change the trace was told of, in the order it was told. The run
+    /// report's `limits_timeline` is computed from these.
+    pub fn limits_changes(&self) -> Vec<moruna_kernel::LimitsChanged> {
+        crate::lock(&self.shared.limits_changes).clone()
+    }
+
     /// Every chunk of the trace, oldest first. Reads the overflow file (or the final file)
     /// lazily, one message at a time, so a trace larger than memory is still readable.
     pub fn batches(&self) -> Batches {

@@ -408,8 +408,7 @@ pub struct BudgetDoc {
     /// CPUs, in cores; absent: discovered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<f64>,
-    /// How far the budget may follow the machine (MH 4.4). Read and validated here; the
-    /// elasticity itself is F8.2's.
+    /// How far the budget may follow the machine (MH 4.4); `RunSpec::elastic`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elastic: Option<ElasticDoc>,
 }

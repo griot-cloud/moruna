@@ -20,7 +20,9 @@ pub mod report;
 pub mod view;
 pub mod writer;
 
-pub use report::{DeviceSummary, ExitReason, LimitsSummary, RunMeta, RunReport, StageReport};
+pub use report::{
+    DeviceSummary, DrainSummary, ExitReason, LimitsSummary, RunMeta, RunReport, StageReport,
+};
 pub use view::TraceView;
 pub use writer::{TraceConfig, TraceWriter};
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::ids::{Seq, StageId};
+use crate::limits::Limits;
 
 /// What happened to a morsel at a stage.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -183,6 +184,47 @@ impl TraceRecord {
     }
 }
 
+/// Which of the limits moved. A change smaller than one huge page of memory and one
+/// CPU is not a change and never produces one of these.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum LimitsChangeReason {
+    /// The memory ceiling or the kill line moved.
+    Memory,
+    /// The CPU quota moved.
+    Cpu,
+    /// Both moved in the same reading.
+    MemoryAndCpu,
+}
+
+impl LimitsChangeReason {
+    /// The name the host protocol and the report use: `"memory"`, `"cpu"` or `"memory,cpu"`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            LimitsChangeReason::Memory => "memory",
+            LimitsChangeReason::Cpu => "cpu",
+            LimitsChangeReason::MemoryAndCpu => "memory,cpu",
+        }
+    }
+}
+
+/// A change of the machine's limits while the run is in progress.
+///
+/// It is not a `TraceRecord`: a record is one row per morsel per stage under a pinned schema
+/// (CT-I8, e.5), and a limits change belongs to no morsel. It travels beside the records through
+/// the same `TraceSink`, and the run report reads the timeline back from the trace, so the report
+/// stays a function of the trace, the limits and the meta (TR-I3).
+#[derive(Clone, Debug)]
+pub struct LimitsChanged {
+    /// When the watcher saw the change, nanoseconds since the Unix epoch.
+    pub at_ns: u64,
+    /// The limits in force before the change.
+    pub old: Limits,
+    /// The limits in force from now on.
+    pub new: Limits,
+    /// What moved.
+    pub reason: LimitsChangeReason,
+}
+
 /// Where a trace record goes (component 4, write side).
 pub trait TraceSink: Send + Sync {
     /// Bounded, non-blocking beyond a channel push; drops nothing (backpressure is on the
@@ -190,6 +232,13 @@ pub trait TraceSink: Send + Sync {
     fn record(&self, r: TraceRecord);
     /// Push everything buffered to its destination.
     fn flush(&self) -> crate::Result<()>;
+    /// A change of the limits. Called by the facade's watcher, never by a worker, and
+    /// rarely: once per change the watcher accepts. Default: nothing, so a sink that keeps no
+    /// timeline (a fake, a test double) is still a valid sink; the trace writer keeps them for
+    /// the run report's `limits_timeline`.
+    fn limits_changed(&self, change: LimitsChanged) {
+        let _ = change;
+    }
 }
 
 /// Read-side of the trace for the controller; implemented by the trace writer.

@@ -60,8 +60,8 @@ fn anon_workers(state: &ControllerState) -> u16 {
     match model::anon_for_kernels(state).checked_div(max_anon_allowance) {
         Some(allowed) => u16::try_from(allowed)
             .unwrap_or(u16::MAX)
-            .clamp(1, state.cfg.workers_max.max(1)),
-        None => state.cfg.workers_max.max(1),
+            .clamp(1, crate::elastic::workers_bound(state)),
+        None => crate::elastic::workers_bound(state),
     }
 }
 
@@ -89,6 +89,11 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     let Some(at) = state.stages.iter().position(|s| s.stage == r.stage) else {
         return;
     };
+    // A record whose `apply` started before the limits or the arena last moved was measured
+    // against a line that no longer holds; it says nothing about the run as it is now.
+    if crate::elastic::stale(state, r.t_start_ns) {
+        return;
+    }
     let host_breach = r.mem_anon_peak > state.breach_line();
     let device_budget = state.budgets.device[0];
     let device_breach = device_budget > 0 && r.dev_mem_peak > device_budget;
@@ -148,6 +153,13 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     }
 
     if !at_floor {
+        return;
+    }
+    // While the arena drains after the machine shrank, the process can be over the
+    // lowered ceiling by the regions still resident. That is the accepted cost of an eventual
+    // shrink, not a kernel that does not fit, so the run sheds (above) and is not terminated for
+    // it; once the drain is complete the ordinary rule applies again.
+    if state.arena_draining > 0 {
         return;
     }
     let floor_breaches = state.stages[at].floor_breaches;

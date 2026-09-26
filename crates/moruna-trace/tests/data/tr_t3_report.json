@@ -4,7 +4,7 @@
   "resumed": false,
   "manifest": null,
   "wall_s": 10.0,
-  "limits": {
+  "limits_initial": {
     "memory_ceiling": 8589934592,
     "memory_kill": 10737418240,
     "cpu_quota": 8.0,
@@ -18,6 +18,8 @@
       }
     ]
   },
+  "limits_timeline": [],
+  "drains": [],
   "io_paths": {
     "direct_io": true,
     "io_uring": false,
@@ -27,6 +29,7 @@
   },
   "peak_anon_bytes": 9100,
   "peak_fraction_of_ceiling": 1.0593794286251068e-6,
+  "peak_ceiling_bytes": 8589934592,
   "worker_busy_fraction": 0.29,
   "cpu_throttled_fraction": 0.025,
   "source_bytes_per_s": 1500.0,

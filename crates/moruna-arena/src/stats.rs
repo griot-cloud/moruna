@@ -25,6 +25,15 @@ pub struct ArenaStats {
     /// True when the host region is page-locked, so the run's host tier is `PinnedHost`
     /// (AR-I6).
     pub pinned: bool,
+    /// Host regions mapped now: one for a run whose budget never moved, more after a `grow`
+    ///.
+    pub host_regions: u32,
+    /// Host bytes in draining regions not yet unmapped.
+    pub draining_bytes: u64,
+    /// Regions a shrink retired over the run, and the bytes they gave back.
+    pub retired_regions: u64,
+    /// The bytes those retired regions held.
+    pub retired_bytes: u64,
 }
 
 impl Inner {
@@ -32,7 +41,7 @@ impl Inner {
     /// `boundary_copies_total` are the copy counters other components own; the arena has no
     /// interface through which they can be raised and therefore always reports zero.
     pub(crate) fn alloc_stats(&self) -> AllocStats {
-        let host = self.host.space.in_use();
+        let host: u64 = self.read_host().iter().map(|r| r.space.in_use()).sum();
         let mut device_in_use = [0u64; 8];
         for region in &self.devices {
             device_in_use[region.index] = region.space.in_use();
@@ -51,21 +60,44 @@ impl Inner {
         }
     }
 
-    /// The arena's own figures (section j); the slab, stranding and largest-free columns
-    /// are the host region's, which is the region the report is about.
+    /// The arena's own figures (section j); the slab, stranding and largest-free columns are the
+    /// host regions', summed (largest-free is the largest of any region still serving), which is
+    /// the memory the report is about.
     pub(crate) fn arena_stats(&self) -> ArenaStats {
-        let mut double_release = self.host.space.double_releases()
-            + self.foreign.load(std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let host = self.read_host();
+        let mut double_release =
+            self.foreign.load(Relaxed) + self.retired_double_release.load(Relaxed);
+        let mut slabs_by_class = [0u32; CLASS_COUNT];
+        let mut largest_free = 0u64;
+        let mut stranded_bytes = 0u64;
+        let mut draining_bytes = 0u64;
+        for region in host.iter() {
+            double_release += region.space.double_releases();
+            for (total, count) in slabs_by_class.iter_mut().zip(region.space.slabs_by_class()) {
+                *total = total.saturating_add(count);
+            }
+            stranded_bytes += region.space.stranded_bytes();
+            if region.draining.load(std::sync::atomic::Ordering::SeqCst) {
+                draining_bytes += region.space.bytes();
+            } else {
+                largest_free = largest_free.max(region.space.largest_free());
+            }
+        }
         for region in &self.devices {
             double_release += region.space.double_releases();
         }
         ArenaStats {
-            slabs_by_class: self.host.space.slabs_by_class(),
-            largest_free: self.host.space.largest_free(),
-            stranded_bytes: self.host.space.stranded_bytes(),
+            slabs_by_class,
+            largest_free,
+            stranded_bytes,
             double_release,
             huge_pages_active: self.huge_pages_active,
             pinned: self.pinned,
+            host_regions: u32::try_from(host.len()).unwrap_or(u32::MAX),
+            draining_bytes,
+            retired_regions: self.retired_regions.load(Relaxed),
+            retired_bytes: self.retired_bytes.load(Relaxed),
         }
     }
 }

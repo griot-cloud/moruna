@@ -335,11 +335,10 @@ fn ho_t9_build_translates_every_field() {
     assert!(spec.resume.is_none());
     assert_eq!(
         spec.notes,
-        vec![
-            "clamped checkpoint.interval_ms from 100 to 500".to_string(),
-            "budget.elastic is recorded; this build sizes the run once, at start".to_string(),
-        ]
+        vec!["clamped checkpoint.interval_ms from 100 to 500".to_string()]
     );
+    assert_eq!(spec.elastic.memory_max_bytes, Some(34_359_738_368));
+    assert_eq!(spec.elastic.cpu_max, Some(32));
     assert_eq!(built.discovery.explicit_budget, Some(1 << 30));
 
     // A declared profile carries its keys; one that disagrees with `durable` is refused.

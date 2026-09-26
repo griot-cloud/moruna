@@ -12,7 +12,7 @@ use moruna_kernel::{MorunaError, Outcome, StageId, TraceRecord};
 use crate::{
     Actions, ControllerState, Inner, PROFILE_WRITE_AFTER, Phase, RecordSummary,
     SAMPLER_STALL_TICKS, SizerOutcome, TICK_LOCK_BOUND, WINDOW, apply, breach, classify, device,
-    model, profile,
+    elastic, model, profile,
 };
 
 /// The exponential weight of one record on the shadow sizer's peak ratio (f.8).
@@ -109,6 +109,11 @@ pub(crate) fn tick(ctl: &Inner) {
                 ctl_stage.instances_live = stage_stats.instances_live;
             }
         }
+
+        // The limits of this moment, before anything is decided against them. The ceiling
+        // the classifier reads below is the one the sample carried, not the one the run began
+        // with.
+        elastic::follow_sample(&mut state, &sample, &mut actions);
 
         state.last_state_total = state.state_total;
         model::recompute_state(&mut state);
@@ -213,6 +218,9 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
     // The state term is funded before the fit, so the fit is of what is left above it (f.3).
     let funded = state.state_total;
     let stage = summary.stage;
+    // A record measured before the limits or the arena last moved was measured against a
+    // resting figure that no longer holds, so it is counted and not fitted.
+    let current = !crate::elastic::stale(state, summary.t_start_ns);
     let mut over_target = false;
     {
         let ctl = &mut state.stages[at];
@@ -227,7 +235,7 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
             let slot = ctl.state_by_instance.entry(0).or_insert(0);
             *slot = (*slot).max(summary.state_bytes);
         }
-        if summary.bytes_in > 0 {
+        if summary.bytes_in > 0 && current {
             let ratio = summary.peak_delta as f64 / summary.bytes_in as f64;
             // f.3's anon fit. Two readings of the same record, and the model takes the larger,
             // because the inequality it feeds has to bound a peak and not track a mean:

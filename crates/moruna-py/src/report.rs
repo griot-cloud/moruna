@@ -167,7 +167,7 @@ impl PyRunReport {
     /// The discovered limits, field by field.
     #[getter]
     fn limits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let l = &self.inner.limits;
+        let l = &self.inner.limits_initial;
         let d = PyDict::new(py);
         d.set_item("memory_ceiling", l.memory_ceiling)?;
         d.set_item("memory_kill", l.memory_kill)?;
@@ -283,13 +283,13 @@ impl PyRunReport {
             r.wall_s,
             bytes(r.peak_anon_bytes),
             r.peak_fraction_of_ceiling * 100.0,
-            bytes(r.limits.memory_ceiling),
+            bytes(r.limits_initial.memory_ceiling),
             r.worker_busy_fraction * 100.0
         ));
         out.push(format!(
             "cpu quota {:.2} ({})   throttled {:.1}%",
-            r.limits.cpu_quota,
-            r.limits.source,
+            r.limits_initial.cpu_quota,
+            r.limits_initial.source,
             r.cpu_throttled_fraction * 100.0
         ));
         out.push(format!(
@@ -427,13 +427,15 @@ mod tests {
             resumed: false,
             manifest: Some("/tmp/run/manifest.json".into()),
             wall_s: 12.5,
-            limits: LimitsSummary {
+            limits_initial: LimitsSummary {
                 memory_ceiling: 8 << 30,
                 memory_kill: None,
                 cpu_quota: 8.0,
                 source: "cgroup".into(),
                 devices: Vec::new(),
             },
+            limits_timeline: Vec::new(),
+            drains: Vec::new(),
             io_paths: IoPaths {
                 direct_io: true,
                 io_uring: false,
@@ -443,6 +445,7 @@ mod tests {
             },
             peak_anon_bytes: 4 << 30,
             peak_fraction_of_ceiling: 0.5,
+            peak_ceiling_bytes: 8 << 30,
             worker_busy_fraction: 0.9,
             cpu_throttled_fraction: 0.0,
             source_bytes_per_s: 1.0,

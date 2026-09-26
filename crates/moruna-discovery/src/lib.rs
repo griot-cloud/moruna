@@ -21,6 +21,7 @@ mod limits;
 mod os;
 mod probes;
 mod sampler;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,11 @@ use crate::probes::ProbeReport;
 
 pub use crate::env::parse_profile;
 pub use crate::sampler::Sampler;
+pub use crate::watch::{
+    CPU_STEP, ElasticBounds, HUGE_PAGE_BYTES, HostLimitsSource, LimitsReading, LimitsSource,
+    LimitsSubscriber, LimitsWatch, ManualLimitsSource, parse_cpu_list,
+};
+pub use arc_swap::ArcSwap;
 
 /// What the caller already knows, and what it wants to override (d.1).
 #[derive(Clone, Debug, Default)]
@@ -126,11 +132,7 @@ fn discover_with(env: &dyn EnvSource, roots: &Roots, input: &DiscoveryInput) -> 
         notes.push("explicit budget recommended on this host: JVM present".to_string());
     }
 
-    let explicit_cpu = match (input.explicit_cpu, env.get("MORUNA_CPU")) {
-        (Some(cpu), _) => Some(cpu),
-        (None, Some(text)) => Some(crate::env::parse_cpu(&text)?),
-        (None, None) => None,
-    };
+    let explicit_cpu = explicit_cpu(env, input)?;
 
     // f.6: the staging cap. The value is computed once the staging directory is known, below;
     // the environment variable is parsed here so a malformed one fails before any probe runs.
@@ -237,6 +239,29 @@ fn discover_with(env: &dyn EnvSource, roots: &Roots, input: &DiscoveryInput) -> 
         cgroup_path,
         disk_budget,
         notes,
+    })
+}
+
+/// The explicit budget and CPU quota (DS-I1): the constructor's, else `MORUNA_BUDGET` and
+/// `MORUNA_CPU`. `discover` and the limits watcher read them the same way.
+pub(crate) fn explicit(
+    env: &dyn EnvSource,
+    input: &DiscoveryInput,
+) -> Result<(Option<u64>, Option<f64>)> {
+    let budget = match (input.explicit_budget, env.get("MORUNA_BUDGET")) {
+        (Some(budget), _) => Some(budget),
+        (None, Some(text)) => Some(crate::env::parse_size("budget", &text)?),
+        (None, None) => None,
+    };
+    Ok((budget, explicit_cpu(env, input)?))
+}
+
+/// The explicit CPU quota: the constructor's, else `MORUNA_CPU`.
+fn explicit_cpu(env: &dyn EnvSource, input: &DiscoveryInput) -> Result<Option<f64>> {
+    Ok(match (input.explicit_cpu, env.get("MORUNA_CPU")) {
+        (Some(cpu), _) => Some(cpu),
+        (None, Some(text)) => Some(crate::env::parse_cpu(&text)?),
+        (None, None) => None,
     })
 }
 

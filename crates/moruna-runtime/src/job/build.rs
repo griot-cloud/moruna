@@ -281,19 +281,15 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         )
         .into());
     }
-    if let Some(elastic) = &job.budget.elastic {
-        if let (Some(max), Some(start)) = (elastic.memory_max_bytes, job.budget.memory_bytes)
-            && max < start
-        {
-            return Err(SpecError::new(
-                "budget.elastic.memory_max_bytes",
-                format!("{max} is below budget.memory_bytes {start}"),
-            )
-            .into());
-        }
-        notes.push(
-            "budget.elastic is recorded; this build sizes the run once, at start".to_string(),
-        );
+    if let Some(elastic) = &job.budget.elastic
+        && let (Some(max), Some(start)) = (elastic.memory_max_bytes, job.budget.memory_bytes)
+        && max < start
+    {
+        return Err(SpecError::new(
+            "budget.elastic.memory_max_bytes",
+            format!("{max} is below budget.memory_bytes {start}"),
+        )
+        .into());
     }
     let host_profile = host_profile_of(job)?;
     let staging_dir = job.staging.dir.as_deref().map(PathBuf::from);
@@ -328,6 +324,14 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     }
     spec.budget = job.budget.memory_bytes;
     spec.cpu = job.budget.cpu;
+    if let Some(elastic) = &job.budget.elastic {
+        spec.elastic = crate::elastic::ElasticBudget {
+            memory_max_bytes: elastic.memory_max_bytes,
+            cpu_max: elastic
+                .cpu_max
+                .map(|cpus| u16::try_from(cpus.clamp(1, 1024)).unwrap_or(1024)),
+        };
+    }
     spec.trace_path = trace_path;
     spec.staging_dir = staging_dir;
     spec.staging_limit = staging_limit;

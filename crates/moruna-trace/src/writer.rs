@@ -15,7 +15,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::ipc::writer::{FileWriter, StreamWriter};
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, bounded};
-use moruna_kernel::{MorunaError, RunId, StageId, TraceRecord, TraceSink, TraceTail};
+use moruna_kernel::{
+    LimitsChanged, MorunaError, RunId, StageId, TraceRecord, TraceSink, TraceTail,
+};
 
 use crate::view::{ChunkSet, TraceView, record_at};
 use crate::{CHUNK_ROWS, DRAIN_INTERVAL_MS, Result, lock, run_id_hex};
@@ -315,6 +317,9 @@ pub(crate) struct Shared {
     pub(crate) final_path: Option<PathBuf>,
     pub(crate) schema: SchemaRef,
     memory_limit: u64,
+    /// Every limits change the facade's watcher reported, in the order it reported them
+    ///. A handful per run at most, so they are kept whole and never overflow.
+    pub(crate) limits_changes: Mutex<Vec<LimitsChanged>>,
 }
 
 /// The trace writer (d.1). Held by the facade as `Arc<TraceWriter>`, by the scheduler as
@@ -364,6 +369,7 @@ impl TraceWriter {
             final_path: cfg.path.clone(),
             schema,
             memory_limit: cfg.memory_limit,
+            limits_changes: Mutex::new(Vec::new()),
         });
         let (tx, rx) = bounded::<Msg>(capacity);
         let rx_keep = rx.clone();
@@ -543,6 +549,17 @@ impl TraceSink for TraceWriter {
             // The writer thread died without answering; `finish` reports the reason.
             Err(_) => Ok(()),
         }
+    }
+
+    /// A change of the limits, kept for the report's `limits_timeline`. Accepted until
+    /// `finish`, and counted as late after it like a record.
+    fn limits_changed(&self, change: LimitsChanged) {
+        if self.shared.finished.load(Ordering::SeqCst) {
+            self.shared.late_records.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(target: "trace.late_record", "a limits change after finish");
+            return;
+        }
+        lock(&self.shared.limits_changes).push(change);
     }
 }
 
@@ -997,6 +1014,7 @@ mod tests {
             final_path: None,
             schema,
             memory_limit: 1024,
+            limits_changes: Mutex::new(Vec::new()),
         });
         let (tx, rx) = bounded::<Msg>(8);
 

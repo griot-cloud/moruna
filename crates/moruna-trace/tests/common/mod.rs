@@ -110,6 +110,7 @@ pub fn limits() -> Limits {
             name: "test device".to_string(),
         }],
         source: LimitSource::Cgroup,
+        observed_at: 0,
     }
 }
 
@@ -136,6 +137,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         sizer_fallback_at: None,
         bottleneck_timeline: vec![(0.0, "Compute".to_string()), (4.0, "IoRead".to_string())],
         controller_notes: vec!["small dataset: no adaptation".to_string()],
+        drains: Vec::new(),
     }
 }
 

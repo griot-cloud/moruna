@@ -59,6 +59,9 @@ hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 tracing-subscriber = { version = "=0.3.23" }
+# Added by F8.2: the one-writer, many-reader cell the limits watcher publishes
+# into and the sampler reads on every sample. E2 table addition, preamble 6.2.
+arc-swap = { version = "=1.9.1" }
 # The rust-vmm crates, used by moruna-vmm only (MH 4.8; additions to the preamble 6.2 table,
 # 2026-09-26). moruna-vmm also verifies guest image digests with the sha2 pin below.
 kvm-ioctls = { version = "=0.25.0" }

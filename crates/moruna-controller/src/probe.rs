@@ -137,8 +137,18 @@ fn load_profiles(state: &mut crate::ControllerState) {
         let Some(kernel) = state.kernels.iter().find(|k| k.stage == stage) else {
             continue;
         };
-        match profile::load(&dir, &kernel.fingerprint, &kernel.schema_hash) {
-            profile::Loaded::Found(found) => state.stages[at].profile = Some(found),
+        let (loaded, other_schema) =
+            profile::load_nearest(&dir, &kernel.fingerprint, &kernel.schema_hash);
+        match loaded {
+            profile::Loaded::Found(found) => {
+                if let Some(schema) = other_schema {
+                    state.note(format!(
+                        "profile for stage {stage} seeded from the same kernel's row for input \
+                         schema {schema}: no row matches this run's input schema"
+                    ));
+                }
+                state.stages[at].profile = Some(found);
+            }
             profile::Loaded::Missing => {}
             profile::Loaded::Unreadable(why) => {
                 state.note(format!("profile for stage {stage} ignored: {why}"));

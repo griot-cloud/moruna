@@ -35,6 +35,7 @@ mod breach;
 mod budget;
 mod classify;
 mod device;
+mod elastic;
 mod model;
 mod probe;
 mod profile;
@@ -306,6 +307,7 @@ impl Default for ControllerConfig {
                 page_bytes: 4096,
                 devices: Vec::new(),
                 source: moruna_kernel::LimitSource::Explicit,
+                observed_at: 0,
             },
             plan: PlanSummary::default(),
             workers_max: 1,
@@ -530,6 +532,9 @@ impl StageCtl {
 pub(crate) struct RecordSummary {
     pub seq: Seq,
     pub stage: StageId,
+    /// When `apply` started, nanoseconds since the epoch: a record that started before the last
+    /// change of the limits or the arena was measured under other limits.
+    pub t_start_ns: u64,
     pub instance: u16,
     pub bytes_in: u64,
     pub rows_in: u64,
@@ -563,6 +568,7 @@ impl RecordSummary {
         RecordSummary {
             seq: r.seq,
             stage: r.stage,
+            t_start_ns: r.t_start_ns,
             instance: r.instance,
             bytes_in: r.bytes_in,
             rows_in: r.rows_in,
@@ -614,6 +620,17 @@ pub(crate) struct ControllerState {
     pub last_profile_write: Instant,
     pub source_exhausted: bool,
     pub high_water_override: Option<(StageId, u64)>,
+    /// The current CPU limit as a worker count, once a sample has carried one.
+    pub cpu_bound: Option<u16>,
+    /// Memory ceiling changes the controller followed.
+    pub limits_changes: u32,
+    /// Arena bytes in regions that are draining: resident, not the plan's, and not the
+    /// kernels'.
+    pub arena_draining: u64,
+    /// When the limits or the arena last moved, nanoseconds since the epoch. A record whose
+    /// `apply` started before it was measured against a resting figure and a ceiling that no
+    /// longer hold, so it feeds neither the fit of f.3 nor the breach path of f.7.
+    pub limits_epoch_ns: u64,
 }
 
 impl ControllerState {
@@ -653,7 +670,7 @@ impl ControllerState {
     /// therefore sits inside the headroom, at `BREACH_SHARE` of it, which leaves the rest as
     /// the cushion the reaction has to work in and agrees with f.6's memory rows.
     pub(crate) fn breach_line(&self) -> u64 {
-        let resting = self.budgets.baseline.saturating_add(self.budgets.host);
+        let resting = model::resting_anon(self);
         let headroom = self.cfg.limits.memory_ceiling.saturating_sub(resting);
         resting
             .saturating_add(model::scale(headroom, BREACH_SHARE))
@@ -961,6 +978,10 @@ impl Controller {
             last_profile_write: now,
             source_exhausted: false,
             high_water_override: None,
+            cpu_bound: None,
+            limits_changes: 0,
+            arena_draining: 0,
+            limits_epoch_ns: 0,
         };
         Ok(Controller {
             inner: Arc::new(Inner {
@@ -1016,6 +1037,54 @@ impl Controller {
         model::start(&self.inner)?;
         self.spawn_tick();
         Ok(())
+    }
+
+    /// Follow a change of the machine's limits now rather than at the next tick: the
+    /// facade's watcher calls this with the limits it has just published, so a lowered ceiling
+    /// sets the shrink target at once. The tick reads the same figures from the sample
+    /// and finds nothing left to do. Zero in either argument leaves that limit as it is.
+    pub fn follow_limits(&self, ceiling_bytes: u64, cpu_limit: f64) {
+        let actions = {
+            let mut state = self.inner.held();
+            let mut actions = Actions::default();
+            if !state.terminated {
+                elastic::follow(&mut state, ceiling_bytes, cpu_limit, &mut actions);
+            }
+            actions
+        };
+        self.inner.perform(actions);
+    }
+
+    /// The arena grew or shrank: `budget_bytes` is the host allowance the controller may
+    /// plan inside from now on (f.1), and `draining_bytes` what the arena still holds in regions
+    /// that are draining, which are resident but no one's to plan with. The plan is
+    /// re-solved inside the budget and the placement engine gets its new tier budgets. Called by
+    /// the facade's watcher only.
+    pub fn set_arena(&self, budget_bytes: u64, draining_bytes: u64) {
+        let actions = {
+            let mut state = self.inner.held();
+            let mut actions = Actions::default();
+            if state.arena_draining != draining_bytes {
+                state.arena_draining = draining_bytes;
+                state.limits_epoch_ns = elastic::now_ns();
+            }
+            if !state.terminated {
+                elastic::set_host_budget(&mut state, budget_bytes, &mut actions);
+            }
+            actions
+        };
+        self.inner.perform(actions);
+    }
+
+    /// The limits the controller is working to now: the memory ceiling, the most workers it may
+    /// make active (the pool bounded by the CPU limit), and the host budget.
+    pub fn limits_in_force(&self) -> (u64, u16, u64) {
+        let state = self.inner.held();
+        (
+            state.cfg.limits.memory_ceiling,
+            elastic::workers_bound(&state),
+            state.budgets.host,
+        )
     }
 
     /// The hook the scheduler calls after every trace record (contracts d.11 `RecordHook`).

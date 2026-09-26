@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use moruna_arena::{Arena, ArenaConfig};
 use moruna_controller::{Controller, ControllerConfig, KernelInfo, PlanSummary};
-use moruna_discovery::{Discovered, DiscoveryInput, Sampler as DiscoverySampler};
+use moruna_discovery::{
+    Discovered, DiscoveryInput, ElasticBounds, LimitsWatch, Sampler as DiscoverySampler,
+};
 use moruna_kernel::{
     Allocator, CancelToken, Kernel, Knobs, MorunaError, ObjectMetadata, Placement, Prober, Reactor,
     RunId, Sampler, SourceSchema, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
@@ -20,6 +22,7 @@ use moruna_trace::{RunReport, TraceConfig, TraceWriter};
 
 use crate::cancel::{CancelOnDrop, Started};
 use crate::config;
+use crate::elastic::{WatchCtx, WatchState, Watcher};
 use crate::error::{Result, RunError};
 use crate::report::{self, MetaInput};
 use crate::spec::{BuildCtx, Components, RunSpec};
@@ -108,6 +111,7 @@ fn drive(
         sink: sink_spec,
         budget,
         cpu,
+        elastic: elastic_budget,
         trace_path,
         staging_dir: explicit_staging_dir,
         staging_limit,
@@ -152,15 +156,20 @@ fn drive(
     let host_profile = durable_profile(host_profile, staging_durable)?;
 
     // 1. Discover.
+    let discovery_input = DiscoveryInput {
+        explicit_budget: budget,
+        explicit_cpu: cpu,
+        explicit_staging_dir: explicit_staging_dir.clone(),
+        explicit_spill_limit: staging_limit,
+        profile_override: host_profile,
+    };
+    // The watcher reads the host's files when the facade discovered the host itself; a
+    // caller that injected the findings describes a machine those files are not, so the watcher
+    // follows only a source the caller also injected.
+    let host_discovered = components.discovered.is_none();
     let discovered = match components.discovered {
         Some(discovered) => discovered,
-        None => moruna_discovery::discover(&DiscoveryInput {
-            explicit_budget: budget,
-            explicit_cpu: cpu,
-            explicit_staging_dir: explicit_staging_dir.clone(),
-            explicit_spill_limit: staging_limit,
-            profile_override: host_profile,
-        })?,
+        None => moruna_discovery::discover(&discovery_input)?,
     };
 
     // f.7: the manifest header before anything takes the run id, so the new process continues
@@ -211,13 +220,64 @@ fn drive(
         observer.discovered(&limits, kernels.len());
     }
     let staging_dir = discovered.profile.staging_dir.clone();
-    let workers_max = workers_from(limits.cpu_quota);
+    // The pool is created up to `budget.elastic.cpu_max` and parked; the starting
+    // N is what is active. With no `elastic` the two are the same N, as before.
+    let workers_start = workers_from(limits.cpu_quota);
+    let workers_max = match elastic_budget.cpu_max {
+        Some(cpu_max) => cpu_max.clamp(1, 1024),
+        None => workers_start,
+    };
+    let workers_start = workers_start.min(workers_max);
+    if workers_max > workers_start {
+        notes.push(format!(
+            "{workers_max} worker threads created and {workers_start} active: the pool follows \
+             the machine up to budget.elastic.cpu_max"
+        ));
+    }
+
+    // The limits watcher starts from what discovery found, and the sampler reads the limits
+    // it publishes, so every sample carries the ceiling of its moment.
+    let memory_max = elastic_budget
+        .memory_max_bytes
+        .unwrap_or(limits.memory_ceiling);
+    if memory_max < limits.memory_ceiling {
+        notes.push(format!(
+            "budget.elastic.memory_max_bytes ({memory_max}) is below the starting ceiling \
+             ({}); the run does not grow past its starting ceiling",
+            limits.memory_ceiling
+        ));
+    }
+    let watch = match (components.limits_source, host_discovered) {
+        (Some(source), _) => Some(LimitsWatch::new(&discovered, &discovery_input, source)?),
+        (None, true) => Some(LimitsWatch::host(&discovered, &discovery_input)?),
+        (None, false) => {
+            notes.push(
+                "the limits watcher is off: the discovery findings were supplied by the caller \
+                 and no limits source was"
+                    .to_string(),
+            );
+            None
+        }
+    }
+    .map(|watch| {
+        let watch = watch.with_bounds(ElasticBounds {
+            memory_max_bytes: memory_max.max(limits.memory_ceiling),
+            cpu_max: f64::from(workers_max),
+        });
+        for subscriber in components.limits_subscribers {
+            watch.subscribe(subscriber);
+        }
+        Arc::new(watch)
+    });
 
     // The sampler exists before the arena, because the arena's size depends on what the
     // process already holds (see `arena_host_bytes`).
     let sampler: Arc<dyn Sampler> = match components.sampler {
         Some(sampler) => sampler,
-        None => Arc::new(DiscoverySampler::new(&discovered)?),
+        None => match &watch {
+            Some(watch) => Arc::new(DiscoverySampler::following(&discovered, watch.limits())?),
+            None => Arc::new(DiscoverySampler::new(&discovered)?),
+        },
     };
 
     // 2. Arena. The baseline is sampled here, before the region exists (12 f.1, 02 f.1,
@@ -256,26 +316,29 @@ fn drive(
         }
         .into());
     }
-    let alloc: Arc<dyn Allocator> = match components.alloc {
-        Some(alloc) => alloc,
-        None => Arena::new(ArenaConfig {
-            host_bytes: arena_bytes,
-            host_tier: discovered.host_tier,
-            device_bytes: limits
-                .devices
-                .iter()
-                .map(|d| {
-                    (
-                        d.id,
-                        (d.free_bytes as f64 * config::DEVICE_BUDGET_FRACTION) as u64,
-                    )
-                })
-                .collect(),
-            page_bytes: limits.page_bytes,
-            huge_pages: discovered.profile.huge_pages,
-            memlock: discovered.profile.memlock,
-            register_rdma: false,
-        })?,
+    let (alloc, arena): (Arc<dyn Allocator>, Option<Arc<Arena>>) = match components.alloc {
+        Some(alloc) => (alloc, None),
+        None => {
+            let arena = Arena::new(ArenaConfig {
+                host_bytes: arena_bytes,
+                host_tier: discovered.host_tier,
+                device_bytes: limits
+                    .devices
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.id,
+                            (d.free_bytes as f64 * config::DEVICE_BUDGET_FRACTION) as u64,
+                        )
+                    })
+                    .collect(),
+                page_bytes: limits.page_bytes,
+                huge_pages: discovered.profile.huge_pages,
+                memlock: discovered.profile.memlock,
+                register_rdma: false,
+            })?;
+            (arena.clone() as Arc<dyn Allocator>, Some(arena))
+        }
     };
 
     // 3. Reactor.
@@ -317,6 +380,9 @@ fn drive(
         Some((sink, tail)) => (sink, tail),
         None => (trace_writer.clone(), trace_writer.clone()),
     };
+    // The limits timeline goes to the writer the report is computed from, whatever sink the
+    // records go to.
+    let limits_trace: Arc<dyn TraceSink> = trace_writer.clone();
 
     // 5. Sources and sinks built.
     let ctx = BuildCtx {
@@ -453,7 +519,7 @@ fn drive(
     let scheduler = Arc::new(Scheduler::new(
         SchedulerConfig {
             workers_max,
-            workers_active: workers_max,
+            workers_active: workers_start,
             read_ahead: config::READAHEAD_SPLITS,
             sink_concurrency: config::SINK_CONCURRENCY,
             error_policy,
@@ -555,11 +621,52 @@ fn drive(
         controller.probe_all()?;
     }
     controller.start()?;
+    // The limits watcher, from the moment the controller is running until the scheduler
+    // returns. The arena arithmetic is the same function that sized the first region, with
+    // everything but the ceiling fixed at what the run started with.
+    let kernel_state = expected_kernel_state(&kernels);
+    let out_of_arena = expected_out_of_arena_amplification(&kernels);
+    let page_bytes = limits.page_bytes;
+    let watcher = watch.map(|watch| {
+        Watcher::start(
+            WatchCtx {
+                watch,
+                trace: limits_trace,
+                arena,
+                controller: controller.clone(),
+                scheduler: scheduler.clone(),
+                sizing: Box::new(move |ceiling| {
+                    arena_host_bytes(
+                        ceiling,
+                        baseline_bytes,
+                        config::RESERVE_FRACTION,
+                        kernel_state,
+                        out_of_arena,
+                        page_bytes,
+                        &mut Vec::new(),
+                    )
+                }),
+                start_ns,
+                workers_max,
+                tick: std::time::Duration::from_millis(config::TICK_MS),
+            },
+            WatchState::new(arena_bytes),
+        )
+    });
     let outcome = if resume.is_some() {
-        scheduler.run_resumed(guard.token())?
+        scheduler.run_resumed(guard.token())
     } else {
-        scheduler.run(guard.token())?
+        scheduler.run(guard.token())
     };
+    let (drains, watch_notes) = match watcher {
+        Some(watcher) => {
+            let watched = watcher.stop();
+            (watched.drains, watched.notes)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let outcome = outcome?;
+    notes.extend(watch_notes);
 
     // 12. stop, finish, report.
     let (exit, outcome_manifest) = report::exit_of(&outcome);
@@ -603,6 +710,7 @@ fn drive(
         gil,
         io_paths,
         controller: summary,
+        drains,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {

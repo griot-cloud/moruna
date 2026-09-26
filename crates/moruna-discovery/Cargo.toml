@@ -12,6 +12,7 @@ description = "Moruna resource discovery and host profile"
 moruna-kernel = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+arc-swap = { workspace = true }
 cudarc = { workspace = true, optional = true }
 
 [features]
