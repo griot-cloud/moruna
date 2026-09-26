@@ -459,7 +459,8 @@ fn wide() -> SessionContext {
 /// allowed past it.
 #[test]
 fn a_plan_larger_than_its_pool_spills_or_is_refused() {
-    const POOL: u64 = 16 << 20;
+    // A share whose pool half, 16 MiB, is well under the 40 MiB the sort must hold.
+    const POOL: u64 = 32 << 20;
     let ctx = wide();
     let sql = "SELECT x, s FROM w ORDER BY s DESC";
     let spill = std::env::temp_dir().join(format!("moruna-spill-{}", std::process::id()));

@@ -1,9 +1,12 @@
 //! The memory a plan's own operators hold, inside the run's budget (MH 4.5).
 //!
 //! A DataFusion plan's sorts, aggregations and joins hold their working state outside Moruna's
-//! arena, in reservations against the session's `MemoryPool`. A `PlanSource` runs its plan in a
-//! session whose pool is a [`BudgetPool`]: the facade sizes it from the run's budget beside the
-//! arena, charges it to the controller, and resizes it when the machine's limits move. An
+//! arena, in reservations against the session's `MemoryPool`; its scans and exchanges hold the
+//! batches in flight between its operators, which no pool sees. A `PlanSource` runs its plan in
+//! a session whose pool is a [`BudgetPool`]: the facade gives it a share of the run's budget
+//! beside the arena, charges that share to the controller, and moves it when the machine's
+//! limits move. Half the share is the pool the operators reserve from; the other half is what
+//! the plan's batches in flight may hold, and `PlanSource` sizes the session's batches to it. An
 //! operator that can spill and finds the pool full spills to [`PlanMemory::spill_dir`], which is
 //! the run's staging directory; one that cannot is refused with DataFusion's
 //! `ResourcesExhausted` rather than taking the process past its ceiling.
@@ -23,10 +26,11 @@ use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
 
-/// A DataFusion memory pool whose limit the run sets and moves.
+/// A DataFusion memory pool over a share of the run's budget that the run sets and moves.
 #[derive(Debug)]
 pub struct BudgetPool {
-    limit: AtomicU64,
+    share: AtomicU64,
+    refusals: AtomicU64,
     state: Mutex<Reserved>,
 }
 
@@ -43,23 +47,41 @@ struct Reserved {
 }
 
 impl BudgetPool {
-    /// A pool of `limit` bytes.
-    pub fn new(limit: u64) -> BudgetPool {
+    /// A pool over a share of `share` bytes.
+    pub fn new(share: u64) -> BudgetPool {
         BudgetPool {
-            limit: AtomicU64::new(limit),
+            share: AtomicU64::new(share),
+            refusals: AtomicU64::new(0),
             state: Mutex::new(Reserved::default()),
         }
     }
 
-    /// Move the limit. Growth past it is refused from now on; what is reserved above it is given
-    /// back as its holders spill or finish.
+    /// Move the share. Growth past the new capacity is refused from now on; what is reserved
+    /// above it is given back as its holders spill or finish. The batches in flight are sized
+    /// when the plan starts and keep that size.
     pub fn set_limit(&self, bytes: u64) {
-        self.limit.store(bytes, Ordering::SeqCst);
+        self.share.store(bytes, Ordering::SeqCst);
     }
 
-    /// The limit in force.
+    /// The share in force: the pool and the batches in flight together.
     pub fn limit(&self) -> u64 {
-        self.limit.load(Ordering::SeqCst)
+        self.share.load(Ordering::SeqCst)
+    }
+
+    /// What the operators may reserve: half the share.
+    pub fn capacity(&self) -> u64 {
+        self.limit() / 2
+    }
+
+    /// What the plan's batches in flight may hold: the other half.
+    pub fn in_flight(&self) -> u64 {
+        self.limit() - self.capacity()
+    }
+
+    /// Requests the pool refused: each one an operator that spilled, or failed for want of
+    /// memory when it could not.
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::SeqCst)
     }
 
     /// The most the plan's operators have held at once.
@@ -71,8 +93,8 @@ impl BudgetPool {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn capacity(&self) -> usize {
-        usize::try_from(self.limit()).unwrap_or(usize::MAX)
+    fn reservable(&self) -> usize {
+        usize::try_from(self.capacity()).unwrap_or(usize::MAX)
     }
 }
 
@@ -133,7 +155,7 @@ impl MemoryPool for BudgetPool {
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
-        let capacity = self.capacity();
+        let capacity = self.reservable();
         let mut state = self.held();
         let can_spill = reservation.consumer().can_spill();
         let available = if can_spill {
@@ -146,6 +168,7 @@ impl MemoryPool for BudgetPool {
             capacity.saturating_sub(state.unspillable + state.spillable)
         };
         if additional > available {
+            self.refusals.fetch_add(1, Ordering::SeqCst);
             return Err(exhausted(reservation, additional, available));
         }
         state.add(can_spill, additional);
@@ -158,13 +181,13 @@ impl MemoryPool for BudgetPool {
     }
 
     fn memory_limit(&self) -> MemoryLimit {
-        MemoryLimit::Finite(self.capacity())
+        MemoryLimit::Finite(self.reservable())
     }
 }
 
 impl std::fmt::Display for BudgetPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}(limit: {} bytes)", self.name(), self.limit())
+        write!(f, "{}(capacity: {} bytes)", self.name(), self.capacity())
     }
 }
 
@@ -190,8 +213,8 @@ mod tests {
     }
 
     #[test]
-    fn spillers_share_what_the_others_leave_and_the_limit_moves() {
-        let pool = Arc::new(BudgetPool::new(1000));
+    fn spillers_share_what_the_others_leave_and_the_share_moves() {
+        let pool = Arc::new(BudgetPool::new(2000));
         let fixed = reservation(&pool, "fixed", false);
         fixed.try_grow(200).expect("room");
         let a = reservation(&pool, "a", true);
@@ -199,6 +222,7 @@ mod tests {
         // 800 shared by two spillers: 400 each.
         a.try_grow(400).expect("a's share");
         let refused = a.try_grow(1).expect_err("past a's share");
+        assert_eq!(pool.refusals(), 1);
         assert!(
             refused.to_string().contains("budget for its plan"),
             "{refused}"
@@ -209,14 +233,14 @@ mod tests {
         assert_eq!(pool.peak(), 1000);
 
         // Lowered: nothing grows until the holders give back.
-        pool.set_limit(500);
+        pool.set_limit(1000);
         assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(500)));
         a.shrink(400);
         assert!(b.try_grow(1).is_err(), "still above the new limit");
         b.shrink(400);
         b.try_grow(100).expect("under the new limit");
         // Raised: room again.
-        pool.set_limit(2000);
+        pool.set_limit(4000);
         fixed
             .try_grow(1000)
             .expect("unspillable takes what is free");
@@ -226,7 +250,8 @@ mod tests {
         drop(b);
         drop(fixed);
         assert_eq!(pool.reserved(), 0);
-        assert_eq!(pool.limit(), 2000);
+        assert_eq!(pool.limit(), 4000);
+        assert_eq!((pool.capacity(), pool.in_flight()), (2000, 2000));
         assert_eq!(pool.name(), "moruna-budget");
         assert!(pool.to_string().contains("2000"));
     }

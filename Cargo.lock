@@ -3372,6 +3372,7 @@ dependencies = [
  "moruna-sources",
  "moruna-testkit",
  "moruna-trace",
+ "moruna-vmm",
  "parquet",
  "serde",
  "serde_json",
@@ -3815,7 +3816,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 [[package]]
 name = "peql"
 version = "0.4.0"
-source = "git+https://github.com/griot-cloud/peQL?rev=ee21469#ee2146926e9cc35da97a93b5dad629455604ee48"
+source = "git+https://github.com/griot-cloud/peQL?rev=189b58e#189b58e4988dfe981701a765314ed5f215f91a88"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

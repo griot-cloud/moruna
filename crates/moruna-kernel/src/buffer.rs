@@ -333,6 +333,15 @@ pub trait Allocator: Send + Sync {
     fn page_bytes(&self) -> usize;
     /// Live allocation statistics.
     fn stats(&self) -> AllocStats;
+    /// Bytes `tier` could still give, when this allocator has a budget for it; `None` when it
+    /// has none. A figure and not a promise: a size class may still not be free all at once. A
+    /// component that holds a working set of its own for the whole run (a sink's file buffers)
+    /// sizes it from this while the arena is empty, rather than taking whatever one request
+    /// happens to be given.
+    fn available(&self, tier: Tier) -> Option<u64> {
+        let _ = tier;
+        None
+    }
     /// True if `ptr` lies inside a region this allocator owns (used by adapters to skip the boundary copy).
     fn contains(&self, ptr: *const u8) -> bool {
         let _ = ptr;

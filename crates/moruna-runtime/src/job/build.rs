@@ -505,10 +505,12 @@ fn sink_of(
             let target = url.clone();
             Ok((
                 SinkSpec::Build(Box::new(move |ctx| {
+                    // The sink encodes each file in the arena, in one of two buffers: together
+                    // they are the share the facade sets aside for it.
                     let cfg = ParquetSinkConfig {
                         url,
                         row_group_bytes,
-                        file_bytes,
+                        file_bytes: file_bytes.min(ctx.claim_file_buffer() / 2),
                         compression,
                         writer_props: None,
                     };

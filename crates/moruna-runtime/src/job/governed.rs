@@ -108,6 +108,17 @@ mod imp {
         fn set_limit(&self, bytes: u64) {
             BudgetPool::set_limit(self, bytes);
         }
+
+        fn note(&self) -> String {
+            format!(
+                "the source's plan operators held at most {} of the {} bytes they could \
+                 reserve, and were refused {} times, which a spilling operator answers by \
+                 spilling",
+                self.peak(),
+                self.capacity(),
+                self.refusals()
+            )
+        }
     }
 
     /// Where a contract's files are, as its binding resolves them: the path or the object
@@ -158,12 +169,12 @@ mod imp {
             (Some(name), _) => (PeqlRead::Contract(name.clone()), "source.contract"),
             (None, sql) => (PeqlRead::Sql(sql.clone().unwrap_or_default()), "source.sql"),
         };
+        let names = read
+            .contracts()
+            .map_err(|e| SpecError::new("source.sql", e))?;
         let engine = engines.open(&root)?;
         let mut targets = Vec::new();
-        for name in read
-            .contracts()
-            .map_err(|e| SpecError::new("source.sql", e))?
-        {
+        for name in names {
             targets.extend(target(&engine, field, &name)?);
         }
         // Sized by the facade before the source is built (MH 4.5); nothing may be held until then.

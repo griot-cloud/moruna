@@ -38,6 +38,31 @@ fn class_ceil(n: u64) -> u64 {
     n.max(GRANULE).next_power_of_two()
 }
 
+/// The bytes a batch's rows occupy, which is what the encoder reads: not the capacity of the
+/// buffers they are a slice of. A morsel read back from staging is a slice of the segment it
+/// was staged in, and measured by its buffers it looked several times its size, so the sink
+/// rolled for it and asked for a buffer the arena could not give (F8.8, H6 at 256 MiB).
+fn rows_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|c| {
+            c.to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| c.get_array_memory_size()) as u64
+        })
+        .sum()
+}
+
+/// The largest size class no larger than `n`, and the granule below it.
+fn class_floor(n: u64) -> u64 {
+    if n <= GRANULE {
+        GRANULE
+    } else {
+        1u64 << (63 - n.leading_zeros())
+    }
+}
+
 /// The footer's share of a `want` byte class (f.1): `FOOTER_HEADROOM`, or half the class when
 /// that is smaller, because a small file's footer is small and a buffer that is all footer can
 /// hold no row group. A file with a `want / 2` roll size can hold at most one row group per
@@ -161,6 +186,11 @@ pub struct ParquetSink {
     alloc: Arc<dyn Allocator>,
     run_id: RunId,
     inner: Mutex<Inner>,
+    /// File buffers no file holds: the two taken at `open` while the arena is still empty, and
+    /// after that the buffer of the last file whose write completed. The next ordinary file
+    /// takes one rather than asking the arena again, so the sink's buffers are found once, when
+    /// they can be, and not in an arena the queues have since divided up (F8.8).
+    spare: Mutex<Vec<Buffer>>,
 }
 
 impl ParquetSink {
@@ -194,6 +224,7 @@ impl ParquetSink {
                 stats: SinkStats::default(),
                 roll_bytes: 0,
             }),
+            spare: Mutex::new(Vec::new()),
         })
     }
 
@@ -222,6 +253,12 @@ impl ParquetSink {
     /// 02 e.2 serves that out of the 256 MiB class, which has to be free all at once: the
     /// sink reserved twice what it wanted and no 512 MiB budget could open it (PM, 2026-09-23).
     fn alloc_file_buf(&self, min_bytes: u64) -> Result<(Buffer, u64)> {
+        if min_bytes == 0
+            && let Some(buf) = self.spare.lock().unwrap_or_else(|e| e.into_inner()).pop()
+        {
+            let want = buf.len() as u64;
+            return Ok((buf, want - footer_for(want)));
+        }
         // `row_group_bytes` is a flush threshold and an upper bound, so the footer may come out
         // of its class; `min_bytes` is a morsel that has to fit, so its class is sized above the
         // footer as well as above the morsel.
@@ -371,6 +408,47 @@ impl ParquetSink {
         })
     }
 
+    /// Keep a written file's buffer for the next file when there is no spare already; any other
+    /// goes back to the arena.
+    fn keep_spare(&self, buf: Arc<Buffer>) {
+        if let Ok(buf) = Arc::try_unwrap(buf) {
+            let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+            if spare.is_empty() {
+                spare.push(buf);
+            }
+        }
+    }
+
+    /// The sink's two file buffers, taken at `open` (f.1): the file being encoded and the one a
+    /// roll opens while the first is still being written. Each is the class `file_bytes` asks
+    /// for and no more than a quarter of what the arena has free, so the pair leaves the arena
+    /// at least half of itself; when the arena cannot give the pair, both halve together, down
+    /// to the smallest class, below which the sink cannot open.
+    fn alloc_pair(&self) -> Result<Vec<Buffer>> {
+        let tier = host_tier(&*self.alloc);
+        let floor = class_ceil(GRANULE);
+        let mut want = class_ceil(self.cfg.file_bytes).max(floor);
+        if let Some(free) = self.alloc.available(tier) {
+            want = want.min(class_floor(free / 4).max(floor));
+        }
+        loop {
+            let capacity = usize::try_from(want).map_err(|_| {
+                MorunaError::Sink(format!(
+                    "a file buffer of {want} bytes does not fit this platform"
+                ))
+            })?;
+            let pair = self
+                .alloc
+                .alloc(capacity, tier)
+                .and_then(|first| Ok(vec![first, self.alloc.alloc(capacity, tier)?]));
+            match pair {
+                Ok(pair) => return Ok(pair),
+                Err(e) if want <= floor => return Err(e),
+                Err(_) => want = (want / 2).max(floor),
+            }
+        }
+    }
+
     /// Record a file whose completion resolved (f.5, f.7).
     fn commit(&self, entry: CommittedFile, seqs: &[Seq]) {
         let mut inner = self.lock();
@@ -394,12 +472,12 @@ impl ParquetSink {
         inner.phase.require_open()?;
         require_host(&payload)?;
         let rows = payload.rows();
-        let bytes = payload.bytes();
         let Payload::Table(batch, _) = payload else {
             return Err(MorunaError::Sink(
                 "the parquet sink accepts a table payload".into(),
             ));
         };
+        let bytes = rows_bytes(&batch);
         // f.1: the first payload settles the output schema; every later one is checked
         // against it, so a kernel that appends a column is written as it is and a kernel that
         // drifts between morsels is still an error.
@@ -442,8 +520,16 @@ impl ParquetSink {
             None => return Err(MorunaError::Sink("the sink has no open file".into())),
         };
         let pending = if started && so_far + bytes > inner.roll_bytes {
-            // A morsel larger than `file_bytes` gets a file of its own, sized for it (h).
-            Some(self.roll(inner, bytes.saturating_mul(2), true)?)
+            // A morsel larger than a file gets a file of its own, sized for it (h); one that
+            // fits an ordinary file gets an ordinary file. Asking every roll for twice the
+            // morsel doubled the buffer's class whenever morsels were a large share of it, and
+            // at the smallest budget that was the allocation the arena could not give (F8.8).
+            let need = if bytes > inner.roll_bytes {
+                bytes.saturating_mul(2)
+            } else {
+                0
+            };
+            Some(self.roll(inner, need, true)?)
         } else {
             None
         };
@@ -558,6 +644,8 @@ impl Sink for ParquetSink {
         // output schema is the first payload's, so the writer is built there and this one is
         // kept only for a run that writes nothing.
         inner.declared = Some(Arc::clone(schema));
+        // The file buffers, now, while the arena holds nothing else.
+        *self.spare.lock().unwrap_or_else(|e| e.into_inner()) = self.alloc_pair()?;
         inner.phase = Phase::Open;
         Ok(())
     }
@@ -585,7 +673,7 @@ impl Sink for ParquetSink {
                 buf,
             } = pending;
             let outcome = completion.await;
-            drop(buf);
+            self.keep_spare(buf);
             match outcome {
                 Ok(()) => {
                     self.commit(entry, &seqs);
@@ -640,7 +728,7 @@ impl Sink for ParquetSink {
             buf,
         } = pending;
         let outcome = completion.wait();
-        drop(buf);
+        self.keep_spare(buf);
         match outcome {
             Ok(()) => self.commit(entry, &seqs),
             Err(e) => {

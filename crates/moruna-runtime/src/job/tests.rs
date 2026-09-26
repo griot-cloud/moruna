@@ -658,6 +658,35 @@ fn governed_sources_and_sinks_are_documents() {
     }
     #[cfg(feature = "peql")]
     {
+        // The engine is opened when the document is built, to resolve where each contract's
+        // files are: a disk with both contracts on it.
+        let disk = std::env::temp_dir().join(format!("moruna-job-peql-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&disk);
+        let engine = moruna_datafusion::engine::Engine::open(&disk).expect("an engine");
+        let schema = moruna_kernel::arrow::datatypes::Schema::new(vec![
+            moruna_kernel::arrow::datatypes::Field::new(
+                "id",
+                moruna_kernel::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]);
+        for (name, dir) in [("demo/big", "big/"), ("demo/copy", "copy/")] {
+            let contract = format!(
+                "contract: {name}\nversion: 1\nowner: demo\nbinding: {{parquet: {dir}}}\n\
+                 expose:\n  - {{name: id, type: int64}}\n"
+            );
+            engine
+                .register_contract(&contract, &schema)
+                .expect("compiles");
+        }
+        let root = disk.display().to_string();
+        let mut job = job.clone();
+        if let SourceDoc::Datafusion { root: r, .. } = &mut job.source {
+            *r = root.clone();
+        }
+        if let SinkDoc::Peql { root: r, .. } = &mut job.sink {
+            *r = format!("file://{root}");
+        }
         let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("builds");
         assert!(built.spec.spec_digest.is_some());
         let mut not_a_caller = job.clone();
@@ -671,6 +700,7 @@ fn governed_sources_and_sinks_are_documents() {
         let mut bad_sql = job.clone();
         bad_sql.source = with_source(None, Some("SELEC"), "/disk").source;
         assert!(refusal(&bad_sql).contains("source.sql"));
+        let _ = std::fs::remove_dir_all(&disk);
     }
 }
 

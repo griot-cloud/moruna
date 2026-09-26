@@ -412,9 +412,26 @@ fn drive(
         reactor: reactor.clone(),
         object_metadata,
         run_id,
+        arena_bytes,
+        sink_buffer: std::sync::atomic::AtomicU64::new(0),
     };
     let source = source_spec.build(&ctx)?;
     let sink = sink_spec.build(&ctx)?;
+    let sink_buffer_bytes = ctx.sink_buffer_bytes();
+    // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
+    // is at most half a file, so every morsel fits an ordinary file and none needs a buffer of
+    // its own that the arena may no longer be able to give.
+    let morsel_max = match sink_buffer_bytes {
+        0 => config::MORSEL_MAX_BYTES,
+        claim => (claim / 4).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
+    };
+    if morsel_max < config::MORSEL_MAX_BYTES {
+        notes.push(format!(
+            "morsels are at most {morsel_max} bytes, half of one of the sink's two {} byte file \
+             buffers",
+            sink_buffer_bytes / 2
+        ));
+    }
     let plan = source.plan()?;
     let plan_summary = summarise(&plan);
     let repeatable = source.repeatable();
@@ -546,7 +563,7 @@ fn drive(
             error_policy,
             initial_morsel_target: config::MORSEL_PROBE_BYTES,
             morsel_min: config::MORSEL_MIN_BYTES,
-            morsel_max: config::MORSEL_MAX_BYTES,
+            morsel_max,
             checkpoint_enabled,
             checkpoint_interval_ms,
             checkpoint_keep,
@@ -592,7 +609,7 @@ fn drive(
             oscillation_flips: config::OSCILLATION_FLIPS,
             freeze_morsels: config::FREEZE_MORSELS,
             morsel_min: config::MORSEL_MIN_BYTES,
-            morsel_max: config::MORSEL_MAX_BYTES,
+            morsel_max,
             probe_bytes: config::MORSEL_PROBE_BYTES,
             sizer,
             fallback_error_ratio: config::SIZER_FALLBACK_ERROR_RATIO,
@@ -601,6 +618,7 @@ fn drive(
             arena_bytes,
             baseline_bytes,
             engine_bytes,
+            sink_buffer_bytes,
             checkpoint_enabled,
             checkpoint_interval_ms,
         },
@@ -649,6 +667,7 @@ fn drive(
     let out_of_arena = expected_out_of_arena_amplification(&kernels);
     let page_bytes = limits.page_bytes;
     let has_engine = engine_memory.is_some();
+    let engine_after = engine_memory.clone();
     let watcher = watch.map(|watch| {
         Watcher::start(
             WatchCtx {
@@ -703,6 +722,9 @@ fn drive(
     };
     let outcome = outcome?;
     notes.extend(watch_notes);
+    if let Some(engine) = engine_after {
+        notes.push(engine.note());
+    }
 
     // 12. stop, finish, report.
     let (exit, outcome_manifest) = report::exit_of(&outcome);

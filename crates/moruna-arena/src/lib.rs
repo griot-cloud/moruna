@@ -546,6 +546,20 @@ impl Inner {
 /// Contracts d.3. The arena overrides every method, including the three with defaults
 /// (d.1).
 impl Allocator for Arena {
+    fn available(&self, tier: Tier) -> Option<u64> {
+        if self.inner.is_host(tier) {
+            let host = self.inner.read_host();
+            let live = host.iter().filter(|r| !r.draining.load(Ordering::SeqCst));
+            let (bytes, in_use) = live.fold((0u64, 0u64), |(b, u), r| {
+                (b + r.space.bytes(), u + r.space.in_use())
+            });
+            return Some(bytes.saturating_sub(in_use));
+        }
+        self.inner
+            .space_of(tier)
+            .map(|space| space.bytes().saturating_sub(space.in_use()))
+    }
+
     fn note_payload_copy(&self, bytes: u64) {
         self.inner
             .payload_copies

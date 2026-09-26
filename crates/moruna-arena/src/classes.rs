@@ -251,6 +251,65 @@ impl Space {
     }
 
     fn alloc_class(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {
+        match self.try_class(c, requested) {
+            Ok(off) => Ok(off),
+            Err(OutOfSpace) => self.alloc_merged(c, requested),
+        }
+    }
+
+    /// Serve class `c` from what the free lists hold once free buddies are merged (f.5).
+    ///
+    /// A release puts its slot back on its own class's list and nothing more, which keeps a
+    /// release O(1) (AR-T4); but a class then never gave its blocks back to a larger one, and a
+    /// run that had cut the region into small slots could not serve a larger class again with
+    /// most of the region free. At the smallest budget that was the staging buffer an
+    /// unrepeatable source could not be given (F8.5's finding, F8.8). So a request the lists
+    /// cannot serve merges them first: every class lock is taken, in ascending order as
+    /// everywhere else, every pair of free buddies becomes one block of the next class, and the
+    /// request is served from the smallest block that fits. Two free buddies are the whole of
+    /// their parent, aligned to its size, so the parent is a block whatever slab or seed block
+    /// each half came from, and nothing is ever off every list while another thread looks.
+    fn alloc_merged(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {
+        let mut lists: Vec<_> = (0..CLASS_COUNT).map(|k| self.lock_free(k)).collect();
+        for k in 0..CLASS_COUNT - 1 {
+            let size = class_size(k);
+            let mut blocks = std::mem::take(&mut *lists[k]);
+            blocks.sort_unstable();
+            let mut kept = Vec::with_capacity(blocks.len());
+            let mut at = 0;
+            while at < blocks.len() {
+                let off = blocks[at];
+                let pair = off & size == 0
+                    && off + 2 * size <= self.bytes
+                    && blocks.get(at + 1) == Some(&(off + size));
+                if pair {
+                    self.mark_range(off, 2 * size, (k + 1) as u8);
+                    lists[k + 1].push(off);
+                    at += 2;
+                } else {
+                    kept.push(off);
+                    at += 1;
+                }
+            }
+            *lists[k] = kept;
+        }
+        let d = (c..CLASS_COUNT)
+            .find(|&d| !lists[d].is_empty())
+            .ok_or(OutOfSpace)?;
+        let off = lists[d].pop().ok_or(OutOfSpace)?;
+        for k in (c..d).rev() {
+            let buddy = off + class_size(k);
+            self.mark_range(buddy, class_size(k), k as u8);
+            lists[k].push(buddy);
+        }
+        self.mark_range(off, class_size(c), c as u8);
+        drop(lists);
+        self.activate(off, requested, class_size(c));
+        Ok(off)
+    }
+
+    /// Serve class `c` from its own list, a fresh slab or a larger class's free slot.
+    fn try_class(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {
         let mut fl = self.lock_free(c);
         if let Some(off) = fl.pop() {
             drop(fl);
@@ -519,6 +578,37 @@ mod tests {
             assert_eq!(h.space.release(p, MIB), Release::Freed);
         }
         assert_eq!(h.space.largest_free(), MIB);
+        assert_eq!(
+            h.space.alloc(4 * MIB).map(|(_, c)| c),
+            Ok(4 * MIB),
+            "the buddies merge back when the lists alone cannot serve"
+        );
+    }
+
+    /// A region cut into its smallest class and given back serves its largest class again:
+    /// free buddies merge, so small slots do not strand the region (F8.8). A region that is
+    /// not a power of two merges only into blocks that lie inside it.
+    #[test]
+    fn freed_buddies_merge_back_into_larger_classes() {
+        let bytes = 8 * MIB + 3 * GRANULE;
+        let h = heap(bytes, true);
+        let mut live = Vec::new();
+        while let Ok((p, _)) = h.space.alloc(GRANULE) {
+            live.push(p);
+        }
+        assert_eq!(live.len() as u64, bytes / GRANULE);
+        assert_eq!(h.space.alloc(GRANULE), Err(OutOfSpace));
+        // Every other slot first, so no buddy is free when its partner goes back.
+        let (odd, even): (Vec<_>, Vec<_>) = live.iter().enumerate().partition(|(i, _)| i % 2 == 1);
+        for (_, p) in odd.into_iter().chain(even) {
+            assert_eq!(h.space.release(*p, GRANULE), Release::Freed);
+        }
+        assert_eq!(h.space.in_use(), 0);
+        let (big, charged) = h.space.alloc(8 * MIB).expect("the largest class again");
+        assert_eq!(charged, 8 * MIB);
+        assert_eq!(h.space.alloc(2 * GRANULE).map(|(_, c)| c), Ok(2 * GRANULE));
+        assert_eq!(h.space.release(big, 8 * MIB), Release::Freed);
+        assert_eq!(h.space.double_releases(), 0);
     }
 
     #[test]

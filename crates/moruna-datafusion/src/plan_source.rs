@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::config::ConfigNonZeroUsize;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -36,7 +37,9 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, StatisticsArgs, StatisticsContext,
+};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use moruna_kernel::arrow::array::{Array, RecordBatch, UInt32Array};
@@ -131,6 +134,11 @@ impl PlanSource {
         let mut state = SessionStateBuilder::new_from_existing(state)
             .with_runtime_env(env)
             .build();
+        // The batches in flight are the other half of the plan's share: every partition that
+        // runs at once holds a few, whatever the pool says, so their size is set from it.
+        state.config_mut().options_mut().execution.batch_size =
+            ConfigNonZeroUsize::try_new(batch_rows(&plan, memory.pool.in_flight()))
+                .map_err(|e| plan_err(e.to_string()))?;
         // A file scan's partitions steal files from one another while they run together, so
         // which rows a partition yields depends on timing, and a partition run alone reads
         // every file. Splits are partitions, counted once and read later, perhaps one at a
@@ -376,6 +384,74 @@ impl Drop for Runtime {
             rt.shutdown_background();
         }
     }
+}
+
+/// What one running partition of a scan holds whatever its batch size, measured on a governed
+/// view over Parquet row groups of 4 MB: the column chunks it fetched, the pages it
+/// decompressed, and the batches in its exchanges (F8.8, about 9.5 MB at 64-row batches and 16
+/// MB at DataFusion's default).
+const PARTITION_BYTES: u64 = 64 << 20;
+
+/// The partitions a plan is planned for inside `in_flight` bytes of batches (MH 4.5): every
+/// partition of a stage runs at once, so as many as `PARTITION_BYTES` each fit, at least one
+/// and at most one per core.
+pub(crate) fn partitions_for(in_flight: u64) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    (in_flight / PARTITION_BYTES).clamp(1, cores.max(1)) as usize
+}
+
+/// Batches one running partition may hold at once: the one its scan is decoding, the ones
+/// queued in the exchanges above it, and the one its consumer holds.
+const BATCHES_PER_PARTITION: u64 = 4;
+/// The bytes a row of a variable-width column is assumed to take when the plan's statistics do
+/// not say: a scan over files the statistics cover (Parquet, what a governed plan reads) is
+/// measured instead.
+const VARIABLE_WIDTH_BYTES: u64 = 256;
+/// The fewest rows a batch is cut to, so a very wide row still moves in batches worth the
+/// per-batch cost, and DataFusion's own default, the most.
+const BATCH_ROWS: (u64, u64) = (64, 8192);
+
+/// The session's batch size for `plan` inside `in_flight` bytes (MH 4.5): every partition that
+/// runs at once holds `BATCHES_PER_PARTITION` batches, so a batch is `in_flight` divided by the
+/// most partitions any stage of the plan runs and by that depth, in rows of the widest row the
+/// plan's scans produce. A plan with more partitions, or wider rows, gets smaller batches; its
+/// operators' own state is the pool's, not this.
+fn batch_rows(plan: &Arc<dyn ExecutionPlan>, in_flight: u64) -> usize {
+    let mut partitions = 1u64;
+    let mut width = 1u64;
+    let _ = plan.apply(|node| {
+        partitions = partitions.max(node.output_partitioning().partition_count() as u64);
+        if node.children().is_empty() {
+            width = width.max(row_width(node));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    let per_batch = in_flight / (partitions * BATCHES_PER_PARTITION);
+    (per_batch / width).clamp(BATCH_ROWS.0, BATCH_ROWS.1) as usize
+}
+
+/// The bytes a row of a leaf's output takes: its statistics' byte size over its rows when both
+/// are known, otherwise its schema's fixed widths with `VARIABLE_WIDTH_BYTES` for the rest.
+fn row_width(leaf: &Arc<dyn ExecutionPlan>) -> u64 {
+    if let Ok(stats) = StatisticsContext::new().compute(leaf.as_ref(), &StatisticsArgs::new())
+        && let (Some(bytes), Some(rows)) = (
+            stats.total_byte_size.get_value(),
+            stats.num_rows.get_value(),
+        )
+        && *rows > 0
+    {
+        return (*bytes as u64).div_ceil(*rows as u64).max(1);
+    }
+    leaf.schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            f.data_type()
+                .primitive_width()
+                .map_or(VARIABLE_WIDTH_BYTES, |w| w as u64)
+        })
+        .sum::<u64>()
+        .max(1)
 }
 
 /// Cut each partition into splits of about [`SPLIT_BYTES`], numbered in partition order. A
