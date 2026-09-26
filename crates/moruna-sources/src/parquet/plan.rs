@@ -1,27 +1,35 @@
 //! The Parquet plan (e.1), footer reads (f.1) and row-group pruning (f.2).
 //!
-//! Footers are parsed with `std::fs` here, not through the reactor. A reactor read needs a
-//! `Buffer`, a `Buffer` can only come from an `Allocator`, and no allocator exists at
-//! construction: the arena reaches a source only through the `&dyn Allocator` that `read`
-//! receives. The document's e.1 has the footer arriving through `read_object`/`read_file`,
-//! which cannot be written against the contracts as they stand; that is reported as an
-//! escalation. An object URL is a `Plan` error naming it, because there is no `std::fs` for a
-//! remote object; `head_object` and `list_prefix` are still what list and size it.
+//! A local footer is parsed with `std::fs` here, not through the reactor. A reactor read needs
+//! a `Buffer`, and a `Buffer` can only come from an `Allocator`, which a source built with
+//! `ParquetSource::new` does not have: the arena reaches it only through the `&dyn Allocator`
+//! that `read` receives. An object's footer has no `std::fs`, so it is read through
+//! `read_object` into the arena, which needs the allocator `ParquetSource::with_allocator`
+//! was given (MH 4.6, H7); without one an object URL is a `Plan` error saying so.
+//! `head_object` and `list_prefix` list and size objects either way.
 
 use std::sync::Arc;
 
-use moruna_kernel::{ObjectMetadata, Result, SourceSchema, Split, SplitId};
-use parquet::file::metadata::ParquetMetaData;
+use moruna_kernel::{Allocator, ObjectMetadata, Reactor, Result, SourceSchema, Split, SplitId};
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::statistics::Statistics;
 
 use super::{ParquetSourceConfig, RowFilter, ScalarValue};
 use crate::stats::Counters;
 use crate::util::{is_local, local_path, plan_err};
 
+/// What reading an object's footer at plan time needs: the reactor and an allocator.
+pub(crate) type ObjectReader<'a> = (&'a Arc<dyn Reactor>, &'a Arc<dyn Allocator>);
+
 /// One planned file: its footer, its projection and the Arrow schema it yields.
 pub(crate) struct FileMeta {
     pub(crate) url: String,
     pub(crate) path: std::path::PathBuf,
+    /// An object in a store rather than a local file: read with `read_object` at `url`, and
+    /// `len` is the size `head_object` or `list_prefix` reported at plan time.
+    pub(crate) object: bool,
+    /// The file's length at plan time.
+    pub(crate) len: u64,
     pub(crate) metadata: Arc<ParquetMetaData>,
     /// Leaf column indices of the projection, in schema order.
     pub(crate) projected: Vec<usize>,
@@ -43,11 +51,13 @@ pub(crate) fn files(
     cfg: &ParquetSourceConfig,
     meta: &Arc<dyn ObjectMetadata>,
     counters: &Counters,
+    objects: Option<ObjectReader<'_>>,
 ) -> Result<Vec<FileMeta>> {
     if cfg.urls.is_empty() {
         return Err(plan_err("a ParquetSource needs at least one url"));
     }
     let mut urls = Vec::new();
+    let mut objects_found: Vec<(String, u64, ParquetMetaData)> = Vec::new();
     for url in &cfg.urls {
         if is_local(url) {
             let path = local_path(url);
@@ -70,28 +80,50 @@ pub(crate) fn files(
                 urls.push((url.clone(), path));
             }
         } else {
-            // An object URL: list the prefix, then fail on the footer read with the
-            // escalation. `head_object` sizes a single object so that the listing and the
-            // sizing paths of d.1 are exercised before the escalation is reported.
-            let listed = meta.list_prefix(url).wait()?;
+            // An object URL: list the prefix, or size the one object `head_object` names.
+            // Reading its footer needs an arena buffer for the reactor to land the bytes in,
+            // which a source built without an allocator does not have (`with_allocator`).
+            let Some((reactor, alloc)) = objects else {
+                let listed = meta.list_prefix(url).wait()?;
+                if listed.is_empty() {
+                    meta.head_object(url).wait()?;
+                }
+                return Err(plan_err(format!(
+                    "{url}: a Parquet footer over an object store is read into the arena, and \
+                     this source was built without one; build it with \
+                     ParquetSource::with_allocator"
+                )));
+            };
+            let mut listed: Vec<moruna_kernel::ObjectMeta> = meta
+                .list_prefix(url)
+                .wait()?
+                .into_iter()
+                .filter(|object| object.url.ends_with(".parquet"))
+                .collect();
             if listed.is_empty() {
-                meta.head_object(url).wait()?;
+                listed.push(meta.head_object(url).wait()?);
             }
-            return Err(plan_err(format!(
-                "{url}: a Parquet footer over an object store needs a plan-time ranged read, \
-                 and a reactor read needs a Buffer from an Allocator that a source does not \
-                 have at construction (escalation E10 on 07 d.1 and e.1)"
-            )));
+            listed.sort_by(|a, b| a.url.cmp(&b.url));
+            for object in listed {
+                let object_url = object_url(url, &object.url);
+                let metadata = object_footer(reactor, alloc, &object_url, object.size)?;
+                Counters::add(&counters.footer_reads, 2);
+                objects_found.push((object_url, object.size, metadata));
+            }
         }
     }
-    if urls.is_empty() {
+    if urls.is_empty() && objects_found.is_empty() {
         return Err(plan_err("no Parquet file matched the configuration"));
     }
 
-    let mut out = Vec::new();
+    let mut parsed: Vec<(String, std::path::PathBuf, bool, u64, ParquetMetaData)> = Vec::new();
     for (url, path) in urls {
         let file =
             std::fs::File::open(&path).map_err(|e| plan_err(format!("{}: {e}", path.display())))?;
+        let len = file
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| plan_err(format!("{}: {e}", path.display())))?;
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&file)
             .map_err(|e| moruna_kernel::MorunaError::Source {
@@ -101,6 +133,20 @@ pub(crate) fn files(
         // f.1: the footer length is read speculatively and then in full, so two ranged reads
         // per file at most.
         Counters::add(&counters.footer_reads, 2);
+        parsed.push((url, path, false, len, metadata));
+    }
+    for (url, len, metadata) in objects_found {
+        parsed.push((
+            url.clone(),
+            std::path::PathBuf::from(&url),
+            true,
+            len,
+            metadata,
+        ));
+    }
+
+    let mut out = Vec::new();
+    for (url, path, object, len, metadata) in parsed {
         let metadata = Arc::new(metadata);
         let descr = metadata.file_metadata().schema_descr();
         let projected = project(descr, cfg.columns.as_deref(), &path)?;
@@ -114,6 +160,8 @@ pub(crate) fn files(
         out.push(FileMeta {
             url,
             path,
+            object,
+            len,
             metadata,
             projected,
             schema: Arc::new(schema),
@@ -121,6 +169,82 @@ pub(crate) fn files(
     }
     check_one_schema(&out)?;
     Ok(out)
+}
+
+/// The URL of a listed object. A store lists keys relative to its container, so a key that
+/// is not already a URL is put back under the scheme and container `prefix` names.
+fn object_url(prefix: &str, listed: &str) -> String {
+    if listed.contains("://") {
+        return listed.to_string();
+    }
+    let Some((scheme, rest)) = prefix.split_once("://") else {
+        return listed.to_string();
+    };
+    let container = rest.split('/').next().unwrap_or_default();
+    format!("{scheme}://{container}/{}", listed.trim_start_matches('/'))
+}
+
+/// Read and decode one object's footer through the reactor (e.1, f.1): the last 64 KiB in one
+/// ranged read, which holds the footer of any ordinary file, and the rest of the metadata in a
+/// second when it does not.
+fn object_footer(
+    reactor: &Arc<dyn Reactor>,
+    alloc: &Arc<dyn Allocator>,
+    url: &str,
+    size: u64,
+) -> Result<ParquetMetaData> {
+    const TAIL: u64 = 64 * 1024;
+    let footer_err = |msg: String| moruna_kernel::MorunaError::Source {
+        split: 0,
+        msg: format!("{url}: {msg}"),
+    };
+    if size < 12 {
+        return Err(footer_err(format!(
+            "{size} bytes is too short to be Parquet"
+        )));
+    }
+    let tail_len = size.min(TAIL);
+    let tail = read_range(reactor, alloc, url, size - tail_len, tail_len)?;
+    let end = &tail[tail.len() - 8..];
+    if &end[4..] != b"PAR1" {
+        return Err(footer_err(
+            "the file does not end in PAR1 (an encrypted footer is not supported)".into(),
+        ));
+    }
+    let metadata_len = u64::from(u32::from_le_bytes([end[0], end[1], end[2], end[3]]));
+    if metadata_len + 8 > size {
+        return Err(footer_err(format!(
+            "the footer claims {metadata_len} bytes of metadata in a {size} byte file"
+        )));
+    }
+    let decoded = if metadata_len + 8 <= tail_len {
+        let start = (tail_len - 8 - metadata_len) as usize;
+        ParquetMetaDataReader::decode_metadata(&tail[start..tail.len() - 8])
+    } else {
+        let whole = read_range(reactor, alloc, url, size - 8 - metadata_len, metadata_len)?;
+        ParquetMetaDataReader::decode_metadata(&whole)
+    };
+    decoded.map_err(|e| footer_err(format!("the footer does not parse: {e}")))
+}
+
+/// `len` bytes of an object at `offset`, landed in an arena buffer by the reactor.
+fn read_range(
+    reactor: &Arc<dyn Reactor>,
+    alloc: &Arc<dyn Allocator>,
+    url: &str,
+    offset: u64,
+    len: u64,
+) -> Result<bytes::Bytes> {
+    let length = usize::try_from(len)
+        .map_err(|_| plan_err(format!("{url}: {len} bytes do not fit in memory")))?;
+    let tier = if alloc.is_pinned() {
+        moruna_kernel::Tier::PinnedHost
+    } else {
+        moruna_kernel::Tier::Host
+    };
+    let buffer = alloc.alloc(length, tier)?;
+    let buffer = reactor.read_object(url, offset, buffer).wait()?;
+    Ok(bytes::Bytes::from_owner(buffer).slice(..length))
 }
 
 /// The leaf column indices the projection selects, in schema order. A name no file has is a

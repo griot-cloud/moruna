@@ -22,6 +22,7 @@
 
 pub mod cancel;
 pub mod check;
+pub mod checkpoint;
 pub mod config;
 pub mod error;
 pub mod host;
@@ -31,6 +32,7 @@ pub mod report;
 pub mod run;
 pub mod spec;
 
+pub use checkpoint::CheckpointHandle;
 pub use error::{Result, RunError};
 pub use job::JobSpec;
 pub use observe::{Progress, RunObserver};

@@ -123,6 +123,12 @@ pub struct RunSpec {
     pub staging_dir: Option<PathBuf>,
     /// `budget.disk`.
     pub staging_limit: Option<u64>,
+    /// `staging.durable` (MH 4.1, 4.7): the staging directory is on a disk that survives the
+    /// machine, so the host profile is declared `durable_staging=present` and a manifest
+    /// written there may be resumed on another machine (Q9). Discovery still refuses a tmpfs
+    /// or overlay directory declared so (03 e.4). A `host_profile` that declares
+    /// `durable_staging` otherwise is a `Config` error naming both.
+    pub staging_durable: bool,
     /// What happens after a kernel error.
     pub error_policy: ErrorPolicy,
     /// Deliver morsels to the sink in sequence order.
@@ -145,6 +151,12 @@ pub struct RunSpec {
     pub checkpoint_keep: bool,
     /// `None`: a fresh run. `Some`: resume from this manifest.
     pub resume: Option<PathBuf>,
+    /// `resume = "auto"` (MH 4.7): when `resume` is `None`, look under the staging directory
+    /// for the newest `moruna-*/manifest.json` written by this same job, the same kernel
+    /// fingerprints and, when the source is already built, the same plan digest, and resume
+    /// it; with none, start fresh and say so in `notes`. This is what a host that restarts a
+    /// destroyed machine with the same job sets.
+    pub resume_auto: bool,
     /// Clamps and translations the surface reports (12 f.3).
     pub notes: Vec<String>,
     /// The job document's content address (MH 4.1), when the run was built from one. Recorded
@@ -172,6 +184,7 @@ impl RunSpec {
             trace_path: None,
             staging_dir: None,
             staging_limit: None,
+            staging_durable: false,
             error_policy: ErrorPolicy::Terminate,
             ordered: false,
             sizer: SizerKind::Rule,
@@ -185,6 +198,7 @@ impl RunSpec {
             checkpoint_interval_ms: crate::config::CHECKPOINT_INTERVAL_MS,
             checkpoint_keep: false,
             resume: None,
+            resume_auto: false,
             notes: Vec::new(),
             spec_digest: None,
         }
@@ -261,6 +275,9 @@ pub struct Components {
     pub placement: Option<Arc<dyn Placement>>,
     /// Uses this run id instead of minting one.
     pub run_id: Option<RunId>,
+    /// Attached to the run's scheduler while it runs, so another thread can ask for a
+    /// manifest now (MH 4.3 `checkpoint`, 4.7).
+    pub checkpoint: Option<crate::checkpoint::CheckpointHandle>,
     /// A window onto the run for a host (MH 4.3); the facade attaches to it and detaches when
     /// the run ends.
     pub observer: Option<Arc<crate::observe::RunObserver>>,
@@ -350,6 +367,8 @@ mod tests {
         assert!(spec.checkpoint);
         assert!(!spec.checkpoint_keep);
         assert!(spec.resume.is_none());
+        assert!(!spec.resume_auto);
+        assert!(!spec.staging_durable);
         assert_eq!(
             spec.profiles_dir, None,
             "the facade resolves the default, so a fresh spec names no store (12 f.1)"
@@ -374,6 +393,7 @@ mod tests {
         assert!(components.sampler.is_none());
         assert!(components.placement.is_none());
         assert!(components.run_id.is_none());
+        assert!(components.checkpoint.is_none());
         assert!(components.observer.is_none());
         let _: Cancel = Cancel::new();
     }

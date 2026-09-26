@@ -58,6 +58,15 @@ hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 tracing-subscriber = { version = "=0.3.23" }
+# Object storage through a socket (MH 4.6, F8.6): an HTTP/1.1 connection over a Unix or vsock
+# stream for `object_store`'s S3 client. Every one of them is already in the graph through
+# `object_store`'s own HTTP stack at these versions; they are named here so the reactor can
+# speak HTTP without a TCP connector (a preamble 6.2 table addition, E2).
+hyper = { version = "=1.11.1", default-features = false }
+hyper-util = { version = "=0.1.20", default-features = false }
+http = { version = "=1.5.0" }
+http-body-util = { version = "=0.1.5" }
+socket2 = { version = "=0.6.5" }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON. Already
 # in the graph through the engine bridges at this version, so the pin adds no second copy.
 sha2 = { version = "=0.11.0" }

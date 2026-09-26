@@ -349,7 +349,19 @@ fn build_s3(cfg: &S3Config, bucket: &str, allow_http: bool) -> Result<object_sto
         .with_bucket_name(bucket)
         .with_allow_http(allow_http);
     if let Some(v) = &cfg.endpoint {
-        b = b.with_endpoint(v);
+        // MH 4.6: a `unix://` or `vsock://` endpoint is a socket the host proxies; the client
+        // speaks plain HTTP/1.1 over it, path-style, whatever `allow_http` says, because the
+        // socket never leaves the machine.
+        match crate::socket::parse_endpoint(v)? {
+            Some(target) => {
+                b = b
+                    .with_endpoint(crate::socket::SOCKET_ENDPOINT)
+                    .with_allow_http(true)
+                    .with_virtual_hosted_style_request(false)
+                    .with_http_connector(crate::socket::SocketConnector::new(target));
+            }
+            None => b = b.with_endpoint(v),
+        }
     }
     if let Some(v) = &cfg.region {
         b = b.with_region(v);

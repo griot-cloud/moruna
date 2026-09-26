@@ -859,12 +859,170 @@ fn so_t16_local_paths_use_read_file() {
     assert_eq!(listed.plan().expect("the plan").len(), 1);
 }
 
-// SO-T16, the object-store half. (integration, closes in wave 3)
+// SO-T16, the object-store half (MH 4.6, H7): an object URL's footer is read with
+// `read_object` into the arena at plan time and its column chunks with `read_object` at read
+// time; nothing touches `read_file`. A prefix lists every Parquet object under it.
 #[test]
-#[ignore = "integration, closes in wave 3: an object url needs a plan-time ranged read, which \
-            needs an Allocator a source does not have at construction (escalation E10)"]
 fn so_t16_object_urls_use_the_object_store() {
-    unimplemented!("closes when the contracts change for a plan-time allocator lands");
+    let dir = scratch();
+    let first = write_parquet(&dir, "t16-obj-a", 60, 20, 0);
+    let second = write_parquet(&dir, "t16-obj-b", 40, 40, 0);
+    let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
+    let reactor = FakeReactor::new()
+        .with_file(
+            "s3://bucket/data/a.parquet",
+            std::fs::read(&first.path).expect("fixture"),
+        )
+        .with_file(
+            "s3://bucket/data/b.parquet",
+            std::fs::read(&second.path).expect("fixture"),
+        )
+        .with_file("s3://bucket/data/notes.txt", b"not parquet".to_vec());
+    let observer = reactor.clone();
+    let source = ParquetSource::with_allocator(
+        ParquetSourceConfig {
+            urls: vec!["s3://bucket/data/".to_string()],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(reactor.clone()) as Arc<dyn Reactor>,
+        Arc::new(reactor) as Arc<dyn ObjectMetadata>,
+        alloc.clone(),
+    )
+    .expect("a source over objects");
+    let plan = source.plan().expect("the plan");
+    assert_eq!(plan.len(), 4, "three row groups of a, one of b");
+    let mut rows = 0;
+    for split in &plan {
+        rows += block_on(source.read(split, None, alloc.as_ref(), Tier::Host))
+            .expect("a read")
+            .rows();
+    }
+    assert_eq!(rows, 100, "every row of both objects");
+    let kinds: Vec<OpKind> = observer.ops().iter().map(|op| op.kind).collect();
+    assert!(kinds.contains(&OpKind::ListPrefix));
+    assert!(kinds.contains(&OpKind::ReadObject));
+    assert!(
+        !kinds.contains(&OpKind::ReadFile),
+        "an object never goes through read_file: {kinds:?}"
+    );
+
+    // One object by name, listed as nothing under it, is sized with `head_object`.
+    let single = FakeReactor::new().with_file(
+        "gs://bucket/one.parquet",
+        std::fs::read(&second.path).expect("fixture"),
+    );
+    let lister = HeadOnly(single.clone());
+    let one = ParquetSource::with_allocator(
+        ParquetSourceConfig {
+            urls: vec!["gs://bucket/one.parquet".to_string()],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(single.clone()) as Arc<dyn Reactor>,
+        Arc::new(lister) as Arc<dyn ObjectMetadata>,
+        alloc.clone(),
+    )
+    .expect("a single object");
+    assert_eq!(one.plan().expect("plan").len(), 1);
+    assert!(
+        single.ops().iter().any(|op| op.kind == OpKind::HeadObject),
+        "sized by head_object"
+    );
+
+    // A footer larger than the first tail read comes back in a second read.
+    let wide = write_parquet(&dir, "t16-obj-wide", 3000, 1, 0);
+    let big = FakeReactor::new().with_file(
+        "s3://bucket/wide.parquet",
+        std::fs::read(&wide.path).expect("fixture"),
+    );
+    let many = ParquetSource::with_allocator(
+        ParquetSourceConfig {
+            urls: vec!["s3://bucket/wide.parquet".to_string()],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(big.clone()) as Arc<dyn Reactor>,
+        Arc::new(big.clone()) as Arc<dyn ObjectMetadata>,
+        alloc.clone(),
+    )
+    .expect("a footer over 64 KiB");
+    assert_eq!(many.plan().expect("plan").len(), 3000);
+    assert!(
+        big.ops()
+            .iter()
+            .filter(|op| op.kind == OpKind::ReadObject)
+            .count()
+            >= 2,
+        "the tail, then the rest of the metadata"
+    );
+
+    // Built without an allocator, an object URL says what it needs.
+    let without = FakeReactor::new().with_file(
+        "s3://bucket/data/a.parquet",
+        std::fs::read(&first.path).expect("fixture"),
+    );
+    let error = ParquetSource::new(
+        ParquetSourceConfig {
+            urls: vec!["s3://bucket/data/a.parquet".to_string()],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(without.clone()) as Arc<dyn Reactor>,
+        Arc::new(without) as Arc<dyn ObjectMetadata>,
+    )
+    .err()
+    .expect("no allocator, no object footer");
+    assert!(error.to_string().contains("with_allocator"), "{error}");
+
+    // An object that is not Parquet is refused naming it.
+    for (url, bytes) in [
+        ("s3://bucket/short.parquet", b"PAR1".to_vec()),
+        ("s3://bucket/plain.parquet", vec![0u8; 64]),
+        (
+            "s3://bucket/liar.parquet",
+            [
+                vec![0u8; 16],
+                1000u32.to_le_bytes().to_vec(),
+                b"PAR1".to_vec(),
+            ]
+            .concat(),
+        ),
+    ] {
+        let fake = FakeReactor::new().with_file(url, bytes);
+        let error = ParquetSource::with_allocator(
+            ParquetSourceConfig {
+                urls: vec![url.to_string()],
+                ..ParquetSourceConfig::default()
+            },
+            Arc::new(fake.clone()) as Arc<dyn Reactor>,
+            Arc::new(fake) as Arc<dyn ObjectMetadata>,
+            alloc.clone(),
+        )
+        .err()
+        .expect("not parquet");
+        assert!(error.to_string().contains(url), "{url}: {error}");
+    }
+}
+
+/// Lists nothing, so a single object's URL falls through to `head_object`, as a real store's
+/// one-level listing of an object's own key does.
+struct HeadOnly(FakeReactor);
+
+impl ObjectMetadata for HeadOnly {
+    fn head_object(&self, url: &str) -> moruna_kernel::Completion<moruna_kernel::ObjectMeta> {
+        let completion = self.0.head_object(url);
+        let meta = completion.wait();
+        let (sender, out) = moruna_kernel::Completion::channel();
+        // The real reactor names an object by its key, not its URL.
+        sender.resolve(meta.map(|mut m| {
+            m.url = "one.parquet".to_string();
+            m
+        }));
+        out
+    }
+
+    fn list_prefix(&self, _url: &str) -> moruna_kernel::Completion<Vec<moruna_kernel::ObjectMeta>> {
+        let (sender, out) = moruna_kernel::Completion::channel();
+        sender.resolve(Ok(Vec::new()));
+        out
+    }
 }
 
 /// Dictionary columns are unpacked before the copy (f.4), so no payload leaves this crate as a
@@ -1365,7 +1523,8 @@ fn plan_and_read_failures_are_named() {
     .unwrap_err();
     assert!(error.to_string().contains("outside the split"), "{error}");
 
-    // An object url is refused at plan time with the escalation named.
+    // An object url, on a source built without an allocator, is refused at plan time naming
+    // the constructor that can read it.
     let reactor = FakeReactor::new().with_file("s3://bucket/a.parquet", vec![0u8; 8]);
     let error = err(ParquetSource::new(
         ParquetSourceConfig {
@@ -1375,9 +1534,9 @@ fn plan_and_read_failures_are_named() {
         Arc::new(reactor.clone()) as Arc<dyn Reactor>,
         Arc::new(reactor) as Arc<dyn ObjectMetadata>,
     ));
-    assert!(error.to_string().contains("E10"), "{error}");
+    assert!(error.to_string().contains("with_allocator"), "{error}");
 
-    // A prefix with nothing under it heads the object and still reports the escalation.
+    // A prefix with nothing under it heads the object and still says so.
     let bare = FakeReactor::new().with_file("s3://empty/a", vec![0u8; 1]);
     let error = err(ParquetSource::new(
         ParquetSourceConfig {
