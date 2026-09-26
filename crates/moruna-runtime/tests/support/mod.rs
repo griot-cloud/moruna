@@ -368,24 +368,24 @@ pub fn resident_bytes() -> Option<u64> {
     }
 }
 
-/// A real kernel that takes its time and changes nothing, so a test can act while the run is
-/// in flight (MH 4.7: a kill, or a host's on-demand checkpoint).
-pub struct Slow {
+/// A real kernel that passes its input through after sleeping, so a run lasts long enough for
+/// a host to hear it (MH HO-T6 to HO-T8).
+pub struct Sleeper {
     fingerprint: Fingerprint,
-    millis: u64,
+    ms: u64,
 }
 
-impl Slow {
-    /// One kernel sleeping `millis` per morsel.
-    pub fn new(millis: u64) -> Slow {
-        Slow {
-            fingerprint: Fingerprint::compute("moruna-runtime::tests::Slow", b"v1"),
-            millis,
+impl Sleeper {
+    /// One kernel that sleeps `ms` in every `apply`.
+    pub fn new(ms: u64) -> Sleeper {
+        Sleeper {
+            fingerprint: Fingerprint::compute("moruna-runtime::tests::Sleeper", b"v1"),
+            ms,
         }
     }
 }
 
-impl Kernel for Slow {
+impl Kernel for Sleeper {
     fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
     }
@@ -421,7 +421,7 @@ impl Kernel for Slow {
         _state: &mut dyn KernelState,
         input: Payload,
     ) -> moruna_kernel::Result<Payload> {
-        std::thread::sleep(std::time::Duration::from_millis(self.millis));
+        std::thread::sleep(std::time::Duration::from_millis(self.ms));
         Ok(input)
     }
 }

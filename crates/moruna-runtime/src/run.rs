@@ -62,7 +62,7 @@ impl Runtime {
 }
 
 /// Mint a run id from 16 random bytes (12 f.1).
-fn mint_run_id() -> Result<RunId> {
+pub(crate) fn mint_run_id() -> Result<RunId> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| {
         RunError::bare(MorunaError::Config {
@@ -125,9 +125,11 @@ fn drive(
         resume,
         resume_auto,
         notes: spec_notes,
+        spec_digest,
     } = spec;
     let checkpoint_handle = components.checkpoint.clone();
     let _detach = crate::checkpoint::DetachOnDrop(checkpoint_handle.clone());
+    let observer = components.observer.clone();
 
     // f.4: the GIL refusal comes before any Rust component starts (PY-I4).
     #[cfg(feature = "python")]
@@ -172,6 +174,7 @@ fn drive(
                 discovered.profile.staging_dir.as_deref(),
                 &kernels,
                 &source_spec,
+                spec_digest.as_deref(),
             )?;
             match &found {
                 Some(path) => notes.push(format!("resume auto: resuming {}", path.display())),
@@ -187,6 +190,11 @@ fn drive(
         Some(path) => Some(PlacementEngine::read_manifest_header(path)?),
         None => None,
     };
+    // MH 4.3: a resume from a document is refused when the manifest was written by another
+    // document, which the plan digest alone cannot see (a changed kernel hint, a changed sink).
+    if let (Some(path), Some(digest)) = (&resume, &spec_digest) {
+        check_spec_digest(path, digest)?;
+    }
     let run_id = match (&header, components.run_id) {
         (Some(header), _) => header.run_id,
         (None, Some(id)) => id,
@@ -199,6 +207,9 @@ fn drive(
     notes.extend(discovered.notes.iter().cloned());
     notes.extend(spec_notes);
     let limits = discovered.limits.clone();
+    if let Some(observer) = &observer {
+        observer.discovered(&limits, kernels.len());
+    }
     let staging_dir = discovered.profile.staging_dir.clone();
     let workers_max = workers_from(limits.cpu_quota);
 
@@ -397,16 +408,19 @@ fn drive(
                     plan_digest: plan_digest(&plan),
                     fingerprints: kernels.iter().map(|k| k.fingerprint()).collect(),
                     resume_policy: kernels.iter().map(|k| k.hints().resume).collect(),
-                    config: config::resolved(
-                        limits.memory_ceiling,
-                        disk_budget,
-                        workers_max,
-                        config::READAHEAD_SPLITS,
-                        &error_policy,
-                        ordered,
-                        sizer,
-                        checkpoint_enabled,
-                        checkpoint_interval_ms,
+                    config: with_spec_digest(
+                        config::resolved(
+                            limits.memory_ceiling,
+                            disk_budget,
+                            workers_max,
+                            config::READAHEAD_SPLITS,
+                            &error_policy,
+                            ordered,
+                            sizer,
+                            checkpoint_enabled,
+                            checkpoint_interval_ms,
+                        ),
+                        spec_digest.as_deref(),
                     ),
                     checkpoint_enabled,
                 },
@@ -505,7 +519,7 @@ fn drive(
         scheduler.clone() as Arc<dyn Knobs>,
         scheduler.clone() as Arc<dyn StatsSource>,
         scheduler.clone() as Arc<dyn Prober>,
-        sampler,
+        sampler.clone(),
         trace_tail,
         placement.clone(),
         kernel_infos,
@@ -518,11 +532,20 @@ fn drive(
     // region (12 f.1, 11 f.1). The controller outlives every record: it is held here and in
     // `started` until after the scheduler has stopped.
     let hooked = Arc::downgrade(&controller);
+    let watching = observer.clone();
     scheduler.set_record_hook(Arc::new(move |record| {
         if let Some(controller) = hooked.upgrade() {
             controller.on_record(record);
         }
+        if let Some(observer) = &watching {
+            observer.on_record(record);
+        }
     }));
+    if let Some(observer) = &observer {
+        observer.attach(&scheduler, &controller, &placement, &sampler);
+    }
+    // Detached however the run ends, so a watcher never holds the last reference to anything.
+    let _detach = DetachOnDrop(observer.clone());
 
     // 11. prepare, probe, start, run.
     controller.prepare()?;
@@ -629,7 +652,8 @@ fn durable_profile(
 }
 
 /// `resume = "auto"` (MH 4.7): the newest manifest in the staging directory that this run could
-/// resume, judged by the kernels and, when the source is already built, the plan. A source
+/// resume, judged by the kernels, the job document's digest when the run has one, and, when
+/// the source is already built, the plan. A source
 /// still to be built cannot be asked for its plan before the run id exists (PY-I1 builds it
 /// after the trace), so for one the plan is left to `restore`, which refuses a mismatch by
 /// name. No staging directory is no manifest.
@@ -637,6 +661,7 @@ fn auto_manifest(
     staging_dir: Option<&std::path::Path>,
     kernels: &[Arc<dyn Kernel>],
     source: &crate::spec::SourceSpec,
+    spec_digest: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let Some(dir) = staging_dir else {
         return Ok(None);
@@ -650,9 +675,59 @@ fn auto_manifest(
     let want = moruna_placement::manifest::ManifestMatch {
         fingerprints: &fingerprints,
         plan_digest,
-        spec_digest: None,
+        spec_digest,
     };
     Ok(PlacementEngine::find_resumable_manifest(dir, &want)?)
+}
+
+/// Detaches an observer when the run's lifecycle function returns, by any path.
+struct DetachOnDrop(Option<Arc<crate::observe::RunObserver>>);
+
+impl Drop for DetachOnDrop {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer.detach();
+        }
+    }
+}
+
+/// The resolved configuration table with the job document's digest added under `spec.digest`
+/// (MH 4.3), so the manifest records which document wrote it.
+fn with_spec_digest(mut config: serde_json::Value, digest: Option<&str>) -> serde_json::Value {
+    if let (Some(digest), serde_json::Value::Object(map)) = (digest, &mut config) {
+        map.insert(
+            "spec.digest".to_string(),
+            serde_json::Value::String(digest.to_string()),
+        );
+    }
+    config
+}
+
+/// Refuse a resume whose manifest was written under another job document (MH 4.3, MH 4.1). A
+/// manifest that records no digest was written by a library run, and is left to the checks
+/// `Placement::restore` makes.
+fn check_spec_digest(manifest: &std::path::Path, digest: &str) -> Result<()> {
+    let text = std::fs::read_to_string(manifest).map_err(|e| {
+        RunError::bare(MorunaError::Resume(format!(
+            "{}: the manifest could not be read: {e}",
+            manifest.display()
+        )))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        RunError::bare(MorunaError::Resume(format!(
+            "{}: the manifest is not JSON: {e}",
+            manifest.display()
+        )))
+    })?;
+    match value.get("config").and_then(|c| c.get("spec.digest")) {
+        Some(serde_json::Value::String(theirs)) if theirs != digest => {
+            Err(RunError::bare(MorunaError::Resume(format!(
+                "{}: the manifest was written by the job document {theirs}, and this one is                  {digest}",
+                manifest.display()
+            ))))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The Python stages' interpreter state, for `RunMeta.gil` (12 f.2, f.4).
@@ -942,14 +1017,23 @@ mod tests {
         let built = crate::spec::SourceSpec::Built(
             Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>
         );
-        assert_eq!(auto_manifest(None, &[], &built).expect("no dir"), None);
+        assert_eq!(
+            auto_manifest(None, &[], &built, None).expect("no dir"),
+            None
+        );
         let dir = std::env::temp_dir().join(format!("moruna-auto-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
-        assert_eq!(auto_manifest(Some(&dir), &[], &built).expect("empty"), None);
+        assert_eq!(
+            auto_manifest(Some(&dir), &[], &built, None).expect("empty"),
+            None
+        );
         let later = crate::spec::SourceSpec::Build(Box::new(|_| {
             Ok(Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>)
         }));
-        assert_eq!(auto_manifest(Some(&dir), &[], &later).expect("empty"), None);
+        assert_eq!(
+            auto_manifest(Some(&dir), &[], &later, None).expect("empty"),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

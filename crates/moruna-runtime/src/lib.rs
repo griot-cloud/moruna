@@ -24,12 +24,17 @@ pub mod cancel;
 pub mod checkpoint;
 pub mod config;
 pub mod error;
+pub mod host;
+pub mod job;
+pub mod observe;
 pub mod report;
 pub mod run;
 pub mod spec;
 
 pub use checkpoint::CheckpointHandle;
 pub use error::{Result, RunError};
+pub use job::JobSpec;
+pub use observe::{Progress, RunObserver};
 pub use run::Runtime;
 pub use spec::{BuildCtx, Components, RunSpec, SinkSpec, SourceSpec};
 

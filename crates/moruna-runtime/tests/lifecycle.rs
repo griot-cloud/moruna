@@ -77,6 +77,7 @@ impl Rig {
             placement: Some(Arc::new(self.placement.clone()) as Arc<dyn Placement>),
             run_id: Some(RunId([7; 16])),
             checkpoint: None,
+            observer: None,
         }
     }
 }

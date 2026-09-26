@@ -29,7 +29,7 @@ use moruna_kernel::{
     Allocator, BoxFuture, Kernel, Payload, Result as MResult, RowRange, SourceSchema, Split, Tier,
 };
 use moruna_runtime::{CancelToken, Components, RunId, RunSpec, Runtime, SinkSpec, SourceSpec};
-use support::{Appender, Doubler, Slow, write_parquet};
+use support::{Appender, Doubler, Sleeper, write_parquet};
 
 const CHILD: &str = "MORUNA_KILL_RESUME_CHILD";
 const ROWS: u64 = 240_000;
@@ -138,7 +138,7 @@ fn job_spec(job: &Job) -> RunSpec {
     let sink_url = format!("file://{}", job.out.display());
     let kernels: Vec<Arc<dyn Kernel>> = vec![
         Arc::new(Doubler::new()),
-        Arc::new(Slow::new(25)),
+        Arc::new(Sleeper::new(25)),
         Arc::new(Appender::new("loud")),
     ];
     let mut spec = RunSpec::new(

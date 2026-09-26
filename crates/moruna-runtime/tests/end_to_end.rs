@@ -478,7 +478,7 @@ fn rt_t9_checkpoint_on_demand_and_resume_auto() {
 
     let handle = moruna_runtime::CheckpointHandle::new();
     assert!(!handle.is_attached(), "nothing is attached before the run");
-    let kernel: Arc<dyn Kernel> = Arc::new(support::Slow::new(20));
+    let kernel: Arc<dyn Kernel> = Arc::new(support::Sleeper::new(20));
     let mut spec = resume_spec(
         &input,
         &out_dir,
