@@ -28,6 +28,7 @@ moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.1.1" }
 moruna-controller = { path = "crates/moruna-controller", version = "0.1.1" }
 moruna-runtime = { path = "crates/moruna-runtime", version = "0.1.1" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.1.1" }
+moruna-kernels = { path = "crates/moruna-kernels", version = "0.1.1" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -47,6 +48,7 @@ thiserror = { version = "=2.0.20" }
 tracing = { version = "=0.1.44" }
 mimalloc = { version = "=0.1.52" }
 blake3 = { version = "=1.8.7" }
+sha2 = { version = "=0.11.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151" }
 base64 = { version = "=0.23.1" }

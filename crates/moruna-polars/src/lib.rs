@@ -18,7 +18,11 @@
 #[cfg(feature = "polars")]
 mod ffi;
 #[cfg(feature = "polars")]
+pub mod frame;
+#[cfg(feature = "polars")]
 mod plugin;
 
+#[cfg(feature = "polars")]
+pub use frame::{FrameKernel, batch_from_dataframe, dataframe_from_batch, frame_kernel};
 #[cfg(feature = "polars")]
 pub use plugin::{polars_plugin, run_kernel};

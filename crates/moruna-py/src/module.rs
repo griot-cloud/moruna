@@ -13,6 +13,7 @@ pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sources::register(m)?;
     crate::sinks::register(m)?;
     crate::kernel::register(m)?;
+    crate::check::register(m)?;
     crate::report::register(m)?;
     m.add_function(wrap_pyfunction!(crate::inspect::inspect_host, m)?)?;
     m.add_function(wrap_pyfunction!(crate::run::run, m)?)?;

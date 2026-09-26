@@ -21,6 +21,8 @@ pub mod size;
 pub mod translate;
 
 #[cfg(feature = "python")]
+pub mod check;
+#[cfg(feature = "python")]
 pub mod errors;
 #[cfg(feature = "python")]
 pub mod inspect;

@@ -66,6 +66,9 @@ pub struct PyKernelSpec {
     pub preferred_rows: Option<u64>,
     pub resume: ResumePolicy,               // decorator resume="reinit" | "checkpoint" | "forbid"
     pub state_bytes: Option<u64>,           // KernelHints.state_bytes, the declared state size (RC f.3)
+    pub declared: Declared,                 // input_schema= and output_schema= (e.5); Kernel::declared returns it
+    pub lockfile: Option<Vec<u8>>,          // lockfile= bytes, folded into the fingerprint (e.4)
+    pub origin: Option<Py<PyAny>>,          // the author's function when `callable` wraps it (a Polars kernel, f.9)
 }
 pub struct PyKernel { /* private */ }
 impl PyKernel {
@@ -92,6 +95,11 @@ pub fn python_build_info() -> String;       // version, free-threaded flag, for 
 
 // crate moruna-polars
 pub fn polars_plugin<K: Kernel>(kernel: K) -> impl Fn(&[polars::prelude::Series]) -> polars::prelude::PolarsResult<polars::prelude::Series>;
+// f.9, Polars as syntax for a Rust author (amended 2026-09-26, F8.3)
+pub fn dataframe_from_batch(batch: &RecordBatch) -> PolarsResult<DataFrame>;    // by pointer, per column
+pub fn batch_from_dataframe(frame: &DataFrame) -> PolarsResult<RecordBatch>;   // by pointer; views and large types cast to plain
+pub fn frame_kernel<F: Fn(DataFrame) -> PolarsResult<DataFrame> + Send + Sync + 'static>(name: &str, f: F) -> FrameKernel<F>;
+impl<F> FrameKernel<F> { pub fn with_declared(self, d: Declared) -> Self; pub fn with_hints(self, h: KernelHints) -> Self; }
 
 // crate moruna-datafusion
 pub fn datafusion_udf<K: Kernel>(kernel: K, name: &str) -> datafusion::logical_expr::ScalarUDF;
@@ -129,7 +137,13 @@ pub fn datafusion_udf<K: Kernel>(kernel: K, name: &str) -> datafusion::logical_e
 
 ### e.4 Fingerprint
 
-`Fingerprint::compute(identity, config)` with `identity = f"py:{module}.{qualname}"` (of the callable, or of the class for a class kernel) and `config = blake3(inspect.getsource(callable) or code object co_code) || decorator args as canonical JSON` (every `PyKernelSpec` field except `callable`). If the source is unavailable (a lambda in a REPL), `co_code` plus `co_consts` repr is used and a note is recorded.
+**Amended 2026-09-26 (F8.3, MH 4.9):** the fingerprint is `sha256(canonical source ‖ lockfile bytes, when given ‖ Moruna ABI version)`, byte for byte as `15-check.md` e.7 fixes it: the canonical source is the qualified name (not the module, so `moruna check file.py` and a program importing the same file under another name agree), the source text normalised, and the decorator arguments and the declaration as canonical JSON. It is still 32 bytes in a `Fingerprint`, so the profile store's keys are unchanged in shape; every stored Python profile from before the amendment is simply not found again, once. The text below is the rule it replaced, kept for the record of AD-T8.
+
+Formerly: `Fingerprint::compute(identity, config)` with `identity = f"py:{module}.{qualname}"` (of the callable, or of the class for a class kernel) and `config = blake3(inspect.getsource(callable) or code object co_code) || decorator args as canonical JSON` (every `PyKernelSpec` field except `callable`). If the source is unavailable (a lambda in a REPL), `co_code` plus `co_consts` repr is used and a note is recorded.
+
+### e.5 Declared schemas (amended 2026-09-26, F8.3)
+
+`Kernel::declared() -> Declared` (contracts d.7, default: nothing declared) returns `Declared { input: Option<SchemaDecl>, output: Option<SchemaDecl> }` from `moruna_kernel::declare`. A `SchemaDecl` is `Exact(columns)`, `Subset(columns)` or, for an output, `Relative { adds, drops, changes }`; a column is `(name, TypeDecl, nullable)` and a `TypeDecl` is an Arrow type or `Any`. The decorator's `input_schema=` and `output_schema=` translate as: a `pyarrow.Schema` is exact; a mapping of column to type is a subset; an output mapping whose keys are only `adds`, `drops` and `changes` is relative. A type is a `pyarrow.DataType`, its string (the grammar of `15-check.md` e.1), a Python `int`, `float`, `str` or `bool`, or a Polars dtype. The runtime never reads a declaration on the library path; `moruna check` does (15 f.3), and a hosted spec may require one (MH H-Q8). A `PyKernel` returns `spec.declared`.
 
 ## f. Algorithms and policies
 
@@ -148,6 +162,8 @@ pub fn datafusion_udf<K: Kernel>(kernel: K, name: &str) -> datafusion::logical_e
 **f.7 Resume policy for Python kernels.** `PyKernelSpec.resume` maps to `KernelHints.resume`. For `Checkpoint`, the class kernel must define `checkpoint(self, state) -> bytes` and `restore(self, ctx, data: bytes) -> state`; `PyKernel::new` checks both attributes (a `Plan` error naming the missing one otherwise, so the omission is found before any morsel is read) and the adapter implements `KernelState::checkpoint` (calls `checkpoint(state)` under attachment, copies the bytes out of the Python object before detaching, returns `Some`) and `Kernel::restore` (calls `restore(ctx_obj, data)` under attachment and stores the returned value as the new `PyState.state`). For `Reinit` (the default) and `Forbid` nothing is called. A stateful Python kernel that accumulates across morsels and leaves the default is a user error the documentation names in one sentence, and the resume path cannot detect; the `stateful=True` docstring says "if your state depends on the morsels seen, declare resume='checkpoint' or 'forbid'".
 
 **f.8 Startup placement.** The surface constructs `PyKernel::new(spec)` while translating arguments, before discovery, so `Plan` errors from `new` surface before any component starts; the facade binds the allocator in the "kernels built" step of the facade's startup order (12 PY-I1) and the scheduler's `init_instances` (SC f.4) then calls `init` for every instance of every class kernel on the worker that owns it, so `setup` failures terminate before any morsel is read (architecture 7, "stateful init fails"; SC-T18).
+
+**f.9 Polars as syntax (amended 2026-09-26, F8.3, MH 4.9).** A function whose annotated signature is one positional parameter of type `pl.DataFrame` or `pl.LazyFrame` returning either (annotations evaluated with `typing.get_type_hints`, string annotations read as their text) is accepted by `@moruna.kernel` and by `moruna check` without further declaration. The decorator wraps it in a callable over `pyarrow.RecordBatch` (`moruna._declare.polars_callable`): the batch enters Polars as `pl.DataFrame(batch)`, which reads the Arrow PyCapsule stream, the C Data Interface, so fixed-width columns are not copied (strings are, because Polars keeps them as views); a `LazyFrame` parameter gets `.lazy()` and a `LazyFrame` result is collected; the result leaves through `to_arrow()`, the same interface, rechunked only when Polars left it in several chunks, and its `large_string`, `string_view`, `large_binary`, `binary_view` and large list columns are cast to `string`, `binary` and `list`, the spellings a declaration names. The wrapper is the `PyKernel`'s callable and the author's function is its `origin`, which is what the fingerprint takes. `moruna.polars(fn)` is the same path for a function without annotations and replaces 12 f.6's `from_arrow` helper. For a Rust author the same idea is `moruna_polars::frame_kernel`, which crosses each column through `ffi.rs` by pointer in both directions and casts the same types back to plain on the way out. The two paths do not share code because the Python one runs Python Polars and the Rust one Rust Polars: two builds of Polars cannot exchange a `DataFrame` except through the C Data Interface, which is what each of them uses.
 
 ## g. Concurrency within the component
 
@@ -197,9 +213,13 @@ Python tests run under both a GIL and a free-threaded interpreter in CI (matrix)
 
 **AD-T12 class_kernel_shape.** A class kernel whose `setup` returns a counter object: `init` is called `instances` times with `ctx.instance` 0..instances and distinct returned states; `apply` passes the matching state as the first argument; `footprint` returns the int the class reports and `None` when the method is absent; a class without `__call__` or `setup` is `Plan` at `new`; `resume=Checkpoint` without `restore` is `Plan` at `new` naming `restore`; with both, `KernelState::checkpoint` returns the bytes `checkpoint(state)` produced and `Kernel::restore` yields a state whose `__call__` output equals the original's. b, e.1, f.7.
 
+**AD-T8, amended (F8.3).** Also: the same source under a different module name has the same fingerprint; a declaration, a lockfile and a different lockfile each change it; a wrapper whose `origin` is a function is fingerprinted as that function (`ad_t8_declaration_lockfile_origin_and_module`). 15 e.7.
+
+**AD-T13 polars_frame_kernel.** `moruna-polars` `frame_kernel`: an `int64` column crosses into Polars and back at the same address; view types come back plain; a frame function is a kernel whose output agrees with its declaration; a Polars error is a `Kernel` error (`crates/moruna-polars/tests/frame_kernel.rs`). The Python path is CK-T8 in `15-check.md`. f.9.
+
 ## l. Implementation notes for the agent
 
-Files: `crates/moruna-adapters/src/lib.rs`, `src/python/{mod.rs, kernel.rs (f.1, f.2, d.1 `PyKernel`), state.rs (e.1 `PyState`, f.7), cross.rs (e.2, e.3), copy.rs (f.3), gil.rs (f.4), fingerprint.rs (e.4), tensor_obj.rs (the `__dlpack__` class), ctx.rs (the `ctx` object)}`; `crates/moruna-polars/src/lib.rs` (f.5); `crates/moruna-datafusion/src/lib.rs` (f.6). `unsafe` permitted in `cross.rs` (C Data Interface and DLPack capsule handling) with `// SAFETY:` citing the Arrow and DLPack ownership rules; nowhere else in these three crates outside tests (E9).
+Files: `crates/moruna-adapters/src/lib.rs`, `src/python/{mod.rs, kernel.rs (f.1, f.2, d.1 `PyKernel`), state.rs (e.1 `PyState`, f.7), cross.rs (e.2, e.3), copy.rs (f.3), gil.rs (f.4), fingerprint.rs (e.4), tensor_obj.rs (the `__dlpack__` class), ctx.rs (the `ctx` object)}`; `crates/moruna-polars/src/lib.rs` (f.5), `src/frame.rs` (f.9); `crates/moruna-datafusion/src/lib.rs` (f.6); `python/moruna/_declare.py` (e.5, f.9, the Python half). `unsafe` permitted in `cross.rs` (C Data Interface and DLPack capsule handling) with `// SAFETY:` citing the Arrow and DLPack ownership rules; nowhere else in these three crates outside tests (E9).
 
 PyO3: modules declare `gil_used = false` (0.28 default); use `Python::attach` and `Python::detach`; never hold `Python<'py>` across the boundary copy.
 
@@ -220,6 +240,7 @@ None. (`AllocStats.boundary_copies_total` and `Allocator::contains` are in `01-c
 | S7 | AD-I6 | AD-T9, AD-T10 |
 | G-I8 | AD-I7 | AD-T7 |
 | S17, D13 (Python kernels resume) | e.1, f.7, f.8 | AD-T12 |
+| MH H13, 4.9 (declarations, fingerprint, Polars) | e.4, e.5, f.9 | AD-T8, AD-T13, 15 CK-T8 |
 
 ## o. Deferred (post-v1)
 

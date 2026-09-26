@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 moruna-kernel = { workspace = true }
 arrow = { workspace = true }
 moruna-runtime = { workspace = true }
+moruna-kernels = { workspace = true }
 moruna-discovery = { workspace = true }
 moruna-sources = { workspace = true }
 moruna-sinks = { workspace = true }

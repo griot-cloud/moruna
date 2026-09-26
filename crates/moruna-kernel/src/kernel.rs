@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::buffer::Allocator;
+use crate::declare::Declared;
 use crate::error::MorunaError;
 use crate::fingerprint::Fingerprint;
 use crate::ids::DeviceId;
@@ -111,6 +112,12 @@ pub trait Kernel: Send + Sync + 'static {
     /// What the controller should assume before the probe.
     fn hints(&self) -> KernelHints {
         KernelHints::default()
+    }
+    /// The kernel's declared input and output schemas (MH 4.9, 05 e.5). Optional: the default
+    /// declares nothing, which leaves the kernel runnable and not checkable. The runtime never
+    /// reads it on the library path; `moruna check` (15) does.
+    fn declared(&self) -> Declared {
+        Declared::default()
     }
     /// What this kernel wants delivered.
     fn accepts(&self) -> PayloadSpec;

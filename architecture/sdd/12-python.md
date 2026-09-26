@@ -119,7 +119,11 @@ def kernel(fn=None, *, stateful=False, instances=1, device_memory=False,
            expected_amplification=None, preferred_rows=None,
            resume="reinit",     # "reinit" | "checkpoint" | "forbid"; "checkpoint" requires the
                                 # object to define checkpoint(self, state) -> bytes and restore(self, ctx, data) -> state
-           state_bytes=None)    # declared per-instance state size in bytes (05 d.1)
+           state_bytes=None,    # declared per-instance state size in bytes (05 d.1)
+           input_schema=None,   # 05 e.5: pyarrow.Schema (exact) or {column: type} (subset)
+           output_schema=None,  # 05 e.5: as input_schema, or {"adds": ..., "drops": [...], "changes": ...}
+           lockfile=None)       # a path or bytes, folded into the fingerprint (15 e.7)
+    # a function annotated pl.DataFrame -> pl.DataFrame (or pl.LazyFrame) is a Polars kernel (05 f.9)
     # stateful=False: fn is a plain callable f(batch) -> batch
     # stateful=True: fn is a class instance with setup(self, ctx) -> state and __call__(self, state, batch) -> batch,
     #                optionally footprint(self, state) -> int | None; ctx exposes .instance and .device (05 b)
@@ -138,7 +142,9 @@ class ResumeError(MorunaError) ...   # a manifest that cannot be used; message n
 class PlanError(MorunaError) ...; KernelError; BudgetError; IoError; ConfigError; Cancelled
 
 def inspect_host() -> dict    # {"limits": {...}, "host_profile": {...}, "anon_bytes": n, "notes": [...]}: Limits and HostProfile field by field, what the process already holds (through the same sampler a run would use, 03 f.7), discovery notes
-def polars(fn, *, accepts="table")  # wraps a function from a Polars DataFrame to a Polars DataFrame as a stateless Python kernel (f.6)
+def polars(fn, *, accepts="table", **declarations)  # a Polars frame function without annotations, as a kernel (05 f.9)
+std                                  # module: moruna.std.cast(...), ... date_trunc(...), the standard kernels (15 e.6)
+                                     # python -m moruna check <module-or-file> [--kernel] [--json] [--seed] (15 d.1)
 __version__: str
 ```
 
@@ -174,6 +180,9 @@ python/moruna/__init__.py        the API above; imports moruna._core (the PyO3 m
 python/moruna/_report.py         RunReport wrapper and __str__
 python/moruna/_errors.py         exception classes
 python/moruna/py.typed, _core.pyi   type stubs; _core.pyi is hand-written and checked against the module in PY-T5
+python/moruna/_declare.py        declarations and the Polars signature (05 e.5, f.9)
+python/moruna/std.py             the standard kernels by arguments (15 e.6)
+python/moruna/_check.py, __main__.py   python -m moruna check (15)
 pyproject.toml                  maturin backend; wheel matrix in CI
 ```
 
@@ -191,7 +200,9 @@ pyproject.toml                  maturin backend; wheel matrix in CI
 
 **f.5 `KeyboardInterrupt` and thread roles.** `moruna.run` spawns the runtime thread, which runs `Runtime::run` and never touches the interpreter (the adapters attach on worker threads for kernel calls, 05 f.1; the runtime thread itself only wires and waits). The Python main thread stays in `moruna.run` and loops: attach, `PyErr::check_signals`, detach, sleep 100 ms, until the runtime thread finishes. When `check_signals` raises `KeyboardInterrupt`, the main thread sets the cancel token, keeps looping (a second interrupt is swallowed with a message) until the runtime thread returns, then raises `Cancelled` with the partial report. Signals are delivered to the main thread by CPython's design, which is why the roles are not the other way round.
 
-**f.6 `polars()` helper.** In v1 the only path is a stateless Python kernel `lambda batch: pl.from_arrow(batch).pipe(fn).to_arrow()` wrapped as if decorated with the given `accepts` (this copies inside Polars on some types; the docstring says so). The Rust path through `pyo3-polars` and `moruna-polars` is deferred (preamble 6.2 lists `pyo3-polars` as deferred); the signature does not change when it lands.
+**f.6 `polars()` helper.** **Superseded 2026-09-26 (F8.3)** by 05 f.9: `moruna.polars(fn)` and the decorator's Polars signature both hand the batch to Polars through the Arrow C Data Interface and take the result back the same way, with no `from_arrow` and no `combine_chunks`. What follows is the rule it replaced. In v1 the only path is a stateless Python kernel `lambda batch: pl.from_arrow(batch).pipe(fn).to_arrow()` wrapped as if decorated with the given `accepts` (this copies inside Polars on some types; the docstring says so). The Rust path through `pyo3-polars` and `moruna-polars` is deferred (preamble 6.2 lists `pyo3-polars` as deferred); the signature does not change when it lands.
+
+**f.8 Standard kernels and `moruna check` (amended 2026-09-26, F8.3).** `kernels` may hold `moruna.std` kernels beside decorated ones; `kernels_of` fuses adjacent standard kernels where `moruna_kernels::fuse` says their combination is one stage (15 f.6), so the report has one stage row per fused group, and a run whose kernels are all standard is not a Python run for the GIL check of f.4. `python -m moruna check` is `moruna/_check.py` behind `moruna/__main__.py`; its bindings are `_core.check_kernel`, `_core.std_kernel` and `_core.default_profiles_dir` (15 d.1). There is no `moruna` console script: the `moruna` binary of MH 4.2 is F8.1's Rust bin, which calls `moruna_runtime::check::check` for its own `check` subcommand, and two programs of one name on a `PATH` would be one too many.
 
 **f.7 Resume path.** With `resume` set, in this order: resolve it to a manifest path (`"auto"`: `PlacementEngine::find_manifest(staging_dir, None)`; a run id: `find_manifest(staging_dir, Some(id))`; a path: as given; nothing found is `ResumeError`); refuse with `ResumeError` if `source.repeatable()` is false; read the manifest header (`PlacementEngine::read_manifest_header`) and take its `run_id` and `node` for `PlacementConfig` and `TraceConfig`, so the new process continues the old run's identity rather than minting a new one; then PY-I1's steps discover → arena → reactor → trace → sources and sinks → kernels → placement; `placement.restore(&manifest, &plan, &fingerprints)` (its refusals surface as `ResumeError` before the sink is touched); scheduler `new` with `resuming = true` (the sink is not opened); `scheduler.apply_resume_point(point)` (SC f.13: refuses when checkpointing cannot be on, resumes the sink, sets the cursor, restores or re-inits instances) in place of `init_instances`; controller `prepare`; controller `probe_missing` in place of `probe_all`; controller `start`; `scheduler.run_resumed(cancel)` in place of `run` (re-reads `to_recompute`, then continues as `run`); controller `stop`; trace `finish`; report with `resumed = true`. `checkpoint=True` is the default whenever a staging directory exists and the source is repeatable (discovery finds or creates one; `staging_dir=None` with no discoverable directory disables both staging and checkpointing with a note in the report); a non-resumable sink forces it off with a note naming the sink (SC f.1); on `Completed`, the run directory is removed unless `keep_checkpoint`, and when `keep_checkpoint` is set the scheduler has written a final manifest at the end of the run whether or not the checkpoint interval ever elapsed, so a run shorter than `checkpoint.interval_ms` keeps something rather than an empty directory; on `Terminated` or `Cancelled`, the final manifest the scheduler wrote is put on the exception and the partial report, and the message ends with "resumable: pass resume=\"<run_id>\"" when it is. The resume argument is the only new parameter a user meets, and only after a failure; PY-I3 holds.
 

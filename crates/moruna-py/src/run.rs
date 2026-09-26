@@ -23,7 +23,7 @@ use pyo3::types::{PyAny, PyDict};
 
 use crate::errors::{Attachments, to_py_err};
 use crate::handles::{IteratorSchema, SinkSpec, SourceSpec};
-use crate::kernel::kernels_of;
+use crate::kernel::{Stage, kernels_of};
 use crate::report::PyRunReport;
 use crate::sources::type_name;
 use crate::translate::{
@@ -99,7 +99,8 @@ pub fn run(
 
     let source_spec = sources::spec_of(source)?;
     let (sink_spec, sink_notes) = sinks::spec_of(sink)?;
-    let py_kernels = kernels_of(py, kernels)?;
+    let stages = kernels_of(py, kernels)?;
+    let any_python = stages.iter().any(|s| matches!(s, Stage::Py(_)));
 
     let raw = RawArgs {
         budget: match budget {
@@ -130,7 +131,7 @@ pub fn run(
     map(py, check_sink_not_source(&sink_spec, &source_spec))?;
 
     // f.4, PY-I4: before any Rust component starts.
-    if !py_kernels.is_empty() && python_gil_enabled() && !translated.allow_gil {
+    if any_python && python_gil_enabled() && !translated.allow_gil {
         return Err(map_err(
             py,
             &MorunaError::Config {
@@ -165,7 +166,7 @@ pub fn run(
             translated,
             source_spec,
             sink_spec,
-            py_kernels,
+            stages,
             iterator,
             object_store,
             resume_path,
@@ -328,20 +329,22 @@ fn build_spec(
     t: Translated,
     source: SourceSpec,
     sink: SinkSpec,
-    py_kernels: Vec<Arc<PyKernel>>,
+    stages: Vec<Stage>,
     iterator: Option<Py<PyAny>>,
     object_store: ObjectStoreConfig,
     resume: Option<PathBuf>,
 ) -> Result<RunSpec, MorunaError> {
-    let kernels: Vec<Arc<dyn Kernel>> = py_kernels
-        .iter()
-        .map(|k| Arc::clone(k) as Arc<dyn Kernel>)
-        .collect();
-    let staged: Vec<(moruna_kernel::StageId, Arc<PyKernel>)> = py_kernels
-        .into_iter()
-        .enumerate()
-        .map(|(i, k)| ((i + 1) as moruna_kernel::StageId, k))
-        .collect();
+    let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
+    let mut staged: Vec<(moruna_kernel::StageId, Arc<PyKernel>)> = Vec::new();
+    for (i, stage) in stages.into_iter().enumerate() {
+        match stage {
+            Stage::Py(k) => {
+                staged.push(((i + 1) as moruna_kernel::StageId, Arc::clone(&k)));
+                kernels.push(k as Arc<dyn Kernel>);
+            }
+            Stage::Std(k) => kernels.push(Arc::new(*k) as Arc<dyn Kernel>),
+        }
+    }
 
     let mut spec = RunSpec::new(
         source_factory(source, iterator)?,

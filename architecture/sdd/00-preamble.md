@@ -406,6 +406,7 @@ moruna/
     moruna-py/                component 12: PyO3 module, built by maturin; depends on moruna-runtime; wave 5
     moruna-polars/            engine bridge: hosts a kernel inside Polars; depends on moruna-kernel and polars only (feature: polars)
     moruna-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on moruna-kernel and datafusion only (feature: datafusion)
+    moruna-kernels/           standard kernels by arguments (15 e.6); depends on moruna-kernel, serde_json, sha2, blake3 (F8.3)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
@@ -439,6 +440,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a) |
 | `mimalloc` | runtime, 4 (dev only) | global allocator for non-arena allocations | returns freed memory promptly. Component 4 takes it as a dev-dependency for TR-T4, whose claim is about the runtime's process, which sets `mimalloc` globally (12 l); under the system allocator the same run plateaus 22 to 25 MiB above baseline through allocator retention alone, which is bounded but above TR-T4's limit, so testing under the system allocator would measure the allocator rather than the trace writer (E2, PM, 2026-09-22) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
+| `sha2` | 5, `moruna-kernels` | the Python and standard kernel fingerprints of MH 4.9 (`sha256`), `moruna.std.hash` | 0.11.0, already in the lock through `datafusion` and `polars`; added by F8.3 as an E2 table addition for the PM |
 | `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
 | `serde_json` | 4, 7, 8, 9, 11, 12 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config` | the only text format in the runtime |
 | `base64` | 8, 9 | kernel and sink state bytes inside the JSON manifest and checkpoint | |
