@@ -2645,6 +2645,7 @@ dependencies = [
  "moruna-testkit",
  "pyo3",
  "pyo3-arrow",
+ "sha2",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -2720,6 +2721,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-kernels"
+version = "0.1.1"
+dependencies = [
+ "blake3",
+ "moruna-kernel",
+ "moruna-testkit",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "moruna-placement"
 version = "0.1.1"
 dependencies = [
@@ -2754,6 +2766,7 @@ dependencies = [
  "moruna-adapters",
  "moruna-discovery",
  "moruna-kernel",
+ "moruna-kernels",
  "moruna-placement",
  "moruna-reactor",
  "moruna-runtime",
@@ -2806,6 +2819,7 @@ dependencies = [
  "moruna-controller",
  "moruna-discovery",
  "moruna-kernel",
+ "moruna-kernels",
  "moruna-placement",
  "moruna-reactor",
  "moruna-scheduler",

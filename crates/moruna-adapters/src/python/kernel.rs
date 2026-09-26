@@ -4,6 +4,7 @@ use core::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use moruna_kernel::declare::Declared;
 use moruna_kernel::{
     Allocator, Fingerprint, GilState, InitCtx, Kernel, KernelHints, KernelKind, KernelState,
     MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, Seq,
@@ -93,6 +94,13 @@ pub struct PyKernelSpec {
     pub resume: ResumePolicy,
     /// Bytes one instance's state is expected to hold (RC f.3).
     pub state_bytes: Option<u64>,
+    /// `input_schema=` and `output_schema=` (MH 4.9); part of the fingerprint.
+    pub declared: Declared,
+    /// `lockfile=`: the bytes of the author's lockfile, part of the fingerprint (MH 4.9).
+    pub lockfile: Option<Vec<u8>>,
+    /// The function the author wrote, when `callable` wraps it (a Polars kernel, MH 4.9): its
+    /// name and source are what the fingerprint takes.
+    pub origin: Option<Py<PyAny>>,
 }
 
 impl PyKernelSpec {
@@ -113,6 +121,9 @@ impl PyKernelSpec {
             preferred_rows: None,
             resume: ResumePolicy::Reinit,
             state_bytes: None,
+            declared: Declared::default(),
+            lockfile: None,
+            origin: None,
         }
     }
 }
@@ -140,6 +151,7 @@ pub struct PyKernel {
     accepts: PayloadSpec,
     hints: KernelHints,
     resume: ResumePolicy,
+    declared: Declared,
     has_footprint: bool,
     fingerprint: Fingerprint,
     source_available: bool,
@@ -209,6 +221,7 @@ impl PyKernel {
                     state_bytes: spec.state_bytes,
                 },
                 resume: spec.resume,
+                declared: spec.declared.clone(),
                 has_footprint,
                 fingerprint: printed.fingerprint,
                 source_available: printed.source_available,
@@ -344,6 +357,10 @@ impl Kernel for PyKernel {
 
     fn hints(&self) -> KernelHints {
         self.hints.clone()
+    }
+
+    fn declared(&self) -> Declared {
+        self.declared.clone()
     }
 
     fn accepts(&self) -> PayloadSpec {

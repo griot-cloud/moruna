@@ -31,7 +31,7 @@ if _importlib_util.find_spec("pyarrow") is None:  # h, failures
         "hands Python kernels and the one it takes back, with no copy in between."
     )
 
-from moruna import _core
+from moruna import _core, _declare
 from moruna._core import (
     MorunaError,
     ArrowIpcSink,
@@ -47,6 +47,7 @@ from moruna._core import (
     PlanError,
     ResumeError,
     RunReport,
+    StdKernel,
     TensorSink,
     TensorSource,
     inspect_host,
@@ -69,6 +70,7 @@ __all__ = [
     "PlanError",
     "ResumeError",
     "RunReport",
+    "StdKernel",
     "TensorSink",
     "TensorSource",
     "__version__",
@@ -76,6 +78,7 @@ __all__ = [
     "kernel",
     "polars",
     "run",
+    "std",
 ]
 
 
@@ -152,6 +155,9 @@ def kernel(
     preferred_rows: int | None = None,
     resume: str = "reinit",
     state_bytes: int | None = None,
+    input_schema: Any = None,
+    output_schema: Any = None,
+    lockfile: Any = None,
 ) -> Any:
     """Turn a callable or a class instance into a kernel.
 
@@ -162,10 +168,24 @@ def kernel(
     ``checkpoint(self, state) -> bytes`` and ``restore(self, ctx, data) -> state``, and is refused
     at decoration when either is missing.
 
+    ``input_schema`` and ``output_schema`` declare what the kernel takes and gives, which makes
+    it checkable (``python -m moruna check``): a ``pyarrow.Schema`` is exact, a mapping of
+    column to type is a subset, and an output mapping whose keys are only ``adds``, ``drops`` and
+    ``changes`` is relative to the input. ``lockfile`` (a path or bytes) is folded into the
+    fingerprint, so a kernel whose dependencies change is a different kernel.
+
+    A function annotated ``pl.DataFrame -> pl.DataFrame`` (or ``pl.LazyFrame``) is a Polars
+    kernel: the batch reaches it as a Polars frame through the Arrow C data interface, and the
+    frame it returns comes back the same way.
+
     Usable bare (``@moruna.kernel``) or with arguments (``@moruna.kernel(stateful=True)``).
     """
 
     def decorate(obj: Any) -> KernelSpec:
+        origin = None
+        frame = None if stateful else _declare.polars_signature(obj)
+        if frame is not None:
+            origin, obj = obj, _declare.polars_callable(obj, frame)
         return _core.build_kernel(
             obj,
             stateful=stateful,
@@ -178,6 +198,10 @@ def kernel(
             preferred_rows=preferred_rows,
             resume=resume,
             state_bytes=state_bytes,
+            input_schema=_declare.declaration(input_schema, "input_schema"),
+            output_schema=_declare.declaration(output_schema, "output_schema"),
+            lockfile=_declare.lockfile_bytes(lockfile),
+            origin=origin,
         )
 
     if fn is None:
@@ -185,23 +209,24 @@ def kernel(
     return decorate(fn)
 
 
-def polars(fn: Any, *, accepts: str = "table") -> KernelSpec:
-    """Wrap a Polars function as a stateless Python kernel (f.6).
+def polars(fn: Any, *, accepts: str = "table", **declarations: Any) -> KernelSpec:
+    """Wrap a function from a Polars frame to a Polars frame as a stateless kernel (MH 4.9).
 
-    ``fn`` takes a ``polars.DataFrame`` and returns one. In v1 the only path is through Python:
-    the batch is handed to ``polars.from_arrow`` and the result is taken back with ``to_arrow``,
-    which copies inside Polars for some types. The Rust path through ``pyo3-polars`` is deferred
-    and will not change this signature.
+    The same path the decorator takes for a function annotated ``pl.DataFrame ->
+    pl.DataFrame``, for a function that carries no annotations: the batch enters Polars through
+    the Arrow C data interface and the result leaves the same way. ``declarations`` are the
+    decorator's ``input_schema``, ``output_schema`` and ``lockfile``.
     """
-    # Imported here so that `import moruna` does not need polars installed.
-    import polars as pl
+    kind = _declare.polars_signature(fn) or "eager"
+    wrapped = _declare.polars_callable(fn, kind)
+    return _core.build_kernel(
+        wrapped,
+        accepts=accepts,
+        input_schema=_declare.declaration(declarations.get("input_schema"), "input_schema"),
+        output_schema=_declare.declaration(declarations.get("output_schema"), "output_schema"),
+        lockfile=_declare.lockfile_bytes(declarations.get("lockfile")),
+        origin=fn,
+    )
 
-    def call(batch: Any) -> Any:
-        frame = pl.from_arrow(batch)
-        result = fn(frame)
-        table = result.to_arrow()
-        # A Polars frame converts to a pyarrow.Table; a kernel returns one record batch.
-        return table.combine_chunks().to_batches()[0] if table.num_rows else table
 
-    call.__name__ = getattr(fn, "__name__", "polars_kernel")
-    return kernel(call, accepts=accepts)
+from moruna import std  # noqa: E402, the standard kernels need the names above
