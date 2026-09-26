@@ -186,6 +186,62 @@ pub fn arm64_reg_pstate() -> u64 {
 /// EL1h with D, A, I, F masked: the state the arm64 boot protocol requires.
 pub const ARM64_BOOT_PSTATE: u64 = 0x3c5;
 
+/// The MSRs the first instruction of a 64-bit kernel expects zeroed, and fast string
+/// operations enabled (`IA32_MISC_ENABLE` bit 0): `(index, value)`.
+pub fn x86_boot_msrs() -> Vec<(u32, u64)> {
+    vec![
+        (0x174, 0),       // IA32_SYSENTER_CS
+        (0x175, 0),       // IA32_SYSENTER_ESP
+        (0x176, 0),       // IA32_SYSENTER_EIP
+        (0xc000_0081, 0), // STAR
+        (0xc000_0082, 0), // LSTAR
+        (0xc000_0083, 0), // CSTAR
+        (0xc000_0084, 0), // SYSCALL_MASK
+        (0xc000_0102, 0), // KERNEL_GS_BASE
+        (0x10, 0),        // TSC
+        (0x1a0, 1),       // IA32_MISC_ENABLE: fast strings
+    ]
+}
+
+/// Adjust one CPUID leaf for vCPU `id` of `cpus_max`: the APIC id in leaf 1 and the x2APIC
+/// topology in leaf 0xb, and the hypervisor bit. `regs` is `[eax, ebx, ecx, edx]`.
+pub fn x86_patch_cpuid(function: u32, index: u32, regs: &mut [u32; 4], id: u32, cpus_max: u32) {
+    match function {
+        1 => {
+            regs[1] = (regs[1] & 0x0000_ffff) | (id << 24) | ((cpus_max.min(255)) << 16);
+            regs[2] |= 1 << 31;
+            // HTT: the logical processor count in EBX is valid.
+            regs[3] |= 1 << 28;
+        }
+        0xb => {
+            let shift = 32 - cpus_max.max(1).saturating_sub(1).leading_zeros();
+            match index {
+                0 => *regs = [0, 1, (1 << 8), id],
+                1 => *regs = [shift, cpus_max, (2 << 8) | 1, id],
+                _ => *regs = [0, 0, index, id],
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Program the local APIC's LINT0 as ExtINT and LINT1 as NMI (the virtual-wire setup the
+/// kernel expects from firmware), in a `kvm_lapic_state` register image.
+pub fn x86_set_lint(regs: &mut [u8]) {
+    for (off, mode) in [(0x350usize, 7u32), (0x360, 4)] {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&regs[off..off + 4]);
+        let v = (u32::from_le_bytes(b) & !0x700) | (mode << 8);
+        regs[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// The aarch64 MPIDR affinity KVM gives vCPU `id` (Aff0 is the low four bits, Aff1 the rest),
+/// which is the `reg` of its device-tree node.
+pub fn arm64_mpidr(id: u32) -> u32 {
+    ((id >> 4) << 8) | (id & 0xf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +315,42 @@ mod tests {
     }
 
     #[test]
+    fn vm_t22_x86_cpu_state_helpers() {
+        let msrs = x86_boot_msrs();
+        assert!(msrs.contains(&(0x1a0, 1)));
+        assert_eq!(msrs.len(), 10);
+        let mut r = [0, 0x0000_0800, 0, 0];
+        x86_patch_cpuid(1, 0, &mut r, 3, 8);
+        assert_eq!(r[1] >> 24, 3);
+        assert_eq!((r[1] >> 16) & 0xff, 8);
+        assert_eq!(r[1] & 0xffff, 0x0800);
+        assert_ne!(r[2] & (1 << 31), 0);
+        let mut r = [9; 4];
+        x86_patch_cpuid(0xb, 0, &mut r, 5, 8);
+        assert_eq!(r, [0, 1, 0x100, 5]);
+        x86_patch_cpuid(0xb, 1, &mut r, 5, 8);
+        assert_eq!(r, [3, 8, 0x201, 5]);
+        x86_patch_cpuid(0xb, 2, &mut r, 5, 8);
+        assert_eq!(r, [0, 0, 2, 5]);
+        let mut r = [1, 2, 3, 4];
+        x86_patch_cpuid(7, 0, &mut r, 5, 8);
+        assert_eq!(r, [1, 2, 3, 4]);
+        let mut lapic = vec![0xffu8; 1024];
+        x86_set_lint(&mut lapic);
+        assert_eq!(
+            u32::from_le_bytes(lapic[0x350..0x354].try_into().unwrap()) & 0x700,
+            0x700
+        );
+        assert_eq!(
+            u32::from_le_bytes(lapic[0x360..0x364].try_into().unwrap()) & 0x700,
+            0x400
+        );
+    }
+
+    #[test]
     fn vm_t22_arm64_register_ids() {
+        assert_eq!(arm64_mpidr(3), 3);
+        assert_eq!(arm64_mpidr(17), 0x101);
         assert_eq!(arm64_reg_x(0), 0x6030_0000_0010_0000);
         assert_eq!(arm64_reg_x(1), 0x6030_0000_0010_0002);
         assert_eq!(arm64_reg_pc(), 0x6030_0000_0010_0040);

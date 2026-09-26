@@ -63,11 +63,12 @@ pub fn build(s: &FdtSpec<'_>) -> Result<Vec<u8>> {
     f.property_u32("#address-cells", 1).map_err(e)?;
     f.property_u32("#size-cells", 0).map_err(e)?;
     for i in 0..s.cpus {
-        let c = f.begin_node(&format!("cpu@{i:x}")).map_err(e)?;
+        let mpidr = crate::boot::arm64_mpidr(i);
+        let c = f.begin_node(&format!("cpu@{mpidr:x}")).map_err(e)?;
         f.property_string("device_type", "cpu").map_err(e)?;
         f.property_string("compatible", "arm,arm-v8").map_err(e)?;
         f.property_string("enable-method", "psci").map_err(e)?;
-        f.property_u32("reg", i).map_err(e)?;
+        f.property_u32("reg", mpidr).map_err(e)?;
         f.end_node(c).map_err(e)?;
     }
     f.end_node(cpus).map_err(e)?;

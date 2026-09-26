@@ -110,6 +110,23 @@ impl VmmError {
         }
     }
 
+    /// Why `/dev/kvm` could not be opened, from the `open(2)` errno, naming what to do.
+    pub fn kvm_open(errno: i32) -> Self {
+        let why = match errno {
+            libc::ENOENT | libc::ENODEV | libc::ENXIO => {
+                "absent: this host has no KVM (on bare metal load kvm_intel or kvm_amd; on a \
+                 cloud VM enable nested virtualization)"
+                    .to_string()
+            }
+            libc::EACCES | libc::EPERM => {
+                "not permitted: run as a member of the kvm group, or grant access to /dev/kvm"
+                    .to_string()
+            }
+            e => format!("cannot be opened: {}", std::io::Error::from_raw_os_error(e)),
+        };
+        VmmError::NoKvm(why)
+    }
+
     /// Shorthand for a device error.
     pub fn device(device: &'static str, msg: impl Into<String>) -> Self {
         VmmError::Device {
@@ -196,6 +213,21 @@ mod tests {
             assert!(![0, 2, 3, 4, 5, 130].contains(&c));
         }
         assert_eq!(EXIT_OK, 0);
+    }
+
+    #[test]
+    fn vm_t7_no_kvm_names_the_reason() {
+        for (errno, want) in [
+            (libc::ENOENT, "absent"),
+            (libc::EACCES, "not permitted"),
+            (libc::EPERM, "kvm group"),
+            (libc::EBUSY, "cannot be opened"),
+        ] {
+            let e = VmmError::kvm_open(errno);
+            assert_eq!(e.exit_code(), EXIT_CONFIG);
+            let t = e.to_string();
+            assert!(t.starts_with("/dev/kvm: ") && t.contains(want), "{t}");
+        }
     }
 
     #[test]

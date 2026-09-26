@@ -46,8 +46,49 @@ usage:
   moruna-vmm status (--control <path> | --vsock <cid>)
   moruna-vmm stop   (--control <path> | --vsock <cid>)
 bytes accept a K, M, G or T suffix (binary: 1G = 1073741824), with or without \"iB\".
-exit: the guest's code; 2 bad configuration or no /dev/kvm; 6 guest kernel panic;
-      7 guest stopped without reporting a code; 8 monitor or hypervisor failure.";
+exit (boot): the guest's code; 2 bad configuration or no /dev/kvm; 6 guest kernel panic;
+      7 guest stopped without reporting a code; 8 monitor or hypervisor failure.
+exit (resize, status, stop): 0 done; 1 refused (the reason is printed); 2 no monitor there.";
+
+/// Exit code of a control request the monitor refused.
+pub const EXIT_REFUSED: i32 = 1;
+
+/// Run the command line `args` (without the program name), writing to `out` and `err`;
+/// returns the process exit code.
+pub fn run(args: &[String], out: &mut dyn std::io::Write, err: &mut dyn std::io::Write) -> i32 {
+    let fail = |err: &mut dyn std::io::Write, e: &VmmError| {
+        let _ = writeln!(err, "moruna-vmm: {e}");
+        e.exit_code()
+    };
+    match parse(args) {
+        Err(e) => {
+            let code = fail(err, &e);
+            let _ = writeln!(err, "{USAGE}");
+            code
+        }
+        Ok(Command::Help) => {
+            let _ = writeln!(out, "{USAGE}");
+            0
+        }
+        Ok(Command::Version) => {
+            let _ = writeln!(out, "moruna-vmm {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Ok(Command::Boot(c)) => match crate::boot(&c) {
+            Ok(code) => code,
+            Err(e) => fail(err, &e),
+        },
+        Ok(Command::Control { socket, request }) => {
+            match crate::control::request(&socket, &request) {
+                Ok(resp) => {
+                    let _ = writeln!(out, "{}", serde_json::to_string(&resp).unwrap_or_default());
+                    if resp.ok { 0 } else { EXIT_REFUSED }
+                }
+                Err(e) => fail(err, &e),
+            }
+        }
+    }
+}
 
 /// Parse `args` (without the program name).
 pub fn parse(args: &[String]) -> Result<Command> {
@@ -410,6 +451,53 @@ mod tests {
         assert_eq!(parse(&args("--help")).unwrap(), Command::Help);
         assert_eq!(parse(&args("-V")).unwrap(), Command::Version);
         assert!(USAGE.contains("resize"));
+    }
+
+    fn run_str(a: &str) -> (i32, String, String) {
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let code = run(&args(a), &mut o, &mut e);
+        (
+            code,
+            String::from_utf8(o).unwrap(),
+            String::from_utf8(e).unwrap(),
+        )
+    }
+
+    #[test]
+    fn vm_t3_run_dispatches_and_maps_exit_codes() {
+        let (c, o, _) = run_str("--help");
+        assert_eq!((c, o.contains("usage:")), (0, true));
+        let (c, o, _) = run_str("--version");
+        assert_eq!(c, 0);
+        assert!(o.starts_with("moruna-vmm "));
+        let (c, _, e) = run_str("boot --image");
+        assert_eq!(c, crate::error::EXIT_CONFIG);
+        assert!(e.contains("needs a value") && e.contains("usage:"));
+        let (c, _, e) = run_str("boot --image /nonexistent --memory 512M --cpus 1 --vsock 3");
+        assert_eq!(c, crate::error::EXIT_CONFIG);
+        assert!(e.starts_with("moruna-vmm: "));
+        // No monitor at the socket.
+        let (c, _, e) = run_str("status --control /nonexistent/c.sock");
+        assert_eq!(c, crate::error::EXIT_CONFIG);
+        assert!(e.contains("--control"));
+
+        // Against a live control socket: done is 0, refused is 1.
+        let dir = crate::testing::scratch_dir("cli-ctl");
+        let path = dir.join("c.sock");
+        let server = crate::control::ControlServer::bind(&path).unwrap();
+        let f = crate::control::tests::fake();
+        let (f2, stop) = (f.clone(), f.stop.clone());
+        let t = std::thread::spawn(move || server.serve(&*f2, &stop));
+        let p = path.display().to_string();
+        let (c, o, _) = run_str(&format!("resize --control {p} --memory 2G"));
+        assert_eq!(c, 0);
+        assert!(o.contains("\"ok\":true"));
+        let (c, o, _) = run_str(&format!("resize --control {p} --memory 64G"));
+        assert_eq!(c, EXIT_REFUSED);
+        assert!(o.contains("--memory-max"));
+        let (c, _, _) = run_str(&format!("stop --control {p}"));
+        assert_eq!(c, 0);
+        t.join().unwrap();
     }
 
     #[test]
