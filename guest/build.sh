@@ -10,7 +10,8 @@
 # release job checks that by building twice.
 #
 # Output: <out-dir>/oci (the layout `moruna-vmm boot --image` reads), <out-dir>/digest, and
-# the three layers beside it (vmlinux or Image, initramfs.cpio.gz, rootfs.erofs).
+# the three layers beside it (vmlinux or Image, initramfs.cpio.gz, rootfs.erofs), and the
+# root filesystem tree the SBOM is taken from (rootfs/).
 #
 # Needs: Linux, docker. Runs natively; the release builds arm64 on an arm64 runner.
 set -euo pipefail
@@ -117,6 +118,8 @@ cp -r /guest/rootfs/. rootfs/
 chmod 0755 rootfs/sbin/moruna-init rootfs/usr/local/bin/moruna-report
 mkdir -p rootfs/disk
 rm -rf rootfs/var/cache/apt/* rootfs/var/lib/apt/lists/* rootfs/var/log/* rootfs/tmp/*
+# The tree itself stays beside the image: the release takes the SBOM from it.
+rm -rf /out/rootfs && cp -a rootfs /out/rootfs
 mkfs.erofs --quiet -T "$SOURCE_DATE_EPOCH" --all-root -U 00000000-0000-0000-0000-000000000000 \
     -zlz4hc /out/rootfs.erofs rootfs
 
