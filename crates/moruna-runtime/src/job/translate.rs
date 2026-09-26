@@ -158,7 +158,8 @@ pub fn local_path(url: &str) -> PathBuf {
 
 /// Normalise a URL or path for the sink equals source rule (12 f.3): the scheme is lower cased,
 /// a trailing slash is removed and a `file://` URL or a bare relative path becomes an absolute
-/// path.
+/// path, resolved as far as it exists (symbolic links, `.` and `..`), so two spellings of one
+/// directory are one target whether or not it has been written yet.
 pub fn normalise_target(value: &str) -> String {
     let trimmed = value.trim();
     let normalised = match trimmed.find("://") {
@@ -183,12 +184,32 @@ pub fn normalise_target(value: &str) -> String {
 
 fn absolute(path: &str) -> String {
     let p = Path::new(path);
-    if p.is_absolute() {
-        return p.to_string_lossy().into_owned();
-    }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(p).to_string_lossy().into_owned(),
-        Err(_) => p.to_string_lossy().into_owned(),
+    let whole = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    resolved(&whole).to_string_lossy().into_owned()
+}
+
+/// `path` with its longest existing prefix resolved by the file system and the rest appended.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return rest.iter().rev().fold(real, |p, name| p.join(name));
+        }
+        match (at.parent(), at.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last.as_os_str().to_os_string());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -275,6 +296,18 @@ mod tests {
         assert_eq!(normalise_target("file:///"), "/");
         assert!(check_sink_not_source("s3://b/", &["s3://b/in/".into()]).is_err());
         assert!(check_sink_not_source("s3://b/in2", &["s3://b/in/".into()]).is_ok());
+
+        // One directory by two spellings, written yet or not, is one target.
+        let base = std::env::temp_dir().join(format!("moruna-target-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("real")).expect("dir");
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(base.join("real"), &link).expect("link");
+        let via_link = format!("{}/./out/", link.display());
+        let direct = format!("file://{}/real/out", base.display());
+        assert_eq!(normalise_target(&via_link), normalise_target(&direct));
+        assert!(check_sink_not_source(&via_link, &[direct]).is_err());
+        let _ = std::fs::remove_dir_all(&base);
 
         let dir = std::env::temp_dir();
         assert_eq!(trace_path(&dir.to_string_lossy()).expect("dir"), dir);

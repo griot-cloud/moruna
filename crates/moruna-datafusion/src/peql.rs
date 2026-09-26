@@ -19,6 +19,7 @@ use moruna_kernel::{
 };
 use peql::{Caller, Engine, WriteMode, Writing};
 
+use crate::memory::PlanMemory;
 use crate::plan_source::{PlanSource, Runtime, plan_err};
 
 /// What a run reads from peQL.
@@ -60,7 +61,14 @@ impl PlanSource {
     /// The plan peQL makes for `caller` (MH 4.5): resolved, gated and shaped, its budgets
     /// charged now. A refusal (an unknown contract, a `decide` rule, a failed guarantee, an
     /// exhausted budget) is a `Plan` error carrying peQL's own words.
-    pub fn peql(engine: &Engine, read: &PeqlRead, caller: &Caller) -> Result<PlanSource> {
+    /// Its operators hold their working memory in `memory`, the share of the run's budget the
+    /// facade gives the plan.
+    pub fn peql(
+        engine: &Engine,
+        read: &PeqlRead,
+        caller: &Caller,
+        memory: &PlanMemory,
+    ) -> Result<PlanSource> {
         let runtime = Runtime::new()?;
         let planned = runtime
             .block_on(async {
@@ -70,7 +78,7 @@ impl PlanSource {
                 }
             })
             .map_err(|e| plan_err(format!("peQL: {e}")))?;
-        PlanSource::build(planned.plan, &planned.ctx, runtime)
+        PlanSource::build(planned.plan, &planned.ctx, runtime, memory)
     }
 }
 

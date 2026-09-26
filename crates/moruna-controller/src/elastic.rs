@@ -120,6 +120,24 @@ pub(crate) fn set_host_budget(state: &mut ControllerState, bytes: u64, actions: 
     }
 }
 
+/// An engine source's operator memory moved: it is resident beside the arena (`resting_anon`),
+/// so what the kernels may be planned into moves the other way.
+pub(crate) fn set_engine(state: &mut ControllerState, bytes: u64, actions: &mut Actions) {
+    if bytes == state.cfg.engine_bytes {
+        return;
+    }
+    let lowered_room = bytes > state.cfg.engine_bytes;
+    state.note(format!(
+        "the plan's operator memory moved from {} to {bytes} bytes",
+        state.cfg.engine_bytes
+    ));
+    state.cfg.engine_bytes = bytes;
+    state.limits_epoch_ns = now_ns();
+    if state.phase == Phase::Running {
+        replan(state, lowered_room, actions);
+    }
+}
+
 /// Re-run f.3's solve inside the limits as they now stand, with the worker count the limit
 /// allows as its `W`, and, when the budget came down, take f.6's memory row at once: the
 /// largest target halves and the last queue stages, so the run stops filling what it is about to

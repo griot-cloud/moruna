@@ -28,6 +28,10 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -42,6 +46,8 @@ use moruna_kernel::{
     SplitId, Tier,
 };
 use tokio::sync::{Mutex, mpsc};
+
+use crate::memory::PlanMemory;
 
 /// Batches a partition's producer may compute ahead of the reads.
 const AHEAD: usize = 1;
@@ -80,31 +86,55 @@ pub struct PlanSource {
 }
 
 impl PlanSource {
-    /// A physical plan, run in `ctx`'s session.
-    pub fn new(plan: Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> Result<PlanSource> {
-        PlanSource::build(plan, ctx, Runtime::new()?)
+    /// A physical plan, run in `ctx`'s session with its operators' memory in `memory`.
+    pub fn new(
+        plan: Arc<dyn ExecutionPlan>,
+        ctx: &SessionContext,
+        memory: &PlanMemory,
+    ) -> Result<PlanSource> {
+        PlanSource::build(plan, ctx, Runtime::new()?, memory)
     }
 
-    /// A logical plan, planned in `ctx`'s session.
-    pub fn from_logical(plan: LogicalPlan, ctx: &SessionContext) -> Result<PlanSource> {
+    /// A logical plan, planned in `ctx`'s session and run with its operators' memory in
+    /// `memory`.
+    pub fn from_logical(
+        plan: LogicalPlan,
+        ctx: &SessionContext,
+        memory: &PlanMemory,
+    ) -> Result<PlanSource> {
         let runtime = Runtime::new()?;
         let state = ctx.state();
         let physical = runtime
             .block_on(state.create_physical_plan(&plan))
             .map_err(|e| plan_err(format!("planning: {e}")))?;
-        PlanSource::build(physical, ctx, runtime)
+        PlanSource::build(physical, ctx, runtime, memory)
     }
 
     pub(crate) fn build(
         plan: Arc<dyn ExecutionPlan>,
         ctx: &SessionContext,
         runtime: Runtime,
+        memory: &PlanMemory,
     ) -> Result<PlanSource> {
+        // The session's object stores and caches, with the run's pool in place of the session's
+        // unbounded one and the staging directory as the place a spilling operator writes.
+        let state = ctx.state();
+        let spill = match &memory.spill_dir {
+            Some(dir) => DiskManagerMode::Directories(vec![dir.clone()]),
+            None => DiskManagerMode::Disabled,
+        };
+        let env = RuntimeEnvBuilder::from_runtime_env(state.runtime_env())
+            .with_memory_pool(Arc::clone(&memory.pool) as Arc<dyn MemoryPool>)
+            .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(spill))
+            .build_arc()
+            .map_err(|e| plan_err(format!("the plan's memory: {e}")))?;
+        let mut state = SessionStateBuilder::new_from_existing(state)
+            .with_runtime_env(env)
+            .build();
         // A file scan's partitions steal files from one another while they run together, so
         // which rows a partition yields depends on timing, and a partition run alone reads
         // every file. Splits are partitions, counted once and read later, perhaps one at a
         // time: each partition reads its own files.
-        let mut state = ctx.state();
         state
             .config_mut()
             .options_mut()

@@ -1,10 +1,19 @@
 //! The peQL ends of a run (MH 4.5): `"kind": "datafusion"` as the source, `"kind": "peql"` as
 //! the sink. One engine per root per run, shared by both ends, so a run that reads one contract
 //! and writes another on the same disk has one store, one ledger and one audit log open.
+//!
+//! The engine is opened when the document is built, because what the sink equals source rule
+//! compares is where each contract's files are, as the engine resolves its binding, and not the
+//! contract's name: two contracts bound to the same files are one target.
+
+use std::sync::Arc;
 
 use super::SpecError;
-use crate::spec::{SinkSpec, SourceSpec};
+use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 use moruna_kernel::Result;
+
+/// A source's builder, the data locations it reads, and the memory its plan's operators hold.
+pub(super) type Read = (SourceSpec, Vec<String>, Option<Arc<dyn EngineMemory>>);
 
 /// The engines a run opens, by root. Opened at the lifecycle's "sources and sinks built" step.
 #[derive(Clone, Default)]
@@ -53,20 +62,20 @@ fn overwrite_of(mode: &Option<String>) -> Result<bool> {
     }
 }
 
-/// The source's builder and the contracts it reads.
+/// The source's builder, where the contracts it reads keep their files, and its plan's memory.
 pub(super) fn source(
     root: &str,
     contract: &Option<String>,
     sql: &Option<String>,
     caller: &serde_json::Map<String, serde_json::Value>,
     engines: &Engines,
-) -> Result<(SourceSpec, Vec<String>)> {
+) -> Result<Read> {
     check_read(contract, sql)?;
     let root = root_of("source.root", root)?;
     imp::source(root, contract, sql, caller, engines)
 }
 
-/// The sink's builder and the contract it writes.
+/// The sink's builder and where the contract it writes keeps its files.
 pub(super) fn sink(
     root: &str,
     contract: &str,
@@ -87,16 +96,31 @@ mod imp {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use moruna_datafusion::engine::{Caller, Engine, WriteMode};
-    use moruna_datafusion::{PeqlRead, PeqlSink, PlanSource};
+    use moruna_datafusion::engine::{Caller, Engine, Location, WriteMode};
+    use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource};
     use moruna_kernel::{MorunaError, Result, Sink, Source};
 
-    use super::{Engines, SpecError};
-    use crate::spec::{SinkSpec, SourceSpec};
+    use super::{Engines, Read, SpecError};
+    use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 
-    /// Where a contract's data is, as the sink equals source rule compares targets.
-    fn target(root: &std::path::Path, contract: &str) -> String {
-        format!("peql://{}#{contract}", root.display())
+    /// The facade sizes a plan's pool; this is how it reaches it.
+    impl EngineMemory for BudgetPool {
+        fn set_limit(&self, bytes: u64) {
+            BudgetPool::set_limit(self, bytes);
+        }
+    }
+
+    /// Where a contract's files are, as its binding resolves them: the path or the object
+    /// URL the sink equals source rule compares. A contract peQL does not know is refused here,
+    /// by the field that names it.
+    fn target(engine: &Engine, field: &str, contract: &str) -> Result<Option<String>> {
+        let location = engine
+            .location(contract)
+            .map_err(|e| SpecError::new(field, format!("peQL: {e}")))?;
+        Ok(location.map(|location| match location {
+            Location::Local(path) => path.display().to_string(),
+            Location::Object(object) => object.url(true),
+        }))
     }
 
     fn caller_of(
@@ -128,25 +152,36 @@ mod imp {
         sql: &Option<String>,
         caller: &serde_json::Map<String, serde_json::Value>,
         engines: &Engines,
-    ) -> Result<(SourceSpec, Vec<String>)> {
+    ) -> Result<Read> {
         let caller = caller_of("source.caller", caller)?;
-        let read = match (contract, sql) {
-            (Some(name), _) => PeqlRead::Contract(name.clone()),
-            (None, sql) => PeqlRead::Sql(sql.clone().unwrap_or_default()),
+        let (read, field) = match (contract, sql) {
+            (Some(name), _) => (PeqlRead::Contract(name.clone()), "source.contract"),
+            (None, sql) => (PeqlRead::Sql(sql.clone().unwrap_or_default()), "source.sql"),
         };
-        let targets = read
+        let engine = engines.open(&root)?;
+        let mut targets = Vec::new();
+        for name in read
             .contracts()
             .map_err(|e| SpecError::new("source.sql", e))?
-            .iter()
-            .map(|c| target(&root, c))
-            .collect();
-        let engines = engines.clone();
+        {
+            targets.extend(target(&engine, field, &name)?);
+        }
+        // Sized by the facade before the source is built (MH 4.5); nothing may be held until then.
+        let pool = Arc::new(BudgetPool::new(0));
+        let memory = Arc::clone(&pool);
         Ok((
-            SourceSpec::Build(Box::new(move |_ctx| {
-                let engine = engines.open(&root)?;
-                Ok(Arc::new(PlanSource::peql(&engine, &read, &caller)?) as Arc<dyn Source>)
+            SourceSpec::Build(Box::new(move |ctx| {
+                let memory = PlanMemory {
+                    pool: memory,
+                    spill_dir: ctx.discovered.profile.staging_dir.clone(),
+                };
+                Ok(
+                    Arc::new(PlanSource::peql(&engine, &read, &caller, &memory)?)
+                        as Arc<dyn Source>,
+                )
             })),
             targets,
+            Some(pool as Arc<dyn EngineMemory>),
         ))
     }
 
@@ -163,12 +198,16 @@ mod imp {
         } else {
             WriteMode::Append
         };
-        let written = target(&root, contract);
+        let engine = engines.open(&root)?;
+        let written = target(&engine, "sink.contract", contract)?.ok_or_else(|| {
+            SpecError::new(
+                "sink.contract",
+                format!("`{contract}` is served from a table, and only files are written"),
+            )
+        })?;
         let contract = contract.to_string();
-        let engines = engines.clone();
         Ok((
             SinkSpec::Build(Box::new(move |_ctx| {
-                let engine = engines.open(&root)?;
                 Ok(Box::new(PeqlSink::new(engine, &contract, &caller, mode)?) as Box<dyn Sink>)
             })),
             written,
@@ -178,8 +217,8 @@ mod imp {
 
 #[cfg(not(feature = "peql"))]
 mod imp {
-    use super::{Engines, SpecError};
-    use crate::spec::{SinkSpec, SourceSpec};
+    use super::{Engines, Read, SpecError};
+    use crate::spec::SinkSpec;
     use moruna_kernel::Result;
 
     const ABSENT: &str = "this build of moruna has no peQL bridge (feature `peql`)";
@@ -190,7 +229,7 @@ mod imp {
         _sql: &Option<String>,
         _caller: &serde_json::Map<String, serde_json::Value>,
         _engines: &Engines,
-    ) -> Result<(SourceSpec, Vec<String>)> {
+    ) -> Result<Read> {
         Err(SpecError::new("source.kind", ABSENT).into())
     }
 

@@ -24,6 +24,8 @@ mod udf;
 pub use udf::{KernelUdf, datafusion_udf};
 
 #[cfg(feature = "peql")]
+mod memory;
+#[cfg(feature = "peql")]
 mod peql;
 #[cfg(feature = "peql")]
 mod plan_source;
@@ -31,6 +33,8 @@ mod plan_source;
 /// The engine the `peql` constructors take, re-exported so a caller names one version of it.
 #[cfg(feature = "peql")]
 pub use ::peql as engine;
+#[cfg(feature = "peql")]
+pub use memory::{BudgetPool, PlanMemory};
 #[cfg(feature = "peql")]
 pub use peql::{PeqlRead, PeqlSink};
 #[cfg(feature = "peql")]

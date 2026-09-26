@@ -409,23 +409,26 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
     let _ = std::fs::remove_dir_all(exchange(std::process::id()));
 }
 
-/// The document names what it reads and writes; a run whose sink writes the contract its
-/// source reads is refused before anything is opened, as a file sink over its source is.
-#[test]
-fn a_sink_over_its_own_source_is_refused() {
-    let scratch = Scratch::new("h6_same");
-    let root = scratch.path().join("disk");
+/// Another name for `demo/big`'s files.
+const ALIAS: &str = r#"
+contract: demo/alias
+version: 1
+owner: demo
+binding: {parquet: ./big}
+expose:
+  - {name: id, type: int64}
+  - {name: region, type: utf8}
+  - {name: meter, type: utf8}
+  - {name: note, type: utf8}
+"#;
+
+fn refusal(source: serde_json::Value, sink: serde_json::Value) -> String {
     let job = JobSpec::from_value(serde_json::json!({
-        "moruna_spec": 1,
-        "source": {"kind": "datafusion", "root": root,
-                   "sql": r#"SELECT * FROM "demo/big" JOIN "demo/copy" USING (id)"#,
-                   "caller": caller("ana", "demo")},
-        "sink": {"kind": "peql", "root": root, "contract": "demo/copy",
-                 "caller": caller("ana", "demo")},
+        "moruna_spec": 1, "source": source, "sink": sink,
     }))
     .expect("parses");
     let env = |_: &str| None;
-    let refused = build(
+    build(
         &job,
         &NoKernels,
         BuildOptions {
@@ -435,12 +438,60 @@ fn a_sink_over_its_own_source_is_refused() {
         },
     )
     .err()
-    .expect("refused");
-    assert!(
-        refused
-            .to_string()
-            .contains("the sink writes where the source reads"),
-        "{refused}"
+    .expect("refused")
+    .to_string()
+}
+
+/// The sink equals source rule compares where the data is, as each contract's binding resolves,
+/// and not the contracts' names: a run whose sink writes the files its source reads is refused
+/// before anything is read, whether the two name one contract, two contracts bound to the same
+/// files, or a contract and a Parquet source over its directory.
+#[test]
+fn a_sink_over_its_own_source_is_refused() {
+    let scratch = Scratch::new("h6_same");
+    let root = scratch.path().join("disk");
+    disk(&root);
+    Engine::open(&root)
+        .expect("the engine")
+        .register_contract(ALIAS, &schema())
+        .expect("compiles");
+    let owner = caller("ana", "demo");
+    let same = "the sink writes where the source reads";
+
+    let joined = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root,
+                           "sql": r#"SELECT * FROM "demo/big" JOIN "demo/copy" USING (id)"#,
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                           "caller": owner}),
     );
-    assert!(!root.exists(), "no engine was opened");
+    assert!(joined.contains(same), "{joined}");
+
+    let aliased = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/alias",
+                           "caller": owner}),
+    );
+    assert!(
+        aliased.contains(same),
+        "two names, one set of files: {aliased}"
+    );
+
+    let by_path = refusal(
+        serde_json::json!({"kind": "parquet", "url": root.join("big").join("part.parquet")}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/alias",
+                           "caller": owner}),
+    );
+    assert!(by_path.contains(same), "{by_path}");
+
+    // A contract peQL does not know is refused by the field that names it.
+    let unknown = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/none",
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                           "caller": owner}),
+    );
+    assert!(unknown.contains("source.contract"), "{unknown}");
+    assert!(!root.join("big").exists(), "nothing was written");
 }

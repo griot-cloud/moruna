@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use moruna_datafusion::PlanSource;
+use moruna_datafusion::{BudgetPool, PlanMemory, PlanSource};
 use moruna_kernel::arrow::array::{
     Array, AsArray, DictionaryArray, Int64Array, RecordBatch, StringArray,
 };
@@ -62,11 +62,27 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a runtime")
 }
 
+/// Room for anything these small plans hold, and nowhere to spill.
+fn memory() -> PlanMemory {
+    PlanMemory {
+        pool: Arc::new(BudgetPool::new(256 << 20)),
+        spill_dir: None,
+    }
+}
+
 fn source(ctx: &SessionContext, sql: &str) -> moruna_kernel::Result<PlanSource> {
+    source_in(ctx, sql, &memory())
+}
+
+fn source_in(
+    ctx: &SessionContext,
+    sql: &str,
+    memory: &PlanMemory,
+) -> moruna_kernel::Result<PlanSource> {
     let plan = runtime()
         .block_on(async { ctx.sql(sql).await?.into_optimized_plan() })
         .expect("a plan");
-    PlanSource::from_logical(plan, ctx)
+    PlanSource::from_logical(plan, ctx, memory)
 }
 
 fn read(
@@ -237,7 +253,7 @@ fn a_physical_plan_and_an_empty_one() {
                 .await
         })
         .expect("a physical plan");
-    let src = PlanSource::new(physical, &ctx).expect("a source");
+    let src = PlanSource::new(physical, &ctx, &memory()).expect("a source");
     let splits = src.plan().expect("the plan");
     assert!(splits.iter().all(|s| s.rows == 0));
     let empty = read(&src, &splits[0], None).expect("an empty read");
@@ -412,4 +428,71 @@ fn a_source_drops_inside_a_runtime() {
         .build()
         .expect("a runtime");
     rt.block_on(async move { drop(src) });
+}
+
+/// `w`: 160,000 rows of 256 bytes of text, about 40 MiB, in one partition.
+fn wide() -> SessionContext {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let batches = (0..160)
+        .map(|b| {
+            let xs: Vec<i64> = (b * 1000..(b + 1) * 1000).collect();
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(xs.clone())),
+                    Arc::new(StringArray::from(
+                        xs.iter().map(|x| format!("{x:0>256}")).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("a batch")
+        })
+        .collect();
+    let t = MemTable::try_new(schema(), vec![batches]).expect("a table");
+    ctx.register_table("w", Arc::new(t)).expect("registered");
+    ctx
+}
+
+/// MH 4.5: a plan's operators hold their state in the run's pool, not in an unbounded one. A
+/// sort larger than the pool spills to the staging directory and completes, holding no more
+/// than the pool at any moment; with nowhere to spill it is refused for the budget rather than
+/// allowed past it.
+#[test]
+fn a_plan_larger_than_its_pool_spills_or_is_refused() {
+    const POOL: u64 = 16 << 20;
+    let ctx = wide();
+    let sql = "SELECT x, s FROM w ORDER BY s DESC";
+    let spill = std::env::temp_dir().join(format!("moruna-spill-{}", std::process::id()));
+    std::fs::create_dir_all(&spill).expect("a spill directory");
+    let pool = Arc::new(BudgetPool::new(POOL));
+    let memory = PlanMemory {
+        pool: Arc::clone(&pool),
+        spill_dir: Some(spill.clone()),
+    };
+    let src = source_in(&ctx, sql, &memory).expect("a source");
+    let splits = src.plan().expect("the plan");
+    let total: u64 = splits.iter().map(|s| s.rows).sum();
+    assert_eq!(total, 160_000);
+    let first = read(&src, &splits[0], Some(RowRange { start: 0, end: 1 })).expect("a read");
+    assert_eq!(xs(&first), vec![159_999], "sorted descending by text");
+    assert!(pool.peak() > 0, "the sort reserved from the run's pool");
+    assert!(
+        pool.peak() <= POOL,
+        "the pool held {} of {POOL}",
+        pool.peak()
+    );
+
+    let nowhere = PlanMemory {
+        pool: Arc::new(BudgetPool::new(POOL)),
+        spill_dir: None,
+    };
+    let refused = source_in(&ctx, sql, &nowhere)
+        .err()
+        .expect("a sort that must spill with nowhere to spill");
+    assert!(
+        refused.to_string().contains("budget for its plan")
+            || refused.to_string().contains("isabled"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&spill);
 }

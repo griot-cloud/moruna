@@ -102,6 +102,18 @@ impl From<Box<dyn Sink>> for SinkSpec {
     }
 }
 
+/// The working memory an engine source's own operators hold outside the arena (MH 4.5): a
+/// DataFusion plan's sorts, aggregations and joins. The facade gives it a share of the budget
+/// beside the arena before the source is built, charges that share to the controller, and moves
+/// it when the machine's limits move, so the arena and the engine together stay inside the
+/// ceiling.
+pub trait EngineMemory: Send + Sync {
+    /// The most the engine's operators may hold from now on, in bytes. Growth past it is refused
+    /// (an operator that can spill spills); what is held above a lowered figure is given back as
+    /// its holders finish.
+    fn set_limit(&self, bytes: u64);
+}
+
 /// One run, as the surface describes it (12 d.1).
 pub struct RunSpec {
     /// The input.
@@ -113,6 +125,9 @@ pub struct RunSpec {
     pub py_kernels: Vec<(moruna_kernel::StageId, Arc<moruna_adapters::PyKernel>)>,
     /// The output; wrapped into a `SinkHandle` by the facade.
     pub sink: SinkSpec,
+    /// The source's engine memory, when the source is an engine that runs operators of its own
+    /// (a DataFusion plan); `None` for every other source.
+    pub engine_memory: Option<Arc<dyn EngineMemory>>,
     /// An explicit host ceiling in bytes; discovery clamps it.
     pub budget: Option<u64>,
     /// An explicit CPU quota in cores; discovery clamps it.
@@ -183,6 +198,7 @@ impl RunSpec {
             #[cfg(feature = "python")]
             py_kernels: Vec::new(),
             sink: sink.into(),
+            engine_memory: None,
             budget: None,
             cpu: None,
             elastic: crate::elastic::ElasticBudget::default(),
