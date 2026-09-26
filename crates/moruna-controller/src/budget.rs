@@ -16,7 +16,8 @@ const DEVICE_QUEUE_SHARE: f64 = 0.6;
 /// placement engine the tier budgets it starts with. The only placement call the controller
 /// ever makes is `set_budgets`, here and when the state term changes (f.3, f.6).
 ///
-/// The host budget is `cfg.arena_bytes` and nothing is subtracted from it: the arena is where
+/// The host budget is `cfg.arena_bytes` less the sink's file buffer, and nothing else is
+/// subtracted from it: the arena is where
 /// morsels live and its accounting is what enforces G-I1, and the facade has already taken the
 /// ceiling, the pre-arena baseline, the reserve and the expected kernel state out of it
 /// (12 f.1, 02 f.1). A sample is still taken, for the tick clock and the throttling counter.
@@ -38,7 +39,11 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
         let ceiling = state.cfg.limits.memory_ceiling;
         let baseline = state.cfg.baseline_bytes;
         let reserve = model::scale(ceiling, f64::from(state.cfg.reserve_fraction));
-        let host = state.cfg.arena_bytes;
+        // The sink's file buffer is in the arena and no morsel's.
+        let host = state
+            .cfg
+            .arena_bytes
+            .saturating_sub(state.cfg.sink_buffer_bytes);
         if host <= state.cfg.morsel_min.saturating_mul(2) {
             return Err(MorunaError::Config {
                 name: "budget.host",

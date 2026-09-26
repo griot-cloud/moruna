@@ -9,7 +9,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moruna_datafusion::engine::{Caller, Engine, WriteMode};
-use moruna_datafusion::{PeqlRead, PeqlSink, PlanSource};
+use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource};
+
+/// Room for what these plans hold, and nowhere to spill.
+fn memory() -> PlanMemory {
+    PlanMemory {
+        pool: Arc::new(BudgetPool::new(256 << 20)),
+        spill_dir: None,
+    }
+}
 use moruna_kernel::arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use moruna_kernel::{Allocator, MorunaError, Payload, Sink, Source, SourceSchema, Tier};
@@ -164,7 +172,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
     let read = PeqlRead::Contract("demo/readings".into());
 
     // The guest's view: eastern rows only, meters hashed, kwh noised and paid for.
-    let src = PlanSource::peql(&engine, &read, &guest()).expect("a governed source");
+    let src = PlanSource::peql(&engine, &read, &guest(), &memory()).expect("a governed source");
     assert!(
         !src.repeatable(),
         "noise and suppression make one merged partition"
@@ -191,7 +199,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
     assert!(meters.iter().all(|m| m.len() == 64), "meters are hashed");
     // The view spent 1.0 of 2.0 when it was planned and the query the rest: nothing is left.
     assert_eq!(answer.envelope.budgets["kwh"], 0.0);
-    let spent = PlanSource::peql(&engine, &read, &guest())
+    let spent = PlanSource::peql(&engine, &read, &guest(), &memory())
         .err()
         .expect("refused");
     assert!(
@@ -200,7 +208,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
     );
 
     // The owner is exempt from every shape: all rows, several partitions, repeatable.
-    let src = PlanSource::peql(&engine, &read, &owner()).expect("the owner's source");
+    let src = PlanSource::peql(&engine, &read, &owner(), &memory()).expect("the owner's source");
     let SourceSchema::Table(schema) = src.schema() else {
         panic!("a table schema");
     };
@@ -212,7 +220,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
         r#"SELECT region, COUNT(*) AS n FROM "demo/readings" GROUP BY region"#.into(),
     );
     assert_eq!(sql.contracts().expect("parsed"), ["demo/readings"]);
-    let src = PlanSource::peql(&engine, &sql, &owner()).expect("an aggregate");
+    let src = PlanSource::peql(&engine, &sql, &owner(), &memory()).expect("an aggregate");
     let n: i64 = drain(&src)
         .iter()
         .map(|b| {
@@ -227,13 +235,18 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
 
     // Refusals are peQL's own words.
     let marketer = Caller::new("m", "partner", "marketing");
-    let denied = PlanSource::peql(&engine, &read, &marketer)
+    let denied = PlanSource::peql(&engine, &read, &marketer, &memory())
         .err()
         .expect("denied");
     assert!(denied.to_string().contains("analytics"), "{denied}");
-    let unknown = PlanSource::peql(&engine, &PeqlRead::Contract("demo/none".into()), &owner())
-        .err()
-        .expect("unknown");
+    let unknown = PlanSource::peql(
+        &engine,
+        &PeqlRead::Contract("demo/none".into()),
+        &owner(),
+        &memory(),
+    )
+    .err()
+    .expect("unknown");
     assert!(
         unknown.to_string().contains("no contract named"),
         "{unknown}"

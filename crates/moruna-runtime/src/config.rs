@@ -5,6 +5,9 @@
 
 /// `budget.reserve_fraction`.
 pub const RESERVE_FRACTION: f32 = 0.10;
+/// The share of the arena a sink that encodes files in it may hold for its file buffer: a
+/// Parquet file buffer larger than this writes smaller files and row groups instead.
+pub const SINK_BUFFER_SHARE: f64 = 0.25;
 /// `morsel.min_bytes`.
 pub const MORSEL_MIN_BYTES: u64 = 4 << 20;
 /// `morsel.max_bytes`.

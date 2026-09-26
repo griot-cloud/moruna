@@ -19,6 +19,7 @@ use moruna_kernel::{
 };
 use peql::{Caller, Engine, WriteMode, Writing};
 
+use crate::memory::PlanMemory;
 use crate::plan_source::{PlanSource, Runtime, plan_err};
 
 /// What a run reads from peQL.
@@ -60,17 +61,26 @@ impl PlanSource {
     /// The plan peQL makes for `caller` (MH 4.5): resolved, gated and shaped, its budgets
     /// charged now. A refusal (an unknown contract, a `decide` rule, a failed guarantee, an
     /// exhausted budget) is a `Plan` error carrying peQL's own words.
-    pub fn peql(engine: &Engine, read: &PeqlRead, caller: &Caller) -> Result<PlanSource> {
+    /// Its operators hold their working memory in `memory`, the share of the run's budget the
+    /// facade gives the plan, and it is planned for as many partitions as that share's batches
+    /// in flight can hold at once ([`crate::plan_source::partitions_for`]).
+    pub fn peql(
+        engine: &Engine,
+        read: &PeqlRead,
+        caller: &Caller,
+        memory: &PlanMemory,
+    ) -> Result<PlanSource> {
         let runtime = Runtime::new()?;
+        let partitions = Some(crate::plan_source::partitions_for(memory.pool.in_flight()));
         let planned = runtime
             .block_on(async {
                 match read {
-                    PeqlRead::Contract(name) => engine.view(name, caller).await,
-                    PeqlRead::Sql(sql) => engine.plan(sql, caller).await,
+                    PeqlRead::Contract(name) => engine.view_for(name, caller, partitions).await,
+                    PeqlRead::Sql(sql) => engine.plan_for(sql, caller, partitions).await,
                 }
             })
             .map_err(|e| plan_err(format!("peQL: {e}")))?;
-        PlanSource::build(planned.plan, &planned.ctx, runtime)
+        PlanSource::build(planned.plan, &planned.ctx, runtime, memory)
     }
 }
 

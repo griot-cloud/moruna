@@ -449,6 +449,14 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `polars` | `moruna-polars` | the Polars expression plugin host | feature `polars`; `pyo3-polars` deferred (12 o) |
 | `datafusion` | `moruna-datafusion` | the DataFusion `ScalarUDF` host | feature `datafusion` |
 | `tracing-subscriber` | 12, bench | log output for the Python surface and the bench runner | never in a library crate |
+| `arc-swap` | 3 | the one-writer, many-reader cell `LimitsWatch` publishes the current `Limits` into and the sampler reads (MH 4.4) | added by F8.2 |
+| `sha2` | 5, runtime, `moruna-kernels`, `moruna-vmm` | the job document's content address (MH 4.1), the `hash` standard kernel, guest image digests | already in the graph through the engine bridges |
+| `peql` | `moruna-datafusion`, runtime, 12 | the contract-native engine on both ends of a run: a governed plan as a source, a contract write as a sink (MH 4.5) | git dependency pinned by revision; feature `peql`; peQL never depends on Moruna |
+| `futures` | `moruna-datafusion` | streams of record batches out of a DataFusion plan | already in the graph through `datafusion` |
+| `hyper`, `hyper-util`, `http`, `http-body-util`, `socket2` | 6, runtime (dev) | object storage through a Unix or vsock socket: HTTP/1.1 over a stream for `object_store`'s S3 client (MH 4.6) | already in the graph through `object_store`; `default-features = false` on `hyper` and `hyper-util` |
+| `kvm-ioctls`, `kvm-bindings`, `vmm-sys-util` | `moruna-vmm` | KVM: the VM, memory slots, irqchip, vCPUs (MH 4.8) | Linux only; `kvm-bindings` with `fam-wrappers` |
+| `vm-memory`, `virtio-queue`, `virtio-bindings`, `vm-superio`, `linux-loader` | `moruna-vmm` | guest memory, split virtqueues, the virtio constants, the serial console, loading the guest kernel (MH 4.8) | the rust-vmm crates; `vm-memory` with `backend-mmap`, `linux-loader` with `bzimage`, `elf`, `pe` |
+| `vm-fdt`, `acpi_tables` | `moruna-vmm` | the aarch64 device tree and the x86_64 ACPI tables that describe the guest's devices and hot-pluggable CPUs | |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
 
@@ -469,6 +477,16 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `pyo3-arrow` | 0.19.0 | `hostname` | 0.4.2 |
 | `maturin` (build tool, not a Cargo dependency; pinned by the wave 5 `pyproject.toml` and the wheel job) | 1.15.0 | `polars` | 0.55.2 |
 | `datafusion` | 55.1.0 | `tracing-subscriber` | 0.3.23 |
+| `arc-swap` | 1.9.1 | `sha2` | 0.11.0 |
+| `peql` | 0.4.0, git rev `189b58e` | `futures` | 0.3.34 |
+| `hyper` | 1.11.1 | `hyper-util` | 0.1.20 |
+| `http` | 1.5.0 | `http-body-util` | 0.1.5 |
+| `socket2` | 0.6.5 | `kvm-ioctls` | 0.25.0 |
+| `kvm-bindings` | 0.14.1 | `vmm-sys-util` | 0.15.0 |
+| `vm-memory` | 0.18.0 | `virtio-queue` | 0.18.0 |
+| `virtio-bindings` | 0.2.7 | `vm-superio` | 0.8.2 |
+| `linux-loader` | 0.14.0 | `vm-fdt` | 0.3.0 |
+| `acpi_tables` | 0.2.1 | | |
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 

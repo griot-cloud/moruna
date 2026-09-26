@@ -177,7 +177,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     };
 
     let engines = governed::Engines::default();
-    let (source, source_targets) = source_of(&job.source, loader, &engines)?;
+    let (source, source_targets, engine_memory) = source_of(&job.source, loader, &engines)?;
     let (sink, sink_target) = sink_of(&job.sink, &mut notes, &engines)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;
 
@@ -320,6 +320,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     };
 
     let mut spec = RunSpec::new(source, kernels, sink);
+    spec.engine_memory = engine_memory;
     #[cfg(feature = "python")]
     {
         spec.py_kernels = py_kernels;
@@ -369,12 +370,13 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     })
 }
 
-/// The source's builder and the URLs it reads, for the sink equals source rule.
+/// The source's builder, the locations it reads for the sink equals source rule, and the memory
+/// its engine's operators hold when it is an engine that runs operators of its own.
 fn source_of(
     doc: &SourceDoc,
     loader: &dyn KernelLoader,
     engines: &governed::Engines,
-) -> Result<(SourceSpec, Vec<String>)> {
+) -> Result<governed::Read> {
     match doc {
         SourceDoc::Parquet { url, options } => {
             if url.0.is_empty() {
@@ -405,6 +407,7 @@ fn source_of(
                     )?) as Arc<dyn Source>)
                 })),
                 targets,
+                None,
             ))
         }
         SourceDoc::Tensor { url, options } => {
@@ -426,9 +429,10 @@ fn source_of(
                     Ok(Arc::new(TensorSource::new(cfg, ctx.reactor.clone())?) as Arc<dyn Source>)
                 })),
                 targets,
+                None,
             ))
         }
-        SourceDoc::Iterator => Ok((loader.iterator_source()?, Vec::new())),
+        SourceDoc::Iterator => Ok((loader.iterator_source()?, Vec::new(), None)),
         SourceDoc::Datafusion {
             root,
             contract,
@@ -501,10 +505,12 @@ fn sink_of(
             let target = url.clone();
             Ok((
                 SinkSpec::Build(Box::new(move |ctx| {
+                    // The sink encodes each file in the arena, in one of two buffers: together
+                    // they are the share the facade sets aside for it.
                     let cfg = ParquetSinkConfig {
                         url,
                         row_group_bytes,
-                        file_bytes,
+                        file_bytes: file_bytes.min(ctx.claim_file_buffer() / 2),
                         compression,
                         writer_props: None,
                     };

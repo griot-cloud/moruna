@@ -22,7 +22,7 @@ use moruna_trace::{RunReport, TraceConfig, TraceWriter};
 
 use crate::cancel::{CancelOnDrop, Started};
 use crate::config;
-use crate::elastic::{WatchCtx, WatchState, Watcher};
+use crate::elastic::{Shares, WatchCtx, WatchState, Watcher};
 use crate::error::{Result, RunError};
 use crate::report::{self, MetaInput};
 use crate::spec::{BuildCtx, Components, RunSpec};
@@ -109,6 +109,7 @@ fn drive(
         #[cfg(feature = "python")]
         py_kernels,
         sink: sink_spec,
+        engine_memory,
         budget,
         cpu,
         elastic: elastic_budget,
@@ -284,11 +285,31 @@ fn drive(
     // 11 f.1): the arena touches every page at `new`, so a sample taken after it contains the
     // arena and subtracting it later would charge the arena twice.
     let baseline_bytes = sampler.sample().anon_bytes;
+    let kernel_state = expected_kernel_state(&kernels);
+    // An engine source's operators get their share before the arena is sized, and the arena is
+    // sized over what is left: the two together stay inside the ceiling (MH 4.5).
+    let engine_bytes = match &engine_memory {
+        Some(engine) => {
+            let bytes = engine_host_bytes(
+                limits.memory_ceiling,
+                baseline_bytes,
+                config::RESERVE_FRACTION,
+                kernel_state,
+            );
+            engine.set_limit(bytes);
+            notes.push(format!(
+                "the source's plan operators may hold {bytes} bytes outside the arena, and \
+                 spill to the staging directory past it"
+            ));
+            bytes
+        }
+        None => 0,
+    };
     let arena_bytes = arena_host_bytes(
         limits.memory_ceiling,
         baseline_bytes,
         config::RESERVE_FRACTION,
-        expected_kernel_state(&kernels),
+        kernel_state.saturating_add(engine_bytes),
         expected_out_of_arena_amplification(&kernels),
         limits.page_bytes,
         &mut notes,
@@ -391,9 +412,26 @@ fn drive(
         reactor: reactor.clone(),
         object_metadata,
         run_id,
+        arena_bytes,
+        sink_buffer: std::sync::atomic::AtomicU64::new(0),
     };
     let source = source_spec.build(&ctx)?;
     let sink = sink_spec.build(&ctx)?;
+    let sink_buffer_bytes = ctx.sink_buffer_bytes();
+    // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
+    // is at most half a file, so every morsel fits an ordinary file and none needs a buffer of
+    // its own that the arena may no longer be able to give.
+    let morsel_max = match sink_buffer_bytes {
+        0 => config::MORSEL_MAX_BYTES,
+        claim => (claim / 4).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
+    };
+    if morsel_max < config::MORSEL_MAX_BYTES {
+        notes.push(format!(
+            "morsels are at most {morsel_max} bytes, half of one of the sink's two {} byte file \
+             buffers",
+            sink_buffer_bytes / 2
+        ));
+    }
     let plan = source.plan()?;
     let plan_summary = summarise(&plan);
     let repeatable = source.repeatable();
@@ -525,7 +563,7 @@ fn drive(
             error_policy,
             initial_morsel_target: config::MORSEL_PROBE_BYTES,
             morsel_min: config::MORSEL_MIN_BYTES,
-            morsel_max: config::MORSEL_MAX_BYTES,
+            morsel_max,
             checkpoint_enabled,
             checkpoint_interval_ms,
             checkpoint_keep,
@@ -571,7 +609,7 @@ fn drive(
             oscillation_flips: config::OSCILLATION_FLIPS,
             freeze_morsels: config::FREEZE_MORSELS,
             morsel_min: config::MORSEL_MIN_BYTES,
-            morsel_max: config::MORSEL_MAX_BYTES,
+            morsel_max,
             probe_bytes: config::MORSEL_PROBE_BYTES,
             sizer,
             fallback_error_ratio: config::SIZER_FALLBACK_ERROR_RATIO,
@@ -579,6 +617,8 @@ fn drive(
             disk_budget,
             arena_bytes,
             baseline_bytes,
+            engine_bytes,
+            sink_buffer_bytes,
             checkpoint_enabled,
             checkpoint_interval_ms,
         },
@@ -624,9 +664,10 @@ fn drive(
     // The limits watcher, from the moment the controller is running until the scheduler
     // returns. The arena arithmetic is the same function that sized the first region, with
     // everything but the ceiling fixed at what the run started with.
-    let kernel_state = expected_kernel_state(&kernels);
     let out_of_arena = expected_out_of_arena_amplification(&kernels);
     let page_bytes = limits.page_bytes;
+    let has_engine = engine_memory.is_some();
+    let engine_after = engine_memory.clone();
     let watcher = watch.map(|watch| {
         Watcher::start(
             WatchCtx {
@@ -635,22 +676,36 @@ fn drive(
                 arena,
                 controller: controller.clone(),
                 scheduler: scheduler.clone(),
+                engine: engine_memory,
                 sizing: Box::new(move |ceiling| {
-                    arena_host_bytes(
-                        ceiling,
-                        baseline_bytes,
-                        config::RESERVE_FRACTION,
-                        kernel_state,
-                        out_of_arena,
-                        page_bytes,
-                        &mut Vec::new(),
-                    )
+                    let engine = if has_engine {
+                        engine_host_bytes(
+                            ceiling,
+                            baseline_bytes,
+                            config::RESERVE_FRACTION,
+                            kernel_state,
+                        )
+                    } else {
+                        0
+                    };
+                    Shares {
+                        engine,
+                        arena: arena_host_bytes(
+                            ceiling,
+                            baseline_bytes,
+                            config::RESERVE_FRACTION,
+                            kernel_state.saturating_add(engine),
+                            out_of_arena,
+                            page_bytes,
+                            &mut Vec::new(),
+                        ),
+                    }
                 }),
                 start_ns,
                 workers_max,
                 tick: std::time::Duration::from_millis(config::TICK_MS),
             },
-            WatchState::new(arena_bytes),
+            WatchState::new(arena_bytes, engine_bytes),
         )
     });
     let outcome = if resume.is_some() {
@@ -667,6 +722,9 @@ fn drive(
     };
     let outcome = outcome?;
     notes.extend(watch_notes);
+    if let Some(engine) = engine_after {
+        notes.push(engine.note());
+    }
 
     // 12. stop, finish, report.
     let (exit, outcome_manifest) = report::exit_of(&outcome);
@@ -858,6 +916,25 @@ fn gil_states(
     }
 }
 
+/// The share of the allowance an engine source's operators are given (MH 4.5). A DataFusion
+/// plan's sorts, aggregations and joins hold their state outside the arena, and what they need
+/// is not known before they run; the rest of the allowance is the arena's, whose queues hold the
+/// batches the plan emits. An operator that finds its share full spills to the staging
+/// directory, so the share bounds the plan's memory and not the data it can process.
+const ENGINE_SHARE: f64 = 0.4;
+
+/// The bytes an engine source's operators may hold (MH 4.5): `ENGINE_SHARE` of the allowance,
+/// `ceiling - baseline - reserve - expected kernel state`. The arena is then sized over the
+/// allowance less this figure, so the two never add up past the ceiling.
+fn engine_host_bytes(ceiling: u64, baseline: u64, reserve_fraction: f32, kernel_state: u64) -> u64 {
+    let reserve = (ceiling as f64 * f64::from(reserve_fraction)) as u64;
+    let allowance = ceiling
+        .saturating_sub(baseline)
+        .saturating_sub(reserve)
+        .saturating_sub(kernel_state);
+    (allowance as f64 * ENGINE_SHARE) as u64
+}
+
 /// `ArenaConfig::host_bytes` (12 f.1, 02 f.1, 11 f.1).
 ///
 /// The *allowance* is `ceiling - baseline - reserve - expected kernel state`: the bytes the run
@@ -911,8 +988,8 @@ fn arena_host_bytes(
     notes.push(format!(
         "arena sized at {arena} bytes: {share:.2} of the {allowance} byte allowance, which is \
          the ceiling {ceiling} less the {baseline} bytes the process held before the arena \
-         existed, the {reserve} byte reserve and the {kernel_state} bytes the stateful kernels \
-         declare; the share is set by the {a_anon:.2} bytes the chain is expected to allocate \
+         existed, the {reserve} byte reserve and the {kernel_state} bytes held outside it for \
+         the stateful kernels' declared state and a plan's operators; the share is set by the {a_anon:.2} bytes the chain is expected to allocate \
          outside the arena per byte in flight, and {headroom} bytes are left above the arena for \
          it"
     ));

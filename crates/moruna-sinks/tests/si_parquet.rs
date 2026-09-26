@@ -122,8 +122,9 @@ fn si_t3_no_partial_final() {
 }
 
 /// SI-T4. The encode is the only CPU copy a Parquet sink makes: one `note_payload_copy` per
-/// morsel, `encode_bytes` equal to the input bytes, and every object write out of the host
-/// tier. SI-I4, G-I2.
+/// morsel, `encode_bytes` equal to the bytes of the input's rows (what the encoder reads, not
+/// the capacity of the buffers they sit in), and every object write out of the host tier.
+/// SI-I4, G-I2.
 #[test]
 fn si_t4_encode_only_copy() {
     let scratch = Scratch::new("t4");
@@ -133,7 +134,14 @@ fn si_t4_encode_only_copy() {
     let mut input = 0u64;
     for seq in 0..8 {
         let payload = arena_payload(alloc.fake(), 512, seq as i64);
-        input += payload.bytes();
+        let moruna_kernel::Payload::Table(batch, _) = &payload else {
+            panic!("a table");
+        };
+        input += batch
+            .columns()
+            .iter()
+            .map(|c| c.to_data().get_slice_memory_size().expect("sized") as u64)
+            .sum::<u64>();
         block_on(sink.write(seq, payload)).expect("write");
     }
     sink.finish().expect("finish");
@@ -241,8 +249,9 @@ fn si_t16_parquet_encodes_into_arena() {
     sink.open(&table_source_schema()).expect("open");
     assert_eq!(
         alloc.fake().allocations_total(),
-        before,
-        "f.1: `open` allocates nothing; the writer waits for the first payload's schema"
+        before + 2,
+        "f.1: `open` takes the two file buffers while the arena is empty, and nothing else; \
+         the writer waits for the first payload's schema"
     );
 
     for seq in 0..24 {
@@ -308,13 +317,12 @@ fn si_t16_parquet_encodes_into_arena() {
         Arc::new(starved),
     )
     .expect("parquet sink");
-    sink.open(&table_source_schema())
-        .expect("open takes no memory");
-    let outcome = block_on(sink.write(0, arena_payload(&starved_fake, 8, 0)));
+    let outcome = sink.open(&table_source_schema());
     assert!(
         matches!(outcome, Err(MorunaError::Alloc { .. })),
-        "below the format's own floor the error stands, got {outcome:?}"
+        "below the format's own floor the error stands, at open, got {outcome:?}"
     );
+    assert_eq!(starved_fake.in_use(Tier::Host), 0, "nothing is held");
 }
 
 /// SI-T16, f.1. The file buffer is one whole size class of 02 e.2 with the footer inside it, so
@@ -327,14 +335,15 @@ fn si_t16_parquet_encodes_into_arena() {
 fn si_t16_the_file_buffer_is_one_size_class() {
     let scratch = Scratch::new("t16-class");
     let row_group: u64 = 128 << 20;
-    // Exactly the 129 MiB the sink used to ask for, so a sink that still asked for
-    // `row_group_bytes + footer` could not open here once the payload is in hand.
-    let limit = FakeAllocator::new().with_limit(Tier::Host, row_group + (1 << 20));
+    // Four times the class and the 1 MiB the sink used to add: the sink takes two buffers of
+    // at most a quarter of what is free, so a sink that still asked for `row_group_bytes +
+    // footer` would be served the class below.
+    let limit = FakeAllocator::new().with_limit(Tier::Host, 4 * row_group + (1 << 20));
     let fake = limit.clone();
     let mut sink = ParquetSink::new(
         ParquetSinkConfig {
             url: scratch.url(),
-            file_bytes: 1 << 30,
+            file_bytes: row_group,
             row_group_bytes: row_group,
             ..ParquetSinkConfig::default()
         },
@@ -496,4 +505,74 @@ fn si_t14_opens_inside_a_small_arena() {
             op.len
         );
     }
+}
+
+/// A roll for a morsel that fits an ordinary file opens an ordinary file: the sink writes every
+/// file into the two buffers it took at `open` and asks the arena for nothing more. Asking
+/// every roll for twice the morsel doubled the buffer's size class whenever a morsel was a
+/// large share of a file, and in a tight arena that was the allocation it could not give (F8.8,
+/// H6 at 256 MiB).
+#[test]
+fn a_roll_for_a_morsel_that_fits_opens_an_ordinary_file() {
+    const FILE: u64 = 4 << 20;
+    let scratch = Scratch::new("roll-ordinary");
+    let alloc = FakeAllocator::new();
+    let per_row = arena_payload(&alloc, 1_000, 0).bytes() / 1_000;
+    // Morsels of about 2.5 MB: two do not fit a 3 MiB roll, one does.
+    let rows = ((5u64 << 19) / per_row.max(1)) as usize;
+    let reactor = FakeReactor::new();
+    let mut sink = ParquetSink::new(
+        config(&scratch, FILE),
+        Arc::new(reactor.clone()),
+        Arc::new(alloc.clone()),
+    )
+    .expect("parquet sink");
+    sink.open(&table_source_schema()).expect("open");
+    let payloads: Vec<_> = (0..6)
+        .map(|seq| arena_payload(&alloc, rows, seq * 100_000))
+        .collect();
+    let before = alloc.allocations_total();
+    for (seq, payload) in payloads.into_iter().enumerate() {
+        block_on(sink.write(seq as u64, payload)).expect("written into an ordinary file");
+    }
+    assert_eq!(
+        alloc.allocations_total(),
+        before,
+        "every roll reused a buffer the sink already held"
+    );
+    let summary = sink.finish().expect("finish");
+    assert!(summary.files.len() >= 3, "{:?}", summary.files);
+    assert_eq!(sink.stats().roll_bytes, FILE - (1 << 20));
+}
+
+/// A morsel that is a few rows of a large buffer, as one read back from staging is, is measured
+/// by its rows: it fits an ordinary file and asks the arena for nothing (F8.8).
+#[test]
+fn a_slice_of_a_large_buffer_is_measured_by_its_rows() {
+    let scratch = Scratch::new("slice-rows");
+    let alloc = FakeAllocator::new();
+    let mut sink = ParquetSink::new(
+        config(&scratch, 1 << 20),
+        Arc::new(FakeReactor::new()),
+        Arc::new(alloc.clone()),
+    )
+    .expect("parquet sink");
+    sink.open(&table_source_schema()).expect("open");
+    let whole = arena_payload(&alloc, 200_000, 0);
+    assert!(whole.bytes() > 2 << 20, "the buffer is larger than a file");
+    let moruna_kernel::Payload::Table(batch, tier) = whole else {
+        panic!("a table");
+    };
+    let before = alloc.allocations_total();
+    for seq in 0..4 {
+        let slice = batch.slice(seq as usize * 100, 100);
+        let payload = moruna_kernel::Payload::Table(slice, tier);
+        block_on(sink.write(seq, payload)).expect("a few rows");
+    }
+    assert_eq!(
+        alloc.allocations_total(),
+        before,
+        "no file buffer of its own"
+    );
+    assert_eq!(sink.finish().expect("finish").files.len(), 1);
 }

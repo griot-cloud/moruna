@@ -28,9 +28,35 @@ pub struct BuildCtx {
     pub object_metadata: Option<Arc<dyn ObjectMetadata>>,
     /// The run's identity, minted or read from a manifest.
     pub run_id: RunId,
+    /// The arena's host capacity when the run started.
+    pub arena_bytes: u64,
+    /// The file buffer a sink claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
+    pub(crate) sink_buffer: std::sync::atomic::AtomicU64,
 }
 
 impl BuildCtx {
+    /// The most a sink that encodes files in the arena (Parquet) may hold for its file buffers,
+    /// claimed: `config::SINK_BUFFER_SHARE` of the arena, rounded down to the arena's size
+    /// class so the buffer the sink asks for is the one it is given. The facade takes the claim
+    /// out of what the controller plans morsels and queues into, so a sink that grabbed the
+    /// largest buffer the arena would give can no longer leave the queues and the staging of an
+    /// unrepeatable source with nothing (F8.5's finding at 256 MiB).
+    pub fn claim_file_buffer(&self) -> u64 {
+        let share = (self.arena_bytes as f64 * crate::config::SINK_BUFFER_SHARE) as u64;
+        let bytes = match share {
+            0 => 0,
+            n => 1u64 << (63 - n.leading_zeros()),
+        };
+        self.sink_buffer
+            .store(bytes, std::sync::atomic::Ordering::SeqCst);
+        bytes
+    }
+
+    /// What a sink claimed with [`BuildCtx::claim_file_buffer`]; zero when it claimed nothing.
+    pub fn sink_buffer_bytes(&self) -> u64 {
+        self.sink_buffer.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The object metadata handle, or a `Config` error naming what is missing. A source that
     /// reads object URLs needs it; one that reads local files does not (07 d.1).
     pub fn object_metadata(&self) -> moruna_kernel::Result<Arc<dyn ObjectMetadata>> {
@@ -102,6 +128,20 @@ impl From<Box<dyn Sink>> for SinkSpec {
     }
 }
 
+/// The working memory an engine source's own operators hold outside the arena (MH 4.5): a
+/// DataFusion plan's sorts, aggregations and joins. The facade gives it a share of the budget
+/// beside the arena before the source is built, charges that share to the controller, and moves
+/// it when the machine's limits move, so the arena and the engine together stay inside the
+/// ceiling.
+pub trait EngineMemory: Send + Sync {
+    /// The most the engine's operators may hold from now on, in bytes. Growth past it is refused
+    /// (an operator that can spill spills); what is held above a lowered figure is given back as
+    /// its holders finish.
+    fn set_limit(&self, bytes: u64);
+    /// What the engine's operators held and how often they were refused, for the report.
+    fn note(&self) -> String;
+}
+
 /// One run, as the surface describes it (12 d.1).
 pub struct RunSpec {
     /// The input.
@@ -113,6 +153,9 @@ pub struct RunSpec {
     pub py_kernels: Vec<(moruna_kernel::StageId, Arc<moruna_adapters::PyKernel>)>,
     /// The output; wrapped into a `SinkHandle` by the facade.
     pub sink: SinkSpec,
+    /// The source's engine memory, when the source is an engine that runs operators of its own
+    /// (a DataFusion plan); `None` for every other source.
+    pub engine_memory: Option<Arc<dyn EngineMemory>>,
     /// An explicit host ceiling in bytes; discovery clamps it.
     pub budget: Option<u64>,
     /// An explicit CPU quota in cores; discovery clamps it.
@@ -183,6 +226,7 @@ impl RunSpec {
             #[cfg(feature = "python")]
             py_kernels: Vec::new(),
             sink: sink.into(),
+            engine_memory: None,
             budget: None,
             cpu: None,
             elastic: crate::elastic::ElasticBudget::default(),
@@ -324,7 +368,24 @@ mod tests {
             reactor: Arc::new(FakeReactor::new()) as Arc<dyn Reactor>,
             object_metadata: metadata,
             run_id: RunId([3; 16]),
+            arena_bytes: 139_198_464,
+            sink_buffer: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A sink's file buffer is a quarter of the arena at most, a whole size class, and what it
+    /// claimed is what the facade takes out of the controller's budget.
+    #[test]
+    fn a_sink_claims_a_class_of_a_quarter_of_the_arena() {
+        let ctx = ctx(None);
+        assert_eq!(ctx.sink_buffer_bytes(), 0, "nothing claimed yet");
+        assert_eq!(ctx.claim_file_buffer(), 32 << 20);
+        assert_eq!(ctx.sink_buffer_bytes(), 32 << 20);
+        let empty = BuildCtx {
+            arena_bytes: 0,
+            ..self::ctx(None)
+        };
+        assert_eq!(empty.claim_file_buffer(), 0);
     }
 
     /// A built source or sink is handed back unchanged; a builder is run.

@@ -4,12 +4,14 @@
 //! Every `controller.tick_ms` it polls discovery's `LimitsWatch`; when the limits moved it tells
 //! the trace (the report's `limits_timeline`), the controller (the ceiling and the CPU limit, at
 //! once rather than at its next tick) and the scheduler (the CPU limit), then re-runs the arena
-//! arithmetic of 12 f.1 for the new ceiling and grows or shrinks the arena by the difference.
+//! arithmetic of 12 f.1 for the new ceiling, moves an engine source's operator memory to its new
+//! share (MH 4.5), and grows or shrinks the arena by the difference.
 //!
 //! Nothing here decides anything the components do not already decide: the arena reserves what
 //! it is told, the controller re-plans inside the limits it is given, and the scheduler parks what
 //! the limit does not allow. The watcher is the one caller of `Arena::grow`, `Arena::shrink`,
-//! `Controller::set_arena` and `Scheduler::set_cpu_limit`.
+//! `Controller::set_arena`, `Controller::set_engine`, `EngineMemory::set_limit` after the start,
+//! and `Scheduler::set_cpu_limit`.
 //!
 //! Shrink is eventual: a region that is draining is unmapped when its last buffer comes
 //! home, and the watcher does not grow while a drain is running (the pacing of MH 7.1), so the
@@ -28,6 +30,8 @@ use moruna_kernel::{Tier, TraceSink};
 use moruna_scheduler::Scheduler;
 use moruna_trace::DrainSummary;
 
+use crate::spec::EngineMemory;
+
 /// The largest figures a run may follow the machine up to (MH 4.1 `budget.elastic`).
 ///
 /// Both default to the run's starting figures, so a spec that says nothing never grows (MH H-Q4):
@@ -44,9 +48,17 @@ pub struct ElasticBudget {
     pub cpu_max: Option<u16>,
 }
 
+/// What a ceiling is divided into: an engine source's operator memory (zero without one) and the
+/// arena, sized over what the engine leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shares {
+    pub(crate) engine: u64,
+    pub(crate) arena: u64,
+}
+
 /// The arena arithmetic of 12 f.1, closed over everything but the ceiling, so the watcher can
 /// re-run it for each new ceiling.
-pub(crate) type Sizing = Box<dyn Fn(u64) -> u64 + Send>;
+pub(crate) type Sizing = Box<dyn Fn(u64) -> Shares + Send>;
 
 /// What one watcher needs.
 pub(crate) struct WatchCtx {
@@ -55,6 +67,8 @@ pub(crate) struct WatchCtx {
     pub(crate) arena: Option<Arc<Arena>>,
     pub(crate) controller: Arc<Controller>,
     pub(crate) scheduler: Arc<Scheduler>,
+    /// The source's engine memory, moved to its share of each new ceiling.
+    pub(crate) engine: Option<Arc<dyn EngineMemory>>,
     pub(crate) sizing: Sizing,
     pub(crate) start_ns: u64,
     pub(crate) workers_max: u16,
@@ -65,6 +79,8 @@ pub(crate) struct WatchCtx {
 pub(crate) struct WatchState {
     /// The host budget and the draining bytes last handed to the controller.
     budget: (u64, u64),
+    /// The engine memory last set.
+    engine: u64,
     /// Every shrink, and the drain in progress when there is one.
     drains: Vec<DrainSummary>,
     /// When the drain in progress started, nanoseconds.
@@ -74,9 +90,10 @@ pub(crate) struct WatchState {
 }
 
 impl WatchState {
-    pub(crate) fn new(budget: u64) -> WatchState {
+    pub(crate) fn new(budget: u64, engine: u64) -> WatchState {
         WatchState {
             budget: (budget, 0),
+            engine,
             drains: Vec::new(),
             draining_since: None,
             notes: Vec::new(),
@@ -209,7 +226,17 @@ fn check_drain(ctx: &WatchCtx, state: &mut WatchState) {
 /// and no drain is running, and hand the controller the budget it may plan inside.
 fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
     let ceiling = ctx.watch.current().memory_ceiling;
-    let target = (ctx.sizing)(ceiling);
+    let shares = (ctx.sizing)(ceiling);
+    if let Some(engine) = &ctx.engine
+        && shares.engine != state.engine
+    {
+        // Before the arena moves: a lowered share refuses the engine's growth at once, so its
+        // operators spill rather than hold what the ceiling no longer allows.
+        state.engine = shares.engine;
+        engine.set_limit(shares.engine);
+        ctx.controller.set_engine(shares.engine);
+    }
+    let target = shares.arena;
     let Some(arena) = &ctx.arena else {
         // An injected allocator is not the facade's to resize; the controller still follows the
         // ceiling through its sampler.

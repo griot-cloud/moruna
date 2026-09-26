@@ -76,6 +76,9 @@ fn unchanged() -> SchemaDecl {
 
 #[test]
 fn ck_t1_h13_a_kernel_that_disagrees_is_refused_naming_the_column() {
+    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
+    // its own: no check runs beside it.
+    let _serial = one_run_at_a_time();
     // The appender adds a boolean column; its author declared an integer one.
     let liar = Declaring::new(
         Arc::new(Appender::new("loud")),
@@ -233,6 +236,9 @@ fn ck_t2_h13_the_profile_row_a_check_writes_is_read_by_a_later_run() {
 
 #[test]
 fn ck_t4_a_check_never_overwrites_a_profile() {
+    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
+    // its own: no check runs beside it.
+    let _serial = one_run_at_a_time();
     let scratch = Scratch::new("ck_t4");
     let kernel = Declaring::new(
         Arc::new(Doubler::new()),
@@ -264,6 +270,9 @@ fn ck_t4_a_check_never_overwrites_a_profile() {
 
 #[test]
 fn ck_t5_every_standard_kernel_passes_check() {
+    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
+    // its own: no check runs beside it.
+    let _serial = one_run_at_a_time();
     let chain = [
         ("cast", json!({"columns": {"a": "double"}})),
         ("rename", json!({"columns": {"a": "b"}})),
@@ -321,6 +330,9 @@ fn ck_t5_every_standard_kernel_passes_check() {
 
 #[test]
 fn ck_not_checkable_and_plan_refusals() {
+    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
+    // its own: no check runs beside it.
+    let _serial = one_run_at_a_time();
     // No declarations at all: not checkable, exit 2, and the reason says what is missing.
     let bare: Arc<dyn Kernel> = Arc::new(Doubler::new());
     let report = check(bare, CheckOptions::new("bare")).expect("runs");
@@ -420,6 +432,9 @@ fn ck_not_checkable_and_plan_refusals() {
 
 #[test]
 fn ck_json_and_summary_carry_the_profile_and_the_gil() {
+    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
+    // its own: no check runs beside it.
+    let _serial = one_run_at_a_time();
     let kernel = Declaring::new(
         Arc::new(Doubler::new()),
         Declared {

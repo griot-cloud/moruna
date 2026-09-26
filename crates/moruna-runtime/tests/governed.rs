@@ -228,13 +228,38 @@ fn child_run() {
     ) {
         Err(e) => serde_json::json!({"error": e.to_string()}),
         Ok(built) => match Runtime::run(built.spec, CancelToken::new()) {
-            Ok(report) => serde_json::json!({"report": report}),
+            Ok(report) => serde_json::json!({"report": report, "peak_anon": peak_anon()}),
             Err(e) => serde_json::json!({"error": e.to_string()}),
         },
     };
     let mut file = std::fs::File::create(dir.join("outcome.json")).expect("the outcome");
     file.write_all(outcome.to_string().as_bytes())
         .expect("written");
+}
+
+/// The most anonymous memory this process has held, by the kernel's own ledger where the
+/// platform keeps one, so no sampling interval can miss a peak: on macOS the lifetime maximum
+/// of `phys_footprint`, the quantity the run's budget counts there (03 DS-I4). Linux keeps no
+/// such peak outside a cgroup, and there the report's own samples are the evidence.
+fn peak_anon() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `proc_pid_rusage` fills one `rusage_info_v4` it is given for this process
+        // and keeps no pointer; an all-zero value of that plain C struct is valid.
+        unsafe {
+            let mut info: libc::rusage_info_v4 = std::mem::zeroed();
+            let got = libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                (&mut info as *mut libc::rusage_info_v4).cast(),
+            );
+            (got == 0).then_some(info.ri_lifetime_max_phys_footprint)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn completed(outcome: &serde_json::Value, what: &str) {
@@ -409,23 +434,99 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
     let _ = std::fs::remove_dir_all(exchange(std::process::id()));
 }
 
-/// The document names what it reads and writes; a run whose sink writes the contract its
-/// source reads is refused before anything is opened, as a file sink over its source is.
+/// The runs of H6 whose source cannot be re-read, into a Parquet sink at the smallest budget:
+/// the guest's gated view (its whole-result suppression makes it unrepeatable, so its queued
+/// morsels are staged, which is where an arena buffer could not be found, F8.5's finding), and
+/// an aggregation whose state is larger than the budget, whose operators hold their state in
+/// the run's pool and spill to the staging directory past it (MH 4.5).
 #[test]
-fn a_sink_over_its_own_source_is_refused() {
-    let scratch = Scratch::new("h6_same");
+fn h6_an_unrepeatable_plan_into_parquet_inside_the_budget() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("h6_parquet");
     let root = scratch.path().join("disk");
+    disk(&root);
+    let file = scratch.path().join("in.parquet");
+    input(&file);
+    let wrote = run_apart(
+        scratch.path(),
+        serde_json::json!({"kind": "parquet", "url": file}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/big",
+                           "caller": caller("ana", "demo"), "mode": "overwrite"}),
+    );
+    completed(&wrote, "the write");
+
+    let viewed_to = scratch.path().join("view-out");
+    let viewed = run_apart(
+        scratch.path(),
+        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
+                           "caller": caller("gus", "partner")}),
+        serde_json::json!({"kind": "parquet", "url": viewed_to}),
+    );
+    completed(&viewed, "the view into Parquet");
+    operators_within(&viewed, "the view into Parquet");
+
+    assert_eq!(support::read_back_rows(&viewed_to), (ROWS / 2) as u64);
+
+    // Every id is its own group, and each group keeps a kilobyte note: 400 MB of state.
+    let grouped_to = scratch.path().join("grouped-out");
+    let grouped = run_apart(
+        scratch.path(),
+        serde_json::json!({"kind": "datafusion", "root": root,
+                           "sql": r#"SELECT id, MAX(note) AS note, COUNT(*) AS n
+                                     FROM "demo/big" GROUP BY id"#,
+                           "caller": caller("ana", "demo")}),
+        serde_json::json!({"kind": "parquet", "url": grouped_to}),
+    );
+    completed(&grouped, "the aggregation");
+    let refused = operators_within(&grouped, "the aggregation");
+    assert!(
+        refused > 0,
+        "400 MB of groups spilled from a pool a fraction of that size"
+    );
+    assert_eq!(support::read_back_rows(&grouped_to), ROWS as u64);
+    let _ = std::fs::remove_dir_all(exchange(std::process::id()));
+}
+
+/// The plan's operators held no more than their pool, and whether the pool refused them; the
+/// process's own high-water mark is printed beside it, as the evidence it is (see the E8 gate
+/// table on the board: DataFusion's scans and a peQL write hold memory no pool accounts for).
+fn operators_within(outcome: &serde_json::Value, what: &str) -> u64 {
+    let notes = outcome["report"]["notes"].as_array().expect("notes");
+    let note = notes
+        .iter()
+        .filter_map(|n| n.as_str())
+        .find(|n| n.starts_with("the source's plan operators held at most"))
+        .unwrap_or_else(|| panic!("{what}: no note on the plan's operators: {notes:?}"));
+    let figures: Vec<u64> = note.split(' ').filter_map(|w| w.parse().ok()).collect();
+    let [held, capacity, refused] = figures[..] else {
+        panic!("{what}: {note}");
+    };
+    eprintln!("{what}: {note}; process peak {}", outcome["peak_anon"]);
+    assert!(capacity > 0, "{what}: the plan had a pool: {note}");
+    assert!(held <= capacity, "{what}: {note}");
+    refused
+}
+
+/// Another name for `demo/big`'s files.
+const ALIAS: &str = r#"
+contract: demo/alias
+version: 1
+owner: demo
+binding: {parquet: ./big}
+expose:
+  - {name: id, type: int64}
+  - {name: region, type: utf8}
+  - {name: meter, type: utf8}
+  - {name: note, type: utf8}
+"#;
+
+fn refusal(source: serde_json::Value, sink: serde_json::Value) -> String {
     let job = JobSpec::from_value(serde_json::json!({
-        "moruna_spec": 1,
-        "source": {"kind": "datafusion", "root": root,
-                   "sql": r#"SELECT * FROM "demo/big" JOIN "demo/copy" USING (id)"#,
-                   "caller": caller("ana", "demo")},
-        "sink": {"kind": "peql", "root": root, "contract": "demo/copy",
-                 "caller": caller("ana", "demo")},
+        "moruna_spec": 1, "source": source, "sink": sink,
     }))
     .expect("parses");
     let env = |_: &str| None;
-    let refused = build(
+    build(
         &job,
         &NoKernels,
         BuildOptions {
@@ -435,12 +536,60 @@ fn a_sink_over_its_own_source_is_refused() {
         },
     )
     .err()
-    .expect("refused");
-    assert!(
-        refused
-            .to_string()
-            .contains("the sink writes where the source reads"),
-        "{refused}"
+    .expect("refused")
+    .to_string()
+}
+
+/// The sink equals source rule compares where the data is, as each contract's binding resolves,
+/// and not the contracts' names: a run whose sink writes the files its source reads is refused
+/// before anything is read, whether the two name one contract, two contracts bound to the same
+/// files, or a contract and a Parquet source over its directory.
+#[test]
+fn a_sink_over_its_own_source_is_refused() {
+    let scratch = Scratch::new("h6_same");
+    let root = scratch.path().join("disk");
+    disk(&root);
+    Engine::open(&root)
+        .expect("the engine")
+        .register_contract(ALIAS, &schema())
+        .expect("compiles");
+    let owner = caller("ana", "demo");
+    let same = "the sink writes where the source reads";
+
+    let joined = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root,
+                           "sql": r#"SELECT * FROM "demo/big" JOIN "demo/copy" USING (id)"#,
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                           "caller": owner}),
     );
-    assert!(!root.exists(), "no engine was opened");
+    assert!(joined.contains(same), "{joined}");
+
+    let aliased = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/alias",
+                           "caller": owner}),
+    );
+    assert!(
+        aliased.contains(same),
+        "two names, one set of files: {aliased}"
+    );
+
+    let by_path = refusal(
+        serde_json::json!({"kind": "parquet", "url": root.join("big").join("part.parquet")}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/alias",
+                           "caller": owner}),
+    );
+    assert!(by_path.contains(same), "{by_path}");
+
+    // A contract peQL does not know is refused by the field that names it.
+    let unknown = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/none",
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                           "caller": owner}),
+    );
+    assert!(unknown.contains("source.contract"), "{unknown}");
+    assert!(!root.join("big").exists(), "nothing was written");
 }

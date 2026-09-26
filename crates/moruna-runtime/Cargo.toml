@@ -21,6 +21,8 @@ moruna-placement = { workspace = true }
 moruna-scheduler = { workspace = true }
 moruna-controller = { workspace = true }
 moruna-kernels = { workspace = true }
+# `moruna run --vm` (MH 4.8.4): the monitor's library seam, `boot_and_run`.
+moruna-vmm = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.
 moruna-datafusion = { workspace = true, optional = true }
 parquet = { workspace = true }

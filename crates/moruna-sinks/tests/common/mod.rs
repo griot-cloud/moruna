@@ -313,6 +313,10 @@ impl CountingAlloc {
 }
 
 impl moruna_kernel::Allocator for CountingAlloc {
+    fn available(&self, tier: Tier) -> Option<u64> {
+        self.inner.available(tier)
+    }
+
     fn alloc(&self, bytes: usize, tier: Tier) -> moruna_kernel::Result<moruna_kernel::Buffer> {
         self.inner.alloc(bytes, tier)
     }

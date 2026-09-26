@@ -146,13 +146,17 @@ pub(crate) fn queue_half(state: &ControllerState) -> u64 {
 ///
 /// A region the arena is draining is resident too until its last buffer comes home, and
 /// it is not the kernels' cost: it is counted here, so the fit of f.3 never reads it as a
-/// kernel's fixed term.
+/// kernel's fixed term. So is an engine source's operator memory (MH 4.5), at the most its pool
+/// may hold: the plan runs beside the chain and what it holds is no kernel's. The host budget
+/// excludes the sink's file buffer, which is arena and resident, so it is added back here.
 pub(crate) fn resting_anon(state: &ControllerState) -> u64 {
     state
         .budgets
         .baseline
         .saturating_add(state.budgets.host)
+        .saturating_add(state.cfg.sink_buffer_bytes)
         .saturating_add(state.arena_draining)
+        .saturating_add(state.cfg.engine_bytes)
 }
 
 /// The anonymous bytes the run may add above the resting figure before the ceiling S1 measures

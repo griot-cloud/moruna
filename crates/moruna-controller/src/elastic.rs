@@ -104,19 +104,38 @@ pub(crate) fn follow(
 /// The arena's capacity moved: the facade grew or shrank it and tells the controller the
 /// new host budget, which is the controller's whole arena allowance (f.1).
 pub(crate) fn set_host_budget(state: &mut ControllerState, bytes: u64, actions: &mut Actions) {
-    if bytes == state.budgets.host {
+    if bytes == state.cfg.arena_bytes {
         return;
     }
-    let lowered = bytes < state.budgets.host;
+    let planned = bytes.saturating_sub(state.cfg.sink_buffer_bytes);
+    let lowered = planned < state.budgets.host;
     state.note(format!(
         "the arena moved from {} to {bytes} bytes",
-        state.budgets.host
+        state.cfg.arena_bytes
     ));
-    state.budgets.host = bytes;
+    state.budgets.host = planned;
     state.cfg.arena_bytes = bytes;
     state.limits_epoch_ns = now_ns();
     if state.phase == Phase::Running {
         replan(state, lowered, actions);
+    }
+}
+
+/// An engine source's operator memory moved: it is resident beside the arena (`resting_anon`),
+/// so what the kernels may be planned into moves the other way.
+pub(crate) fn set_engine(state: &mut ControllerState, bytes: u64, actions: &mut Actions) {
+    if bytes == state.cfg.engine_bytes {
+        return;
+    }
+    let lowered_room = bytes > state.cfg.engine_bytes;
+    state.note(format!(
+        "the plan's operator memory moved from {} to {bytes} bytes",
+        state.cfg.engine_bytes
+    ));
+    state.cfg.engine_bytes = bytes;
+    state.limits_epoch_ns = now_ns();
+    if state.phase == Phase::Running {
+        replan(state, lowered_room, actions);
     }
 }
 

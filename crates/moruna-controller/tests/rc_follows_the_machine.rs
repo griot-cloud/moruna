@@ -1,5 +1,6 @@
 //! The controller under a budget that follows the machine (MH 4.4):
-//! ceiling_from_the_sample, cpu_limit_bounds_workers, host_budget_follows_arena.
+//! ceiling_from_the_sample, cpu_limit_bounds_workers, host_budget_follows_arena,
+//! engine_memory_is_resident.
 
 mod common;
 
@@ -210,6 +211,39 @@ fn host_budget_follows_arena() {
     idle.controller.follow_limits(4 * GIB, 2.0);
     assert!(idle.writes().is_empty());
     assert_eq!(idle.controller.limits_in_force(), (4 * GIB, 2, GIB));
+}
+
+/// engine_memory_is_resident. A plan source's operator memory (MH 4.5) is counted beside the
+/// arena: the facade moving it moves what the kernels may be planned into the other way, the
+/// same figure again is no change, and giving it back lets the plan grow again.
+#[test]
+fn engine_memory_is_resident() {
+    let rig = rig(8 * GIB, 4, run(200 * MIB, 8 * GIB, 4.0, 1_000_000, 64));
+    rig.run_up();
+    let before = *morsel_targets(&rig.writes()).last().expect("a target");
+
+    rig.controller.set_engine(700 * MIB);
+    let after = *morsel_targets(&rig.writes()).last().expect("a target");
+    assert!(
+        after.1 < before.1,
+        "the kernels' room shrank by what the plan may hold: {before:?} to {after:?}"
+    );
+    let writes = rig.writes().len();
+    rig.controller.set_engine(700 * MIB);
+    assert_eq!(rig.writes().len(), writes, "no change, no plan");
+
+    rig.controller.set_engine(0);
+    let back = *morsel_targets(&rig.writes()).last().expect("a target");
+    assert!(back.1 > after.1, "{after:?} to {back:?}");
+    let summary = rig.controller.stop();
+    assert!(
+        summary
+            .notes
+            .iter()
+            .any(|n| n.contains("the plan's operator memory moved")),
+        "{:?}",
+        summary.notes
+    );
 }
 
 /// Nanoseconds since the epoch, the clock trace records carry.

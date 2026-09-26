@@ -267,6 +267,11 @@ impl ArenaHandle for Inner {
 }
 
 impl Allocator for FakeAllocator {
+    fn available(&self, tier: Tier) -> Option<u64> {
+        let budget = self.inner.limits.get(&tier.index()).copied()?;
+        Some(budget.saturating_sub(FakeAllocator::in_use_for(&self.lock(), tier)))
+    }
+
     fn alloc(&self, bytes: usize, tier: Tier) -> Result<Buffer> {
         let len = bytes.max(1);
         let mut state = self.lock();

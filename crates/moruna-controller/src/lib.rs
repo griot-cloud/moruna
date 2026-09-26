@@ -289,6 +289,16 @@ pub struct ControllerConfig {
     /// The process's anonymous memory sampled *before* the arena was created (f.1). Reported
     /// in `Budgets` and never subtracted from `arena_bytes`.
     pub baseline_bytes: u64,
+    /// The bytes an engine source's own operators may hold outside the arena (MH 4.5: a
+    /// DataFusion plan's sorts, aggregations and joins, bounded by its memory pool); zero for
+    /// every other source. The facade sized the arena over what this leaves, and the model
+    /// counts it as resident, beside the baseline and the arena, so no morsel is planned into
+    /// it.
+    pub engine_bytes: u64,
+    /// Bytes of the arena the sink holds for its own file buffer (a Parquet sink encodes a file
+    /// in the arena before it writes it): resident, part of `arena_bytes`, and planned by no one,
+    /// so the host budget the model divides is `arena_bytes` less this.
+    pub sink_buffer_bytes: u64,
     /// `checkpoint.enabled`; turns on the periodic profile writes of f.9.
     pub checkpoint_enabled: bool,
     /// `checkpoint.interval_ms`; the cadence of those writes.
@@ -329,6 +339,8 @@ impl Default for ControllerConfig {
             disk_budget: 0,
             arena_bytes: 0,
             baseline_bytes: 0,
+            engine_bytes: 0,
+            sink_buffer_bytes: 0,
             checkpoint_enabled: false,
             checkpoint_interval_ms: 5000,
         }
@@ -1070,6 +1082,21 @@ impl Controller {
             }
             if !state.terminated {
                 elastic::set_host_budget(&mut state, budget_bytes, &mut actions);
+            }
+            actions
+        };
+        self.inner.perform(actions);
+    }
+
+    /// An engine source's operator memory moved with the machine's limits: `bytes` is what its
+    /// pool may hold from now on, counted as resident beside the arena, and the plan is
+    /// re-solved inside what is left. Called by the facade's watcher only.
+    pub fn set_engine(&self, bytes: u64) {
+        let actions = {
+            let mut state = self.inner.held();
+            let mut actions = Actions::default();
+            if !state.terminated {
+                elastic::set_engine(&mut state, bytes, &mut actions);
             }
             actions
         };
