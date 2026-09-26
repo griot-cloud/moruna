@@ -367,3 +367,61 @@ pub fn resident_bytes() -> Option<u64> {
         Some(kib * 1024)
     }
 }
+
+/// A real kernel that passes its input through after sleeping, so a run lasts long enough for
+/// a host to hear it (MH HO-T6 to HO-T8).
+pub struct Sleeper {
+    fingerprint: Fingerprint,
+    ms: u64,
+}
+
+impl Sleeper {
+    /// One kernel that sleeps `ms` in every `apply`.
+    pub fn new(ms: u64) -> Sleeper {
+        Sleeper {
+            fingerprint: Fingerprint::compute("moruna-runtime::tests::Sleeper", b"v1"),
+            ms,
+        }
+    }
+}
+
+impl Kernel for Sleeper {
+    fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn hints(&self) -> KernelHints {
+        KernelHints {
+            expected_amplification: Some(1.0),
+            ..Default::default()
+        }
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: moruna_kernel::PayloadKind::Table,
+            tier: TierPref::Host,
+        }
+    }
+
+    fn output_schema(&self, input: &SourceSchema) -> moruna_kernel::Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
+        std::thread::sleep(std::time::Duration::from_millis(self.ms));
+        Ok(input)
+    }
+}

@@ -12,6 +12,13 @@ description = "Moruna Python module"
 name = "_core"
 crate-type = ["cdylib", "rlib"]
 
+# `moruna run` and `moruna serve` with the Python adapter compiled in (MH 4.2). It embeds
+# the interpreter PyO3 was built against, so it needs `python`; maturin builds only the library.
+[[bin]]
+name = "moruna"
+path = "src/bin/moruna.rs"
+required-features = ["python"]
+
 [dependencies]
 moruna-kernel = { workspace = true }
 arrow = { workspace = true }

@@ -151,6 +151,9 @@ pub struct RunSpec {
     pub resume: Option<PathBuf>,
     /// Clamps and translations the surface reports (12 f.3).
     pub notes: Vec<String>,
+    /// The job document's content address (MH 4.1), when the run was built from one. Recorded
+    /// in the manifest as `spec.digest`; a resume whose document has another digest is refused.
+    pub spec_digest: Option<String>,
 }
 
 impl RunSpec {
@@ -188,6 +191,7 @@ impl RunSpec {
             checkpoint_keep: false,
             resume: None,
             notes: Vec::new(),
+            spec_digest: None,
         }
     }
 }
@@ -227,6 +231,9 @@ pub struct Components {
     /// Called once per limits change the watcher accepts, after it is published. This
     /// is the seam the host protocol's `limits_changed` message hangs on (MH 4.3, F8.1).
     pub limits_subscribers: Vec<moruna_discovery::LimitsSubscriber>,
+    /// A window onto the run for a host (MH 4.3); the facade attaches to it and detaches when
+    /// the run ends.
+    pub observer: Option<Arc<crate::observe::RunObserver>>,
 }
 
 /// The cancel token a run is driven with, re-exported so a caller needs one import.
@@ -340,6 +347,7 @@ mod tests {
         assert!(components.run_id.is_none());
         assert!(components.limits_source.is_none());
         assert!(components.limits_subscribers.is_empty());
+        assert!(components.observer.is_none());
         let _: Cancel = Cancel::new();
     }
 }

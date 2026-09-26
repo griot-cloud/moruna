@@ -166,5 +166,6 @@ def run(
     keep_checkpoint: bool = ...,
     resume: str | None = ...,
 ) -> RunReport: ...
+def main(argv: list[str]) -> int: ...
 
 _Callable = Callable[..., Any]

@@ -8,23 +8,19 @@
 //! discovery unchanged, which owns their clamping against the discovered ceiling; the scheduler
 //! clamps its own knobs (SC f.15). Nothing else clamps anything.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use moruna_kernel::{ErrorPolicy, MorunaError, Result, SizerKind};
 
 use crate::handles::{SinkSpec, SourceSpec};
 use crate::size::parse_size;
 
-/// `checkpoint.interval_ms` (preamble section 5).
-pub const CHECKPOINT_INTERVAL_MS: (u64, u64) = (500, 60_000);
-/// `sink.row_group_bytes` (preamble section 5).
-pub const ROW_GROUP_BYTES: (u64, u64) = (16 << 20, 1 << 30);
-/// `sink.file_bytes` (preamble section 5).
-pub const FILE_BYTES: (u64, u64) = (64 << 20, 16u64 << 30);
-/// `budget.disk`: the upper bound is the free space in the staging directory, which component 9
-/// resolves; the surface holds the lower bound, which is the only one it can know (preamble
-/// section 5, `0 .. free`).
-pub const STAGING_LIMIT_MIN: u64 = 0;
+// The range checks every description of a run passes through once live in the facade's job
+// module (MH 4.1), so a document from a file and these arguments are clamped by one function.
+pub use moruna_runtime::job::translate::{
+    CHECKPOINT_INTERVAL_MS, FILE_BYTES, ROW_GROUP_BYTES, ResumeArg, STAGING_LIMIT_MIN, clamp,
+    clamp_file_bytes, clamp_row_group_bytes, normalise_target, resume_arg, trace_path,
+};
 
 /// A size argument as Python passed it: bytes, or a string for the parser of 03 f.3.
 #[derive(Clone, Debug)]
@@ -52,17 +48,6 @@ pub enum OnErrorArg {
     Name(String),
     /// `("budget", n)`.
     Budget(u32),
-}
-
-/// `resume=` after the surface resolved its shape, before any manifest is read (f.7).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResumeArg {
-    /// `"auto"`: the newest manifest under the staging directory.
-    Auto,
-    /// A run id: 32 lowercase hexadecimal characters.
-    RunId(String),
-    /// A path to a `manifest.json`.
-    Path(PathBuf),
 }
 
 /// Everything `moruna.run` was given, before translation.
@@ -132,30 +117,6 @@ pub struct Translated {
     pub notes: Vec<String>,
 }
 
-/// Clamp `value` into `[lo, hi]`, appending the note PY-I10 requires when it moves.
-pub fn clamp(name: &str, value: u64, bounds: (u64, u64), notes: &mut Vec<String>) -> u64 {
-    let (lo, hi) = bounds;
-    if value < lo {
-        notes.push(format!("clamped {name} from {value} to {lo}"));
-        lo
-    } else if value > hi {
-        notes.push(format!("clamped {name} from {value} to {hi}"));
-        hi
-    } else {
-        value
-    }
-}
-
-/// `sink.row_group_bytes`, clamped where the `ParquetSink` handle is constructed.
-pub fn clamp_row_group_bytes(value: u64, notes: &mut Vec<String>) -> u64 {
-    clamp("sink.row_group_bytes", value, ROW_GROUP_BYTES, notes)
-}
-
-/// `sink.file_bytes`, clamped where the sink handle is constructed.
-pub fn clamp_file_bytes(value: u64, notes: &mut Vec<String>) -> u64 {
-    clamp("sink.file_bytes", value, FILE_BYTES, notes)
-}
-
 /// `on_error` to `ErrorPolicy` (contracts d.11). An unknown name is a `Config` error, never a
 /// clamp (f.3).
 pub fn error_policy(arg: &OnErrorArg) -> Result<ErrorPolicy> {
@@ -186,101 +147,11 @@ pub fn sizer_kind(name: &str) -> Result<SizerKind> {
     }
 }
 
-/// `resume=` to its three shapes (f.7). A 32 character lowercase hexadecimal string is a run id;
-/// `"auto"` is the newest manifest; anything else is a path.
-pub fn resume_arg(value: &str) -> ResumeArg {
-    if value == "auto" {
-        return ResumeArg::Auto;
-    }
-    let is_run_id = value.len() == 32
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if is_run_id {
-        ResumeArg::RunId(value.to_string())
-    } else {
-        ResumeArg::Path(PathBuf::from(value))
-    }
-}
-
-/// `trace=`'s path validity (f.3). A path whose directory does not exist cannot be clamped to a
-/// bound, so it is refused by name rather than silently ignored; h decides the file name inside a
-/// directory, and the facade does that once it has the run id.
-pub fn trace_path(value: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(value);
-    let dir: &Path = if path.is_dir() {
-        &path
-    } else {
-        match path.parent() {
-            Some(p) if p.as_os_str().is_empty() => Path::new("."),
-            Some(p) => p,
-            None => Path::new("."),
-        }
-    };
-    if !dir.is_dir() {
-        return Err(config(
-            "trace.path",
-            format!(
-                "`{value}` is not a writable path: `{}` is not a directory",
-                dir.display()
-            ),
-        ));
-    }
-    Ok(path)
-}
-
-/// Normalise a URL or path for the sink equals source rule (f.3): the scheme is lower cased, a
-/// trailing slash is removed and a `file://` URL or a bare relative path becomes an absolute path.
-pub fn normalise_target(value: &str) -> String {
-    let trimmed = value.trim();
-    let normalised = match trimmed.find("://") {
-        Some(idx) => {
-            let (scheme, rest) = trimmed.split_at(idx);
-            let scheme = scheme.to_ascii_lowercase();
-            if scheme == "file" {
-                absolute(rest.trim_start_matches("://"))
-            } else {
-                format!("{scheme}{rest}")
-            }
-        }
-        None => absolute(trimmed),
-    };
-    let stripped = normalised.trim_end_matches('/');
-    if stripped.is_empty() {
-        "/".to_string()
-    } else {
-        stripped.to_string()
-    }
-}
-
-fn absolute(path: &str) -> String {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        return p.to_string_lossy().into_owned();
-    }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(p).to_string_lossy().into_owned(),
-        Err(_) => p.to_string_lossy().into_owned(),
-    }
-}
-
 /// The sink equals source rule (f.3, PY-T14): the run is refused with `Plan` when the sink writes
-/// where a source reads, or into a directory a source reads from.
+/// where a source reads, or into a directory a source reads from. The rule is the facade's
+/// (MH 4.1); this is its spelling over the Python handles.
 pub fn check_sink_not_source(sink: &SinkSpec, source: &SourceSpec) -> Result<()> {
-    let sink_target = normalise_target(&sink.target());
-    let sink_prefix = format!("{sink_target}/");
-    for raw in source.targets() {
-        let src = normalise_target(&raw);
-        if src == sink_target || src.starts_with(&sink_prefix) {
-            return Err(MorunaError::Plan(format!(
-                "the sink writes where the source reads: sink `{}` and source `{}` resolve to \
-                 `{sink_target}` and `{src}`; the run would overwrite or write into its input",
-                sink.target(),
-                raw
-            )));
-        }
-    }
-    Ok(())
+    moruna_runtime::job::translate::check_sink_not_source(&sink.target(), &source.targets())
 }
 
 /// Translate the arguments of `moruna.run` (f.3). `sink_notes` are the clamps the sink handle's
