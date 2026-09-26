@@ -1,0 +1,6 @@
+# Online every vCPU the monitor hot-adds (moruna-vmm resize --cpus; MH 4.8.5). Moruna's
+# LimitsWatch then sees it in /sys/devices/system/cpu/online.
+SUBSYSTEM=="cpu", ACTION=="add", TEST=="online", ATTR{online}=="0", ATTR{online}="1"
+# Memory is onlined by the kernel (memhp_default_state=online_movable); this covers a kernel
+# built without that default.
+SUBSYSTEM=="memory", ACTION=="add", TEST=="state", ATTR{state}=="offline", ATTR{state}="online_movable"

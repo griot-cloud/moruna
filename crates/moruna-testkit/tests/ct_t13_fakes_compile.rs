@@ -461,6 +461,7 @@ fn fake_placement() {
             row_offset: 4,
             next_seq: 31,
         },
+        issued: Vec::new(),
     };
     let path = writer.checkpoint(&extras).expect("a manifest");
     assert_eq!(writer.manifests_written(), vec![path.clone()]);

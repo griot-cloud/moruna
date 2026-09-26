@@ -1357,6 +1357,22 @@ fn object_metadata_answers_head_and_list() {
     assert_eq!(meta.url, "s3://bucket/dir/a");
     let listed = reactor.list_prefix("s3://bucket/dir").wait().expect("list");
     assert_eq!(listed.len(), 2, "both objects under the prefix: {listed:?}");
+    let mut urls: Vec<&str> = listed.iter().map(|m| m.url.as_str()).collect();
+    urls.sort_unstable();
+    assert_eq!(
+        urls,
+        vec!["s3://bucket/dir/a", "s3://bucket/dir/b"],
+        "each listed object's URL reads it back"
+    );
+    let trailing = reactor
+        .list_prefix("s3://bucket/dir/")
+        .wait()
+        .expect("list");
+    assert!(
+        trailing
+            .iter()
+            .all(|m| m.url.starts_with("s3://bucket/dir/") && !m.url.contains("dir/dir"))
+    );
     let missing = reactor.head_object("s3://bucket/absent").wait();
     assert!(missing.is_err());
     let bad = reactor.head_object("ftp://host/key").wait();

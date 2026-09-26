@@ -140,6 +140,26 @@ impl Scheduler {
         lifecycle::shutdown(&self.shared);
     }
 
+    /// The current CPU limit, as a worker count. Called by the facade's limits watcher,
+    /// and by nothing else, when the machine's CPU quota changes. It is a limit, not a
+    /// knob (G-I5 stands: the controller still writes `workers.active`): the workers that take
+    /// tasks are `min(workers.active, cpu_limit)`, so a lowered limit parks workers down to it at
+    /// their next pick, and a raised one lets the knob take effect up to it. Clamped to
+    /// `1..=workers_max`, because threads beyond the pool created at `new` do not exist. Returns
+    /// the bound stored.
+    pub fn set_cpu_limit(&self, workers: u16) -> u16 {
+        let bound = self.shared.knobs.set_cpu_bound(workers);
+        tracing::info!(target: "sched.cpu_limit", workers = bound, "CPU limit changed");
+        // A raised bound may let parked workers take tasks now (SC-I5's "within one pick").
+        self.shared.unpark_all();
+        bound
+    }
+
+    /// The current CPU limit as a worker count, and the thread pool size.
+    pub fn cpu_limit(&self) -> (u16, u16) {
+        (self.shared.knobs.cpu_bound(), self.shared.cfg.workers_max)
+    }
+
     /// The kernels of the chain, in stage order, for the facade's fingerprint list.
     pub fn kernels(&self) -> Vec<Arc<dyn Kernel>> {
         self.shared
@@ -165,13 +185,15 @@ impl Scheduler {
     /// run is not checkpointing, in which case nothing is written. The manifest is written on
     /// the checkpoint thread, as every other one is (f.12), so the lock order is unchanged.
     pub fn request_checkpoint(&self) -> bool {
-        if !self.shared.checkpoint_enabled() {
-            return false;
-        }
-        self.shared
-            .checkpoint_request
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        true
+        checkpoint::request(&self.shared).is_some()
+    }
+
+    /// [`Scheduler::request_checkpoint`], then wait until a manifest started after the request
+    /// is on disk and return its path (MH 4.7). `Resume` when the run writes no manifests or
+    /// none was written within `timeout`. Blocks the caller, which is never a worker or a drive:
+    /// the facade's `CheckpointHandle` calls it from the host's thread.
+    pub fn checkpoint_now(&self, timeout: std::time::Duration) -> Result<std::path::PathBuf> {
+        checkpoint::checkpoint_and_wait(&self.shared, timeout)
     }
 
     /// The shared state, for the tests that assert on the stage table and the pick rule.

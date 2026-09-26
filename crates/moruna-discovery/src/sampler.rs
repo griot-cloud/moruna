@@ -9,10 +9,11 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use moruna_kernel::{Device, Result, Sample, Sampler as SamplerTrait};
+use arc_swap::ArcSwap;
+use moruna_kernel::{Device, Limits, Result, Sample, Sampler as SamplerTrait};
 
 use crate::cgroup;
 use crate::devices;
@@ -52,6 +53,9 @@ pub struct Sampler {
     read_errors: AtomicU64,
     last_at_ns: AtomicU64,
     devices: Vec<Device>,
+    /// The limits in force: the ones `discover` found, or the cell a `LimitsWatch` publishes
+    /// into, so every sample carries the ceiling and quota of its moment.
+    limits: Arc<ArcSwap<Limits>>,
 }
 
 impl Sampler {
@@ -59,6 +63,17 @@ impl Sampler {
     /// last sample and is counted in [`Sampler::read_errors`] (DS-I3).
     pub fn new(discovered: &crate::Discovered) -> Result<Sampler> {
         Sampler::with_roots(discovered, Path::new("/proc"))
+    }
+
+    /// As [`Sampler::new`], reading the ceiling and quota every sample carries from `limits`,
+    /// the cell a [`crate::LimitsWatch`] publishes into.
+    pub fn following(
+        discovered: &crate::Discovered,
+        limits: Arc<ArcSwap<Limits>>,
+    ) -> Result<Sampler> {
+        let mut sampler = Sampler::with_roots(discovered, Path::new("/proc"))?;
+        sampler.limits = limits;
+        Ok(sampler)
     }
 
     /// As [`Sampler::new`], with the `/proc` root as a parameter so the operating system path is
@@ -94,6 +109,7 @@ impl Sampler {
             read_errors: AtomicU64::new(0),
             last_at_ns: AtomicU64::new(0),
             devices: discovered.limits.devices.clone(),
+            limits: Arc::new(ArcSwap::from_pointee(discovered.limits.clone())),
         };
         // Prime the running peak and the last sample, so a read error on the very first call
         // still returns a coherent value.
@@ -141,6 +157,10 @@ impl SamplerTrait for Sampler {
     fn sample(&self) -> Sample {
         let at_ns = self.next_at_ns();
         let device_used = devices::device_used(&self.devices);
+        let (ceiling_bytes, cpu_limit) = {
+            let limits = self.limits.load();
+            (limits.memory_ceiling, limits.cpu_quota)
+        };
         let mut inner = self
             .inner
             .lock()
@@ -190,6 +210,8 @@ impl SamplerTrait for Sampler {
             let repeated = Sample {
                 at_ns,
                 device_used,
+                ceiling_bytes,
+                cpu_limit,
                 ..*last
             };
             *last = repeated;
@@ -204,6 +226,8 @@ impl SamplerTrait for Sampler {
             throttled_us,
             device_used,
             at_ns,
+            ceiling_bytes,
+            cpu_limit,
         };
         *last = sample;
         sample
@@ -271,6 +295,7 @@ mod tests {
                 page_bytes: 4096,
                 devices: Vec::new(),
                 source: LimitSource::Os,
+                observed_at: 0,
             },
             profile: HostProfile::default(),
             host_tier: TierKind::Host,
@@ -522,5 +547,33 @@ mod tests {
         sampler.reset_peak();
         let input = DiscoveryInput::default();
         assert!(input.explicit_budget.is_none());
+    }
+
+    /// sample_carries_the_limits. Every sample carries the ceiling and the quota in force
+    /// when it was taken: the discovered ones for a sampler of its own, and whatever the watcher
+    /// last published for one that follows its cell, from the very next sample.
+    #[test]
+    fn sample_carries_the_limits() {
+        let tmp = TempDir::new("ds-t19");
+        let dir = tmp.path().join("cgroup");
+        write(&dir, "memory.stat", "anon 1000\nfile 2000\nunevictable 0\n");
+        let own =
+            Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
+        let sample = own.sample();
+        assert_eq!(sample.ceiling_bytes, 1024 * 1024 * 1024);
+        assert!((sample.cpu_limit - 1.0).abs() < f64::EPSILON);
+
+        let discovered = discovered_at(Some(dir.clone()));
+        let cell = Arc::new(ArcSwap::from_pointee(discovered.limits.clone()));
+        let following = Sampler::following(&discovered, Arc::clone(&cell)).expect("sampler");
+        assert_eq!(following.sample().ceiling_bytes, 1024 * 1024 * 1024);
+        cell.store(Arc::new(Limits {
+            memory_ceiling: 3 * 1024 * 1024 * 1024,
+            cpu_quota: 6.0,
+            ..discovered.limits.clone()
+        }));
+        let sample = following.sample();
+        assert_eq!(sample.ceiling_bytes, 3 * 1024 * 1024 * 1024);
+        assert!((sample.cpu_limit - 6.0).abs() < f64::EPSILON);
     }
 }

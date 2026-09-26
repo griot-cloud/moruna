@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use moruna_arena::{Arena, ArenaConfig};
 use moruna_controller::{Controller, ControllerConfig, KernelInfo, PlanSummary};
-use moruna_discovery::{Discovered, DiscoveryInput, Sampler as DiscoverySampler};
+use moruna_discovery::{
+    Discovered, DiscoveryInput, ElasticBounds, LimitsWatch, Sampler as DiscoverySampler,
+};
 use moruna_kernel::{
     Allocator, CancelToken, Kernel, Knobs, MorunaError, ObjectMetadata, Placement, Prober, Reactor,
     RunId, Sampler, SourceSchema, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
@@ -20,6 +22,7 @@ use moruna_trace::{RunReport, TraceConfig, TraceWriter};
 
 use crate::cancel::{CancelOnDrop, Started};
 use crate::config;
+use crate::elastic::{WatchCtx, WatchState, Watcher};
 use crate::error::{Result, RunError};
 use crate::report::{self, MetaInput};
 use crate::spec::{BuildCtx, Components, RunSpec};
@@ -108,9 +111,11 @@ fn drive(
         sink: sink_spec,
         budget,
         cpu,
+        elastic: elastic_budget,
         trace_path,
         staging_dir: explicit_staging_dir,
         staging_limit,
+        staging_durable,
         error_policy,
         ordered,
         sizer,
@@ -122,9 +127,12 @@ fn drive(
         checkpoint_interval_ms,
         checkpoint_keep,
         resume,
+        resume_auto,
         notes: spec_notes,
         spec_digest,
     } = spec;
+    let checkpoint_handle = components.checkpoint.clone();
+    let _detach = crate::checkpoint::DetachOnDrop(checkpoint_handle.clone());
     let observer = components.observer.clone();
 
     // f.4: the GIL refusal comes before any Rust component starts (PY-I4).
@@ -142,7 +150,51 @@ fn drive(
 
     let mut notes: Vec<String> = Vec::new();
 
-    // f.7: the manifest header first, so the new process continues the old run's identity.
+    // MH 4.7: `staging.durable` is `durable_staging=present` spelled where a host thinks of it.
+    // It goes in through the profile override, so discovery's own refusal of an ephemeral
+    // staging directory declared durable still applies (03 e.4).
+    let host_profile = durable_profile(host_profile, staging_durable)?;
+
+    // 1. Discover.
+    let discovery_input = DiscoveryInput {
+        explicit_budget: budget,
+        explicit_cpu: cpu,
+        explicit_staging_dir: explicit_staging_dir.clone(),
+        explicit_spill_limit: staging_limit,
+        profile_override: host_profile,
+    };
+    // The watcher reads the host's files when the facade discovered the host itself; a
+    // caller that injected the findings describes a machine those files are not, so the watcher
+    // follows only a source the caller also injected.
+    let host_discovered = components.discovered.is_none();
+    let discovered = match components.discovered {
+        Some(discovered) => discovered,
+        None => moruna_discovery::discover(&discovery_input)?,
+    };
+
+    // f.7: the manifest header before anything takes the run id, so the new process continues
+    // the old run's identity. `resume_auto` looks for one here (MH 4.7), after discovery,
+    // because the staging directory it looks in is discovery's answer.
+    let resume = match (resume, resume_auto) {
+        (Some(path), _) => Some(path),
+        (None, false) => None,
+        (None, true) => {
+            let found = auto_manifest(
+                discovered.profile.staging_dir.as_deref(),
+                &kernels,
+                &source_spec,
+                spec_digest.as_deref(),
+            )?;
+            match &found {
+                Some(path) => notes.push(format!("resume auto: resuming {}", path.display())),
+                None => notes.push(
+                    "resume auto: no manifest of this job in the staging directory; a fresh run"
+                        .to_string(),
+                ),
+            }
+            found
+        }
+    };
     let header = match &resume {
         Some(path) => Some(PlacementEngine::read_manifest_header(path)?),
         None => None,
@@ -161,18 +213,6 @@ fn drive(
         Some(header) => header.node,
         None => moruna_kernel::LOCAL_NODE,
     };
-
-    // 1. Discover.
-    let discovered = match components.discovered {
-        Some(discovered) => discovered,
-        None => moruna_discovery::discover(&DiscoveryInput {
-            explicit_budget: budget,
-            explicit_cpu: cpu,
-            explicit_staging_dir: explicit_staging_dir.clone(),
-            explicit_spill_limit: staging_limit,
-            profile_override: host_profile,
-        })?,
-    };
     notes.extend(discovered.notes.iter().cloned());
     notes.extend(spec_notes);
     let limits = discovered.limits.clone();
@@ -180,13 +220,64 @@ fn drive(
         observer.discovered(&limits, kernels.len());
     }
     let staging_dir = discovered.profile.staging_dir.clone();
-    let workers_max = workers_from(limits.cpu_quota);
+    // The pool is created up to `budget.elastic.cpu_max` and parked; the starting
+    // N is what is active. With no `elastic` the two are the same N, as before.
+    let workers_start = workers_from(limits.cpu_quota);
+    let workers_max = match elastic_budget.cpu_max {
+        Some(cpu_max) => cpu_max.clamp(1, 1024),
+        None => workers_start,
+    };
+    let workers_start = workers_start.min(workers_max);
+    if workers_max > workers_start {
+        notes.push(format!(
+            "{workers_max} worker threads created and {workers_start} active: the pool follows \
+             the machine up to budget.elastic.cpu_max"
+        ));
+    }
+
+    // The limits watcher starts from what discovery found, and the sampler reads the limits
+    // it publishes, so every sample carries the ceiling of its moment.
+    let memory_max = elastic_budget
+        .memory_max_bytes
+        .unwrap_or(limits.memory_ceiling);
+    if memory_max < limits.memory_ceiling {
+        notes.push(format!(
+            "budget.elastic.memory_max_bytes ({memory_max}) is below the starting ceiling \
+             ({}); the run does not grow past its starting ceiling",
+            limits.memory_ceiling
+        ));
+    }
+    let watch = match (components.limits_source, host_discovered) {
+        (Some(source), _) => Some(LimitsWatch::new(&discovered, &discovery_input, source)?),
+        (None, true) => Some(LimitsWatch::host(&discovered, &discovery_input)?),
+        (None, false) => {
+            notes.push(
+                "the limits watcher is off: the discovery findings were supplied by the caller \
+                 and no limits source was"
+                    .to_string(),
+            );
+            None
+        }
+    }
+    .map(|watch| {
+        let watch = watch.with_bounds(ElasticBounds {
+            memory_max_bytes: memory_max.max(limits.memory_ceiling),
+            cpu_max: f64::from(workers_max),
+        });
+        for subscriber in components.limits_subscribers {
+            watch.subscribe(subscriber);
+        }
+        Arc::new(watch)
+    });
 
     // The sampler exists before the arena, because the arena's size depends on what the
     // process already holds (see `arena_host_bytes`).
     let sampler: Arc<dyn Sampler> = match components.sampler {
         Some(sampler) => sampler,
-        None => Arc::new(DiscoverySampler::new(&discovered)?),
+        None => match &watch {
+            Some(watch) => Arc::new(DiscoverySampler::following(&discovered, watch.limits())?),
+            None => Arc::new(DiscoverySampler::new(&discovered)?),
+        },
     };
 
     // 2. Arena. The baseline is sampled here, before the region exists (12 f.1, 02 f.1,
@@ -225,26 +316,29 @@ fn drive(
         }
         .into());
     }
-    let alloc: Arc<dyn Allocator> = match components.alloc {
-        Some(alloc) => alloc,
-        None => Arena::new(ArenaConfig {
-            host_bytes: arena_bytes,
-            host_tier: discovered.host_tier,
-            device_bytes: limits
-                .devices
-                .iter()
-                .map(|d| {
-                    (
-                        d.id,
-                        (d.free_bytes as f64 * config::DEVICE_BUDGET_FRACTION) as u64,
-                    )
-                })
-                .collect(),
-            page_bytes: limits.page_bytes,
-            huge_pages: discovered.profile.huge_pages,
-            memlock: discovered.profile.memlock,
-            register_rdma: false,
-        })?,
+    let (alloc, arena): (Arc<dyn Allocator>, Option<Arc<Arena>>) = match components.alloc {
+        Some(alloc) => (alloc, None),
+        None => {
+            let arena = Arena::new(ArenaConfig {
+                host_bytes: arena_bytes,
+                host_tier: discovered.host_tier,
+                device_bytes: limits
+                    .devices
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.id,
+                            (d.free_bytes as f64 * config::DEVICE_BUDGET_FRACTION) as u64,
+                        )
+                    })
+                    .collect(),
+                page_bytes: limits.page_bytes,
+                huge_pages: discovered.profile.huge_pages,
+                memlock: discovered.profile.memlock,
+                register_rdma: false,
+            })?;
+            (arena.clone() as Arc<dyn Allocator>, Some(arena))
+        }
     };
 
     // 3. Reactor.
@@ -286,6 +380,9 @@ fn drive(
         Some((sink, tail)) => (sink, tail),
         None => (trace_writer.clone(), trace_writer.clone()),
     };
+    // The limits timeline goes to the writer the report is computed from, whatever sink the
+    // records go to.
+    let limits_trace: Arc<dyn TraceSink> = trace_writer.clone();
 
     // 5. Sources and sinks built.
     let ctx = BuildCtx {
@@ -422,7 +519,7 @@ fn drive(
     let scheduler = Arc::new(Scheduler::new(
         SchedulerConfig {
             workers_max,
-            workers_active: workers_max,
+            workers_active: workers_start,
             read_ahead: config::READAHEAD_SPLITS,
             sink_concurrency: config::SINK_CONCURRENCY,
             error_policy,
@@ -447,6 +544,9 @@ fn drive(
         sampler.clone(),
     )?);
     started.scheduler = Some(scheduler.clone());
+    if let Some(handle) = &checkpoint_handle {
+        handle.attach(&scheduler);
+    }
 
     // 9. Instances: eagerly, before the baseline is sampled.
     match resume_point {
@@ -521,11 +621,52 @@ fn drive(
         controller.probe_all()?;
     }
     controller.start()?;
+    // The limits watcher, from the moment the controller is running until the scheduler
+    // returns. The arena arithmetic is the same function that sized the first region, with
+    // everything but the ceiling fixed at what the run started with.
+    let kernel_state = expected_kernel_state(&kernels);
+    let out_of_arena = expected_out_of_arena_amplification(&kernels);
+    let page_bytes = limits.page_bytes;
+    let watcher = watch.map(|watch| {
+        Watcher::start(
+            WatchCtx {
+                watch,
+                trace: limits_trace,
+                arena,
+                controller: controller.clone(),
+                scheduler: scheduler.clone(),
+                sizing: Box::new(move |ceiling| {
+                    arena_host_bytes(
+                        ceiling,
+                        baseline_bytes,
+                        config::RESERVE_FRACTION,
+                        kernel_state,
+                        out_of_arena,
+                        page_bytes,
+                        &mut Vec::new(),
+                    )
+                }),
+                start_ns,
+                workers_max,
+                tick: std::time::Duration::from_millis(config::TICK_MS),
+            },
+            WatchState::new(arena_bytes),
+        )
+    });
     let outcome = if resume.is_some() {
-        scheduler.run_resumed(guard.token())?
+        scheduler.run_resumed(guard.token())
     } else {
-        scheduler.run(guard.token())?
+        scheduler.run(guard.token())
     };
+    let (drains, watch_notes) = match watcher {
+        Some(watcher) => {
+            let watched = watcher.stop();
+            (watched.drains, watched.notes)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let outcome = outcome?;
+    notes.extend(watch_notes);
 
     // 12. stop, finish, report.
     let (exit, outcome_manifest) = report::exit_of(&outcome);
@@ -569,6 +710,7 @@ fn drive(
         gil,
         io_paths,
         controller: summary,
+        drains,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {
@@ -587,6 +729,63 @@ fn drive(
             .with_report(Some(computed))
             .with_manifest(manifest)),
     }
+}
+
+/// `staging.durable` as the profile override discovery is handed (MH 4.7, 03 d.1). A caller's
+/// profile that already declares `durable_staging` must agree with it.
+fn durable_profile(
+    profile: Option<moruna_kernel::HostProfile>,
+    durable: bool,
+) -> Result<Option<moruna_kernel::HostProfile>> {
+    use moruna_kernel::Guarantee;
+    if !durable {
+        return Ok(profile);
+    }
+    let mut profile = profile.unwrap_or_default();
+    match profile.durable_staging {
+        Guarantee::Unknown | Guarantee::Present => {}
+        Guarantee::Absent | Guarantee::Probed(_) => {
+            return Err(RunError::bare(MorunaError::Config {
+                name: "staging.durable",
+                msg: format!(
+                    "staging.durable is set and host_profile.durable_staging is {:?}; the two \
+                     must agree",
+                    profile.durable_staging
+                ),
+            }));
+        }
+    }
+    profile.durable_staging = Guarantee::Present;
+    Ok(Some(profile))
+}
+
+/// `resume = "auto"` (MH 4.7): the newest manifest in the staging directory that this run could
+/// resume, judged by the kernels, the job document's digest when the run has one, and, when
+/// the source is already built, the plan. A source
+/// still to be built cannot be asked for its plan before the run id exists (PY-I1 builds it
+/// after the trace), so for one the plan is left to `restore`, which refuses a mismatch by
+/// name. No staging directory is no manifest.
+fn auto_manifest(
+    staging_dir: Option<&std::path::Path>,
+    kernels: &[Arc<dyn Kernel>],
+    source: &crate::spec::SourceSpec,
+    spec_digest: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let Some(dir) = staging_dir else {
+        return Ok(None);
+    };
+    let fingerprints: Vec<moruna_kernel::Fingerprint> =
+        kernels.iter().map(|k| k.fingerprint()).collect();
+    let plan_digest = match source {
+        crate::spec::SourceSpec::Built(source) => Some(plan_digest(&source.plan()?)),
+        crate::spec::SourceSpec::Build(_) => None,
+    };
+    let want = moruna_placement::manifest::ManifestMatch {
+        fingerprints: &fingerprints,
+        plan_digest,
+        spec_digest,
+    };
+    Ok(PlacementEngine::find_resumable_manifest(dir, &want)?)
 }
 
 /// Detaches an observer when the run's lifecycle function returns, by any path.
@@ -874,6 +1073,77 @@ fn summarise(plan: &[moruna_kernel::Split]) -> PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MH 4.7: `staging.durable` declares `durable_staging=present`, over a profile or none,
+    /// and refuses a profile that says otherwise.
+    #[test]
+    fn staging_durable_is_a_declared_profile() {
+        use moruna_kernel::{Guarantee, HostProfile};
+        assert!(durable_profile(None, false).expect("off").is_none());
+        let kept = durable_profile(
+            Some(HostProfile {
+                memlock: Guarantee::Absent,
+                ..HostProfile::default()
+            }),
+            false,
+        )
+        .expect("off")
+        .expect("the caller's profile");
+        assert_eq!(kept.durable_staging, Guarantee::Unknown);
+        let made = durable_profile(None, true).expect("on").expect("a profile");
+        assert_eq!(made.durable_staging, Guarantee::Present);
+        let merged = durable_profile(
+            Some(HostProfile {
+                memlock: Guarantee::Absent,
+                durable_staging: Guarantee::Present,
+                ..HostProfile::default()
+            }),
+            true,
+        )
+        .expect("agrees")
+        .expect("a profile");
+        assert_eq!(merged.memlock, Guarantee::Absent, "the rest of it is kept");
+        assert_eq!(merged.durable_staging, Guarantee::Present);
+        let refused = durable_profile(
+            Some(HostProfile {
+                durable_staging: Guarantee::Absent,
+                ..HostProfile::default()
+            }),
+            true,
+        );
+        match refused {
+            Err(error) => assert!(error.to_string().contains("staging.durable"), "{error}"),
+            Ok(_) => panic!("a profile declaring the staging not durable is refused"),
+        }
+    }
+
+    /// MH 4.7: with no staging directory, or none that holds a manifest of this job, `resume
+    /// auto` finds nothing; a built source's plan is read to compare digests.
+    #[test]
+    fn resume_auto_finds_nothing_where_there_is_nothing() {
+        use moruna_testkit::FakeSource;
+        let built = crate::spec::SourceSpec::Built(
+            Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>
+        );
+        assert_eq!(
+            auto_manifest(None, &[], &built, None).expect("no dir"),
+            None
+        );
+        let dir = std::env::temp_dir().join(format!("moruna-auto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(
+            auto_manifest(Some(&dir), &[], &built, None).expect("empty"),
+            None
+        );
+        let later = crate::spec::SourceSpec::Build(Box::new(|_| {
+            Ok(Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>)
+        }));
+        assert_eq!(
+            auto_manifest(Some(&dir), &[], &later, None).expect("empty"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `workers.max` follows the discovered quota, rounded up, and is never zero.
     #[test]

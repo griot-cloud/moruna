@@ -1,0 +1,29 @@
+#!/opt/python/bin/python3
+"""Report Moruna's exit code to the monitor: `exit <code>` on vsock, host port 1024.
+
+The monitor serves this port itself and relays the code as its own exit status; if the report
+cannot be made the monitor exits 7 ("stopped without reporting a code"), which is the truth.
+"""
+
+import socket
+import sys
+
+HOST_CID = 2
+STATUS_PORT = 1024
+
+
+def main() -> int:
+    code = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    try:
+        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((HOST_CID, STATUS_PORT))
+        s.sendall(f"exit {code}\n".encode())
+        s.close()
+    except OSError as e:
+        print(f"moruna-report: {e}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

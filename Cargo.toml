@@ -29,6 +29,8 @@ moruna-controller = { path = "crates/moruna-controller", version = "0.1.1" }
 moruna-runtime = { path = "crates/moruna-runtime", version = "0.1.1" }
 moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.1.1" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.1.1" }
+moruna-vmm = { path = "crates/moruna-vmm", version = "0.1.1" }
+moruna-kernels = { path = "crates/moruna-kernels", version = "0.1.1" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -64,6 +66,30 @@ peql = { git = "https://github.com/griot-cloud/peQL", rev = "93d9481", version =
 # at this version.
 futures = { version = "=0.3.34" }
 tracing-subscriber = { version = "=0.3.23" }
+# Added by F8.2: the one-writer, many-reader cell the limits watcher publishes
+# into and the sampler reads on every sample. E2 table addition, preamble 6.2.
+arc-swap = { version = "=1.9.1" }
+# The rust-vmm crates, used by moruna-vmm only (MH 4.8; additions to the preamble 6.2 table,
+# 2026-09-26). moruna-vmm also verifies guest image digests with the sha2 pin below.
+kvm-ioctls = { version = "=0.25.0" }
+kvm-bindings = { version = "=0.14.1", features = ["fam-wrappers"] }
+vm-memory = { version = "=0.18.0", features = ["backend-mmap"] }
+linux-loader = { version = "=0.14.0", features = ["bzimage", "elf", "pe"] }
+vm-superio = { version = "=0.8.2" }
+vmm-sys-util = { version = "=0.15.0" }
+virtio-queue = { version = "=0.18.0" }
+virtio-bindings = { version = "=0.2.7" }
+vm-fdt = { version = "=0.3.0" }
+acpi_tables = { version = "=0.2.1" }
+# Object storage through a socket (MH 4.6, F8.6): an HTTP/1.1 connection over a Unix or vsock
+# stream for `object_store`'s S3 client. Every one of them is already in the graph through
+# `object_store`'s own HTTP stack at these versions; they are named here so the reactor can
+# speak HTTP without a TCP connector (a preamble 6.2 table addition, E2).
+hyper = { version = "=1.11.1", default-features = false }
+hyper-util = { version = "=0.1.20", default-features = false }
+http = { version = "=1.5.0" }
+http-body-util = { version = "=0.1.5" }
+socket2 = { version = "=0.6.5" }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON. Already
 # in the graph through the engine bridges at this version, so the pin adds no second copy.
 sha2 = { version = "=0.11.0" }

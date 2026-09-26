@@ -43,6 +43,11 @@ pub struct Limits {
     pub devices: Vec<Device>,
     /// Where these figures came from.
     pub source: LimitSource,
+    /// When these figures were read, nanoseconds since the Unix epoch. Discovery stamps the
+    /// first reading and every later one its watcher publishes, so a consumer holding
+    /// two `Limits` can tell which is current and the run report can place a change in time.
+    /// Zero means "not stamped" (a `Limits` built by hand, a test, a fake).
+    pub observed_at: u64,
 }
 
 /// Guarantees a platform declares; `Unknown` means probe. Discovery replaces every
@@ -131,6 +136,15 @@ pub struct Sample {
     pub device_used: [u64; 8],
     /// When the sample was taken, nanoseconds since the epoch.
     pub at_ns: u64,
+    /// The host memory ceiling in force when the sample was taken, from the limits the
+    /// discovery watcher last published. The controller reads its ceiling from here
+    /// every tick instead of copying it once at start. Zero means the sampler knows
+    /// no ceiling (a fake), and a consumer keeps the one it has.
+    pub ceiling_bytes: u64,
+    /// The CPU quota in force when the sample was taken, in cores, from the same published
+    /// limits. The controller bounds `active_workers` by its ceiling. Zero means the
+    /// sampler knows no quota, and a consumer keeps the bound it has.
+    pub cpu_limit: f64,
 }
 
 #[cfg(test)]

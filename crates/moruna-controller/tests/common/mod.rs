@@ -33,6 +33,7 @@ pub fn limits(ceiling: u64) -> Limits {
         page_bytes: 4096,
         devices: Vec::new(),
         source: LimitSource::Cgroup,
+        observed_at: 0,
     }
 }
 
@@ -129,6 +130,9 @@ pub fn sample(anon: u64, at: u64) -> Sample {
         throttled_us: 0,
         device_used: [0; 8],
         at_ns: at,
+        // A fake that knows no limits: the controller keeps the ones it was configured with.
+        ceiling_bytes: 0,
+        cpu_limit: 0.0,
     }
 }
 

@@ -8,6 +8,7 @@ mod common;
 
 mod sc_behaviour;
 
+mod sc_cpu_limit;
 mod sc_t10_probe_protocol;
 mod sc_t11_cancel;
 mod sc_t12_utilisation;
@@ -20,6 +21,7 @@ mod sc_t18_stateful_init_fails;
 mod sc_t19_worker_heartbeat;
 mod sc_t1_workers_only_apply;
 mod sc_t20_manifest_on_completion;
+mod sc_t21_checkpoint_on_demand;
 mod sc_t2_admission_rule;
 mod sc_t3_source_admission;
 mod sc_t4_one_record_per_morsel_stage;

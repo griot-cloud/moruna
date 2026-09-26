@@ -8,6 +8,13 @@
 //!
 //! The arena implements the contract's `Allocator` (contracts d.3) and the `ArenaHandle`
 //! every `Buffer` releases to; consumers reach it through `Arc<dyn Allocator>`.
+//!
+//! The host side is a list of regions. A run whose budget never moves has one, made at
+//! `new`, exactly as before. When the machine grows under the run, the facade's watcher calls
+//! [`Arena::grow`], which maps and touches one more region; when it shrinks, [`Arena::shrink`]
+//! marks the newest grown regions *draining*: they take no new allocation, and each is unmapped
+//! when its last buffer comes home. Neither method is on the contract's
+//! `Allocator`, so no consumer can call them: they are the facade's alone (MH 4.4).
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -22,8 +29,8 @@ mod large;
 pub mod region;
 mod stats;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use moruna_kernel::{
     AllocStats, Allocator, Buffer, DeviceId, Guarantee, MorunaError, Result, Tier, TierKind,
@@ -71,7 +78,25 @@ impl Default for ArenaConfig {
     }
 }
 
-/// One reserved region and the size-class allocator over it.
+/// The size a grown region is rounded up to: the huge page, so a region is backed by whole
+/// huge pages when the host has them and a small change of the budget is never a region.
+pub const REGION_ROUNDING: u64 = 2 * 1024 * 1024;
+
+/// One host region: the region `new` reserved, or one `grow` added.
+struct HostRegion {
+    space: Space,
+    /// Held so the mapping is released exactly once, when the region is retired or the arena
+    /// drops. The `Space` addresses this mapping, so it is dropped after it.
+    _mapping: Mapping,
+    /// Set by `shrink`: the region takes no new allocation and is unmapped when its last buffer
+    /// is released.
+    draining: AtomicBool,
+    /// True for the region `new` made. It never drains: the run's first region is what every
+    /// zero-length buffer points into, and the budget arithmetic of 11 f.1 sized it.
+    base: bool,
+}
+
+/// One reserved device region and the size-class allocator over it.
 struct RegionAlloc {
     space: Space,
     /// Held so the mapping is released exactly once, when the arena drops (AR-I3). The
@@ -84,7 +109,9 @@ struct RegionAlloc {
 /// Everything a `Buffer` needs to find its way home. `Buffer`s hold an `Arc` of this, so
 /// the regions outlive every buffer cut from them.
 struct Inner {
-    host: RegionAlloc,
+    /// The host regions, oldest first. Read-locked on every allocation and release, and
+    /// write-locked only by `grow`, `shrink` and the release that retires a drained region.
+    host: RwLock<Vec<Arc<HostRegion>>>,
     devices: Vec<RegionAlloc>,
     host_tier: Tier,
     page_bytes: usize,
@@ -98,6 +125,15 @@ struct Inner {
     /// `Allocator::note_payload_copy` and `note_boundary_copy` (contracts d.3).
     payload_copies: AtomicU64,
     boundary_copies: AtomicU64,
+    /// What `grow` needs to prepare a region the way `new` prepared the first.
+    align: u64,
+    huge_pages: Guarantee,
+    memlock: Guarantee,
+    /// Regions retired after draining, and the bytes they held (section j).
+    retired_regions: AtomicU64,
+    retired_bytes: AtomicU64,
+    /// Double releases counted by regions that have since been retired.
+    retired_double_release: AtomicU64,
 }
 
 /// The memory arena (d.1).
@@ -170,7 +206,7 @@ impl Arena {
         )?;
         let pinned = host.pinned;
         let host_tier = if pinned { Tier::PinnedHost } else { Tier::Host };
-        let host_alloc = RegionAlloc {
+        let host_alloc = Arc::new(HostRegion {
             space: Space::new(
                 host.mapping.base(),
                 host.mapping.bytes(),
@@ -178,8 +214,9 @@ impl Arena {
                 host_bytes < SMALL_BUDGET_BYTES,
             ),
             _mapping: host.mapping,
-            index: 0,
-        };
+            draining: AtomicBool::new(false),
+            base: true,
+        });
         let devices = Self::devices(&cfg, align)?;
         tracing::info!(
             target: "arena.reserved",
@@ -191,7 +228,7 @@ impl Arena {
         );
         Ok(Arc::new(Arena {
             inner: Arc::new(Inner {
-                host: host_alloc,
+                host: RwLock::new(vec![host_alloc]),
                 devices,
                 host_tier,
                 page_bytes: cfg.page_bytes,
@@ -201,8 +238,118 @@ impl Arena {
                 foreign: AtomicU64::new(0),
                 payload_copies: AtomicU64::new(0),
                 boundary_copies: AtomicU64::new(0),
+                align,
+                huge_pages: cfg.huge_pages,
+                memlock: cfg.memlock,
+                retired_regions: AtomicU64::new(0),
+                retired_bytes: AtomicU64::new(0),
+                retired_double_release: AtomicU64::new(0),
             }),
         }))
+    }
+
+    /// Add `bytes` of host memory as one new region: rounded up to
+    /// [`REGION_ROUNDING`], mapped, advised and touched exactly as `new` prepared the first
+    /// region, and page-locked when the arena is (AR-I6: pinning stays all or nothing, so a
+    /// grown region that cannot be locked is refused, not added unlocked). Returns the bytes
+    /// added.
+    ///
+    /// The facade's watcher is the only caller: the method is not on the contract's
+    /// `Allocator`, so no consumer reaches it. The caller bounds the total by
+    /// `budget.elastic.memory_max_bytes`; the arena reserves what it is told to (a).
+    pub fn grow(&self, bytes: u64) -> Result<u64> {
+        let inner = &self.inner;
+        let bytes = region::align_up(bytes, REGION_ROUNDING.max(inner.align));
+        if bytes < GRANULE {
+            return Ok(0);
+        }
+        let host = region::new_host(
+            bytes,
+            inner.align,
+            inner.pinned,
+            inner.huge_pages,
+            inner.memlock,
+        )?;
+        if host.pinned != inner.pinned {
+            // The mapping drops here and is released: the grown region could not be locked, and a
+            // run has one host tier (AR-I6).
+            return Err(MorunaError::Config {
+                name: "arena.pin",
+                msg: format!(
+                    "a grown region of {bytes} bytes could not be page-locked, and the arena is;                      the region is not added (AR-I6)"
+                ),
+            });
+        }
+        let added = host.mapping.bytes();
+        let grown = Arc::new(HostRegion {
+            space: Space::new(
+                host.mapping.base(),
+                added,
+                inner.host_tier,
+                added < SMALL_BUDGET_BYTES,
+            ),
+            _mapping: host.mapping,
+            draining: AtomicBool::new(false),
+            base: false,
+        });
+        inner.write_host().push(grown);
+        tracing::info!(target: "arena.grow", bytes = added, "arena grew by a region");
+        Ok(added)
+    }
+
+    /// Give back at least `bytes` of host memory: mark the newest grown regions
+    /// draining until the bytes marked reach `bytes` or no grown region is left. A draining
+    /// region takes no new allocation and is unmapped when its last buffer is released;
+    /// one that is already empty is unmapped here. Returns the bytes marked, which may exceed
+    /// `bytes` by part of one region and may fall short of it: the region `new` made never
+    /// drains, so what is below it is the controller's to give back by holding less.
+    ///
+    /// Shrink is eventual: the caller learns when it is complete from
+    /// [`Arena::draining_bytes`] reaching zero. The facade's watcher is the only caller.
+    pub fn shrink(&self, bytes: u64) -> u64 {
+        let mut marked = 0u64;
+        let mut host = self.inner.write_host();
+        for region in host.iter().rev() {
+            if marked >= bytes {
+                break;
+            }
+            if region.base || region.draining.load(Ordering::SeqCst) {
+                continue;
+            }
+            // Under the write lock no allocation is in flight, so once the flag is set nothing
+            // new can land in the region.
+            region.draining.store(true, Ordering::SeqCst);
+            marked += region.space.bytes();
+        }
+        self.inner.retire_drained(&mut host);
+        drop(host);
+        if marked > 0 {
+            tracing::info!(target: "arena.shrink", bytes = marked, "arena regions draining");
+        }
+        marked
+    }
+
+    /// Host bytes in regions that are draining and not yet unmapped. Zero when every
+    /// shrink is complete.
+    pub fn draining_bytes(&self) -> u64 {
+        self.inner
+            .read_host()
+            .iter()
+            .filter(|r| r.draining.load(Ordering::SeqCst))
+            .map(|r| r.space.bytes())
+            .sum()
+    }
+
+    /// Host bytes the arena can hand out: every region that is not draining. The facade's
+    /// budget arithmetic compares its target with this and with [`Arena::region_bytes`], which
+    /// counts the draining regions too, because they are still resident.
+    pub fn host_capacity(&self) -> u64 {
+        self.inner
+            .read_host()
+            .iter()
+            .filter(|r| !r.draining.load(Ordering::SeqCst))
+            .map(|r| r.space.bytes())
+            .sum()
     }
 
     #[cfg(feature = "cuda")]
@@ -258,8 +405,12 @@ impl Arena {
         self.inner.huge_pages_active
     }
 
-    /// Bytes reserved for `tier`; zero for a tier this arena has no region for (d.1).
+    /// Bytes reserved for `tier`; zero for a tier this arena has no region for (d.1). For the
+    /// host tier, every region still mapped, draining ones included, because they are resident.
     pub fn region_bytes(&self, tier: Tier) -> u64 {
+        if self.inner.is_host(tier) {
+            return self.inner.read_host().iter().map(|r| r.space.bytes()).sum();
+        }
         match self.inner.space_of(tier) {
             Some(space) => space.bytes(),
             None => 0,
@@ -267,8 +418,18 @@ impl Arena {
     }
 
     /// Largest single allocation currently possible in `tier`, for controller diagnostics
-    /// (d.1, f.5).
+    /// (d.1, f.5). A draining region serves nothing, so it is not counted.
     pub fn largest_free(&self, tier: Tier) -> u64 {
+        if self.inner.is_host(tier) {
+            return self
+                .inner
+                .read_host()
+                .iter()
+                .filter(|r| !r.draining.load(Ordering::SeqCst))
+                .map(|r| r.space.largest_free())
+                .max()
+                .unwrap_or(0);
+        }
         match self.inner.space_of(tier) {
             Some(space) => space.largest_free(),
             None => 0,
@@ -285,7 +446,7 @@ impl std::fmt::Debug for Arena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Arena")
             .field("host_tier", &self.inner.host_tier)
-            .field("host_bytes", &self.inner.host.space.bytes())
+            .field("host_bytes", &self.region_bytes(self.inner.host_tier))
             .field("devices", &self.inner.devices.len())
             .field("pinned", &self.inner.pinned)
             .field("huge_pages_active", &self.inner.huge_pages_active)
@@ -294,18 +455,17 @@ impl std::fmt::Debug for Arena {
 }
 
 impl Inner {
-    /// The region that serves `tier`, or `None` when this arena has none. The host region
-    /// serves exactly one of `Host` and `PinnedHost` for the whole run (AR-I6).
+    /// True when `tier` is this run's host tier (AR-I6): the one tier the host regions serve.
+    fn is_host(&self, tier: Tier) -> bool {
+        matches!(tier, Tier::Host | Tier::PinnedHost) && tier == self.host_tier
+    }
+
+    /// The device region that serves `tier`, or `None` when this arena has none. Host tiers are
+    /// served by the region list, not by this.
     fn space_of(&self, tier: Tier) -> Option<&Space> {
         match tier {
-            Tier::Host | Tier::PinnedHost => {
-                if tier == self.host_tier {
-                    Some(&self.host.space)
-                } else {
-                    None
-                }
-            }
             Tier::Device(id) => self.device(id),
+            Tier::Host | Tier::PinnedHost => None,
             Tier::Disk(_) => None,
             Tier::Remote(_, _) => None,
         }
@@ -319,15 +479,67 @@ impl Inner {
             .map(|r| &r.space)
     }
 
+    /// The host regions, for reading.
+    fn read_host(&self) -> RwLockReadGuard<'_, Vec<Arc<HostRegion>>> {
+        self.host.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The host regions, for `grow`, `shrink` and retiring.
+    fn write_host(&self) -> RwLockWriteGuard<'_, Vec<Arc<HostRegion>>> {
+        self.host.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Unmap every draining region that holds no live buffer. Called with the write
+    /// lock held, so no allocation or release is inside a region while it is removed.
+    fn retire_drained(&self, host: &mut Vec<Arc<HostRegion>>) {
+        host.retain(|region| {
+            let empty = region.draining.load(Ordering::SeqCst) && region.space.in_use() == 0;
+            if empty {
+                self.retired_regions.fetch_add(1, Ordering::Relaxed);
+                self.retired_bytes
+                    .fetch_add(region.space.bytes(), Ordering::Relaxed);
+                self.retired_double_release
+                    .fetch_add(region.space.double_releases(), Ordering::Relaxed);
+                tracing::info!(
+                    target: "arena.retired",
+                    bytes = region.space.bytes(),
+                    "a drained region was unmapped"
+                );
+            }
+            !empty
+        });
+    }
+
     /// The tier of the region holding `ptr` (f.7).
     fn tier_of(&self, ptr: *const u8) -> Option<Tier> {
-        if self.host.space.contains(ptr) {
+        if self.read_host().iter().any(|r| r.space.contains(ptr)) {
             return Some(self.host_tier);
         }
         self.devices
             .iter()
             .find(|r| r.space.contains(ptr))
             .map(|r| r.space.tier())
+    }
+
+    /// Serve a host allocation from the oldest region that is not draining and can hold it
+    /// (f.3). Oldest first, so the regions a shrink would pick are the last to fill.
+    fn alloc_host(&self, bytes: u64) -> core::result::Result<(*mut u8, Tier), (u64, u64)> {
+        let host = self.read_host();
+        for region in host.iter() {
+            if region.draining.load(Ordering::SeqCst) {
+                continue;
+            }
+            if let Ok((ptr, _charged)) = region.space.alloc(bytes) {
+                return Ok((ptr, region.space.tier()));
+            }
+        }
+        let budget = host
+            .iter()
+            .filter(|r| !r.draining.load(Ordering::SeqCst))
+            .map(|r| r.space.bytes())
+            .sum();
+        let in_use = host.iter().map(|r| r.space.in_use()).sum();
+        Err((budget, in_use))
     }
 }
 
@@ -351,31 +563,40 @@ impl Allocator for Arena {
             return Err(MorunaError::Unsupported("rdma"));
         }
         let inner = &self.inner;
-        let Some(space) = inner.space_of(tier) else {
-            return Err(MorunaError::Alloc {
-                bytes: bytes as u64,
-                tier,
-                budget: 0,
-                in_use: 0,
-            });
+        let served = if inner.is_host(tier) {
+            inner.alloc_host(bytes as u64)
+        } else {
+            match inner.space_of(tier) {
+                Some(space) => match space.alloc(bytes as u64) {
+                    Ok((ptr, _charged)) => Ok((ptr, space.tier())),
+                    Err(_) => Err((space.bytes(), space.in_use())),
+                },
+                None => {
+                    return Err(MorunaError::Alloc {
+                        bytes: bytes as u64,
+                        tier,
+                        budget: 0,
+                        in_use: 0,
+                    });
+                }
+            }
         };
-        match space.alloc(bytes as u64) {
-            Ok((ptr, _charged)) => {
+        match served {
+            Ok((ptr, served_tier)) => {
                 inner.allocations.fetch_add(1, Ordering::Relaxed);
                 let handle: Arc<dyn moruna_kernel::ArenaHandle> = Arc::clone(inner) as Arc<_>;
-                // SAFETY: `ptr` is `bytes` bytes inside the region this arena reserved for
-                // `tier` and holds for the life of the run (AR-I3), the allocator will not
-                // hand the same bytes out again until they are released, and the buffer
-                // releases them to this same arena exactly once on drop (CT-I2).
-                Ok(unsafe { Buffer::from_raw(ptr, bytes, space.tier(), handle) })
+                // SAFETY: `ptr` is `bytes` bytes inside a region this arena reserved for
+                // `tier`; that region stays mapped until it holds no live buffer (AR-I3),
+                // the allocator will not hand the same bytes out again until they are released,
+                // and the buffer releases them to this same arena exactly once on drop (CT-I2).
+                Ok(unsafe { Buffer::from_raw(ptr, bytes, served_tier, handle) })
             }
-            Err(_) => {
-                let in_use = space.in_use();
+            Err((budget, in_use)) => {
                 tracing::debug!(target: "arena.alloc_failed", bytes, tier = ?tier, in_use, "allocation refused");
                 Err(MorunaError::Alloc {
                     bytes: bytes as u64,
                     tier,
-                    budget: space.bytes(),
+                    budget,
                     in_use,
                 })
             }

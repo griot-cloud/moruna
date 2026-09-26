@@ -53,10 +53,25 @@ pub struct RunMeta {
     pub bottleneck_timeline: Vec<(f64, String)>,
     /// `ControllerSummary.notes`, appended to `notes` in the report.
     pub controller_notes: Vec<String>,
+    /// Every shrink the facade's watcher started, and how long its drain took.
+    pub drains: Vec<DrainSummary>,
+}
+
+/// One shrink of the arena and its drain: when the watcher marked regions draining, how
+/// many bytes, and how long until the last of them was unmapped. The host paces its next
+/// lowering on this (MH 7.1).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DrainSummary {
+    /// Milliseconds from the start of the run to the shrink.
+    pub at_ms: u64,
+    /// Bytes marked draining.
+    pub bytes: u64,
+    /// Milliseconds until the drain completed; `None` when the run ended first.
+    pub drain_ms: Option<u64>,
 }
 
 /// One accelerator, as the report names it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DeviceSummary {
     /// `DeviceId`.
     pub id: u8,
@@ -70,7 +85,7 @@ pub struct DeviceSummary {
 
 /// The discovered limits, as the report shows them (d.1: ceiling, kill, cpu quota, source,
 /// devices).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LimitsSummary {
     /// The host ceiling the run was sized against.
     pub memory_ceiling: u64,
@@ -159,15 +174,25 @@ pub struct RunReport {
     pub manifest: Option<String>,
     /// `meta.end_ns - meta.start_ns` in seconds.
     pub wall_s: f64,
-    /// The discovered limits.
-    pub limits: LimitsSummary,
+    /// The limits the run started with, as discovery found them.
+    pub limits_initial: LimitsSummary,
+    /// Every change of the limits while the run was in progress, as `(milliseconds from the start
+    /// of the run, the limits from then on)`, oldest first. Empty for a run whose machine
+    /// never moved. This is the host's sizing input: it tells "90% of 8 GB" from "90% of 8 GB
+    /// for one minute and of 3 GB the rest of the time" (MH 2.1).
+    pub limits_timeline: Vec<(u64, LimitsSummary)>,
+    /// Every shrink of the arena and how long its drain took.
+    pub drains: Vec<DrainSummary>,
     /// The direct paths taken (G-I7).
     #[serde(serialize_with = "io_paths_json")]
     pub io_paths: IoPaths,
     /// The largest `mem_anon_peak` any record saw.
     pub peak_anon_bytes: u64,
-    /// That over `limits.memory_ceiling` (S1).
+    /// That over the memory ceiling in force when the peak was reached (S1): the initial
+    /// ceiling, or the one the last limits change before the peak set.
     pub peak_fraction_of_ceiling: f64,
+    /// The ceiling `peak_fraction_of_ceiling` was taken against.
+    pub peak_ceiling_bytes: u64,
     /// Kernel busy time over wall time times the mean active worker count (S4).
     pub worker_busy_fraction: f64,
     /// Throttled microseconds over the CPU the run was allowed.
@@ -353,6 +378,7 @@ impl RunReport {
     pub fn compute(trace: &TraceView, limits: &Limits, meta: &RunMeta) -> RunReport {
         let mut stages: BTreeMap<StageId, StageAcc> = BTreeMap::new();
         let mut peak_anon = 0u64;
+        let mut peak_at = 0u64;
         let mut throttled_us = 0u64;
         let mut staging_written = 0u64;
         let mut staging_abs = 0u128;
@@ -366,7 +392,10 @@ impl RunReport {
                 let Some(r) = crate::view::record_at(&batch, row) else {
                     continue;
                 };
-                peak_anon = peak_anon.max(r.mem_anon_peak);
+                if r.mem_anon_peak > peak_anon {
+                    peak_anon = r.mem_anon_peak;
+                    peak_at = r.t_end_ns;
+                }
                 throttled_us += r.throttled_delta_us;
                 staging_written += r.staging_bytes_delta.max(0) as u64;
                 staging_abs += r.staging_bytes_delta.unsigned_abs() as u128;
@@ -411,11 +440,29 @@ impl RunReport {
         } else {
             0.0
         };
-        let peak_fraction_of_ceiling = if limits.memory_ceiling > 0 {
-            peak_anon as f64 / limits.memory_ceiling as f64
+        // The ceiling in force at the peak, which is the initial one unless the machine
+        // changed before it.
+        let mut changes = trace.limits_changes();
+        changes.sort_by_key(|change| change.at_ns);
+        let peak_ceiling_bytes = changes
+            .iter()
+            .rev()
+            .find(|change| change.at_ns <= peak_at)
+            .map_or(limits.memory_ceiling, |change| change.new.memory_ceiling);
+        let peak_fraction_of_ceiling = if peak_ceiling_bytes > 0 {
+            peak_anon as f64 / peak_ceiling_bytes as f64
         } else {
             0.0
         };
+        let limits_timeline = changes
+            .iter()
+            .map(|change| {
+                (
+                    change.at_ns.saturating_sub(meta.start_ns) / 1_000_000,
+                    LimitsSummary::of(&change.new),
+                )
+            })
+            .collect();
         let mut notes = meta.notes.clone();
         notes.extend(meta.controller_notes.iter().cloned());
 
@@ -425,10 +472,13 @@ impl RunReport {
             resumed: meta.resumed,
             manifest: meta.manifest.as_ref().map(|p| p.display().to_string()),
             wall_s,
-            limits: LimitsSummary::of(limits),
+            limits_initial: LimitsSummary::of(limits),
+            limits_timeline,
+            drains: meta.drains.clone(),
             io_paths: meta.io_paths.clone(),
             peak_anon_bytes: peak_anon,
             peak_fraction_of_ceiling,
+            peak_ceiling_bytes,
             worker_busy_fraction,
             cpu_throttled_fraction,
             source_bytes_per_s,

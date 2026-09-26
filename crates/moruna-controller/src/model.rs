@@ -143,8 +143,16 @@ pub(crate) fn queue_half(state: &ControllerState) -> u64 {
 /// This is the floor of the quantity S1 measures and the controller cannot move it: the arena's
 /// size is the facade's decision and its pages are resident whether the runtime is using them
 /// or not. What the controller can move is everything above it.
+///
+/// A region the arena is draining is resident too until its last buffer comes home, and
+/// it is not the kernels' cost: it is counted here, so the fit of f.3 never reads it as a
+/// kernel's fixed term.
 pub(crate) fn resting_anon(state: &ControllerState) -> u64 {
-    state.budgets.baseline.saturating_add(state.budgets.host)
+    state
+        .budgets
+        .baseline
+        .saturating_add(state.budgets.host)
+        .saturating_add(state.arena_draining)
 }
 
 /// The anonymous bytes the run may add above the resting figure before the ceiling S1 measures
@@ -419,7 +427,8 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
     // skipped on the tiny path (f.10), which has nothing to adapt to; the anon cap never is,
     // because a small dataset does not make a greedy kernel cheap and the process's peak is
     // what S1 measures either way.
-    let workers_max = state.cfg.workers_max.max(1);
+    // The pool, bounded by the CPU limit in force.
+    let workers_max = crate::elastic::workers_bound(state);
     let mut allowed = workers_max;
     if !state.tiny
         && let Some(arena_cap) = worker_half.checked_div(max_allowance)
@@ -555,7 +564,7 @@ pub(crate) fn start(ctl: &Inner) -> Result<()> {
                 ),
             });
         }
-        state.active_workers = state.cfg.workers_max.max(1);
+        state.active_workers = crate::elastic::workers_bound(&state);
         initial_knobs(&mut state)?
     };
     ctl.perform(actions);

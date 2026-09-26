@@ -117,12 +117,22 @@ pub struct RunSpec {
     pub budget: Option<u64>,
     /// An explicit CPU quota in cores; discovery clamps it.
     pub cpu: Option<f64>,
+    /// How far the run follows the machine up while it is in progress. The
+    /// default is the starting figures: an inelastic run never grows, and every run follows the
+    /// machine down. The JSON spec's `budget.elastic` (MH 4.1) maps onto it; F8.1 adds that serde.
+    pub elastic: crate::elastic::ElasticBudget,
     /// Where the trace file goes; `None` keeps the trace in memory.
     pub trace_path: Option<PathBuf>,
     /// Where staging segments go; `None` lets discovery resolve one.
     pub staging_dir: Option<PathBuf>,
     /// `budget.disk`.
     pub staging_limit: Option<u64>,
+    /// `staging.durable` (MH 4.1, 4.7): the staging directory is on a disk that survives the
+    /// machine, so the host profile is declared `durable_staging=present` and a manifest
+    /// written there may be resumed on another machine (Q9). Discovery still refuses a tmpfs
+    /// or overlay directory declared so (03 e.4). A `host_profile` that declares
+    /// `durable_staging` otherwise is a `Config` error naming both.
+    pub staging_durable: bool,
     /// What happens after a kernel error.
     pub error_policy: ErrorPolicy,
     /// Deliver morsels to the sink in sequence order.
@@ -145,6 +155,12 @@ pub struct RunSpec {
     pub checkpoint_keep: bool,
     /// `None`: a fresh run. `Some`: resume from this manifest.
     pub resume: Option<PathBuf>,
+    /// `resume = "auto"` (MH 4.7): when `resume` is `None`, look under the staging directory
+    /// for the newest `moruna-*/manifest.json` written by this same job, the same kernel
+    /// fingerprints and, when the source is already built, the same plan digest, and resume
+    /// it; with none, start fresh and say so in `notes`. This is what a host that restarts a
+    /// destroyed machine with the same job sets.
+    pub resume_auto: bool,
     /// Clamps and translations the surface reports (12 f.3).
     pub notes: Vec<String>,
     /// The job document's content address (MH 4.1), when the run was built from one. Recorded
@@ -169,9 +185,11 @@ impl RunSpec {
             sink: sink.into(),
             budget: None,
             cpu: None,
+            elastic: crate::elastic::ElasticBudget::default(),
             trace_path: None,
             staging_dir: None,
             staging_limit: None,
+            staging_durable: false,
             error_policy: ErrorPolicy::Terminate,
             ordered: false,
             sizer: SizerKind::Rule,
@@ -185,10 +203,52 @@ impl RunSpec {
             checkpoint_interval_ms: crate::config::CHECKPOINT_INTERVAL_MS,
             checkpoint_keep: false,
             resume: None,
+            resume_auto: false,
             notes: Vec::new(),
             spec_digest: None,
         }
     }
+}
+
+/// One entry of the job document's `kernels[]` (MH 4.1), as far as this build knows it (MH 4.9).
+///
+/// The Rust variant only: the JSON field, its serde and the `kernels[].fingerprint` check at
+/// load are F8.1's, which serialises this enum; `fingerprint` is the value a document pins.
+#[derive(Clone, Debug)]
+pub enum KernelEntry {
+    /// `{ "kind": "std", "name": ..., "args": {...} }`: a standard kernel by arguments.
+    Std(moruna_kernels::StdKernel),
+}
+
+impl KernelEntry {
+    /// A standard kernel entry; an unknown name or a bad argument is a `Plan` error naming it.
+    pub fn std(name: &str, args: serde_json::Value) -> moruna_kernel::Result<KernelEntry> {
+        Ok(KernelEntry::Std(moruna_kernels::StdKernel::new(
+            name, &args,
+        )?))
+    }
+
+    /// The fingerprint a job document pins for this entry (MH 4.9).
+    pub fn fingerprint(&self) -> moruna_kernel::Fingerprint {
+        match self {
+            KernelEntry::Std(kernel) => kernel.fingerprint(),
+        }
+    }
+}
+
+/// The kernels a list of entries runs as, in stage order, with adjacent standard kernels fused
+/// where their combination is one stage (MH 4.9).
+pub fn build_kernels(entries: Vec<KernelEntry>) -> Vec<Arc<dyn Kernel>> {
+    let std: Vec<moruna_kernels::StdKernel> = entries
+        .into_iter()
+        .map(|entry| match entry {
+            KernelEntry::Std(kernel) => kernel,
+        })
+        .collect();
+    moruna_kernels::fuse_chain(std)
+        .into_iter()
+        .map(|kernel| Arc::new(kernel) as Arc<dyn Kernel>)
+        .collect()
 }
 
 /// `profiles.dir`: the preamble's default is `~/.moruna/profiles`, and no directory at all on
@@ -220,6 +280,15 @@ pub struct Components {
     pub placement: Option<Arc<dyn Placement>>,
     /// Uses this run id instead of minting one.
     pub run_id: Option<RunId>,
+    /// Where the limits watcher reads the machine from; `None` is the host's own files.
+    /// A test scripts a machine here; a host that knows its own figures could push them.
+    pub limits_source: Option<Arc<dyn moruna_discovery::LimitsSource>>,
+    /// Called once per limits change the watcher accepts, after it is published. This
+    /// is the seam the host protocol's `limits_changed` message hangs on (MH 4.3, F8.1).
+    pub limits_subscribers: Vec<moruna_discovery::LimitsSubscriber>,
+    /// Attached to the run's scheduler while it runs, so another thread can ask for a
+    /// manifest now (MH 4.3 `checkpoint`, 4.7).
+    pub checkpoint: Option<crate::checkpoint::CheckpointHandle>,
     /// A window onto the run for a host (MH 4.3); the facade attaches to it and detaches when
     /// the run ends.
     pub observer: Option<Arc<crate::observe::RunObserver>>,
@@ -243,6 +312,7 @@ mod tests {
                     page_bytes: 4096,
                     devices: Vec::new(),
                     source: moruna_kernel::LimitSource::Explicit,
+                    observed_at: 0,
                 },
                 profile: HostProfile::default(),
                 host_tier: moruna_kernel::TierKind::Host,
@@ -309,6 +379,8 @@ mod tests {
         assert!(spec.checkpoint);
         assert!(!spec.checkpoint_keep);
         assert!(spec.resume.is_none());
+        assert!(!spec.resume_auto);
+        assert!(!spec.staging_durable);
         assert_eq!(
             spec.profiles_dir, None,
             "the facade resolves the default, so a fresh spec names no store (12 f.1)"
@@ -333,6 +405,9 @@ mod tests {
         assert!(components.sampler.is_none());
         assert!(components.placement.is_none());
         assert!(components.run_id.is_none());
+        assert!(components.limits_source.is_none());
+        assert!(components.limits_subscribers.is_empty());
+        assert!(components.checkpoint.is_none());
         assert!(components.observer.is_none());
         let _: Cancel = Cancel::new();
     }

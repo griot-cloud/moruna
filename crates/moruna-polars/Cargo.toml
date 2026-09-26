@@ -26,3 +26,8 @@ polars = ["dep:polars", "dep:polars-arrow"]
 name = "ad_t9_polars_bridge"
 path = "tests/ad_t9_polars_bridge.rs"
 required-features = ["polars"]
+
+[[test]]
+name = "frame_kernel"
+path = "tests/frame_kernel.rs"
+required-features = ["polars"]

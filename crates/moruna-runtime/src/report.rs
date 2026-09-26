@@ -71,6 +71,8 @@ pub struct MetaInput {
     pub io_paths: IoPaths,
     /// The controller's summary, when the controller ran.
     pub controller: Option<ControllerSummary>,
+    /// Every shrink the limits watcher started and how long its drain took.
+    pub drains: Vec<moruna_trace::DrainSummary>,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -102,6 +104,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         sizer_fallback_at: fallback_at,
         bottleneck_timeline: timeline,
         controller_notes,
+        drains: input.drains,
     }
 }
 
@@ -171,6 +174,7 @@ mod tests {
             gil: Vec::new(),
             io_paths: moruna_kernel::IoPaths::default(),
             controller: Some(summary),
+            drains: Vec::new(),
         });
         assert_eq!(meta.bottleneck_timeline.len(), all.len());
         assert_eq!(meta.bottleneck_timeline[0].1, "IoRead");
@@ -193,6 +197,7 @@ mod tests {
             gil: Vec::new(),
             io_paths: moruna_kernel::IoPaths::default(),
             controller: None,
+            drains: Vec::new(),
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());

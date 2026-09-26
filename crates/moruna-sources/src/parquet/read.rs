@@ -54,9 +54,13 @@ fn read_now(
         .get(entry.row_group)
         .ok_or_else(|| source_err(split.id, "the plan names no such row group"))?;
     let page = alloc.page_bytes() as u64;
-    let file_len = std::fs::metadata(&file.path)
-        .map(|m| m.len())
-        .map_err(|e| source_err(split.id, format!("{}: {e}", file.path.display())))?;
+    let file_len = if file.object {
+        file.len
+    } else {
+        std::fs::metadata(&file.path)
+            .map(|m| m.len())
+            .map_err(|e| source_err(split.id, format!("{}: {e}", file.path.display())))?
+    };
 
     // f.3: one contiguous range over the projected chunks while the gaps are small.
     let mut spans: Vec<(u64, u64)> = Vec::new();
@@ -77,19 +81,29 @@ fn read_now(
             )
         })?;
         let buffer = alloc.alloc(length, tier)?;
-        let (buffer, filled) = source
-            .reactor()
-            .read_file_opt(&file.path, start, buffer, true)
-            .wait()
-            .map_err(|e| {
-                source_err(
-                    split.id,
-                    format!(
-                        "reading bytes {start}..{end} of {}: {e}",
-                        file.path.display()
-                    ),
-                )
-            })?;
+        // An object's range is clipped to the length the store reported at plan time, so the
+        // read is exact; a local file may be read short at its end (f.3).
+        let read = if file.object {
+            source
+                .reactor()
+                .read_object(&file.url, start, buffer)
+                .wait()
+                .map(|buffer| (buffer, length))
+        } else {
+            source
+                .reactor()
+                .read_file_opt(&file.path, start, buffer, true)
+                .wait()
+        };
+        let (buffer, filled) = read.map_err(|e| {
+            source_err(
+                split.id,
+                format!(
+                    "reading bytes {start}..{end} of {}: {e}",
+                    file.path.display()
+                ),
+            )
+        })?;
         if (filled as u64) < end - start && start + filled as u64 != file_len {
             return Err(source_err(
                 split.id,

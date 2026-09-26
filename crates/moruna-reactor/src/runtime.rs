@@ -734,11 +734,28 @@ async fn run_meta(inner: Arc<Inner>, op: MetaOp, _permit: OwnedSemaphorePermit) 
     }
 }
 
+/// The URL an object key is appended to: `scheme://container/` for a store, `file:///` for
+/// the local filesystem (whose keys are paths from the root, or from `local_root`).
+fn listing_base(url: &str) -> String {
+    match url.split_once("://") {
+        Some(("file", _)) => "file:///".to_string(),
+        Some((scheme, rest)) => {
+            let container = rest.split('/').next().unwrap_or_default();
+            format!("{scheme}://{container}/")
+        }
+        None => String::new(),
+    }
+}
+
 /// Every object under a prefix, walked one level at a time because the crate's recursive
 /// listing is a `futures` stream and the dependency table carries no `futures` (object.rs).
 async fn list_prefix(inner: &Arc<Inner>, url: &str) -> Result<Vec<ObjectMeta>> {
     let (backend, path) = inner.objects.resolve(url)?;
-    let prefix = url.trim_end_matches('/');
+    // A store names each object by its key inside the container, so the URL is the
+    // container's own URL and the key. Joining the key to the listed prefix instead doubled
+    // every directory in it (`s3://b/in/` listed `s3://b/in/in/x`), which no source could
+    // read back (found by H7, MH 4.6).
+    let base = listing_base(url);
     let mut out = Vec::new();
     let mut todo = vec![Some(path)];
     while let Some(next) = todo.pop() {
@@ -747,7 +764,7 @@ async fn list_prefix(inner: &Arc<Inner>, url: &str) -> Result<Vec<ObjectMeta>> {
             .await
             .map_err(|e| crate::object::io("list_prefix", url, &e))?;
         for mut m in objects {
-            m.url = format!("{}/{}", prefix.trim_end_matches(&m.url), m.url);
+            m.url = format!("{base}{}", m.url.trim_start_matches('/'));
             out.push(m);
         }
         todo.extend(prefixes.into_iter().map(Some));

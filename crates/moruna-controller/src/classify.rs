@@ -201,7 +201,7 @@ fn worst_state(state: &ControllerState) -> Option<(u16, u64, u64)> {
 }
 
 /// The Memory row: halve the largest stage, raise its safety and turn staging on.
-fn memory_pressure(state: &mut ControllerState, last_stage: u16, actions: &mut Actions) {
+pub(crate) fn memory_pressure(state: &mut ControllerState, last_stage: u16, actions: &mut Actions) {
     let largest = state
         .stages
         .iter()
@@ -273,11 +273,10 @@ pub(crate) fn workers_allowed(state: &ControllerState) -> u16 {
         .map(|ctl| ctl.allowance(ctl.target))
         .max()
         .unwrap_or(0);
+    let bound = crate::elastic::workers_bound(state);
     if max_allowance == 0 {
-        return state.cfg.workers_max.max(1);
+        return bound;
     }
     let allowed = model::worker_half(state) / max_allowance;
-    u16::try_from(allowed)
-        .unwrap_or(u16::MAX)
-        .clamp(1, state.cfg.workers_max.max(1))
+    u16::try_from(allowed).unwrap_or(u16::MAX).clamp(1, bound)
 }

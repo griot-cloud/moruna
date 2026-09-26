@@ -336,6 +336,7 @@ pub fn run_job(
         Components {
             run_id: Some(run_id),
             observer: Some(observer),
+            limits_subscribers: vec![limits_changed(wire.clone())],
             ..Components::default()
         },
     );
@@ -516,6 +517,17 @@ fn listen_to_peer(
             Err(reason) => wire.note(format!("an unreadable message was ignored: {reason}")),
         }
     }
+}
+
+/// Tell the peer of every limits change the run's watcher accepts (MH 4.3 `limits_changed`).
+fn limits_changed(wire: Arc<Wire>) -> moruna_discovery::LimitsSubscriber {
+    Box::new(move |change| {
+        wire.send(&Outbound::LimitsChanged {
+            old: LimitsMsg::of(&change.old),
+            new: LimitsMsg::of(&change.new),
+            reason: change.reason.name().to_string(),
+        });
+    })
 }
 
 /// The limits for `hello`, from the fields of the document discovery would be given.

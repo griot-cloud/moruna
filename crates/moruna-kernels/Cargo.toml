@@ -1,0 +1,20 @@
+[package]
+name = "moruna-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna standard kernels, constructed by arguments"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+# SHA-256 for the standard kernels' fingerprints (MH 4.9) and `hash(algo="sha256")`. E2: a
+# table addition (preamble 6.2), already in the lock through datafusion and polars.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+moruna-testkit = { workspace = true }

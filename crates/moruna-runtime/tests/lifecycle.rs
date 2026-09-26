@@ -27,6 +27,7 @@ fn discovered(ceiling: u64, staging: Option<std::path::PathBuf>) -> Discovered {
             page_bytes: 4096,
             devices: Vec::new(),
             source: LimitSource::Explicit,
+            observed_at: 0,
         },
         profile: HostProfile {
             staging_dir: staging,
@@ -76,6 +77,9 @@ impl Rig {
             sampler: Some(Arc::new(self.sampler.clone()) as Arc<dyn Sampler>),
             placement: Some(Arc::new(self.placement.clone()) as Arc<dyn Placement>),
             run_id: Some(RunId([7; 16])),
+            limits_source: None,
+            limits_subscribers: Vec::new(),
+            checkpoint: None,
             observer: None,
         }
     }
@@ -310,7 +314,7 @@ fn rt_t5_a_device_in_the_limits_is_passed_on() {
 
     let report =
         Runtime::run_with(spec, CancelToken::new(), components).expect("the run completes");
-    assert_eq!(report.limits.devices.len(), 1);
+    assert_eq!(report.limits_initial.devices.len(), 1);
 }
 
 /// PY-T15: `checkpoint.keep` on a run shorter than `checkpoint.interval_ms` still leaves a

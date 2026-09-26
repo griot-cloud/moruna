@@ -20,6 +20,7 @@ moruna-sinks = { workspace = true }
 moruna-placement = { workspace = true }
 moruna-scheduler = { workspace = true }
 moruna-controller = { workspace = true }
+moruna-kernels = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.
 moruna-datafusion = { workspace = true, optional = true }
 parquet = { workspace = true }
@@ -37,13 +38,18 @@ libc = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
-# The governed tests drive a peQL engine, whose API is asynchronous.
-tokio = { workspace = true }
 moruna-testkit = { workspace = true }
 # The Linux branch of tests/support/mod.rs reads /proc/self/statm and needs the page
 # size. A developer host is macOS, where that branch is not compiled, so its absence
 # only ever showed up on CI, on the platform this runtime is actually built for.
 libc = { workspace = true }
+# H7 (MH 4.6): a small S3-compatible server bound to a Unix socket, the only way the run in
+# `tests/no_network.rs` reaches its object store; the governed tests drive a peQL engine.
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 # The first program a user writes, kept at the repository root so it reads as an example and
 # not as a test; the quality gate runs it on every commit.

@@ -58,6 +58,14 @@ class KernelSpec:
     def fingerprint(self) -> str: ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
+class StdKernel:
+    @property
+    def name(self) -> str: ...
+    @property
+    def args(self) -> str: ...
+    @property
+    def fingerprint(self) -> str: ...
+
 class RunReport:
     @property
     def run_id(self) -> str: ...
@@ -143,7 +151,20 @@ def build_kernel(
     preferred_rows: int | None = ...,
     resume: str = ...,
     state_bytes: int | None = ...,
+    input_schema: tuple[Any, ...] | None = ...,
+    output_schema: tuple[Any, ...] | None = ...,
+    lockfile: bytes | None = ...,
+    origin: Any = ...,
 ) -> KernelSpec: ...
+def std_kernel(name: str, args_json: str) -> StdKernel: ...
+def check_kernel(
+    kernel: KernelSpec | StdKernel,
+    *,
+    name: str | None = ...,
+    seed: int = ...,
+    profiles_dir: str | None = ...,
+) -> str: ...
+def default_profiles_dir() -> str | None: ...
 def run(
     source: Any,
     kernels: Any,

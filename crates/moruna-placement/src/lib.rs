@@ -276,6 +276,15 @@ impl PlacementEngine {
         manifest::find_manifest(staging_dir, run_id)
     }
 
+    /// `resume = "auto"` (MH 4.7): the newest manifest under `staging_dir` that `restore`
+    /// could accept for a run described by `want`, or `None`.
+    pub fn find_resumable_manifest(
+        staging_dir: &Path,
+        want: &manifest::ManifestMatch<'_>,
+    ) -> moruna_kernel::Result<Option<PathBuf>> {
+        manifest::find_resumable_manifest(staging_dir, want)
+    }
+
     /// Read only the identity fields of a manifest so the facade can build a
     /// `PlacementConfig` with the manifest's run id before `restore`.
     pub fn read_manifest_header(path: &Path) -> moruna_kernel::Result<ManifestHeader> {

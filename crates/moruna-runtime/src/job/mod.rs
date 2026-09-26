@@ -302,6 +302,8 @@ pub enum KernelKindDoc {
     Python,
     /// A Rust kernel by crate and symbol. Reserved in version 1 and refused.
     Rust,
+    /// A standard kernel of `moruna-kernels` by `name` and `args` (MH 4.9).
+    Std,
 }
 
 /// One stage (MH 4.1). A Python kernel is named by `module` and `callable`; the hints are the
@@ -323,6 +325,12 @@ pub struct KernelDoc {
     /// Reserved for `rust`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// For `std`: the standard kernel's name (`cast`, `select`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// For `std`: its arguments, a JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
     /// The fingerprint the loaded kernel must have, hex, optionally prefixed `algo:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
@@ -367,6 +375,8 @@ impl KernelDoc {
             callable: Some(callable.into()),
             krate: None,
             symbol: None,
+            name: None,
+            args: None,
             fingerprint: None,
             stateful: None,
             instances: None,
@@ -379,6 +389,17 @@ impl KernelDoc {
             resume: None,
             state_bytes: None,
         }
+    }
+
+    /// A standard kernel named by `name` with `args` (MH 4.9).
+    pub fn std(name: impl Into<String>, args: serde_json::Value) -> KernelDoc {
+        let mut doc = KernelDoc::python("", "");
+        doc.kind = KernelKindDoc::Std;
+        doc.module = None;
+        doc.callable = None;
+        doc.name = Some(name.into());
+        doc.args = Some(args);
+        doc
     }
 
     /// The names of the decorator hints this entry sets, in document order.
@@ -418,8 +439,7 @@ pub struct BudgetDoc {
     /// CPUs, in cores; absent: discovered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<f64>,
-    /// How far the budget may follow the machine (MH 4.4). Read and validated here; the
-    /// elasticity itself is F8.2's.
+    /// How far the budget may follow the machine (MH 4.4); `RunSpec::elastic`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elastic: Option<ElasticDoc>,
 }

@@ -335,11 +335,10 @@ fn ho_t9_build_translates_every_field() {
     assert!(spec.resume.is_none());
     assert_eq!(
         spec.notes,
-        vec![
-            "clamped checkpoint.interval_ms from 100 to 500".to_string(),
-            "budget.elastic is recorded; this build sizes the run once, at start".to_string(),
-        ]
+        vec!["clamped checkpoint.interval_ms from 100 to 500".to_string()]
     );
+    assert_eq!(spec.elastic.memory_max_bytes, Some(34_359_738_368));
+    assert_eq!(spec.elastic.cpu_max, Some(32));
     assert_eq!(built.discovery.explicit_budget, Some(1 << 30));
 
     // A declared profile carries its keys; one that disagrees with `durable` is refused.
@@ -492,6 +491,15 @@ fn build_refusals() {
         Err(MorunaError::Resume(_))
     ));
     assert_eq!(build::resume_shape(&job), Some(translate::ResumeArg::Auto));
+    // With a staging directory, "auto" is left to the facade, which picks this job's newest
+    // manifest after discovery or starts fresh (MH 4.7).
+    let staging = std::env::temp_dir().join(format!("moruna-job-auto-{}", std::process::id()));
+    std::fs::create_dir_all(&staging).expect("staging");
+    job.staging.dir = Some(staging.display().to_string());
+    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("auto builds");
+    assert!(built.spec.resume_auto);
+    assert!(built.spec.resume.is_none());
+    let _ = std::fs::remove_dir_all(&staging);
 }
 
 /// Every sink kind builds, and the sink sizes are clamped with the library's notes.
@@ -664,4 +672,50 @@ fn governed_sources_and_sinks_are_documents() {
         bad_sql.source = with_source(None, Some("SELEC"), "/disk").source;
         assert!(refusal(&bad_sql).contains("source.sql"));
     }
+}
+
+/// MH 4.1 and 4.9: `{"kind": "std", "name", "args"}` round-trips, builds without a loader,
+/// fuses adjacent standard kernels, and honours a pinned fingerprint.
+#[test]
+fn std_kernels_in_a_document() {
+    let mut job = minimal("/out");
+    job.kernels.push(KernelDoc::std(
+        "cast",
+        serde_json::json!({"columns": {"a": "double"}}),
+    ));
+    job.kernels.push(KernelDoc::std(
+        "select",
+        serde_json::json!({"columns": ["a"]}),
+    ));
+    job.kernels.push(KernelDoc::python("m", "k"));
+    job.kernels.push(KernelDoc::std(
+        "drop",
+        serde_json::json!({"columns": ["a"]}),
+    ));
+    let text = job.to_json_pretty();
+    assert!(text.contains("\"kind\": \"std\""), "{text}");
+    assert_eq!(JobSpec::from_json(&text).expect("parses"), job);
+    let built = build::build(&job, &Fakes, opts(false, &no_env)).expect("builds");
+    assert_eq!(
+        built.spec.kernels.len(),
+        3,
+        "cast and select fuse into one stage"
+    );
+    assert!(built.spec.kernels[0].declared().is_checkable());
+
+    let pinned = crate::spec::KernelEntry::std("drop", serde_json::json!({"columns": ["a"]}))
+        .expect("entry")
+        .fingerprint()
+        .to_hex();
+    job.kernels[3].fingerprint = Some(format!("sha256:{pinned}"));
+    assert!(build::build(&job, &Fakes, opts(false, &no_env)).is_ok());
+    job.kernels[3].fingerprint = Some("sha256:00".into());
+    assert_refused(&job, "kernels[3].fingerprint");
+
+    let mut job = minimal("/out");
+    job.kernels
+        .push(KernelDoc::std("nope", serde_json::Value::Null));
+    assert_refused(&job, "kernels[0]");
+    job.kernels[0].name = None;
+    assert_refused(&job, "kernels[0].name");
 }

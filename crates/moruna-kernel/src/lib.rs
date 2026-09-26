@@ -14,6 +14,7 @@
 
 pub mod buffer;
 pub mod completion;
+pub mod declare;
 pub mod error;
 pub mod fingerprint;
 pub mod ids;
@@ -42,6 +43,7 @@ pub use dlpark;
 
 pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
 pub use completion::{Completion, CompletionSender};
+pub use declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, TypeDecl};
 pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
@@ -64,7 +66,7 @@ pub use sink::{Sink, SinkSummary};
 pub use source::{RowRange, Source, Split};
 pub use tensor::{DeleterHook, Dlpack, ManagedTensor};
 pub use tier::{RemoteRef, SegmentRef, StagingCodec, TIER_COUNT, Tier, TierKind};
-pub use trace::{Outcome, TraceRecord, TraceSink, TraceTail};
+pub use trace::{LimitsChangeReason, LimitsChanged, Outcome, TraceRecord, TraceSink, TraceTail};
 pub use view::BufferView;
 
 /// `core::result::Result<T, MorunaError>`; every fallible contract returns it.

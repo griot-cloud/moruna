@@ -24,6 +24,7 @@ fn extras() -> CheckpointExtras {
             row_offset: 40,
             next_seq: 12,
         },
+        issued: Vec::new(),
     }
 }
 

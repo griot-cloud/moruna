@@ -4,6 +4,8 @@ use std::path::Path;
 
 use moruna_kernel::{Device, Guarantee, LimitSource, Limits, TierKind};
 
+use crate::watch::LimitsReading;
+
 use crate::cgroup::{self, Cgroup};
 use crate::os;
 
@@ -33,13 +35,67 @@ pub(crate) struct LimitsInput<'a> {
 
 /// Derive `Limits` (e.3), appending a note for every fallback and every clamp.
 pub(crate) fn derive(input: LimitsInput<'_>, notes: &mut Vec<String>) -> Limits {
-    let page_bytes = os::page_bytes();
-    let total_ram = os::total_ram_bytes(input.proc_root);
-    let cgroup_limits = cgroup::limits(input.cgroup);
-    let kill = cgroup_limits.memory_max;
+    let reading = read(input.cgroup, input.proc_root, None);
+    let limits = derive_from(
+        &reading,
+        input.explicit_budget,
+        input.explicit_cpu,
+        os::page_bytes(),
+        input.devices,
+        notes,
+    );
+
+    if let Some(current) = cgroup::memory_current(input.cgroup) {
+        notes.push(format!("memory.current at discovery: {current}"));
+    }
+    tracing::info!(
+        target: "discovery.limits",
+        memory_ceiling = limits.memory_ceiling,
+        memory_kill = limits.memory_kill,
+        cpu_quota = limits.cpu_quota,
+        page_bytes = limits.page_bytes,
+        devices = limits.devices.len(),
+        source = ?limits.source,
+        "limits discovered"
+    );
+    limits
+}
+
+/// Read every source e.3 derives from, once. `sys_root` is `/sys` when the online CPU count is
+/// to be read from `devices/system/cpu/online` (the watcher's guest source); `None` asks the
+/// operating system (`sysconf`), which is what `discover` has always done.
+pub(crate) fn read(cgroup: &Cgroup, proc_root: &Path, sys_root: Option<&Path>) -> LimitsReading {
+    let cgroup_limits = cgroup::limits(cgroup);
+    let os_cpus = sys_root
+        .and_then(|sys| std::fs::read_to_string(sys.join("devices/system/cpu/online")).ok())
+        .and_then(|text| crate::watch::parse_cpu_list(&text))
+        .map(|count| count as f64)
+        .unwrap_or_else(os::logical_cores);
+    LimitsReading {
+        memory_max: cgroup_limits.memory_max,
+        memory_high: cgroup_limits.memory_high,
+        cpu_max: cgroup::cpu_quota(cgroup),
+        total_ram: os::total_ram_bytes(proc_root),
+        cpus_online: os_cpus,
+    }
+}
+
+/// e.3 over one reading: the precedence and every clamp, with no file touched. `discover` and the
+/// watcher both derive through here, which is what "the precedence is unchanged, only
+/// re-evaluated" means in code.
+pub(crate) fn derive_from(
+    reading: &LimitsReading,
+    explicit_budget: Option<u64>,
+    explicit_cpu: Option<f64>,
+    page_bytes: usize,
+    devices: Vec<Device>,
+    notes: &mut Vec<String>,
+) -> Limits {
+    let total_ram = reading.total_ram;
+    let kill = reading.memory_max;
 
     // `memory.high` above `memory.max` is a misconfiguration: ignore it and say so (h).
-    let high = match (cgroup_limits.memory_high, kill) {
+    let high = match (reading.memory_high, kill) {
         (Some(high), Some(kill)) if high > kill => {
             notes.push(format!(
                 "memory.high ({high}) is above memory.max ({kill}); ignoring memory.high"
@@ -49,7 +105,7 @@ pub(crate) fn derive(input: LimitsInput<'_>, notes: &mut Vec<String>) -> Limits 
         (high, _) => high,
     };
 
-    let (mut ceiling, source) = if let Some(budget) = input.explicit_budget {
+    let (mut ceiling, source) = if let Some(budget) = explicit_budget {
         (budget, LimitSource::Explicit)
     } else if let Some(high) = high {
         (high, LimitSource::Cgroup)
@@ -99,38 +155,32 @@ pub(crate) fn derive(input: LimitsInput<'_>, notes: &mut Vec<String>) -> Limits 
         }
     }
 
-    let cpu_quota = if let Some(cpu) = input.explicit_cpu {
+    let cpu_quota = if let Some(cpu) = explicit_cpu {
         cpu
-    } else if let Some(quota) = cgroup::cpu_quota(input.cgroup) {
+    } else if let Some(quota) = reading.cpu_max {
         quota
     } else {
         notes.push("no cgroup CPU quota; using the host's logical core count".to_string());
-        os::logical_cores()
+        reading.cpus_online
     };
 
-    if let Some(current) = cgroup::memory_current(input.cgroup) {
-        notes.push(format!("memory.current at discovery: {current}"));
-    }
-
-    let limits = Limits {
+    Limits {
         memory_ceiling: ceiling,
         memory_kill: kill,
         cpu_quota,
         page_bytes,
-        devices: input.devices,
+        devices,
         source,
-    };
-    tracing::info!(
-        target: "discovery.limits",
-        memory_ceiling = limits.memory_ceiling,
-        memory_kill = limits.memory_kill,
-        cpu_quota = limits.cpu_quota,
-        page_bytes = limits.page_bytes,
-        devices = limits.devices.len(),
-        source = ?limits.source,
-        "limits discovered"
-    );
-    limits
+        observed_at: now_ns(),
+    }
+}
+
+/// Nanoseconds since the Unix epoch; zero on a clock before it.
+pub(crate) fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// The run's one host tier (contracts e.1, f.1): pinned when there is a device to copy to and
