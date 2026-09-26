@@ -48,8 +48,9 @@ pub struct Block {
 
 impl Block {
     /// Open `disk`, taking an advisory lock (shared for read-only, exclusive for read-write) so
-    /// two monitors cannot write one disk; `index` names the device for `GET_ID`.
-    pub fn open(disk: &DiskConfig, index: usize) -> Result<Self> {
+    /// two monitors cannot write one disk; `id` is what `GET_ID` answers (at most 20 bytes are
+    /// sent), which is how the guest finds a disk whatever order the kernel probed them in.
+    pub fn open(disk: &DiskConfig, id: &str) -> Result<Self> {
         let shown = disk.path.display().to_string();
         let mut file = OpenOptions::new()
             .read(true)
@@ -75,7 +76,7 @@ impl Block {
             path: disk.path.clone(),
             read_only: disk.read_only,
             capacity_sectors: len / SECTOR_BYTES,
-            id: format!("moruna-disk-{index}"),
+            id: id.to_string(),
             buf: vec![0; CHUNK_BYTES],
         })
     }
@@ -301,7 +302,7 @@ mod tests {
                 path: path.clone(),
                 read_only,
             },
-            3,
+            "moruna-disk-3",
         )
         .unwrap();
         let mem = guest_memory(4 << 20);
@@ -437,7 +438,7 @@ mod tests {
                 path: r.path.clone(),
                 read_only: true,
             },
-            0,
+            "d0",
         );
         assert!(again.is_ok());
     }
@@ -524,7 +525,7 @@ mod tests {
                 path: dir.join("absent"),
                 read_only: true,
             },
-            0,
+            "d0",
         );
         assert!(matches!(
             absent,
@@ -540,8 +541,8 @@ mod tests {
             path: path.clone(),
             read_only: false,
         };
-        let _first = Block::open(&cfg, 0).unwrap();
-        match Block::open(&cfg, 1) {
+        let _first = Block::open(&cfg, "d0").unwrap();
+        match Block::open(&cfg, "d1") {
             Err(VmmError::Config { field, msg }) => {
                 assert_eq!(field, "--disk");
                 assert!(msg.contains("in use"), "{msg}");
