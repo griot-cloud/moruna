@@ -1,11 +1,12 @@
 //! `boot_and_run`: boot a guest, hand Moruna one spec over vsock, relay what it says, return
-//! how it ended. This is the library seam `moruna run --vm` (F8.1's binary) calls.
+//! how it ended. This is the library seam `moruna run --vm` calls.
 //!
-//! The host protocol itself (MH 4.3) belongs to F8.1. This module speaks only what it must:
-//! it sends one `spec` message, `{"type":"spec","spec":<the spec file's JSON>}` followed by a
-//! newline, and relays every line Moruna sends back to the caller's writer untouched. When
-//! F8.1 lands the message types in `moruna-kernel`, [`spec_message`] is the one function to
-//! replace.
+//! The host protocol (MH 4.3) is F8.1's, in `moruna-runtime::host`. `moruna-vmm` depends on
+//! `moruna-kernel` only (H-Q7), so it does not import those types; it speaks the one message it
+//! must, the `spec` of `moruna_runtime::host::protocol::Inbound::Spec`,
+//! `{"type":"spec","spec":<the spec file's JSON>}` and a newline, and relays every line Moruna
+//! sends back (`hello`, heartbeats, `report`, `exit`) to the caller untouched. If the protocol
+//! types move into `moruna-kernel`, [`spec_message`] is the one function to replace.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
