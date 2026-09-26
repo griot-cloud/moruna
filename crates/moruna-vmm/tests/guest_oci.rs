@@ -39,7 +39,11 @@ fn vm_t32_recipe_layout_resolves() {
     let again = run(&dir.join("layout2")).unwrap();
     assert_eq!(String::from_utf8(again.stdout).unwrap().trim(), digest);
     // Bad arguments are refused.
-    let bad = Command::new("python3").arg(&script).arg("x").output().unwrap();
+    let bad = Command::new("python3")
+        .arg(&script)
+        .arg("x")
+        .output()
+        .unwrap();
     assert_eq!(bad.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
