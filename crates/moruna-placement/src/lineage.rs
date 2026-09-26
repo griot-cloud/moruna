@@ -28,6 +28,12 @@ pub struct Lineage {
     pub disk: Option<SegmentRef>,
     /// True once the morsel has been popped (it is inside a kernel or the sink).
     pub consumed: bool,
+    /// True once `set_committed` has passed it while checkpointing is on. The record is kept,
+    /// without a disk copy, until a manifest whose watermark covers it has been written: the
+    /// scheduler reads the watermark before the sink's state and the lineage after it, so a
+    /// morsel committed in between belongs to neither the watermark nor, without this, the
+    /// lineage, and a resume would lose it (MH 4.7, H5).
+    pub committed: bool,
 }
 
 impl PlacementEngine {
@@ -68,6 +74,7 @@ impl PlacementEngine {
                         bytes,
                         disk: None,
                         consumed: false,
+                        committed: false,
                     },
                 );
             }
@@ -107,29 +114,51 @@ impl PlacementEngine {
         self.committed.store(seq, Ordering::Release);
         let released: Vec<SegmentRef> = {
             let mut lineage = self.lock_lineage();
-            let above = lineage.split_off(&seq.saturating_add(1));
-            let below = std::mem::replace(&mut *lineage, above);
-            below
-                .into_values()
-                .filter_map(|record| record.disk)
-                .collect()
+            if self.cfg.checkpoint_enabled {
+                // Kept, marked, until the next manifest prunes it (`lineage_snapshot`).
+                lineage
+                    .range_mut(..=seq)
+                    .filter(|(_, record)| !record.committed)
+                    .filter_map(|(_, record)| {
+                        record.committed = true;
+                        record.consumed = true;
+                        record.disk.take()
+                    })
+                    .collect()
+            } else {
+                let above = lineage.split_off(&seq.saturating_add(1));
+                let below = std::mem::replace(&mut *lineage, above);
+                below
+                    .into_values()
+                    .filter_map(|record| record.disk)
+                    .collect()
+            }
         };
         for segment in released {
             self.release_record(segment.segment);
         }
     }
 
-    /// The lineage index as the manifest writes it: ascending `seq` (e.5).
-    pub(crate) fn lineage_snapshot(&self) -> Vec<(Seq, Lineage)> {
-        let lineage = self.lock_lineage();
+    /// The lineage index as the manifest writes it: ascending `seq`, every record above the
+    /// manifest's watermark `above` whether or not the sink has committed it since (e.5, MH
+    /// 4.7). Committed records the watermark covers are dropped here, under the same lock, so
+    /// a record leaves the index only once a manifest no longer needs it.
+    pub(crate) fn lineage_snapshot(&self, above: Option<Seq>) -> Vec<(Seq, Lineage)> {
+        let mut lineage = self.lock_lineage();
+        let covered = |seq: Seq| above.is_some_and(|watermark| seq <= watermark);
+        lineage.retain(|seq, record| !(record.committed && covered(*seq)));
         lineage
             .iter()
+            .filter(|(seq, _)| !covered(**seq))
             .map(|(seq, record)| (*seq, record.clone()))
             .collect()
     }
 
     /// How many uncommitted morsels the engine is tracking (j).
     pub(crate) fn lineage_len(&self) -> u64 {
-        self.lock_lineage().len() as u64
+        self.lock_lineage()
+            .values()
+            .filter(|record| !record.committed)
+            .count() as u64
     }
 }

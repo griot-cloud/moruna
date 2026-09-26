@@ -256,10 +256,21 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     }
     let host_profile = host_profile_of(job)?;
     let staging_dir = job.staging.dir.as_deref().map(PathBuf::from);
-    let resume = translate::resolve_resume(
-        job.resume.as_deref().map(translate::resume_arg).as_ref(),
-        staging_dir.as_deref(),
-    )?;
+    // `"auto"` is resolved by the facade, after discovery, to the newest manifest this job wrote
+    // (same document digest and kernels), or a fresh run when there is none (MH 4.7). It still
+    // needs a staging directory to look in.
+    let resume_arg = job.resume.as_deref().map(translate::resume_arg);
+    let resume_auto = matches!(resume_arg, Some(translate::ResumeArg::Auto));
+    let resume = if resume_auto {
+        if staging_dir.is_none() {
+            return Err(MorunaError::Resume(
+                "resume \"auto\" needs staging.dir so the manifest can be found".into(),
+            ));
+        }
+        None
+    } else {
+        translate::resolve_resume(resume_arg.as_ref(), staging_dir.as_deref())?
+    };
 
     let discovery = DiscoveryInput {
         explicit_budget: job.budget.memory_bytes,
@@ -297,6 +308,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     spec.checkpoint_interval_ms = checkpoint_interval_ms;
     spec.checkpoint_keep = job.checkpoint.keep;
     spec.resume = resume;
+    spec.resume_auto = resume_auto;
     let digest = job.digest();
     spec.spec_digest = Some(digest.clone());
     spec.notes = notes;
@@ -333,10 +345,13 @@ fn source_of(doc: &SourceDoc, loader: &dyn KernelLoader) -> Result<(SourceSpec, 
             Ok((
                 SourceSpec::Build(Box::new(move |ctx| {
                     let meta = ctx.object_metadata()?;
-                    Ok(
-                        Arc::new(ParquetSource::new(cfg, ctx.reactor.clone(), meta)?)
-                            as Arc<dyn Source>,
-                    )
+                    // With the arena, so an object URL's footer can be read (MH 4.6).
+                    Ok(Arc::new(ParquetSource::with_allocator(
+                        cfg,
+                        ctx.reactor.clone(),
+                        meta,
+                        ctx.alloc.clone(),
+                    )?) as Arc<dyn Source>)
                 })),
                 targets,
             ))
