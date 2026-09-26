@@ -57,6 +57,9 @@ hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 tracing-subscriber = { version = "=0.3.23" }
+# The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON. Already
+# in the graph through the engine bridges at this version, so the pin adds no second copy.
+sha2 = { version = "=0.11.0" }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six

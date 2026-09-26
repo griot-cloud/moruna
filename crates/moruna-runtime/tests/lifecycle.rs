@@ -76,6 +76,7 @@ impl Rig {
             sampler: Some(Arc::new(self.sampler.clone()) as Arc<dyn Sampler>),
             placement: Some(Arc::new(self.placement.clone()) as Arc<dyn Placement>),
             run_id: Some(RunId([7; 16])),
+            observer: None,
         }
     }
 }

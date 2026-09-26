@@ -13,6 +13,11 @@ requires-python = ">=3.14"
 dependencies = ["pyarrow>=17"]
 dynamic = ["version"]
 
+# `moruna run <spec.json>` and `moruna serve --listen <address>` (MH 4.2, SDD 13 f.7): the same
+# command the `moruna` binary runs, from the interpreter the wheel is installed in.
+[project.scripts]
+moruna = "moruna.__main__:main"
+
 [project.urls]
 Repository = "https://github.com/griot-cloud/moruna"
 

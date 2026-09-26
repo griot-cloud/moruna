@@ -29,6 +29,9 @@ pub(crate) fn thread(shared: Arc<Shared>) {
             if shared.checkpoint_stop.load(Ordering::SeqCst) {
                 return;
             }
+            if shared.checkpoint_request.swap(false, Ordering::SeqCst) {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(1).min(interval));
         }
         if shared.checkpoint_stop.load(Ordering::SeqCst) {

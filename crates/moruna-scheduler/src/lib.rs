@@ -160,6 +160,20 @@ impl Scheduler {
         self.shared.checkpoint_enabled()
     }
 
+    /// Ask the checkpoint thread for a manifest now rather than at the end of its interval
+    /// (MH 4.3 `checkpoint`: the host is about to destroy the machine). Returns false when the
+    /// run is not checkpointing, in which case nothing is written. The manifest is written on
+    /// the checkpoint thread, as every other one is (f.12), so the lock order is unchanged.
+    pub fn request_checkpoint(&self) -> bool {
+        if !self.shared.checkpoint_enabled() {
+            return false;
+        }
+        self.shared
+            .checkpoint_request
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
     /// The shared state, for the tests that assert on the stage table and the pick rule.
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<Shared> {

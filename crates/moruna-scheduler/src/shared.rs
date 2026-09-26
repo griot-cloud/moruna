@@ -268,6 +268,9 @@ pub(crate) struct Shared {
 
     pub(crate) checkpoint_on: AtomicBool,
     pub(crate) checkpoint_stop: AtomicBool,
+    /// Set by `Scheduler::request_checkpoint`: the checkpoint thread writes a manifest at once
+    /// rather than at the end of its interval (MH 4.3 `checkpoint`).
+    pub(crate) checkpoint_request: AtomicBool,
     pub(crate) checkpoint_handle: Mutex<Option<JoinHandle<()>>>,
 
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
@@ -462,6 +465,7 @@ impl Shared {
             sink_unparker: Mutex::new(None),
             checkpoint_on: AtomicBool::new(checkpoint_enabled),
             checkpoint_stop: AtomicBool::new(false),
+            checkpoint_request: AtomicBool::new(false),
             checkpoint_handle: Mutex::new(None),
             record_hook: RwLock::new(None),
             stats_cache: Mutex::new(StatsCache {
