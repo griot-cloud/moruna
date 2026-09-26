@@ -28,6 +28,7 @@ moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.1.1" }
 moruna-controller = { path = "crates/moruna-controller", version = "0.1.1" }
 moruna-runtime = { path = "crates/moruna-runtime", version = "0.1.1" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.1.1" }
+moruna-vmm = { path = "crates/moruna-vmm", version = "0.1.1" }
 moruna-kernels = { path = "crates/moruna-kernels", version = "0.1.1" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
@@ -58,6 +59,18 @@ hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 tracing-subscriber = { version = "=0.3.23" }
+# The rust-vmm crates, used by moruna-vmm only (MH 4.8; additions to the preamble 6.2 table,
+# 2026-09-26). moruna-vmm also verifies guest image digests with the sha2 pin below.
+kvm-ioctls = { version = "=0.25.0" }
+kvm-bindings = { version = "=0.14.1", features = ["fam-wrappers"] }
+vm-memory = { version = "=0.18.0", features = ["backend-mmap"] }
+linux-loader = { version = "=0.14.0", features = ["bzimage", "elf", "pe"] }
+vm-superio = { version = "=0.8.2" }
+vmm-sys-util = { version = "=0.15.0" }
+virtio-queue = { version = "=0.18.0" }
+virtio-bindings = { version = "=0.2.7" }
+vm-fdt = { version = "=0.3.0" }
+acpi_tables = { version = "=0.2.1" }
 # Object storage through a socket (MH 4.6, F8.6): an HTTP/1.1 connection over a Unix or vsock
 # stream for `object_store`'s S3 client. Every one of them is already in the graph through
 # `object_store`'s own HTTP stack at these versions; they are named here so the reactor can

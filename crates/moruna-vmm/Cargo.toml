@@ -1,0 +1,39 @@
+[package]
+name = "moruna-vmm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna packaged as a microVM: the monitor that boots the Moruna guest on KVM"
+
+[[bin]]
+name = "moruna-vmm"
+path = "src/main.rs"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+vm-memory = { workspace = true }
+virtio-queue = { workspace = true }
+virtio-bindings = { workspace = true }
+vm-superio = { workspace = true }
+vm-fdt = { workspace = true }
+acpi_tables = { workspace = true }
+linux-loader = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = { workspace = true }
+kvm-bindings = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[dev-dependencies]
+virtio-queue = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = []

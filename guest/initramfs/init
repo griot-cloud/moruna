@@ -1,0 +1,48 @@
+#!/bin/busybox sh
+# PID 1 of the Moruna guest, first stage. Mounts the read-only root filesystem the monitor
+# attached as the block device whose serial is `moruna.root=` on the command line, puts tmpfs
+# where a run writes, and hands PID 1 to /sbin/moruna-init, whose only job is Moruna.
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+mount -t devtmpfs dev /dev
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+
+fail() {
+    echo "moruna-init: $*" >&2
+    # Nothing to report the failure to but the console; the monitor sees the panic that
+    # follows PID 1 exiting and returns 6.
+    exit 1
+}
+
+root_id=""
+# The command line is words, not lines.
+# shellcheck disable=SC2013
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        moruna.root=*) root_id="${arg#moruna.root=}" ;;
+    esac
+done
+[ -n "$root_id" ] || fail "no moruna.root= on the command line"
+
+root_dev=""
+for b in /sys/block/vd*; do
+    [ -e "$b/serial" ] || continue
+    if [ "$(cat "$b/serial")" = "$root_id" ]; then
+        root_dev="/dev/${b##*/}"
+    fi
+done
+[ -n "$root_dev" ] || fail "no block device with serial $root_id"
+
+mkdir -p /newroot
+mount -t erofs -o ro "$root_dev" /newroot || fail "cannot mount $root_dev"
+# /disk is where moruna-init mounts the host's disks; the root filesystem has the empty
+# directories.
+for d in tmp run var/tmp disk; do
+    mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "/newroot/$d" || fail "tmpfs /$d"
+done
+mount --move /dev /newroot/dev
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+exec switch_root /newroot /sbin/moruna-init
