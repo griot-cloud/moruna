@@ -128,17 +128,20 @@ impl From<Box<dyn Sink>> for SinkSpec {
     }
 }
 
-/// The working memory an engine source's own operators hold outside the arena (MH 4.5): a
-/// DataFusion plan's sorts, aggregations and joins. The facade gives it a share of the budget
-/// beside the arena before the source is built, charges that share to the controller, and moves
-/// it when the machine's limits move, so the arena and the engine together stay inside the
-/// ceiling.
+/// The working memory an engine at either end of a run holds outside the arena (MH 4.5): a
+/// DataFusion plan's scans, sorts, aggregations and joins at the source, a contract write's
+/// encoders and row groups at the sink. The facade gives each a share of the budget beside the
+/// arena before it is built, charges the shares to the controller, and moves them when the
+/// machine's limits move, so the arena and the engines together stay inside the ceiling.
 pub trait EngineMemory: Send + Sync {
-    /// The most the engine's operators may hold from now on, in bytes. Growth past it is refused
-    /// (an operator that can spill spills); what is held above a lowered figure is given back as
+    /// The most the engine may hold from now on, in bytes. Growth past it is refused (an
+    /// operator that can spill spills); what is held above a lowered figure is given back as
     /// its holders finish.
     fn set_limit(&self, bytes: u64);
-    /// What the engine's operators held and how often they were refused, for the report.
+    /// The largest morsel the engine can take inside its share, when it bounds that: a sink
+    /// whose every write holds working memory in proportion to the morsel it writes.
+    fn morsel_max(&self) -> Option<u64>;
+    /// What the engine held and how often it was refused, for the report.
     fn note(&self) -> String;
 }
 
@@ -156,6 +159,9 @@ pub struct RunSpec {
     /// The source's engine memory, when the source is an engine that runs operators of its own
     /// (a DataFusion plan); `None` for every other source.
     pub engine_memory: Option<Arc<dyn EngineMemory>>,
+    /// The sink's engine memory, when the sink is an engine that encodes outside the arena (a
+    /// peQL contract write); `None` for every other sink.
+    pub sink_memory: Option<Arc<dyn EngineMemory>>,
     /// An explicit host ceiling in bytes; discovery clamps it.
     pub budget: Option<u64>,
     /// An explicit CPU quota in cores; discovery clamps it.
@@ -227,6 +233,7 @@ impl RunSpec {
             py_kernels: Vec::new(),
             sink: sink.into(),
             engine_memory: None,
+            sink_memory: None,
             budget: None,
             cpu: None,
             elastic: crate::elastic::ElasticBudget::default(),

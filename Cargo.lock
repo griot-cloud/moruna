@@ -2970,15 +2970,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libmimalloc-sys"
-version = "0.1.49"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "libyaml-rs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3136,15 +3127,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
-dependencies = [
- "libmimalloc-sys",
 ]
 
 [[package]]
@@ -3357,7 +3339,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "mimalloc",
  "moruna-adapters",
  "moruna-arena",
  "moruna-controller",
@@ -3439,7 +3420,6 @@ version = "0.1.1"
 dependencies = [
  "arrow",
  "crossbeam",
- "mimalloc",
  "moruna-kernel",
  "serde",
  "serde_json",
@@ -3816,7 +3796,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 [[package]]
 name = "peql"
 version = "0.4.0"
-source = "git+https://github.com/griot-cloud/peQL?rev=189b58e#189b58e4988dfe981701a765314ed5f215f91a88"
+source = "git+https://github.com/griot-cloud/peQL?rev=23450f1#23450f166c203a08f42aa3305c1072dcbcdd5ab7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

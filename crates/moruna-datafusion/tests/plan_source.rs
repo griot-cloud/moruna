@@ -239,6 +239,23 @@ fn an_exchange_or_a_volatile_function_is_not_repeatable() {
     let src = source(&ctx, "SELECT x, random() AS r FROM t").expect("a source");
     assert!(!src.repeatable(), "random() is volatile");
     assert_eq!(src.plan().expect("the plan").len(), 1);
+
+    // With one partition there is no exchange, and an aggregation or a sort is still not
+    // repeatable: what it emits, and in what order, depends on how it spilled (F8.9).
+    let one = crate::ctx(1);
+    for sql in [
+        "SELECT x % 7 AS k, COUNT(*) AS n FROM t GROUP BY x % 7",
+        "SELECT x FROM t ORDER BY x DESC",
+    ] {
+        let src = source(&one, sql).expect("a source");
+        assert!(!src.repeatable(), "{sql}");
+    }
+    assert!(
+        source(&one, "SELECT x FROM t WHERE x > 3")
+            .expect("a source")
+            .repeatable(),
+        "a filter streams"
+    );
 }
 
 #[test]
@@ -459,7 +476,7 @@ fn wide() -> SessionContext {
 /// allowed past it.
 #[test]
 fn a_plan_larger_than_its_pool_spills_or_is_refused() {
-    // A share whose pool half, 16 MiB, is well under the 40 MiB the sort must hold.
+    // A share whose pool, a tenth of it, is well under the 40 MiB the sort must hold.
     const POOL: u64 = 32 << 20;
     let ctx = wide();
     let sql = "SELECT x, s FROM w ORDER BY s DESC";

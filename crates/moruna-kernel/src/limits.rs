@@ -119,6 +119,24 @@ pub trait Sampler: Send + Sync {
     /// kernels 6.x and later; otherwise the sampler tracks its own running peak and resets
     /// that), so a probe measures its own peak (RC f.2).
     fn reset_peak(&self);
+    /// The most anonymous memory the whole process has held since this sampler was created,
+    /// as the operating system counts it, whatever the run's shape: every sample's reading,
+    /// and on a platform that keeps a lifetime high-water mark, every rise of that mark, so a
+    /// burst between two samples is not missed. `reset_peak` does not touch it. This is the
+    /// figure the run report's peak is taken from.
+    fn process_peak(&self) -> ProcessPeak;
+}
+
+/// The whole process's high-water mark over a run ([`Sampler::process_peak`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessPeak {
+    /// Anonymous host bytes at the peak.
+    pub bytes: u64,
+    /// When the sampler saw it, nanoseconds since the epoch.
+    pub at_ns: u64,
+    /// True when the figure is the kernel's own high-water mark and not only the highest of
+    /// the samples taken, so no burst between samples can have been missed.
+    pub exact: bool,
 }
 
 /// One sample of live resource state; produced by discovery's sampler.

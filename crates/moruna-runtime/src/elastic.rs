@@ -48,11 +48,12 @@ pub struct ElasticBudget {
     pub cpu_max: Option<u16>,
 }
 
-/// What a ceiling is divided into: an engine source's operator memory (zero without one) and the
-/// arena, sized over what the engine leaves.
+/// What a ceiling is divided into: an engine source's plan memory and an engine sink's write
+/// memory (each zero without one), and the arena, sized over what the engines leave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Shares {
     pub(crate) engine: u64,
+    pub(crate) sink: u64,
     pub(crate) arena: u64,
 }
 
@@ -69,6 +70,8 @@ pub(crate) struct WatchCtx {
     pub(crate) scheduler: Arc<Scheduler>,
     /// The source's engine memory, moved to its share of each new ceiling.
     pub(crate) engine: Option<Arc<dyn EngineMemory>>,
+    /// The sink's engine memory, likewise.
+    pub(crate) sink: Option<Arc<dyn EngineMemory>>,
     pub(crate) sizing: Sizing,
     pub(crate) start_ns: u64,
     pub(crate) workers_max: u16,
@@ -79,8 +82,8 @@ pub(crate) struct WatchCtx {
 pub(crate) struct WatchState {
     /// The host budget and the draining bytes last handed to the controller.
     budget: (u64, u64),
-    /// The engine memory last set.
-    engine: u64,
+    /// The engine shares last set.
+    shares: Shares,
     /// Every shrink, and the drain in progress when there is one.
     drains: Vec<DrainSummary>,
     /// When the drain in progress started, nanoseconds.
@@ -90,10 +93,10 @@ pub(crate) struct WatchState {
 }
 
 impl WatchState {
-    pub(crate) fn new(budget: u64, engine: u64) -> WatchState {
+    pub(crate) fn new(budget: u64, shares: Shares) -> WatchState {
         WatchState {
             budget: (budget, 0),
-            engine,
+            shares,
             drains: Vec::new(),
             draining_since: None,
             notes: Vec::new(),
@@ -227,14 +230,18 @@ fn check_drain(ctx: &WatchCtx, state: &mut WatchState) {
 fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
     let ceiling = ctx.watch.current().memory_ceiling;
     let shares = (ctx.sizing)(ceiling);
-    if let Some(engine) = &ctx.engine
-        && shares.engine != state.engine
-    {
-        // Before the arena moves: a lowered share refuses the engine's growth at once, so its
+    if (shares.engine, shares.sink) != (state.shares.engine, state.shares.sink) {
+        // Before the arena moves: a lowered share refuses the engines' growth at once, so their
         // operators spill rather than hold what the ceiling no longer allows.
-        state.engine = shares.engine;
-        engine.set_limit(shares.engine);
-        ctx.controller.set_engine(shares.engine);
+        if let Some(engine) = &ctx.engine {
+            engine.set_limit(shares.engine);
+        }
+        if let Some(sink) = &ctx.sink {
+            sink.set_limit(shares.sink);
+        }
+        state.shares = shares;
+        ctx.controller
+            .set_engine(shares.engine.saturating_add(shares.sink));
     }
     let target = shares.arena;
     let Some(arena) = &ctx.arena else {

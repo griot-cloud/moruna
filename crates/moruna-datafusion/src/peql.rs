@@ -70,8 +70,9 @@ impl PlanSource {
         caller: &Caller,
         memory: &PlanMemory,
     ) -> Result<PlanSource> {
-        let runtime = Runtime::new()?;
-        let partitions = Some(crate::plan_source::partitions_for(memory.pool.in_flight()));
+        let partitions = crate::plan_source::partitions_for(memory.pool.in_flight());
+        let runtime = Runtime::with_threads(partitions + 1)?;
+        let partitions = Some(partitions);
         let planned = runtime
             .block_on(async {
                 match read {
@@ -84,14 +85,57 @@ impl PlanSource {
     }
 }
 
+/// The memory a contract write holds outside the arena, inside the run's budget (MH 4.5).
+///
+/// The run gives the sink a share of its budget before the sink opens; the share is divided
+/// among the parts that may be written at once, and each part is written inside its piece
+/// (`Writing::with_memory`): its row groups, file buffers, bloom filters and a clustered
+/// layout's sort. A part is one morsel, so a piece is also the largest morsel the sink takes.
+#[derive(Debug)]
+pub struct WriteMemory {
+    share: AtomicU64,
+    parts: u64,
+}
+
+impl WriteMemory {
+    /// A share of nothing yet, divided among `parts` writes in flight.
+    pub fn new(parts: u16) -> WriteMemory {
+        WriteMemory {
+            share: AtomicU64::new(0),
+            parts: u64::from(parts.max(1)),
+        }
+    }
+
+    /// Set the share. Parts are sized when the sink opens and keep that size.
+    pub fn set_limit(&self, bytes: u64) {
+        self.share.store(bytes, Ordering::SeqCst);
+    }
+
+    /// The share in force.
+    pub fn limit(&self) -> u64 {
+        self.share.load(Ordering::SeqCst)
+    }
+
+    /// What one part in flight may hold.
+    pub fn per_part(&self) -> u64 {
+        self.limit() / self.parts
+    }
+
+    /// The parts that may be written at once.
+    pub fn parts(&self) -> u64 {
+        self.parts
+    }
+}
+
 /// A contract write as a sink (MH 4.5): `Engine::begin_write` on `open`, one
 /// `Engine::write_part` per morsel, `Engine::finish_write` on `finish`, which validates the
 /// data and refreshes the manifest. Parts land in files of their own, so morsels are written as
-/// they arrive, in any order and concurrently.
+/// they arrive, in any order and concurrently, each inside its piece of `memory`.
 pub struct PeqlSink {
     engine: Arc<Engine>,
     contract: String,
     mode: WriteMode,
+    memory: Arc<WriteMemory>,
     runtime: Runtime,
     writing: Option<Arc<Writing>>,
     rows: AtomicU64,
@@ -107,6 +151,7 @@ impl PeqlSink {
         contract: &str,
         caller: &Caller,
         mode: WriteMode,
+        memory: Arc<WriteMemory>,
     ) -> Result<PeqlSink> {
         engine
             .authorize_write(contract, caller)
@@ -115,7 +160,8 @@ impl PeqlSink {
             engine,
             contract: contract.to_string(),
             mode,
-            runtime: Runtime::new()?,
+            runtime: Runtime::with_threads(usize::try_from(memory.parts()).unwrap_or(2))?,
+            memory,
             writing: None,
             rows: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
@@ -129,10 +175,15 @@ fn sink_err(e: impl std::fmt::Display) -> MorunaError {
 
 impl Sink for PeqlSink {
     fn open(&mut self, _schema: &SourceSchema) -> Result<()> {
-        let writing = self
+        let mut writing = self
             .runtime
             .block_on(self.engine.begin_write(&self.contract, self.mode))
             .map_err(sink_err)?;
+        if let Ok(per_part) = usize::try_from(self.memory.per_part())
+            && per_part > 0
+        {
+            writing = writing.with_memory(per_part);
+        }
         self.writing = Some(Arc::new(writing));
         Ok(())
     }

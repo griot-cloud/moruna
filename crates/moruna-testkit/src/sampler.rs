@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use moruna_kernel::{Sample, Sampler};
+use moruna_kernel::{ProcessPeak, Sample, Sampler};
 
 struct Inner {
     scripted: Mutex<Vec<Sample>>,
@@ -11,6 +11,8 @@ struct Inner {
     live: bool,
     samples_taken: AtomicU64,
     peak_resets: AtomicU64,
+    /// The highest of every sample handed out, as `process_peak` reports it.
+    peak: Mutex<ProcessPeak>,
 }
 
 /// The sampler as a test sees it: a scripted sequence of samples, or the real process.
@@ -37,6 +39,7 @@ impl FakeSampler {
                 live: false,
                 samples_taken: AtomicU64::new(0),
                 peak_resets: AtomicU64::new(0),
+                peak: Mutex::new(ProcessPeak::default()),
             }),
         }
     }
@@ -61,6 +64,7 @@ impl FakeSampler {
                 live: true,
                 samples_taken: AtomicU64::new(self.samples_taken()),
                 peak_resets: AtomicU64::new(self.peak_resets()),
+                peak: Mutex::new(self.process_peak()),
             }),
         }
     }
@@ -97,9 +101,8 @@ impl FakeSampler {
     }
 }
 
-impl Sampler for FakeSampler {
-    fn sample(&self) -> Sample {
-        self.inner.samples_taken.fetch_add(1, Ordering::SeqCst);
+impl FakeSampler {
+    fn next_sample(&self) -> Sample {
         if self.inner.live {
             return self.live_sample();
         }
@@ -111,8 +114,30 @@ impl Sampler for FakeSampler {
         let index = at.min(scripted.len() - 1);
         scripted[index]
     }
+}
+
+impl Sampler for FakeSampler {
+    fn sample(&self) -> Sample {
+        self.inner.samples_taken.fetch_add(1, Ordering::SeqCst);
+        let sample = self.next_sample();
+        let bytes = sample.anon_bytes.max(sample.peak_anon_bytes);
+        let mut peak = self.inner.peak.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes > peak.bytes {
+            *peak = ProcessPeak {
+                bytes,
+                at_ns: sample.at_ns,
+                exact: false,
+            };
+        }
+        sample
+    }
 
     fn reset_peak(&self) {
         self.inner.peak_resets.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The highest `anon_bytes` or `peak_anon_bytes` of every sample handed out so far.
+    fn process_peak(&self) -> ProcessPeak {
+        *self.inner.peak.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

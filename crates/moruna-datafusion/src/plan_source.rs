@@ -18,7 +18,8 @@
 //!
 //! A plan is repeatable when its partitions come out in the same order every time: file scans,
 //! filters and projections are; an exchange (`RepartitionExec`), a merge of partitions in
-//! arrival order (`CoalescePartitionsExec`) or a volatile function (noise, `random()`) is not.
+//! arrival order (`CoalescePartitionsExec`), an operator whose output order depends on how it
+//! spilled (an aggregation, a sort, a join) or a volatile function (noise, `random()`) is not.
 //! A plan that is not repeatable is read as one partition, merged first, so that its row count
 //! is the whole result's, which does not depend on the order rows arrive in, and so that an
 //! exchange is never left buffering every other partition while one is read.
@@ -50,7 +51,7 @@ use moruna_kernel::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-use crate::memory::PlanMemory;
+use crate::memory::{BudgetPool, PlanMemory};
 
 /// Batches a partition's producer may compute ahead of the reads.
 const AHEAD: usize = 1;
@@ -134,11 +135,19 @@ impl PlanSource {
         let mut state = SessionStateBuilder::new_from_existing(state)
             .with_runtime_env(env)
             .build();
-        // The batches in flight are the other half of the plan's share: every partition that
-        // runs at once holds a few, whatever the pool says, so their size is set from it.
-        state.config_mut().options_mut().execution.batch_size =
-            ConfigNonZeroUsize::try_new(batch_rows(&plan, memory.pool.in_flight()))
-                .map_err(|e| plan_err(e.to_string()))?;
+        // The batches in flight are half the plan's share: every partition that runs at once
+        // holds a few, whatever the pool says, so their size is set from it, and from the pool,
+        // whose operators reserve a batch or two at a time.
+        let estimated = batch_rows(&plan, &memory.pool, None);
+        set_batch_rows(&mut state, estimated)?;
+        // A sort sets aside its merge's memory before it spills (DataFusion's default is 10 MiB,
+        // more than the whole pool of a small budget): a quarter of the pool.
+        state
+            .config_mut()
+            .options_mut()
+            .execution
+            .sort_spill_reservation_bytes =
+            usize::try_from(memory.pool.capacity() / 4).unwrap_or(usize::MAX);
         // A file scan's partitions steal files from one another while they run together, so
         // which rows a partition yields depends on timing, and a partition run alone reads
         // every file. Splits are partitions, counted once and read later, perhaps one at a
@@ -158,6 +167,22 @@ impl PlanSource {
             };
         let schema = unpacked(&plan.schema());
         let partitions = runtime.block_on(count(&plan, &task))?;
+        // The count saw every row the plan emits: a row wider than the estimate makes the reads'
+        // batches smaller.
+        let (bytes, rows) = partitions.iter().fold((0u64, 0u64), |(b, r), split| {
+            (b + split.uncompressed_bytes, r + split.rows)
+        });
+        let measured = batch_rows(
+            &plan,
+            &memory.pool,
+            (rows > 0).then(|| bytes.div_ceil(rows)),
+        );
+        let task = if measured < estimated {
+            set_batch_rows(&mut state, measured)?;
+            Arc::new(TaskContext::from(&state))
+        } else {
+            task
+        };
         let streams = partitions.iter().map(|_| Mutex::new(None)).collect();
         let (splits, places) = divide(&partitions);
         Ok(PlanSource {
@@ -360,9 +385,17 @@ pub(crate) struct Runtime(Option<tokio::runtime::Runtime>);
 
 impl Runtime {
     pub(crate) fn new() -> Result<Runtime> {
-        let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
+        Runtime::with_threads(std::thread::available_parallelism().map_or(2, |n| n.get()))
+    }
+
+    /// A runtime of `threads` workers, at least two and at most eight, and as many threads again
+    /// for blocking file IO. Every thread is a heap the allocator may keep freed memory in, so
+    /// a plan or a write gets the threads its parallelism uses and no more (F8.9).
+    pub(crate) fn with_threads(threads: usize) -> Result<Runtime> {
+        let threads = threads.clamp(2, 8);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(threads)
+            .max_blocking_threads(threads)
             .thread_name("moruna-plan")
             .enable_all()
             .build()
@@ -390,7 +423,7 @@ impl Drop for Runtime {
 /// view over Parquet row groups of 4 MB: the column chunks it fetched, the pages it
 /// decompressed, and the batches in its exchanges (F8.8, about 9.5 MB at 64-row batches and 16
 /// MB at DataFusion's default).
-const PARTITION_BYTES: u64 = 64 << 20;
+const PARTITION_BYTES: u64 = 128 << 20;
 
 /// The partitions a plan is planned for inside `in_flight` bytes of batches (MH 4.5): every
 /// partition of a stage runs at once, so as many as `PARTITION_BYTES` each fit, at least one
@@ -403,22 +436,27 @@ pub(crate) fn partitions_for(in_flight: u64) -> usize {
 /// Batches one running partition may hold at once: the one its scan is decoding, the ones
 /// queued in the exchanges above it, and the one its consumer holds.
 const BATCHES_PER_PARTITION: u64 = 4;
+/// Batches the pool holds at the least: an aggregation or a sort reserves a batch or two at a
+/// time, and a spill merge a batch for every file it reads back, so a batch larger than this
+/// fraction of the pool leaves an operator starved of what it needs to spill (measured at
+/// 256 MiB, F8.9: an aggregation over batches of an eighth of its pool was refused outright).
+const BATCHES_PER_POOL: u64 = 16;
 /// The bytes a row of a variable-width column is assumed to take when the plan's statistics do
-/// not say: a scan over files the statistics cover (Parquet, what a governed plan reads) is
-/// measured instead.
-const VARIABLE_WIDTH_BYTES: u64 = 256;
+/// not say, until the count has measured the rows the plan emits.
+const VARIABLE_WIDTH_BYTES: u64 = 1024;
 /// The fewest rows a batch is cut to, so a very wide row still moves in batches worth the
 /// per-batch cost, and DataFusion's own default, the most.
 const BATCH_ROWS: (u64, u64) = (64, 8192);
 
-/// The session's batch size for `plan` inside `in_flight` bytes (MH 4.5): every partition that
-/// runs at once holds `BATCHES_PER_PARTITION` batches, so a batch is `in_flight` divided by the
-/// most partitions any stage of the plan runs and by that depth, in rows of the widest row the
-/// plan's scans produce. A plan with more partitions, or wider rows, gets smaller batches; its
-/// operators' own state is the pool's, not this.
-fn batch_rows(plan: &Arc<dyn ExecutionPlan>, in_flight: u64) -> usize {
+/// The session's batch size for `plan` inside `pool`'s share (MH 4.5): every partition that
+/// runs at once holds `BATCHES_PER_PARTITION` batches, so a batch is the share's bytes in flight
+/// divided by the most partitions any stage of the plan runs and by that depth, and at most
+/// `1 / BATCHES_PER_POOL` of the pool, in rows of the widest row the plan's scans produce or,
+/// once counted, it emits (`measured`). A plan with more partitions, or wider rows, gets
+/// smaller batches.
+fn batch_rows(plan: &Arc<dyn ExecutionPlan>, pool: &BudgetPool, measured: Option<u64>) -> usize {
     let mut partitions = 1u64;
-    let mut width = 1u64;
+    let mut width = measured.unwrap_or(1).max(1);
     let _ = plan.apply(|node| {
         partitions = partitions.max(node.output_partitioning().partition_count() as u64);
         if node.children().is_empty() {
@@ -426,8 +464,15 @@ fn batch_rows(plan: &Arc<dyn ExecutionPlan>, in_flight: u64) -> usize {
         }
         Ok(TreeNodeRecursion::Continue)
     });
-    let per_batch = in_flight / (partitions * BATCHES_PER_PARTITION);
+    let per_batch = (pool.in_flight() / (partitions * BATCHES_PER_PARTITION))
+        .min(pool.capacity() / BATCHES_PER_POOL);
     (per_batch / width).clamp(BATCH_ROWS.0, BATCH_ROWS.1) as usize
+}
+
+fn set_batch_rows(state: &mut datafusion::execution::SessionState, rows: usize) -> Result<()> {
+    state.config_mut().options_mut().execution.batch_size =
+        ConfigNonZeroUsize::try_new(rows).map_err(|e| plan_err(e.to_string()))?;
+    Ok(())
 }
 
 /// The bytes a row of a leaf's output takes: its statistics' byte size over its rows when both
@@ -554,11 +599,36 @@ fn column_bytes(column: &dyn Array) -> u64 {
         .unwrap_or_else(|_| column.get_array_memory_size()) as u64
 }
 
-/// True when the plan's partitions come out in the same order every run.
+/// Operators that stream their input through in the order it arrives, holding no state across
+/// batches: over a deterministic input, their output is the same rows in the same order every
+/// time they run.
+const STREAMING: &[&str] = &[
+    "DataSourceExec",
+    "FilterExec",
+    "ProjectionExec",
+    "CoalesceBatchesExec",
+    "CooperativeExec",
+    "GlobalLimitExec",
+    "LocalLimitExec",
+    "UnionExec",
+    "EmptyExec",
+    "PlaceholderRowExec",
+    // peQL's gate and its scan (MH 4.5): a filter and a file scan.
+    "GateExec",
+    "ScanExec",
+];
+
+/// True when the plan's partitions come out in the same order every run: every operator
+/// streams (`STREAMING`) and no expression is volatile. An exchange or a merge of partitions
+/// emits in arrival order; an aggregation, a sort, a join or a window holds state whose output
+/// order depends on how it spilled, which depends on the memory it found; a shape decides over
+/// the whole result. Reading a range of such a plan again would run it again, whole, and could
+/// return other rows, so none of them is repeatable: its queued morsels are staged, never
+/// evicted and re-read.
 pub(crate) fn deterministic(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut fixed = true;
     let _ = plan.apply(|node| {
-        if matches!(node.name(), "RepartitionExec" | "CoalescePartitionsExec") {
+        if !STREAMING.contains(&node.name()) {
             fixed = false;
         }
         let _ = node.apply_expressions(&mut |e| {

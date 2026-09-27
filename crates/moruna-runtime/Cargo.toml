@@ -31,7 +31,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-mimalloc = { workspace = true }
 getrandom = { workspace = true }
 
 # The vsock transport of `moruna serve` (MH 4.3) is Linux only: AF_VSOCK has no other home.

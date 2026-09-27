@@ -48,7 +48,6 @@ pyo3 = { version = "=0.29.2" }
 pyo3-arrow = { version = "=0.19.0" }
 thiserror = { version = "=2.0.20" }
 tracing = { version = "=0.1.44" }
-mimalloc = { version = "=0.1.52" }
 blake3 = { version = "=1.8.7" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151" }
@@ -61,7 +60,7 @@ polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 # The contract-native engine on both ends of a run (MH 4.5): a governed plan as a source, a
 # contract write as a sink. `moruna-datafusion`'s `peql` feature; peQL never depends on Moruna.
-peql = { git = "https://github.com/griot-cloud/peQL", rev = "189b58e", version = "=0.4.0" }
+peql = { git = "https://github.com/griot-cloud/peQL", rev = "23450f1", version = "=0.4.0" }
 # Streams of record batches out of a DataFusion plan; already in the graph through datafusion
 # at this version.
 futures = { version = "=0.3.34" }

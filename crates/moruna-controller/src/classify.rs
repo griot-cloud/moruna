@@ -16,6 +16,10 @@ const BUSY_LOW: f64 = 0.7;
 const BUSY_HIGH: f64 = 0.9;
 /// The fraction of the reserve that anonymous memory reaching triggers the memory rows.
 const RESERVE_TRIP: f64 = 0.5;
+/// The fraction of the reserve left under the ceiling at which a run with no kernel stage, whose
+/// process is still growing past everything the memory rows took back, is stopped (see
+/// `outgrown`).
+const RESERVE_STOP: f64 = 0.25;
 /// The fraction of a tick spent throttled that means the CPU quota is the bottleneck.
 const THROTTLE_TRIP: f64 = 0.10;
 /// How much a high water shrinks when a row calls for it.
@@ -63,6 +67,9 @@ pub(crate) fn classify(
         now > before && (before == 0 || (now - before) as f64 / before as f64 > STATE_GROWTH)
     };
 
+    if outgrown(state, inputs, anon, actions) {
+        return Bottleneck::Memory;
+    }
     if anon >= trip && state_grew {
         state_growth(state, actions);
         return Bottleneck::StateGrowth;
@@ -120,6 +127,42 @@ pub(crate) fn classify(
         return Bottleneck::Compute;
     }
     Bottleneck::Idle
+}
+
+/// A run with no kernel stage whose process has come within `RESERVE_STOP` of the reserve of its
+/// ceiling is stopped with a diagnostic, before the operating system's ceiling is reached. Such a
+/// run's memory rows have nothing to halve: its morsels are the source's reads, and what it holds
+/// above its arena and its engines' shares is the ends' own (a sink that keeps what it writes, an
+/// engine that holds more than it reserved). The memory row below has already dropped the
+/// read-ahead to one and staged the queue by the time the process passes the trip line, so a
+/// process still growing to here is one no knob bounds; a run with kernels has the breach path
+/// of f.7 for the same end. A refusal is honest; an overshoot is not (F8.9).
+fn outgrown(
+    state: &mut ControllerState,
+    inputs: &Inputs,
+    anon: u64,
+    actions: &mut Actions,
+) -> bool {
+    let ceiling = state.cfg.limits.memory_ceiling;
+    let stop = ceiling.saturating_sub(model::scale(state.budgets.reserve, RESERVE_STOP));
+    if !state.stages.is_empty() || state.terminated || anon < stop {
+        return false;
+    }
+    let outside = anon.saturating_sub(model::resting_anon(state));
+    state.terminated = true;
+    state.note(format!(
+        "the process held {anon} bytes against a {ceiling} byte ceiling, {outside} of them above \
+         its arena and its engines' shares, which no knob of a run with no kernel gives back; \
+         the run was stopped at {stop} bytes rather than let the operating system stop it"
+    ));
+    actions.terminate = Some(MorunaError::Budget {
+        seq: inputs.stats.seq_issued,
+        stage: 0,
+        footprint: anon,
+        budget: stop,
+        features: moruna_kernel::MorselFeatures::default(),
+    });
+    true
 }
 
 /// Whether the tick spent more than a tenth of itself throttled (f.6).
@@ -200,8 +243,14 @@ fn worst_state(state: &ControllerState) -> Option<(u16, u64, u64)> {
         })
 }
 
-/// The Memory row: halve the largest stage, raise its safety and turn staging on.
+/// The Memory row: halve the largest stage, raise its safety and turn staging on. A run with no
+/// kernel stage has no target to halve: its reads are what it holds, so the read-ahead drops to
+/// one instead.
 pub(crate) fn memory_pressure(state: &mut ControllerState, last_stage: u16, actions: &mut Actions) {
+    if state.stages.is_empty() && state.read_ahead > 1 {
+        state.read_ahead = 1;
+        actions.knobs.push(Knob::ReadAhead(1));
+    }
     let largest = state
         .stages
         .iter()

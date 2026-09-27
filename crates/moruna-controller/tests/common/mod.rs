@@ -487,6 +487,11 @@ impl Sampler for Watcher<FakeSampler> {
         self.check("Sampler::reset_peak");
         self.inner.reset_peak();
     }
+
+    fn process_peak(&self) -> moruna_kernel::ProcessPeak {
+        self.check("Sampler::process_peak");
+        self.inner.process_peak()
+    }
 }
 
 impl TraceTail for Watcher<FakeTrace> {
