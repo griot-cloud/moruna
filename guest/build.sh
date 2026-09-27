@@ -86,7 +86,11 @@ fetch "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" bb.tar.
     "$BUSYBOX_SHA256"
 tar xf bb.tar.bz2 && cd "busybox-${BUSYBOX_VERSION}"
 make -s defconfig
-sed -i "s/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/" .config
+# The SHA hardware paths exist only for x86, but defconfig turns them on everywhere and the
+# aarch64 build then refers to an x86-only function; both architectures build without them.
+sed -i "s/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; \
+    s/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/; \
+    s/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/" .config
 make -s -j"$(nproc)"
 cp busybox $work/busybox
 cd $work
