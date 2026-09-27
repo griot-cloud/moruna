@@ -118,6 +118,9 @@ $PY -m pip install --quiet --no-index --no-deps --no-compile \
 # Bytecode is compiled once here, deterministically, so the read-only root never needs it.
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH $PY -m compileall -q --invalidation-mode unchecked-hash \
     rootfs/opt/python/lib
+# The free-threaded marshal flags references by refcount, which varies run to run; guest/pyc.py
+# keeps only the references a file uses, so the bytecode is the same on every build.
+$PY /guest/pyc.py rootfs/opt/python/lib
 cp busybox rootfs/usr/local/bin/busybox
 cp -r /guest/rootfs/. rootfs/
 chmod 0755 rootfs/sbin/moruna-init rootfs/usr/local/bin/moruna-report
