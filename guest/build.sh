@@ -115,6 +115,18 @@ fetch "https://files.pythonhosted.org/packages/cp314/p/pyarrow/pyarrow-${PYARROW
 PY=rootfs/opt/python/bin/python3
 $PY -m pip install --quiet --no-index --no-deps --no-compile \
     "pyarrow-${PYARROW_VERSION}-cp314-cp314t-manylinux_2_28_${ARCH}.whl" "$WHEEL"
+# pip writes the build interpreter absolute path (/tmp/build/rootfs/...) into every console
+# script it installs; in the guest that path does not exist, so `moruna` would not start.
+# Point each script at the guest interpreter, and refuse any build path left behind.
+for f in rootfs/opt/python/bin/*; do
+    [ -f "$f" ] && head -c 2 "$f" | grep -q "#!" || continue
+    sed -i "1s|^#!.*/rootfs/opt/python/bin/python3.*$|#!/opt/python/bin/python3|" "$f"
+done
+if grep -rIl "$work/rootfs" rootfs/opt/python/bin >/dev/null 2>&1; then
+    echo "guest: a build path survives in rootfs/opt/python/bin:" >&2
+    grep -rIl "$work/rootfs" rootfs/opt/python/bin >&2
+    exit 1
+fi
 # Bytecode is compiled once here, deterministically, so the read-only root never needs it.
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH $PY -m compileall -q --invalidation-mode unchecked-hash \
     rootfs/opt/python/lib
