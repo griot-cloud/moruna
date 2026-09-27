@@ -437,7 +437,6 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `maturin` (build) | 12 | wheels | CPython 3.14, free-threaded and standard (6.6) |
 | `thiserror` | all | error types | |
 | `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a) |
-| `mimalloc` | runtime, 4 (dev only) | global allocator for non-arena allocations | returns freed memory promptly. Component 4 takes it as a dev-dependency for TR-T4, whose claim is about the runtime's process, which sets `mimalloc` globally (12 l); under the system allocator the same run plateaus 22 to 25 MiB above baseline through allocator retention alone, which is bounded but above TR-T4's limit, so testing under the system allocator would measure the allocator rather than the trace writer (E2, PM, 2026-09-22) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
 | `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
 | `serde_json` | 4, 7, 8, 9, 11, 12 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config` | the only text format in the runtime |
@@ -466,7 +465,7 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 |---|---|---|---|
 | `arrow` | 59.3.0 | `thiserror` | 2.0.20 |
 | `parquet` | 59.3.0 | `tracing` | 0.1.44 |
-| `object_store` | 0.13.2 | `mimalloc` | 0.1.52 |
+| `object_store` | 0.13.2 | | |
 | `dlpark` | 0.8.0 | `blake3` | 1.8.7 |
 | `safetensors` | 0.8.0 | `serde` | 1.0.229 |
 | `tokio` | 1.53.1 | `serde_json` | 1.0.151 |

@@ -209,7 +209,7 @@ Per-class mutex (one per class per tier), one bump lock per region, atomics for 
 
 Files: `src/lib.rs`, `src/region.rs` (f.1, f.2, f.7, mmap and cuda), `src/classes.rs` (e.2, f.3, f.4), `src/large.rs` (large table and coalescing), `src/handle.rs` (`ArenaHandle` impl), `src/stats.rs`, `src/rdma.rs` (feature). `unsafe` permitted in `region.rs` (syscalls, cuda) and `classes.rs`/`large.rs` (pointer arithmetic), each with `// SAFETY:` citing AR-I1 or AR-I2.
 
-Use `libc` for `mmap`, `madvise`, `mlock`; do not use `memmap2` here (no crate maps files; sources read into the arena through the reactor). Do not use `alloc::alloc` for arena memory. The global allocator for the process is `mimalloc`, set in `moruna-runtime`, not here.
+Use `libc` for `mmap`, `madvise`, `mlock`; do not use `memmap2` here (no crate maps files; sources read into the arena through the reactor). Do not use `alloc::alloc` for arena memory. The process uses the platform allocator; its glibc tuning is set in `moruna-runtime`, not here (F8.9).
 
 Anti-patterns: no per-allocation syscalls; no `Vec<u8>` behind `Buffer`; no growth of the region after `new`; no silent fallback under a `Present` guarantee.
 

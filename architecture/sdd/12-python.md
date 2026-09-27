@@ -269,7 +269,7 @@ Python tests run under the four interpreter builds in CI; Rust facade tests use 
 
 Rust files: `crates/moruna-runtime/src/{lib.rs, spec.rs (RunSpec, Components), run.rs (f.1, f.7), report.rs (f.2), cancel.rs}` (wave 4, so RC-T12 can drive real components through it); `crates/moruna-py/src/{lib.rs (module, gil_used = false), sources.rs, sinks.rs, kernel.rs (decorator support: a frozen `#[pyclass] KernelSpec` holding the `PyKernel`), run.rs (f.3, f.4, f.5), report.rs, errors.rs (e.2), inspect.rs}` and the Python files per e.3 (wave 5). Every `#[pyclass]` is `frozen`; state that must change lives in Rust behind a `Mutex` or is returned as a new object. `_core.pyi` is written by hand and kept in step by PY-T5. `unsafe` not permitted outside what PyO3 generates.
 
-Set the global allocator to `mimalloc` in `moruna-runtime` (`#[global_allocator]`), which also covers the Python module since it links the runtime.
+Use the platform allocator. On glibc, `moruna-runtime` sets `M_MMAP_THRESHOLD` to 256 KiB and `M_ARENA_MAX` to 4 at start, which also covers the Python module since it links the runtime (F8.9: measured; mimalloc retained freed memory above the ceiling).
 
 `pyproject.toml`: `[build-system] requires = ["maturin>=1.7"]`, `[tool.maturin] features = ["python"]`, `python-source = "python"`, `module-name = "moruna._core"`; CI matrix over `cp313`, `cp313t`, `cp314`, `cp314t` × `manylinux_2_28_x86_64`, `manylinux_2_28_aarch64`, `macosx_11_0_arm64` (twelve wheels); features `uring` on Linux, `cuda` and `gds` off in published wheels (a separate `moruna-cuda` wheel is a later decision; record in o).
 
