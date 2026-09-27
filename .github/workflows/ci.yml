@@ -286,9 +286,27 @@ jobs:
           guest/build.sh wheel/moruna-*.whl build-b
           if [ "$(cat build-a/digest)" != "$(cat build-b/digest)" ]; then
             echo "the guest image does not reproduce: $(cat build-a/digest) vs $(cat build-b/digest)" >&2
+            # Which layer, and what in the root differs. mtimes are left out: mkfs.erofs -T
+            # clamps them, so they never reach the image.
+            find build-a build-b -maxdepth 1 -type f -exec sha256sum {} + | sort -k2 >&2
+            sudo diff -rq --no-dereference build-a/rootfs build-b/rootfs >&2 || true
+            list() { (cd "$1" && sudo find . -printf '%p %M %U:%G %s %n %l\n' | LC_ALL=C sort); }
+            diff <(list build-a/rootfs) <(list build-b/rootfs) >&2 || true
             exit 1
           fi
           echo "GUEST_DIGEST=$(cat build-a/digest)" >> "$GITHUB_ENV"
+      - name: Keep both guest builds when they differ, to diff offline
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guest-builds-${{ matrix.arch }}
+          path: |
+            build-*/Image
+            build-*/vmlinux
+            build-*/initramfs.cpio.gz
+            build-*/rootfs.erofs
+          if-no-files-found: ignore
+          retention-days: 3
       - name: Publish the guest image by digest
         env:
           GH_TOKEN: ${{ github.token }}
