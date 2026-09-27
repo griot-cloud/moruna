@@ -86,7 +86,8 @@ fetch "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" bb.tar.
     "$BUSYBOX_SHA256"
 tar xf bb.tar.bz2 && cd "busybox-${BUSYBOX_VERSION}"
 make -s defconfig
-sed -i "s/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/" .config
+# The SHA hardware paths are x86-only in 1.37 and do not build for aarch64; one config for both.
+sed -i "s/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/; s/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/" .config
 make -s -j"$(nproc)"
 cp busybox $work/busybox
 cd $work
