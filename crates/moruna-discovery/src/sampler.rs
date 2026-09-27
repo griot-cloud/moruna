@@ -48,11 +48,10 @@ struct Inner {
     /// The whole process's high-water mark since the sampler was created, which `reset_peak`
     /// leaves alone: what the run report's peak is (`Sampler::process_peak`).
     process_peak: ProcessPeak,
-    /// The platform's lifetime high-water mark when the sampler was created and when the peak
-    /// was last reset, where the platform keeps one (macOS). A rise above either is the
-    /// process's exact peak since then, however short the burst that made it.
+    /// The platform's lifetime high-water mark when the sampler was created, where the platform
+    /// keeps one (macOS). A rise above it is the process's exact peak since then, however short
+    /// the burst that made it.
     lifetime_at_create: Option<u64>,
-    lifetime_at_reset: Option<u64>,
 }
 
 /// Live resource sampling over the cgroup files (d.1).
@@ -115,7 +114,6 @@ impl Sampler {
                 peak_reset_refused: false,
                 process_peak: ProcessPeak::default(),
                 lifetime_at_create: None,
-                lifetime_at_reset: None,
             }),
             read_errors: AtomicU64::new(0),
             last_at_ns: AtomicU64::new(0),
@@ -124,9 +122,7 @@ impl Sampler {
         };
         {
             let mut inner = sampler.held();
-            let lifetime = inner.lifetime_peak();
-            inner.lifetime_at_create = lifetime;
-            inner.lifetime_at_reset = lifetime;
+            inner.lifetime_at_create = inner.lifetime_peak();
         }
         // Prime the running peak and the last sample, so a read error on the very first call
         // still returns a coherent value.
@@ -194,7 +190,6 @@ impl SamplerTrait for Sampler {
             last,
             process_peak,
             lifetime_at_create,
-            lifetime_at_reset,
             ..
         } = &mut *inner;
 
@@ -243,16 +238,15 @@ impl SamplerTrait for Sampler {
         };
 
         *running_peak = (*running_peak).max(memory.anon);
-        // A lifetime mark that has risen since the last reset is the peak since then, to the
-        // byte; one that has not says the peak since then is below it, which the samples bound.
-        let risen = |mark: &Option<u64>| match (lifetime, *mark) {
+        // A lifetime mark that has risen since the sampler was created is the process's peak
+        // since then, to the byte; one that has not says the peak is below it, which the samples
+        // bound. It is the run's peak and never a record's: the mark only rises, so between two
+        // resets it would charge every `apply` with the highest moment of the whole interval.
+        let risen = match (lifetime, *lifetime_at_create) {
             (Some(now), Some(then)) if now > then => Some(now),
             _ => None,
         };
-        let since_reset = kernel_peak
-            .unwrap_or(*running_peak)
-            .max(risen(lifetime_at_reset).unwrap_or(0));
-        match risen(lifetime_at_create) {
+        match risen {
             Some(exact) if exact > process_peak.bytes || !process_peak.exact => {
                 *process_peak = ProcessPeak {
                     bytes: exact.max(process_peak.bytes),
@@ -272,7 +266,7 @@ impl SamplerTrait for Sampler {
         let sample = Sample {
             anon_bytes: memory.anon,
             file_bytes: memory.file,
-            peak_anon_bytes: since_reset,
+            peak_anon_bytes: kernel_peak.unwrap_or(*running_peak),
             throttled_us,
             device_used,
             at_ns,
@@ -291,7 +285,6 @@ impl SamplerTrait for Sampler {
         let mut inner = self.held();
         let current = inner.last.anon_bytes;
         inner.running_peak = current;
-        inner.lifetime_at_reset = inner.lifetime_peak();
         let refused = match &inner.source {
             Source::V2 {
                 peak, peak_path, ..
