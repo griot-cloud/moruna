@@ -123,10 +123,16 @@ cp -r /guest/rootfs/. rootfs/
 chmod 0755 rootfs/sbin/moruna-init rootfs/usr/local/bin/moruna-report
 mkdir -p rootfs/disk
 rm -rf rootfs/var/cache/apt/* rootfs/var/lib/apt/lists/* rootfs/var/log/* rootfs/tmp/*
+# mmdebstrap copies the build container /etc/hostname (the container id, new every run) and
+# /etc/resolv.conf (the runner resolver) into the root. The guest talks vsock only.
+echo moruna > rootfs/etc/hostname
+: > rootfs/etc/resolv.conf
 # The tree itself stays beside the image: the release takes the SBOM from it.
 rm -rf /out/rootfs && cp -a rootfs /out/rootfs
+# -x -1: no xattrs. The only ones in the tree are the build host LSM labels (SELinux MCS
+# categories differ per container), so they would make the image depend on the builder.
 mkfs.erofs --quiet -T "$SOURCE_DATE_EPOCH" --all-root -U 00000000-0000-0000-0000-000000000000 \
-    -zlz4hc /out/rootfs.erofs rootfs
+    -x -1 -zlz4hc /out/rootfs.erofs rootfs
 
 cd /out && python3 /guest/oci.py oci '"$oci_arch"' $(basename "$KIMAGE") \
     initramfs.cpio.gz rootfs.erofs > digest
