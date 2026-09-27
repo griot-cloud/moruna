@@ -12,8 +12,11 @@ use super::SpecError;
 use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 use moruna_kernel::Result;
 
-/// A source's builder, the data locations it reads, and the memory its plan's operators hold.
+/// A source's builder, the data locations it reads, and the memory its plan holds.
 pub(super) type Read = (SourceSpec, Vec<String>, Option<Arc<dyn EngineMemory>>);
+
+/// A sink's builder, the data location it writes, and the memory its writes hold.
+pub(super) type Write = (SinkSpec, String, Option<Arc<dyn EngineMemory>>);
 
 /// The engines a run opens, by root. Opened at the lifecycle's "sources and sinks built" step.
 #[derive(Clone, Default)]
@@ -75,14 +78,14 @@ pub(super) fn source(
     imp::source(root, contract, sql, caller, engines)
 }
 
-/// The sink's builder and where the contract it writes keeps its files.
+/// The sink's builder, where the contract it writes keeps its files, and its writes' memory.
 pub(super) fn sink(
     root: &str,
     contract: &str,
     caller: &serde_json::Map<String, serde_json::Value>,
     mode: &Option<String>,
     engines: &Engines,
-) -> Result<(SinkSpec, String)> {
+) -> Result<Write> {
     if contract.is_empty() {
         return Err(SpecError::new("sink.contract", "empty: a write is under a contract").into());
     }
@@ -97,16 +100,20 @@ mod imp {
     use std::sync::Arc;
 
     use moruna_datafusion::engine::{Caller, Engine, Location, WriteMode};
-    use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource};
+    use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory};
     use moruna_kernel::{MorunaError, Result, Sink, Source};
 
-    use super::{Engines, Read, SpecError};
+    use super::{Engines, Read, SpecError, Write};
     use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 
     /// The facade sizes a plan's pool; this is how it reaches it.
     impl EngineMemory for BudgetPool {
         fn set_limit(&self, bytes: u64) {
             BudgetPool::set_limit(self, bytes);
+        }
+
+        fn morsel_max(&self) -> Option<u64> {
+            None
         }
 
         fn note(&self) -> String {
@@ -196,13 +203,33 @@ mod imp {
         ))
     }
 
+    /// The facade sizes a write's memory; this is how it reaches it.
+    impl EngineMemory for WriteMemory {
+        fn set_limit(&self, bytes: u64) {
+            WriteMemory::set_limit(self, bytes);
+        }
+
+        /// A part is one morsel, written inside its piece of the share.
+        fn morsel_max(&self) -> Option<u64> {
+            Some(self.per_part())
+        }
+
+        fn note(&self) -> String {
+            format!(
+                "the sink's writes held their parts to {} bytes each, {} in flight",
+                self.per_part(),
+                crate::config::SINK_CONCURRENCY
+            )
+        }
+    }
+
     pub(super) fn sink(
         root: PathBuf,
         contract: &str,
         caller: &serde_json::Map<String, serde_json::Value>,
         overwrite: bool,
         engines: &Engines,
-    ) -> Result<(SinkSpec, String)> {
+    ) -> Result<Write> {
         let caller = caller_of("sink.caller", caller)?;
         let mode = if overwrite {
             WriteMode::Overwrite
@@ -217,11 +244,18 @@ mod imp {
             )
         })?;
         let contract = contract.to_string();
+        // Sized by the facade before the sink is built (MH 4.5).
+        let memory = Arc::new(WriteMemory::new(crate::config::SINK_CONCURRENCY));
+        let held = Arc::clone(&memory);
         Ok((
             SinkSpec::Build(Box::new(move |_ctx| {
-                Ok(Box::new(PeqlSink::new(engine, &contract, &caller, mode)?) as Box<dyn Sink>)
+                Ok(
+                    Box::new(PeqlSink::new(engine, &contract, &caller, mode, held)?)
+                        as Box<dyn Sink>,
+                )
             })),
             written,
+            Some(memory as Arc<dyn EngineMemory>),
         ))
     }
 }
@@ -229,7 +263,6 @@ mod imp {
 #[cfg(not(feature = "peql"))]
 mod imp {
     use super::{Engines, Read, SpecError};
-    use crate::spec::SinkSpec;
     use moruna_kernel::Result;
 
     const ABSENT: &str = "this build of moruna has no peQL bridge (feature `peql`)";
@@ -250,7 +283,7 @@ mod imp {
         _caller: &serde_json::Map<String, serde_json::Value>,
         _overwrite: bool,
         _engines: &Engines,
-    ) -> Result<(SinkSpec, String)> {
+    ) -> Result<super::Write> {
         Err(SpecError::new("sink.kind", ABSENT).into())
     }
 }

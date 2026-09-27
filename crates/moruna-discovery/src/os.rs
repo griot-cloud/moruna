@@ -1,4 +1,4 @@
-//! The operating system fallback: `/proc/meminfo`, `/proc/self/statm`, `sysconf` (e.3, f.2).
+//! The operating system fallback: `/proc/meminfo`, `/proc/self/status`, `sysconf` (e.3, f.2).
 //!
 //! Both readers take the `/proc` root as a parameter, so the Linux path is exercised against a
 //! fixture directory on any host. Where `/proc` does not exist (macOS, which is where the team
@@ -42,33 +42,34 @@ pub(crate) fn parse_meminfo_field(text: &str, key: &str) -> Option<u64> {
 }
 
 /// The process's anonymous and file backed resident bytes outside a cgroup (f.2): from
-/// `/proc/self/statm` where there is a `/proc`, from the platform otherwise. `None` when neither
+/// `/proc/self/status` where there is a `/proc`, from the platform otherwise. `None` when neither
 /// answers, which leaves the sampler repeating its last sample.
 ///
-/// Both halves are the DS-I4 quantity on both paths: `resident - shared` from `statm`, and
-/// `phys_footprint` from mach, never plain resident size (see `probes::platform_anon_and_file`).
-pub(crate) fn process_memory(proc_root: &Path, page: usize) -> Option<(u64, u64)> {
-    if let Ok(text) = std::fs::read_to_string(proc_root.join("self/statm"))
-        && let Some(pair) = parse_statm(&text, page)
+/// Both halves are the DS-I4 quantity on both paths: `RssAnon` from `status` (the kernel's own
+/// count of the process's resident anonymous pages, every thread's heap and every arena region
+/// included), and `phys_footprint` from mach, never plain resident size (see
+/// `probes::platform_anon_and_file`).
+pub(crate) fn process_memory(proc_root: &Path, _page: usize) -> Option<(u64, u64)> {
+    if let Ok(text) = std::fs::read_to_string(proc_root.join("self/status"))
+        && let Some(pair) = parse_status(&text)
     {
         return Some(pair);
     }
     probes::platform_anon_and_file()
 }
 
-/// `/proc/self/statm` is `size resident shared text lib data dt` in pages; anonymous memory is
-/// `resident - shared` (f.2) and the file backed part is `shared`.
-pub(crate) fn parse_statm(text: &str, page: usize) -> Option<(u64, u64)> {
-    let mut fields = text.split_ascii_whitespace();
-    let _size = fields.next()?;
-    let resident: u64 = fields.next()?.parse().ok()?;
-    let shared: u64 = fields.next()?.parse().ok()?;
-    let page = page as u64;
-    Some((
-        resident.saturating_sub(shared).saturating_mul(page),
-        shared.saturating_mul(page),
-    ))
+/// `/proc/self/status`: anonymous memory is `RssAnon`, and the file backed part is `RssFile`
+/// plus `RssShmem`, all in kB.
+pub(crate) fn parse_status(text: &str) -> Option<(u64, u64)> {
+    let anon = parse_meminfo_field(text, "RssAnon")?;
+    let file = parse_meminfo_field(text, "RssFile").unwrap_or(0)
+        + parse_meminfo_field(text, "RssShmem").unwrap_or(0);
+    Some((anon.saturating_mul(1024), file.saturating_mul(1024)))
 }
+
+#[cfg(test)]
+pub(crate) const STATUS: &str = "Name:\tmoruna\nVmHWM:\t 4000 kB\nVmRSS:\t 2000 kB\n\
+RssAnon:\t 1600 kB\nRssFile:\t 300 kB\nRssShmem:\t 100 kB\nThreads:\t4\n";
 
 #[cfg(test)]
 mod tests {
@@ -114,28 +115,31 @@ mod tests {
         }
     }
 
-    /// f.2: `statm` gives anonymous and file backed bytes; the platform answers where it does not.
+    /// f.2: `status` gives anonymous and file backed bytes; the platform answers where it does
+    /// not.
     #[test]
     fn reads_process_memory() {
-        let tmp = TempDir::new("statm");
+        let tmp = TempDir::new("status");
         let proc_dir = tmp.path().join("proc");
-        write(&proc_dir, "self/statm", "1000 500 100 20 0 300 0\n");
+        write(&proc_dir, "self/status", STATUS);
         assert_eq!(
             process_memory(&proc_dir, 4096),
-            Some((400 * 4096, 100 * 4096))
+            Some((1600 * 1024, (300 + 100) * 1024))
         );
+        assert_eq!(parse_status(STATUS), Some((1_638_400, 409_600)));
         assert_eq!(
-            parse_statm("1000 500 100 20 0 300 0", 4096),
-            Some((1_638_400, 409_600))
+            parse_status("RssAnon: 8 kB\n"),
+            Some((8192, 0)),
+            "no file backed lines is none of them"
         );
-        assert_eq!(parse_statm("1000", 4096), None);
-        assert_eq!(parse_statm("1000 many 100", 4096), None);
-        assert_eq!(parse_statm("", 4096), None);
+        assert_eq!(parse_status("VmRSS: 8 kB\n"), None);
+        assert_eq!(parse_status("RssAnon: many kB\n"), None);
+        assert_eq!(parse_status(""), None);
 
         // The real host answers on every supported target.
         assert!(process_memory(Path::new("/proc"), page_bytes()).is_some_and(|(anon, _)| anon > 0));
 
-        // Pointed at a root with no `self/statm`, only a platform with its own interface
+        // Pointed at a root with no `self/status`, only a platform with its own interface
         // answers. The figure itself moves between calls, so only its presence is asserted.
         let absent = tmp.path().join("absent");
         let fallback = process_memory(&absent, 4096);

@@ -138,6 +138,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         bottleneck_timeline: vec![(0.0, "Compute".to_string()), (4.0, "IoRead".to_string())],
         controller_notes: vec!["small dataset: no adaptation".to_string()],
         drains: Vec::new(),
+        process_peak: moruna_kernel::ProcessPeak::default(),
     }
 }
 

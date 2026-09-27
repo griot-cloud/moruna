@@ -3,12 +3,6 @@
 
 mod common;
 
-/// The bound TR-I4 claims holds in the runtime's process, which sets `mimalloc` as its
-/// global allocator (12 l); this test binary sets the same one so the resident set it reads
-/// is the resident set the runtime would have.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::sync::Arc;
 
 use common::{TempDir, config, lean_record, resident_bytes};

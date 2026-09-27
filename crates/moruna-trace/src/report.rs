@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use moruna_kernel::{GilState, IoPaths, Limits, Outcome, RunId, Seq, StageId, TraceRecord};
+use moruna_kernel::{
+    GilState, IoPaths, Limits, Outcome, ProcessPeak, RunId, Seq, StageId, TraceRecord,
+};
 use serde::{Serialize, Serializer};
 
 use crate::TraceView;
@@ -55,6 +57,10 @@ pub struct RunMeta {
     pub controller_notes: Vec<String>,
     /// Every shrink the facade's watcher started, and how long its drain took.
     pub drains: Vec<DrainSummary>,
+    /// The whole process's high-water mark over the run, as the operating system counts it
+    /// (`Sampler::process_peak`): what the report's peak is, for every shape of run, a chain
+    /// with no kernel included.
+    pub process_peak: ProcessPeak,
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -186,7 +192,9 @@ pub struct RunReport {
     /// The direct paths taken (G-I7).
     #[serde(serialize_with = "io_paths_json")]
     pub io_paths: IoPaths,
-    /// The largest `mem_anon_peak` any record saw.
+    /// The most anonymous memory the whole process held during the run, as the operating
+    /// system counts it: the sampler's process peak, or a record's `mem_anon_peak` when one is
+    /// higher.
     pub peak_anon_bytes: u64,
     /// That over the memory ceiling in force when the peak was reached (S1): the initial
     /// ceiling, or the one the last limits change before the peak set.
@@ -440,6 +448,12 @@ impl RunReport {
         } else {
             0.0
         };
+        // The process's own high-water mark is the peak; a record that saw more (a kernel peak
+        // inside one `apply`) raises it.
+        if meta.process_peak.bytes > peak_anon {
+            peak_anon = meta.process_peak.bytes;
+            peak_at = meta.process_peak.at_ns;
+        }
         // The ceiling in force at the peak, which is the initial one unless the machine
         // changed before it.
         let mut changes = trace.limits_changes();
@@ -464,6 +478,13 @@ impl RunReport {
             })
             .collect();
         let mut notes = meta.notes.clone();
+        if meta.process_peak.bytes > 0 {
+            notes.push(if meta.process_peak.exact {
+                "the peak is the operating system's own high-water mark of the process".into()
+            } else {
+                "the peak is the highest of the samples the run took of the process".into()
+            });
+        }
         notes.extend(meta.controller_notes.iter().cloned());
 
         RunReport {

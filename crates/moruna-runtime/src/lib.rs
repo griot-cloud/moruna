@@ -14,12 +14,20 @@
 //! first, `Placement::restore` runs before the scheduler is built, `apply_resume_point`
 //! replaces `init_instances`, `probe_missing` replaces `probe_all` and `run_resumed`
 //! replaces `run`.
+//!
+//! The process allocates outside the arena through the platform's own allocator, told to give
+//! freed memory back (`allocator`). mimalloc was set here until 2026-09-27 (12 l), and it held
+//! freed memory the process no longer used: at a 256 MiB budget, a contract write peaked at 1.8
+//! times the ceiling on Linux and 2 times on macOS under mimalloc 3 (1.5 to 4.7 times under
+//! mimalloc 2), against 1.1 to 1.2 times under the platform's, the same runs measured by the
+//! operating system (F8.9).
 
 #![deny(missing_docs)]
 // `MorunaError` is the contracts crate's error and is 128 bytes wide; every crate in the
 // workspace carries the same allow rather than boxing at every boundary.
 #![allow(clippy::result_large_err)]
 
+mod allocator;
 pub mod cancel;
 pub mod check;
 pub mod checkpoint;
@@ -46,8 +54,3 @@ pub use moruna_discovery::{
 };
 pub use moruna_kernel::{CancelToken, ErrorPolicy, RunId, SizerKind};
 pub use moruna_trace::{ExitReason, RunReport};
-
-/// The process allocator for everything outside the arena (12 l). It is set here rather than
-/// in `moruna-py` because the Python module links this crate, so one setting covers both.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

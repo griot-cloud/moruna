@@ -1,18 +1,18 @@
 //! H6 (MH 3, E8.5): a governed plan is a source, a governed write is a sink. Job documents with
 //! `"kind": "datafusion"` sources and `"kind": "peql"` sinks, run for real over a peQL engine
-//! opened on a disk, with data larger than the run's memory budget.
+//! opened on a disk, with data larger than the run's memory budget, at 256 MiB and at 1 GiB.
 //!
 //! A run's budget counts what its process already holds (12 f.1), so each run here is its own
-//! process, as it is in a guest: the test binary runs itself, one run per child, and the parent
-//! only writes the input and checks what the runs left on the disk.
+//! process, as it is in a guest (`support::apart`): the parent writes the input, checks what the
+//! runs left on the disk, and checks that each whole process stayed under its ceiling, by the
+//! run's report and by the operating system (F8.9).
 
 #![allow(clippy::result_large_err)]
 
 mod support;
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use moruna_datafusion::engine::{Caller, Engine};
@@ -21,10 +21,9 @@ use moruna_kernel::arrow::array::{AsArray, Int64Array, RecordBatch, StringArray}
 use moruna_kernel::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use moruna_runtime::Runtime;
 use moruna_runtime::job::{BuildOptions, JobSpec, NoKernels, build};
+use support::apart::{self, BUDGETS};
 use support::{Scratch, one_run_at_a_time};
 
-/// The run's memory ceiling: the smallest the range allows.
-const BUDGET: u64 = 256 << 20;
 /// Rows of a kilobyte of incompressible text each: over the budget as Parquet and decoded.
 const ROWS: i64 = 400_000;
 const NOTE_BYTES: usize = 1000;
@@ -166,44 +165,26 @@ fn caller(id: &str, tenant: &str) -> serde_json::Value {
     serde_json::json!({"id": id, "tenant": tenant, "purpose": "analytics"})
 }
 
-/// Where a child finds its job and leaves its outcome: named by the parent's process id.
-fn exchange(parent: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("moruna-h6-exchange-{parent}"))
-}
-
-/// Run `source` into `sink` in a process of its own, at the budget. The report, or the error.
+/// Run `source` into `sink` in a process of its own, at `budget`. The report, or the error.
 fn run_apart(
     scratch: &Path,
     source: serde_json::Value,
     sink: serde_json::Value,
+    budget: u64,
 ) -> serde_json::Value {
     let staging = scratch.join("staging");
     std::fs::create_dir_all(&staging).expect("staging");
-    let job = serde_json::json!({
-        "moruna_spec": 1,
-        "source": source,
-        "sink": sink,
-        "budget": {"memory_bytes": BUDGET, "cpu": 2.0},
-        "staging": {"dir": staging, "limit_bytes": 1u64 << 30},
-        "profiles_dir": scratch.join("profiles"),
-    });
-    let dir = exchange(std::process::id());
-    std::fs::create_dir_all(&dir).expect("the exchange");
-    std::fs::write(dir.join("job.json"), job.to_string()).expect("the job");
-    let _ = std::fs::remove_file(dir.join("outcome.json"));
-    let status = std::process::Command::new(std::env::current_exe().expect("this binary"))
-        .args([
-            "--exact",
-            "child_run",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .status()
-        .expect("the child ran");
-    assert!(status.success(), "the child failed: {status}");
-    let outcome = std::fs::read_to_string(dir.join("outcome.json")).expect("an outcome");
-    serde_json::from_str(&outcome).expect("JSON")
+    apart::run(
+        "child_run",
+        &serde_json::json!({
+            "moruna_spec": 1,
+            "source": source,
+            "sink": sink,
+            "budget": {"memory_bytes": budget, "cpu": 2.0},
+            "staging": {"dir": staging, "limit_bytes": 1u64 << 30},
+            "profiles_dir": scratch.join("profiles"),
+        }),
+    )
 }
 
 /// The child: one run, from the job its parent left, its outcome written back. Run by the
@@ -211,11 +192,10 @@ fn run_apart(
 #[test]
 #[ignore = "run by h6 in a process of its own"]
 fn child_run() {
-    let dir = exchange(std::os::unix::process::parent_id());
-    let Ok(text) = std::fs::read_to_string(dir.join("job.json")) else {
+    let Some(job) = apart::job() else {
         return;
     };
-    let job = JobSpec::from_json(&text).expect("the document parses");
+    let job = JobSpec::from_value(job).expect("the document parses");
     let env = |_: &str| None;
     let outcome = match build(
         &job,
@@ -228,51 +208,11 @@ fn child_run() {
     ) {
         Err(e) => serde_json::json!({"error": e.to_string()}),
         Ok(built) => match Runtime::run(built.spec, CancelToken::new()) {
-            Ok(report) => serde_json::json!({"report": report, "peak_anon": peak_anon()}),
+            Ok(report) => serde_json::json!({"report": report}),
             Err(e) => serde_json::json!({"error": e.to_string()}),
         },
     };
-    let mut file = std::fs::File::create(dir.join("outcome.json")).expect("the outcome");
-    file.write_all(outcome.to_string().as_bytes())
-        .expect("written");
-}
-
-/// The most anonymous memory this process has held, by the kernel's own ledger where the
-/// platform keeps one, so no sampling interval can miss a peak: on macOS the lifetime maximum
-/// of `phys_footprint`, the quantity the run's budget counts there (03 DS-I4). Linux keeps no
-/// such peak outside a cgroup, and there the report's own samples are the evidence.
-fn peak_anon() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `proc_pid_rusage` fills one `rusage_info_v4` it is given for this process
-        // and keeps no pointer; an all-zero value of that plain C struct is valid.
-        unsafe {
-            let mut info: libc::rusage_info_v4 = std::mem::zeroed();
-            let got = libc::proc_pid_rusage(
-                std::process::id() as i32,
-                libc::RUSAGE_INFO_V4,
-                (&mut info as *mut libc::rusage_info_v4).cast(),
-            );
-            (got == 0).then_some(info.ri_lifetime_max_phys_footprint)
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-fn completed(outcome: &serde_json::Value, what: &str) {
-    let report = outcome
-        .get("report")
-        .unwrap_or_else(|| panic!("{what}: {}", outcome["error"]));
-    assert_eq!(
-        report["exit"],
-        serde_json::json!("Completed"),
-        "{what}: {report}"
-    );
-    let peak = report["peak_fraction_of_ceiling"].as_f64().expect("a peak");
-    assert!(peak <= 1.0, "{what}: peak {peak} of the ceiling");
+    apart::answer(outcome);
 }
 
 /// `id -> meter` for every row, each note checked whole.
@@ -314,7 +254,8 @@ fn bytes_under(dir: &Path) -> u64 {
 /// H6. A write larger than the budget (a Parquet file into a contract) lands with a valid
 /// manifest; the guest's gated, shaped view of it, larger than the budget, streams through a
 /// run inside the budget and lands exactly as `Engine::query` answers it; the owner copies the
-/// contract into another with SQL; a guest's write is refused before anything is read.
+/// contract into another with SQL; a guest's write is refused before anything is read. Every
+/// run, at 256 MiB and at 1 GiB, keeps its whole process under its ceiling.
 #[test]
 fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
     let _serial = one_run_at_a_time();
@@ -324,101 +265,108 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
     let file = scratch.path().join("in.parquet");
     input(&file);
     assert!(
-        std::fs::metadata(&file).expect("the file").len() > BUDGET,
-        "the input file is larger than the budget"
+        std::fs::metadata(&file).expect("the file").len() > BUDGETS[0],
+        "the input file is larger than the smaller budget"
     );
-
-    // The write: a file larger than the budget, under the contract, by its owner.
-    let wrote = run_apart(
-        scratch.path(),
-        serde_json::json!({"kind": "parquet", "url": file}),
-        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/big",
-                           "caller": caller("ana", "demo"), "mode": "overwrite"}),
-    );
-    completed(&wrote, "the write");
-    let engine = Engine::open(&root).expect("the engine");
-    let manifest = engine.manifest("demo/big").expect("read").expect("written");
-    assert!(manifest.valid, "{:?}", manifest.breached);
-    assert_eq!(manifest.row_count, ROWS);
-    assert!(
-        bytes_under(&root.join("big")) > BUDGET,
-        "the contract's files outweigh the budget"
-    );
-
-    // The guest's view, kept under the guest's own contract.
-    let viewed = run_apart(
-        scratch.path(),
-        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
-                           "caller": caller("gus", "partner")}),
-        serde_json::json!({"kind": "peql", "root": root, "contract": "partner/kept",
-                           "caller": caller("gus", "partner"), "mode": "overwrite"}),
-    );
-    completed(&viewed, "the view");
-    let engine = Engine::open(&root).expect("the engine again");
-    let kept = engine
-        .manifest("partner/kept")
-        .expect("read")
-        .expect("written");
-    assert!(kept.valid, "only eastern rows arrived: {:?}", kept.breached);
-    let guest = Caller::new("gus", "partner", "analytics");
     let rt = rt();
-    let moved = rows(
-        &rt.block_on(engine.query(r#"SELECT * FROM "partner/kept""#, &guest))
-            .expect("the kept rows")
-            .batches,
-    );
-    assert_eq!(moved.len() as i64, ROWS / 2, "the eastern half");
-    assert!(
-        moved.values().all(|meter| meter.len() == 64),
-        "meters hashed"
-    );
-    let answer = rt
-        .block_on(engine.query(r#"SELECT * FROM "demo/big""#, &guest))
-        .expect("the query");
-    assert_eq!(
-        moved,
-        rows(&answer.batches),
-        "the run delivered what the query answers"
-    );
-    drop(answer);
 
-    // The owner's copy through SQL: another write larger than the budget.
-    let copied = run_apart(
-        scratch.path(),
-        serde_json::json!({"kind": "datafusion", "root": root,
-                           "sql": r#"SELECT id, region, meter, note FROM "demo/big""#,
-                           "caller": caller("ana", "demo")}),
-        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
-                           "caller": caller("ana", "demo")}),
-    );
-    completed(&copied, "the copy");
-    let engine = Engine::open(&root).expect("the engine again");
-    let manifest = engine
-        .manifest("demo/copy")
-        .expect("read")
-        .expect("written");
-    assert!(manifest.valid, "{:?}", manifest.breached);
-    assert_eq!(manifest.row_count, ROWS);
-    let sums = rt
-        .block_on(engine.query(
-            r#"SELECT COUNT(*) AS n, SUM(id) AS s FROM "demo/copy""#,
-            &Caller::new("ana", "demo", "analytics"),
-        ))
-        .expect("the copy answers");
-    let b = &sums.batches[0];
-    assert_eq!(b.column(0).as_primitive::<Int64Type>().value(0), ROWS);
-    assert_eq!(
-        b.column(1).as_primitive::<Int64Type>().value(0),
-        ROWS * (ROWS - 1) / 2
-    );
+    for budget in BUDGETS {
+        // The write: a file larger than the budget, under the contract, by its owner.
+        let wrote = run_apart(
+            scratch.path(),
+            serde_json::json!({"kind": "parquet", "url": file}),
+            serde_json::json!({"kind": "peql", "root": root, "contract": "demo/big",
+                               "caller": caller("ana", "demo"), "mode": "overwrite"}),
+            budget,
+        );
+        apart::within(&wrote, "the write", budget);
+        let engine = Engine::open(&root).expect("the engine");
+        let manifest = engine.manifest("demo/big").expect("read").expect("written");
+        assert!(manifest.valid, "{:?}", manifest.breached);
+        assert_eq!(manifest.row_count, ROWS);
+        assert!(
+            bytes_under(&root.join("big")) > BUDGETS[0],
+            "the contract's files outweigh the smaller budget"
+        );
+
+        // The guest's view, kept under the guest's own contract.
+        let viewed = run_apart(
+            scratch.path(),
+            serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
+                               "caller": caller("gus", "partner")}),
+            serde_json::json!({"kind": "peql", "root": root, "contract": "partner/kept",
+                               "caller": caller("gus", "partner"), "mode": "overwrite"}),
+            budget,
+        );
+        apart::within(&viewed, "the view", budget);
+        let engine = Engine::open(&root).expect("the engine again");
+        let kept = engine
+            .manifest("partner/kept")
+            .expect("read")
+            .expect("written");
+        assert!(kept.valid, "only eastern rows arrived: {:?}", kept.breached);
+        let guest = Caller::new("gus", "partner", "analytics");
+        let moved = rows(
+            &rt.block_on(engine.query(r#"SELECT * FROM "partner/kept""#, &guest))
+                .expect("the kept rows")
+                .batches,
+        );
+        assert_eq!(moved.len() as i64, ROWS / 2, "the eastern half");
+        assert!(
+            moved.values().all(|meter| meter.len() == 64),
+            "meters hashed"
+        );
+        let answer = rt
+            .block_on(engine.query(r#"SELECT * FROM "demo/big""#, &guest))
+            .expect("the query");
+        assert_eq!(
+            moved,
+            rows(&answer.batches),
+            "the run delivered what the query answers"
+        );
+        drop(answer);
+
+        // The owner's copy through SQL: another write larger than the budget.
+        let copied = run_apart(
+            scratch.path(),
+            serde_json::json!({"kind": "datafusion", "root": root,
+                               "sql": r#"SELECT id, region, meter, note FROM "demo/big""#,
+                               "caller": caller("ana", "demo")}),
+            serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                               "caller": caller("ana", "demo"), "mode": "overwrite"}),
+            budget,
+        );
+        apart::within(&copied, "the copy", budget);
+        let engine = Engine::open(&root).expect("the engine again");
+        let manifest = engine
+            .manifest("demo/copy")
+            .expect("read")
+            .expect("written");
+        assert!(manifest.valid, "{:?}", manifest.breached);
+        assert_eq!(manifest.row_count, ROWS);
+        let sums = rt
+            .block_on(engine.query(
+                r#"SELECT COUNT(*) AS n, SUM(id) AS s FROM "demo/copy""#,
+                &Caller::new("ana", "demo", "analytics"),
+            ))
+            .expect("the copy answers");
+        let b = &sums.batches[0];
+        assert_eq!(b.column(0).as_primitive::<Int64Type>().value(0), ROWS);
+        assert_eq!(
+            b.column(1).as_primitive::<Int64Type>().value(0),
+            ROWS * (ROWS - 1) / 2
+        );
+    }
 
     // A guest may read the contract, and may not write under it.
+    let engine = Engine::open(&root).expect("the engine again");
     let before = engine.manifest("demo/big").expect("read").expect("written");
     let refused = run_apart(
         scratch.path(),
         serde_json::json!({"kind": "parquet", "url": file}),
         serde_json::json!({"kind": "peql", "root": root, "contract": "demo/big",
                            "caller": caller("gus", "partner")}),
+        BUDGETS[0],
     );
     let error = refused["error"]
         .as_str()
@@ -431,14 +379,15 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
         .expect("still written");
     assert_eq!(after.row_count, ROWS, "nothing landed");
     assert_eq!(after.written_at, before.written_at);
-    let _ = std::fs::remove_dir_all(exchange(std::process::id()));
 }
 
-/// The runs of H6 whose source cannot be re-read, into a Parquet sink at the smallest budget:
+/// The runs of H6 whose source cannot be re-read, into a Parquet sink, at 256 MiB and at 1 GiB:
 /// the guest's gated view (its whole-result suppression makes it unrepeatable, so its queued
 /// morsels are staged, which is where an arena buffer could not be found, F8.5's finding), and
 /// an aggregation whose state is larger than the budget, whose operators hold their state in
-/// the run's pool and spill to the staging directory past it (MH 4.5).
+/// the run's pool and spill to the staging directory past it (MH 4.5). An aggregation's output
+/// order depends on how it spilled, so it is not repeatable either (F8.9). Every run keeps its
+/// whole process under its ceiling.
 #[test]
 fn h6_an_unrepeatable_plan_into_parquet_inside_the_budget() {
     let _serial = one_run_at_a_time();
@@ -447,49 +396,50 @@ fn h6_an_unrepeatable_plan_into_parquet_inside_the_budget() {
     disk(&root);
     let file = scratch.path().join("in.parquet");
     input(&file);
-    let wrote = run_apart(
-        scratch.path(),
-        serde_json::json!({"kind": "parquet", "url": file}),
-        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/big",
-                           "caller": caller("ana", "demo"), "mode": "overwrite"}),
-    );
-    completed(&wrote, "the write");
+    for budget in BUDGETS {
+        let wrote = run_apart(
+            scratch.path(),
+            serde_json::json!({"kind": "parquet", "url": file}),
+            serde_json::json!({"kind": "peql", "root": root, "contract": "demo/big",
+                               "caller": caller("ana", "demo"), "mode": "overwrite"}),
+            budget,
+        );
+        apart::within(&wrote, "the write", budget);
 
-    let viewed_to = scratch.path().join("view-out");
-    let viewed = run_apart(
-        scratch.path(),
-        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
-                           "caller": caller("gus", "partner")}),
-        serde_json::json!({"kind": "parquet", "url": viewed_to}),
-    );
-    completed(&viewed, "the view into Parquet");
-    operators_within(&viewed, "the view into Parquet");
+        let viewed_to = scratch.path().join(format!("view-out-{budget}"));
+        let viewed = run_apart(
+            scratch.path(),
+            serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
+                               "caller": caller("gus", "partner")}),
+            serde_json::json!({"kind": "parquet", "url": viewed_to}),
+            budget,
+        );
+        apart::within(&viewed, "the view into Parquet", budget);
+        operators_within(&viewed, "the view into Parquet");
+        assert_eq!(support::read_back_rows(&viewed_to), (ROWS / 2) as u64);
 
-    assert_eq!(support::read_back_rows(&viewed_to), (ROWS / 2) as u64);
-
-    // Every id is its own group, and each group keeps a kilobyte note: 400 MB of state.
-    let grouped_to = scratch.path().join("grouped-out");
-    let grouped = run_apart(
-        scratch.path(),
-        serde_json::json!({"kind": "datafusion", "root": root,
-                           "sql": r#"SELECT id, MAX(note) AS note, COUNT(*) AS n
-                                     FROM "demo/big" GROUP BY id"#,
-                           "caller": caller("ana", "demo")}),
-        serde_json::json!({"kind": "parquet", "url": grouped_to}),
-    );
-    completed(&grouped, "the aggregation");
-    let refused = operators_within(&grouped, "the aggregation");
-    assert!(
-        refused > 0,
-        "400 MB of groups spilled from a pool a fraction of that size"
-    );
-    assert_eq!(support::read_back_rows(&grouped_to), ROWS as u64);
-    let _ = std::fs::remove_dir_all(exchange(std::process::id()));
+        // Every id is its own group, and each group keeps a kilobyte note: 400 MB of state.
+        let grouped_to = scratch.path().join(format!("grouped-out-{budget}"));
+        let grouped = run_apart(
+            scratch.path(),
+            serde_json::json!({"kind": "datafusion", "root": root,
+                               "sql": r#"SELECT id, MAX(note) AS note, COUNT(*) AS n
+                                         FROM "demo/big" GROUP BY id"#,
+                               "caller": caller("ana", "demo")}),
+            serde_json::json!({"kind": "parquet", "url": grouped_to}),
+            budget,
+        );
+        apart::within(&grouped, "the aggregation", budget);
+        let refused = operators_within(&grouped, "the aggregation");
+        assert!(
+            refused > 0,
+            "400 MB of groups spilled from a pool a fraction of that size"
+        );
+        assert_eq!(support::read_back_rows(&grouped_to), ROWS as u64);
+    }
 }
 
-/// The plan's operators held no more than their pool, and whether the pool refused them; the
-/// process's own high-water mark is printed beside it, as the evidence it is (see the E8 gate
-/// table on the board: DataFusion's scans and a peQL write hold memory no pool accounts for).
+/// The plan's operators held no more than their pool, and how often the pool refused them.
 fn operators_within(outcome: &serde_json::Value, what: &str) -> u64 {
     let notes = outcome["report"]["notes"].as_array().expect("notes");
     let note = notes
@@ -501,7 +451,7 @@ fn operators_within(outcome: &serde_json::Value, what: &str) -> u64 {
     let [held, capacity, refused] = figures[..] else {
         panic!("{what}: {note}");
     };
-    eprintln!("{what}: {note}; process peak {}", outcome["peak_anon"]);
+    eprintln!("{what}: {note}");
     assert!(capacity > 0, "{what}: the plan had a pool: {note}");
     assert!(held <= capacity, "{what}: {note}");
     refused

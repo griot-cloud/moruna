@@ -5,10 +5,19 @@
 //! batches in flight between its operators, which no pool sees. A `PlanSource` runs its plan in
 //! a session whose pool is a [`BudgetPool`]: the facade gives it a share of the run's budget
 //! beside the arena, charges that share to the controller, and moves it when the machine's
-//! limits move. Half the share is the pool the operators reserve from; the other half is what
-//! the plan's batches in flight may hold, and `PlanSource` sizes the session's batches to it. An
-//! operator that can spill and finds the pool full spills to [`PlanMemory::spill_dir`], which is
-//! the run's staging directory; one that cannot is refused with DataFusion's
+//! limits move. The share is divided three ways:
+//!
+//! - a tenth is the pool the operators reserve from ([`BudgetPool::capacity`]);
+//! - four tenths are held back for what the operators hold beyond what they reserve. DataFusion
+//!   counts an aggregation's groups but not the copies it makes of them to sort and spill, nor
+//!   the batches a spill merge reads back: measured on a grouped aggregation that spills (F8.9),
+//!   the process held three to five times the pool above its arena and its batches in flight,
+//!   which is where this figure comes from ([`BudgetPool::unaccounted`]);
+//! - half is what the plan's batches in flight may hold, and the scans that decode them
+//!   ([`BudgetPool::in_flight`]); `PlanSource` sizes the session's batches and partitions to it.
+//!
+//! An operator that can spill and finds the pool full spills to [`PlanMemory::spill_dir`], which
+//! is the run's staging directory; one that cannot is refused with DataFusion's
 //! `ResourcesExhausted` rather than taking the process past its ceiling.
 //!
 //! The pool divides itself as DataFusion's `FairSpillPool` does: consumers that cannot spill take
@@ -63,19 +72,25 @@ impl BudgetPool {
         self.share.store(bytes, Ordering::SeqCst);
     }
 
-    /// The share in force: the pool and the batches in flight together.
+    /// The share in force: the pool, what the operators hold beyond it, and the batches in
+    /// flight together.
     pub fn limit(&self) -> u64 {
         self.share.load(Ordering::SeqCst)
     }
 
-    /// What the operators may reserve: half the share.
+    /// What the operators may reserve: a tenth of the share.
     pub fn capacity(&self) -> u64 {
-        self.limit() / 2
+        self.limit() / 10
     }
 
-    /// What the plan's batches in flight may hold: the other half.
+    /// What the operators are expected to hold beyond their reservations, four times the pool.
+    pub fn unaccounted(&self) -> u64 {
+        self.capacity() * 4
+    }
+
+    /// What the plan's batches in flight and its scans may hold: the rest, half the share.
     pub fn in_flight(&self) -> u64 {
-        self.limit() - self.capacity()
+        self.limit() - self.capacity() - self.unaccounted()
     }
 
     /// Requests the pool refused: each one an operator that spilled, or failed for want of
@@ -214,7 +229,7 @@ mod tests {
 
     #[test]
     fn spillers_share_what_the_others_leave_and_the_share_moves() {
-        let pool = Arc::new(BudgetPool::new(2000));
+        let pool = Arc::new(BudgetPool::new(10000));
         let fixed = reservation(&pool, "fixed", false);
         fixed.try_grow(200).expect("room");
         let a = reservation(&pool, "a", true);
@@ -233,14 +248,14 @@ mod tests {
         assert_eq!(pool.peak(), 1000);
 
         // Lowered: nothing grows until the holders give back.
-        pool.set_limit(1000);
+        pool.set_limit(5000);
         assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(500)));
         a.shrink(400);
         assert!(b.try_grow(1).is_err(), "still above the new limit");
         b.shrink(400);
         b.try_grow(100).expect("under the new limit");
         // Raised: room again.
-        pool.set_limit(4000);
+        pool.set_limit(20000);
         fixed
             .try_grow(1000)
             .expect("unspillable takes what is free");
@@ -250,8 +265,11 @@ mod tests {
         drop(b);
         drop(fixed);
         assert_eq!(pool.reserved(), 0);
-        assert_eq!(pool.limit(), 4000);
-        assert_eq!((pool.capacity(), pool.in_flight()), (2000, 2000));
+        assert_eq!(pool.limit(), 20000);
+        assert_eq!(
+            (pool.capacity(), pool.unaccounted(), pool.in_flight()),
+            (2000, 8000, 10000)
+        );
         assert_eq!(pool.name(), "moruna-budget");
         assert!(pool.to_string().contains("2000"));
     }

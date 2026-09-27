@@ -178,7 +178,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
 
     let engines = governed::Engines::default();
     let (source, source_targets, engine_memory) = source_of(&job.source, loader, &engines)?;
-    let (sink, sink_target) = sink_of(&job.sink, &mut notes, &engines)?;
+    let (sink, sink_target, sink_memory) = sink_of(&job.sink, &mut notes, &engines)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;
 
     // Each entry is loaded and its pin checked on its own; adjacent standard kernels are then
@@ -321,6 +321,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
 
     let mut spec = RunSpec::new(source, kernels, sink);
     spec.engine_memory = engine_memory;
+    spec.sink_memory = sink_memory;
     #[cfg(feature = "python")]
     {
         spec.py_kernels = py_kernels;
@@ -485,7 +486,7 @@ fn sink_of(
     doc: &SinkDoc,
     notes: &mut Vec<String>,
     engines: &governed::Engines,
-) -> Result<(SinkSpec, String)> {
+) -> Result<governed::Write> {
     match doc {
         SinkDoc::Parquet { url, options } => {
             let url = translate::local_url(url);
@@ -520,6 +521,7 @@ fn sink_of(
                     Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
                 })),
                 target,
+                None,
             ))
         }
         SinkDoc::Tensor { url, options } => {
@@ -540,6 +542,7 @@ fn sink_of(
                     )?) as Box<dyn moruna_kernel::Sink>)
                 })),
                 url.clone(),
+                None,
             ))
         }
         SinkDoc::ArrowIpc { url, options } => {
@@ -560,6 +563,7 @@ fn sink_of(
                     )?) as Box<dyn moruna_kernel::Sink>)
                 })),
                 url.clone(),
+                None,
             ))
         }
         SinkDoc::Peql {

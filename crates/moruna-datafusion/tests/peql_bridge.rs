@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moruna_datafusion::engine::{Caller, Engine, WriteMode};
-use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource};
+use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory};
 
 /// Room for what these plans hold, and nowhere to spill.
 fn memory() -> PlanMemory {
@@ -266,11 +266,17 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
     let alloc = FakeAllocator::new();
     let rt = rt();
 
+    // The run's share for the sink, two parts in flight: each part is written inside half.
+    let memory = Arc::new(WriteMemory::new(2));
+    memory.set_limit(32 << 20);
+    assert_eq!(memory.limit(), 32 << 20);
+    assert_eq!(memory.per_part(), 16 << 20);
     let mut sink = PeqlSink::new(
         Arc::clone(&engine),
         "demo/readings",
         &owner(),
         WriteMode::Append,
+        Arc::clone(&memory),
     )
     .expect("the owner writes");
     assert_eq!(sink.accepts().kind, moruna_kernel::PayloadKind::Table);
@@ -294,12 +300,14 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
     assert_eq!(manifest.row_count, 410);
     assert_eq!(summary.files.len(), manifest.files.len());
 
-    // Overwrite replaces; data that breaches the contract lands, and the run is told.
+    // Overwrite replaces; data that breaches the contract lands, and the run is told. A share of
+    // nothing leaves the write unbounded.
     let mut sink = PeqlSink::new(
         Arc::clone(&engine),
         "demo/readings",
         &owner(),
         WriteMode::Overwrite,
+        Arc::new(WriteMemory::new(2)),
     )
     .expect("the owner writes");
     sink.open(&schema).expect("opened");
@@ -319,6 +327,7 @@ fn only_the_owner_writes_and_the_sink_keeps_its_order() {
         "demo/readings",
         &guest(),
         WriteMode::Append,
+        Arc::new(WriteMemory::new(1)),
     )
     .err()
     .expect("a guest may not write");
@@ -332,6 +341,7 @@ fn only_the_owner_writes_and_the_sink_keeps_its_order() {
         "demo/readings",
         &owner(),
         WriteMode::Append,
+        Arc::new(WriteMemory::new(1)),
     )
     .expect("the owner writes");
     let rt = rt();

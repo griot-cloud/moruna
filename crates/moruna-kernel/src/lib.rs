@@ -54,7 +54,9 @@ pub use knobs::{
     CancelToken, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, RecordHook,
     SchedulerStats, SizerKind, StageStats, StatsSource,
 };
-pub use limits::{Device, Guarantee, HostProfile, LimitSource, Limits, Sample, Sampler};
+pub use limits::{
+    Device, Guarantee, HostProfile, LimitSource, Limits, ProcessPeak, Sample, Sampler,
+};
 pub use morsel::{Morsel, MorselFeatures, Origin};
 pub use payload::{DType, Payload, PayloadKind, PayloadSpec, SourceSchema, TierPref};
 pub use placement::{

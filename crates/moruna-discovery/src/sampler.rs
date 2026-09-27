@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use moruna_kernel::{Device, Limits, Result, Sample, Sampler as SamplerTrait};
+use moruna_kernel::{Device, Limits, ProcessPeak, Result, Sample, Sampler as SamplerTrait};
 
 use crate::cgroup;
 use crate::devices;
@@ -32,7 +32,7 @@ enum Source {
     },
     /// cgroup v1: `memory.stat` and `cpu.stat` with the v1 field names.
     V1 { stat: File, cpu: Option<File> },
-    /// No cgroup: `/proc/self/statm`, or the platform's own interface (os.rs).
+    /// No cgroup: `/proc/self/status`, or the platform's own interface (os.rs).
     Os { proc_root: PathBuf },
 }
 
@@ -45,6 +45,13 @@ struct Inner {
     page_bytes: usize,
     /// Set once when `memory.peak` turned out not to be writable, so the note is made once (f.2).
     peak_reset_refused: bool,
+    /// The whole process's high-water mark since the sampler was created, which `reset_peak`
+    /// leaves alone: what the run report's peak is (`Sampler::process_peak`).
+    process_peak: ProcessPeak,
+    /// The platform's lifetime high-water mark when the sampler was created, where the platform
+    /// keeps one (macOS). A rise above it is the process's exact peak since then, however short
+    /// the burst that made it.
+    lifetime_at_create: Option<u64>,
 }
 
 /// Live resource sampling over the cgroup files (d.1).
@@ -105,16 +112,28 @@ impl Sampler {
                 last: Sample::default(),
                 page_bytes: discovered.limits.page_bytes,
                 peak_reset_refused: false,
+                process_peak: ProcessPeak::default(),
+                lifetime_at_create: None,
             }),
             read_errors: AtomicU64::new(0),
             last_at_ns: AtomicU64::new(0),
             devices: discovered.limits.devices.clone(),
             limits: Arc::new(ArcSwap::from_pointee(discovered.limits.clone())),
         };
+        {
+            let mut inner = sampler.held();
+            inner.lifetime_at_create = inner.lifetime_peak();
+        }
         // Prime the running peak and the last sample, so a read error on the very first call
         // still returns a coherent value.
         let _ = sampler.sample();
         Ok(sampler)
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// How many samples repeated the previous one because a file could not be read (DS-I3).
@@ -161,16 +180,16 @@ impl SamplerTrait for Sampler {
             let limits = self.limits.load();
             (limits.memory_ceiling, limits.cpu_quota)
         };
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.held();
         let page_bytes = inner.page_bytes;
+        let lifetime = inner.lifetime_peak();
         let Inner {
             source,
             buffer,
             running_peak,
             last,
+            process_peak,
+            lifetime_at_create,
             ..
         } = &mut *inner;
 
@@ -219,6 +238,31 @@ impl SamplerTrait for Sampler {
         };
 
         *running_peak = (*running_peak).max(memory.anon);
+        // A lifetime mark that has risen since the sampler was created is the process's peak
+        // since then, to the byte; one that has not says the peak is below it, which the samples
+        // bound. It is the run's peak and never a record's: the mark only rises, so between two
+        // resets it would charge every `apply` with the highest moment of the whole interval.
+        let risen = match (lifetime, *lifetime_at_create) {
+            (Some(now), Some(then)) if now > then => Some(now),
+            _ => None,
+        };
+        match risen {
+            Some(exact) if exact > process_peak.bytes || !process_peak.exact => {
+                *process_peak = ProcessPeak {
+                    bytes: exact.max(process_peak.bytes),
+                    at_ns,
+                    exact: true,
+                };
+            }
+            _ if memory.anon > process_peak.bytes => {
+                *process_peak = ProcessPeak {
+                    bytes: memory.anon,
+                    at_ns,
+                    exact: false,
+                };
+            }
+            _ => {}
+        }
         let sample = Sample {
             anon_bytes: memory.anon,
             file_bytes: memory.file,
@@ -233,11 +277,12 @@ impl SamplerTrait for Sampler {
         sample
     }
 
+    fn process_peak(&self) -> ProcessPeak {
+        self.held().process_peak
+    }
+
     fn reset_peak(&self) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.held();
         let current = inner.last.anon_bytes;
         inner.running_peak = current;
         let refused = match &inner.source {
@@ -257,6 +302,18 @@ impl SamplerTrait for Sampler {
                 target: "discovery.probe",
                 "memory.peak is not writable on this kernel; the sampler tracks its own peak"
             );
+        }
+    }
+}
+
+impl Inner {
+    /// The platform's lifetime high-water mark of the process's anonymous memory, where the
+    /// sampler reads the platform and the platform keeps one (macOS's
+    /// `ri_lifetime_max_phys_footprint`). A cgroup's own peak is `memory.peak`, read above.
+    fn lifetime_peak(&self) -> Option<u64> {
+        match self.source {
+            Source::Os { .. } => crate::probes::platform_lifetime_peak(),
+            Source::V2 { .. } | Source::V1 { .. } => None,
         }
     }
 }
@@ -476,17 +533,17 @@ mod tests {
         assert_eq!(sampler.sample().peak_anon_bytes, 4096);
     }
 
-    /// f.2, outside a cgroup: `/proc/self/statm` where there is one, the platform otherwise, and
+    /// f.2, outside a cgroup: `/proc/self/status` where there is one, the platform otherwise, and
     /// `throttled_us` is zero either way.
     #[test]
     fn samples_outside_a_cgroup() {
         let tmp = TempDir::new("os-sample");
         let proc_dir = tmp.path().join("proc");
-        write(&proc_dir, "self/statm", "1000 500 100 20 0 300 0\n");
+        write(&proc_dir, "self/status", crate::os::STATUS);
         let sampler = Sampler::with_roots(&discovered_at(None), &proc_dir).expect("sampler");
         let sample = sampler.sample();
-        assert_eq!(sample.anon_bytes, 400 * 4096);
-        assert_eq!(sample.file_bytes, 100 * 4096);
+        assert_eq!(sample.anon_bytes, 1600 * 1024);
+        assert_eq!(sample.file_bytes, 400 * 1024);
         assert_eq!(sample.throttled_us, 0);
         assert_eq!(sample.device_used, [0u64; 8]);
 
@@ -497,6 +554,43 @@ mod tests {
         assert!(sample.peak_anon_bytes >= sample.anon_bytes);
         real.reset_peak();
         assert!(real.sample().peak_anon_bytes > 0);
+    }
+
+    /// F8.9: the process peak is the whole process's high-water mark since the sampler was
+    /// created, whatever `reset_peak` does to the probe's peak. On macOS it is the kernel's own
+    /// lifetime mark, so a burst no sample saw is still in it; elsewhere it is the highest sample.
+    #[test]
+    fn the_process_peak_is_the_whole_process_and_survives_a_reset() {
+        const BURST: usize = 64 << 20;
+        let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
+        let before = sampler.sample().anon_bytes;
+        let burst = vec![7u8; BURST];
+        if !cfg!(target_vendor = "apple") {
+            // Only a sample sees the burst where the platform keeps no mark of its own.
+            let _ = sampler.sample();
+        }
+        drop(std::hint::black_box(burst));
+        sampler.reset_peak();
+        let after = sampler.sample();
+        let peak = sampler.process_peak();
+        assert!(
+            peak.bytes >= before + (BURST as u64) / 2,
+            "the burst of {BURST} bytes over {before} is in the peak: {peak:?}"
+        );
+        assert!(peak.bytes >= after.anon_bytes);
+        assert!(peak.at_ns > 0);
+        assert_eq!(peak.exact, cfg!(target_vendor = "apple"), "{peak:?}");
+        // A fixture cgroup keeps no lifetime mark: the peak is the highest sample.
+        let tmp = TempDir::new("process-peak");
+        let dir = tmp.path().join("cgroup");
+        write(&dir, "memory.stat", "anon 5000\nfile 0\nunevictable 0\n");
+        let fixture =
+            Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
+        write(&dir, "memory.stat", "anon 900\nfile 0\nunevictable 0\n");
+        fixture.reset_peak();
+        let _ = fixture.sample();
+        let peak = fixture.process_peak();
+        assert_eq!((peak.bytes, peak.exact), (5000, false));
     }
 
     /// DS-I3: a read error repeats the last sample with a fresh timestamp and is counted.

@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod apart;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

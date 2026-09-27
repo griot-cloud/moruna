@@ -357,3 +357,62 @@ fn rc_t9_row4_short_tail_is_not_evidence() {
     );
     rig.controller.stop();
 }
+
+/// F8.9: a run with no kernel stage (a copy) has no target to halve. Past the trip line its
+/// memory row drops the read-ahead to one and stages the last queue; within a quarter
+/// of the reserve of the ceiling, with nothing left that a knob gives back, the run is stopped
+/// with a diagnostic naming what the process held, before the operating system's ceiling.
+#[test]
+fn f8_9_a_copy_sheds_its_reads_and_is_stopped_before_the_ceiling() {
+    let reserve = (CEILING as f64 * 0.10) as u64;
+    let stop = CEILING - reserve / 4;
+    let cfg = config(CEILING, 8);
+    let rig = common::Rig::new(
+        cfg,
+        Vec::new(),
+        FakeKnobs::new().stats(SchedulerStats {
+            workers_active: 8,
+            workers_busy: 8,
+            sink_concurrency: 2,
+            seq_issued: 41,
+            ..SchedulerStats::default()
+        }),
+        FakeSampler::new().scripted(vec![
+            sample(BASELINE, 1_000),
+            sample(over_the_line(), 2_000),
+            sample(stop + MIB, 3_000),
+        ]),
+    );
+    rig.run_up();
+    let mark = rig.writes().len();
+    rig.controller.tick_once();
+    assert_eq!(last_class(&rig), Bottleneck::Memory);
+    let fresh = &rig.writes()[mark..];
+    assert_eq!(read_aheads(fresh), vec![1], "the reads drop to one");
+    assert_eq!(
+        staging_triggers(fresh),
+        vec![(0, true)],
+        "and the queue stages"
+    );
+    assert_eq!(
+        rig.knobs.terminated(),
+        None,
+        "past the trip line is not past the stop"
+    );
+
+    rig.controller.tick_once();
+    let diagnostic = rig.knobs.terminated().expect("stopped");
+    assert!(
+        diagnostic.starts_with("budget: morsel 41 stage 0"),
+        "{diagnostic}"
+    );
+    let summary = rig.controller.stop();
+    assert!(
+        summary
+            .notes
+            .iter()
+            .any(|n| n.contains("rather than let the operating system stop it")),
+        "{:?}",
+        summary.notes
+    );
+}

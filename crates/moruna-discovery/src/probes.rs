@@ -163,7 +163,7 @@ struct TaskVmInfoRev1 {
 }
 
 /// The process's `(anonymous, file backed)` resident bytes where the platform has no
-/// `/proc/self/statm` (macOS). `None` on a platform that has `/proc`.
+/// `/proc/self/status` (macOS). `None` on a platform that has `/proc`.
 ///
 /// The anonymous figure is `phys_footprint`: the ledger macOS charges a process for, enforces
 /// its own per-process memory limits against, and shows as "Memory" in Activity Monitor. It is
@@ -171,7 +171,7 @@ struct TaskVmInfoRev1 {
 /// anonymous pages the compressor has taken (the analogue of `unevictable`: still owed by the
 /// process, not reclaimable by dropping a cache), and it excludes the file backed pages a
 /// mapped Parquet file or a loaded dylib contributes. Those are `external`, returned here as
-/// the file backed half, which is what `/proc/self/statm`'s `shared` field gives on Linux.
+/// the file backed half, which is what `/proc/self/status`'s `RssFile` gives on Linux.
 ///
 /// The three candidate routes were measured against the same process at the same moment, with
 /// 256 MiB of touched anonymous memory and then a 512 MiB file mapped and fully read:
@@ -226,6 +226,26 @@ pub(crate) fn platform_anon_and_file() -> Option<(u64, u64)> {
 /// does not reach the field. The same number, without the file backed half.
 #[cfg(target_vendor = "apple")]
 fn platform_phys_footprint_rusage() -> Option<u64> {
+    rusage_v4().map(|info| info.ri_phys_footprint)
+}
+
+/// The most `phys_footprint` this process has ever reached, as the kernel's ledger keeps it
+/// (`ri_lifetime_max_phys_footprint`): no sampling interval can miss a peak of it. `None` on a
+/// platform that keeps no such mark for a process outside a cgroup (Linux keeps `VmHWM`, which
+/// counts file backed pages too and is not the DS-I4 quantity).
+pub(crate) fn platform_lifetime_peak() -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        rusage_v4().map(|info| info.ri_lifetime_max_phys_footprint)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rusage_v4() -> Option<libc::rusage_info_v4> {
     // SAFETY: `rusage_info_v4` is a plain C struct of integers, for which an all zero bit
     // pattern is a valid value; it is overwritten by the call below before it is read.
     let mut info: libc::rusage_info_v4 = unsafe { core::mem::zeroed() };
@@ -239,10 +259,7 @@ fn platform_phys_footprint_rusage() -> Option<u64> {
             (&raw mut info).cast::<libc::rusage_info_t>(),
         )
     };
-    if rc == 0 {
-        return Some(info.ri_phys_footprint);
-    }
-    None
+    (rc == 0).then_some(info)
 }
 
 /// What the sampler is measuring on a host where the platform answers instead of `/proc`, for
@@ -669,7 +686,7 @@ mod tests {
         assert!(platform_total_ram().is_some() || std::fs::read_to_string("/proc/meminfo").is_ok());
         assert!(
             platform_anon_and_file().is_some()
-                || std::fs::read_to_string("/proc/self/statm").is_ok()
+                || std::fs::read_to_string("/proc/self/status").is_ok()
         );
         // The note exists exactly where the platform path is the one that answers.
         assert_eq!(

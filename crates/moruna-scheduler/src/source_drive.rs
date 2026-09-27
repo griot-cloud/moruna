@@ -209,14 +209,21 @@ fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>) -> bool
     issued
 }
 
-/// f.5: service `placement.evicted(0)` by re-reading each entry and calling `replace`.
+/// f.5: service `placement.evicted(0)` by re-reading each entry and calling `replace`, the
+/// entries nearest the head first and no more of them at once than the read-ahead. An entry was
+/// evicted because Q0 was over its high water, so re-reading every evicted entry as soon as it was
+/// evicted put them all back over it: the placement evicted others, which were re-read in turn,
+/// and the replacements, which no admission check stops, filled the arena (a peQL copy at
+/// 256 MiB behind a slow sink held 27 morsels, twice Q0's share, F8.9). The rest stay evicted
+/// until the consumer reaches them.
 fn issue_replacements<'a>(
     shared: &'a Shared,
     inflight: &mut Vec<InFlight<'a>>,
     replacing: &mut HashSet<Seq>,
 ) -> bool {
     let mut issued = false;
-    for (seq, origin) in shared.placement.evicted(0) {
+    let window = usize::from(shared.knobs.read_ahead().max(1));
+    for (seq, origin) in shared.placement.evicted(0).into_iter().take(window) {
         if !replacing.insert(seq) {
             continue;
         }
