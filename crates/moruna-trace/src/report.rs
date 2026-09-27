@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use moruna_kernel::{
-    GilState, IoPaths, Limits, Outcome, ProcessPeak, RunId, Seq, StageId, TraceRecord,
+    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, StageId, TraceRecord,
 };
 use serde::{Serialize, Serializer};
 
@@ -61,6 +61,8 @@ pub struct RunMeta {
     /// (`Sampler::process_peak`): what the report's peak is, for every shape of run, a chain
     /// with no kernel included.
     pub process_peak: ProcessPeak,
+    /// What the whole process consumed over the run, measured (`Sampler::process_usage`).
+    pub process_usage: ProcessUsage,
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -196,6 +198,14 @@ pub struct RunReport {
     /// system counts it: the sampler's process peak, or a record's `mem_anon_peak` when one is
     /// higher.
     pub peak_anon_bytes: u64,
+    /// The process's CPU time over the run, user plus system, nanoseconds, as the operating
+    /// system accounted it. Zero when `usage_measured` is false.
+    pub cpu_ns: u64,
+    /// The process's anonymous memory integrated over the run, byte-seconds. Zero when
+    /// `usage_measured` is false.
+    pub mem_byte_seconds: u64,
+    /// True when `cpu_ns` and `mem_byte_seconds` were measured; a host never bills otherwise.
+    pub usage_measured: bool,
     /// That over the memory ceiling in force when the peak was reached (S1): the initial
     /// ceiling, or the one the last limits change before the peak set.
     pub peak_fraction_of_ceiling: f64,
@@ -498,6 +508,9 @@ impl RunReport {
             drains: meta.drains.clone(),
             io_paths: meta.io_paths.clone(),
             peak_anon_bytes: peak_anon,
+            cpu_ns: meta.process_usage.cpu_ns,
+            mem_byte_seconds: meta.process_usage.mem_byte_seconds,
+            usage_measured: meta.process_usage.measured,
             peak_fraction_of_ceiling,
             peak_ceiling_bytes,
             worker_busy_fraction,

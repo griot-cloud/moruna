@@ -55,7 +55,7 @@ pub use knobs::{
     SchedulerStats, SizerKind, StageStats, StatsSource,
 };
 pub use limits::{
-    Device, Guarantee, HostProfile, LimitSource, Limits, ProcessPeak, Sample, Sampler,
+    Device, Guarantee, HostProfile, LimitSource, Limits, ProcessPeak, ProcessUsage, Sample, Sampler,
 };
 pub use morsel::{Morsel, MorselFeatures, Origin};
 pub use payload::{DType, Payload, PayloadKind, PayloadSpec, SourceSchema, TierPref};

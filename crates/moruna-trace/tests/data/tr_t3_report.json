@@ -28,6 +28,9 @@
     "rdma": false
   },
   "peak_anon_bytes": 9100,
+  "cpu_ns": 0,
+  "mem_byte_seconds": 0,
+  "usage_measured": false,
   "peak_fraction_of_ceiling": 1.0593794286251068e-6,
   "peak_ceiling_bytes": 8589934592,
   "worker_busy_fraction": 0.29,

@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use moruna_kernel::{Device, Limits, ProcessPeak, Result, Sample, Sampler as SamplerTrait};
+use moruna_kernel::{
+    Device, Limits, ProcessPeak, ProcessUsage, Result, Sample, Sampler as SamplerTrait,
+};
 
 use crate::cgroup;
 use crate::devices;
@@ -52,6 +54,14 @@ struct Inner {
     /// keeps one (macOS). A rise above it is the process's exact peak since then, however short
     /// the burst that made it.
     lifetime_at_create: Option<u64>,
+    /// The process's CPU time when the sampler was created, nanoseconds; `None` where the
+    /// operating system would not say.
+    cpu_at_create_ns: Option<u64>,
+    /// Anonymous memory integrated over the samples so far, byte-nanoseconds.
+    mem_integral: u128,
+    /// The last successful sample's time and anonymous bytes, the left edge of the next
+    /// step of the integral.
+    integral_edge: Option<(u64, u64)>,
 }
 
 /// Live resource sampling over the cgroup files (d.1).
@@ -114,6 +124,9 @@ impl Sampler {
                 peak_reset_refused: false,
                 process_peak: ProcessPeak::default(),
                 lifetime_at_create: None,
+                cpu_at_create_ns: process_cpu_ns(),
+                mem_integral: 0,
+                integral_edge: None,
             }),
             read_errors: AtomicU64::new(0),
             last_at_ns: AtomicU64::new(0),
@@ -190,6 +203,8 @@ impl SamplerTrait for Sampler {
             last,
             process_peak,
             lifetime_at_create,
+            mem_integral,
+            integral_edge,
             ..
         } = &mut *inner;
 
@@ -238,6 +253,12 @@ impl SamplerTrait for Sampler {
         };
 
         *running_peak = (*running_peak).max(memory.anon);
+        if let Some((then, bytes)) = *integral_edge
+            && at_ns > then
+        {
+            *mem_integral += u128::from(bytes) * u128::from(at_ns - then);
+        }
+        *integral_edge = Some((at_ns, memory.anon));
         // A lifetime mark that has risen since the sampler was created is the process's peak
         // since then, to the byte; one that has not says the peak is below it, which the samples
         // bound. It is the run's peak and never a record's: the mark only rises, so between two
@@ -275,6 +296,23 @@ impl SamplerTrait for Sampler {
         };
         *last = sample;
         sample
+    }
+
+    fn process_usage(&self) -> ProcessUsage {
+        let inner = self.held();
+        let cpu = match (inner.cpu_at_create_ns, process_cpu_ns()) {
+            (Some(then), Some(now)) => Some(now.saturating_sub(then)),
+            _ => None,
+        };
+        match cpu {
+            Some(cpu_ns) if inner.integral_edge.is_some() => ProcessUsage {
+                cpu_ns,
+                mem_byte_seconds: u64::try_from(inner.mem_integral / 1_000_000_000)
+                    .unwrap_or(u64::MAX),
+                measured: true,
+            },
+            _ => ProcessUsage::default(),
+        }
     }
 
     fn process_peak(&self) -> ProcessPeak {
@@ -332,6 +370,22 @@ fn open(path: &Path) -> Result<File> {
 fn read_at_zero<'a>(file: &File, buffer: &'a mut [u8; BUFFER_BYTES]) -> Option<&'a str> {
     let read = file.read_at(buffer, 0).ok()?;
     std::str::from_utf8(&buffer[..read]).ok()
+}
+
+/// The process's own CPU time, user plus system, from `getrusage(RUSAGE_SELF)`.
+fn process_cpu_ns() -> Option<u64> {
+    // SAFETY: `getrusage` fills the zeroed struct it is handed and reads nothing else.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    let ns = |t: libc::timeval| {
+        u64::try_from(t.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(u64::try_from(t.tv_usec).ok()?.checked_mul(1_000)?)
+    };
+    ns(usage.ru_utime)?.checked_add(ns(usage.ru_stime)?)
 }
 
 #[cfg(test)]
@@ -669,5 +723,29 @@ mod tests {
         let sample = following.sample();
         assert_eq!(sample.ceiling_bytes, 3 * 1024 * 1024 * 1024);
         assert!((sample.cpu_limit - 6.0).abs() < f64::EPSILON);
+    }
+    /// The process's usage is measured from the operating system: CPU time grows while the
+    /// process works, and the memory integral grows between samples. Never an estimate.
+    #[test]
+    fn process_usage_is_measured_not_estimated() {
+        let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
+        let _ = sampler.sample();
+        let mut x = 0u64;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(60) {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
+        std::hint::black_box(x);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = sampler.sample();
+        let usage = sampler.process_usage();
+        assert!(usage.measured, "{usage:?}");
+        assert!(
+            usage.cpu_ns >= 30_000_000,
+            "60 ms of work is at least 30 ms of CPU: {usage:?}"
+        );
+        assert!(usage.mem_byte_seconds > 0, "{usage:?}");
     }
 }

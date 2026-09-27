@@ -139,6 +139,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         controller_notes: vec!["small dataset: no adaptation".to_string()],
         drains: Vec::new(),
         process_peak: moruna_kernel::ProcessPeak::default(),
+        process_usage: moruna_kernel::ProcessUsage::default(),
     }
 }
 

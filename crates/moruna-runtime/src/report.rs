@@ -75,6 +75,8 @@ pub struct MetaInput {
     pub drains: Vec<moruna_trace::DrainSummary>,
     /// The whole process's high-water mark over the run (`Sampler::process_peak`).
     pub process_peak: moruna_kernel::ProcessPeak,
+    /// What the whole process consumed over the run (`Sampler::process_usage`).
+    pub process_usage: moruna_kernel::ProcessUsage,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -108,6 +110,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         controller_notes,
         drains: input.drains,
         process_peak: input.process_peak,
+        process_usage: input.process_usage,
     }
 }
 
@@ -183,6 +186,7 @@ mod tests {
                 at_ns: 2,
                 exact: true,
             },
+            process_usage: moruna_kernel::ProcessUsage::default(),
         });
         assert_eq!(meta.process_peak.bytes, 9);
         assert_eq!(meta.bottleneck_timeline.len(), all.len());
@@ -208,6 +212,7 @@ mod tests {
             controller: None,
             drains: Vec::new(),
             process_peak: moruna_kernel::ProcessPeak::default(),
+            process_usage: moruna_kernel::ProcessUsage::default(),
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());

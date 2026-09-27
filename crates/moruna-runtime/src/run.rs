@@ -724,6 +724,7 @@ fn drive(
     // since the last tick is in the peak the report states.
     let _ = sampler.sample();
     let process_peak = sampler.process_peak();
+    let process_usage = sampler.process_usage();
     let (exit, outcome_manifest) = report::exit_of(&outcome);
     let summary = started
         .controller
@@ -767,6 +768,7 @@ fn drive(
         controller: summary,
         drains,
         process_peak,
+        process_usage,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {

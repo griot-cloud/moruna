@@ -125,6 +125,26 @@ pub trait Sampler: Send + Sync {
     /// burst between two samples is not missed. `reset_peak` does not touch it. This is the
     /// figure the run report's peak is taken from.
     fn process_peak(&self) -> ProcessPeak;
+    /// What the whole process has consumed since this sampler was created, measured from the
+    /// operating system: CPU time from the process's own accounting, and the integral of its
+    /// anonymous memory over the samples taken. A sampler that cannot measure returns
+    /// [`ProcessUsage::default`], whose `measured` is false; nobody bills an estimate.
+    fn process_usage(&self) -> ProcessUsage {
+        ProcessUsage::default()
+    }
+}
+
+/// The whole process's consumption over a run ([`Sampler::process_usage`]): the facts a
+/// host meters, never a quota or a peak multiplied by wall time.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessUsage {
+    /// User plus system CPU time, nanoseconds.
+    pub cpu_ns: u64,
+    /// Anonymous memory integrated over time, byte-seconds (each sample's bytes times the time
+    /// until the next sample).
+    pub mem_byte_seconds: u64,
+    /// True when both figures were read from the operating system.
+    pub measured: bool,
 }
 
 /// The whole process's high-water mark over a run ([`Sampler::process_peak`]).
