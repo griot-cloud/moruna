@@ -281,7 +281,8 @@ jobs:
       - name: The guest image, built twice to prove it reproduces
         run: |
           python -m pip install --upgrade pip maturin
-          maturin build --release --out wheel --interpreter python3.14t
+          # The guest runs governed plans (PlanSource) and contract writes (PeqlSink) from Python.
+          maturin build --release --out wheel --interpreter python3.14t --features moruna-py/python,moruna-py/peql
           guest/build.sh wheel/moruna-*.whl build-a
           guest/build.sh wheel/moruna-*.whl build-b
           if [ "$(cat build-a/digest)" != "$(cat build-b/digest)" ]; then
