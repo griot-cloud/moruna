@@ -22,8 +22,12 @@ wheel="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 out="$(mkdir -p "$2" && cd "$2" && pwd)"
 [ -f "$wheel" ] || { echo "guest/build.sh: no wheel at $1" >&2; exit 2; }
 
+# Exported, because `docker run -e NAME` passes a variable only when it is in the environment:
+# a pin that is merely set reaches the container unset, and its `set -u` stops there.
+set -a
 # shellcheck source=/dev/null
 . "$here/pins.env"
+set +a
 
 case "$(uname -m)" in
     x86_64) arch=x86_64 oci_arch=amd64 karch=x86_64 kimage=vmlinux ;;
