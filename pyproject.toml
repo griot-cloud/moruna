@@ -28,7 +28,9 @@ polars = ["polars>=1.0"]
 manifest-path = "crates/moruna-py/Cargo.toml"
 module-name = "moruna._core"
 python-source = "python"
-features = ["moruna-py/python"]
+# `peql`: a governed plan (PlanSource) and a contract write (PeqlSink) from Python, the
+# same as the guest image's wheel. An owner's machine runs these outside a VM.
+features = ["moruna-py/python", "moruna-py/peql"]
 # PY-I7 and preamble 6.6: CPython 3.14 in both builds, standard and free threaded, on
 # manylinux_2_28 x86_64 and aarch64 and macosx arm64. Six wheels, no abi3: PyO3 cannot use the
 # stable ABI for a free threaded build, so the two builds cannot share one wheel. The 3.13
