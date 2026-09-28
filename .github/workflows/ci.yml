@@ -213,24 +213,38 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
+      # Both builds (PY-I7), each named by its own path: the free-threaded install also
+      # carries a `python3.14`, so a bare name finds 3.14t twice (0.2.4 shipped only 3.14t).
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: standard
         with:
-          # Both builds (PY-I7): without the standard interpreter maturin finds only 3.14t.
-          python-version: |
-            3.14
-            3.14t
+          python-version: "3.14"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: freethreaded
+        with:
+          python-version: "3.14t"
       - name: Build the wheels
+        env:
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
           python -m pip install --upgrade pip maturin
-          maturin build --release --out dist --interpreter python3.14 python3.14t
+          maturin build --release --out dist --interpreter "$STANDARD" "$FREETHREADED"
+          ls dist/*-cp314-cp314-* dist/*-cp314-cp314t-*
           ls -la dist
       - name: The wheel installs and runs before it is published
         # A wheel that has never been imported is not a release candidate. The tests
-        # themselves ran on the pull request; this is the artefact, on this platform.
+        # themselves ran on the pull request; this is the artefact, on this platform, in
+        # both builds.
+        env:
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
-          python -m pip install --only-binary=:all: pyarrow
-          python -m pip install --no-index --find-links dist moruna
-          python -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
+          for py in "$STANDARD" "$FREETHREADED"; do
+            "$py" -m pip install --only-binary=:all: pyarrow
+            "$py" -m pip install --no-index --find-links dist moruna
+            "$py" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.os }}
