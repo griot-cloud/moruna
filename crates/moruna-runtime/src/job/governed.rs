@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use super::SpecError;
+use super::build::KernelLoader;
 use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 use moruna_kernel::Result;
 
@@ -71,11 +72,12 @@ pub(super) fn source(
     contract: &Option<String>,
     sql: &Option<String>,
     caller: &serde_json::Map<String, serde_json::Value>,
+    loader: &dyn KernelLoader,
     engines: &Engines,
 ) -> Result<Read> {
     check_read(contract, sql)?;
     let root = root_of("source.root", root)?;
-    imp::source(root, contract, sql, caller, engines)
+    imp::source(root, contract, sql, caller, loader, engines)
 }
 
 /// The sink's builder, where the contract it writes keeps its files, and its writes' memory.
@@ -84,6 +86,7 @@ pub(super) fn sink(
     contract: &str,
     caller: &serde_json::Map<String, serde_json::Value>,
     mode: &Option<String>,
+    loader: &dyn KernelLoader,
     engines: &Engines,
 ) -> Result<Write> {
     if contract.is_empty() {
@@ -91,7 +94,7 @@ pub(super) fn sink(
     }
     let overwrite = overwrite_of(mode)?;
     let root = root_of("sink.root", root)?;
-    imp::sink(root, contract, caller, overwrite, engines)
+    imp::sink(root, contract, caller, overwrite, loader, engines)
 }
 
 #[cfg(feature = "peql")]
@@ -103,7 +106,7 @@ mod imp {
     use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory};
     use moruna_kernel::{MorunaError, Result, Sink, Source};
 
-    use super::{Engines, Read, SpecError, Write};
+    use super::{Engines, KernelLoader, Read, SpecError, Write};
     use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 
     /// The facade sizes a plan's pool; this is how it reaches it.
@@ -150,15 +153,20 @@ mod imp {
     }
 
     impl Engines {
-        fn open(&self, root: &PathBuf) -> Result<Arc<Engine>> {
+        fn open(&self, root: &PathBuf, loader: &dyn KernelLoader) -> Result<Arc<Engine>> {
             let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = open.get(root) {
                 return Ok(Arc::clone(engine));
             }
-            let engine = Arc::new(Engine::open(root).map_err(|e| MorunaError::Config {
+            let mut engine = Engine::open(root).map_err(|e| MorunaError::Config {
                 name: "peql",
                 msg: format!("opening the engine at {}: {e}", root.display()),
-            })?);
+            })?;
+            // The loader's resolution, when it has one, before anything asks where a contract is.
+            if let Some(bindings) = loader.bindings(root)? {
+                engine = engine.with_bindings(bindings);
+            }
+            let engine = Arc::new(engine);
             open.insert(root.clone(), Arc::clone(&engine));
             Ok(engine)
         }
@@ -169,6 +177,7 @@ mod imp {
         contract: &Option<String>,
         sql: &Option<String>,
         caller: &serde_json::Map<String, serde_json::Value>,
+        loader: &dyn KernelLoader,
         engines: &Engines,
     ) -> Result<Read> {
         let caller = caller_of("source.caller", caller)?;
@@ -179,7 +188,7 @@ mod imp {
         let names = read
             .contracts()
             .map_err(|e| SpecError::new("source.sql", e))?;
-        let engine = engines.open(&root)?;
+        let engine = engines.open(&root, loader)?;
         let mut targets = Vec::new();
         for name in names {
             targets.extend(target(&engine, field, &name)?);
@@ -228,6 +237,7 @@ mod imp {
         contract: &str,
         caller: &serde_json::Map<String, serde_json::Value>,
         overwrite: bool,
+        loader: &dyn KernelLoader,
         engines: &Engines,
     ) -> Result<Write> {
         let caller = caller_of("sink.caller", caller)?;
@@ -236,7 +246,7 @@ mod imp {
         } else {
             WriteMode::Append
         };
-        let engine = engines.open(&root)?;
+        let engine = engines.open(&root, loader)?;
         let written = target(&engine, "sink.contract", contract)?.ok_or_else(|| {
             SpecError::new(
                 "sink.contract",
@@ -262,7 +272,7 @@ mod imp {
 
 #[cfg(not(feature = "peql"))]
 mod imp {
-    use super::{Engines, Read, SpecError};
+    use super::{Engines, KernelLoader, Read, SpecError};
     use moruna_kernel::Result;
 
     const ABSENT: &str = "this build of moruna has no peQL bridge (feature `peql`)";
@@ -272,6 +282,7 @@ mod imp {
         _contract: &Option<String>,
         _sql: &Option<String>,
         _caller: &serde_json::Map<String, serde_json::Value>,
+        _loader: &dyn KernelLoader,
         _engines: &Engines,
     ) -> Result<Read> {
         Err(SpecError::new("source.kind", ABSENT).into())
@@ -282,6 +293,7 @@ mod imp {
         _contract: &str,
         _caller: &serde_json::Map<String, serde_json::Value>,
         _overwrite: bool,
+        _loader: &dyn KernelLoader,
         _engines: &Engines,
     ) -> Result<super::Write> {
         Err(SpecError::new("sink.kind", ABSENT).into())

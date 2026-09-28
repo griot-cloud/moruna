@@ -543,3 +543,90 @@ fn a_sink_over_its_own_source_is_refused() {
     assert!(unknown.contains("source.contract"), "{unknown}");
     assert!(!root.join("big").exists(), "nothing was written");
 }
+
+/// A loader that knows `demo/big`'s files are the ones `demo/copy` keeps: an engine's own
+/// resolution would put them apart.
+struct Moved;
+
+struct MovedBindings {
+    own: moruna_datafusion::engine::LocalParquet,
+    to: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl moruna_datafusion::engine::BindingResolver for MovedBindings {
+    async fn provider(
+        &self,
+        contract: &parcel_core::CompiledContract,
+        stored: bool,
+    ) -> moruna_datafusion::engine::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        self.own.provider(contract, stored).await
+    }
+    fn location(
+        &self,
+        contract: &parcel_core::CompiledContract,
+    ) -> Option<moruna_datafusion::engine::Location> {
+        if contract.name == "demo/big" {
+            Some(moruna_datafusion::engine::Location::Local(self.to.clone()))
+        } else {
+            self.own.location(contract)
+        }
+    }
+}
+
+impl moruna_runtime::job::KernelLoader for Moved {
+    fn load(
+        &self,
+        index: usize,
+        doc: &moruna_runtime::job::KernelDoc,
+    ) -> moruna_kernel::Result<moruna_runtime::job::LoadedKernel> {
+        NoKernels.load(index, doc)
+    }
+    fn bindings(
+        &self,
+        root: &Path,
+    ) -> moruna_kernel::Result<Option<Arc<dyn moruna_datafusion::engine::BindingResolver>>> {
+        Ok(Some(Arc::new(MovedBindings {
+            own: moruna_datafusion::engine::LocalParquet {
+                base: root.to_path_buf(),
+            },
+            to: root.join("copy"),
+        })))
+    }
+}
+
+/// A loader's binding resolution is the engine's: where it says a contract's files are is
+/// where the run reads them, so a sink over them is refused as a sink over its own source.
+#[test]
+fn a_loaders_bindings_decide_where_a_contract_is() {
+    let scratch = Scratch::new("h6_bindings");
+    let root = scratch.path().join("disk");
+    disk(&root);
+    let owner = caller("ana", "demo");
+    let job = |loader: &dyn moruna_runtime::job::KernelLoader| {
+        let job = JobSpec::from_value(serde_json::json!({
+            "moruna_spec": 1,
+            "source": {"kind": "datafusion", "root": root, "contract": "demo/big", "caller": owner},
+            "sink": {"kind": "peql", "root": root, "contract": "demo/copy", "caller": owner},
+        }))
+        .expect("parses");
+        let env = |_: &str| None;
+        build(
+            &job,
+            loader,
+            BuildOptions {
+                strict: false,
+                env: &env,
+                notes: Vec::new(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+    job(&NoKernels).expect("apart on the engine's own resolution");
+    let moved = job(&Moved).expect_err("together on the loader's");
+    assert!(
+        moved.contains("the sink writes where the source reads"),
+        "{moved}"
+    );
+}

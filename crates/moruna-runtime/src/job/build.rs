@@ -51,6 +51,18 @@ pub trait KernelLoader {
     /// The kernel for `doc`, which is entry `index` of `kernels` (stage `index + 1`).
     fn load(&self, index: usize, doc: &KernelDoc) -> Result<LoadedKernel>;
 
+    /// Where the contracts of the governed engine opened at `root` keep their files, when a
+    /// caller knows more than the engine does: an authorized read-only root another party's
+    /// contract is bound to, say. `None` (the default) is the engine's own resolution, every
+    /// contract on `root`.
+    #[cfg(feature = "peql")]
+    fn bindings(
+        &self,
+        _root: &std::path::Path,
+    ) -> Result<Option<std::sync::Arc<dyn moruna_datafusion::engine::BindingResolver>>> {
+        Ok(None)
+    }
+
     /// The source for `"kind": "iterator"`, which only a library caller can supply.
     fn iterator_source(&self) -> Result<SourceSpec> {
         Err(SpecError::new(
@@ -178,7 +190,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
 
     let engines = governed::Engines::default();
     let (source, source_targets, engine_memory) = source_of(&job.source, loader, &engines)?;
-    let (sink, sink_target, sink_memory) = sink_of(&job.sink, &mut notes, &engines)?;
+    let (sink, sink_target, sink_memory) = sink_of(&job.sink, &mut notes, loader, &engines)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;
 
     // Each entry is loaded and its pin checked on its own; adjacent standard kernels are then
@@ -439,7 +451,7 @@ fn source_of(
             contract,
             sql,
             caller,
-        } => governed::source(root, contract, sql, caller, engines),
+        } => governed::source(root, contract, sql, caller, loader, engines),
     }
 }
 
@@ -485,6 +497,7 @@ fn row_filter(index: usize, doc: &FilterDoc) -> Result<RowFilter> {
 fn sink_of(
     doc: &SinkDoc,
     notes: &mut Vec<String>,
+    loader: &dyn KernelLoader,
     engines: &governed::Engines,
 ) -> Result<governed::Write> {
     match doc {
@@ -571,7 +584,7 @@ fn sink_of(
             contract,
             caller,
             mode,
-        } => governed::sink(root, contract, caller, mode, engines),
+        } => governed::sink(root, contract, caller, mode, loader, engines),
     }
 }
 

@@ -3333,7 +3333,9 @@ name = "moruna-runtime"
 version = "0.2.2"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
+ "datafusion",
  "getrandom 0.4.3",
  "http-body-util",
  "hyper",
@@ -3354,6 +3356,7 @@ dependencies = [
  "moruna-testkit",
  "moruna-trace",
  "moruna-vmm",
+ "parcel-core",
  "parquet",
  "serde",
  "serde_json",
