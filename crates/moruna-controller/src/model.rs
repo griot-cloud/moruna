@@ -318,22 +318,36 @@ pub(crate) fn working_set(state: &ControllerState, targets: &[u64]) -> u64 {
     total
 }
 
-/// The anon half of RC-I1 read without the fixed term: what the targets cost if every byte the
-/// probe saw scales with the morsel.
+/// What the targets cost on the most favourable reading of what has been measured: for each
+/// stage, the smaller of its fixed term and its scaling term, plus the funded state.
 ///
 /// One probe cannot tell a kernel that holds a fixed 160 MB from one that holds ten bytes per
-/// byte, so f.3 funds the fixed term and plans small until a record separates them. That is the
-/// right way to be wrong about a morsel target. It is the wrong way to be wrong about whether a
-/// run may start at all: the fixed reading of a steep probe exceeds many a ceiling on its own,
-/// and refusing on it would refuse runs whose second record would have shown the cost scaling.
-/// So the refusal at `start` answers to this reading, and the plan answers to the other one.
+/// byte, so f.3 funds both terms and plans small until a record separates them. That is the
+/// right way to be wrong about a morsel target, and the wrong way to be wrong about whether a
+/// run may start at all, so the refusal at `start` answers to whichever reading predicts less.
+/// Taking the slope alone, as this did until 2026-09-29, is favourable only when the probe's
+/// morsel is at least the floor's size: a probe of a few hundred bytes whose window caught a
+/// one-time cost (a worker's first allocation sets up a glibc arena on Linux, megabytes) read
+/// as a slope in the thousands, the floor morsel was "measured" at 22.7 GB, and a run with room
+/// to spare was refused on a Linux runner. Read as a fixed cost, the same measurement is a few
+/// megabytes. No term measured means nothing to refuse on.
+fn optimistic_cost(state: &ControllerState, targets: &[u64]) -> u64 {
+    let mut total = state.state_total;
+    for (at, target) in targets.iter().enumerate() {
+        let scaling = scale(anon_allowance(state, at, *target), share(state, *target));
+        total = total.saturating_add(scaling.min(state.stages[at].c_anon));
+    }
+    total
+}
+
+/// The anon half of RC-I1 on the most favourable reading of the evidence (`optimistic_cost`).
 ///
 /// It answers to the ceiling, too, and not to `for_kernels`: the share withheld there is a margin
 /// the runtime keeps for its own bytes, and a plan that overruns a margin is a plan to tighten,
 /// not a run to refuse.
 pub(crate) fn fits_anon_optimistically(state: &ControllerState, targets: &[u64]) -> bool {
-    let scaling = anon_footprint(state, targets).saturating_sub(anon_fixed(state));
-    resting_anon(state).saturating_add(scaling) <= state.cfg.limits.memory_ceiling
+    resting_anon(state).saturating_add(optimistic_cost(state, targets))
+        <= state.cfg.limits.memory_ceiling
 }
 
 /// RC-I1: whether a proposed set of targets fits the budget -- both of the budgets in the
@@ -693,7 +707,7 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Result<Actions> {
 fn cannot_be_sized(state: &ControllerState, targets: &[u64]) -> moruna_kernel::MorunaError {
     let ceiling = state.cfg.limits.memory_ceiling;
     let resting = resting_anon(state);
-    let predicted = anon_footprint(state, targets).saturating_sub(anon_fixed(state));
+    let predicted = optimistic_cost(state, targets);
     let msg = format!(
         "this budget cannot hold this job on this host: the ceiling is {ceiling} bytes, the \
              process held {} bytes before the arena existed, the arena took {} more, and the \
