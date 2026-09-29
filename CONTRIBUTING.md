@@ -34,6 +34,12 @@ publishes them to PyPI, and creates the tag afterwards, so a tag always names so
 shipped. Nobody creates tags by hand, and a merge that does not change the version publishes
 nothing.
 
+Nothing is published from a commit that was not tested. The tests run on the pull request, not
+again on the merge; before anything is built for PyPI or the documentation site, CI checks that
+the commit on `main` is the merge of a pull request whose `build, test, lint` passed, and
+publishes nothing otherwise. Since `main` only takes pull requests that are up to date with it,
+what was tested is what landed.
+
 ## Reporting a problem
 
 Please include the host, the budget you gave the run, and what the run report said. The report is a pure function of the per morsel trace, so `report.to_json()` (and the trace file, where you can share it) usually answers the question outright. For anything with a security angle, follow [`SECURITY.md`](SECURITY.md) rather than opening a public issue.

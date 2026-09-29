@@ -174,12 +174,50 @@ jobs:
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
 
+  # The rule every publish below follows: a commit on main is published (to PyPI, as a tag,
+  # or as the documentation site) only when it is the merge of a pull request whose
+  # `build, test, lint` passed. Tests do not run again on the merge; this job checks that they
+  # ran, and passed, on the change that was merged, and the branch's protection requires a
+  # pull request to be up to date with main before it merges, so what was tested is what
+  # landed. A commit that reached main any other way (an administrator's push past the
+  # protection, as E8's did on 2026-09-27, and 0.2.0 shipped from it) publishes nothing.
+  tested:
+    name: the merged change passed its checks
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api "repos/$REPO/commits/$SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null and .base.ref == "main" and .merge_commit_sha == env.SHA)][0].number // empty')"
+          if [ -z "$pr" ]; then
+            echo "::error::$SHA is not the merge of a pull request into main, so nothing checked it; it is not published"
+            exit 1
+          fi
+          head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
+          conclusion="$(gh api "repos/$REPO/commits/$head/check-runs?check_name=build,%20test,%20lint" \
+            --jq '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.completed_at) | last | .conclusion // empty')"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::pull request #$pr's build, test, lint on $head is '${conclusion:-absent}', so $SHA is not published"
+            exit 1
+          fi
+          echo "$SHA is the merge of pull request #$pr, whose build, test, lint passed on $head"
+
   # The documentation site, on a merge to main that changed docs/. Built here rather than
   # carried over from the pull request, because an artefact from another run cannot be
   # deployed; the pull request's build is the one that failed on a warning. Two jobs,
   # because only the second may write to Pages.
   docs:
     name: build the documentation site
+    needs: tested
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
@@ -237,6 +275,7 @@ jobs:
   # tokens that can write to PyPI and to this repository.
   version:
     name: a version to release
+    needs: tested
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
