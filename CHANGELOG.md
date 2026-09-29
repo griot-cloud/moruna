@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **A safetensors file whose header was not padded reads correctly.** The reference writer pads the JSON header to eight bytes, so a tensor's data starts on an item boundary; a writer that does not pad can put a `float32` tensor at byte 91, and a `TensorSource` refused it (`byte offset 91 is not a multiple of the item size 4`). Such a range is now read from its own first byte, buffered, and the tensor is a view at offset zero. Found by the first end-to-end tensor job, which is now a test in the Python suite.
+- **A shared cgroup's lifetime peak no longer sizes the run.** Where `memory.peak` cannot be reset (a cgroup the process may not write, as on a CI runner), it is the cgroup's peak since the cgroup was made, and a probe of a few hundred bytes was measured to cost everything the cgroup had ever held, so a run at any budget was refused as unsizeable. After a refused reset the sampler's own running peak is the peak.
+
 ## 0.1.1
 
 Fixes S1 for tight budgets. **Do not use 0.1.0**: its memory bound could be exceeded by about a percent at a tight ceiling, it was published from a failing pipeline, and it carried a Linux wheel only. It is no longer on PyPI.

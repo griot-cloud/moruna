@@ -23,7 +23,7 @@ struct Pending {
     base: u64,
     top: u64,
     hi: u64,
-    enclosing: u64,
+    direct: bool,
     byte_offset: u64,
     dtype: moruna_kernel::DType,
     shape: Vec<i64>,
@@ -43,7 +43,7 @@ pub(crate) fn read<'a>(
     match submit(source, split, rows, alloc, tier) {
         Err(e) => Box::pin(async move { Err(e) }),
         Ok(Ok(payload)) => Box::pin(async move { payload }),
-        Ok(Err(pending)) => Box::pin(finish(source, pending)),
+        Ok(Err(pending)) => Box::pin(finish(pending)),
     }
 }
 
@@ -89,7 +89,17 @@ fn submit(
     let page = alloc.page_bytes() as u64;
     let lo = entry.data_offset + range.start * row_bytes;
     let hi = lo + payload_bytes;
-    let base = page_floor(lo, page);
+    // The tensor is a view at `lo - base` inside the buffer, and a view has to start on an item
+    // boundary (contracts d.4, CT-T19). A safetensors data section starts wherever its JSON
+    // header ends, which is a multiple of eight when the reference writer padded it and
+    // anything at all when another did not; a `float32` tensor at byte 99 has a start no page
+    // floor can make aligned. Such a range is read from its own first byte instead, buffered
+    // (the reactor takes any offset on that path, 06 e.2), so the view starts at zero. The
+    // aligned case keeps the page-floored read, which is what makes it direct (2026-09-29;
+    // this was the first thing the first real tensor job found).
+    let item = entry.dtype.item_size() as u64;
+    let aligned = lo.is_multiple_of(item);
+    let base = if aligned { page_floor(lo, page) } else { lo };
     let top = page_ceil(hi, page).min(entry.file_len);
     let enclosing = top - base;
 
@@ -102,7 +112,9 @@ fn submit(
     let buffer = alloc.alloc(length, tier)?;
     // Direct when the reactor selected the direct path and the range is a whole number of
     // pages; a file that ends mid-page makes the last read buffered (e.4).
-    let direct = source.reactor().paths().direct_io && enclosing.is_multiple_of(page);
+    let direct = source.reactor().paths().direct_io
+        && base.is_multiple_of(page)
+        && enclosing.is_multiple_of(page);
     if direct {
         Counters::add(&source.counters().tensor_direct_reads, 1);
     } else {
@@ -118,7 +130,7 @@ fn submit(
         base,
         top,
         hi,
-        enclosing,
+        direct,
         byte_offset: lo - base,
         dtype: entry.dtype,
         shape,
@@ -130,7 +142,7 @@ fn submit(
 
 /// The half that waits: the bytes land in the buffer the reactor was given, and the tensor is
 /// a view at `byte_offset` inside it (e.4). No copy, no mapping, no `unsafe`.
-async fn finish(source: &TensorSource, pending: Pending) -> Result<Payload> {
+async fn finish(pending: Pending) -> Result<Payload> {
     let Pending {
         completion,
         split,
@@ -138,7 +150,7 @@ async fn finish(source: &TensorSource, pending: Pending) -> Result<Payload> {
         base,
         top,
         hi,
-        enclosing,
+        direct,
         byte_offset,
         dtype,
         shape,
@@ -169,7 +181,7 @@ async fn finish(source: &TensorSource, pending: Pending) -> Result<Payload> {
         end,
         bytes = payload_bytes,
         decode_us = 0u64,
-        direct = source.reactor().paths().direct_io && enclosing.is_multiple_of(4096),
+        direct,
         "tensor read",
     );
     let tensor = ManagedTensor::from_buffer(buffer, byte_offset, dtype, shape)

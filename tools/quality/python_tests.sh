@@ -12,7 +12,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 uv run --python "$MORUNA_PYTHON" --with maturin maturin build --release --out "$work/dist" >/dev/null
 uv venv --python "$MORUNA_PYTHON" "$work/venv" >/dev/null
-uv pip install --python "$work/venv" --quiet "$work"/dist/*.whl pyarrow pytest
+uv pip install --python "$work/venv" --quiet "$work"/dist/*.whl pyarrow pytest numpy
 # Run from a copy of the tests so no stale extension module in python/ is importable.
 cp -R python/tests "$work/tests"
 ( cd "$work" && "$work/venv/bin/python" -m pytest -q tests )

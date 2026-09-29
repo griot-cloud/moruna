@@ -200,6 +200,7 @@ impl SamplerTrait for Sampler {
             source,
             buffer,
             running_peak,
+            peak_reset_refused,
             last,
             process_peak,
             lifetime_at_create,
@@ -287,7 +288,16 @@ impl SamplerTrait for Sampler {
         let sample = Sample {
             anon_bytes: memory.anon,
             file_bytes: memory.file,
-            peak_anon_bytes: kernel_peak.unwrap_or(*running_peak),
+            // `memory.peak` is the peak since it was last reset. Where the reset is refused, it
+            // is the cgroup's peak since the cgroup was made, which on a shared cgroup predates
+            // this process: a GitHub runner's, after the Rust build that ran there, read 13.4
+            // GiB, and a probe of a few hundred bytes was "measured" to cost that. The sampler
+            // then tracks its own peak from its samples, as the reset's note already said it
+            // does (f.2; 2026-09-29).
+            peak_anon_bytes: match kernel_peak {
+                Some(kernel) if !*peak_reset_refused => kernel,
+                _ => *running_peak,
+            },
             throttled_us,
             device_used,
             at_ns,
@@ -568,6 +578,56 @@ mod tests {
         sampler.reset_peak();
         let written = std::fs::read_to_string(dir.join("memory.peak")).expect("memory.peak");
         assert_eq!(written, "reset");
+    }
+
+    /// f.2, the peak the kernel keeps but will not let go of: where `memory.peak` cannot be
+    /// reset, it is the cgroup's peak since the cgroup was made, which on a shared cgroup is
+    /// someone else's high-water mark (a GitHub runner's, 13.4 GiB after the Rust build, which
+    /// a probe of a few hundred bytes was then "measured" to cost on 2026-09-29). After a refused
+    /// reset the sampler's own running peak is the peak, and the file is not read into it again.
+    #[test]
+    fn a_peak_that_cannot_be_reset_is_not_the_peak() {
+        let tmp = TempDir::new("peak-refused");
+        let dir = tmp.path().join("cgroup");
+        write(&dir, "memory.stat", "anon 100\nfile 0\nunevictable 0\n");
+        write(&dir, "memory.peak", "999999\n");
+        let peak_path = dir.join("memory.peak");
+        let mut perms = std::fs::metadata(&peak_path)
+            .expect("memory.peak")
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&peak_path, perms).expect("read-only memory.peak");
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&peak_path)
+            .is_ok()
+        {
+            // Root writes through a read-only bit: this process cannot stage the refusal.
+            eprintln!("skipped: this process can write a read-only file");
+            return;
+        }
+        let sampler =
+            Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
+        // Until a reset is refused the kernel's figure stands, as before.
+        assert_eq!(sampler.sample().peak_anon_bytes, 999_999);
+
+        sampler.reset_peak();
+        let after = sampler.sample();
+        assert_eq!(
+            after.peak_anon_bytes, 100,
+            "after a refused reset the peak is the sampler's own, not the cgroup's lifetime mark"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&peak_path).expect("memory.peak"),
+            "999999\n",
+            "the refused write left the file alone"
+        );
+
+        // And the running peak keeps following the samples from there.
+        write(&dir, "memory.stat", "anon 250\nfile 0\nunevictable 0\n");
+        assert_eq!(sampler.sample().peak_anon_bytes, 250);
+        write(&dir, "memory.stat", "anon 120\nfile 0\nunevictable 0\n");
+        assert_eq!(sampler.sample().peak_anon_bytes, 250);
     }
 
     /// f.2, v1 fallback: the v1 field names are read and `throttled_time` is nanoseconds.

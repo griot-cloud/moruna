@@ -244,6 +244,20 @@ pub fn write_safetensors(
     shape: Vec<i64>,
     base: f32,
 ) -> (PathBuf, Vec<f32>) {
+    write_safetensors_padded(dir, name, shape, base, true)
+}
+
+/// `write_safetensors` with the choice of padding the header. The reference writer pads it to
+/// a multiple of eight; other writers (a hand-rolled one, an older library) do not, and then
+/// the data section starts wherever the JSON ends, which for a `float32` tensor is usually not
+/// on an item boundary. Both are valid safetensors files.
+pub fn write_safetensors_padded(
+    dir: &Path,
+    name: &str,
+    shape: Vec<i64>,
+    base: f32,
+    pad: bool,
+) -> (PathBuf, Vec<f32>) {
     let path = dir.join(format!("{name}.safetensors"));
     let count: i64 = shape.iter().product();
     let values: Vec<f32> = (0..count).map(|i| base + i as f32).collect();
@@ -258,7 +272,7 @@ pub fn write_safetensors(
     );
     // The safetensors writer pads the header with spaces to a multiple of eight, so the data
     // section starts eight byte aligned and never on a 64 byte boundary (e.4).
-    while !(8 + header.len()).is_multiple_of(8) {
+    while pad && !(8 + header.len()).is_multiple_of(8) {
         header.push(' ');
     }
     let mut bytes = Vec::new();

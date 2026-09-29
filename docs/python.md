@@ -26,10 +26,10 @@ source = moruna.ParquetSource(
 
 `filters` skips whole row groups that cannot contain a match. Each filter is a column, an operator (`>`, `<` or `==`) and a value, checked against the statistics Parquet stores for each row group. Rows that do not match can still arrive in groups that were not skipped, so apply the exact condition in a kernel as well. Filters help most when the data is sorted or clustered on the filtered column.
 
-**Tensor files.** `moruna.TensorSource` reads safetensors files, or files in Moruna's aligned binary format, and passes each tensor to kernels that declare `accepts="tensor"`:
+**Tensor files.** `moruna.TensorSource` reads safetensors files, or files in Moruna's aligned binary format, and passes each tensor to kernels that declare `accepts="tensor"`. Name the files, not a directory:
 
 ```python
-source = moruna.TensorSource("embeddings/", tensors=["vectors"])
+source = moruna.TensorSource(["embeddings/part-0.safetensors", "embeddings/part-1.safetensors"], tensors=["vectors"])
 ```
 
 **Your own iterator.** `moruna.IteratorSource` reads from any Python iterable that yields `pyarrow.RecordBatch` objects, for data that is not in files Moruna can read:
