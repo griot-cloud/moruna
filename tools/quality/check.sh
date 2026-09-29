@@ -2,9 +2,9 @@
 # Moruna quality gate. Run by the pre-commit hook (tools/hooks/pre-commit) and by
 # the first CI job (preamble 6.6). It fails on: an em dash in any tracked text
 # file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
-# StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab,
-# an unlisted page or a placeholder with no citation under docs/
-# (tools/docs/check_docs.py, F7.1); a commit-message rule the DCO self-test
+# StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab
+# or a page in no toctree under docs/ (tools/docs/check_docs.py; CI also builds
+# the site with Sphinx, warnings as errors); a commit-message rule the DCO self-test
 # rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
 # when cargo-deny is installed (F6.5); a failing test; a failing
 # examples/append_column.rs, which is the first program a user writes; line
@@ -48,7 +48,7 @@ step "tools/quality/no_stubs.sh (nothing in a shipping crate is a stub)"
 quiet no_stubs tools/quality/no_stubs.sh
 
 if [ -d docs ] && [ -x tools/docs/check_docs.py ]; then
-  step "tools/docs/check_docs.py (docs conventions, links, SUMMARY, citations)"
+  step "tools/docs/check_docs.py (docs conventions, links, every page in a toctree)"
   quiet docs tools/docs/check_docs.py
 fi
 
