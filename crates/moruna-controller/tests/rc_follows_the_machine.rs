@@ -320,3 +320,39 @@ fn stale_records_and_drains_are_not_breaches() {
     );
     rig.controller.stop();
 }
+
+/// Between the watcher lowering the ceiling (`follow_limits`) and reporting the drain it started
+/// (`set_arena`), the arena above the new ceiling is already on its way out. A breach in that
+/// window sheds and does not end the run: a run on a machine raised and then lowered was
+/// terminated with "footprint exceeds budget 0" when a record landed there (2026-09-29).
+#[test]
+fn a_breach_before_the_drain_is_reported_does_not_end_the_run() {
+    let rig = rig(GIB, 1, run(200 * MIB, GIB, 1.0, 1_000_000, 64));
+    rig.run_up();
+    let host = rig.controller.limits_in_force().2;
+    // Lowered below what is resident: the arena alone is now over the ceiling.
+    rig.controller.follow_limits(200 * MIB, 0.0);
+
+    // No `set_arena` yet. Current breaches at the floor on one worker.
+    let now = epoch_ns() + 1_000_000_000;
+    for seq in 1..40 {
+        rig.feed(&over(seq, now + seq));
+    }
+    assert!(
+        rig.knobs.terminated().is_none(),
+        "the drain has begun though it is not reported yet: {:?}",
+        rig.knobs.terminated()
+    );
+
+    // The watcher reports the drain complete: the ordinary rule applies again.
+    rig.controller.set_arena(host, 0);
+    let now = epoch_ns() + 2_000_000_000;
+    for seq in 40..80 {
+        rig.feed(&over(seq, now + seq));
+    }
+    assert!(
+        rig.knobs.terminated().is_some(),
+        "after the drain a run that cannot fit is diagnosed"
+    );
+    rig.controller.stop();
+}

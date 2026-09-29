@@ -639,6 +639,10 @@ pub(crate) struct ControllerState {
     /// Arena bytes in regions that are draining: resident, not the plan's, and not the
     /// kernels'.
     pub arena_draining: u64,
+    /// Bytes of the resting figure above a ceiling that was just lowered, before the watcher's
+    /// `set_arena` reports the drain it started. Only the breach path reads it (a shrink under
+    /// way is not a kernel that does not fit); the plan waits for the arena's own figure.
+    pub drain_pending: u64,
     /// When the limits or the arena last moved, nanoseconds since the epoch. A record whose
     /// `apply` started before it was measured against a resting figure and a ceiling that no
     /// longer hold, so it feeds neither the fit of f.3 nor the breach path of f.7.
@@ -993,6 +997,7 @@ impl Controller {
             cpu_bound: None,
             limits_changes: 0,
             arena_draining: 0,
+            drain_pending: 0,
             limits_epoch_ns: 0,
         };
         Ok(Controller {
@@ -1080,6 +1085,8 @@ impl Controller {
                 state.arena_draining = draining_bytes;
                 state.limits_epoch_ns = elastic::now_ns();
             }
+            // The arena's own figure has arrived, so the provisional one is superseded.
+            state.drain_pending = 0;
             if !state.terminated {
                 elastic::set_host_budget(&mut state, budget_bytes, &mut actions);
             }
