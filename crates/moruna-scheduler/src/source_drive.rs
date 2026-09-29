@@ -50,6 +50,8 @@ struct InFlight<'a> {
     split: u32,
     rows: RowRange,
     kind: ReadKind,
+    /// What the arena may charge for this read, as admission counted it (f.5).
+    charge: u64,
 }
 
 /// The tier a read lands in: the run's one host tier (contracts e.1, f.5).
@@ -67,6 +69,18 @@ fn target_stage(shared: &Shared) -> moruna_kernel::StageId {
     if shared.stages.is_empty() { 0 } else { 1 }
 }
 
+/// Where a range that starts at `start` in `split` ends, for a read of about `bytes` (the
+/// morsel target when `None`), clamped to the morsel range (f.5).
+fn range_end(shared: &Shared, split: &Split, start: u64, bytes: Option<u64>) -> u64 {
+    if !split.sub_splittable {
+        return split.rows;
+    }
+    let target = bytes
+        .unwrap_or_else(|| shared.knobs.morsel_target(target_stage(shared)))
+        .clamp(shared.cfg.morsel_min, shared.cfg.morsel_max);
+    (start + rows_for(split, target)).min(split.rows)
+}
+
 /// The next range to issue, and the cursor advanced past it (f.5). `None` when the plan is
 /// exhausted. The range is recorded as issued under the same lock that advances the cursor, so
 /// a checkpoint never sees the cursor past a read it cannot find (MH 4.7).
@@ -80,17 +94,9 @@ fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRan
             cursor.row_offset = 0;
             continue;
         }
-        let target = bytes
-            .unwrap_or_else(|| shared.knobs.morsel_target(target_stage(shared)))
-            .clamp(shared.cfg.morsel_min, shared.cfg.morsel_max);
-        let rows = rows_for(split, target);
         let start = cursor.row_offset;
         let whole = !split.sub_splittable;
-        let end = if whole {
-            split.rows
-        } else {
-            (start + rows).min(split.rows)
-        };
+        let end = range_end(shared, split, start, bytes);
         let seq = cursor.next_seq;
         cursor.next_seq += 1;
         cursor.row_offset = end;
@@ -107,6 +113,67 @@ fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRan
         cursor.issued.insert(seq, origin);
         return Some((index, RowRange { start, end }, seq, whole));
     }
+}
+
+/// The range `take_next_range(shared, None)` would issue next, without taking it: its split's
+/// index and its rows. `None` when the plan is exhausted.
+fn peek_next_range(shared: &Shared) -> Option<(usize, RowRange)> {
+    let cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut index, mut start) = (cursor.split_index as usize, cursor.row_offset);
+    loop {
+        let split = shared.plan.get(index)?;
+        if start >= split.rows {
+            index += 1;
+            start = 0;
+            continue;
+        }
+        let end = range_end(shared, split, start, None);
+        return Some((index, RowRange { start, end }));
+    }
+}
+
+/// The split's estimate of the bytes `rows` of it decode to: its share of the split's
+/// uncompressed bytes, by rows (f.5).
+fn estimated_bytes(split: &Split, rows: RowRange) -> u64 {
+    if split.rows == 0 {
+        return 0;
+    }
+    let share = u128::from(split.uncompressed_bytes) * u128::from(rows.end - rows.start)
+        / u128::from(split.rows);
+    u64::try_from(share).unwrap_or(u64::MAX)
+}
+
+/// What the arena may charge for a read of `rows` of `split` (f.5): the estimate, scaled by
+/// the most any read so far has come to over its estimate (`learned`, at least one), and
+/// doubled, because the arena charges each buffer the power-of-two class it rounds up to and
+/// that is at most twice the buffer (02 AR-I2, e.2).
+fn read_charge(split: &Split, rows: RowRange, learned: f64) -> u64 {
+    let estimate = estimated_bytes(split, rows) as f64;
+    (estimate * learned.max(1.0) * ARENA_ROUNDING) as u64
+}
+
+/// The most a size class rounds a buffer up by (02 e.2): the next power of two.
+const ARENA_ROUNDING: f64 = 2.0;
+
+/// f.5: whether the arena has room for a read that may be charged `charge`, beside what the
+/// reads in flight may still be charged. An allocator with no budget for the tier bounds
+/// nothing. When the arena does not have the room and nothing the run holds is on its way to
+/// being released (no read in flight, no write in flight, no worker busy and every queue empty),
+/// the read is admitted anyway and the arena decides: a read that cannot fit even an arena
+/// holding nothing but what the run keeps for itself ends the run naming its split and rows
+/// (h), rather than the drive waiting for bytes nobody will free.
+fn arena_admits(shared: &Shared, inflight: &[InFlight<'_>], charge: u64) -> bool {
+    let Some(available) = shared.alloc.available(tier0(shared)) else {
+        return true;
+    };
+    let pending: u64 = inflight.iter().map(|entry| entry.charge).sum();
+    if pending.saturating_add(charge) <= available {
+        return true;
+    }
+    inflight.is_empty()
+        && shared.writes_in_flight.load(Ordering::SeqCst) == 0
+        && shared.workers_busy.load(Ordering::SeqCst) == 0
+        && (0..=shared.last_queue()).all(|stage| shared.queue_count(stage) == 0)
 }
 
 /// A read recorded by `take_next_range` (or by a resume's recompute list) has reached Q0, so
@@ -139,10 +206,19 @@ pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, par
     let mut inflight: Vec<InFlight<'_>> = Vec::new();
     let mut replacing: HashSet<Seq> = HashSet::new();
     let mut recomputed = false;
+    // The most a read has come to over its split's estimate, which scales the next read's
+    // admission (f.5).
+    let mut learned = 1.0f64;
 
     loop {
         let mode = shared.source_mode.get();
-        let mut worked = poll_inflight(&shared, &mut inflight, &mut replacing, &mut cx);
+        let mut worked = poll_inflight(
+            &shared,
+            &mut inflight,
+            &mut replacing,
+            &mut learned,
+            &mut cx,
+        );
         while let Ok(request) = helper_rx.try_recv() {
             service_helper(&shared, request, &parker, &mut cx);
             worked = true;
@@ -160,8 +236,8 @@ pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, par
                 recomputed = true;
                 recompute(&shared, &parker, &mut cx);
             }
-            worked |= issue_replacements(&shared, &mut inflight, &mut replacing);
-            worked |= issue_reads(&shared, &mut inflight);
+            worked |= issue_replacements(&shared, &mut inflight, &mut replacing, learned);
+            worked |= issue_reads(&shared, &mut inflight, learned);
             close_when_exhausted(&shared, &inflight);
         }
         if !worked {
@@ -172,7 +248,17 @@ pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, par
 
 /// f.5: while there is room, a read at the cursor. `read_ahead = 0` keeps a floor of one read,
 /// issued only when Q0 is empty.
-fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>) -> bool {
+///
+/// Room includes the arena's, because `is_full(0)` does not keep reads inside it: a queue over
+/// its high water with a candidate to demote or evict is draining, not full (09 f.14), and a
+/// queue whose head is evicted is not planned at all until the head is back (09 f.2 step 1).
+/// A peQL copy at 256 MiB behind a slow sink (2026-09-29) evicted its seven
+/// youngest entries, waited on the head's re-read, and meanwhile read on until Q0 held 27
+/// entries, 83.8 MB of a 92.8 MB arena, and the next read's `Alloc` ended the run. A fresh read
+/// is now issued only while no evicted entry waits for its re-read and the arena has room for
+/// it beside what the reads already in flight may still take (`arena_admits`), so the queue
+/// waits on the sink instead.
+fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>, learned: f64) -> bool {
     let depth = shared.knobs.read_ahead();
     let mut issued = false;
     loop {
@@ -200,10 +286,38 @@ fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>) -> bool
         {
             break;
         }
+        // f.5: an evicted Q0 entry is one the planner took out because Q0 was over its high
+        // water, and its re-read needs back the room its eviction gave. A fresh read lands at
+        // the tail, which is where the planner evicts from next, and when the evicted entry is
+        // the head nothing leaves Q0 until it is back (09 f.2 step 1). Fresh reads wait for the
+        // replacements.
+        if !shared.placement.evicted(0).is_empty() {
+            break;
+        }
+        let Some((index, rows)) = peek_next_range(shared) else {
+            break;
+        };
+        if !arena_admits(
+            shared,
+            inflight,
+            read_charge(&shared.plan[index], rows, learned),
+        ) {
+            break;
+        }
         let Some((index, rows, seq, whole)) = take_next_range(shared, None) else {
             break;
         };
-        submit(shared, inflight, index, rows, seq, whole, ReadKind::Fresh);
+        let charge = read_charge(&shared.plan[index], rows, learned);
+        submit(
+            shared,
+            inflight,
+            index,
+            rows,
+            seq,
+            whole,
+            ReadKind::Fresh,
+            charge,
+        );
         issued = true;
     }
     issued
@@ -220,6 +334,7 @@ fn issue_replacements<'a>(
     shared: &'a Shared,
     inflight: &mut Vec<InFlight<'a>>,
     replacing: &mut HashSet<Seq>,
+    learned: f64,
 ) -> bool {
     let mut issued = false;
     let window = usize::from(shared.knobs.read_ahead().max(1));
@@ -239,6 +354,9 @@ fn issue_replacements<'a>(
             end: origin.row_end,
         };
         let whole = !shared.plan[index].sub_splittable;
+        // Counted beside the fresh reads' charges, so a fresh read is not admitted into bytes
+        // a replacement is about to take.
+        let charge = read_charge(&shared.plan[index], rows, learned);
         submit(
             shared,
             inflight,
@@ -247,12 +365,14 @@ fn issue_replacements<'a>(
             seq,
             whole,
             ReadKind::Replacement,
+            charge,
         );
         issued = true;
     }
     issued
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit<'a>(
     shared: &'a Shared,
     inflight: &mut Vec<InFlight<'a>>,
@@ -261,6 +381,7 @@ fn submit<'a>(
     seq: Seq,
     whole: bool,
     kind: ReadKind,
+    charge: u64,
 ) {
     let split = &shared.plan[index];
     let origin = Origin {
@@ -281,6 +402,7 @@ fn submit<'a>(
         split: split.id,
         rows,
         kind,
+        charge,
     });
 }
 
@@ -289,6 +411,7 @@ fn poll_inflight(
     shared: &Shared,
     inflight: &mut Vec<InFlight<'_>>,
     replacing: &mut HashSet<Seq>,
+    learned: &mut f64,
     cx: &mut Context<'_>,
 ) -> bool {
     let mut progressed = false;
@@ -304,6 +427,7 @@ fn poll_inflight(
                 replacing.remove(&entry.seq);
                 match result {
                     Ok(payload) => {
+                        learn(shared, &entry, &payload, learned);
                         let morsel = Morsel::new(entry.seq, 0, payload, entry.origin.clone());
                         let outcome = match entry.kind {
                             ReadKind::Replacement => shared.placement.replace(0, morsel),
@@ -338,6 +462,20 @@ fn poll_inflight(
         }
     }
     progressed
+}
+
+/// f.5: a split's bytes are an estimate (`Split::estimated`), so the drive keeps the most any
+/// read has come to over its estimate and scales the next read's admission by it. It never
+/// falls, so one read that came to more than its estimate keeps the bound honest for the rest
+/// of the run.
+fn learn(shared: &Shared, entry: &InFlight<'_>, payload: &Payload, learned: &mut f64) {
+    let Some(split) = shared.plan.iter().find(|split| split.id == entry.split) else {
+        return;
+    };
+    let estimate = estimated_bytes(split, entry.rows);
+    if estimate > 0 {
+        *learned = learned.max(payload.bytes() as f64 / estimate as f64);
+    }
 }
 
 /// h: name the split and the row range on any read failure.
