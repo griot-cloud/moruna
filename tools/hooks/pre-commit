@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Moruna pre-commit hook. Installed by tools/hooks/install.sh, which points
-# core.hooksPath at tools/hooks. It runs the same quality gate as the first CI
-# job, so a commit that would fail CI fails here first. An agent never bypasses
-# it (no --no-verify, no MORUNA_SKIP_QUALITY); the variable exists for a human
-# committing documentation on a machine without the Rust toolchain, and CI
-# re-runs the gate regardless.
+# core.hooksPath at tools/hooks. It runs the fast half of the quality gate
+# (tools/quality/check.sh --fast): formatting, clippy over every target, the lints
+# and the documentation checks, in seconds on an incremental build. The tests, the
+# 90% coverage floor and the Python suite run in the pre-push hook, before anything
+# reaches GitHub. MORUNA_SKIP_QUALITY=1 skips both, for a human committing
+# documentation on a machine without the Rust toolchain; CI re-runs the gate on the
+# pull request regardless.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 if [ "${MORUNA_SKIP_QUALITY:-0}" = "1" ]; then
-  echo "pre-commit: quality gate skipped by MORUNA_SKIP_QUALITY=1 (humans only; CI still runs it)"
+  echo "pre-commit: quality checks skipped by MORUNA_SKIP_QUALITY=1 (CI still runs them)"
   exit 0
 fi
-exec tools/quality/check.sh
+exec tools/quality/check.sh --fast

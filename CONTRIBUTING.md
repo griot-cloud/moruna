@@ -5,7 +5,7 @@ Thanks for your interest. Moruna makes hard promises about memory, so a change h
 ## Getting a change in
 
 1. Fork, branch from `main`, open a pull request. `main` is protected: it takes pull requests with a green pipeline.
-2. Run `tools/hooks/install.sh` once in your clone. The pre-commit hook runs the same gate CI runs, so a commit that would fail CI fails locally first.
+2. Run `tools/hooks/install.sh` once in your clone. Before each commit, a hook runs the quick checks (formatting, lints and a compile of every test) in a few seconds; before each push, it runs the full gate that CI runs, including the tests and the coverage floor, so a change that would fail CI fails on your machine first.
 3. Keep the crate you touch at 90% line coverage or better. The gate judges coverage per crate.
 
 ## What we look for

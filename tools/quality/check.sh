@@ -14,6 +14,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 MIN="${MORUNA_COVERAGE_MIN:-90}"
+# `--fast` is the pre-commit hook's half: every check that takes seconds on an incremental
+# build (em dashes, stubs, the docs, formatting, clippy over every target, which compiles the
+# tests too, the tier lint and the supply-chain bans). The pre-push hook runs the whole gate,
+# tests, the 90% coverage floor and the Python suite included, so nothing leaves the machine
+# unchecked and a commit does not wait ten minutes for it.
+FAST=0
+[ "${1:-}" = "--fast" ] && FAST=1
 
 fail() { printf 'quality: FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf 'quality: %s\n' "$*"; }
@@ -84,6 +91,10 @@ if [ -f Cargo.toml ]; then
     fi
   else
     step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml not checked here, the supply-chain workflow checks it"
+  fi
+  if [ "$FAST" = "1" ]; then
+    step "OK (fast checks; the tests, the coverage floor and the Python suite run on push)"
+    exit 0
   fi
   step "cargo test"
   quiet test cargo test --workspace

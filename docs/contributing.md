@@ -4,14 +4,13 @@ Moruna is built in Rust, with a Python package on top. Changes to how data is re
 
 ## Build and check
 
-Use the Rust toolchain pinned in `rust-toolchain.toml`. From the repository root, install the pre-commit hook once, then run the same checks the continuous integration runs:
+Use the Rust toolchain pinned in `rust-toolchain.toml`. From the repository root, install the hooks once:
 
 ```bash
 tools/hooks/install.sh
-tools/quality/check.sh
 ```
 
-The checks format and lint the code, run every test, and require at least 90% line coverage in each crate. A change to what Moruna does should include a test that shows it, on any machine: assert a property, such as the peak memory staying under the budget, rather than a figure measured on your own computer.
+Before each commit, a hook runs the quick checks in a few seconds: formatting, lints and a compile of every test. Before each push, it runs the full gate that the continuous integration runs, which also runs every test and requires at least 90% line coverage in each crate. You can run either yourself with `tools/quality/check.sh --fast` or `tools/quality/check.sh`. A change to what Moruna does should include a test that shows it, on any machine: assert a property, such as the peak memory staying under the budget, rather than a figure measured on your own computer.
 
 ## Build the Python package
 

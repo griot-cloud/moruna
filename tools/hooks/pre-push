@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Moruna pre-push hook. Installed by tools/hooks/install.sh. It runs the whole quality
+# gate (tools/quality/check.sh): the fast checks again, then the tests, the 90% line
+# coverage floor for every crate, and the Python suite when MORUNA_PYTHON names a
+# free-threaded CPython 3.14. A push that would fail the gate does not leave the
+# machine. MORUNA_SKIP_QUALITY=1 skips it, for a human pushing documentation on a
+# machine without the Rust toolchain; CI re-runs the gate on the pull request.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+if [ "${MORUNA_SKIP_QUALITY:-0}" = "1" ]; then
+  echo "pre-push: quality gate skipped by MORUNA_SKIP_QUALITY=1 (CI still runs it)"
+  exit 0
+fi
+exec tools/quality/check.sh
