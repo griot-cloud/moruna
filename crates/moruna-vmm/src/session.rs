@@ -322,10 +322,13 @@ mod tests {
         };
         let e = boot_and_run(&spec, &img, &[], small).unwrap_err();
         assert!(e.to_string().contains("--memory"), "{e}");
-        assert_eq!(
-            spec_message(&serde_json::json!({"a": 1})),
-            b"{\"spec\":{\"a\":1},\"type\":\"spec\"}\n".to_vec()
-        );
+        // One line of JSON. The order of its keys is not part of the protocol, and it
+        // depends on whether any crate in the build turns on serde_json's
+        // `preserve_order`, so the message is compared as JSON, not as bytes.
+        let line = spec_message(&serde_json::json!({"a": 1}));
+        assert_eq!(line.last(), Some(&b'\n'));
+        let sent: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(sent, serde_json::json!({"type": "spec", "spec": {"a": 1}}));
         assert!(default_cid() > 2);
     }
 
