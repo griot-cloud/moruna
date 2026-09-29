@@ -35,7 +35,7 @@ def _projection(report: dict) -> dict:
     return {
         "exit": report["exit"],
         "resumed": report["resumed"],
-        "limits": (report["limits"]["memory_ceiling"], report["limits"]["cpu_quota"]),
+        "limits": (report["limits_initial"]["memory_ceiling"], report["limits_initial"]["cpu_quota"]),
         "gil_serialised": report["gil_serialised"],
         "stages": [(s["stage"], s["rows_in"], s["rows_out"]) for s in report["stages"]],
     }
