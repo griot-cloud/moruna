@@ -10,6 +10,13 @@
 //! <- {"ok":false,"error":"..."}
 //! ```
 //!
+//! A request line longer than [`LINE_MAX`] is answered with an error and the connection is
+//! closed in order: the server shuts its side for writing, so the peer reads the answer and
+//! then end of stream, and reads and discards what the peer still sends until it closes, for
+//! at most [`REFUSED_DRAIN_MAX`] bytes and [`REFUSED_LINGER`]. Closing a Unix socket that
+//! still holds unread bytes resets its peer on Linux, and a peer still writing would see its
+//! write fail.
+//!
 //! What a peer here can do is bounded by what boot fixed (MH 4.8.4): resize within
 //! `--memory-max` and `--cpus-max`, read the status, stop the guest. There is no request that
 //! adds a device, and none that reads or writes guest memory or vsock traffic.
@@ -18,7 +25,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +38,10 @@ pub const LINE_MAX: usize = 4096;
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the server checks whether the guest has stopped while idle.
 pub const ACCEPT_POLL: Duration = Duration::from_millis(100);
+/// Most bytes read and discarded from a refused client before its connection is closed.
+pub const REFUSED_DRAIN_MAX: usize = 64 << 10;
+/// Longest a refused client is drained before its connection is closed regardless.
+pub const REFUSED_LINGER: Duration = Duration::from_secs(1);
 
 /// A request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,8 +226,35 @@ fn serve_client(stream: UnixStream, c: &dyn Controller) {
             return;
         };
         text.push(b'\n');
-        if out.write_all(&text).is_err() || too_long {
+        if out.write_all(&text).is_err() {
             return;
+        }
+        if too_long {
+            close_refused(&out);
+            return;
+        }
+    }
+}
+
+/// Shut a refused client's connection for writing, so it reads what it was sent and then end
+/// of stream, and discard what it still sends until it closes, [`REFUSED_DRAIN_MAX`] bytes
+/// or [`REFUSED_LINGER`]; the caller then closes it. Closed at once, a connection holding
+/// unread bytes would reset the client on Linux.
+fn close_refused(stream: &UnixStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = Instant::now() + REFUSED_LINGER;
+    let mut buf = [0u8; 4096];
+    let mut drained = 0;
+    while drained < REFUSED_DRAIN_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match (&*stream).read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => drained += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
         }
     }
 }
@@ -363,6 +401,63 @@ pub(crate) mod tests {
                 ..
             })
         ));
+
+        let r = request(&path, &Request::Stop).unwrap();
+        assert!(r.status.unwrap().stopped);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn vm_t18_an_over_long_request_is_answered_then_ends_in_eof() {
+        // A client that writes past an over-long line, even after the server has answered it,
+        // reads the answer and then end of stream, not a reset or a failed write: on Linux,
+        // closing a Unix socket that still holds unread bytes resets its peer.
+        let dir = scratch_dir("ctl-long");
+        let path = dir.join("c.sock");
+        let f = fake();
+        let server = ControlServer::bind(&path).unwrap();
+        let (f2, stop) = (f.clone(), f.stop.clone());
+        let t = std::thread::spawn(move || server.serve(&*f2, &stop));
+        let over_long = [vec![b'x'; LINE_MAX + 10], b"\n".to_vec()].concat();
+
+        for extra in [&b""[..], b"more bytes after the line\n"] {
+            let mut s = UnixStream::connect(&path).unwrap();
+            s.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+            s.write_all(&[&over_long[..], extra].concat()).unwrap();
+            let mut rd = BufReader::new(s.try_clone().unwrap());
+            let mut answer = String::new();
+            rd.read_line(&mut answer).unwrap();
+            assert!(answer.contains("longer than"), "{answer}");
+            // The server is still draining: a write after the answer is taken.
+            s.write_all(b"and more\n").unwrap();
+            let mut rest = Vec::new();
+            rd.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty());
+        }
+
+        // A client that writes on past REFUSED_DRAIN_MAX is closed while it writes, and one
+        // that goes quiet is closed after REFUSED_LINGER; the server then serves the next.
+        let s = UnixStream::connect(&path).unwrap();
+        let mut w = s.try_clone().unwrap();
+        w.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+        let big = [&over_long[..], &vec![b'y'; 64 * REFUSED_DRAIN_MAX]].concat();
+        let e = w.write_all(&big).unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            ),
+            "{e}"
+        );
+        drop((s, w));
+        let quiet = UnixStream::connect(&path).unwrap();
+        (&quiet).write_all(&over_long).unwrap();
+        let started = std::time::Instant::now();
+        assert!(request(&path, &Request::Status).unwrap().ok);
+        assert!(started.elapsed() >= REFUSED_LINGER / 2);
+        drop(quiet);
 
         let r = request(&path, &Request::Stop).unwrap();
         assert!(r.status.unwrap().stopped);
