@@ -87,7 +87,8 @@ pub trait Reactor: Send + Sync {
     fn write_file(&self, path: &Path, offset: u64, src: BufferView) -> Completion<()>;
     /// Ranged object read (S3-compatible, GCS, Azure, file://) into `dst`.
     fn read_object(&self, url: &str, offset: u64, dst: Buffer) -> Completion<Buffer>;
-    /// Write an object from a view.
+    /// Write an object from a view. An empty view writes an empty object (a sink's
+    /// `_SUCCESS` marker, 08 e.2); it is not skipped as having nothing to do (06 h).
     fn write_object(&self, url: &str, src: BufferView) -> Completion<()>;
     /// DMA between tiers per the reactor's copy table (06 f.5): PinnedHost to and from Device
     /// via the copy engine; Disk to and from Device via GDS when present. Returns the

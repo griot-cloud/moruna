@@ -1852,20 +1852,77 @@ fn a_zero_length_operation_resolves_at_once() {
             r.expect("zero object read");
             f();
         }));
+    assert_eq!(
+        here.load(Ordering::SeqCst),
+        4,
+        "all four ran on this thread"
+    );
+    assert_eq!(std::fs::read(&source).expect("unchanged").len(), 16);
+    // `write_object` is the exception (h): an empty object is an object, so it is put rather
+    // than resolved at once, and RE-T16 says what it leaves behind.
     let f = mark(&here);
+    let (tx, rx) = std::sync::mpsc::channel();
     reactor
         .write_object("s3://bucket/o", empty_view)
         .then(Box::new(move |r| {
-            r.expect("zero object write");
             f();
+            let _ = tx.send(r);
         }));
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the object write resolved")
+        .expect("zero object write");
     assert_eq!(
         here.load(Ordering::SeqCst),
-        5,
-        "all five ran on this thread"
+        4,
+        "the object write resolved on a reactor thread, not this one"
     );
-    assert_eq!(std::fs::read(&source).expect("unchanged").len(), 16);
     reactor.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RE-T16. A zero-length `write_object` puts an empty object: on an object store the object
+/// exists with size 0, and under a `file://` URL an empty file appears in the directory, and an
+/// existing file of that name is replaced by an empty one. This is the `_SUCCESS` marker a
+/// Parquet sink writes at `finish` (08 e.2), which the reactor used to resolve without writing.
+/// f.4, h.
+#[test]
+fn re_t16_zero_length_object_write() {
+    let alloc = FakeAllocator::new();
+    let whole = Arc::new(alloc.buffer(64, Tier::Host));
+
+    let (reactor, _backend) = reactor(&alloc);
+    reactor
+        .write_object("s3://bucket/out/_SUCCESS", whole.view().slice(0, 0))
+        .wait()
+        .expect("an empty object is written");
+    let meta = reactor
+        .head_object("s3://bucket/out/_SUCCESS")
+        .wait()
+        .expect("the empty object exists");
+    assert_eq!(meta.size, 0);
+    reactor.shutdown();
+
+    let dir = scratch_dir("zero-object");
+    let mut cfg = config(profile(Guarantee::Probed(true)));
+    cfg.object_store.local_root = Some(dir.clone());
+    let local = build(cfg, &alloc, Hooks::default());
+    local
+        .write_object("file:///_SUCCESS", whole.view().slice(0, 0))
+        .wait()
+        .expect("an empty file is written");
+    let marker = dir.join("_SUCCESS");
+    assert_eq!(
+        std::fs::metadata(&marker).expect("the marker exists").len(),
+        0
+    );
+    let stale = dir.join("stale");
+    write_file(&stale, &pattern(32, 9));
+    local
+        .write_object("file:///stale", whole.view().slice(0, 0))
+        .wait()
+        .expect("an empty file replaces a full one");
+    assert_eq!(std::fs::read(&stale).expect("still there").len(), 0);
+    local.shutdown();
     std::fs::remove_dir_all(&dir).ok();
 }
 

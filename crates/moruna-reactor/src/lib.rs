@@ -554,9 +554,10 @@ impl moruna_kernel::Reactor for Reactor {
     }
 
     fn write_object(&self, url: &str, src: BufferView) -> Completion<()> {
-        if src.is_empty() {
-            return Completion::resolved(Ok(()));
-        }
+        // No zero-length shortcut here, unlike every other operation (h): an empty object is an
+        // object on every store, and writing one is the whole point of a sink's `_SUCCESS`
+        // marker (08 e.2). Resolving it at once without a `put` meant the marker was never
+        // written anywhere.
         let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.write_object,
