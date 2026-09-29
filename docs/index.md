@@ -7,7 +7,7 @@ content_max_width: 68rem
 
 # Moruna
 
-<p class="home-lead">Moruna is a batch runtime that runs your Python functions over datasets larger than memory, inside a memory limit you set, and sizes the work itself so the job neither runs out of memory nor leaves the machine idle.</p>
+<p class="home-lead">Moruna is a fast, lightweight runtime that runs your Python functions over datasets larger than memory, inside a memory limit you set, and sizes the work itself so the job neither runs out of memory nor leaves the machine idle.</p>
 
 <section class="home-usecases" aria-labelledby="usecases-title">
   <h2 id="usecases-title" class="home-section-title">Use cases</h2>
