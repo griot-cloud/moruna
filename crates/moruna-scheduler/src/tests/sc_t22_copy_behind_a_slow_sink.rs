@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moruna_kernel::{
-    Allocator, BoxFuture, CancelToken, Payload, Placement, Result, RowRange, Source, SourceSchema,
-    Split, Tier,
+    Allocator, BoxFuture, CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind,
+    KernelState, NoState, Payload, PayloadKind, PayloadSpec, Placement, Result, RowRange, Source,
+    SourceSchema, Split, Tier, TierPref,
 };
 use moruna_testkit::{FakeAllocator, FakePlacement, FakeSink, FakeSource};
 
@@ -169,5 +170,83 @@ fn sc_t22_copy_behind_a_slow_sink_waits_for_its_replacements() {
         source.fresh_behind_evicted.load(Ordering::SeqCst),
         0,
         "a fresh read was issued while an evicted entry waited for its re-read"
+    );
+}
+
+/// A test-local stateless `Kernel` (k): passes its input through after `latency`, keeping the
+/// most applies that ran at once.
+struct Concurrent {
+    latency: Duration,
+    running: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Kernel for Concurrent {
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::compute("moruna-scheduler::tests::sc_t22::Concurrent", &[])
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn hints(&self) -> KernelHints {
+        KernelHints::default()
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: PayloadKind::Either,
+            tier: TierPref::Any,
+        }
+    }
+
+    fn output_schema(&self, input: &SourceSchema) -> Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(self.latency);
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        Ok(input)
+    }
+}
+
+#[test]
+fn sc_t22_admission_feeds_every_worker() {
+    // The bound is on the arena and not on the pool: with an arena far larger than the
+    // read-ahead needs and a source faster than the kernel, every active worker has a morsel.
+    let kernel = Arc::new(Concurrent {
+        latency: Duration::from_millis(20),
+        running: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 6;
+            cfg.workers_active = 6;
+            cfg.read_ahead = 2;
+            cfg.initial_morsel_target = MORSEL;
+            cfg.morsel_min = 8;
+        })
+        .source(FakeSource::new().splits(96, 128, MORSEL))
+        .kernel(Arc::clone(&kernel) as Arc<dyn Kernel>)
+        .alloc(FakeAllocator::new().with_limit(Tier::Host, 64 << 20))
+        .go();
+    match rig.scheduler.run(CancelToken::new()) {
+        Ok(crate::RunOutcome::Completed { .. }) => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    assert_eq!(rig.sink.written().len(), 96, "every morsel");
+    assert_eq!(
+        kernel.peak.load(Ordering::SeqCst),
+        6,
+        "six active workers each had a morsel at once"
     );
 }
