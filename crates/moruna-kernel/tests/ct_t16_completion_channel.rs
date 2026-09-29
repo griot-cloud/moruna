@@ -143,3 +143,48 @@ fn ready_label(poll: &Poll<moruna_kernel::Result<u64>>) -> String {
         Poll::Ready(Err(e)) => format!("Ready(Err({e}))"),
     }
 }
+
+/// A completion made with a `Dispatch` runs a callback registered after it resolved through that
+/// dispatch, not on the registering thread; one made without keeps the rule above and runs it at
+/// once. This is how the reactor keeps a late callback off a worker (RE-I2, RE-T14).
+#[test]
+fn ct_t16_a_late_callback_runs_through_the_dispatch() {
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+
+    type Jobs = Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+    let queued: Jobs = Arc::new(Mutex::new(Vec::new()));
+    let queue = Arc::clone(&queued);
+    let dispatch: moruna_kernel::Dispatch = Arc::new(move |job| {
+        queue.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+    });
+    let (sender, completion) = Completion::<u64>::channel_on(dispatch);
+    sender.resolve(Ok(7));
+    let (tx, rx) = mpsc::channel();
+    completion.then(Box::new(move |r| {
+        tx.send((r.ok(), thread::current().id())).ok();
+    }));
+    assert!(
+        rx.try_recv().is_err(),
+        "the callback did not run on the registering thread"
+    );
+    let jobs: Vec<_> = std::mem::take(&mut *queued.lock().unwrap_or_else(|e| e.into_inner()));
+    assert_eq!(jobs.len(), 1, "it went to the dispatch, once");
+    let runner = thread::spawn(move || {
+        for job in jobs {
+            job();
+        }
+        thread::current().id()
+    });
+    let ran_on = runner.join().expect("the dispatch thread");
+    assert_eq!(rx.recv().expect("the callback ran"), (Some(7), ran_on));
+
+    // Without a dispatch: at once, here.
+    let (sender, completion) = Completion::<u64>::channel();
+    sender.resolve(Ok(8));
+    let (tx, rx) = mpsc::channel();
+    completion.then(Box::new(move |r| {
+        tx.send(r.ok()).ok();
+    }));
+    assert_eq!(rx.try_recv().ok(), Some(Some(8)));
+}

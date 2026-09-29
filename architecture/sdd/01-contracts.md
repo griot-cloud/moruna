@@ -608,14 +608,24 @@ pub trait Sink: Send + Sync {
 /// so that the reactor, the fakes and this crate agree on one type.
 pub struct Completion<T> { /* private */ }
 pub struct CompletionSender<T> { /* private */ }
+/// Where a `then` registered after resolution runs, for a completion that has one.
+pub type Dispatch = Arc<dyn Fn(Box<dyn FnOnce() + Send + 'static>) + Send + Sync>;
 impl<T: Send + 'static> Completion<T> {
     /// A linked pair. The reactor (or a fake) keeps the sender and resolves it once.
     pub fn channel() -> (CompletionSender<T>, Completion<T>);
+    /// A linked pair whose late `then` callbacks run through `dispatch`. The reactor makes
+    /// every completion of a real operation this way, so a callback registered after the
+    /// operation resolved still runs on a reactor thread (RE-I2).
+    pub fn channel_on(dispatch: Dispatch) -> (CompletionSender<T>, Completion<T>);
     /// Blocking wait; only the scheduler's source and sink drives may call it (CT-I7, RE-I2).
     pub fn wait(self) -> Result<T>;
-    /// Run `f` on the thread that resolves the completion, at resolution (or at once if
-    /// already resolved). This is how the placement engine observes move completions
-    /// without a thread of its own (placement g); `f` must be short and must not block.
+    /// Run `f` on the thread that resolves the completion, at resolution. If it has already
+    /// resolved, `f` runs through the completion's `Dispatch` when it has one, and at once on
+    /// the registering thread when it does not. This is how the placement engine observes move
+    /// completions without a thread of its own (placement g); `f` must be short and must not
+    /// block. Before 2026-09-29 a late callback always ran at once, which put a reactor
+    /// callback on a worker holding placement's locks whenever an operation resolved before
+    /// `then` was reached (found by RE-T14 on a Linux runner).
     pub fn then(self, f: Box<dyn FnOnce(Result<T>) + Send + 'static>);
 }
 impl<T> core::future::Future for Completion<T> { type Output = Result<T>; /* ... */ }
@@ -1196,7 +1206,7 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T14 reserved_variants_matched.** A `match` on `Tier` with five named arms, and a `match` on `StagingCodec` with one named arm, compile with no wildcard (the same helper technique as CT-T1); `Tier::Remote(..).is_resident() == false`; `rank` and `index` return the f.6 values; `LOCAL_NODE == NodeId::default()`. A repository-level lint (`tools/lint/no_tier_wildcard.sh`, added by this component) greps every crate for `match` expressions on a `Tier` or a `StagingCodec` with a `_ =>` arm and fails CI on a hit. Proves CT-I11.
 
-**CT-T16 completion_channel.** `Completion::channel`; `resolve` on another thread wakes a `wait`, a `.await`, and a `then` callback, each exactly once; `then` registered after resolution runs at once; a dropped sender resolves with `Cancelled`. Proves d.9.
+**CT-T16 completion_channel.** `Completion::channel`; `resolve` on another thread wakes a `wait`, a `.await`, and a `then` callback, each exactly once; `then` registered after resolution runs at once, or through the `Dispatch` of a completion made with `channel_on`, never on the registering thread; a dropped sender resolves with `Cancelled`. Proves d.9.
 
 **CT-T17 buffer_view.** `BufferView::of_arrow` over an arrow buffer sliced from `into_arrow_buffer` reports the arena's tier and pointer; over a heap buffer returns `Staging`; `of_tensor` matches `data_ptr`; dropping the view while the source lives changes nothing; dropping the source while the view lives keeps the bytes valid (owner held). Proves d.3.
 
