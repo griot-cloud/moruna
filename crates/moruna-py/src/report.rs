@@ -25,6 +25,17 @@ impl PyRunReport {
     }
 }
 
+/// One field of the report as Python objects, taken from the same serialisation `to_json`
+/// uses, so an attribute and the JSON cannot disagree about the field's shape.
+fn field<'py>(py: Python<'py>, report: &RunReport, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    let whole = serde_json::to_value(report)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let text = whole
+        .get(name)
+        .map_or_else(|| "null".to_string(), |v| v.to_string());
+    py.import("json")?.call_method1("loads", (text,))
+}
+
 #[pymethods]
 impl PyRunReport {
     /// `moruna_trace::RunReport::run_id` (04 d.1).
@@ -164,9 +175,17 @@ impl PyRunReport {
         })
     }
 
-    /// The discovered limits, field by field.
+    /// The limits the run started with, field by field. The name the report used before the
+    /// limits could change during a run, kept so programs written against it still work; the
+    /// report's own name for it is `limits_initial`.
     #[getter]
     fn limits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.limits_initial(py)
+    }
+
+    /// `moruna_trace::RunReport::limits_initial` (04 d.1): the limits the run started with.
+    #[getter]
+    fn limits_initial<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let l = &self.inner.limits_initial;
         let d = PyDict::new(py);
         d.set_item("memory_ceiling", l.memory_ceiling)?;
@@ -184,6 +203,46 @@ impl PyRunReport {
         }
         d.set_item("devices", devices)?;
         Ok(d)
+    }
+
+    /// `moruna_trace::RunReport::limits_timeline` (04 d.1): each change to the machine's limits
+    /// during the run, as `(t_ms, limits)`, in the shape `to_json` gives it.
+    #[getter]
+    fn limits_timeline<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        field(py, &self.inner, "limits_timeline")
+    }
+
+    /// `moruna_trace::RunReport::drains` (04 d.1): every shrink of the arena and how long it took
+    /// to drain, in the shape `to_json` gives it.
+    #[getter]
+    fn drains<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        field(py, &self.inner, "drains")
+    }
+
+    /// `moruna_trace::RunReport::cpu_ns` (04 d.1): the process's CPU time, user plus system.
+    #[getter]
+    fn cpu_ns(&self) -> u64 {
+        self.inner.cpu_ns
+    }
+
+    /// `moruna_trace::RunReport::mem_byte_seconds` (04 d.1): memory held, integrated over time.
+    #[getter]
+    fn mem_byte_seconds(&self) -> u64 {
+        self.inner.mem_byte_seconds
+    }
+
+    /// `moruna_trace::RunReport::usage_measured` (04 d.1): whether the two figures above were
+    /// measured.
+    #[getter]
+    fn usage_measured(&self) -> bool {
+        self.inner.usage_measured
+    }
+
+    /// `moruna_trace::RunReport::peak_ceiling_bytes` (04 d.1): the ceiling the peak fraction was
+    /// taken against.
+    #[getter]
+    fn peak_ceiling_bytes(&self) -> u64 {
+        self.inner.peak_ceiling_bytes
     }
 
     /// Which direct paths the run took (G-I7).
@@ -446,6 +505,9 @@ mod tests {
             peak_anon_bytes: 4 << 30,
             peak_fraction_of_ceiling: 0.5,
             peak_ceiling_bytes: 8 << 30,
+            cpu_ns: 0,
+            mem_byte_seconds: 0,
+            usage_measured: false,
             worker_busy_fraction: 0.9,
             cpu_throttled_fraction: 0.0,
             source_bytes_per_s: 1.0,
