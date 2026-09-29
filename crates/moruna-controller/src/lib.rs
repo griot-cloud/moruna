@@ -647,6 +647,11 @@ pub(crate) struct ControllerState {
     /// `apply` started before it was measured against a resting figure and a ceiling that no
     /// longer hold, so it feeds neither the fit of f.3 nor the breach path of f.7.
     pub limits_epoch_ns: u64,
+    /// How many times the facade's watcher has handed the controller limits of its own
+    /// (`follow_limits`, `set_arena`, `set_engine`). The tick reads it before it samples and
+    /// takes the sample's limits only if it has not moved since: a sample taken before the
+    /// watcher's calls carries the limits those calls replaced (f.15, amended 2026-09-30).
+    pub facade_limits: u64,
 }
 
 impl ControllerState {
@@ -999,6 +1004,7 @@ impl Controller {
             arena_draining: 0,
             drain_pending: 0,
             limits_epoch_ns: 0,
+            facade_limits: 0,
         };
         Ok(Controller {
             inner: Arc::new(Inner {
@@ -1063,6 +1069,7 @@ impl Controller {
     pub fn follow_limits(&self, ceiling_bytes: u64, cpu_limit: f64) {
         let actions = {
             let mut state = self.inner.held();
+            state.facade_limits = state.facade_limits.wrapping_add(1);
             let mut actions = Actions::default();
             if !state.terminated {
                 elastic::follow(&mut state, ceiling_bytes, cpu_limit, &mut actions);
@@ -1080,6 +1087,7 @@ impl Controller {
     pub fn set_arena(&self, budget_bytes: u64, draining_bytes: u64) {
         let actions = {
             let mut state = self.inner.held();
+            state.facade_limits = state.facade_limits.wrapping_add(1);
             let mut actions = Actions::default();
             if state.arena_draining != draining_bytes {
                 state.arena_draining = draining_bytes;
@@ -1101,6 +1109,7 @@ impl Controller {
     pub fn set_engine(&self, bytes: u64) {
         let actions = {
             let mut state = self.inner.held();
+            state.facade_limits = state.facade_limits.wrapping_add(1);
             let mut actions = Actions::default();
             if !state.terminated {
                 elastic::set_engine(&mut state, bytes, &mut actions);
