@@ -468,11 +468,26 @@ impl RunReport {
         // changed before it.
         let mut changes = trace.limits_changes();
         changes.sort_by_key(|change| change.at_ns);
-        let peak_ceiling_bytes = changes
-            .iter()
-            .rev()
-            .find(|change| change.at_ns <= peak_at)
-            .map_or(limits.memory_ceiling, |change| change.new.memory_ceiling);
+        let latest = changes.iter().rev().find(|change| change.at_ns <= peak_at);
+        let mut peak_ceiling_bytes =
+            latest.map_or(limits.memory_ceiling, |change| change.new.memory_ceiling);
+        // Unless the peak came while the arena was still giving memory back after a lowered
+        // ceiling. That memory was taken under the ceiling before the change: Moruna never
+        // allocates past the ceiling in force, and returns what it holds as the buffers in it
+        // are freed, which the hosted design accepts takes as long as it takes (MH 4.4, 7.1).
+        // Judging such a peak against the lowered ceiling reported a run that had done
+        // nothing wrong at 1.78 of its ceiling, and whether it did depended on whether the
+        // peak sample landed just before the change or just after it (2026-09-29).
+        let peak_ms = peak_at.saturating_sub(meta.start_ns) / 1_000_000;
+        let draining_at_peak = meta.drains.iter().any(|drain| {
+            drain.at_ms <= peak_ms && drain.drain_ms.is_none_or(|ms| peak_ms <= drain.at_ms + ms)
+        });
+        if let Some(change) = latest
+            && draining_at_peak
+            && change.new.memory_ceiling < change.old.memory_ceiling
+        {
+            peak_ceiling_bytes = change.old.memory_ceiling;
+        }
         let peak_fraction_of_ceiling = if peak_ceiling_bytes > 0 {
             peak_anon as f64 / peak_ceiling_bytes as f64
         } else {

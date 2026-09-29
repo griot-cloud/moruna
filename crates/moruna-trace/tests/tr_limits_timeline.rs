@@ -120,3 +120,51 @@ fn no_change_is_no_timeline() {
     assert_eq!(report.peak_ceiling_bytes, limits().memory_ceiling);
     assert!(!report.to_string().contains("limits moved"));
 }
+
+/// A peak reached while the arena was still giving memory back after a lowered ceiling was
+/// memory taken under the ceiling before the change, and is judged against that one (MH 4.4,
+/// 7.1): Moruna never allocates past the ceiling in force and returns what it holds eventually.
+/// A peak outside any drain is judged against the ceiling in force, lowered or not, so a real
+/// breach after a shrink still shows. Before 2026-09-29 the first case read as over the ceiling
+/// whenever the peak sample landed just after the change.
+#[test]
+fn a_peak_during_a_drain_is_judged_against_the_ceiling_it_was_taken_under() {
+    let dir = TempDir::new("t12-drain");
+    let writer = TraceWriter::start(config(dir.path())).expect("start");
+    let initial = limits();
+    let start_ns = meta(ExitReason::Completed).start_ns;
+    for seq in 0..10 {
+        writer.record(record(seq, 1));
+    }
+    // Lowered to half 5 us in, before the peak at 9.5 us.
+    let lowered = change(start_ns + 5_000, &initial, initial.memory_ceiling / 2, 16.0);
+    writer.limits_changed(lowered);
+    let view = writer.finish().expect("finish");
+
+    // The drain began at the change and was still running at the peak.
+    let mut draining = meta(ExitReason::Completed);
+    draining.drains = vec![DrainSummary {
+        at_ms: 0,
+        bytes: GIB,
+        drain_ms: Some(10),
+    }];
+    let report = RunReport::compute(&view, &initial, &draining);
+    assert_eq!(
+        report.peak_ceiling_bytes, initial.memory_ceiling,
+        "a peak while draining is judged against the ceiling it was taken under"
+    );
+
+    // No drain under way at the peak: the lowered ceiling is the one in force.
+    let mut settled = meta(ExitReason::Completed);
+    settled.drains = vec![DrainSummary {
+        at_ms: 1,
+        bytes: GIB,
+        drain_ms: Some(10),
+    }];
+    let report = RunReport::compute(&view, &initial, &settled);
+    assert_eq!(
+        report.peak_ceiling_bytes,
+        initial.memory_ceiling / 2,
+        "outside a drain the lowered ceiling stands, so a real breach still shows"
+    );
+}
