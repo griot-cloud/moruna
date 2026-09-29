@@ -242,7 +242,7 @@ The trace is the observability. `tracing` events: `trace.overflow` (debug, chunk
 
 **TR-T3 pure_report.** Same trace and meta → equal JSON, twice, across processes (golden file). TR-I3.
 
-**TR-T4 memory_bound.** 10 M records with `memory_limit` 8 MiB; process RSS growth under 16 MiB above baseline; overflow file present. TR-I4.
+**TR-T4 memory_bound.** 10 M records with `memory_limit` 8 MiB; the writer's in-memory bytes never pass the limit at any sample; overflow file present; process RSS growth bounded by a small multiple of the limit (four), which catches a writer that lost its bound without asserting the allocator: the exact figure depends on the allocator and, under an instrumented build, on the instrumentation (measured 15 to 18 MiB against a 16 MiB allowance, 2026-09-29). TR-I4.
 
 **TR-T5 flush_on_exit.** For each exit reason, the final file is complete and readable by `arrow` IPC reader. TR-I5.
 
