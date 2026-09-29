@@ -8,6 +8,14 @@
 //! - **Guest to host.** A guest connecting to host port `P` reaches the Unix socket
 //!   `<uds_path>_P`, or an in-process endpoint the monitor registered for `P` (the status
 //!   port). No listener there is a refusal (`RST`).
+//! - **Refusal.** A line that is not `CONNECT <port>` (or is longer than
+//!   [`CONNECT_LINE_MAX`]), a connection the guest refuses before it accepts, and one there is
+//!   no room for get no reply: the host reads end of stream, on every platform, whatever it
+//!   wrote after its line. The stream is closed in order: its write side is shut first, and
+//!   what the host still sends is read and discarded until the host closes, for at most
+//!   [`CLOSE_DRAIN_MAX`] bytes and [`CLOSE_LINGER`]. Closing a Unix socket that still holds
+//!   unread bytes resets its peer on Linux (the host would read `ECONNRESET` instead of end
+//!   of stream); macOS gives end of stream either way.
 //!
 //! The muxer never interprets the bytes it carries (MH 4.8.4, "the monitor never reads the
 //! traffic"); the status port is the monitor's own endpoint, not a peek into anyone else's.
@@ -21,6 +29,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
@@ -50,6 +59,13 @@ pub const MAX_PENDING_CONTROL: usize = 4096;
 /// The first host port handed to a host-initiated connection; high, so it never collides
 /// with a well-known port a guest might connect to.
 pub const FIRST_HOST_PORT: u32 = 1 << 30;
+/// Longest a refused host stream is drained before it is closed regardless; checked whenever
+/// the backend wakes, so an idle host may hold it until the next wakeup.
+pub const CLOSE_LINGER: Duration = Duration::from_secs(1);
+/// Most bytes drained from a refused host stream before it is closed regardless.
+pub const CLOSE_DRAIN_MAX: usize = 64 << 10;
+/// Most refused host streams draining at once; beyond this the oldest is closed.
+pub const MAX_CLOSING: usize = 64;
 
 /// Opens the host end of a guest-initiated connection to one host port.
 pub type Connector = Box<dyn Fn() -> std::io::Result<UnixStream> + Send>;
@@ -153,6 +169,51 @@ struct Accepting {
     line: Vec<u8>,
 }
 
+/// How reading a `CONNECT` line ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEnd {
+    /// The line is not complete yet.
+    Pending,
+    /// The host hung up or the stream failed: nothing is left to read.
+    Gone,
+    /// Not a `CONNECT <port>` line.
+    Bad,
+    /// `CONNECT <port>`.
+    Connect(u32),
+}
+
+/// A refused host stream being closed in order: its write side is shut, so the host reads end
+/// of stream, and what the host still sends is discarded until the host closes, the stream
+/// fails, [`CLOSE_DRAIN_MAX`] bytes have been read or [`CLOSE_LINGER`] has passed. Closing it
+/// with unread bytes would reset the host on Linux instead.
+struct Closing {
+    stream: UnixStream,
+    deadline: Instant,
+    drained: usize,
+}
+
+impl Closing {
+    /// Read and discard what the host sent; true when the stream can be closed now.
+    fn drain(&mut self, buf: &mut [u8]) -> bool {
+        loop {
+            match self.stream.read(buf) {
+                Ok(0) => return true,
+                Ok(n) => {
+                    self.drained += n;
+                    if self.drained >= CLOSE_DRAIN_MAX {
+                        return true;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    return Instant::now() >= self.deadline;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return true,
+            }
+        }
+    }
+}
+
 /// What a poll entry refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Token {
@@ -162,6 +223,8 @@ pub enum Token {
     Listener,
     /// A host connection still sending its `CONNECT` line.
     Accepting(usize),
+    /// A refused host stream being drained before it is closed.
+    Closing(usize),
     /// A connection.
     Conn(Key),
 }
@@ -183,6 +246,7 @@ pub struct Muxer {
     uds_path: PathBuf,
     listener: UnixListener,
     accepting: Vec<Accepting>,
+    closing: VecDeque<Closing>,
     conns: BTreeMap<Key, Conn>,
     control: VecDeque<Header>,
     next_port: u32,
@@ -230,6 +294,7 @@ impl Muxer {
             uds_path: uds_path.to_path_buf(),
             listener,
             accepting: Vec::new(),
+            closing: VecDeque::new(),
             conns: BTreeMap::new(),
             control: VecDeque::new(),
             next_port: FIRST_HOST_PORT,
@@ -283,6 +348,44 @@ impl Muxer {
         self.control.len()
     }
 
+    /// Refused host streams still being drained before they are closed.
+    pub fn closing_streams(&self) -> usize {
+        self.closing.len()
+    }
+
+    /// Close a refused host stream in order (see [`Closing`]). The stream is non-blocking.
+    fn close_host_stream(&mut self, stream: UnixStream) {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut c = Closing {
+            stream,
+            deadline: Instant::now() + CLOSE_LINGER,
+            drained: 0,
+        };
+        if c.drain(&mut self.buf) {
+            return;
+        }
+        if self.closing.len() >= MAX_CLOSING {
+            self.closing.pop_front();
+        }
+        self.closing.push_back(c);
+    }
+
+    /// Drain every refused host stream, closing those that are done.
+    fn drain_closing(&mut self) {
+        let buf = &mut self.buf;
+        self.closing.retain_mut(|c| !c.drain(buf));
+    }
+
+    /// Forget a connection. A host stream the guest never accepted is closed in order, as a
+    /// refusal; an established one is simply closed.
+    fn drop_conn(&mut self, key: Key) {
+        if let Some(c) = self.conns.remove(&key)
+            && c.state == State::Connecting
+        {
+            self.close_host_stream(c.stream);
+        }
+    }
+
     fn alloc_port(&mut self, guest_port: u32) -> u32 {
         loop {
             let p = self.next_port;
@@ -324,7 +427,7 @@ impl Muxer {
     }
 
     fn reset(&mut self, key: Key) {
-        self.conns.remove(&key);
+        self.drop_conn(key);
         self.push_control(key, op::RST, 0);
     }
 
@@ -391,9 +494,7 @@ impl Muxer {
                 }
                 self.finish_if_closed(key);
             }
-            op::RST => {
-                self.conns.remove(&key);
-            }
+            op::RST => self.drop_conn(key),
             // A RESPONSE to an established connection, data before the guest accepted, or an
             // unknown operation: the connection is torn down.
             _ => self.reset(key),
@@ -473,6 +574,16 @@ impl Muxer {
                 Token::Accepting(i),
             ));
         }
+        for (i, c) in self.closing.iter().enumerate() {
+            v.push((
+                PollFd {
+                    fd: c.stream.as_raw_fd(),
+                    read: true,
+                    write: false,
+                },
+                Token::Closing(i),
+            ));
+        }
         for (k, c) in &self.conns {
             let read = c.wants_read() && !c.readable;
             let write = !c.out.is_empty();
@@ -501,8 +612,9 @@ impl Muxer {
                 }
                 Token::Listener if r.read => self.accept(),
                 Token::Accepting(i) if r.read || r.error => {
-                    if self.read_connect_line(*i) {
-                        accepting_done.push(*i);
+                    let end = self.read_connect_line(*i);
+                    if end != LineEnd::Pending {
+                        accepting_done.push((*i, end));
                     }
                 }
                 Token::Conn(key) => {
@@ -523,17 +635,33 @@ impl Muxer {
                 _ => {}
             }
         }
-        accepting_done.sort_unstable();
-        for i in accepting_done.into_iter().rev() {
-            self.accepting.swap_remove(i);
+        // Refused streams are drained whether or not poll named them, so one past its
+        // deadline is closed at the next wakeup.
+        self.drain_closing();
+        accepting_done.sort_unstable_by_key(|(i, _)| *i);
+        for (i, end) in accepting_done.into_iter().rev() {
+            let a = self.accepting.swap_remove(i);
+            match end {
+                LineEnd::Connect(port) if self.conns.len() < MAX_CONNECTIONS => {
+                    // Only a failure to make the stream non-blocking is left to refuse it
+                    // here, and that closes the stream.
+                    let _ = self.connect_to_guest(a.stream, port);
+                }
+                LineEnd::Pending | LineEnd::Gone => {}
+                LineEnd::Bad | LineEnd::Connect(_) => self.close_host_stream(a.stream),
+            }
         }
         !self.control.is_empty() || self.conns.values().any(|c| c.readable && c.wants_read())
     }
 
     fn accept(&mut self) {
         while let Ok((stream, _)) = self.listener.accept() {
-            if self.accepting.len() >= MAX_ACCEPTING || stream.set_nonblocking(true).is_err() {
+            if stream.set_nonblocking(true).is_err() {
                 continue; // dropped: the host sees the stream close
+            }
+            if self.accepting.len() >= MAX_ACCEPTING {
+                self.close_host_stream(stream);
+                continue;
             }
             self.accepting.push(Accepting {
                 stream,
@@ -542,39 +670,29 @@ impl Muxer {
         }
     }
 
-    /// Read the `CONNECT` line one byte at a time (so no byte of the connection is consumed);
-    /// true when this accepting entry is finished, either way.
-    fn read_connect_line(&mut self, i: usize) -> bool {
+    /// Read the `CONNECT` line one byte at a time (so no byte of the connection is consumed).
+    fn read_connect_line(&mut self, i: usize) -> LineEnd {
         let Some(a) = self.accepting.get_mut(i) else {
-            return true;
+            return LineEnd::Gone;
         };
         let mut b = [0u8];
         loop {
             match a.stream.read(&mut b) {
-                Ok(0) => return true,
+                Ok(0) => return LineEnd::Gone,
                 Ok(_) if b[0] == b'\n' => break,
-                Ok(_) if a.line.len() >= CONNECT_LINE_MAX => return true,
+                Ok(_) if a.line.len() >= CONNECT_LINE_MAX => return LineEnd::Bad,
                 Ok(_) => a.line.push(b[0]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return LineEnd::Pending,
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => return true,
+                Err(_) => return LineEnd::Gone,
             }
         }
         let line = String::from_utf8_lossy(&a.line)
             .trim_end_matches('\r')
             .to_string();
-        let port = line
-            .strip_prefix("CONNECT ")
-            .and_then(|p| p.trim().parse::<u32>().ok());
-        let Some(port) = port else {
-            return true;
-        };
-        let Ok(stream) = a.stream.try_clone() else {
-            return true;
-        };
-        // A refusal here (too many connections) closes the stream, which the host sees.
-        let _ = self.connect_to_guest(stream, port);
-        true
+        line.strip_prefix("CONNECT ")
+            .and_then(|p| p.trim().parse::<u32>().ok())
+            .map_or(LineEnd::Bad, LineEnd::Connect)
     }
 
     /// Write pending bytes to every host stream that can take them.
