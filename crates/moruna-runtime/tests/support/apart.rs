@@ -67,8 +67,10 @@ pub fn answer(mut outcome: Value) {
 
 /// The most anonymous memory this process has held, by the kernel's own ledger where the
 /// platform keeps one: on macOS the lifetime maximum of `phys_footprint`, the quantity the run's
-/// budget counts there (03 DS-I4). Linux keeps no such mark for a process outside a cgroup, and
-/// there the report's peak, sampled from `/proc/self/status`, is the evidence.
+/// budget counts there (03 DS-I4). Linux keeps no such mark for a process, and there the
+/// report's peak, sampled from `/proc/self/status`, is the evidence: every budget here is
+/// explicit, so it is this child's own memory even inside a cgroup, never its parent's or
+/// `cargo`'s beside it.
 pub fn os_peak() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {

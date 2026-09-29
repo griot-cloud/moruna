@@ -173,6 +173,16 @@ fn discover_with(env: &dyn EnvSource, roots: &Roots, input: &DiscoveryInput) -> 
         },
         &mut notes,
     );
+    // DS-I4: in a cgroup whose limit is not the ceiling, the sampler counts the process's own
+    // memory and not the cgroup's, and the report says so beside the figures.
+    if cgroup_path.is_some() && limits.source != moruna_kernel::LimitSource::Cgroup {
+        notes.push(
+            "the ceiling is not the cgroup's limit, so memory is measured for this process \
+             alone: anon_bytes is RssAnon from /proc/self/status, not the cgroup's memory.stat, \
+             which counts every other process in the cgroup too (DS-I4)"
+                .to_string(),
+        );
+    }
 
     // e.1: the declared profile, the environment variable underneath the override.
     let mut profile = match env.get("MORUNA_HOST_PROFILE") {
@@ -1132,6 +1142,42 @@ mod tests {
 
         let sampler = Sampler::new(&found).expect("sampler over the v1 fixture");
         assert_eq!(sampler.sample().anon_bytes, 1024);
+    }
+
+    /// DS-T15 ceiling_scope, through `discover`: with an explicit budget inside a cgroup, the
+    /// note says the figures are the process's own, and the sampler `discover`'s findings make
+    /// reads `/proc/self/status` rather than the cgroup's `memory.stat`; with the ceiling from
+    /// the cgroup's limit there is no such note and the cgroup's figure stands. DS-I4.
+    #[test]
+    fn ds_t15_ceiling_scope_is_noted() {
+        let tmp = TempDir::new("ds-t15-discover");
+        proc_fixture(tmp.path(), "0::/\n", 16 * 1024 * 1024);
+        write(&tmp.path().join("proc"), "self/status", crate::os::STATUS);
+        cgroup_v2(tmp.path(), "4294967296", "max", "max");
+        let roots = roots_at(tmp.path());
+        let spill = staging(tmp.path());
+        let env = MapEnv::with(&[("MORUNA_SPILL_DIR", spill.to_str().expect("utf-8"))]);
+        let alone = |notes: &[String]| notes.iter().any(|n| n.contains("this process alone"));
+
+        let explicit = discover_with(
+            &env,
+            &roots,
+            &DiscoveryInput {
+                explicit_budget: Some(256 * 1024 * 1024),
+                ..DiscoveryInput::default()
+            },
+        )
+        .expect("discovery");
+        assert_eq!(explicit.limits.source, LimitSource::Explicit);
+        assert!(alone(&explicit.notes), "{:?}", explicit.notes);
+        let sampler = Sampler::with_roots(&explicit, &roots.proc_dir).expect("sampler");
+        assert_eq!(sampler.sample().anon_bytes, 1600 * 1024, "RssAnon");
+
+        let pod = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
+        assert_eq!(pod.limits.source, LimitSource::Cgroup);
+        assert!(!alone(&pod.notes), "{:?}", pod.notes);
+        let sampler = Sampler::with_roots(&pod, &roots.proc_dir).expect("sampler");
+        assert_eq!(sampler.sample().anon_bytes, 1048576, "the cgroup's anon");
     }
 
     /// h, normal path (laptop): `discover` on the real host answers, leaves no `Unknown`, and
