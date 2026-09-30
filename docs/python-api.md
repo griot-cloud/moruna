@@ -63,6 +63,7 @@ A kernel object has `fingerprint`, a string identifying its code, and `stateful`
 | Source | Arguments |
 | --- | --- |
 | `ParquetSource(urls, *, columns=None, filters=None)` | A path, URL, or list of them; the columns to read; row-group filters as `(column, op, value)` with op `>`, `<` or `==`. |
+| `VortexSource(urls, *, columns=None, split_bytes=None)` | A path, URL, or list of them, or a directory or prefix of `.vortex` files; the columns to read; the size each piece of work is cut toward, about 128 MiB by default. |
 | `TensorSource(paths, *, tensors=None)` | Safetensors or aligned binary tensor files; the tensors to read. |
 | `IteratorSource(iterable, *, schema)` | An iterable of `pyarrow.RecordBatch` objects and their schema. |
 | A subclass of `Source` | Your own source; see below. |
@@ -72,6 +73,7 @@ A kernel object has `fingerprint`, a string identifying its code, and `stateful`
 | Sink | Arguments |
 | --- | --- |
 | `ParquetSink(url, *, row_group_bytes=None, file_bytes=None, compression="zstd")` | Target directory or prefix; about 128 MiB per row group and 1 GiB per file by default. |
+| `VortexSink(url, *, file_bytes=None)` | Target directory or prefix; files of at most 1 GiB by default. |
 | `TensorSink(path, *, format="mrb1", one_file_per_morsel=False, name="tensor")` | Target directory; `mrb1` or `safetensors`. |
 | `ArrowIpcSink(path, *, file_bytes=None)` | Target directory. |
 | A subclass of `Sink` | Your own sink; see below. |

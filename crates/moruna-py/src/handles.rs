@@ -1,6 +1,6 @@
-//! What `ParquetSource`, `TensorSource`, `IteratorSource`, `ParquetSink`, `TensorSink`,
-//! `ArrowIpcSink` and the user's `moruna.Source` and `moruna.Sink` subclasses carry from Python
-//! into the facade (d.2, b).
+//! What `ParquetSource`, `VortexSource`, `TensorSource`, `IteratorSource`, `ParquetSink`,
+//! `VortexSink`, `TensorSink`, `ArrowIpcSink` and the user's `moruna.Source` and `moruna.Sink`
+//! subclasses carry from Python into the facade (d.2, b).
 //!
 //! Each Python handle holds a configuration, not a built component: every source and sink
 //! constructor in components 7 and 8 takes the run's `Arc<dyn Reactor>` and `Arc<dyn Allocator>`,
@@ -10,13 +10,15 @@
 
 use std::path::Path;
 
-use moruna_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorSinkConfig};
-use moruna_sources::{ParquetSourceConfig, TensorSourceConfig};
+use moruna_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorSinkConfig, VortexSinkConfig};
+use moruna_sources::{ParquetSourceConfig, TensorSourceConfig, VortexSourceConfig};
 
 /// Which source a run reads, and with what settings.
 pub enum SourceSpec {
     /// `moruna.ParquetSource`.
     Parquet(ParquetSourceConfig),
+    /// `moruna.VortexSource`.
+    Vortex(VortexSourceConfig),
     /// `moruna.TensorSource`.
     Tensor(TensorSourceConfig),
     /// `moruna.IteratorSource`: the iterable and the schema it promises. The object is held by
@@ -52,6 +54,8 @@ pub enum IteratorSchema {
 pub enum SinkSpec {
     /// `moruna.ParquetSink`.
     Parquet(ParquetSinkConfig),
+    /// `moruna.VortexSink`.
+    Vortex(VortexSinkConfig),
     /// `moruna.TensorSink`.
     Tensor(TensorSinkConfig),
     /// `moruna.ArrowIpcSink`.
@@ -65,6 +69,7 @@ impl SourceSpec {
     pub fn targets(&self) -> Vec<String> {
         match self {
             SourceSpec::Parquet(cfg) => cfg.urls.clone(),
+            SourceSpec::Vortex(cfg) => cfg.urls.clone(),
             SourceSpec::Tensor(cfg) => cfg
                 .paths
                 .iter()
@@ -80,6 +85,7 @@ impl SinkSpec {
     pub fn target(&self) -> String {
         match self {
             SinkSpec::Parquet(cfg) => cfg.url.clone(),
+            SinkSpec::Vortex(cfg) => cfg.url.clone(),
             SinkSpec::Tensor(cfg) => path_string(&cfg.path),
             SinkSpec::ArrowIpc(cfg) => path_string(&cfg.path),
             // A user's sink names no location; the empty target is what the rule skips.
@@ -91,6 +97,7 @@ impl SinkSpec {
     pub fn kind_name(&self) -> &'static str {
         match self {
             SinkSpec::Parquet(_) => "ParquetSink",
+            SinkSpec::Vortex(_) => "VortexSink",
             SinkSpec::Tensor(_) => "TensorSink",
             SinkSpec::ArrowIpc(_) => "ArrowIpcSink",
             SinkSpec::Python => "Sink",

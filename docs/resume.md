@@ -6,7 +6,7 @@ While a job runs, Moruna regularly records how far it has got. If the process is
 
 A **checkpoint** is a small file, `manifest.json`, that records which output the sink has already committed, where the source was reading, and which data was spilled to disk. Moruna writes it to a directory for the job, `moruna-<run id>`, inside the staging directory, every 5 seconds by default. It also writes one when a job stops with an error or is cancelled.
 
-Writing a checkpoint does not copy data. Morsels that were in memory when the process stopped are read from the source again on resume, which is why the source must be able to read the same data twice: Parquet and tensor files can, an `IteratorSource` cannot.
+Writing a checkpoint does not copy data. Morsels that were in memory when the process stopped are read from the source again on resume, which is why the source must be able to read the same data twice: Parquet, Vortex and tensor files can, an `IteratorSource` cannot.
 
 `checkpoint_interval` changes how often checkpoints are written, in seconds. `checkpoint=False` turns them off. Moruna deletes a job's checkpoint directory when the job completes, unless you pass `keep_checkpoint=True`.
 

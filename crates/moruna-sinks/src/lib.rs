@@ -24,6 +24,7 @@
 
 mod checkpoint;
 mod commit;
+mod file_buf;
 mod handle;
 mod ipc_sink;
 mod parquet_sink;
@@ -33,6 +34,7 @@ mod py_sink;
 mod reorder;
 mod stats;
 mod tensor_sink;
+mod vortex_sink;
 
 pub use handle::SinkHandle;
 pub use ipc_sink::{ArrowIpcSink, ArrowIpcSinkConfig};
@@ -42,6 +44,7 @@ pub use py_sink::{PySink, PySinkStats};
 pub use reorder::ReorderBuffer;
 pub use stats::SinkStats;
 pub use tensor_sink::{TensorFormat, TensorSink, TensorSinkConfig};
+pub use vortex_sink::{VortexSink, VortexSinkConfig};
 
 use moruna_kernel::{Allocator, MorunaError, Payload, Result, Tier};
 

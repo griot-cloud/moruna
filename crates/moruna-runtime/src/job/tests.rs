@@ -542,6 +542,67 @@ fn build_refusals() {
     let _ = std::fs::remove_dir_all(&staging);
 }
 
+/// The Vortex kinds (07 e.6, 08 f.10): a document names them, the canonical form keeps their
+/// options, both build, a small `file_bytes` is clamped with the library's note, and an empty
+/// url or a zero split size is refused naming the field.
+#[test]
+fn vortex_kinds_parse_and_build() {
+    let text = r#"{"moruna_spec":1,
+        "source":{"kind":"vortex","url":["/in/a.vortex","s3://b/in/"],
+                  "options":{"columns":["id"],"split_bytes":1048576}},
+        "sink":{"kind":"vortex","url":"/out","options":{"file_bytes":1048576}}}"#;
+    let job = JobSpec::from_json(text).expect("vortex source and sink");
+    assert_eq!(
+        job.source,
+        SourceDoc::Vortex {
+            url: Urls(vec!["/in/a.vortex".into(), "s3://b/in/".into()]),
+            options: VortexSourceOptions {
+                columns: Some(vec!["id".into()]),
+                split_bytes: Some(1 << 20),
+            },
+        }
+    );
+    let canonical = job.canonical_json();
+    assert!(canonical.contains(r#""kind":"vortex""#), "{canonical}");
+    assert_eq!(
+        JobSpec::from_json(&canonical).expect("the canonical form reads back"),
+        job
+    );
+    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("vortex builds");
+    assert_eq!(
+        built.spec.notes,
+        vec!["clamped sink.file_bytes from 1048576 to 67108864".to_string()]
+    );
+    let unknown = r#"{"moruna_spec":1,"source":{"kind":"vortex","url":"/i","options":{"filters":[]}},
+                     "sink":{"kind":"vortex","url":"/o"}}"#;
+    assert!(
+        JobSpec::from_json(unknown).is_err(),
+        "a vortex source has no filters"
+    );
+
+    let mut empty = job.clone();
+    empty.source = SourceDoc::Vortex {
+        url: Urls(Vec::new()),
+        options: VortexSourceOptions::default(),
+    };
+    let error = build::build(&empty, &NoKernels, opts(false, &no_env))
+        .err()
+        .expect("an empty url");
+    assert!(error.to_string().contains("source.url"), "{error}");
+    let mut zero = job;
+    zero.source = SourceDoc::Vortex {
+        url: Urls(vec!["/in".into()]),
+        options: VortexSourceOptions {
+            columns: None,
+            split_bytes: Some(0),
+        },
+    };
+    let error = build::build(&zero, &NoKernels, opts(false, &no_env))
+        .err()
+        .expect("a zero split size");
+    assert!(error.to_string().contains("split_bytes"), "{error}");
+}
+
 /// Every sink kind builds, and the sink sizes are clamped with the library's notes.
 #[test]
 fn every_sink_kind_builds() {

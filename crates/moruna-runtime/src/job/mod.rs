@@ -167,6 +167,14 @@ pub enum SourceDoc {
         #[serde(default)]
         options: TensorSourceOptions,
     },
+    /// Vortex files or prefixes, local or in an object store (07 e.7).
+    Vortex {
+        /// `file://`, `s3://`, `gs://`, `az://` or a bare local path.
+        url: Urls,
+        /// Projection and split size.
+        #[serde(default)]
+        options: VortexSourceOptions,
+    },
     /// A Python iterable. Library only: the iterable is an object in the caller's process and
     /// cannot be named in a file, so a document from a file or a socket is refused (MH 4.1).
     Iterator,
@@ -203,6 +211,18 @@ pub struct ParquetSourceOptions {
     pub filters: Vec<FilterDoc>,
 }
 
+/// `source.options` for `vortex`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VortexSourceOptions {
+    /// The projection; absent is every column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
+    /// The uncompressed bytes a split is cut toward; absent is 128 MiB (07 e.7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_bytes: Option<u64>,
+}
+
 /// One row-group predicate: `[column, op, value]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilterDoc(pub String, pub String, pub serde_json::Value);
@@ -235,6 +255,14 @@ pub enum SinkDoc {
         /// Format and naming.
         #[serde(default)]
         options: TensorSinkOptions,
+    },
+    /// Vortex files under a prefix (08 f.11).
+    Vortex {
+        /// `file://`, `s3://`, `gs://`, `az://` or a bare local directory.
+        url: String,
+        /// Sizes.
+        #[serde(default)]
+        options: VortexSinkOptions,
     },
     /// Page-aligned Arrow IPC files.
     ArrowIpc {
@@ -289,6 +317,15 @@ pub struct TensorSinkOptions {
     /// The tensor name; absent is `tensor`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// `sink.options` for `vortex`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VortexSinkOptions {
+    /// `sink.file_bytes`; absent is 1 GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<u64>,
 }
 
 /// `sink.options` for `arrow_ipc`.

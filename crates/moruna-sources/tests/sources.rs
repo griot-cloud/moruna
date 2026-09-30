@@ -4,6 +4,7 @@
 //! and parquet, and under `cargo llvm-cov` each is instrumented as well.
 
 mod support;
+mod vortex;
 
 use std::sync::Arc;
 

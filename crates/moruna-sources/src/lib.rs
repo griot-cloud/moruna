@@ -24,6 +24,7 @@
 pub mod parquet;
 pub mod stats;
 pub mod tensor;
+pub mod vortex;
 
 #[cfg(feature = "python")]
 pub mod py_iter;
@@ -36,6 +37,7 @@ mod util;
 pub use crate::parquet::decode_copy::copy_batch;
 pub use crate::parquet::{ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue};
 pub use crate::tensor::{TensorSource, TensorSourceConfig};
+pub use crate::vortex::{VortexSource, VortexSourceConfig};
 pub use stats::SourceStats;
 
 #[cfg(feature = "python")]

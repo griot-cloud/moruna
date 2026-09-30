@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use moruna_kernel::arrow::array::{Array, ArrayData, RecordBatch, RecordBatchOptions, make_array};
-use moruna_kernel::arrow::buffer::{BooleanBuffer, NullBuffer};
+use moruna_kernel::arrow::buffer::{BooleanBuffer, Buffer as ArrowBuffer, NullBuffer};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
 use moruna_kernel::{Allocator, MorunaError, Result, Tier};
 
@@ -25,6 +25,19 @@ pub fn copy_batch(
     alloc: &dyn Allocator,
     tier: Tier,
 ) -> Result<(RecordBatch, u64)> {
+    copy_batch_except(batch, alloc, tier, &|_| false)
+}
+
+/// [`copy_batch`], leaving in place every buffer `resident` says is already in the arena in
+/// `tier`. The Vortex source (e.8) decodes a column in a canonical encoding over the very buffer
+/// the reactor landed its segment in, so that column needs no copy at all; every other buffer is
+/// copied as Parquet's are. Returns the new batch and the bytes copied.
+pub(crate) fn copy_batch_except(
+    batch: &RecordBatch,
+    alloc: &dyn Allocator,
+    tier: Tier,
+    resident: &dyn Fn(&ArrowBuffer) -> bool,
+) -> Result<(RecordBatch, u64)> {
     let mut copied = 0u64;
     let mut columns = Vec::with_capacity(batch.num_columns());
     let mut fields = Vec::with_capacity(batch.num_columns());
@@ -35,7 +48,7 @@ pub fn copy_batch(
             Field::new(field.name(), plain.data_type().clone(), field.is_nullable())
                 .with_metadata(field.metadata().clone()),
         ));
-        let data = copy_data(&plain.to_data(), alloc, tier, &mut copied)?;
+        let data = copy_data(&plain.to_data(), alloc, tier, resident, &mut copied)?;
         columns.push(make_array(data));
     }
     let schema = Arc::new(
@@ -71,35 +84,41 @@ fn copy_data(
     data: &ArrayData,
     alloc: &dyn Allocator,
     tier: Tier,
+    resident: &dyn Fn(&ArrowBuffer) -> bool,
     copied: &mut u64,
 ) -> Result<ArrayData> {
     let mut builder = ArrayData::builder(data.data_type().clone())
         .len(data.len())
         .offset(data.offset());
     for buffer in data.buffers() {
-        builder = builder.add_buffer(copy_buffer(buffer, alloc, tier, copied)?);
+        builder = builder.add_buffer(copy_buffer(buffer, alloc, tier, resident, copied)?);
     }
     if let Some(nulls) = data.nulls() {
         let inner = nulls.inner();
-        let bits = copy_buffer(inner.inner(), alloc, tier, copied)?;
+        let bits = copy_buffer(inner.inner(), alloc, tier, resident, copied)?;
         let boolean = BooleanBuffer::new(bits, inner.offset(), inner.len());
         builder = builder.nulls(Some(NullBuffer::new(boolean)));
     }
     for child in data.child_data() {
-        builder = builder.add_child_data(copy_data(child, alloc, tier, copied)?);
+        builder = builder.add_child_data(copy_data(child, alloc, tier, resident, copied)?);
     }
     builder
         .build()
         .map_err(|e| MorunaError::Plan(format!("rebuilding a decoded column: {e}")))
 }
 
-/// One Arrow buffer copied into an arena buffer of `tier`.
+/// One Arrow buffer copied into an arena buffer of `tier`, or kept as it is when `resident`
+/// says it already lies there.
 fn copy_buffer(
-    source: &moruna_kernel::arrow::buffer::Buffer,
+    source: &ArrowBuffer,
     alloc: &dyn Allocator,
     tier: Tier,
+    resident: &dyn Fn(&ArrowBuffer) -> bool,
     copied: &mut u64,
-) -> Result<moruna_kernel::arrow::buffer::Buffer> {
+) -> Result<ArrowBuffer> {
+    if resident(source) {
+        return Ok(source.clone());
+    }
     let bytes = source.as_slice();
     let mut buffer = alloc.alloc(bytes.len(), tier)?;
     buffer[..bytes.len()].copy_from_slice(bytes);

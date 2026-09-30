@@ -608,3 +608,163 @@ fn rt_t9_checkpoint_on_demand_and_resume_auto() {
     assert_eq!(read_back_rows(&out_dir), 400_000);
     let _ = std::fs::remove_dir_all(&staging);
 }
+
+/// 07 SO-T30 vortex_round_trip_through_a_kernel: a Parquet file is copied into Vortex files by
+/// a `VortexSink`, those are read by a `VortexSource` through a real kernel into a second
+/// `VortexSink`, and the second set of files, read back with the Vortex library itself, holds
+/// every row once with the kernel's change in it. Every component is real (07 e.7, e.8; 08 f.11).
+#[test]
+fn so_t30_vortex_round_trip_through_a_kernel() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("so_t30");
+    let input = scratch.path().join("in.parquet");
+    let first = scratch.path().join("vx1");
+    let second = scratch.path().join("vx2");
+    let rows: u64 = 40_000;
+    write_parquet(&input, rows, 4);
+
+    let run = |source: SourceSpec, kernels: Vec<Arc<dyn Kernel>>, out: &std::path::Path| {
+        let sink_url = format!("file://{}", out.display());
+        let mut spec = RunSpec::new(
+            source,
+            kernels,
+            SinkSpec::Build(Box::new(move |ctx| {
+                moruna_sinks::VortexSink::new(
+                    moruna_sinks::VortexSinkConfig {
+                        url: sink_url.clone(),
+                        file_bytes: 8 << 20,
+                    },
+                    ctx.reactor.clone(),
+                    ctx.alloc.clone(),
+                )
+                .map(|sink| Box::new(sink.with_run_id(ctx.run_id)) as Box<dyn moruna_kernel::Sink>)
+            })),
+        );
+        spec.budget = Some(1 << 30);
+        spec.cpu = Some(2.0);
+        spec.staging_dir = Some(scratch.path().join("staging"));
+        spec.staging_limit = Some(1 << 30);
+        spec.profiles_dir = Some(scratch.path().join("profiles"));
+        std::fs::create_dir_all(scratch.path().join("staging")).expect("the staging directory");
+        match Runtime::run(spec, CancelToken::new()) {
+            Ok(report) => report,
+            Err(error) => panic!("the run did not complete: {error}"),
+        }
+    };
+
+    let parquet = input.clone();
+    let copied = run(
+        SourceSpec::Build(Box::new(move |ctx| {
+            moruna_sources::ParquetSource::new(
+                moruna_sources::ParquetSourceConfig {
+                    urls: vec![format!("file://{}", parquet.display())],
+                    ..Default::default()
+                },
+                ctx.reactor.clone(),
+                ctx.object_metadata()?,
+            )
+            .map(|source| Arc::new(source) as Arc<dyn moruna_kernel::Source>)
+        })),
+        Vec::new(),
+        &first,
+    );
+    assert_eq!(copied.exit, moruna_runtime::ExitReason::Completed);
+
+    let vortex_in = first.clone();
+    let doubled = run(
+        SourceSpec::Build(Box::new(move |ctx| {
+            moruna_sources::VortexSource::new(
+                moruna_sources::VortexSourceConfig {
+                    urls: vec![vortex_in.display().to_string()],
+                    columns: None,
+                    split_bytes: Some(256 << 10),
+                },
+                ctx.reactor.clone(),
+                ctx.object_metadata()?,
+            )
+            .map(|source| Arc::new(source) as Arc<dyn moruna_kernel::Source>)
+        })),
+        vec![Arc::new(Doubler::new()) as Arc<dyn Kernel>],
+        &second,
+    );
+    assert_eq!(
+        doubled.exit,
+        moruna_runtime::ExitReason::Completed,
+        "notes: {:?}",
+        doubled.notes
+    );
+    let stage_rows: u64 = doubled
+        .stages
+        .iter()
+        .find(|s| s.stage == 1)
+        .map(|s| s.rows_in)
+        .unwrap_or(0);
+    assert_eq!(stage_rows, rows, "the kernel saw every row");
+
+    let mut pairs = read_back_vortex(&second);
+    pairs.sort_unstable();
+    assert_eq!(pairs.len() as u64, rows, "every row once");
+    for (i, (id, value)) in pairs.iter().enumerate() {
+        assert_eq!(*id, i as i64);
+        assert_eq!(*value, id * 4, "the input's value doubled by the kernel");
+    }
+}
+
+/// `(id, value)` of every row of every Vortex file under `dir`, read with the Vortex library.
+fn read_back_vortex(dir: &std::path::Path) -> Vec<(i64, i64)> {
+    use moruna_kernel::arrow::array::AsArray;
+    use moruna_kernel::arrow::datatypes::Int64Type;
+    use vortex::VortexSessionDefault;
+    use vortex::array::VortexSessionExecute;
+    use vortex::array::stream::ArrayStreamExt;
+    use vortex::arrow::ArrowSessionExt;
+    use vortex::file::OpenOptionsSessionExt;
+    use vortex::io::runtime::BlockingRuntime;
+    use vortex::io::session::RuntimeSessionExt;
+
+    let runtime = vortex::io::runtime::current::CurrentThreadRuntime::new();
+    let session = vortex::session::VortexSession::default().with_handle(runtime.handle());
+    let mut out = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("the output directory")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("vortex"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "the sink wrote Vortex files");
+    for path in files {
+        let bytes = std::fs::read(&path).expect("a Vortex file");
+        let file = session.open_options().open_buffer(bytes).expect("it opens");
+        let array = runtime
+            .block_on(
+                file.scan()
+                    .expect("scan")
+                    .into_array_stream()
+                    .expect("stream")
+                    .read_all(),
+            )
+            .expect("its rows");
+        if array.is_empty() {
+            continue;
+        }
+        let arrow = session
+            .arrow()
+            .execute_arrow(array, None, &mut session.create_execution_ctx())
+            .expect("to arrow");
+        let table = arrow.as_struct();
+        let ids = table
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<Int64Type>()
+            .clone();
+        let values = table
+            .column_by_name("value")
+            .expect("value")
+            .as_primitive::<Int64Type>()
+            .clone();
+        for i in 0..ids.len() {
+            out.push((ids.value(i), values.value(i)));
+        }
+    }
+    out
+}

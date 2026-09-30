@@ -51,6 +51,9 @@ hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+# Reads back what the Vortex round trip in `tests/end_to_end.rs` wrote (07 SO-T30); already in
+# the graph through moruna-sources and moruna-sinks.
+vortex = { workspace = true }
 # A loader's own binding resolver, in `tests/governed.rs`.
 async-trait = "0.1"
 datafusion = { workspace = true }

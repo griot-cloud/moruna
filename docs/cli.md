@@ -86,7 +86,7 @@ The peer sends:
 A `moruna serve` session starts with Moruna's greeting, then the peer's job document:
 
 ```text
-<- {"type": "hello", "moruna_version": "0.2.5", "spec_digest": null, "limits": {...}}
+<- {"type": "hello", "moruna_version": "0.3.1", "spec_digest": null, "limits": {...}}
 -> {"type": "spec", "spec": {"moruna_spec": 1, "source": {...}, "sink": {...}}}
 <- {"type": "heartbeat", "t_ms": 2000, "rows_out": 120000, "active_workers": 8, ...}
 <- {"type": "report", "report": {...}}

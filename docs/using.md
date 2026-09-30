@@ -9,7 +9,7 @@ You can use Moruna from Python, where a job is a call to `moruna.run`, or from t
 :link: python
 :link-type: doc
 
-Read Parquet, tensor files or your own iterator, write the results, and set the budget and other options.
+Read Parquet, Vortex or tensor files or your own iterator, write the results, and set the budget and other options.
 :::
 
 :::{grid-item-card} Writing your own source or sink

@@ -20,6 +20,8 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+vortex = { workspace = true }
+futures = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 # The Arrow C Data Interface import of a `pyarrow.RecordBatch` (src/py_iter.rs). Taking an
 # `FFI_ArrowArray` out of a PyCapsule by hand needs `unsafe`, which 07 section l does not

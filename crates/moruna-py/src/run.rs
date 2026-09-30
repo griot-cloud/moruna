@@ -17,7 +17,7 @@ use moruna_runtime::job::{
     ArrowIpcSinkOptions, AzureDoc, BuildOptions, ErrorPolicyDoc, FilterDoc, GcsDoc, JobSpec,
     KernelDoc, KernelLoader, LoadedKernel, ObjectStoreDoc, ParquetSinkOptions,
     ParquetSourceOptions, S3Doc, SinkDoc, SizerDoc, SourceDoc, TensorSinkOptions,
-    TensorSourceOptions, Urls,
+    TensorSourceOptions, Urls, VortexSinkOptions, VortexSourceOptions,
 };
 use moruna_runtime::{RunSpec, Runtime};
 use moruna_sources::{RowFilter, ScalarValue};
@@ -264,6 +264,13 @@ fn source_doc(source: &SourceSpec) -> SourceDoc {
                 filters: cfg.filters.iter().map(filter_doc).collect(),
             },
         },
+        SourceSpec::Vortex(cfg) => SourceDoc::Vortex {
+            url: Urls(cfg.urls.clone()),
+            options: VortexSourceOptions {
+                columns: cfg.columns.clone(),
+                split_bytes: cfg.split_bytes,
+            },
+        },
         SourceSpec::Tensor(cfg) => SourceDoc::Tensor {
             url: Urls(
                 cfg.paths
@@ -304,6 +311,12 @@ fn sink_doc(sink: &SinkSpec) -> SinkDoc {
                 row_group_bytes: Some(cfg.row_group_bytes),
                 file_bytes: Some(cfg.file_bytes),
                 compression: Some(compression_name(cfg.compression).to_string()),
+            },
+        },
+        SinkSpec::Vortex(cfg) => SinkDoc::Vortex {
+            url: cfg.url.clone(),
+            options: VortexSinkOptions {
+                file_bytes: Some(cfg.file_bytes),
             },
         },
         SinkSpec::Tensor(cfg) => SinkDoc::Tensor {

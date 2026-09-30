@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// What a source has done so far. Read through `ParquetSource::stats`,
+/// What a source has done so far. Read through `ParquetSource::stats`, `VortexSource::stats`,
 /// `TensorSource::stats` and `PyIteratorSource::stats`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceStats {
@@ -27,6 +27,9 @@ pub struct SourceStats {
     /// Bytes a `PySource` compacted out of a sliced batch before its decode copy (f.7); zero for
     /// every other source.
     pub compacted_bytes: u64,
+    /// Payload bytes a Vortex read returned in the arena buffers the reactor landed the file's
+    /// segments in, with no decode copy: columns in a canonical encoding.
+    pub zero_copy_bytes: u64,
 }
 
 /// The live counters; one per source instance, shared with every read in flight.
@@ -42,6 +45,7 @@ pub(crate) struct Counters {
     pub(crate) groups_skipped: AtomicU64,
     pub(crate) oversized_rows: AtomicU64,
     pub(crate) compacted_bytes: AtomicU64,
+    pub(crate) zero_copy_bytes: AtomicU64,
 }
 
 impl Counters {
@@ -62,6 +66,7 @@ impl Counters {
             groups_skipped: get(&self.groups_skipped),
             oversized_rows: get(&self.oversized_rows),
             compacted_bytes: get(&self.compacted_bytes),
+            zero_copy_bytes: get(&self.zero_copy_bytes),
         }
     }
 }
