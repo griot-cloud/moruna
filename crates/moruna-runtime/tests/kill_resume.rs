@@ -495,10 +495,19 @@ fn kill_and_resume(
             });
         }
     }
-    let killed = matches!(child.try_wait(), Ok(None));
+    let alive = matches!(child.try_wait(), Ok(None));
     let _ = child.kill();
-    let _ = child.wait();
+    let output = child.wait_with_output().expect("the child's output");
     let _ = std::fs::remove_file(&job.reads);
+    let found = manifests(&job.staging, false);
+    // A run that finished during the delay removed its own checkpoint directory (12 f.7,
+    // `keep_checkpoint` off) and printed CHILD-OK, and its process can still be alive at the
+    // kill: an instrumented binary spends its last moments writing coverage data. That is a run
+    // that completed, not a kill that lost a checkpoint, and it is told apart by the child's
+    // own last line rather than by whether the process had exited yet (found under the coverage
+    // build, one run in three, 2026-09-29).
+    let completed = String::from_utf8_lossy(&output.stdout).contains("CHILD-OK");
+    let killed = alive && !completed;
     if !killed {
         return (
             job,
@@ -509,7 +518,6 @@ fn kill_and_resume(
         );
     }
 
-    let found = manifests(&job.staging, false);
     assert_eq!(
         found.len(),
         1,

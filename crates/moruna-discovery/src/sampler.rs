@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use moruna_kernel::{
-    Device, Limits, ProcessPeak, ProcessUsage, Result, Sample, Sampler as SamplerTrait,
+    Device, LimitSource, Limits, ProcessPeak, ProcessUsage, Result, Sample, Sampler as SamplerTrait,
 };
 
 use crate::cgroup;
@@ -34,8 +34,20 @@ enum Source {
     },
     /// cgroup v1: `memory.stat` and `cpu.stat` with the v1 field names.
     V1 { stat: File, cpu: Option<File> },
-    /// No cgroup: `/proc/self/status`, or the platform's own interface (os.rs).
-    Os { proc_root: PathBuf },
+    /// The process's own memory: `/proc/self/status`, or the platform's own interface (os.rs).
+    /// Outside a cgroup, and inside one whose limit is not the ceiling (DS-I4); there `cpu` is
+    /// still the cgroup's `cpu.stat`, since the cgroup throttles the process whoever set its
+    /// budget.
+    Os {
+        proc_root: PathBuf,
+        cpu: Option<CpuStat>,
+    },
+}
+
+/// A cgroup's `cpu.stat`, and whether it uses the v1 field names.
+struct CpuStat {
+    file: File,
+    v1: bool,
 }
 
 /// The mutable half of the sampler.
@@ -50,6 +62,9 @@ struct Inner {
     /// The whole process's high-water mark since the sampler was created, which `reset_peak`
     /// leaves alone: what the run report's peak is (`Sampler::process_peak`).
     process_peak: ProcessPeak,
+    /// When the platform's lifetime mark was last read: a mark seen to have risen rose after
+    /// this moment, which is the start of the peak's window (`ProcessPeak::since_ns`).
+    mark_read_ns: u64,
     /// The platform's lifetime high-water mark when the sampler was created, where the platform
     /// keeps one (macOS). A rise above it is the process's exact peak since then, however short
     /// the burst that made it.
@@ -96,7 +111,23 @@ impl Sampler {
     /// As [`Sampler::new`], with the `/proc` root as a parameter so the operating system path is
     /// tested against a fixture directory on a host that has no `/proc`.
     pub(crate) fn with_roots(discovered: &crate::Discovered, proc_root: &Path) -> Result<Sampler> {
+        // DS-I4: `memory.stat` counts every process in the cgroup, which is what the ceiling
+        // counts only when the ceiling is the cgroup's own limit, since the kernel enforces
+        // that limit on all of them together. An explicit budget is the process's (DS-I8: on a
+        // Databricks driver the JVM beside it holds most of the cgroup), and so is a ceiling
+        // taken from the machine's RAM; both count the process's own memory, as macOS's
+        // `phys_footprint` does, and never a `cargo`, a test harness's parent or a JVM that
+        // happens to share the cgroup (2026-09-30). Decided once, from the ceiling discovery
+        // found: an explicit budget stays explicit for the whole run.
+        let own = discovered.limits.source != LimitSource::Cgroup;
         let source = match discovered.cgroup_path.as_deref() {
+            Some(dir) if own => Source::Os {
+                proc_root: proc_root.to_path_buf(),
+                cpu: File::open(dir.join("cpu.stat")).ok().map(|file| CpuStat {
+                    file,
+                    v1: dir.join("memory.limit_in_bytes").is_file(),
+                }),
+            },
             Some(dir) if dir.join("memory.limit_in_bytes").is_file() => Source::V1 {
                 stat: open(&dir.join("memory.stat"))?,
                 cpu: File::open(dir.join("cpu.stat")).ok(),
@@ -112,6 +143,7 @@ impl Sampler {
             }
             None => Source::Os {
                 proc_root: proc_root.to_path_buf(),
+                cpu: None,
             },
         };
         let sampler = Sampler {
@@ -123,6 +155,7 @@ impl Sampler {
                 page_bytes: discovered.limits.page_bytes,
                 peak_reset_refused: false,
                 process_peak: ProcessPeak::default(),
+                mark_read_ns: 0,
                 lifetime_at_create: None,
                 cpu_at_create_ns: process_cpu_ns(),
                 mem_integral: 0,
@@ -200,8 +233,10 @@ impl SamplerTrait for Sampler {
             source,
             buffer,
             running_peak,
+            peak_reset_refused,
             last,
             process_peak,
+            mark_read_ns,
             lifetime_at_create,
             mem_integral,
             integral_edge,
@@ -235,8 +270,22 @@ impl SamplerTrait for Sampler {
                         .unwrap_or(0);
                     (memory, None, throttled)
                 }),
-            Source::Os { proc_root } => crate::os::process_memory(proc_root, page_bytes)
-                .map(|(anon, file)| (cgroup::MemoryStat { anon, file }, None, 0u64)),
+            Source::Os { proc_root, cpu } => {
+                crate::os::process_memory(proc_root, page_bytes).map(|(anon, file)| {
+                    let throttled = cpu
+                        .as_ref()
+                        .and_then(|cpu| {
+                            let text = read_at_zero(&cpu.file, buffer)?;
+                            Some(if cpu.v1 {
+                                cgroup::parse_throttled_usec_v1(text)
+                            } else {
+                                cgroup::parse_throttled_usec_v2(text)
+                            })
+                        })
+                        .unwrap_or(0);
+                    (cgroup::MemoryStat { anon, file }, None, throttled)
+                })
+            }
         };
 
         let Some((memory, kernel_peak, throttled_us)) = reading else {
@@ -267,19 +316,35 @@ impl SamplerTrait for Sampler {
             (Some(now), Some(then)) if now > then => Some(now),
             _ => None,
         };
+        // The mark was last read at `mark_read_ns` (the sampler's creation primes it), so a rise
+        // seen now happened after then; two samples racing for the lock can arrive out of order,
+        // so the window never starts after its own end.
+        let since_ns = (*mark_read_ns).min(at_ns);
+        if lifetime.is_some() {
+            *mark_read_ns = at_ns.max(*mark_read_ns);
+        }
         match risen {
             Some(exact) if exact > process_peak.bytes || !process_peak.exact => {
+                // A mark the process is still at was reached now, to the sampling interval's
+                // benefit of the doubt; one the process has come down from was reached before.
+                // Either way it was reached inside the window since the mark was last read.
+                // The mark is read before the memory, so a reading taken after it can be the
+                // higher of the two; the process's lifetime mark is never below any reading.
                 *process_peak = ProcessPeak {
-                    bytes: exact.max(process_peak.bytes),
+                    bytes: exact.max(process_peak.bytes).max(memory.anon),
                     at_ns,
                     exact: true,
+                    since_ns,
                 };
             }
             _ if memory.anon > process_peak.bytes => {
+                // A reading above the mark read a moment before it: the kernel's mark holds it
+                // too, so a peak that was exact stays exact. Reached at this reading.
                 *process_peak = ProcessPeak {
                     bytes: memory.anon,
                     at_ns,
-                    exact: false,
+                    exact: process_peak.exact && lifetime.is_some(),
+                    since_ns: at_ns,
                 };
             }
             _ => {}
@@ -287,7 +352,16 @@ impl SamplerTrait for Sampler {
         let sample = Sample {
             anon_bytes: memory.anon,
             file_bytes: memory.file,
-            peak_anon_bytes: kernel_peak.unwrap_or(*running_peak),
+            // `memory.peak` is the peak since it was last reset. Where the reset is refused, it
+            // is the cgroup's peak since the cgroup was made, which on a shared cgroup predates
+            // this process: a GitHub runner's, after the Rust build that ran there, read 13.4
+            // GiB, and a probe of a few hundred bytes was "measured" to cost that. The sampler
+            // then tracks its own peak from its samples, as the reset's note already said it
+            // does (f.2; 2026-09-29).
+            peak_anon_bytes: match kernel_peak {
+                Some(kernel) if !*peak_reset_refused => kernel,
+                _ => *running_peak,
+            },
             throttled_us,
             device_used,
             at_ns,
@@ -397,7 +471,18 @@ mod tests {
     use std::sync::Arc;
 
     /// A `Discovered` pointing at a fixture cgroup directory.
+    /// A `Discovered` pointing at a fixture cgroup directory whose limit is the ceiling, as in a
+    /// pod, or at none.
     fn discovered_at(cgroup_path: Option<PathBuf>) -> Discovered {
+        let source = match cgroup_path {
+            Some(_) => LimitSource::Cgroup,
+            None => LimitSource::Os,
+        };
+        discovered_with(cgroup_path, source)
+    }
+
+    /// A `Discovered` pointing at a fixture cgroup directory, with the ceiling from `source`.
+    fn discovered_with(cgroup_path: Option<PathBuf>, source: LimitSource) -> Discovered {
         Discovered {
             limits: Limits {
                 memory_ceiling: 1024 * 1024 * 1024,
@@ -405,7 +490,7 @@ mod tests {
                 cpu_quota: 1.0,
                 page_bytes: 4096,
                 devices: Vec::new(),
-                source: LimitSource::Os,
+                source,
                 observed_at: 0,
             },
             profile: HostProfile::default(),
@@ -570,6 +655,56 @@ mod tests {
         assert_eq!(written, "reset");
     }
 
+    /// f.2, the peak the kernel keeps but will not let go of: where `memory.peak` cannot be
+    /// reset, it is the cgroup's peak since the cgroup was made, which on a shared cgroup is
+    /// someone else's high-water mark (a GitHub runner's, 13.4 GiB after the Rust build, which
+    /// a probe of a few hundred bytes was then "measured" to cost on 2026-09-29). After a refused
+    /// reset the sampler's own running peak is the peak, and the file is not read into it again.
+    #[test]
+    fn a_peak_that_cannot_be_reset_is_not_the_peak() {
+        let tmp = TempDir::new("peak-refused");
+        let dir = tmp.path().join("cgroup");
+        write(&dir, "memory.stat", "anon 100\nfile 0\nunevictable 0\n");
+        write(&dir, "memory.peak", "999999\n");
+        let peak_path = dir.join("memory.peak");
+        let mut perms = std::fs::metadata(&peak_path)
+            .expect("memory.peak")
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&peak_path, perms).expect("read-only memory.peak");
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&peak_path)
+            .is_ok()
+        {
+            // Root writes through a read-only bit: this process cannot stage the refusal.
+            eprintln!("skipped: this process can write a read-only file");
+            return;
+        }
+        let sampler =
+            Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
+        // Until a reset is refused the kernel's figure stands, as before.
+        assert_eq!(sampler.sample().peak_anon_bytes, 999_999);
+
+        sampler.reset_peak();
+        let after = sampler.sample();
+        assert_eq!(
+            after.peak_anon_bytes, 100,
+            "after a refused reset the peak is the sampler's own, not the cgroup's lifetime mark"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&peak_path).expect("memory.peak"),
+            "999999\n",
+            "the refused write left the file alone"
+        );
+
+        // And the running peak keeps following the samples from there.
+        write(&dir, "memory.stat", "anon 250\nfile 0\nunevictable 0\n");
+        assert_eq!(sampler.sample().peak_anon_bytes, 250);
+        write(&dir, "memory.stat", "anon 120\nfile 0\nunevictable 0\n");
+        assert_eq!(sampler.sample().peak_anon_bytes, 250);
+    }
+
     /// f.2, v1 fallback: the v1 field names are read and `throttled_time` is nanoseconds.
     #[test]
     fn samples_a_cgroup_v1_directory() {
@@ -610,6 +745,134 @@ mod tests {
         assert!(real.sample().peak_anon_bytes > 0);
     }
 
+    /// DS-T15 ceiling_scope: the sampler counts what the ceiling counts. In a cgroup whose limit
+    /// is the ceiling, the cgroup's `anon + unevictable`; with an explicit budget, or a ceiling
+    /// from the machine's RAM, the process's own `RssAnon`, however much the rest of the cgroup
+    /// holds and whatever its `memory.peak` says, while `cpu.stat` is still the cgroup's. The
+    /// fixture is the one that refused a 256 MiB run on 2026-09-30: `cargo test` and the test
+    /// harness's parent held a gibibyte of the container's cgroup beside a child holding 1.6 MB.
+    /// DS-I4.
+    #[test]
+    fn ds_t15_ceiling_scope() {
+        let tmp = TempDir::new("ds-t15");
+        let proc_dir = tmp.path().join("proc");
+        write(&proc_dir, "self/status", crate::os::STATUS);
+        let v2 = tmp.path().join("v2");
+        write(
+            &v2,
+            "memory.stat",
+            "anon 1073741824\nfile 0\nunevictable 0\n",
+        );
+        write(&v2, "memory.peak", "2147483648\n");
+        write(&v2, "cpu.stat", "usage_usec 10\nthrottled_usec 42\n");
+        let v1 = tmp.path().join("v1");
+        write(&v1, "memory.limit_in_bytes", "4294967296");
+        write(&v1, "memory.stat", "rss 1073741824\ncache 0\n");
+        write(&v1, "cpu.stat", "throttled_time 5000\n");
+
+        for (dir, throttled) in [(&v2, 42), (&v1, 5)] {
+            for source in [LimitSource::Explicit, LimitSource::Os] {
+                let sampler =
+                    Sampler::with_roots(&discovered_with(Some(dir.clone()), source), &proc_dir)
+                        .expect("sampler");
+                let sample = sampler.sample();
+                assert_eq!(
+                    sample.anon_bytes,
+                    1600 * 1024,
+                    "{source:?}: RssAnon, not the cgroup"
+                );
+                assert_eq!(sample.file_bytes, 400 * 1024);
+                assert_eq!(
+                    sample.peak_anon_bytes,
+                    1600 * 1024,
+                    "{source:?}: the cgroup's memory.peak is not this process's peak"
+                );
+                assert_eq!(
+                    sample.throttled_us, throttled,
+                    "the cgroup throttles the process"
+                );
+                if !cfg!(target_vendor = "apple") {
+                    // macOS joins its real lifetime mark to the samples, which a fixture file
+                    // cannot stand in for; Linux keeps none, so the samples are the peak.
+                    assert_eq!(sampler.process_peak().bytes, 1600 * 1024);
+                }
+            }
+            let pod = Sampler::with_roots(
+                &discovered_with(Some(dir.clone()), LimitSource::Cgroup),
+                &proc_dir,
+            )
+            .expect("sampler");
+            assert_eq!(
+                pod.sample().anon_bytes,
+                1 << 30,
+                "the cgroup's limit is enforced on every process in it"
+            );
+        }
+
+        // A cgroup with no `cpu.stat` the process can open is no throttling, as outside one.
+        let bare = tmp.path().join("bare");
+        write(
+            &bare,
+            "memory.stat",
+            "anon 1073741824\nfile 0\nunevictable 0\n",
+        );
+        let sampler = Sampler::with_roots(
+            &discovered_with(Some(bare), LimitSource::Explicit),
+            &proc_dir,
+        )
+        .expect("sampler");
+        let sample = sampler.sample();
+        assert_eq!((sample.anon_bytes, sample.throttled_us), (1600 * 1024, 0));
+    }
+
+    /// DS-T16 status_file_pages_are_not_anon: `/proc/self/status` of a large debug test binary,
+    /// whose mapped text and libraries are gigabytes of `RssFile` and whose `VmRSS` is mostly
+    /// that, gives the budget only `RssAnon`; the file backed pages, the shared memory with them
+    /// and the swapped pages are none of it, and neither the peak nor the process peak rises when
+    /// a sibling maps more files. The same holds in a cgroup whose limit is not the ceiling.
+    /// DS-I4.
+    #[test]
+    fn ds_t16_status_file_pages_are_not_anon() {
+        const MIB: u64 = 1024 * 1024;
+        let status = |file_kib: u64| {
+            format!(
+                "Name:\twhole_process-1\nVmHWM:\t{hwm} kB\nVmRSS:\t{rss} kB\n\
+                 RssAnon:\t 40960 kB\nRssFile:\t {file_kib} kB\nRssShmem:\t 65536 kB\n\
+                 VmSwap:\t 1024 kB\nThreads:\t9\n",
+                hwm = 40960 + file_kib + 65536,
+                rss = 40960 + file_kib + 65536,
+            )
+        };
+        let tmp = TempDir::new("ds-t16");
+        let proc_dir = tmp.path().join("proc");
+        let cgroup = tmp.path().join("cgroup");
+        write(
+            &cgroup,
+            "memory.stat",
+            "anon 999999999\nfile 0\nunevictable 0\n",
+        );
+        for discovered in [
+            discovered_at(None),
+            discovered_with(Some(cgroup.clone()), LimitSource::Explicit),
+        ] {
+            write(&proc_dir, "self/status", &status(3 * 1024 * 1024));
+            let sampler = Sampler::with_roots(&discovered, &proc_dir).expect("sampler");
+            let sample = sampler.sample();
+            assert_eq!(sample.anon_bytes, 40 * MIB, "RssAnon alone, never VmRSS");
+            assert_eq!(sample.file_bytes, 3 * 1024 * MIB + 64 * MIB);
+
+            // More mapped file, the same anonymous memory: nothing the budget counts moved.
+            write(&proc_dir, "self/status", &status(6 * 1024 * 1024));
+            let sample = sampler.sample();
+            assert_eq!(sample.anon_bytes, 40 * MIB);
+            assert_eq!(sample.peak_anon_bytes, 40 * MIB);
+            if !cfg!(target_vendor = "apple") {
+                // As in DS-T15: macOS joins its real lifetime mark, Linux keeps none.
+                assert_eq!(sampler.process_peak().bytes, 40 * MIB);
+            }
+        }
+    }
+
     /// F8.9: the process peak is the whole process's high-water mark since the sampler was
     /// created, whatever `reset_peak` does to the probe's peak. On macOS it is the kernel's own
     /// lifetime mark, so a burst no sample saw is still in it; elsewhere it is the highest sample.
@@ -645,6 +908,43 @@ mod tests {
         let _ = fixture.sample();
         let peak = fixture.process_peak();
         assert_eq!((peak.bytes, peak.exact), (5000, false));
+    }
+
+    /// A kernel's high-water mark is read, not watched, so a peak that is the mark carries the
+    /// window it rose in: from the sampler's last reading of the mark to the reading that saw
+    /// it (contracts d.12, 03 f.2, amended 2026-09-30). A peak that is a sample's own reading
+    /// was reached at the instant it was read: its window is zero-width.
+    #[test]
+    fn a_peak_carries_the_window_it_rose_in() {
+        const BURST: usize = 128 << 20;
+        let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
+        let first = sampler.sample();
+        let burst = vec![7u8; BURST];
+        drop(std::hint::black_box(burst));
+        let second = sampler.sample();
+        let peak = sampler.process_peak();
+        assert!(peak.since_ns <= peak.at_ns, "{peak:?}");
+        if cfg!(target_vendor = "apple") {
+            // The burst is gone by the second reading; the mark kept it, and it rose after the
+            // first reading.
+            assert!(peak.exact, "{peak:?}");
+            assert_eq!(peak.at_ns, second.at_ns, "{peak:?}");
+            assert_eq!(peak.since_ns, first.at_ns, "{peak:?}");
+            assert!(peak.since_ns < peak.at_ns);
+        } else {
+            assert_eq!(peak.since_ns, peak.at_ns, "{peak:?}");
+        }
+        // A fixture cgroup keeps no mark: the peak is a sample's reading, with no window.
+        let tmp = TempDir::new("peak-window");
+        let dir = tmp.path().join("cgroup");
+        write(&dir, "memory.stat", "anon 5000\nfile 0\nunevictable 0\n");
+        let fixture =
+            Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
+        write(&dir, "memory.stat", "anon 9000\nfile 0\nunevictable 0\n");
+        let risen = fixture.sample();
+        let peak = fixture.process_peak();
+        assert_eq!((peak.bytes, peak.exact), (9000, false));
+        assert_eq!((peak.at_ns, peak.since_ns), (risen.at_ns, risen.at_ns));
     }
 
     /// DS-I3: a read error repeats the last sample with a fresh timestamp and is counted.

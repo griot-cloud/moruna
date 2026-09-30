@@ -94,6 +94,16 @@ pub(crate) fn follow(
         state.limits_changes = state.limits_changes.saturating_add(1);
         state.limits_epoch_ns = now_ns();
         moved = true;
+        // A ceiling below what is already resident is a shrink the arena has not started yet:
+        // the facade's watcher reports the drain through `set_arena`, in a call of its own, and
+        // until it does the breach path would see the lowered ceiling with nothing draining and
+        // end the run for the arena it is about to give back. That window is real: a run on a
+        // machine raised and then lowered was terminated with "footprint exceeds budget 0"
+        // when a record landed between the two calls (2026-09-29). So the part of the resting
+        // figure above the new ceiling counts as a pending drain from this moment, for the
+        // breach path only, until `set_arena` reports the arena's own figure. A ceiling raised
+        // back above the resting figure leaves nothing pending.
+        state.drain_pending = model::resting_anon(state).saturating_sub(ceiling_bytes);
     }
 
     if moved && state.phase == Phase::Running {

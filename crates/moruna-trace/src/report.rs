@@ -278,6 +278,10 @@ fn gil_json<S: Serializer>(
     seq.end()
 }
 
+/// How a note that judged the peak across a limits change or a drain begins; `Display` shows
+/// it beside the memory line (04 f.4, amended 2026-09-30).
+pub const PEAK_WINDOW_NOTE: &str = "the peak rose between";
+
 /// A record's place in the walk: `(t_start_ns, seq)`, which orders the records of one stage
 /// the same way whichever order the chunks were read in.
 type OrderKey = (u64, u64);
@@ -397,6 +401,9 @@ impl RunReport {
         let mut stages: BTreeMap<StageId, StageAcc> = BTreeMap::new();
         let mut peak_anon = 0u64;
         let mut peak_at = 0u64;
+        // Where the peak could have been reached from: a record's peak anywhere in its
+        // `apply`, a kernel's mark anywhere since the sampler last read it (04 f.4).
+        let mut peak_since = 0u64;
         let mut throttled_us = 0u64;
         let mut staging_written = 0u64;
         let mut staging_abs = 0u128;
@@ -413,6 +420,7 @@ impl RunReport {
                 if r.mem_anon_peak > peak_anon {
                     peak_anon = r.mem_anon_peak;
                     peak_at = r.t_end_ns;
+                    peak_since = r.t_start_ns;
                 }
                 throttled_us += r.throttled_delta_us;
                 staging_written += r.staging_bytes_delta.max(0) as u64;
@@ -463,16 +471,94 @@ impl RunReport {
         if meta.process_peak.bytes > peak_anon {
             peak_anon = meta.process_peak.bytes;
             peak_at = meta.process_peak.at_ns;
+            peak_since = if meta.process_peak.exact {
+                meta.process_peak.since_ns
+            } else {
+                peak_at
+            };
         }
         // The ceiling in force at the peak, which is the initial one unless the machine
         // changed before it.
         let mut changes = trace.limits_changes();
         changes.sort_by_key(|change| change.at_ns);
-        let peak_ceiling_bytes = changes
-            .iter()
-            .rev()
-            .find(|change| change.at_ns <= peak_at)
-            .map_or(limits.memory_ceiling, |change| change.new.memory_ceiling);
+        let latest = changes.iter().rev().find(|change| change.at_ns <= peak_at);
+        let mut peak_ceiling_bytes =
+            latest.map_or(limits.memory_ceiling, |change| change.new.memory_ceiling);
+        // Unless the peak came while the arena was still giving memory back after a lowered
+        // ceiling. That memory was taken under the ceiling before the change: Moruna never
+        // allocates past the ceiling in force, and returns what it holds as the buffers in it
+        // are freed, which the hosted design accepts takes as long as it takes (MH 4.4, 7.1).
+        // Judging such a peak against the lowered ceiling reported a run that had done
+        // nothing wrong at 1.78 of its ceiling, and whether it did depended on whether the
+        // peak sample landed just before the change or just after it (2026-09-29).
+        let peak_ms = peak_at.saturating_sub(meta.start_ns) / 1_000_000;
+        let draining_at_peak = meta.drains.iter().any(|drain| {
+            drain.at_ms <= peak_ms && drain.drain_ms.is_none_or(|ms| peak_ms <= drain.at_ms + ms)
+        });
+        if let Some(change) = latest
+            && draining_at_peak
+            && change.new.memory_ceiling < change.old.memory_ceiling
+        {
+            peak_ceiling_bytes = change.old.memory_ceiling;
+        }
+        // A peak is stamped with the end of the window it could have been reached in: a kernel's
+        // own mark anywhere since the sampler last read it, a record's peak anywhere in its
+        // `apply`. When the ceiling moved, or the arena began a drain, inside the window, the peak
+        // may have been reached under any ceiling in force in it; it is judged against the highest
+        // of them, and the report says so, naming both ceilings and the window, so a real breach
+        // is never absorbed without a word. A sample's own reading has no window and is judged as
+        // before. Measured: a machine lowered from 809 MB to 272 MB whose grown
+        // region was empty and unmapped at once still had its 494 MB mark stamped 8 ms after the
+        // lowering, and the run was reported at 1.82 of a ceiling it never ran under (2026-09-30).
+        let mut window_note = None;
+        let since = peak_since.min(peak_at);
+        if since < peak_at {
+            let ms = |ns: u64| ns.saturating_sub(meta.start_ns) / 1_000_000;
+            let (since_ms, at_ms) = (ms(since), ms(peak_at));
+            let inside: Vec<_> = changes
+                .iter()
+                .filter(|change| change.at_ns > since && change.at_ns <= peak_at)
+                .collect();
+            let drains_inside: Vec<_> = meta
+                .drains
+                .iter()
+                .filter(|drain| drain.at_ms >= since_ms && drain.at_ms <= at_ms)
+                .collect();
+            if !inside.is_empty() || !drains_inside.is_empty() {
+                let at_start = changes
+                    .iter()
+                    .rev()
+                    .find(|change| change.at_ns <= since)
+                    .map_or(limits.memory_ceiling, |change| change.new.memory_ceiling);
+                let highest = inside
+                    .iter()
+                    .map(|change| change.new.memory_ceiling)
+                    .fold(at_start, u64::max);
+                if highest > peak_ceiling_bytes {
+                    let mut across: Vec<String> = inside
+                        .iter()
+                        .map(|change| {
+                            format!(
+                                "the ceiling's move from {} to {} bytes at {} ms",
+                                change.old.memory_ceiling,
+                                change.new.memory_ceiling,
+                                ms(change.at_ns)
+                            )
+                        })
+                        .collect();
+                    across.extend(drains_inside.iter().map(|drain| {
+                        format!("a drain of {} bytes at {} ms", drain.bytes, drain.at_ms)
+                    }));
+                    window_note = Some(format!(
+                        "{PEAK_WINDOW_NOTE} {since_ms} and {at_ms} ms, across {}; it is judged \
+                         against the {highest} byte ceiling in force within that window, not the \
+                         {peak_ceiling_bytes} byte ceiling in force at {at_ms} ms",
+                        across.join(" and ")
+                    ));
+                    peak_ceiling_bytes = highest;
+                }
+            }
+        }
         let peak_fraction_of_ceiling = if peak_ceiling_bytes > 0 {
             peak_anon as f64 / peak_ceiling_bytes as f64
         } else {
@@ -488,6 +574,10 @@ impl RunReport {
             })
             .collect();
         let mut notes = meta.notes.clone();
+        // First, so that it is never among the notes a rendering leaves out.
+        if let Some(note) = window_note {
+            notes.insert(0, note);
+        }
         if meta.process_peak.bytes > 0 {
             notes.push(if meta.process_peak.exact {
                 "the peak is the operating system's own high-water mark of the process".into()

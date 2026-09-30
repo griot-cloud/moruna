@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use moruna_kernel::{
-    Allocator, Buffer, BufferView, Completion, CopyDst, CopySrc, DeviceId, HostProfile, IoPaths,
-    MorunaError, ObjectMeta, ObjectMetadata, Result,
+    Allocator, Buffer, BufferView, Completion, CopyDst, CopySrc, DeviceId, Dispatch, HostProfile,
+    IoPaths, MorunaError, ObjectMeta, ObjectMetadata, Result,
 };
 
 use crate::fdcache::{FdCache, Mode, Opener, SysOpener};
@@ -196,6 +196,9 @@ pub struct Reactor {
     /// tasks that hold `Inner`.
     rt: Mutex<Option<tokio::runtime::Runtime>>,
     shutting_down: AtomicBool,
+    /// Given to every completion this reactor makes, so a `then` registered after the
+    /// operation resolved still runs on a reactor thread (RE-I2, RE-T14).
+    dispatch: Dispatch,
 }
 
 impl std::fmt::Debug for Reactor {
@@ -261,6 +264,29 @@ impl Reactor {
             handle,
             bounce_bytes,
         });
+        // A `then` registered on a completion that has already resolved would otherwise run on
+        // the registering thread, which is a worker holding placement's locks (RE-I2): the
+        // callback goes to a reactor thread instead, under the same panic guard `resolve`
+        // applies. The reactor is held weakly, so a completion does not keep it alive; once it
+        // has shut down no reactor thread will take the callback, and it runs where it is
+        // rather than not at all.
+        let dispatch: Dispatch = {
+            let weak = Arc::downgrade(&inner);
+            Arc::new(
+                move |job: Box<dyn FnOnce() + Send + 'static>| match weak.upgrade() {
+                    Some(live) if !live.cancelled() => {
+                        let counted = Arc::clone(&live);
+                        live.handle.spawn(async move {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                            counted.counters.note_error();
+                            tracing::error!(target: "reactor.op", "a completion callback panicked");
+                        }
+                    });
+                    }
+                    _ => job(),
+                },
+            )
+        };
         let queues = runtime::start(&inner, cfg.object_concurrency, cfg.file_depth);
         Ok(Arc::new(Reactor {
             inner,
@@ -268,6 +294,7 @@ impl Reactor {
             queues: RwLock::new(Some(queues)),
             rt: Mutex::new(Some(rt)),
             shutting_down: AtomicBool::new(false),
+            dispatch,
         }))
     }
 
@@ -409,7 +436,7 @@ fn select_gds(paths: &mut Paths) -> Result<()> {
 
 impl ObjectMetadata for Reactor {
     fn head_object(&self, url: &str) -> Completion<ObjectMeta> {
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         let op = MetaOp::Head {
             url: url.to_string(),
             tx,
@@ -419,7 +446,7 @@ impl ObjectMetadata for Reactor {
     }
 
     fn list_prefix(&self, url: &str) -> Completion<Vec<ObjectMeta>> {
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         let op = MetaOp::List {
             url: url.to_string(),
             tx,
@@ -455,7 +482,7 @@ impl moruna_kernel::Reactor for Reactor {
         if dst.is_empty() {
             return Completion::resolved(Ok(dst));
         }
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.read_file,
             ReadFileOp {
@@ -478,7 +505,7 @@ impl moruna_kernel::Reactor for Reactor {
         if dst.is_empty() {
             return Completion::resolved(Ok((dst, 0)));
         }
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.read_file_opt,
             ReadFileOptOp {
@@ -496,7 +523,7 @@ impl moruna_kernel::Reactor for Reactor {
         if src.is_empty() {
             return Completion::resolved(Ok(()));
         }
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.write_file,
             WriteFileOp {
@@ -513,7 +540,7 @@ impl moruna_kernel::Reactor for Reactor {
         if dst.is_empty() {
             return Completion::resolved(Ok(dst));
         }
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.read_object,
             ReadObjectOp {
@@ -530,7 +557,7 @@ impl moruna_kernel::Reactor for Reactor {
         if src.is_empty() {
             return Completion::resolved(Ok(()));
         }
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.write_object,
             WriteObjectOp {
@@ -543,7 +570,7 @@ impl moruna_kernel::Reactor for Reactor {
     }
 
     fn delete_object(&self, url: &str) -> Completion<()> {
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.delete_object,
             DeleteObjectOp {
@@ -555,7 +582,7 @@ impl moruna_kernel::Reactor for Reactor {
     }
 
     fn abort_multipart(&self, url: &str, upload_id: &str) -> Completion<()> {
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(
             |q| &q.abort_multipart,
             AbortMultipartOp {
@@ -579,10 +606,10 @@ impl moruna_kernel::Reactor for Reactor {
             Ok(plan) => plan,
             Err(e) => {
                 self.inner.counters.note_error();
-                return Completion::resolved(Err(e));
+                return Completion::resolved_on(Err(e), self.dispatch.clone());
             }
         };
-        let (tx, completion) = Completion::channel();
+        let (tx, completion) = Completion::channel_on(self.dispatch.clone());
         self.send(|q| &q.copy, CopyOp { plan, src, dst, tx });
         completion
     }

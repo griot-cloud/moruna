@@ -83,6 +83,40 @@ fn rc_f3_a_floor_morsel_that_cannot_fit_is_refused_at_start() {
     );
 }
 
+/// f.3: a probe of a few hundred bytes whose window caught a one-time cost starts the run.
+///
+/// Divided by its tiny input, that cost reads as a slope in the thousands, and taking the slope
+/// alone put the floor morsel at 22.7 GB and refused a run with room to spare on a Linux runner,
+/// where a worker's first allocation sets up a glibc arena (2026-09-29). Read as a fixed cost,
+/// the same measurement is 8 MiB. The refusal answers to whichever reading predicts less.
+#[test]
+fn rc_f3_a_tiny_probe_that_caught_a_fixed_cost_does_not_refuse() {
+    let cfg = common::config_with_baseline(GIB, 8, 100 * MIB);
+    let one_time = moruna_kernel::ProbeResult {
+        bytes_in: 256,
+        rows_in: 16,
+        peak_delta: 8 * MIB,
+        dev_peak_delta: 0,
+        wall_ns: 1_000_000,
+        cpu_ns: 1_000_000,
+    };
+    let rig = common::Rig::new(
+        cfg,
+        vec![kernel(1, KernelHints::default())],
+        FakeKnobs::new().probe_result(1, one_time),
+        FakeSampler::new().scripted(steady(100 * MIB, 8)),
+    );
+    rig.controller.prepare().expect("prepare");
+    rig.controller.probe_all().expect("probe_all");
+    rig.controller
+        .start()
+        .expect("a fixed cost of 8 MiB fits a 1 GiB ceiling, however steep it reads as a slope");
+    assert!(
+        !morsel_targets(&rig.writes()).is_empty(),
+        "f.3: the run started and wrote its knobs"
+    );
+}
+
 /// h, edge cases: a kernel that allocates device memory on a host with no device cannot be
 /// sized, and that is knowable at `prepare`.
 #[test]

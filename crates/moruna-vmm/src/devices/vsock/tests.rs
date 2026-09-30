@@ -2,14 +2,17 @@
 //! through real Unix sockets.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use vm_memory::{Bytes, GuestAddress};
 
-use super::muxer::{BUF_ALLOC, CREDIT_UPDATE_THRESHOLD, FIRST_HOST_PORT, MAX_PKT_PAYLOAD};
+use super::muxer::{
+    BUF_ALLOC, CLOSE_DRAIN_MAX, CLOSE_LINGER, CREDIT_UPDATE_THRESHOLD, FIRST_HOST_PORT,
+    MAX_ACCEPTING, MAX_CLOSING, MAX_PKT_PAYLOAD,
+};
 use super::packet::{HDR_BYTES, Header, SHUTDOWN_RCV, SHUTDOWN_SEND, TYPE_STREAM, op};
 use super::*;
 use crate::devices::Device;
@@ -490,4 +493,125 @@ fn vm_t14_bad_connect_lines_are_closed() {
     // Receive buffers too small for a header are returned empty and skipped.
     g.rxq.add(&g.mem, &[(RX_AREA, 8, true)]);
     wr(&mut g.t, regs::QUEUE_NOTIFY, RXQ as u32);
+}
+
+/// A host stream connected to the device, with a read timeout.
+fn host_stream(g: &Guest) -> UnixStream {
+    let s = UnixStream::connect(&g.uds).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s
+}
+
+/// Read to the end of `s`, which must be an orderly end of stream with nothing before it.
+fn assert_eof(s: &mut UnixStream) {
+    let mut rest = Vec::new();
+    s.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn vm_t14_bad_connect_line_with_trailing_bytes_ends_in_eof() {
+    // A host that sends bytes after a bad line reads end of stream, not a reset: on Linux,
+    // closing a Unix socket that still holds unread bytes resets its peer.
+    let mut g = Guest::new();
+    let payload = vec![b'x'; 4096];
+    for line in [&b"HELLO 5\n"[..], b"CONNECT x\n", &[b'C'; 40][..]] {
+        let mut s = host_stream(&g);
+        s.write_all(&[line, &payload[..]].concat()).unwrap();
+        g.pump();
+        assert_eof(&mut s);
+    }
+    // Each host hung up after its end of stream, and its stream is closed.
+    g.pump();
+    assert_eq!(g.t.device().muxer().closing_streams(), 0);
+
+    // A host that goes on writing after its bad line is drained while it writes, then reads
+    // end of stream.
+    let mut s = host_stream(&g);
+    let mut w = s.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        w.write_all(b"HELLO 5\n")?;
+        w.write_all(&vec![b'y'; CLOSE_DRAIN_MAX / 2])
+    });
+    for _ in 0..500 {
+        if writer.is_finished() {
+            break;
+        }
+        g.pump();
+    }
+    writer.join().unwrap().unwrap();
+    g.pump();
+    assert_eof(&mut s);
+    drop(s);
+    g.pump();
+    assert_eq!(g.t.device().muxer().closing_streams(), 0);
+
+    // The guest refuses a host that wrote past its CONNECT line: end of stream too.
+    let mut s = host_stream(&g);
+    s.write_all(&[&b"CONNECT 9\n"[..], &payload[..]].concat())
+        .unwrap();
+    g.post_rx(2);
+    let (h, _) = g.recv_one();
+    assert_eq!(h.op, op::REQUEST);
+    g.send(g.hdr(op::RST, 9, h.src_port), &[]);
+    assert_eof(&mut s);
+    assert_eq!(g.t.device().muxer().connections(), 0);
+}
+
+#[test]
+fn vm_t14_refused_streams_are_drained_within_bounds() {
+    let mut g = Guest::new();
+    // A host that writes on past CLOSE_DRAIN_MAX is closed while it writes.
+    let s = host_stream(&g);
+    let mut w = s.try_clone().unwrap();
+    w.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    let writer = std::thread::spawn(move || {
+        w.write_all(b"HELLO 5\n")?;
+        w.write_all(&vec![b'z'; 64 * CLOSE_DRAIN_MAX])
+    });
+    for _ in 0..500 {
+        if writer.is_finished() {
+            break;
+        }
+        g.pump();
+    }
+    let e = writer.join().unwrap().unwrap_err();
+    assert!(
+        matches!(
+            e.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
+        ),
+        "{e}"
+    );
+    assert_eq!(g.t.device().muxer().closing_streams(), 0);
+    drop(s);
+
+    // A host that goes quiet after its bad line is closed once CLOSE_LINGER has passed.
+    let mut s = host_stream(&g);
+    s.write_all(b"HELLO 5\n").unwrap();
+    g.pump();
+    assert_eof(&mut s);
+    assert_eq!(g.t.device().muxer().closing_streams(), 1);
+    std::thread::sleep(CLOSE_LINGER);
+    g.pump();
+    assert_eq!(g.t.device().muxer().closing_streams(), 0);
+    drop(s);
+
+    // More quiet hosts than MAX_ACCEPTING at once: the one beyond it is refused on accept,
+    // every one reads end of stream, and at most MAX_CLOSING are held open.
+    let mut hosts: Vec<UnixStream> = (0..=MAX_ACCEPTING)
+        .map(|_| {
+            let mut s = host_stream(&g);
+            s.write_all(b"HELLO 5\n").unwrap();
+            s
+        })
+        .collect();
+    g.pump();
+    for s in &mut hosts {
+        assert_eof(s);
+    }
+    assert_eq!(g.t.device().muxer().closing_streams(), MAX_CLOSING);
+    drop(hosts);
+    g.pump();
+    assert_eq!(g.t.device().muxer().closing_streams(), 0);
 }

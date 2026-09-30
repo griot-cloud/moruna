@@ -185,7 +185,12 @@ impl Machine {
 }
 
 fn spec(scratch: &Scratch, kernel: Arc<dyn Kernel>, splits: u32) -> RunSpec {
-    let source: Arc<dyn Source> = Arc::new(FakeSource::new().splits(splits, 131_072, 131_072 * 8));
+    spec_of(scratch, kernel, splits, 131_072)
+}
+
+/// `spec` with splits of `rows` rows (eight bytes a row, one morsel a split at most).
+fn spec_of(scratch: &Scratch, kernel: Arc<dyn Kernel>, splits: u32, rows: u64) -> RunSpec {
+    let source: Arc<dyn Source> = Arc::new(FakeSource::new().splits(splits, rows, rows * 8));
     let sink: Box<dyn Sink> = Box::new(FakeSink::new());
     let mut spec = RunSpec::new(source, vec![kernel], sink);
     spec.staging_dir = Some(scratch.path().join("staging"));
@@ -386,7 +391,12 @@ fn cpus_follow_the_machine() {
     let kernel = Arc::new(Spinner::new(Duration::from_millis(20)));
     let applies = Arc::clone(&kernel.applies);
     let watched = Arc::clone(&kernel);
-    let mut spec = spec(&scratch, kernel.clone(), 600);
+    // Morsels of 128 KiB, so that what bounds the workers is the CPU limit and not the source:
+    // the fake source builds each morsel on the source drive's one thread, and at a MiB a
+    // morsel an unoptimised build on a 4 vCPU runner took about 22 ms a read, slower than two
+    // 20 ms applies consume, so the run was source-bound throughout and never had the morsels
+    // to run a third worker (CI, 2026-09-30).
+    let mut spec = spec_of(&scratch, kernel.clone(), 600, 16_384);
     spec.elastic = ElasticBudget {
         memory_max_bytes: None,
         cpu_max: Some(6),

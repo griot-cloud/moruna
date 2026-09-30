@@ -1,12 +1,15 @@
 //! The controller under a budget that follows the machine (MH 4.4):
 //! ceiling_from_the_sample, cpu_limit_bounds_workers, host_budget_follows_arena,
-//! engine_memory_is_resident.
+//! engine_memory_is_resident, rc_t19_a_sample_older_than_the_watcher.
 
 mod common;
 
 use common::{GIB, MIB, active_workers, config, kernel, morsel_targets, probe, staging_triggers};
-use moruna_kernel::{KernelHints, Sample};
-use moruna_testkit::{FakeKnobs, FakeSampler};
+use std::sync::{Arc, Mutex};
+
+use moruna_controller::Controller;
+use moruna_kernel::{KernelHints, ProcessPeak, Sample, Sampler, TraceSink};
+use moruna_testkit::{FakeKnobs, FakePlacement, FakeSampler, FakeTrace};
 
 /// A sample carrying the limits in force, as discovery's sampler produces it once a watcher
 /// publishes into its cell.
@@ -319,4 +322,148 @@ fn stale_records_and_drains_are_not_breaches() {
         "after the drain a run that cannot fit is diagnosed"
     );
     rig.controller.stop();
+}
+
+/// Between the watcher lowering the ceiling (`follow_limits`) and reporting the drain it started
+/// (`set_arena`), the arena above the new ceiling is already on its way out. A breach in that
+/// window sheds and does not end the run: a run on a machine raised and then lowered was
+/// terminated with "footprint exceeds budget 0" when a record landed there (2026-09-29).
+#[test]
+fn a_breach_before_the_drain_is_reported_does_not_end_the_run() {
+    let rig = rig(GIB, 1, run(200 * MIB, GIB, 1.0, 1_000_000, 64));
+    rig.run_up();
+    let host = rig.controller.limits_in_force().2;
+    // Lowered below what is resident: the arena alone is now over the ceiling.
+    rig.controller.follow_limits(200 * MIB, 0.0);
+
+    // No `set_arena` yet. Current breaches at the floor on one worker.
+    let now = epoch_ns() + 1_000_000_000;
+    for seq in 1..40 {
+        rig.feed(&over(seq, now + seq));
+    }
+    assert!(
+        rig.knobs.terminated().is_none(),
+        "the drain has begun though it is not reported yet: {:?}",
+        rig.knobs.terminated()
+    );
+
+    // The watcher reports the drain complete: the ordinary rule applies again.
+    rig.controller.set_arena(host, 0);
+    let now = epoch_ns() + 2_000_000_000;
+    for seq in 40..80 {
+        rig.feed(&over(seq, now + seq));
+    }
+    assert!(
+        rig.knobs.terminated().is_some(),
+        "after the drain a run that cannot fit is diagnosed"
+    );
+    rig.controller.stop();
+}
+
+/// A test-local `Sampler`: the fake, and between taking a sample and handing it back, the
+/// watcher's calls, once. That is the window a tick samples in with no lock held (RC-I10).
+struct Racing {
+    inner: FakeSampler,
+    watcher: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Sampler for Racing {
+    fn sample(&self) -> Sample {
+        let sample = self.inner.sample();
+        let watcher = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(watcher) = watcher {
+            watcher();
+        }
+        sample
+    }
+
+    fn reset_peak(&self) {
+        self.inner.reset_peak();
+    }
+
+    fn process_peak(&self) -> ProcessPeak {
+        self.inner.process_peak()
+    }
+}
+
+/// rc_t19_a_sample_older_than_the_watcher. A tick samples with no lock held, so the facade's
+/// watcher can raise the ceiling and grow the arena between the sample and the tick taking it.
+/// The sample then carries the ceiling the raise replaced; taken, it set the lowered ceiling
+/// beside the grown arena, left no headroom above the arena, and a record at the floor on one
+/// worker ended the run with "footprint exceeds budget 0" (2026-09-30). The tick keeps the
+/// watcher's limits, and the next sample, which carries them, changes nothing.
+#[test]
+fn rc_t19_a_sample_older_than_the_watcher() {
+    let low = GIB;
+    let high = 4 * GIB;
+    let grown = 3 * GIB;
+    let cfg = config(low, 1);
+    let knobs = FakeKnobs::new().probe_result(1, probe(cfg.probe_bytes, 1.0));
+    let inner = FakeSampler::new().scripted(run(200 * MIB, low, 1.0, 1_000_000, 64));
+    let sampler = Arc::new(Racing {
+        inner: inner.clone(),
+        watcher: Mutex::new(None),
+    });
+    let prober = common::RecordingProber::new(knobs.clone());
+    let trace = FakeTrace::new();
+    let controller = Arc::new(
+        Controller::new(
+            cfg,
+            Arc::new(knobs.clone()),
+            Arc::new(knobs.clone()),
+            prober,
+            sampler.clone(),
+            Arc::new(trace.clone()),
+            Arc::new(FakePlacement::new()),
+            vec![kernel(1, KernelHints::default())],
+        )
+        .expect("controller"),
+    );
+    controller.prepare().expect("prepare");
+    controller.probe_all().expect("probe_all");
+    controller.start().expect("start");
+
+    // The watcher raises the ceiling while the next tick holds a sample taken before it, and
+    // reports the grown arena once the tick has decided: the order the failing run had.
+    let watched = Arc::clone(&controller);
+    *sampler.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+        watched.follow_limits(high, 0.0);
+    }));
+    controller.tick_once();
+    controller.set_arena(grown, 0);
+    assert_eq!(
+        controller.limits_in_force().0,
+        high,
+        "the tick kept the watcher's ceiling, not the older one its sample carried"
+    );
+
+    // Records at the floor on the one worker, measured after the change: resident is the grown
+    // arena, well inside the raised ceiling. None of them ends the run.
+    let now = epoch_ns() + 1_000_000_000;
+    for seq in 1..40 {
+        let mut r = common::record(seq, 1, 16 * MIB, 64 * MIB);
+        r.t_start_ns = now + seq;
+        r.t_end_ns = now + seq + 1_000;
+        r.mem_anon_before = grown + 200 * MIB;
+        r.mem_anon_peak = grown + 264 * MIB;
+        trace.record(r.clone());
+        controller.on_record(&r);
+    }
+    assert!(
+        knobs.terminated().is_none(),
+        "a run inside the raised ceiling was ended: {:?}",
+        knobs.terminated()
+    );
+
+    // The next sample carries the raised limits: the tick takes them and nothing moves back.
+    inner
+        .clone()
+        .scripted(run(200 * MIB, high, 1.0, 100_000_000, 8));
+    controller.tick_once();
+    assert_eq!(controller.limits_in_force().0, high);
+    controller.stop();
 }

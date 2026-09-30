@@ -39,8 +39,10 @@ pub trait Sink: Send + Sync {
 
     /// Highest `seq` such that every morsel with a sequence number at or below
     /// it is committed (visible to a reader and safe against process loss) or was
-    /// declared skipped through `skip`. `None` means nothing is committed yet, or
-    /// the sink does not track commits.
+    /// declared skipped through `skip`, and no committed output that holds one of
+    /// them also holds a sequence number above it (such output could be neither
+    /// kept nor discarded by `resume` without losing or duplicating rows; 08 f.7).
+    /// `None` means nothing is committed yet, or the sink does not track commits.
     fn committed_seq(&self) -> Option<Seq> {
         None
     }

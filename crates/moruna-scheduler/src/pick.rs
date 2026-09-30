@@ -15,7 +15,7 @@ use crate::shared::Shared;
 
 /// The stage this worker should serve next, or `None` when nothing is admissible (f.3).
 pub(crate) fn pick(shared: &Shared, worker: u16) -> Option<StageId> {
-    if shared.gate.load(Ordering::SeqCst) {
+    if shared.gated() {
         return None;
     }
     let stats = shared.placement_stats();

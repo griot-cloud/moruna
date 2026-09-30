@@ -23,6 +23,7 @@ fn the_peak_is_the_processes_whatever_the_records_say() {
         bytes: ceiling / 2,
         at_ns: run_meta.start_ns + 1_000,
         exact: true,
+        since_ns: run_meta.start_ns + 1_000,
     };
     let report = RunReport::compute(&view, &limits(), &run_meta);
     assert_eq!(report.peak_anon_bytes, ceiling / 2);

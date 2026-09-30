@@ -12,6 +12,7 @@ use moruna_kernel::{Knob, KnobSnapshot, StageId, TierKind};
 
 use crate::pipeline::SchedulerConfig;
 use crate::shared::{RunState, Shared};
+use crate::slots::WorkerSlots;
 
 /// The preamble's range for `readahead.splits`.
 const READ_AHEAD_MAX: u16 = 64;
@@ -22,11 +23,12 @@ const PROMOTION_MAX: u16 = 32;
 /// Every knob's current value, in the form the reader wants it (f.15).
 pub(crate) struct KnobState {
     morsel_target: Vec<AtomicU64>,
-    active_workers: AtomicU16,
-    /// The current CPU limit as a worker count: `workers.active` takes effect up to it and
-    /// no further. `workers_max` until the facade's watcher says otherwise, so a run whose limits
-    /// never move sees exactly the knob.
-    cpu_bound: AtomicU16,
+    /// `workers.active`, the current CPU limit as a worker count, and the busy count, in one
+    /// word so a worker's claim is checked against the bound in force when it is made
+    /// (`slots`). `workers.active` takes effect up to the limit and no further; the limit is
+    /// `workers_max` until the facade's watcher says otherwise, so a run whose limits never move
+    /// sees exactly the knob.
+    pub(crate) slots: WorkerSlots,
     read_ahead: AtomicU16,
     workers_max: u16,
     morsel_min: u64,
@@ -46,8 +48,10 @@ impl KnobState {
             .clamp(cfg.morsel_min, cfg.morsel_max);
         KnobState {
             morsel_target: (0..queues).map(|_| AtomicU64::new(initial)).collect(),
-            active_workers: AtomicU16::new(cfg.workers_active.clamp(1, cfg.workers_max)),
-            cpu_bound: AtomicU16::new(cfg.workers_max.max(1)),
+            slots: WorkerSlots::new(
+                cfg.workers_active.clamp(1, cfg.workers_max),
+                cfg.workers_max.max(1),
+            ),
             read_ahead: AtomicU16::new(cfg.read_ahead.min(READ_AHEAD_MAX)),
             workers_max: cfg.workers_max,
             morsel_min: cfg.morsel_min,
@@ -76,22 +80,19 @@ impl KnobState {
     /// The workers that may take a task: the `workers.active` knob, bounded by the current CPU
     /// limit. Every reader of the knob reads it through here.
     pub(crate) fn active_workers(&self) -> u16 {
-        self.active_workers
-            .load(Ordering::SeqCst)
-            .min(self.cpu_bound.load(Ordering::SeqCst))
-            .max(1)
+        self.slots.active()
     }
 
     /// The current CPU limit as a worker count.
     pub(crate) fn cpu_bound(&self) -> u16 {
-        self.cpu_bound.load(Ordering::SeqCst)
+        self.slots.cpu_bound()
     }
 
     /// Set the CPU bound, clamped to `1..=workers_max`: threads beyond `workers_max` do not
     /// exist, and a run always has one worker. Returns the value stored.
     pub(crate) fn set_cpu_bound(&self, workers: u16) -> u16 {
         let bound = workers.clamp(1, self.workers_max.max(1));
-        self.cpu_bound.store(bound, Ordering::SeqCst);
+        self.slots.set_cpu_bound(bound);
         bound
     }
 
@@ -189,7 +190,7 @@ pub(crate) fn set(shared: &Shared, knob: Knob) {
             if clamped != workers {
                 state.clamped(1, "active_workers", workers as u64, clamped as u64);
             }
-            state.active_workers.store(clamped, Ordering::SeqCst);
+            state.slots.set_knob(clamped);
             // SC-I5: the next pick sees it, so a raise must wake the parked workers now.
             shared.unpark_all();
         }

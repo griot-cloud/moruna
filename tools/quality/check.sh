@@ -2,9 +2,9 @@
 # Moruna quality gate. Run by the pre-commit hook (tools/hooks/pre-commit) and by
 # the first CI job (preamble 6.6). It fails on: an em dash in any tracked text
 # file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
-# StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab,
-# an unlisted page or a placeholder with no citation under docs/
-# (tools/docs/check_docs.py, F7.1); a commit-message rule the DCO self-test
+# StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab
+# or a page in no toctree under docs/ (tools/docs/check_docs.py; CI also builds
+# the site with Sphinx, warnings as errors); a commit-message rule the DCO self-test
 # rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
 # when cargo-deny is installed (F6.5); a failing test; a failing
 # examples/append_column.rs, which is the first program a user writes; line
@@ -14,6 +14,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 MIN="${MORUNA_COVERAGE_MIN:-90}"
+# `--fast` is the pre-commit hook's half: every check that takes seconds on an incremental
+# build (em dashes, stubs, the docs, formatting, clippy over every target, which compiles the
+# tests too, the tier lint and the supply-chain bans). The pre-push hook runs the whole gate,
+# tests, the 90% coverage floor and the Python suite included, so nothing leaves the machine
+# unchecked and a commit does not wait ten minutes for it.
+FAST=0
+[ "${1:-}" = "--fast" ] && FAST=1
 
 fail() { printf 'quality: FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf 'quality: %s\n' "$*"; }
@@ -48,7 +55,7 @@ step "tools/quality/no_stubs.sh (nothing in a shipping crate is a stub)"
 quiet no_stubs tools/quality/no_stubs.sh
 
 if [ -d docs ] && [ -x tools/docs/check_docs.py ]; then
-  step "tools/docs/check_docs.py (docs conventions, links, SUMMARY, citations)"
+  step "tools/docs/check_docs.py (docs conventions, links, every page in a toctree)"
   quiet docs tools/docs/check_docs.py
 fi
 
@@ -84,6 +91,10 @@ if [ -f Cargo.toml ]; then
     fi
   else
     step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml not checked here, the supply-chain workflow checks it"
+  fi
+  if [ "$FAST" = "1" ]; then
+    step "OK (fast checks; the tests, the coverage floor and the Python suite run on push)"
+    exit 0
   fi
   step "cargo test"
   quiet test cargo test --workspace

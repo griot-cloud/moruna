@@ -148,7 +148,7 @@ pub struct ReactorStats {
 
 ### e.1 Operation state machine
 
-`Submitted` (the caller's thread: the operation is placed on the runtime's queue and the call returns) → `Queued` (on a reactor thread, waiting for a permit) → `InFlight` → `Completed | Failed | Cancelled`. `Completion` observes only the terminal state, and a `then` callback registered on it runs on the reactor thread that reaches the terminal state. An operation on a guaranteed path that fails goes `Failed`; on an available (`Probed(true)`) path it goes `InFlight` again once via the fallback, then terminal. A sticky fallback (f.9) is decided before `InFlight` and is not a retry.
+`Submitted` (the caller's thread: the operation is placed on the runtime's queue and the call returns) → `Queued` (on a reactor thread, waiting for a permit) → `InFlight` → `Completed | Failed | Cancelled`. `Completion` observes only the terminal state, and a `then` callback registered on it runs on the reactor thread that reaches the terminal state, or, when it is registered after that, on a reactor thread through the completion's `Dispatch` (contracts d.9). An operation on a guaranteed path that fails goes `Failed`; on an available (`Probed(true)`) path it goes `InFlight` again once via the fallback, then terminal. A sticky fallback (f.9) is decided before `InFlight` and is not a retry.
 
 ### e.2 Path selection
 
@@ -269,7 +269,7 @@ Tests use the real reactor over `FakeAllocator` buffers (testkit, contracts d.15
 
 **RE-T13 segment_registry.** `register_segment` twice with one number errors; `copy(Disk(seg), ..)` for an unregistered number is RE-I8's error; after `unregister_segment` and unlink, `df` on the temp filesystem shows the space returned (the descriptor is closed); `unregister_segment` with a read in flight closes after the read resolves with the right bytes. RE-I8, e.4.
 
-**RE-T14 then_on_reactor_thread.** A `then` callback registered on each of the six operation kinds runs exactly once, on a reactor or blocking-pool thread (thread id check), before the next operation on the same path is submitted; a callback that panics is caught, counted in `errors`, and the reactor keeps serving. e.1, g.
+**RE-T14 then_on_reactor_thread.** A `then` callback registered on each of the six operation kinds runs exactly once, on a reactor or blocking-pool thread (thread id check), including one registered after the operation resolved, before the next operation on the same path is submitted; a callback that panics is caught, counted in `errors`, and the reactor keeps serving. e.1, g.
 
 **RE-T15 probed_versus_present.** A profile with `io_uring = Present` and a seccomp shim that fails `io_uring_setup` makes `new` return `Config`; with `Probed(true)` and the same shim, `new` succeeds with `io_uring == false` in `IoPaths` and a note; with `Probed(false)` the ring is never attempted. RE-I3, e.2.
 

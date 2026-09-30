@@ -54,7 +54,7 @@ bytes = { workspace = true }
 # A loader's own binding resolver, in `tests/governed.rs`.
 async-trait = "0.1"
 datafusion = { workspace = true }
-parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b" }
+parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b", version = "=0.0.1" }
 
 # The first program a user writes, kept at the repository root so it reads as an example and
 # not as a test; the quality gate runs it on every commit.

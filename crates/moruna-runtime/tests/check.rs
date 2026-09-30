@@ -12,7 +12,7 @@ use moruna_kernel::arrow::datatypes::DataType;
 use moruna_kernel::declare::{ColumnDecl, Declared, SchemaDecl};
 use moruna_kernel::{
     CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, Payload,
-    PayloadSpec, SourceSchema,
+    PayloadSpec, Sampler as _, SourceSchema,
 };
 use moruna_runtime::check::{CheckOptions, Verdict, check};
 use moruna_runtime::spec::{KernelEntry, build_kernels};
@@ -64,6 +64,16 @@ impl Kernel for Declaring {
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
         self.inner.apply(state, input)
     }
+}
+
+/// The process's resident anonymous memory now, as discovery measures it.
+fn resident_now() -> u64 {
+    let discovered = moruna_discovery::discover(&moruna_discovery::DiscoveryInput::default())
+        .expect("discovery");
+    moruna_discovery::Sampler::new(&discovered)
+        .expect("sampler")
+        .sample()
+        .anon_bytes
 }
 
 fn unchanged() -> SchemaDecl {
@@ -194,7 +204,13 @@ fn ck_t2_h13_the_profile_row_a_check_writes_is_read_by_a_later_run() {
             .map(|sink| Box::new(sink.with_run_id(ctx.run_id)) as Box<dyn moruna_kernel::Sink>)
         })),
     );
-    spec.budget = Some(256 << 20);
+    // What this test is about is the profile, not the budget, so the budget is room above what
+    // the process already holds rather than a fixed number: the budget counts the whole
+    // process, and a test binary rests at a different size on every platform. A fixed 256 MiB
+    // was below the run's own floor on a Linux runner whose test process held 305 MB, and the
+    // run was refused before it could read the profile (2026-09-29). The elastic tests size
+    // their machine the same way.
+    spec.budget = Some(resident_now() + (256 << 20));
     spec.cpu = Some(2.0);
     spec.staging_dir = Some(scratch.path().join("staging"));
     spec.staging_limit = Some(1 << 30);

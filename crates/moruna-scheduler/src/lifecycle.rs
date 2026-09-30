@@ -203,9 +203,9 @@ pub(crate) fn apply_resume_point(shared: &Arc<Shared>, point: ResumePoint) -> Re
 /// on the owning worker; a `Reinit` stage runs the `init_instances` loop of f.4 for that stage.
 /// `Forbid` was refused by `Placement::restore` before the scheduler was asked.
 fn restore_instances(shared: &Arc<Shared>, point: &ResumePoint) -> Result<()> {
-    shared.gate.store(true, Ordering::SeqCst);
+    shared.close_gate();
     let outcome = restore_all(shared, point);
-    shared.gate.store(false, Ordering::SeqCst);
+    shared.open_gate();
     shared.unpark_all();
     outcome
 }

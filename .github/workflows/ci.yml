@@ -9,7 +9,10 @@
 #                        wheels for every platform we ship, the upload to PyPI, and
 #                        then the tag. No tests, because the tree that merged is the
 #                        tree that was just tested: protection requires a branch to be
-#                        up to date with main and keeps history linear.
+#                        up to date with main and keeps history linear. The
+#                        documentation site is published too, and only when docs/
+#                        changed; the pull request already built it with warnings as
+#                        errors.
 #   weekly and on demand the checks that answer to the outside world rather than to a
 #                        commit, and the ones that need a real cgroup ceiling.
 #
@@ -79,6 +82,10 @@ jobs:
           cargo fmt --all -- --check
           tools/lint/no_tier_wildcard.sh
           tools/docs/check_docs.py
+      - name: The documentation site builds, warnings as errors
+        run: |
+          python -m pip install --quiet -r docs/requirements.txt
+          sphinx-build -W --keep-going -q -b html docs docs/_build/html
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
@@ -122,7 +129,7 @@ jobs:
   # Weekly and on demand: the checks that answer to the outside world rather
   # than to a commit, and the ones that need a real cgroup ceiling.
   slow:
-    name: supply chain, container, book
+    name: supply chain, container
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.container)
     needs: ci
     runs-on: ubuntu-latest
@@ -141,10 +148,8 @@ jobs:
       - name: Advisories, licences, bans and sources
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
-          tool: cargo-deny@0.20.2,mdbook@0.5.4
+          tool: cargo-deny@0.20.2
       - run: cargo deny check advisories licenses bans sources
-      - name: The book builds
-        run: mdbook build docs
       - name: MinIO for the object-store paths
         run: |
           docker run -d --name minio --network host \
@@ -169,12 +174,108 @@ jobs:
             rust:1.98.1-slim \
             sh -ec 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max; cargo test --workspace --locked -- --include-ignored'
 
+  # The rule every publish below follows: a commit on main is published (to PyPI, as a tag,
+  # or as the documentation site) only when it is the merge of a pull request whose
+  # `build, test, lint` passed. Tests do not run again on the merge; this job checks that they
+  # ran, and passed, on the change that was merged, and the branch's protection requires a
+  # pull request to be up to date with main before it merges, so what was tested is what
+  # landed. A commit that reached main any other way (an administrator's push past the
+  # protection, as E8's did on 2026-09-27, and 0.2.0 shipped from it) publishes nothing.
+  tested:
+    name: the merged change passed its checks
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api "repos/$REPO/commits/$SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null and .base.ref == "main" and .merge_commit_sha == env.SHA)][0].number // empty')"
+          if [ -z "$pr" ]; then
+            echo "::error::$SHA is not the merge of a pull request into main, so nothing checked it; it is not published"
+            exit 1
+          fi
+          head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
+          conclusion="$(gh api "repos/$REPO/commits/$head/check-runs?check_name=build,%20test,%20lint" \
+            --jq '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.completed_at) | last | .conclusion // empty')"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::pull request #$pr's build, test, lint on $head is '${conclusion:-absent}', so $SHA is not published"
+            exit 1
+          fi
+          echo "$SHA is the merge of pull request #$pr, whose build, test, lint passed on $head"
+
+  # The documentation site, on a merge to main that changed docs/. Built here rather than
+  # carried over from the pull request, because an artefact from another run cannot be
+  # deployed; the pull request's build is the one that failed on a warning. Two jobs,
+  # because only the second may write to Pages.
+  docs:
+    name: build the documentation site
+    needs: tested
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: changed
+        name: Did this merge change docs/?
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # A first push to the branch has no "before"; publish then.
+          if [ -z "$BEFORE" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+             || ! git diff --quiet "$BEFORE" "$GITHUB_SHA" -- docs/; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs/ is unchanged, so the published site stands"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.changed.outputs.changed == 'true'
+        with:
+          python-version: "3.14t"
+      - name: Build the site
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          python -m pip install --quiet -r docs/requirements.txt
+          sphinx-build -W --keep-going -q -b html docs docs/_build/html
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: steps.changed.outputs.changed == 'true'
+        with:
+          path: docs/_build/html
+
+  pages:
+    name: publish the documentation site
+    needs: docs
+    if: needs.docs.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
   # The release path: a merge to main, and only when the version changed. Three jobs
   # because each needs something the others must not have: `version` reads the tree and
   # nothing else, `wheels` runs on every platform we ship, and `release` alone holds the
   # tokens that can write to PyPI and to this repository.
   version:
     name: a version to release
+    needs: tested
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:

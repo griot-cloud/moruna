@@ -9,6 +9,14 @@ use crate::error::MorunaError;
 
 type Callback<T> = Box<dyn FnOnce(crate::Result<T>) + Send + 'static>;
 
+/// Where a `then` callback runs when it is registered on a completion that has already
+/// resolved. A completion without one runs the callback at once, on the registering thread
+/// (CT-T16). The reactor gives every completion it makes its own, so that such a callback still
+/// runs on a reactor thread: a worker registers `then` from inside `Placement::push` with
+/// placement's locks held, and a callback that takes those locks and ran there would wait on
+/// its own thread for ever (RE-I2, 06 g; found by RE-T14 on a fast Linux runner, 2026-09-29).
+pub type Dispatch = std::sync::Arc<dyn Fn(Box<dyn FnOnce() + Send + 'static>) + Send + Sync>;
+
 struct Slot<T> {
     value: Option<crate::Result<T>>,
     waker: Option<Waker>,
@@ -20,6 +28,7 @@ struct Slot<T> {
 struct Shared<T> {
     slot: Mutex<Slot<T>>,
     ready: Condvar,
+    dispatch: Option<Dispatch>,
 }
 
 /// Resolves exactly once. `Completion<Buffer>` returns the same buffer the operation was given.
@@ -37,6 +46,16 @@ pub struct CompletionSender<T> {
 impl<T: Send + 'static> Completion<T> {
     /// A linked pair. The reactor (or a fake) keeps the sender and resolves it once.
     pub fn channel() -> (CompletionSender<T>, Completion<T>) {
+        Completion::channel_with(None)
+    }
+
+    /// A linked pair whose late `then` callbacks run through `dispatch` rather than on the
+    /// registering thread (see [`Dispatch`]).
+    pub fn channel_on(dispatch: Dispatch) -> (CompletionSender<T>, Completion<T>) {
+        Completion::channel_with(Some(dispatch))
+    }
+
+    fn channel_with(dispatch: Option<Dispatch>) -> (CompletionSender<T>, Completion<T>) {
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot {
                 value: None,
@@ -45,6 +64,7 @@ impl<T: Send + 'static> Completion<T> {
                 receiver_gone: false,
             }),
             ready: Condvar::new(),
+            dispatch,
         });
         (
             CompletionSender {
@@ -59,6 +79,13 @@ impl<T: Send + 'static> Completion<T> {
     /// submission.
     pub fn resolved(value: crate::Result<T>) -> Completion<T> {
         let (sender, completion) = Completion::channel();
+        sender.resolve(value);
+        completion
+    }
+
+    /// A completion already resolved, whose `then` callback runs through `dispatch`.
+    pub fn resolved_on(value: crate::Result<T>, dispatch: Dispatch) -> Completion<T> {
+        let (sender, completion) = Completion::channel_on(dispatch);
         sender.resolve(value);
         completion
     }
@@ -78,8 +105,9 @@ impl<T: Send + 'static> Completion<T> {
         }
     }
 
-    /// Run `f` on the thread that resolves the completion, at resolution (or at once if
-    /// already resolved). This is how the placement engine observes move completions
+    /// Run `f` on the thread that resolves the completion, at resolution. If it has already
+    /// resolved, `f` runs through the completion's [`Dispatch`] when it has one, and at once on
+    /// this thread when it does not. This is how the placement engine observes move completions
     /// without a thread of its own (placement g); `f` must be short and must not block.
     pub fn then(self, f: Callback<T>) {
         let mut pending = Some(f);
@@ -96,7 +124,10 @@ impl<T: Send + 'static> Completion<T> {
         // The callback runs outside the lock, because it may take locks of its own
         // (placement g).
         if let (Some(value), Some(f)) = (ready, pending.take()) {
-            f(value);
+            match &self.shared.dispatch {
+                Some(dispatch) => dispatch(Box::new(move || f(value))),
+                None => f(value),
+            }
         }
     }
 

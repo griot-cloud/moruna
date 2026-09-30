@@ -42,7 +42,7 @@ pub use arrow;
 pub use dlpark;
 
 pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
-pub use completion::{Completion, CompletionSender};
+pub use completion::{Completion, CompletionSender, Dispatch};
 pub use declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, TypeDecl};
 pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
