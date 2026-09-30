@@ -437,7 +437,7 @@ mod tests {
         let (h, t) = b.split_at(0);
         assert!(h.is_empty());
         assert_eq!(h.len(), 0);
-        assert_eq!(&*h, &[]);
+        assert_eq!(&*h, &[] as &[u8]);
         assert_eq!(t.len(), 3);
         let (h, t) = t.split_at(3);
         assert_eq!(h.len(), 3);

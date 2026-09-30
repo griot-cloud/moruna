@@ -116,6 +116,21 @@ fn si_t12_committed_seq_exact() {
                     "committed_seq {now} overstates: only {bound} is contiguous"
                 );
             }
+            // A checkpoint taken now is one a resume accepts: no committed file holds sequence
+            // numbers on both sides of the watermark, or the replay above it would duplicate
+            // the ones the kept file already holds (f.7, f.8).
+            let state = sink.checkpoint().expect("checkpoint").expect("resumable");
+            for (name, seq_min, seq_max) in committed_ranges(&state) {
+                let straddles = match watermark {
+                    Some(w) => seq_min <= w && w < seq_max,
+                    None => false,
+                };
+                assert!(
+                    !straddles,
+                    "{name} holds {seq_min}..{seq_max} across the watermark {watermark:?} \
+                     (ordered {ordered})"
+                );
+            }
             last = watermark;
         }
 
@@ -310,6 +325,139 @@ fn checkpoint_next_index(checkpoint: &[u8]) -> u32 {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
     rest[..end].parse().expect("a number")
+}
+
+/// Every committed file of a checkpoint document with its sequence range (e.5).
+fn committed_ranges(checkpoint: &[u8]) -> Vec<(String, u64, u64)> {
+    let doc: serde_json::Value = serde_json::from_slice(checkpoint).expect("checkpoint JSON");
+    doc["committed"]
+        .as_array()
+        .expect("a committed list")
+        .iter()
+        .map(|file| {
+            (
+                file["name"].as_str().expect("name").to_string(),
+                file["seq_min"].as_u64().expect("seq_min"),
+                file["seq_max"].as_u64().expect("seq_max"),
+            )
+        })
+        .collect()
+}
+
+/// SI-T17. Unordered delivery commits a file holding sequence numbers on both sides of the
+/// contiguous point: 0 to `a - 1` in the first file, then `a`, `a + 2`, `a + 3` and on in the
+/// second while `a + 1` is late. The watermark stops at `a - 1`, the start of the second file,
+/// rather than at `a`, which that file straddles; the checkpoint taken there is accepted by
+/// `resume`, the second file goes, and replaying everything above the watermark in another
+/// unordered order puts every row in the output exactly once. Before the watermark was held
+/// back, this checkpoint said `a` and `resume` refused it ("straddles the watermark"), which is
+/// what a SIGKILL resume of an unordered Parquet run met one run in about seventeen. f.7, f.8,
+/// SI-I8, S17.
+#[test]
+fn si_t17_unordered_commit_resumes_exactly_once() {
+    let scratch = Scratch::new("t17");
+    let reactor = FakeReactor::new();
+    let alloc = FakeAllocator::new();
+    let total = 120u64;
+    let file_bytes = 10 * 5 * 4096;
+    let inputs: Vec<RecordBatch> = (0..total)
+        .map(|seq| arena_batch(&alloc, ROWS, seq as i64))
+        .collect();
+    let payload =
+        |seq: Seq| moruna_kernel::Payload::table(inputs[seq as usize].clone()).expect("payload");
+
+    let mut first = ipc_sink(&scratch, &reactor, &alloc, file_bytes);
+    first.open(&table_source_schema()).expect("open");
+    // In order until the first file commits; the IPC sink rolls after the write that fills a
+    // file, so that file holds 0 to `a - 1`.
+    let mut next = 0;
+    while first.stats().files_committed == 0 {
+        block_on(first.write(next, payload(next))).expect("write");
+        next += 1;
+    }
+    let a = next;
+    assert_eq!(
+        first.committed_seq(),
+        Some(a - 1),
+        "the first file is clean"
+    );
+    // `a`, then everything after `a + 1`, until the second file commits.
+    let late = a + 1;
+    block_on(first.write(a, payload(a))).expect("write");
+    next = late + 1;
+    while first.stats().files_committed == 1 {
+        block_on(first.write(next, payload(next))).expect("write");
+        next += 1;
+    }
+    // The scheduler reads the watermark, then the state (SC f.12).
+    let watermark = first.committed_seq();
+    let checkpoint = first.checkpoint().expect("checkpoint").expect("resumable");
+    let ranges = committed_ranges(&checkpoint);
+    assert_eq!(ranges.len(), 2, "{ranges:?}");
+    assert_eq!(
+        (ranges[1].1, ranges[1].2 > late),
+        (a, true),
+        "the second file holds `a` and sequence numbers above the late one: {ranges:?}"
+    );
+    // A few more, still without the late one, then the process dies.
+    for seq in next..next + 5 {
+        block_on(first.write(seq, payload(seq))).expect("write");
+    }
+    drop(first);
+    materialise(&reactor, scratch.path());
+
+    let mut second = ipc_sink(&scratch, &reactor, &alloc, file_bytes);
+    second
+        .resume(&table_source_schema(), &checkpoint, watermark)
+        .expect("a checkpoint written by a correct run is accepted");
+    assert_eq!(
+        watermark,
+        Some(a - 1),
+        "the watermark stops at the start of the file that straddles the contiguous point"
+    );
+    let after = scratch.names();
+    assert!(after.contains(&ranges[0].0), "{after:?}");
+    assert!(
+        !after.contains(&ranges[1].0),
+        "the straddling file lies above the watermark and goes: {after:?}"
+    );
+
+    // The scheduler replays everything above the watermark, in whatever order it completes.
+    let replay: Vec<Seq> = shuffled(total, 0x9E37_79B9_7F4A_7C15)
+        .into_iter()
+        .filter(|seq| *seq >= a)
+        .collect();
+    for seq in replay {
+        block_on(second.write(seq, payload(seq))).expect("write");
+    }
+    let summary = second.finish().expect("finish");
+    assert_eq!(second.committed_seq(), Some(total - 1));
+
+    // Exactly once: every input batch is in the output, and none twice.
+    let mut read: Vec<RecordBatch> = Vec::new();
+    for name in &summary.files {
+        let bytes = written(&reactor, scratch.path(), name);
+        let reader = FileReader::try_new(std::io::Cursor::new(bytes), None).expect("reader");
+        for batch in reader {
+            read.push(batch.expect("batch"));
+        }
+    }
+    let first_value = |batch: &RecordBatch| {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<moruna_kernel::arrow::array::Int64Array>()
+            .expect("an Int64 column")
+            .value(0)
+    };
+    read.sort_by_key(first_value);
+    assert_eq!(
+        read.len(),
+        inputs.len(),
+        "every morsel is in the output once"
+    );
+    assert_eq!(read, inputs, "and each holds the rows it was given");
+    assert_eq!(summary.rows, total * ROWS as u64);
 }
 
 /// The names the checkpoint document lists as committed.

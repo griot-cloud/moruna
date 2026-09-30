@@ -7,13 +7,17 @@
 //! than on the fake, exactly as the controller agent's tests do. That is a gap in the fake,
 //! reported rather than worked around in the testkit.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use moruna_kernel::{Prober, Sample, StatsSource};
+use moruna_kernel::{
+    CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, NoState,
+    Payload, PayloadKind, PayloadSpec, Prober, Result, Sample, SourceSchema, StatsSource, TierPref,
+};
 use moruna_testkit::{FakeKernel, FakeSource};
 
-use super::common::{Latch, RigBuilder, StatefulKernel, scripted_sampler};
+use super::common::{Latch, PickGate, RigBuilder, StatefulKernel, scripted_sampler, wait_for};
 
 fn sample(anon: u64, peak: u64) -> Sample {
     Sample {
@@ -121,4 +125,136 @@ fn sc_t10_probe_protocol() {
     // h: a chain has no stage 0 and no stage beyond its last kernel.
     assert!(rig.scheduler.probe(0, 16).is_err());
     assert!(rig.scheduler.probe(3, 16).is_err());
+}
+
+/// A test-local stateless `Kernel` (k): the first apply waits for `release(0)` and the second for
+/// `release(1)`; every later one returns at once. It keeps how many applies have started, how
+/// many run now and the most that have run at once.
+struct Ticketed {
+    open: Mutex<[bool; 2]>,
+    opened: Condvar,
+    entered: AtomicUsize,
+    running: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Ticketed {
+    fn new() -> Ticketed {
+        Ticketed {
+            open: Mutex::new([false; 2]),
+            opened: Condvar::new(),
+            entered: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn release(&self, ticket: usize) {
+        self.open.lock().unwrap_or_else(|e| e.into_inner())[ticket] = true;
+        self.opened.notify_all();
+    }
+}
+
+impl Kernel for Ticketed {
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::compute("moruna-scheduler::tests::sc_t10::Ticketed", &[])
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn hints(&self) -> KernelHints {
+        KernelHints::default()
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: PayloadKind::Either,
+            tier: TierPref::Any,
+        }
+    }
+
+    fn output_schema(&self, input: &SourceSchema) -> Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        let ticket = self.entered.fetch_add(1, Ordering::SeqCst);
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        if ticket < 2 {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !open[ticket] {
+                open = self.opened.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        Ok(input)
+    }
+}
+
+/// f.9: a worker that passed `pick`'s gate check before a probe raised the gate does not run
+/// beside the probe. Worker 1 is stopped between its pick and its claim; worker 0 runs the first
+/// apply and is held in it while the probe raises the gate and waits for quiet; worker 0 is let
+/// go, the probe's apply (the second) starts and is held, and only then is worker 1 let go. The
+/// claim it makes is after the gate went up, so it is refused and the probe's apply runs alone.
+#[test]
+fn sc_f9_a_worker_past_its_pick_does_not_run_beside_the_probe() {
+    let kernel = Arc::new(Ticketed::new());
+    let gate = PickGate::new(1);
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 2;
+            cfg.workers_active = 2;
+            cfg.initial_morsel_target = 8;
+            cfg.read_ahead = 8;
+        })
+        .source(FakeSource::new().splits(1, 4_000, 32_000))
+        .kernel(Arc::clone(&kernel) as Arc<dyn Kernel>)
+        .go();
+    let hook = Arc::clone(&gate);
+    rig.scheduler
+        .test_pick_hook(Arc::new(move |worker| hook.at_pick(worker)));
+
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let (placed, probing, beside, probed, joined) = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| rig.scheduler.run(token));
+        // Worker 0 in the first apply, worker 1 past its pick, and morsels waiting in Q0.
+        let placed = wait_for(Duration::from_secs(5), || {
+            kernel.entered.load(Ordering::SeqCst) == 1
+                && gate.arrived()
+                && rig.scheduler.shared().queue_count(0) > 1
+        });
+        let prober = scope.spawn(|| rig.scheduler.probe(1, 8));
+        let raised = wait_for(Duration::from_secs(5), || rig.scheduler.shared().gated());
+        kernel.release(0);
+        // The probe saw quiet and its own apply is the second.
+        let probing = raised
+            && wait_for(Duration::from_secs(5), || {
+                kernel.entered.load(Ordering::SeqCst) == 2
+            });
+        gate.release();
+        // Every chance for worker 1 to start its task beside the probe's.
+        std::thread::sleep(Duration::from_millis(200));
+        let beside = kernel.peak.load(Ordering::SeqCst);
+        kernel.release(1);
+        let probed = prober.join();
+        cancel.cancel();
+        (placed, probing, beside, probed, handle.join())
+    });
+    assert!(placed, "the workers never reached their places");
+    assert!(probing, "the probe's apply never started");
+    assert_eq!(beside, 1, "{beside} applies at once while the probe ran");
+    match probed {
+        Ok(Ok(result)) => assert!(result.rows_in > 0, "the probe measured a morsel"),
+        Ok(Err(e)) => panic!("probe during a run: {e}"),
+        Err(_) => panic!("the probing thread panicked"),
+    }
+    assert!(joined.is_ok(), "the run thread panicked");
 }

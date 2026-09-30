@@ -19,6 +19,10 @@ use crate::heartbeat::HeartbeatTable;
 use crate::knobs::KnobState;
 use crate::pipeline::{Pipeline, SchedulerConfig, validate_chain};
 
+/// A test's hook into the worker loop between the pick and the claim (see `Shared::pick_hook`).
+#[cfg(test)]
+pub(crate) type PickHook = Arc<dyn Fn(u16) + Send + Sync>;
+
 /// Where the run is (e.2). Stored as an atomic code so any thread can read it without a lock.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum RunState {
@@ -246,8 +250,6 @@ pub(crate) struct Shared {
     pub(crate) cancel: AtomicBool,
     pub(crate) token: Mutex<Option<CancelToken>>,
     pub(crate) stopping: AtomicBool,
-    /// While true no worker picks a task: `init_instances` and the probe run alone (f.4, f.9).
-    pub(crate) gate: AtomicBool,
     pub(crate) probing: AtomicBool,
 
     pub(crate) cursor: Mutex<Cursor>,
@@ -276,9 +278,12 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_handle: Mutex<Option<JoinHandle<()>>>,
 
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
+    /// The seam the CPU limit tests use: called by a worker after `pick` has named a stage and
+    /// before it claims a busy slot, which is the window a lowered limit must not slip through.
+    #[cfg(test)]
+    pub(crate) pick_hook: RwLock<Option<PickHook>>,
     pub(crate) stats_cache: Mutex<StatsCache>,
 
-    pub(crate) workers_busy: AtomicU16,
     pub(crate) reads_in_flight: AtomicU16,
     pub(crate) writes_in_flight: AtomicU16,
     pub(crate) source_exhausted: AtomicBool,
@@ -446,7 +451,6 @@ impl Shared {
             cancel: AtomicBool::new(false),
             token: Mutex::new(None),
             stopping: AtomicBool::new(false),
-            gate: AtomicBool::new(false),
             probing: AtomicBool::new(false),
             cursor: Mutex::new(Cursor {
                 split_index: 0,
@@ -475,12 +479,13 @@ impl Shared {
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_handle: Mutex::new(None),
             record_hook: RwLock::new(None),
+            #[cfg(test)]
+            pick_hook: RwLock::new(None),
             stats_cache: Mutex::new(StatsCache {
                 at: Instant::now(),
                 stats: PlacementStats::default(),
                 valid: false,
             }),
-            workers_busy: AtomicU16::new(0),
             reads_in_flight: AtomicU16::new(0),
             writes_in_flight: AtomicU16::new(0),
             source_exhausted: AtomicBool::new(false),
@@ -633,6 +638,23 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Whether the gate is up: while it is, no worker takes a task, so `init_instances`, a
+    /// restore and the probe run alone (f.4, f.9). It is a bit of the slot word, so a claim
+    /// made after it went up is refused (`slots`).
+    pub(crate) fn gated(&self) -> bool {
+        self.knobs.slots.gated()
+    }
+
+    /// Raise the gate (see `gated`).
+    pub(crate) fn close_gate(&self) {
+        self.knobs.slots.close_gate();
+    }
+
+    /// Lower the gate (see `gated`).
+    pub(crate) fn open_gate(&self) {
+        self.knobs.slots.open_gate();
     }
 
     pub(crate) fn unpark_all(&self) {

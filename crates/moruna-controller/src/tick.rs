@@ -26,12 +26,13 @@ const ABSORB_PER_LOCK: usize = 16;
 
 /// One tick (f.6, f.5, f.9).
 pub(crate) fn tick(ctl: &Inner) {
-    let (phase, stages, tick_ms) = {
+    let (phase, stages, tick_ms, facade_limits) = {
         let state = ctl.held();
         (
             state.phase,
             state.stages.iter().map(|s| s.stage).collect::<Vec<_>>(),
             state.cfg.tick_ms,
+            state.facade_limits,
         )
     };
     if phase != Phase::Running {
@@ -113,7 +114,19 @@ pub(crate) fn tick(ctl: &Inner) {
         // The limits of this moment, before anything is decided against them. The ceiling
         // the classifier reads below is the one the sample carried, not the one the run began
         // with.
-        elastic::follow_sample(&mut state, &sample, &mut actions);
+        //
+        // Unless the facade's watcher handed over limits of its own since this tick began: the
+        // sample was taken with no lock held, perhaps before those calls, so it may carry the
+        // limits they replaced. Taking them would put back the ceiling the machine had a moment
+        // ago beside the arena it has now. A run raised from 272 MB to 809 MB had its ceiling set
+        // back to 272 MB by a sample taken 20 microseconds before the raise; the watcher then
+        // reported the grown arena of 483 MB, the headroom above the arena was nothing, and a
+        // record at the floor ended the run with "footprint exceeds budget 0" (2026-09-30). The
+        // watcher's own calls already applied what it published, and the next tick's sample
+        // carries it too.
+        if state.facade_limits == facade_limits {
+            elastic::follow_sample(&mut state, &sample, &mut actions);
+        }
 
         state.last_state_total = state.state_total;
         model::recompute_state(&mut state);

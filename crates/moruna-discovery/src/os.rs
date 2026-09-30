@@ -41,14 +41,17 @@ pub(crate) fn parse_meminfo_field(text: &str, key: &str) -> Option<u64> {
     })
 }
 
-/// The process's anonymous and file backed resident bytes outside a cgroup (f.2): from
+/// The process's own anonymous and file backed resident bytes (f.2), which the sampler reads
+/// outside a cgroup and inside one whose limit is not the ceiling (DS-I4): from
 /// `/proc/self/status` where there is a `/proc`, from the platform otherwise. `None` when neither
 /// answers, which leaves the sampler repeating its last sample.
 ///
-/// Both halves are the DS-I4 quantity on both paths: `RssAnon` from `status` (the kernel's own
-/// count of the process's resident anonymous pages, every thread's heap and every arena region
-/// included), and `phys_footprint` from mach, never plain resident size (see
-/// `probes::platform_anon_and_file`).
+/// The anonymous half is the DS-I4 quantity on both paths: `RssAnon` from `status` (the kernel's
+/// own count of the process's resident anonymous pages, every thread's heap and every arena
+/// region included), and `phys_footprint` from mach, never plain resident size (see
+/// `probes::platform_anon_and_file`). Never `VmRSS`, which adds `RssFile` and `RssShmem`: the
+/// mapped text of the binary and its libraries, and every file the process has mapped, are
+/// pages the kernel can drop and the process never allocated.
 pub(crate) fn process_memory(proc_root: &Path, _page: usize) -> Option<(u64, u64)> {
     if let Ok(text) = std::fs::read_to_string(proc_root.join("self/status"))
         && let Some(pair) = parse_status(&text)
@@ -59,7 +62,9 @@ pub(crate) fn process_memory(proc_root: &Path, _page: usize) -> Option<(u64, u64
 }
 
 /// `/proc/self/status`: anonymous memory is `RssAnon`, and the file backed part is `RssFile`
-/// plus `RssShmem`, all in kB.
+/// plus `RssShmem`, all in kB. Shared memory goes with the file half because a cgroup's
+/// `memory.stat` counts it under `file` and not `anon`, so the two paths agree on what a
+/// process's anonymous memory is; a swapped page is in neither, as in `memory.stat`.
 pub(crate) fn parse_status(text: &str) -> Option<(u64, u64)> {
     let anon = parse_meminfo_field(text, "RssAnon")?;
     let file = parse_meminfo_field(text, "RssFile").unwrap_or(0)
@@ -131,6 +136,11 @@ mod tests {
             parse_status("RssAnon: 8 kB\n"),
             Some((8192, 0)),
             "no file backed lines is none of them"
+        );
+        assert_eq!(
+            parse_status("VmRSS: 4194312 kB\nRssAnon: 8 kB\nRssFile: 4194304 kB\n"),
+            Some((8192, 4 << 30)),
+            "four gibibytes of mapped binary are file backed, never anonymous (DS-I4)"
         );
         assert_eq!(parse_status("VmRSS: 8 kB\n"), None);
         assert_eq!(parse_status("RssAnon: many kB\n"), None);

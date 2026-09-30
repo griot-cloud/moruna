@@ -120,6 +120,13 @@ impl fmt::Display for RunReport {
             bytes_binary(self.peak_ceiling_bytes),
             percent(self.peak_fraction_of_ceiling)
         )?;
+        if let Some(note) = self
+            .notes
+            .iter()
+            .find(|note| note.starts_with(crate::report::PEAK_WINDOW_NOTE))
+        {
+            writeln!(f, "memory: {note}")?;
+        }
         writeln!(
             f,
             "cpu: workers busy {}, throttled {}",

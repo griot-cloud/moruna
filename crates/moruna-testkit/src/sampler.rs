@@ -127,6 +127,7 @@ impl Sampler for FakeSampler {
                 bytes,
                 at_ns: sample.at_ns,
                 exact: false,
+                since_ns: sample.at_ns,
             };
         }
         sample

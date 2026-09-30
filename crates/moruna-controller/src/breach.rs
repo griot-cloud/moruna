@@ -159,7 +159,7 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     // lowered ceiling by the regions still resident. That is the accepted cost of an eventual
     // shrink, not a kernel that does not fit, so the run sheds (above) and is not terminated for
     // it; once the drain is complete the ordinary rule applies again.
-    if state.arena_draining > 0 {
+    if state.arena_draining > 0 || state.drain_pending > 0 {
         return;
     }
     let floor_breaches = state.stages[at].floor_breaches;

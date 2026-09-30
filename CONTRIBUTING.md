@@ -5,7 +5,7 @@ Thanks for your interest. Moruna makes hard promises about memory, so a change h
 ## Getting a change in
 
 1. Fork, branch from `main`, open a pull request. `main` is protected: it takes pull requests with a green pipeline.
-2. Run `tools/hooks/install.sh` once in your clone. The pre-commit hook runs the same gate CI runs, so a commit that would fail CI fails locally first.
+2. Run `tools/hooks/install.sh` once in your clone. Before each commit, a hook runs the quick checks (formatting, lints and a compile of every test) in a few seconds; before each push, it runs the full gate that CI runs, including the tests and the coverage floor, so a change that would fail CI fails on your machine first.
 3. Keep the crate you touch at 90% line coverage or better. The gate judges coverage per crate.
 
 ## What we look for
@@ -14,7 +14,7 @@ Thanks for your interest. Moruna makes hard promises about memory, so a change h
 
 **A test should prove a property, not a machine.** An assertion like "this finishes in 20 microseconds" or "this run fits in 512 MiB" describes the laptop it was written on, and it fails for the next person without telling them anything true. Prefer assertions that hold anywhere: that submission returned before the work finished, that the peak never passed the ceiling, that the sink wrote exactly the sequence numbers the trace says were committed. Where a figure genuinely needs particular hardware, tag it for the reference host so it reports instead of asserting.
 
-**A budget assertion needs a cgroup of its own.** Moruna sizes a run against the memory its own cgroup already holds, which is the run itself in a pod and the whole machine on a shared CI runner. Tests that assert a budget therefore run in the container stage, where the cgroup belongs to the test.
+**A budget from the cgroup needs a cgroup of its own.** Where a run's ceiling is its cgroup's memory limit, Moruna sizes the run against the memory the whole cgroup already holds, which is the run itself in a pod and the whole machine on a shared CI runner. Tests that assert a budget discovered from the cgroup therefore run in the container stage, where the cgroup belongs to the test. An explicit budget counts only the process's own memory, so a test that gives one can run anywhere, and should run its run in a process of its own (`crates/moruna-runtime/tests/support/apart.rs`).
 
 **No stubs in shipping source.** `tools/quality/no_stubs.sh` refuses `todo!`, `unimplemented!`, a panic whose message admits it, `NotImplementedError`, or a crate with no code. Tests are exempt, since a test tagged for hardware we do not have is meant to exist without running.
 
@@ -33,6 +33,12 @@ A release is a pull request that bumps the version in `Cargo.toml` and adds its 
 publishes them to PyPI, and creates the tag afterwards, so a tag always names something that
 shipped. Nobody creates tags by hand, and a merge that does not change the version publishes
 nothing.
+
+Nothing is published from a commit that was not tested. The tests run on the pull request, not
+again on the merge; before anything is built for PyPI or the documentation site, CI checks that
+the commit on `main` is the merge of a pull request whose `build, test, lint` passed, and
+publishes nothing otherwise. Since `main` only takes pull requests that are up to date with it,
+what was tested is what landed.
 
 ## Reporting a problem
 

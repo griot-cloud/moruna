@@ -44,6 +44,7 @@ mod policy;
 mod probe;
 mod shared;
 mod sink_drive;
+mod slots;
 mod source_drive;
 mod stats;
 mod worker;
@@ -200,6 +201,17 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// The seam the CPU limit tests use: `hook(worker)` runs after a worker's pick has named a
+    /// stage and before the worker claims a busy slot for it.
+    #[cfg(test)]
+    pub(crate) fn test_pick_hook(&self, hook: shared::PickHook) {
+        *self
+            .shared
+            .pick_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     /// The seam SC-T19 uses: make worker `w` leave its loop without reporting, so the heartbeat

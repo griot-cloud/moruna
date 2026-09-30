@@ -157,6 +157,12 @@ pub struct ProcessPeak {
     /// True when the figure is the kernel's own high-water mark and not only the highest of
     /// the samples taken, so no burst between samples can have been missed.
     pub exact: bool,
+    /// The start of the window the peak was reached in, nanoseconds since the epoch: a
+    /// kernel's high-water mark is read, not watched, so a mark that rose was reached at some
+    /// moment after the sampler last read it (this figure) and at or before `at_ns`. A peak
+    /// that is a sample's own reading was reached at the instant it was read, and the window
+    /// is zero-width (`since_ns == at_ns`). Contracts d.12, amended 2026-09-30.
+    pub since_ns: u64,
 }
 
 /// One sample of live resource state; produced by discovery's sampler.

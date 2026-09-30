@@ -2053,3 +2053,38 @@ fn a_multipart_write_that_succeeds_completes_the_upload() {
     assert_eq!((aborts, completes), (0, 1));
     reactor.shutdown();
 }
+
+/// RE-T14, the late half, made deterministic: an operation that has already resolved when its
+/// `then` is registered still calls back on a reactor thread, not on the registering one. On a
+/// fast host an in-memory object write resolves before `then` is reached, and the callback ran on
+/// the caller, which is a worker holding placement's locks in the real pipeline (RE-I2, found on
+/// a Linux runner, 2026-09-29). Zero-length operations are the documented exception (h).
+#[test]
+fn re_t14_a_callback_registered_late_runs_on_a_reactor_thread() {
+    let alloc = FakeAllocator::new();
+    let (reactor, _backend) = reactor(&alloc);
+    let mut buf = alloc.buffer(64, Tier::Host);
+    buf.copy_from_slice(&pattern(64, 3));
+    let owned = Arc::new(buf);
+    let completion = reactor.write_object("s3://bucket/late", owned.view());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !completion.is_ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write never resolved"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let caller = std::thread::current().id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    completion.then(Box::new(move |r| {
+        tx.send((r.is_ok(), std::thread::current().id() != caller))
+            .ok();
+    }));
+    let (ok, elsewhere) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the callback ran");
+    assert!(ok, "the write succeeded");
+    assert!(elsewhere, "the late callback ran on the registering thread");
+    reactor.shutdown();
+}

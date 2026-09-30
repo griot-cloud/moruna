@@ -20,7 +20,7 @@ use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
 use support::{
     CountingAllocator, Ledger, NoObjectStore, block_on, err, scratch, seed, seed_truncated,
     write_amb1, write_dictionary_parquet, write_npy, write_one_huge_row, write_parquet,
-    write_safetensors,
+    write_safetensors, write_safetensors_padded,
 };
 
 /// A Parquet source over one generated file, reading its bytes through the fake.
@@ -547,6 +547,71 @@ fn so_t9_tensor_view_in_arena() {
     let error = block_on(source.read(&split, None, &alloc, Tier::Host)).unwrap_err();
     assert!(matches!(error, MorunaError::Source { .. }), "{error}");
     assert!(error.to_string().contains("needs bytes to"), "{error}");
+}
+
+/// e.4, the data section that no page floor can align: a safetensors header that was not padded
+/// puts a `float32` tensor at a byte offset that is not a multiple of four, so a view at
+/// `lo - page_floor(lo)` would not start on an item boundary and `from_buffer` refuses it
+/// (contracts d.4). The read then starts at the tensor's own first byte, buffered, and the
+/// view starts at zero. Found by the first real tensor job on 2026-09-29: the reference
+/// `safetensors` writer pads, and every fixture here had been written padded.
+#[test]
+fn an_unaligned_safetensors_data_section_is_read_from_its_first_byte() {
+    let dir = scratch();
+    let (path, values) = write_safetensors_padded(&dir, "unpadded", vec![64, 8], 1000.0, false);
+    let header_len = u64::from_le_bytes(
+        std::fs::read(&path).expect("the file")[..8]
+            .try_into()
+            .expect("eight bytes"),
+    );
+    let data_offset = 8 + header_len;
+    assert!(
+        !data_offset.is_multiple_of(4),
+        "the fixture must put the data at an unaligned offset, not {data_offset}"
+    );
+
+    let reactor = seed(FakeReactor::new(), &path);
+    let observer = reactor.clone();
+    let source = tensor_over(&path, reactor);
+    let alloc = CountingAllocator::new(FakeAllocator::new());
+    let split = source.plan().expect("the plan").remove(0);
+
+    let mut state = 11u64;
+    for _ in 0..50 {
+        let before = observer.ops().len();
+        let start = rng(&mut state) % split.rows;
+        let end = start + 1 + rng(&mut state) % (split.rows - start);
+        let payload =
+            block_on(source.read(&split, Some(RowRange { start, end }), &alloc, Tier::Host))
+                .expect("an unaligned tensor read");
+
+        let ops = observer.ops();
+        assert_eq!(ops.len(), before + 1, "still one read_file per tensor read");
+        let op = ops.last().expect("the read");
+        assert_eq!(
+            op.offset,
+            data_offset + start * 8 * 4,
+            "the read starts at the tensor's own first byte"
+        );
+
+        let Payload::Tensor(tensor, _) = &payload else {
+            panic!("a tensor");
+        };
+        let (_, offset) = tensor.data_ptr();
+        assert_eq!(offset, 0, "the view starts where the read did");
+        assert_eq!(tensor.shape(), &[(end - start) as i64, 8]);
+        let got = tensor_values(&payload);
+        let expected = &values[(start as usize) * 8..(end as usize) * 8];
+        assert_eq!(got, expected, "rows {start}..{end}");
+    }
+    let stats = source.stats();
+    assert_eq!(
+        stats.tensor_direct_reads, 0,
+        "an unaligned start cannot be direct"
+    );
+    assert_eq!(stats.tensor_buffered_reads, 50);
+    assert_eq!(stats.decode_bytes, 0, "still no decode");
+    assert_eq!(alloc.payload_copies(), 0, "still no copy");
 }
 
 // SO-T10 iterator_source. (integration, closes in wave 3; `python` feature) f.5.
