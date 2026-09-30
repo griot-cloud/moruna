@@ -1,11 +1,15 @@
 """Sphinx configuration for the Moruna documentation site."""
 
+import tomllib
 from datetime import date
+from pathlib import Path
 
 project = "Moruna"
 copyright = f"{date.today().year}, Griot Data Technologies"
 author = "Griot Data Technologies"
-release = "0.2.5"
+# The version is the workspace's, read from Cargo.toml, so the site cannot fall behind a release.
+with (Path(__file__).resolve().parent.parent / "Cargo.toml").open("rb") as manifest:
+    release = tomllib.load(manifest)["workspace"]["package"]["version"]
 
 extensions = ["myst_parser", "sphinx_design"]
 source_suffix = {".md": "markdown"}
