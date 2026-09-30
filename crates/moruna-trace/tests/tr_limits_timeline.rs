@@ -168,3 +168,158 @@ fn a_peak_during_a_drain_is_judged_against_the_ceiling_it_was_taken_under() {
         "outside a drain the lowered ceiling stands, so a real breach still shows"
     );
 }
+
+const MS: u64 = 1_000_000;
+
+/// A report of a run lowered from the initial ceiling to a third of it at 3525 ms, whose
+/// process peak (the kernel's mark, 0.6 of the initial ceiling, so 1.8 of the lowered one) the
+/// sampler read at `at_ms`, having last read the mark at `since_ms`. The drain the lowering began
+/// found its region empty and took no time at all.
+fn lowered_with_a_mark(tag: &str, since_ms: u64, at_ms: u64) -> RunReport {
+    let dir = TempDir::new(tag);
+    let writer = TraceWriter::start(config(dir.path())).expect("start");
+    let initial = limits();
+    let start_ns = meta(ExitReason::Completed).start_ns;
+    for seq in 0..10 {
+        writer.record(record(seq, 1));
+    }
+    writer.limits_changed(change(
+        start_ns + 3525 * MS,
+        &initial,
+        initial.memory_ceiling / 3,
+        16.0,
+    ));
+    let view = writer.finish().expect("finish");
+    let mut run = meta(ExitReason::Completed);
+    run.drains = vec![DrainSummary {
+        at_ms: 3525,
+        bytes: GIB,
+        drain_ms: Some(0),
+    }];
+    run.process_peak = moruna_kernel::ProcessPeak {
+        bytes: initial.memory_ceiling / 10 * 6,
+        at_ns: start_ns + at_ms * MS,
+        exact: true,
+        since_ns: start_ns + since_ms * MS,
+    };
+    RunReport::compute(&view, &initial, &run)
+}
+
+/// A kernel's high-water mark is read, not watched: a mark that rose was reached somewhere
+/// between the sampler's last reading of it and this one. When the ceiling was lowered inside
+/// that window (here with a drain that took no time, so the drain rule of 4f5ce0c does not reach
+/// the peak), the peak is judged against the highest ceiling in force in the window, and the
+/// report says so, in its notes and in `Display`, naming both ceilings and the window
+/// (2026-09-30: `memory_follows_the_machine` reported 1.82 of a ceiling it never ran under).
+#[test]
+fn a_mark_read_across_a_lowering_is_judged_against_the_highest_ceiling_in_its_window() {
+    let initial = limits().memory_ceiling;
+    let report = lowered_with_a_mark("t12-window", 3518, 3533);
+    assert_eq!(
+        report.peak_ceiling_bytes, initial,
+        "the ceiling before the lowering"
+    );
+    assert!(report.peak_fraction_of_ceiling <= 1.0);
+    let note = report
+        .notes
+        .first()
+        .expect("the judgement is the first note");
+    assert!(
+        note.starts_with("the peak rose between 3518 and 3533 ms")
+            && note.contains(&format!(
+                "from {initial} to {} bytes at 3525 ms",
+                initial / 3
+            ))
+            && note.contains(&format!(
+                "the {initial} byte ceiling in force within that window"
+            ))
+            && note.contains(&format!(
+                "not the {} byte ceiling in force at 3533 ms",
+                initial / 3
+            )),
+        "{note}"
+    );
+    let shown = report.to_string();
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.starts_with("memory: the peak rose between")),
+        "{shown}"
+    );
+}
+
+/// A mark whose whole window came after the lowering was reached under the lowered ceiling:
+/// judged against it, the breach shows, and no note moves it.
+#[test]
+fn a_mark_read_after_a_lowering_is_judged_against_the_lowered_ceiling() {
+    let initial = limits().memory_ceiling;
+    let report = lowered_with_a_mark("t12-after", 3530, 3545);
+    assert_eq!(report.peak_ceiling_bytes, initial / 3);
+    assert!(
+        report.peak_fraction_of_ceiling > 1.0,
+        "a breach after the lowering still shows: {}",
+        report.peak_fraction_of_ceiling
+    );
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("the peak rose between")),
+        "{:?}",
+        report.notes
+    );
+    assert!(!report.to_string().contains("the peak rose between"));
+}
+
+/// A record's peak was reached somewhere in its `apply`, and it is stamped with the `apply`'s
+/// end. An `apply` that straddled a lowering is the same case as a mark read across one: judged
+/// against the highest ceiling in force while it ran, with the note (2026-09-30: the one
+/// `memory_follows_the_machine` failure in 130 runs left by the mark's window alone).
+#[test]
+fn a_record_whose_apply_straddled_a_lowering_is_judged_across_it() {
+    let dir = TempDir::new("t12-record");
+    let writer = TraceWriter::start(config(dir.path())).expect("start");
+    let initial = limits();
+    let start_ns = meta(ExitReason::Completed).start_ns;
+    let mut straddling = record(0, 1);
+    straddling.t_start_ns = start_ns + 1661 * MS;
+    straddling.t_end_ns = start_ns + 1696 * MS;
+    straddling.mem_anon_peak = initial.memory_ceiling / 10 * 6;
+    writer.record(straddling);
+    writer.limits_changed(change(
+        start_ns + 1691 * MS,
+        &initial,
+        initial.memory_ceiling / 3,
+        16.0,
+    ));
+    let view = writer.finish().expect("finish");
+    let report = RunReport::compute(&view, &initial, &meta(ExitReason::Completed));
+    assert_eq!(report.peak_ceiling_bytes, initial.memory_ceiling);
+    let note = report
+        .notes
+        .first()
+        .expect("the judgement is the first note");
+    assert!(
+        note.starts_with("the peak rose between 1661 and 1696 ms"),
+        "{note}"
+    );
+
+    // An `apply` that began after the lowering ran under the lowered ceiling only.
+    let dir = TempDir::new("t12-record-after");
+    let writer = TraceWriter::start(config(dir.path())).expect("start");
+    let mut after = record(0, 1);
+    after.t_start_ns = start_ns + 1692 * MS;
+    after.t_end_ns = start_ns + 1696 * MS;
+    after.mem_anon_peak = initial.memory_ceiling / 10 * 6;
+    writer.record(after);
+    writer.limits_changed(change(
+        start_ns + 1691 * MS,
+        &initial,
+        initial.memory_ceiling / 3,
+        16.0,
+    ));
+    let view = writer.finish().expect("finish");
+    let report = RunReport::compute(&view, &initial, &meta(ExitReason::Completed));
+    assert_eq!(report.peak_ceiling_bytes, initial.memory_ceiling / 3);
+    assert!(report.peak_fraction_of_ceiling > 1.0);
+}

@@ -62,6 +62,9 @@ struct Inner {
     /// The whole process's high-water mark since the sampler was created, which `reset_peak`
     /// leaves alone: what the run report's peak is (`Sampler::process_peak`).
     process_peak: ProcessPeak,
+    /// When the platform's lifetime mark was last read: a mark seen to have risen rose after
+    /// this moment, which is the start of the peak's window (`ProcessPeak::since_ns`).
+    mark_read_ns: u64,
     /// The platform's lifetime high-water mark when the sampler was created, where the platform
     /// keeps one (macOS). A rise above it is the process's exact peak since then, however short
     /// the burst that made it.
@@ -152,6 +155,7 @@ impl Sampler {
                 page_bytes: discovered.limits.page_bytes,
                 peak_reset_refused: false,
                 process_peak: ProcessPeak::default(),
+                mark_read_ns: 0,
                 lifetime_at_create: None,
                 cpu_at_create_ns: process_cpu_ns(),
                 mem_integral: 0,
@@ -232,6 +236,7 @@ impl SamplerTrait for Sampler {
             peak_reset_refused,
             last,
             process_peak,
+            mark_read_ns,
             lifetime_at_create,
             mem_integral,
             integral_edge,
@@ -311,19 +316,35 @@ impl SamplerTrait for Sampler {
             (Some(now), Some(then)) if now > then => Some(now),
             _ => None,
         };
+        // The mark was last read at `mark_read_ns` (the sampler's creation primes it), so a rise
+        // seen now happened after then; two samples racing for the lock can arrive out of order,
+        // so the window never starts after its own end.
+        let since_ns = (*mark_read_ns).min(at_ns);
+        if lifetime.is_some() {
+            *mark_read_ns = at_ns.max(*mark_read_ns);
+        }
         match risen {
             Some(exact) if exact > process_peak.bytes || !process_peak.exact => {
+                // A mark the process is still at was reached now, to the sampling interval's
+                // benefit of the doubt; one the process has come down from was reached before.
+                // Either way it was reached inside the window since the mark was last read.
+                // The mark is read before the memory, so a reading taken after it can be the
+                // higher of the two; the process's lifetime mark is never below any reading.
                 *process_peak = ProcessPeak {
-                    bytes: exact.max(process_peak.bytes),
+                    bytes: exact.max(process_peak.bytes).max(memory.anon),
                     at_ns,
                     exact: true,
+                    since_ns,
                 };
             }
             _ if memory.anon > process_peak.bytes => {
+                // A reading above the mark read a moment before it: the kernel's mark holds it
+                // too, so a peak that was exact stays exact. Reached at this reading.
                 *process_peak = ProcessPeak {
                     bytes: memory.anon,
                     at_ns,
-                    exact: false,
+                    exact: process_peak.exact && lifetime.is_some(),
+                    since_ns: at_ns,
                 };
             }
             _ => {}
@@ -887,6 +908,43 @@ mod tests {
         let _ = fixture.sample();
         let peak = fixture.process_peak();
         assert_eq!((peak.bytes, peak.exact), (5000, false));
+    }
+
+    /// A kernel's high-water mark is read, not watched, so a peak that is the mark carries the
+    /// window it rose in: from the sampler's last reading of the mark to the reading that saw
+    /// it (contracts d.12, 03 f.2, amended 2026-09-30). A peak that is a sample's own reading
+    /// was reached at the instant it was read: its window is zero-width.
+    #[test]
+    fn a_peak_carries_the_window_it_rose_in() {
+        const BURST: usize = 128 << 20;
+        let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
+        let first = sampler.sample();
+        let burst = vec![7u8; BURST];
+        drop(std::hint::black_box(burst));
+        let second = sampler.sample();
+        let peak = sampler.process_peak();
+        assert!(peak.since_ns <= peak.at_ns, "{peak:?}");
+        if cfg!(target_vendor = "apple") {
+            // The burst is gone by the second reading; the mark kept it, and it rose after the
+            // first reading.
+            assert!(peak.exact, "{peak:?}");
+            assert_eq!(peak.at_ns, second.at_ns, "{peak:?}");
+            assert_eq!(peak.since_ns, first.at_ns, "{peak:?}");
+            assert!(peak.since_ns < peak.at_ns);
+        } else {
+            assert_eq!(peak.since_ns, peak.at_ns, "{peak:?}");
+        }
+        // A fixture cgroup keeps no mark: the peak is a sample's reading, with no window.
+        let tmp = TempDir::new("peak-window");
+        let dir = tmp.path().join("cgroup");
+        write(&dir, "memory.stat", "anon 5000\nfile 0\nunevictable 0\n");
+        let fixture =
+            Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
+        write(&dir, "memory.stat", "anon 9000\nfile 0\nunevictable 0\n");
+        let risen = fixture.sample();
+        let peak = fixture.process_peak();
+        assert_eq!((peak.bytes, peak.exact), (9000, false));
+        assert_eq!((peak.at_ns, peak.since_ns), (risen.at_ns, risen.at_ns));
     }
 
     /// DS-I3: a read error repeats the last sample with a fresh timestamp and is counted.

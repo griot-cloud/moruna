@@ -940,6 +940,25 @@ pub trait Sampler: Send + Sync {
     /// kernels ≥ 6.x; otherwise the sampler tracks its own running peak and resets
     /// that), so a probe measures its own peak (RC f.2).
     fn reset_peak(&self);
+    /// The whole process's high-water mark since the sampler was created, which `reset_peak`
+    /// leaves alone: what the run report's peak is (F8.9).
+    fn process_peak(&self) -> ProcessPeak;
+}
+
+/// The whole process's high-water mark over a run. Amended 2026-09-30: `since_ns`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessPeak {
+    pub bytes: u64,
+    /// When the sampler saw it, nanoseconds since the epoch.
+    pub at_ns: u64,
+    /// True when `bytes` is the kernel's own high-water mark (macOS's lifetime
+    /// `phys_footprint`), not only the highest of the samples.
+    pub exact: bool,
+    /// The start of the window the peak was reached in. A kernel's mark is read, not
+    /// watched: a mark seen to have risen was reached after the sampler last read it (this
+    /// figure) and at or before `at_ns`. A peak that is a sample's own reading was reached
+    /// at the instant it was read, and `since_ns == at_ns`.
+    pub since_ns: u64,
 }
 
 /// One sample of live resource state; produced by discovery's sampler.

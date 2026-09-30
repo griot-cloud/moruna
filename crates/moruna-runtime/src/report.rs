@@ -185,6 +185,7 @@ mod tests {
                 bytes: 9,
                 at_ns: 2,
                 exact: true,
+                since_ns: 2,
             },
             process_usage: moruna_kernel::ProcessUsage::default(),
         });
