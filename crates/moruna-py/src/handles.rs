@@ -1,5 +1,6 @@
-//! What `ParquetSource`, `TensorSource`, `IteratorSource`, `ParquetSink`, `TensorSink` and
-//! `ArrowIpcSink` carry from Python into the facade (d.2, b).
+//! What `ParquetSource`, `TensorSource`, `IteratorSource`, `ParquetSink`, `TensorSink`,
+//! `ArrowIpcSink` and the user's `moruna.Source` and `moruna.Sink` subclasses carry from Python
+//! into the facade (d.2, b).
 //!
 //! Each Python handle holds a configuration, not a built component: every source and sink
 //! constructor in components 7 and 8 takes the run's `Arc<dyn Reactor>` and `Arc<dyn Allocator>`,
@@ -24,6 +25,9 @@ pub enum SourceSpec {
         /// The schema the user declared, as an Arrow schema or a tensor shape.
         schema: IteratorSchema,
     },
+    /// A `moruna.Source` subclass (07 e.6). The object is held by `moruna.run`, which hands it to
+    /// the runtime through the library loader, as it does the iterable.
+    Python,
 }
 
 /// The schema an `IteratorSource` was given.
@@ -52,6 +56,8 @@ pub enum SinkSpec {
     Tensor(TensorSinkConfig),
     /// `moruna.ArrowIpcSink`.
     ArrowIpc(ArrowIpcSinkConfig),
+    /// A `moruna.Sink` subclass (08 f.10), held by `moruna.run` like a `moruna.Source`.
+    Python,
 }
 
 impl SourceSpec {
@@ -64,7 +70,7 @@ impl SourceSpec {
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
-            SourceSpec::Iterator { .. } => Vec::new(),
+            SourceSpec::Iterator { .. } | SourceSpec::Python => Vec::new(),
         }
     }
 }
@@ -76,6 +82,8 @@ impl SinkSpec {
             SinkSpec::Parquet(cfg) => cfg.url.clone(),
             SinkSpec::Tensor(cfg) => path_string(&cfg.path),
             SinkSpec::ArrowIpc(cfg) => path_string(&cfg.path),
+            // A user's sink names no location; the empty target is what the rule skips.
+            SinkSpec::Python => String::new(),
         }
     }
 
@@ -85,6 +93,7 @@ impl SinkSpec {
             SinkSpec::Parquet(_) => "ParquetSink",
             SinkSpec::Tensor(_) => "TensorSink",
             SinkSpec::ArrowIpc(_) => "ArrowIpcSink",
+            SinkSpec::Python => "Sink",
         }
     }
 }

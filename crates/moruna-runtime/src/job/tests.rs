@@ -115,6 +115,39 @@ fn ho_t1_spec_round_trip() {
         JobSpec::from_json(iter).expect("iterator").source,
         SourceDoc::Iterator
     );
+    let python = r#"{"moruna_spec":1,"source":{"kind":"python"},"sink":{"kind":"python"}}"#;
+    let job = JobSpec::from_json(python).expect("python");
+    assert_eq!(job.source, SourceDoc::Python);
+    assert_eq!(job.sink, SinkDoc::Python);
+    assert!(job.canonical_json().contains(r#""sink":{"kind":"python"}"#));
+}
+
+/// A library caller that supplies a user's source and sink (07 e.6, 08 f.10) builds a run whose
+/// sink names no location, so the sink equals source rule has nothing to refuse.
+#[test]
+fn python_source_and_sink_come_from_the_loader() {
+    struct Library;
+    impl KernelLoader for Library {
+        fn load(&self, index: usize, doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
+            Fakes.load(index, doc)
+        }
+        fn python_source(&self) -> moruna_kernel::Result<crate::SourceSpec> {
+            Ok(crate::SourceSpec::Built(Arc::new(
+                moruna_testkit::FakeSource::new().splits(1, 10, 1 << 10),
+            )))
+        }
+        fn python_sink(&self) -> moruna_kernel::Result<crate::SinkSpec> {
+            Ok(crate::SinkSpec::Built(Box::new(
+                moruna_testkit::FakeSink::new(),
+            )))
+        }
+    }
+    let mut job = minimal("/out");
+    job.source = SourceDoc::Python;
+    job.sink = SinkDoc::Python;
+    assert!(build::build(&job, &Library, opts(false, &no_env)).is_ok());
+    // Only the library can: the default loader refuses both kinds by name.
+    assert!(build::build(&job, &NoKernels, opts(false, &no_env)).is_err());
 }
 
 /// HO-T2 spec_digest: the digest is the SHA-256 of the canonical form, independent of key
@@ -414,6 +447,13 @@ fn build_refusals() {
     assert_refused(&job, "source.url");
     job.source = SourceDoc::Iterator;
     assert_refused(&job, "source.kind");
+    // A user's `moruna.Source` and `moruna.Sink` are objects in the caller's process too (07 e.6,
+    // 08 f.10): a document from a file or a socket cannot name one.
+    job.source = SourceDoc::Python;
+    assert_refused(&job, "source.kind");
+    let mut job = minimal("/out");
+    job.sink = SinkDoc::Python;
+    assert_refused(&job, "sink.kind");
 
     let mut job = minimal("/out");
     job.source = SourceDoc::Parquet {

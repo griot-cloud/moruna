@@ -3388,6 +3388,8 @@ dependencies = [
  "moruna-kernel",
  "moruna-testkit",
  "parquet",
+ "pyo3",
+ "pyo3-arrow",
  "safetensors",
  "serde",
  "serde_json",

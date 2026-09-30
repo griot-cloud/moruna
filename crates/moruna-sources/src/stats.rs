@@ -24,6 +24,9 @@ pub struct SourceStats {
     pub groups_skipped: u64,
     /// One-row payloads returned above the range's target (SO-I9).
     pub oversized_rows: u64,
+    /// Bytes a `PySource` compacted out of a sliced batch before its decode copy (f.7); zero for
+    /// every other source.
+    pub compacted_bytes: u64,
 }
 
 /// The live counters; one per source instance, shared with every read in flight.
@@ -38,6 +41,7 @@ pub(crate) struct Counters {
     pub(crate) footer_reads: AtomicU64,
     pub(crate) groups_skipped: AtomicU64,
     pub(crate) oversized_rows: AtomicU64,
+    pub(crate) compacted_bytes: AtomicU64,
 }
 
 impl Counters {
@@ -57,6 +61,7 @@ impl Counters {
             footer_reads: get(&self.footer_reads),
             groups_skipped: get(&self.groups_skipped),
             oversized_rows: get(&self.oversized_rows),
+            compacted_bytes: get(&self.compacted_bytes),
         }
     }
 }

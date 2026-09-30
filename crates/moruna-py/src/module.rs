@@ -12,6 +12,8 @@ pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::errors::register(m)?;
     crate::sources::register(m)?;
     crate::sinks::register(m)?;
+    // The classes a user subclasses for a source or a sink of their own (07 e.6, 08 f.10).
+    crate::extend::register(m)?;
     crate::kernel::register(m)?;
     crate::check::register(m)?;
     crate::report::register(m)?;

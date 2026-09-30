@@ -4,16 +4,16 @@
 **Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/moruna-runtime-design.md` section 5.2; decision D3; criteria S12, S13; global invariant G-I2 (decode exception)
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.6 (`Source`, `Split`, `RowRange`), d.4 (`SourceSchema`, `Payload`, `ManagedTensor::from_buffer`), d.3 (`Buffer`, `Allocator`), d.9 (`Reactor`), e.4 (`MRB1`)
-**Component location:** `crates/moruna-sources`, Rust; feature `python` for `PyIteratorSource`
+**Component location:** `crates/moruna-sources`, Rust; feature `python` for `PyIteratorSource` and `PySource`
 **Consumes:** contracts (1); the reactor (6) as `Arc<dyn Reactor>` and as `Arc<dyn ObjectMetadata>` (both contracts d.9); the arena (2) only through the `&dyn Allocator` that `read` receives. **Consumed by:** scheduler (10, drives reads), placement (9, receives Q0 morsels), python surface (12, constructs)
 
-**Decisions worth your eye:** (1) Parquet decoding produces Arrow buffers from the parquet crate's own allocations and is then moved into the arena with one copy, counted as decode; the alternative, a custom Arrow allocator through the parquet crate, is not supported upstream and is recorded as a later optimisation; (2) tensor files are read by the reactor into arena buffers, page-aligned enclosing range and all, and the tensor is a safe view at a byte offset into that buffer (`ManagedTensor::from_buffer`), so an unaligned safetensors data section costs no copy and no `unsafe`, and every payload a source returns is arena-owned; (3) a `PyIteratorSource` exists for users with data that is neither, with no look-ahead and probe-only sizing, pulled on the reactor's blocking pool under interpreter attachment.
+**Decisions worth your eye:** (1) Parquet decoding produces Arrow buffers from the parquet crate's own allocations and is then moved into the arena with one copy, counted as decode; the alternative, a custom Arrow allocator through the parquet crate, is not supported upstream and is recorded as a later optimisation; (2) tensor files are read by the reactor into arena buffers, page-aligned enclosing range and all, and the tensor is a safe view at a byte offset into that buffer (`ManagedTensor::from_buffer`), so an unaligned safetensors data section costs no copy and no `unsafe`, and every payload a source returns is arena-owned; (3) a `PyIteratorSource` exists for users with data that is neither, with no look-ahead and probe-only sizing, pulled on the reactor's blocking pool under interpreter attachment; (4) a `PySource` (2026-09-29) lets a user write a source of their own in Python by subclassing `moruna.Source`: it plans splits with exact row counts and reads any row range of a split, so, unlike the iterator source, it is sub-splittable and repeatable and a run over it keeps look-ahead, Q0 eviction and resume (e.6, f.7).
 
 ---
 
 ## a. Purpose and boundary
 
-A source turns a dataset into splits with metadata, then reads splits into resident payloads on request. Three implementations: `ParquetSource` (object store or local, footer-driven look-ahead, projection, row-range sub-splitting), `TensorSource` (safetensors, NumPy `.npy`, `MRB1`; read into the arena and sliced along the leading dimension), and `PyIteratorSource` (a Python iterator of `pyarrow.RecordBatch` or DLPack objects; no metadata). Reads run on the reactor and land in arena buffers of the requested tier; sources never block a worker.
+A source turns a dataset into splits with metadata, then reads splits into resident payloads on request. Three implementations: `ParquetSource` (object store or local, footer-driven look-ahead, projection, row-range sub-splitting), `TensorSource` (safetensors, NumPy `.npy`, `MRB1`; read into the arena and sliced along the leading dimension), and `PyIteratorSource` (a Python iterator of `pyarrow.RecordBatch` or DLPack objects; no metadata). A fourth, `PySource` (2026-09-29), is the extension point: a user's `moruna.Source` subclass that plans its own splits and reads row ranges of them (e.6, f.7). Reads run on the reactor and land in arena buffers of the requested tier; sources never block a worker.
 
 It owns: split planning and metadata extraction; decoding Parquet into Arrow; reading tensor files; sub-splitting and the row-range contract; the decode boundary copy into the arena.
 
@@ -49,7 +49,7 @@ It refuses to know: how many splits to read ahead (scheduler's `read_ahead` knob
 
 **SO-I7. Zero rows is a valid split.** A Parquet row group or tensor with zero rows plans as a split with `rows = 0` and reads as an empty payload.
 
-**SO-I8. Reads are repeatable.** For `ParquetSource` and `TensorSource`, `plan()` called twice on unchanged inputs returns equal splits, and `read(split, rows)` called twice returns equal payloads (CT-I12). `PyIteratorSource` cannot promise this: it plans one split per pulled batch and cannot re-pull, so it reports `sub_splittable = false` and `repeatable() == false`, and a run over it is not resumable and Q0 eviction is disabled for it (the facade calls the placement engine's `set_staging(0, true)` before the first push, so its morsels are written rather than dropped, PL-I6; the facade notes "iterator source: no resume, Q0 staged"). Rationale: recovery and Q0 eviction both re-read; a source that cannot must say so rather than return different rows.
+**SO-I8. Reads are repeatable.** For `ParquetSource` and `TensorSource`, `plan()` called twice on unchanged inputs returns equal splits, and `read(split, rows)` called twice returns equal payloads (CT-I12). `PyIteratorSource` cannot promise this: it plans one split per pulled batch and cannot re-pull, so it reports `sub_splittable = false` and `repeatable() == false`, and a run over it is not resumable and Q0 eviction is disabled for it (the facade calls the placement engine's `set_staging(0, true)` before the first push, so its morsels are written rather than dropped, PL-I6; the facade notes "iterator source: no resume, Q0 staged"). Rationale: recovery and Q0 eviction both re-read; a source that cannot must say so rather than return different rows. `PySource` (e.6) promises SO-I8 by default, because its `read` takes a row range and a user's source can be read again by position; a user whose reads are not deterministic sets `repeatable = False` on the class, and the run is then treated exactly as a run over `PyIteratorSource` is (no resume, Q0 staged), through the same `repeatable()` the facade reads for both (2026-09-29).
 
 **SO-I9. A row is never split.** `read` returns whole rows: a single row (a long text row, a wide tensor row) larger than the scheduler's morsel maximum is returned at its natural size as a one-row payload, never truncated and never refused for being large; the scheduler decides what to do with an oversized morsel (SC-T17), the source only reports the size truthfully in `Payload::bytes`. A source is never told the current morsel target, so "oversized" for the counter means at or above 64 MiB, the lowest value `morsel.max_bytes` may take (preamble section 5), which is the largest threshold a source can apply without knowing a knob it cannot read (PM, 2026-09-22). Rationale: architecture section 7's "single row larger than the maximum morsel" case must degrade to one large morsel, not to an error at morsel 40,000.
 
@@ -100,11 +100,25 @@ impl PyIteratorSource {
 }
 impl Source for PyIteratorSource { /* plan returns one Split per pulled batch, pulled lazily: see f.5; repeatable() == false */ }
 
+// feature "python" (2026-09-29): a user's `moruna.Source` subclass (e.6, f.7).
+pub struct PySource { /* private: the object, its plan, its schema, a call mutex */ }
+impl PySource {
+    /// Calls the object's `plan()`, and `schema()` when it defines one, under attachment; reads a
+    /// sample of the first non-empty split when the schema or a split's byte estimate is missing
+    /// (e.6). Every error here is `Plan` (or `Source` for the sample read), before any run step
+    /// after "sources built".
+    pub fn new(object: pyo3::Py<pyo3::PyAny>, reactor: std::sync::Arc<dyn Reactor>) -> Result<PySource>;
+    pub fn stats(&self) -> SourceStats;
+}
+impl Source for PySource { /* sub_splittable always; repeatable() is the class's `repeatable`, default true; f.7 */ }
+pub const SAMPLE_ROWS: u64 = 1024;         // rows of the plan-time sample (e.6)
+
 #[derive(Clone, Debug, Default)]
 pub struct SourceStats {
     pub splits: u64, pub bytes_planned: u64, pub reads: u64, pub decode_bytes: u64,
     pub tensor_direct_reads: u64, pub tensor_buffered_reads: u64, pub footer_reads: u64, pub groups_skipped: u64,
     pub oversized_rows: u64,                // one-row payloads at or above 64 MiB (SO-I9)
+    pub compacted_bytes: u64,               // PySource only: bytes compacted out of sliced batches before the decode copy (f.7)
 }
 
 /// Row-group statistics predicate; only min/max pruning in v1.
@@ -115,7 +129,7 @@ The scheduler calls `read` with a `RowRange` it computes from the controller's m
 
 ### d.2 Consumed
 
-`moruna_kernel::{Source, Split, RowRange, SourceSchema, Payload, ManagedTensor, Allocator, Buffer, BufferView, Reactor, Completion, ObjectMetadata, ObjectMeta, Tier, DType, MorunaError, mrb1}` (`ObjectMetadata` and `ObjectMeta` are contracts d.9; `head_object`, `list_prefix`; no `moruna_reactor` dependency); `parquet` (`ParquetMetaDataReader`, `ParquetRecordBatchStreamBuilder` with a custom `AsyncFileReader` over the reactor, `ProjectionMask`, `RowSelection`); `safetensors` (header parse); `arrow`; `bytes` (`Bytes::from_owner`); with `python`, `pyo3` and `arrow`'s C Data Interface (`FFI_ArrowArray`, `FFI_ArrowSchema`).
+`moruna_kernel::{Source, Split, RowRange, SourceSchema, Payload, ManagedTensor, Allocator, Buffer, BufferView, Reactor, Completion, ObjectMetadata, ObjectMeta, Tier, DType, MorunaError, mrb1}` (`ObjectMetadata` and `ObjectMeta` are contracts d.9; `head_object`, `list_prefix`; no `moruna_reactor` dependency); `parquet` (`ParquetMetaDataReader`, `ParquetRecordBatchStreamBuilder` with a custom `AsyncFileReader` over the reactor, `ProjectionMask`, `RowSelection`); `safetensors` (header parse); `arrow`; `bytes` (`Bytes::from_owner`); with `python`, `pyo3` and `arrow`'s C Data Interface (`FFI_ArrowArray`, `FFI_ArrowSchema`), reached through `pyo3-arrow` (section l allows no `unsafe` here; the preamble 6.2 row for `pyo3-arrow` gains component 7, an E2 note).
 
 ## e. Data model, formats and state machines
 
@@ -150,6 +164,22 @@ For `(split, rows)`, compute the byte range for rows `[start, end)` along dimens
 
 Splits are immutable after plan; the source keeps no per-split state (SO-I6).
 
+### e.6 Python source plan (2026-09-29)
+
+The user's class (12 d.2):
+
+```python
+class Split:                       # frozen; id: int (u32, unique in the plan), rows: int (u64), bytes: int | None
+    def __init__(self, id, rows, bytes=None)
+class Source:                      # the base a user subclasses
+    repeatable: bool = True        # class attribute; False turns resume and Q0 eviction off (SO-I8)
+    def plan(self) -> list[Split]                                        # required
+    def read(self, split_id: int, start: int, end: int) -> pyarrow.RecordBatch   # required: exactly rows [start, end)
+    def schema(self) -> pyarrow.Schema | None                            # optional; None (the default) is "the first read's"
+```
+
+`PySource::new` calls `plan()` once and caches the result; `Source::plan` returns a clone, so SO-I1 and the facade's single plan call (12 f.1) hold. Each entry is read by attribute (`id`, `rows`, `bytes`), so `moruna.Split` and any object with those attributes are accepted; a missing attribute, a negative or non-integer value, or an id named twice is a `Plan` error naming the entry. The row count is required because the contract gives a split its rows before any read (contracts d.6) and the scheduler sizes ranges from it. The schema is `schema()` when it returns one, else the schema of a sample read. The sample is taken only when something is missing, the schema or any split's `bytes`: `read(id, 0, min(rows, SAMPLE_ROWS))` of the first split with rows, or `read(first.id, 0, 0)` when every split is empty (a zero-row batch still has a schema); a plan with no splits and no `schema()` is a `Plan` error that says to declare the schema. A split's `uncompressed_bytes` is the user's `bytes` when given, else the sample's bytes per row times its rows; `column_bytes` is the sample's per-column proportion of that figure (an even share when there was no sample); `null_counts` are `None`; `estimated = true` always, because the figure is the user's or a sample's, not a file's; `sub_splittable = true` always, because `read` takes a range. A class attribute `repeatable` that is not a bool is a `Plan` error.
+
 ## f. Algorithms and policies
 
 **f.1 Footer reads.** Two ranged reads per file (last 64 KiB speculatively, then the rest of the footer if longer), issued for all files with `object_concurrency` parallelism; `footer_reads` counts them.
@@ -164,9 +194,11 @@ Splits are immutable after plan; the source keeps no per-split state (SO-I6).
 
 **f.6 Coalescing.** When a split's `uncompressed_bytes` is below the scheduler's target, the scheduler may pass a `RowRange` spanning the whole split and issue several splits; the source does not merge splits (each read is one payload). The placement engine's queue is where small morsels accumulate; the controller raises `morsel.min_bytes` in effect by asking the scheduler for larger ranges, not by asking the source to merge. In the other direction the source never shrinks below one row: a `RowRange` of one row is honoured whatever its bytes (SO-I9).
 
+**f.7 `PySource::read` (2026-09-29).** For `(split, rows)`: a split id not in the plan is `Source` (SO-I1); `rows` of `None` is the whole split; a range outside the split is `Source` naming it. Then, like f.5's pull and on the same thread (the source drive; `PySource` issues no reactor operation), attach and call `read(split_id, start, end)`; a Python exception is `Source { split, msg: "<Class>.read(<id>, <start>, <end>): <ExceptionType>: <message>" }`, and a return value that is not a `pyarrow.RecordBatch` is `Source` naming its type. The batch is taken out through `pyo3-arrow` and the attachment released. A batch whose row count is not `end - start` is `Source` naming the split, the range and both counts (SO-I4); a batch whose column names and types differ from the source's schema is `Source` naming the split and both schemas; the batch is then rebuilt under the source's schema, so a non-nullable declared column that holds nulls is refused there too. A column whose buffers hold more than twice the bytes its slice needs plus 64 KiB, which is what `table.slice(start, n)` returns and the natural way to write `read`, is compacted to its own rows first (`MutableArrayData`), because the decode copy of f.4 keeps an array's offset and copies whole buffers, and without the compaction each morsel of a sliced table would put the whole table's column into the arena; the compaction is a CPU copy of the slice's bytes into heap memory, the price of returning a view, and is counted in `compacted_bytes`; a batch that owns its buffers pays nothing here. Then the decode copy into arena buffers of `tier` (f.4, SO-I5: `decode_bytes`, `note_payload_copy`), after detaching (AD-I4), and `Payload::table`. An `Alloc` error is returned as it is (h). Every call into the object (`plan`, `schema`, `read`) is made holding one mutex per source, taken before attaching, so the user's code is never entered from two threads at once whatever the interpreter build. Relation to f.5: `PySource` is what a user writes when the data can be read again by position (an in-memory table, a keyed store, an API with offsets, a file format Moruna does not read); `PyIteratorSource` remains the tool for a true stream, which cannot be re-read and therefore cannot be sub-split, evicted or resumed.
+
 ## g. Concurrency within the component
 
-`read` is called from the scheduler's source-drive loop and runs on reactor threads (decode included; decode is CPU-heavy, so the source runs it on the blocking pool through `spawn_blocking`, which is legal because the future is polled inside the reactor's runtime, and the Python pull of f.5 goes the same way). The reactor operations a read issues never block the polling thread (RE-I6); the future awaits their `Completion`s. Sources are `Send + Sync`; the Parquet plan cache is immutable after `new`; the iterator source holds its `Py<PyAny>` behind a mutex taken only on the blocking thread. No other locks after construction.
+`read` is called from the scheduler's source-drive loop and runs on reactor threads (decode included; decode is CPU-heavy, so the source runs it on the blocking pool through `spawn_blocking`, which is legal because the future is polled inside the reactor's runtime, and the Python pull of f.5 goes the same way). The reactor operations a read issues never block the polling thread (RE-I6); the future awaits their `Completion`s. Sources are `Send + Sync`; the Parquet plan cache is immutable after `new`; the iterator source holds its `Py<PyAny>` behind a mutex taken only on the blocking thread; `PySource` holds one mutex per source across each call into the user's object, taken before attaching and never while attached (f.7). No other locks after construction.
 
 ## h. Behaviour
 
@@ -208,7 +240,7 @@ Files are written by the tests themselves with `arrow`, `parquet`, `safetensors`
 
 **SO-T9 tensor_view_in_arena.** Aligned `MRB1` and safetensors with an unaligned data section: for 50 random row ranges each, the tensor's `data_ptr` lies inside the one arena buffer of the read at `lo − page_floor(lo)`, `FakeReactor::ops()` shows one `read_file` whose offset and length are page multiples (except at the file's last page), the values equal the generator's, and `payload_copies_total` and `decode_bytes` are unchanged; a file truncated below its header's claim gives `Source`. e.4. And a safetensors file whose header was not padded, so the data section starts off the item boundary: the same 50 random ranges read correctly, each `read_file` starts at the range's own first byte, the view's offset is zero, every read is counted buffered and none direct, and `payload_copies_total` and `decode_bytes` are still unchanged (`an_unaligned_safetensors_data_section_is_read_from_its_first_byte`, 2026-09-29).
 
-**SO-T10 iterator_source.** (integration, closes in wave 3; `python` feature) A Python generator of five `pyarrow.RecordBatch`es yields five morsels then exhaustion; `estimated` is true; every buffer of every morsel is arena-owned (`contains`); the pull ran on a thread that is not the polling thread; a generator that raises gives `Source` with the exception's type in the message; a DLPack generator gives tensors through `from_buffer`. f.5.
+**SO-T10 iterator_source.** (`python` feature; run by the gate's python step since 2026-09-29, which closed the wave 3 tag; the pull-thread and DLPack halves are not asserted yet) A Python generator of five `pyarrow.RecordBatch`es yields five morsels then exhaustion; `estimated` is true; every buffer of every morsel is arena-owned (`contains`); the pull ran on a thread that is not the polling thread; a generator that raises gives `Source` with the exception's type in the message; a DLPack generator gives tensors through `from_buffer`. f.5.
 
 **SO-T11 schema_mismatch.** Two files with a column type difference in the projection: `Plan` error names both files. h.
 
@@ -222,9 +254,21 @@ Files are written by the tests themselves with `arrow`, `parquet`, `safetensors`
 
 **SO-T16 local_paths_use_read_file.** `ParquetSource` over plain paths and `file://` URLs issues only `read_file`/`read_file_opt` on `FakeReactor` (`ops()` has no object operations) and never calls `ObjectMetadata` (a test-local implementation that panics is passed as `meta`); over an `s3://` URL it calls `head_object` and `read_object` (integration, closes in wave 3). d.1, e.1.
 
+**SO-T17 py_source_plan_and_read.** (`python` feature; `tests/py_source.rs`) A `moruna.Source`-shaped fake over three in-memory splits of 3000, 0 and 7 rows with no `schema()` and no byte estimates: the plan has the user's ids and row counts, `estimated` and `sub_splittable` on every split, byte figures from exactly one sample read of `[0, 1024)` of the first split; whole-split reads return exactly the rows, every buffer arena-owned, one decode copy per read counted in `decode_bytes`. e.6, f.7, SO-I2, SO-I3, SO-I5.
+
+**SO-T18 py_source_sub_split.** Ranges `[0,10)`, `[10,25)`, `[25,40000)` of one 40,000-row split concatenate to it; the same range twice and ranges in reverse order read equal rows; a ten-row range of a sliced 40,000-row batch copies less than a hundredth of the split's bytes into the arena and `compacted_bytes > 0`. SO-I4, SO-I6, f.7.
+
+**SO-T19 py_source_wrong_rows.** A `read` that returns one row short is `Source` naming the split and both counts, at plan time (the sample) and at read time; a batch whose column type or name changes after the first is `Source` naming both schemas; a declared `schema()` the batches do not match is refused at the sample; a `read` that returns a list is `Source` naming its type. f.7, h.
+
+**SO-T20 py_source_exception.** A `ValueError` in `read` is `Source { split }` carrying `ValueError: <message>` and the call's arguments, with nothing allocated; an exception in `plan` or `schema`, a plan that is not a list, an entry with no `id`, a negative row count, a duplicated id, a `schema()` that returns a string, a non-bool `repeatable` and an empty plan with no schema are `Plan` errors naming what is wrong. e.6, h.
+
+**SO-T21 py_source_not_repeatable.** A class with `repeatable = False` reports `repeatable() == false` and still reads ranges; the facade's side (Q0 staged, no resume, the note) is RT-T3 and `python/tests/test_custom_source_sink.py`. SO-I8.
+
+**SO-T22 py_source_plan_edges.** A declared schema and byte estimates cost no read at plan time and keep the user's figure (an even per-column share); a byte estimate with a sample is shared in the sample's proportions; an all-empty plan samples `[0, 0)`; an empty plan with a schema is valid; an unplanned split id and ranges outside the split or reversed are `Source`; `FakeAllocator::fail_next(1)` gives the arena's `Alloc` unchanged. SO-I1, SO-I7, h.
+
 ## l. Implementation notes for the agent
 
-Files: `src/lib.rs`, `src/parquet/{mod.rs, plan.rs (e.1, f.1, f.2), read.rs (e.2, f.3), decode_copy.rs (f.4), reader.rs (AsyncFileReader over `Arc<dyn Reactor>`, local and object paths)}`, `src/tensor/{mod.rs, plan.rs (e.3), read.rs (e.4), safetensors.rs, npy.rs}`, `src/py_iter.rs` (feature python, f.5), `src/stats.rs`. No `unsafe` in this crate: the tensor view is `ManagedTensor::from_buffer` (contracts d.4) and the Arrow C Data Interface import in `py_iter.rs` goes through `arrow`'s safe `from_ffi`, and the copy into the arena follows it. No crate maps files: every read lands in the arena through the reactor (e.4), so `memmap2` is not a dependency of this crate.
+Files: `src/lib.rs`, `src/parquet/{mod.rs, plan.rs (e.1, f.1, f.2), read.rs (e.2, f.3), decode_copy.rs (f.4), reader.rs (AsyncFileReader over `Arc<dyn Reactor>`, local and object paths)}`, `src/tensor/{mod.rs, plan.rs (e.3), read.rs (e.4), safetensors.rs, npy.rs}`, `src/py_iter.rs` (feature python, f.5), `src/py_source.rs` (feature python, e.6, f.7; 2026-09-29), `src/stats.rs`. No `unsafe` in this crate: the tensor view is `ManagedTensor::from_buffer` (contracts d.4) and the Arrow C Data Interface import in `py_iter.rs` goes through `arrow`'s safe `from_ffi`, and the copy into the arena follows it. No crate maps files: every read lands in the arena through the reactor (e.4), so `memmap2` is not a dependency of this crate.
 
 The `AsyncFileReader` implementation must request page-aligned ranges and hand the parquet crate a `Bytes` view over the arena buffer without copying (use `Bytes::from_owner` over the `Buffer`); the decode copy happens after decoding, not before. The reactor calls it makes are `read_object`, `read_file` and `read_file_opt` from contracts d.9 and `head_object`/`list_prefix` from `ObjectMetadata` (contracts d.9); nothing else of the reactor is named here.
 
@@ -250,6 +294,7 @@ None. (The Vortex source that used to sit here is SO-O1 in section o.)
 | architecture 7 (single row larger than the maximum morsel) | SO-I9 | SO-T14 |
 | contracts d.9 (`Arc<dyn Reactor>`, `ObjectMetadata`) | d.1, e.1 | SO-T15, SO-T16 |
 | f.5 (iterator pull under attachment), PL-I6 | SO-I8 | SO-T10 |
+| 12 d.2 `moruna.Source` (user extension, 2026-09-29), CT-I12 | e.6, f.7, SO-I4, SO-I8 | SO-T17, SO-T18, SO-T19, SO-T20, SO-T21, SO-T22 |
 
 ## o. Deferred (post-v1)
 

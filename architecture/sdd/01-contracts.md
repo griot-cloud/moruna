@@ -602,6 +602,8 @@ pub trait Sink: Send + Sync {
 }
 ```
 
+A sink whose output is state it cannot edit (a user's `moruna.Sink`, 08 f.10; 2026-09-29) meets `resume`'s obligation the other way round rather than by discarding: its `checkpoint` records exactly which sequence numbers the state holds, and after `resume` it acknowledges without writing any sequence the restored state already holds when the scheduler delivers it again. The outcome the contract asks for is the same, no sequence reaches the output twice; for such a sink "committed" in `committed_seq` means the write returned, and safety against process loss is the checkpoint's, which is taken under the same lock as the writes. The trait is unchanged.
+
 ### d.9 Reactor
 
 ```rust

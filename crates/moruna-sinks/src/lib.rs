@@ -3,7 +3,8 @@
 //! Design: `architecture/sdd/08-sinks.md`. A sink absorbs morsels and produces durable output:
 //! `ParquetSink` to an object store or a local directory, `TensorSink` to safetensors or the
 //! aligned binary format of contracts e.4, `ArrowIpcSink` to an Arrow IPC file whose record
-//! batches are the page-aligned records of contracts e.7. `ReorderBuffer` wraps any sink and
+//! batches are the page-aligned records of contracts e.7, and, with the `python` feature,
+//! `PySink` to a user's `moruna.Sink` subclass (f.10). `ReorderBuffer` wraps any sink and
 //! delivers morsels in sequence order within a byte bound, and `SinkHandle` is the one type the
 //! scheduler drives, plain or ordered.
 //!
@@ -26,6 +27,9 @@ mod commit;
 mod handle;
 mod ipc_sink;
 mod parquet_sink;
+// A user's `moruna.Sink` subclass (f.10, e.6), 2026-09-29.
+#[cfg(feature = "python")]
+mod py_sink;
 mod reorder;
 mod stats;
 mod tensor_sink;
@@ -33,6 +37,8 @@ mod tensor_sink;
 pub use handle::SinkHandle;
 pub use ipc_sink::{ArrowIpcSink, ArrowIpcSinkConfig};
 pub use parquet_sink::{ParquetSink, ParquetSinkConfig};
+#[cfg(feature = "python")]
+pub use py_sink::{PySink, PySinkStats};
 pub use reorder::ReorderBuffer;
 pub use stats::SinkStats;
 pub use tensor_sink::{TensorFormat, TensorSink, TensorSinkConfig};

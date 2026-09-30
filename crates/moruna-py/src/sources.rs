@@ -76,6 +76,16 @@ impl PyTensorSource {
 }
 
 /// A source over a Python iterable of `pyarrow.RecordBatch` objects.
+///
+/// The right tool for a true stream: data that arrives once, in order, and cannot be asked for
+/// again (a socket, a queue, a generator over something that moves on). Such a source cannot be
+/// re-read, so a run over it has no look-ahead, no Q0 eviction (its morsels are staged instead)
+/// and cannot be resumed.
+///
+/// When the data can be read again by position (an in-memory table, a database with a key, an
+/// API with offsets, files in a format Moruna does not read), subclass `moruna.Source` instead:
+/// its `read(split_id, start, end)` takes a row range, so the run is sub-splittable, keeps its
+/// look-ahead and eviction, and can be resumed.
 #[pyclass(frozen, module = "moruna._core", name = "IteratorSource")]
 pub struct PyIteratorSourceHandle {
     /// The iterator the run pulls from; `iter()` is called here so a list is accepted too.
@@ -117,8 +127,13 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<SourceSpec> {
             schema: clone_schema(&i.get().schema),
         });
     }
+    // A user's `moruna.Source` subclass (07 e.6).
+    if crate::extend::is_source(handle)? {
+        return Ok(SourceSpec::Python);
+    }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "source must be an moruna.ParquetSource, moruna.TensorSource or moruna.IteratorSource, not {}",
+        "source must be an moruna.ParquetSource, moruna.TensorSource, moruna.IteratorSource or \
+         a moruna.Source subclass, not {}",
         type_name(handle)
     )))
 }

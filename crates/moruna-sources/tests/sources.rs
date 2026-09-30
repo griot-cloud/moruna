@@ -617,7 +617,8 @@ fn an_unaligned_safetensors_data_section_is_read_from_its_first_byte() {
 // SO-T10 iterator_source. (integration, closes in wave 3; `python` feature) f.5.
 #[cfg(feature = "python")]
 #[test]
-#[ignore = "integration, closes in wave 3: needs CPython 3.14 free threaded with pyarrow"]
+// Runs wherever the `python` feature is built: the gate's python step (MORUNA_PYTHON) builds it
+// with an interpreter that imports pyarrow, so the wave 3 tag is closed (2026-09-29).
 fn so_t10_iterator_source() {
     use moruna_sources::PyIteratorSource;
     use pyo3::prelude::*;
