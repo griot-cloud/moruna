@@ -65,6 +65,7 @@ A kernel object has `fingerprint`, a string identifying its code, and `stateful`
 | `ParquetSource(urls, *, columns=None, filters=None)` | A path, URL, or list of them; the columns to read; row-group filters as `(column, op, value)` with op `>`, `<` or `==`. |
 | `TensorSource(paths, *, tensors=None)` | Safetensors or aligned binary tensor files; the tensors to read. |
 | `IteratorSource(iterable, *, schema)` | An iterable of `pyarrow.RecordBatch` objects and their schema. |
+| A subclass of `Source` | Your own source; see below. |
 
 ## Sinks
 
@@ -73,6 +74,41 @@ A kernel object has `fingerprint`, a string identifying its code, and `stateful`
 | `ParquetSink(url, *, row_group_bytes=None, file_bytes=None, compression="zstd")` | Target directory or prefix; about 128 MiB per row group and 1 GiB per file by default. |
 | `TensorSink(path, *, format="mrb1", one_file_per_morsel=False, name="tensor")` | Target directory; `mrb1` or `safetensors`. |
 | `ArrowIpcSink(path, *, file_bytes=None)` | Target directory. |
+| A subclass of `Sink` | Your own sink; see below. |
+
+## moruna.Source, moruna.Sink and moruna.Split
+
+Base classes for a source or a sink of your own. For examples and the rules they follow, see [Writing your own source or sink](sources-and-sinks.md).
+
+```python
+class Split:
+    def __init__(self, id: int, rows: int, bytes: int | None = None)
+
+class Source:
+    repeatable: bool = True
+    def plan(self) -> list[Split]
+    def read(self, split_id: int, start: int, end: int) -> pyarrow.RecordBatch
+    def schema(self) -> pyarrow.Schema | None
+
+class Sink:
+    def write(self, batch: pyarrow.RecordBatch) -> None
+    def finish(self) -> None
+    def checkpoint(self) -> bytes | None
+    def restore(self, state: bytes) -> None
+```
+
+| Method | Required | Meaning |
+| --- | --- | --- |
+| `Source.plan` | yes | The splits to read, each with its exact row count. Called once. |
+| `Source.read` | yes | Exactly rows `start` to `end` (not included) of one split. |
+| `Source.schema` | no | The columns every batch has. By default, the first batch's. |
+| `Source.repeatable` | no | `False` when reading a range twice can give different rows; the job then cannot be resumed. |
+| `Sink.write` | yes | Receives each result. The batch is Moruna's memory, counted against the budget while you keep it. |
+| `Sink.finish` | no | Called once after the last write, when the job completes. |
+| `Sink.checkpoint` | no | Bytes that describe everything written so far; `None` means the sink cannot be resumed. |
+| `Sink.restore` | with `checkpoint` | Returns a new sink to the state of a checkpoint when a job resumes. |
+
+`Split` is read-only; its `bytes` is an estimate and may be `None`.
 
 ## Standard kernels
 

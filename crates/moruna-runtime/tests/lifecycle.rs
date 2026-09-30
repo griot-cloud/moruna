@@ -278,6 +278,40 @@ fn rt_t3_iterator_source_stages_q0() {
     );
 }
 
+/// 12 f.7, SC f.1, 08 f.10: a sink that does not checkpoint cannot be resumed, and the report
+/// says so as it does for a one-shot source; a sink that checkpoints gets no such note, and
+/// neither does a run that asked for no checkpoints.
+#[test]
+fn rt_t3b_a_sink_without_checkpoints_is_noted() {
+    let run = |sink: FakeSink, checkpoint: bool| {
+        let scratch = Scratch::new("rt_t3b");
+        let rig = Rig::new();
+        let components = rig.components(4 << 30, Some(scratch.path().to_path_buf()));
+        let mut spec = spec(
+            FakeSource::new().splits(2, 100, 1 << 20),
+            Vec::new(),
+            sink,
+            &scratch,
+        );
+        spec.checkpoint = checkpoint;
+        let report = Runtime::run_with(spec, CancelToken::new(), components)
+            .unwrap_or_else(|e| panic!("the run completes: {e}"));
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("the sink does not checkpoint"))
+    };
+    assert!(run(FakeSink::new().resumable(false), true), "noted");
+    assert!(
+        !run(FakeSink::new().resumable(true), true),
+        "a resumable sink is not"
+    );
+    assert!(
+        !run(FakeSink::new().resumable(false), false),
+        "nor a run without checkpoints"
+    );
+}
+
 /// d.1: `inspect` is discovery on its own and reads the real host.
 #[test]
 fn rt_t4_inspect_reads_the_host() {

@@ -72,6 +72,28 @@ pub trait KernelLoader {
         )
         .into())
     }
+
+    /// The source for `"kind": "python"`: a user's `moruna.Source` subclass, which only a
+    /// library caller can supply (07 e.6).
+    fn python_source(&self) -> Result<SourceSpec> {
+        Err(SpecError::new(
+            "source.kind",
+            "`python` names a moruna.Source object in the caller's process and is library \
+             only; a document names a parquet or tensor source",
+        )
+        .into())
+    }
+
+    /// The sink for `"kind": "python"`: a user's `moruna.Sink` subclass, which only a library
+    /// caller can supply (08 f.10).
+    fn python_sink(&self) -> Result<SinkSpec> {
+        Err(SpecError::new(
+            "sink.kind",
+            "`python` names a moruna.Sink object in the caller's process and is library only; a \
+             document names a parquet, tensor or arrow_ipc sink",
+        )
+        .into())
+    }
 }
 
 /// A loader with no kernels at all: every kernel entry is refused. What a build without the
@@ -446,6 +468,7 @@ fn source_of(
             ))
         }
         SourceDoc::Iterator => Ok((loader.iterator_source()?, Vec::new(), None)),
+        SourceDoc::Python => Ok((loader.python_source()?, Vec::new(), None)),
         SourceDoc::Datafusion {
             root,
             contract,
@@ -585,6 +608,9 @@ fn sink_of(
             caller,
             mode,
         } => governed::sink(root, contract, caller, mode, loader, engines),
+        // A user's sink names no location of its own, so the sink equals source rule has
+        // nothing to compare (12 f.3).
+        SinkDoc::Python => Ok((loader.python_sink()?, String::new(), None)),
     }
 }
 

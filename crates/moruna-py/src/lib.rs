@@ -26,6 +26,10 @@ pub mod check;
 pub mod cli;
 #[cfg(feature = "python")]
 pub mod errors;
+// `moruna.Source`, `moruna.Sink` and `moruna.Split`, the classes a user extends (07 e.6, 08
+// f.10, 2026-09-29).
+#[cfg(feature = "python")]
+pub mod extend;
 #[cfg(feature = "python")]
 pub mod inspect;
 #[cfg(feature = "python")]

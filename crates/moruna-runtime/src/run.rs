@@ -455,6 +455,12 @@ fn drive(
             "the source is not repeatable, so this run cannot be resumed".into(),
         )));
     }
+    // 12 f.7, SC f.1: a sink whose checkpoint is `None` before it is opened cannot be resumed,
+    // and the scheduler turns checkpointing off for it; the report says so, as it does for a
+    // one-shot source (a user's `moruna.Sink` without `checkpoint`, 08 f.10, is the usual case).
+    if checkpoint && sink.checkpoint()?.is_none() {
+        notes.push("sink: no resume, the sink does not checkpoint".to_string());
+    }
     let sink_handle = SinkHandle::wrap(sink, ordered, config::ORDERING_BUFFER_BYTES);
 
     // 6. Kernels built: bind the arena, walk the chain, build the controller's view of them.
@@ -552,9 +558,10 @@ fn drive(
     };
     started.placement = Some(placement.clone());
     if !repeatable {
-        // 07 SO-I8, PL-I6: a one-shot source's Q0 is staged rather than evicted.
+        // 07 SO-I8, PL-I6: a one-shot source's Q0 is staged rather than evicted. An iterator
+        // source is one; a `moruna.Source` that sets `repeatable = False` is the other (07 e.6).
         placement.set_staging(0, true);
-        notes.push("iterator source: no resume, Q0 staged".to_string());
+        notes.push("source is not repeatable (an iterator source, or repeatable = False): no resume, Q0 staged".to_string());
     }
 
     // f.7: restore before the scheduler is built, so its refusals land before the sink.

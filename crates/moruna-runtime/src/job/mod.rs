@@ -170,6 +170,9 @@ pub enum SourceDoc {
     /// A Python iterable. Library only: the iterable is an object in the caller's process and
     /// cannot be named in a file, so a document from a file or a socket is refused (MH 4.1).
     Iterator,
+    /// A user's `moruna.Source` subclass (07 e.6, 2026-09-29). Library only, for the reason
+    /// `iterator` is: the object lives in the caller's process.
+    Python,
     /// A governed DataFusion plan (MH 4.5): what peQL, opened on the disk at `root`, plans for
     /// `caller` over one contract or over SQL in which every table is a contract. Exactly one of
     /// `contract` and `sql`. Needs a build with the `peql` feature.
@@ -254,6 +257,9 @@ pub enum SinkDoc {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
     },
+    /// A user's `moruna.Sink` subclass (08 f.10, 2026-09-29). Library only: the object lives in
+    /// the caller's process, so a document from a file or a socket is refused (MH 4.1).
+    Python,
 }
 
 /// `sink.options` for `parquet`.

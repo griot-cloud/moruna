@@ -1,6 +1,7 @@
 """Moruna: a memory-aware runtime for data and tensor pipelines (component 12, SDD 12).
 
-Four constructors, one decorator and one function::
+Four constructors, one decorator and one function (and two base classes, ``moruna.Source`` and
+``moruna.Sink``, for a source or a sink of your own)::
 
     import moruna, pyarrow as pa
 
@@ -53,6 +54,9 @@ from moruna._core import (
     inspect_host,
 )
 
+# The classes a user subclasses for a source or a sink of their own (SDD 07 e.6, 08 f.10).
+from moruna._core import Sink, Source, Split
+
 __version__: str = _core.__version__
 
 __all__ = [
@@ -80,6 +84,9 @@ __all__ = [
     "run",
     "std",
 ]
+
+# A source or a sink of the user's own (SDD 07 e.6, 08 f.10).
+__all__ += ["Sink", "Source", "Split"]
 
 
 def run(

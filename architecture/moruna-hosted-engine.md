@@ -100,7 +100,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
   "moruna_spec": 1,
   "run_id": "01J…",                      // host-assigned; default: generated
   "source": {
-    "kind": "parquet",                     // parquet | tensor | datafusion | iterator (library only)
+    "kind": "parquet",                     // parquet | tensor | datafusion | iterator | python (the last two library only)
     "url": "file:///data/raw/events/",     // or s3://…, gs://…; see object_store
     "options": {}
   },

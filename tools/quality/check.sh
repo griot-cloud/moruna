@@ -142,6 +142,13 @@ sys.stdout.write(", ".join(absent))
     fi
     step "cargo test --features python (interpreter: ${MORUNA_PYTHON})"
     PYO3_PYTHON="$MORUNA_PYTHON" quiet test_python cargo test -p moruna-adapters --features python
+    # A user's `moruna.Source` and `moruna.Sink` (07 e.6, 08 f.10, 2026-09-29): their bridges
+    # compile only with `python`, so a default-feature run neither tests nor measures them. The
+    # SO-T17..22 and SI-T18..22 tests run here, and the two crates' coverage with the feature on
+    # is judged by the same per-crate rule as the workspace's, below.
+    step "cargo test --features python (moruna-sources, moruna-sinks: the user's Source and Sink)"
+    PYO3_PYTHON="$MORUNA_PYTHON" quiet test_python_ends cargo test -p moruna-sources -p moruna-sinks \
+      --features moruna-sources/python,moruna-sinks/python
   else
     step "python adapter not measured: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
   fi
@@ -165,6 +172,14 @@ sys.stdout.write(", ".join(absent))
     fi
   else
     python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
+  fi
+  if [ -n "${MORUNA_PYTHON:-}" ]; then
+    step "line coverage >= ${MIN}% for moruna-sources and moruna-sinks with --features python"
+    PYO3_PYTHON="$MORUNA_PYTHON" cargo llvm-cov -p moruna-sources -p moruna-sinks \
+      --features moruna-sources/python,moruna-sinks/python --json --summary-only \
+      --output-path target/llvm-cov/summary-python.json >/dev/null 2>target/llvm-cov/stderr-python.log \
+      || { cat target/llvm-cov/stderr-python.log >&2; fail "cargo llvm-cov --features python failed"; }
+    python3 tools/quality/coverage_gate.py target/llvm-cov/summary-python.json "$MIN"
   fi
 else
   step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"

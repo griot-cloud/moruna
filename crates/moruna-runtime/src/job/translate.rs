@@ -216,6 +216,11 @@ fn resolved(path: &Path) -> PathBuf {
 /// The sink equals source rule (12 f.3, PY-T14): refused with `Plan` when the sink writes where
 /// a source reads, or into a directory a source reads from.
 pub fn check_sink_not_source(sink: &str, sources: &[String]) -> Result<()> {
+    // A sink with no location (a user's `moruna.Sink`, 08 f.10) cannot write into the input:
+    // there is nothing to compare, and an empty prefix would match every path.
+    if sink.is_empty() {
+        return Ok(());
+    }
     let sink_target = normalise_target(sink);
     let sink_prefix = format!("{sink_target}/");
     for raw in sources {
@@ -296,6 +301,8 @@ mod tests {
         assert_eq!(normalise_target("file:///"), "/");
         assert!(check_sink_not_source("s3://b/", &["s3://b/in/".into()]).is_err());
         assert!(check_sink_not_source("s3://b/in2", &["s3://b/in/".into()]).is_ok());
+        // A sink with no location (a user's `moruna.Sink`) writes into nothing it reads.
+        assert!(check_sink_not_source("", &["/data/in/".into(), "s3://b/".into()]).is_ok());
 
         // One directory by two spellings, written yet or not, is one target.
         let base = std::env::temp_dir().join(format!("moruna-target-{}", std::process::id()));

@@ -1,5 +1,5 @@
-//! Moruna component 7, the sources (`Source` over Parquet, safetensors, aligned binary and a
-//! Python iterator).
+//! Moruna component 7, the sources (`Source` over Parquet, safetensors, aligned binary, a
+//! Python iterator and a user's `moruna.Source` subclass).
 //!
 //! Design: `architecture/sdd/07-sources.md`. A source turns a dataset into splits with
 //! metadata (`plan`), then reads splits into resident payloads on request (`read`). Every
@@ -27,6 +27,9 @@ pub mod tensor;
 
 #[cfg(feature = "python")]
 pub mod py_iter;
+// A user's `moruna.Source` subclass (e.6, f.7), 2026-09-29.
+#[cfg(feature = "python")]
+pub mod py_source;
 
 mod util;
 
@@ -37,3 +40,5 @@ pub use stats::SourceStats;
 
 #[cfg(feature = "python")]
 pub use py_iter::PyIteratorSource;
+#[cfg(feature = "python")]
+pub use py_source::PySource;

@@ -17,6 +17,12 @@ parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# A user's `moruna.Sink` subclass (src/py_sink.rs, 08 f.10), the same route `moruna-sources` takes
+# for its Python sources: `pyo3` for the calls and `pyo3-arrow` for the Arrow C Data Interface
+# export of each batch, since this crate has no `unsafe` (section l). Reported as an E2 note: the
+# preamble 6.2 rows for `pyo3` and `pyo3-arrow` do not list component 8 (2026-09-29).
+pyo3 = { workspace = true, optional = true }
+pyo3-arrow = { workspace = true, optional = true }
 
 [dev-dependencies]
 moruna-testkit = { workspace = true }
@@ -25,3 +31,4 @@ bytes = { workspace = true }
 
 [features]
 default = []
+python = ["dep:pyo3", "dep:pyo3-arrow"]

@@ -602,6 +602,8 @@ pub trait Sink: Send + Sync {
 }
 ```
 
+A sink whose output is state it cannot edit (a user's `moruna.Sink`, 08 f.10; 2026-09-29) meets `resume`'s obligation the other way round rather than by discarding: its `checkpoint` records exactly which sequence numbers the state holds, and after `resume` it acknowledges without writing any sequence the restored state already holds when the scheduler delivers it again. The outcome the contract asks for is the same, no sequence reaches the output twice; for such a sink "committed" in `committed_seq` means the write returned, and safety against process loss is the checkpoint's, which is taken under the same lock as the writes. The trait is unchanged.
+
 ### d.9 Reactor
 
 ```rust
@@ -651,6 +653,8 @@ pub trait Reactor: Send + Sync {
     fn write_file(&self, path: &std::path::Path, offset: u64, src: BufferView) -> Completion<()>;
     /// Ranged object read (S3-compatible, GCS, Azure, file://) into `dst`.
     fn read_object(&self, url: &str, offset: u64, dst: Buffer) -> Completion<Buffer>;
+    /// Write an object from a view. An empty view writes an empty object (a sink's
+    /// `_SUCCESS` marker, 08 e.2); it is not skipped as having nothing to do (06 h).
     fn write_object(&self, url: &str, src: BufferView) -> Completion<()>;
     /// DMA between tiers per the reactor's copy table (06 f.5): PinnedHost<->Device via
     /// the copy engine; Disk<->Device via GDS when present. Returns the destination

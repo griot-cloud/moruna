@@ -422,6 +422,14 @@ mod tests {
             },
         };
         assert!(check_sink_not_source(&parquet_sink("s3://b/out/"), &iter).is_ok());
+
+        // A user's `moruna.Source` reads no URL and a user's `moruna.Sink` writes none (07 e.6,
+        // 08 f.10), so neither can collide with anything.
+        assert!(SourceSpec::Python.targets().is_empty());
+        assert_eq!(SinkSpec::Python.target(), "");
+        assert_eq!(SinkSpec::Python.kind_name(), "Sink");
+        assert!(check_sink_not_source(&SinkSpec::Python, &file_source).is_ok());
+        assert!(check_sink_not_source(&parquet_sink("s3://b/out/"), &SourceSpec::Python).is_ok());
     }
 
     #[test]

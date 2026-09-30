@@ -12,6 +12,13 @@ You can use Moruna from Python, where a job is a call to `moruna.run`, or from t
 Read Parquet, tensor files or your own iterator, write the results, and set the budget and other options.
 :::
 
+:::{grid-item-card} Writing your own source or sink
+:link: sources-and-sinks
+:link-type: doc
+
+Read from, or write to, anything Moruna does not support itself, with a Python class of your own.
+:::
+
 :::{grid-item-card} Writing kernels
 :link: kernels
 :link-type: doc
@@ -38,6 +45,7 @@ Run on a laptop, in a container or Kubernetes pod, or in an isolated virtual mac
 :hidden:
 
 python
+sources-and-sinks
 kernels
 command-line
 hosting

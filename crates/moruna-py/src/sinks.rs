@@ -192,8 +192,13 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<(SinkSpec, Vec<String>)> {
             h.notes.clone(),
         ));
     }
+    // A user's `moruna.Sink` subclass (08 f.10).
+    if crate::extend::is_sink(handle)? {
+        return Ok((SinkSpec::Python, Vec::new()));
+    }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "sink must be an moruna.ParquetSink, moruna.TensorSink or moruna.ArrowIpcSink, not {}",
+        "sink must be an moruna.ParquetSink, moruna.TensorSink, moruna.ArrowIpcSink or a \
+         moruna.Sink subclass, not {}",
         type_name(handle)
     )))
 }

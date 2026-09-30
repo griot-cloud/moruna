@@ -189,6 +189,15 @@ pub fn run(
             }
             _ => None,
         }),
+        // A user's `moruna.Source` and `moruna.Sink` (07 e.6, 08 f.10): the objects themselves.
+        python_source: Mutex::new(match source_spec {
+            SourceSpec::Python => Some(source.clone().unbind()),
+            _ => None,
+        }),
+        python_sink: Mutex::new(match sink_spec {
+            SinkSpec::Python => Some(sink.clone().unbind()),
+            _ => None,
+        }),
     };
     let built = map(
         py,
@@ -267,6 +276,7 @@ fn source_doc(source: &SourceSpec) -> SourceDoc {
             },
         },
         SourceSpec::Iterator { .. } => SourceDoc::Iterator,
+        SourceSpec::Python => SourceDoc::Python,
     }
 }
 
@@ -310,6 +320,7 @@ fn sink_doc(sink: &SinkSpec) -> SinkDoc {
                 file_bytes: Some(cfg.file_bytes),
             },
         },
+        SinkSpec::Python => SinkDoc::Python,
     }
 }
 
@@ -350,6 +361,10 @@ struct LibraryLoader {
     /// Entry by entry; `None` for a standard kernel, which the build makes itself.
     kernels: Vec<Option<Arc<PyKernel>>>,
     iterator: Mutex<Option<(Py<PyAny>, SourceSchema)>>,
+    /// A `moruna.Source` subclass instance, taken once by `python_source`.
+    python_source: Mutex<Option<Py<PyAny>>>,
+    /// A `moruna.Sink` subclass instance, taken once by `python_sink`.
+    python_sink: Mutex<Option<Py<PyAny>>>,
 }
 
 impl KernelLoader for LibraryLoader {
@@ -380,6 +395,33 @@ impl KernelLoader for LibraryLoader {
             )?))
         })))
     }
+
+    fn python_source(&self) -> moruna_kernel::Result<moruna_runtime::SourceSpec> {
+        let object = take(&self.python_source, "a moruna.Source")?;
+        // `PySource::new` calls the user's `plan()` at the lifecycle's "sources built" step, so a
+        // plan error surfaces before a sink is opened or a morsel is read (12 f.1).
+        Ok(moruna_runtime::SourceSpec::Build(Box::new(move |ctx| {
+            Ok(Arc::new(moruna_sources::PySource::new(
+                object,
+                ctx.reactor.clone(),
+            )?))
+        })))
+    }
+
+    fn python_sink(&self) -> moruna_kernel::Result<moruna_runtime::SinkSpec> {
+        let object = take(&self.python_sink, "a moruna.Sink")?;
+        Ok(moruna_runtime::SinkSpec::Build(Box::new(move |_ctx| {
+            Ok(Box::new(moruna_sinks::PySink::new(object)?) as Box<dyn moruna_kernel::Sink>)
+        })))
+    }
+}
+
+/// Take the object `moruna.run` was given, once.
+fn take(slot: &Mutex<Option<Py<PyAny>>>, what: &str) -> moruna_kernel::Result<Py<PyAny>> {
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .ok_or_else(|| MorunaError::Plan(format!("{what} was named without its object")))
 }
 
 fn clone_schema(schema: &IteratorSchema) -> IteratorSchema {

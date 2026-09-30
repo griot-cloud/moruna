@@ -154,6 +154,77 @@ fn rt_t2_end_to_end_no_kernels() {
     };
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     assert_eq!(read_back_rows(&out_dir), rows);
+    let marker = std::fs::metadata(out_dir.join("_SUCCESS")).expect("a completed run's marker");
+    assert_eq!(marker.len(), 0, "the marker is empty (08 e.2)");
+}
+
+/// Drive one sink future to completion; the real reactor resolves it from its own threads.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(value) => return value,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// SI-T23 (08 k): a `ParquetSink` over the real reactor, writing to a local directory, leaves an
+/// empty `_SUCCESS` beside its files once `finish` returns, and none before; `SinkSummary.files`
+/// does not list it. The reactor used to resolve the marker's zero-length `write_object` without
+/// writing anything (06 h, RE-T16), so no local run ever had one. e.2, f.5.
+#[test]
+fn si_t23_success_marker_on_a_local_directory() {
+    use moruna_kernel::{Payload, Sink, SourceSchema};
+    let scratch = Scratch::new("si_t23");
+    let out_dir = scratch.path().join("out");
+    let alloc = Arc::new(moruna_testkit::FakeAllocator::new());
+    let reactor = moruna_reactor::Reactor::new(
+        moruna_reactor::ReactorConfig::default(),
+        alloc.clone() as Arc<dyn moruna_kernel::Allocator>,
+    )
+    .expect("the real reactor");
+    let mut sink = moruna_sinks::ParquetSink::new(
+        moruna_sinks::ParquetSinkConfig {
+            url: format!("file://{}", out_dir.display()),
+            row_group_bytes: 64 << 10,
+            file_bytes: 256 << 10,
+            ..Default::default()
+        },
+        reactor.clone(),
+        alloc.clone(),
+    )
+    .expect("the sink");
+    sink.open(&SourceSchema::Table(support::schema()))
+        .expect("open");
+    let marker = out_dir.join("_SUCCESS");
+    for seq in 0..20u64 {
+        let rows = 4_000i64;
+        let ids: arrow::array::Int64Array = (0..rows).map(|i| seq as i64 * rows + i).collect();
+        let values: arrow::array::Int64Array = (0..rows).map(|i| i * 2).collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            support::schema(),
+            vec![Arc::new(ids), Arc::new(values)],
+        )
+        .expect("a batch");
+        block_on(sink.write(seq, Payload::table(batch).expect("a payload"))).expect("write");
+    }
+    assert!(!marker.exists(), "no marker before finish");
+    let summary = sink.finish().expect("finish");
+    assert!(summary.files.len() > 1, "{:?}", summary.files);
+    assert!(
+        !summary.files.iter().any(|f| f == "_SUCCESS"),
+        "the marker is not an output file: {:?}",
+        summary.files
+    );
+    assert_eq!(
+        std::fs::metadata(&marker).expect("the marker exists").len(),
+        0,
+        "and is empty"
+    );
+    assert_eq!(read_back_rows(&out_dir), 80_000);
+    moruna_kernel::Reactor::shutdown(&*reactor);
 }
 
 /// f.7: a run that terminated left a manifest, and a second run resumes from it, keeps the
