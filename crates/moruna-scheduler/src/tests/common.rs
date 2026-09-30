@@ -910,3 +910,45 @@ pub fn quiet_kernel_panics() {
         }));
     });
 }
+
+/// Stops one worker, the first time it gets there, between its pick and its claim, until the
+/// test lets it go. Installed with `Scheduler::test_pick_hook` (the CPU limit tests, f.9's gate).
+pub struct PickGate {
+    worker: u16,
+    /// (arrived, released)
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl PickGate {
+    pub fn new(worker: u16) -> Arc<PickGate> {
+        Arc::new(PickGate {
+            worker,
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub fn at_pick(&self, worker: u16) {
+        if worker != self.worker {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 {
+            return;
+        }
+        state.0 = true;
+        while !state.1 {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    pub fn arrived(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
+    pub fn release(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        self.changed.notify_all();
+    }
+}

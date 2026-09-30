@@ -17,7 +17,7 @@ use moruna_kernel::{
 };
 use moruna_testkit::{FakeKernel, FakeSource};
 
-use super::common::{RigBuilder, wait_for};
+use super::common::{PickGate, RigBuilder, wait_for};
 
 #[test]
 fn cpu_limit_bounds_active() {
@@ -175,48 +175,6 @@ impl Kernel for Held {
         drop(hold);
         self.running.fetch_sub(1, Ordering::SeqCst);
         Ok(input)
-    }
-}
-
-/// Stops one worker, the first time it gets there, between its pick and its claim, until the
-/// test lets it go.
-struct PickGate {
-    worker: u16,
-    /// (arrived, released)
-    state: Mutex<(bool, bool)>,
-    changed: Condvar,
-}
-
-impl PickGate {
-    fn new(worker: u16) -> Arc<PickGate> {
-        Arc::new(PickGate {
-            worker,
-            state: Mutex::new((false, false)),
-            changed: Condvar::new(),
-        })
-    }
-
-    fn at_pick(&self, worker: u16) {
-        if worker != self.worker {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.0 {
-            return;
-        }
-        state.0 = true;
-        while !state.1 {
-            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    fn arrived(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).0
-    }
-
-    fn release(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
-        self.changed.notify_all();
     }
 }
 

@@ -27,12 +27,14 @@ pub(crate) fn probe(shared: &Shared, stage: StageId, bytes: u64) -> Result<Probe
         )));
     }
     shared.probing.store(true, Ordering::SeqCst);
-    shared.gate.store(true, Ordering::SeqCst);
+    shared.close_gate();
     // Every worker that was inside `apply` finishes first; after this nobody but the probing
-    // worker runs anything, because `pick` returns None while the gate is up.
+    // worker runs anything, because `pick` returns None while the gate is up and a worker that
+    // picked before it went up either claimed its slot before (and is waited for here) or is
+    // refused the claim (`slots`).
     wait_for_quiet(shared);
     let outcome = probe_inner(shared, stage, bytes);
-    shared.gate.store(false, Ordering::SeqCst);
+    shared.open_gate();
     shared.probing.store(false, Ordering::SeqCst);
     shared.unpark_all();
     outcome

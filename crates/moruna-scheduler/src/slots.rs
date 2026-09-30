@@ -11,6 +11,12 @@
 //! `cpu_limit_bounds_active`, 2026-09-30). A task running when the bound is lowered keeps its
 //! slot until it ends (parking is between tasks), and until then its slot counts against the
 //! new bound, so the busy count only falls towards it and never climbs back over it.
+//!
+//! The gate lives in the same word, for the same reason. While it is up no claim succeeds, so
+//! the probe, which raises it and then waits for the busy count to reach zero, runs alone: a
+//! worker that passed `pick`'s gate check before the gate went up either claimed before it did,
+//! and is counted in what the probe waits for, or claims after, and is refused (f.9, amended
+//! 2026-09-30).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,6 +25,7 @@ const MASK: u64 = 0xffff;
 const BUSY: u32 = 0;
 const KNOB: u32 = FIELD;
 const CPU: u32 = 2 * FIELD;
+const GATE: u64 = 1 << (3 * FIELD);
 
 fn field(word: u64, at: u32) -> u16 {
     ((word >> at) & MASK) as u16
@@ -61,6 +68,21 @@ impl WorkerSlots {
         field(self.word.load(Ordering::SeqCst), BUSY)
     }
 
+    /// Whether the gate is up.
+    pub(crate) fn gated(&self) -> bool {
+        self.word.load(Ordering::SeqCst) & GATE != 0
+    }
+
+    /// Raise the gate: no claim succeeds from the moment this returns until `open_gate`.
+    pub(crate) fn close_gate(&self) {
+        self.word.fetch_or(GATE, Ordering::SeqCst);
+    }
+
+    /// Lower the gate.
+    pub(crate) fn open_gate(&self) {
+        self.word.fetch_and(!GATE, Ordering::SeqCst);
+    }
+
     /// Store the `workers.active` knob. Every claim after this returns sees it.
     pub(crate) fn set_knob(&self, workers: u16) {
         self.store(KNOB, workers);
@@ -86,13 +108,13 @@ impl WorkerSlots {
         }
     }
 
-    /// Claim a busy slot for `worker`, or `None` when the worker is outside the bound or the
-    /// bound's slots are all held. The slot is released when the returned guard drops.
+    /// Claim a busy slot for `worker`, or `None` when the gate is up, the worker is outside the
+    /// bound or the bound's slots are all held. The slot is released when the returned guard drops.
     pub(crate) fn try_claim(&self, worker: u16) -> Option<BusySlot<'_>> {
         let mut word = self.word.load(Ordering::SeqCst);
         loop {
             let bound = bound(word);
-            if worker >= bound || field(word, BUSY) >= bound {
+            if word & GATE != 0 || worker >= bound || field(word, BUSY) >= bound {
                 return None;
             }
             match self.word.compare_exchange_weak(
@@ -170,10 +192,23 @@ mod unit {
         slots.set_knob(0);
         assert_eq!(slots.active(), 1);
 
-        // The probe's claim ignores the bound and is released like any other.
+        // The gate refuses every claim while it is up, and only while it is up.
+        slots.close_gate();
+        assert!(slots.gated());
+        assert!(slots.try_claim(0).is_none(), "the gate is up");
+        slots.open_gate();
+        assert!(!slots.gated());
+        let after = slots.try_claim(0);
+        assert!(after.is_some(), "the gate is down");
+        drop(after);
+
+        // The probe's claim ignores the bound and the gate and is released like any other.
+        slots.close_gate();
         let probe = slots.claim();
         assert_eq!(slots.busy(), 1);
         drop(probe);
         assert_eq!(slots.busy(), 0);
+        slots.open_gate();
+        assert_eq!(slots.active(), 1, "the gate is not a field of the bound");
     }
 }

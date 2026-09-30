@@ -47,7 +47,7 @@ pub(crate) fn worker_loop(
             let _ = request.reply.send(outcome);
             continue;
         }
-        if !active_slot(&shared, worker) || shared.gate.load(Ordering::SeqCst) {
+        if !active_slot(&shared, worker) || shared.gated() {
             idle(&shared, worker, &parker);
             continue;
         }

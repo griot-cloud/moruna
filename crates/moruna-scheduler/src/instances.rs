@@ -1,8 +1,6 @@
 //! The stateful instance pools: eager creation, affinity, retirement and the resume path
 //! (f.4, f.13, SC-I6).
 
-use std::sync::atomic::Ordering;
-
 use moruna_kernel::{DeviceId, InitCtx, KernelState, MorunaError, Result};
 
 use crate::shared::{JobOutput, Shared, WorkerJob};
@@ -23,9 +21,9 @@ fn device_for(shared: &Shared, index: usize, instance: usize) -> Option<DeviceId
 /// that will own it (f.4). The first `Err` stops the loop and is returned as it is, with nothing
 /// read and nothing written (SC-T18).
 pub(crate) fn init_instances(shared: &Shared) -> Result<()> {
-    shared.gate.store(true, Ordering::SeqCst);
+    shared.close_gate();
     let outcome = init_all(shared);
-    shared.gate.store(false, Ordering::SeqCst);
+    shared.open_gate();
     shared.unpark_all();
     outcome
 }

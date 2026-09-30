@@ -250,8 +250,6 @@ pub(crate) struct Shared {
     pub(crate) cancel: AtomicBool,
     pub(crate) token: Mutex<Option<CancelToken>>,
     pub(crate) stopping: AtomicBool,
-    /// While true no worker picks a task: `init_instances` and the probe run alone (f.4, f.9).
-    pub(crate) gate: AtomicBool,
     pub(crate) probing: AtomicBool,
 
     pub(crate) cursor: Mutex<Cursor>,
@@ -453,7 +451,6 @@ impl Shared {
             cancel: AtomicBool::new(false),
             token: Mutex::new(None),
             stopping: AtomicBool::new(false),
-            gate: AtomicBool::new(false),
             probing: AtomicBool::new(false),
             cursor: Mutex::new(Cursor {
                 split_index: 0,
@@ -641,6 +638,23 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Whether the gate is up: while it is, no worker takes a task, so `init_instances`, a
+    /// restore and the probe run alone (f.4, f.9). It is a bit of the slot word, so a claim
+    /// made after it went up is refused (`slots`).
+    pub(crate) fn gated(&self) -> bool {
+        self.knobs.slots.gated()
+    }
+
+    /// Raise the gate (see `gated`).
+    pub(crate) fn close_gate(&self) {
+        self.knobs.slots.close_gate();
+    }
+
+    /// Lower the gate (see `gated`).
+    pub(crate) fn open_gate(&self) {
+        self.knobs.slots.open_gate();
     }
 
     pub(crate) fn unpark_all(&self) {
