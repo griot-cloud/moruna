@@ -10,7 +10,7 @@ Every keyword argument is optional. This page describes the sources, the sinks a
 
 ## Sources
 
-A source reads the input in pieces that Moruna can size. There are three.
+A source reads the input in pieces that Moruna can size. There are three built in, and you can [write your own](sources-and-sinks.md).
 
 **Parquet.** `moruna.ParquetSource` reads one or more Parquet files, or every file under a directory or prefix:
 
@@ -40,6 +40,8 @@ source = moruna.IteratorSource(fetch_batches(), schema=my_schema)
 
 `schema` is the `pyarrow.Schema` every batch has. Each batch the iterator yields becomes one morsel, so yield batches of a sensible size. An iterator can be read only once, so a job with an iterator source cannot be resumed after it is stopped.
 
+**Your own source.** When you can read part of your data by position, with an offset, a page number or a key range, subclass `moruna.Source` instead. Moruna can then split the work, read ahead and resume. See [Writing your own source or sink](sources-and-sinks.md).
+
 ## Sinks
 
 A sink writes what the last kernel returns.
@@ -49,6 +51,8 @@ A sink writes what the last kernel returns.
 | `moruna.ParquetSink(url)` | Parquet files under a directory or prefix | `row_group_bytes` (default 128 MiB), `file_bytes` (default 1 GiB), `compression` (`zstd`, `snappy`, `gzip`, `lz4` or `none`; default `zstd`) |
 | `moruna.TensorSink(path)` | Tensor files | `format` (`mrb1`, the default, or `safetensors`), `one_file_per_morsel`, `name` |
 | `moruna.ArrowIpcSink(path)` | Arrow IPC files | `file_bytes` |
+
+To write anywhere else, subclass `moruna.Sink`; see [Writing your own source or sink](sources-and-sinks.md).
 
 Moruna refuses to start a job whose sink would write into the files its source reads.
 
@@ -92,4 +96,4 @@ Every Moruna exception is a `moruna.MorunaError`. When a job had started, the ex
 
 Moruna runs morsels in parallel, so by default results reach the sink in the order they finish. With `ordered=True`, the sink receives them in the order the source produced them, at some cost in memory and throughput.
 
-Next: [Writing kernels](kernels.md).
+Next: [Writing your own source or sink](sources-and-sinks.md).
