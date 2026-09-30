@@ -22,6 +22,7 @@ use moruna_kernel::{
 use crate::cputime::{now_ns, thread_cpu_ns};
 use crate::instances;
 use crate::shared::{JobOutput, JobRequest, Shared, WorkerJob};
+use crate::slots::BusySlot;
 
 /// The per-worker loop of e.1: `Parked` -> `Idle` -> `Running(stage, seq)` -> `Idle`.
 pub(crate) fn worker_loop(
@@ -54,7 +55,25 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         };
-        match run_task(&shared, worker, stage, false) {
+        #[cfg(test)]
+        {
+            let hook = shared
+                .pick_hook
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook(worker);
+            }
+        }
+        // SC-I7, G-I5: the active-slot check above is advisory; this claim is the one that
+        // binds. It succeeds only while this worker and the busy count are both under the bound
+        // in force now, so a limit or knob lowered since the check is honoured here.
+        let Some(slot) = shared.knobs.slots.try_claim(worker) else {
+            idle(&shared, worker, &parker);
+            continue;
+        };
+        match run_task(&shared, worker, stage, slot, false) {
             Ok(_) | Err(MorunaError::Cancelled) => {}
             Err(e) => crate::policy::terminate(&shared, e),
         }
@@ -92,7 +111,8 @@ fn run_job(shared: &Shared, worker: u16, job: WorkerJob) -> Result<JobOutput> {
             bytes,
         } => instances::run_restore(shared, worker, stage_ix, instance, &bytes),
         WorkerJob::Probe { stage } => {
-            run_task(shared, worker, stage, true).map(|result| match result {
+            let slot = shared.knobs.slots.claim();
+            run_task(shared, worker, stage, slot, true).map(|result| match result {
                 Some(probe) => JobOutput::Probe(probe),
                 None => JobOutput::Done,
             })
@@ -141,10 +161,12 @@ enum Applied {
 
 /// One task: f.2's body. With `probing` it is also f.9's body, which is the same work with a
 /// peak reset in front, a sample taken before the pop and a `Probe` outcome on the record.
+/// `slot` is the busy slot the caller claimed for it, held until the task's counters are down.
 pub(crate) fn run_task(
     shared: &Shared,
     worker: u16,
     stage: StageId,
+    slot: BusySlot<'_>,
     probing: bool,
 ) -> Result<Option<ProbeResult>> {
     let stage_ix = match (stage as usize).checked_sub(1) {
@@ -212,7 +234,6 @@ pub(crate) fn run_task(
     let rows_in = features.rows;
     let tier_in = payload.tier().index() as u8;
 
-    shared.workers_busy.fetch_add(1, Ordering::SeqCst);
     shared.heartbeat.start_task(worker, stage, seq);
     let q_before = tier_totals(&shared.placement_stats());
 
@@ -354,7 +375,7 @@ pub(crate) fn run_task(
     }
 
     entry.running.fetch_sub(1, Ordering::SeqCst);
-    shared.workers_busy.fetch_sub(1, Ordering::SeqCst);
+    drop(slot);
     emit(shared, record);
 
     if let Some(e) = push_error {

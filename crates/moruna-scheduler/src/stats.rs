@@ -31,7 +31,7 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
         } else {
             shared.knobs.active_workers()
         },
-        workers_busy: shared.workers_busy.load(Ordering::SeqCst),
+        workers_busy: shared.knobs.slots.busy(),
         reads_in_flight: shared.reads_in_flight.load(Ordering::SeqCst),
         writes_in_flight: shared.writes_in_flight.load(Ordering::SeqCst),
         sink_concurrency: shared.cfg.sink_concurrency,

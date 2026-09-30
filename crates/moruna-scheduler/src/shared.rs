@@ -19,6 +19,10 @@ use crate::heartbeat::HeartbeatTable;
 use crate::knobs::KnobState;
 use crate::pipeline::{Pipeline, SchedulerConfig, validate_chain};
 
+/// A test's hook into the worker loop between the pick and the claim (see `Shared::pick_hook`).
+#[cfg(test)]
+pub(crate) type PickHook = Arc<dyn Fn(u16) + Send + Sync>;
+
 /// Where the run is (e.2). Stored as an atomic code so any thread can read it without a lock.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum RunState {
@@ -276,9 +280,12 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_handle: Mutex<Option<JoinHandle<()>>>,
 
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
+    /// The seam the CPU limit tests use: called by a worker after `pick` has named a stage and
+    /// before it claims a busy slot, which is the window a lowered limit must not slip through.
+    #[cfg(test)]
+    pub(crate) pick_hook: RwLock<Option<PickHook>>,
     pub(crate) stats_cache: Mutex<StatsCache>,
 
-    pub(crate) workers_busy: AtomicU16,
     pub(crate) reads_in_flight: AtomicU16,
     pub(crate) writes_in_flight: AtomicU16,
     pub(crate) source_exhausted: AtomicBool,
@@ -475,12 +482,13 @@ impl Shared {
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_handle: Mutex::new(None),
             record_hook: RwLock::new(None),
+            #[cfg(test)]
+            pick_hook: RwLock::new(None),
             stats_cache: Mutex::new(StatsCache {
                 at: Instant::now(),
                 stats: PlacementStats::default(),
                 valid: false,
             }),
-            workers_busy: AtomicU16::new(0),
             reads_in_flight: AtomicU16::new(0),
             writes_in_flight: AtomicU16::new(0),
             source_exhausted: AtomicBool::new(false),

@@ -53,7 +53,7 @@ It refuses to know: where morsel bytes are (placement); how big a morsel should 
 
 **SC-I6. A stateful instance is used by one worker at a time and affinity is preferred.** An instance is acquired under the pool lock; a worker re-acquires the instance it last used when free; every instance is created by `init_instances` before the run and the pool is full from the start (f.4).
 
-**SC-I7. Parking is lossless.** Lowering `active_workers` parks workers only between tasks; a parked worker holds no morsel and no instance.
+**SC-I7. Parking is lossless.** Lowering `active_workers` parks workers only between tasks; a parked worker holds no morsel and no instance. (Amended 2026-09-30.) The workers that take tasks are `min(workers.active, cpu_limit)` at every instant after a lowering is stored, counted: a task already running when the bound falls finishes and holds its busy slot until it ends, so the busy count falls to the new bound and never rises above it again, and no worker starts a task while it is outside the bound or the bound's slots are all held (f.2's claim).
 
 **SC-I8. Errors follow the policy and never panic the pool.** A kernel error or panic is caught on the worker; under `Terminate`, the run enters termination with the diagnostic; under `Skip`, a trace record with `Outcome::Error` is written, the morsel is dropped (and the sink told to skip its seq); under `Budget(n)`, errors 1 to n−1 are skipped and the n-th terminates. Upholds G-I8.
 
@@ -168,6 +168,7 @@ loop:
   heartbeat[w] = now()
   if !active_slot(): park(); continue
   stage = pick()                                     // f.3; None → park 1 ms, continue
+  claim_busy_slot()                                  // SC-I7; refused → park 1 ms, continue
   (morsel, wait_us) = placement.pop_blocking(stage-1, spec[stage], Locality::Any)   // resident by construction of pick, so wait_us is normally 0; None (closed) → continue
   (state, slot) = acquire_instance(stage)            // f.4; NoState for a stateless stage
   t0, c0, s0 = now(), thread_cpu(), sampler.sample()
@@ -181,6 +182,8 @@ loop:
     Err(e)   → apply_policy(e); record(Error)
   loop
 ```
+
+**The claim (amended 2026-09-30).** `active_slot()` at the loop head reads the bound before the pick, so on its own it cannot keep a lowering: a limit lowered between the check and the task let a worker outside the new bound start the task it had picked after the others had parked, and a worker inside it start one while a task from before the lowering still ran, three busy under a limit of two for up to a task's length (`cpu_limit_bounds_active`, once, on a loaded macOS gate). The knob, the CPU limit and the busy count therefore share one atomic word, and after the pick the worker claims a busy slot with a compare-and-swap that succeeds only while its index and the busy count are both below `min(workers.active, cpu_limit)` in that word; `Knobs::set(ActiveWorkers)` and `set_cpu_limit` write the same word, so every claim after a lowering sees it. A refused claim holds nothing (the pop has not happened) and the worker parks for a millisecond and goes round the loop; the slot is released when the task's counters are down, on every path out of the task. `SchedulerStats::workers_busy` is the busy count of that word. The probe's worker (f.9) claims its slot unconditionally, because it runs alone once every other task has ended.
 
 `record` builds the `TraceRecord` (contracts d.13) from `morsel` (features, bytes_in), `out` (bytes_out, rows_out, tier_out), timings, the knob snapshot, `placement_miss_wait_us = wait_us` (the second element `pop_blocking` returned, PL-I9), `state_bytes`, `instance` (the slot index, `u16::MAX` for a stateless stage), `cpu_time_us = c1 − c0`, and the memory fields with these semantics (shared with RC f.4): `mem_anon_before = s0.anon_bytes`, `mem_anon_peak = max(s0.anon_bytes, s1.anon_bytes)`, `throttled_delta_us = s1.throttled_us − s0.throttled_us`, `dev_mem_peak = s1.device_used[d]` for the instance's device (0 otherwise). The sampler's monotonic `peak_anon_bytes` is not used per record; it belongs to the probe (f.9). After `trace.record(r)` the worker calls the installed `RecordHook`, if any, with `&r` (the controller's `on_record`, RC d.1); the hook is cheap by contract and runs on the worker.
 

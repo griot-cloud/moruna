@@ -77,7 +77,7 @@ fn probe_inner(shared: &Shared, stage: StageId, bytes: u64) -> Result<ProbeResul
 /// Wait until no worker is inside `apply`, bounded so a long kernel cannot wedge the call.
 fn wait_for_quiet(shared: &Shared) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while shared.workers_busy.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+    while shared.knobs.slots.busy() > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
 }

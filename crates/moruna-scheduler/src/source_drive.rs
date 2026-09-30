@@ -172,7 +172,7 @@ fn arena_admits(shared: &Shared, inflight: &[InFlight<'_>], charge: u64) -> bool
     }
     inflight.is_empty()
         && shared.writes_in_flight.load(Ordering::SeqCst) == 0
-        && shared.workers_busy.load(Ordering::SeqCst) == 0
+        && shared.knobs.slots.busy() == 0
         && (0..=shared.last_queue()).all(|stage| shared.queue_count(stage) == 0)
 }
 
