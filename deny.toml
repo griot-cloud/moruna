@@ -70,6 +70,12 @@ ignore = [
   # reactor first enables an object-store backend. See issue #9.
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
+  # paste 1.0.15 is archived by its author (unmaintained, not a vulnerability). It
+  # came in with Vortex 0.86.1 on 2026-09-30, approved by Brackly: a compile-time
+  # macro only, reached only through vortex-array and vortex-fastlanes, with no
+  # maintained alternative the Vortex crates accept. Re-decided when the vortex pin
+  # moves.
+  { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15, archived: a compile-time macro only, reached only through vortex-array and vortex-fastlanes (vortex 0.86.1), with no maintained alternative Vortex accepts; approved by Brackly 2026-09-30, re-decided when the vortex pin moves" },
 ]
 
 [licenses]
@@ -109,6 +115,18 @@ allow = ["BSL-1.0"]
 [[licenses.exceptions]]
 crate = "libbz2-rs-sys"
 allow = ["bzip2-1.0.6"]
+
+# enum-iterator and enum-iterator-derive are 0BSD only (BSD Zero Clause: public
+# domain equivalent, no attribution requirement, more permissive than MIT). They
+# came in with Vortex 0.86.1 on 2026-09-30, approved by Brackly, through
+# vortex-array. 0BSD is granted to these two crates only, not to the allow list.
+[[licenses.exceptions]]
+crate = "enum-iterator"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+crate = "enum-iterator-derive"
+allow = ["0BSD"]
 
 # ar_archive_writer and target-lexicon are "Apache-2.0 WITH LLVM-exception"
 # only, which the allow list above already covers; they need no exception and

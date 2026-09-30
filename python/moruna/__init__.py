@@ -1,7 +1,7 @@
 """Moruna: a memory-aware runtime for data and tensor pipelines (component 12, SDD 12).
 
-Four constructors, one decorator and one function (and two base classes, ``moruna.Source`` and
-``moruna.Sink``, for a source or a sink of your own)::
+Constructors for each source and sink, one decorator and one function (and two base classes,
+``moruna.Source`` and ``moruna.Sink``, for a source or a sink of your own)::
 
     import moruna, pyarrow as pa
 
@@ -51,6 +51,8 @@ from moruna._core import (
     StdKernel,
     TensorSink,
     TensorSource,
+    VortexSink,
+    VortexSource,
     inspect_host,
 )
 
@@ -77,6 +79,8 @@ __all__ = [
     "StdKernel",
     "TensorSink",
     "TensorSource",
+    "VortexSink",
+    "VortexSource",
     "__version__",
     "inspect_host",
     "kernel",

@@ -100,7 +100,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
   "moruna_spec": 1,
   "run_id": "01J…",                      // host-assigned; default: generated
   "source": {
-    "kind": "parquet",                     // parquet | tensor | datafusion | iterator | python (the last two library only)
+    "kind": "parquet",                     // parquet | vortex | tensor | datafusion | iterator | python (the last two library only)
     "url": "file:///data/raw/events/",     // or s3://…, gs://…; see object_store
     "options": {}
   },
@@ -110,7 +110,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
       "expected_amplification": 1.5, "releases_gil": true },
     { "kind": "rust",   "crate": "…", "symbol": "…" }                // reserved
   ],
-  "sink":   { "kind": "parquet", "url": "file:///data/refined/events/" },
+  "sink":   { "kind": "parquet", "url": "file:///data/refined/events/" },   // parquet | vortex | tensor | arrow_ipc | peql
   "budget": {
     "memory_bytes": null,                  // null: discover
     "cpu": null,

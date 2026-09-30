@@ -1,4 +1,4 @@
-//! The sink handles: `ParquetSink`, `TensorSink`, `ArrowIpcSink` (d.2).
+//! The sink handles: `ParquetSink`, `VortexSink`, `TensorSink`, `ArrowIpcSink` (d.2).
 //!
 //! Each is a frozen `#[pyclass]` (PY-I7) holding the configuration component 8 builds from. The
 //! two sizes a user may pass, `row_group_bytes` and `file_bytes`, are rows of the preamble's
@@ -7,7 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use moruna_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorFormat, TensorSinkConfig};
+use moruna_sinks::{
+    ArrowIpcSinkConfig, ParquetSinkConfig, TensorFormat, TensorSinkConfig, VortexSinkConfig,
+};
 use parquet::basic::{Compression, ZstdLevel};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
@@ -81,6 +83,37 @@ impl PyParquetSink {
 
     fn __repr__(&self) -> String {
         format!("ParquetSink({})", self.cfg.url)
+    }
+}
+
+/// A sink that writes Vortex files under a prefix (08 f.11).
+#[pyclass(frozen, module = "moruna._core", name = "VortexSink")]
+pub struct PyVortexSink {
+    pub(crate) cfg: VortexSinkConfig,
+    pub(crate) notes: Vec<String>,
+}
+
+#[pymethods]
+impl PyVortexSink {
+    #[new]
+    #[pyo3(signature = (url, *, file_bytes = None))]
+    fn new(url: String, file_bytes: Option<&Bound<'_, PyAny>>) -> PyResult<PyVortexSink> {
+        let mut notes = Vec::new();
+        let file_bytes = match file_bytes {
+            Some(v) => clamp_file_bytes(size(v, "sink.file_bytes")?, &mut notes),
+            None => 1 << 30,
+        };
+        Ok(PyVortexSink {
+            cfg: VortexSinkConfig {
+                url: local_url(url),
+                file_bytes,
+            },
+            notes,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("VortexSink({})", self.cfg.url)
     }
 }
 
@@ -170,6 +203,10 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<(SinkSpec, Vec<String>)> {
             h.notes.clone(),
         ));
     }
+    if let Ok(v) = handle.cast::<PyVortexSink>() {
+        let h = v.get();
+        return Ok((SinkSpec::Vortex(h.cfg.clone()), h.notes.clone()));
+    }
     if let Ok(t) = handle.cast::<PyTensorSink>() {
         let h = t.get();
         return Ok((
@@ -197,8 +234,8 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<(SinkSpec, Vec<String>)> {
         return Ok((SinkSpec::Python, Vec::new()));
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "sink must be an moruna.ParquetSink, moruna.TensorSink, moruna.ArrowIpcSink or a \
-         moruna.Sink subclass, not {}",
+        "sink must be a moruna.ParquetSink, moruna.VortexSink, moruna.TensorSink, \
+         moruna.ArrowIpcSink or a moruna.Sink subclass, not {}",
         type_name(handle)
     )))
 }
@@ -233,9 +270,10 @@ fn parse_compression(name: &str) -> PyResult<Compression> {
     })
 }
 
-/// Add the three sink classes to the module.
+/// Add the four sink classes to the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyParquetSink>()?;
+    m.add_class::<PyVortexSink>()?;
     m.add_class::<PyTensorSink>()?;
     m.add_class::<PyArrowIpcSink>()?;
     Ok(())

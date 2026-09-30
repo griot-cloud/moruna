@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+Vortex files as a source and a sink, with no decode copy for columns stored in a canonical encoding.
+
+- **Vortex as a source.** `moruna.VortexSource(paths_or_prefix, columns=None, split_bytes=None)` and the Rust `VortexSource` read Vortex files, local or in an object store. The plan comes from the files' zone maps, so a split is a run of whole 8,192-row zones of about 128 MiB, its row and null counts are the file's own, and a fixed-width column's bytes are exact. A column the writer left in a canonical encoding is returned in the very arena buffer the reactor read it into, with no decode copy at all; compressed columns are decoded and copied into the arena once, as Parquet columns are. A read of any row range of any split is exact and repeatable, so runs over it can resume and spill.
+- **Vortex as a sink.** `moruna.VortexSink(prefix, file_bytes=None)` and the Rust `VortexSink` write rolling `part-00000.vortex` files encoded straight into the arena, with the Parquet sink's commit, checkpoint and resume: a run killed in the middle of a file resumes and writes each row exactly once. A file rolls when the rows pushed into it reach the roll size, so `file_bytes` is a firm upper bound and a file of compressible data comes out smaller.
+- The job document accepts `"kind": "vortex"` for the source (`options`: `columns`, `split_bytes`) and the sink (`options`: `file_bytes`).
+- Adds the `vortex` 0.86.1 crates to the build (E2, 2026-09-29), with two supply-chain exceptions scoped to them: the 0BSD licence of `enum-iterator` and `enum-iterator-derive`, and the unmaintained-crate advisory for `paste`, a compile-time macro they use.
+
 ## 0.3.0
 
 Sources and sinks of your own, written in Python, and correctness fixes across resume, the controller, the scheduler and Linux memory accounting, with a publish gate that ships only what was tested.

@@ -10,7 +10,7 @@ Every keyword argument is optional. This page describes the sources, the sinks a
 
 ## Sources
 
-A source reads the input in pieces that Moruna can size. There are three built in, and you can [write your own](sources-and-sinks.md).
+A source reads the input in pieces that Moruna can size. There are four built in, and you can [write your own](sources-and-sinks.md).
 
 **Parquet.** `moruna.ParquetSource` reads one or more Parquet files, or every file under a directory or prefix:
 
@@ -25,6 +25,18 @@ source = moruna.ParquetSource(
 `columns` limits the read to the columns you name. Columns you leave out are never decoded and never use memory, so naming them is the simplest way to make a wide dataset cheaper to process.
 
 `filters` skips whole row groups that cannot contain a match. Each filter is a column, an operator (`>`, `<` or `==`) and a value, checked against the statistics Parquet stores for each row group. Rows that do not match can still arrive in groups that were not skipped, so apply the exact condition in a kernel as well. Filters help most when the data is sorted or clustered on the filtered column.
+
+**Vortex.** `moruna.VortexSource` reads one or more [Vortex](https://github.com/vortex-data/vortex) files, or every `.vortex` file under a directory or prefix:
+
+```python
+source = moruna.VortexSource("s3://acme-data/events/", columns=["event_id", "text"])
+```
+
+`columns` works as it does for Parquet. The columns come back in the order the file stores them, and text columns come back as ordinary `pyarrow.string()` columns.
+
+Moruna plans the work from the statistics a Vortex file keeps for every 8,192 rows, so it knows each piece's row count and null count before it reads anything. `split_bytes` sets how large each piece is, about 128 MiB by default.
+
+When Vortex has stored a column uncompressed, because no encoding made it smaller, that column reaches your kernel without being copied: Moruna reads it from disk into its own memory and hands the kernel those same bytes. A compressed column is decompressed and then copied into Moruna's memory once, as a Parquet column is. Either way the memory counts against the budget.
 
 **Tensor files.** `moruna.TensorSource` reads safetensors files, or files in Moruna's aligned binary format, and passes each tensor to kernels that declare `accepts="tensor"`. Name the files, not a directory:
 
@@ -49,8 +61,11 @@ A sink writes what the last kernel returns.
 | Sink | Writes | Options |
 | --- | --- | --- |
 | `moruna.ParquetSink(url)` | Parquet files under a directory or prefix | `row_group_bytes` (default 128 MiB), `file_bytes` (default 1 GiB), `compression` (`zstd`, `snappy`, `gzip`, `lz4` or `none`; default `zstd`) |
+| `moruna.VortexSink(url)` | Vortex files under a directory or prefix | `file_bytes` (default 1 GiB) |
 | `moruna.TensorSink(path)` | Tensor files | `format` (`mrb1`, the default, or `safetensors`), `one_file_per_morsel`, `name` |
 | `moruna.ArrowIpcSink(path)` | Arrow IPC files | `file_bytes` |
+
+`moruna.VortexSink` writes files named `part-00000.vortex`, `part-00001.vortex` and so on, then an empty `_SUCCESS` file when the job completes. A file is closed when the data written into it reaches `file_bytes`, so no file is larger than that, and a file of data that compresses well is smaller. A job writing to a `VortexSink` can be resumed like one writing to a `ParquetSink`: every row is written exactly once.
 
 To write anywhere else, subclass `moruna.Sink`; see [Writing your own source or sink](sources-and-sinks.md).
 

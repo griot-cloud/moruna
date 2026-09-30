@@ -6,7 +6,7 @@ resolver = "3"
 members = ["bench", "crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -15,22 +15,22 @@ publish = false
 
 [workspace.dependencies]
 # Workspace crates (preamble 6.1; the crate graph is preamble 1.3).
-moruna-kernel = { path = "crates/moruna-kernel", version = "0.3.0" }
-moruna-arena = { path = "crates/moruna-arena", version = "0.3.0" }
-moruna-discovery = { path = "crates/moruna-discovery", version = "0.3.0" }
-moruna-trace = { path = "crates/moruna-trace", version = "0.3.0" }
-moruna-adapters = { path = "crates/moruna-adapters", version = "0.3.0" }
-moruna-reactor = { path = "crates/moruna-reactor", version = "0.3.0" }
-moruna-sources = { path = "crates/moruna-sources", version = "0.3.0" }
-moruna-sinks = { path = "crates/moruna-sinks", version = "0.3.0" }
-moruna-placement = { path = "crates/moruna-placement", version = "0.3.0" }
-moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.3.0" }
-moruna-controller = { path = "crates/moruna-controller", version = "0.3.0" }
-moruna-runtime = { path = "crates/moruna-runtime", version = "0.3.0" }
-moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.3.0" }
-moruna-testkit = { path = "crates/moruna-testkit", version = "0.3.0" }
-moruna-vmm = { path = "crates/moruna-vmm", version = "0.3.0" }
-moruna-kernels = { path = "crates/moruna-kernels", version = "0.3.0" }
+moruna-kernel = { path = "crates/moruna-kernel", version = "0.3.1" }
+moruna-arena = { path = "crates/moruna-arena", version = "0.3.1" }
+moruna-discovery = { path = "crates/moruna-discovery", version = "0.3.1" }
+moruna-trace = { path = "crates/moruna-trace", version = "0.3.1" }
+moruna-adapters = { path = "crates/moruna-adapters", version = "0.3.1" }
+moruna-reactor = { path = "crates/moruna-reactor", version = "0.3.1" }
+moruna-sources = { path = "crates/moruna-sources", version = "0.3.1" }
+moruna-sinks = { path = "crates/moruna-sinks", version = "0.3.1" }
+moruna-placement = { path = "crates/moruna-placement", version = "0.3.1" }
+moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.3.1" }
+moruna-controller = { path = "crates/moruna-controller", version = "0.3.1" }
+moruna-runtime = { path = "crates/moruna-runtime", version = "0.3.1" }
+moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.3.1" }
+moruna-testkit = { path = "crates/moruna-testkit", version = "0.3.1" }
+moruna-vmm = { path = "crates/moruna-vmm", version = "0.3.1" }
+moruna-kernels = { path = "crates/moruna-kernels", version = "0.3.1" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -89,6 +89,11 @@ hyper-util = { version = "=0.1.20", default-features = false }
 http = { version = "=1.5.0" }
 http-body-util = { version = "=0.1.5" }
 socket2 = { version = "=0.6.5" }
+# The Vortex file format as a source and a sink (07 SO-O1, 08 SK-O1): the facade crate with its
+# file reader and writer only (no wasm, no cloud registry, no memmap). Added under E2 on
+# 2026-09-29 by the PM on Brackly's approval; `arrow` ^59.2 and `object_store` ^0.13.2 inside it
+# resolve to the pins above, so the graph keeps one arrow.
+vortex = { version = "=0.86.1", default-features = false, features = ["files"] }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON. Already
 # in the graph through the engine bridges at this version, so the pin adds no second copy.
 sha2 = { version = "=0.11.0" }

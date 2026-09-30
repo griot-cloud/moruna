@@ -451,7 +451,8 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `arc-swap` | 3 | the one-writer, many-reader cell `LimitsWatch` publishes the current `Limits` into and the sampler reads (MH 4.4) | added by F8.2 |
 | `sha2` | 5, runtime, `moruna-kernels`, `moruna-vmm` | the job document's content address (MH 4.1), the `hash` standard kernel, guest image digests | already in the graph through the engine bridges |
 | `peql` | `moruna-datafusion`, runtime, 12 | the contract-native engine on both ends of a run: a governed plan as a source, a contract write as a sink (MH 4.5) | git dependency pinned by revision; feature `peql`; peQL never depends on Moruna |
-| `futures` | `moruna-datafusion` | streams of record batches out of a DataFusion plan | already in the graph through `datafusion` |
+| `futures` | `moruna-datafusion`, 7 | streams of record batches out of a DataFusion plan; the channels of the Vortex source's byte path (07 f.8) | already in the graph through `datafusion` and `vortex` |
+| `vortex` | 7, 8 | the Vortex file format as a source (07 e.7, e.8) and a sink (08 f.11): footer, layout and zone-map reads, scans, the writer | `default-features = false, features = ["files"]` (no wasm, no zstd, no cloud registry, no memmap); its `arrow` ^59.2 and `object_store` ^0.13.2 resolve to the pins here, so the graph keeps one arrow; it brings 113 crates into the lock file; two findings of `cargo deny` are its own, and `deny.toml` grants each one to the crates that need it and to nothing else (approved by Brackly, 2026-09-30): a `[[licenses.exceptions]]` entry allowing 0BSD (public-domain equivalent, more permissive than MIT) for `enum-iterator` and one for `enum-iterator-derive`, and an `ignore` entry for RUSTSEC-2024-0436, `paste` unmaintained (a compile-time macro, reached only through `vortex-array` and `vortex-fastlanes`). Added under E2 on 2026-09-29 by the PM on Brackly's approval |
 | `hyper`, `hyper-util`, `http`, `http-body-util`, `socket2` | 6, runtime (dev) | object storage through a Unix or vsock socket: HTTP/1.1 over a stream for `object_store`'s S3 client (MH 4.6) | already in the graph through `object_store`; `default-features = false` on `hyper` and `hyper-util` |
 | `kvm-ioctls`, `kvm-bindings`, `vmm-sys-util` | `moruna-vmm` | KVM: the VM, memory slots, irqchip, vCPUs (MH 4.8) | Linux only; `kvm-bindings` with `fam-wrappers` |
 | `vm-memory`, `virtio-queue`, `virtio-bindings`, `vm-superio`, `linux-loader` | `moruna-vmm` | guest memory, split virtqueues, the virtio constants, the serial console, loading the guest kernel (MH 4.8) | the rust-vmm crates; `vm-memory` with `backend-mmap`, `linux-loader` with `bzimage`, `elf`, `pe` |
@@ -485,7 +486,7 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `vm-memory` | 0.18.0 | `virtio-queue` | 0.18.0 |
 | `virtio-bindings` | 0.2.7 | `vm-superio` | 0.8.2 |
 | `linux-loader` | 0.14.0 | `vm-fdt` | 0.3.0 |
-| `acpi_tables` | 0.2.1 | | |
+| `acpi_tables` | 0.2.1 | `vortex` | 0.86.1 (E2, 2026-09-29: the newest release; it builds on 1.98.1 and declares `rust-version = 1.95`) |
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 

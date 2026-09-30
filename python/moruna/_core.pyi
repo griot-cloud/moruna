@@ -18,6 +18,15 @@ class ParquetSource:
         filters: Sequence[tuple[str, str, Any]] | None = ...,
     ) -> None: ...
 
+class VortexSource:
+    def __init__(
+        self,
+        urls: str | Sequence[str],
+        *,
+        columns: Sequence[str] | None = ...,
+        split_bytes: int | None = ...,
+    ) -> None: ...
+
 class TensorSource:
     def __init__(
         self, paths: str | Sequence[str], *, tensors: Sequence[str] | None = ...
@@ -35,6 +44,9 @@ class ParquetSink:
         file_bytes: int | str | None = ...,
         compression: str = ...,
     ) -> None: ...
+
+class VortexSink:
+    def __init__(self, url: str, *, file_bytes: int | str | None = ...) -> None: ...
 
 class TensorSink:
     def __init__(

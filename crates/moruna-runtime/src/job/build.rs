@@ -11,10 +11,11 @@ use moruna_kernel::{
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 use moruna_sinks::{
     ArrowIpcSink, ArrowIpcSinkConfig, ParquetSink, ParquetSinkConfig, TensorFormat, TensorSink,
-    TensorSinkConfig,
+    TensorSinkConfig, VortexSink, VortexSinkConfig,
 };
 use moruna_sources::{
     ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue, TensorSource, TensorSourceConfig,
+    VortexSource, VortexSourceConfig,
 };
 use parquet::basic::{Compression, ZstdLevel};
 
@@ -68,7 +69,7 @@ pub trait KernelLoader {
         Err(SpecError::new(
             "source.kind",
             "`iterator` names a Python iterable in the caller's process and is library only; a \
-             document names a parquet or tensor source",
+             document names a parquet, vortex or tensor source",
         )
         .into())
     }
@@ -467,6 +468,40 @@ fn source_of(
                 None,
             ))
         }
+        SourceDoc::Vortex { url, options } => {
+            if url.0.is_empty() {
+                return Err(
+                    SpecError::new("source.url", "empty: a source needs at least one url").into(),
+                );
+            }
+            if options.split_bytes == Some(0) {
+                return Err(SpecError::new(
+                    "source.options.split_bytes",
+                    "0: a split holds at least one zone",
+                )
+                .into());
+            }
+            let cfg = VortexSourceConfig {
+                urls: url.0.clone(),
+                columns: options.columns.clone(),
+                split_bytes: options.split_bytes,
+            };
+            let targets = url.0.clone();
+            Ok((
+                SourceSpec::Build(Box::new(move |ctx| {
+                    let meta = ctx.object_metadata()?;
+                    // With the arena, so an object URL's footer and zone maps can be read.
+                    Ok(Arc::new(VortexSource::with_allocator(
+                        cfg,
+                        ctx.reactor.clone(),
+                        meta,
+                        ctx.alloc.clone(),
+                    )?) as Arc<dyn Source>)
+                })),
+                targets,
+                None,
+            ))
+        }
         SourceDoc::Iterator => Ok((loader.iterator_source()?, Vec::new(), None)),
         SourceDoc::Python => Ok((loader.python_source()?, Vec::new(), None)),
         SourceDoc::Datafusion {
@@ -578,6 +613,29 @@ fn sink_of(
                     )?) as Box<dyn moruna_kernel::Sink>)
                 })),
                 url.clone(),
+                None,
+            ))
+        }
+        SinkDoc::Vortex { url, options } => {
+            let url = translate::local_url(url);
+            let file_bytes = translate::clamp_file_bytes(
+                options.file_bytes.unwrap_or(translate::DEFAULT_FILE_BYTES),
+                notes,
+            );
+            let target = url.clone();
+            Ok((
+                SinkSpec::Build(Box::new(move |ctx| {
+                    // As for Parquet: the sink encodes each file in the arena, in one of two
+                    // buffers, which together are the share the facade sets aside for it.
+                    let cfg = VortexSinkConfig {
+                        url,
+                        file_bytes: file_bytes.min(ctx.claim_file_buffer() / 2),
+                    };
+                    let sink = VortexSink::new(cfg, ctx.reactor.clone(), ctx.alloc.clone())?
+                        .with_run_id(ctx.run_id);
+                    Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
+                })),
+                target,
                 None,
             ))
         }

@@ -44,6 +44,12 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 {"kind": "parquet", "url": "s3://acme-data/reviews/", "options": {"columns": ["review_id", "text"]}}
 ```
 
+**`vortex`**: `url` is a path, a URL or a list of them; a directory or prefix is read for its `.vortex` files. `options.columns` lists the columns to read, and `options.split_bytes` sets the size each piece of work is cut toward (default 128 MiB).
+
+```json
+{"kind": "vortex", "url": "s3://acme-data/events/", "options": {"columns": ["event_id", "text"]}}
+```
+
 **`tensor`**: `url` is a path or a list of paths to safetensors or aligned binary tensor files; `options.tensors` lists the tensors to read.
 
 **`datafusion`**: a query planned by peQL for a caller. `root` is the peQL workspace; exactly one of `contract`, to read one contract, or `sql`, a query over contracts; and `caller`, the caller as peQL reads it, with `id`, `tenant` and `purpose` and optionally `tier`, `clearance`, `classification`, `roles`, `now` and `other`. See the [peQL documentation](https://griot-cloud.github.io/peQL/).
@@ -72,6 +78,8 @@ Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refus
 ## sink
 
 **`parquet`**: `url` is a directory or prefix. `options.row_group_bytes` (default 128 MiB), `options.file_bytes` (default 1 GiB) and `options.compression`: `zstd` (default), `snappy`, `gzip`, `lz4` or `none`.
+
+**`vortex`**: `url` is a directory or prefix. `options.file_bytes` (default 1 GiB) is the most a file may hold.
 
 **`tensor`**: `url` is a directory. `options.format` is `mrb1` (default) or `safetensors`; `options.one_file_per_morsel` and `options.name` (default `tensor`).
 
