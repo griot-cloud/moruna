@@ -465,8 +465,18 @@ fn drive(
 
     // 6. Kernels built: bind the arena, walk the chain, build the controller's view of them.
     #[cfg(feature = "python")]
-    for (_, py_kernel) in &py_kernels {
-        py_kernel.bind_allocator(alloc.clone());
+    {
+        // 05 f.9, E13: one gate for the run, bound to every Python kernel; it refuses only for
+        // those whose decorator left `memory_guard` on, and counting needs none.
+        let gate = (!py_kernels.is_empty()).then(|| {
+            moruna_adapters::guard::MemoryGate::new(sampler.clone(), limits.memory_ceiling)
+        });
+        for (_, py_kernel) in &py_kernels {
+            py_kernel.bind_allocator(alloc.clone());
+            if let Some(gate) = &gate {
+                py_kernel.bind_gate(gate.clone());
+            }
+        }
     }
     let schemas = chain_schemas(source.schema(), &kernels)?;
     let kernel_infos: Vec<KernelInfo> = kernels

@@ -139,6 +139,9 @@ fn ck_t1_h13_a_kernel_that_disagrees_is_refused_naming_the_column() {
     assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
     assert_eq!(report.batches.len(), 5);
     assert_eq!(report.trace_records, 5, "one trace record per batch");
+    // PY-T21 (E13): a Rust kernel is not counted by the allocator guard, and says so.
+    assert!(report.alloc.is_none() && report.memory_guard.is_none());
+    assert!(report.to_json()["alloc"].is_null());
 }
 
 #[test]

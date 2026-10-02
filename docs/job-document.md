@@ -65,7 +65,7 @@ An `iterator` source exists only in Python and is refused in a document.
 
 Each entry has a `kind`.
 
-**`python`**: `module` is a module name or a path to a `.py` file, and `callable` is the name of the kernel in it, dotted for a nested name. The decorator's options can be given here as well: `stateful`, `instances`, `accepts`, `tier`, `device_memory`, `releases_gil`, `expected_amplification`, `preferred_rows`, `resume` and `state_bytes`.
+**`python`**: `module` is a module name or a path to a `.py` file, and `callable` is the name of the kernel in it, dotted for a nested name. The decorator's options can be given here as well: `stateful`, `instances`, `accepts`, `tier`, `device_memory`, `releases_gil`, `expected_amplification`, `preferred_rows`, `resume`, `state_bytes` and `memory_guard`.
 
 **`std`**: `name` is a standard kernel, such as `"filter"`, and `args` is an object of its arguments.
 

@@ -169,6 +169,7 @@ def kernel(
     input_schema: Any = None,
     output_schema: Any = None,
     lockfile: Any = None,
+    memory_guard: bool = True,
 ) -> Any:
     """Turn a callable or a class instance into a kernel.
 
@@ -184,6 +185,13 @@ def kernel(
     column to type is a subset, and an output mapping whose keys are only ``adds``, ``drops`` and
     ``changes`` is relative to the input. ``lockfile`` (a path or bytes) is folded into the
     fingerprint, so a kernel whose dependencies change is a different kernel.
+
+    ``memory_guard`` (default on): while the kernel runs, a single request for memory (a NumPy
+    array, a Python object) that would take the process past its memory ceiling is refused
+    before the memory exists; the kernel sees ``MemoryError`` and the run ends with a budget
+    error naming the kernel and the request, rather than being killed. ``memory_guard=False``
+    turns refusal off for this kernel; what it asks for is still counted and reported per
+    kernel in the run report's ``stages[..]["alloc"]``.
 
     A function annotated ``pl.DataFrame -> pl.DataFrame`` (or ``pl.LazyFrame``) is a Polars
     kernel: the batch reaches it as a Polars frame through the Arrow C data interface, and the
@@ -213,6 +221,7 @@ def kernel(
             output_schema=_declare.declaration(output_schema, "output_schema"),
             lockfile=_declare.lockfile_bytes(lockfile),
             origin=origin,
+            memory_guard=memory_guard,
         )
 
     if fn is None:

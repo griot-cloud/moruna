@@ -52,6 +52,12 @@ impl PyKernelHandle {
         self.stateful
     }
 
+    /// Whether the allocator guard may refuse this kernel's requests (`memory_guard=`, E13).
+    #[getter]
+    fn memory_guard(&self) -> bool {
+        self.kernel.memory_guard()
+    }
+
     /// The kernel's fingerprint as 64 lowercase hexadecimal characters (05 e.4).
     #[getter]
     fn fingerprint(&self) -> String {
@@ -94,6 +100,7 @@ pub fn build(
     declared: Declared,
     lockfile: Option<Vec<u8>>,
     origin: Option<&Bound<'_, PyAny>>,
+    memory_guard: bool,
 ) -> PyResult<PyKernelHandle> {
     if !obj.is_callable() && !stateful {
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -117,6 +124,7 @@ pub fn build(
         declared,
         lockfile,
         origin: origin.map(|o| o.clone().unbind()),
+        memory_guard,
     };
     let kernel = PyKernel::new(spec).map_err(|e| to_py_err(py, &e, Attachments::default()))?;
     Ok(PyKernelHandle {
@@ -210,6 +218,7 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stag
                 Declared::default(),
                 None,
                 None,
+                true,
             )?;
             out.push(Stage::Py(handle.kernel));
             continue;
@@ -265,7 +274,8 @@ fn declaration(py: Python<'_>, value: Option<&Bound<'_, PyAny>>) -> PyResult<Opt
                     accepts = "table", tier = "host", releases_gil = None,
                     expected_amplification = None, preferred_rows = None,
                     resume = "reinit", state_bytes = None, input_schema = None,
-                    output_schema = None, lockfile = None, origin = None))]
+                    output_schema = None, lockfile = None, origin = None,
+                    memory_guard = true))]
 #[allow(clippy::too_many_arguments)]
 pub fn build_kernel(
     py: Python<'_>,
@@ -284,6 +294,7 @@ pub fn build_kernel(
     output_schema: Option<&Bound<'_, PyAny>>,
     lockfile: Option<&Bound<'_, pyo3::types::PyBytes>>,
     origin: Option<&Bound<'_, PyAny>>,
+    memory_guard: bool,
 ) -> PyResult<PyKernelHandle> {
     let lockfile = lockfile.map(|b| b.as_bytes().to_vec());
     let declared = Declared {
@@ -306,6 +317,7 @@ pub fn build_kernel(
         declared,
         lockfile,
         origin,
+        memory_guard,
     )
 }
 

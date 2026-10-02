@@ -64,6 +64,9 @@ pub struct CheckOptions {
     pub profiles_dir: Option<PathBuf>,
     /// A Python kernel's GIL state; `None` for a kernel that never enters the interpreter.
     pub gil: Option<GilState>,
+    /// A Python kernel's `memory_guard` (05 AD-I10, E13): whether a run would refuse its
+    /// requests past the ceiling; `None` for a kernel the allocator guard does not see.
+    pub memory_guard: Option<bool>,
     /// Called once with the arena before the first batch, for a kernel that needs the
     /// allocator bound (a Python kernel's `bind_allocator`, 05 d.1).
     pub bind: Option<Bind>,
@@ -79,6 +82,7 @@ impl CheckOptions {
             seed: 0,
             profiles_dir: None,
             gil: None,
+            memory_guard: None,
             bind: None,
         }
     }
@@ -176,6 +180,11 @@ pub struct CheckReport {
     pub seed: u64,
     /// Trace records written, one per batch run (MH 4.9).
     pub trace_records: u64,
+    /// What the kernel asked for over the batches, per source, from the trace records' `alloc`
+    /// exactly as the run report computes a stage's (04 f.2; E13); `None` when nothing counted.
+    pub alloc: Option<moruna_trace::StageAlloc>,
+    /// The kernel's `memory_guard`, when it has one (`CheckOptions::memory_guard`).
+    pub memory_guard: Option<bool>,
     /// Anything else worth saying.
     pub notes: Vec<String>,
 }
@@ -267,6 +276,8 @@ impl CheckReport {
             "refusals": refusals,
             "profile": profile,
             "trace_records": self.trace_records,
+            "memory_guard": self.memory_guard,
+            "alloc": self.alloc.as_ref().and_then(|a| serde_json::to_value(a).ok()),
             "notes": self.notes,
         })
     }
@@ -307,6 +318,23 @@ impl CheckReport {
                 (None, _) => {}
             }
         }
+        if let Some(a) = &self.alloc {
+            let outside = a
+                .outside_arrow_fraction
+                .map(|x| format!(", {:.1}% of it outside Arrow", x * 100.0))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  allocations: refusal {}, peak {} bytes{outside}; python {} bytes in {}, numpy {} bytes in {}, arrow {} bytes in {}\n",
+                if self.memory_guard.unwrap_or(a.refusal_on) { "on" } else { "off" },
+                a.peak_bytes,
+                a.python.requested_bytes,
+                a.python.requests,
+                a.numpy.requested_bytes,
+                a.numpy.requests,
+                a.arrow.requested_bytes,
+                a.arrow.requests,
+            ));
+        }
         for note in &self.notes {
             out.push_str(&format!("  note: {note}\n"));
         }
@@ -324,6 +352,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         seed,
         profiles_dir,
         gil,
+        memory_guard,
         bind,
     } = opts;
     let fingerprint = kernel.fingerprint();
@@ -337,6 +366,8 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         profile: None,
         seed,
         trace_records: 0,
+        alloc: None,
+        memory_guard,
         notes: Vec::new(),
     };
 
@@ -437,7 +468,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         }
         report.batches.push(outcome.batch);
     }
-    report.trace_records = harness.finish();
+    (report.trace_records, report.alloc) = harness.finish();
 
     let failed = report
         .batches
@@ -562,6 +593,8 @@ impl Harness {
         let t_start_ns = crate::report::now_ns();
         let result = kernel.apply(state, payload);
         let wall_ns = started.elapsed().as_nanos() as u64;
+        // What the call asked for, which a counting kernel left on this thread (E13).
+        let alloc = moruna_kernel::take_kernel_alloc();
         let t_end_ns = crate::report::now_ns();
         let anon_after = self.anon();
         let mut outcome = BatchOutcome {
@@ -634,7 +667,7 @@ impl Harness {
                 Outcome::Probe
             },
             error: outcome.error.clone(),
-            alloc: moruna_kernel::KernelAlloc::default(),
+            alloc,
         });
         Ok(RunOne {
             batch: outcome,
@@ -642,11 +675,12 @@ impl Harness {
         })
     }
 
-    /// Flush and close the trace; the records it holds.
-    fn finish(self) -> u64 {
+    /// Flush and close the trace; the records it holds, and what the kernel asked for over
+    /// them (E13), computed from the records as the run report computes a stage's.
+    fn finish(self) -> (u64, Option<moruna_trace::StageAlloc>) {
         let records = match self.trace.finish() {
-            Ok(view) => view.len(),
-            Err(_) => 0,
+            Ok(view) => (view.len(), moruna_trace::StageAlloc::of(&view.records())),
+            Err(_) => (0, None),
         };
         let _ = std::fs::remove_dir_all(&self.scratch);
         records

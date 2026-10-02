@@ -85,6 +85,7 @@ impl KernelLoader for ModuleLoader {
                 moruna_kernel::declare::Declared::default(),
                 None,
                 None,
+                doc.memory_guard.unwrap_or(true),
             )
             .map_err(|e| SpecError::new(format!("kernels[{index}]"), e.to_string()))?;
             let kernel = handle.kernel;

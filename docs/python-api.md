@@ -53,6 +53,7 @@ Turns a function, or for a stateful kernel an object, into a kernel.
 | `input_schema` | `None` | Columns the kernel needs: a `pyarrow.Schema`, or a mapping of column name to type. |
 | `output_schema` | `None` | What the kernel returns: a schema, a mapping, or a mapping with `adds`, `drops` and `changes`. |
 | `lockfile` | `None` | A lock file whose contents are included in the fingerprint. |
+| `memory_guard` | `True` | Refuse a request for memory (a NumPy array, a Python object) that would take the process past its memory ceiling: the kernel sees `MemoryError` and the run ends with a budget error naming the kernel and the request, instead of being killed. `False` turns refusal off; the kernel's memory requests are still counted and reported. |
 
 A kernel object has `fingerprint`, a string identifying its code, and `stateful`.
 
