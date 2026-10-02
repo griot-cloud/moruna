@@ -82,6 +82,7 @@ pub fn kind_of(err: &RsError) -> &'static str {
         RsError::Cancelled => "Cancelled",
         RsError::Resume(_) => "Resume",
         RsError::Unsupported(_) => "Unsupported",
+        RsError::Refused { .. } => "Refused",
     }
 }
 
@@ -90,7 +91,9 @@ pub fn class_of(py: Python<'_>, err: &RsError) -> Py<PyType> {
     let class = match err {
         RsError::Plan(_) | RsError::Convert(_) => py.get_type::<PlanError>(),
         RsError::Kernel { .. } => py.get_type::<KernelError>(),
-        RsError::Budget { .. } | RsError::Alloc { .. } => py.get_type::<BudgetError>(),
+        RsError::Budget { .. } | RsError::Alloc { .. } | RsError::Refused { .. } => {
+            py.get_type::<BudgetError>()
+        }
         RsError::Source { .. } | RsError::Sink(_) | RsError::Io { .. } | RsError::Staging(_) => {
             py.get_type::<IoError>()
         }
@@ -176,6 +179,23 @@ pub fn diagnostic<'py>(py: Python<'py>, err: &RsError) -> PyResult<Bound<'py, Py
             d.set_item("message", e.to_string())?;
         }
         RsError::Cancelled => {}
+        RsError::Refused {
+            stage,
+            seq,
+            kernel,
+            requested,
+            in_use,
+            ceiling,
+            features,
+        } => {
+            d.set_item("stage", stage)?;
+            d.set_item("seq", seq)?;
+            d.set_item("kernel", kernel)?;
+            d.set_item("requested", requested)?;
+            d.set_item("in_use", in_use)?;
+            d.set_item("ceiling", ceiling)?;
+            d.set_item("features", features_dict(py, features.as_deref())?)?;
+        }
     }
     Ok(d)
 }
@@ -273,6 +293,19 @@ mod tests {
                     "Config",
                 ),
                 (RsError::Unsupported("rdma"), "ConfigError", "Unsupported"),
+                (
+                    RsError::Refused {
+                        stage: 1,
+                        seq: 3,
+                        kernel: "jobs.greedy".into(),
+                        requested: 1 << 30,
+                        in_use: 10,
+                        ceiling: 20,
+                        features: None,
+                    },
+                    "BudgetError",
+                    "Refused",
+                ),
                 (
                     RsError::Kernel {
                         stage: 1,

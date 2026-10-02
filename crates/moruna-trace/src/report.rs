@@ -166,6 +166,9 @@ pub struct StageReport {
     /// The largest growth of one instance's state over the run: its last `state_bytes`
     /// less its first non-zero one (f.2, RC f.6 StateGrowth).
     pub state_growth: i64,
+    /// What the stage's kernel asked for, per source (f.2; E13); `None` when no record of the
+    /// stage was measured.
+    pub alloc: Option<crate::alloc::StageAlloc>,
 }
 
 /// What the user reads and what S1 to S4 are measured from (d.1). Pure in the trace, the
@@ -308,6 +311,7 @@ struct StageAcc {
     /// Per instance: the first non-zero `state_bytes` and the last one, each with the
     /// record's order key so the walk is independent of the order the chunks are read in.
     state: BTreeMap<u16, StateSpan>,
+    alloc: crate::alloc::AllocAcc,
 }
 
 impl StageAcc {
@@ -336,6 +340,7 @@ impl StageAcc {
             Outcome::Ok | Outcome::Probe => {}
         }
         self.state_max = self.state_max.max(r.state_bytes);
+        self.alloc.add(r);
         let key = (r.t_start_ns, r.seq);
         let entry = self.state.entry(r.instance).or_default();
         if r.state_bytes > 0 && entry.0.is_none_or(|(k, _)| key < k) {
@@ -381,6 +386,7 @@ impl StageAcc {
             skipped: self.skipped,
             state_bytes_max: self.state_max,
             state_growth: growth,
+            alloc: self.alloc.finish(),
         }
     }
 }

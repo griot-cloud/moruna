@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::ids::{Seq, StageId};
+use crate::kernel::{AllocCounts, KernelAlloc};
 use crate::limits::Limits;
 
 /// What happened to a morsel at a stage.
@@ -108,6 +109,58 @@ pub struct TraceRecord {
     pub outcome: Outcome,
     /// The error message, when the outcome is `Error`.
     pub error: Option<String>,
+    /// What the call asked for, per source (contracts d.7, d.13; E13): what
+    /// `take_kernel_alloc` returned after `apply`, the default when the kernel counted nothing.
+    pub alloc: KernelAlloc,
+}
+
+/// The sources of `KernelAlloc`, in schema order (e.5).
+pub const ALLOC_SOURCES: [&str; 3] = ["python", "numpy", "arrow"];
+/// The counts of each source, in schema order (e.5).
+pub const ALLOC_COUNTS: [&str; 5] = ["bytes", "requests", "largest", "peak", "refused"];
+
+impl KernelAlloc {
+    /// The source's counts by its schema index (0 python, 1 numpy, 2 arrow).
+    pub fn source(&self, index: usize) -> &AllocCounts {
+        match index {
+            0 => &self.python,
+            1 => &self.numpy,
+            _ => &self.arrow,
+        }
+    }
+
+    /// As `source`, mutably.
+    pub fn source_mut(&mut self, index: usize) -> &mut AllocCounts {
+        match index {
+            0 => &mut self.python,
+            1 => &mut self.numpy,
+            _ => &mut self.arrow,
+        }
+    }
+}
+
+impl AllocCounts {
+    /// The count by its schema index (`ALLOC_COUNTS`).
+    pub fn count(&self, index: usize) -> u64 {
+        match index {
+            0 => self.bytes,
+            1 => self.requests,
+            2 => self.largest,
+            3 => self.peak,
+            _ => self.refused,
+        }
+    }
+
+    /// As `count`, mutably.
+    pub fn count_mut(&mut self, index: usize) -> &mut u64 {
+        match index {
+            0 => &mut self.bytes,
+            1 => &mut self.requests,
+            2 => &mut self.largest,
+            3 => &mut self.peak,
+            _ => &mut self.refused,
+        }
+    }
 }
 
 impl TraceRecord {
@@ -125,7 +178,14 @@ impl TraceRecord {
         "cpu_time_us:u64,throttled_delta_us:u64,",
         "q_bytes_before:list<u64>,q_bytes_after:list<u64>,",
         "staging_bytes_delta:i64,placement_miss_wait_us:u64,state_bytes:u64,",
-        "sizer:u8,outcome:u8,error:string"
+        "sizer:u8,outcome:u8,error:string,",
+        "alloc_measured:u8,alloc_refusal_on:u8,",
+        "alloc_python_bytes:u64,alloc_python_requests:u64,alloc_python_largest:u64,",
+        "alloc_python_peak:u64,alloc_python_refused:u64,",
+        "alloc_numpy_bytes:u64,alloc_numpy_requests:u64,alloc_numpy_largest:u64,",
+        "alloc_numpy_peak:u64,alloc_numpy_refused:u64,",
+        "alloc_arrow_bytes:u64,alloc_arrow_requests:u64,alloc_arrow_largest:u64,",
+        "alloc_arrow_peak:u64,alloc_arrow_refused:u64"
     );
 
     /// BLAKE3 of the canonical field list (CT-I8). A compile-time constant: the digest of
@@ -134,9 +194,9 @@ impl TraceRecord {
     /// CT-T9 recomputes the digest from `SCHEMA_FIELDS` and asserts this value, so a schema
     /// change is a deliberate edit of the test and of this constant.
     pub const SCHEMA_HASH: [u8; 32] = [
-        0x77, 0x8b, 0x6e, 0x4d, 0xc4, 0xa7, 0x7e, 0x03, 0x5f, 0x40, 0x6b, 0x66, 0xdb, 0x86, 0x0d,
-        0xad, 0xed, 0x56, 0x67, 0xa1, 0x76, 0x1f, 0x19, 0x8d, 0x34, 0x89, 0x4c, 0xe2, 0x94, 0x6a,
-        0x81, 0x4b,
+        0xb2, 0x76, 0x85, 0x66, 0xc9, 0xb6, 0x93, 0xc4, 0x1b, 0x00, 0x05, 0x89, 0x8a, 0x72, 0x30,
+        0x8d, 0xd7, 0x4f, 0x98, 0xe4, 0xc0, 0x43, 0x04, 0xfd, 0xb6, 0x40, 0xc1, 0x2c, 0x70, 0xa1,
+        0xca, 0x91,
     ];
 
     /// The digest of `SCHEMA_FIELDS`, recomputed. Equal to `SCHEMA_HASH` (CT-T9).
@@ -179,7 +239,19 @@ impl TraceRecord {
             Field::new("sizer", DataType::UInt8, false),
             Field::new("outcome", DataType::UInt8, false),
             Field::new("error", DataType::Utf8, true),
+            Field::new("alloc_measured", DataType::UInt8, false),
+            Field::new("alloc_refusal_on", DataType::UInt8, false),
         ];
+        let mut fields = fields;
+        for source in ALLOC_SOURCES {
+            for count in ALLOC_COUNTS {
+                fields.push(Field::new(
+                    format!("alloc_{source}_{count}"),
+                    DataType::UInt64,
+                    false,
+                ));
+            }
+        }
         Arc::new(Schema::new(fields))
     }
 }

@@ -258,6 +258,8 @@ pub(crate) fn run_task(
     };
     let c1 = thread_cpu_ns();
     let t1 = now_ns();
+    // What the call asked for, which a counting kernel left on this thread (contracts d.7, E13).
+    let alloc = moruna_kernel::take_kernel_alloc();
     let s1 = shared.sampler.sample();
     shared.heartbeat.end_task(worker);
 
@@ -314,8 +316,11 @@ pub(crate) fn run_task(
             }
         }
         Applied::Failed(e) => {
-            error = Some(e.to_string());
-            failure = Some(enrich(e, stage, seq, &features));
+            // The record carries the diagnostic with the morsel named, not the adapter's
+            // sentinels (CT-I10).
+            let enriched = enrich(e, stage, seq, &features);
+            error = Some(enriched.to_string());
+            failure = Some(enriched);
         }
     }
 
@@ -349,6 +354,7 @@ pub(crate) fn run_task(
                 Outcome::Ok
             },
             error,
+            alloc,
         },
     );
 
@@ -402,6 +408,22 @@ fn enrich(e: MorunaError, stage: StageId, seq: Seq, features: &MorselFeatures) -
             seq,
             msg,
             features: Some(features.clone()),
+        },
+        // 05 f.12: the adapter does not know the morsel, so the refusal carries sentinels.
+        MorunaError::Refused {
+            kernel,
+            requested,
+            in_use,
+            ceiling,
+            ..
+        } => MorunaError::Refused {
+            stage,
+            seq,
+            kernel,
+            requested,
+            in_use,
+            ceiling,
+            features: Some(Box::new(features.clone())),
         },
         other => other,
     }
@@ -464,6 +486,7 @@ pub(crate) struct RecordInput<'a> {
     pub(crate) state_bytes: u64,
     pub(crate) outcome: Outcome,
     pub(crate) error: Option<String>,
+    pub(crate) alloc: moruna_kernel::KernelAlloc,
 }
 
 /// The only builder of a `TraceRecord` in this crate (l, anti-patterns); the probe reaches it
@@ -506,5 +529,6 @@ pub(crate) fn build_record(shared: &Shared, input: RecordInput<'_>) -> TraceReco
         sizer: 0,
         outcome: input.outcome,
         error: input.error,
+        alloc: input.alloc,
     }
 }

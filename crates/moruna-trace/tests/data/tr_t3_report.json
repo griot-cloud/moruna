@@ -77,7 +77,8 @@
       "errors": 0,
       "skipped": 0,
       "state_bytes_max": 0,
-      "state_growth": 0
+      "state_growth": 0,
+      "alloc": null
     },
     {
       "stage": 2,
@@ -96,7 +97,8 @@
       "errors": 1,
       "skipped": 1,
       "state_bytes_max": 0,
-      "state_growth": 0
+      "state_growth": 0,
+      "alloc": null
     },
     {
       "stage": 3,
@@ -115,7 +117,8 @@
       "errors": 0,
       "skipped": 0,
       "state_bytes_max": 3000,
-      "state_growth": 2000
+      "state_growth": 2000,
+      "alloc": null
     }
   ],
   "notes": [

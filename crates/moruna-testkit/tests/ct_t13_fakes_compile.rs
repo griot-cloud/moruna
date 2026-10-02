@@ -794,6 +794,7 @@ fn record(seq: u64, stage: u16) -> TraceRecord {
         sizer: 0,
         outcome: Outcome::Ok,
         error: None,
+        alloc: moruna_kernel::KernelAlloc::default(),
     }
 }
 

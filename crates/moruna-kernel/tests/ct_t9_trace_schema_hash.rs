@@ -7,7 +7,7 @@ use moruna_kernel::{Outcome, TraceRecord};
 /// The pinned value (e.5): the BLAKE3 digest of the canonical field list, computed once by the
 /// component 1 agent and asserted here, so a schema change is a deliberate edit of this test
 /// and of the constant.
-const PINNED: &str = "778b6e4dc4a77e035f406b66db860daded5667a1761f198d34894ce2946a814b";
+const PINNED: &str = "b2768566c9b693c41b0005898a72308dd74f98e4c04304fdb640c12c70a1ca91";
 
 #[test]
 fn ct_t9_trace_schema_hash() {
@@ -53,6 +53,23 @@ fn ct_t9_trace_schema_hash() {
         ("sizer", DataType::UInt8),
         ("outcome", DataType::UInt8),
         ("error", DataType::Utf8),
+        ("alloc_measured", DataType::UInt8),
+        ("alloc_refusal_on", DataType::UInt8),
+        ("alloc_python_bytes", DataType::UInt64),
+        ("alloc_python_requests", DataType::UInt64),
+        ("alloc_python_largest", DataType::UInt64),
+        ("alloc_python_peak", DataType::UInt64),
+        ("alloc_python_refused", DataType::UInt64),
+        ("alloc_numpy_bytes", DataType::UInt64),
+        ("alloc_numpy_requests", DataType::UInt64),
+        ("alloc_numpy_largest", DataType::UInt64),
+        ("alloc_numpy_peak", DataType::UInt64),
+        ("alloc_numpy_refused", DataType::UInt64),
+        ("alloc_arrow_bytes", DataType::UInt64),
+        ("alloc_arrow_requests", DataType::UInt64),
+        ("alloc_arrow_largest", DataType::UInt64),
+        ("alloc_arrow_peak", DataType::UInt64),
+        ("alloc_arrow_refused", DataType::UInt64),
     ];
     assert_eq!(schema.fields().len(), expected.len());
     for (field, (name, data_type)) in schema.fields().iter().zip(&expected) {

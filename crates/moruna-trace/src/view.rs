@@ -11,7 +11,7 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::ipc::reader::{FileReader, StreamReader};
-use moruna_kernel::{MorunaError, Outcome, StageId, TraceRecord};
+use moruna_kernel::{KernelAlloc, MorunaError, Outcome, StageId, TraceRecord};
 
 use crate::Result;
 use crate::writer::Shared;
@@ -251,7 +251,7 @@ fn list_values(a: &ListArray, row: usize) -> Vec<u64> {
 /// Decode one row of a trace chunk back into a `TraceRecord`. `None` when a column is not
 /// the type the schema pins, which `check_schema` makes impossible at start (TR-I6).
 pub(crate) fn record_at(batch: &RecordBatch, row: usize) -> Option<TraceRecord> {
-    if row >= batch.num_rows() || batch.num_columns() < 31 {
+    if row >= batch.num_rows() || batch.num_columns() < 48 {
         return None;
     }
     let error_col = col!(batch, 30, StringArray);
@@ -290,6 +290,18 @@ pub(crate) fn record_at(batch: &RecordBatch, row: usize) -> Option<TraceRecord> 
             None
         } else {
             Some(error_col.value(row).to_string())
+        },
+        alloc: {
+            let mut alloc = KernelAlloc {
+                measured: col!(batch, 31, UInt8Array).value(row) != 0,
+                refusal_on: col!(batch, 32, UInt8Array).value(row) != 0,
+                ..KernelAlloc::default()
+            };
+            for at in 0..15 {
+                *alloc.source_mut(at / 5).count_mut(at % 5) =
+                    col!(batch, 33 + at, UInt64Array).value(row);
+            }
+            alloc
         },
     })
 }

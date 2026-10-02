@@ -177,6 +177,7 @@ pub fn record(seq: Seq, stage: StageId, bytes_in: u64, peak_delta: u64) -> Trace
         sizer: 0,
         outcome: Outcome::Ok,
         error: None,
+        alloc: moruna_kernel::KernelAlloc::default(),
     }
 }
 

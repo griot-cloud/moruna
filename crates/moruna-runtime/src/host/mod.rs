@@ -37,7 +37,9 @@ pub fn exit_code(error: &MorunaError) -> i32 {
     match error {
         MorunaError::Config { name, .. } if name.starts_with("budget") => exit::BUDGET_REFUSED,
         MorunaError::Config { .. } | MorunaError::Plan(_) => exit::SPEC_REFUSED,
-        MorunaError::Budget { .. } | MorunaError::Alloc { .. } => exit::BUDGET_REFUSED,
+        MorunaError::Budget { .. } | MorunaError::Alloc { .. } | MorunaError::Refused { .. } => {
+            exit::BUDGET_REFUSED
+        }
         MorunaError::Kernel { .. } => exit::KERNEL_ERROR,
         MorunaError::Resume(_) => exit::RESUME_REFUSED,
         MorunaError::Cancelled => exit::CANCELLED,

@@ -44,6 +44,74 @@ pub enum GilState {
     Serialised,
 }
 
+/// What one call of a kernel asked for from one source (contracts d.7; 05 b "call counts";
+/// E13). A field a source cannot measure is zero here and absent in the run report.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct AllocCounts {
+    /// Bytes requested in total.
+    pub bytes: u64,
+    /// Number of requests.
+    pub requests: u64,
+    /// The largest single request.
+    pub largest: u64,
+    /// The most held at once during the call.
+    pub peak: u64,
+    /// Requests the allocator guard refused.
+    pub refused: u64,
+}
+
+impl AllocCounts {
+    const ZERO: AllocCounts = AllocCounts {
+        bytes: 0,
+        requests: 0,
+        largest: 0,
+        peak: 0,
+        refused: 0,
+    };
+}
+
+/// One call's counts per source, carried on its trace record (contracts d.7, d.13).
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct KernelAlloc {
+    /// False for a call nothing counted (a Rust kernel, no kernel).
+    pub measured: bool,
+    /// Whether the allocator guard could refuse this call's requests.
+    pub refusal_on: bool,
+    /// CPython's allocator domains (Python objects); `peak` is unmeasured.
+    pub python: AllocCounts,
+    /// NumPy's data allocator.
+    pub numpy: AllocCounts,
+    /// pyarrow's default pool, from its statistics; `largest` and `refused` are unmeasured.
+    pub arrow: AllocCounts,
+}
+
+impl KernelAlloc {
+    /// The default, as a constant.
+    pub const NONE: KernelAlloc = KernelAlloc {
+        measured: false,
+        refusal_on: false,
+        python: AllocCounts::ZERO,
+        numpy: AllocCounts::ZERO,
+        arrow: AllocCounts::ZERO,
+    };
+}
+
+thread_local! {
+    static LAST_ALLOC: core::cell::Cell<KernelAlloc> = const { core::cell::Cell::new(KernelAlloc::NONE) };
+}
+
+/// The kernel's half of the hand-off (contracts d.7): the counts of the call that is about to
+/// return, on the worker thread that made it.
+pub fn set_kernel_alloc(counts: KernelAlloc) {
+    LAST_ALLOC.with(|slot| slot.set(counts));
+}
+
+/// The scheduler's half: what the last `set_kernel_alloc` on this thread left, once; the
+/// default when nothing did.
+pub fn take_kernel_alloc() -> KernelAlloc {
+    LAST_ALLOC.with(|slot| slot.replace(KernelAlloc::NONE))
+}
+
 /// What a kernel tells the controller about itself before it has been probed.
 #[derive(Clone, Debug, Default)]
 pub struct KernelHints {

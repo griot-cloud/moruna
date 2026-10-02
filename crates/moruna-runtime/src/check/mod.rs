@@ -634,6 +634,7 @@ impl Harness {
                 Outcome::Probe
             },
             error: outcome.error.clone(),
+            alloc: moruna_kernel::KernelAlloc::default(),
         });
         Ok(RunOne {
             batch: outcome,

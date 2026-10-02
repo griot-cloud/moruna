@@ -89,6 +89,10 @@ struct Builders {
     sizer: UInt8Builder,
     outcome: UInt8Builder,
     error: StringBuilder,
+    alloc_measured: UInt8Builder,
+    alloc_refusal_on: UInt8Builder,
+    /// The fifteen `alloc_<source>_<count>` columns, in schema order (contracts e.5).
+    alloc_counts: Vec<UInt64Builder>,
 }
 
 fn list_builder() -> ListBuilder<UInt64Builder> {
@@ -146,6 +150,9 @@ impl Builders {
             sizer: u8b(),
             outcome: u8b(),
             error: StringBuilder::new(),
+            alloc_measured: u8b(),
+            alloc_refusal_on: u8b(),
+            alloc_counts: (0..15).map(|_| u64b()).collect(),
         }
     }
 
@@ -190,6 +197,12 @@ impl Builders {
         self.sizer.append_value(r.sizer);
         self.outcome.append_value(r.outcome.code());
         self.error.append_option(r.error.as_deref());
+        self.alloc_measured.append_value(u8::from(r.alloc.measured));
+        self.alloc_refusal_on
+            .append_value(u8::from(r.alloc.refusal_on));
+        for (at, builder) in self.alloc_counts.iter_mut().enumerate() {
+            builder.append_value(r.alloc.source(at / 5).count(at % 5));
+        }
         self.rows += 1;
     }
 
@@ -204,7 +217,7 @@ impl Builders {
                 }
             };
         }
-        vec![
+        let mut cols = vec![
             col!(seq),
             col!(stage),
             col!(worker),
@@ -236,7 +249,17 @@ impl Builders {
             col!(sizer),
             col!(outcome),
             col!(error),
-        ]
+            col!(alloc_measured),
+            col!(alloc_refusal_on),
+        ];
+        for builder in &mut self.alloc_counts {
+            cols.push(if reset {
+                ArrayBuilder::finish(builder)
+            } else {
+                ArrayBuilder::finish_cloned(builder)
+            });
+        }
+        cols
     }
 
     /// Finalise the chunk and reset the builders.
@@ -1092,6 +1115,7 @@ mod tests {
             sizer: 0,
             outcome: moruna_kernel::Outcome::Ok,
             error: None,
+            alloc: moruna_kernel::KernelAlloc::default(),
         }
     }
 

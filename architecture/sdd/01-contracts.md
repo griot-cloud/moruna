@@ -1088,7 +1088,7 @@ pub enum MorunaError {
     /// adapter fills `stage` and `seq` with its sentinels and the scheduler replaces them with
     /// the morsel's, and adds its features (SC f.8). A host maps it to the budget's exit code.
     #[error("budget: kernel {kernel} stage {stage} morsel {seq} requested {requested} bytes with {in_use} in use, which would pass the ceiling of {ceiling} bytes; refused before the memory existed")]
-    Refused { stage: StageId, seq: Seq, kernel: String, requested: u64, in_use: u64, ceiling: u64, features: Option<MorselFeatures> },
+    Refused { stage: StageId, seq: Seq, kernel: String, requested: u64, in_use: u64, ceiling: u64, features: Option<Box<MorselFeatures>> },
 }
 
 #[derive(thiserror::Error, Debug)]

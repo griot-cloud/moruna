@@ -23,6 +23,7 @@ mod sc_t1_workers_only_apply;
 mod sc_t20_manifest_on_completion;
 mod sc_t21_checkpoint_on_demand;
 mod sc_t22_copy_behind_a_slow_sink;
+mod sc_t23_refusal_follows_the_policy;
 mod sc_t2_admission_rule;
 mod sc_t3_source_admission;
 mod sc_t4_one_record_per_morsel_stage;
