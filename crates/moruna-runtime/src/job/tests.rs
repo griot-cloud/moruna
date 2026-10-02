@@ -694,6 +694,14 @@ fn hints_are_listed() {
     doc.resume = Some("reinit".into());
     doc.state_bytes = Some(1);
     assert_eq!(doc.hints_set().len(), 10);
+    // PY-T21 (E13): the allocator guard's switch is a hint like the others, and a document
+    // carries it.
+    doc.memory_guard = Some(false);
+    assert_eq!(doc.hints_set().last(), Some(&"memory_guard"));
+    let json = serde_json::to_value(&doc).expect("serialises");
+    assert_eq!(json["memory_guard"], serde_json::Value::Bool(false));
+    let back: KernelDoc = serde_json::from_value(json).expect("reads back");
+    assert_eq!(back.memory_guard, Some(false));
 }
 
 /// MH 4.5: the governed ends of a run. The document reads and writes them, refuses a malformed

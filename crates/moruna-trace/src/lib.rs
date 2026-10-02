@@ -15,11 +15,13 @@
 // the contract's `Result`, so the lint is allowed for the crate rather than worked around.
 #![allow(clippy::result_large_err)]
 
+pub mod alloc;
 pub mod render;
 pub mod report;
 pub mod view;
 pub mod writer;
 
+pub use alloc::{SourceAlloc, StageAlloc};
 pub use report::{
     DeviceSummary, DrainSummary, ExitReason, LimitsSummary, RunMeta, RunReport, StageReport,
 };

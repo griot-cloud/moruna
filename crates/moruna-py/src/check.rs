@@ -83,6 +83,7 @@ pub fn check_kernel(
             opts.kind = "python";
             opts.fingerprint_scheme = "sha256";
             opts.gil = Some(py_kernel.gil_state());
+            opts.memory_guard = Some(py_kernel.memory_guard());
             let bound = Arc::clone(&py_kernel);
             opts.bind = Some(Box::new(move |alloc| bound.bind_allocator(alloc)));
             (py_kernel as Arc<dyn Kernel>, opts)

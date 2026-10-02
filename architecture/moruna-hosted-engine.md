@@ -249,8 +249,9 @@ moruna run --vm <spec.json> [--image ...] [--disk ...]   (boots, sends the spec,
 2. **synthetic batch**: from `input_schema`, generate batches, empty, one row, `preferred_rows` rows, all-null columns, type edge values (min/max integers, empty strings, NaN, epoch boundaries), deterministically from a seed.
 3. **run** each batch through the kernel in-process with the arena and the trace on, exactly as a run would.
 4. **compare** the produced schema with `output_schema`; refuse on a mismatch naming the column and the types.
-5. **profile**: write the first profile-store row for the kernel's fingerprint (amplification p50/p95, state bytes, wall per row, GIL held or released) so a later `run` sizes from evidence.
-6. **fingerprint**: `sha256(canonical source ∥ lockfile bytes ∥ Moruna ABI version)`, printed, and recorded in the profile row; the same value a hosted `RunSpec` pins in `kernels[].fingerprint`.
+5. **allocations** (E13, 2026-10-02): the report's `alloc` gives, over the synthetic batches, what the kernel asked for from each source the allocator guard counts (adapters 05 f.10 to f.14, the run report's per-stage `alloc` of 04 d.1), and `memory_guard` whether refusal would be on, so a function can be judged by what it asks for outside Arrow before it meets real data.
+6. **profile**: write the first profile-store row for the kernel's fingerprint (amplification p50/p95, state bytes, wall per row, GIL held or released) so a later `run` sizes from evidence.
+7. **fingerprint**: `sha256(canonical source ∥ lockfile bytes ∥ Moruna ABI version)`, printed, and recorded in the profile row; the same value a hosted `RunSpec` pins in `kernels[].fingerprint`.
 
 Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, agreeing kernel, 2 on a refused one. A Rust kernel is checked the same way through a small harness the `Kernel` trait exposes.
 

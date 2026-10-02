@@ -96,3 +96,8 @@ required-features = ["python"]
 name = "ad_h_edge_cases"
 path = "tests/ad_h_edge_cases.rs"
 required-features = ["python"]
+
+[[test]]
+name = "ad_guard"
+path = "tests/ad_guard.rs"
+required-features = ["python"]

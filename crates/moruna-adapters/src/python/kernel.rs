@@ -16,7 +16,10 @@ use super::cross::{self, Imported};
 use super::ctx::PyInitCtx;
 use super::fingerprint;
 use super::gil::{gil_enabled_in, python_gil_enabled};
+use super::hooks;
 use super::state::{PyState, missing_restore};
+use crate::guard::{KernelMemory, LiveCounts, MemoryGate};
+use moruna_kernel::set_kernel_alloc;
 
 /// The stage an `MorunaError::Kernel` from this crate carries.
 ///
@@ -101,6 +104,9 @@ pub struct PyKernelSpec {
     /// The function the author wrote, when `callable` wraps it (a Polars kernel, MH 4.9): its
     /// name and source are what the fingerprint takes.
     pub origin: Option<Py<PyAny>>,
+    /// `memory_guard=`: whether the allocator guard may refuse this kernel's requests (05 AD-I10;
+    /// E13). Counting is on either way; not part of the fingerprint (e.4).
+    pub memory_guard: bool,
 }
 
 impl PyKernelSpec {
@@ -124,6 +130,7 @@ impl PyKernelSpec {
             declared: Declared::default(),
             lockfile: None,
             origin: None,
+            memory_guard: true,
         }
     }
 }
@@ -162,6 +169,12 @@ pub struct PyKernel {
     calls: AtomicU64,
     exceptions: AtomicU64,
     boundary_copies: AtomicU64,
+    /// `<module>.<qualname>`, which a refusal names (d.1).
+    name: String,
+    /// The allocator guard's view of this kernel (05 f.9 to f.12).
+    memory: Arc<KernelMemory>,
+    /// This kernel's NumPy handler capsule, made the first time NumPy is loaded (f.11).
+    numpy: OnceLock<Py<PyAny>>,
 }
 
 impl PyKernel {
@@ -197,6 +210,7 @@ impl PyKernel {
             }
             let has_footprint = callable.hasattr("footprint").unwrap_or(false);
             let printed = fingerprint::compute(py, &spec);
+            let name = fingerprint::kernel_name(py, &spec);
             let gil = if gil_enabled_in(py) {
                 GIL_SERIALISED
             } else {
@@ -232,6 +246,9 @@ impl PyKernel {
                 calls: AtomicU64::new(0),
                 exceptions: AtomicU64::new(0),
                 boundary_copies: AtomicU64::new(0),
+                name,
+                memory: KernelMemory::new(spec.memory_guard),
+                numpy: OnceLock::new(),
             })
         })
     }
@@ -241,6 +258,37 @@ impl PyKernel {
     /// second call is ignored, because the arena a run allocates from does not change.
     pub fn bind_allocator(&self, alloc: Arc<dyn Allocator>) {
         let _ = self.alloc.set(alloc);
+    }
+
+    /// The run's allocator gate (05 d.1, f.9); a second call is ignored. Without one the kernel
+    /// is counted and never refused.
+    pub fn bind_gate(&self, gate: Arc<MemoryGate>) {
+        self.memory.bind(gate);
+    }
+
+    /// Whether the decorator left refusal on (05 AD-I10).
+    pub fn memory_guard(&self) -> bool {
+        self.memory.guarded()
+    }
+
+    /// What the guard holds for this kernel now (05 d.1).
+    pub fn memory(&self) -> LiveCounts {
+        self.memory.live()
+    }
+
+    /// `<module>.<qualname>` of the function the author wrote (05 d.1).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// This kernel's NumPy handler, made once NumPy is loaded (f.11).
+    fn numpy_capsule(&self, py: Python<'_>) -> Option<&Py<PyAny>> {
+        if self.numpy.get().is_none()
+            && let Some(capsule) = hooks::numpy_handler(py, &self.memory)
+        {
+            let _ = self.numpy.set(capsule);
+        }
+        self.numpy.get()
     }
 
     /// AD-I3: `Serialised` under a GIL build or after a flip, `FreeThreaded` otherwise.
@@ -301,8 +349,58 @@ impl PyKernel {
         input: Payload,
     ) -> Result<(Imported, Py<PyAny>)> {
         Python::attach(|py| {
+            hooks::install_python_hooks(py);
             let argument = cross::export(py, input)?;
             let callable = self.callable.bind(py);
+            let capsule = self.numpy_capsule(py);
+            let before = hooks::arrow_pool(py);
+            // 05 f.12: the frame covers the call alone, so what the adapter itself allocates to
+            // cross is not charged to the kernel; the NumPy handler is in for the frame.
+            let (returned, end) = hooks::with_numpy_handler(py, capsule, || {
+                self.memory
+                    .frame(|| self.invoke(py, state, callable, argument))
+            });
+            let after = hooks::arrow_pool(py);
+            let mut counts = end.counts;
+            counts.arrow = hooks::arrow_counts(before, after);
+            set_kernel_alloc(counts);
+            let returned = match (returned, end.refusal) {
+                (Err(_), Some(refusal)) => {
+                    return Err(MorunaError::Refused {
+                        stage: UNKNOWN_STAGE,
+                        seq: UNKNOWN_SEQ,
+                        kernel: self.name.clone(),
+                        requested: refusal.requested,
+                        in_use: refusal.in_use,
+                        ceiling: refusal.ceiling,
+                        features: None,
+                    });
+                }
+                (Ok(value), Some(refusal)) => {
+                    tracing::warn!(
+                        target: "adapter.guard",
+                        kernel = %self.name,
+                        requested = refusal.requested,
+                        "a request was refused and the kernel recovered from the MemoryError"
+                    );
+                    value
+                }
+                (returned, None) => returned?,
+            };
+            let imported = cross::import(py, &returned)?;
+            Ok((imported, returned.unbind()))
+        })
+    }
+
+    /// The call itself, inside the frame.
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        state: &mut dyn KernelState,
+        callable: &Bound<'py, PyAny>,
+        argument: Bound<'py, PyAny>,
+    ) -> Result<Bound<'py, PyAny>> {
+        {
             let returned = if self.stateful {
                 let py_state = state
                     .as_any_mut()
@@ -317,10 +415,8 @@ impl PyKernel {
             } else {
                 callable.call1((argument,))
             };
-            let returned = returned.map_err(|e| kernel_error(py_err_message(py, &e)))?;
-            let imported = cross::import(py, &returned)?;
-            Ok((imported, returned.unbind()))
-        })
+            returned.map_err(|e| kernel_error(py_err_message(py, &e)))
+        }
     }
 
     fn ctx_object<'py>(&self, py: Python<'py>, ctx: &InitCtx) -> Result<Bound<'py, PyAny>> {

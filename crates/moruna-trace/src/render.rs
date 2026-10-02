@@ -11,6 +11,8 @@ use crate::report::{RunReport, gil_name};
 const MAX_STAGE_LINES: usize = 20;
 /// The most note lines, for the same reason.
 const MAX_NOTE_LINES: usize = 6;
+/// The most allocation lines (E13), for the same reason; `to_json` carries every stage's.
+const MAX_ALLOC_LINES: usize = 3;
 
 /// Bytes in binary units, three significant figures.
 pub(crate) fn bytes_binary(n: u64) -> String {
@@ -216,6 +218,37 @@ impl fmt::Display for RunReport {
                     "free threaded"
                 },
                 stages.join(" ")
+            )?;
+        }
+        let measured: Vec<_> = self
+            .stages
+            .iter()
+            .filter_map(|s| s.alloc.as_ref().map(|a| (s.stage, a)))
+            .collect();
+        for (stage, a) in measured.iter().take(MAX_ALLOC_LINES) {
+            let outside = match a.outside_arrow_fraction {
+                Some(x) => format!(" ({}% outside Arrow)", sig3(x * 100.0)),
+                None => String::new(),
+            };
+            let refused = a.python.refused.unwrap_or(0) + a.numpy.refused.unwrap_or(0);
+            writeln!(
+                f,
+                "alloc {stage}: refusal {}, peak {}{outside}, python {}/{}, numpy {}/{}, arrow {}/{}, refused {refused}",
+                if a.refusal_on { "on" } else { "off" },
+                bytes_binary(a.peak_bytes),
+                bytes_binary(a.python.requested_bytes),
+                a.python.requests,
+                bytes_binary(a.numpy.requested_bytes),
+                a.numpy.requests,
+                bytes_binary(a.arrow.requested_bytes),
+                a.arrow.requests,
+            )?;
+        }
+        if measured.len() > MAX_ALLOC_LINES {
+            writeln!(
+                f,
+                "alloc: {} more stages in to_json",
+                measured.len() - MAX_ALLOC_LINES
             )?;
         }
         if let Some(m) = &self.manifest {

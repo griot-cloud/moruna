@@ -20,6 +20,8 @@
 /// `GilState` is `moruna_kernel::GilState` (contracts d.7), the type the run report carries.
 pub use moruna_kernel::GilState;
 
+pub mod guard;
+
 #[cfg(feature = "python")]
 pub mod python;
 

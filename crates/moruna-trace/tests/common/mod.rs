@@ -47,6 +47,7 @@ pub fn record(seq: Seq, stage: StageId) -> TraceRecord {
         sizer: 0,
         outcome: Outcome::Ok,
         error: None,
+        alloc: moruna_kernel::KernelAlloc::default(),
     }
 }
 

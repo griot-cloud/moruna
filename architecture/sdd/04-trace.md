@@ -118,6 +118,31 @@ pub struct StageReport {
     /// reported; d.1 omitted them (PM, 2026-09-22, on the component 4 agent's report).
     /// A stage whose state grows with morsels seen is what RC f.3 budgets for.
     pub state_bytes_max: u64, pub state_growth: i64,
+    /// What the stage's kernel asked for, per source, from the records' `alloc` (f.2; E13,
+    /// added 2026-10-02 at Brackly's request, as a basis for judging a function's design: the
+    /// ideal asks for little or nothing outside Arrow). `None` when no record of the stage was
+    /// measured (a Rust kernel, the source's stage).
+    pub alloc: Option<StageAlloc>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct StageAlloc {
+    pub refusal_on: bool,                   // the guard could refuse this kernel's requests
+    pub python: SourceAlloc,                // Python objects: peak_bytes is None (unmeasured, 05 f.10)
+    pub numpy: SourceAlloc,                 // NumPy data
+    pub arrow: SourceAlloc,                 // Arrow, from the pool's statistics: largest_request_bytes and refused are None (05 f.14)
+    pub peak_bytes: u64,                    // the most one call held at once, all sources (f.2)
+    pub outside_arrow_peak_bytes: u64,      // the part of that peak that was not Arrow
+    pub outside_arrow_fraction: Option<f64>,// outside_arrow_peak_bytes / peak_bytes; None when peak_bytes is 0
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SourceAlloc {
+    pub requested_bytes: u64,               // bytes requested in total
+    pub requests: u64,                      // number of requests
+    pub largest_request_bytes: Option<u64>, // the largest single request; None where unmeasured
+    pub peak_bytes: Option<u64>,            // the most one call held at once; None where unmeasured
+    pub refused: Option<u64>,               // requests refused; None where the source has no hook
 }
 
 /// The discovered limits as the report carries them. Named by d.1 and never defined
@@ -190,7 +215,7 @@ Overflow: Arrow IPC stream format, one message per chunk, in `staging_dir/trace-
 
 ### e.3 Report rendering
 
-`Display` produces a fixed layout of at most 40 lines: header (run id, exit, resumed, wall), limits line, memory line (peak, fraction, ceiling), CPU line (busy fraction, throttled fraction, workers), IO line (source bytes per second, paths taken), staging line (engaged, bytes, then staging bandwidth and source bandwidth side by side so a staging directory that shares a device with the source is visible, architecture 7), one line per stage (morsels, rows/s, amplification p50/p95, misses), sizer line, GIL line when any stage is Python, manifest line when one exists, and notes. Numbers use binary units for bytes and three significant figures.
+`Display` produces a fixed layout of at most 40 lines: header (run id, exit, resumed, wall), limits line, memory line (peak, fraction, ceiling), CPU line (busy fraction, throttled fraction, workers), IO line (source bytes per second, paths taken), staging line (engaged, bytes, then staging bandwidth and source bandwidth side by side so a staging directory that shares a device with the source is visible, architecture 7), one line per stage (morsels, rows/s, amplification p50/p95, misses), sizer line, GIL line when any stage is Python, one allocation line per stage whose `alloc` is `Some` (`alloc <stage>: refusal on|off, peak <bytes> (<percent> outside Arrow), python <bytes>/<requests>, numpy <bytes>/<requests>, arrow <bytes>/<requests>, refused <n>`, E13), manifest line when one exists, and notes. Numbers use binary units for bytes and three significant figures.
 
 ## f. Algorithms and policies
 
@@ -211,6 +236,7 @@ Overflow: Arrow IPC stream format, one message per chunk, in `staging_dir/trace-
 - `staging_bytes_written` = Σ max(`staging_bytes_delta`, 0); `staging_engaged` = that > 0.
 - `staging_bandwidth` = Σ |`staging_bytes_delta`| / W (bytes demoted to and promoted from staging over the whole run, per second); `source_bandwidth` = Σ`bytes_in` for stage 1 / W. Both are over W, not over a stage's wall time, so the two are comparable side by side (architecture 7, "spill directory on the same device as the source").
 - `state_bytes_max` per stage = max(`state_bytes`); `state_growth` per stage = last `state_bytes` − first non-zero `state_bytes` (reported so a stateful kernel whose state grows with morsels seen is visible in the report; RC f.6 StateGrowth). Records are grouped by `instance` (contracts d.13) when it is not `u16::MAX`, so a growing instance is not hidden by a fresh one.
+- `alloc` (E13, 2026-10-02), over the stage's records whose `alloc.measured` is true (none: `None`): for each source, `requested_bytes` = Σ`bytes`, `requests` = Σ`requests`, `largest_request_bytes` = max(`largest`), `peak_bytes` = max(`peak`), `refused` = Σ`refused`, with Python's `peak_bytes` and Arrow's `largest_request_bytes` and `refused` `None` because nothing measures them (05 f.10, f.14); `refusal_on` = any record's. A call's peak is `total = max(mem_anon_peak − mem_anon_before, arrow.peak + numpy.peak)`, the process's rise during the call or what the hooks saw held, whichever is larger, which is how Python objects (whose peak no hook sees) enter it; its outside-Arrow part is `total − min(arrow.peak, total)`. The stage's `peak_bytes` is the largest call total and `outside_arrow_peak_bytes` is that same call's outside-Arrow part, so the fraction describes one real call rather than a mixture. With several workers the process's rise and the Arrow pool's figures include concurrent calls (05 AD-I15), so the fraction is exact with one worker and indicative otherwise.
 - `gil_serialised` = any entry of `meta.gil` is `Serialised`; `notes` = `meta.notes` followed by `meta.controller_notes`; `run_id` = hex of `meta.run_id`.
 
 **f.3 `tail(stage, n)` (`TraceTail`).** Walk in-memory chunks from newest, including the builder's partial chunk; filter by stage; stop at n; return oldest first (the contract's order). Does not read the overflow file (the controller's window is recent by definition; a `tail` larger than what is in memory returns fewer records). The controller calls it every tick through `Arc<dyn TraceTail>`; the walk holds the chunk mutex for the duration of the walk only, never across a channel operation.
@@ -257,6 +283,8 @@ The trace is the observability. `tracing` events: `trace.overflow` (debug, chunk
 
 **TR-T10 staging_vs_source_bandwidth.** Synthetic trace over a 10 s run with 2 GiB of stage-1 `bytes_in` and `staging_bytes_delta` summing to +1 GiB and then −1 GiB: `source_bandwidth` is 204.8 MiB/s, `staging_bandwidth` is 204.8 MiB/s, both appear on the staging line of `Display` and in `to_json`; a run with no staging deltas reports 0.0 and `staging_engaged == false`. f.2, e.3 (architecture 7, spill directory on the same device as the source).
 
+**TR-T14 alloc_per_stage.** (E13, 2026-10-02) A synthetic trace with a Python stage whose records carry known `alloc` counts (one of them refused, one with a process rise larger than its hooked peaks) and a Rust stage with none: the Python stage's `alloc` equals the hand-computed sums, maxima and the outside-Arrow part of the largest call; its unmeasured fields are `None` and serialise as `null` in `to_json`; the Rust stage's `alloc` is `None`; `Display` has one `alloc` line for the Python stage only and stays within 40 lines; the record's `alloc` columns round-trip through the trace file. d.1, f.2, e.3.
+
 **TR-T13 peak_window.** (added 2026-09-30; `tr_limits_timeline.rs`) A run lowered to a third of its ceiling at 3525 ms with a drain that took 0 ms, and an exact process peak at 0.6 of the initial ceiling. Read between 3518 and 3533 ms: judged against the initial ceiling, at most 1.0, with the first note naming the window, the move and both ceilings, and `Display` showing it on a `memory:` line. Read between 3530 and 3545 ms: judged against the lowered ceiling, over 1.0, and no such note. A record whose `apply` ran from 1661 to 1696 ms across a lowering at 1691 ms: judged against the ceiling before it, with the note; one whose `apply` began at 1692 ms: judged against the lowered ceiling, over 1.0. f.4.
 
 **TR-T11 flush_then_finish.** From four threads, `record` 100,000 records, then each thread calls `flush` concurrently; after every `flush` returns, `snapshot().len() == 400,000`; `finish` once afterwards writes the footer; a second `finish` is a no-op; `record` after `finish` counts in `late_records`. TR-I5, e.1.
@@ -282,6 +310,7 @@ None. (`trace.memory_limit` is in the preamble's table.)
 | G-I8 (diagnostic durability) | TR-I5 | TR-T5, TR-T11 |
 | architecture 7 (spill directory on the source's device) | f.2 bandwidths, e.3 | TR-T10 |
 | D2, RC (controller window) | f.3 `TraceTail` | TR-T8 |
+| E13 (per-function allocation figures, refusal on or off) | d.1 `StageReport::alloc`, f.2 | TR-T14 |
 
 ## o. Deferred (post-v1)
 

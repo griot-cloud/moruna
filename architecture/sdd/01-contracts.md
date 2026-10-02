@@ -494,6 +494,36 @@ pub enum ResumePolicy {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum GilState { FreeThreaded, Serialised }
 
+/// What one call of a kernel asked for from one source (05 b "call counts"; E13, added
+/// 2026-10-02). A field a source cannot measure is zero here and absent in the report (04 f.2).
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct AllocCounts {
+    pub bytes: u64,      // bytes requested in total
+    pub requests: u64,   // number of requests
+    pub largest: u64,    // the largest single request
+    pub peak: u64,       // the most held at once during the call
+    pub refused: u64,    // requests the allocator guard refused
+}
+
+/// One call's counts per source, carried on its trace record (d.13). `measured` is false for a
+/// call nothing counted (a Rust kernel, no kernel); `refusal_on` is whether the guard could
+/// refuse this call's requests (the decorator's `memory_guard` and a bound gate).
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct KernelAlloc {
+    pub measured: bool,
+    pub refusal_on: bool,
+    pub python: AllocCounts,   // CPython's allocator domains (Python objects); `peak` unmeasured
+    pub numpy: AllocCounts,    // NumPy's data allocator
+    pub arrow: AllocCounts,    // pyarrow's default pool, from its statistics; `largest`, `refused` unmeasured
+}
+
+/// The hand-off from a kernel to the scheduler on the worker thread: a kernel that counts its
+/// call sets its counts before `apply` returns, and the scheduler takes them right after, into
+/// the call's record. A thread-local slot: `take` returns what the last `set` on this thread
+/// left, and the default when nothing did.
+pub fn set_kernel_alloc(counts: KernelAlloc);
+pub fn take_kernel_alloc() -> KernelAlloc;
+
 #[derive(Clone, Debug, Default)]
 pub struct KernelHints {
     pub expected_amplification: Option<f64>,
@@ -1000,6 +1030,9 @@ pub struct TraceRecord {
     pub state_bytes: u64,     // KernelState::footprint after apply; 0 when None or stateless
     pub sizer: u8,            // 0 rule, 1 learned
     pub outcome: Outcome, pub error: Option<String>,
+    /// The call's counts (d.7 `KernelAlloc`; E13, added 2026-10-02): what `take_kernel_alloc`
+    /// returned after `apply`; the default on a record whose kernel counted nothing.
+    pub alloc: KernelAlloc,
 }
 
 impl TraceRecord {
@@ -1050,6 +1083,12 @@ pub enum MorunaError {
     /// A reserved path (`rdma`, `remote`) was reached in a build that does not
     /// implement it. Always a bug or a misconfiguration, never a runtime condition.
     #[error("unsupported: {0}")] Unsupported(&'static str),
+    /// A kernel's own allocation was refused by the allocator guard because it would have
+    /// taken the process past its ceiling (05 AD-I8, AD-I13; E13, added 2026-10-02). The
+    /// adapter fills `stage` and `seq` with its sentinels and the scheduler replaces them with
+    /// the morsel's, and adds its features (SC f.8). A host maps it to the budget's exit code.
+    #[error("budget: kernel {kernel} stage {stage} morsel {seq} requested {requested} bytes with {in_use} in use, which would pass the ceiling of {ceiling} bytes; refused before the memory existed")]
+    Refused { stage: StageId, seq: Seq, kernel: String, requested: u64, in_use: u64, ceiling: u64, features: Option<Box<MorselFeatures>> },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1145,7 +1184,7 @@ A reader validates magic, version, ndim, that `data_offset` is a multiple of 409
 
 ### e.5 Trace record Arrow schema
 
-Field order and types are exactly as in `TraceRecord` (d.13): unsigned integers as `UInt64`/`UInt16`/`UInt8`, floats as `Float32`, vectors as `List<UInt64>`, `outcome` as `UInt8` (Ok=0, Error=1, Skipped=2, Probe=3), `error` as nullable `Utf8`. `SCHEMA_HASH` is BLAKE3 over `"seq:u64,stage:u16,..."` in that order; test CT-T9 pins the value after the agent computes it once.
+Field order and types are exactly as in `TraceRecord` (d.13): unsigned integers as `UInt64`/`UInt16`/`UInt8`, floats as `Float32`, vectors as `List<UInt64>`, `outcome` as `UInt8` (Ok=0, Error=1, Skipped=2, Probe=3), `error` as nullable `Utf8`, then `alloc` flattened (2026-10-02, E13): `alloc_measured:u8`, `alloc_refusal_on:u8`, and for each source `python`, `numpy`, `arrow` in that order the five `u64` columns `alloc_<source>_bytes`, `alloc_<source>_requests`, `alloc_<source>_largest`, `alloc_<source>_peak`, `alloc_<source>_refused`. `SCHEMA_HASH` is BLAKE3 over `"seq:u64,stage:u16,..."` in that order; test CT-T9 pins the value after the agent computes it once.
 
 ### e.6 Fingerprint
 
@@ -1238,6 +1277,8 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 **CT-T18 ipc_page_aligned.** `encode_framing` then `decode` over a page-rounded copy round-trips 20 generated batches (all e.3 types plus strings and lists); every body offset is a page multiple; decoded arrays' data pointers lie inside the input buffer (no copy); a corrupted body offset is `Io { op: "ipc" }`. Proves e.7.
 
 **CT-T19 tensor_from_buffer.** `ManagedTensor::from_buffer` over an `MRB1` body: `data_ptr == buf.host_ptr() + offset`, shape and dtype as given; a short buffer or misaligned offset is `Convert`/`Io`, not a panic. Proves d.4.
+
+**CT-T21 refused_names_the_request.** (E13, 2026-10-02) `MorunaError::Refused` displays exactly the d.14 text with its kernel, stage, morsel, request, memory in use and ceiling; `KernelAlloc::default()` is all zero and unmeasured; `take_kernel_alloc` returns what `set_kernel_alloc` left on the same thread once and the default after it, and nothing set on another thread. d.7, d.13, d.14, CT-I10.
 
 **CT-T15 resume_defaults.** A kernel with the default `restore` returns `Resume`; a `KernelState` with the default `checkpoint` returns `Ok(None)`; a sink with the default `resume` returns `Resume` and `committed_seq() == None`; `ResumePolicy::default() == Reinit`. Proves the resume defaults are refusals, not silent successes (l, anti-patterns).
 

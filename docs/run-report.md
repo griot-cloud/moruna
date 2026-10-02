@@ -44,6 +44,9 @@ These are attributes of the report object and keys of `to_json()`.
 | `amplification_p50`, `amplification_p95` | The kernel's memory use as a multiple of its input: typical and near the highest. |
 | `errors`, `skipped` | Morsels that failed, and morsels skipped under the error policy. |
 | `state_bytes_max`, `state_growth` | For a stateful kernel, the largest state and how much it grew. |
+| `alloc` | For a Python kernel, the memory it asked for itself, outside the data Moruna hands it; `null` for other kernels. See below. |
+
+`alloc` has `refusal_on` (whether a request past the memory ceiling would be refused, the decorator's `memory_guard`), then one entry each for `python` (Python objects), `numpy` (NumPy arrays) and `arrow` (pyarrow's memory pool), each with `requested_bytes`, `requests`, `largest_request_bytes`, `peak_bytes` (the most one call held at once) and `refused`, and finally `peak_bytes` (the most one call held at once, all sources together), `outside_arrow_peak_bytes` and `outside_arrow_fraction`. A field that cannot be measured for a source is `null`: the peak of Python objects, and the largest request and refusals for Arrow, whose figures come from the pool's own statistics around each call (with several workers they include what the others asked for at the same time). A kernel that works in Arrow and asks for little else has a small `outside_arrow_fraction`.
 
 ## Reading a report
 
@@ -52,6 +55,7 @@ A few patterns come up often:
 - **`peak_fraction_of_ceiling` is low and `worker_busy_fraction` is high.** The job was limited by CPU, not memory. More cores would make it faster; more memory would not.
 - **`worker_busy_fraction` is low.** The kernels were waiting, usually for the source or the sink. `bottleneck_timeline` says which.
 - **`staging_engaged` is true.** Data waited long enough to be written to disk, usually because the sink was slower than the kernels. The job was correct but slower than it could have been.
+- **A stage's `alloc.outside_arrow_fraction` is high.** The kernel builds most of its working memory as Python objects or NumPy arrays rather than Arrow. It costs memory Moruna can only observe, and is where a rewrite in Arrow, Polars or a standard kernel pays.
 - **`amplification_p95` is much higher than `amplification_p50`.** Some morsels cost far more memory than most, which makes Moruna size conservatively. Look for rows much larger than the rest.
 
 The notes explain each decision Moruna made in a sentence, and are the first place to look when a job behaves unexpectedly.

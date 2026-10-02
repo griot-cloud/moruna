@@ -292,6 +292,17 @@ impl PyRunReport {
             d.set_item("skipped", s.skipped)?;
             d.set_item("state_bytes_max", s.state_bytes_max)?;
             d.set_item("state_growth", s.state_growth)?;
+            // E13: what the stage's kernel asked for, per source (04 d.1), as the JSON has it.
+            let alloc = match &s.alloc {
+                Some(a) => {
+                    let text = serde_json::to_string(a).map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!("stage alloc: {e}"))
+                    })?;
+                    py.import("json")?.call_method1("loads", (text,))?.unbind()
+                }
+                None => py.None(),
+            };
+            d.set_item("alloc", alloc)?;
             list.append(d)?;
         }
         Ok(list)
@@ -476,6 +487,7 @@ mod tests {
             skipped: 0,
             state_bytes_max: 0,
             state_growth: 0,
+            alloc: None,
         }
     }
 

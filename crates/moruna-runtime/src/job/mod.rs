@@ -407,6 +407,10 @@ pub struct KernelDoc {
     /// The decorator's `state_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_bytes: Option<u64>,
+    /// The decorator's `memory_guard` (E13): whether the allocator guard may refuse this
+    /// kernel's requests past the ceiling; absent means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_guard: Option<bool>,
 }
 
 impl KernelDoc {
@@ -431,6 +435,7 @@ impl KernelDoc {
             preferred_rows: None,
             resume: None,
             state_bytes: None,
+            memory_guard: None,
         }
     }
 
@@ -448,7 +453,7 @@ impl KernelDoc {
     /// The names of the decorator hints this entry sets, in document order.
     pub fn hints_set(&self) -> Vec<&'static str> {
         let mut set = Vec::new();
-        let flags: [(&'static str, bool); 10] = [
+        let flags: [(&'static str, bool); 11] = [
             ("stateful", self.stateful.is_some()),
             ("instances", self.instances.is_some()),
             ("device_memory", self.device_memory.is_some()),
@@ -462,6 +467,7 @@ impl KernelDoc {
             ("preferred_rows", self.preferred_rows.is_some()),
             ("resume", self.resume.is_some()),
             ("state_bytes", self.state_bytes.is_some()),
+            ("memory_guard", self.memory_guard.is_some()),
         ];
         for (name, on) in flags {
             if on {

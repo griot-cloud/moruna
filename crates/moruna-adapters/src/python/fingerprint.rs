@@ -50,6 +50,17 @@ pub fn compute(py: Python<'_>, spec: &PyKernelSpec) -> Fingerprinted {
     }
 }
 
+/// `<module>.<qualname>` of the function the author wrote (the fingerprint's target), which the
+/// allocator guard's diagnostic names (05 d.1 `PyKernel::name`).
+pub fn kernel_name(py: Python<'_>, spec: &PyKernelSpec) -> String {
+    let target = fingerprint_target(py, spec);
+    let qualname = qualname_of(&target);
+    match attr_string(&target, "__module__") {
+        Some(module) => format!("{module}.{qualname}"),
+        None => qualname,
+    }
+}
+
 /// What the fingerprint is taken of: the function the author wrote (`origin`, for a Polars
 /// kernel the decorator wrapped), the callable itself, or the class of a class kernel (b).
 fn fingerprint_target<'py>(py: Python<'py>, spec: &PyKernelSpec) -> Bound<'py, PyAny> {

@@ -96,6 +96,29 @@ pub enum MorunaError {
     /// implement it. Always a bug or a misconfiguration, never a runtime condition.
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+    /// A kernel's own allocation was refused by the allocator guard because it would have taken
+    /// the process past its ceiling (05 AD-I8, AD-I13; E13). The adapter fills `stage` and
+    /// `seq` with its sentinels and the scheduler replaces them (SC f.8).
+    #[error(
+        "budget: kernel {kernel} stage {stage} morsel {seq} requested {requested} bytes with {in_use} in use, which would pass the ceiling of {ceiling} bytes; refused before the memory existed"
+    )]
+    Refused {
+        /// The morsel's stage.
+        stage: StageId,
+        /// The morsel.
+        seq: Seq,
+        /// `<module>.<qualname>` of the kernel.
+        kernel: String,
+        /// Bytes the refused request asked for.
+        requested: u64,
+        /// The process's memory when it was refused, as the gate judged it.
+        in_use: u64,
+        /// The ceiling it would have passed.
+        ceiling: u64,
+        /// The morsel's features, once the scheduler knows them; boxed, so the variant does
+        /// not make every `MorunaError` larger.
+        features: Option<Box<MorselFeatures>>,
+    },
 }
 
 /// Why a payload conversion (d.4) was refused.
