@@ -13,6 +13,7 @@ pub mod cross;
 pub mod ctx;
 pub mod fingerprint;
 pub mod gil;
+pub mod hooks;
 pub mod kernel;
 pub mod state;
 pub mod tensor_obj;
