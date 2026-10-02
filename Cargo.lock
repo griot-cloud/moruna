@@ -3698,7 +3698,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-adapters"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "dlpark",
@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-arena"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cudarc",
  "libc",
@@ -3724,7 +3724,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-bench"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "blake3",
@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-controller"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "moruna-kernel",
  "moruna-testkit",
@@ -3753,7 +3753,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-datafusion"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "datafusion",
  "futures",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-discovery"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "cudarc",
@@ -3777,7 +3777,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernel"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "blake3",
@@ -3788,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernels"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "moruna-kernel",
@@ -3799,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-placement"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-polars"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "moruna-kernel",
  "polars",
@@ -3826,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-py"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "moruna-adapters",
@@ -3850,7 +3850,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-reactor"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "cudarc",
@@ -3870,7 +3870,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-scheduler"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossbeam",
  "libc",
@@ -3922,7 +3922,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sinks"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -3940,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sources"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -3958,14 +3958,14 @@ dependencies = [
 
 [[package]]
 name = "moruna-testkit"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "moruna-kernel",
 ]
 
 [[package]]
 name = "moruna-trace"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "crossbeam",
@@ -3978,7 +3978,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-vmm"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "acpi_tables",
  "kvm-bindings",
@@ -4287,8 +4287,8 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "parcel-core"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
 dependencies = [
  "cel",
  "chrono",
@@ -4310,8 +4310,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-runtime"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
 dependencies = [
  "cel",
  "chrono",
@@ -4331,8 +4331,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-udf"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
 
 [[package]]
 name = "parking"
@@ -4470,8 +4470,8 @@ dependencies = [
 
 [[package]]
 name = "peql"
-version = "0.4.0"
-source = "git+https://github.com/griot-cloud/peQL?rev=23450f1#23450f166c203a08f42aa3305c1072dcbcdd5ab7"
+version = "0.4.1"
+source = "git+https://github.com/griot-cloud/peQL?rev=3023b0b#3023b0b04d4632fab1c8f071dce7fda6aeb7609c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5291,7 +5291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
