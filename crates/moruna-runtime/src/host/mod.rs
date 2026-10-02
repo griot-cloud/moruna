@@ -91,6 +91,18 @@ mod tests {
             exit::FAILED
         );
         assert_eq!(exit_code(&MorunaError::Unsupported("rdma")), exit::FAILED);
+        // E13: a refusal by the allocator guard keeps the budget's exit code.
+        let refused = MorunaError::Refused {
+            stage: 1,
+            seq: 2,
+            kernel: "jobs.greedy".into(),
+            requested: 3,
+            in_use: 4,
+            ceiling: 5,
+            features: None,
+        };
+        assert_eq!(exit_code(&refused), exit::BUDGET_REFUSED);
+        assert!(diagnostic(&refused).starts_with("budget: kernel jobs.greedy"));
         assert_eq!(diagnostic(&config("spec")), "");
         assert_eq!(diagnostic(&MorunaError::Cancelled), "cancelled");
     }
