@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+The allocator guard: a Python kernel's own requests for memory are counted per call and refused at the ceiling, and the run report says how much of each stage's memory lived outside Arrow.
+
+- **`memory_guard` on `@moruna.kernel`, default on.** While a Python kernel runs, a single request for memory (a NumPy array, a Python object) that would take the process past its memory ceiling is refused before the memory exists: the kernel sees `MemoryError`, and the run ends with a budget error naming the kernel and the request (`MorunaError::Refused`, the budget's exit code), rather than being killed at the ceiling. `memory_guard=False` turns refusal off for that kernel; what it asks for is still counted. The job document carries the same switch on a kernel stage, and `moruna check` reports whether each kernel's requests would be refused.
+- **How the requests are seen.** CPython's three allocator domains (raw, mem, object) are hooked through PEP 445 and NumPy's data allocator through NEP 49, so each request is counted per call and can be refused; Arrow's requests are read from its memory pool's statistics, counted but never refused there (the arena's own accounting covers them). PyTorch and Rust allocations are not hooked.
+- **Allocation counts on every trace record and per stage in the run report.** Each call's record carries what the kernel asked for; the report's `stages[..]["alloc"]` folds them per source (CPython, NumPy, Arrow): the number of requests, the bytes, the largest request, the peak, and the requests refused where the source can refuse. `outside_arrow_peak_bytes` and `outside_arrow_fraction` say how much of a stage's peak was memory outside Arrow, which is what a kernel's design should drive toward zero.
+- **A refusal keeps the budget's exit code and follows the error policy.** A run whose kernel's request was refused ends as an over-budget run does, with the kernel and the request named; `moruna.MorunaError` carries the `Refused` kind in Python.
+
 ## 0.3.1
 
 Vortex files as a source and a sink, with no decode copy for columns stored in a canonical encoding.
