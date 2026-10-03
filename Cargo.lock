@@ -4949,7 +4949,7 @@ dependencies = [
 [[package]]
 name = "peql"
 version = "0.4.1"
-source = "git+https://github.com/griot-cloud/peQL?rev=3023b0b#3023b0b04d4632fab1c8f071dce7fda6aeb7609c"
+source = "git+https://github.com/griot-cloud/peQL?rev=44c111f#44c111fdf544f08db065af6f44f4fea4586d7db1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5799,7 +5799,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
