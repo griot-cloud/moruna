@@ -158,6 +158,19 @@ impl PyRunReport {
         self.inner.late_records
     }
 
+    /// `moruna_trace::RunReport::snapshot` (04 d.1): `{"snapshot_id", "parent_snapshot_id"}`
+    /// for a run whose sink committed a snapshot, otherwise `None`.
+    #[getter]
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(snap) = self.inner.snapshot else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("snapshot_id", snap.snapshot_id)?;
+        d.set_item("parent_snapshot_id", snap.parent_snapshot_id)?;
+        Ok(Some(d))
+    }
+
     /// How the run ended: `"Completed"`, `"Cancelled"`, or `{"Terminated": {"diagnostic": ...}}`,
     /// which is the shape `to_json` gives the same field.
     #[getter]
@@ -536,6 +549,7 @@ mod tests {
             notes: (0..notes).map(|i| format!("note {i}")).collect(),
             overflow_failed: false,
             late_records: 0,
+            snapshot: None,
         }
     }
 

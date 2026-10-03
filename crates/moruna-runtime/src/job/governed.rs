@@ -102,8 +102,10 @@ mod imp {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use moruna_datafusion::engine::{Caller, Engine, Location, WriteMode};
-    use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory};
+    use moruna_datafusion::engine::{Caller, Engine, WriteMode};
+    use moruna_datafusion::{
+        BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory, location_target,
+    };
     use moruna_kernel::{MorunaError, Result, Sink, Source};
 
     use super::{Engines, KernelLoader, Read, SpecError, Write};
@@ -138,10 +140,7 @@ mod imp {
         let location = engine
             .location(contract)
             .map_err(|e| SpecError::new(field, format!("peQL: {e}")))?;
-        Ok(location.map(|location| match location {
-            Location::Local(path) => path.display().to_string(),
-            Location::Object(object) => object.url(true),
-        }))
+        Ok(location.as_ref().map(location_target))
     }
 
     fn caller_of(

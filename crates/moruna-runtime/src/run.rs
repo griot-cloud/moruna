@@ -786,6 +786,10 @@ fn drive(
         drains,
         process_peak,
         process_usage,
+        snapshot: match &outcome {
+            RunOutcome::Completed { sink } => sink.snapshot,
+            RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
+        },
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {

@@ -540,6 +540,7 @@ impl Sink for ParquetSink {
             rows,
             bytes,
             files: inner.ledger.names(),
+            snapshot: None,
         })
     }
 

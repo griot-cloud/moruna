@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use datafusion::config::Dialect;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use moruna_kernel::{
-    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary,
-    SourceSchema, TierPref,
+    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSnapshot,
+    SinkSummary, SourceSchema, TierPref,
 };
-use peql::{Caller, Engine, WriteMode, Writing};
+use peql::{Caller, Engine, Location, PeqlError, WriteMode, Writing};
 
 use crate::memory::PlanMemory;
 use crate::plan_source::{PlanSource, Runtime, plan_err};
@@ -82,6 +82,19 @@ impl PlanSource {
             })
             .map_err(|e| plan_err(format!("peQL: {e}")))?;
         PlanSource::build(planned.plan, &planned.ctx, runtime, memory)
+    }
+}
+
+/// Where a contract's data is, as one string: a local path, an object URL, or an Iceberg
+/// table's catalog key. Two contracts with the same target write the same data, which is what
+/// a job document's sink equals source rule compares. A host that turns on peQL's `iceberg`
+/// feature turns on this crate's `peql-iceberg` with it, so that its tables are named here.
+pub fn location_target(location: &Location) -> String {
+    match location {
+        Location::Local(path) => path.display().to_string(),
+        Location::Object(object) => object.url(true),
+        #[cfg(feature = "peql-iceberg")]
+        Location::Iceberg(table) => table.key(),
     }
 }
 
@@ -173,6 +186,18 @@ fn sink_err(e: impl std::fmt::Display) -> MorunaError {
     MorunaError::Sink(format!("peQL: {e}"))
 }
 
+/// What a failed `finish_write` ends the run with. A conflict (the table moved while the run
+/// wrote, so peQL refused to commit over it) says that nothing was committed, which a host
+/// needs to know to run the write again; every other failure is peQL's own words.
+fn finish_err(contract: &str, e: PeqlError) -> MorunaError {
+    match e {
+        PeqlError::Conflict(msg) => MorunaError::Sink(format!(
+            "peQL: `{contract}` was not committed, because its table moved while this run wrote it: {msg}"
+        )),
+        other => sink_err(other),
+    }
+}
+
 impl Sink for PeqlSink {
     fn open(&mut self, _schema: &SourceSchema) -> Result<()> {
         let mut writing = self
@@ -230,7 +255,7 @@ impl Sink for PeqlSink {
         let report = self
             .runtime
             .block_on(self.engine.finish_write(writing))
-            .map_err(sink_err)?;
+            .map_err(|e| finish_err(&self.contract, e))?;
         if !report.verdict.valid {
             return Err(MorunaError::Sink(format!(
                 "peQL: `{}` is written but not servable: {}",
@@ -248,6 +273,39 @@ impl Sink for PeqlSink {
             rows: report.rows_written as u64,
             bytes: self.bytes.load(Ordering::SeqCst),
             files,
+            snapshot: report.snapshot.map(|s| SinkSnapshot {
+                snapshot_id: s.snapshot_id,
+                parent_snapshot_id: s.parent_snapshot_id,
+            }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A conflict says the write was not committed and keeps peQL's account of it; any other
+    /// failure of `finish_write` is peQL's own words.
+    #[test]
+    fn a_conflict_says_nothing_was_committed() {
+        let e = finish_err(
+            "demo/big",
+            PeqlError::Conflict("ns.big is at snapshot Some(7)".into()),
+        );
+        assert_eq!(
+            e.to_string(),
+            "sink: peQL: `demo/big` was not committed, because its table moved while this run \
+             wrote it: ns.big is at snapshot Some(7)"
+        );
+        let e = finish_err("demo/big", PeqlError::Invalid("bad".into()));
+        assert_eq!(e.to_string(), "sink: peQL: bad");
+    }
+
+    /// A local binding's target is its path as written.
+    #[test]
+    fn a_local_target_is_its_path() {
+        let location = Location::Local(std::path::PathBuf::from("/data/big"));
+        assert_eq!(location_target(&location), "/data/big");
     }
 }

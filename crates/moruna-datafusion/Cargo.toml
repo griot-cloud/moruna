@@ -29,6 +29,9 @@ datafusion = ["dep:datafusion"]
 # `PlanSource` over a DataFusion plan and peQL's governed plans, `PeqlSink` over peQL's
 # contract writes (MH 4.5).
 peql = ["datafusion", "dep:moruna-sources", "dep:tokio", "dep:futures", "dep:peql"]
+# Contracts bound to Iceberg tables, through a catalog the host gives peQL's engine; Moruna
+# constructs no catalog, it only writes through the engine it is handed.
+peql-iceberg = ["peql", "peql/iceberg"]
 
 [[test]]
 name = "ad_t10_datafusion_bridge"

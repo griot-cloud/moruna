@@ -102,6 +102,8 @@ def test_py_t3_normalise(
     )
 
     assert report.exit == "Completed", report.notes
+    # A Parquet sink keeps no snapshots.
+    assert report.snapshot is None
     out = pathlib.Path(out_url.removeprefix("file://"))
     back = pq.read_table(str(out)).sort_by("id")
     assert back.num_rows == rows

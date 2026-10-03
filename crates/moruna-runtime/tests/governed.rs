@@ -280,6 +280,12 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
             budget,
         );
         apart::within(&wrote, "the write", budget);
+        // A Parquet binding keeps no snapshots: the report has none.
+        assert!(
+            wrote["report"].get("snapshot").is_none(),
+            "{}",
+            wrote["report"]
+        );
         let engine = Engine::open(&root).expect("the engine");
         let manifest = engine.manifest("demo/big").expect("read").expect("written");
         assert!(manifest.valid, "{:?}", manifest.breached);

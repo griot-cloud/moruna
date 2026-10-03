@@ -36,6 +36,6 @@ pub use ::peql as engine;
 #[cfg(feature = "peql")]
 pub use memory::{BudgetPool, PlanMemory};
 #[cfg(feature = "peql")]
-pub use peql::{PeqlRead, PeqlSink, WriteMemory};
+pub use peql::{PeqlRead, PeqlSink, WriteMemory, location_target};
 #[cfg(feature = "peql")]
 pub use plan_source::{PlanSource, SPLIT_BYTES};
