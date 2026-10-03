@@ -119,6 +119,12 @@ if [ -f Cargo.toml ]; then
   quiet clippy_peql cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets --features moruna-datafusion/peql,moruna-runtime/peql -- -D warnings
   step "cargo test --features peql (H6: a governed plan is a source, a contract write a sink)"
   quiet test_peql cargo test -p moruna-runtime --features peql
+  # A host that embeds peQL with `iceberg` unifies that feature into this build, so the governed
+  # ends must compile and pass with it on (0.4.1).
+  step "cargo clippy and test --features peql-iceberg (peQL's Iceberg binding compiled in)"
+  quiet clippy_peql_iceberg cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets \
+    --features moruna-datafusion/peql-iceberg,moruna-runtime/peql -- -D warnings
+  quiet test_peql_iceberg cargo test -p moruna-datafusion --features moruna-datafusion/peql-iceberg
   if [ -n "${MORUNA_PYTHON:-}" ]; then
     # The adapter's fixtures import pyarrow and numpy inside the embedded interpreter, so
     # MORUNA_PYTHON has to be able to find both. A uv-managed interpreter is externally managed

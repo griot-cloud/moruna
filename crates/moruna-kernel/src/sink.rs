@@ -14,6 +14,18 @@ pub struct SinkSummary {
     pub bytes: u64,
     /// The files or objects produced.
     pub files: Vec<String>,
+    /// The snapshot the write committed, for a sink whose table keeps snapshots (a peQL
+    /// contract bound to an Iceberg table); `None` for every other write.
+    pub snapshot: Option<SinkSnapshot>,
+}
+
+/// A snapshot a sink committed to a table with snapshots, and the one it followed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SinkSnapshot {
+    /// The snapshot the write committed.
+    pub snapshot_id: i64,
+    /// The table's snapshot before this one; `None` for a table's first.
+    pub parent_snapshot_id: Option<i64>,
 }
 
 /// Where a run's output goes (component 8).

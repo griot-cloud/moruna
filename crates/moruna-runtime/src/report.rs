@@ -77,6 +77,8 @@ pub struct MetaInput {
     pub process_peak: moruna_kernel::ProcessPeak,
     /// What the whole process consumed over the run (`Sampler::process_usage`).
     pub process_usage: moruna_kernel::ProcessUsage,
+    /// The snapshot the sink committed, when the run completed into a table with snapshots.
+    pub snapshot: Option<moruna_kernel::SinkSnapshot>,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -111,6 +113,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         drains: input.drains,
         process_peak: input.process_peak,
         process_usage: input.process_usage,
+        snapshot: input.snapshot,
     }
 }
 
@@ -188,6 +191,7 @@ mod tests {
                 since_ns: 2,
             },
             process_usage: moruna_kernel::ProcessUsage::default(),
+            snapshot: None,
         });
         assert_eq!(meta.process_peak.bytes, 9);
         assert_eq!(meta.bottleneck_timeline.len(), all.len());
@@ -214,6 +218,7 @@ mod tests {
             drains: Vec::new(),
             process_peak: moruna_kernel::ProcessPeak::default(),
             process_usage: moruna_kernel::ProcessUsage::default(),
+            snapshot: None,
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());

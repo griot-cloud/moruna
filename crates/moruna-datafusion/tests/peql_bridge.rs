@@ -294,6 +294,8 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
     );
     let summary = sink.finish().expect("finished");
     assert_eq!(summary.rows, 400);
+    // A Parquet binding keeps no snapshots, so the write commits none.
+    assert_eq!(summary.snapshot, None);
     assert!(summary.bytes > 0);
     let manifest = engine.manifest("demo/readings").unwrap().unwrap();
     assert!(manifest.valid);

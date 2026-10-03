@@ -176,4 +176,9 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
   "https://github.com/griot-cloud/peQL",
   "https://github.com/griot-cloud/parcel",
+  # Apache Iceberg's Rust crates, at the commits peQL 0.4.1 (`44c111f`) pins for its
+  # `iceberg` feature. They enter the graph only through `moruna-datafusion`'s
+  # `peql-iceberg`, which no Moruna build turns on; a host that embeds peQL with Iceberg does.
+  "https://github.com/apache/iceberg-rust",
+  "https://github.com/apache/datafusion-iceberg",
 ]

@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use moruna_kernel::{
-    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, StageId, TraceRecord,
+    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, SinkSnapshot,
+    StageId, TraceRecord,
 };
 use serde::{Serialize, Serializer};
 
@@ -63,6 +64,10 @@ pub struct RunMeta {
     pub process_peak: ProcessPeak,
     /// What the whole process consumed over the run, measured (`Sampler::process_usage`).
     pub process_usage: ProcessUsage,
+    /// The snapshot the sink committed, for a sink whose table keeps snapshots
+    /// (`SinkSummary::snapshot`); `None` for every other run, and for a run that did not
+    /// complete.
+    pub snapshot: Option<SinkSnapshot>,
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -247,6 +252,31 @@ pub struct RunReport {
     pub overflow_failed: bool,
     /// Records that arrived after `finish` or after the writer failed (04 e.1, h).
     pub late_records: u64,
+    /// The snapshot the run's sink committed, for a table with snapshots (a peQL contract
+    /// bound to an Iceberg table). Absent from the JSON for every other run.
+    #[serde(
+        serialize_with = "snapshot_json",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub snapshot: Option<SinkSnapshot>,
+}
+
+/// `SinkSnapshot` is the contracts' type (d.8); serialised here as
+/// `{"snapshot_id", "parent_snapshot_id"}`.
+fn snapshot_json<S: Serializer>(
+    v: &Option<SinkSnapshot>,
+    s: S,
+) -> core::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    match v {
+        None => s.serialize_none(),
+        Some(snap) => {
+            let mut st = s.serialize_struct("SinkSnapshot", 2)?;
+            st.serialize_field("snapshot_id", &snap.snapshot_id)?;
+            st.serialize_field("parent_snapshot_id", &snap.parent_snapshot_id)?;
+            st.end()
+        }
+    }
 }
 
 fn io_paths_json<S: Serializer>(p: &IoPaths, s: S) -> core::result::Result<S::Ok, S::Error> {
@@ -628,6 +658,7 @@ impl RunReport {
             notes,
             overflow_failed: trace.overflow_failed(),
             late_records: trace.late_records(),
+            snapshot: meta.snapshot,
         }
     }
 

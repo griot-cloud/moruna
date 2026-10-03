@@ -631,6 +631,7 @@ impl Sink for VortexSink {
             rows,
             bytes,
             files: inner.ledger.names(),
+            snapshot: None,
         })
     }
 

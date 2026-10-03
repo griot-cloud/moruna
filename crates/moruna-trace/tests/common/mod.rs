@@ -141,6 +141,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         drains: Vec::new(),
         process_peak: moruna_kernel::ProcessPeak::default(),
         process_usage: moruna_kernel::ProcessUsage::default(),
+        snapshot: None,
     }
 }
 
