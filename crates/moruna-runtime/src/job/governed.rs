@@ -140,7 +140,11 @@ mod imp {
         let location = engine
             .location(contract)
             .map_err(|e| SpecError::new(field, format!("peQL: {e}")))?;
-        Ok(location.as_ref().map(location_target))
+        location
+            .as_ref()
+            .map(location_target)
+            .transpose()
+            .map_err(|e| SpecError::new(field, format!("peQL: {e}")).into())
     }
 
     fn caller_of(

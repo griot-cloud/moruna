@@ -90,6 +90,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      - name: peQL with its Iceberg binding compiled in (moruna-datafusion's peql-iceberg)
+        # A host that embeds peQL with `iceberg` unifies that feature into Moruna's build, so the
+        # governed ends must compile and pass with it on, not only in the default graph.
+        run: |
+          cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets --locked \
+            --features moruna-datafusion/peql-iceberg,moruna-runtime/peql -- -D warnings
+          cargo test -p moruna-datafusion --locked --features moruna-datafusion/peql-iceberg
       - name: CT-T12 boundary, moruna-kernel has no runtime dependency
         run: |
           cargo tree -p moruna-kernel > kernel-tree.txt

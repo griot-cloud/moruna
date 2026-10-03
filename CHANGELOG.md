@@ -7,7 +7,7 @@ Moruna moves to peQL 0.4.1, so a contract write can land in an Iceberg table and
 - **peQL 0.4.1 and parcel 0.0.3.** The `peql` feature now builds against peQL at `3023b0b` and parcel at `93322ad`, where a contract's binding is a Parquet location or an Iceberg table. A host that embeds Moruna and peQL together uses this one peQL.
 - **The snapshot a contract write committed is on its report.** A sink's summary carries `snapshot` (`snapshot_id`, `parent_snapshot_id`) when its table keeps snapshots, and the run report has the same `snapshot` field, `report.snapshot` in Python. A write to a Parquet binding commits no snapshot, and its report has no `snapshot` field, so it is unchanged.
 - **A write conflict ends the run as a sink error that says nothing was committed.** When peQL refuses to commit an overwrite because the table moved while the run wrote it (`PeqlError::Conflict`), the run fails as any sink failure does (exit code 1) with a diagnostic naming the contract and the snapshots, so a host can run the write again.
-- **`peql-iceberg` on `moruna-datafusion`.** It turns on peQL's `iceberg` feature, so a host can hand Moruna an engine whose bindings resolve to Iceberg tables through a catalog the host builds; Moruna builds no catalog. A host that turns on peQL's `iceberg` directly turns this on with it.
+- **`peql-iceberg` on `moruna-datafusion`.** It turns on peQL's `iceberg` feature, so a host can hand Moruna an engine whose bindings resolve to Iceberg tables through a catalog the host builds; Moruna builds no catalog. Moruna also builds when a host turns on peQL's `iceberg` through its own dependency on peQL; an Iceberg binding's target is peQL's key for the table, and CI builds and tests the governed ends with the feature on.
 
 ## 0.4.0
 

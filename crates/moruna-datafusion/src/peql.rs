@@ -85,16 +85,17 @@ impl PlanSource {
     }
 }
 
-/// Where a contract's data is, as one string: a local path, an object URL, or an Iceberg
-/// table's catalog key. Two contracts with the same target write the same data, which is what
-/// a job document's sink equals source rule compares. A host that turns on peQL's `iceberg`
-/// feature turns on this crate's `peql-iceberg` with it, so that its tables are named here.
-pub fn location_target(location: &Location) -> String {
+/// Where a contract's data is, as one string: a local path as written, an object URL, or, for
+/// a binding peQL adds behind a feature of its own (an Iceberg table), peQL's key for it. Two
+/// contracts with the same target write the same data, which is what a job document's sink
+/// equals source rule compares. Cargo unifies features, so peQL's `iceberg` may be on in a host's
+/// build without this crate's `peql-iceberg`; the last arm keeps this match whole either way.
+pub fn location_target(location: &Location) -> peql::Result<String> {
     match location {
-        Location::Local(path) => path.display().to_string(),
-        Location::Object(object) => object.url(true),
-        #[cfg(feature = "peql-iceberg")]
-        Location::Iceberg(table) => table.key(),
+        Location::Local(path) => Ok(path.display().to_string()),
+        Location::Object(object) => Ok(object.url(true)),
+        #[allow(unreachable_patterns)]
+        other => other.key(),
     }
 }
 
@@ -306,6 +307,6 @@ mod tests {
     #[test]
     fn a_local_target_is_its_path() {
         let location = Location::Local(std::path::PathBuf::from("/data/big"));
-        assert_eq!(location_target(&location), "/data/big");
+        assert_eq!(location_target(&location).expect("a path"), "/data/big");
     }
 }
