@@ -188,6 +188,8 @@ The sizing arithmetic (ceiling − baseline − reserve − expected kernel stat
 
 A governed engine needs nothing from Moruna beyond this: it hands over the plan and Moruna sees only the batches the plan emits. The spec's `source.kind = "datafusion"` names the engine by crate feature; the first engine is peQL 0.4.0 (`github.com/griot-cloud/peQL`), whose `Engine::view(name, caller)` returns a `LogicalPlan` already wrapped in its `Gate` node with the caller's context bound (`src/engine.rs:621-670`), so `PlanSource` executes a plan that peQL's own `ensure_gated` invariant has approved. peQL's binding is a streaming `ListingTable` over the attached disk (`src/binding.rs:117-150`); its per-partition streams are what `read` consumes.
 
+**Contracts arrive compiled.** The engine Moruna opens on the attached disk serves the contracts already registered there, each stored as parcel's compiled bytes (`v<n>.peql.json`); peQL loads that compiled form and never compiles, and Moruna neither compiles nor registers a contract. A contract that is not on the disk in that form is not found, and the run fails naming it.
+
 **The write side is the same seam in reverse.** `PeqlSink` wraps `Engine::write(name, batches, mode)` (`src/engine.rs:389-495`): Moruna's sink queue delivers morsels, peQL conforms them to the contract's row schema, computes the flag and derived columns its `WritePlan` demands, writes partitioned, clustered, bloom-filtered Parquet, and refreshes the manifest on `finish`. Moruna makes that path out-of-core; peQL's semantics are untouched. Both `PlanSource` and `PeqlSink` live in `moruna-datafusion` behind a `peql` feature, so the bridge crate depends on `peql` and `peql` never depends on Moruna.
 
 ### 4.6 Object storage through a socket

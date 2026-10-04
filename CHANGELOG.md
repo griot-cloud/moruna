@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **peQL 0.4.2 and parcel at `0af4c09`: contracts are compiled entries.** The `peql` feature builds against peQL at `7563bfa` and parcel at `0af4c09`. peQL reads a disk's contracts as parcel's compiled bytes (`v<n>.peql.json`) and never compiles; a disk whose contracts are the old `v<n>.parcel.json` bundles has no contracts to this build.
+
 ## 0.4.1
 
 Moruna moves to peQL 0.4.1, so a contract write can land in an Iceberg table and the run report names the snapshot it committed.
