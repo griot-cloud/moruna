@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2
 
 - **A job's contracts travel in its document.** `contracts` lists the compiled contracts a `datafusion` source reads and a `peql` sink writes under (document, compiled bytes, pinned function modules, audiences). The job's peQL engine keeps its manifests, ledger and audit log at `root` and its contracts in memory: it reads no contract from the disk and writes none there, and a contract the job names that the document does not carry is refused by name. `KernelLoader::admit` lets a host refuse a carried contract before it is registered; `job::entry_of` writes a contract peQL registered as an entry.
 - **peQL 0.4.2 and parcel at `0af4c09`: contracts are compiled entries.** The `peql` feature builds against peQL at `7563bfa` and parcel at `0af4c09`. peQL reads a disk's contracts as parcel's compiled bytes (`v<n>.peql.json`) and never compiles; a disk whose contracts are the old `v<n>.parcel.json` bundles has no contracts to this build.
