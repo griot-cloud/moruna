@@ -33,6 +33,7 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 | `profiles_dir` | string | `~/.moruna/profiles` | Where kernel profiles are stored. |
 | `allow_gil` | boolean | `false` | Run Python kernels on the standard build of Python. |
 | `report` | object | report file only | Where the report goes. |
+| `contracts` | list | `[]` | The contracts a `datafusion` source reads and a `peql` sink writes under, compiled. |
 
 ## source
 
@@ -52,7 +53,7 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 
 **`tensor`**: `url` is a path or a list of paths to safetensors or aligned binary tensor files; `options.tensors` lists the tensors to read.
 
-**`datafusion`**: a query planned by peQL for a caller. `root` is the peQL workspace; exactly one of `contract`, to read one contract, or `sql`, a query over contracts; and `caller`, the caller as peQL reads it, with `id`, `tenant` and `purpose` and optionally `tier`, `clearance`, `classification`, `roles`, `now` and `other`. See the [peQL documentation](https://griot-cloud.github.io/peQL/).
+**`datafusion`**: a query planned by peQL for a caller. `root` is the peQL workspace, where peQL keeps its manifests, privacy ledger and audit log; the contracts are the ones listed in [`contracts`](#contracts); exactly one of `contract`, to read one contract, or `sql`, a query over contracts; and `caller`, the caller as peQL reads it, with `id`, `tenant` and `purpose` and optionally `tier`, `clearance`, `classification`, `roles`, `now` and `other`. See the [peQL documentation](https://griot-cloud.github.io/peQL/).
 
 ```json
 {"kind": "datafusion", "root": "/data/workspace", "contract": "purchasing/orders",
@@ -85,7 +86,11 @@ Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refus
 
 **`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB).
 
-**`peql`**: writes under a peQL contract. `root` is the peQL workspace, `contract` the contract, `caller` the writer, who must own the contract, and `mode` either `append` (default) or `overwrite`. peQL writes the data in the contract's layout and updates the contract's manifest when the job finishes.
+**`peql`**: writes under a peQL contract listed in [`contracts`](#contracts). `root` is the peQL workspace, `contract` the contract, `caller` the writer, who must own the contract, and `mode` either `append` (default) or `overwrite`. peQL writes the data in the contract's layout and updates the contract's manifest when the job finishes.
+
+## contracts
+
+Each entry is one contract, as peQL registers a compiled one: `document`, the contract's document; `compiled`, its compiled form exactly as parcel wrote it; `functions`, the function modules the compiled form pins; and `audiences`, the tenants it is published to for this job besides its owner (`public` is everyone). The job's peQL engine holds these contracts in memory and nothing else: it reads no contract from `root` and writes none there, and a contract the job names that is not listed here is refused by name. A document that lists contracts and has no `datafusion` source or `peql` sink is refused.
 
 ## budget
 

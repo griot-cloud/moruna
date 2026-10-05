@@ -122,7 +122,10 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
   "resume": null,                          // or a manifest path
   "error_policy": "terminate",
   "ordered": false,
-  "report": { "socket": "vsock://2:5000", "file": "/staging/moruna-<run_id>/report.json" }
+  "report": { "socket": "vsock://2:5000", "file": "/staging/moruna-<run_id>/report.json" },
+  "contracts": [                           // what a datafusion source or a peql sink reads (§4.5)
+    { "document": {}, "compiled": "parcel-compiled/1…", "functions": [], "audiences": [] }
+  ]
 }
 ```
 
@@ -131,6 +134,7 @@ Rules:
 - **Precedence:** a spec field set → the spec wins; a spec field `null` → discovery, then the environment variable if the field has one, then the default. `moruna run` prints every field it resolved from the environment as a `notes` entry, and **refuses** when `--strict` (the hosted default) and any such resolution happened (H8).
 - The spec is content-addressed: `sha256(canonical JSON)` is the `plan digest` the manifest already records (parent §10), so a resume with a changed spec is refused as today.
 - `report.file` is always written, even when the socket is unset; the socket is additive.
+- `contracts` is the job's whole contract store (§4.5): each entry is a contract's document, its compiled bytes exactly as parcel wrote them, the function modules they pin, and the tenants it is published to for this run. It is part of the spec, so it is covered by the digest. A document that carries contracts and has no `datafusion` source or `peql` sink is refused.
 
 ### 4.2 `moruna run` and `moruna serve`
 
@@ -188,7 +192,7 @@ The sizing arithmetic (ceiling − baseline − reserve − expected kernel stat
 
 A governed engine needs nothing from Moruna beyond this: it hands over the plan and Moruna sees only the batches the plan emits. The spec's `source.kind = "datafusion"` names the engine by crate feature; the first engine is peQL 0.4.0 (`github.com/griot-cloud/peQL`), whose `Engine::view(name, caller)` returns a `LogicalPlan` already wrapped in its `Gate` node with the caller's context bound (`src/engine.rs:621-670`), so `PlanSource` executes a plan that peQL's own `ensure_gated` invariant has approved. peQL's binding is a streaming `ListingTable` over the attached disk (`src/binding.rs:117-150`); its per-partition streams are what `read` consumes.
 
-**Contracts arrive compiled.** The engine Moruna opens on the attached disk serves the contracts already registered there, each stored as parcel's compiled bytes (`v<n>.peql.json`); peQL loads that compiled form and never compiles, and Moruna neither compiles nor registers a contract. A contract that is not on the disk in that form is not found, and the run fails naming it.
+**Contracts arrive compiled, in the job document.** The engine Moruna opens at the source's or sink's `root` keeps its manifests, privacy ledger and audit log on the attached disk, and its contracts in memory: exactly the ones the document carries in `contracts`, registered as compiled (`Engine::register_compiled`) when the document is built and gone when the process exits. peQL never compiles them and Moruna never compiles one. Moruna reads no contract from the disk and writes none there; a contract the job names that the document does not carry is refused by the field that names it, whatever the disk holds. Before registering an entry Moruna asks its kernel loader to admit it (`KernelLoader::admit`); the default admits what the document carries, and a host that knows where the contracts it trusts come from refuses the others there.
 
 **The write side is the same seam in reverse.** `PeqlSink` wraps `Engine::write(name, batches, mode)` (`src/engine.rs:389-495`): Moruna's sink queue delivers morsels, peQL conforms them to the contract's row schema, computes the flag and derived columns its `WritePlan` demands, writes partitioned, clustered, bloom-filtered Parquet, and refreshes the manifest on `finish`. Moruna makes that path out-of-core; peQL's semantics are untouched. Both `PlanSource` and `PeqlSink` live in `moruna-datafusion` behind a `peql` feature, so the bridge crate depends on `peql` and `peql` never depends on Moruna.
 

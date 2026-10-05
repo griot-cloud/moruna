@@ -4346,6 +4346,7 @@ dependencies = [
  "moruna-trace",
  "moruna-vmm",
  "parcel-core",
+ "parcel-runtime",
  "parquet",
  "serde",
  "serde_json",

@@ -64,6 +64,13 @@ pub trait KernelLoader {
         Ok(None)
     }
 
+    /// Whether the run may register entry `index` of the document's `contracts` (MH 4.5), before
+    /// its governed engine registers it. A loader that knows where the contracts it trusts come
+    /// from refuses the others here; the default registers what the document carries.
+    fn admit(&self, _index: usize, _contract: &super::ContractEntry) -> Result<()> {
+        Ok(())
+    }
+
     /// The source for `"kind": "iterator"`, which only a library caller can supply.
     fn iterator_source(&self) -> Result<SourceSpec> {
         Err(SpecError::new(
@@ -211,7 +218,11 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         None => None,
     };
 
-    let engines = governed::Engines::default();
+    let engines = governed::Engines::carrying(&job.contracts);
+    engines.check_used(
+        matches!(job.source, SourceDoc::Datafusion { .. })
+            || matches!(job.sink, SinkDoc::Peql { .. }),
+    )?;
     let (source, source_targets, engine_memory) = source_of(&job.source, loader, &engines)?;
     let (sink, sink_target, sink_memory) = sink_of(&job.sink, &mut notes, loader, &engines)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;

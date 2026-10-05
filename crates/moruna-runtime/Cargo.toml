@@ -25,6 +25,10 @@ moruna-kernels = { workspace = true }
 moruna-vmm = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.
 moruna-datafusion = { workspace = true, optional = true }
+# A job's carried contracts (`contracts`, MH 4.5) read as the engine registers one: a parcel
+# document and the function modules its compiled form pins, on the parcel peQL is built with.
+parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "0af4c09", version = "=0.0.3", optional = true }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "0af4c09", version = "=0.0.3", optional = true }
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -79,4 +83,4 @@ gds = ["cuda", "moruna-reactor/gds"]
 rdma = ["moruna-arena/rdma", "moruna-reactor/rdma", "moruna-placement/rdma"]
 python = ["moruna-adapters/python", "moruna-sources/python"]
 # `"kind": "datafusion"` sources and `"kind": "peql"` sinks in the job document (MH 4.5).
-peql = ["dep:moruna-datafusion", "moruna-datafusion/peql"]
+peql = ["dep:moruna-datafusion", "moruna-datafusion/peql", "dep:parcel-core", "dep:parcel-runtime"]

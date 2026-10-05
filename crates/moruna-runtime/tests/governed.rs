@@ -1,6 +1,7 @@
 //! H6 (MH 3, E8.5): a governed plan is a source, a governed write is a sink. Job documents with
 //! `"kind": "datafusion"` sources and `"kind": "peql"` sinks, run for real over a peQL engine
-//! opened on a disk, with data larger than the run's memory budget, at 256 MiB and at 1 GiB.
+//! opened on a disk with the contracts the document carries, with data larger than the run's
+//! memory budget, at 256 MiB and at 1 GiB.
 //!
 //! A run's budget counts what its process already holds (12 f.1), so each run here is its own
 //! process, as it is in a guest (`support::apart`): the parent writes the input, checks what the
@@ -20,7 +21,7 @@ use moruna_kernel::CancelToken;
 use moruna_kernel::arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use moruna_runtime::Runtime;
-use moruna_runtime::job::{BuildOptions, JobSpec, NoKernels, build};
+use moruna_runtime::job::{BuildOptions, JobSpec, NoKernels, build, entry_of};
 use support::apart::{self, BUDGETS};
 use support::{Scratch, one_run_at_a_time};
 
@@ -143,15 +144,50 @@ fn input(path: &Path) {
     writer.close().expect("closed");
 }
 
-/// The disk: both contracts registered, nothing written.
+/// The disk: nothing on it.
 fn disk(root: &Path) {
-    let engine = Engine::open(root).expect("an engine");
-    engine.register_contract(BIG, &schema()).expect("compiles");
-    engine.register_contract(COPY, &schema()).expect("compiles");
-    engine.register_contract(KEPT, &schema()).expect("compiles");
+    std::fs::create_dir_all(root).expect("the disk");
+}
+
+/// `sources` compiled, as a document carries them (`contracts`); `demo/big` published to
+/// everyone.
+fn carrying(sources: &[&str]) -> serde_json::Value {
+    let compiler = Engine::in_memory(std::env::temp_dir());
+    serde_json::Value::Array(
+        sources
+            .iter()
+            .map(|source| {
+                let registered = compiler
+                    .register_contract(source, &schema())
+                    .expect("compiles");
+                let mut entry = entry_of(&registered).expect("an entry");
+                if registered.name() == "demo/big" {
+                    entry.audiences = vec![moruna_datafusion::engine::store::PUBLIC.into()];
+                }
+                serde_json::to_value(entry).expect("JSON")
+            })
+            .collect(),
+    )
+}
+
+/// What every run here carries.
+fn carried() -> serde_json::Value {
+    carrying(&[BIG, COPY, KEPT])
+}
+
+/// The test's own engine over the disk, with the contracts the runs carry: what it reads of
+/// what the runs wrote.
+fn reader(root: &Path) -> Engine {
+    let engine = Engine::in_memory(root);
+    for source in [BIG, COPY, KEPT] {
+        engine
+            .register_contract(source, &schema())
+            .expect("compiles");
+    }
     engine
         .publish("demo/big", moruna_datafusion::engine::store::PUBLIC)
         .expect("published");
+    engine
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -183,6 +219,7 @@ fn run_apart(
             "budget": {"memory_bytes": budget, "cpu": 2.0},
             "staging": {"dir": staging, "limit_bytes": 1u64 << 30},
             "profiles_dir": scratch.join("profiles"),
+            "contracts": carried(),
         }),
     )
 }
@@ -286,7 +323,7 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
             "{}",
             wrote["report"]
         );
-        let engine = Engine::open(&root).expect("the engine");
+        let engine = reader(&root);
         let manifest = engine.manifest("demo/big").expect("read").expect("written");
         assert!(manifest.valid, "{:?}", manifest.breached);
         assert_eq!(manifest.row_count, ROWS);
@@ -305,7 +342,7 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
             budget,
         );
         apart::within(&viewed, "the view", budget);
-        let engine = Engine::open(&root).expect("the engine again");
+        let engine = reader(&root);
         let kept = engine
             .manifest("partner/kept")
             .expect("read")
@@ -343,7 +380,7 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
             budget,
         );
         apart::within(&copied, "the copy", budget);
-        let engine = Engine::open(&root).expect("the engine again");
+        let engine = reader(&root);
         let manifest = engine
             .manifest("demo/copy")
             .expect("read")
@@ -365,7 +402,7 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
     }
 
     // A guest may read the contract, and may not write under it.
-    let engine = Engine::open(&root).expect("the engine again");
+    let engine = reader(&root);
     let before = engine.manifest("demo/big").expect("read").expect("written");
     let refused = run_apart(
         scratch.path(),
@@ -378,13 +415,17 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
         .as_str()
         .expect("a guest's write is refused");
     assert!(error.contains("writes are the owner's"), "{error}");
-    let after = Engine::open(&root)
-        .expect("the engine again")
+    let after = reader(&root)
         .manifest("demo/big")
         .expect("read")
         .expect("still written");
     assert_eq!(after.row_count, ROWS, "nothing landed");
     assert_eq!(after.written_at, before.written_at);
+    // The contracts lived in the runs' memory: none is on the disk.
+    assert!(
+        !root.join("_peql").join("contracts").exists(),
+        "no run kept a contract on the disk"
+    );
 }
 
 /// The runs of H6 whose source cannot be re-read, into a Parquet sink, at 256 MiB and at 1 GiB:
@@ -476,9 +517,13 @@ expose:
   - {name: note, type: utf8}
 "#;
 
-fn refusal(source: serde_json::Value, sink: serde_json::Value) -> String {
+fn refusal(
+    source: serde_json::Value,
+    sink: serde_json::Value,
+    contracts: serde_json::Value,
+) -> String {
     let job = JobSpec::from_value(serde_json::json!({
-        "moruna_spec": 1, "source": source, "sink": sink,
+        "moruna_spec": 1, "source": source, "sink": sink, "contracts": contracts,
     }))
     .expect("parses");
     let env = |_: &str| None;
@@ -505,10 +550,7 @@ fn a_sink_over_its_own_source_is_refused() {
     let scratch = Scratch::new("h6_same");
     let root = scratch.path().join("disk");
     disk(&root);
-    Engine::open(&root)
-        .expect("the engine")
-        .register_contract(ALIAS, &schema())
-        .expect("compiles");
+    let contracts = carrying(&[BIG, COPY, KEPT, ALIAS]);
     let owner = caller("ana", "demo");
     let same = "the sink writes where the source reads";
 
@@ -518,6 +560,7 @@ fn a_sink_over_its_own_source_is_refused() {
                            "caller": owner}),
         serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
                            "caller": owner}),
+        contracts.clone(),
     );
     assert!(joined.contains(same), "{joined}");
 
@@ -526,6 +569,7 @@ fn a_sink_over_its_own_source_is_refused() {
                            "caller": owner}),
         serde_json::json!({"kind": "peql", "root": root, "contract": "demo/alias",
                            "caller": owner}),
+        contracts.clone(),
     );
     assert!(
         aliased.contains(same),
@@ -536,18 +580,60 @@ fn a_sink_over_its_own_source_is_refused() {
         serde_json::json!({"kind": "parquet", "url": root.join("big").join("part.parquet")}),
         serde_json::json!({"kind": "peql", "root": root, "contract": "demo/alias",
                            "caller": owner}),
+        contracts.clone(),
     );
     assert!(by_path.contains(same), "{by_path}");
 
-    // A contract peQL does not know is refused by the field that names it.
+    // A contract the document does not carry is refused by the field that names it.
     let unknown = refusal(
         serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/none",
                            "caller": owner}),
         serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
                            "caller": owner}),
+        contracts.clone(),
     );
-    assert!(unknown.contains("source.contract"), "{unknown}");
+    assert!(
+        unknown.contains(
+            "source.contract: `demo/none` is not among the contracts the document carries"
+        ),
+        "{unknown}"
+    );
     assert!(!root.join("big").exists(), "nothing was written");
+}
+
+/// A run reads no contract from its disk: one registered in the disk's own store and not
+/// carried by the document is refused as unknown, and carried contracts with nothing governed
+/// to read them are refused too.
+#[test]
+fn a_contract_only_on_the_disk_is_refused() {
+    let scratch = Scratch::new("h6_disk_store");
+    let root = scratch.path().join("disk");
+    disk(&root);
+    Engine::open(&root)
+        .expect("the disk's own engine")
+        .register_contract(BIG, &schema())
+        .expect("compiles onto the disk");
+    assert!(root.join("_peql").join("contracts").exists());
+    let owner = caller("ana", "demo");
+    let on_disk = refusal(
+        serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/big",
+                           "caller": owner}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                           "caller": owner}),
+        carrying(&[COPY]),
+    );
+    assert!(
+        on_disk.contains(
+            "source.contract: `demo/big` is not among the contracts the document carries"
+        ),
+        "{on_disk}"
+    );
+    let unused = refusal(
+        serde_json::json!({"kind": "parquet", "url": root.join("in.parquet")}),
+        serde_json::json!({"kind": "parquet", "url": root.join("out")}),
+        carrying(&[COPY]),
+    );
+    assert!(unused.contains("contracts: carried"), "{unused}");
 }
 
 /// A loader that knows `demo/big`'s files are the ones `demo/copy` keeps: an engine's own
@@ -614,6 +700,7 @@ fn a_loaders_bindings_decide_where_a_contract_is() {
             "moruna_spec": 1,
             "source": {"kind": "datafusion", "root": root, "contract": "demo/big", "caller": owner},
             "sink": {"kind": "peql", "root": root, "contract": "demo/copy", "caller": owner},
+            "contracts": carried(),
         }))
         .expect("parses");
         let env = |_: &str| None;

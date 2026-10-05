@@ -20,6 +20,8 @@ pub mod translate;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use build::{BuildOptions, Built, KernelLoader, LoadedKernel, NoKernels, build};
+#[cfg(feature = "peql")]
+pub use governed::entry_of;
 
 /// The one version of the document this build reads (MH 4.1).
 pub const SPEC_VERSION: u32 = 1;
@@ -116,6 +118,31 @@ pub struct JobSpec {
     /// Where the report goes.
     #[serde(default)]
     pub report: ReportDoc,
+    /// The contracts a `datafusion` source reads and a `peql` sink writes under (MH 4.5), each
+    /// as its compiler wrote it. They are the job's whole contract store: the engine holds them
+    /// in memory for this run alone and reads no contract from its root, so a contract the job
+    /// names and does not carry is refused by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<ContractEntry>,
+}
+
+/// One contract a job carries (`contracts[i]`, MH 4.5): its document, its compiled form exactly
+/// as the compiler wrote it, and the function modules that form pins. Registered as given, never
+/// compiled; whoever writes the document vouches that `compiled` is what `document` compiles to,
+/// and a loader may refuse any entry ([`KernelLoader::admit`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractEntry {
+    /// The contract's document, as the engine reads one.
+    pub document: serde_json::Value,
+    /// The compiled contract: the compiler's bytes, which are UTF-8.
+    pub compiled: String,
+    /// The function modules the compiled contract pins, as the engine reads a bundled function.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<serde_json::Value>,
+    /// The tenants it is published to for this run besides its owner; `public` is everyone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
 }
 
 /// Files or prefixes: one string or a list of them. The canonical form writes one as a
@@ -181,12 +208,12 @@ pub enum SourceDoc {
     /// A user's `moruna.Source` subclass (07 e.6, 2026-09-29). Library only, for the reason
     /// `iterator` is: the object lives in the caller's process.
     Python,
-    /// A governed DataFusion plan (MH 4.5): what peQL, opened on the disk at `root`, plans for
-    /// `caller` over one contract or over SQL in which every table is a contract. Exactly one of
-    /// `contract` and `sql`. Needs a build with the `peql` feature.
+    /// A governed DataFusion plan (MH 4.5): what peQL, opened on the disk at `root` with the
+    /// job's `contracts`, plans for `caller` over one contract or over SQL in which every table
+    /// is a contract. Exactly one of `contract` and `sql`. Needs a build with the `peql` feature.
     Datafusion {
-        /// The engine's root: the disk, with peQL's store, manifests, ledger and audit log under
-        /// `<root>/_peql/`.
+        /// The engine's root: the disk, with peQL's manifests, ledger and audit log under
+        /// `<root>/_peql/`. Its contracts are the job's `contracts`, never a store on the disk.
         root: String,
         /// One contract, every row and column the caller may see.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,7 +299,8 @@ pub enum SinkDoc {
         #[serde(default)]
         options: ArrowIpcSinkOptions,
     },
-    /// A write under a peQL contract (MH 4.5), by `caller`, who must be the contract's owner.
+    /// A write under a peQL contract the job carries in `contracts` (MH 4.5), by `caller`, who
+    /// must be the contract's owner.
     /// The manifest is refreshed when the run finishes. Needs a build with the `peql` feature.
     Peql {
         /// The engine's root: the disk.
@@ -712,7 +740,7 @@ pub struct ReportDoc {
 }
 
 /// The top-level keys of version 1, in the order MH 4.1 lists them.
-const TOP_LEVEL: [&str; 18] = [
+const TOP_LEVEL: [&str; 19] = [
     "moruna_spec",
     "run_id",
     "source",
@@ -731,6 +759,7 @@ const TOP_LEVEL: [&str; 18] = [
     "host_profile",
     "allow_gil",
     "report",
+    "contracts",
 ];
 
 impl JobSpec {
@@ -756,6 +785,7 @@ impl JobSpec {
             host_profile: None,
             allow_gil: false,
             report: ReportDoc::default(),
+            contracts: Vec::new(),
         }
     }
 
@@ -853,6 +883,15 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
             };
             for (i, item) in items.iter().enumerate() {
                 read::<KernelDoc>(&format!("kernels[{i}]"), item)?;
+            }
+            Ok(())
+        }
+        "contracts" => {
+            let serde_json::Value::Array(items) = section else {
+                return Err(SpecError::new(key, "a list of contracts"));
+            };
+            for (i, item) in items.iter().enumerate() {
+                read::<ContractEntry>(&format!("contracts[{i}]"), item)?;
             }
             Ok(())
         }

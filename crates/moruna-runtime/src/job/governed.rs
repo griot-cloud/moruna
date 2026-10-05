@@ -1,6 +1,8 @@
 //! The peQL ends of a run (MH 4.5): `"kind": "datafusion"` as the source, `"kind": "peql"` as
 //! the sink. One engine per root per run, shared by both ends, so a run that reads one contract
-//! and writes another on the same disk has one store, one ledger and one audit log open.
+//! and writes another on the same disk has one ledger and one audit log open. Its contracts are
+//! the ones the document carries (`contracts`), registered in memory for this run alone: the
+//! engine reads no contract from its root, and keeps none there.
 //!
 //! The engine is opened when the document is built, because what the sink equals source rule
 //! compares is where each contract's files are, as the engine resolves its binding, and not the
@@ -19,9 +21,11 @@ pub(super) type Read = (SourceSpec, Vec<String>, Option<Arc<dyn EngineMemory>>);
 /// A sink's builder, the data location it writes, and the memory its writes hold.
 pub(super) type Write = (SinkSpec, String, Option<Arc<dyn EngineMemory>>);
 
-/// The engines a run opens, by root. Opened at the lifecycle's "sources and sinks built" step.
+/// The engines a run opens, by root, each with the contracts the document carries. Opened at
+/// the lifecycle's "sources and sinks built" step.
 #[derive(Clone, Default)]
 pub(super) struct Engines {
+    contracts: Vec<super::ContractEntry>,
     #[cfg(feature = "peql")]
     open: std::sync::Arc<
         std::sync::Mutex<
@@ -31,6 +35,30 @@ pub(super) struct Engines {
             >,
         >,
     >,
+}
+
+impl Engines {
+    /// The engines of a run that carries `contracts`.
+    pub(super) fn carrying(contracts: &[super::ContractEntry]) -> Engines {
+        Engines {
+            contracts: contracts.to_vec(),
+            #[cfg(feature = "peql")]
+            open: Default::default(),
+        }
+    }
+
+    /// A document that carries contracts and has no governed end to read them is refused: the
+    /// contracts would be carried for nothing.
+    pub(super) fn check_used(&self, governed: bool) -> Result<()> {
+        if !self.contracts.is_empty() && !governed {
+            return Err(SpecError::new(
+                "contracts",
+                "carried, and no `datafusion` source or `peql` sink reads or writes under them",
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 /// A `datafusion` source reads exactly one of a contract and SQL.
@@ -98,15 +126,22 @@ pub(super) fn sink(
 }
 
 #[cfg(feature = "peql")]
+pub use imp::entry_of;
+
+#[cfg(feature = "peql")]
 mod imp {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use moruna_datafusion::engine::{Caller, Engine, WriteMode};
+    use moruna_datafusion::engine::audit::JsonlAudit;
+    use moruna_datafusion::engine::budget::BudgetStore;
+    use moruna_datafusion::engine::store::Registered;
+    use moruna_datafusion::engine::{Caller, Engine, PeqlError, WriteMode};
     use moruna_datafusion::{
         BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory, location_target,
     };
     use moruna_kernel::{MorunaError, Result, Sink, Source};
+    use parcel_runtime::compiled::CompiledBytes;
 
     use super::{Engines, KernelLoader, Read, SpecError, Write};
     use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
@@ -137,9 +172,13 @@ mod imp {
     /// URL the sink equals source rule compares. A contract peQL does not know is refused here,
     /// by the field that names it.
     fn target(engine: &Engine, field: &str, contract: &str) -> Result<Option<String>> {
-        let location = engine
-            .location(contract)
-            .map_err(|e| SpecError::new(field, format!("peQL: {e}")))?;
+        let location = engine.location(contract).map_err(|e| match e {
+            PeqlError::UnknownContract(name) => SpecError::new(
+                field,
+                format!("`{name}` is not among the contracts the document carries (`contracts`)"),
+            ),
+            e => SpecError::new(field, format!("peQL: {e}")),
+        })?;
         location
             .as_ref()
             .map(location_target)
@@ -156,23 +195,86 @@ mod imp {
     }
 
     impl Engines {
+        /// The engine at `root`: its manifests, ledger and audit log on the disk, its contracts
+        /// the document's, each admitted by the loader and registered as compiled, in memory.
         fn open(&self, root: &PathBuf, loader: &dyn KernelLoader) -> Result<Arc<Engine>> {
             let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = open.get(root) {
                 return Ok(Arc::clone(engine));
             }
-            let mut engine = Engine::open(root).map_err(|e| MorunaError::Config {
-                name: "peql",
-                msg: format!("opening the engine at {}: {e}", root.display()),
-            })?;
+            let config = |msg: String| MorunaError::Config { name: "peql", msg };
+            let state = root.join("_peql");
+            std::fs::create_dir_all(&state)
+                .map_err(|e| config(format!("the engine's state at {}: {e}", state.display())))?;
+            let budgets = BudgetStore::open(state.join("budgets.json"))
+                .map_err(|e| config(format!("the ledger at {}: {e}", state.display())))?;
+            let mut engine = Engine::in_memory(root.clone())
+                .with_budgets(Arc::new(budgets))
+                .with_audit(Arc::new(JsonlAudit::new(state.join("audit.jsonl"))));
             // The loader's resolution, when it has one, before anything asks where a contract is.
             if let Some(bindings) = loader.bindings(root)? {
                 engine = engine.with_bindings(bindings);
+            }
+            for (index, entry) in self.contracts.iter().enumerate() {
+                let field = format!("contracts[{index}]");
+                loader.admit(index, entry)?;
+                let (document, functions) = parts(&field, entry)?;
+                let registered = engine
+                    .register_compiled(document, entry.compiled.as_bytes(), &functions)
+                    .map_err(|e| SpecError::new(&field, format!("peQL: {e}")))?;
+                for audience in &entry.audiences {
+                    engine
+                        .publish(registered.name(), audience)
+                        .map_err(|e| SpecError::new(format!("{field}.audiences"), e.to_string()))?;
+                }
             }
             let engine = Arc::new(engine);
             open.insert(root.clone(), Arc::clone(&engine));
             Ok(engine)
         }
+    }
+
+    /// An entry's document and function modules, as the engine reads them.
+    fn parts(
+        field: &str,
+        entry: &super::super::ContractEntry,
+    ) -> Result<(
+        parcel_core::ContractDoc,
+        Vec<parcel_runtime::compiled::BundledFunction>,
+    )> {
+        let document = serde_json::from_value(entry.document.clone())
+            .map_err(|e| SpecError::new(format!("{field}.document"), e.to_string()))?;
+        let functions = entry
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                serde_json::from_value(f.clone())
+                    .map_err(|e| SpecError::new(format!("{field}.functions[{i}]"), e.to_string()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((document, functions))
+    }
+
+    /// The entry that carries `registered`, as a document writes it: what a caller that compiled
+    /// a contract with peQL puts in `contracts`.
+    pub fn entry_of(registered: &Registered) -> Result<super::super::ContractEntry> {
+        let invalid = |e: String| MorunaError::Config {
+            name: "peql",
+            msg: format!("`{}`: {e}", registered.name()),
+        };
+        let compiled = registered.compilation.to_bytes().map_err(invalid)?;
+        Ok(super::super::ContractEntry {
+            document: serde_json::to_value(&registered.doc).map_err(|e| invalid(e.to_string()))?,
+            compiled: String::from_utf8(compiled).map_err(|e| invalid(e.to_string()))?,
+            functions: registered
+                .functions
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| invalid(e.to_string()))?,
+            audiences: Vec::new(),
+        })
     }
 
     pub(super) fn source(
