@@ -4346,6 +4346,7 @@ dependencies = [
  "moruna-trace",
  "moruna-vmm",
  "parcel-core",
+ "parcel-runtime",
  "parquet",
  "serde",
  "serde_json",
@@ -4765,7 +4766,7 @@ dependencies = [
 [[package]]
 name = "parcel-core"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 dependencies = [
  "cel",
  "chrono",
@@ -4788,7 +4789,7 @@ dependencies = [
 [[package]]
 name = "parcel-runtime"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 dependencies = [
  "cel",
  "chrono",
@@ -4798,6 +4799,7 @@ dependencies = [
  "hex",
  "parcel-core",
  "parcel-udf",
+ "prost",
  "regex",
  "serde",
  "serde_json",
@@ -4809,7 +4811,7 @@ dependencies = [
 [[package]]
 name = "parcel-udf"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 
 [[package]]
 name = "parking"
@@ -4948,8 +4950,8 @@ dependencies = [
 
 [[package]]
 name = "peql"
-version = "0.4.1"
-source = "git+https://github.com/griot-cloud/peQL?rev=44c111f#44c111fdf544f08db065af6f44f4fea4586d7db1"
+version = "0.4.2"
+source = "git+https://github.com/griot-cloud/peQL?rev=7563bfa#7563bfac3cc8f73a0434093ca40de9eaf1a22f1c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

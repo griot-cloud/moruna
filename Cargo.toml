@@ -60,7 +60,7 @@ polars = { version = "=0.55.2" }
 datafusion = { version = "=55.1.0" }
 # The contract-native engine on both ends of a run (MH 4.5): a governed plan as a source, a
 # contract write as a sink. `moruna-datafusion`'s `peql` feature; peQL never depends on Moruna.
-peql = { git = "https://github.com/griot-cloud/peQL", rev = "44c111f", version = "=0.4.1" }
+peql = { git = "https://github.com/griot-cloud/peQL", rev = "7563bfa", version = "=0.4.2" }
 # Streams of record batches out of a DataFusion plan; already in the graph through datafusion
 # at this version.
 futures = { version = "=0.3.34" }

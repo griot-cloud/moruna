@@ -768,10 +768,10 @@ fn governed_sources_and_sinks_are_documents() {
     #[cfg(feature = "peql")]
     {
         // The engine is opened when the document is built, to resolve where each contract's
-        // files are: a disk with both contracts on it.
+        // files are: a disk, and both contracts carried by the document.
         let disk = std::env::temp_dir().join(format!("moruna-job-peql-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&disk);
-        let engine = moruna_datafusion::engine::Engine::open(&disk).expect("an engine");
+        let compiler = moruna_datafusion::engine::Engine::in_memory(&disk);
         let schema = moruna_kernel::arrow::datatypes::Schema::new(vec![
             moruna_kernel::arrow::datatypes::Field::new(
                 "id",
@@ -779,17 +779,22 @@ fn governed_sources_and_sinks_are_documents() {
                 false,
             ),
         ]);
+        let mut carried = Vec::new();
         for (name, dir) in [("demo/big", "big/"), ("demo/copy", "copy/")] {
             let contract = format!(
                 "contract: {name}\nversion: 1\nowner: demo\nbinding: {{parquet: {dir}}}\n\
                  expose:\n  - {{name: id, type: int64}}\n"
             );
-            engine
+            let registered = compiler
                 .register_contract(&contract, &schema)
                 .expect("compiles");
+            carried.push(super::entry_of(&registered).expect("an entry"));
         }
         let root = disk.display().to_string();
         let mut job = job.clone();
+        job.contracts = carried;
+        let again = JobSpec::from_json(&job.canonical_json()).expect("carried contracts parse");
+        assert_eq!(again, job, "carried contracts round-trip");
         if let SourceDoc::Datafusion { root: r, .. } = &mut job.source {
             *r = root.clone();
         }
