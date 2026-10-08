@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::{
-    DType, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError,
-    NoState, Payload, PayloadSpec, SourceSchema, TierPref,
+    DType, Fingerprint, InitCtx, Judged, Kernel, KernelHints, KernelKind, KernelState, MorunaError,
+    NoState, Payload, PayloadSpec, RowRefusal, SourceSchema, TierPref,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -177,6 +177,79 @@ impl Kernel for Doubler {
             .map(|v| v.map(|v| v.wrapping_mul(2)))
             .collect();
         input.with_column("value", Arc::new(doubled) as ArrayRef)
+    }
+}
+
+/// A real kernel that judges rows: it refuses every row whose `id` is a multiple of `of`, for
+/// column `id`, and passes the others through.
+pub struct RefuseMultiples {
+    fingerprint: Fingerprint,
+    of: i64,
+}
+
+impl RefuseMultiples {
+    /// Refuses the multiples of `of`.
+    pub fn new(of: i64) -> RefuseMultiples {
+        RefuseMultiples {
+            fingerprint: Fingerprint::compute("moruna-runtime::tests::RefuseMultiples", b"v1"),
+            of,
+        }
+    }
+}
+
+impl Kernel for RefuseMultiples {
+    fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: moruna_kernel::PayloadKind::Table,
+            tier: TierPref::Host,
+        }
+    }
+
+    fn output_schema(&self, input: &SourceSchema) -> moruna_kernel::Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(&self, state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+        self.judge(state, input)?.into_output()
+    }
+
+    fn judge(&self, _state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Judged> {
+        let Payload::Table(batch, _) = &input else {
+            return Err(MorunaError::Plan("the refuser wants a table".into()));
+        };
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>().cloned())
+            .ok_or_else(|| MorunaError::Plan("the batch has no Int64 id column".into()))?;
+        let refused = (0..ids.len())
+            .filter(|&i| ids.value(i) % self.of == 0)
+            .map(|i| RowRefusal {
+                row: i as u64,
+                column: Some("id".into()),
+                cause: "multiple".into(),
+            })
+            .collect();
+        let keep: BooleanArray = (0..ids.len())
+            .map(|i| Some(ids.value(i) % self.of != 0))
+            .collect();
+        let kept = arrow::compute::filter_record_batch(batch, &keep)
+            .map_err(|e| MorunaError::Plan(e.to_string()))?;
+        Ok(Judged {
+            output: Payload::table(kept)?,
+            refused,
+        })
     }
 }
 

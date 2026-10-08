@@ -23,9 +23,9 @@ use super::governed;
 use super::translate::{self, ResumeArg};
 use super::{
     ErrorPolicyDoc, FilterDoc, GuaranteeDoc, HostProfileDoc, JobSpec, KernelDoc, KernelKindDoc,
-    ObjectStoreDoc, SinkDoc, SizerDoc, SourceDoc, SpecError,
+    ObjectStoreDoc, RefusedRowsDoc, SinkDoc, SizerDoc, SourceDoc, SpecError,
 };
-use crate::spec::{RunSpec, SinkSpec, SourceSpec};
+use crate::spec::{RefusedRows, RunSpec, SinkSpec, SourceSpec};
 
 /// The fields whose `null` an environment variable may fill, and the variable (MH 4.1).
 pub const ENV_FIELDS: [(&str, &str); 5] = [
@@ -389,6 +389,21 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         ErrorPolicyDoc::Terminate => ErrorPolicy::Terminate,
         ErrorPolicyDoc::Skip => ErrorPolicy::Skip,
         ErrorPolicyDoc::Budget(n) => ErrorPolicy::Budget(n),
+    };
+    spec.refused_rows = match &job.refused_rows {
+        RefusedRowsDoc::Fail => RefusedRows::Fail,
+        RefusedRowsDoc::SetAside(set_aside) => {
+            if job.resume.is_some() {
+                return Err(SpecError::new(
+                    "refused_rows",
+                    "a resumed run cannot set rows aside: the rows its earlier attempt set aside                      are not in this run's output",
+                )
+                .into());
+            }
+            RefusedRows::SetAside {
+                dir: set_aside.url.as_deref().map(translate::local_path),
+            }
+        }
     };
     spec.ordered = job.ordered;
     spec.sizer = match job.sizer {

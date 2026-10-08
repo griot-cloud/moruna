@@ -231,6 +231,8 @@ pub(crate) struct Shared {
     pub(crate) stages: Vec<StageEntry>,
     pub(crate) plan: Vec<Split>,
     pub(crate) schemas: Vec<SourceSchema>,
+    /// Where refused rows go, when the run sets them aside (MH 4.1 `refused_rows`).
+    pub(crate) set_aside: Option<Arc<crate::set_aside::SetAside>>,
     pub(crate) knobs: KnobState,
 
     /// The stage table lock of preamble 4.2 position 1. Held only while the close cascade of
@@ -344,6 +346,10 @@ impl Shared {
         // f.1: validate the chain before anything is opened or read.
         let schemas = validate_chain(source.as_ref(), &kernels, &sink)?;
         let plan = source.plan()?;
+        let set_aside = match &cfg.set_aside {
+            Some(dir) => Some(crate::set_aside::SetAside::new(dir.clone(), &plan)?),
+            None => None,
+        };
 
         // f.1: a sink that cannot say what it committed cannot be resumed, and neither can a
         // source that cannot be re-read; either forces checkpointing off, named in the log.
@@ -442,6 +448,7 @@ impl Shared {
             stages,
             plan,
             schemas,
+            set_aside,
             stage_table: Mutex::new(()),
             closed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
             closing: (0..queues).map(|_| AtomicBool::new(false)).collect(),

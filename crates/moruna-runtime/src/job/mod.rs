@@ -97,6 +97,9 @@ pub struct JobSpec {
     /// What happens after a kernel error.
     #[serde(default)]
     pub error_policy: ErrorPolicyDoc,
+    /// What becomes of a row a kernel refuses; absent: the run fails naming it.
+    #[serde(default, skip_serializing_if = "RefusedRowsDoc::is_fail")]
+    pub refused_rows: RefusedRowsDoc,
     /// Deliver morsels to the sink in sequence order.
     #[serde(default)]
     pub ordered: bool,
@@ -657,6 +660,38 @@ pub enum ErrorPolicyDoc {
     Budget(u32),
 }
 
+/// `refused_rows`: `"fail"` or `{"set_aside": {"url": ...}}`. What becomes of a row a kernel
+/// refuses (`Kernel::judge`): by default it is the kernel's error, and the run fails naming its
+/// row, its column and why (through `error_policy`); set aside, it is written with where it was
+/// and why to the set-aside output, and the rows kept go on to the sink. The canonical form
+/// leaves the default out, so a document that says nothing has the digest it always had.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusedRowsDoc {
+    /// The run fails naming the first refused row.
+    #[default]
+    Fail,
+    /// Refused rows go to the set-aside output; the rest go on.
+    SetAside(SetAsideDoc),
+}
+
+impl RefusedRowsDoc {
+    /// The default, which the canonical form leaves out.
+    pub fn is_fail(&self) -> bool {
+        *self == RefusedRowsDoc::Fail
+    }
+}
+
+/// `refused_rows.set_aside`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetAsideDoc {
+    /// The set-aside output, a local directory (`file://` or a bare path) that the run makes;
+    /// absent: `moruna-<run_id>.set-aside` in the staging directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// `sizer`: `"rule"` or `"learned"`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -740,7 +775,7 @@ pub struct ReportDoc {
 }
 
 /// The top-level keys of version 1, in the order MH 4.1 lists them.
-const TOP_LEVEL: [&str; 19] = [
+const TOP_LEVEL: [&str; 20] = [
     "moruna_spec",
     "run_id",
     "source",
@@ -752,6 +787,7 @@ const TOP_LEVEL: [&str; 19] = [
     "checkpoint",
     "resume",
     "error_policy",
+    "refused_rows",
     "ordered",
     "sizer",
     "trace",
@@ -778,6 +814,7 @@ impl JobSpec {
             checkpoint: CheckpointDoc::default(),
             resume: None,
             error_policy: ErrorPolicyDoc::default(),
+            refused_rows: RefusedRowsDoc::default(),
             ordered: false,
             sizer: SizerDoc::default(),
             trace: None,
@@ -874,6 +911,7 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
         "object_store" => read::<ObjectStoreDoc>(key, section),
         "checkpoint" => read::<CheckpointDoc>(key, section),
         "error_policy" => read::<ErrorPolicyDoc>(key, section),
+        "refused_rows" => read::<RefusedRowsDoc>(key, section),
         "sizer" => read::<SizerDoc>(key, section),
         "host_profile" => read::<Option<HostProfileDoc>>(key, section),
         "report" => read::<ReportDoc>(key, section),

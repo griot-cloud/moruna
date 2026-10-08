@@ -550,6 +550,7 @@ mod tests {
             overflow_failed: false,
             late_records: 0,
             snapshot: None,
+            set_aside: None,
         }
     }
 

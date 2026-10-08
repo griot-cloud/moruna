@@ -171,6 +171,58 @@ pub struct InitCtx {
     pub alloc: Arc<dyn Allocator>,
 }
 
+/// One row of its input a kernel refused: the row's index in the payload the kernel was given,
+/// the column that made the kernel refuse it when one did, and why, in words that name no value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowRefusal {
+    /// The row's index in the kernel's input payload.
+    pub row: u64,
+    /// The column the row was refused for, when it was refused for one.
+    pub column: Option<String>,
+    /// Why, without the value.
+    pub cause: String,
+}
+
+impl RowRefusal {
+    /// The kernel error a run that fails on refused rows ends with: `count` rows refused, this
+    /// one first, at `row` of `whose` (`this payload`, `the source`).
+    pub fn error(&self, whose: &str, row: u64, count: usize) -> MorunaError {
+        let column = match &self.column {
+            Some(column) => format!(", column `{column}`"),
+            None => String::new(),
+        };
+        MorunaError::Kernel {
+            stage: 0,
+            seq: 0,
+            msg: format!(
+                "{count} row(s) refused; the first is row {row} of {whose}{column}: {}",
+                self.cause
+            ),
+            features: None,
+        }
+    }
+}
+
+/// What a kernel made of one payload when it may refuse single rows: the output, from the rows
+/// it kept, and each row of the input it refused.
+pub struct Judged {
+    /// The output, built from the rows the kernel kept.
+    pub output: Payload,
+    /// Every row of the input the kernel refused, each at most once, in any order.
+    pub refused: Vec<RowRefusal>,
+}
+
+impl Judged {
+    /// The output when no row was refused, and otherwise the refusal as a kernel error: what
+    /// `apply` is for a kernel that judges rows, wherever a refused row cannot be set aside.
+    pub fn into_output(self) -> crate::Result<Payload> {
+        let Some(first) = self.refused.iter().min_by_key(|r| r.row) else {
+            return Ok(self.output);
+        };
+        Err(first.error("this payload", first.row, self.refused.len()))
+    }
+}
+
 /// The user's transformation (component 5 adapts foreign ones).
 pub trait Kernel: Send + Sync + 'static {
     /// Stable identity plus configuration hash (e.6).
@@ -205,4 +257,16 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Payload>;
+    /// `apply` for a kernel that refuses single rows rather than the whole payload: the output
+    /// holds what it made of the rows it kept, and `refused` names each row of `input` it did
+    /// not. The scheduler calls this, and the run's `refused_rows` decides what becomes of a
+    /// refused row: it fails the run, or it is set aside while the rest go on. The default
+    /// refuses no row. A kernel that overrides it makes its `apply`
+    /// `self.judge(state, input)?.into_output()`.
+    fn judge(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Judged> {
+        Ok(Judged {
+            output: self.apply(state, input)?,
+            refused: Vec::new(),
+        })
+    }
 }

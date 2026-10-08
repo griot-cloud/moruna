@@ -30,6 +30,9 @@ pub struct SchedulerConfig {
     pub sink_concurrency: u16,
     /// What happens after a kernel error (`errors.policy`).
     pub error_policy: ErrorPolicy,
+    /// Where a row a kernel refuses is set aside, the rest going on to the sink (MH 4.1
+    /// `refused_rows`); `None`: a refused row is a kernel error, and `error_policy` decides.
+    pub set_aside: Option<std::path::PathBuf>,
     /// Per stage, before the controller sets knobs (`morsel.probe_bytes`).
     pub initial_morsel_target: u64,
     /// Lower clamp for `MorselTarget` and for the source drive's row range (f.5, f.15).
@@ -59,6 +62,7 @@ impl Default for SchedulerConfig {
             read_ahead: 2,
             sink_concurrency: 2,
             error_policy: ErrorPolicy::Terminate,
+            set_aside: None,
             initial_morsel_target: 16 * 1024 * 1024,
             morsel_min: 4 * 1024 * 1024,
             morsel_max: 512 * 1024 * 1024,
@@ -97,6 +101,14 @@ impl SchedulerConfig {
             return Err(MorunaError::Config {
                 name: "heartbeat_interval_ms",
                 msg: "the heartbeat interval must be positive".into(),
+            });
+        }
+        if self.resuming && self.set_aside.is_some() {
+            return Err(MorunaError::Config {
+                name: "refused_rows",
+                msg: "a resumed run cannot set rows aside: the rows its earlier attempt set \
+                      aside are not in this run's output"
+                    .into(),
             });
         }
         if self.checkpoint_interval_ms == 0 {

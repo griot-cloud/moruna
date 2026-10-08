@@ -25,7 +25,7 @@ use crate::config;
 use crate::elastic::{Shares, WatchCtx, WatchState, Watcher};
 use crate::error::{Result, RunError};
 use crate::report::{self, MetaInput};
-use crate::spec::{BuildCtx, Components, RunSpec};
+use crate::spec::{BuildCtx, Components, RefusedRows, RunSpec};
 
 /// The facade: the only place the components are wired (12 a).
 pub struct Runtime;
@@ -120,6 +120,7 @@ fn drive(
         staging_limit,
         staging_durable,
         error_policy,
+        refused_rows,
         ordered,
         sizer,
         profiles_dir,
@@ -584,6 +585,24 @@ fn drive(
         None => None,
     };
 
+    // MH 4.1 `refused_rows`: where a refused row is set aside, when it is.
+    let set_aside = match refused_rows {
+        RefusedRows::Fail => None,
+        RefusedRows::SetAside { dir: Some(dir) } => Some(dir),
+        RefusedRows::SetAside { dir: None } => Some(
+            staging_dir
+                .as_ref()
+                .ok_or_else(|| {
+                    RunError::bare(MorunaError::Config {
+                        name: "refused_rows",
+                        msg: "the set-aside output names no directory and the run has no                               staging directory to put it in"
+                            .into(),
+                    })
+                })?
+                .join(format!("moruna-{}.set-aside", run_id.to_hex())),
+        ),
+    };
+
     // 8. Scheduler `new`: validates the chain, opens the sink on a fresh run, spawns the
     // workers parked.
     let scheduler = Arc::new(Scheduler::new(
@@ -593,6 +612,7 @@ fn drive(
             read_ahead: config::READAHEAD_SPLITS,
             sink_concurrency: config::SINK_CONCURRENCY,
             error_policy,
+            set_aside,
             initial_morsel_target: config::MORSEL_PROBE_BYTES,
             morsel_min: config::MORSEL_MIN_BYTES,
             morsel_max,
@@ -729,6 +749,7 @@ fn drive(
         None => (Vec::new(), Vec::new()),
     };
     let outcome = outcome?;
+    let set_aside = scheduler.set_aside();
     notes.extend(watch_notes);
     if let Some(engine) = engine_after {
         notes.push(engine.note());
@@ -790,6 +811,7 @@ fn drive(
             RunOutcome::Completed { sink } => sink.snapshot,
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
         },
+        set_aside,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {

@@ -48,8 +48,8 @@ pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{
-    AllocCounts, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind, KernelState,
-    NoState, ResumePolicy, set_kernel_alloc, take_kernel_alloc,
+    AllocCounts, GilState, InitCtx, Judged, Kernel, KernelAlloc, KernelHints, KernelKind,
+    KernelState, NoState, ResumePolicy, RowRefusal, set_kernel_alloc, take_kernel_alloc,
 };
 pub use knobs::{
     CancelToken, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, RecordHook,

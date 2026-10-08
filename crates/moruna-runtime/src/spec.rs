@@ -145,6 +145,22 @@ pub trait EngineMemory: Send + Sync {
     fn note(&self) -> String;
 }
 
+/// What becomes of a row a kernel refuses ([`moruna_kernel::Kernel::judge`], MH 4.1
+/// `refused_rows`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RefusedRows {
+    /// The run fails naming the first refused row, as a kernel error the error policy sees.
+    #[default]
+    Fail,
+    /// Each refused row is set aside, with where it was and why, in the directory `dir`, and
+    /// the rows kept go on to the sink. `None`: `moruna-<run_id>.set-aside` in the staging
+    /// directory.
+    SetAside {
+        /// The set-aside output.
+        dir: Option<PathBuf>,
+    },
+}
+
 /// One run, as the surface describes it (12 d.1).
 pub struct RunSpec {
     /// The input.
@@ -184,6 +200,8 @@ pub struct RunSpec {
     pub staging_durable: bool,
     /// What happens after a kernel error.
     pub error_policy: ErrorPolicy,
+    /// What becomes of a row a kernel refuses (MH 4.1 `refused_rows`).
+    pub refused_rows: RefusedRows,
     /// Deliver morsels to the sink in sequence order.
     pub ordered: bool,
     /// Which decision function sizes morsels.
@@ -242,6 +260,7 @@ impl RunSpec {
             staging_limit: None,
             staging_durable: false,
             error_policy: ErrorPolicy::Terminate,
+            refused_rows: RefusedRows::Fail,
             ordered: false,
             sizer: SizerKind::Rule,
             // `None` is the preamble's default, which the facade resolves and creates

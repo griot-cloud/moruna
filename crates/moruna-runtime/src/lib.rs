@@ -47,7 +47,7 @@ pub use error::{Result, RunError};
 pub use job::JobSpec;
 pub use observe::{Progress, RunObserver};
 pub use run::Runtime;
-pub use spec::{BuildCtx, Components, EngineMemory, RunSpec, SinkSpec, SourceSpec};
+pub use spec::{BuildCtx, Components, EngineMemory, RefusedRows, RunSpec, SinkSpec, SourceSpec};
 
 pub use moruna_discovery::{
     Discovered, DiscoveryInput, LimitsReading, LimitsSource, LimitsSubscriber, ManualLimitsSource,

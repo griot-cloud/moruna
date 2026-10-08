@@ -2,9 +2,9 @@
 //!
 //! A worker pops, applies, pushes and records. It never calls the reactor, never waits on a
 //! `Completion` and never allocates payload memory: the only calls it makes into another
-//! component are `Placement::pop`, `Placement::push`, `Kernel::apply` and `TraceSink::record`
+//! component are `Placement::pop`, `Placement::push`, `Kernel::judge` and `TraceSink::record`
 //! (SC-I1). It holds no scheduler lock across any of them, and it does not block outside
-//! `Kernel::apply`: see the note on the claim in `run_task`.
+//! `Kernel::judge`: see the note on the claim in `run_task`.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use crossbeam::channel::Receiver;
 use crossbeam::sync::Parker;
 use moruna_kernel::{
-    KernelState, Locality, Morsel, MorselFeatures, MorunaError, NoState, Outcome, Payload,
+    KernelState, Locality, Morsel, MorselFeatures, MorunaError, NoState, Origin, Outcome, Payload,
     PayloadSpec, PlacementStats, ProbeResult, Result, Sample, Seq, StageId, TIER_COUNT, Tier,
     TraceRecord,
 };
@@ -243,6 +243,13 @@ pub(crate) fn run_task(
     };
     let mut no_state = NoState;
 
+    // A row the kernel refuses is set aside with its own values, which are the input's: the
+    // input's arrays are shared, not copied, and live as long as the call does anyway.
+    let input = match (&shared.set_aside, &payload) {
+        (Some(_), Payload::Table(batch, tier)) if tier.is_host() => Some(batch.clone()),
+        _ => None,
+    };
+
     if !probing {
         s0 = shared.sampler.sample();
     }
@@ -254,7 +261,7 @@ pub(crate) fn run_task(
             None => &mut no_state,
         };
         let kernel = entry.kernel.clone();
-        std::panic::catch_unwind(AssertUnwindSafe(move || kernel.apply(state, payload)))
+        std::panic::catch_unwind(AssertUnwindSafe(move || kernel.judge(state, payload)))
     };
     let c1 = thread_cpu_ns();
     let t1 = now_ns();
@@ -270,7 +277,34 @@ pub(crate) fn run_task(
         .unwrap_or(0);
 
     let applied = match raw {
-        Ok(Ok(out)) => Applied::Produced(out),
+        Ok(Ok(judged)) if judged.refused.is_empty() => Applied::Produced(judged.output),
+        Ok(Ok(judged)) => match &shared.set_aside {
+            // MH 4.1 `refused_rows`: set aside, and the rows kept go on.
+            Some(set_aside) => match set_aside.put(
+                stage,
+                seq,
+                &origin,
+                rows_in,
+                input.as_ref(),
+                &judged.refused,
+            ) {
+                Ok(()) => Applied::Produced(judged.output),
+                Err(e) => Applied::Failed(e),
+            },
+            // A refused row is the kernel's error, named by its row in the source when the
+            // stage reads the source's rows.
+            None => {
+                let first = judged
+                    .refused
+                    .iter()
+                    .min_by_key(|r| r.row)
+                    .expect("refused rows");
+                Applied::Failed(match source_row(shared, stage, &origin, first.row) {
+                    Some(row) => first.error("the source", row, judged.refused.len()),
+                    None => first.error("this stage's input", first.row, judged.refused.len()),
+                })
+            }
+        },
         Ok(Err(e)) => Applied::Failed(e),
         // l: a panicking kernel's state is retired, and the panic becomes a `Kernel` error
         // whose message starts with `panic:` (f.8).
@@ -398,6 +432,17 @@ pub(crate) fn run_task(
         }));
     }
     Ok(None)
+}
+
+/// Row `row` of stage `stage`'s input in a morsel from `origin`, as a row of the source counted
+/// from 0 over every split in plan order: known at stage 1, whose input is the source's rows.
+fn source_row(shared: &Shared, stage: StageId, origin: &Origin, row: u64) -> Option<u64> {
+    if stage != 1 {
+        return None;
+    }
+    let at = shared.plan.iter().position(|s| s.id == origin.split)?;
+    let before: u64 = shared.plan[..at].iter().map(|s| s.rows).sum();
+    Some(before + origin.row_start + row)
 }
 
 /// CT-I10: the diagnostic names the morsel, its stage and its features.

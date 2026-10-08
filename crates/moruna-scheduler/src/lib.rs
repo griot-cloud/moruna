@@ -12,7 +12,7 @@
 //! probe protocol without knowing its internals.
 //!
 //! Two properties hold by construction rather than by care. A worker only ever runs
-//! `Kernel::apply`: it never issues an IO operation and never waits on a `Completion`, because
+//! `Kernel::judge`: it never issues an IO operation and never waits on a `Completion`, because
 //! the only code that does either lives in the two drive threads (SC-I1, `source_drive` and
 //! `sink_drive`). And every morsel leaves exactly one trace record per stage, because the only
 //! two places that build one are `worker::build_record`, called once at the end of a task, and
@@ -42,6 +42,7 @@ mod pick;
 mod pipeline;
 mod policy;
 mod probe;
+mod set_aside;
 mod shared;
 mod sink_drive;
 mod slots;
@@ -50,6 +51,9 @@ mod stats;
 mod worker;
 
 pub use pipeline::{Pipeline, SchedulerConfig};
+pub use set_aside::{
+    COLUMNS as SET_ASIDE_COLUMNS, MAX_LISTED as SET_ASIDE_MAX_LISTED, RefusedRow, SetAsideSummary,
+};
 
 use shared::Shared;
 
@@ -159,6 +163,11 @@ impl Scheduler {
     /// The current CPU limit as a worker count, and the thread pool size.
     pub fn cpu_limit(&self) -> (u16, u16) {
         (self.shared.knobs.cpu_bound(), self.shared.cfg.workers_max)
+    }
+
+    /// What the run set aside so far, when it sets refused rows aside (MH 4.1 `refused_rows`).
+    pub fn set_aside(&self) -> Option<SetAsideSummary> {
+        self.shared.set_aside.as_ref().map(|s| s.summary())
     }
 
     /// The kernels of the chain, in stage order, for the facade's fingerprint list.

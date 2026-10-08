@@ -79,6 +79,35 @@ pub struct MetaInput {
     pub process_usage: moruna_kernel::ProcessUsage,
     /// The snapshot the sink committed, when the run completed into a table with snapshots.
     pub snapshot: Option<moruna_kernel::SinkSnapshot>,
+    /// What the run set aside, when it sets refused rows aside (MH 4.1 `refused_rows`).
+    pub set_aside: Option<moruna_scheduler::SetAsideSummary>,
+}
+
+/// The scheduler's account of what a run set aside, as the report states it.
+pub fn set_aside_report(
+    summary: moruna_scheduler::SetAsideSummary,
+) -> moruna_trace::SetAsideReport {
+    moruna_trace::SetAsideReport {
+        dir: summary.dir.display().to_string(),
+        rows: summary.rows,
+        files: summary
+            .files
+            .iter()
+            .map(|f| f.display().to_string())
+            .collect(),
+        refused: summary
+            .refused
+            .into_iter()
+            .map(|r| moruna_trace::SetAsideRow {
+                stage: r.stage,
+                seq: r.seq,
+                row: r.row,
+                source_row: r.source_row,
+                column: r.column,
+                cause: r.cause,
+            })
+            .collect(),
+    }
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -114,6 +143,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         process_peak: input.process_peak,
         process_usage: input.process_usage,
         snapshot: input.snapshot,
+        set_aside: input.set_aside.map(set_aside_report),
     }
 }
 
@@ -192,6 +222,7 @@ mod tests {
             },
             process_usage: moruna_kernel::ProcessUsage::default(),
             snapshot: None,
+            set_aside: None,
         });
         assert_eq!(meta.process_peak.bytes, 9);
         assert_eq!(meta.bottleneck_timeline.len(), all.len());
@@ -219,6 +250,7 @@ mod tests {
             process_peak: moruna_kernel::ProcessPeak::default(),
             process_usage: moruna_kernel::ProcessUsage::default(),
             snapshot: None,
+            set_aside: None,
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());

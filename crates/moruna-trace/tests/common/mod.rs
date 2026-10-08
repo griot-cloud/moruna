@@ -142,6 +142,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         process_peak: moruna_kernel::ProcessPeak::default(),
         process_usage: moruna_kernel::ProcessUsage::default(),
         snapshot: None,
+        set_aside: None,
     }
 }
 

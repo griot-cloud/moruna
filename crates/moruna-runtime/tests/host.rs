@@ -24,7 +24,8 @@ use moruna_runtime::job::{KernelDoc, KernelLoader, LoadedKernel};
 use moruna_runtime::{JobSpec, RunSpec, Runtime, SinkSpec, SourceSpec};
 use serde_json::{Value, json};
 use support::{
-    Doubler, FailOnce, Scratch, Sleeper, one_run_at_a_time, read_back_rows, write_parquet,
+    Doubler, FailOnce, RefuseMultiples, Scratch, Sleeper, one_run_at_a_time, read_back_rows,
+    write_parquet,
 };
 
 const RUN_ID: &str = "00112233445566778899aabbccddeeff";
@@ -38,6 +39,7 @@ impl KernelLoader for TestKernels {
             Some("double") => Arc::new(Doubler::new()),
             Some("sleep") => Arc::new(Sleeper::new(700)),
             Some("fail") => Arc::new(FailOnce::new(1)),
+            Some("refuse") => Arc::new(RefuseMultiples::new(7)),
             other => {
                 return Err(moruna_kernel::MorunaError::Plan(format!(
                     "kernels[{index}]: no test kernel `{other:?}`"
@@ -682,5 +684,93 @@ fn ho_t13_report_file_placement() {
     assert_eq!(
         cli::summary(&outcome),
         format!("moruna: exit 0; report: {}", expected.display())
+    );
+}
+
+/// HO-T14 refused_rows (MH 4.1): by default a row the kernel refuses fails the run as a kernel
+/// error naming its row of the source, its column and why; with `refused_rows` set aside, the
+/// run completes, the rows kept are the output, and the refused ones are in the set-aside
+/// output under the staging directory and named in the report by their row of the source.
+#[test]
+fn ho_t14_refused_rows_fail_or_are_set_aside() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t14");
+    let rows = 1_000u64;
+
+    let doc = document(scratch.path(), rows, 4, Some("refuse"));
+    let path = write_doc(scratch.path(), &doc);
+    assert_eq!(
+        run_cli(&["run", &path.to_string_lossy()], &no_env),
+        exit::KERNEL_ERROR
+    );
+    let failed = report_file(scratch.path());
+    let diagnostic = failed["exit"]["diagnostic"].as_str().unwrap_or_default();
+    assert!(
+        diagnostic
+            .contains("row(s) refused; the first is row 0 of the source, column `id`: multiple"),
+        "{failed}"
+    );
+    assert!(failed["report"].get("set_aside").is_none(), "{failed}");
+
+    let scratch = Scratch::new("ho_t14_aside");
+    let mut doc = document(scratch.path(), rows, 4, Some("refuse"));
+    doc["refused_rows"] = json!({"set_aside": {}});
+    let path = write_doc(scratch.path(), &doc);
+    assert_eq!(
+        run_cli(&["run", &path.to_string_lossy()], &no_env),
+        exit::COMPLETED
+    );
+    let refused: Vec<u64> = (0..rows).filter(|r| r % 7 == 0).collect();
+    assert_eq!(
+        read_back_rows(&scratch.path().join("out")),
+        rows - refused.len() as u64,
+        "the rows kept are the output"
+    );
+    let done = report_file(scratch.path());
+    let set_aside = &done["report"]["set_aside"];
+    let dir = scratch
+        .path()
+        .join("staging")
+        .join(format!("moruna-{RUN_ID}.set-aside"));
+    assert_eq!(
+        set_aside["dir"],
+        dir.to_string_lossy().as_ref(),
+        "{set_aside}"
+    );
+    assert_eq!(set_aside["rows"], refused.len() as u64);
+    let mut named: Vec<u64> = set_aside["refused"]
+        .as_array()
+        .expect("the refused rows")
+        .iter()
+        .map(|r| {
+            assert_eq!(r["stage"], 1);
+            assert_eq!(r["column"], "id");
+            assert_eq!(r["cause"], "multiple");
+            r["source_row"]
+                .as_u64()
+                .expect("stage 1 names its source row")
+        })
+        .collect();
+    named.sort_unstable();
+    assert_eq!(named, refused, "each refused row by its row of the source");
+    let file = std::fs::File::open(dir.join("stage-1.arrow")).expect("the set-aside file");
+    let reader = arrow::ipc::reader::FileReader::try_new(file, None).expect("finished");
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in reader {
+        let batch = batch.expect("a batch");
+        let column = batch
+            .column_by_name("id")
+            .expect("the refused row's own id");
+        let column = column
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int64");
+        ids.extend(column.values().iter());
+    }
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        refused.iter().map(|&r| r as i64).collect::<Vec<_>>(),
+        "each refused row's own values are set aside"
     );
 }

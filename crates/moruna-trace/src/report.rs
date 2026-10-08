@@ -68,6 +68,41 @@ pub struct RunMeta {
     /// (`SinkSummary::snapshot`); `None` for every other run, and for a run that did not
     /// complete.
     pub snapshot: Option<SinkSnapshot>,
+    /// What the run set aside, when it sets refused rows aside (MH 4.1 `refused_rows`).
+    pub set_aside: Option<SetAsideReport>,
+}
+
+/// What a run set aside (MH 4.1 `refused_rows`): where, how many rows, and the rows
+/// themselves by where they were and why (never their values, which are in the output).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SetAsideReport {
+    /// The set-aside output, a directory.
+    pub dir: String,
+    /// Every row set aside.
+    pub rows: u64,
+    /// The files written, one per stage that refused a row.
+    pub files: Vec<String>,
+    /// The rows set aside, at most a bound of them; `refused.len() < rows` when the bound cut
+    /// the list.
+    pub refused: Vec<SetAsideRow>,
+}
+
+/// One row a run set aside.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SetAsideRow {
+    /// The stage whose kernel refused it.
+    pub stage: StageId,
+    /// The morsel it was in.
+    pub seq: Seq,
+    /// Its index in the stage's input morsel.
+    pub row: u64,
+    /// Its row in the source, counted from 0 over the source's splits in plan order, when the
+    /// stage reads the source's rows.
+    pub source_row: Option<u64>,
+    /// The column it was refused for, when one.
+    pub column: Option<String>,
+    /// Why.
+    pub cause: String,
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -259,6 +294,10 @@ pub struct RunReport {
         skip_serializing_if = "Option::is_none"
     )]
     pub snapshot: Option<SinkSnapshot>,
+    /// What the run set aside, for a run that sets refused rows aside (MH 4.1
+    /// `refused_rows`). Absent from the JSON for every other run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_aside: Option<SetAsideReport>,
 }
 
 /// `SinkSnapshot` is the contracts' type (d.8); serialised here as
@@ -659,6 +698,7 @@ impl RunReport {
             overflow_failed: trace.overflow_failed(),
             late_records: trace.late_records(),
             snapshot: meta.snapshot,
+            set_aside: meta.set_aside.clone(),
         }
     }
 

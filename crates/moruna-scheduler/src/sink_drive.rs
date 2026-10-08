@@ -82,6 +82,13 @@ fn write_loop(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) -> Drained
     let interval = Duration::from_millis(shared.cfg.heartbeat_interval_ms);
 
     loop {
+        // What the workers set aside is written here, between the sink's writes (SC-I1).
+        if let Some(set_aside) = &shared.set_aside
+            && let Err(e) = set_aside.flush()
+        {
+            crate::policy::terminate(shared, e);
+            return Drained::Stopped;
+        }
         let mut worked = poll_writes(shared, sink, &mut inflight, cx);
         let ending =
             shared.has_exit() || shared.is_cancelled() || shared.stopping.load(Ordering::SeqCst);
@@ -228,10 +235,15 @@ fn finish(shared: &Shared) {
         return;
     }
     shared.set_run_state(RunState::Finishing);
-    let summary: Result<SinkSummary> = {
+    // The set-aside output is complete before the sink commits the rows that were kept.
+    let set_aside = match &shared.set_aside {
+        Some(set_aside) => set_aside.finish(),
+        None => Ok(()),
+    };
+    let summary: Result<SinkSummary> = set_aside.and_then(|()| {
         let mut guard = shared.sink.write().unwrap_or_else(|e| e.into_inner());
         guard.finish()
-    };
+    });
     match summary {
         Ok(summary) => {
             let next_seq = crate::source_drive::cursor(shared).0.next_seq;

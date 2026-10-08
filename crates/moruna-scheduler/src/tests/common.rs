@@ -47,6 +47,7 @@ pub fn cfg() -> SchedulerConfig {
         read_ahead: 2,
         sink_concurrency: 2,
         error_policy: ErrorPolicy::Terminate,
+        set_aside: None,
         initial_morsel_target: 32,
         morsel_min: 8,
         morsel_max: 1 << 30,

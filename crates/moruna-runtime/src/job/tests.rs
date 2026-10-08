@@ -863,3 +863,69 @@ fn std_kernels_in_a_document() {
     job.kernels[0].name = None;
     assert_refused(&job, "kernels[0].name");
 }
+
+/// `refused_rows`: absent is `fail` and leaves the digest as it was; `set_aside` reads with or
+/// without its directory, builds to the facade's `RefusedRows`, changes the digest, and is
+/// refused beside a resume.
+#[test]
+fn refused_rows_fail_by_default_and_set_aside_when_asked() {
+    let plain = r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/in"},
+                    "sink":{"kind":"parquet","url":"/out"}}"#;
+    let job = JobSpec::from_json(plain).expect("plain");
+    assert_eq!(job.refused_rows, RefusedRowsDoc::Fail);
+    let said = JobSpec::from_json(
+        r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/in"},
+            "sink":{"kind":"parquet","url":"/out"},"refused_rows":"fail"}"#,
+    )
+    .expect("fail, said");
+    assert_eq!(said.digest(), job.digest(), "the default is not the job");
+    assert!(!job.canonical_json().contains("refused_rows"));
+    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("builds");
+    assert_eq!(built.spec.refused_rows, crate::spec::RefusedRows::Fail);
+
+    let aside = JobSpec::from_json(
+        r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/in"},
+            "sink":{"kind":"parquet","url":"/out"},
+            "refused_rows":{"set_aside":{"url":"file:///disk/1/aside"}}}"#,
+    )
+    .expect("set aside");
+    assert_ne!(aside.digest(), job.digest());
+    let canonical = aside.canonical_json();
+    assert!(
+        canonical.contains(r#""refused_rows":{"set_aside":{"url":"file:///disk/1/aside"}}"#),
+        "{canonical}"
+    );
+    assert_eq!(JobSpec::from_json(&canonical).unwrap(), aside);
+    let built = build::build(&aside, &NoKernels, opts(false, &no_env)).expect("builds");
+    assert_eq!(
+        built.spec.refused_rows,
+        crate::spec::RefusedRows::SetAside {
+            dir: Some("/disk/1/aside".into())
+        }
+    );
+    let staged = JobSpec::from_json(
+        r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/in"},
+            "sink":{"kind":"parquet","url":"/out"},"refused_rows":{"set_aside":{}}}"#,
+    )
+    .expect("set aside in the staging directory");
+    let built = build::build(&staged, &NoKernels, opts(false, &no_env)).expect("builds");
+    assert_eq!(
+        built.spec.refused_rows,
+        crate::spec::RefusedRows::SetAside { dir: None }
+    );
+
+    for bad in [
+        r#""refused_rows":"skip""#,
+        r#""refused_rows":{"set_aside":{"dir":"/x"}}"#,
+    ] {
+        let text = format!(
+            r#"{{"moruna_spec":1,"source":{{"kind":"parquet","url":"/in"}},
+                "sink":{{"kind":"parquet","url":"/out"}},{bad}}}"#
+        );
+        let e = JobSpec::from_json(&text).unwrap_err();
+        assert_eq!(e.field, "refused_rows", "{bad}: {e}");
+    }
+    let mut resumed = aside.clone();
+    resumed.resume = Some("/staging/moruna-x/manifest.json".into());
+    assert_refused(&resumed, "refused_rows");
+}
