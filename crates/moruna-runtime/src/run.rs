@@ -585,17 +585,21 @@ fn drive(
         None => None,
     };
 
-    // MH 4.1 `refused_rows`: where a refused row is set aside, when it is.
+    // MH 4.1 `refused_rows`: where a refused row is set aside, when it is: the directory the
+    // document names, or one in the staging directory it names (made when the run starts, as
+    // the staging directory itself is), or else in the one discovery found.
     let set_aside = match refused_rows {
         RefusedRows::Fail => None,
         RefusedRows::SetAside { dir: Some(dir) } => Some(dir),
         RefusedRows::SetAside { dir: None } => Some(
-            staging_dir
+            explicit_staging_dir
                 .as_ref()
+                .or(staging_dir.as_ref())
                 .ok_or_else(|| {
                     RunError::bare(MorunaError::Config {
                         name: "refused_rows",
-                        msg: "the set-aside output names no directory and the run has no                               staging directory to put it in"
+                        msg: "the set-aside output names no directory and the run has no \
+                              staging directory to put it in"
                             .into(),
                     })
                 })?

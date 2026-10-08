@@ -704,11 +704,18 @@ fn ho_t14_refused_rows_fail_or_are_set_aside() {
         exit::KERNEL_ERROR
     );
     let failed = report_file(scratch.path());
+    // Two workers: whichever morsel's refusal ends the run first is named, by its first row.
     let diagnostic = failed["exit"]["diagnostic"].as_str().unwrap_or_default();
-    assert!(
-        diagnostic
-            .contains("row(s) refused; the first is row 0 of the source, column `id`: multiple"),
-        "{failed}"
+    let row: u64 = diagnostic
+        .split("row(s) refused; the first is row ")
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(" of the source, column `id`: multiple"))
+        .and_then(|row| row.parse().ok())
+        .unwrap_or_else(|| panic!("{failed}"));
+    assert_eq!(
+        row % 7,
+        0,
+        "a refused row, by its row of the source: {failed}"
     );
     assert!(failed["report"].get("set_aside").is_none(), "{failed}");
 

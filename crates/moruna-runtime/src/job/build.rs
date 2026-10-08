@@ -396,7 +396,8 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
             if job.resume.is_some() {
                 return Err(SpecError::new(
                     "refused_rows",
-                    "a resumed run cannot set rows aside: the rows its earlier attempt set aside                      are not in this run's output",
+                    "a resumed run cannot set rows aside: the rows its earlier attempt set aside \
+                     are not in this run's output",
                 )
                 .into());
             }
