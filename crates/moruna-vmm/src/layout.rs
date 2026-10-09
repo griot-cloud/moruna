@@ -252,8 +252,9 @@ pub fn cmdline(arch: Arch, has_rootfs: bool) -> String {
     match arch {
         Arch::X86_64 => {
             parts.push("console=ttyS0".into());
-            // reboot=k: reset through the i8042, which the monitor sees; the guest has no PCI.
+            // reboot=k: reset through the i8042, which the monitor sees.
             parts.push("reboot=k".into());
+            // The kernel has PCI support (ACPICA needs it) but the machine has no PCI bus.
             parts.push("pci=off".into());
             parts.push("i8042.noaux".into());
             parts.push("i8042.nomux".into());

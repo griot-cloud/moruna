@@ -1,17 +1,22 @@
 //! The x86_64 ACPI tables: a hardware-reduced platform with the CPUs, the CPU hot-plug
-//! controller, the Generic Event Device that announces a hot-added CPU, and the sleep and
-//! reset registers a guest powers off and reboots through.
+//! controller, the Generic Event Device that announces a hot-added CPU, the console, the
+//! virtio-mmio devices, and the sleep and reset registers a guest powers off and reboots
+//! through.
 //!
 //! Tables (all at [`x86::ACPI_ADDR`], where the kernel scans for the RSDP): RSDP, XSDT, FADT,
-//! DSDT, MADT. The virtio-mmio devices are not in ACPI: the kernel command line names them.
-//! Built with `acpi_tables`, so they are generated and checked on any host.
+//! DSDT, MADT. Built with `acpi_tables`, so they are generated and checked on any host.
+//!
+//! A hardware-reduced platform has no legacy PIC, so Linux maps no interrupt line until a
+//! device's `_CRS` names its GSI: every device that interrupts (COM1, each virtio-mmio
+//! window, the GED) is described here, and a GSI named anywhere else (a kernel command line
+//! `virtio_mmio.device=`, the 8250's built-in ISA table) has no Linux IRQ behind it.
 
 use acpi_tables::Aml;
 use acpi_tables::aml::{
     self, Acquire, Add, Arg, BufferData, EISAName, Equal, Field, FieldAccessType, FieldEntry,
-    FieldLockRule, FieldUpdateRule, If, Interrupt, LessThan, Local, Method, MethodCall, Name,
-    Notify, OpRegion, OpRegionSpace, Package, Path, Release, ResourceTemplate, Return, Scope,
-    Store, While,
+    FieldLockRule, FieldUpdateRule, IO, If, Interrupt, LessThan, Local, Memory32Fixed, Method,
+    MethodCall, Name, Notify, OpRegion, OpRegionSpace, Package, Path, Release, ResourceTemplate,
+    Return, Scope, Store, While,
 };
 use acpi_tables::fadt::{FADTBuilder, Flags};
 use acpi_tables::gas::{AccessSize, AddressSpace, GAS};
@@ -26,8 +31,14 @@ use crate::devices::cpu_hotplug;
 use crate::devices::legacy::{
     ACPI_PM_PORT, RESET_REGISTER, RESET_VALUE, S5_TYPE, SLEEP_CONTROL, SLEEP_STATUS,
 };
+use crate::devices::serial;
 use crate::error::{Result, VmmError};
-use crate::layout::x86;
+use crate::layout::{MMIO_WINDOW, Slot, x86};
+
+/// The `_HID` Linux's virtio-mmio driver binds an ACPI device by.
+pub const VIRTIO_MMIO_HID: &str = "LNRO0005";
+/// The `_HID` of a 16550-compatible UART, which Linux's 8250 PNP driver binds.
+pub const UART_HID: &str = "PNP0501";
 
 const OEM_ID: [u8; 6] = *b"MORUNA";
 const OEM_TABLE: [u8; 8] = *b"MRNAVMM ";
@@ -51,9 +62,15 @@ fn lapic_entry(i: u32) -> Vec<u8> {
     vec![0, 8, i as u8, i as u8, 1, 0, 0, 0]
 }
 
-/// The DSDT body: `\_SB.CPUS` with one device per possible vCPU and the scan method, the GED,
-/// and `\_S5`.
-pub fn dsdt(cpus_max: u32) -> Vec<u8> {
+/// An edge-triggered, active-high, exclusive interrupt: what an irqfd without a resample fd
+/// raises.
+fn edge_irq(gsi: u32) -> Interrupt {
+    Interrupt::new(true, true, false, false, gsi)
+}
+
+/// The DSDT body: `\_SB.COM1`, one `\_SB.Vnnn` per virtio-mmio slot, `\_SB.CPUS` with one
+/// device per possible vCPU and the scan method, the GED, and `\_S5`.
+pub fn dsdt(cpus_max: u32, virtio: &[Slot]) -> Result<Vec<u8>> {
     let hp_addr = x86::CPU_HOTPLUG_ADDR as u32;
     let hp_len = cpu_hotplug::WINDOW_BYTES as u32;
     let region = OpRegion::new(
@@ -198,7 +215,51 @@ pub fn dsdt(cpus_max: u32) -> Vec<u8> {
     let evt = Method::new("_EVT".into(), 1, true, vec![&cscn_call]);
     let ged = aml::Device::new("GED0".into(), vec![&hid_ged, &uid_ged, &crs, &evt]);
 
-    let sb = Scope::new("\\_SB_".into(), vec![&cpus_dev, &ged]);
+    // The console, at COM1's port and line.
+    let hid_com_v = EISAName::new(UART_HID);
+    let hid_com = Name::new("_HID".into(), &hid_com_v);
+    let uid_com = Name::new("_UID".into(), &zero);
+    let com_port = serial::COM1_PORT as u16;
+    let com_io = IO::new(com_port, com_port, 1, serial::WINDOW_BYTES as u8);
+    let com_irq = edge_irq(serial::COM1_IRQ);
+    let com_crs_v = ResourceTemplate::new(vec![&com_io, &com_irq]);
+    let com_crs = Name::new("_CRS".into(), &com_crs_v);
+    let com1 = aml::Device::new("COM1".into(), vec![&hid_com, &uid_com, &com_crs]);
+
+    // One device per virtio-mmio slot: its window and its line.
+    let hid_virtio = Name::new("_HID".into(), &VIRTIO_MMIO_HID);
+    let mut v_uids = Vec::with_capacity(virtio.len());
+    let mut v_crs = Vec::with_capacity(virtio.len());
+    for (i, s) in virtio.iter().enumerate() {
+        let base = u32::try_from(s.addr)
+            .ok()
+            .filter(|b| b.checked_add(MMIO_WINDOW as u32).is_some())
+            .ok_or_else(|| {
+                VmmError::config(
+                    "--disk",
+                    format!("virtio-mmio window {:#x} is above 4 GiB", s.addr),
+                )
+            })?;
+        let window = Memory32Fixed::new(true, base, MMIO_WINDOW as u32);
+        let line = edge_irq(s.gsi);
+        let crs = ResourceTemplate::new(vec![&window, &line]);
+        v_uids.push(Name::new("_UID".into(), &(i as u32)));
+        v_crs.push(Name::new("_CRS".into(), &crs));
+    }
+    let v_devs: Vec<aml::Device<'_>> = (0..virtio.len())
+        .map(|i| {
+            aml::Device::new(
+                name4('V', i as u32).as_str().into(),
+                vec![&hid_virtio, &v_uids[i], &v_crs[i]],
+            )
+        })
+        .collect();
+
+    let mut sb_children: Vec<&dyn Aml> = vec![&com1];
+    sb_children.extend(v_devs.iter().map(|d| d as &dyn Aml));
+    sb_children.push(&cpus_dev);
+    sb_children.push(&ged);
+    let sb = Scope::new("\\_SB_".into(), sb_children);
     let s5_typ = S5_TYPE;
     let s5_pkg = Package::new(vec![&s5_typ, &zero]);
     let s5 = Name::new("_S5_".into(), &s5_pkg);
@@ -206,7 +267,7 @@ pub fn dsdt(cpus_max: u32) -> Vec<u8> {
     let mut out = Vec::new();
     sb.to_aml_bytes(&mut out);
     s5.to_aml_bytes(&mut out);
-    out
+    Ok(out)
 }
 
 /// The MADT: one local APIC per possible vCPU (enabled for the boot vCPUs, online-capable for
@@ -253,8 +314,8 @@ pub fn fadt(dsdt_addr: u64) -> Vec<u8> {
 }
 
 /// Every table, placed from [`x86::ACPI_ADDR`] up: RSDP first (where the kernel finds it),
-/// then XSDT, FADT, DSDT and MADT, each 8-byte aligned.
-pub fn tables(cpus: u32, cpus_max: u32) -> Result<Vec<Placed>> {
+/// then XSDT, FADT, DSDT and MADT, each 8-byte aligned. `virtio` is every virtio-mmio slot.
+pub fn tables(cpus: u32, cpus_max: u32, virtio: &[Slot]) -> Result<Vec<Placed>> {
     let align = |a: u64| a.div_ceil(8) * 8;
     let rsdp_addr = x86::ACPI_ADDR;
     let xsdt_addr = align(rsdp_addr + Rsdp::len() as u64);
@@ -265,7 +326,7 @@ pub fn tables(cpus: u32, cpus_max: u32) -> Result<Vec<Placed>> {
     let dsdt_addr = align(fadt_addr + fadt_bytes.len() as u64);
 
     let mut dsdt_sdt = Sdt::new(*b"DSDT", 36, 6, OEM_ID, OEM_TABLE, OEM_REV);
-    dsdt_sdt.append_slice(&dsdt(cpus_max));
+    dsdt_sdt.append_slice(&dsdt(cpus_max, virtio)?);
     let dsdt_bytes = dsdt_sdt.as_slice().to_vec();
     let madt_addr = align(dsdt_addr + dsdt_bytes.len() as u64);
     let madt_bytes = madt(cpus, cpus_max);
@@ -296,15 +357,35 @@ pub fn tables(cpus: u32, cpus_max: u32) -> Result<Vec<Placed>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::layout::{Arch, Layout, MAX_VIRTIO_DEVICES};
 
     fn sum(b: &[u8]) -> u8 {
         b.iter().fold(0u8, |a, x| a.wrapping_add(*x))
     }
 
+    /// The first `n` virtio slots of an x86_64 machine.
+    fn slots(n: usize) -> Vec<Slot> {
+        let l = Layout::new(Arch::X86_64, 1 << 30, 1 << 30).unwrap();
+        (0..n).map(|i| l.virtio_slot(i).unwrap()).collect()
+    }
+
+    /// `ExtendedInterrupt (ResourceConsumer, Edge, ActiveHigh, Exclusive) { gsi }`.
+    fn edge_irq_bytes(gsi: u32) -> Vec<u8> {
+        let mut v = vec![0x89, 6, 0, 0b0011, 1];
+        v.extend(gsi.to_le_bytes());
+        v
+    }
+
+    fn count(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
     #[test]
     fn vm_t20_tables_checksum_and_link() {
-        let t = tables(2, 8).unwrap();
+        let t = tables(2, 8, &slots(MAX_VIRTIO_DEVICES)).unwrap();
         let sig = |b: &[u8]| String::from_utf8_lossy(&b[0..4]).to_string();
         let (rsdp_at, rsdp) = &t[0];
         assert_eq!(*rsdp_at, x86::ACPI_ADDR);
@@ -386,7 +467,7 @@ mod tests {
 
     #[test]
     fn vm_t21_dsdt_names_every_possible_cpu_and_the_ged() {
-        let d = dsdt(3);
+        let d = dsdt(3, &[]).unwrap();
         let has = |s: &[u8]| d.windows(s.len()).any(|w| w == s);
         for n in [
             &b"C000"[..],
@@ -408,6 +489,92 @@ mod tests {
         // The hot-plug controller's address appears as the OpRegion offset.
         assert!(has(&(x86::CPU_HOTPLUG_ADDR as u32).to_le_bytes()));
         // Too many vCPUs for the space below 1 MiB would be refused, not truncated.
-        assert!(tables(1, 64).is_ok());
+        assert!(tables(1, 64, &slots(MAX_VIRTIO_DEVICES)).is_ok());
+    }
+
+    /// A hardware-reduced x86 guest has no legacy PIC, so it maps a GSI to an IRQ only when a
+    /// `_CRS` names it: every virtio-mmio window and COM1 must be in the DSDT with its line.
+    #[test]
+    fn vm_t20_dsdt_describes_every_device_that_interrupts() {
+        let s = slots(MAX_VIRTIO_DEVICES);
+        let d = dsdt(2, &s).unwrap();
+        let mut hid = vec![0x08, b'_', b'H', b'I', b'D', 0x0d];
+        hid.extend(VIRTIO_MMIO_HID.as_bytes());
+        hid.push(0);
+        assert_eq!(count(&d, &hid), s.len(), "one LNRO0005 per slot");
+        for (i, slot) in s.iter().enumerate() {
+            assert!(count(&d, name4('V', i as u32).as_bytes()) == 1, "V{i:03X}");
+            // Memory32Fixed (ReadWrite, base, 4 KiB), then the slot's edge-triggered line.
+            let mut crs = vec![0x86, 9, 0, 1];
+            crs.extend((slot.addr as u32).to_le_bytes());
+            crs.extend((MMIO_WINDOW as u32).to_le_bytes());
+            crs.extend(edge_irq_bytes(slot.gsi));
+            assert_eq!(count(&d, &crs), 1, "slot {i} at {:#x}", slot.addr);
+        }
+        assert_eq!(count(&d, name4('V', s.len() as u32).as_bytes()), 0);
+        // COM1: EISAID ("PNP0501"), IO (Decode16, 0x3F8, 0x3F8, 1, 8), IRQ 4.
+        let mut com = vec![0x08, b'_', b'H', b'I', b'D', 0x0c, 0x41, 0xd0, 0x05, 0x01];
+        assert_eq!(count(&d, &com), 1);
+        com = vec![0x47, 1, 0xf8, 0x03, 0xf8, 0x03, 1, 8];
+        com.extend(edge_irq_bytes(serial::COM1_IRQ));
+        assert_eq!(count(&d, &com), 1);
+        // The GED keeps its own line; no two devices share one.
+        assert_eq!(count(&d, &edge_irq_bytes(x86::GED_GSI)), 1);
+        let mut gsis: Vec<u32> = s.iter().map(|s| s.gsi).collect();
+        gsis.extend([serial::COM1_IRQ, x86::GED_GSI]);
+        gsis.sort_unstable();
+        gsis.dedup();
+        assert_eq!(gsis.len(), s.len() + 2);
+        // A window the 32-bit descriptor cannot express is refused.
+        let high = [Slot {
+            addr: 1 << 32,
+            gsi: 5,
+        }];
+        assert!(dsdt(1, &high).is_err());
+    }
+
+    /// The guest kernel's merged configuration (allnoconfig, `moruna.config`, then the x86_64
+    /// fragment): `CONFIG_NAME` to `y` or `n`.
+    fn x86_guest_config() -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        for f in [
+            include_str!("../../../guest/kernel/moruna.config"),
+            include_str!("../../../guest/kernel/x86_64.config"),
+        ] {
+            for line in f.lines() {
+                if let Some((k, v)) = line.strip_prefix("CONFIG_").and_then(|l| l.split_once('=')) {
+                    m.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        m
+    }
+
+    /// The guest kernel binds what these tables describe. ACPICA installs a default handler
+    /// for every default address space, PCI_Config among them, and without `CONFIG_PCI` that
+    /// install fails with AE_BAD_PARAMETER, so no table loads ("During Region
+    /// initialization"). PNPACPI and the 8250 PNP driver take COM1 with its mapped line; the
+    /// virtio-mmio driver binds LNRO0005.
+    #[test]
+    fn vm_t20_guest_kernel_binds_what_the_tables_describe() {
+        let c = x86_guest_config();
+        let on = |k: &str| c.get(k).map(String::as_str) == Some("y");
+        for k in [
+            "ACPI",
+            "PCI",
+            "PNP",
+            "PNPACPI",
+            "SERIAL_8250",
+            "SERIAL_8250_PNP",
+            "VIRTIO_MMIO",
+            "VIRTIO_BLK",
+            "VIRTIO_MEM",
+            "VIRTIO_VSOCKETS",
+            "ACPI_HOTPLUG_CPU",
+        ] {
+            assert!(on(k), "the x86_64 guest kernel needs CONFIG_{k}=y");
+        }
+        // Nothing names a device on the command line any more.
+        assert!(!on("VIRTIO_MMIO_CMDLINE_DEVICES"));
     }
 }

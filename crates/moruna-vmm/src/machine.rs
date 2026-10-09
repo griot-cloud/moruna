@@ -137,11 +137,6 @@ pub fn load_file(mem: &Mem, path: &std::path::Path, addr: u64) -> Result<u64> {
     Ok(data.len() as u64)
 }
 
-/// The `virtio_mmio.device=` parameter the x86 kernel discovers a device by.
-pub fn virtio_mmio_param(slot: &Slot) -> String {
-    format!("virtio_mmio.device=4K@{:#x}:{}", slot.addr, slot.gsi)
-}
-
 /// Everything a boot assembled.
 pub struct Machine {
     /// The architecture.
@@ -295,13 +290,9 @@ impl Machine {
             Arch::Aarch64 => (None, None),
         };
 
-        let mut cmdline = crate::layout::cmdline(arch, image.rootfs.is_some());
-        if arch == Arch::X86_64 {
-            for s in &virtio {
-                cmdline.push(' ');
-                cmdline.push_str(&virtio_mmio_param(s));
-            }
-        }
+        // The guest finds the virtio devices in the ACPI tables (x86_64) or the device tree
+        // (aarch64), never on the command line.
+        let cmdline = crate::layout::cmdline(arch, image.rootfs.is_some());
 
         Ok(Machine {
             arch,
@@ -363,7 +354,9 @@ impl Machine {
         match self.arch {
             Arch::X86_64 => {
                 crate::boot::write_x86_boot_tables(&self.mem)?;
-                for (addr, bytes) in crate::acpi::tables(self.config.cpus, self.config.cpus_max)? {
+                for (addr, bytes) in
+                    crate::acpi::tables(self.config.cpus, self.config.cpus_max, &self.virtio)?
+                {
                     self.mem
                         .write_slice(&bytes, GuestAddress(addr))
                         .map_err(|e| VmmError::device("acpi", e.to_string()))?;
