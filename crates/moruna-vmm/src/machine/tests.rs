@@ -110,8 +110,10 @@ fn vm_t23_x86_machine_has_exactly_its_devices() {
     assert_eq!(ids, vec![19, 24, 2, 2]);
     for s in &m.virtio {
         assert_eq!(rd32(&m.mmio, s.addr), crate::devices::mmio::MAGIC_VALUE);
-        assert!(m.cmdline.contains(&virtio_mmio_param(s)));
     }
+    // The DSDT names every device; the command line names none (a GSI given there has no
+    // Linux IRQ behind it on a hardware-reduced platform).
+    assert!(!m.cmdline.contains("virtio_mmio.device"));
     // Nothing else answers in the device window.
     let past = m.virtio.last().unwrap().addr + crate::layout::MMIO_WINDOW;
     let mut b = [0u8; 4];
