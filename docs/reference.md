@@ -36,6 +36,7 @@ What each field of the report means, and where to find it.
 
 ```{toctree}
 :hidden:
+:maxdepth: 2
 
 python-api
 job-document
