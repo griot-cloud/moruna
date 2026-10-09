@@ -35,10 +35,11 @@ fn ad_t13_gate_admits_within_the_estimate_without_measuring() {
     let (gate, sampler) = gate_over(vec![sample(100 * MIB, 0)], 200 * MIB);
     assert_eq!(sampler.samples_taken(), 1, "one measurement at creation");
     assert_eq!(gate.admit(50 * MIB), Ok(()));
+    gate.settle(50 * MIB);
     assert_eq!(gate.admit(50 * MIB), Ok(()));
     assert_eq!(sampler.samples_taken(), 1, "the fast path takes no sample");
     assert_eq!(gate.measurements(), 1);
-    assert!(format!("{gate:?}").contains("since"));
+    assert!(format!("{gate:?}").contains("pending"));
 }
 
 #[test]
@@ -53,8 +54,10 @@ fn ad_t13_gate_measures_before_it_refuses() {
         200 * MIB,
     );
     assert_eq!(gate.admit(80 * MIB), Ok(()));
+    gate.settle(80 * MIB);
     // 100 + 80 + 40 > 200 on the estimate; the fresh measurement (60) leaves room.
     assert_eq!(gate.admit(40 * MIB), Ok(()));
+    gate.settle(40 * MIB);
     assert_eq!(sampler.samples_taken(), 2);
     // 60 + 40 since + 120 > 200: measured again; the fresh 150 replaces what was admitted
     // before it (it is resident now or never will be, f.9), and 150 + 120 > 200.
@@ -71,6 +74,54 @@ fn ad_t13_gate_measures_before_it_refuses() {
     assert_eq!(gate.measurements(), 3);
     // The refused bytes were not kept: a small request fits again on the estimate.
     assert_eq!(gate.admit(5 * MIB), Ok(()));
+}
+
+#[test]
+fn ad_t13_bytes_in_flight_stay_counted_over_a_measurement() {
+    // 2026-10-09: a measurement subtracted every byte admitted before it, including bytes whose
+    // allocation had not returned; when that allocation then failed, its credit came off a
+    // second time, and the estimate sat a whole request below what the process held.
+    let (gate, sampler) = gate_over(vec![sample(100 * MIB, 0)], 200 * MIB);
+    assert_eq!(gate.admit(80 * MIB), Ok(()), "admitted, not yet allocated");
+    // Another request needs a measurement while the 80 are in flight: the measurement cannot
+    // contain them, so they stay on top of it.
+    let refused = gate
+        .admit(30 * MIB)
+        .expect_err("100 + 80 in flight + 30 > 200");
+    assert_eq!(refused.in_use, 180 * MIB);
+    assert_eq!(sampler.samples_taken(), 2);
+    // The allocator underneath fails: exactly the 80 go back.
+    gate.credit(80 * MIB);
+    let refused = gate
+        .admit(180 * MIB)
+        .expect_err("100 held + 180 > 200, whatever came back before");
+    assert_eq!(refused.in_use, 100 * MIB);
+    assert_eq!(gate.admit(100 * MIB), Ok(()), "and what fits is admitted");
+}
+
+#[test]
+fn ad_t13_concurrent_requests_never_pass_the_ceiling() {
+    // 2026-10-09 (PY-T20 flaked in CI, `refused` 3 against 4 skipped): the fast path added a
+    // request before judging it and took it back when it did not fit, and a measurement on
+    // another thread could subtract it in between and so subtract it twice. Four threads ask
+    // for twice the ceiling over and over; a single admission is the defect.
+    let (gate, _) = gate_over(vec![sample(100 * MIB, 0)], 512 * MIB);
+    let admitted = std::sync::atomic::AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..100_000 {
+                    if gate.admit(1024 * MIB).is_ok() {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        gate.credit(1024 * MIB);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(admitted.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(gate.refusals(), 400_000);
+    assert!(format!("{gate:?}").contains("pending: 0"), "{gate:?}");
 }
 
 #[test]
@@ -102,6 +153,7 @@ fn ad_t13_no_ceiling_admits_everything_and_credit_makes_room() {
     assert_eq!(gate.admit(90 * MIB), Ok(()));
     gate.credit(90 * MIB);
     assert_eq!(gate.admit(90 * MIB), Ok(()));
+
     assert_eq!(
         sampler.samples_taken(),
         1,
@@ -279,6 +331,36 @@ fn ad_t13_numpy_blocks_are_exact() {
         .join()
         .expect("freed");
     assert_eq!(owner.live().live_bytes, 0);
+}
+
+#[test]
+fn ad_t13_the_allocator_underneath_a_numpy_block_is_not_counted_again() {
+    // NumPy's default allocator takes its blocks from `PyMem_RawMalloc`, whose hook is ours too:
+    // the block is a NumPy request, counted and judged once, and the Python request it makes
+    // underneath is neither (2026-10-09: it was refused as a Python request after the NumPy one
+    // was admitted, so a refusal was counted under the wrong source).
+    let (gate, sampler) = gate_over(vec![sample(100 * MIB, 0)], 120 * MIB);
+    let owner = KernelMemory::new(true);
+    owner.bind(gate.clone());
+    let (_, end) = owner.frame(|| {
+        assert!(!allocate_owned(&owner, 15 * MIB, || allocate(15 * MIB + 16, some)).is_null());
+        assert!(
+            !resize_owned(&owner, 15 * MIB, 18 * MIB, || allocate(18 * MIB + 16, some)).is_null()
+        );
+        assert!(allocate_owned(&owner, 30 * MIB, || allocate(30 * MIB + 16, some)).is_null());
+    });
+    assert_eq!(end.counts.python.requests, 0, "{:?}", end.counts.python);
+    assert_eq!(end.counts.python.refused, 0);
+    assert_eq!(end.counts.numpy.requests, 3);
+    assert_eq!(end.counts.numpy.refused, 1);
+    assert_eq!(
+        sampler.samples_taken(),
+        2,
+        "only the refused request measured"
+    );
+    // The frame's `inside` is down again: a Python request now is counted.
+    let (_, end) = owner.frame(|| allocate(10, some));
+    assert_eq!(end.counts.python.requests, 1);
 }
 
 #[test]

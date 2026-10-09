@@ -8,7 +8,7 @@
 
 use core::cell::Cell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use moruna_kernel::{AllocCounts, KernelAlloc, Sampler};
 
@@ -44,11 +44,28 @@ pub struct LiveCounts {
 }
 
 /// One per run (05 f.9): decides every guarded request.
+///
+/// The estimate is the last measurement, plus what was allocated since it was taken, plus what
+/// has been admitted and not yet allocated (`pending`). No thread ever adds bytes it may take
+/// back: the fast path claims with a compare and swap only when the request fits, so another
+/// thread never judges against a request that is about to be refused. A measurement replaces
+/// only bytes that were allocated before it was taken (`settled`), never bytes still in flight,
+/// so an allocation that then fails gives back exactly what it was admitted with, and no
+/// interleaving of measurements, claims and give-backs can leave the estimate below what was
+/// admitted (2026-10-09: a measurement that subtracted another thread's in-flight claim, which
+/// that thread then took back as well, left the estimate a whole request short, and the next
+/// request of that size was admitted).
 pub struct MemoryGate {
     sampler: Arc<dyn Sampler>,
     ceiling: AtomicU64,
+    /// The process's memory at the last measurement.
     base: AtomicU64,
-    since: AtomicI64,
+    /// Bytes admitted whose allocation has not returned yet.
+    pending: AtomicU64,
+    /// Bytes allocated since the last measurement was taken.
+    settled: AtomicU64,
+    /// Held while the gate measures the process: one measurement at a time.
+    measuring: Mutex<()>,
     measurements: AtomicU64,
     refusals: AtomicU64,
 }
@@ -58,7 +75,8 @@ impl std::fmt::Debug for MemoryGate {
         f.debug_struct("MemoryGate")
             .field("ceiling", &self.ceiling.load(Ordering::Relaxed))
             .field("base", &self.base.load(Ordering::Relaxed))
-            .field("since", &self.since.load(Ordering::Relaxed))
+            .field("pending", &self.pending.load(Ordering::Relaxed))
+            .field("settled", &self.settled.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -81,53 +99,100 @@ impl MemoryGate {
             sampler,
             ceiling: AtomicU64::new(ceiling),
             base: AtomicU64::new(sample.anon_bytes),
-            since: AtomicI64::new(0),
+            pending: AtomicU64::new(0),
+            settled: AtomicU64::new(0),
+            measuring: Mutex::new(()),
             measurements: AtomicU64::new(1),
             refusals: AtomicU64::new(0),
         })
     }
 
-    /// f.9: admit `bytes` (counting them in `since`) or refuse them.
+    /// f.9: admit `bytes` or refuse them. Every admission is answered once, by [`settle`] when
+    /// the allocator underneath returned the memory or by [`credit`] when it did not.
+    ///
+    /// [`settle`]: MemoryGate::settle
+    /// [`credit`]: MemoryGate::credit
     pub fn admit(&self, bytes: u64) -> Result<(), Refusal> {
-        let n = signed(bytes);
-        let s = self.since.fetch_add(n, Ordering::AcqRel).saturating_add(n);
-        let ceiling = self.ceiling.load(Ordering::Acquire);
-        let estimate = self
-            .base
-            .load(Ordering::Acquire)
-            .saturating_add(s.max(0) as u64);
-        if ceiling == 0 || estimate <= ceiling {
-            return Ok(());
+        let mut pending = self.pending.load(Ordering::Acquire);
+        loop {
+            let ceiling = self.ceiling.load(Ordering::Acquire);
+            let estimate = self
+                .base
+                .load(Ordering::Acquire)
+                .saturating_add(self.settled.load(Ordering::Acquire))
+                .saturating_add(pending)
+                .saturating_add(bytes);
+            if ceiling != 0 && estimate > ceiling {
+                return self.measure_and_admit(bytes);
+            }
+            match self.pending.compare_exchange_weak(
+                pending,
+                pending.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(seen) => pending = seen,
+            }
         }
-        // The slow path: undo the add and judge on a fresh measurement.
-        self.since.fetch_sub(n, Ordering::AcqRel);
-        let counted = self.since.load(Ordering::Acquire);
+    }
+
+    /// The slow path: judge `bytes` on a fresh measurement.
+    fn measure_and_admit(&self, bytes: u64) -> Result<(), Refusal> {
+        let _measuring = self
+            .measuring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // What was allocated before the sample is in it, or never will be (f.9); what is
+        // allocated while it is taken stays counted on top of it, which can only over-estimate.
+        let counted = self.settled.load(Ordering::Acquire);
         let sample = self.sampler.sample();
-        self.since.fetch_sub(counted, Ordering::AcqRel);
+        // The measurement goes in before the bytes it replaces come out, so a fast path that
+        // reads between the two over-estimates instead of under-estimating.
         self.base.store(sample.anon_bytes, Ordering::Release);
         if sample.ceiling_bytes > 0 {
             self.ceiling.store(sample.ceiling_bytes, Ordering::Release);
         }
+        self.settled.fetch_sub(counted, Ordering::AcqRel);
         self.measurements.fetch_add(1, Ordering::Relaxed);
         let ceiling = self.ceiling.load(Ordering::Acquire);
-        let in_use = sample
-            .anon_bytes
-            .saturating_add(self.since.load(Ordering::Acquire).max(0) as u64);
-        if ceiling > 0 && in_use.saturating_add(bytes) > ceiling {
-            self.refusals.fetch_add(1, Ordering::Relaxed);
-            return Err(Refusal {
-                requested: bytes,
-                in_use,
-                ceiling,
-            });
+        let mut pending = self.pending.load(Ordering::Acquire);
+        loop {
+            let in_use = sample
+                .anon_bytes
+                .saturating_add(self.settled.load(Ordering::Acquire))
+                .saturating_add(pending);
+            if ceiling > 0 && in_use.saturating_add(bytes) > ceiling {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(Refusal {
+                    requested: bytes,
+                    in_use,
+                    ceiling,
+                });
+            }
+            match self.pending.compare_exchange_weak(
+                pending,
+                pending.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(seen) => pending = seen,
+            }
         }
-        self.since.fetch_add(n, Ordering::AcqRel);
-        Ok(())
     }
 
-    /// Bytes an admitted request gave back without being allocated.
+    /// An admitted request's memory exists: it moves from in flight to allocated.
+    pub fn settle(&self, bytes: u64) {
+        // Counted as allocated before it stops being in flight: a reader in between sees it
+        // twice, never not at all.
+        self.settled.fetch_add(bytes, Ordering::AcqRel);
+        self.pending.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// An admitted request the allocator underneath did not satisfy: its bytes go back.
     pub fn credit(&self, bytes: u64) {
-        self.since.fetch_sub(signed(bytes), Ordering::AcqRel);
+        self.pending.fetch_sub(bytes, Ordering::AcqRel);
     }
 
     /// How many times the gate measured the process (its first measurement included).
@@ -317,8 +382,9 @@ impl Frame {
         }
     }
 
-    /// Ask the gate about a request when it is a guarded one: `Ok(true)` charged, `Ok(false)`
-    /// not examined, `Err` refused (and recorded).
+    /// Ask the gate about a request when it is a guarded one: `Ok(true)` admitted (and to be
+    /// answered once the allocator underneath returns), `Ok(false)` not examined, `Err` refused
+    /// (and recorded).
     fn examine(&self, source: usize, bytes: u64) -> Result<bool, ()> {
         let Some(gate) = self.gate() else {
             return Ok(false);
@@ -340,13 +406,33 @@ impl Frame {
             }
         }
     }
+}
 
-    fn call<T>(&self, underlying: impl FnOnce() -> *mut T) -> *mut T {
-        let was = self.inside.replace(true);
-        let p = underlying();
-        self.inside.set(was);
-        p
-    }
+/// Call the allocator underneath a request with the open frame's `inside` set, so a hooked domain
+/// it reaches is neither counted nor examined a second time. NumPy's default allocator takes its
+/// blocks from `PyMem_RawMalloc`: without this every NumPy block was also counted as a Python
+/// request, and judged again, by a gate that had just admitted it (2026-10-09).
+fn underneath<T>(underlying: impl FnOnce() -> *mut T) -> *mut T {
+    let Some(was) = with_frame(|frame| frame.inside.replace(true)) else {
+        return underlying();
+    };
+    let p = underlying();
+    with_frame(|frame| frame.inside.set(was));
+    p
+}
+
+/// Answer the admission the open frame's gate gave `bytes`: the allocator underneath returned
+/// the memory, or it did not and the bytes go back.
+fn answer(bytes: u64, allocated: bool) {
+    with_frame(|frame| {
+        if let Some(gate) = frame.gate() {
+            if allocated {
+                gate.settle(bytes);
+            } else {
+                gate.credit(bytes);
+            }
+        }
+    });
 }
 
 /// f.10: a Python domain hook's request for `bytes`; `underlying` calls the allocator underneath.
@@ -367,9 +453,9 @@ pub fn allocate<T>(bytes: u64, underlying: impl FnOnce() -> *mut T) -> *mut T {
         None => underlying(),
         Some(Err(())) => core::ptr::null_mut(),
         Some(Ok(charged)) => {
-            let p = with_frame(|frame| frame.call(underlying)).unwrap_or(core::ptr::null_mut());
-            if p.is_null() && charged {
-                with_frame(|frame| frame.gate().map(|g| g.credit(bytes)));
+            let p = underneath(underlying);
+            if charged {
+                answer(bytes, !p.is_null());
             }
             p
         }
@@ -410,11 +496,11 @@ pub fn allocate_owned<T>(
         Some(Err(())) => return core::ptr::null_mut(),
         Some(Ok(charged)) => charged,
     };
-    let p = underlying();
+    let p = underneath(underlying);
+    if charged {
+        answer(bytes, !p.is_null());
+    }
     if p.is_null() {
-        if charged {
-            owner_frame(owner, |frame| frame.gate().map(|g| g.credit(bytes)));
-        }
         return p;
     }
     owner.add_live(counted(bytes));
@@ -439,11 +525,11 @@ pub fn resize_owned<T>(
         Some(Err(())) => return core::ptr::null_mut(),
         Some(Ok(charged)) => charged,
     };
-    let p = underlying();
+    let p = underneath(underlying);
+    if charged {
+        answer(growth, !p.is_null());
+    }
     if p.is_null() {
-        if charged {
-            owner_frame(owner, |frame| frame.gate().map(|g| g.credit(growth)));
-        }
         return p;
     }
     owner.add_live(counted(new) - counted(old));

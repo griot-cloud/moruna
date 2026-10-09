@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3
+
+- **An x86_64 guest boots.** The x86_64 guest kernel is built with `CONFIG_PCI` (ACPICA installs its PCI-config address-space handler before loading any table, and 6.18 has it only with PCI; `pci=off` still keeps the bus unprobed), `PNP`, `PNPACPI` and `SERIAL_8250_PNP`. moruna-vmm's DSDT now describes COM1 (PNP0501) and one LNRO0005 device per virtio-mmio slot with its window and edge interrupt, so a hardware-reduced guest maps every device's GSI; the `virtio_mmio.device=` command-line devices are gone (`VIRTIO_MMIO_CMDLINE_DEVICES=n`). Before this, the first x86_64 boot refused every ACPI table and every virtio probe failed with -22.
+- **The memory guard never admits past its ceiling.** The gate keeps admitted-but-unallocated bytes (`pending`) apart from bytes allocated since the last measurement (`settled`), claims only what fits, and answers every admission once (`settle()` or `credit()`); concurrent requests could drift its count a whole request low and let one through. A NumPy block is counted once: the allocator beneath NumPy and Python runs marked inside, so a block is no longer judged again as a Python request.
+
 ## 0.4.2
 
 - **A job's contracts travel in its document.** `contracts` lists the compiled contracts a `datafusion` source reads and a `peql` sink writes under (document, compiled bytes, pinned function modules, audiences). The job's peQL engine keeps its manifests, ledger and audit log at `root` and its contracts in memory: it reads no contract from the disk and writes none there, and a contract the job names that the document does not carry is refused by name. `KernelLoader::admit` lets a host refuse a carried contract before it is registered; `job::entry_of` writes a contract peQL registered as an entry.
