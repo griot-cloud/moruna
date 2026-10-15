@@ -408,7 +408,16 @@ mod tests {
                 assets: None,
             });
             let code = match r {
-                Err(f) if f.step == "namespace" && f.error.contains("mount") => 0,
+                // Refused at the namespace step and named: by `mount` of the missing root
+                // where the process may make a mount namespace, or by `unshare` itself where
+                // it may not (an unprivileged CI runner whose AppArmor restricts user
+                // namespaces). Never a confinement that pretends to have happened.
+                Err(f)
+                    if f.step == "namespace"
+                        && (f.error.contains("mount") || f.error.contains("unshare")) =>
+                {
+                    0
+                }
                 Err(_) => 1,
                 Ok(()) => 2,
             };
