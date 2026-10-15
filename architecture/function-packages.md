@@ -2,7 +2,7 @@
 
 **Document type:** full architecture design (not an ADR)
 **Status:** DRAFT for review · 2026-10-15
-**Scope:** how a kernel becomes one portable file that carries its code and its dependencies, how Moruna runs such a file without giving it Moruna's own access to the machine, and how a program on any machine loads and calls it. OUT: a build system for languages other than Python (an author brings a wasm toolchain), Python compiled to WebAssembly (§7), what a host stores, shares or meters (a host's concern; this document names no host).
+**Scope:** how a kernel becomes one portable file that carries its code and its dependencies, how Moruna runs such a file, and how a program on any machine loads and calls it. OUT: a build system for languages other than Python (an author brings a wasm toolchain), Python compiled to WebAssembly (§7), what a host stores, shares or meters (a host's concern; this document names no host).
 **Companion:** `moruna-hosted-engine.md` (MH), §4.9 for the kernel, its declarations and `moruna check`, which this document consumes unchanged; §4.1 for the job document; §4.8 for the guest image.
 
 ## 1. Problem statement
@@ -11,7 +11,7 @@
 
 **P2 — The lockfile is a hash, not an environment.** The lockfile is folded into the fingerprint and never installed. A kernel runs with the interpreter's packages, not its own.
 
-**P3 — Tenant code runs in Moruna's process.** A Python kernel is imported into the interpreter beside Moruna, with everything Moruna can see in view: every attached disk, the job document, the host socket. A host that runs one party's kernel over another party's data has no boundary but the VM.
+**P3 — No kernel can be run for someone else.** A Python kernel is imported into the interpreter beside Moruna and sees what Moruna sees. A host that wants to run one party's kernel over another party's data has nothing between the kernel and the data but the machine itself; it needs a kernel format that can see only its batches.
 
 **P4 — One language.** A Rust kernel's path ends at a check; nothing else has a path at all.
 
@@ -37,23 +37,16 @@ One WIT world, `moruna:kernel`:
 
 The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
 
-## 4. The two runtimes, neither with Moruna's access to the machine
+## 4. The two runtimes
 
-Today a Python kernel is imported into Moruna's own interpreter and sees what Moruna sees. A packaged kernel never does, in one of two ways:
+- **`moruna-wasm`**: wasmtime inside Moruna's process, one instance per stage, with a linear-memory limit and a fuel limit taken from the stage's budget. The module can touch only its own linear memory and call only what the `moruna:kernel` world hands it; it has no path to Moruna's memory, disks, sockets or another stage. Every growth of its memory passes through wasmtime's resource limiter, which is where Moruna intervenes; CPU is fuel. No allocator is hooked, because none needs to be.
+- **A `.pex`** runs inside Moruna's process through the Python adapter of SDD 05, exactly as a Python kernel runs today: the package's extracted tree is put on the interpreter's path, the entry is loaded under the adapter, and the allocator guard (SDD 05, E13), the per-call frame, the counting and the refusals are unchanged. What the package adds is that the dependencies are the package's own, not the interpreter's.
 
-- **`moruna-wasm`**: wasmtime inside Moruna's process, one instance per stage, with a linear-memory limit and a fuel limit taken from the stage's budget. The module can touch only its own linear memory and call only what the `moruna:kernel` world hands it; it has no path to Moruna's memory, disks, sockets or another stage. Same process, no access.
-- **`moruna-sandbox`**: for `.pex`, a separate operating-system process, one per stage, started once for the run and kept for its state: `python <package>.pex`, in a mount namespace that holds only the package's extracted tree (read-only), a private temporary directory, and one Unix socket back to Moruna; Landlock over those paths; seccomp allowing the file, memory and socket calls the interpreter needs and no `connect`, no `execve` outside the tree, no namespace calls; no capabilities; the stage's memory budget as the child's limit, under the memory guard (MH §4.4). Batches cross the socket as Arrow IPC, the same bytes as the wasm interface. The child never sees the job document, the host socket, or any disk but its own tree.
+So a packaged kernel adds no process and no virtualization: the VM is the boundary around a tenant's data, as before, and inside it a wasm kernel is sandboxed while a pex kernel is trusted the way a tenant's own Python is today. A host that runs one party's `.pex` for another must therefore do so where nothing but the batches is reachable; a host that wants a foreign `.pex` beside a disk needs the confined child below.
 
-**The guard across the boundary.** The allocator guard (SDD 05, E13) is Moruna's code, not the kernel's, and it goes where the kernel goes. The sandbox child is not a bare interpreter: it is Moruna's runner, which loads the package under the adapter, installs the same hooks (CPython's allocator domains, NumPy's data allocator), opens the same per-call frame, counts the same way and refuses the same way, on the same fast path, inside the child. What changes:
-- **The gate measures the child**, which is exactly the kernel's memory, not Moruna's process with the kernel's allocations mixed in. Moruna sends the stage's ceiling at start and whenever it changes (a resize, the controller's shrink target); the child's gate holds that line.
-- **The counts reach the trace as before.** Each call's `KernelAlloc` travels back with the batch's reply, so the call's trace record and the report's per-stage figures are built unchanged; peak and in-use are also in a shared-memory page the sampler reads at its tick, so the controller sees the stage between batches.
-- **A hard ceiling the hooks never gave.** The child runs in a cgroup with `memory.max` at the ceiling and a CPU weight from the stage's budget: what a C extension allocates past the hooks (raw `malloc`, invisible to E13 today) it cannot keep, and per-stage CPU is exact. The adapter's GIL serialisation (SDD 05 decision 2) has no work across processes.
-- **Arrow is exact.** The child has its own pyarrow pool, so a call's Arrow figures are the kernel's alone (AD-I15's shared-pool caveat is gone).
-- **The cost** is one interpreter per stage, counted in the stage's budget as its baseline, and one copy of each batch across the socket, which the profile measures. The step past that, in a later revision, maps the arena region into the child as shared memory so the child's Arrow pool allocates from Moruna's arena and no copy happens; the arena stays Moruna's.
+**Deferred: `moruna-sandbox`, a confined child for a `.pex`.** One separate operating-system process per stage, holding only the package's extracted tree, a temporary directory and one socket; Landlock, seccomp, no capabilities, a cgroup with `memory.max` at the ceiling. The runner in the child is Moruna's and installs the same guard, measuring the child's own memory against the ceiling Moruna sends it and reporting each call's counts with the batch's reply. It costs one interpreter per stage and a copy of each batch across the socket (or, later, the arena region mapped into the child as shared memory). It is not part of this design's first implementation; it becomes one when a host needs foreign Python kernels beside an attached disk.
 
-For a `.wasm` kernel the same questions have one answer each: its memory is a wasmtime linear memory with a limit from the stage's budget, every growth of it passes through wasmtime's resource limiter (the point at which Moruna intervenes), and CPU is fuel. No allocator is hooked.
-
-The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path, `moruna.run(...)` over a function object in the author's own interpreter, and the path of the standard kernels (MH §4.9). A **hosted** run (MH §4.3) loads a kernel through a package and one of the two runtimes above, never in-process; strict mode refuses a job document that names a Python module by import path.
+The in-process `pyo3` path of SDD 12 is therefore unchanged for `.pex` and remains the library path, `moruna.run(...)` over a function object, and the path of the standard kernels (MH §4.9). A hosted run in strict mode refuses a job document that names a Python module by import path rather than a package.
 
 ## 5. The job document
 
@@ -71,7 +64,7 @@ The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path,
 
 - **Not a build system for other languages.** The author brings a wasm toolchain; `moruna package --wasm` verifies, it does not compile.
 - **Not Python-in-wasm.** Accepted for the reasons in §2; revisit when the data libraries publish for a WASI runtime.
-- **Not one isolation strength.** A wasm kernel can make no system call; a pex kernel is a confined process. A host that runs one party's kernel for another states which it accepts for what.
+- **Not one isolation strength.** A wasm kernel can make no system call; a pex kernel runs with Moruna's own access, as a tenant's Python does today. A host that runs one party's kernel for another runs a `.pex` only where nothing but the batches is reachable, and requires `.wasm` beside a disk.
 - **The wheel ecosystem decides what a `.pex` may contain.** A pin with no wheel for a named platform is refused by name, never substituted.
 
 ## 8. Component amendments, by SDD
@@ -81,13 +74,13 @@ The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path,
 | `12-python.md` | `moruna package`, `moruna aot`, `moruna load`; the library path unchanged |
 | `15-check.md` | a package checked through its runtime (§6) |
 | **new `16-package.md`** | the package (§2): the two formats, `moruna.json`, the `moruna:kernel` world (§3), the fingerprint, the three commands (§6); `kernels[].kind = package` in the job document (§5) |
-| **new `17-sandbox.md`** | `moruna-wasm` and `moruna-sandbox` (§4): the wasmtime limits, the child's namespaces, Landlock, seccomp, the socket protocol, the memory limit under the guard; strict mode's refusal of an unpackaged kernel |
+| **new `17-wasm.md`** | `moruna-wasm` (§4): the wasmtime instance per stage, the memory limit and the resource limiter, fuel, the world's bindings; strict mode's refusal of an unpackaged kernel. `moruna-sandbox` (deferred, §4) gets its own document when a host needs it |
 | `14-vmm.md` | the guest image carries the standard-build interpreter for packaged kernels (§2) |
 
 ## 9. Implementation plan
 
 1. `16-package.md`: the manifest, the world, `moruna package` for a project and for a wasm module, the fingerprint; `moruna check` over a package.
-2. `17-sandbox.md`: `moruna-wasm`, then `moruna-sandbox`; strict mode.
+2. `17-wasm.md`: `moruna-wasm`; strict mode.
 3. `moruna aot` and `moruna load`.
 4. The guest image: the standard-build interpreter beside the engine's own.
 5. A release, which a host pins.
