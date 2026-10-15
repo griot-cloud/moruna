@@ -2,7 +2,7 @@
 
 **Document type:** full architecture design (not an ADR)
 **Status:** DRAFT for review · 2026-10-15
-**Scope:** how a kernel becomes one portable file that carries its code and its dependencies, how Moruna runs such a file out of its own process, and how a program on any machine loads and calls it. OUT: a build system for languages other than Python (an author brings a wasm toolchain), Python compiled to WebAssembly (§7), what a host stores, shares or meters (a host's concern; this document names no host).
+**Scope:** how a kernel becomes one portable file that carries its code and its dependencies, how Moruna runs such a file without giving it Moruna's own access to the machine, and how a program on any machine loads and calls it. OUT: a build system for languages other than Python (an author brings a wasm toolchain), Python compiled to WebAssembly (§7), what a host stores, shares or meters (a host's concern; this document names no host).
 **Companion:** `moruna-hosted-engine.md` (MH), §4.9 for the kernel, its declarations and `moruna check`, which this document consumes unchanged; §4.1 for the job document; §4.8 for the guest image.
 
 ## 1. Problem statement
@@ -37,10 +37,12 @@ One WIT world, `moruna:kernel`:
 
 The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
 
-## 4. The two runtimes, inside Moruna, outside its process
+## 4. The two runtimes, neither with Moruna's access to the machine
 
-- **`moruna-wasm`**: wasmtime, in-process, one instance per stage, with a linear-memory limit and a fuel limit taken from the stage's budget. Nothing a wasm kernel does can touch a disk, a socket or another stage.
-- **`moruna-sandbox`**: for `.pex`, one child process per stage, started once for the run and kept for its state: `python <package>.pex`, in a mount namespace that holds only the package's extracted tree (read-only), a private temporary directory, and one Unix socket back to Moruna; Landlock over those paths; seccomp allowing the file, memory and socket calls the interpreter needs and no `connect`, no `execve` outside the tree, no namespace calls; no capabilities; the stage's memory budget as the child's limit, under the memory guard (MH §4.4). Batches cross the socket as Arrow IPC, the same bytes as the wasm interface. The child never sees the job document, the host socket, or any disk but its own tree.
+Today a Python kernel is imported into Moruna's own interpreter and sees what Moruna sees. A packaged kernel never does, in one of two ways:
+
+- **`moruna-wasm`**: wasmtime inside Moruna's process, one instance per stage, with a linear-memory limit and a fuel limit taken from the stage's budget. The module can touch only its own linear memory and call only what the `moruna:kernel` world hands it; it has no path to Moruna's memory, disks, sockets or another stage. Same process, no access.
+- **`moruna-sandbox`**: for `.pex`, a separate operating-system process, one per stage, started once for the run and kept for its state: `python <package>.pex`, in a mount namespace that holds only the package's extracted tree (read-only), a private temporary directory, and one Unix socket back to Moruna; Landlock over those paths; seccomp allowing the file, memory and socket calls the interpreter needs and no `connect`, no `execve` outside the tree, no namespace calls; no capabilities; the stage's memory budget as the child's limit, under the memory guard (MH §4.4). Batches cross the socket as Arrow IPC, the same bytes as the wasm interface. The child never sees the job document, the host socket, or any disk but its own tree.
 
 The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path, `moruna.run(...)` over a function object in the author's own interpreter, and the path of the standard kernels (MH §4.9). A **hosted** run (MH §4.3) loads a kernel through a package and one of the two runtimes above, never in-process; strict mode refuses a job document that names a Python module by import path.
 
