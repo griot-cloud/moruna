@@ -265,6 +265,8 @@ Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, a
 
 **What this is not.** Not a test framework (the author's tests are theirs), not a type checker for Python, and not a guarantee about behaviour on real data, it is the guarantee that the function *is a kernel* and a first measurement of what it costs.
 
+**Packaging (2026-10-15).** A kernel as one file, `.wasm` or `.pex`, its two out-of-process runtimes, `moruna package`, `moruna aot` and `moruna load` are `architecture/function-packages.md`, which consumes this section.
+
 ---
 
 ## 5. Component amendments, by SDD

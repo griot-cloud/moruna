@@ -375,6 +375,9 @@ pub enum KernelKindDoc {
     Rust,
     /// A standard kernel of `moruna-kernels` by `name` and `args` (MH 4.9).
     Std,
+    /// A function package by `path`, pinned by `fingerprint` (16 d.4): its runtime is its
+    /// extension's (17).
+    Package,
 }
 
 /// One stage (MH 4.1). A Python kernel is named by `module` and `callable`; the hints are the
@@ -382,8 +385,14 @@ pub enum KernelKindDoc {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelDoc {
-    /// `python` or `rust`.
+    /// `python`, `rust`, `std` or `package`.
     pub kind: KernelKindDoc,
+    /// For `package`: the package's file, on a disk the run attaches (16 d.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// For `package`: a directory the kernel reads, read only (16 b, d.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<String>,
     /// A module name on the interpreter's path, or a path to a `.py` file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
@@ -399,7 +408,8 @@ pub struct KernelDoc {
     /// For `std`: the standard kernel's name (`cast`, `select`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// For `std`: its arguments, a JSON object.
+    /// For `std`: its arguments, a JSON object; for `package`: the arguments of a kernel built
+    /// by them (16 b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
     /// The fingerprint the loaded kernel must have, hex, optionally prefixed `algo:`.
@@ -446,6 +456,8 @@ impl KernelDoc {
     pub fn python(module: impl Into<String>, callable: impl Into<String>) -> KernelDoc {
         KernelDoc {
             kind: KernelKindDoc::Python,
+            path: None,
+            assets: None,
             module: Some(module.into()),
             callable: Some(callable.into()),
             krate: None,
@@ -475,6 +487,17 @@ impl KernelDoc {
         doc.callable = None;
         doc.name = Some(name.into());
         doc.args = Some(args);
+        doc
+    }
+
+    /// A function package at `path`, pinned to `fingerprint` (16 d.4).
+    pub fn package(path: impl Into<String>, fingerprint: impl Into<String>) -> KernelDoc {
+        let mut doc = KernelDoc::python("", "");
+        doc.kind = KernelKindDoc::Package;
+        doc.module = None;
+        doc.callable = None;
+        doc.path = Some(path.into());
+        doc.fingerprint = Some(fingerprint.into());
         doc
     }
 

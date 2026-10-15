@@ -241,6 +241,7 @@ fn child_run() {
             strict: true,
             env: &env,
             notes: Vec::new(),
+            packages: moruna_runtime::packaged::PackageHost::default(),
         },
     ) {
         Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -534,6 +535,7 @@ fn refusal(
             strict: false,
             env: &env,
             notes: Vec::new(),
+            packages: moruna_runtime::packaged::PackageHost::default(),
         },
     )
     .err()
@@ -711,6 +713,7 @@ fn a_loaders_bindings_decide_where_a_contract_is() {
                 strict: false,
                 env: &env,
                 notes: Vec::new(),
+                packages: moruna_runtime::packaged::PackageHost::default(),
             },
         )
         .map(|_| ())

@@ -10,12 +10,12 @@ not produced them.
 """
 
 from moruna._core import (
-    MorunaError,
     BudgetError,
     Cancelled,
     ConfigError,
     IoError,
     KernelError,
+    MorunaError,
     PlanError,
     ResumeError,
 )

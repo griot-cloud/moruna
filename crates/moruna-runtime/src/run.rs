@@ -109,6 +109,7 @@ fn drive(
         kernels,
         #[cfg(feature = "python")]
         py_kernels,
+        packaged,
         sink: sink_spec,
         engine_memory,
         sink_memory,
@@ -270,6 +271,11 @@ fn drive(
         for subscriber in components.limits_subscribers {
             watch.subscribe(subscriber);
         }
+        // MH 4.4: a packaged stage's ceiling moves with the run's (17 f.7).
+        for stage in &packaged {
+            let stage = stage.clone();
+            watch.subscribe(Box::new(move |_| stage.limits_changed()));
+        }
         Arc::new(watch)
     });
 
@@ -281,6 +287,13 @@ fn drive(
             Some(watch) => Arc::new(DiscoverySampler::following(&discovered, watch.limits())?),
             None => Arc::new(DiscoverySampler::new(&discovered)?),
         },
+    };
+    // SB-I9: the memory a packaged stage's child holds is the run's, and every sample says so.
+    let outside: Vec<_> = packaged.iter().filter_map(|p| p.outside()).collect();
+    let sampler: Arc<dyn Sampler> = if outside.is_empty() {
+        sampler
+    } else {
+        Arc::new(crate::packaged::WithOutside::new(sampler, outside))
     };
 
     // 2. Arena. The baseline is sampled here, before the region exists (12 f.1, 02 f.1,
@@ -464,18 +477,24 @@ fn drive(
     let sink_handle = SinkHandle::wrap(sink, ordered, config::ORDERING_BUFFER_BYTES);
 
     // 6. Kernels built: bind the arena, walk the chain, build the controller's view of them.
+    // 05 f.9, E13: one gate for the run, bound to every Python kernel and every packaged one; it
+    // refuses only for those that leave `memory_guard` on, and counting needs none.
     #[cfg(feature = "python")]
-    {
-        // 05 f.9, E13: one gate for the run, bound to every Python kernel; it refuses only for
-        // those whose decorator left `memory_guard` on, and counting needs none.
-        let gate = (!py_kernels.is_empty()).then(|| {
-            moruna_adapters::guard::MemoryGate::new(sampler.clone(), limits.memory_ceiling)
-        });
-        for (_, py_kernel) in &py_kernels {
-            py_kernel.bind_allocator(alloc.clone());
-            if let Some(gate) = &gate {
-                py_kernel.bind_gate(gate.clone());
-            }
+    let python_present = !py_kernels.is_empty();
+    #[cfg(not(feature = "python"))]
+    let python_present = false;
+    let gate = (python_present || !packaged.is_empty())
+        .then(|| moruna_adapters::guard::MemoryGate::new(sampler.clone(), limits.memory_ceiling));
+    #[cfg(feature = "python")]
+    for (_, py_kernel) in &py_kernels {
+        py_kernel.bind_allocator(alloc.clone());
+        if let Some(gate) = &gate {
+            py_kernel.bind_gate(gate.clone());
+        }
+    }
+    if let Some(gate) = &gate {
+        for stage in &packaged {
+            stage.bind(gate, &sampler, limits.memory_ceiling);
         }
     }
     let schemas = chain_schemas(source.schema(), &kernels)?;

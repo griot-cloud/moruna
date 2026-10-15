@@ -204,6 +204,43 @@ def check_kernel(
     profiles_dir: str | None = ...,
 ) -> str: ...
 def default_profiles_dir() -> str | None: ...
+
+# The function package (SDD 16).
+KERNEL_ABI: int
+def manifest_json(text: str) -> str: ...
+def package_manifest(path: str) -> str: ...
+def package_wasm(module: str, manifest: str, out: str) -> None: ...
+def check_package(
+    path: str,
+    *,
+    seed: int = 0,
+    profiles_dir: str | None = None,
+    sandbox_python: str | None = None,
+    sandbox_cgroup: str | None = None,
+    args: str | None = None,
+    assets: str | None = None,
+) -> str: ...
+def aot(path: str) -> str: ...
+
+class PackageKernel:
+    @property
+    def path(self) -> str: ...
+    @property
+    def fingerprint(self) -> str: ...
+    @property
+    def format(self) -> str: ...
+    @property
+    def manifest(self) -> dict[str, Any]: ...
+    def __call__(self, batch: Any) -> Any: ...
+
+def load(
+    path: str,
+    *,
+    python: str | None = None,
+    cgroup: str | None = None,
+    args: Mapping[str, Any] | None = None,
+    assets: str | None = None,
+) -> PackageKernel: ...
 def run(
     source: Any,
     kernels: Any,

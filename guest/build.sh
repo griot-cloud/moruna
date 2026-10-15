@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Moruna guest image as an OCI layout, reproducibly, for this host's architecture.
 #
-#   guest/build.sh <moruna-cp314t-wheel> <out-dir>
+#   guest/build.sh <moruna-cp314t-wheel> <moruna-cp314-wheel> <out-dir>
 #
 # Everything is fetched by the version and digest in guest/pins.env and built inside the
 # pinned build container, with SOURCE_DATE_EPOCH taken from the last commit, fixed kernel build
@@ -19,8 +19,13 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 wheel="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-out="$(mkdir -p "$2" && cd "$2" && pwd)"
+# The standard-build wheel is the sandbox's: a .pex stage's child runs on it (SDD 17 f.10).
+std_wheel="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+out="$(mkdir -p "$3" && cd "$3" && pwd)"
 [ -f "$wheel" ] || { echo "guest/build.sh: no wheel at $1" >&2; exit 2; }
+[ -f "$std_wheel" ] || { echo "guest/build.sh: no standard-build wheel at $2" >&2; exit 2; }
+[ "$(dirname "$wheel")" = "$(dirname "$std_wheel")" ] \
+    || { echo "guest/build.sh: the two wheels are in one directory" >&2; exit 2; }
 
 # Exported, because `docker run -e NAME` passes a variable only when it is in the environment:
 # a pin that is merely set reaches the container unset, and its `set -u` stops there.
@@ -36,6 +41,8 @@ case "$(uname -m)" in
 esac
 py_sha_var="PYTHON_SHA256_${arch}"
 pa_sha_var="PYARROW_SHA256_${arch}"
+py_std_sha_var="PYTHON_STD_SHA256_${arch}"
+pa_std_sha_var="PYARROW_STD_SHA256_${arch}"
 
 SOURCE_DATE_EPOCH="$(git -C "$repo" log -1 --format=%ct)"
 export SOURCE_DATE_EPOCH
@@ -47,6 +54,8 @@ docker run --rm \
     -e BUSYBOX_VERSION -e BUSYBOX_SHA256 \
     -e PYTHON_RELEASE -e PYTHON_VERSION -e PYTHON_SHA256="${!py_sha_var}" \
     -e PYARROW_VERSION -e PYARROW_SHA256="${!pa_sha_var}" \
+    -e PYTHON_STD_SHA256="${!py_std_sha_var}" -e PYARROW_STD_SHA256="${!pa_std_sha_var}" \
+    -e STD_WHEEL="/in/$(basename "$std_wheel")" \
     -e DEBIAN_SUITE -e DEBIAN_SNAPSHOT \
     -e WHEEL="/in/$(basename "$wheel")" \
     -v "$here:/guest:ro" \
@@ -104,7 +113,8 @@ chmod 0755 initramfs/init initramfs/bin/busybox
     | gzip -9 -n > /out/initramfs.cpio.gz
 
 # The root filesystem: Debian minbase with udev, free-threaded CPython 3.14, pyarrow and the
-# moruna wheel, BusyBox, and the Moruna init.
+# moruna wheel, the standard build with its own pyarrow and moruna wheel (for the sandbox), BusyBox,
+# and the Moruna init.
 mmdebstrap --quiet --variant=minbase --include=udev,ca-certificates \
     "$DEBIAN_SUITE" rootfs "$mirror"
 fetch "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-${ARCH}-unknown-linux-gnu-freethreaded-install_only.tar.gz" \
@@ -127,6 +137,27 @@ if grep -rIl "$work/rootfs" rootfs/opt/python/bin >/dev/null 2>&1; then
     grep -rIl "$work/rootfs" rootfs/opt/python/bin >&2
     exit 1
 fi
+# The standard build beside it, for packaged kernels (SDD 17 f.10): the child of a .pex stage is
+# a fork of a template on this interpreter, with pyarrow and the cp314 moruna wheel.
+fetch "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-${ARCH}-unknown-linux-gnu-install_only.tar.gz" \
+    python-std.tar.gz "$PYTHON_STD_SHA256"
+mkdir -p python-std && tar xf python-std.tar.gz -C python-std && mv python-std/python rootfs/opt/python-std
+fetch "https://files.pythonhosted.org/packages/cp314/p/pyarrow/pyarrow-${PYARROW_VERSION}-cp314-cp314-manylinux_2_28_${ARCH}.whl" \
+    "pyarrow-${PYARROW_VERSION}-cp314-cp314-manylinux_2_28_${ARCH}.whl" "$PYARROW_STD_SHA256"
+PY_STD=rootfs/opt/python-std/bin/python3
+$PY_STD -m pip install --quiet --no-index --no-deps --no-compile \
+    "pyarrow-${PYARROW_VERSION}-cp314-cp314-manylinux_2_28_${ARCH}.whl" "$STD_WHEEL"
+for f in rootfs/opt/python-std/bin/*; do
+    [ -f "$f" ] && head -c 2 "$f" | grep -q "#!" || continue
+    sed -i "1s|^#!.*/rootfs/opt/python-std/bin/python3.*$|#!/opt/python-std/bin/python3|" "$f"
+done
+if grep -rIl "$work/rootfs" rootfs/opt/python-std/bin >/dev/null 2>&1; then
+    echo "guest: a build path survives in rootfs/opt/python-std/bin:" >&2
+    grep -rIl "$work/rootfs" rootfs/opt/python-std/bin >&2
+    exit 1
+fi
+SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH $PY_STD -m compileall -q --invalidation-mode unchecked-hash \
+    rootfs/opt/python-std/lib
 # Bytecode is compiled once here, deterministically, so the read-only root never needs it.
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH $PY -m compileall -q --invalidation-mode unchecked-hash \
     rootfs/opt/python/lib

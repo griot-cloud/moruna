@@ -49,6 +49,7 @@ fn opts(strict: bool, env: &dyn Fn(&str) -> Option<String>) -> BuildOptions<'_> 
         strict,
         env,
         notes: Vec::new(),
+        packages: crate::packaged::PackageHost::default(),
     }
 }
 
@@ -332,7 +333,9 @@ fn ho_t9_build_translates_every_field() {
     job.checkpoint.interval_ms = 100;
     job.staging.dir = Some(dir.to_string_lossy().into_owned());
     job.host_profile = None;
-    let built = build::build(&job, &Fakes, opts(true, &no_env)).expect("builds");
+    // Not strict: the document names a Python kernel by import path, which strict mode refuses
+    // (16 PK-I8, PK-T11 below); with no environment the two modes build the same spec otherwise.
+    let built = build::build(&job, &Fakes, opts(false, &no_env)).expect("builds");
     let spec = &built.spec;
     assert_eq!(
         built.run_id.map(|r| r.to_hex()).as_deref(),
@@ -862,4 +865,56 @@ fn std_kernels_in_a_document() {
     assert_refused(&job, "kernels[0]");
     job.kernels[0].name = None;
     assert_refused(&job, "kernels[0].name");
+}
+
+/// PK-T11 strict_refuses_import_paths (16 PK-I8): a hosted run loads no kernel by import path.
+#[test]
+fn pk_t11_strict_refuses_import_paths() {
+    let job = JobSpec::from_json(FULL).expect("parses");
+    let e = build::build(&job, &Fakes, opts(true, &no_env))
+        .err()
+        .expect("strict refuses a python kernel");
+    let text = e.to_string();
+    assert!(text.contains("kernels[0].module"), "{text}");
+    assert!(text.contains("loads no kernel by import path"), "{text}");
+    build::build(&job, &Fakes, opts(false, &no_env)).expect("not strict: built");
+}
+
+/// PK-T12 package_entry_fields (16 d.4): a package entry has a path and a fingerprint and
+/// nothing else; each other field set is refused by name, and so is a missing path or pin.
+#[test]
+fn pk_t12_package_entry_fields() {
+    let refused = |edit: &dyn Fn(&mut KernelDoc), field: &str| {
+        let mut job = JobSpec::from_json(FULL).expect("parses");
+        let mut doc = KernelDoc::package("/nowhere/k.wasm", format!("sha256:{}", "0".repeat(64)));
+        edit(&mut doc);
+        job.kernels = vec![doc];
+        let e = build::build(&job, &Fakes, opts(false, &no_env))
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains(field), "{field}: {e}");
+    };
+    refused(&|d| d.module = Some("m".into()), "kernels[0].module");
+    refused(&|d| d.callable = Some("c".into()), "kernels[0].callable");
+    refused(&|d| d.krate = Some("c".into()), "kernels[0].crate");
+    refused(&|d| d.symbol = Some("s".into()), "kernels[0].symbol");
+    refused(&|d| d.name = Some("n".into()), "kernels[0].name");
+    refused(
+        &|d| d.preferred_rows = Some(10),
+        "kernels[0].preferred_rows",
+    );
+    refused(&|d| d.path = None, "kernels[0].path");
+    refused(&|d| d.fingerprint = None, "kernels[0].fingerprint");
+    // The document's args reach a package not built by them: refused naming the field (the file
+    // must exist for that, so this one is checked in tests/package.rs, PK-T17).
+    // A file that is not there is refused naming it.
+    refused(&|_| {}, "/nowhere/k.wasm");
+    // The document's spelling round-trips.
+    let doc = KernelDoc::package("/p.pex", "sha256:ab");
+    let text = serde_json::to_string(&doc).unwrap();
+    assert_eq!(
+        text,
+        r#"{"kind":"package","path":"/p.pex","fingerprint":"sha256:ab"}"#
+    );
+    assert_eq!(serde_json::from_str::<KernelDoc>(&text).unwrap(), doc);
 }

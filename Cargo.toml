@@ -31,6 +31,9 @@ moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.4.2" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.4.2" }
 moruna-vmm = { path = "crates/moruna-vmm", version = "0.4.2" }
 moruna-kernels = { path = "crates/moruna-kernels", version = "0.4.2" }
+moruna-package = { path = "crates/moruna-package", version = "0.4.2" }
+moruna-wasm = { path = "crates/moruna-wasm", version = "0.4.2" }
+moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.4.2" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -97,6 +100,17 @@ vortex = { version = "=0.86.1", default-features = false, features = ["files"] }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON. Already
 # in the graph through the engine bridges at this version, so the pin adds no second copy.
 sha2 = { version = "=0.11.0" }
+
+# Function packages (architecture/function-packages.md, SDD 16 and 17; preamble 6.2 table
+# additions, 2026-10-15). wasmtime runs a `.wasm` package with the component model and nothing
+# else, at the version parcel's runtime already brings so the graph has one wasmtime; wat
+# writes the test components in the text format, at the wasmparser that wasmtime uses; zip is the `.pex`
+# archive; landlock and seccompiler confine a `.pex` stage's child on Linux.
+wasmtime = { version = "=47.0.4", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wat = { version = "=1.252.0" }
+zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
+landlock = { version = "=0.4.7" }
+seccompiler = { version = "=0.5.0" }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six

@@ -37,6 +37,7 @@ pub mod error;
 pub mod host;
 pub mod job;
 pub mod observe;
+pub mod packaged;
 pub mod report;
 pub mod run;
 pub mod spec;

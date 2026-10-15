@@ -154,6 +154,9 @@ pub struct RunSpec {
     /// The Python kernels among them, for `bind_allocator` and `gil_state` (05 d.1).
     #[cfg(feature = "python")]
     pub py_kernels: Vec<(moruna_kernel::StageId, Arc<moruna_adapters::PyKernel>)>,
+    /// The packaged kernels among them (16, 17), which the facade binds to the run's gate,
+    /// sampler and limits.
+    pub packaged: Vec<crate::packaged::Packaged>,
     /// The output; wrapped into a `SinkHandle` by the facade.
     pub sink: SinkSpec,
     /// The source's engine memory, when the source is an engine that runs operators of its own
@@ -231,6 +234,7 @@ impl RunSpec {
             kernels,
             #[cfg(feature = "python")]
             py_kernels: Vec::new(),
+            packaged: Vec::new(),
             sink: sink.into(),
             engine_memory: None,
             sink_memory: None,

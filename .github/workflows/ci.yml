@@ -113,7 +113,9 @@ jobs:
           # back with no copy. It publishes cp314t manylinux wheels, so --only-binary
           # is satisfiable; if that ever stops being true this step fails loudly, which
           # is what we want, because the Python surface would not work on Linux.
-          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin
+          # pyyaml is the `package` extra's (pip is already here): `moruna package` reads
+          # function.yaml (SDD 16 e.3), and python/tests packages projects.
+          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml
           cd bench/python && python -m pytest -q
       - name: The wheel builds, installs and runs on Linux
         # The check that matters for a release: not "does the source tree import", which
@@ -408,8 +410,10 @@ jobs:
           python -m pip install --upgrade pip maturin
           # pyproject.toml's features: the guest runs governed plans and contract writes.
           maturin build --release --out wheel --interpreter python3.14t
-          guest/build.sh wheel/moruna-*.whl build-a
-          guest/build.sh wheel/moruna-*.whl build-b
+          # The standard build's wheel: the sandbox a .pex stage runs in (SDD 17 f.10).
+          maturin build --release --out wheel --interpreter python3.14
+          guest/build.sh wheel/moruna-*-cp314-cp314t-*.whl wheel/moruna-*-cp314-cp314-*.whl build-a
+          guest/build.sh wheel/moruna-*-cp314-cp314t-*.whl wheel/moruna-*-cp314-cp314-*.whl build-b
           if [ "$(cat build-a/digest)" != "$(cat build-b/digest)" ]; then
             echo "the guest image does not reproduce: $(cat build-a/digest) vs $(cat build-b/digest)" >&2
             # Which layer, and what in the root differs. mtimes are left out: mkfs.erofs -T

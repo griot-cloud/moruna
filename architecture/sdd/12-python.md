@@ -156,6 +156,8 @@ class ResumeError(MorunaError) ...   # a manifest that cannot be used; message n
 class PlanError(MorunaError) ...; KernelError; BudgetError; IoError; ConfigError; Cancelled
 
 def inspect_host() -> dict    # {"limits": {...}, "host_profile": {...}, "anon_bytes": n, "notes": [...]}: Limits and HostProfile field by field, what the process already holds (through the same sampler a run would use, 03 f.7), discovery notes
+def load(path, *, python=None, cgroup=None) -> PackageKernel   # 16 d.3 (FP 6, 2026-10-15): a packaged kernel under its own runtime here
+class PackageKernel: path; fingerprint; format; manifest; __call__(batch) -> batch   # `run` accepts it in `kernels` (f.8)
 def polars(fn, *, accepts="table")  # wraps a function from a Polars DataFrame to a Polars DataFrame as a stateless Python kernel (f.6)
 __version__: str
 ```
@@ -194,6 +196,10 @@ A user's `moruna.Source` or `moruna.Sink` (d.2, 2026-09-29) raises through this 
 python/moruna/__init__.py        the API above; imports moruna._core (the PyO3 module)
 python/moruna/_report.py         RunReport wrapper and __str__
 python/moruna/_errors.py         exception classes
+python/moruna/_check.py          `moruna check`: a module or file in process, a package through its runtime (16 f.9)
+python/moruna/_package.py        `moruna package` for a Python project (16 f.4) and `--wasm` (16 f.5)
+python/moruna/_sandbox.py        the template a `.pex` stage's child is forked from (17 f.9)
+python/moruna/__main__.py        the `moruna` console script: run, serve, check, package, aot
 python/moruna/py.typed, _core.pyi   type stubs; _core.pyi is hand-written and checked against the module in PY-T5
 pyproject.toml                  maturin backend; wheel matrix in CI
 ```
@@ -213,6 +219,8 @@ pyproject.toml                  maturin backend; wheel matrix in CI
 **f.5 `KeyboardInterrupt` and thread roles.** `moruna.run` spawns the runtime thread, which runs `Runtime::run` and never touches the interpreter (the adapters attach on worker threads for kernel calls, 05 f.1; the runtime thread itself only wires and waits). The Python main thread stays in `moruna.run` and loops: attach, `PyErr::check_signals`, detach, sleep 100 ms, until the runtime thread finishes. When `check_signals` raises `KeyboardInterrupt`, the main thread sets the cancel token, keeps looping (a second interrupt is swallowed with a message) until the runtime thread returns, then raises `Cancelled` with the partial report. Signals are delivered to the main thread by CPython's design, which is why the roles are not the other way round.
 
 **f.6 `polars()` helper.** In v1 the only path is a stateless Python kernel `lambda batch: pl.from_arrow(batch).pipe(fn).to_arrow()` wrapped as if decorated with the given `accepts` (this copies inside Polars on some types; the docstring says so). The Rust path through `pyo3-polars` and `moruna-polars` is deferred (preamble 6.2 lists `pyo3-polars` as deferred); the signature does not change when it lands.
+
+**f.8 Packaged kernels on the library path (FP 4, FP 6, 2026-10-15).** The library path is unchanged: `moruna.run(...)` over a function object still runs it in the author's own interpreter through the in-process adapter (05), as do the standard kernels (MH 4.9). `moruna.load(path)` (16 d.3) returns a `PackageKernel`; given one in `kernels`, `run` writes the job document entry `{"kind": "package", "path", "fingerprint"}` with the loaded file's fingerprint, so the run opens, pins and runs that file under its own runtime and budget (16 f.8, 17), never in-process. `python=` and `cgroup=` of the load are the run's sandbox host for a `.pex`. The commands `moruna package`, `moruna aot` and `moruna check <package>` are 16 d.2; the console script routes `package` to `_package.py`, `aot` and a package's `check` to the module's `package` functions (`crates/moruna-py/src/package.rs`), and `run` and `serve` to the Rust command, which takes `--sandbox-python` and `--sandbox-cgroup` (17 e.6). A hosted run (strict mode, MH 4.1) refuses a kernel named by import path (16 PK-I8).
 
 **f.7 Resume path.** With `resume` set, in this order: resolve it to a manifest path (`"auto"`: `PlacementEngine::find_manifest(staging_dir, None)`; a run id: `find_manifest(staging_dir, Some(id))`; a path: as given; nothing found is `ResumeError`); refuse with `ResumeError` if `source.repeatable()` is false; read the manifest header (`PlacementEngine::read_manifest_header`) and take its `run_id` and `node` for `PlacementConfig` and `TraceConfig`, so the new process continues the old run's identity rather than minting a new one; then PY-I1's steps discover → arena → reactor → trace → sources and sinks → kernels → placement; `placement.restore(&manifest, &plan, &fingerprints)` (its refusals surface as `ResumeError` before the sink is touched); scheduler `new` with `resuming = true` (the sink is not opened); `scheduler.apply_resume_point(point)` (SC f.13: refuses when checkpointing cannot be on, resumes the sink, sets the cursor, restores or re-inits instances) in place of `init_instances`; controller `prepare`; controller `probe_missing` in place of `probe_all`; controller `start`; `scheduler.run_resumed(cancel)` in place of `run` (re-reads `to_recompute`, then continues as `run`); controller `stop`; trace `finish`; report with `resumed = true`. `checkpoint=True` is the default whenever a staging directory exists and the source is repeatable (discovery finds or creates one; `staging_dir=None` with no discoverable directory disables both staging and checkpointing with a note in the report); a non-resumable sink forces it off with a note naming the sink (SC f.1); on `Completed`, the run directory is removed unless `keep_checkpoint`, and when `keep_checkpoint` is set the scheduler has written a final manifest at the end of the run whether or not the checkpoint interval ever elapsed, so a run shorter than `checkpoint.interval_ms` keeps something rather than an empty directory; on `Terminated` or `Cancelled`, the final manifest the scheduler wrote is put on the exception and the partial report, and the message ends with "resumable: pass resume=\"<run_id>\"" when it is. The resume argument is the only new parameter a user meets, and only after a failure; PY-I3 holds.
 
@@ -292,6 +300,8 @@ Python tests run under the four interpreter builds in CI; Rust facade tests use 
 
 **PY-T21 alloc_reported.** (E13) `@moruna.kernel` without the keyword has refusal on and with `memory_guard=False` off, and the two have the same fingerprint (05 e.4); a run's report has, for a Python stage, an `alloc` with the documented fields (`refusal_on`, `python`, `numpy`, `arrow`, each with `requested_bytes`, `requests`, `largest_request_bytes`, `peak_bytes`, `refused`, then `peak_bytes`, `outside_arrow_peak_bytes`, `outside_arrow_fraction`) in `to_json()` and on the report object, NumPy's figures covering what the kernel built; `moruna check` reports the same `alloc` and `memory_guard` for a Python kernel over its synthetic batches; a job document's Python kernel entry accepts `memory_guard` and lists it among the hints it sets. d.2, 05 d.1, 04 d.1.
 
+**PY-T22 run_a_loaded_package.** (`python/tests/test_package.py`, FP 6) `moruna.run(source, [moruna.load("identity.wasm")], sink)` writes the source's rows, and the run's kernel is the package's fingerprint; `moruna.load(x)(batch)` returns the kernel's output; a `PackageKernel` for a `.pex` on a host that is not Linux is refused when loaded, naming the reason. f.8.
+
 **PY-T19 vortex_end_to_end.** (`python/tests/test_vortex.py`, 2026-09-29) A Parquet file pyarrow wrote is copied into Vortex files by `moruna.VortexSink`, which leaves `part-00000.vortex` onward, `_SUCCESS` and no `.tmp`; `moruna.VortexSource` over them feeds a kernel that upper-cases a column into a `ParquetSink`, and pyarrow reads back every row with the kernel's change and the nullable column's nulls where they were; a Vortex to Vortex copy and a projection `columns=["score", "id"]` read back in file order; `VortexSource(split_bytes=0)`, an empty url list and a non-size `file_bytes` raise at construction, a projection naming a missing column raises `PlanError` naming it, and a `file_bytes` below the range is clamped with a report note (PY-I10). Budgets are what the process holds plus a margin (`inspect_host()["anon_bytes"]`), never a fixed figure, so the result does not depend on what ran before it in the process. d.2, f.3; 07 e.7, e.8; 08 f.11.
 
 ## l. Implementation notes for the agent
@@ -325,6 +335,7 @@ None. (The GPU-wheel question is PY-O1 in section o; it does not block hand-off.
 | user extension (2026-09-29), S17 | d.2 `Source`/`Sink`/`Split`, e.2, f.1 notes | PY-T18 |
 | 07 o SO-O1 (Vortex, source and sink, exposed to Python) | d.2, f.3 | PY-T19 |
 | E13 (allocator guard: the keyword, the refusal end to end, the per-function figures) | d.2 `memory_guard`, e.2 `Refused`, f.1 gate | PY-T20, PY-T21 |
+| FP 4, FP 6 (packaged kernels from the library: `load`, the commands) | d.2 `load`, `PackageKernel`, f.8 | PK-T15, PK-T16, PY-T22 |
 
 ## o. Deferred (post-v1)
 

@@ -115,17 +115,18 @@ pub struct TraceRecord {
 }
 
 /// The sources of `KernelAlloc`, in schema order (e.5).
-pub const ALLOC_SOURCES: [&str; 3] = ["python", "numpy", "arrow"];
+pub const ALLOC_SOURCES: [&str; 4] = ["python", "numpy", "arrow", "linear"];
 /// The counts of each source, in schema order (e.5).
 pub const ALLOC_COUNTS: [&str; 5] = ["bytes", "requests", "largest", "peak", "refused"];
 
 impl KernelAlloc {
-    /// The source's counts by its schema index (0 python, 1 numpy, 2 arrow).
+    /// The source's counts by its schema index (0 python, 1 numpy, 2 arrow, 3 linear).
     pub fn source(&self, index: usize) -> &AllocCounts {
         match index {
             0 => &self.python,
             1 => &self.numpy,
-            _ => &self.arrow,
+            2 => &self.arrow,
+            _ => &self.linear,
         }
     }
 
@@ -134,7 +135,8 @@ impl KernelAlloc {
         match index {
             0 => &mut self.python,
             1 => &mut self.numpy,
-            _ => &mut self.arrow,
+            2 => &mut self.arrow,
+            _ => &mut self.linear,
         }
     }
 }
@@ -185,7 +187,10 @@ impl TraceRecord {
         "alloc_numpy_bytes:u64,alloc_numpy_requests:u64,alloc_numpy_largest:u64,",
         "alloc_numpy_peak:u64,alloc_numpy_refused:u64,",
         "alloc_arrow_bytes:u64,alloc_arrow_requests:u64,alloc_arrow_largest:u64,",
-        "alloc_arrow_peak:u64,alloc_arrow_refused:u64"
+        "alloc_arrow_peak:u64,alloc_arrow_refused:u64,",
+        "alloc_linear_bytes:u64,alloc_linear_requests:u64,alloc_linear_largest:u64,",
+        "alloc_linear_peak:u64,alloc_linear_refused:u64,",
+        "alloc_lease_wait_us:u64"
     );
 
     /// BLAKE3 of the canonical field list (CT-I8). A compile-time constant: the digest of
@@ -194,9 +199,9 @@ impl TraceRecord {
     /// CT-T9 recomputes the digest from `SCHEMA_FIELDS` and asserts this value, so a schema
     /// change is a deliberate edit of the test and of this constant.
     pub const SCHEMA_HASH: [u8; 32] = [
-        0xb2, 0x76, 0x85, 0x66, 0xc9, 0xb6, 0x93, 0xc4, 0x1b, 0x00, 0x05, 0x89, 0x8a, 0x72, 0x30,
-        0x8d, 0xd7, 0x4f, 0x98, 0xe4, 0xc0, 0x43, 0x04, 0xfd, 0xb6, 0x40, 0xc1, 0x2c, 0x70, 0xa1,
-        0xca, 0x91,
+        0x04, 0xe3, 0xf8, 0x96, 0x91, 0xe9, 0xa5, 0xbc, 0x10, 0xe3, 0x8e, 0x9b, 0x9a, 0x0b, 0x0c,
+        0x2c, 0xb5, 0xbd, 0xe2, 0x66, 0xe3, 0x81, 0xcd, 0x4a, 0xc9, 0x34, 0x37, 0x13, 0x43, 0x45,
+        0x58, 0xa6,
     ];
 
     /// The digest of `SCHEMA_FIELDS`, recomputed. Equal to `SCHEMA_HASH` (CT-T9).
@@ -252,6 +257,7 @@ impl TraceRecord {
                 ));
             }
         }
+        fields.push(Field::new("alloc_lease_wait_us", DataType::UInt64, false));
         Arc::new(Schema::new(fields))
     }
 }

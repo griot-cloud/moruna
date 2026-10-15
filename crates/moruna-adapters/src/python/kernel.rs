@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use moruna_kernel::declare::Declared;
 use moruna_kernel::{
-    Allocator, Fingerprint, GilState, InitCtx, Kernel, KernelHints, KernelKind, KernelState,
-    MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, Seq,
-    SourceSchema, StageId, TierPref,
+    Allocator, Fingerprint, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind,
+    KernelState, MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy,
+    SourceSchema, TierPref,
 };
 use pyo3::prelude::*;
 
@@ -21,16 +21,7 @@ use super::state::{PyState, missing_restore};
 use crate::guard::{KernelMemory, LiveCounts, MemoryGate};
 use moruna_kernel::set_kernel_alloc;
 
-/// The stage an `MorunaError::Kernel` from this crate carries.
-///
-/// `Kernel::apply` receives a `Payload`, not a morsel, so the adapter never learns which stage it
-/// is or which morsel it is holding: a kernel that knew its position could not also be a Polars
-/// expression or a DataFusion function, which S7 requires. AD-I7 names both fields all the same,
-/// so the adapter fills them with a sentinel the scheduler can recognise and replace rather than
-/// with a plausible lie. Reported.
-pub const UNKNOWN_STAGE: StageId = StageId::MAX;
-/// The morsel an `MorunaError::Kernel` from this crate carries; see [`UNKNOWN_STAGE`].
-pub const UNKNOWN_SEQ: Seq = Seq::MAX;
+pub use crate::{UNKNOWN_SEQ, UNKNOWN_STAGE};
 
 const GIL_FREE_THREADED: u8 = 0;
 const GIL_SERIALISED: u8 = 1;
@@ -349,47 +340,82 @@ impl PyKernel {
         input: Payload,
     ) -> Result<(Imported, Py<PyAny>)> {
         Python::attach(|py| {
-            hooks::install_python_hooks(py);
             let argument = cross::export(py, input)?;
-            let callable = self.callable.bind(py);
-            let capsule = self.numpy_capsule(py);
-            let before = hooks::arrow_pool(py);
-            // 05 f.12: the frame covers the call alone, so what the adapter itself allocates to
-            // cross is not charged to the kernel; the NumPy handler is in for the frame.
-            let (returned, end) = hooks::with_numpy_handler(py, capsule, || {
-                self.memory
-                    .frame(|| self.invoke(py, state, callable, argument))
-            });
-            let after = hooks::arrow_pool(py);
-            let mut counts = end.counts;
-            counts.arrow = hooks::arrow_counts(before, after);
+            let (returned, counts) = self.guarded_call(py, state, argument);
             set_kernel_alloc(counts);
-            let returned = match (returned, end.refusal) {
-                (Err(_), Some(refusal)) => {
-                    return Err(MorunaError::Refused {
-                        stage: UNKNOWN_STAGE,
-                        seq: UNKNOWN_SEQ,
-                        kernel: self.name.clone(),
-                        requested: refusal.requested,
-                        in_use: refusal.in_use,
-                        ceiling: refusal.ceiling,
-                        features: None,
-                    });
-                }
-                (Ok(value), Some(refusal)) => {
-                    tracing::warn!(
-                        target: "adapter.guard",
-                        kernel = %self.name,
-                        requested = refusal.requested,
-                        "a request was refused and the kernel recovered from the MemoryError"
-                    );
-                    value
-                }
-                (returned, None) => returned?,
-            };
+            let returned = returned?;
             let imported = cross::import(py, &returned)?;
             Ok((imported, returned.unbind()))
         })
+    }
+
+    /// f.12 for a caller that holds a `pyarrow.RecordBatch` rather than a payload (17 f.6): the
+    /// hooks, the NumPy handler, the Arrow pool reads and the frame around one call, exactly as
+    /// `apply`'s attached half, returning the call's result and its counts. Counts the call and,
+    /// when it fails, the exception, as `apply` does.
+    pub fn call_arrow<'py>(
+        &self,
+        py: Python<'py>,
+        state: &mut dyn KernelState,
+        batch: Bound<'py, PyAny>,
+    ) -> (Result<Bound<'py, PyAny>>, KernelAlloc) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (returned, counts) = self.guarded_call(py, state, batch);
+        if returned.is_err() {
+            self.exceptions.fetch_add(1, Ordering::SeqCst);
+        }
+        (returned, counts)
+    }
+
+    /// The state `init` builds (a stateless kernel's is `NoState`), for a caller that runs the
+    /// kernel outside a scheduler (17 f.6).
+    pub fn new_state(&self, ctx: &InitCtx) -> Result<Box<dyn KernelState>> {
+        Kernel::init(self, ctx)
+    }
+
+    /// The call inside its frame (f.10 to f.14): the call's value, or the refusal that ended it
+    /// (AD-I13), and its counts with Arrow's.
+    fn guarded_call<'py>(
+        &self,
+        py: Python<'py>,
+        state: &mut dyn KernelState,
+        argument: Bound<'py, PyAny>,
+    ) -> (Result<Bound<'py, PyAny>>, KernelAlloc) {
+        hooks::install_python_hooks(py);
+        let callable = self.callable.bind(py);
+        let capsule = self.numpy_capsule(py);
+        let before = hooks::arrow_pool(py);
+        // 05 f.12: the frame covers the call alone, so what the adapter itself allocates to
+        // cross is not charged to the kernel; the NumPy handler is in for the frame.
+        let (returned, end) = hooks::with_numpy_handler(py, capsule, || {
+            self.memory
+                .frame(|| self.invoke(py, state, callable, argument))
+        });
+        let after = hooks::arrow_pool(py);
+        let mut counts = end.counts;
+        counts.arrow = hooks::arrow_counts(before, after);
+        let returned = match (returned, end.refusal) {
+            (Err(_), Some(refusal)) => Err(MorunaError::Refused {
+                stage: UNKNOWN_STAGE,
+                seq: UNKNOWN_SEQ,
+                kernel: self.name.clone(),
+                requested: refusal.requested,
+                in_use: refusal.in_use,
+                ceiling: refusal.ceiling,
+                features: None,
+            }),
+            (Ok(value), Some(refusal)) => {
+                tracing::warn!(
+                    target: "adapter.guard",
+                    kernel = %self.name,
+                    requested = refusal.requested,
+                    "a request was refused and the kernel recovered from the MemoryError"
+                );
+                Ok(value)
+            }
+            (returned, None) => returned,
+        };
+        (returned, counts)
     }
 
     /// The call itself, inside the frame.

@@ -195,6 +195,11 @@ impl MemoryGate {
         self.pending.fetch_sub(bytes, Ordering::AcqRel);
     }
 
+    /// The ceiling in force, as the gate last saw it (17 f.7).
+    pub fn ceiling(&self) -> u64 {
+        self.ceiling.load(Ordering::Acquire)
+    }
+
     /// How many times the gate measured the process (its first measurement included).
     pub fn measurements(&self) -> u64 {
         self.measurements.load(Ordering::Relaxed)

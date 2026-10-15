@@ -1,0 +1,30 @@
+[package]
+name = "moruna-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna's runtime for a .wasm function package: wasmtime, no imports, the resource limiter and fuel (SDD 17)"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+# The run's gate (05 f.9) and the boundary copy (05 f.3); no feature: no interpreter.
+moruna-adapters = { workspace = true }
+moruna-package = { workspace = true }
+wasmtime = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# The test components (feature `testing`), in the text format.
+wat = { workspace = true, optional = true }
+
+[features]
+default = []
+# `moruna_wasm::testing`: components for the tests of the crates that run packages.
+testing = ["dep:wat"]
+
+[dev-dependencies]
+moruna-testkit = { workspace = true }
+wat = { workspace = true }
+zip = { workspace = true }

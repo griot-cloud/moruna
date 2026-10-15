@@ -11,6 +11,7 @@
 //! It is not a test framework and not a guarantee about real data: it is the guarantee that the
 //! function *is a kernel*, and a first measurement of what it costs.
 
+pub mod package;
 pub mod synth;
 
 use std::path::PathBuf;
@@ -187,6 +188,8 @@ pub struct CheckReport {
     pub memory_guard: Option<bool>,
     /// Anything else worth saying.
     pub notes: Vec<String>,
+    /// A package's manifest (16 e.1, d.2), when the kernel is a package's.
+    pub manifest: Option<Value>,
 }
 
 impl CheckReport {
@@ -279,6 +282,7 @@ impl CheckReport {
             "memory_guard": self.memory_guard,
             "alloc": self.alloc.as_ref().and_then(|a| serde_json::to_value(a).ok()),
             "notes": self.notes,
+            "manifest": self.manifest,
         })
     }
 
@@ -324,7 +328,7 @@ impl CheckReport {
                 .map(|x| format!(", {:.1}% of it outside Arrow", x * 100.0))
                 .unwrap_or_default();
             out.push_str(&format!(
-                "  allocations: refusal {}, peak {} bytes{outside}; python {} bytes in {}, numpy {} bytes in {}, arrow {} bytes in {}\n",
+                "  allocations: refusal {}, peak {} bytes{outside}; python {} bytes in {}, numpy {} bytes in {}, arrow {} bytes in {}, linear {} bytes in {}\n",
                 if self.memory_guard.unwrap_or(a.refusal_on) { "on" } else { "off" },
                 a.peak_bytes,
                 a.python.requested_bytes,
@@ -333,6 +337,8 @@ impl CheckReport {
                 a.numpy.requests,
                 a.arrow.requested_bytes,
                 a.arrow.requests,
+                a.linear.requested_bytes,
+                a.linear.requests,
             ));
         }
         for note in &self.notes {
@@ -369,6 +375,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         alloc: None,
         memory_guard,
         notes: Vec::new(),
+        manifest: None,
     };
 
     // 1. Load: the declarations and the hints.

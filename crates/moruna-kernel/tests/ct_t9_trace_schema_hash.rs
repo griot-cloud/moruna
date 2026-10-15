@@ -7,7 +7,7 @@ use moruna_kernel::{Outcome, TraceRecord};
 /// The pinned value (e.5): the BLAKE3 digest of the canonical field list, computed once by the
 /// component 1 agent and asserted here, so a schema change is a deliberate edit of this test
 /// and of the constant.
-const PINNED: &str = "b2768566c9b693c41b0005898a72308dd74f98e4c04304fdb640c12c70a1ca91";
+const PINNED: &str = "04e3f89691e9a5bc10e38e9b9a0b0c2cb5bde266e381cd4ac9343713434558a6";
 
 #[test]
 fn ct_t9_trace_schema_hash() {
@@ -70,6 +70,12 @@ fn ct_t9_trace_schema_hash() {
         ("alloc_arrow_largest", DataType::UInt64),
         ("alloc_arrow_peak", DataType::UInt64),
         ("alloc_arrow_refused", DataType::UInt64),
+        ("alloc_linear_bytes", DataType::UInt64),
+        ("alloc_linear_requests", DataType::UInt64),
+        ("alloc_linear_largest", DataType::UInt64),
+        ("alloc_linear_peak", DataType::UInt64),
+        ("alloc_linear_refused", DataType::UInt64),
+        ("alloc_lease_wait_us", DataType::UInt64),
     ];
     assert_eq!(schema.fields().len(), expected.len());
     for (field, (name, data_type)) in schema.fields().iter().zip(&expected) {

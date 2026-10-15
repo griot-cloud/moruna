@@ -33,8 +33,10 @@ if _importlib_util.find_spec("pyarrow") is None:  # h, failures
     )
 
 from moruna import _core, _declare
+
+# The classes a user subclasses for a source or a sink of their own (SDD 07 e.6, 08 f.10).
+# A function package under its own runtime on this machine (SDD 16 d.3, 12 f.8).
 from moruna._core import (
-    MorunaError,
     ArrowIpcSink,
     BudgetError,
     Cancelled,
@@ -43,21 +45,24 @@ from moruna._core import (
     IteratorSource,
     KernelError,
     KernelSpec,
+    MorunaError,
+    PackageKernel,
     ParquetSink,
     ParquetSource,
     PlanError,
     ResumeError,
     RunReport,
+    Sink,
+    Source,
+    Split,
     StdKernel,
     TensorSink,
     TensorSource,
     VortexSink,
     VortexSource,
     inspect_host,
+    load,
 )
-
-# The classes a user subclasses for a source or a sink of their own (SDD 07 e.6, 08 f.10).
-from moruna._core import Sink, Source, Split
 
 __version__: str = _core.__version__
 
@@ -91,6 +96,9 @@ __all__ = [
 
 # A source or a sink of the user's own (SDD 07 e.6, 08 f.10).
 __all__ += ["Sink", "Source", "Split"]
+
+# A function package (SDD 16 d.3).
+__all__ += ["PackageKernel", "load"]
 
 
 def run(

@@ -107,6 +107,26 @@ pub fn run(
     let (sink_spec, sink_notes) = sinks::spec_of(sink)?;
     let stages = kernels_of(py, kernels)?;
     let any_python = stages.iter().any(|s| matches!(s, Stage::Py(_)));
+    // 12 f.8: the sandbox host the loaded packages were given; a run has one.
+    let mut packages = moruna_runtime::packaged::PackageHost::default();
+    for stage in &stages {
+        if let Stage::Package(host) = stage
+            && *host != moruna_runtime::packaged::PackageHost::default()
+        {
+            if packages != moruna_runtime::packaged::PackageHost::default() && packages != *host {
+                return Err(map_err(
+                    py,
+                    &MorunaError::Config {
+                        name: "kernels",
+                        msg: "the loaded packages name two sandbox hosts (python=, cgroup=); a \
+                              run has one"
+                            .into(),
+                    },
+                ));
+            }
+            packages = host.clone();
+        }
+    }
 
     let raw = RawArgs {
         budget: match budget {
@@ -180,7 +200,7 @@ pub fn run(
             .into_iter()
             .map(|s| match s {
                 Stage::Py(k) => Some(k),
-                Stage::Std(_) => None,
+                Stage::Std(_) | Stage::Package(_) => None,
             })
             .collect(),
         iterator: Mutex::new(match (&source_spec, iterator) {
@@ -208,6 +228,7 @@ pub fn run(
                 strict: false,
                 env: &process_env,
                 notes,
+                packages,
             },
         ),
     )?;
@@ -358,6 +379,17 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KernelD
             if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
                 let kernel = &std.get().kernel;
                 return KernelDoc::std(kernel.name(), kernel.args().clone());
+            }
+            if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
+                let package = package.get();
+                let mut doc = KernelDoc::package(package.path.clone(), package.fingerprint.clone());
+                doc.args = package.inputs.args.clone();
+                doc.assets = package
+                    .inputs
+                    .assets
+                    .as_ref()
+                    .map(|a| a.display().to_string());
+                return doc;
             }
             let target = match item.cast::<PyKernelHandle>() {
                 Ok(handle) => handle.get().callable.bind(py).clone(),

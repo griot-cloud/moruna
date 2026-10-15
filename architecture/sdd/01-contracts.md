@@ -515,6 +515,10 @@ pub struct KernelAlloc {
     pub python: AllocCounts,   // CPython's allocator domains (Python objects); `peak` unmeasured
     pub numpy: AllocCounts,    // NumPy's data allocator
     pub arrow: AllocCounts,    // pyarrow's default pool, from its statistics; `largest`, `refused` unmeasured
+    pub linear: AllocCounts,   // a wasm instance's linear memory (17 e.2; amended 2026-10-15): growths as requests,
+                               // `peak` the memory's size at the call's end
+    pub lease_wait_us: u64,    // microseconds the call waited for its kernel to release a region of the
+                               // shared mapping (17 SB-I13; amended 2026-10-15)
 }
 
 /// The hand-off from a kernel to the scheduler on the worker thread: a kernel that counts its
@@ -977,6 +981,13 @@ pub trait Sampler: Send + Sync {
     /// The whole process's high-water mark since the sampler was created, which `reset_peak`
     /// leaves alone: what the run report's peak is (F8.9).
     fn process_peak(&self) -> ProcessPeak;
+}
+
+/// Memory a run holds outside its own process: a packaged stage's child (17 SB-I9; amended
+/// 2026-10-15). The run's sampler adds every registered one's `in_use` to each sample's
+/// `anon_bytes`, so the ceiling governs the process and its children together.
+pub trait OutsideMemory: Send + Sync {
+    fn in_use(&self) -> u64;
 }
 
 /// The whole process's high-water mark over a run. Amended 2026-09-30: `since_ns`.

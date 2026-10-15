@@ -23,6 +23,8 @@ Repository = "https://github.com/griot-cloud/moruna"
 
 [project.optional-dependencies]
 polars = ["polars>=1.0"]
+# `moruna package` reads function.yaml (SDD 16 e.3) and resolves wheels with pip (16 f.4).
+package = ["pyyaml>=6.0", "pip>=24.0"]
 
 [tool.maturin]
 manifest-path = "crates/moruna-py/Cargo.toml"

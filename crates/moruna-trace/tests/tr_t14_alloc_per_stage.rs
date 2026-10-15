@@ -39,6 +39,8 @@ fn trace() -> Vec<TraceRecord> {
                 python: counts(MIB, 100, 64 * 1024, 0, 0),
                 numpy: counts(6 * MIB, 2, 4 * MIB, 6 * MIB, 0),
                 arrow: counts(2 * MIB, 3, 0, 2 * MIB, 0),
+                linear: counts(0, 0, 0, 0, 0),
+                lease_wait_us: 0,
             },
             4 * MIB,
         ),
@@ -51,6 +53,9 @@ fn trace() -> Vec<TraceRecord> {
                 python: counts(2 * MIB, 50, 2 * MIB, 0, 1),
                 numpy: counts(3 * MIB, 1, 3 * MIB, 3 * MIB, 1),
                 arrow: counts(5 * MIB, 1, 0, 5 * MIB, 0),
+                linear: counts(0, 0, 0, 0, 0),
+                // It waited 1.5 ms for its shared mapping (17 SB-I13).
+                lease_wait_us: 1500,
             },
             20 * MIB,
         ),
@@ -112,6 +117,7 @@ fn tr_t14_alloc_per_stage() {
     assert_eq!(python.peak_bytes, 20 * MIB);
     assert_eq!(python.outside_arrow_peak_bytes, 15 * MIB);
     assert_eq!(python.outside_arrow_fraction, Some(0.75));
+    assert_eq!(python.lease_wait_us, 1500);
 
     let json = report.to_json();
     assert!(json.contains("\"outside_arrow_fraction\": 0.75"), "{json}");
@@ -127,6 +133,7 @@ fn tr_t14_alloc_per_stage() {
     assert!(lines[0].contains("refusal on"), "{}", lines[0]);
     assert!(lines[0].contains("75.0% outside Arrow"), "{}", lines[0]);
     assert!(lines[0].contains("refused 2"), "{}", lines[0]);
+    assert!(lines[0].ends_with(", lease wait 1.50 ms"), "{}", lines[0]);
     assert!(text.lines().count() <= 40);
 }
 
@@ -168,4 +175,53 @@ fn tr_t14_ties_choose_the_earlier_call() {
         MIB - MIB / 4,
         "the earlier call of two equals"
     );
+}
+
+/// A wasm stage's calls count their linear memory (17 e.2): a fourth source, with its own
+/// largest request, peak and refusals, and its peak in the call's total.
+#[test]
+fn tr_t14_linear_is_a_source() {
+    let wasm = |seq, linear| TraceRecord {
+        alloc: KernelAlloc {
+            measured: true,
+            refusal_on: true,
+            linear,
+            ..KernelAlloc::default()
+        },
+        mem_anon_before: 0,
+        mem_anon_peak: MIB,
+        ..record(seq, 1)
+    };
+    let a = StageAlloc::of(&[
+        wasm(0, counts(4 * MIB, 2, 3 * MIB, 6 * MIB, 0)),
+        wasm(1, counts(MIB, 1, MIB, 7 * MIB, 1)),
+    ])
+    .expect("measured");
+    assert_eq!(a.linear.requested_bytes, 5 * MIB);
+    assert_eq!(a.linear.requests, 3);
+    assert_eq!(a.linear.largest_request_bytes, Some(3 * MIB));
+    assert_eq!(a.linear.peak_bytes, Some(7 * MIB));
+    assert_eq!(a.linear.refused, Some(1));
+    assert_eq!(
+        a.peak_bytes,
+        7 * MIB,
+        "the linear peak is in the call's total"
+    );
+    assert_eq!(a.outside_arrow_peak_bytes, 7 * MIB);
+    assert_eq!(a.lease_wait_us, 0);
+}
+
+/// 17 SB-I13: a stage's waits for its runtime's shared mapping add up over its calls.
+#[test]
+fn tr_t14_lease_waits_add_up() {
+    let waited = |seq, us| TraceRecord {
+        alloc: KernelAlloc {
+            measured: true,
+            lease_wait_us: us,
+            ..KernelAlloc::default()
+        },
+        ..record(seq, 1)
+    };
+    let a = StageAlloc::of(&[waited(0, 250), waited(1, 750)]).expect("measured");
+    assert_eq!(a.lease_wait_us, 1000);
 }
