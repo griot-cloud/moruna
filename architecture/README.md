@@ -8,6 +8,7 @@ Design documents for Moruna. Code is written from these documents; a change in b
 |---|---|---|
 | [moruna-runtime-design.md](moruna-runtime-design.md) | Architecture design: the runtime as a system, its problems, sufficiency criteria, decisions and component map | Draft, revision 3 |
 | [moruna-hosted-engine.md](moruna-hosted-engine.md) | Architecture design: Moruna as the engine inside a host's microVM, the job document, `moruna run`/`moruna serve`, the host protocol, a budget that follows the machine, a DataFusion plan as a source | Draft |
+| [function-packages.md](function-packages.md) | Architecture design: a kernel as one file, `.wasm` or `.pex`, with its dependencies inside; the `moruna:kernel` world; `moruna-wasm` and `moruna-sandbox`, both outside Moruna's process; `moruna package`, `moruna aot`, `moruna load`; `kernels[].kind = package` | Draft, 2026-10-15 |
 | [sdd/00-preamble.md](sdd/00-preamble.md) | SDD preamble: purpose and component map, global vocabulary and invariants, process and concurrency model, global configuration, crate layout and build order, escalations, traceability, hand-off protocol | Draft |
 | [sdd/01-contracts.md](sdd/01-contracts.md) | Component 1: contracts crate (`moruna-kernel`), every cross-component type and interface | Draft |
 | [sdd/02-arena.md](sdd/02-arena.md) | Component 2: memory arena | Draft |

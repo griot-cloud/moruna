@@ -265,42 +265,7 @@ Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, a
 
 **What this is not.** Not a test framework (the author's tests are theirs), not a type checker for Python, and not a guarantee about behaviour on real data, it is the guarantee that the function *is a kernel* and a first measurement of what it costs.
 
-### 4.10 The function package: one file, two runtimes, `moruna package`
-
-**The problem.** §4.9 makes a function checkable; it does not make it portable. A kernel is still a Python module whose dependencies are whatever the interpreter that imports it happens to have, or a Rust crate that has to be compiled into the guest. A host that wants to store a function once, run it in a VM, run it on an author's laptop, and hand it to a third party needs one artefact that carries the code and its dependencies and runs the same everywhere. That artefact is the **package**.
-
-**One file.** A package is a single file whose kind is its extension:
-
-| format | holds | for |
-|---|---|---|
-| `.wasm` | one WebAssembly component exporting the kernel interface below, every dependency linked in | any language with a wasm toolchain: Rust, Go, C, Zig, … |
-| `.pex` | a Python executable zip: `function.py`, the sibling files, and the **wheels** of the author's lockfile, resolved for the interpreters and platforms it names, bytecode precompiled | Python and Polars |
-
-Both embed a manifest, `moruna.json`: `{name, entry, declaration: {input_schema, output_schema, hints}, abi, moruna, format, platforms}`, the declaration spelled exactly as §4.9 reads it from a decorator. The package's **fingerprint is `sha256` of the file**; for a packaged kernel it supersedes the source-and-lockfile hash of §4.9 step 7, because the file *is* the pinned unit: a dependency changed is a different file. `moruna check` prints it, a `RunSpec` pins it (`kernels[].fingerprint`), the profile store keys on it.
-
-**The kernel interface, for wasm.** One WIT world, `moruna:kernel`:
-- `declare() -> string`: the manifest, so a loader needs no file beside the module;
-- `process(batch: list<u8>) -> result<list<u8>, string>`: one Arrow record batch in as an IPC stream, one out; an error is the kernel's refusal of that batch, named;
-- `open(state: list<u8>) -> result<_, string>` and `close() -> list<u8>` for a stateful kernel (`stateful` hint), so state crosses a checkpoint (§4.7) as bytes.
-
-The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
-
-**The two runtimes, inside Moruna.** A stage whose kernel is a package runs under one of:
-- **`moruna-wasm`**: wasmtime, in-process, one instance per stage, with a linear-memory limit and a fuel limit taken from the stage's budget. Nothing a wasm kernel does can touch a disk, a socket or another stage.
-- **`moruna-sandbox`**: for `.pex`, one child process per stage, started once for the run and kept for its state: `python <package>.pex`, in a mount namespace that holds only the package's extracted tree (read-only), a private temporary directory, and one Unix socket back to Moruna; Landlock over those paths; seccomp allowing the file, memory and socket calls the interpreter needs and no `connect`, `execve` of anything outside the tree, or namespace calls; no capabilities; the stage's memory budget as the child's limit, under the memory guard. Batches cross the socket as Arrow IPC, the same bytes as the wasm interface. The child never sees the job document, the host socket, or any disk but its own tree.
-
-The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path, `moruna.run(...)` over a function object in the author's own interpreter, and the path of the standard kernels. A **hosted** run (§4.3) loads tenant code through a package and one of the two runtimes above, never in-process; a `RunSpec` that names a Python module by import path is refused in strict mode.
-
-**Ahead-of-time compilation.** `moruna aot <package>.wasm` writes `<package>.cwasm`, wasmtime's precompiled form for this Moruna version and CPU target, named by the package's fingerprint and the Moruna version inside it; a loader uses it when both match and otherwise compiles and says so. For a `.pex` the equivalent is the extracted tree with its `.pyc` files, written once beside the package by whoever runs it first with write access to that place. Either way a second load is milliseconds, which is what lets one serving process hold many kernels.
-
-**`moruna package`.** The local half of packaging, the whole of it for an author with no platform:
-- `moruna package <project>`: a Python project (`function.py`, `function.yaml`, a lockfile) becomes `<name>.pex`, its wheels resolved for the interpreter tags and platforms given with `--platform` (the guest image's, by default: §4.8 names them) and never for the laptop's; refused when a wheel the lockfile pins does not exist for a named platform, naming it. The guest's interpreter for packaged kernels is the **standard build** of CPython, not the free-threaded one: a packaged kernel runs in its own process (`moruna-sandbox`), so free threading buys nothing there, and the standard build is the one the ecosystem publishes wheels for.
-- `moruna package --wasm <module.wasm> <project>`: a component the author built with their own toolchain is verified against the interface (exports, imports, `declare()` agreeing with `function.yaml`), the manifest is embedded, and the result is `<name>.wasm`.
-- `moruna check <package>` runs the seven steps of §4.9 **through the package's runtime**, not in-process, so the verdict is the one a hosted run would give. `moruna load <package>` returns a kernel the library path can call, running under that same runtime on this machine: wasmtime in-process, or the sandboxed child; this is what a client library's "run it here" mode is.
-
-**The job document.** `kernels[]` gains `{ "kind": "package", "path": "<file on a disk the run attaches>", "fingerprint": "sha256:…" }`. Before a stage starts, Moruna hashes the file and refuses the run on a mismatch; it then picks the runtime from the extension and the budget from the stage. The host decides where the file is and how it got there; Moruna reads it from a disk like any other input.
-
-**What this is not.** Not a build system for other languages (the author brings a wasm toolchain), not a Python-in-wasm runtime (a `.pex` runs a native interpreter, because the data libraries have no wasm builds and a 32-bit module has 4 GB), and not an isolation claim of the same strength for both formats: a wasm kernel can make no system call; a pex kernel is a confined process. A host that shares functions between parties states which it accepts for what.
+**Packaging (2026-10-15).** A kernel as one file, `.wasm` or `.pex`, its two out-of-process runtimes, `moruna package`, `moruna aot` and `moruna load` are `architecture/function-packages.md`, which consumes this section.
 
 ---
 
@@ -317,12 +282,10 @@ The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path,
 | `09-placement.md` | issued splits in the manifest; `checkpoint` on demand |
 | `10-scheduler.md` | parked threads up to `cpu_max`; `active` bounded by the current limit |
 | `11-controller.md` | ceiling read from the swap each tick; the shrink target rule; no new decision rules |
-| `12-python.md` | `moruna.run(...)` builds a `RunSpec`; the bin entry points `run`, `serve`, `check`; the `moruna` console script; the decorator's schema declarations and the Polars signature; `moruna package`, `moruna load`, `moruna aot` (§4.10) |
-| **new `15-check.md`** | `moruna check`: synthetic batch generation (byte-exact, seeded), the schema comparison rules (`adds`/`drops`/`changes`), the profile row it writes, the JSON report, exit codes (§4.9); a package checked through its runtime (§4.10) |
+| `12-python.md` | `moruna.run(...)` builds a `RunSpec`; the bin entry points `run`, `serve`, `check`; the `moruna` console script; the decorator's schema declarations and the Polars signature |
+| **new `15-check.md`** | `moruna check`: synthetic batch generation (byte-exact, seeded), the schema comparison rules (`adds`/`drops`/`changes`), the profile row it writes, the JSON report, exit codes (§4.9) |
 | **new `13-host.md`** | the protocol of §4.3, byte-exact; `moruna serve`; exit codes; the strict-mode refusal texts |
 | **new `14-vmm.md`** | `moruna-vmm`: the device model trait and the five devices, boot, the control socket, resize, the guest image recipe, the release artefacts (§4.8) |
-| **new `16-package.md`** | the package (§4.10): the two formats, `moruna.json`, the `moruna:kernel` WIT world, the fingerprint, `moruna package`, `moruna aot`, `moruna load`; `kernels[].kind = package` in the job document |
-| **new `17-sandbox.md`** | `moruna-wasm` (wasmtime, memory and fuel from the stage budget, no imports beyond the interface) and `moruna-sandbox` (the pex child: namespaces, Landlock, seccomp, the socket protocol, the memory limit under the guard); strict mode refuses an unpackaged kernel |
 
 ---
 
