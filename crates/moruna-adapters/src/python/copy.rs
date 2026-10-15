@@ -11,10 +11,9 @@
 
 use std::sync::Arc;
 
-use moruna_kernel::arrow::array::{Array, ArrayData, ArrayRef, make_array};
-use moruna_kernel::arrow::buffer::{BooleanBuffer, Buffer as ArrowBuffer, NullBuffer};
-use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{Allocator, ManagedTensor, MorunaError, Payload, Result, Tier};
+
+use crate::land::host_tier;
 
 use super::cross::{Imported, host_tensor_bytes};
 
@@ -33,7 +32,13 @@ pub struct Landed {
 /// [`Allocator::note_boundary_copy`], once, here, where the copy happens.
 pub fn land(imported: Imported, alloc: &Arc<dyn Allocator>) -> Result<Landed> {
     let landed = match imported {
-        Imported::Table(batch) => land_table(batch, alloc.as_ref())?,
+        Imported::Table(batch) => {
+            let (payload, copied_bytes) = crate::land::table(batch, alloc.as_ref())?;
+            Landed {
+                payload,
+                copied_bytes,
+            }
+        }
         Imported::Tensor(tensor) => land_tensor(tensor, alloc.as_ref())?,
     };
     if landed.copied_bytes > 0 {
@@ -45,118 +50,6 @@ pub fn land(imported: Imported, alloc: &Arc<dyn Allocator>) -> Result<Landed> {
         );
     }
     Ok(landed)
-}
-
-/// The run's one host tier: `PinnedHost` when the arena is page locked, `Host` otherwise
-/// (contracts e.1).
-fn host_tier(alloc: &dyn Allocator) -> Tier {
-    if alloc.is_pinned() {
-        Tier::PinnedHost
-    } else {
-        Tier::Host
-    }
-}
-
-fn land_table(batch: RecordBatch, alloc: &dyn Allocator) -> Result<Landed> {
-    if batch_is_arena_owned(&batch, alloc) {
-        return Ok(Landed {
-            payload: Payload::table_with(batch, alloc)?,
-            copied_bytes: 0,
-        });
-    }
-    let tier = host_tier(alloc);
-    let mut copied = 0u64;
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    for column in batch.columns() {
-        let data = copy_array_data(&column.to_data(), alloc, tier, &mut copied)?;
-        columns.push(make_array(data));
-    }
-    let schema = batch.schema();
-    let copy = RecordBatch::try_new_with_options(
-        schema,
-        columns,
-        &moruna_kernel::arrow::record_batch::RecordBatchOptions::new()
-            .with_row_count(Some(batch.num_rows())),
-    )
-    .map_err(|e| MorunaError::Plan(format!("boundary copy: {e}")))?;
-    Ok(Landed {
-        payload: Payload::table_with(copy, alloc)?,
-        copied_bytes: copied,
-    })
-}
-
-/// True when every buffer of every column already lies in a region this allocator owns, which is
-/// the case when the kernel returned a slice of what it was given.
-fn batch_is_arena_owned(batch: &RecordBatch, alloc: &dyn Allocator) -> bool {
-    let mut any = false;
-    for column in batch.columns() {
-        if !data_is_arena_owned(&column.to_data(), alloc, &mut any) {
-            return false;
-        }
-    }
-    any
-}
-
-fn data_is_arena_owned(data: &ArrayData, alloc: &dyn Allocator, any: &mut bool) -> bool {
-    if let Some(nulls) = data.nulls() {
-        *any = true;
-        if !alloc.contains(nulls.buffer().as_ptr()) {
-            return false;
-        }
-    }
-    for buffer in data.buffers() {
-        *any = true;
-        if !alloc.contains(buffer.as_ptr()) {
-            return false;
-        }
-    }
-    for child in data.child_data() {
-        if !data_is_arena_owned(child, alloc, any) {
-            return false;
-        }
-    }
-    true
-}
-
-fn copy_array_data(
-    data: &ArrayData,
-    alloc: &dyn Allocator,
-    tier: Tier,
-    copied: &mut u64,
-) -> Result<ArrayData> {
-    let mut builder = ArrayData::builder(data.data_type().clone())
-        .len(data.len())
-        .offset(data.offset());
-    if let Some(nulls) = data.nulls() {
-        let bits = copy_buffer(nulls.buffer(), alloc, tier, copied)?;
-        let boolean = BooleanBuffer::new(bits, nulls.offset(), nulls.len());
-        builder = builder.nulls(Some(NullBuffer::new(boolean)));
-    }
-    for buffer in data.buffers() {
-        builder = builder.add_buffer(copy_buffer(buffer, alloc, tier, copied)?);
-    }
-    for child in data.child_data() {
-        builder = builder.add_child_data(copy_array_data(child, alloc, tier, copied)?);
-    }
-    builder
-        .build()
-        .map_err(|e| MorunaError::Plan(format!("boundary copy: rebuilding an array: {e}")))
-}
-
-/// Copy one Arrow buffer into an arena buffer of the same length.
-fn copy_buffer(
-    source: &ArrowBuffer,
-    alloc: &dyn Allocator,
-    tier: Tier,
-    copied: &mut u64,
-) -> Result<ArrowBuffer> {
-    let bytes = source.as_slice();
-    let mut buffer = alloc.alloc(bytes.len().max(1), tier)?;
-    buffer[..bytes.len()].copy_from_slice(bytes);
-    *copied += bytes.len() as u64;
-    Ok(buffer
-        .into_arrow_buffer()?
-        .slice_with_length(0, bytes.len()))
 }
 
 fn land_tensor(tensor: ManagedTensor, alloc: &dyn Allocator) -> Result<Landed> {

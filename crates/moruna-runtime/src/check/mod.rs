@@ -324,7 +324,7 @@ impl CheckReport {
                 .map(|x| format!(", {:.1}% of it outside Arrow", x * 100.0))
                 .unwrap_or_default();
             out.push_str(&format!(
-                "  allocations: refusal {}, peak {} bytes{outside}; python {} bytes in {}, numpy {} bytes in {}, arrow {} bytes in {}\n",
+                "  allocations: refusal {}, peak {} bytes{outside}; python {} bytes in {}, numpy {} bytes in {}, arrow {} bytes in {}, linear {} bytes in {}\n",
                 if self.memory_guard.unwrap_or(a.refusal_on) { "on" } else { "off" },
                 a.peak_bytes,
                 a.python.requested_bytes,
@@ -333,6 +333,8 @@ impl CheckReport {
                 a.numpy.requests,
                 a.arrow.requested_bytes,
                 a.arrow.requests,
+                a.linear.requested_bytes,
+                a.linear.requests,
             ));
         }
         for note in &self.notes {

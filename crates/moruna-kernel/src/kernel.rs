@@ -83,6 +83,9 @@ pub struct KernelAlloc {
     pub numpy: AllocCounts,
     /// pyarrow's default pool, from its statistics; `largest` and `refused` are unmeasured.
     pub arrow: AllocCounts,
+    /// A wasm instance's linear memory (17 e.2): each growth a request, `peak` the memory's size
+    /// at the call's end.
+    pub linear: AllocCounts,
 }
 
 impl KernelAlloc {
@@ -93,6 +96,7 @@ impl KernelAlloc {
         python: AllocCounts::ZERO,
         numpy: AllocCounts::ZERO,
         arrow: AllocCounts::ZERO,
+        linear: AllocCounts::ZERO,
     };
 }
 

@@ -20,6 +20,10 @@ use moruna_kernel::{
 };
 
 use crate::view::{ChunkSet, TraceView, record_at};
+
+/// The `alloc_<source>_<count>` columns of a record (contracts e.5): every count of every source.
+pub(crate) const ALLOC_COLUMNS: usize =
+    moruna_kernel::trace::ALLOC_SOURCES.len() * moruna_kernel::trace::ALLOC_COUNTS.len();
 use crate::{CHUNK_ROWS, DRAIN_INTERVAL_MS, Result, lock, run_id_hex};
 
 /// What the facade gives the writer at start (d.1). The three tunables are the preamble's
@@ -91,7 +95,7 @@ struct Builders {
     error: StringBuilder,
     alloc_measured: UInt8Builder,
     alloc_refusal_on: UInt8Builder,
-    /// The fifteen `alloc_<source>_<count>` columns, in schema order (contracts e.5).
+    /// The twenty `alloc_<source>_<count>` columns, in schema order (contracts e.5).
     alloc_counts: Vec<UInt64Builder>,
 }
 
@@ -152,7 +156,7 @@ impl Builders {
             error: StringBuilder::new(),
             alloc_measured: u8b(),
             alloc_refusal_on: u8b(),
-            alloc_counts: (0..15).map(|_| u64b()).collect(),
+            alloc_counts: (0..ALLOC_COLUMNS).map(|_| u64b()).collect(),
         }
     }
 

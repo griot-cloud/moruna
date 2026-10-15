@@ -115,17 +115,18 @@ pub struct TraceRecord {
 }
 
 /// The sources of `KernelAlloc`, in schema order (e.5).
-pub const ALLOC_SOURCES: [&str; 3] = ["python", "numpy", "arrow"];
+pub const ALLOC_SOURCES: [&str; 4] = ["python", "numpy", "arrow", "linear"];
 /// The counts of each source, in schema order (e.5).
 pub const ALLOC_COUNTS: [&str; 5] = ["bytes", "requests", "largest", "peak", "refused"];
 
 impl KernelAlloc {
-    /// The source's counts by its schema index (0 python, 1 numpy, 2 arrow).
+    /// The source's counts by its schema index (0 python, 1 numpy, 2 arrow, 3 linear).
     pub fn source(&self, index: usize) -> &AllocCounts {
         match index {
             0 => &self.python,
             1 => &self.numpy,
-            _ => &self.arrow,
+            2 => &self.arrow,
+            _ => &self.linear,
         }
     }
 
@@ -134,7 +135,8 @@ impl KernelAlloc {
         match index {
             0 => &mut self.python,
             1 => &mut self.numpy,
-            _ => &mut self.arrow,
+            2 => &mut self.arrow,
+            _ => &mut self.linear,
         }
     }
 }
@@ -185,7 +187,9 @@ impl TraceRecord {
         "alloc_numpy_bytes:u64,alloc_numpy_requests:u64,alloc_numpy_largest:u64,",
         "alloc_numpy_peak:u64,alloc_numpy_refused:u64,",
         "alloc_arrow_bytes:u64,alloc_arrow_requests:u64,alloc_arrow_largest:u64,",
-        "alloc_arrow_peak:u64,alloc_arrow_refused:u64"
+        "alloc_arrow_peak:u64,alloc_arrow_refused:u64,",
+        "alloc_linear_bytes:u64,alloc_linear_requests:u64,alloc_linear_largest:u64,",
+        "alloc_linear_peak:u64,alloc_linear_refused:u64"
     );
 
     /// BLAKE3 of the canonical field list (CT-I8). A compile-time constant: the digest of
@@ -194,9 +198,9 @@ impl TraceRecord {
     /// CT-T9 recomputes the digest from `SCHEMA_FIELDS` and asserts this value, so a schema
     /// change is a deliberate edit of the test and of this constant.
     pub const SCHEMA_HASH: [u8; 32] = [
-        0xb2, 0x76, 0x85, 0x66, 0xc9, 0xb6, 0x93, 0xc4, 0x1b, 0x00, 0x05, 0x89, 0x8a, 0x72, 0x30,
-        0x8d, 0xd7, 0x4f, 0x98, 0xe4, 0xc0, 0x43, 0x04, 0xfd, 0xb6, 0x40, 0xc1, 0x2c, 0x70, 0xa1,
-        0xca, 0x91,
+        0x7c, 0x1e, 0xbb, 0xc2, 0x6b, 0x28, 0x78, 0xfd, 0x6f, 0xd5, 0x5f, 0xff, 0x50, 0xaa, 0x2f,
+        0xe5, 0x84, 0xb5, 0x3b, 0x2d, 0x1d, 0x13, 0xe2, 0xa6, 0xa8, 0x2e, 0xea, 0xac, 0x50, 0xec,
+        0xc0, 0x81,
     ];
 
     /// The digest of `SCHEMA_FIELDS`, recomputed. Equal to `SCHEMA_HASH` (CT-T9).

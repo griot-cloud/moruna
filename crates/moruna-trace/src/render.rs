@@ -230,10 +230,12 @@ impl fmt::Display for RunReport {
                 Some(x) => format!(" ({}% outside Arrow)", sig3(x * 100.0)),
                 None => String::new(),
             };
-            let refused = a.python.refused.unwrap_or(0) + a.numpy.refused.unwrap_or(0);
+            let refused = a.python.refused.unwrap_or(0)
+                + a.numpy.refused.unwrap_or(0)
+                + a.linear.refused.unwrap_or(0);
             writeln!(
                 f,
-                "alloc {stage}: refusal {}, peak {}{outside}, python {}/{}, numpy {}/{}, arrow {}/{}, refused {refused}",
+                "alloc {stage}: refusal {}, peak {}{outside}, python {}/{}, numpy {}/{}, arrow {}/{}, linear {}/{}, refused {refused}",
                 if a.refusal_on { "on" } else { "off" },
                 bytes_binary(a.peak_bytes),
                 bytes_binary(a.python.requested_bytes),
@@ -242,6 +244,8 @@ impl fmt::Display for RunReport {
                 a.numpy.requests,
                 bytes_binary(a.arrow.requested_bytes),
                 a.arrow.requests,
+                bytes_binary(a.linear.requested_bytes),
+                a.linear.requests,
             )?;
         }
         if measured.len() > MAX_ALLOC_LINES {

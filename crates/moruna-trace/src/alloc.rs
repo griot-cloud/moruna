@@ -33,6 +33,8 @@ pub struct StageAlloc {
     pub numpy: SourceAlloc,
     /// Arrow, from the default pool's statistics.
     pub arrow: SourceAlloc,
+    /// A wasm instance's linear memory (17 e.2).
+    pub linear: SourceAlloc,
     /// The most one call held at once, all sources (f.2).
     pub peak_bytes: u64,
     /// The part of that peak that was not Arrow.
@@ -78,6 +80,7 @@ pub struct AllocAcc {
     python: SourceAcc,
     numpy: SourceAcc,
     arrow: SourceAcc,
+    linear: SourceAcc,
     /// The largest call total and that call's outside-Arrow part, with the record's order key
     /// so the choice between equal totals does not depend on the order chunks are read in.
     peak: Option<((u64, u64), u64, u64)>,
@@ -95,8 +98,14 @@ impl AllocAcc {
         self.python.add(&a.python);
         self.numpy.add(&a.numpy);
         self.arrow.add(&a.arrow);
+        self.linear.add(&a.linear);
         let rise = r.mem_anon_peak.saturating_sub(r.mem_anon_before);
-        let total = rise.max(a.arrow.peak.saturating_add(a.numpy.peak));
+        let hooked = a
+            .arrow
+            .peak
+            .saturating_add(a.numpy.peak)
+            .saturating_add(a.linear.peak);
+        let total = rise.max(hooked);
         let outside = total - a.arrow.peak.min(total);
         let key = (r.t_start_ns, r.seq);
         let better = match self.peak {
@@ -119,6 +128,7 @@ impl AllocAcc {
             python: self.python.finish(true, false, true),
             numpy: self.numpy.finish(true, true, true),
             arrow: self.arrow.finish(false, true, false),
+            linear: self.linear.finish(true, true, true),
             peak_bytes: peak,
             outside_arrow_peak_bytes: outside,
             outside_arrow_fraction: (peak > 0).then(|| outside as f64 / peak as f64),

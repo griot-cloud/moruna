@@ -134,6 +134,14 @@ pub trait Sampler: Send + Sync {
     }
 }
 
+/// Memory a run holds outside its own process: a packaged stage's child (17 SB-I9; contracts
+/// d.12, amended 2026-10-15). The run's sampler adds every registered one's `in_use` to each
+/// sample's `anon_bytes`, so the ceiling governs the process and its children together.
+pub trait OutsideMemory: Send + Sync {
+    /// Bytes held now.
+    fn in_use(&self) -> u64;
+}
+
 /// The whole process's consumption over a run ([`Sampler::process_usage`]): the facts a
 /// host meters, never a quota or a peak multiplied by wall time.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
