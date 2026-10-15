@@ -498,6 +498,9 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `virtio-bindings` | 0.2.7 | `vm-superio` | 0.8.2 |
 | `linux-loader` | 0.14.0 | `vm-fdt` | 0.3.0 |
 | `acpi_tables` | 0.2.1 | `vortex` | 0.86.1 (E2, 2026-09-29: the newest release; it builds on 1.98.1 and declares `rust-version = 1.95`) |
+| `wasmtime` | 47.0.4 (2026-10-15: the version `parcel-runtime` brings, so the graph has one; 49.0.3 was the newest) | `wat` (dev) | 1.252.0 (the `wasmparser` wasmtime 47 uses) |
+| `zip` | 9.0.3 | `landlock` | 0.4.7 |
+| `seccompiler` | 0.5.0 | | |
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 

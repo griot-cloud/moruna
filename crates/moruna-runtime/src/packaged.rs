@@ -208,3 +208,100 @@ impl Sampler for WithOutside {
         self.inner.process_usage()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use moruna_kernel::Sample;
+    use moruna_testkit::FakeSampler;
+
+    use super::*;
+
+    struct Held(AtomicU64);
+
+    impl OutsideMemory for Held {
+        fn in_use(&self) -> u64 {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    /// SB-I9: every sample carries what the children hold, and the peak follows it.
+    #[test]
+    fn with_outside_adds_the_children() {
+        let inner: Arc<dyn Sampler> = Arc::new(FakeSampler::new().scripted(vec![Sample {
+            anon_bytes: 100,
+            peak_anon_bytes: 100,
+            ceiling_bytes: 1000,
+            ..Sample::default()
+        }]));
+        let child = Arc::new(Held(AtomicU64::new(50)));
+        let sampler = WithOutside::new(inner, vec![child.clone() as Arc<dyn OutsideMemory>]);
+        let s = sampler.sample();
+        assert_eq!(
+            (s.anon_bytes, s.peak_anon_bytes, s.ceiling_bytes),
+            (150, 150, 1000)
+        );
+        child.0.store(400, Ordering::Release);
+        assert_eq!(sampler.sample().anon_bytes, 500);
+        child.0.store(0, Ordering::Release);
+        assert_eq!(sampler.sample().anon_bytes, 100);
+        let peak = sampler.process_peak();
+        assert!(peak.bytes >= 500 && !peak.exact, "{peak:?}");
+        sampler.reset_peak();
+        let _ = sampler.process_usage();
+    }
+
+    #[test]
+    fn a_wasm_package_binds_and_says_what_it_is() {
+        let dir = std::env::temp_dir().join(format!("moruna-packaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = moruna_wasm::testing::manifest("echo", false, true);
+        let bytes = moruna_wasm::testing::component(
+            &m.to_json(),
+            moruna_wasm::testing::IDENTITY,
+            &[],
+            "",
+            "",
+        );
+        let package = moruna_wasm::testing::package_at(&dir, &bytes, &m);
+        let packaged = open(
+            &package.path,
+            None,
+            &PackageHost::default(),
+            Inputs::default(),
+        )
+        .unwrap();
+        assert_eq!(packaged.kind(), "wasm");
+        assert!(packaged.outside().is_none());
+        packaged.limits_changed();
+        packaged.bind_here().unwrap();
+        // A .pex with no sandbox host: refused naming what is missing (or, off Linux, Linux).
+        let pex = dir.join("x.pex");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&pex).unwrap());
+        zip.start_file("moruna.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            serde_json::json!({
+                "name": "x", "entry": "function:x", "declaration": {"hints": {}},
+                "abi": moruna_kernel::declare::ABI_VERSION, "moruna": "0", "format": "pex",
+                "platforms": ["cp314-manylinux_2_28_x86_64"]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let e = open(&pex, None, &PackageHost::default(), Inputs::default())
+            .err()
+            .expect("refused");
+        let text = e.to_string();
+        assert!(
+            text.contains("--sandbox-python") || text.contains("needs Linux"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -691,3 +691,38 @@ def predict(args):
     assert!(e.to_string().contains("args"), "{e}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn a_template_that_cannot_start_is_named() {
+    use moruna_sandbox::template::Template;
+    let e = Template::spawn(Path::new("/nonexistent/python3")).unwrap_err();
+    assert!(e.contains("cannot start the sandbox template"), "{e}");
+    let dir = scratch();
+    // An interpreter that exits before its hello.
+    let quits = dir.join("quits");
+    std::fs::write(&quits, "#!/bin/sh\nexit 7\n").unwrap();
+    std::fs::set_permissions(&quits, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let e = Template::spawn(&quits).unwrap_err();
+    assert!(e.contains("did not say hello"), "{e}");
+    // One whose moruna has no child runner, or no pyarrow: refused, named.
+    let bare = dir.join("bare");
+    std::fs::write(
+        &bare,
+        format!(
+            "#!/bin/sh\nexec {} -I -c 'import socket, json, struct\ns = socket.socket(fileno=3)\nb = json.dumps({{\"op\": \"refused\", \"reason\": \"no pyarrow\"}}).encode()\ns.sendall(struct.pack(\"<I\", len(b)) + b)'\n",
+            host().python.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bare, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let e = Template::spawn(&bare).unwrap_err();
+    assert!(e.contains("refused to start: no pyarrow"), "{e}");
+    // The running template answers a status for a pid that is not its child.
+    let t = moruna_sandbox::template::template(&host().python).unwrap();
+    assert!(t.alive());
+    assert_eq!(t.status(1).unwrap(), "running");
+    assert!(t.hello.target().unwrap().starts_with("cp314-manylinux_"));
+    assert!(format!("{t:?}").contains("Template"));
+    let _ = std::fs::remove_dir_all(dir);
+}

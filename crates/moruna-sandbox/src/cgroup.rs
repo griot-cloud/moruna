@@ -144,6 +144,58 @@ mod tests {
         assert_eq!(cpu_max(0.001), "1000 100000");
     }
 
+    /// The files a stage's cgroup is made of, over a plain directory that stands in for a
+    /// cgroup v2 parent: what is written, read and refused.
+    #[test]
+    fn a_stage_cgroup_writes_its_limits() {
+        let dir = std::env::temp_dir().join(format!("moruna-cg-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cgroup.subtree_control"), "cpu memory\n").unwrap();
+        let cg = StageCgroup::create(&dir, "stage", 1 << 20, 1.5).unwrap();
+        assert_eq!(cg.memory_max().unwrap(), (1u64 << 20).to_string());
+        assert_eq!(cg.cpu_max_now().unwrap(), "150000 100000");
+        assert_eq!(
+            fs::read_to_string(cg.dir().join("cpu.weight")).unwrap(),
+            "100"
+        );
+        assert_eq!(
+            fs::read_to_string(cg.dir().join("memory.swap.max")).unwrap(),
+            "0"
+        );
+        cg.set_memory_max(7).unwrap();
+        assert_eq!(cg.memory_max().unwrap(), "7");
+        cg.set_cpu_max(0.0).unwrap();
+        assert_eq!(cg.cpu_max_now().unwrap(), "max 100000");
+        assert!(cg.memory_current().is_err(), "no memory.current yet");
+        fs::write(cg.dir().join("memory.current"), "123\n").unwrap();
+        assert_eq!(cg.memory_current().unwrap(), 123);
+        fs::write(cg.dir().join("memory.current"), "x").unwrap();
+        assert!(cg.memory_current().is_err());
+        fs::write(cg.dir().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(cg.populated().unwrap());
+        fs::write(cg.dir().join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(!cg.populated().unwrap());
+        // Made twice: refused naming the directory.
+        let e = StageCgroup::create(&dir, "stage", 1, 1.0).unwrap_err();
+        assert!(e.to_string().contains("stage"), "{e}");
+        // A plain directory with files in it is not removable as a cgroup is; a removed one is
+        // gone and removing it again is nothing.
+        for f in [
+            "memory.max",
+            "memory.swap.max",
+            "cpu.weight",
+            "cpu.max",
+            "memory.current",
+            "cgroup.events",
+        ] {
+            fs::remove_file(cg.dir().join(f)).unwrap();
+        }
+        cg.remove().unwrap();
+        cg.remove().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_parent_without_the_controllers_is_refused() {
         let dir = std::env::temp_dir().join(format!("moruna-cg-{}", std::process::id()));
