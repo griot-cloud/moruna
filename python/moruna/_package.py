@@ -1,9 +1,11 @@
 """``moruna package``: a Python project or a wasm component as one file (SDD 16 f.4, f.5).
 
-A project is ``function.py``, ``function.yaml`` (16 e.3), any sibling files and, optionally, a
-lockfile in pip's requirements format with a hash on every pin. ``moruna package <project>``
-writes ``<name>.pex``: the project's files, the wheels of the lockfile installed once per target,
-bytecode beside every source file, and ``moruna.json``. Wheels are resolved by ``pip download``
+A project is ``function.py``, ``function.yaml`` (16 e.3), any sibling files and, optionally,
+``function.lock``, a lockfile in pip's requirements format with a hash on every pin.
+``moruna package <project>`` writes ``<name>.pex`` into the working directory (or ``--out``):
+the project's files, the wheels of the lockfile installed once per target, bytecode beside every
+source file, and ``moruna.json``; it prints ``<path> sha256:<hex>``, or with ``--json`` the
+report of 16 d.2. Wheels are resolved by ``pip download``
 for each named target and never for the machine packaging them (PK-I5), and the archive is
 written the same way every time (PK-I6). ``moruna package --wasm <module.wasm> <project>``
 verifies a component the author built against the ``moruna:kernel`` world and embeds the
@@ -34,7 +36,10 @@ EXIT_REFUSED = 2
 # The guest image's interpreter and the wheel platforms the release builds for (16 i; MH 4.8).
 DEFAULT_TARGETS = ("cp314-manylinux_2_28_x86_64", "cp314-manylinux_2_28_aarch64")
 
-YAML_KEYS = ("name", "entry", "input_schema", "output_schema", "hints", "lockfile")
+YAML_KEYS = ("name", "entry", "input_schema", "output_schema", "hints")
+
+# The lockfile's one name (16 e.3).
+LOCKFILE = "function.lock"
 
 # 16 e.4: every entry of a .pex has this time, a file this mode, and deflate at this level.
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
@@ -290,12 +295,10 @@ def _tree_files(root: Path, prefix: str) -> dict[str, bytes]:
     }
 
 
-def _project_files(project: Path, lockfile: str | None) -> list[Path]:
-    """The project's files that go into ``src/``: everything but ``function.yaml``, the lockfile,
-    dot-files, bytecode caches and packages written there before."""
-    left_out = {"function.yaml"}
-    if lockfile:
-        left_out.add(Path(lockfile).as_posix())
+def _project_files(project: Path) -> list[Path]:
+    """The project's files that go into ``src/``: everything but ``function.yaml``,
+    ``function.lock``, dot-files, bytecode caches and packages written there before."""
+    left_out = {"function.yaml", LOCKFILE}
     chosen = []
     for path in sorted(project.rglob("*")):
         relative = path.relative_to(project)
@@ -321,13 +324,13 @@ def package_project(project: Path, args: argparse.Namespace, log: list[str]) -> 
         )
     targets = targets_of(args.platform)
     text = manifest_text(spec, "pex", entry, targets)
-    lockfile = spec.get("lockfile")
-    pins = parse_lockfile(project / lockfile) if lockfile else []
+    lockfile = project / LOCKFILE
+    pins = parse_lockfile(lockfile) if lockfile.is_file() else []
     files: dict[str, bytes] = {"__main__.py": MAIN.encode(), "moruna.json": text.encode()}
     with tempfile.TemporaryDirectory(prefix="moruna-package-") as work:
         work_dir = Path(work)
         src = work_dir / "src"
-        for path in _project_files(project, lockfile):
+        for path in _project_files(project):
             target = src / path.relative_to(project)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(path.read_bytes())
@@ -338,7 +341,7 @@ def package_project(project: Path, args: argparse.Namespace, log: list[str]) -> 
             deps = work_dir / "deps" / target
             deps.mkdir(parents=True)
             if pins:
-                wheels = resolve(project / lockfile, target, work_dir / "wheels" / target, options)
+                wheels = resolve(lockfile, target, work_dir / "wheels" / target, options)
                 names = {_normal(w.name.split("-", 1)[0]) for w in wheels}
                 for name, version in pins:
                     if _normal(name) not in names:
@@ -349,9 +352,9 @@ def package_project(project: Path, args: argparse.Namespace, log: list[str]) -> 
             compile_tree(deps)
             files.update(_tree_files(deps, f"deps/{target}/"))
             log.append(f"{target}: resolved {len(pins)} pins")
-    out_dir = Path(args.out) if args.out else project
+    out_dir = Path(args.out) if args.out else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{spec['name']}.pex"
+    out = (out_dir / f"{spec['name']}.pex").absolute()
     write_zip(files, out)
     return out
 
@@ -359,19 +362,18 @@ def package_project(project: Path, args: argparse.Namespace, log: list[str]) -> 
 def package_wasm(module: Path, project: Path, args: argparse.Namespace) -> Path:
     """16 f.5: ``<out>/<name>.wasm``, the component verified and its manifest embedded."""
     spec = read_function_yaml(project)
-    if "lockfile" in spec:
+    if (project / LOCKFILE).is_file():
         raise Refused(
-            f"{project / 'function.yaml'}: lockfile: a component links its dependencies; a "
-            "lockfile is for a .pex"
+            f"{project / LOCKFILE}: a component links its dependencies; a lockfile is for a .pex"
         )
     if "entry" in spec:
         raise Refused(f"{project / 'function.yaml'}: entry: a .wasm's entry is moruna:kernel")
     text = manifest_text(spec, "wasm", "moruna:kernel", ["wasm32"])
     if not module.is_file():
         raise Refused(f"{module}: no such component")
-    out_dir = Path(args.out) if args.out else project
+    out_dir = Path(args.out) if args.out else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{spec['name']}.wasm"
+    out = (out_dir / f"{spec['name']}.wasm").absolute()
     try:
         _core.package_wasm(str(module), text, str(out))
     except (ValueError, OSError) as exc:
@@ -391,7 +393,10 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="a target, cp314-manylinux_2_28_x86_64; repeatable (default: the guest image's)",
     )
-    parser.add_argument("--out", help="where the package is written (default: the project)")
+    parser.add_argument(
+        "--out", help="where the package is written (default: the working directory)"
+    )
+    parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--index-url", help="passed to pip download")
     parser.add_argument("--find-links", action="append", help="passed to pip download")
     parser.add_argument("--no-index", action="store_true", help="passed to pip download")
@@ -410,8 +415,24 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_REFUSED
     for line in log:
         print(line, file=sys.stderr)
-    digest = hashlib.sha256(out.read_bytes()).hexdigest()
-    print(f"{out} sha256:{digest}")
+    data = out.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if args.json:
+        manifest = json.loads(_core.package_manifest(str(out)))
+        print(
+            json.dumps(
+                {
+                    "moruna_package": 1,
+                    "path": str(out),
+                    "name": manifest["name"],
+                    "format": manifest["format"],
+                    "fingerprint": f"sha256:{digest}",
+                    "manifest": manifest,
+                }
+            )
+        )
+    else:
+        print(f"{out} sha256:{digest}")
     return EXIT_DONE
 
 

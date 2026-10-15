@@ -382,7 +382,14 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KernelD
             }
             if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
                 let package = package.get();
-                return KernelDoc::package(package.path.clone(), package.fingerprint.clone());
+                let mut doc = KernelDoc::package(package.path.clone(), package.fingerprint.clone());
+                doc.args = package.inputs.args.clone();
+                doc.assets = package
+                    .inputs
+                    .assets
+                    .as_ref()
+                    .map(|a| a.display().to_string());
+                return doc;
             }
             let target = match item.cast::<PyKernelHandle>() {
                 Ok(handle) => handle.get().callable.bind(py).clone(),

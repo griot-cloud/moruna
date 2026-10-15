@@ -15,6 +15,8 @@ use landlock::{
 
 /// Where the tree is inside the child's namespace.
 pub const TREE: &str = "/pkg";
+/// Where the assets directory is inside the child's namespace (17 f.11).
+pub const ASSETS: &str = "/assets";
 /// The devices the child's namespace holds.
 pub const DEVICES: [&str; 3] = ["null", "zero", "urandom"];
 
@@ -29,6 +31,8 @@ pub struct Confinement {
     pub tree: PathBuf,
     /// The interpreter's import roots, mounted read only at their own paths.
     pub roots: Vec<PathBuf>,
+    /// The assets directory the host named, mounted read only at [`ASSETS`].
+    pub assets: Option<PathBuf>,
 }
 
 /// A step of f.5 that failed, named.
@@ -169,6 +173,11 @@ fn namespace(c: &Confinement) -> io::Result<()> {
     let pkg = under(root, Path::new(TREE));
     fs::create_dir_all(&pkg)?;
     bind(&c.tree, &pkg, false)?;
+    if let Some(assets) = &c.assets {
+        let at = under(root, Path::new(ASSETS));
+        fs::create_dir_all(&at)?;
+        bind(assets, &at, false)?;
+    }
     for import_root in outermost(&c.roots) {
         if !import_root.is_dir() {
             continue;
@@ -292,11 +301,14 @@ fn drop_privileges() -> io::Result<()> {
 /// Landlock over the namespace's paths (f.5 step 6): read and execute under the tree and the
 /// import roots, read and write under `/tmp` and on the devices, nothing else. A kernel without
 /// Landlock refuses the child.
-fn landlock(roots: &[PathBuf]) -> Result<(), String> {
+fn landlock(roots: &[PathBuf], assets: bool) -> Result<(), String> {
     let abi = ABI::V1;
     let read = AccessFs::from_read(abi);
     let all = AccessFs::from_all(abi);
     let mut readable: Vec<PathBuf> = vec![PathBuf::from(TREE)];
+    if assets {
+        readable.push(PathBuf::from(ASSETS));
+    }
     readable.extend(outermost(roots).into_iter().filter(|r| r.is_dir()));
     let mut ruleset = Ruleset::default()
         .handle_access(all)
@@ -337,7 +349,7 @@ fn landlock(roots: &[PathBuf]) -> Result<(), String> {
 pub fn confine(c: &Confinement) -> Result<(), Failed> {
     step("namespace", namespace(c))?;
     step("capabilities", drop_privileges())?;
-    landlock(&c.roots).map_err(|error| Failed {
+    landlock(&c.roots, c.assets.is_some()).map_err(|error| Failed {
         step: "landlock",
         error,
     })?;

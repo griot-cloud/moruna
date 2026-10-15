@@ -390,6 +390,9 @@ pub struct KernelDoc {
     /// For `package`: the package's file, on a disk the run attaches (16 d.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// For `package`: a directory the kernel reads, read only (16 b, d.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<String>,
     /// A module name on the interpreter's path, or a path to a `.py` file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
@@ -405,7 +408,8 @@ pub struct KernelDoc {
     /// For `std`: the standard kernel's name (`cast`, `select`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// For `std`: its arguments, a JSON object.
+    /// For `std`: its arguments, a JSON object; for `package`: the arguments of a kernel built
+    /// by them (16 b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
     /// The fingerprint the loaded kernel must have, hex, optionally prefixed `algo:`.
@@ -453,6 +457,7 @@ impl KernelDoc {
         KernelDoc {
             kind: KernelKindDoc::Python,
             path: None,
+            assets: None,
             module: Some(module.into()),
             callable: Some(callable.into()),
             krate: None,

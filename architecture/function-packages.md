@@ -35,7 +35,7 @@ One WIT world, `moruna:kernel`:
 - `process(batch: list<u8>) -> result<list<u8>, string>`: one Arrow record batch in as an IPC stream, one out; an error is the kernel's refusal of that batch, named;
 - `open(state: list<u8>) -> result<_, string>` and `close() -> list<u8>` for a stateful kernel (`stateful` hint), so state crosses a checkpoint (MH §4.7) as bytes.
 
-The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
+The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. (Amended 2026-10-15, for a host's kernels built by arguments, model inference first: a kernel may export `configure(args: string)` to receive its arguments once, and import the world's own `read-asset(name)`, which reads a file of a read-only assets directory the host names and nothing else; a `.pex` sees the same directory read-only at `/assets` in its child. SDD 16 e.5, 17 f.11.) Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
 
 ## 4. The two runtimes, neither with Moruna's access to the machine
 
@@ -67,7 +67,7 @@ The in-process `pyo3` path of SDD 12 is not removed: it is the **library** path,
 
 ## 5. The job document
 
-`kernels[]` gains `{ "kind": "package", "path": "<file on a disk the run attaches>", "fingerprint": "sha256:…" }`. Before a stage starts, Moruna hashes the file and refuses the run on a mismatch; it then picks the runtime from the extension and the budget from the stage. The host decides where the file is and how it got there; Moruna reads it from a disk like any other input.
+`kernels[]` gains `{ "kind": "package", "path": "<file on a disk the run attaches>", "fingerprint": "sha256:…" }`, with optional `args` and `assets` (amended 2026-10-15; SDD 16 d.4). Before a stage starts, Moruna hashes the file and refuses the run on a mismatch; it then picks the runtime from the extension and the budget from the stage. The host decides where the file is and how it got there; Moruna reads it from a disk like any other input.
 
 ## 6. The commands
 

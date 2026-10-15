@@ -111,22 +111,63 @@ def _status(ended: dict[int, str], pid: int) -> str:
         time.sleep(0.01)
 
 
+# A start request carries the child's control socket and the memfd (17 e.3).
+FDS_PER_START = 2
+
+
+def _preload() -> dict[str, str]:
+    """Import the data libraries (17 f.9) and the extension; their versions by name."""
+    libraries: dict[str, str] = {}
+    for name in PRELOAD:
+        top = name.split(".")[0]
+        if importlib.util.find_spec(top) is None:
+            if top == "pyarrow":
+                raise ImportError("the sandbox's interpreter has no pyarrow")
+            continue
+        importlib.import_module(name)
+        libraries[top] = importlib.metadata.version(top)
+    from moruna import _core  # noqa: PLC0415, the extension, for the child's runner
+
+    if not hasattr(_core, "_sandbox_child"):
+        raise ImportError("this moruna was built without the sandbox's child runner")
+    return libraries
+
+
+def _start(sock: socket.socket, message: dict, fds: list[int], ended: dict[int, str]) -> None:
+    """Fork a child for a stage (17 f.9); the child never returns from here."""
+    _reap(ended)
+    threads = _threads()
+    if threads != 1 or len(fds) != FDS_PER_START:
+        for fd in fds:
+            os.close(fd)
+        reason = (
+            f"the template holds {threads} threads; a fork needs one (SB-I10)"
+            if threads != 1
+            else f"a start request carries {FDS_PER_START} descriptors, not {len(fds)}"
+        )
+        _send(sock, {"op": "refused", "reason": reason})
+        return
+    pid = os.fork()
+    if pid == 0:
+        sock.close()
+        code = 3
+        try:
+            from moruna import _core  # noqa: PLC0415
+
+            code = _core._sandbox_child(json.dumps(message), fds[0], fds[1])
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(code)
+    for fd in fds:
+        os.close(fd)
+    _send(sock, {"op": "started", "pid": pid})
+
+
 def main() -> int:
     sock = socket.socket(fileno=TEMPLATE_FD)
-    libraries: dict[str, str] = {}
     try:
-        for name in PRELOAD:
-            top = name.split(".")[0]
-            if importlib.util.find_spec(top) is None:
-                if top == "pyarrow":
-                    raise ImportError("the sandbox's interpreter has no pyarrow")
-                continue
-            importlib.import_module(name)
-            libraries[top] = importlib.metadata.version(top)
-        from moruna import _core  # noqa: PLC0415, the extension, for the child's runner
-
-        if not hasattr(_core, "_sandbox_child"):
-            raise ImportError("this moruna was built without the sandbox's child runner")
+        libraries = _preload()
     except Exception as exc:  # noqa: BLE001, the refusal names it
         _send(sock, {"op": "refused", "reason": f"{type(exc).__name__}: {exc}"})
         return 2
@@ -159,31 +200,7 @@ def main() -> int:
             return 0
         op = message.get("op")
         if op == "start":
-            _reap(ended)
-            threads = _threads()
-            if threads != 1 or len(fds) != 2:
-                for fd in fds:
-                    os.close(fd)
-                reason = (
-                    f"the template holds {threads} threads; a fork needs one (SB-I10)"
-                    if threads != 1
-                    else f"a start request carries 2 descriptors, not {len(fds)}"
-                )
-                _send(sock, {"op": "refused", "reason": reason})
-                continue
-            pid = os.fork()
-            if pid == 0:
-                sock.close()
-                code = 3
-                try:
-                    code = _core._sandbox_child(json.dumps(message), fds[0], fds[1])
-                finally:
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                    os._exit(code)
-            for fd in fds:
-                os.close(fd)
-            _send(sock, {"op": "started", "pid": pid})
+            _start(sock, message, fds, ended)
         elif op == "status":
             pid = int(message["pid"])
             _send(sock, {"op": "exited", "pid": pid, "status": _status(ended, pid)})

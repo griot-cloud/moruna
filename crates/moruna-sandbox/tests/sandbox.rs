@@ -19,7 +19,7 @@ use moruna_kernel::{
     Allocator, InitCtx, Kernel, KernelState, MorunaError, Payload, Sample, Sampler, Tier,
     take_kernel_alloc,
 };
-use moruna_package::Package;
+use moruna_package::{Inputs, Package};
 use moruna_sandbox::{SandboxHost, SandboxKernel, SandboxState};
 use moruna_testkit::{FakeAllocator, FakeSampler};
 use serde_json::{Value, json};
@@ -100,7 +100,7 @@ fn sampler(anon: u64, ceiling: u64) -> Arc<dyn Sampler> {
 const GIB: u64 = 1 << 30;
 
 fn kernel(package: Arc<Package>, ceiling: u64) -> SandboxKernel {
-    let k = SandboxKernel::new(package, host()).unwrap();
+    let k = SandboxKernel::new(package, host(), Inputs::default()).unwrap();
     k.bind_run(sampler(0, ceiling), ceiling);
     k
 }
@@ -482,6 +482,7 @@ fn sb_t19_template_threads() {
             python: wrapper,
             cgroup: host().cgroup,
         },
+        Inputs::default(),
     )
     .expect_err("refused");
     let text = e.to_string();
@@ -614,6 +615,7 @@ fn the_child_refuses_what_it_cannot_load() {
             &[],
         ),
         host(),
+        Inputs::default(),
     )
     .unwrap();
     assert!(
@@ -628,5 +630,64 @@ fn the_child_refuses_what_it_cannot_load() {
         unbound.restore(&ctx(), b"").is_err(),
         "not a checkpointing package"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn pk_t17_args_and_assets_in_the_child() {
+    let dir = scratch();
+    let assets = dir.join("model");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("weights.txt"), "42").unwrap();
+    let function = r#"
+import pyarrow as pa
+
+def predict(args):
+    with open("/assets/weights.txt") as f:
+        weight = f.read()
+    try:
+        open("/assets/new.txt", "w")
+        wrote = "written"
+    except Exception as e:
+        wrote = type(e).__name__
+    def kernel(batch):
+        return pa.record_batch({"r": [args["label"], weight, wrote]})
+    return kernel
+"#;
+    let package = pex(&dir, "predict", function, json!({"args": true}), &[]);
+    let inputs = Inputs {
+        args: Some(json!({"label": "churn"})),
+        assets: Some(assets.clone()),
+    };
+    let k = SandboxKernel::new(package.clone(), host(), inputs).unwrap();
+    k.bind_run(sampler(0, GIB), GIB);
+    let mut state = k.init(&ctx()).unwrap();
+    let out = strings(&call(&k, state.as_mut()).unwrap(), "r");
+    assert_eq!(out[0], "churn");
+    assert_eq!(out[1], "42");
+    assert!(
+        out[2] == "PermissionError" || out[2] == "OSError",
+        "{out:?}"
+    );
+    assert!(!assets.join("new.txt").exists());
+    // Arguments for a package not built by them are refused before a child starts.
+    let plain = pex(
+        &dir,
+        "same",
+        "def same(batch):\n    return batch\n",
+        json!({}),
+        &[],
+    );
+    let e = SandboxKernel::new(
+        plain,
+        host(),
+        Inputs {
+            args: Some(json!({})),
+            assets: None,
+        },
+    )
+    .expect_err("refused");
+    assert!(e.to_string().contains("args"), "{e}");
     let _ = std::fs::remove_dir_all(dir);
 }

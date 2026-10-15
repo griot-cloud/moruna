@@ -29,7 +29,11 @@ It refuses to know: how a package is run (SDD 17), where a host keeps packages o
 
 **Fingerprint.** `sha256` of the package file's bytes, written `sha256:<64 lowercase hex>`. For a packaged kernel it replaces the source-and-lockfile hash of MH 4.9 step 7.
 
-**Project.** A directory with `function.py`, `function.yaml` (e.3), any sibling files, and optionally the lockfile `function.yaml` names.
+**Project.** A directory with `function.py`, `function.yaml` (e.3), any sibling files, and optionally the lockfile `function.lock` (e.3).
+
+**Arguments.** A JSON object a host gives a kernel built by arguments (the hint `args`, e.2): a `.pex` entry is then a factory called once with them; a `.wasm` receives them through `configure` (e.5). Not part of the fingerprint: the file is the kernel, the arguments its configuration for a run.
+
+**Assets.** A directory a host names, read only, that a kernel reads files from (a model's weights): `/assets` in a `.pex` child's namespace (17 f.5), `read-asset` for a `.wasm` (e.5).
 
 **Interpreter tag, platform tag, target.** The wheel tags of PEP 425: `cp314` and `manylinux_2_28_x86_64`; a target is the pair, written `cp314-manylinux_2_28_x86_64`.
 
@@ -45,7 +49,7 @@ It refuses to know: how a package is run (SDD 17), where a host keeps packages o
 
 **PK-I3. The manifest is complete and closed.** Every field of e.1 is present, no other field is, every hint is one e.2 lists, and `format` agrees with the extension; anything else refuses the package naming the field.
 
-**PK-I4. A component imports nothing.** A `.wasm` whose component imports anything is refused naming the first import; one that does not export `declare` and `process` with the world's types, that exports `open` without `close` or the reverse, or that exports anything else, is refused naming the export. A component whose `declare()` disagrees with its embedded manifest on `name`, `declaration`, `abi` or `format` is refused naming the field. FP 3.
+**PK-I4. A component imports nothing but the world's `read-asset`.** A `.wasm` whose component imports anything else, or `read-asset` with another type, is refused naming the import; one that does not export `declare` and `process` with the world's types, that exports `open` without `close` or the reverse, that exports `configure` without the hint `args` or lacks it with the hint, or that exports anything else, is refused naming the export. A component whose `declare()` disagrees with its embedded manifest on `name`, `declaration`, `abi` or `format` is refused naming the field. FP 3.
 
 **PK-I5. Wheels are resolved for the named targets and never for the packaging machine.** `moruna package` calls `pip download` once per target with `--platform`, `--implementation cp`, `--python-version`, `--abi`, `--only-binary=:all:`, `--no-deps` and `--require-hashes`; a requirement with no wheel for a target refuses the package naming the requirement and the target. FP 6, FP 7.
 
@@ -110,22 +114,23 @@ impl From<PackageError> for MorunaError;   // Config { name: "package", .. }; Pi
 ### d.2 Exposed (commands)
 
 ```
-moruna package <project> [--platform <target>]... [--out <dir>] [--index-url <url>] [--find-links <path>]... [--no-index]
-moruna package --wasm <module.wasm> <project> [--out <dir>]
-moruna check <package> [--json] [--seed N] [--profiles-dir DIR] [--no-profile] [--sandbox-python PATH] [--sandbox-cgroup DIR]
+moruna package <project> [--platform <target>]... [--out <dir>] [--json] [--index-url <url>] [--find-links <path>]... [--no-index]
+moruna package --wasm <module.wasm> <project> [--out <dir>] [--json]
+moruna check <package> [--json] [--seed N] [--profiles-dir DIR] [--no-profile] [--args JSON] [--assets DIR] [--sandbox-python PATH] [--sandbox-cgroup DIR]
 moruna aot <package> [--sandbox-python PATH]
 moruna run <spec.json> [--strict] [--sandbox-python PATH] [--sandbox-cgroup DIR]
 moruna serve --listen <address> [--no-strict] [--sandbox-python PATH] [--sandbox-cgroup DIR]
 ```
 
-Exit codes: 0 done (or, for `check`, a checkable and agreeing kernel); 2 refused, with one line naming the field, the file or the requirement. `--platform` defaults to the guest image's targets (MH 4.8): `cp314-manylinux_2_28_x86_64` and `cp314-manylinux_2_28_aarch64`. `--sandbox-python` names a standard-build CPython 3.14 with the `moruna` wheel and `pyarrow` installed, and `--sandbox-cgroup` a cgroup v2 directory the process may create children in with the `memory` and `cpu` controllers enabled (SDD 17 e.6); both are needed for a `.pex` and neither for a `.wasm`.
+Exit codes: 0 done (or, for `check`, a checkable and agreeing kernel); 2 refused, with one line naming the field, the file or the requirement. `moruna package` writes `<name>.pex` or `<name>.wasm`, `name` from `function.yaml`, into `--out` (default: the current working directory) and prints one line on stdout, `<absolute path> sha256:<hex>`, or with `--json` one JSON object `{"moruna_package": 1, "path": <absolute path>, "name": <name>, "format": "pex" | "wasm", "fingerprint": "sha256:<hex>", "manifest": <16 e.1>}`; what it left out of a wheel and resolved per target goes to stderr. `moruna aot` writes `<stem>.cwasm` beside a `.wasm` (`x.wasm` gives `x.cwasm`) and `<file>.tree/` beside a `.pex` (`x.pex` gives `x.pex.tree/`), and prints the path. `moruna check --json` gives each package kernel's report a `manifest` field, the package's 16 e.1 manifest, so a host reads the declaration from the report and never parses the package itself. `--platform` defaults to the guest image's targets (MH 4.8): `cp314-manylinux_2_28_x86_64` and `cp314-manylinux_2_28_aarch64`. `--sandbox-python` names a standard-build CPython 3.14 with the `moruna` wheel and `pyarrow` installed, and `--sandbox-cgroup` a cgroup v2 directory the process may create children in with the `memory` and `cpu` controllers enabled (SDD 17 e.6); both are needed for a `.pex` and neither for a `.wasm`.
 
 ### d.3 Exposed (Python)
 
 ```python
-def load(path, *, python=None, cgroup=None) -> PackageKernel
+def load(path, *, python=None, cgroup=None, args=None, assets=None) -> PackageKernel
     # python: the standard-build interpreter for a .pex; None is sys.executable when it is a
     # standard build, and refused naming the keyword when it is not. cgroup: as --sandbox-cgroup.
+    # args: a dict, the kernel's arguments (b); assets: a directory, read only (b).
 
 class PackageKernel:                       # frozen; moruna.run accepts it in `kernels`
     path: str; fingerprint: str; format: str; manifest: dict
@@ -135,10 +140,11 @@ class PackageKernel:                       # frozen; moruna.run accepts it in `k
 ### d.4 Exposed (job document, MH 4.1)
 
 ```jsonc
-{ "kind": "package", "path": "/disk/0/fn/shout.pex", "fingerprint": "sha256:9f2c…" }
+{ "kind": "package", "path": "/disk/0/fn/predict.pex", "fingerprint": "sha256:9f2c…",
+  "args": {"threshold": 0.5}, "assets": "/disk/1/models/churn" }
 ```
 
-`path` and `fingerprint` are required; no other field of a kernel entry may be set (the hints are the manifest's), and each one set is refused by name.
+`path` and `fingerprint` are required. `args` (a JSON object) and `assets` (a directory on a disk the run attaches) are optional: `args` only for a package whose manifest has the hint `args`, which then always receives an object (`{}` when the document gives none); `assets` for any package. No other field of a kernel entry may be set (the hints are the manifest's), and each one set is refused by name.
 
 ### d.5 Consumed
 
@@ -180,9 +186,11 @@ UTF-8 JSON, one object, keys in this order when Moruna writes it, two-space inde
 - A schema as a JSON array of `[column, type]` or `[column, type, nullable]` is exact, in order (the decorator's `pyarrow.Schema`); `nullable` absent is `true`.
 - An `output_schema` object whose keys are a non-empty subset of `adds`, `drops`, `changes` is relative: `adds` and `changes` are objects `{column: type}`, `drops` an array of names.
 - A type is the type grammar of MH 4.9 (`moruna_kernel::declare::parse_type`).
-- `hints` is an object with only these keys: `stateful` (bool, default false), `expected_amplification` (number > 0), `preferred_rows` (integer > 0), `state_bytes` (integer ≥ 0), `memory_guard` (bool, default true: E13, AD-I10), `resume` (`"reinit" | "checkpoint" | "forbid"`, a `.pex` only; a stateful `.wasm` always checkpoints through `close` and `open`). Any other key, or a value of another type, is refused naming `declaration.hints.<key>`.
+- `hints` is an object with only these keys: `stateful` (bool, default false), `args` (bool, default false: the kernel is built from arguments, b), `expected_amplification` (number > 0), `preferred_rows` (integer > 0), `state_bytes` (integer ≥ 0), `memory_guard` (bool, default true: E13, AD-I10), `resume` (`"reinit" | "checkpoint" | "forbid"`, a `.pex` only; a stateful `.wasm` always checkpoints through `close` and `open`). Any other key, or a value of another type, is refused naming `declaration.hints.<key>`.
 
 ### e.3 `function.yaml`
+
+A project is a directory holding `function.yaml`, `function.py` (a `.pex`) and, optionally, `function.lock`; every other file under it (sub-directories included, dot-files, `__pycache__` and packages written there before left out) is a sibling packaged under `src/`.
 
 ```yaml
 name: shout                       # required, as e.1
@@ -190,12 +198,11 @@ entry: function:shout             # required for a .pex; absent for --wasm (it i
 input_schema: {name: string}      # optional, as e.2
 output_schema: {adds: {loud: string}}
 hints: {preferred_rows: 8192}     # optional, as e.2
-lockfile: requirements.lock       # optional, a .pex only; relative to the project
 ```
 
-Parsed with PyYAML (`moruna[package]`); its absence is a refusal naming the extra. Any other key is refused by name. `lockfile` with `--wasm` is refused: a component links its dependencies.
+Parsed with PyYAML (`moruna[package]`); its absence is a refusal naming the extra. Any other key is refused by name. A `function.lock` in a project packaged with `--wasm` is refused: a component links its dependencies.
 
-The lockfile is pip's requirements format: one requirement per logical line, each `name==version` followed by at least one `--hash=sha256:<hex>`; comments, blank lines and backslash continuations are allowed; anything else (an unpinned requirement, a URL, an editable, an option line other than `--hash`) is refused naming the line.
+The lockfile, `function.lock`, is pip's requirements format: one requirement per logical line, each `name==version` followed by at least one `--hash=sha256:<hex>`; comments, blank lines and backslash continuations are allowed; anything else (an unpinned requirement, a URL, an editable, an option line other than `--hash`) is refused naming the line.
 
 ### e.4 `.pex` layout
 
@@ -204,7 +211,7 @@ A zip archive (PK-I6) with exactly these top-level entries:
 ```
 __main__.py                         prints moruna.json and exits 0: `python shout.pex`
 moruna.json                         e.1
-src/function.py, src/<siblings>     the project's files except function.yaml, the lockfile and dot-files
+src/function.py, src/<siblings>     the project's files except function.yaml, function.lock and dot-files
 src/**/__pycache__/*.cpython-3NN.pyc
 deps/<target>/<installed wheels>    one directory per target in `platforms`
 deps/<target>/**/__pycache__/*.pyc
@@ -220,6 +227,9 @@ A tree is the zip extracted under `<package>.tree/` (beside the package) or a pr
 package moruna:kernel@0.1.0;
 
 world kernel {
+  /// A file of the assets directory the host named, by its path relative to it; refused when
+  /// there is none, or the path leaves it.
+  import read-asset: func(name: string) -> result<list<u8>, string>;
   /// The package's manifest, moruna.json, as text.
   export declare: func() -> string;
   /// One Arrow record batch as an IPC stream in, one out; an error refuses this batch, named.
@@ -228,10 +238,12 @@ world kernel {
   export open: func(state: list<u8>) -> result<_, string>;
   /// A stateful kernel's state out.
   export close: func() -> list<u8>;
+  /// A kernel built by arguments: the arguments as JSON, once, before anything else.
+  export configure: func(args: string) -> result<_, string>;
 }
 ```
 
-`open` and `close` are exported by a stateful kernel and by no other. The component imports nothing. The manifest is embedded as a custom section named `moruna.json` placed at the end of the component (f.3).
+`open` and `close` are exported by a stateful kernel and by no other; `configure` by a kernel with the hint `args` and by no other. The component may import `read-asset` and nothing else. The manifest is embedded as a custom section named `moruna.json` placed at the end of the component (f.3).
 
 ### e.6 `.cwasm` layout
 
@@ -248,15 +260,15 @@ world kernel {
 **f.4 `moruna package <project>`.**
 1. Read `function.yaml` (e.3); build the manifest with `format: pex`, `entry` from the file, `abi` and `moruna` from this build, `platforms` the sorted, de-duplicated `--platform` values (or the defaults of d.2). A target whose interpreter tag is not `cp3NN` with `NN` equal to the packaging interpreter's minor version, or whose platform is not `manylinux_<major>_<minor>_<x86_64|aarch64>`, is refused naming it (a `.pex` runs in the sandbox, which is Linux only; the free-threaded tag `cp314t` is refused because a packaged kernel runs on the standard build, FP 2).
 2. Parse the lockfile (e.3). With requirements, for each target, `python -m pip download --dest <tmp>/<target> --no-deps --only-binary=:all: --require-hashes --implementation cp --python-version 3.NN --abi cp3NN --platform <platform> -r <lockfile>` plus `--index-url`, `--find-links`, `--no-index` as given. A non-zero exit refuses the package: the requirement in pip's `No matching distribution found for <req>` (or, failing that, pip's last stderr line) and the target are named (PK-I5). Every requirement must have produced exactly one wheel whose normalised name matches it.
-3. Install each wheel into `deps/<target>/` (e.4), copy `src/`, compile bytecode, write the zip (PK-I6) to `<out>/<name>.pex` (default: the project directory), print the fingerprint.
+3. Install each wheel into `deps/<target>/` (e.4), copy `src/`, compile bytecode, write the zip (PK-I6) to `<out>/<name>.pex` (default: the current working directory), print the report of d.2.
 
-**f.5 `moruna package --wasm <module.wasm> <project>`.** Read `function.yaml`; build the manifest with `format: wasm`, `entry: moruna:kernel`, `platforms: ["wasm32"]`; verify the component (SDD 17 f.2: imports, exports, types); instantiate it with no imports and call `declare()`; compare its manifest with the one built here field by field on `name`, `declaration`, `abi`, `format`, `entry`, `platforms` (PK-I4); embed (f.3); write `<out>/<name>.wasm`; print the fingerprint.
+**f.5 `moruna package --wasm <module.wasm> <project>`.** Read `function.yaml`; build the manifest with `format: wasm`, `entry: moruna:kernel`, `platforms: ["wasm32"]`; verify the component (SDD 17 f.2: imports, exports, types); instantiate it with no imports and call `declare()`; compare its manifest with the one built here field by field on `name`, `declaration`, `abi`, `format`, `entry`, `platforms` (PK-I4); embed (f.3); write `<out>/<name>.wasm`; print the report of d.2.
 
 **f.6 The tree.** Given a `.pex` and this machine's target (f.7): if `<package>.tree/MORUNA-TREE` names the fingerprint and this version, use it. Otherwise extract into `<package>.tree.tmp-<pid>-<n>/`, write the marker, remove a stale `<package>.tree/` and rename. When the package's directory is not writable, extract into a private directory under the system temporary directory, removed when the `Tree` is dropped, with the note "`<package>.tree` cannot be written beside the package; extracted to a private directory for this process". The chosen `deps/<target>/` is the first of the package's `platforms` compatible with the host (f.7); none compatible refuses naming the host's target and the package's platforms.
 
 **f.7 Platform compatibility.** The host's target for a `.pex` is `cp3NN-manylinux_<glibc major>_<glibc minor>_<arch>` from the sandbox interpreter's version, its C library's version (`os.confstr("CS_GNU_LIBC_VERSION")`) and the machine's architecture, which the template reports in its `hello` (17 e.3); on a host that is not Linux with glibc, `host_target` is refused ("a .pex runs in the sandbox, which needs Linux with glibc"). `manylinux_<a>_<b>_<arch>` is compatible with a host `manylinux_<c>_<d>_<arch>` when the interpreter tags are equal, the architectures are equal, and `(a, b) <= (c, d)`.
 
-**f.8 The job document.** `KernelKindDoc::Package` entries are built by SDD 17's runtimes: open the package (f.1), check the pin (f.2), then `moruna_wasm::WasmKernel::new` or `moruna_sandbox::SandboxKernel::new` by format. A `.pex` entry without the sandbox host of d.2 (`--sandbox-python`, `--sandbox-cgroup`) is refused naming the missing option. Strict mode refuses `kind: python` before any kernel is loaded (PK-I8).
+**f.8 The job document.** `KernelKindDoc::Package` entries are built by SDD 17's runtimes: open the package (f.1), check the pin (f.2), check the entry's `args` against the hint (an object only for a kernel with `args`; a kernel with it gets `{}` when the document gives none) and its `assets` (an existing directory), then `moruna_wasm::WasmKernel::new` or `moruna_sandbox::SandboxKernel::new` by format, each given the arguments and the assets. A `.pex` entry without the sandbox host of d.2 (`--sandbox-python`, `--sandbox-cgroup`) is refused naming the missing option. Strict mode refuses `kind: python` before any kernel is loaded (PK-I8).
 
 **f.9 `moruna check <package>`.** Open the package; build its kernel as f.8 does; run `moruna_runtime::check::check` with `kind` `wasm` or `pex` and `fingerprint_scheme` `sha256`; the report's `fingerprint` is the package's (PK-I9). The kernel's `Fingerprint` (contracts e.6) is the package's 32 bytes, so the profile row is keyed by the file and a later run of the same file sizes from it.
 
@@ -314,13 +326,17 @@ world kernel {
 
 **PK-T11 strict_refuses_import_paths.** A document with a `python` kernel built with `strict` is refused naming `kernels[0].module`; the same document without `strict` builds. PK-I8.
 
-**PK-T12 package_entry_fields.** A `package` entry with `module`, `callable`, `name`, `args` or any hint set is refused naming that field; `path` absent is refused. d.4.
+**PK-T12 package_entry_fields.** A `package` entry with `module`, `callable`, `name` or any hint set is refused naming that field; `path` or `fingerprint` absent is refused; `args` for a package without the hint `args`, or `assets` that is not a directory, is refused naming it. d.4.
 
 **PK-T13 check_through_the_runtime.** `moruna check` on the identity `.wasm` agrees and prints `sha256:<file hash>`; on the column-adding `.wasm` that disagrees with its declaration it is refused naming the column; the profile row it wrote is keyed by the package's fingerprint. PK-I9.
 
 **PK-T14 check_a_pex.** (Linux, sandbox host, SB-T rules) `moruna check` on a packaged Polars kernel agrees and its report's allocation figures come from the child. PK-I9.
 
 **PK-T15 aot_and_load.** `moruna aot x.wasm` writes `x.cwasm` with the header of e.6; `moruna load x.wasm` then uses it (no compile note); a `.cwasm` with another fingerprint is ignored and the note says the component was compiled; `load(x)(batch)` returns the kernel's output. f.10, f.11.
+
+**PK-T17 args_and_assets.** A `.wasm` with `args` gets the document's arguments through `configure` and reads an asset through `read-asset`; a name with `..` or an absolute one is refused; a `.pex` factory gets the arguments as a dict and reads `/assets/<file>`, and cannot write there. b, d.4, e.5.
+
+**PK-T18 package_report.** `moruna package --json` prints the object of d.2 with the file's fingerprint and manifest; `moruna check --json` on a package carries its manifest. d.2.
 
 **PK-T16 run_a_package.** A job document with a `package` entry runs to a Parquet sink and the rows written equal the kernel's output of the source. f.8.
 
@@ -346,6 +362,8 @@ None.
 | FP 6 (`check` through the runtime) | PK-I9 | PK-T13, PK-T14 |
 | FP 4 (strict mode) | PK-I8 | PK-T11 |
 | FP 5 (the job document) | PK-I2, d.4, f.8 | PK-T2, PK-T12, PK-T16 |
+| a host's kernels built by arguments and reading assets (2026-10-15, from Griot's function registry) | b, d.4, e.5 | PK-T17 |
+| a host reads the package's report, never the package (2026-10-15) | d.2 | PK-T18 |
 
 ## o. Deferred (post-v1)
 

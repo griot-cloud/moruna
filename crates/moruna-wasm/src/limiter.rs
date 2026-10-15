@@ -20,6 +20,8 @@ pub struct Limits {
     pending: u64,
     counts: AllocCounts,
     refusal: Option<Refusal>,
+    /// The assets directory the host named (16 b), read by `read-asset`.
+    assets: Option<std::path::PathBuf>,
 }
 
 impl Limits {
@@ -32,7 +34,44 @@ impl Limits {
             pending: 0,
             counts: AllocCounts::default(),
             refusal: None,
+            assets: None,
         }
+    }
+
+    /// The same limits, with the assets directory `read-asset` reads.
+    pub fn with_assets(mut self, assets: Option<std::path::PathBuf>) -> Limits {
+        self.assets = assets;
+        self
+    }
+
+    /// 17 f.11: `<assets>/<name>`, when `name` is relative, has no `..` and resolves inside the
+    /// directory; the reason otherwise.
+    pub fn read_asset(&self, name: &str) -> Result<Vec<u8>, String> {
+        let Some(dir) = &self.assets else {
+            return Err("no assets directory was named for this kernel".into());
+        };
+        let relative = std::path::Path::new(name);
+        if relative.is_absolute()
+            || name.is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "`{name}` is not a path inside the assets directory"
+            ));
+        }
+        let root = dir
+            .canonicalize()
+            .map_err(|e| format!("the assets directory: {e}"))?;
+        let path = root
+            .join(relative)
+            .canonicalize()
+            .map_err(|e| format!("`{name}`: {e}"))?;
+        if !path.starts_with(&root) {
+            return Err(format!("`{name}` leaves the assets directory"));
+        }
+        std::fs::read(&path).map_err(|e| format!("`{name}`: {e}"))
     }
 
     /// No gate: the limit is wasm32's own.

@@ -81,6 +81,8 @@ def check_package(args: argparse.Namespace, profiles_dir: str | None) -> dict[st
             profiles_dir=profiles_dir,
             sandbox_python=args.sandbox_python,
             sandbox_cgroup=args.sandbox_cgroup,
+            args=args.args,
+            assets=args.assets,
         )
     )
 
@@ -102,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-profile", action="store_true", help="write no profile row")
     parser.add_argument("--sandbox-python", help="a .pex's standard-build interpreter (SDD 17 e.6)")
     parser.add_argument("--sandbox-cgroup", help="the cgroup a .pex's child runs under")
+    parser.add_argument("--args", help="a package's arguments, a JSON object (SDD 16 b)")
+    parser.add_argument("--assets", help="a directory a package reads, read only (SDD 16 b)")
     args = parser.parse_args(argv)
     if args.seed < 0 or args.seed >= 1 << 64:
         parser.error("--seed takes an integer from 0 to 2**64 - 1")

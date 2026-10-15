@@ -8,6 +8,7 @@ use moruna_kernel::arrow::array::Int64Array;
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::arrow::ipc::writer::StreamWriter;
 use moruna_kernel::arrow::record_batch::RecordBatch;
+use moruna_package::Inputs;
 use moruna_runtime::check::Verdict;
 use moruna_runtime::check::package::check_package;
 use moruna_runtime::packaged::{self, PackageHost};
@@ -38,7 +39,14 @@ fn pk_t13_check_through_the_runtime() {
     let package = package_at(&dir, &component(&m.to_json(), IDENTITY, &[], "", ""), &m);
     let path = package.path.clone();
     let profiles = dir.join("profiles");
-    let report = check_package(&path, 7, Some(profiles.clone()), &PackageHost::default()).unwrap();
+    let report = check_package(
+        &path,
+        7,
+        Some(profiles.clone()),
+        &PackageHost::default(),
+        Inputs::default(),
+    )
+    .unwrap();
     assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
     assert_eq!(report.kind, "wasm");
     let file = std::fs::read(&path).unwrap();
@@ -76,7 +84,14 @@ fn pk_t13_check_through_the_runtime() {
         &component(&m2.to_json(), &constant(ipc.len()), &ipc, "", ""),
         &m2,
     );
-    let report = check_package(&wrong.path, 0, None, &PackageHost::default()).unwrap();
+    let report = check_package(
+        &wrong.path,
+        0,
+        None,
+        &PackageHost::default(),
+        Inputs::default(),
+    )
+    .unwrap();
     assert_eq!(report.verdict, Verdict::Refused);
     let columns: Vec<&str> = report.refusals().iter().map(|(_, d)| d.column()).collect();
     assert!(
@@ -92,13 +107,20 @@ fn pk_t2_the_pin_holds_or_the_package_is_refused() {
     let m = manifest("echo", false, true);
     let package = package_at(&dir, &component(&m.to_json(), IDENTITY, &[], "", ""), &m);
     let pin = package.fingerprint_string();
-    let opened = packaged::open(&package.path, Some(&pin), &PackageHost::default()).unwrap();
+    let opened = packaged::open(
+        &package.path,
+        Some(&pin),
+        &PackageHost::default(),
+        Inputs::default(),
+    )
+    .unwrap();
     assert_eq!(opened.kind(), "wasm");
     assert_eq!(opened.kernel().fingerprint(), package.kernel_fingerprint());
     let e = packaged::open(
         &package.path,
         Some(&format!("sha256:{}", "0".repeat(64))),
         &PackageHost::default(),
+        Inputs::default(),
     )
     .err()
     .expect("a mismatched pin is refused");
@@ -113,7 +135,13 @@ fn pk_t15_aot_then_no_compile() {
     let package = package_at(&dir, &component(&m.to_json(), IDENTITY, &[], "", ""), &m);
     let written = moruna_wasm::aot(&package).unwrap();
     assert_eq!(written, dir.join("echo.cwasm"));
-    let opened = packaged::open(&package.path, None, &PackageHost::default()).unwrap();
+    let opened = packaged::open(
+        &package.path,
+        None,
+        &PackageHost::default(),
+        Inputs::default(),
+    )
+    .unwrap();
     assert!(opened.notes().is_empty(), "{:?}", opened.notes());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -301,7 +329,7 @@ fn pk_t14_check_a_pex() {
             .ok()
             .map(PathBuf::from),
     };
-    let report = check_package(&path, 0, None, &host).unwrap();
+    let report = check_package(&path, 0, None, &host, Inputs::default()).unwrap();
     assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
     assert_eq!(report.kind, "pex");
     let json = report.to_json();
@@ -313,4 +341,56 @@ fn pk_t14_check_a_pex() {
         report.fingerprint,
         format!("sha256:{}", sha256_hex(&std::fs::read(&path).unwrap()))
     );
+}
+
+/// PK-T12 and PK-T17 (16 d.4): `args` only for a package built by them, `assets` a directory;
+/// both accepted where they belong.
+#[test]
+fn pk_t17_package_entry_args_and_assets() {
+    let scratch = Scratch::new("pk_t17");
+    let plain = manifest("plain", false, true);
+    let plain_pkg = package_at(
+        scratch.path(),
+        &component(&plain.to_json(), IDENTITY, &[], "", ""),
+        &plain,
+    );
+    let am = moruna_wasm::testing::args_manifest("configured");
+    let args_pkg = package_at(
+        scratch.path(),
+        &moruna_wasm::testing::configure_component(&am.to_json()),
+        &am,
+    );
+    let try_build = |package: &moruna_package::Package, edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut doc: serde_json::Value = serde_json::to_value(package_document(
+            scratch.path(),
+            10,
+            &package.path.display().to_string(),
+            &package.fingerprint_string(),
+        ))
+        .unwrap();
+        edit(&mut doc["kernels"][0]);
+        let job = JobSpec::from_value(doc).unwrap();
+        build(
+            &job,
+            &NoKernels,
+            BuildOptions {
+                strict: true,
+                env: &no_env,
+                notes: Vec::new(),
+                packages: PackageHost::default(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+    let e = try_build(&plain_pkg, &|k| k["args"] = json!({"x": 1})).unwrap_err();
+    assert!(e.contains("kernels[0].args"), "{e}");
+    let e = try_build(&plain_pkg, &|k| k["assets"] = json!("/nowhere/at/all")).unwrap_err();
+    assert!(e.contains("kernels[0].assets"), "{e}");
+    let assets = scratch.path().display().to_string();
+    try_build(&plain_pkg, &|k| k["assets"] = json!(assets)).unwrap();
+    try_build(&args_pkg, &|k| k["args"] = json!({"x": 1})).unwrap();
+    try_build(&args_pkg, &|_| {}).unwrap();
+    let e = try_build(&args_pkg, &|k| k["args"] = json!([1])).unwrap_err();
+    assert!(e.contains("kernels[0].args"), "{e}");
 }

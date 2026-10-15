@@ -18,7 +18,7 @@ use moruna_kernel::{
     MorunaError, OutsideMemory, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, Sampler,
     SourceSchema, TierPref, set_kernel_alloc,
 };
-use moruna_package::{Format, Package, Tree};
+use moruna_package::{Format, Inputs, Package, Tree};
 
 use crate::cgroup::StageCgroup;
 use crate::mapping::{Mapping, PAGE, field};
@@ -100,6 +100,7 @@ pub struct SandboxKernel {
     notes: Vec<String>,
     binding: Mutex<Option<Binding>>,
     memory: Arc<StageMemory>,
+    inputs: Inputs,
 }
 
 impl std::fmt::Debug for SandboxKernel {
@@ -114,7 +115,8 @@ impl std::fmt::Debug for SandboxKernel {
 impl SandboxKernel {
     /// The package's tree, the template for `host.python`, and the target this host offers the
     /// package (16 f.6, f.7; 17 f.9).
-    pub fn new(package: Arc<Package>, host: SandboxHost) -> Result<SandboxKernel> {
+    pub fn new(package: Arc<Package>, host: SandboxHost, inputs: Inputs) -> Result<SandboxKernel> {
+        inputs.check(&package.manifest).map_err(MorunaError::from)?;
         if package.format != Format::Pex {
             return Err(config(format!(
                 "{}: only a .pex runs in the sandbox",
@@ -156,6 +158,7 @@ impl SandboxKernel {
             notes,
             binding: Mutex::new(None),
             memory: Arc::new(StageMemory::default()),
+            inputs,
         })
     }
 
@@ -267,6 +270,13 @@ impl SandboxKernel {
             root: root.display().to_string(),
             mapping_bytes: mapping.len() as u64,
             libraries: self.template.hello.libraries.clone(),
+            args: self.package.manifest.hints().args.then(|| {
+                self.inputs
+                    .args
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}))
+            }),
+            assets: self.inputs.assets.as_ref().map(|a| a.display().to_string()),
         };
         let pid = self
             .template

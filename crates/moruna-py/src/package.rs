@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use moruna_kernel::{Allocator, InitCtx, KernelState, Payload, Tier};
-use moruna_package::{Format, Manifest, Package};
+use moruna_package::{Format, Inputs, Manifest, Package};
 use moruna_runtime::check::package::check_package as check_through_runtime;
 use moruna_runtime::packaged::{self, PackageHost, Packaged};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyAny, PyModule};
 use pyo3_arrow::PyRecordBatch;
 
 /// The arena `moruna.load` lands a kernel's outputs in (16 i).
@@ -30,6 +30,14 @@ pub fn manifest_json(text: &str) -> PyResult<String> {
     Ok(manifest.to_json())
 }
 
+/// `_core.package_manifest(path)`: a package's manifest (16 e.1), read as a loader reads it.
+#[pyfunction]
+pub fn package_manifest(path: &str) -> PyResult<String> {
+    let package =
+        Package::open(Path::new(path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(package.manifest.to_json())
+}
+
 /// `_core.package_wasm(module, manifest, out)` (16 f.5): the component at `module` verified
 /// against the world and against `manifest`, written to `out` with the manifest embedded.
 #[pyfunction]
@@ -45,6 +53,21 @@ pub fn package_wasm(py: Python<'_>, module: &str, manifest: &str, out: &str) -> 
     Ok(())
 }
 
+/// The inputs of 16 b from their spellings: the arguments as JSON text, the assets as a path.
+fn inputs(args: Option<&str>, assets: Option<String>) -> PyResult<Inputs> {
+    let args = match args {
+        Some(text) => Some(
+            serde_json::from_str::<serde_json::Value>(text)
+                .map_err(|e| PyValueError::new_err(format!("args: not JSON: {e}")))?,
+        ),
+        None => None,
+    };
+    Ok(Inputs {
+        args,
+        assets: assets.map(PathBuf::from),
+    })
+}
+
 fn host(python: Option<String>, cgroup: Option<String>) -> PackageHost {
     PackageHost {
         sandbox_python: python.map(PathBuf::from),
@@ -55,7 +78,8 @@ fn host(python: Option<String>, cgroup: Option<String>) -> PackageHost {
 /// `_core.check_package(path, *, seed, profiles_dir, sandbox_python, sandbox_cgroup)`: the
 /// harness of MH 4.9 through the package's runtime (16 f.9); the JSON report plus `summary`.
 #[pyfunction]
-#[pyo3(signature = (path, *, seed = 0, profiles_dir = None, sandbox_python = None, sandbox_cgroup = None))]
+#[pyo3(signature = (path, *, seed = 0, profiles_dir = None, sandbox_python = None, sandbox_cgroup = None, args = None, assets = None))]
+#[allow(clippy::too_many_arguments)]
 pub fn check_package(
     py: Python<'_>,
     path: &str,
@@ -63,12 +87,15 @@ pub fn check_package(
     profiles_dir: Option<String>,
     sandbox_python: Option<String>,
     sandbox_cgroup: Option<String>,
+    args: Option<String>,
+    assets: Option<String>,
 ) -> PyResult<String> {
     let host = host(sandbox_python, sandbox_cgroup);
+    let inputs = inputs(args.as_deref(), assets)?;
     let path = PathBuf::from(path);
     let profiles = profiles_dir.map(PathBuf::from);
     let report = py
-        .detach(move || check_through_runtime(&path, seed, profiles, &host))
+        .detach(move || check_through_runtime(&path, seed, profiles, &host, inputs))
         .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
     let mut json = report.to_json();
     if let serde_json::Value::Object(map) = &mut json {
@@ -108,6 +135,8 @@ pub struct PyPackageKernel {
     pub(crate) fingerprint: String,
     /// What a `.pex` needs, for the run this kernel is given to.
     pub(crate) host: PackageHost,
+    /// Its arguments and assets, for the run this kernel is given to (16 b).
+    pub(crate) inputs: Inputs,
     format: &'static str,
     manifest: String,
     packaged: Packaged,
@@ -183,13 +212,24 @@ impl PyPackageKernel {
 
 /// `_core.load(path, *, python, cgroup)` (16 d.3, f.11).
 #[pyfunction]
-#[pyo3(signature = (path, *, python = None, cgroup = None))]
+#[pyo3(signature = (path, *, python = None, cgroup = None, args = None, assets = None))]
 pub fn load(
     py: Python<'_>,
     path: &str,
     python: Option<String>,
     cgroup: Option<String>,
+    args: Option<&Bound<'_, PyAny>>,
+    assets: Option<String>,
 ) -> PyResult<PyPackageKernel> {
+    let args_text: Option<String> = match args {
+        Some(dict) => Some(
+            py.import("json")?
+                .call_method1("dumps", (dict,))?
+                .extract()?,
+        ),
+        None => None,
+    };
+    let inputs = inputs(args_text.as_deref(), assets)?;
     let format =
         Format::of_path(Path::new(path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let mut host = PackageHost {
@@ -219,9 +259,10 @@ pub fn load(
     }
     let path_buf = PathBuf::from(path);
     let opened_host = host.clone();
+    let opened_inputs = inputs.clone();
     let (packaged, alloc, state) = py
         .detach(move || -> moruna_kernel::Result<_> {
-            let packaged = packaged::open(&path_buf, None, &opened_host)?;
+            let packaged = packaged::open(&path_buf, None, &opened_host, opened_inputs)?;
             packaged.bind_here()?;
             let arena = moruna_arena_for_load()?;
             let state = packaged.kernel().init(&InitCtx {
@@ -239,6 +280,7 @@ pub fn load(
         format: package.format.as_str(),
         manifest: package.manifest.to_json(),
         host,
+        inputs,
         packaged,
         state: Mutex::new(state),
         alloc,
@@ -257,6 +299,7 @@ fn moruna_arena_for_load() -> moruna_kernel::Result<Arc<dyn Allocator>> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("KERNEL_ABI", moruna_kernel::declare::ABI_VERSION)?;
     m.add_function(wrap_pyfunction!(manifest_json, m)?)?;
+    m.add_function(wrap_pyfunction!(package_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(package_wasm, m)?)?;
     m.add_function(wrap_pyfunction!(check_package, m)?)?;
     m.add_function(wrap_pyfunction!(aot, m)?)?;

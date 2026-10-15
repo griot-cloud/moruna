@@ -18,6 +18,7 @@ use serde_json::json;
 
 use super::*;
 use crate::testing::*;
+use moruna_package::Inputs;
 
 static SCRATCH: AtomicU64 = AtomicU64::new(0);
 
@@ -39,7 +40,7 @@ fn kernel_of(body: &str, m: &Manifest) -> (WasmKernel, PathBuf) {
     } else {
         component(&m.to_json(), body, &[], "", "")
     };
-    let kernel = WasmKernel::new(package_at(&dir, &bytes, m)).unwrap();
+    let kernel = WasmKernel::new(package_at(&dir, &bytes, m), Inputs::default()).unwrap();
     (kernel, dir)
 }
 
@@ -170,7 +171,7 @@ fn sb_t1_output_must_be_one_batch() {
     let dir = scratch();
     // Not an IPC stream.
     let bytes = component(&m.to_json(), &constant(4), b"junk", "", "");
-    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m)).unwrap();
+    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m), Inputs::default()).unwrap();
     let mut state = state_of(&kernel);
     let e = kernel
         .apply(
@@ -194,7 +195,7 @@ fn sb_t1_output_must_be_one_batch() {
     };
     let m2 = manifest("empty", false, true);
     let bytes = component(&m2.to_json(), &constant(empty.len()), &empty, "", "");
-    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m2)).unwrap();
+    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m2), Inputs::default()).unwrap();
     let mut state = state_of(&kernel);
     let e = kernel
         .apply(
@@ -211,16 +212,16 @@ fn sb_t2_import_refused() {
     let engine = engine().unwrap();
     let importing = wat::parse_str(r#"(component (import "host-fn" (func)))"#).unwrap();
     let c = Component::new(engine, &importing).unwrap();
-    let e = verify(&c, false).unwrap_err();
+    let e = verify(&c, false, false).unwrap_err();
     assert!(e.to_string().contains("imports `host-fn`"), "{e}");
 
     let m = manifest("echo", false, true);
     let ok = component(&m.to_json(), IDENTITY, &[], "", "");
     let c = Component::new(engine, &ok).unwrap();
-    verify(&c, false).unwrap();
+    verify(&c, false, false).unwrap();
     // Stateful in the manifest and no open or close.
     assert!(
-        verify(&c, true)
+        verify(&c, true, false)
             .unwrap_err()
             .to_string()
             .contains("neither `open` nor `close`")
@@ -229,12 +230,12 @@ fn sb_t2_import_refused() {
     let both = component(&m.to_json(), IDENTITY, &[], STATE_FUNCS, STATE_LIFTS);
     let c = Component::new(engine, &both).unwrap();
     assert!(
-        verify(&c, false)
+        verify(&c, false, false)
             .unwrap_err()
             .to_string()
             .contains("does not say stateful")
     );
-    verify(&c, true).unwrap();
+    verify(&c, true, false).unwrap();
     // open without close, close without open.
     let open_only = component(
         &m.to_json(),
@@ -246,7 +247,7 @@ fn sb_t2_import_refused() {
     );
     let c = Component::new(engine, &open_only).unwrap();
     assert!(
-        verify(&c, true)
+        verify(&c, true, false)
             .unwrap_err()
             .to_string()
             .contains("`open` without `close`")
@@ -261,7 +262,7 @@ fn sb_t2_import_refused() {
     );
     let c = Component::new(engine, &close_only).unwrap();
     assert!(
-        verify(&c, true)
+        verify(&c, true, false)
             .unwrap_err()
             .to_string()
             .contains("`close` without `open`")
@@ -277,7 +278,7 @@ fn sb_t2_import_refused() {
     );
     let c = Component::new(engine, &extra).unwrap();
     assert!(
-        verify(&c, false)
+        verify(&c, false, false)
             .unwrap_err()
             .to_string()
             .contains("exports `extra`")
@@ -291,12 +292,12 @@ fn sb_t2_import_refused() {
     )
     .unwrap();
     let c = Component::new(engine, &wrong).unwrap();
-    let said = verify(&c, false).unwrap_err().to_string();
+    let said = verify(&c, false, false).unwrap_err().to_string();
     assert!(said.contains("the world's is"), "{said}");
     let missing = wat::parse_str("(component)").unwrap();
     let c = Component::new(engine, &missing).unwrap();
     assert!(
-        verify(&c, false)
+        verify(&c, false, false)
             .unwrap_err()
             .to_string()
             .contains("does not export `declare`")
@@ -306,7 +307,7 @@ fn sb_t2_import_refused() {
     if let Ok(bytes) = not_func {
         let c = Component::new(engine, &bytes).unwrap();
         assert!(
-            verify(&c, false)
+            verify(&c, false, false)
                 .unwrap_err()
                 .to_string()
                 .contains("not a function")
@@ -323,7 +324,7 @@ fn sb_t2_declare_must_agree() {
     let embedded = moruna_package::embed_manifest(&bytes, &m).unwrap();
     std::fs::write(dir.join("echo.wasm"), embedded).unwrap();
     let opened = Arc::new(Package::open(&dir.join("echo.wasm")).unwrap());
-    let e = WasmKernel::new(opened).unwrap_err();
+    let e = WasmKernel::new(opened, Inputs::default()).unwrap_err();
     assert!(e.to_string().contains("package: name:"), "{e}");
     // package(): the same check, and the embedded result.
     assert!(
@@ -497,7 +498,7 @@ fn sb_t7_cwasm_reused() {
     assert_eq!(written, dir.join("echo.cwasm"));
     let head = std::fs::read(&written).unwrap();
     assert_eq!(&head[..16], &cwasm::MAGIC);
-    let kernel = WasmKernel::new(package.clone()).unwrap();
+    let kernel = WasmKernel::new(package.clone(), Inputs::default()).unwrap();
     assert!(
         kernel.notes().is_empty(),
         "the .cwasm was used: {:?}",
@@ -517,7 +518,7 @@ fn sb_t7_cwasm_reused() {
     let other_dir = scratch();
     let other_package = package_at(&other_dir, &other_bytes, &other);
     std::fs::copy(&written, other_dir.join("echo.cwasm")).unwrap();
-    let kernel = WasmKernel::new(other_package.clone()).unwrap();
+    let kernel = WasmKernel::new(other_package.clone(), Inputs::default()).unwrap();
     assert!(
         kernel.notes()[0].contains("it was compiled from"),
         "{:?}",
@@ -526,12 +527,20 @@ fn sb_t7_cwasm_reused() {
     // Not a .cwasm, a short header, another Moruna.
     std::fs::write(other_dir.join("echo.cwasm"), b"junk").unwrap();
     assert!(
-        WasmKernel::new(other_package.clone()).unwrap().notes()[0].contains("not a Moruna .cwasm")
+        WasmKernel::new(other_package.clone(), Inputs::default())
+            .unwrap()
+            .notes()[0]
+            .contains("not a Moruna .cwasm")
     );
     let mut cut = cwasm::MAGIC.to_vec();
     cut.extend_from_slice(&1000u32.to_le_bytes());
     std::fs::write(other_dir.join("echo.cwasm"), &cut).unwrap();
-    assert!(WasmKernel::new(other_package.clone()).unwrap().notes()[0].contains("cut short"));
+    assert!(
+        WasmKernel::new(other_package.clone(), Inputs::default())
+            .unwrap()
+            .notes()[0]
+            .contains("cut short")
+    );
     let mut aged = cwasm::MAGIC.to_vec();
     let h =
         json!({"fingerprint": other_package.fingerprint_string(), "moruna": "0.0.0"}).to_string();
@@ -539,7 +548,10 @@ fn sb_t7_cwasm_reused() {
     aged.extend_from_slice(h.as_bytes());
     std::fs::write(other_dir.join("echo.cwasm"), &aged).unwrap();
     assert!(
-        WasmKernel::new(other_package.clone()).unwrap().notes()[0].contains("compiled by Moruna")
+        WasmKernel::new(other_package.clone(), Inputs::default())
+            .unwrap()
+            .notes()[0]
+            .contains("compiled by Moruna")
     );
     let mut broken = cwasm::MAGIC.to_vec();
     let h = json!({"fingerprint": other_package.fingerprint_string(), "moruna": moruna_package::MORUNA_VERSION}).to_string();
@@ -548,13 +560,21 @@ fn sb_t7_cwasm_reused() {
     broken.extend_from_slice(b"not wasmtime's");
     std::fs::write(other_dir.join("echo.cwasm"), &broken).unwrap();
     assert!(
-        WasmKernel::new(other_package.clone()).unwrap().notes()[0].contains("wasmtime refused it")
+        WasmKernel::new(other_package.clone(), Inputs::default())
+            .unwrap()
+            .notes()[0]
+            .contains("wasmtime refused it")
     );
     let mut bad_json = cwasm::MAGIC.to_vec();
     bad_json.extend_from_slice(&2u32.to_le_bytes());
     bad_json.extend_from_slice(b"{]");
     std::fs::write(other_dir.join("echo.cwasm"), &bad_json).unwrap();
-    assert!(WasmKernel::new(other_package).unwrap().notes()[0].contains("not JSON"));
+    assert!(
+        WasmKernel::new(other_package, Inputs::default())
+            .unwrap()
+            .notes()[0]
+            .contains("not JSON")
+    );
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(other_dir);
 }
@@ -590,7 +610,7 @@ fn sb_t3_a_failed_growth_gives_its_admission_back() {
         "(memory (export \"memory\") 2 20)",
     );
     let bytes = wat::parse_str(text).unwrap();
-    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m)).unwrap();
+    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m), Inputs::default()).unwrap();
     let g = gate(0, 1 << 30);
     kernel.bind_gate(g.clone());
     let mut state = state_of(&kernel);
@@ -627,7 +647,187 @@ fn sb_t7_aot_needs_the_place() {
         "{e}"
     );
     // A .cwasm that is a directory cannot be read either, and the kernel compiles.
-    let kernel = WasmKernel::new(package).unwrap();
+    let kernel = WasmKernel::new(package, Inputs::default()).unwrap();
     assert!(kernel.notes()[0].contains("compiled"));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// PK-T17 (a .wasm): the document's arguments reach `configure`, once, before any batch; a kernel
+/// not built by arguments refuses them; one that is gets `{}` when none are given.
+#[test]
+fn pk_t17_configure_gets_the_arguments() {
+    let dir = scratch();
+    let m = args_manifest("configured");
+    let package = package_at(&dir, &configure_component(&m.to_json()), &m);
+    let inputs = Inputs {
+        args: Some(json!({"model": "churn", "threshold": 0.5})),
+        assets: None,
+    };
+    let kernel = WasmKernel::new(package.clone(), inputs).unwrap();
+    let mut state = state_of(&kernel);
+    let e = kernel
+        .apply(
+            state.as_mut(),
+            Payload::Table(batch(), moruna_kernel::Tier::Host),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, MorunaError::Kernel { msg, .. } if msg == r#"{"model":"churn","threshold":0.5}"#),
+        "{e}"
+    );
+    let kernel = WasmKernel::new(package, Inputs::default()).unwrap();
+    let mut state = state_of(&kernel);
+    let e = kernel
+        .apply(
+            state.as_mut(),
+            Payload::Table(batch(), moruna_kernel::Tier::Host),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, MorunaError::Kernel { msg, .. } if msg == "{}"),
+        "{e}"
+    );
+    // Arguments for a kernel that is not built by them.
+    let plain = manifest("plain", false, true);
+    let package = package_at(
+        &dir,
+        &component(&plain.to_json(), IDENTITY, &[], "", ""),
+        &plain,
+    );
+    let e = WasmKernel::new(
+        package,
+        Inputs {
+            args: Some(json!({})),
+            assets: None,
+        },
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("args"), "{e}");
+    // `configure` without the hint, and the hint without `configure`.
+    let engine = engine().unwrap();
+    let c = Component::new(engine, configure_component(&plain.to_json())).unwrap();
+    assert!(
+        verify(&c, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("does not say args")
+    );
+    let c = Component::new(engine, component(&plain.to_json(), IDENTITY, &[], "", "")).unwrap();
+    assert!(
+        verify(&c, false, true)
+            .unwrap_err()
+            .to_string()
+            .contains("does not export `configure`")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// PK-T17 (a .wasm): `read-asset` reads a file of the assets directory, and nothing outside it.
+#[test]
+fn pk_t17_read_asset() {
+    let dir = scratch();
+    let assets = dir.join("assets");
+    std::fs::create_dir_all(assets.join("weights")).unwrap();
+    // The asset is the IPC stream of a batch, so the kernel's output is the asset itself.
+    let mut ipc = Vec::new();
+    let mut w =
+        moruna_kernel::arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &batch().schema())
+            .unwrap();
+    w.write(&batch()).unwrap();
+    w.finish().unwrap();
+    drop(w);
+    std::fs::write(assets.join("weights/w.arrow"), &ipc).unwrap();
+    std::fs::write(dir.join("secret"), b"no").unwrap();
+    let m = manifest("reads", false, true);
+    let package = package_at(&dir, &asset_component(&m.to_json(), "weights/w.arrow"), &m);
+    let inputs = Inputs {
+        args: None,
+        assets: Some(assets.clone()),
+    };
+    let kernel = WasmKernel::new(package.clone(), inputs.clone()).unwrap();
+    let mut state = state_of(&kernel);
+    let out = kernel
+        .apply(
+            state.as_mut(),
+            Payload::Table(batch(), moruna_kernel::Tier::Host),
+        )
+        .unwrap();
+    let Payload::Table(out, _) = out else {
+        panic!("a table");
+    };
+    assert_eq!(out, batch());
+    // No assets directory named: the import's error is the kernel's.
+    let kernel = WasmKernel::new(package, Inputs::default()).unwrap();
+    let mut state = state_of(&kernel);
+    let e = kernel
+        .apply(
+            state.as_mut(),
+            Payload::Table(batch(), moruna_kernel::Tier::Host),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("no assets directory"), "{e}");
+    // Names that leave the directory.
+    let limits = limiter::Limits::unbound().with_assets(Some(assets.clone()));
+    assert!(
+        limits
+            .read_asset("../secret")
+            .unwrap_err()
+            .contains("not a path inside")
+    );
+    assert!(
+        limits
+            .read_asset("/etc/hosts")
+            .unwrap_err()
+            .contains("not a path inside")
+    );
+    assert!(limits.read_asset("").is_err());
+    assert!(limits.read_asset("missing").is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("secret"), assets.join("link")).unwrap();
+        assert!(
+            limits
+                .read_asset("link")
+                .unwrap_err()
+                .contains("leaves the assets directory")
+        );
+    }
+    assert_eq!(limits.read_asset("weights/w.arrow").unwrap(), ipc);
+    let missing = Inputs {
+        args: None,
+        assets: Some(dir.join("none")),
+    };
+    let m2 = manifest("reads2", false, true);
+    let package = package_at(&dir, &asset_component(&m2.to_json(), "x"), &m2);
+    assert!(
+        WasmKernel::new(package, missing)
+            .unwrap_err()
+            .to_string()
+            .contains("assets")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_import_other_than_read_asset_is_refused() {
+    let engine = engine().unwrap();
+    let c = Component::new(
+        engine,
+        wat::parse_str(r#"(component (import "read-asset" (func (param "name" string))))"#)
+            .unwrap(),
+    )
+    .unwrap();
+    let said = verify(&c, false, false).unwrap_err().to_string();
+    assert!(said.contains("imported as"), "{said}");
+    let c = Component::new(
+        engine,
+        wat::parse_str(r#"(component (import "env" (instance)))"#).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        verify(&c, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("imports `env`")
+    );
 }

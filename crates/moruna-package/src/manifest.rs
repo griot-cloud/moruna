@@ -12,8 +12,9 @@ pub const MANIFEST_MAX_BYTES: usize = 1 << 20;
 pub const NAME_MAX_BYTES: usize = 64;
 
 /// The hints a declaration may carry (16 e.2).
-pub const HINTS: [&str; 6] = [
+pub const HINTS: [&str; 7] = [
     "stateful",
+    "args",
     "expected_amplification",
     "preferred_rows",
     "state_bytes",
@@ -73,6 +74,8 @@ pub struct DeclarationDoc {
 pub struct Hints {
     /// Keeps state between calls (`open` and `close` for a `.wasm`).
     pub stateful: bool,
+    /// Built from arguments (16 b): a `.pex` entry is a factory, a `.wasm` exports `configure`.
+    pub args: bool,
     /// Expected peak working set over input bytes.
     pub expected_amplification: Option<f64>,
     /// A row count the kernel would rather receive.
@@ -89,6 +92,7 @@ impl Default for Hints {
     fn default() -> Hints {
         Hints {
             stateful: false,
+            args: false,
             expected_amplification: None,
             preferred_rows: None,
             state_bytes: None,
@@ -123,6 +127,11 @@ impl Hints {
             match key.as_str() {
                 "stateful" => {
                     hints.stateful = v
+                        .as_bool()
+                        .ok_or_else(|| refuse(&field, "must be a bool"))?
+                }
+                "args" => {
+                    hints.args = v
                         .as_bool()
                         .ok_or_else(|| refuse(&field, "must be a bool"))?
                 }
@@ -182,6 +191,9 @@ impl Hints {
         let mut out = Map::new();
         if self.stateful {
             out.insert("stateful".into(), Value::Bool(true));
+        }
+        if self.args {
+            out.insert("args".into(), Value::Bool(true));
         }
         if let Some(a) = self.expected_amplification {
             out.insert("expected_amplification".into(), Value::from(a));

@@ -39,6 +39,9 @@ pub const MORUNA_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const WIT: &str = "package moruna:kernel@0.1.0;
 
 world kernel {
+  /// A file of the assets directory the host named, by its path relative to it; refused when
+  /// there is none, or the path leaves it.
+  import read-asset: func(name: string) -> result<list<u8>, string>;
   /// The package's manifest, moruna.json, as text.
   export declare: func() -> string;
   /// One Arrow record batch as an IPC stream in, one out; an error refuses this batch, named.
@@ -47,6 +50,8 @@ world kernel {
   export open: func(state: list<u8>) -> result<_, string>;
   /// A stateful kernel's state out.
   export close: func() -> list<u8>;
+  /// A kernel built by arguments: the arguments as JSON, once, before anything else.
+  export configure: func(args: string) -> result<_, string>;
 }
 ";
 
@@ -165,6 +170,56 @@ pub fn fingerprint_of(bytes: &[u8]) -> [u8; 32] {
 /// 64 lowercase hex characters.
 pub fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a host gives one packaged stage besides the file (16 b, d.4): its arguments and its
+/// assets directory.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Inputs {
+    /// The arguments, a JSON object; only for a kernel with the hint `args`.
+    pub args: Option<serde_json::Value>,
+    /// A directory the kernel reads, read only.
+    pub assets: Option<PathBuf>,
+}
+
+impl Inputs {
+    /// Check the inputs against the package (16 f.8): arguments only for a kernel built by them,
+    /// and an object; assets an existing directory.
+    pub fn check(&self, manifest: &Manifest) -> Result<(), PackageError> {
+        if let Some(args) = &self.args {
+            if !manifest.hints().args {
+                return Err(PackageError::format(
+                    "args",
+                    format!(
+                        "{} is not built from arguments (its manifest has no hint `args`)",
+                        manifest.name
+                    ),
+                ));
+            }
+            if !args.is_object() {
+                return Err(PackageError::format(
+                    "args",
+                    "the arguments are a JSON object",
+                ));
+            }
+        }
+        if let Some(dir) = &self.assets
+            && !dir.is_dir()
+        {
+            return Err(PackageError::format(
+                "assets",
+                format!("{} is not a directory", dir.display()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The arguments a kernel built by them receives, as JSON: the given object, or `{}`.
+    pub fn args_json(&self) -> String {
+        self.args
+            .as_ref()
+            .map_or_else(|| "{}".to_string(), serde_json::Value::to_string)
+    }
 }
 
 /// A package, read once (16 f.1, PK-I1).

@@ -15,7 +15,7 @@
 
 pub mod cwasm;
 mod ipc;
-mod limiter;
+pub(crate) mod limiter;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -29,7 +29,7 @@ use moruna_kernel::{
     MorunaError, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
     set_kernel_alloc,
 };
-use moruna_package::{Format, Manifest, Package};
+use moruna_package::{Format, Inputs, Manifest, Package};
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, Func, Instance, Linker, Type};
 use wasmtime::{Config, Engine, OptLevel, Store, Trap};
@@ -51,7 +51,10 @@ pub const MEMORIES_MAX: usize = 16;
 pub const WASM32_MAX_BYTES: u64 = 1 << 32;
 
 /// The exports of the world (16 e.5).
-const EXPORTS: [&str; 4] = ["declare", "process", "open", "close"];
+const EXPORTS: [&str; 5] = ["declare", "process", "open", "close", "configure"];
+
+/// The world's one import (16 e.5).
+pub const READ_ASSET: &str = "read-asset";
 
 static ENGINE: OnceLock<std::result::Result<Engine, String>> = OnceLock::new();
 
@@ -140,20 +143,46 @@ fn expected(name: &str) -> &'static str {
         "declare" => "() -> string",
         "process" => "(list<u8>) -> result<list<u8>, string>",
         "open" => "(list<u8>) -> result<_, string>",
+        "configure" => "(string) -> result<_, string>",
+        "read-asset" => "(string) -> result<list<u8>, string>",
         _ => "() -> list<u8>",
     }
 }
 
-/// f.2: no imports; exactly `declare` and `process`, and `open` and `close` when `stateful`;
-/// each with the world's type (16 PK-I4).
-pub fn verify(component: &Component, stateful: bool) -> Result<()> {
+/// f.2: no import but `read-asset`; exactly `declare` and `process`, `open` and `close` when
+/// `stateful`, `configure` when built by `args`; each with the world's type (16 PK-I4).
+pub fn verify(component: &Component, stateful: bool, args: bool) -> Result<()> {
     let engine = engine()?;
     let ty = component.component_type();
-    if let Some((name, _)) = ty.imports(engine).next() {
-        return Err(refused(
-            "wasm",
-            format!("the component imports `{name}`; a moruna:kernel component imports nothing"),
-        ));
+    for (name, item) in ty.imports(engine) {
+        let ComponentItem::ComponentFunc(f) = item.ty else {
+            return Err(refused(
+                "wasm",
+                format!(
+                    "the component imports `{name}`; a moruna:kernel component imports \
+                     `{READ_ASSET}` and nothing else"
+                ),
+            ));
+        };
+        if name != READ_ASSET {
+            return Err(refused(
+                "wasm",
+                format!(
+                    "the component imports `{name}`; a moruna:kernel component imports \
+                     `{READ_ASSET}` and nothing else"
+                ),
+            ));
+        }
+        let found = signature(&f);
+        if found != expected(READ_ASSET) {
+            return Err(refused(
+                "wasm",
+                format!(
+                    "`{name}` is imported as `{found}` and the world's is `{}`",
+                    expected(READ_ASSET)
+                ),
+            ));
+        }
     }
     let mut seen = Vec::new();
     for (name, item) in ty.exports(engine) {
@@ -162,7 +191,7 @@ pub fn verify(component: &Component, stateful: bool) -> Result<()> {
                 "wasm",
                 format!(
                     "the component exports `{name}`, which is not in the moruna:kernel world \
-                     (declare, process, open, close)"
+                     (declare, process, open, close, configure)"
                 ),
             ));
         }
@@ -192,6 +221,17 @@ pub fn verify(component: &Component, stateful: bool) -> Result<()> {
             ));
         }
     }
+    let configure = seen.iter().any(|s| s == "configure");
+    if configure != args {
+        return Err(refused(
+            "wasm",
+            if args {
+                "the manifest says args and the component does not export `configure`"
+            } else {
+                "the component exports `configure` and the manifest does not say args"
+            },
+        ));
+    }
     let open = seen.iter().any(|s| s == "open");
     let close = seen.iter().any(|s| s == "close");
     match (stateful, open, close) {
@@ -215,7 +255,8 @@ pub fn verify(component: &Component, stateful: bool) -> Result<()> {
     }
 }
 
-/// A store for one instance of `component`, with the limiter installed and no imports.
+/// A store for one instance of `component`, with the limiter installed and `read-asset` the
+/// only import defined.
 fn instantiate(component: &Component, limits: Limits) -> Result<(Store<Limits>, Instance)> {
     let engine = engine()?;
     let mut store = Store::new(engine, limits);
@@ -223,7 +264,16 @@ fn instantiate(component: &Component, limits: Limits) -> Result<(Store<Limits>, 
     store
         .set_fuel(FUEL_FLOOR)
         .map_err(|e| kernel_error(format!("wasm: setting fuel: {e}")))?;
-    let linker: Linker<Limits> = Linker::new(engine);
+    let mut linker: Linker<Limits> = Linker::new(engine);
+    linker
+        .root()
+        .func_wrap(
+            READ_ASSET,
+            |store: wasmtime::StoreContextMut<'_, Limits>, (name,): (String,)| {
+                Ok((store.data().read_asset(&name),))
+            },
+        )
+        .map_err(|e| kernel_error(format!("wasm: defining `{READ_ASSET}`: {e}")))?;
     let instance = linker
         .instantiate(&mut store, component)
         .map_err(|e| kernel_error(format!("wasm: instantiating the component: {e}")))?;
@@ -270,7 +320,7 @@ pub fn package(module: &[u8], manifest: &Manifest) -> Result<Vec<u8>> {
     let engine = engine()?;
     let component = Component::new(engine, module)
         .map_err(|e| refused("wasm", format!("not a valid component: {e}")))?;
-    verify(&component, manifest.hints().stateful)?;
+    verify(&component, manifest.hints().stateful, manifest.hints().args)?;
     agrees(&component, manifest)?;
     moruna_package::embed_manifest(module, manifest).map_err(MorunaError::from)
 }
@@ -293,6 +343,7 @@ pub struct WasmKernel {
     declared: Declared,
     notes: Vec<String>,
     gate: OnceLock<Arc<MemoryGate>>,
+    inputs: Inputs,
 }
 
 impl std::fmt::Debug for WasmKernel {
@@ -307,11 +358,12 @@ impl std::fmt::Debug for WasmKernel {
 impl WasmKernel {
     /// The package's component, compiled or read from its `.cwasm`, verified against the world
     /// and against its embedded manifest (f.2, f.3).
-    pub fn new(package: Arc<Package>) -> Result<WasmKernel> {
-        let Compiled { component, notes } = compile(&package)?;
+    pub fn new(package: Arc<Package>, inputs: Inputs) -> Result<WasmKernel> {
         let manifest = &package.manifest;
+        inputs.check(manifest).map_err(MorunaError::from)?;
+        let Compiled { component, notes } = compile(&package)?;
         let stateful = manifest.hints().stateful;
-        verify(&component, stateful)?;
+        verify(&component, stateful, manifest.hints().args)?;
         agrees(&component, manifest)?;
         let declared = manifest.declared().map_err(MorunaError::from)?;
         let h = manifest.hints();
@@ -335,6 +387,7 @@ impl WasmKernel {
             declared,
             notes,
             gate: OnceLock::new(),
+            inputs,
         })
     }
 
@@ -359,6 +412,7 @@ impl WasmKernel {
             self.gate.get().cloned(),
             self.package.manifest.hints().memory_guard,
         )
+        .with_assets(self.inputs.assets.clone())
     }
 
     fn new_state(&self, alloc: Arc<dyn Allocator>, state: Option<&[u8]>) -> Result<WasmState> {
@@ -372,6 +426,9 @@ impl WasmKernel {
             name: self.package.manifest.name.clone(),
             stateful: self.stateful,
         };
+        if self.package.manifest.hints().args {
+            st.configure(&self.inputs.args_json())?;
+        }
         if self.stateful {
             st.open(state.unwrap_or(&[]))?;
         }
@@ -470,6 +527,22 @@ impl WasmState {
         match called? {
             (Ok(()),) => Ok(()),
             (Err(said),) => Err(kernel_error(format!("open: {said}"))),
+        }
+    }
+
+    /// 17 f.11: the arguments, once, before anything else.
+    fn configure(&mut self, args: &str) -> Result<()> {
+        self.begin(args.len() as u64)?;
+        let f = func(&self.instance, &mut self.store, "configure")?
+            .typed::<(&str,), (std::result::Result<(), String>,)>(&self.store)
+            .map_err(|e| kernel_error(format!("wasm: `configure`: {e}")))?;
+        let called = f
+            .call(&mut self.store, (args,))
+            .map_err(|e| self.failure(e));
+        self.end();
+        match called? {
+            (Ok(()),) => Ok(()),
+            (Err(said),) => Err(kernel_error(format!("configure: {said}"))),
         }
     }
 

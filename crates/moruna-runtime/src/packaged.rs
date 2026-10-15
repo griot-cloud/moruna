@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use moruna_kernel::{Kernel, MorunaError, OutsideMemory, Result, Sampler};
-use moruna_package::{Format, Package};
+use moruna_package::{Format, Inputs, Package};
 use moruna_wasm::WasmKernel;
 
 /// What a host gives a `.pex` (17 e.6): the standard-build interpreter and the sandbox cgroup.
@@ -110,19 +110,24 @@ impl Packaged {
 
 /// Open the package at `path`, check `pin` against it when one is given (PK-I2), and make its
 /// kernel (16 f.8).
-pub fn open(path: &Path, pin: Option<&str>, host: &PackageHost) -> Result<Packaged> {
+pub fn open(
+    path: &Path,
+    pin: Option<&str>,
+    host: &PackageHost,
+    inputs: Inputs,
+) -> Result<Packaged> {
     let package = Arc::new(Package::open(path).map_err(MorunaError::from)?);
     if let Some(pin) = pin {
         package.check_pin(pin).map_err(MorunaError::from)?;
     }
     match package.format {
-        Format::Wasm => Ok(Packaged::Wasm(Arc::new(WasmKernel::new(package)?))),
-        Format::Pex => pex(package, host),
+        Format::Wasm => Ok(Packaged::Wasm(Arc::new(WasmKernel::new(package, inputs)?))),
+        Format::Pex => pex(package, host, inputs),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn pex(package: Arc<Package>, host: &PackageHost) -> Result<Packaged> {
+fn pex(package: Arc<Package>, host: &PackageHost, inputs: Inputs) -> Result<Packaged> {
     let missing = |option: &str| MorunaError::Config {
         name: "sandbox",
         msg: format!(
@@ -140,11 +145,12 @@ fn pex(package: Arc<Package>, host: &PackageHost) -> Result<Packaged> {
     Ok(Packaged::Pex(Arc::new(moruna_sandbox::SandboxKernel::new(
         Arc::clone(&package),
         host,
+        inputs,
     )?)))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pex(package: Arc<Package>, _host: &PackageHost) -> Result<Packaged> {
+fn pex(package: Arc<Package>, _host: &PackageHost, _inputs: Inputs) -> Result<Packaged> {
     Err(MorunaError::Config {
         name: "sandbox",
         msg: format!("{}: {}", package.path.display(), moruna_sandbox::NOT_LINUX),

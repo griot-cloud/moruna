@@ -171,6 +171,7 @@ fn pk_t1_manifest_round_trip() {
     );
     for (hint, value) in [
         ("stateful", json!(1)),
+        ("args", json!("yes")),
         ("memory_guard", json!("no")),
         ("expected_amplification", json!(0)),
         ("preferred_rows", json!(0)),
@@ -205,12 +206,12 @@ fn pk_t1_manifest_round_trip() {
     // Every hint, round-tripped.
     let mut v = pex_manifest_value();
     v["declaration"]["hints"] = json!({
-        "stateful": true, "expected_amplification": 1.5, "preferred_rows": 10,
+        "stateful": true, "args": true, "expected_amplification": 1.5, "preferred_rows": 10,
         "state_bytes": 0, "memory_guard": false, "resume": "checkpoint"
     });
     let m = Manifest::from_value(&v).unwrap();
     let h = m.hints();
-    assert!(h.stateful && !h.memory_guard);
+    assert!(h.stateful && h.args && !h.memory_guard);
     assert_eq!(h.expected_amplification, Some(1.5));
     assert_eq!(h.preferred_rows, Some(10));
     assert_eq!(h.state_bytes, Some(0));
@@ -515,4 +516,39 @@ fn pk_t6_platform_compatibility() {
     assert!(manifest::parse_target("cp314-manylinux_02_28_x86_64").is_none());
     assert_eq!(Format::Pex.as_str(), "pex");
     assert!(WIT.contains("export process: func(batch: list<u8>) -> result<list<u8>, string>;"));
+    assert!(WIT.contains("import read-asset: func(name: string) -> result<list<u8>, string>;"));
+}
+
+#[test]
+fn pk_t17_inputs_are_checked_against_the_manifest() {
+    let m = Manifest::from_value(&pex_manifest_value()).unwrap();
+    Inputs::default().check(&m).unwrap();
+    let with_args = Inputs {
+        args: Some(json!({"k": 1})),
+        assets: None,
+    };
+    assert_eq!(field_of(with_args.check(&m).unwrap_err()), "args");
+    let mut v = pex_manifest_value();
+    v["declaration"]["hints"] = json!({"args": true});
+    let m = Manifest::from_value(&v).unwrap();
+    with_args.check(&m).unwrap();
+    assert_eq!(with_args.args_json(), r#"{"k":1}"#);
+    assert_eq!(Inputs::default().args_json(), "{}");
+    let not_object = Inputs {
+        args: Some(json!([1])),
+        assets: None,
+    };
+    assert_eq!(field_of(not_object.check(&m).unwrap_err()), "args");
+    let dir = scratch("t17");
+    let assets = Inputs {
+        args: None,
+        assets: Some(dir.clone()),
+    };
+    assets.check(&m).unwrap();
+    let missing = Inputs {
+        args: None,
+        assets: Some(dir.join("missing")),
+    };
+    assert_eq!(field_of(missing.check(&m).unwrap_err()), "assets");
+    let _ = std::fs::remove_dir_all(&dir);
 }

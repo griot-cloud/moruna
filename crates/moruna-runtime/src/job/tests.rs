@@ -899,13 +899,14 @@ fn pk_t12_package_entry_fields() {
     refused(&|d| d.krate = Some("c".into()), "kernels[0].crate");
     refused(&|d| d.symbol = Some("s".into()), "kernels[0].symbol");
     refused(&|d| d.name = Some("n".into()), "kernels[0].name");
-    refused(&|d| d.args = Some(serde_json::json!({})), "kernels[0].args");
     refused(
         &|d| d.preferred_rows = Some(10),
         "kernels[0].preferred_rows",
     );
     refused(&|d| d.path = None, "kernels[0].path");
     refused(&|d| d.fingerprint = None, "kernels[0].fingerprint");
+    // The document's args reach a package not built by them: refused naming the field (the file
+    // must exist for that, so this one is checked in tests/package.rs, PK-T17).
     // A file that is not there is refused naming it.
     refused(&|_| {}, "/nowhere/k.wasm");
     // The document's spelling round-trips.

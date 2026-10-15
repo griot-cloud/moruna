@@ -37,13 +37,13 @@ It refuses to know: the package format (16), how the run is planned or scheduled
 
 ## c. Invariants
 
-**SB-I1. A wasm kernel reaches nothing but its world.** The linker defines nothing; a component with an import is refused before instantiation (16 PK-I4). The instance's only inputs are the bytes `process` and `open` are given.
+**SB-I1. A wasm kernel reaches nothing but its world.** The linker defines `read-asset` and nothing else; a component with any other import is refused before instantiation (16 PK-I4). The instance's only inputs are the bytes `process`, `open` and `configure` are given and the files of the assets directory `read-asset` reads, by a relative path that cannot leave it (no `..`, no absolute path, no symbolic link out).
 
 **SB-I2. Every growth of a wasm instance's memory is decided by Moruna first.** The resource limiter sees every `memory.grow` and table growth; growth past the stage ceiling, or a growth the run's gate refuses (05 f.9), is refused before the memory exists, counted in the call's `linear.refused`, and a call that then traps ends as `MorunaError::Refused` naming the request (05 AD-I13).
 
 **SB-I3. A wasm call is bounded in CPU.** Each call is given `FUEL_FLOOR + FUEL_PER_INPUT_BYTE × bytes_in` units of fuel; exhaustion ends the call as `MorunaError::Kernel` whose message starts `wasm: fuel exhausted`.
 
-**SB-I4. The child sees only its tree.** After confinement the child's mount namespace holds the tree (read only) at `/pkg`, a private `tmpfs` at `/tmp`, the template interpreter's import roots (read only, at their own paths) and `/dev/null`, `/dev/zero`, `/dev/urandom`; nothing else. Landlock allows read and execute under the tree and the import roots, read and write under `/tmp` and on the three devices, and nothing else. FP 4.
+**SB-I4. The child sees only its tree.** After confinement the child's mount namespace holds the tree (read only) at `/pkg`, the assets directory the host named (read only) at `/assets` when there is one, a private `tmpfs` at `/tmp`, the template interpreter's import roots (read only, at their own paths) and `/dev/null`, `/dev/zero`, `/dev/urandom`; nothing else. Landlock allows read and execute under the tree, the assets and the import roots, read and write under `/tmp` and on the three devices, and nothing else. FP 4.
 
 **SB-I5. The child can open no connection and gain no privilege.** seccomp allows the system calls of e.5 and refuses every other with `EPERM`; `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`, `accept4`, `execve`, `execveat`, `unshare`, `setns`, `mount`, `pivot_root`, `ptrace` and `clone` with any namespace flag are not on it; `kill` and `tgkill` are allowed only towards the child itself. The child has no capability in any set, and `no_new_privs` is set. FP 4.
 
@@ -127,7 +127,7 @@ Engine: component model on, fuel on, cranelift at `speed`, threads off, `memory6
 Each frame is a little-endian `u32` byte length followed by that many bytes of UTF-8 JSON, one object with an `op` field; a frame over `FRAME_MAX_BYTES` is refused.
 
 To the template (its socket; the request carries the child's control end and the memfd as `SCM_RIGHTS`, in that order):
-`{"op":"start","tree":"/abs/tree","target":"cp314-manylinux_2_28_x86_64","entry":"function:shout","manifest":{…16 e.1…},"cgroup":"/sys/fs/cgroup/moruna-sandbox/stage-…","root":"/tmp/moruna-sandbox-…/root","mapping_bytes":N}`.
+`{"op":"start","tree":"/abs/tree","target":"cp314-manylinux_2_28_x86_64","entry":"function:shout","manifest":{…16 e.1…},"cgroup":"/sys/fs/cgroup/moruna-sandbox/stage-…","root":"/tmp/moruna-sandbox-…","mapping_bytes":N,"libraries":{…},"args":{…}|null,"assets":"/disk/1/models/churn"|null}`.
 The request also carries `"libraries"`, the template's own `{name: version}`, for 17 f.6. `{"op":"status","pid":C}` asks how a child ended. From the template: `{"op":"hello","pid":P,"python":"3.14.7","libraries":{"pyarrow":"25.0.1",…},"glibc":[2,41],"machine":"aarch64"}` once (or `refused` naming why it cannot serve), then per `start` `{"op":"started","pid":C}` or `{"op":"refused","reason":"…"}`, and per `status` `{"op":"exited","pid":C,"status":"exit status 3"}` (or `"running"`). The template reaps its children on `start` and `status`.
 
 To the child: `{"op":"call","offset":O,"len":L}`, `{"op":"open","offset":O,"len":L}` (state bytes in the mapping), `{"op":"checkpoint"}`, `{"op":"stop"}`.
@@ -190,6 +190,10 @@ and these with a condition: `clone` when its flags hold no namespace flag (`CLON
 **f.9 The template.** Started with `env_clear()` plus `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `-I -m moruna._sandbox`, its socket at descriptor 3 and its stdout on Moruna's stderr. It imports `pyarrow`, `pyarrow.compute`, `pyarrow.ipc` (required) and `numpy` (when its interpreter has it), and `moruna._core`, checks SB-I10, sends `hello`, and serves requests: for `start`, `os.fork()`; the child closes the template's socket and returns `_core._sandbox_child(...)`'s code through `os._exit`; the template closes its copies of the passed descriptors and answers `started`; for `status`, it reaps the child (waiting up to two seconds) and answers how it ended. End of stream on its socket ends it. One template per sandbox interpreter per Moruna process, restarted when it has died.
 
 **f.10 The guest (MH 4.8).** The image carries, beside the free-threaded interpreter at `/opt/python`, the standard build at `/opt/python-std` with `pyarrow` and the `moruna` wheel for `cp314`; the guest kernel has `CONFIG_NAMESPACES`, `CONFIG_SECCOMP_FILTER`, `CONFIG_SECURITY_LANDLOCK` (and `CONFIG_LSM` naming it), `CONFIG_CGROUPS`, `CONFIG_MEMCG`, `CONFIG_CGROUP_SCHED`, `CONFIG_FAIR_GROUP_SCHED`, `CONFIG_CFS_BANDWIDTH`, `CONFIG_MEMFD_CREATE`; `moruna-init` mounts `cgroup2` at `/sys/fs/cgroup`, enables `+memory +cpu` in the root's `cgroup.subtree_control`, creates `/sys/fs/cgroup/moruna-sandbox` with the same controllers enabled, and starts `moruna serve` with `--sandbox-python /opt/python-std/bin/python3 --sandbox-cgroup /sys/fs/cgroup/moruna-sandbox`.
+
+**f.11 Arguments and assets (16 b).** A `.wasm` with the hint `args` is called `configure(<arguments as JSON>)` on every new instance, before `open`; an error refuses the stage. `read-asset(name)` reads `<assets>/<name>` whole when `name` is relative, has no `..` component and resolves inside the assets directory; anything else is the `Err` naming why. A `.pex` child bind-mounts the assets directory at `/assets` (17 f.5 step 3) and, for a kernel with `args`, calls the entry once with the arguments as a `dict` after import; what it returns is the kernel (a callable, or for a stateful kernel an object with `setup` and `__call__`).
+
+**f.12 Loopback.** Nothing of Moruna's needs a network interface in the guest, loopback included: the control socket is a socket pair and batches cross a memfd. A host may bring `lo` up for its own use; Moruna neither needs nor uses it.
 
 ## g. Concurrency within the component
 

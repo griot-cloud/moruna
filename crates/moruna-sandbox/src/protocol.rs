@@ -100,6 +100,10 @@ pub enum ToTemplate {
         /// The libraries the template imported, which the package may not carry at another
         /// version (17 f.6).
         libraries: std::collections::BTreeMap<String, String>,
+        /// The arguments of a kernel built by them (16 b): the factory's.
+        args: Option<serde_json::Value>,
+        /// The assets directory, mounted read only at `/assets` (17 f.11).
+        assets: Option<String>,
     },
     /// How a child ended (SB-I11).
     Status {
@@ -307,6 +311,8 @@ mod tests {
             root: "/tmp/r".into(),
             mapping_bytes: 1 << 20,
             libraries: [("numpy".to_string(), "2.3.0".to_string())].into(),
+            args: Some(serde_json::json!({"k": 1})),
+            assets: Some("/disk/1/models".into()),
         });
         round(ToTemplate::Status { pid: 4 });
         round(FromTemplate::Exited {

@@ -14,8 +14,9 @@ pub fn check_package(
     seed: u64,
     profiles_dir: Option<PathBuf>,
     host: &PackageHost,
+    inputs: moruna_package::Inputs,
 ) -> Result<CheckReport> {
-    let packaged = packaged::open(path, None, host)?;
+    let packaged = packaged::open(path, None, host, inputs)?;
     packaged.bind_here()?;
     let package = packaged.package();
     let mut opts = CheckOptions::new(package.manifest.name.clone());
@@ -27,5 +28,7 @@ pub fn check_package(
     let notes = packaged.notes();
     let mut report = check(packaged.kernel(), opts)?;
     report.notes.extend(notes);
+    // 16 d.2: the declaration is in the report, so a host never parses the package.
+    report.manifest = serde_json::from_str(&package.manifest.to_json()).ok();
     Ok(report)
 }

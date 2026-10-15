@@ -188,6 +188,8 @@ pub struct CheckReport {
     pub memory_guard: Option<bool>,
     /// Anything else worth saying.
     pub notes: Vec<String>,
+    /// A package's manifest (16 e.1, d.2), when the kernel is a package's.
+    pub manifest: Option<Value>,
 }
 
 impl CheckReport {
@@ -280,6 +282,7 @@ impl CheckReport {
             "memory_guard": self.memory_guard,
             "alloc": self.alloc.as_ref().and_then(|a| serde_json::to_value(a).ok()),
             "notes": self.notes,
+            "manifest": self.manifest,
         })
     }
 
@@ -372,6 +375,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         alloc: None,
         memory_guard,
         notes: Vec::new(),
+        manifest: None,
     };
 
     // 1. Load: the declarations and the hints.

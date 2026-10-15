@@ -455,13 +455,12 @@ fn package_of(
     host: &crate::packaged::PackageHost,
 ) -> Result<crate::packaged::Packaged> {
     let field = |name: &str| format!("kernels[{index}].{name}");
-    let set: [(&str, bool); 6] = [
+    let set: [(&str, bool); 5] = [
         ("module", doc.module.is_some()),
         ("callable", doc.callable.is_some()),
         ("crate", doc.krate.is_some()),
         ("symbol", doc.symbol.is_some()),
         ("name", doc.name.is_some()),
-        ("args", doc.args.is_some()),
     ];
     let hints = doc.hints_set();
     if let Some(name) = set
@@ -473,7 +472,8 @@ fn package_of(
     {
         return Err(SpecError::new(
             field(name),
-            "a package entry has a path and a fingerprint; its hints are its manifest's",
+            "a package entry has a path, a fingerprint, and optionally args and assets; its hints \
+             are its manifest's",
         )
         .into());
     }
@@ -487,10 +487,22 @@ fn package_of(
             "a package entry pins its file's sha256 (moruna check prints it)",
         )
     })?;
-    crate::packaged::open(std::path::Path::new(path), Some(pin), host).map_err(|e| match e {
-        MorunaError::Plan(msg) => SpecError::new(field("fingerprint"), msg).into(),
-        other => other,
-    })
+    let inputs = moruna_package::Inputs {
+        args: doc.args.clone(),
+        assets: doc.assets.as_deref().map(std::path::PathBuf::from),
+    };
+    crate::packaged::open(std::path::Path::new(path), Some(pin), host, inputs).map_err(
+        |e| match e {
+            MorunaError::Plan(msg) => SpecError::new(field("fingerprint"), msg).into(),
+            MorunaError::Config { msg, .. } if msg.starts_with("package: args:") => {
+                SpecError::new(field("args"), msg).into()
+            }
+            MorunaError::Config { msg, .. } if msg.starts_with("package: assets:") => {
+                SpecError::new(field("assets"), msg).into()
+            }
+            other => other,
+        },
+    )
 }
 
 /// The source's builder, the locations it reads for the sink equals source rule, and the memory

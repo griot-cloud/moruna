@@ -176,7 +176,13 @@ pub fn conflicts(deps: &Path, libraries: &BTreeMap<String, String>) -> Result<()
 
 /// Import `entry` from the tree and make the adapter's kernel of it with the manifest's
 /// declaration and hints.
-fn load(py: Python<'_>, deps: &Path, entry: &str, manifest: &Manifest) -> Result<PyKernel, String> {
+fn load(
+    py: Python<'_>,
+    deps: &Path,
+    entry: &str,
+    manifest: &Manifest,
+    args: Option<&serde_json::Value>,
+) -> Result<PyKernel, String> {
     let sys = py.import("sys").map_err(|e| failed("load", e))?;
     let path = sys.getattr("path").map_err(|e| failed("load", e))?;
     for dir in [deps.to_path_buf(), Path::new(TREE).join("src")] {
@@ -205,6 +211,17 @@ fn load(py: Python<'_>, deps: &Path, entry: &str, manifest: &Manifest) -> Result
         ));
     }
     let hints = manifest.hints();
+    // 17 f.11: a kernel built by arguments is made by its entry, called once with them.
+    if hints.args {
+        let json = py.import("json").map_err(|e| failed("load", e))?;
+        let text = args.map_or_else(|| "{}".to_string(), serde_json::Value::to_string);
+        let given = json
+            .call_method1("loads", (text,))
+            .map_err(|e| failed("args", e))?;
+        target = target
+            .call1((given,))
+            .map_err(|e| failed(&format!("{entry}(args)"), e))?;
+    }
     let declare = py
         .import("moruna._declare")
         .map_err(|e| failed("load", e))?;
@@ -257,6 +274,8 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
         root,
         mapping_bytes,
         libraries,
+        args,
+        assets,
     } = start
     else {
         return Err("start: not a start request".into());
@@ -268,6 +287,7 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
         root: PathBuf::from(&root),
         tree: PathBuf::from(&tree),
         roots,
+        assets: assets.map(PathBuf::from),
     })
     .map_err(|e| e.to_string())?;
     let mapping =
@@ -275,7 +295,7 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
     let manifest = Manifest::from_value(&manifest).map_err(|e| failed("manifest", e))?;
     let deps = Path::new(TREE).join("deps").join(&target);
     conflicts(&deps, &libraries)?;
-    let kernel = load(py, &deps, &entry, &manifest)?;
+    let kernel = load(py, &deps, &entry, &manifest, args.as_ref())?;
     let sampler = Arc::new(ChildSampler {
         current,
         mapping: Arc::clone(&mapping),

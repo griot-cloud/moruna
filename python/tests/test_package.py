@@ -74,8 +74,7 @@ def project(where: Path, *, lockfile: str | None, yaml_extra: str = "") -> Path:
         """
     )
     if lockfile is not None:
-        (root / "requirements.lock").write_text(lockfile)
-        yaml += "lockfile: requirements.lock\n"
+        (root / "function.lock").write_text(lockfile)
     (root / "function.yaml").write_text(yaml + yaml_extra)
     return root
 
@@ -142,7 +141,7 @@ def test_pk_t7_package_a_project(scratch: Path, wheels: tuple[Path, str], capsys
     assert "__main__.py" in names
     assert "src/function.py" in names and "src/helper.py" in names
     assert "src/.hidden" not in names and "src/function.yaml" not in names
-    assert "src/requirements.lock" not in names
+    assert "src/function.lock" not in names
     tag = sys.implementation.cache_tag
     assert f"src/__pycache__/function.{tag}.pyc" in names
     for target, arch in ((X86, "x86_64"), (ARM, "aarch64")):
@@ -203,7 +202,7 @@ def test_pk_t9_lockfile_rules(scratch: Path, lockfile: str, said: str, capsys) -
     assert _package.main([str(root), "--platform", f"{HERE}-manylinux_2_28_x86_64"]) == 2
     err = capsys.readouterr().err
     assert said in err
-    assert "requirements.lock:1" in err
+    assert "function.lock:1" in err
 
 
 @pytest.mark.parametrize(
@@ -247,7 +246,7 @@ def test_pk_t9_function_yaml_rules(scratch: Path, capsys) -> None:
 def test_pk_t9_no_lockfile_needs_no_pip(scratch: Path, capsys) -> None:
     root = project(scratch, lockfile=None)
     target = f"{HERE}-manylinux_2_28_x86_64"
-    assert _package.main([str(root), "--platform", target]) == 0
+    assert _package.main([str(root), "--platform", target, "--out", str(root)]) == 0
     with zipfile.ZipFile(root / "shout.pex") as archive:
         names = archive.namelist()
         manifest = json.loads(archive.read("moruna.json"))
@@ -291,9 +290,13 @@ def test_pk_t10_disagreement_refused(scratch: Path, capsys) -> None:
     root = wasm_project(scratch, ECHO_YAML.replace("n: int64", "n: int32"))
     assert _package.main([str(root), "--wasm", component]) == 2
     assert "declaration" in capsys.readouterr().err
-    (root / "function.yaml").write_text(ECHO_YAML + "lockfile: requirements.lock\n")
+    (root / "function.lock").write_text("")
     assert _package.main([str(root), "--wasm", component]) == 2
     assert "a component links its dependencies" in capsys.readouterr().err
+    (root / "function.lock").unlink()
+    (root / "function.yaml").write_text(ECHO_YAML + "lockfile: x.lock\n")
+    assert _package.main([str(root), "--wasm", component]) == 2
+    assert "lockfile: not a function.yaml key" in capsys.readouterr().err
     (root / "function.yaml").write_text(ECHO_YAML + "entry: function:f\n")
     assert _package.main([str(root), "--wasm", component]) == 2
     assert "entry is moruna:kernel" in capsys.readouterr().err
@@ -309,7 +312,12 @@ def test_pk_t13_check_a_package(scratch: Path, capsys) -> None:
     from moruna import _check  # noqa: PLC0415
 
     root = wasm_project(scratch)
-    assert _package.main([str(root), "--wasm", str(FIXTURES / "echo.component.wasm")]) == 0
+    assert (
+        _package.main(
+            [str(root), "--wasm", str(FIXTURES / "echo.component.wasm"), "--out", str(root)]
+        )
+        == 0
+    )
     package = root / "echo.wasm"
     capsys.readouterr()
     code = _check.main([str(package), "--json", "--profiles-dir", str(scratch / "profiles")])
@@ -323,7 +331,8 @@ def test_pk_t13_check_a_package(scratch: Path, capsys) -> None:
     # A package that loops runs out of fuel and is refused, not hung.
     (scratch / "l").mkdir()
     loops = wasm_project(scratch / "l", ECHO_YAML.replace("name: echo", "name: loops"))
-    assert _package.main([str(loops), "--wasm", str(FIXTURES / "loops.component.wasm")]) == 0
+    loops_component = str(FIXTURES / "loops.component.wasm")
+    assert _package.main([str(loops), "--wasm", loops_component, "--out", str(loops)]) == 0
     capsys.readouterr()
     assert _check.main([str(loops / "loops.wasm"), "--no-profile"]) == 2
     assert "fuel exhausted" in capsys.readouterr().out
@@ -336,7 +345,8 @@ def test_pk_t15_aot(scratch: Path, capsys) -> None:
     from moruna import __main__ as command  # noqa: PLC0415
 
     root = wasm_project(scratch)
-    assert _package.main([str(root), "--wasm", str(FIXTURES / "echo.component.wasm")]) == 0
+    component = str(FIXTURES / "echo.component.wasm")
+    assert _package.main([str(root), "--wasm", component, "--out", str(root)]) == 0
     capsys.readouterr()
     assert command.main(["aot", str(root / "echo.wasm")]) == 0
     assert capsys.readouterr().out.strip() == str(root / "echo.cwasm")
@@ -348,7 +358,8 @@ def test_pk_t15_aot(scratch: Path, capsys) -> None:
 
 def _echo_package(scratch: Path) -> Path:
     root = wasm_project(scratch)
-    assert _package.main([str(root), "--wasm", str(FIXTURES / "echo.component.wasm")]) == 0
+    component = str(FIXTURES / "echo.component.wasm")
+    assert _package.main([str(root), "--wasm", component, "--out", str(root)]) == 0
     return root / "echo.wasm"
 
 
@@ -441,7 +452,8 @@ def test_pk_t15_load_a_pex(scratch: Path, dataset, capsys) -> None:
         "output_schema: {adds: {loud: string}}\n"
     )
     machine = os.uname().machine
-    assert _package.main([str(root), "--platform", f"{HERE}-manylinux_2_28_{machine}"]) == 0
+    target = f"{HERE}-manylinux_2_28_{machine}"
+    assert _package.main([str(root), "--platform", target, "--out", str(root)]) == 0
     capsys.readouterr()
     pex = root / "shout.pex"
     kernel = moruna.load(str(pex), python=SANDBOX_PYTHON, cgroup=SANDBOX_CGROUP)
@@ -465,3 +477,25 @@ def test_pk_t15_load_a_pex(scratch: Path, dataset, capsys) -> None:
     assert _check.main([*args, "--sandbox-cgroup", SANDBOX_CGROUP]) == 0
     (report,) = json.loads(capsys.readouterr().out)["kernels"]
     assert report["kind"] == "pex" and report["verdict"] == "agreed"
+
+
+def test_pk_t18_package_report(scratch: Path, capsys, monkeypatch) -> None:
+    """16 d.2: the package goes to the working directory by default, and --json reports it."""
+    from moruna import _check  # noqa: PLC0415
+
+    root = wasm_project(scratch)
+    here = scratch / "here"
+    here.mkdir()
+    monkeypatch.chdir(here)
+    component = str(FIXTURES / "echo.component.wasm")
+    assert _package.main([str(root), "--wasm", component, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    out = here / "echo.wasm"
+    assert Path(report["path"]).is_absolute()
+    assert Path(report["path"]).resolve() == out.resolve()
+    assert report["name"] == "echo" and report["format"] == "wasm"
+    assert report["fingerprint"] == "sha256:" + hashlib.sha256(out.read_bytes()).hexdigest()
+    assert report["manifest"]["declaration"]["input_schema"] == {"n": "int64", "s": "string"}
+    assert _check.main([str(out), "--json", "--no-profile"]) == 0
+    (checked,) = json.loads(capsys.readouterr().out)["kernels"]
+    assert checked["manifest"] == report["manifest"]
