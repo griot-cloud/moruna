@@ -3,8 +3,9 @@
 #   1. udev, so hot-added vCPUs are onlined (99-moruna-cpu-online.rules; MH 4.8.5, H12);
 #   2. the host's disks, found by the serial the monitor gave each (moruna-disk-<n>) and
 #      mounted at /disk/<n>, read-only when the monitor attached them read-only;
-#   3. `moruna serve --listen vsock://-1:5000`, one job, then its exit code reported to the
-#      monitor on vsock port 1024 and the machine powered off.
+#   3. the cgroup a packaged kernel's sandbox makes its stages' cgroups in (SDD 17 e.6, f.10);
+#   4. `moruna serve --listen vsock://-1:5000` with the sandbox's interpreter and cgroup, one job,
+#      then its exit code reported to the monitor on vsock port 1024 and the machine powered off.
 set -u
 export PATH=/opt/python/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PYTHON_GIL=0
@@ -29,7 +30,16 @@ for b in /sys/block/vd*; do
     mount -o "$opts" "$dev" "/disk/$n" 2>/dev/null || rmdir "/disk/$n"
 done
 
-moruna serve --listen vsock://-1:5000
+# cgroup v2 with memory and cpu for the sandbox's stages. The root cgroup may hold processes and
+# delegate controllers at once, so moruna serve stays where it is.
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+echo "+memory +cpu" > /sys/fs/cgroup/cgroup.subtree_control
+mkdir -p /sys/fs/cgroup/moruna-sandbox
+echo "+memory +cpu" > /sys/fs/cgroup/moruna-sandbox/cgroup.subtree_control
+
+moruna serve --listen vsock://-1:5000 \
+    --sandbox-python /opt/python-std/bin/python3 \
+    --sandbox-cgroup /sys/fs/cgroup/moruna-sandbox
 code=$?
 moruna-report "$code"
 sync
