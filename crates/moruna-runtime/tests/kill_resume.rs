@@ -452,6 +452,9 @@ enum When {
     After(u64),
     /// As soon as a manifest's temporary file is seen: mid-checkpoint (PL-I12).
     MidCheckpoint,
+    /// As soon as the run has removed its run directory, which a run does once it completed
+    /// (12 f.7) and before it returns: a kill there finds no manifest and a whole output.
+    AtCompletion,
 }
 
 struct Outcome {
@@ -494,19 +497,32 @@ fn kill_and_resume(
                 !manifests(&job.staging, true).is_empty() || !matches!(child.try_wait(), Ok(None))
             });
         }
+        When::AtCompletion => {
+            assert!(
+                wait_until(CHILD_LIMIT, || (manifests(&job.staging, false).is_empty()
+                    && manifests(&job.staging, true).is_empty())
+                    || !matches!(child.try_wait(), Ok(None))),
+                "point {point}: the run neither completed nor ended"
+            );
+        }
     }
     let alive = matches!(child.try_wait(), Ok(None));
     let _ = child.kill();
     let output = child.wait_with_output().expect("the child's output");
     let _ = std::fs::remove_file(&job.reads);
     let found = manifests(&job.staging, false);
-    // A run that finished during the delay removed its own checkpoint directory (12 f.7,
-    // `keep_checkpoint` off) and printed CHILD-OK, and its process can still be alive at the
-    // kill: an instrumented binary spends its last moments writing coverage data. That is a run
-    // that completed, not a kill that lost a checkpoint, and it is told apart by the child's
-    // own last line rather than by whether the process had exited yet (found under the coverage
-    // build, one run in three, 2026-09-29).
-    let completed = String::from_utf8_lossy(&output.stdout).contains("CHILD-OK");
+    // A run that completed removed its own run directory (12 f.7, `keep_checkpoint` off) after
+    // its sink committed the last file, then computed its report, unwound and printed CHILD-OK;
+    // its process can be alive at the kill anywhere in that tail (an instrumented binary also
+    // spends its last moments writing coverage data). A kill there is a run that completed,
+    // not a kill that lost its checkpoint: the run says so itself, by its last line or by
+    // having removed its run directory. Neither is a moment of the clock: the line alone left
+    // the tail between the removal and the print, where a kill found no manifest and no line
+    // (PR 41's CI, point 9 at 674 ms; When::AtCompletion lands there every time). A lost
+    // checkpoint cannot hide behind this: the run then left no manifest and an output that is
+    // not whole, and the caller compares the output byte for byte with an uninterrupted run's.
+    let completed =
+        String::from_utf8_lossy(&output.stdout).contains("CHILD-OK") || found.is_empty();
     let killed = alive && !completed;
     if !killed {
         return (
@@ -615,9 +631,10 @@ fn sc_t16_sigkill_resume_equivalence() {
     assert!(killed >= 2, "only {killed} of 4 points landed mid-run");
 }
 
-/// PL-T17 with real components: an ordered run killed at ten points, one of them while the
-/// manifest's temporary file exists, resumes to files byte-identical to an uninterrupted run's,
-/// and re-reads exactly the recomputed lineage (PL-I12, PL-I13, S17, MH H5).
+/// PL-T17 with real components: an ordered run killed at eleven points, one of them while the
+/// manifest's temporary file exists and one just after the run removed its run directory,
+/// resumes (or, at the last, has already completed) to files byte-identical to an uninterrupted
+/// run's, and re-reads exactly the recomputed lineage (PL-I12, PL-I13, S17, MH H5).
 #[test]
 fn pl_t17_kill_and_resume() {
     if std::env::var(CHILD).is_ok() {
@@ -632,11 +649,11 @@ fn pl_t17_kill_and_resume() {
     assert!(want.len() > 2, "the uninterrupted run rolled several files");
     let mut killed = 0;
     let mut mid = 0;
-    for point in 0..10 {
-        let when = if point == 0 {
-            When::MidCheckpoint
-        } else {
-            When::After(rng.below(800))
+    for point in 0..11 {
+        let when = match point {
+            0 => When::MidCheckpoint,
+            10 => When::AtCompletion,
+            _ => When::After(rng.below(800)),
         };
         let (job, outcome) = kill_and_resume(&root, point, &input, true, when, &plan);
         killed += usize::from(outcome.killed);
@@ -660,6 +677,6 @@ fn pl_t17_kill_and_resume() {
             );
         }
     }
-    assert!(killed >= 5, "only {killed} of 10 points landed mid-run");
+    assert!(killed >= 5, "only {killed} of 11 points landed mid-run");
     println!("pl_t17: {killed} kills, {mid} of them mid-checkpoint");
 }

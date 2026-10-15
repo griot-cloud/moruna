@@ -876,25 +876,40 @@ mod tests {
     /// F8.9: the process peak is the whole process's high-water mark since the sampler was
     /// created, whatever `reset_peak` does to the probe's peak. On macOS it is the kernel's own
     /// lifetime mark, so a burst no sample saw is still in it; elsewhere it is the highest sample.
+    ///
+    /// Elsewhere the property is stated over the samples taken, not over the burst: where the
+    /// host's source is a cgroup, its `memory.stat` is flushed lazily and may not show a burst
+    /// in the sample taken during it (a container on Linux 7.1 showed none, 2026-10-15), and
+    /// the peak is then rightly the highest sample, which this asserts.
     #[test]
     fn the_process_peak_is_the_whole_process_and_survives_a_reset() {
         const BURST: usize = 64 << 20;
         let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
         let before = sampler.sample().anon_bytes;
         let burst = vec![7u8; BURST];
-        if !cfg!(target_vendor = "apple") {
-            // Only a sample sees the burst where the platform keeps no mark of its own.
-            let _ = sampler.sample();
-        }
+        // Where the platform keeps no mark of its own, only a sample can see the burst; on
+        // macOS no sample is taken, so the kernel's mark alone must hold it.
+        let during = if cfg!(target_vendor = "apple") {
+            0
+        } else {
+            sampler.sample().anon_bytes
+        };
         drop(std::hint::black_box(burst));
         sampler.reset_peak();
         let after = sampler.sample();
         let peak = sampler.process_peak();
+        let seen = before.max(during).max(after.anon_bytes);
         assert!(
-            peak.bytes >= before + (BURST as u64) / 2,
-            "the burst of {BURST} bytes over {before} is in the peak: {peak:?}"
+            peak.bytes >= seen,
+            "the highest sample ({seen}) is in the peak after the reset: {peak:?}"
         );
-        assert!(peak.bytes >= after.anon_bytes);
+        if cfg!(target_vendor = "apple") {
+            assert!(
+                peak.bytes >= before + (BURST as u64) / 2,
+                "the kernel's lifetime mark holds the burst of {BURST} bytes over {before}: \
+                 {peak:?}"
+            );
+        }
         assert!(peak.at_ns > 0);
         assert_eq!(peak.exact, cfg!(target_vendor = "apple"), "{peak:?}");
         // A fixture cgroup keeps no lifetime mark: the peak is the highest sample.
