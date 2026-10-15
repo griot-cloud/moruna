@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- **A kernel can be one portable file.** A package is `.wasm` (any language with a wasm toolchain, exporting the `moruna:kernel` world) or `.pex` (Python with the wheels of its `function.lock`), with `moruna.json` inside and the file's sha256 as its fingerprint (`architecture/function-packages.md`, SDD 16). `moruna package` builds one (`--json` reports the path, fingerprint and manifest), `moruna check <package>` checks it through its runtime and reports the manifest, `moruna aot` precompiles it, `moruna.load` runs it on this machine. A kernel built by arguments declares `args`; a package may read a read-only assets directory.
+- **A packaged kernel never has Moruna's access to the machine.** `moruna-wasm` runs a `.wasm` in wasmtime with a linear-memory limit and fuel from the stage's budget; the trace gains its `linear` source. `moruna-sandbox` runs a `.pex` in a child forked from a warm interpreter, confined by namespaces, Landlock, seccomp and a cgroup at the stage's ceiling, with the allocator guard inside the child and its counts back on every reply; batches are read in place from a shared mapping, each input region leased until the child lets go, so a kept batch keeps its bytes (SDD 17).
+- **The job document names a package.** `kernels[].kind = package` with its path and pin, hashed before the stage starts; strict mode (the `serve` default) refuses a Python import-path kernel; `run` and `serve` take `--sandbox-python` and `--sandbox-cgroup`. The guest carries the standard CPython build for packaged kernels.
+- **Tests that judged a machine judge a property.** `pl_t17_kill_and_resume` counts a run that deleted its run directory as finished (a kill between that and its last line read as a lost checkpoint); the process-peak test and the namespace refusal hold on an unprivileged runner.
+
 ## 0.4.3
 
 - **An x86_64 guest boots.** The x86_64 guest kernel is built with `CONFIG_PCI` (ACPICA installs its PCI-config address-space handler before loading any table, and 6.18 has it only with PCI; `pci=off` still keeps the bus unprobed), `PNP`, `PNPACPI` and `SERIAL_8250_PNP`. moruna-vmm's DSDT now describes COM1 (PNP0501) and one LNRO0005 device per virtio-mmio slot with its window and edge interrupt, so a hardware-reduced guest maps every device's GSI; the `virtio_mmio.device=` command-line devices are gone (`VIRTIO_MMIO_CMDLINE_DEVICES=n`). Before this, the first x86_64 boot refused every ACPI table and every virtio probe failed with -22.
