@@ -421,7 +421,11 @@ fn ho_t10_serve_runs_one_spec() {
     let socket = socket_path(scratch.path());
     let doc = document(scratch.path(), 16_000, 4, Some("sleep"));
     let listen = format!("unix://{}", socket.display());
-    let server = std::thread::spawn(move || run_cli(&["serve", "--listen", &listen], &no_env));
+    // The test's kernel is a Python callable named by import path, which a strict serve refuses
+    // (16 PK-I8): the protocol is what this test is about, so the server is not strict.
+    let server = std::thread::spawn(move || {
+        run_cli(&["serve", "--no-strict", "--listen", &listen], &no_env)
+    });
     let conn = connect_when_ready(&socket);
     let (reader, mut writer, _close) = conn.into_parts();
     let mut reader = BufReader::new(reader);
@@ -661,6 +665,7 @@ fn ho_t13_report_file_placement() {
             env: &no_env,
             cancel: CancelToken::new(),
             heartbeat: HEARTBEAT,
+            packages: moruna_runtime::packaged::PackageHost::default(),
         },
     );
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);

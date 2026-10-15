@@ -23,7 +23,7 @@ It refuses to know: the package format (16), how the run is planned or scheduled
 
 **Stage ceiling.** The memory a packaged stage may hold: the run's ceiling in force (03 f.2) minus what the rest of the run holds at that moment (the process's sample less this stage's own in-use). Computed when the stage starts, before every call, and on every limits change (MH 4.4).
 
-**Template.** One standard-build CPython 3.14 process per Moruna process and sandbox host, started on the first `.pex` stage, with `pyarrow` and every other data library its interpreter has (`numpy`, `polars`) imported, and one thread.
+**Template.** One standard-build CPython 3.14 process per Moruna process and sandbox interpreter, started on the first `.pex` stage, with `pyarrow` (required) and `numpy` (when its interpreter has it) imported, and one thread. Polars is not imported by the template: its import starts threads (an out-of-core cleaner and its allocator's background threads, measured with polars 2.0.0), and a template that holds a thread cannot fork (SB-I10); a Polars kernel imports it in its own child.
 
 **Child.** One process per `.pex` stage, a fork of the template, confined (f.5), running the package for the whole run.
 
@@ -45,7 +45,7 @@ It refuses to know: the package format (16), how the run is planned or scheduled
 
 **SB-I4. The child sees only its tree.** After confinement the child's mount namespace holds the tree (read only) at `/pkg`, a private `tmpfs` at `/tmp`, the template interpreter's import roots (read only, at their own paths) and `/dev/null`, `/dev/zero`, `/dev/urandom`; nothing else. Landlock allows read and execute under the tree and the import roots, read and write under `/tmp` and on the three devices, and nothing else. FP 4.
 
-**SB-I5. The child can open no connection and gain no privilege.** seccomp allows the system calls of e.5 and refuses every other with `EPERM`; `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`, `accept4`, `execve`, `execveat`, `unshare`, `setns`, `mount`, `pivot_root`, `ptrace` and `clone` with any namespace flag are not on it; `kill`, `tkill`, `tgkill` are allowed only towards the child itself. The child has no capability in any set, and `no_new_privs` is set. FP 4.
+**SB-I5. The child can open no connection and gain no privilege.** seccomp allows the system calls of e.5 and refuses every other with `EPERM`; `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`, `accept4`, `execve`, `execveat`, `unshare`, `setns`, `mount`, `pivot_root`, `ptrace` and `clone` with any namespace flag are not on it; `kill` and `tgkill` are allowed only towards the child itself. The child has no capability in any set, and `no_new_privs` is set. FP 4.
 
 **SB-I6. The child is capped and weighed by a cgroup.** The child runs in its own cgroup under the sandbox cgroup, created by Moruna before the fork's request, with `memory.max` the stage ceiling (updated with it), `memory.swap.max` 0, `cpu.weight` `CPU_WEIGHT` and `cpu.max` the run's CPU quota in force; it is removed after the child exits. A cgroup that cannot be created or written refuses the stage.
 
@@ -128,7 +128,7 @@ Each frame is a little-endian `u32` byte length followed by that many bytes of U
 
 To the template (its socket; the request carries the child's control end and the memfd as `SCM_RIGHTS`, in that order):
 `{"op":"start","tree":"/abs/tree","target":"cp314-manylinux_2_28_x86_64","entry":"function:shout","manifest":{…16 e.1…},"cgroup":"/sys/fs/cgroup/moruna-sandbox/stage-…","root":"/tmp/moruna-sandbox-…/root","mapping_bytes":N}`.
-From the template: `{"op":"hello","pid":P,"python":"3.14.7","libraries":{"pyarrow":"25.0.1",…},"roots":["/opt/python-std/lib/python3.14",…]}` once, then per request `{"op":"started","pid":C}` or `{"op":"refused","reason":"…"}`.
+The request also carries `"libraries"`, the template's own `{name: version}`, for 17 f.6. `{"op":"status","pid":C}` asks how a child ended. From the template: `{"op":"hello","pid":P,"python":"3.14.7","libraries":{"pyarrow":"25.0.1",…},"glibc":[2,41],"machine":"aarch64"}` once (or `refused` naming why it cannot serve), then per `start` `{"op":"started","pid":C}` or `{"op":"refused","reason":"…"}`, and per `status` `{"op":"exited","pid":C,"status":"exit status 3"}` (or `"running"`). The template reaps its children on `start` and `status`.
 
 To the child: `{"op":"call","offset":O,"len":L}`, `{"op":"open","offset":O,"len":L}` (state bytes in the mapping), `{"op":"checkpoint"}`, `{"op":"stop"}`.
 From the child: `{"op":"ready"}` or `{"op":"failed","reason":"…"}` once after loading; per call `{"op":"done","offset":O,"len":L,"alloc":A}` or `{"op":"error","message":"…","refusal":{"requested":R,"in_use":U,"ceiling":C}|null,"alloc":A}`; per checkpoint `{"op":"state","offset":O,"len":L}`. `A` is `{"measured":bool,"refusal_on":bool,"python":[bytes,requests,largest,peak,refused],"numpy":[…],"arrow":[…]}`.
@@ -139,7 +139,31 @@ From the child: `{"op":"ready"}` or `{"op":"failed","reason":"…"}` once after 
 
 ### e.5 The seccomp allow-list
 
-`read`, `write`, `readv`, `writev`, `pread64`, `pwrite64`, `lseek`, `close`, `close_range`, `openat`, `openat2`, `newfstatat`, `fstat`, `statx`, `statfs`, `fstatfs`, `getdents64`, `readlinkat`, `faccessat`, `faccessat2`, `getcwd`, `chdir`, `fchdir`, `fcntl`, `ioctl`, `dup`, `dup3`, `pipe2`, `mkdirat`, `unlinkat`, `renameat`, `renameat2`, `ftruncate`, `fallocate`, `fsync`, `fdatasync`, `flock`, `fchmod`, `fchmodat`, `utimensat`, `umask`, `copy_file_range`, `mmap`, `munmap`, `mremap`, `mprotect`, `madvise`, `mincore`, `brk`, `membarrier`, `futex`, `futex_waitv`, `set_robust_list`, `get_robust_list`, `rseq`, `set_tid_address`, `clone` (no namespace flag), `exit`, `exit_group`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigtimedwait`, `sigaltstack`, `getpid`, `gettid`, `getppid`, `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`, `getresgid`, `getgroups`, `getrandom`, `clock_gettime`, `clock_getres`, `clock_nanosleep`, `nanosleep`, `gettimeofday`, `sched_yield`, `sched_getaffinity`, `sched_getparam`, `sched_getscheduler`, `getpriority`, `prlimit64`, `getrusage`, `sysinfo`, `uname`, `prctl`, `ppoll`, `pselect6`, `epoll_create1`, `epoll_ctl`, `epoll_pwait`, `eventfd2`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `shutdown`, `getsockopt`, `kill`, `tkill`, `tgkill` (the last three only with the child's pid as target), and on x86_64 also `open`, `stat`, `lstat`, `access`, `readlink`, `poll`, `select`, `pipe`, `dup2`, `mkdir`, `unlink`, `rename`, `arch_prctl`, `epoll_wait`, `getdents`, `time`. `clone3` returns `ENOSYS`, so the C library falls back to `clone`, whose flags seccomp can read.
+Two filters. The allow-list allows exactly these calls and refuses every other with `EPERM`:
+
+```text
+read write readv writev pread64 pwrite64 preadv pwritev lseek close close_range openat openat2
+newfstatat fstat statx statfs fstatfs getdents64 readlinkat faccessat faccessat2 getcwd chdir
+fchdir fcntl ioctl dup dup3 pipe2 mkdirat unlinkat renameat renameat2 ftruncate fallocate
+fadvise64 fsync fdatasync flock fchmod fchmodat utimensat umask copy_file_range mmap munmap
+mremap mprotect madvise mincore brk membarrier futex futex_waitv set_robust_list
+get_robust_list rseq set_tid_address clone3 exit exit_group wait4 restart_syscall rt_sigaction
+rt_sigprocmask rt_sigreturn rt_sigtimedwait sigaltstack getpid gettid getppid getuid geteuid
+getgid getegid getresuid getresgid getgroups getrandom getcpu clock_gettime clock_getres
+clock_nanosleep nanosleep gettimeofday sched_yield sched_getaffinity sched_getparam
+sched_getscheduler getpriority prlimit64 getrusage sysinfo uname prctl ppoll pselect6
+epoll_create1 epoll_ctl epoll_pwait epoll_pwait2 eventfd2 sendmsg recvmsg sendto recvfrom
+shutdown getsockopt
+```
+
+on x86_64 also these, the older forms its C library still uses:
+
+```text
+open stat lstat access readlink poll select pipe dup2 mkdir unlink rename arch_prctl epoll_wait
+getdents time getrlimit
+```
+
+and these with a condition: `clone` when its flags hold no namespace flag (`CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`); `kill` and `tgkill` when their first argument is the child's own pid. The other filter answers `clone3` with `ENOSYS`, so the C library falls back to `clone`, whose flags the allow-list can read (`clone3` passes its flags in memory), and allows every other call, which the allow-list judges. It is installed first: the allow-list does not allow `seccomp` itself. `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`, `accept4`, `execve`, `execveat`, `unshare`, `setns`, `mount`, `pivot_root`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `bpf`, `perf_event_open`, `memfd_create`, `tkill` and the module and key calls are on neither list.
 
 ### e.6 The sandbox host
 
@@ -163,7 +187,7 @@ From the child: `{"op":"ready"}` or `{"op":"failed","reason":"…"}` once after 
 
 **f.8 A pex call (Moruna's side).** Under the stage's lock: refresh the stage ceiling (f.7); write the input as an IPC stream at `PAGE` (refused naming both sizes when larger than the data area); send `call`; read the reply; on `done`, read the output stream in place and land it into the arena (05 f.3); punch the range (e.4); `set_kernel_alloc` with the child's counts; on `error`, the same counts and `MorunaError::Refused` (with the stage and morsel sentinels of 05) when a refusal is attached, `MorunaError::Kernel` otherwise.
 
-**f.9 The template.** Started with `env_clear()` plus `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `-I -m moruna._sandbox`, its socket at descriptor 3. It imports `pyarrow` (required), `numpy` and `polars` (each when its interpreter has it), `moruna._core`, checks SB-I10, sends `hello`, ignores `SIGCHLD` (children are reaped by the kernel), and serves `start` requests: `os.fork()`; the child closes the template's socket and returns `_core._sandbox_child(...)`'s code through `os._exit`; the template closes its copies of the passed descriptors and answers `started`. End of stream on its socket ends it.
+**f.9 The template.** Started with `env_clear()` plus `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `-I -m moruna._sandbox`, its socket at descriptor 3 and its stdout on Moruna's stderr. It imports `pyarrow`, `pyarrow.compute`, `pyarrow.ipc` (required) and `numpy` (when its interpreter has it), and `moruna._core`, checks SB-I10, sends `hello`, and serves requests: for `start`, `os.fork()`; the child closes the template's socket and returns `_core._sandbox_child(...)`'s code through `os._exit`; the template closes its copies of the passed descriptors and answers `started`; for `status`, it reaps the child (waiting up to two seconds) and answers how it ended. End of stream on its socket ends it. One template per sandbox interpreter per Moruna process, restarted when it has died.
 
 **f.10 The guest (MH 4.8).** The image carries, beside the free-threaded interpreter at `/opt/python`, the standard build at `/opt/python-std` with `pyarrow` and the `moruna` wheel for `cp314`; the guest kernel has `CONFIG_NAMESPACES`, `CONFIG_SECCOMP_FILTER`, `CONFIG_SECURITY_LANDLOCK` (and `CONFIG_LSM` naming it), `CONFIG_CGROUPS`, `CONFIG_MEMCG`, `CONFIG_CGROUP_SCHED`, `CONFIG_FAIR_GROUP_SCHED`, `CONFIG_CFS_BANDWIDTH`, `CONFIG_MEMFD_CREATE`; `moruna-init` mounts `cgroup2` at `/sys/fs/cgroup`, enables `+memory +cpu` in the root's `cgroup.subtree_control`, creates `/sys/fs/cgroup/moruna-sandbox` with the same controllers enabled, and starts `moruna serve` with `--sandbox-python /opt/python-std/bin/python3 --sandbox-cgroup /sys/fs/cgroup/moruna-sandbox`.
 
@@ -179,6 +203,7 @@ A stage's instance is used by one worker at a time (`Stateful { max_instances: 1
 - A kernel that tries `socket()`: `EPERM`.
 - The template dies: every child it forked keeps running; the next `start` request restarts it.
 - A run on a host that is not Linux: a `.pex` stage is refused when built ("a .pex runs in the sandbox, which needs Linux"); a `.wasm` runs.
+- A kernel that keeps a reference to its input batch past the call: the batch is read in place from the mapping (SB-I7), and the next call's input is placed over it; a kernel that keeps input rows copies them.
 
 ## i. Configuration
 
@@ -237,7 +262,9 @@ The following run on Linux with a sandbox host (a privileged container: tests ta
 
 **SB-T18 library_conflict.** A package carrying `pyarrow` at a version the template does not have: refused naming both versions. f.6.
 
-**SB-T19 template_threads.** A template whose interpreter started a thread at import refuses `start` naming the count. SB-I10.
+**SB-T19 template_threads.** A template whose interpreter started a thread at import refuses to start, naming the count. SB-I10.
+
+**SB-T20 pex_state_crosses_a_checkpoint.** A stateful class kernel with `checkpoint` and `restore` counting its calls: the checkpoint is the kernel's bytes, a restored child continues the count. SB-I12.
 
 ## l. Implementation notes for the agent
 

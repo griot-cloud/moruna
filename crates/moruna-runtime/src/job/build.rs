@@ -126,6 +126,8 @@ pub struct BuildOptions<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
     /// Notes the caller already made (the Python surface's own clamps), which come first.
     pub notes: Vec<String>,
+    /// What a `.pex` package's sandbox needs from the host (17 e.6).
+    pub packages: crate::packaged::PackageHost,
 }
 
 /// The process environment, for [`BuildOptions::env`].
@@ -218,6 +220,21 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         None => None,
     };
 
+    // 16 PK-I8: a hosted run loads no kernel by import path; its kernels come from packages.
+    if opts.strict
+        && let Some(index) = job
+            .kernels
+            .iter()
+            .position(|k| k.kind == KernelKindDoc::Python)
+    {
+        return Err(SpecError::new(
+            format!("kernels[{index}].module"),
+            "strict mode loads no kernel by import path: a hosted run loads its kernels from \
+             packages (moruna package, then {\"kind\": \"package\", \"path\", \"fingerprint\"})",
+        )
+        .into());
+    }
+
     let engines = governed::Engines::carrying(&job.contracts);
     engines.check_used(
         matches!(job.source, SourceDoc::Datafusion { .. })
@@ -232,6 +249,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     enum Stage {
         Std(Box<moruna_kernels::StdKernel>),
         Loaded(LoadedKernel),
+        Packaged(crate::packaged::Packaged),
     }
     let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
     for (index, doc) in job.kernels.iter().enumerate() {
@@ -256,6 +274,11 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
                 Stage::Std(Box::new(kernel))
             }
             KernelKindDoc::Python => Stage::Loaded(loader.load(index, doc)?),
+            KernelKindDoc::Package => {
+                let packaged = package_of(index, doc, &opts.packages)?;
+                notes.extend(packaged.notes());
+                Stage::Packaged(packaged)
+            }
         };
         if let Some(pinned) = &doc.fingerprint {
             let want = pinned
@@ -266,6 +289,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
             let have = match &stage {
                 Stage::Std(k) => k.fingerprint().to_hex(),
                 Stage::Loaded(l) => l.kernel.fingerprint().to_hex(),
+                Stage::Packaged(p) => p.kernel().fingerprint().to_hex(),
             };
             if want != have {
                 return Err(SpecError::new(
@@ -285,11 +309,16 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         stages.push(stage);
     }
     let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
+    let mut packaged = Vec::new();
     #[cfg(feature = "python")]
     let mut py_kernels = Vec::new();
     for (at, stage) in stages.into_iter().enumerate() {
         match stage {
             Stage::Std(k) => kernels.push(Arc::new(*k) as Arc<dyn Kernel>),
+            Stage::Packaged(p) => {
+                kernels.push(p.kernel());
+                packaged.push(p);
+            }
             Stage::Loaded(loaded) => {
                 #[cfg(feature = "python")]
                 if let Some(py) = loaded.python {
@@ -367,6 +396,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
 
     let mut spec = RunSpec::new(source, kernels, sink);
     spec.engine_memory = engine_memory;
+    spec.packaged = packaged;
     spec.sink_memory = sink_memory;
     #[cfg(feature = "python")]
     {
@@ -414,6 +444,52 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         digest,
         discovery,
         env_resolved,
+    })
+}
+
+/// A `package` entry (16 d.4): `path` and `fingerprint` and nothing else, opened and pinned
+/// (PK-I2) and its runtime made (16 f.8).
+fn package_of(
+    index: usize,
+    doc: &KernelDoc,
+    host: &crate::packaged::PackageHost,
+) -> Result<crate::packaged::Packaged> {
+    let field = |name: &str| format!("kernels[{index}].{name}");
+    let set: [(&str, bool); 6] = [
+        ("module", doc.module.is_some()),
+        ("callable", doc.callable.is_some()),
+        ("crate", doc.krate.is_some()),
+        ("symbol", doc.symbol.is_some()),
+        ("name", doc.name.is_some()),
+        ("args", doc.args.is_some()),
+    ];
+    let hints = doc.hints_set();
+    if let Some(name) = set
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(n, _)| *n)
+        .chain(hints.iter().copied())
+        .next()
+    {
+        return Err(SpecError::new(
+            field(name),
+            "a package entry has a path and a fingerprint; its hints are its manifest's",
+        )
+        .into());
+    }
+    let path = doc
+        .path
+        .as_deref()
+        .ok_or_else(|| SpecError::new(field("path"), "a package entry names its file"))?;
+    let pin = doc.fingerprint.as_deref().ok_or_else(|| {
+        SpecError::new(
+            field("fingerprint"),
+            "a package entry pins its file's sha256 (moruna check prints it)",
+        )
+    })?;
+    crate::packaged::open(std::path::Path::new(path), Some(pin), host).map_err(|e| match e {
+        MorunaError::Plan(msg) => SpecError::new(field("fingerprint"), msg).into(),
+        other => other,
     })
 }
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import textwrap
 import zipfile
@@ -210,8 +211,10 @@ def test_pk_t9_lockfile_rules(scratch: Path, lockfile: str, said: str, capsys) -
     [
         (f"{HERE}t-manylinux_2_28_x86_64", "a .pex target is cp3NN-manylinux"),
         (f"{HERE}-macosx_14_0_arm64", "a .pex target is cp3NN-manylinux"),
-        ("cp313-manylinux_2_28_x86_64" if HERE != "cp313" else "cp315-manylinux_2_28_x86_64",
-         "its bytecode needs Python"),
+        (
+            "cp313-manylinux_2_28_x86_64" if HERE != "cp313" else "cp315-manylinux_2_28_x86_64",
+            "its bytecode needs Python",
+        ),
     ],
 )
 def test_pk_t9_targets_refused(scratch: Path, target: str, said: str, capsys) -> None:
@@ -341,3 +344,124 @@ def test_pk_t15_aot(scratch: Path, capsys) -> None:
     assert command.main(["aot"]) == 2
     assert command.main(["aot", str(scratch / "missing.wasm")]) == 2
     capsys.readouterr()
+
+
+def _echo_package(scratch: Path) -> Path:
+    root = wasm_project(scratch)
+    assert _package.main([str(root), "--wasm", str(FIXTURES / "echo.component.wasm")]) == 0
+    return root / "echo.wasm"
+
+
+def test_pk_t15_load_and_call(scratch: Path, capsys) -> None:
+    import pyarrow as pa  # noqa: PLC0415
+
+    import moruna  # noqa: PLC0415
+
+    package = _echo_package(scratch)
+    capsys.readouterr()
+    kernel = moruna.load(str(package))
+    assert kernel.format == "wasm"
+    assert kernel.path == str(package)
+    assert kernel.fingerprint == "sha256:" + hashlib.sha256(package.read_bytes()).hexdigest()
+    assert kernel.manifest["name"] == "echo"
+    assert "echo.wasm" in repr(kernel)
+    batch = pa.record_batch({"n": [1, 2, 3], "s": ["a", "b", "c"]})
+    assert kernel(batch).equals(batch)
+    with pytest.raises(TypeError):
+        kernel("not a batch")
+
+
+def test_py_t22_run_a_loaded_package(scratch: Path, dataset, capsys) -> None:
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    import moruna  # noqa: PLC0415
+
+    src, out, rows = dataset
+    package = _echo_package(scratch)
+    capsys.readouterr()
+    loaded = moruna.load(str(package))
+    report = moruna.run(moruna.ParquetSource(src), [loaded], moruna.ParquetSink(out))
+    written = pq.read_table(out.removeprefix("file://"))
+    assert written.num_rows == rows
+    stages = json.loads(report.to_json())["stages"]
+    (stage,) = [s for s in stages if s["stage"] == 1]
+    assert stage["rows_in"] == rows
+    assert stage["alloc"]["linear"] is not None
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="off Linux the sandbox does not exist")
+def test_py_t22_a_pex_off_linux_is_refused(scratch: Path) -> None:
+    import moruna  # noqa: PLC0415
+
+    target = sys.platform
+    pex = scratch / "x.pex"
+    with zipfile.ZipFile(pex, "w") as archive:
+        archive.writestr(
+            "moruna.json",
+            json.dumps(
+                {
+                    "name": "x",
+                    "entry": "function:x",
+                    "declaration": {"hints": {}},
+                    "abi": 1,
+                    "moruna": "0",
+                    "format": "pex",
+                    "platforms": ["cp314-manylinux_2_28_x86_64"],
+                }
+            ),
+        )
+    with pytest.raises(moruna.MorunaError, match="needs Linux"):
+        moruna.load(str(pex), python=sys.executable, cgroup="/sys/fs/cgroup/x")
+    assert target != "linux"
+
+
+SANDBOX_PYTHON = os.environ.get("MORUNA_SANDBOX_PYTHON")
+SANDBOX_CGROUP = os.environ.get("MORUNA_SANDBOX_CGROUP")
+needs_sandbox = pytest.mark.skipif(
+    sys.platform != "linux" or not SANDBOX_PYTHON or not SANDBOX_CGROUP,
+    reason="Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP",
+)
+
+
+@needs_sandbox
+def test_pk_t15_load_a_pex(scratch: Path, dataset, capsys) -> None:
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    import moruna  # noqa: PLC0415
+
+    root = project(scratch, lockfile=None)
+    (root / "function.py").write_text(
+        "import pyarrow.compute as pc\n\n"
+        "def shout(batch):\n"
+        "    return batch.append_column('loud', pc.utf8_upper(batch.column('text')))\n"
+    )
+    (root / "function.yaml").write_text(
+        "name: shout\nentry: function:shout\ninput_schema: {text: string}\n"
+        "output_schema: {adds: {loud: string}}\n"
+    )
+    machine = os.uname().machine
+    assert _package.main([str(root), "--platform", f"{HERE}-manylinux_2_28_{machine}"]) == 0
+    capsys.readouterr()
+    pex = root / "shout.pex"
+    kernel = moruna.load(str(pex), python=SANDBOX_PYTHON, cgroup=SANDBOX_CGROUP)
+    assert kernel.format == "pex"
+    out = kernel(pa.record_batch({"text": ["a", "b"]}))
+    assert out.column("loud").to_pylist() == ["A", "B"]
+    # The same file in a run: the run opens it again under its own child.
+    src, sink, rows = dataset
+    moruna.run(moruna.ParquetSource(src), [kernel], moruna.ParquetSink(sink))
+    written = pq.read_table(sink.removeprefix("file://"))
+    assert written.num_rows == rows
+    assert "loud" in written.column_names
+    # `moruna aot` writes the tree beside the package; `check` agrees through the child.
+    from moruna import __main__ as command  # noqa: PLC0415
+    from moruna import _check  # noqa: PLC0415
+
+    assert command.main(["aot", str(pex)]) == 0
+    assert (root / "shout.pex.tree" / "MORUNA-TREE").is_file()
+    capsys.readouterr()
+    args = [str(pex), "--json", "--no-profile", "--sandbox-python", SANDBOX_PYTHON]
+    assert _check.main([*args, "--sandbox-cgroup", SANDBOX_CGROUP]) == 0
+    (report,) = json.loads(capsys.readouterr().out)["kernels"]
+    assert report["kind"] == "pex" and report["verdict"] == "agreed"

@@ -103,10 +103,11 @@ sha2 = { version = "=0.11.0" }
 
 # Function packages (architecture/function-packages.md, SDD 16 and 17; preamble 6.2 table
 # additions, 2026-10-15). wasmtime runs a `.wasm` package with the component model and nothing
-# else; wat writes the test components in the text format; zip is the `.pex`
+# else, at the version parcel's runtime already brings so the graph has one wasmtime; wat
+# writes the test components in the text format, at the wasmparser that wasmtime uses; zip is the `.pex`
 # archive; landlock and seccompiler confine a `.pex` stage's child on Linux.
-wasmtime = { version = "=49.0.3", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
-wat = { version = "=1.258.3" }
+wasmtime = { version = "=47.0.4", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wat = { version = "=1.252.0" }
 zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
 landlock = { version = "=0.4.7" }
 seccompiler = { version = "=0.5.0" }

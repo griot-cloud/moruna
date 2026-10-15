@@ -24,6 +24,7 @@ moruna-kernels = { workspace = true }
 # A packaged kernel (SDD 16, 17): the package and the runtime of a .wasm.
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }
+moruna-sandbox = { workspace = true }
 # `moruna run --vm` (MH 4.8.4): the monitor's library seam, `boot_and_run`.
 moruna-vmm = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.
@@ -45,6 +46,7 @@ getrandom = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+zip = { workspace = true }
 arrow = { workspace = true }
 # The test components of a .wasm package (SDD 17 k).
 moruna-wasm = { workspace = true, features = ["testing"] }
@@ -86,6 +88,6 @@ cuda = ["moruna-arena/cuda", "moruna-discovery/cuda", "moruna-reactor/cuda", "mo
 uring = ["moruna-reactor/uring"]
 gds = ["cuda", "moruna-reactor/gds"]
 rdma = ["moruna-arena/rdma", "moruna-reactor/rdma", "moruna-placement/rdma"]
-python = ["moruna-adapters/python", "moruna-sources/python"]
+python = ["moruna-adapters/python", "moruna-sources/python", "moruna-sandbox/python"]
 # `"kind": "datafusion"` sources and `"kind": "peql"` sinks in the job document (MH 4.5).
 peql = ["dep:moruna-datafusion", "moruna-datafusion/peql", "dep:parcel-core", "dep:parcel-runtime"]

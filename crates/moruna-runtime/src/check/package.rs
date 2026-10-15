@@ -16,6 +16,7 @@ pub fn check_package(
     host: &PackageHost,
 ) -> Result<CheckReport> {
     let packaged = packaged::open(path, None, host)?;
+    packaged.bind_here()?;
     let package = packaged.package();
     let mut opts = CheckOptions::new(package.manifest.name.clone());
     opts.kind = packaged.kind();

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use moruna_kernel::{Kernel, MorunaError, Result};
+use moruna_kernel::{Kernel, MorunaError, OutsideMemory, Result, Sampler};
 use moruna_package::{Format, Package};
 use moruna_wasm::WasmKernel;
 
@@ -24,6 +24,9 @@ pub struct PackageHost {
 pub enum Packaged {
     /// A `.wasm` in wasmtime.
     Wasm(Arc<WasmKernel>),
+    /// A `.pex` in a confined child.
+    #[cfg(target_os = "linux")]
+    Pex(Arc<moruna_sandbox::SandboxKernel>),
 }
 
 impl Packaged {
@@ -31,6 +34,8 @@ impl Packaged {
     pub fn kernel(&self) -> Arc<dyn Kernel> {
         match self {
             Packaged::Wasm(k) => Arc::clone(k) as Arc<dyn Kernel>,
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(k) => Arc::clone(k) as Arc<dyn Kernel>,
         }
     }
 
@@ -38,6 +43,8 @@ impl Packaged {
     pub fn package(&self) -> &Arc<Package> {
         match self {
             Packaged::Wasm(k) => k.package(),
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(k) => k.package(),
         }
     }
 
@@ -45,12 +52,59 @@ impl Packaged {
     pub fn notes(&self) -> Vec<String> {
         match self {
             Packaged::Wasm(k) => k.notes().to_vec(),
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(k) => k.notes(),
         }
     }
 
     /// `wasm` or `pex`, for a check report.
     pub fn kind(&self) -> &'static str {
         self.package().format.as_str()
+    }
+
+    /// Bind the run (17 f.4, f.7): a `.wasm` answers to the run's gate; a `.pex`'s stage
+    /// ceiling is computed from the run's sampler and starting ceiling.
+    pub fn bind(
+        &self,
+        gate: &Arc<moruna_adapters::guard::MemoryGate>,
+        sampler: &Arc<dyn Sampler>,
+        ceiling: u64,
+    ) {
+        match self {
+            Packaged::Wasm(k) => k.bind_gate(Arc::clone(gate)),
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(k) => k.bind_run(Arc::clone(sampler), ceiling),
+        }
+        let _ = (sampler, ceiling);
+    }
+
+    /// Bind to this process alone, for a check or a load (16 f.9, f.11): the machine's ceiling
+    /// as discovery finds it, its sampler, and a gate over that sampler.
+    pub fn bind_here(&self) -> Result<()> {
+        let discovered = moruna_discovery::discover(&moruna_discovery::DiscoveryInput::default())?;
+        let sampler: Arc<dyn Sampler> = Arc::new(moruna_discovery::Sampler::new(&discovered)?);
+        let ceiling = discovered.limits.memory_ceiling;
+        let gate = moruna_adapters::guard::MemoryGate::new(Arc::clone(&sampler), ceiling);
+        self.bind(&gate, &sampler, ceiling);
+        Ok(())
+    }
+
+    /// Memory the stage holds outside this process (SB-I9): a `.pex`'s child.
+    pub fn outside(&self) -> Option<Arc<dyn OutsideMemory>> {
+        match self {
+            Packaged::Wasm(_) => None,
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(k) => Some(k.outside()),
+        }
+    }
+
+    /// The limits moved (MH 4.4): a `.pex` sends its stage ceiling now.
+    pub fn limits_changed(&self) {
+        match self {
+            Packaged::Wasm(_) => {}
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(k) => k.limits_changed(),
+        }
     }
 }
 
@@ -63,16 +117,88 @@ pub fn open(path: &Path, pin: Option<&str>, host: &PackageHost) -> Result<Packag
     }
     match package.format {
         Format::Wasm => Ok(Packaged::Wasm(Arc::new(WasmKernel::new(package)?))),
-        Format::Pex => {
-            let _ = host;
-            Err(MorunaError::Config {
-                name: "package",
-                msg: format!(
-                    "{}: a .pex runs in moruna-sandbox (SDD 17), which this build does not have \
-                     yet",
-                    path.display()
-                ),
-            })
+        Format::Pex => pex(package, host),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pex(package: Arc<Package>, host: &PackageHost) -> Result<Packaged> {
+    let missing = |option: &str| MorunaError::Config {
+        name: "sandbox",
+        msg: format!(
+            "{}: a .pex runs in the sandbox, which needs {option} (17 e.6)",
+            package.path.display()
+        ),
+    };
+    let python = host.sandbox_python.clone().ok_or_else(|| {
+        missing("--sandbox-python, a standard-build CPython with moruna and pyarrow")
+    })?;
+    let cgroup = host.sandbox_cgroup.clone().ok_or_else(|| {
+        missing("--sandbox-cgroup, a cgroup v2 directory with memory and cpu delegated")
+    })?;
+    let host = moruna_sandbox::SandboxHost { python, cgroup };
+    Ok(Packaged::Pex(Arc::new(moruna_sandbox::SandboxKernel::new(
+        Arc::clone(&package),
+        host,
+    )?)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pex(package: Arc<Package>, _host: &PackageHost) -> Result<Packaged> {
+    Err(MorunaError::Config {
+        name: "sandbox",
+        msg: format!("{}: {}", package.path.display(), moruna_sandbox::NOT_LINUX),
+    })
+}
+
+/// A sampler that adds the memory a run's packaged stages hold outside the process (SB-I9).
+pub struct WithOutside {
+    inner: Arc<dyn Sampler>,
+    outside: Vec<Arc<dyn OutsideMemory>>,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl WithOutside {
+    /// `inner`, with `outside` added to every sample.
+    pub fn new(inner: Arc<dyn Sampler>, outside: Vec<Arc<dyn OutsideMemory>>) -> WithOutside {
+        WithOutside {
+            inner,
+            outside,
+            peak: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn held(&self) -> u64 {
+        self.outside.iter().map(|o| o.in_use()).sum()
+    }
+}
+
+impl Sampler for WithOutside {
+    fn sample(&self) -> moruna_kernel::Sample {
+        let mut sample = self.inner.sample();
+        let held = self.held();
+        sample.anon_bytes = sample.anon_bytes.saturating_add(held);
+        sample.peak_anon_bytes = sample.peak_anon_bytes.saturating_add(held);
+        self.peak
+            .fetch_max(sample.anon_bytes, std::sync::atomic::Ordering::AcqRel);
+        sample
+    }
+
+    fn reset_peak(&self) {
+        self.inner.reset_peak();
+    }
+
+    fn process_peak(&self) -> moruna_kernel::ProcessPeak {
+        let mut peak = self.inner.process_peak();
+        let seen = self.peak.load(std::sync::atomic::Ordering::Acquire);
+        if seen > peak.bytes {
+            peak.bytes = seen;
+            peak.exact = false;
+        }
+        peak
+    }
+
+    fn process_usage(&self) -> moruna_kernel::ProcessUsage {
+        self.inner.process_usage()
     }
 }

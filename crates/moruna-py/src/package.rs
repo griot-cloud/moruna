@@ -3,13 +3,19 @@
 //! its runtime (16 f.9) and compiled ahead of time (16 f.10).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use moruna_kernel::{Allocator, InitCtx, KernelState, Payload, Tier};
 use moruna_package::{Format, Manifest, Package};
 use moruna_runtime::check::package::check_package as check_through_runtime;
-use moruna_runtime::packaged::PackageHost;
+use moruna_runtime::packaged::{self, PackageHost, Packaged};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use pyo3_arrow::PyRecordBatch;
+
+/// The arena `moruna.load` lands a kernel's outputs in (16 i).
+pub const LOAD_ARENA_BYTES: u64 = 256 << 20;
 
 use crate::errors::{Attachments, to_py_err};
 
@@ -91,6 +97,162 @@ pub fn aot(py: Python<'_>, path: &str) -> PyResult<String> {
     Ok(written.display().to_string())
 }
 
+/// What `moruna.load` returns (16 d.3): a packaged kernel under its own runtime on this machine,
+/// callable on a batch, and accepted by `moruna.run`, which runs the same file under the run's
+/// own instance (12 f.8).
+#[pyclass(frozen, module = "moruna._core", name = "PackageKernel")]
+pub struct PyPackageKernel {
+    /// The package's file.
+    pub(crate) path: String,
+    /// `sha256:<hex>`.
+    pub(crate) fingerprint: String,
+    /// What a `.pex` needs, for the run this kernel is given to.
+    pub(crate) host: PackageHost,
+    format: &'static str,
+    manifest: String,
+    packaged: Packaged,
+    /// Dropped before `alloc`, the arena its outputs land in (fields drop in order).
+    state: Mutex<Box<dyn KernelState>>,
+    #[allow(dead_code)]
+    alloc: Arc<dyn Allocator>,
+}
+
+#[pymethods]
+impl PyPackageKernel {
+    /// The package's file.
+    #[getter]
+    fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    /// `sha256:<hex>` of the file (16 b).
+    #[getter]
+    fn fingerprint(&self) -> String {
+        self.fingerprint.clone()
+    }
+
+    /// `wasm` or `pex`.
+    #[getter]
+    fn format(&self) -> &'static str {
+        self.format
+    }
+
+    /// The manifest (16 e.1), as a dict.
+    #[getter]
+    fn manifest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        py.import("json")?.call_method1("loads", (&self.manifest,))
+    }
+
+    /// One batch through the kernel, under its runtime (16 f.11).
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        batch: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let input: PyRecordBatch = batch.extract().map_err(|e| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "a package kernel takes a pyarrow.RecordBatch: {e}"
+            ))
+        })?;
+        let input = input.into_inner();
+        let kernel = self.packaged.kernel();
+        let out = py
+            .detach(|| {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                kernel.apply(state.as_mut(), Payload::Table(input, Tier::Host))
+            })
+            .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
+        let _ = moruna_kernel::take_kernel_alloc();
+        match out {
+            Payload::Table(batch, _) => PyRecordBatch::new(batch)
+                .into_pyarrow(py)
+                .map(|b| b.into_any()),
+            Payload::Tensor(..) => Err(pyo3::exceptions::PyTypeError::new_err(
+                "a package kernel returned a tensor",
+            )),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("moruna.load({:?}) {}", self.path, self.fingerprint)
+    }
+}
+
+/// `_core.load(path, *, python, cgroup)` (16 d.3, f.11).
+#[pyfunction]
+#[pyo3(signature = (path, *, python = None, cgroup = None))]
+pub fn load(
+    py: Python<'_>,
+    path: &str,
+    python: Option<String>,
+    cgroup: Option<String>,
+) -> PyResult<PyPackageKernel> {
+    let format =
+        Format::of_path(Path::new(path)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let mut host = PackageHost {
+        sandbox_python: python.map(PathBuf::from),
+        sandbox_cgroup: cgroup.map(PathBuf::from),
+    };
+    if format == Format::Pex {
+        if host.sandbox_python.is_none() {
+            let sys = py.import("sys")?;
+            let gil: bool = sys.call_method0("_is_gil_enabled")?.extract()?;
+            if !gil {
+                return Err(PyValueError::new_err(
+                    "moruna.load: a .pex runs on the standard build of CPython; this interpreter \
+                     is free threaded, so name one with python=",
+                ));
+            }
+            host.sandbox_python = Some(PathBuf::from(
+                sys.getattr("executable")?.extract::<String>()?,
+            ));
+        }
+        if host.sandbox_cgroup.is_none() {
+            return Err(PyValueError::new_err(
+                "moruna.load: a .pex runs under a cgroup; name one with cgroup= (a cgroup v2 \
+                 directory with memory and cpu delegated, 17 e.6)",
+            ));
+        }
+    }
+    let path_buf = PathBuf::from(path);
+    let opened_host = host.clone();
+    let (packaged, alloc, state) = py
+        .detach(move || -> moruna_kernel::Result<_> {
+            let packaged = packaged::open(&path_buf, None, &opened_host)?;
+            packaged.bind_here()?;
+            let arena = moruna_arena_for_load()?;
+            let state = packaged.kernel().init(&InitCtx {
+                instance: 0,
+                device: None,
+                alloc: Arc::clone(&arena),
+            })?;
+            Ok((packaged, arena, state))
+        })
+        .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
+    let package = packaged.package();
+    Ok(PyPackageKernel {
+        path: path.to_string(),
+        fingerprint: package.fingerprint_string(),
+        format: package.format.as_str(),
+        manifest: package.manifest.to_json(),
+        host,
+        packaged,
+        state: Mutex::new(state),
+        alloc,
+    })
+}
+
+fn moruna_arena_for_load() -> moruna_kernel::Result<Arc<dyn Allocator>> {
+    let arena = moruna_arena::Arena::new(moruna_arena::ArenaConfig {
+        host_bytes: LOAD_ARENA_BYTES,
+        ..moruna_arena::ArenaConfig::default()
+    })?;
+    Ok(arena as Arc<dyn Allocator>)
+}
+
 /// Registers the package functions on the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("KERNEL_ABI", moruna_kernel::declare::ABI_VERSION)?;
@@ -98,5 +260,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(package_wasm, m)?)?;
     m.add_function(wrap_pyfunction!(check_package, m)?)?;
     m.add_function(wrap_pyfunction!(aot, m)?)?;
+    m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_class::<PyPackageKernel>()?;
+    #[cfg(target_os = "linux")]
+    moruna_sandbox::python::register(m)?;
     Ok(())
 }

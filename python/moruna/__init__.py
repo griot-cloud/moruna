@@ -59,6 +59,9 @@ from moruna._core import (
 # The classes a user subclasses for a source or a sink of their own (SDD 07 e.6, 08 f.10).
 from moruna._core import Sink, Source, Split
 
+# A function package under its own runtime on this machine (SDD 16 d.3, 12 f.8).
+from moruna._core import PackageKernel, load
+
 __version__: str = _core.__version__
 
 __all__ = [
@@ -91,6 +94,9 @@ __all__ = [
 
 # A source or a sink of the user's own (SDD 07 e.6, 08 f.10).
 __all__ += ["Sink", "Source", "Split"]
+
+# A function package (SDD 16 d.3).
+__all__ += ["PackageKernel", "load"]
 
 
 def run(

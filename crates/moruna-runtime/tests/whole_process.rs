@@ -179,6 +179,7 @@ fn child_run() {
                 strict: true,
                 env: &env,
                 notes: Vec::new(),
+                packages: moruna_runtime::packaged::PackageHost::default(),
             },
         ) {
             Err(e) => json!({"error": e.to_string()}),

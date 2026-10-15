@@ -38,6 +38,8 @@ pub struct HostOptions<'a> {
     pub cancel: CancelToken,
     /// The heartbeat cadence; [`HEARTBEAT`] outside tests.
     pub heartbeat: Duration,
+    /// What a `.pex` package's sandbox needs from the host (17 e.6).
+    pub packages: crate::packaged::PackageHost,
 }
 
 /// How a job ended.
@@ -285,6 +287,7 @@ pub fn run_job(
             strict: opts.strict,
             env: opts.env,
             notes: Vec::new(),
+            packages: opts.packages.clone(),
         },
     ) {
         Ok(built) => built,

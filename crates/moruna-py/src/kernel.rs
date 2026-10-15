@@ -177,6 +177,9 @@ pub enum Stage {
     Py(Arc<PyKernel>),
     /// A standard kernel (`moruna.std.<name>`), which may fuse with its neighbours.
     Std(Box<moruna_kernels::StdKernel>),
+    /// A loaded package (`moruna.load`), which the run opens again by its path and pin under
+    /// its own runtime (12 f.8).
+    Package(moruna_runtime::packaged::PackageHost),
 }
 
 /// The kernels of one run, in stage order, from whatever `moruna.run` was given: one kernel, a
@@ -198,6 +201,10 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stag
         if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
             // Fusion happens where the job document is built, so every entry stays an entry.
             out.push(Stage::Std(Box::new(std.get().kernel.clone())));
+            continue;
+        }
+        if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
+            out.push(Stage::Package(package.get().host.clone()));
             continue;
         }
         if item.is_callable() {

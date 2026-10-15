@@ -463,7 +463,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `hyper`, `hyper-util`, `http`, `http-body-util`, `socket2` | 6, runtime (dev) | object storage through a Unix or vsock socket: HTTP/1.1 over a stream for `object_store`'s S3 client (MH 4.6) | already in the graph through `object_store`; `default-features = false` on `hyper` and `hyper-util` |
 | `kvm-ioctls`, `kvm-bindings`, `vmm-sys-util` | `moruna-vmm` | KVM: the VM, memory slots, irqchip, vCPUs (MH 4.8) | Linux only; `kvm-bindings` with `fam-wrappers` |
 | `vm-memory`, `virtio-queue`, `virtio-bindings`, `vm-superio`, `linux-loader` | `moruna-vmm` | guest memory, split virtqueues, the virtio constants, the serial console, loading the guest kernel (MH 4.8) | the rust-vmm crates; `vm-memory` with `backend-mmap`, `linux-loader` with `bzimage`, `elf`, `pe` |
-| `wasmtime` | 17 (`moruna-wasm`) | a `.wasm` package's runtime: the component model, cranelift, fuel, the resource limiter (FP 4) | `default-features = false`, features `cranelift`, `component-model`, `runtime`, `std`; added 2026-10-15 |
+| `wasmtime` | 17 (`moruna-wasm`) | a `.wasm` package's runtime: the component model, cranelift, fuel, the resource limiter (FP 4) | 47.0.4, the version `parcel-runtime` already brings, so the graph has one; `default-features = false`, features `cranelift`, `component-model`, `runtime`, `std`; added 2026-10-15 |
 | `wat` | 17 (dev) | the test components, written in the text format | dev-dependency only |
 | `zip` | 16 | the `.pex` archive | `default-features = false`, feature `deflate`; added 2026-10-15 |
 | `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |

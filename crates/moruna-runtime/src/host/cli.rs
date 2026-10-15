@@ -15,11 +15,12 @@ use super::transport::Address;
 use super::{VERSION, exit};
 use crate::job::KernelLoader;
 use crate::job::build::process_env;
+use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
-pub const USAGE: &str = "usage: moruna run <spec.json> [--strict]
+pub const USAGE: &str = "usage: moruna run <spec.json> [--strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
        moruna run --vm <spec.json> --image <dir-or-oci> [--disk <path>[:ro|:rw]]...
-       moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict]
+       moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
        moruna --version";
 
 /// A parsed command line.
@@ -31,6 +32,8 @@ pub enum Command {
         spec: String,
         /// Refuse any field the environment would fill.
         strict: bool,
+        /// What a `.pex` package's sandbox needs (17 e.6).
+        packages: PackageHost,
     },
     /// `moruna run --vm <spec.json> --image <path> [--disk <path>[:ro]]...` (MH 4.8.4): boot
     /// the guest with the disks attached, send it the document, relay what it says, exit with
@@ -50,6 +53,8 @@ pub enum Command {
         listen: Address,
         /// Refuse any field the environment would fill.
         strict: bool,
+        /// What a `.pex` package's sandbox needs (17 e.6).
+        packages: PackageHost,
     },
     /// `moruna --version`.
     Version,
@@ -68,7 +73,11 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             let mut vm = false;
             let mut image = None;
             let mut disks = Vec::new();
+            let mut packages = PackageHost::default();
             while let Some(arg) = rest.next() {
+                if sandbox_option(arg, &mut rest, &mut packages, "moruna run")? {
+                    continue;
+                }
                 match arg {
                     "--strict" => strict = true,
                     "--vm" => vm = true,
@@ -106,11 +115,22 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                             .to_string(),
                     );
                 }
-                return Ok(Command::Run { spec, strict });
+                return Ok(Command::Run {
+                    spec,
+                    strict,
+                    packages,
+                });
             }
             if strict {
                 return Err(
                     "moruna run --vm: the guest's `moruna serve` is always strict; drop --strict"
+                        .to_string(),
+                );
+            }
+            if packages != PackageHost::default() {
+                return Err(
+                    "moruna run --vm: the guest names its own sandbox; drop --sandbox-python and \
+                     --sandbox-cgroup"
                         .to_string(),
                 );
             }
@@ -120,7 +140,11 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         Some("serve") => {
             let mut listen = None;
             let mut strict = true;
+            let mut packages = PackageHost::default();
             while let Some(arg) = rest.next() {
+                if sandbox_option(arg, &mut rest, &mut packages, "moruna serve")? {
+                    continue;
+                }
                 match arg {
                     "--listen" => {
                         let text = rest
@@ -135,13 +159,36 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 }
             }
             let listen = listen.ok_or_else(|| "moruna serve: --listen is required".to_string())?;
-            Ok(Command::Serve { listen, strict })
+            Ok(Command::Serve {
+                listen,
+                strict,
+                packages,
+            })
         }
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
         Some(other) => Err(format!("moruna: unknown command `{other}`")),
         None => Err("moruna: which command?".to_string()),
     }
+}
+
+/// `--sandbox-python <path>` and `--sandbox-cgroup <dir>` (17 e.6): true when `arg` was one.
+fn sandbox_option<'a>(
+    arg: &str,
+    rest: &mut impl Iterator<Item = &'a str>,
+    packages: &mut PackageHost,
+    command: &str,
+) -> Result<bool, String> {
+    let slot = match arg {
+        "--sandbox-python" => &mut packages.sandbox_python,
+        "--sandbox-cgroup" => &mut packages.sandbox_cgroup,
+        _ => return Ok(false),
+    };
+    let value = rest
+        .next()
+        .ok_or_else(|| format!("{command}: {arg} needs a path"))?;
+    *slot = Some(PathBuf::from(value));
+    Ok(true)
 }
 
 /// Run a command line and return the process's exit code (MH 4.2). `cancel` is the surface's
@@ -177,7 +224,11 @@ pub fn main_with(
         Command::RunVm { spec, image, disks } => {
             return run_vm(Path::new(&spec), &image, &disks);
         }
-        Command::Run { spec, strict } => session::run_file(
+        Command::Run {
+            spec,
+            strict,
+            packages,
+        } => session::run_file(
             Path::new(&spec),
             loader,
             &HostOptions {
@@ -185,9 +236,14 @@ pub fn main_with(
                 env,
                 cancel,
                 heartbeat,
+                packages,
             },
         ),
-        Command::Serve { listen, strict } => session::serve(
+        Command::Serve {
+            listen,
+            strict,
+            packages,
+        } => session::serve(
             &listen,
             loader,
             &HostOptions {
@@ -195,6 +251,7 @@ pub fn main_with(
                 env,
                 cancel,
                 heartbeat,
+                packages,
             },
         ),
     };
@@ -321,29 +378,87 @@ mod tests {
             parse(&args(&["run", "job.json"])),
             Ok(Command::Run {
                 spec: "job.json".into(),
-                strict: false
+                strict: false,
+                packages: PackageHost::default(),
             })
         );
         assert_eq!(
             parse(&args(&["run", "--strict", "job.json"])),
             Ok(Command::Run {
                 spec: "job.json".into(),
-                strict: true
+                strict: true,
+                packages: PackageHost::default(),
             })
         );
         assert_eq!(
             parse(&args(&["serve", "--listen", "vsock://-1:5000"])),
             Ok(Command::Serve {
                 listen: Address::parse("vsock://-1:5000").expect("address"),
-                strict: true
+                strict: true,
+                packages: PackageHost::default(),
             })
         );
         assert_eq!(
             parse(&args(&["serve", "--no-strict", "--listen", "/tmp/m.sock"])),
             Ok(Command::Serve {
                 listen: Address::parse("/tmp/m.sock").expect("address"),
-                strict: false
+                strict: false,
+                packages: PackageHost::default(),
             })
+        );
+        // 17 e.6: the sandbox's interpreter and cgroup, on run and serve, and not on run --vm.
+        let host = PackageHost {
+            sandbox_python: Some("/opt/py/bin/python3".into()),
+            sandbox_cgroup: Some("/sys/fs/cgroup/sb".into()),
+        };
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "job.json",
+                "--sandbox-python",
+                "/opt/py/bin/python3",
+                "--sandbox-cgroup",
+                "/sys/fs/cgroup/sb",
+            ])),
+            Ok(Command::Run {
+                spec: "job.json".into(),
+                strict: false,
+                packages: host.clone(),
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "serve",
+                "--listen",
+                "/tmp/m.sock",
+                "--sandbox-cgroup",
+                "/sys/fs/cgroup/sb",
+                "--sandbox-python",
+                "/opt/py/bin/python3",
+            ])),
+            Ok(Command::Serve {
+                listen: Address::parse("/tmp/m.sock").expect("address"),
+                strict: true,
+                packages: host,
+            })
+        );
+        assert!(
+            parse(&args(&["run", "job.json", "--sandbox-python"]))
+                .unwrap_err()
+                .contains("--sandbox-python needs a path")
+        );
+        assert!(
+            parse(&args(&[
+                "run",
+                "--vm",
+                "job.json",
+                "--image",
+                "/i",
+                "--sandbox-cgroup",
+                "/c"
+            ]))
+            .unwrap_err()
+            .contains("the guest names its own sandbox")
         );
         assert_eq!(
             parse(&args(&["serve", "--strict", "--listen", "/tmp/m.sock"]))
