@@ -1,4 +1,4 @@
-# Function Packages: One File, Two Runtimes — Architecture Design
+# Function Packages, One File, Two Runtimes: Architecture Design
 
 **Document type:** full architecture design (not an ADR)
 **Status:** DRAFT for review · 2026-10-15
@@ -7,13 +7,13 @@
 
 ## 1. Problem statement
 
-**P1 — A checkable kernel is not a portable one.** §4.9 makes a function checkable and fingerprinted, but the function is still a Python module whose dependencies are whatever the importing interpreter has, or a Rust crate that has to be compiled into the guest. There is no artefact to move.
+**P1. A checkable kernel is not a portable one.** §4.9 makes a function checkable and fingerprinted, but the function is still a Python module whose dependencies are whatever the importing interpreter has, or a Rust crate that has to be compiled into the guest. There is no artefact to move.
 
-**P2 — The lockfile is a hash, not an environment.** The lockfile is folded into the fingerprint and never installed. A kernel runs with the interpreter's packages, not its own.
+**P2. The lockfile is a hash, not an environment.** The lockfile is folded into the fingerprint and never installed. A kernel runs with the interpreter's packages, not its own.
 
-**P3 — Tenant code runs in Moruna's process.** A Python kernel is imported into the interpreter beside Moruna, with everything Moruna can see in view: every attached disk, the job document, the host socket. A host that runs one party's kernel over another party's data has no boundary but the machine.
+**P3. Tenant code runs in Moruna's process.** A Python kernel is imported into the interpreter beside Moruna, with everything Moruna can see in view: every attached disk, the job document, the host socket. A host that runs one party's kernel over another party's data has no boundary but the machine.
 
-**P4 — One language.** A Rust kernel's path ends at a check; nothing else has a path at all.
+**P4. One language.** A Rust kernel's path ends at a check; nothing else has a path at all.
 
 ## 2. The package
 

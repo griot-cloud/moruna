@@ -184,6 +184,25 @@ impl KernelMemory {
     pub fn frame<R>(self: &std::sync::Arc<Self>, f: impl FnOnce() -> R) -> (R, FrameEnd);
 }
 pub struct FrameEnd { pub counts: moruna_kernel::KernelAlloc, pub refusal: Option<Refusal> }
+impl MemoryGate {
+    /// The ceiling in force, as the gate last saw it (17 f.7; amended 2026-10-15).
+    pub fn ceiling(&self) -> u64;
+}
+/// f.3, with no feature (amended 2026-10-15): the one boundary copy of a returned table whose
+/// buffers the arena does not own, used by the Python adapter and by both runtimes of a packaged
+/// kernel (17 f.4, f.8). Returns the payload and the bytes copied, counted in
+/// `boundary_copies_total`.
+pub mod land { pub fn land_table(batch: RecordBatch, alloc: &Arc<dyn Allocator>) -> Result<(Payload, u64)>; }
+impl PyKernel {
+    /// f.12 for a caller that holds a `pyarrow.RecordBatch` rather than a payload: the hooks,
+    /// the NumPy handler, the Arrow pool reads and the frame around one call, exactly as
+    /// `apply`'s attached half, returning the call's result and its counts. The child of a
+    /// packaged kernel calls it (17 f.6; amended 2026-10-15).
+    pub fn call_arrow<'py>(&self, py: Python<'py>, state: &mut dyn KernelState, batch: Bound<'py, PyAny>)
+        -> (Result<Bound<'py, PyAny>>, KernelAlloc);
+    /// The state `init` builds, for a caller that runs the kernel outside a scheduler.
+    pub fn new_state(&self, ctx: &InitCtx) -> Result<Box<dyn KernelState>>;
+}
 /// f.10: what a Python domain hook does with a request for `bytes`; `underlying` calls the
 /// allocator underneath. Returns `underlying()`'s pointer, or null for a refusal.
 pub fn allocate<T>(bytes: u64, underlying: impl FnOnce() -> *mut T) -> *mut T;

@@ -38,6 +38,8 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 10 | Scheduler | `10-scheduler.md` | 1, 8 (`SinkHandle`, `ReorderBuffer`), 9 | implements `Knobs`, `StatsSource` and `Prober`; workers only ever run `Kernel::apply` and nothing that blocks on IO |
 | 11 | Resource controller | `11-controller.md` | 3, 4, 9, 10 (all four through contracts traits; the crate depends on `moruna-kernel` alone) | the only writer of every knob; reads stats, never morsels |
 | 12 | Python surface | `12-python.md` | all | the only component that knows what a user is |
+| 16 | Function package | `16-package.md` | 1, 12's check harness, 17 | a package is one file whose fingerprint is `sha256` of its bytes, read once; its manifest is complete and closed; a hosted run loads no kernel by import path (added 2026-10-15, `architecture/function-packages.md`) |
+| 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -98,7 +100,7 @@ This diagram answers "which components can be built in parallel and which concre
 
 ### 1.4 Per-component schema
 
-Every component SDD has these fifteen sections, in this order, with the component's two-letter prefix (CT, AR, DS, TR, AD, RE, SO, SI, PL, SC, RC, PY) on every invariant and test id:
+Every component SDD has these fifteen sections, in this order, with the component's two-letter prefix (CT, AR, DS, TR, AD, RE, SO, SI, PL, SC, RC, PY; PK and SB for 16 and 17) on every invariant and test id:
 
 a. Purpose and boundary. b. Vocabulary specific to the component. c. Invariants, `XX-I1..`. d. Interfaces: exposed and consumed, complete signatures. e. Data model, formats and state machines. f. Algorithms and policies. g. Concurrency within the component. h. Behaviour: normal path, edge cases, failures. i. Configuration: this component's rows of the global table. j. Observability. k. Tests, `XX-T1..`. l. Implementation notes for the agent. m. Open items: only items that block the build; each is either resolved or moved to the escalation list (section 7) before hand-off, so this section is empty in a hand-off-ready document. n. Traceability: parent ids to invariants to tests. o. Deferred (post-v1): items the component knows about and will not build in v1, with ids `XX-O1..` (an item that started life in section m keeps its number when it moves, so `XX-M1` becomes `XX-O1`); nothing in this section blocks hand-off, and an agent that finds it needs one of these items to meet a gate stops and reports.
 
@@ -408,6 +410,9 @@ moruna/
     moruna-py/                component 12: PyO3 module, built by maturin; depends on moruna-runtime; wave 5
     moruna-polars/            engine bridge: hosts a kernel inside Polars; depends on moruna-kernel and polars only (feature: polars)
     moruna-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on moruna-kernel and datafusion only (feature: datafusion)
+    moruna-package/           component 16: the function package: manifest, reader, fingerprint, tree (added 2026-10-15)
+    moruna-wasm/              component 17: a `.wasm` package in wasmtime
+    moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
@@ -458,6 +463,11 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `hyper`, `hyper-util`, `http`, `http-body-util`, `socket2` | 6, runtime (dev) | object storage through a Unix or vsock socket: HTTP/1.1 over a stream for `object_store`'s S3 client (MH 4.6) | already in the graph through `object_store`; `default-features = false` on `hyper` and `hyper-util` |
 | `kvm-ioctls`, `kvm-bindings`, `vmm-sys-util` | `moruna-vmm` | KVM: the VM, memory slots, irqchip, vCPUs (MH 4.8) | Linux only; `kvm-bindings` with `fam-wrappers` |
 | `vm-memory`, `virtio-queue`, `virtio-bindings`, `vm-superio`, `linux-loader` | `moruna-vmm` | guest memory, split virtqueues, the virtio constants, the serial console, loading the guest kernel (MH 4.8) | the rust-vmm crates; `vm-memory` with `backend-mmap`, `linux-loader` with `bzimage`, `elf`, `pe` |
+| `wasmtime` | 17 (`moruna-wasm`) | a `.wasm` package's runtime: the component model, cranelift, fuel, the resource limiter (FP 4) | `default-features = false`, features `cranelift`, `component-model`, `runtime`, `std`; added 2026-10-15 |
+| `wasmparser` | 16 | a component's custom sections, the embedded manifest | the version `wasmtime` uses, so the graph has one; added 2026-10-15 |
+| `wat` | 17 (dev) | the test components, written in the text format | dev-dependency only |
+| `zip` | 16 | the `.pex` archive | `default-features = false`, feature `deflate`; added 2026-10-15 |
+| `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |
 | `vm-fdt`, `acpi_tables` | `moruna-vmm` | the aarch64 device tree and the x86_64 ACPI tables that describe the guest's devices and hot-pluggable CPUs | |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
