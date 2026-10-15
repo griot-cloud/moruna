@@ -82,7 +82,13 @@ impl Template {
             .env_clear()
             .env("OPENBLAS_NUM_THREADS", "1")
             .env("OMP_NUM_THREADS", "1")
-            .env("MKL_NUM_THREADS", "1")
+            .env("MKL_NUM_THREADS", "1");
+        // A coverage build's profile path reaches the template and its children (17 l).
+        #[cfg(coverage)]
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());

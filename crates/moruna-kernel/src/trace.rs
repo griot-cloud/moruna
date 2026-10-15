@@ -189,7 +189,8 @@ impl TraceRecord {
         "alloc_arrow_bytes:u64,alloc_arrow_requests:u64,alloc_arrow_largest:u64,",
         "alloc_arrow_peak:u64,alloc_arrow_refused:u64,",
         "alloc_linear_bytes:u64,alloc_linear_requests:u64,alloc_linear_largest:u64,",
-        "alloc_linear_peak:u64,alloc_linear_refused:u64"
+        "alloc_linear_peak:u64,alloc_linear_refused:u64,",
+        "alloc_lease_wait_us:u64"
     );
 
     /// BLAKE3 of the canonical field list (CT-I8). A compile-time constant: the digest of
@@ -198,9 +199,9 @@ impl TraceRecord {
     /// CT-T9 recomputes the digest from `SCHEMA_FIELDS` and asserts this value, so a schema
     /// change is a deliberate edit of the test and of this constant.
     pub const SCHEMA_HASH: [u8; 32] = [
-        0x7c, 0x1e, 0xbb, 0xc2, 0x6b, 0x28, 0x78, 0xfd, 0x6f, 0xd5, 0x5f, 0xff, 0x50, 0xaa, 0x2f,
-        0xe5, 0x84, 0xb5, 0x3b, 0x2d, 0x1d, 0x13, 0xe2, 0xa6, 0xa8, 0x2e, 0xea, 0xac, 0x50, 0xec,
-        0xc0, 0x81,
+        0x04, 0xe3, 0xf8, 0x96, 0x91, 0xe9, 0xa5, 0xbc, 0x10, 0xe3, 0x8e, 0x9b, 0x9a, 0x0b, 0x0c,
+        0x2c, 0xb5, 0xbd, 0xe2, 0x66, 0xe3, 0x81, 0xcd, 0x4a, 0xc9, 0x34, 0x37, 0x13, 0x43, 0x45,
+        0x58, 0xa6,
     ];
 
     /// The digest of `SCHEMA_FIELDS`, recomputed. Equal to `SCHEMA_HASH` (CT-T9).
@@ -256,6 +257,7 @@ impl TraceRecord {
                 ));
             }
         }
+        fields.push(Field::new("alloc_lease_wait_us", DataType::UInt64, false));
         Arc::new(Schema::new(fields))
     }
 }

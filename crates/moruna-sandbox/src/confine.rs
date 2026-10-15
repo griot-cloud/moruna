@@ -389,4 +389,41 @@ mod tests {
         };
         assert_eq!(f.to_string(), "x: y");
     }
+
+    /// A confinement whose root does not exist fails at its step, naming the system's answer;
+    /// in a forked child, because it enters a mount namespace.
+    #[test]
+    fn a_missing_root_fails_at_the_namespace() {
+        // SAFETY: the child confines itself (which only touches its own namespace) and `_exit`s
+        // with a code that says what happened.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            crate::coverage::open();
+            let r = confine(&Confinement {
+                cgroup: PathBuf::from("/nonexistent"),
+                root: PathBuf::from("/nonexistent/moruna-root"),
+                tree: PathBuf::from("/nonexistent/tree"),
+                roots: Vec::new(),
+                assets: None,
+            });
+            let code = match r {
+                Err(f) if f.step == "namespace" && f.error.contains("mount") => 0,
+                Err(_) => 1,
+                Ok(()) => 2,
+            };
+            crate::coverage::write();
+            // SAFETY: ends the forked child without running the parent's exit handlers.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for the child this test forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the step and its cause are named"
+        );
+    }
 }

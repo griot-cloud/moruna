@@ -86,6 +86,9 @@ pub struct KernelAlloc {
     /// A wasm instance's linear memory (17 e.2): each growth a request, `peak` the memory's size
     /// at the call's end.
     pub linear: AllocCounts,
+    /// Microseconds the call waited for a region of its runtime's shared mapping to be given
+    /// back by its kernel (17 SB-I13): the backpressure of a kernel that keeps its inputs.
+    pub lease_wait_us: u64,
 }
 
 impl KernelAlloc {
@@ -97,6 +100,7 @@ impl KernelAlloc {
         numpy: AllocCounts::ZERO,
         arrow: AllocCounts::ZERO,
         linear: AllocCounts::ZERO,
+        lease_wait_us: 0,
     };
 }
 

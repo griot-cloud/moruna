@@ -451,6 +451,7 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
+            crate::coverage::open();
             // SAFETY: as above.
             unsafe {
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -485,6 +486,7 @@ mod tests {
                 if libc::kill(me as i32, 0) != 0 {
                     libc::_exit(33);
                 }
+                crate::coverage::write();
                 libc::_exit(0);
             }
         }

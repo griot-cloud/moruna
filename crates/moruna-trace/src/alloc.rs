@@ -35,6 +35,8 @@ pub struct StageAlloc {
     pub arrow: SourceAlloc,
     /// A wasm instance's linear memory (17 e.2).
     pub linear: SourceAlloc,
+    /// Microseconds the stage's calls waited for their runtime's shared mapping (17 SB-I13).
+    pub lease_wait_us: u64,
     /// The most one call held at once, all sources (f.2).
     pub peak_bytes: u64,
     /// The part of that peak that was not Arrow.
@@ -81,6 +83,7 @@ pub struct AllocAcc {
     numpy: SourceAcc,
     arrow: SourceAcc,
     linear: SourceAcc,
+    lease_wait_us: u64,
     /// The largest call total and that call's outside-Arrow part, with the record's order key
     /// so the choice between equal totals does not depend on the order chunks are read in.
     peak: Option<((u64, u64), u64, u64)>,
@@ -99,6 +102,7 @@ impl AllocAcc {
         self.numpy.add(&a.numpy);
         self.arrow.add(&a.arrow);
         self.linear.add(&a.linear);
+        self.lease_wait_us = self.lease_wait_us.saturating_add(a.lease_wait_us);
         let rise = r.mem_anon_peak.saturating_sub(r.mem_anon_before);
         let hooked = a
             .arrow
@@ -129,6 +133,7 @@ impl AllocAcc {
             numpy: self.numpy.finish(true, true, true),
             arrow: self.arrow.finish(false, true, false),
             linear: self.linear.finish(true, true, true),
+            lease_wait_us: self.lease_wait_us,
             peak_bytes: peak,
             outside_arrow_peak_bytes: outside,
             outside_arrow_fraction: (peak > 0).then(|| outside as f64 / peak as f64),

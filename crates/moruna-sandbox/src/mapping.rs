@@ -198,12 +198,13 @@ impl Mapping {
         Ok(unsafe { self.ptr.add(offset) })
     }
 
-    /// Give the pages of `offset..offset + len` back (17 e.4); they read back as zeros.
+    /// Give back the whole pages inside `offset..offset + len` (17 e.4); they read back as
+    /// zeros. A page the range shares with a neighbour is left alone: the neighbour may be an
+    /// input the child still reads (SB-I13).
     pub fn punch(&self, offset: usize, len: usize) -> io::Result<()> {
         self.check(offset, len)?;
-        let start = offset / PAGE * PAGE;
-        let end = (offset + len).div_ceil(PAGE) * PAGE;
-        let end = end.min(self.len);
+        let start = offset.div_ceil(PAGE) * PAGE;
+        let end = (offset + len) / PAGE * PAGE;
         if end <= start {
             return Ok(());
         }
@@ -290,7 +291,21 @@ mod tests {
         a.bytes_mut(PAGE, 5).unwrap().copy_from_slice(b"hello");
         assert_eq!(b.bytes(PAGE, 5).unwrap(), b"hello");
         assert!(!a.address(PAGE, 5).unwrap().is_null());
+        // A range that holds no whole page gives nothing back: its page has neighbours.
         a.punch(PAGE, 5).unwrap();
+        assert_eq!(b.bytes(PAGE, 5).unwrap(), b"hello");
+        a.bytes_mut(2 * PAGE - 3, 3)
+            .unwrap()
+            .copy_from_slice(b"end");
+        a.punch(PAGE + 5, 2 * PAGE).unwrap();
+        assert_eq!(b.bytes(PAGE, 5).unwrap(), b"hello", "a shared page stays");
+        assert_eq!(
+            b.bytes(2 * PAGE - 3, 3).unwrap(),
+            b"end",
+            "a shared page stays"
+        );
+        assert_eq!(b.bytes(2 * PAGE, PAGE).unwrap(), &[0; PAGE][..]);
+        a.punch(PAGE, PAGE).unwrap();
         assert_eq!(b.bytes(PAGE, 5).unwrap(), &[0; 5]);
         assert_eq!(
             a.counter(field::CEILING).load(Ordering::Acquire),
@@ -309,5 +324,8 @@ mod tests {
         let e = Mapping::open(plain.fd().try_clone_to_owned().unwrap(), plain.len()).unwrap_err();
         assert!(e.to_string().contains("counters page"));
         assert!(Mapping::open(plain.fd().try_clone_to_owned().unwrap(), 10).is_err());
+        // A length the address space cannot map: `mmap`'s refusal, named.
+        let e = Mapping::open(plain.fd().try_clone_to_owned().unwrap(), 1 << 62).unwrap_err();
+        assert!(e.to_string().starts_with("mmap"), "{e}");
     }
 }

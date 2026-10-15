@@ -22,11 +22,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub mod protocol;
+pub mod regions;
 
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod confine;
+#[cfg(target_os = "linux")]
+pub mod coverage;
 #[cfg(target_os = "linux")]
 pub mod fdpass;
 #[cfg(target_os = "linux")]
@@ -41,7 +44,7 @@ pub mod seccomp;
 pub mod template;
 
 #[cfg(target_os = "linux")]
-pub use kernel::{SandboxKernel, SandboxState};
+pub use kernel::{LEASE_POLL, LEASE_WAIT, SandboxKernel, SandboxState};
 
 /// How long a child asked to stop has before `SIGKILL` (17 i).
 pub const STOP_GRACE: Duration = Duration::from_secs(2);

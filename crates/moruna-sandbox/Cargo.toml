@@ -32,3 +32,7 @@ zip = { workspace = true }
 [features]
 default = []
 python = ["dep:pyo3", "dep:moruna-arena", "moruna-adapters/python"]
+
+[lints.rust]
+# cargo-llvm-cov sets `coverage`: a forked child writes its profile itself (17 l).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }

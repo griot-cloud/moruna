@@ -97,6 +97,7 @@ struct Builders {
     alloc_refusal_on: UInt8Builder,
     /// The twenty `alloc_<source>_<count>` columns, in schema order (contracts e.5).
     alloc_counts: Vec<UInt64Builder>,
+    alloc_lease_wait_us: UInt64Builder,
 }
 
 fn list_builder() -> ListBuilder<UInt64Builder> {
@@ -157,6 +158,7 @@ impl Builders {
             alloc_measured: u8b(),
             alloc_refusal_on: u8b(),
             alloc_counts: (0..ALLOC_COLUMNS).map(|_| u64b()).collect(),
+            alloc_lease_wait_us: u64b(),
         }
     }
 
@@ -207,6 +209,7 @@ impl Builders {
         for (at, builder) in self.alloc_counts.iter_mut().enumerate() {
             builder.append_value(r.alloc.source(at / 5).count(at % 5));
         }
+        self.alloc_lease_wait_us.append_value(r.alloc.lease_wait_us);
         self.rows += 1;
     }
 
@@ -263,6 +266,7 @@ impl Builders {
                 ArrayBuilder::finish_cloned(builder)
             });
         }
+        cols.push(col!(alloc_lease_wait_us));
         cols
     }
 

@@ -517,6 +517,8 @@ pub struct KernelAlloc {
     pub arrow: AllocCounts,    // pyarrow's default pool, from its statistics; `largest`, `refused` unmeasured
     pub linear: AllocCounts,   // a wasm instance's linear memory (17 e.2; amended 2026-10-15): growths as requests,
                                // `peak` the memory's size at the call's end
+    pub lease_wait_us: u64,    // microseconds the call waited for its kernel to release a region of the
+                               // shared mapping (17 SB-I13; amended 2026-10-15)
 }
 
 /// The hand-off from a kernel to the scheduler on the worker thread: a kernel that counts its

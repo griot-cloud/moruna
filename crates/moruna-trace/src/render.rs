@@ -230,12 +230,17 @@ impl fmt::Display for RunReport {
                 Some(x) => format!(" ({}% outside Arrow)", sig3(x * 100.0)),
                 None => String::new(),
             };
+            let waited = if a.lease_wait_us > 0 {
+                format!(", lease wait {} ms", sig3(a.lease_wait_us as f64 / 1000.0))
+            } else {
+                String::new()
+            };
             let refused = a.python.refused.unwrap_or(0)
                 + a.numpy.refused.unwrap_or(0)
                 + a.linear.refused.unwrap_or(0);
             writeln!(
                 f,
-                "alloc {stage}: refusal {}, peak {}{outside}, python {}/{}, numpy {}/{}, arrow {}/{}, linear {}/{}, refused {refused}",
+                "alloc {stage}: refusal {}, peak {}{outside}, python {}/{}, numpy {}/{}, arrow {}/{}, linear {}/{}, refused {refused}{waited}",
                 if a.refusal_on { "on" } else { "off" },
                 bytes_binary(a.peak_bytes),
                 bytes_binary(a.python.requested_bytes),

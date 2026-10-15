@@ -133,7 +133,7 @@ def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
     alloc = report.stages[0]["alloc"]
     assert alloc == json.loads(report.to_json())["stages"][0]["alloc"]
     assert set(alloc) == {
-        "refusal_on", "python", "numpy", "arrow", "linear",
+        "refusal_on", "python", "numpy", "arrow", "linear", "lease_wait_us",
         "peak_bytes", "outside_arrow_peak_bytes", "outside_arrow_fraction",
     }
     for source in ("python", "numpy", "arrow"):

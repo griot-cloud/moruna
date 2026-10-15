@@ -71,6 +71,7 @@ impl From<&AllocDoc> for KernelAlloc {
             numpy: counts(a.numpy),
             arrow: counts(a.arrow),
             linear: AllocCounts::default(),
+            lease_wait_us: 0,
         }
     }
 }
@@ -152,12 +153,20 @@ pub enum FromTemplate {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToChild {
-    /// Run one batch: an Arrow IPC stream at `offset` in the mapping.
+    /// Run one batch: an Arrow IPC stream at `offset` in the mapping, leased to the child as
+    /// `lease` until every buffer over it is released (SB-I13); the output goes at `out_offset`,
+    /// at most `out_len` bytes.
     Call {
+        /// The input's lease.
+        lease: u64,
         /// Where the input is.
         offset: u64,
         /// Its length.
         len: u64,
+        /// Where the output may be written.
+        out_offset: u64,
+        /// How much room it has.
+        out_len: u64,
     },
     /// Open the state at `offset` (a resume).
     Open {
@@ -166,8 +175,15 @@ pub enum ToChild {
         /// Its length.
         len: u64,
     },
-    /// Write the kernel's state into the mapping.
-    Checkpoint,
+    /// Write the kernel's state into the mapping at `offset`, at most `len` bytes.
+    Checkpoint {
+        /// Where.
+        offset: u64,
+        /// How much room.
+        len: u64,
+    },
+    /// Say which leases are released now, after collecting garbage (SB-I13).
+    Release,
     /// Exit.
     Stop,
 }
@@ -191,6 +207,8 @@ pub enum FromChild {
         len: u64,
         /// The call's counts.
         alloc: AllocDoc,
+        /// The leases released since the last reply.
+        released: Vec<u64>,
     },
     /// A call failed.
     Error {
@@ -200,6 +218,8 @@ pub enum FromChild {
         refusal: Option<RefusalDoc>,
         /// The call's counts.
         alloc: AllocDoc,
+        /// The leases released since the last reply.
+        released: Vec<u64>,
     },
     /// The state, for a checkpoint.
     State {
@@ -207,6 +227,13 @@ pub enum FromChild {
         offset: u64,
         /// Its length.
         len: u64,
+        /// The leases released since the last reply.
+        released: Vec<u64>,
+    },
+    /// The leases released since the last reply (`release`).
+    Released {
+        /// Their ids.
+        released: Vec<u64>,
     },
     /// `open` succeeded.
     Opened,
@@ -329,11 +356,18 @@ mod tests {
         round(FromTemplate::Started { pid: 9 });
         round(FromTemplate::Refused { reason: "x".into() });
         round(ToChild::Call {
+            lease: 1,
             offset: 4096,
             len: 10,
+            out_offset: 4160,
+            out_len: 100,
+        });
+        round(ToChild::Release);
+        round(FromChild::Released {
+            released: vec![1, 2],
         });
         round(ToChild::Open { offset: 1, len: 2 });
-        round(ToChild::Checkpoint);
+        round(ToChild::Checkpoint { offset: 1, len: 2 });
         round(ToChild::Stop);
         round(FromChild::Ready);
         round(FromChild::Opened);
@@ -354,6 +388,7 @@ mod tests {
             offset: 1,
             len: 2,
             alloc: doc,
+            released: vec![3],
         });
         round(FromChild::Error {
             message: "MemoryError".into(),
@@ -363,16 +398,20 @@ mod tests {
                 ceiling: 3,
             }),
             alloc: doc,
+            released: Vec::new(),
         });
-        round(FromChild::State { offset: 1, len: 2 });
+        round(FromChild::State {
+            offset: 1,
+            len: 2,
+            released: vec![],
+        });
 
         // Over the limit, both ways.
         let mut big = Vec::new();
         big.extend_from_slice(&((FRAME_MAX_BYTES + 1) as u32).to_le_bytes());
-        assert!(matches!(
-            read_body(&mut big.as_slice()),
-            Err(FrameError::TooLarge(_))
-        ));
+        let e = read_body(&mut big.as_slice()).unwrap_err();
+        assert!(matches!(e, FrameError::TooLarge(_)));
+        assert!(e.to_string().contains("allowed"), "{e}");
         let huge = FromChild::Failed {
             reason: "x".repeat(FRAME_MAX_BYTES + 1),
         };

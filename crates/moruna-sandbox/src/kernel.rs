@@ -23,8 +23,15 @@ use moruna_package::{Format, Inputs, Package, Tree};
 use crate::cgroup::StageCgroup;
 use crate::mapping::{Mapping, PAGE, field};
 use crate::protocol::{FromChild, ToChild, ToTemplate, read_frame, write_frame};
+use crate::regions::Regions;
 use crate::template::{Template, template};
 use crate::{STOP_GRACE, SandboxHost};
+
+/// How long a call waits for its kernel to release a leased input before it is refused (17 i,
+/// SB-I13).
+pub const LEASE_WAIT: Duration = Duration::from_secs(10);
+/// How often a waiting call asks the child for released leases.
+pub const LEASE_POLL: Duration = Duration::from_millis(10);
 
 /// Names this process's stage cgroups and mount points apart, across kernels.
 static STAGES: AtomicU64 = AtomicU64::new(0);
@@ -284,8 +291,10 @@ impl SandboxKernel {
             .map_err(|e| config(format!("the sandbox template: {e}")))?;
         drop(theirs);
         let pidfd = pidfd_open(pid).map_err(|e| config(format!("pidfd_open {pid}: {e}")))?;
+        let data = (mapping.len() - PAGE) as u64;
         let shared = Arc::new(Shared { mapping, cgroup });
         let mut child = Child {
+            regions: Regions::new(PAGE as u64, data),
             pid,
             pidfd: Some(pidfd),
             control: ours,
@@ -345,6 +354,8 @@ struct Child {
     /// Set when the child ended: every later call fails with it (SB-I11).
     dead: Option<String>,
     name: String,
+    /// The data area's free ranges and the inputs leased to the child (SB-I13).
+    regions: Regions,
 }
 
 impl Child {
@@ -405,30 +416,78 @@ impl Child {
         }
     }
 
-    /// Write `bytes` at the data area's start.
-    fn place(&self, bytes: &[u8]) -> Result<u64> {
-        let cap = self.shared.mapping.len() - PAGE;
-        if bytes.len() > cap {
+    /// Leases the child released: their ranges are free again, their pages given back.
+    fn absorb(&mut self, released: &[u64]) {
+        for id in released {
+            if let Some(range) = self.regions.release(*id) {
+                self.punch(range);
+            }
+        }
+    }
+
+    /// Give back the whole pages of a free range (e.4): never a page a leased input shares.
+    fn punch(&self, (offset, len): (u64, u64)) {
+        if let Err(e) = self.shared.mapping.punch(offset as usize, len as usize) {
+            tracing::warn!(target: "sandbox", "the mapping's free pages were not given back: {e}");
+        }
+    }
+
+    /// Give back the pages of the free range holding `offset`, where an output or a state was.
+    fn punch_free_at(&self, offset: u64) {
+        if let Some(range) = self.regions.free_at(offset) {
+            self.punch(range);
+        }
+    }
+
+    /// Ask the child which leases it has released (it collects garbage first); how many.
+    fn ask_releases(&mut self) -> Result<usize> {
+        self.send(&ToChild::Release)?;
+        match self.receive()? {
+            FromChild::Released { released } => {
+                self.absorb(&released);
+                Ok(released.len())
+            }
+            other => Err(kernel_error(format!(
+                "release: the child answered {other:?}"
+            ))),
+        }
+    }
+
+    /// The data area's size.
+    fn data_bytes(&self) -> u64 {
+        (self.shared.mapping.len() - PAGE) as u64
+    }
+
+    /// Write `bytes` into the largest free range, unleased (state for `open`).
+    fn place(&self, bytes: &[u8]) -> Result<(u64, u64)> {
+        let (offset, cap) = self.regions.largest_free().unwrap_or((PAGE as u64, 0));
+        if bytes.len() as u64 > cap {
             return Err(kernel_error(format!(
-                "{} bytes do not fit the mapping's data area of {cap}",
+                "{} bytes do not fit the mapping's largest free range of {cap}",
                 bytes.len()
             )));
         }
         self.shared
             .mapping
-            .bytes_mut(PAGE, bytes.len())
+            .bytes_mut(offset as usize, bytes.len())
             .map_err(|e| kernel_error(e.to_string()))?
             .copy_from_slice(bytes);
-        Ok(bytes.len() as u64)
+        Ok((offset, bytes.len() as u64))
     }
 
-    /// The input as one IPC stream, written straight into the mapping (SB-I7).
-    fn place_batch(&self, batch: &moruna_kernel::arrow::record_batch::RecordBatch) -> Result<u64> {
-        let cap = self.shared.mapping.len() - PAGE;
+    /// The input as one IPC stream, written straight into the largest free range (SB-I7);
+    /// `None` when it does not fit there.
+    fn try_place_batch(
+        &self,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+    ) -> Result<Option<(u64, u64)>> {
+        let Some((offset, cap)) = self.regions.largest_free() else {
+            return Ok(None);
+        };
         let area = self
             .shared
             .mapping
-            .bytes_mut(PAGE, cap)
+            .bytes_mut(offset as usize, cap as usize)
             .map_err(|e| kernel_error(e.to_string()))?;
         let mut cursor = Cursor::new(area);
         let fits = (|| -> std::result::Result<(), moruna_kernel::arrow::error::ArrowError> {
@@ -436,14 +495,61 @@ impl Child {
             writer.write(batch)?;
             writer.finish()
         })();
-        if let Err(e) = fits {
-            return Err(kernel_error(format!(
-                "the input batch ({} bytes in memory) does not fit the mapping's data area of \
-                 {cap} bytes, the stage ceiling: {e}",
-                batch.get_array_memory_size()
-            )));
+        Ok(fits.ok().map(|()| (offset, cursor.position())))
+    }
+
+    /// SB-I13: the input placed in a free region and leased to the child. When no free region
+    /// is large enough and the child holds leases, wait for it to release them (asking it, which
+    /// collects its garbage), and refuse after `LEASE_WAIT` without a release. Returns the lease,
+    /// where the input is and the microseconds waited.
+    fn lease_batch(
+        &mut self,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+    ) -> Result<(u64, u64, u64, u64)> {
+        let started = Instant::now();
+        let mut progress = started;
+        let mut waited = false;
+        loop {
+            if let Some((offset, len)) = self.try_place_batch(batch)? {
+                let lease = self.regions.lease(offset, len).map_err(kernel_error)?;
+                let us = if waited {
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                };
+                return Ok((lease, offset, len, us));
+            }
+            if self.regions.leased_count() == 0 {
+                return Err(kernel_error(format!(
+                    "the input batch ({} bytes in memory) does not fit the mapping's data area of \
+                     {} bytes, the stage ceiling",
+                    batch.get_array_memory_size(),
+                    self.data_bytes()
+                )));
+            }
+            if progress.elapsed() >= LEASE_WAIT {
+                // The refused call's wait is in its trace record too.
+                set_kernel_alloc(KernelAlloc {
+                    lease_wait_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    ..KernelAlloc::NONE
+                });
+                return Err(MorunaError::Refused {
+                    stage: UNKNOWN_STAGE,
+                    seq: UNKNOWN_SEQ,
+                    kernel: self.name.clone(),
+                    requested: batch.get_array_memory_size() as u64,
+                    in_use: self.regions.leased_bytes(),
+                    ceiling: self.data_bytes(),
+                    features: None,
+                });
+            }
+            waited = true;
+            if self.ask_releases()? > 0 {
+                progress = Instant::now();
+            } else {
+                std::thread::sleep(LEASE_POLL);
+            }
         }
-        Ok(cursor.position())
     }
 
     fn stop(&mut self) {
@@ -487,6 +593,14 @@ impl SandboxState {
             .mapping
             .counter(field::PEAK)
             .load(Ordering::Acquire)
+    }
+
+    /// The inputs the child holds now: leases and bytes (SB-I13).
+    pub fn leased(&self) -> (usize, u64) {
+        (
+            self.child.regions.leased_count(),
+            self.child.regions.leased_bytes(),
+        )
     }
 
     /// The stage cgroup's directory.
@@ -533,9 +647,18 @@ impl KernelState for SandboxState {
         if !self.stateful_checkpoint {
             return Ok(None);
         }
-        self.child.send(&ToChild::Checkpoint)?;
+        let (offset, len) = self
+            .child
+            .regions
+            .largest_free()
+            .unwrap_or((PAGE as u64, 0));
+        self.child.send(&ToChild::Checkpoint { offset, len })?;
         match self.child.receive()? {
-            FromChild::State { offset, len } => {
+            FromChild::State {
+                offset,
+                len,
+                released,
+            } => {
                 let bytes = self
                     .child
                     .shared
@@ -543,11 +666,8 @@ impl KernelState for SandboxState {
                     .bytes(offset as usize, len as usize)
                     .map_err(|e| kernel_error(e.to_string()))?
                     .to_vec();
-                let _ = self
-                    .child
-                    .shared
-                    .mapping
-                    .punch(PAGE, (offset + len) as usize - PAGE);
+                self.child.absorb(&released);
+                self.child.punch_free_at(offset);
                 Ok(Some(bytes))
             }
             FromChild::Error { message, .. } => Err(kernel_error(message)),
@@ -557,8 +677,10 @@ impl KernelState for SandboxState {
         }
     }
 
+    /// The child's memory and the mapping it holds in leased inputs (SB-I13): what a kernel
+    /// that keeps its inputs costs, in the profile.
     fn footprint(&self) -> Option<u64> {
-        Some(self.in_use())
+        Some(self.in_use() + self.child.regions.leased_bytes())
     }
 }
 
@@ -566,12 +688,11 @@ impl SandboxKernel {
     fn state(&self, ctx: &InitCtx, restore: Option<&[u8]>) -> Result<Box<dyn KernelState>> {
         let mut child = self.start_child()?;
         if let Some(bytes) = restore {
-            let len = child.place(bytes)?;
-            child.send(&ToChild::Open {
-                offset: PAGE as u64,
-                len,
-            })?;
-            match child.receive()? {
+            let (offset, len) = child.place(bytes)?;
+            child.send(&ToChild::Open { offset, len })?;
+            let opened = child.receive();
+            child.punch_free_at(offset);
+            match opened? {
                 FromChild::Opened => {}
                 FromChild::Error { message, .. } => {
                     return Err(MorunaError::Resume(format!("open: {message}")));
@@ -649,31 +770,47 @@ impl Kernel for SandboxKernel {
             ));
         };
         self.send_ceiling(&st.child.shared)?;
-        let len = st.child.place_batch(&batch)?;
+        let (lease, offset, len, waited) = st.child.lease_batch(&batch)?;
         drop(batch);
+        let (out_offset, out_len) = st.child.regions.largest_free().unwrap_or((0, 0));
         st.child.send(&ToChild::Call {
-            offset: PAGE as u64,
+            lease,
+            offset,
             len,
+            out_offset,
+            out_len,
         })?;
         let reply = st.child.receive()?;
+        let counted = |alloc: &crate::protocol::AllocDoc| {
+            let mut counts = KernelAlloc::from(alloc);
+            counts.lease_wait_us = waited;
+            set_kernel_alloc(counts);
+        };
         match reply {
-            FromChild::Done { offset, len, alloc } => {
-                set_kernel_alloc(KernelAlloc::from(&alloc));
-                let end = (offset + len) as usize;
+            FromChild::Done {
+                offset,
+                len,
+                alloc,
+                released,
+            } => {
+                counted(&alloc);
                 let batch = read_one(&st.child.shared, offset as usize, len as usize)?;
                 let landed = moruna_adapters::land::land_table(batch, &st.alloc);
-                if let Err(e) = st.child.shared.mapping.punch(PAGE, end - PAGE) {
-                    tracing::warn!(target: "sandbox", "the mapping's pages were not given back: {e}");
-                }
+                st.child.absorb(&released);
+                st.child.punch_free_at(offset);
                 Ok(landed?.0)
             }
             FromChild::Error {
                 message,
                 refusal,
                 alloc,
+                released,
             } => {
-                set_kernel_alloc(KernelAlloc::from(&alloc));
-                let _ = st.child.shared.mapping.punch(PAGE, len as usize);
+                counted(&alloc);
+                st.child.absorb(&released);
+                if out_len > 0 {
+                    st.child.punch_free_at(out_offset);
+                }
                 Err(match refusal {
                     Some(r) => MorunaError::Refused {
                         stage: UNKNOWN_STAGE,

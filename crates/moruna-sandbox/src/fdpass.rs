@@ -106,5 +106,9 @@ mod tests {
         assert_eq!(&got, b"ok");
         drop(x);
         assert!(send_with_fds(&a, b"", &[]).is_err());
+        // A peer that is gone: the send fails with its cause, no signal.
+        drop(b);
+        let e = send_with_fds(&a, b"late", &[]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
     }
 }

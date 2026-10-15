@@ -301,6 +301,8 @@ pub(crate) fn record_at(batch: &RecordBatch, row: usize) -> Option<TraceRecord> 
                 *alloc.source_mut(at / 5).count_mut(at % 5) =
                     col!(batch, 33 + at, UInt64Array).value(row);
             }
+            alloc.lease_wait_us =
+                col!(batch, 33 + crate::writer::ALLOC_COLUMNS, UInt64Array).value(row);
             alloc
         },
     })

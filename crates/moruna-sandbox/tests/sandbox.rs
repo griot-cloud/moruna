@@ -132,10 +132,44 @@ fn batch() -> RecordBatch {
 }
 
 fn call(k: &SandboxKernel, state: &mut dyn KernelState) -> moruna_kernel::Result<RecordBatch> {
-    match k.apply(state, Payload::Table(batch(), Tier::Host))? {
+    call_with(k, state, batch())
+}
+
+fn call_with(
+    k: &SandboxKernel,
+    state: &mut dyn KernelState,
+    input: RecordBatch,
+) -> moruna_kernel::Result<RecordBatch> {
+    match k.apply(state, Payload::Table(input, Tier::Host))? {
         Payload::Table(out, _) => Ok(out),
         Payload::Tensor(..) => panic!("a table"),
     }
+}
+
+/// A batch of the declared schema whose `s` is `words` and `n` counts.
+fn words(words: &[&str]) -> RecordBatch {
+    RecordBatch::try_new(
+        batch().schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..words.len() as i64)),
+            Arc::new(StringArray::from(words.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+/// A batch of `rows` rows, `rows * 13` bytes of buffers.
+fn big(rows: usize) -> RecordBatch {
+    RecordBatch::try_new(
+        batch().schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                "x", rows,
+            ))),
+        ],
+    )
+    .unwrap()
 }
 
 fn strings(b: &RecordBatch, column: &str) -> Vec<String> {
@@ -724,5 +758,240 @@ fn a_template_that_cannot_start_is_named() {
     assert_eq!(t.status(1).unwrap(), "running");
     assert!(t.hello.target().unwrap().starts_with("cp314-manylinux_"));
     assert!(format!("{t:?}").contains("Template"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SB-T21 (SB-I13): a kernel that keeps its input and reads it on the next call sees the first
+/// batch's bytes, not the second's: the region it reads through is leased until it lets go.
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn sb_t21_a_kept_input_keeps_its_bytes() {
+    let dir = scratch();
+    let function = r#"
+class keeper:
+    def setup(self, ctx):
+        return {"previous": None}
+
+    def __call__(self, state, batch):
+        previous = state["previous"]
+        state["previous"] = batch
+        return batch if previous is None else previous
+"#;
+    let k = kernel(
+        pex(&dir, "keeper", function, json!({"stateful": true}), &[]),
+        GIB,
+    );
+    let mut state = k.init(&ctx()).unwrap();
+    let first = call_with(&k, state.as_mut(), words(&["first", "batch", "bytes"])).unwrap();
+    assert_eq!(strings(&first, "s"), ["first", "batch", "bytes"]);
+    let st = state.as_any_mut().downcast_mut::<SandboxState>().unwrap();
+    assert_eq!(st.leased().0, 1, "the kept input is leased");
+    let second = call_with(&k, state.as_mut(), words(&["other", "words", "later"])).unwrap();
+    assert_eq!(
+        strings(&second, "s"),
+        ["first", "batch", "bytes"],
+        "the kept batch reads its own bytes"
+    );
+    let third = call_with(&k, state.as_mut(), words(&["third"])).unwrap();
+    assert_eq!(strings(&third, "s"), ["other", "words", "later"]);
+    let st = state.as_any_mut().downcast_mut::<SandboxState>().unwrap();
+    let (leases, bytes) = st.leased();
+    assert_eq!(leases, 1, "the batch let go of was released");
+    assert!(bytes > 0);
+    assert!(
+        state.footprint().unwrap() >= bytes,
+        "the profile shows the mapping the kernel holds"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SB-T22 (SB-I13): backpressure. A kernel that keeps one batch never waits; one whose kept
+/// batches are garbage the collector frees waits for the release, counted as `lease_wait_us`;
+/// one that keeps every batch is refused after `LEASE_WAIT`, naming the bytes it holds.
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn sb_t22_backpressure() {
+    let dir = scratch();
+    let ceiling = 256 << 20;
+    // About 26 MiB of buffers a batch: nine fit the mapping.
+    let rows = 2 << 20;
+    let last = r#"
+class last:
+    def setup(self, ctx):
+        return {"previous": None}
+
+    def __call__(self, state, batch):
+        state["previous"] = batch
+        return batch.slice(0, 1)
+"#;
+    let k = kernel(
+        pex(&dir, "last", last, json!({"stateful": true}), &[]),
+        ceiling,
+    );
+    let mut state = k.init(&ctx()).unwrap();
+    for _ in 0..30 {
+        call_with(&k, state.as_mut(), big(rows)).unwrap();
+        assert_eq!(take_kernel_alloc().lease_wait_us, 0);
+    }
+    drop(state);
+
+    let cyclic = r#"
+import gc
+
+class cyclic:
+    def setup(self, ctx):
+        gc.disable()
+        return None
+
+    def __call__(self, state, batch):
+        garbage = [batch]
+        garbage.append(garbage)
+        return batch.slice(0, 1)
+"#;
+    let k = kernel(
+        pex(&dir, "cyclic", cyclic, json!({"stateful": true}), &[]),
+        ceiling,
+    );
+    let mut state = k.init(&ctx()).unwrap();
+    let mut waited = 0;
+    for _ in 0..30 {
+        call_with(&k, state.as_mut(), big(rows)).unwrap();
+        waited += take_kernel_alloc().lease_wait_us;
+    }
+    assert!(waited > 0, "a call waited for the collector to release");
+    drop(state);
+
+    let hoarder = r#"
+class hoarder:
+    def setup(self, ctx):
+        return []
+
+    def __call__(self, state, batch):
+        state.append(batch)
+        return batch.slice(0, 1)
+"#;
+    let k = kernel(
+        pex(&dir, "hoarder", hoarder, json!({"stateful": true}), &[]),
+        ceiling,
+    );
+    let mut state = k.init(&ctx()).unwrap();
+    let refused = (0..30).find_map(|_| call_with(&k, state.as_mut(), big(rows)).err());
+    match refused {
+        Some(MorunaError::Refused {
+            kernel,
+            in_use,
+            ceiling: data,
+            ..
+        }) => {
+            assert_eq!(kernel, "hoarder");
+            assert!(in_use > 0 && in_use <= data, "{in_use} of {data}");
+        }
+        other => panic!("expected the hoarder refused, got {other:?}"),
+    }
+    assert!(
+        take_kernel_alloc().lease_wait_us >= moruna_sandbox::LEASE_WAIT.as_micros() as u64,
+        "the refused call's wait is counted"
+    );
+    let st = state.as_any_mut().downcast_mut::<SandboxState>().unwrap();
+    assert!(st.leased().0 >= 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What a `.pex` stage says of itself, and what it refuses: a stage whose ceiling the rest of
+/// the run holds, an input larger than its mapping, a restore without `checkpoint`, a kernel
+/// whose `checkpoint` or `restore` raises, a tensor. f.7, f.8, SB-I12.
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn the_stage_says_what_it_is_and_refuses_what_it_cannot_do() {
+    use moruna_kernel::{KernelKind, PayloadKind, ResumePolicy, SourceSchema};
+    let dir = scratch();
+    let identity = "def plain(b):\n    return b\n";
+    let package = pex(&dir, "plain", identity, json!({}), &[]);
+    let k = SandboxKernel::new(Arc::clone(&package), host(), Inputs::default()).unwrap();
+    assert_eq!(k.fingerprint(), package.kernel_fingerprint());
+    assert!(matches!(k.kind(), KernelKind::Stateful { .. }));
+    assert_eq!(k.hints().resume, ResumePolicy::Reinit);
+    assert!(k.declared().input.is_some());
+    assert_eq!(k.accepts().kind, PayloadKind::Table);
+    assert!(Arc::ptr_eq(k.package(), &package));
+    assert!(k.target().starts_with("cp314-"));
+    let _ = k.notes();
+    let schema = SourceSchema::Table(batch().schema());
+    assert!(matches!(
+        k.output_schema(&schema).unwrap(),
+        SourceSchema::Table(s) if s == batch().schema()
+    ));
+    // Unbound: no ceiling to compute from.
+    let e = k.init(&ctx()).err().expect("unbound").to_string();
+    assert!(e.contains("no ceiling"), "{e}");
+    // The rest of the run holds the whole ceiling.
+    k.bind_run(sampler(GIB, GIB), GIB);
+    let e = k.init(&ctx()).err().expect("no room").to_string();
+    assert!(e.contains("ceiling is 0"), "{e}");
+    // A sample without a ceiling: the bound one is the run's.
+    k.bind_run(sampler(0, 0), 64 << 20);
+    let mut state = k.init(&ctx()).unwrap();
+    call(&k, state.as_mut()).unwrap();
+    // An input larger than the whole data area, with nothing leased.
+    let e = call_with(&k, state.as_mut(), big(6 << 20))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not fit the mapping's data area"), "{e}");
+    assert_eq!(
+        state.checkpoint().unwrap(),
+        None,
+        "a stateless stage has none"
+    );
+    let e = k
+        .restore(&ctx(), b"x")
+        .err()
+        .expect("no checkpoint")
+        .to_string();
+    assert!(e.contains("does not checkpoint"), "{e}");
+    drop(state);
+
+    let forbid = pex(
+        &dir,
+        "forbidden",
+        "class forbidden:\n    def setup(self, ctx):\n        return None\n\n    def __call__(self, state, b):\n        return b\n",
+        json!({"stateful": true, "resume": "forbid"}),
+        &[],
+    );
+    let k = kernel(forbid, GIB);
+    assert_eq!(k.hints().resume, ResumePolicy::Forbid);
+
+    let fragile = r#"
+class fragile:
+    def setup(self, ctx):
+        return {}
+
+    def __call__(self, state, batch):
+        return batch
+
+    def checkpoint(self, state):
+        raise RuntimeError("no state today")
+
+    def restore(self, ctx, data):
+        raise ValueError("bad bytes")
+"#;
+    let k = kernel(
+        pex(
+            &dir,
+            "fragile",
+            fragile,
+            json!({"stateful": true, "resume": "checkpoint"}),
+            &[],
+        ),
+        GIB,
+    );
+    let mut state = k.init(&ctx()).unwrap();
+    let e = state.checkpoint().unwrap_err().to_string();
+    assert!(e.contains("no state today"), "{e}");
+    let e = k
+        .restore(&ctx(), b"saved")
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(e.contains("open") && e.contains("bad bytes"), "{e}");
     let _ = std::fs::remove_dir_all(dir);
 }

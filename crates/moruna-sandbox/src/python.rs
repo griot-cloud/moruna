@@ -8,8 +8,8 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use moruna_adapters::guard::MemoryGate;
 use moruna_adapters::{PyKernel, PyKernelSpec};
@@ -22,7 +22,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 use crate::confine::{self, Confinement, TREE};
-use crate::mapping::{Mapping, PAGE, field};
+use crate::mapping::{Mapping, field};
 use crate::protocol::{
     AllocDoc, FromChild, RefusalDoc, ToChild, ToTemplate, read_frame, write_frame,
 };
@@ -92,14 +92,18 @@ pub fn sandbox_child(py: Python<'_>, start: &str, control_fd: i32, memfd: i32) -
     let control = unsafe { UnixStream::from_raw_fd(control_fd) };
     // SAFETY: as above.
     let memfd = unsafe { OwnedFd::from_raw_fd(memfd) };
-    match run(py, start, &control, memfd) {
+    crate::coverage::open();
+    let code = match run(py, start, &control, memfd) {
         Ok(()) => 0,
         Err(reason) => {
             let mut writer = &control;
             let _ = write_frame(&mut writer, &FromChild::Failed { reason });
             3
         }
-    }
+    };
+    // The template ends the child through `os._exit`.
+    crate::coverage::write();
+    code
 }
 
 /// The interpreter's import roots: every absolute directory on `sys.path`, and the standard
@@ -328,6 +332,7 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
         sampler,
         kernel,
         ctx,
+        released: Arc::new(Mutex::new(Vec::new())),
     };
     loop {
         let message = py.detach(|| {
@@ -336,8 +341,35 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
         });
         let reply = match message {
             Err(_) | Ok(ToChild::Stop) => return Ok(()),
-            Ok(ToChild::Call { offset, len }) => child.call(py, state.as_mut(), offset, len),
-            Ok(ToChild::Checkpoint) => child.checkpoint(state.as_mut()),
+            Ok(ToChild::Call {
+                lease,
+                offset,
+                len,
+                out_offset,
+                out_len,
+            }) => child.call(
+                py,
+                state.as_mut(),
+                lease,
+                (offset as usize, len as usize),
+                (out_offset as usize, out_len as usize),
+            ),
+            Ok(ToChild::Checkpoint { offset, len }) => {
+                child.checkpoint(state.as_mut(), offset as usize, len as usize)
+            }
+            // A kernel's reference cycles hold leases until the collector runs.
+            Ok(ToChild::Release) => match py.import("gc").and_then(|gc| gc.call_method0("collect"))
+            {
+                Ok(_) => FromChild::Released {
+                    released: Vec::new(),
+                },
+                Err(e) => FromChild::Error {
+                    message: format!("release: the collector failed: {}", e.value(py)),
+                    refusal: None,
+                    alloc: AllocDoc::default(),
+                    released: Vec::new(),
+                },
+            },
             Ok(ToChild::Open { offset, len }) => match child.open(offset, len) {
                 Ok(opened) => {
                     state = opened;
@@ -347,9 +379,13 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
                     message,
                     refusal: None,
                     alloc: AllocDoc::default(),
+                    released: Vec::new(),
                 },
             },
         };
+        // Every object of the call is gone by now, so its lease is in the list if the kernel
+        // did not keep the batch (SB-I13).
+        let reply = child.with_released(reply);
         let mut writer = control;
         write_frame(&mut writer, &reply).map_err(|e| failed("reply", e))?;
     }
@@ -361,6 +397,26 @@ struct Served {
     sampler: Arc<ChildSampler>,
     kernel: PyKernel,
     ctx: InitCtx,
+    /// Leases whose last buffer was released since the last reply (SB-I13).
+    released: Arc<Mutex<Vec<u64>>>,
+}
+
+/// An input region leased to the child (SB-I13): the base object of the foreign Arrow buffer
+/// the input is read through. When the last buffer over the region is gone, Python drops it and
+/// its id goes into the released list, which the next reply carries to Moruna.
+#[pyclass(frozen, module = "moruna._core", name = "Lease")]
+struct Lease {
+    id: u64,
+    released: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.id);
+    }
 }
 
 /// A memoryview over `len` bytes of the mapping at `ptr`.
@@ -402,37 +458,81 @@ impl Served {
         AllocDoc::from(&counts)
     }
 
+    /// `reply` with the leases released since the last reply.
+    fn with_released(&self, reply: FromChild) -> FromChild {
+        let ids: Vec<u64> = std::mem::take(
+            &mut *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        match reply {
+            FromChild::Done {
+                offset, len, alloc, ..
+            } => FromChild::Done {
+                offset,
+                len,
+                alloc,
+                released: ids,
+            },
+            FromChild::Error {
+                message,
+                refusal,
+                alloc,
+                ..
+            } => FromChild::Error {
+                message,
+                refusal,
+                alloc,
+                released: ids,
+            },
+            FromChild::State { offset, len, .. } => FromChild::State {
+                offset,
+                len,
+                released: ids,
+            },
+            FromChild::Released { .. } => FromChild::Released { released: ids },
+            other => {
+                // A reply that carries none keeps them for the next.
+                self.released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(ids);
+                other
+            }
+        }
+    }
+
     fn call(
         &mut self,
         py: Python<'_>,
         state: &mut dyn KernelState,
-        offset: u64,
-        len: u64,
+        lease: u64,
+        (offset, len): (usize, usize),
+        (out_at, out_len): (usize, usize),
     ) -> FromChild {
         let error = |message: String, alloc: AllocDoc| FromChild::Error {
             message,
             refusal: None,
             alloc,
+            released: Vec::new(),
         };
-        let (offset, len) = (offset as usize, len as usize);
-        let batch = match self.read(py, offset, len) {
+        let batch = match self.read(py, lease, offset, len) {
             Ok(batch) => batch,
             Err(e) => return error(format!("the input: {e}"), AllocDoc::default()),
         };
         let (result, counts) = self.kernel.call_arrow(py, state, batch);
         let alloc = self.counted(counts);
         match result {
-            Ok(out) => {
-                let out_at = (offset + len).div_ceil(64) * 64;
-                match self.write(py, out, out_at) {
-                    Ok(written) => FromChild::Done {
-                        offset: out_at as u64,
-                        len: written,
-                        alloc,
-                    },
-                    Err(e) => error(e, alloc),
-                }
-            }
+            Ok(out) => match self.write(py, out, out_at, out_len) {
+                Ok(written) => FromChild::Done {
+                    offset: out_at as u64,
+                    len: written,
+                    alloc,
+                    released: Vec::new(),
+                },
+                Err(e) => error(e, alloc),
+            },
             Err(MorunaError::Refused {
                 requested,
                 in_use,
@@ -449,26 +549,48 @@ impl Served {
                     ceiling,
                 }),
                 alloc,
+                released: Vec::new(),
             },
             Err(e) => error(message_of(&e), alloc),
         }
     }
 
-    /// The input stream, read in place: a pyarrow batch over the mapping's bytes.
-    fn read<'py>(&self, py: Python<'py>, offset: usize, len: usize) -> PyResult<Bound<'py, PyAny>> {
+    /// The input stream, read in place: a pyarrow batch over a foreign buffer of the mapping's
+    /// bytes whose base is the lease, so the region stays the input's for as long as anything
+    /// in the child refers to it (SB-I13).
+    fn read<'py>(
+        &self,
+        py: Python<'py>,
+        lease: u64,
+        offset: usize,
+        len: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let ptr = self
             .mapping
             .address(offset, len)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let view = memoryview(py, ptr, len, false)?;
+        let base = Bound::new(
+            py,
+            Lease {
+                id: lease,
+                released: Arc::clone(&self.released),
+            },
+        )?;
         let pa = py.import("pyarrow")?;
-        let buffer = pa.call_method1("py_buffer", (view,))?;
+        let buffer = pa.call_method1("foreign_buffer", (ptr as usize, len, base))?;
         let reader = pa.getattr("ipc")?.call_method1("open_stream", (buffer,))?;
         reader.call_method0("read_next_batch")
     }
 
-    /// The kernel's result as one IPC stream into the mapping at `at`; its length.
-    fn write(&self, py: Python<'_>, out: Bound<'_, PyAny>, at: usize) -> Result<u64, String> {
+    /// The kernel's result as one IPC stream into the mapping at `at`, at most `cap` bytes; its
+    /// length.
+    fn write(
+        &self,
+        py: Python<'_>,
+        out: Bound<'_, PyAny>,
+        at: usize,
+        cap: usize,
+    ) -> Result<u64, String> {
         let inner = || -> PyResult<u64> {
             let pa = py.import("pyarrow")?;
             let mut out = out;
@@ -489,7 +611,11 @@ impl Served {
                     "a packaged kernel returns a pyarrow.RecordBatch, not {name}"
                 )));
             }
-            let cap = self.mapping.len().saturating_sub(at);
+            if cap == 0 {
+                return Err(pyo3::exceptions::PyMemoryError::new_err(
+                    "no free region of the mapping is left: the kernel holds its inputs",
+                ));
+            }
             let ptr = self
                 .mapping
                 .address(at, cap)
@@ -514,31 +640,34 @@ impl Served {
         })
     }
 
-    fn checkpoint(&mut self, state: &mut dyn KernelState) -> FromChild {
+    fn checkpoint(&mut self, state: &mut dyn KernelState, at: usize, cap: usize) -> FromChild {
+        let failed = |message: String| FromChild::Error {
+            message,
+            refusal: None,
+            alloc: AllocDoc::default(),
+            released: Vec::new(),
+        };
         let saved = match state.checkpoint() {
             Ok(Some(bytes)) => bytes,
             Ok(None) => Vec::new(),
-            Err(e) => {
-                return FromChild::Error {
-                    message: message_of(&e),
-                    refusal: None,
-                    alloc: AllocDoc::default(),
-                };
-            }
+            Err(e) => return failed(message_of(&e)),
         };
-        match self.mapping.bytes_mut(PAGE, saved.len()) {
+        if saved.len() > cap {
+            return failed(format!(
+                "the state of {} bytes does not fit the free region of {cap}",
+                saved.len()
+            ));
+        }
+        match self.mapping.bytes_mut(at, saved.len()) {
             Ok(area) => {
                 area.copy_from_slice(&saved);
                 FromChild::State {
-                    offset: PAGE as u64,
+                    offset: at as u64,
                     len: saved.len() as u64,
+                    released: Vec::new(),
                 }
             }
-            Err(e) => FromChild::Error {
-                message: format!("the state does not fit the mapping: {e}"),
-                refusal: None,
-                alloc: AllocDoc::default(),
-            },
+            Err(e) => failed(format!("the state does not fit the mapping: {e}")),
         }
     }
 
