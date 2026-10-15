@@ -113,7 +113,9 @@ jobs:
           # back with no copy. It publishes cp314t manylinux wheels, so --only-binary
           # is satisfiable; if that ever stops being true this step fails loudly, which
           # is what we want, because the Python surface would not work on Linux.
-          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin
+          # pyyaml is the `package` extra's (pip is already here): `moruna package` reads
+          # function.yaml (SDD 16 e.3), and python/tests packages projects.
+          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml
           cd bench/python && python -m pytest -q
       - name: The wheel builds, installs and runs on Linux
         # The check that matters for a release: not "does the source tree import", which
