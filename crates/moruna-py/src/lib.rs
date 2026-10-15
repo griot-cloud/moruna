@@ -34,6 +34,9 @@ pub mod extend;
 pub mod inspect;
 #[cfg(feature = "python")]
 pub mod kernel;
+// The function package (SDD 16): the manifest, `check`, `aot`, `load` and `package --wasm`.
+#[cfg(feature = "python")]
+pub mod package;
 #[cfg(feature = "python")]
 pub mod report;
 #[cfg(feature = "python")]

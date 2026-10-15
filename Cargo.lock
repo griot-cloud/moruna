@@ -4294,6 +4294,7 @@ dependencies = [
  "moruna-discovery",
  "moruna-kernel",
  "moruna-kernels",
+ "moruna-package",
  "moruna-placement",
  "moruna-reactor",
  "moruna-runtime",
