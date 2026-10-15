@@ -21,6 +21,9 @@ moruna-placement = { workspace = true }
 moruna-scheduler = { workspace = true }
 moruna-controller = { workspace = true }
 moruna-kernels = { workspace = true }
+# A packaged kernel (SDD 16, 17): the package and the runtime of a .wasm.
+moruna-package = { workspace = true }
+moruna-wasm = { workspace = true }
 # `moruna run --vm` (MH 4.8.4): the monitor's library seam, `boot_and_run`.
 moruna-vmm = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.
@@ -43,6 +46,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+# The test components of a .wasm package (SDD 17 k).
+moruna-wasm = { workspace = true, features = ["testing"] }
 moruna-testkit = { workspace = true }
 # The Linux branch of tests/support/mod.rs reads /proc/self/statm and needs the page
 # size. A developer host is macOS, where that branch is not compiled, so its absence

@@ -8,7 +8,7 @@ use moruna_kernel::declare::Declared;
 use moruna_kernel::{
     Allocator, Fingerprint, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind,
     KernelState, MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy,
-    Seq, SourceSchema, StageId, TierPref,
+    SourceSchema, TierPref,
 };
 use pyo3::prelude::*;
 
@@ -21,16 +21,7 @@ use super::state::{PyState, missing_restore};
 use crate::guard::{KernelMemory, LiveCounts, MemoryGate};
 use moruna_kernel::set_kernel_alloc;
 
-/// The stage an `MorunaError::Kernel` from this crate carries.
-///
-/// `Kernel::apply` receives a `Payload`, not a morsel, so the adapter never learns which stage it
-/// is or which morsel it is holding: a kernel that knew its position could not also be a Polars
-/// expression or a DataFusion function, which S7 requires. AD-I7 names both fields all the same,
-/// so the adapter fills them with a sentinel the scheduler can recognise and replace rather than
-/// with a plausible lie. Reported.
-pub const UNKNOWN_STAGE: StageId = StageId::MAX;
-/// The morsel an `MorunaError::Kernel` from this crate carries; see [`UNKNOWN_STAGE`].
-pub const UNKNOWN_SEQ: Seq = Seq::MAX;
+pub use crate::{UNKNOWN_SEQ, UNKNOWN_STAGE};
 
 const GIL_FREE_THREADED: u8 = 0;
 const GIL_SERIALISED: u8 = 1;

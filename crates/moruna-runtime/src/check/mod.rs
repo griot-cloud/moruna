@@ -11,6 +11,7 @@
 //! It is not a test framework and not a guarantee about real data: it is the guarantee that the
 //! function *is a kernel*, and a first measurement of what it costs.
 
+pub mod package;
 pub mod synth;
 
 use std::path::PathBuf;

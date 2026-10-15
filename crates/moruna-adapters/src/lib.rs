@@ -23,6 +23,20 @@ pub use moruna_kernel::GilState;
 pub mod guard;
 pub mod land;
 
+use moruna_kernel::{Seq, StageId};
+
+/// The stage an `MorunaError::Kernel` from an adapter carries.
+///
+/// `Kernel::apply` receives a `Payload`, not a morsel, so an adapter never learns which stage it
+/// is or which morsel it is holding: a kernel that knew its position could not also be a Polars
+/// expression or a DataFusion function, which S7 requires. AD-I7 names both fields all the same,
+/// so the adapter fills them with a sentinel the scheduler can recognise and replace rather than
+/// with a plausible lie. Reported.
+pub const UNKNOWN_STAGE: StageId = StageId::MAX;
+/// The morsel an `MorunaError::Kernel` from an adapter carries; see [`UNKNOWN_STAGE`].
+/// Also what a packaged kernel's runtime carries (17 f.4, f.8).
+pub const UNKNOWN_SEQ: Seq = Seq::MAX;
+
 #[cfg(feature = "python")]
 pub mod python;
 

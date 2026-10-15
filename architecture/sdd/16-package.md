@@ -142,7 +142,7 @@ class PackageKernel:                       # frozen; moruna.run accepts it in `k
 
 ### d.5 Consumed
 
-`moruna_kernel::declare::{Declared, SchemaDecl, ColumnDecl, parse_type, ABI_VERSION}`; `moruna_runtime::check::{check, CheckOptions}`; `moruna_wasm::WasmKernel` and `moruna_sandbox::{SandboxHost, SandboxKernel}` (SDD 17 d.1); `zip`, `sha2`, `serde_json`, `wasmparser`.
+`moruna_kernel::declare::{Declared, SchemaDecl, ColumnDecl, parse_type, ABI_VERSION}`; `moruna_runtime::check::{check, CheckOptions}`; `moruna_wasm::WasmKernel` and `moruna_sandbox::{SandboxHost, SandboxKernel}` (SDD 17 d.1); `zip`, `sha2`, `serde_json`.
 
 ## e. Data model, formats and state machines
 
@@ -243,7 +243,7 @@ world kernel {
 
 **f.2 The pin.** `fingerprint` in a job document is `sha256:<hex>` or `<hex>`, compared lowercase with the file's; another algorithm prefix is refused naming it.
 
-**f.3 Embedding the manifest in a component.** Parse the component with `wasmparser`, drop every existing `moruna.json` custom section, append one custom section: byte `0x00`, the section size as unsigned LEB128, the name length as LEB128, the name, the manifest bytes of e.1.
+**f.3 Embedding the manifest in a component.** Walk the component's top-level sections (the 8-byte header, then an id byte, an unsigned LEB128 size and the content of each; the header must be the component layer's, `0d 00 01 00`, so a core module is refused), drop every existing `moruna.json` custom section, append one custom section: byte `0x00`, the section size as unsigned LEB128, the name length as LEB128, the name, the manifest bytes of e.1.
 
 **f.4 `moruna package <project>`.**
 1. Read `function.yaml` (e.3); build the manifest with `format: pex`, `entry` from the file, `abi` and `moruna` from this build, `platforms` the sorted, de-duplicated `--platform` values (or the defaults of d.2). A target whose interpreter tag is not `cp3NN` with `NN` equal to the packaging interpreter's minor version, or whose platform is not `manylinux_<major>_<minor>_<x86_64|aarch64>`, is refused naming it (a `.pex` runs in the sandbox, which is Linux only; the free-threaded tag `cp314t` is refused because a packaged kernel runs on the standard build, FP 2).
@@ -254,7 +254,7 @@ world kernel {
 
 **f.6 The tree.** Given a `.pex` and this machine's target (f.7): if `<package>.tree/MORUNA-TREE` names the fingerprint and this version, use it. Otherwise extract into `<package>.tree.tmp-<pid>-<n>/`, write the marker, remove a stale `<package>.tree/` and rename. When the package's directory is not writable, extract into a private directory under the system temporary directory, removed when the `Tree` is dropped, with the note "`<package>.tree` cannot be written beside the package; extracted to a private directory for this process". The chosen `deps/<target>/` is the first of the package's `platforms` compatible with the host (f.7); none compatible refuses naming the host's target and the package's platforms.
 
-**f.7 Platform compatibility.** The host's target for a `.pex` is `cp3NN-manylinux_<glibc major>_<glibc minor>_<arch>` from the sandbox interpreter's version, `gnu_get_libc_version()` and the machine's architecture; on a host that is not Linux with glibc, `host_target` is refused ("a .pex runs in the sandbox, which needs Linux"). `manylinux_<a>_<b>_<arch>` is compatible with a host `manylinux_<c>_<d>_<arch>` when the interpreter tags are equal, the architectures are equal, and `(a, b) <= (c, d)`.
+**f.7 Platform compatibility.** The host's target for a `.pex` is `cp3NN-manylinux_<glibc major>_<glibc minor>_<arch>` from the sandbox interpreter's version, its C library's version (`os.confstr("CS_GNU_LIBC_VERSION")`) and the machine's architecture, which the template reports in its `hello` (17 e.3); on a host that is not Linux with glibc, `host_target` is refused ("a .pex runs in the sandbox, which needs Linux with glibc"). `manylinux_<a>_<b>_<arch>` is compatible with a host `manylinux_<c>_<d>_<arch>` when the interpreter tags are equal, the architectures are equal, and `(a, b) <= (c, d)`.
 
 **f.8 The job document.** `KernelKindDoc::Package` entries are built by SDD 17's runtimes: open the package (f.1), check the pin (f.2), then `moruna_wasm::WasmKernel::new` or `moruna_sandbox::SandboxKernel::new` by format. A `.pex` entry without the sandbox host of d.2 (`--sandbox-python`, `--sandbox-cgroup`) is refused naming the missing option. Strict mode refuses `kind: python` before any kernel is loaded (PK-I8).
 
@@ -326,9 +326,9 @@ world kernel {
 
 ## l. Implementation notes for the agent
 
-`moruna-package` depends on `sha2`, `serde`, `serde_json`, `zip` (deflate only), `wasmparser` (the version `wasmtime` uses, so the graph has one), `tempfile`-free private directories (`std::env::temp_dir()` plus the process id and a counter), `libc` on Linux for `gnu_get_libc_version`, and `moruna-kernel`. No `unsafe` outside `host.rs` (`gnu_get_libc_version`). `moruna package` is Python because it drives pip; its Rust half (`--wasm`, the manifest) is `_core.package_wasm` and `_core.manifest_check`.
+`moruna-package` depends on `sha2`, `serde`, `serde_json`, `zip` (deflate only) and `moruna-kernel`; private directories are `std::env::temp_dir()` plus the process id and a counter. No `unsafe`. `moruna package` is Python because it drives pip; its Rust half (`--wasm`, the manifest) is `_core.package_wasm` and `_core.manifest_json`. A component is verified and compiled by `moruna-wasm` (SDD 17).
 
-Environment facts to verify before starting: `pip download --platform manylinux_2_28_aarch64 --only-binary=:all: --no-deps` runs on the packaging machine; `wasmparser` reads custom sections of a component.
+Environment facts to verify before starting: `pip download --platform manylinux_2_28_aarch64 --only-binary=:all: --no-deps` runs on the packaging machine.
 
 ## m. Open items
 

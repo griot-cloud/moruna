@@ -204,6 +204,20 @@ def check_kernel(
     profiles_dir: str | None = ...,
 ) -> str: ...
 def default_profiles_dir() -> str | None: ...
+
+# The function package (SDD 16).
+KERNEL_ABI: int
+def manifest_json(text: str) -> str: ...
+def package_wasm(module: str, manifest: str, out: str) -> None: ...
+def check_package(
+    path: str,
+    *,
+    seed: int = 0,
+    profiles_dir: str | None = None,
+    sandbox_python: str | None = None,
+    sandbox_cgroup: str | None = None,
+) -> str: ...
+def aot(path: str) -> str: ...
 def run(
     source: Any,
     kernels: Any,

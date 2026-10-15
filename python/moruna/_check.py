@@ -1,5 +1,8 @@
 """``python -m moruna check``: is this a kernel, and what does it cost (MH 4.9).
 
+A ``.wasm`` or ``.pex`` package is checked through its own runtime (SDD 16 f.9), never in
+process, so the verdict is the one a hosted run would give; its fingerprint is the file's.
+
 Loads a module or a file, finds its kernels (decorated functions, standard kernels, and plain
 functions whose annotated signature is Polars frame to Polars frame), runs each through the
 check harness of ``moruna-runtime`` on synthetic batches from its declared input schema, and
@@ -69,13 +72,26 @@ def check_one(name: str, value: Any, seed: int, profiles_dir: str | None) -> dic
     return json.loads(_core.check_kernel(value, name=name, seed=seed, profiles_dir=profiles_dir))
 
 
+def check_package(args: argparse.Namespace, profiles_dir: str | None) -> dict[str, Any]:
+    """A package through its own runtime (SDD 16 f.9); the JSON report of MH 4.9 as a dict."""
+    return json.loads(
+        _core.check_package(
+            args.target,
+            seed=args.seed,
+            profiles_dir=profiles_dir,
+            sandbox_python=args.sandbox_python,
+            sandbox_cgroup=args.sandbox_cgroup,
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m moruna check",
         description="Check that a module's kernels agree with their declared schemas, and "
         "write each one's first profile.",
     )
-    parser.add_argument("target", help="a module name or a path to a .py file")
+    parser.add_argument("target", help="a module name, a path to a .py file, or a package")
     parser.add_argument("--kernel", help="check only the kernel with this name")
     parser.add_argument("--json", action="store_true", help="print the JSON report")
     parser.add_argument("--seed", type=int, default=0, help="seed of the synthetic batches")
@@ -84,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
         help="where the profile rows go (default: ~/.moruna/profiles, as a run reads them)",
     )
     parser.add_argument("--no-profile", action="store_true", help="write no profile row")
+    parser.add_argument("--sandbox-python", help="a .pex's standard-build interpreter (SDD 17 e.6)")
+    parser.add_argument("--sandbox-cgroup", help="the cgroup a .pex's child runs under")
     args = parser.parse_args(argv)
     if args.seed < 0 or args.seed >= 1 << 64:
         parser.error("--seed takes an integer from 0 to 2**64 - 1")
@@ -92,17 +110,19 @@ def main(argv: list[str] | None = None) -> int:
     reports: list[dict[str, Any]] = []
     error: str | None = None
     try:
-        module = _load(args.target)
-        found = kernels_of(module, args.kernel)
-        if not found:
-            error = (
-                f"no kernel named {args.kernel!r} in {args.target}"
-                if args.kernel
-                else f"no kernels in {args.target}: decorate a function with @moruna.kernel"
-            )
-        for name, value in found:
-            reports.append(check_one(name, value, args.seed, profiles_dir))
-    except Exception as exc:  # noqa: BLE001, a module that does not load is a refusal
+        if args.target.endswith((".wasm", ".pex")):
+            reports.append(check_package(args, profiles_dir))
+        else:
+            found = kernels_of(_load(args.target), args.kernel)
+            if not found:
+                error = (
+                    f"no kernel named {args.kernel!r} in {args.target}"
+                    if args.kernel
+                    else f"no kernels in {args.target}: decorate a function with @moruna.kernel"
+                )
+            for name, value in found:
+                reports.append(check_one(name, value, args.seed, profiles_dir))
+    except Exception as exc:  # noqa: BLE001, a target that does not load is a refusal
         error = f"{type(exc).__name__}: {exc}"
 
     code = EXIT_REFUSED if error or any(r["exit"] != EXIT_AGREED for r in reports) else EXIT_AGREED

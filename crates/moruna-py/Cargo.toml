@@ -25,6 +25,7 @@ arrow = { workspace = true }
 moruna-runtime = { workspace = true }
 moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
+moruna-wasm = { workspace = true }
 moruna-discovery = { workspace = true }
 moruna-sources = { workspace = true }
 moruna-sinks = { workspace = true }
