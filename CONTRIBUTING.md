@@ -31,8 +31,9 @@ Thanks for your interest. Moruna makes hard promises about memory, so a change h
 A release is a pull request that bumps the version in `Cargo.toml` and adds its section to
 [CHANGELOG.md](CHANGELOG.md). Merging it is the release: CI builds the wheels for every platform,
 publishes them to PyPI, and creates the tag afterwards, so a tag always names something that
-shipped. Nobody creates tags by hand, and a merge that does not change the version publishes
-nothing.
+shipped. Nobody creates tags by hand. What decides is the tag, not the diff: a merge publishes
+the version in `Cargo.toml` when `v<version>` is not tagged yet, so a merge after a release that
+failed before its tag publishes that version, and any other merge publishes nothing.
 
 Nothing is published from a commit that was not tested. The tests run on the pull request, not
 again on the merge; before anything is built for PyPI or the documentation site, CI checks that

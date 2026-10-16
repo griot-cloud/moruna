@@ -393,7 +393,16 @@ jobs:
           # build.sh takes SOURCE_DATE_EPOCH from the last commit.
           fetch-depth: 1
       - run: rustup toolchain install
+      # Both builds, each named by its own path, as in `wheels`: the guest carries the
+      # free-threaded one for the engine and the standard one for the sandbox (SDD 17 f.10),
+      # and the free-threaded install also carries a `python3.14`, so a bare name built the
+      # free-threaded wheel twice and 0.5.0 did not publish (2026-10-16).
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: standard
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: freethreaded
         with:
           python-version: "3.14t"
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -406,12 +415,16 @@ jobs:
           cp target/release/moruna-vmm "dist/moruna-vmm-${{ matrix.target }}"
           ./target/release/moruna-vmm --version
       - name: The guest image, built twice to prove it reproduces
+        env:
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
-          python -m pip install --upgrade pip maturin
-          # pyproject.toml's features: the guest runs governed plans and contract writes.
-          maturin build --release --out wheel --interpreter python3.14t
-          # The standard build's wheel: the sandbox a .pex stage runs in (SDD 17 f.10).
-          maturin build --release --out wheel --interpreter python3.14
+          "$FREETHREADED" -m pip install --upgrade pip maturin
+          # pyproject.toml's features: the guest runs governed plans and contract writes. The
+          # free-threaded wheel for the engine, the standard one for the sandbox a .pex stage
+          # runs in (SDD 17 f.10); each must exist before the image is built.
+          "$FREETHREADED" -m maturin build --release --out wheel --interpreter "$FREETHREADED" "$STANDARD"
+          ls wheel/moruna-*-cp314-cp314t-*.whl wheel/moruna-*-cp314-cp314-*.whl
           guest/build.sh wheel/moruna-*-cp314-cp314t-*.whl wheel/moruna-*-cp314-cp314-*.whl build-a
           guest/build.sh wheel/moruna-*-cp314-cp314t-*.whl wheel/moruna-*-cp314-cp314-*.whl build-b
           if [ "$(cat build-a/digest)" != "$(cat build-b/digest)" ]; then
