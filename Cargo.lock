@@ -5082,7 +5082,7 @@ dependencies = [
 [[package]]
 name = "peql"
 version = "0.4.2"
-source = "git+https://github.com/griot-cloud/peQL?rev=6a12346#6a123461b8504d4fec62b4d535ba7ad0e991e28b"
+source = "git+https://github.com/griot-cloud/peQL?rev=16bc090#16bc090b330f73a221b0ec4500f0a2820de7dd20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
