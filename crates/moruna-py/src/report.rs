@@ -160,10 +160,21 @@ impl PyRunReport {
 
     /// `moruna_trace::RunReport::write` (04 d.1): `{"engine", "report"}`, what the engine behind
     /// the run's sink said about the write it committed (a peQL contract's verdict over the rows
-    /// written and the snapshot committed), in the shape `to_json` gives it; otherwise `None`.
+    /// written, the rows that broke each rule and the snapshot committed), with `"excluded"`
+    /// when the sink kept rows the engine handed back, in the shape `to_json` gives it;
+    /// otherwise `None`.
     #[getter]
     fn write<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         field(py, &self.inner, "write")
+    }
+
+    /// `moruna_trace::RunReport::read` (04 d.1): `{"engine", "report"}`, what the engine behind
+    /// the run's source said about the read it planned (a peQL plan's resolution of every
+    /// contract it read, with the rows each view left out by rule), in the shape `to_json` gives
+    /// it; otherwise `None`.
+    #[getter]
+    fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        field(py, &self.inner, "read")
     }
 
     /// How the run ended: `"Completed"`, `"Cancelled"`, or `{"Terminated": {"diagnostic": ...}}`,
@@ -545,6 +556,7 @@ mod tests {
             overflow_failed: false,
             late_records: 0,
             write: None,
+            read: None,
         }
     }
 

@@ -67,4 +67,20 @@ pub trait Source: Send + Sync {
     fn repeatable(&self) -> bool {
         true
     }
+    /// What the engine behind the source said about the read it planned, for a source that
+    /// reads through an engine which governs its reads (a peQL contract); `None` for every
+    /// other source. Known once the source is built.
+    fn read_report(&self) -> Option<SourceRead> {
+        None
+    }
+}
+
+/// A read as the engine that planned it reports it, in that engine's own words: Moruna
+/// carries the report to the run's report and neither reads nor judges it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceRead {
+    /// The engine: `peql`.
+    pub engine: String,
+    /// The engine's report of the read, as the engine serialises it.
+    pub report: serde_json::Value,
 }

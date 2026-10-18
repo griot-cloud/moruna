@@ -737,6 +737,7 @@ fn governed_sources_and_sinks_are_documents() {
             contract: contract.map(Into::into),
             sql: sql.map(Into::into),
             caller: caller.clone(),
+            on_violation: None,
         };
         j
     };
@@ -756,12 +757,93 @@ fn governed_sources_and_sinks_are_documents() {
             contract: contract.into(),
             caller: caller.clone(),
             mode: mode.map(Into::into),
+            on_violation: None,
+            excluded_url: None,
         };
         j
     };
     assert!(refusal(&with_sink("", None, "/disk")).contains("sink.contract"));
     assert!(refusal(&with_sink("c", Some("upsert"), "/disk")).contains("unknown mode"));
     assert!(refusal(&with_sink("c", None, "")).contains("sink.root"));
+
+    // What a read and a write do with rows that break a contract's row rules, refused by field
+    // before any engine is opened.
+    let with_read_violation = |on_violation: &str| {
+        let mut j = with_source(Some("a"), None, "/disk");
+        if let SourceDoc::Datafusion {
+            on_violation: o, ..
+        } = &mut j.source
+        {
+            *o = Some(on_violation.into());
+        }
+        j
+    };
+    for warn in ["warn", "Exclude", ""] {
+        let msg = refusal(&with_read_violation(warn));
+        assert!(
+            msg.contains(&format!(
+                "source.on_violation: unknown on_violation `{warn}` (use \"exclude\" or \"refuse\")"
+            )),
+            "{msg}"
+        );
+    }
+    let with_write_violation = |on_violation: Option<&str>, excluded_url: Option<&str>| {
+        let mut j = with_sink("c", None, "/disk");
+        if let SinkDoc::Peql {
+            on_violation: o,
+            excluded_url: e,
+            ..
+        } = &mut j.sink
+        {
+            *o = on_violation.map(Into::into);
+            *e = excluded_url.map(Into::into);
+        }
+        j
+    };
+    let msg = refusal(&with_write_violation(Some("drop"), None));
+    assert!(
+        msg.contains(
+            "sink.on_violation: unknown on_violation `drop` (use \"refuse\", \"exclude\" or \"warn\")"
+        ),
+        "{msg}"
+    );
+    let msg = refusal(&with_write_violation(Some("exclude"), None));
+    assert!(msg.contains("sink.excluded_url: absent"), "{msg}");
+    for given in [None, Some("refuse"), Some("warn")] {
+        let msg = refusal(&with_write_violation(given, Some("/scratch/excluded")));
+        assert!(msg.contains("sink.excluded_url: given"), "{msg}");
+    }
+    for remote in ["s3://bucket/excluded", "gs://b/x", ""] {
+        let msg = refusal(&with_write_violation(Some("exclude"), Some(remote)));
+        assert!(msg.contains("sink.excluded_url"), "{remote}: {msg}");
+    }
+    // Absent, a write refuses and a read excludes; the fields round-trip as written.
+    assert_eq!(
+        super::governed::on_write_of(&None, &None).expect("the default"),
+        super::governed::OnWrite::Refuse
+    );
+    assert_eq!(
+        super::governed::on_write_of(&Some("exclude".into()), &Some("file:///scratch/x".into()))
+            .expect("exclude"),
+        super::governed::OnWrite::Exclude("/scratch/x".into())
+    );
+    assert_eq!(
+        super::governed::on_read_of(&None).expect("the default"),
+        super::governed::OnRead::Exclude
+    );
+    let excluding = with_write_violation(Some("exclude"), Some("/scratch/excluded"));
+    let text = excluding.canonical_json();
+    assert!(
+        text.contains(r#""on_violation":"exclude""#)
+            && text.contains(r#""excluded_url":"/scratch/excluded""#),
+        "{text}"
+    );
+    assert_eq!(JobSpec::from_json(&text).expect("parses"), excluding);
+    assert!(
+        !with_sink("c", None, "/disk")
+            .canonical_json()
+            .contains("on_violation")
+    );
 
     #[cfg(not(feature = "peql"))]
     {
@@ -814,11 +896,47 @@ fn governed_sources_and_sinks_are_documents() {
             contract: "demo/copy".into(),
             caller: serde_json::Map::new(),
             mode: None,
+            on_violation: None,
+            excluded_url: None,
         };
         assert!(refusal(&not_a_caller).contains("sink.caller: not a caller"));
         let mut bad_sql = job.clone();
         bad_sql.source = with_source(None, Some("SELEC"), "/disk").source;
         assert!(refusal(&bad_sql).contains("source.sql"));
+        // Excluded rows are kept apart from the data: not under the contract's files, nor
+        // over a source's, nor in a directory that holds them.
+        for (dir, overlaps) in [
+            (format!("{root}/copy/excluded"), "the contract's files"),
+            (format!("{root}/big"), "a source"),
+            (root.clone(), "the contract's files"),
+        ] {
+            let mut excluding = job.clone();
+            if let SinkDoc::Peql {
+                on_violation,
+                excluded_url,
+                ..
+            } = &mut excluding.sink
+            {
+                *on_violation = Some("exclude".into());
+                *excluded_url = Some(dir.clone());
+            }
+            let msg = refusal(&excluding);
+            assert!(
+                msg.contains("sink.excluded_url") && msg.contains(&format!("overlaps {overlaps}")),
+                "{dir}: {msg}"
+            );
+        }
+        let mut excluding = job.clone();
+        if let SinkDoc::Peql {
+            on_violation,
+            excluded_url,
+            ..
+        } = &mut excluding.sink
+        {
+            *on_violation = Some("exclude".into());
+            *excluded_url = Some(disk.join("scratch").join("excluded").display().to_string());
+        }
+        build::build(&excluding, &NoKernels, opts(false, &no_env)).expect("kept apart, it builds");
         let _ = std::fs::remove_dir_all(&disk);
     }
 }

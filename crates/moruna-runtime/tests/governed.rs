@@ -431,14 +431,17 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
     );
 }
 
-/// A peQL sink's write is judged once, by peQL, on the rows it writes, and the run reports what
-/// peQL said: rows that breach the contract are committed, the run completes, and its report
-/// carries the verdict (which rule, how many rows, the hash of the files written) beside the
-/// manifest peQL refreshed, which says the same.
+/// Rows that break a contract's row rules, as a job document deals with them (strict, as a
+/// guest's `moruna serve` is). A write refuses them by default: nothing is committed and the
+/// run fails naming the rule and the count. Asked to exclude them, it commits the others and
+/// keeps them in the directory the document names, and the run's report counts them per rule
+/// beside where they are. Asked to warn, it commits every row and its verdict says which rule
+/// rows broke. A read leaves such rows out by default and its report counts them per rule;
+/// asked to refuse, it is refused naming the rule and the count.
 #[test]
-fn a_contract_writes_verdict_is_on_the_runs_report() {
+fn rows_that_break_a_rule_are_dealt_with_as_the_document_asks() {
     let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("write_verdict");
+    let scratch = Scratch::new("on_violation");
     let root = scratch.path().join("disk");
     disk(&root);
     let file = scratch.path().join("in.parquet");
@@ -449,39 +452,91 @@ fn a_contract_writes_verdict_is_on_the_runs_report() {
         writer.write(&batch(-3, 97)).expect("a batch");
         writer.close().expect("closed");
     }
+    let source = serde_json::json!({"kind": "parquet", "url": file});
+    let sink = |extra: serde_json::Value| {
+        let mut sink = serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                                          "caller": caller("ana", "demo"), "mode": "overwrite"});
+        for (k, v) in extra.as_object().expect("fields") {
+            sink[k] = v.clone();
+        }
+        sink
+    };
+    let completed = |outcome: &serde_json::Value| -> serde_json::Value {
+        let report = outcome
+            .get("report")
+            .unwrap_or_else(|| panic!("the run completes: {outcome}"));
+        assert_eq!(report["exit"], "Completed", "{report}");
+        report.clone()
+    };
 
-    let wrote = run_apart(
+    // The default refuses: nothing is committed.
+    let refused = run_apart(
         scratch.path(),
-        serde_json::json!({"kind": "parquet", "url": file}),
-        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
-                           "caller": caller("ana", "demo"), "mode": "overwrite"}),
+        source.clone(),
+        sink(serde_json::json!({})),
         BUDGETS[0],
     );
-    let report = wrote
-        .get("report")
-        .unwrap_or_else(|| panic!("the run completes: {wrote}"));
-    assert_eq!(report["exit"], "Completed", "{report}");
-    let said = &report["write"];
-    assert_eq!(said["engine"], "peql", "{report}");
-    let said = &said["report"];
+    let error = refused["error"].as_str().expect("the write is refused");
+    assert!(
+        error.contains(
+            "`demo/copy` was not committed, because rows break its rules and this write refuses \
+             them: ids_positive (3 rows)"
+        ),
+        "{error}"
+    );
+    assert!(
+        reader(&root).manifest("demo/copy").expect("read").is_none(),
+        "nothing was committed"
+    );
+
+    // Exclude: 97 rows committed, 3 kept apart with the rule each broke.
+    let kept = scratch.path().join("excluded");
+    let report = completed(&run_apart(
+        scratch.path(),
+        source.clone(),
+        sink(serde_json::json!({"on_violation": "exclude", "excluded_url": kept})),
+        BUDGETS[0],
+    ));
+    let write = &report["write"];
+    assert_eq!(write["engine"], "peql", "{report}");
+    assert_eq!(write["report"]["on_violation"], "exclude");
+    assert_eq!(write["report"]["rows_written"], 97);
+    assert_eq!(write["report"]["rows_excluded"], 3);
+    assert_eq!(
+        write["report"]["violations"],
+        serde_json::json!({"ids_positive": 3})
+    );
+    assert_eq!(write["report"]["verdict"]["valid"], true, "{write}");
+    assert_eq!(write["excluded"]["url"], kept.display().to_string());
+    assert_eq!(write["excluded"]["rows"], 3);
+    let files = write["excluded"]["files"].as_array().expect("files");
+    assert_eq!(files.len(), 1, "{write}");
+    assert_eq!(support::read_back_rows(&kept), 3);
+    let manifest = reader(&root)
+        .manifest("demo/copy")
+        .expect("read")
+        .expect("committed");
+    assert_eq!(manifest.row_count, 97);
+    assert!(manifest.valid);
+
+    // Warn: every row committed, and the verdict says which rule rows broke.
+    let report = completed(&run_apart(
+        scratch.path(),
+        source.clone(),
+        sink(serde_json::json!({"on_violation": "warn"})),
+        BUDGETS[0],
+    ));
+    let said = &report["write"]["report"];
+    assert_eq!(said["on_violation"], "warn");
     assert_eq!(said["rows_written"], 100);
+    assert_eq!(said["rows_excluded"], 0);
+    assert_eq!(said["violations"], serde_json::json!({"ids_positive": 3}));
     let verdict = &said["verdict"];
     assert_eq!(verdict["contract"], "demo/copy", "{verdict}");
     assert_eq!(verdict["valid"], false, "{verdict}");
     assert_eq!(verdict["breached"], serde_json::json!(["ids_positive"]));
-    assert_eq!(verdict["row_count"], 100);
     assert_eq!(verdict["failures"]["ids_positive"], 3, "{verdict}");
-    assert!(verdict["stats"].is_object(), "{verdict}");
-    assert!(
-        !verdict["data_hash"].as_str().expect("a hash").is_empty(),
-        "{verdict}"
-    );
-    assert!(
-        !said["files"].as_array().expect("files").is_empty(),
-        "{said}"
-    );
-    assert!(said.get("snapshot").is_none(), "a Parquet binding: {said}");
-
+    assert!(report["write"].get("excluded").is_none(), "{report}");
     let manifest = reader(&root)
         .manifest("demo/copy")
         .expect("read")
@@ -489,6 +544,40 @@ fn a_contract_writes_verdict_is_on_the_runs_report() {
     assert_eq!(manifest.row_count, 100, "the rows were committed");
     assert!(!manifest.valid);
     assert_eq!(manifest.breached, vec!["ids_positive".to_string()]);
+
+    // A read leaves the 3 out by default, and says so.
+    let read_to = scratch.path().join("read-out");
+    let read = serde_json::json!({"kind": "datafusion", "root": root, "contract": "demo/copy",
+                                  "caller": caller("ana", "demo")});
+    let report = completed(&run_apart(
+        scratch.path(),
+        read.clone(),
+        serde_json::json!({"kind": "parquet", "url": read_to}),
+        BUDGETS[0],
+    ));
+    assert_eq!(support::read_back_rows(&read_to), 97);
+    assert_eq!(report["read"]["engine"], "peql", "{report}");
+    let contracts = report["read"]["report"]["contracts"]
+        .as_array()
+        .expect("the contracts read");
+    assert_eq!(contracts.len(), 1);
+    assert_eq!(contracts[0]["contract"], "demo/copy");
+    assert_eq!(
+        contracts[0]["excluded"],
+        serde_json::json!({"ids_positive": 3})
+    );
+
+    // Asked to refuse, it is refused.
+    let mut refusing = read;
+    refusing["on_violation"] = "refuse".into();
+    let refused = run_apart(
+        scratch.path(),
+        refusing,
+        serde_json::json!({"kind": "parquet", "url": scratch.path().join("refused-out")}),
+        BUDGETS[0],
+    );
+    let error = refused["error"].as_str().expect("the read is refused");
+    assert!(error.contains("ids_positive (3 rows)"), "{error}");
 }
 
 /// The runs of H6 whose source cannot be re-read, into a Parquet sink, at 256 MiB and at 1 GiB:

@@ -102,8 +102,10 @@ def test_py_t3_normalise(
     )
 
     assert report.exit == "Completed", report.notes
-    # A Parquet sink has no engine that judges its writes.
+    # A Parquet sink has no engine that judges its writes, nor a Parquet source one that
+    # governs its reads.
     assert report.write is None
+    assert report.read is None
     out = pathlib.Path(out_url.removeprefix("file://"))
     back = pq.read_table(str(out)).sort_by("id")
     assert back.num_rows == rows

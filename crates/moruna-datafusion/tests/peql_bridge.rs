@@ -1,6 +1,8 @@
 //! peQL on both ends (MH 4.5): `PlanSource::peql` reads what peQL plans for a caller, shapes
-//! and charges included; `PeqlSink` writes under a contract, by its owner only, refreshes the
-//! manifest on `finish`, and reports what peQL said about the rows it wrote.
+//! and charges included, leaving out rows that break a row rule (or refusing them) and saying
+//! so in its read report; `PeqlSink` writes under a contract, by its owner only, refreshes the
+//! manifest on `finish`, deals with rows that break a row rule as the write asks (refused,
+//! excluded and kept apart, or committed), and reports what peQL said about the rows it wrote.
 
 #![allow(clippy::result_large_err)]
 
@@ -8,8 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_datafusion::engine::{Caller, Engine, WriteMode};
-use moruna_datafusion::{BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use moruna_datafusion::engine::violation::VIOLATIONS_COLUMN;
+use moruna_datafusion::engine::{Caller, Engine, OnReadViolation, OnWriteViolation, WriteMode};
+use moruna_datafusion::{
+    BudgetPool, OnViolation, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory,
+};
 
 /// Room for what these plans hold, and nowhere to spill.
 fn memory() -> PlanMemory {
@@ -18,13 +24,13 @@ fn memory() -> PlanMemory {
         spill_dir: None,
     }
 }
-use moruna_kernel::arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
+use moruna_kernel::arrow::array::{Array, AsArray, Int64Array, RecordBatch, StringArray};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use moruna_kernel::{Allocator, MorunaError, Payload, Sink, Source, SourceSchema, Tier};
 use moruna_testkit::FakeAllocator;
 
 /// Guests see eastern readings only, with meters hashed; fewer than five rows are withheld;
-/// negative readings breach the contract, which makes the data unservable.
+/// a negative reading breaks a row rule, so a read leaves it out unless asked to refuse.
 const READINGS: &str = r#"
 contract: demo/readings
 version: 1
@@ -104,6 +110,8 @@ fn batch(from: i64, to: i64, kwh: impl Fn(i64) -> i64) -> RecordBatch {
     .expect("a batch")
 }
 
+const EXCLUDE: OnReadViolation = OnReadViolation::Exclude;
+
 fn owner() -> Caller {
     Caller::new("ana", "demo", "analytics")
 }
@@ -131,6 +139,7 @@ fn engine(root: &Path, rows: i64) -> Arc<Engine> {
         "demo/readings",
         vec![batch(0, rows, |i| i)],
         WriteMode::Overwrite,
+        OnWriteViolation::Refuse,
     ))
     .expect("written");
     Arc::new(engine)
@@ -172,7 +181,8 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
     let read = PeqlRead::Contract("demo/readings".into());
 
     // The guest's view: eastern rows only, meters hashed, kwh noised and paid for.
-    let src = PlanSource::peql(&engine, &read, &guest(), &memory()).expect("a governed source");
+    let src =
+        PlanSource::peql(&engine, &read, &guest(), EXCLUDE, &memory()).expect("a governed source");
     assert!(
         !src.repeatable(),
         "noise and suppression make one merged partition"
@@ -197,9 +207,21 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
         })
         .collect();
     assert!(meters.iter().all(|m| m.len() == 64), "meters are hashed");
+    // What peQL decided for the contract: its rules, and no row left out for breaking one.
+    let said = src.read_report().expect("peQL's report of the read");
+    assert_eq!(said.engine, "peql");
+    assert_eq!(said.report["contracts"][0]["contract"], "demo/readings");
+    assert_eq!(
+        said.report["contracts"][0]["excluded"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        said.report["contracts"][0]["decisions"],
+        serde_json::json!(["analytics"])
+    );
     // The view spent 1.0 of 2.0 when it was planned and the query the rest: nothing is left.
     assert_eq!(answer.envelope.budgets["kwh"], 0.0);
-    let spent = PlanSource::peql(&engine, &read, &guest(), &memory())
+    let spent = PlanSource::peql(&engine, &read, &guest(), EXCLUDE, &memory())
         .err()
         .expect("refused");
     assert!(
@@ -208,7 +230,8 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
     );
 
     // The owner is exempt from every shape: all rows, several partitions, repeatable.
-    let src = PlanSource::peql(&engine, &read, &owner(), &memory()).expect("the owner's source");
+    let src =
+        PlanSource::peql(&engine, &read, &owner(), EXCLUDE, &memory()).expect("the owner's source");
     let SourceSchema::Table(schema) = src.schema() else {
         panic!("a table schema");
     };
@@ -220,7 +243,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
         r#"SELECT region, COUNT(*) AS n FROM "demo/readings" GROUP BY region"#.into(),
     );
     assert_eq!(sql.contracts().expect("parsed"), ["demo/readings"]);
-    let src = PlanSource::peql(&engine, &sql, &owner(), &memory()).expect("an aggregate");
+    let src = PlanSource::peql(&engine, &sql, &owner(), EXCLUDE, &memory()).expect("an aggregate");
     let n: i64 = drain(&src)
         .iter()
         .map(|b| {
@@ -235,7 +258,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
 
     // Refusals are peQL's own words.
     let marketer = Caller::new("m", "partner", "marketing");
-    let denied = PlanSource::peql(&engine, &read, &marketer, &memory())
+    let denied = PlanSource::peql(&engine, &read, &marketer, EXCLUDE, &memory())
         .err()
         .expect("denied");
     assert!(denied.to_string().contains("analytics"), "{denied}");
@@ -243,6 +266,7 @@ fn a_governed_view_is_what_peql_answers_and_is_charged_once() {
         &engine,
         &PeqlRead::Contract("demo/none".into()),
         &owner(),
+        EXCLUDE,
         &memory(),
     )
     .err()
@@ -276,6 +300,7 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
         "demo/readings",
         &owner(),
         WriteMode::Append,
+        OnViolation::default(),
         Arc::clone(&memory),
     )
     .expect("the owner writes");
@@ -333,32 +358,181 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
         .collect();
     assert_eq!(paths, summary.files);
     assert!(said.get("snapshot").is_none(), "{said}");
+    // A write that breaks no rule says so whatever it would have done with rows that did.
+    assert_eq!(said["on_violation"], "refuse");
+    assert_eq!(said["violations"], serde_json::json!({}));
+    assert_eq!(said["rows_excluded"], 0);
+    assert!(write.excluded.is_none());
+}
 
-    // Overwrite replaces; rows that breach the contract land, and peQL's verdict on them is
-    // the write's report: the write completes and says which rule they breached. A share of
-    // nothing leaves the write unbounded.
+/// A write of `morsels` through a sink that deals with rows breaking a rule as `on_violation`
+/// says; what `finish` returned.
+fn write_through(
+    engine: &Arc<Engine>,
+    on_violation: OnViolation,
+    morsels: Vec<RecordBatch>,
+) -> moruna_kernel::Result<moruna_kernel::SinkSummary> {
+    let alloc = FakeAllocator::new();
+    let rt = rt();
     let mut sink = PeqlSink::new(
-        Arc::clone(&engine),
+        Arc::clone(engine),
         "demo/readings",
         &owner(),
-        WriteMode::Overwrite,
+        WriteMode::Append,
+        on_violation,
         Arc::new(WriteMemory::new(2)),
+    )?;
+    sink.open(&SourceSchema::Table(schema()))?;
+    for (seq, morsel) in morsels.into_iter().enumerate() {
+        rt.block_on(sink.write(seq as u64, payload(morsel, &alloc)))?;
+    }
+    sink.finish()
+}
+
+fn row_count(engine: &Engine) -> i64 {
+    engine
+        .manifest("demo/readings")
+        .expect("a manifest")
+        .expect("written")
+        .row_count
+}
+
+/// The default: a write any of whose rows breaks a row rule commits nothing, and the run's
+/// error names each rule and how many rows broke it.
+#[test]
+fn a_refusing_write_commits_nothing_and_names_each_rule() {
+    let scratch = Scratch::new("peql-refuse");
+    let engine = engine(scratch.path(), 10);
+    let refused = write_through(
+        &engine,
+        OnViolation::Refuse,
+        vec![batch(10, 30, |i| i), batch(30, 50, |i| i - 35)],
     )
-    .expect("the owner writes");
-    sink.open(&schema).expect("opened");
-    rt.block_on(sink.write(0, payload(batch(0, 20, |i| i - 5), &alloc)))
-        .expect("a morsel");
-    let summary = sink.finish().expect("committed, and reported");
+    .expect_err("refused");
+    assert_eq!(
+        refused.to_string(),
+        "sink: peQL: `demo/readings` was not committed, because rows break its rules and this \
+         write refuses them: non_negative (5 rows)"
+    );
+    assert_eq!(row_count(&engine), 10, "nothing was committed");
+    assert!(engine.manifest("demo/readings").unwrap().unwrap().valid);
+}
+
+/// `exclude`: the rows that pass are committed, the others are kept apart with the rules each
+/// broke, and the report counts them per rule beside where they are.
+#[test]
+fn an_excluding_write_commits_what_passes_and_keeps_the_rest_with_reasons() {
+    let scratch = Scratch::new("peql-exclude");
+    let engine = engine(scratch.path(), 10);
+    let kept = scratch.path().join("run").join("excluded");
+    let summary = write_through(
+        &engine,
+        OnViolation::Exclude(kept.clone()),
+        vec![batch(10, 30, |i| i), batch(30, 50, |i| i - 35)],
+    )
+    .expect("committed");
+    assert_eq!(summary.rows, 35);
+    assert_eq!(row_count(&engine), 45);
+    assert!(engine.manifest("demo/readings").unwrap().unwrap().valid);
+    let write = summary.write.expect("peQL's report of the write");
+    let said = &write.report;
+    assert_eq!(said["on_violation"], "exclude");
+    assert_eq!(said["rows_written"], 35);
+    assert_eq!(said["rows_excluded"], 5);
+    assert_eq!(said["violations"], serde_json::json!({"non_negative": 5}));
+    assert_eq!(said["verdict"]["valid"], true, "{said}");
+
+    // Only the morsel that had such rows left a file, named by its sequence number.
+    let excluded = write.excluded.expect("the rows kept apart");
+    assert_eq!(excluded.url, kept.display().to_string());
+    assert_eq!(excluded.rows, 5);
+    let file = kept.join("excluded-00000000000000000001.parquet");
+    assert_eq!(excluded.files, [file.display().to_string()]);
+    let rows: Vec<RecordBatch> =
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&file).expect("the file"))
+            .expect("Parquet")
+            .build()
+            .expect("a reader")
+            .collect::<std::result::Result<_, _>>()
+            .expect("its rows");
+    assert_eq!(ids(&rows), (30..35).collect::<Vec<_>>());
+    for b in &rows {
+        let reasons = b
+            .column_by_name(VIOLATIONS_COLUMN)
+            .expect("the rules each row broke")
+            .as_list::<i32>();
+        for i in 0..reasons.len() {
+            let rules = reasons.value(i);
+            let rules = rules.as_string::<i32>();
+            assert_eq!(rules.iter().collect::<Vec<_>>(), [Some("non_negative")]);
+        }
+    }
+
+    // Kept in a directory of the write's own: one that holds anything is refused before a row
+    // is written.
+    let again = write_through(
+        &engine,
+        OnViolation::Exclude(kept.clone()),
+        vec![batch(50, 60, |i| i)],
+    )
+    .expect_err("the directory holds the last write's rows");
+    assert!(again.to_string().contains("already holds files"), "{again}");
+    assert_eq!(row_count(&engine), 45);
+}
+
+/// `warn`: every row is committed, and peQL's verdict and counts say which rules rows broke.
+#[test]
+fn a_warning_write_commits_every_row_and_says_which_broke_a_rule() {
+    let scratch = Scratch::new("peql-warn");
+    let engine = engine(scratch.path(), 10);
+    let summary = write_through(&engine, OnViolation::Warn, vec![batch(10, 30, |i| i - 15)])
+        .expect("committed");
     assert_eq!(summary.rows, 20);
-    let said = &summary.write.expect("peQL's report of the write").report;
+    assert_eq!(row_count(&engine), 30);
+    let write = summary.write.expect("peQL's report of the write");
+    let said = &write.report;
+    assert_eq!(said["on_violation"], "warn");
+    assert_eq!(said["rows_excluded"], 0);
+    assert_eq!(said["violations"], serde_json::json!({"non_negative": 5}));
     assert_eq!(said["verdict"]["valid"], false, "{said}");
-    assert_eq!(said["verdict"]["row_count"], 20);
     assert_eq!(
         said["verdict"]["breached"],
         serde_json::json!(["non_negative"])
     );
-    assert_eq!(said["verdict"]["failures"]["non_negative"], 5, "{said}");
+    assert!(write.excluded.is_none());
     assert!(!engine.manifest("demo/readings").unwrap().unwrap().valid);
+}
+
+/// Data holding rows that break a row rule: by default a read leaves them out and its report
+/// counts them per rule; asked to refuse, the read is refused naming the rule and the count.
+#[test]
+fn a_read_leaves_out_rows_that_break_a_rule_unless_asked_to_refuse() {
+    let scratch = Scratch::new("peql-read-violation");
+    let engine = engine(scratch.path(), 10);
+    write_through(&engine, OnViolation::Warn, vec![batch(10, 30, |i| i - 15)]).expect("committed");
+    let read = PeqlRead::Contract("demo/readings".into());
+
+    let src = PlanSource::peql(&engine, &read, &owner(), EXCLUDE, &memory()).expect("a source");
+    let ids = ids(&drain(&src));
+    assert_eq!(ids.len(), 25);
+    assert!((10..15).all(|i| !ids.contains(&i)), "{ids:?}");
+    let report = src.read_report().expect("peQL's report of the read");
+    assert_eq!(report.engine, "peql");
+    let contracts = report.report["contracts"].as_array().expect("contracts");
+    assert_eq!(contracts.len(), 1);
+    assert_eq!(contracts[0]["contract"], "demo/readings");
+    assert_eq!(
+        contracts[0]["excluded"],
+        serde_json::json!({"non_negative": 5})
+    );
+
+    let refused = PlanSource::peql(&engine, &read, &owner(), OnReadViolation::Refuse, &memory())
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(refused, MorunaError::Plan(ref m) if m.contains("non_negative (5 rows)")),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -370,6 +544,7 @@ fn only_the_owner_writes_and_the_sink_keeps_its_order() {
         "demo/readings",
         &guest(),
         WriteMode::Append,
+        OnViolation::Refuse,
         Arc::new(WriteMemory::new(1)),
     )
     .err()
@@ -384,6 +559,7 @@ fn only_the_owner_writes_and_the_sink_keeps_its_order() {
         "demo/readings",
         &owner(),
         WriteMode::Append,
+        OnViolation::Refuse,
         Arc::new(WriteMemory::new(1)),
     )
     .expect("the owner writes");

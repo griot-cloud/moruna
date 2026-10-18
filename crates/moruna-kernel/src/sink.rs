@@ -28,6 +28,22 @@ pub struct SinkWrite {
     pub engine: String,
     /// The engine's report of the write, as the engine serialises it.
     pub report: serde_json::Value,
+    /// The rows the engine handed back rather than commit, and where the sink kept them: for
+    /// a write that excludes the rows breaking its contract's rules, whether or not any did;
+    /// `None` for every other write.
+    pub excluded: Option<ExcludedRows>,
+}
+
+/// Rows a write handed back rather than commit, as the sink kept them: Parquet files under a
+/// local directory the job document names, each row with the rules it broke.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExcludedRows {
+    /// The directory the files are in.
+    pub url: String,
+    /// The files, by path, in the order their morsels were written.
+    pub files: Vec<String>,
+    /// The rows in them.
+    pub rows: u64,
 }
 
 /// Where a run's output goes (component 8).

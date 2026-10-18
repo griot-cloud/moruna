@@ -27,6 +27,8 @@ These are attributes of the report object and keys of `to_json()`.
 | `stages` | One entry per kernel; see below. |
 | `notes` | Decisions Moruna made and facts it found, in sentences. |
 | `trace_path` | The trace file, if `trace` was set. |
+| `write` | For a `peql` sink, what peQL said about the write it committed: `{"engine": "peql", "report": …}`, the report holding the rows written, `on_violation`, `violations` (rows that broke each rule), `rows_excluded`, the files added and the verdict; with `excluded` (`url`, `files`, `rows`) when the write excluded rows. `null` otherwise. |
+| `read` | For a `datafusion` source, what peQL decided for the read it planned: `{"engine": "peql", "report": {"contracts": […]}}`, one entry per contract read, with `excluded`, the rows its view left out by rule. `null` otherwise. |
 
 `to_json()` and the report file also include the following. `limits_timeline` lists each change to the machine's limits during the job. `cpu_ns` is the CPU time the job used. `mem_byte_seconds` is its memory use over time, the sum of memory held multiplied by time. `peak_ceiling_bytes` is the limit that `peak_fraction_of_ceiling` was measured against.
 

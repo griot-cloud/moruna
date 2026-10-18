@@ -268,6 +268,13 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     let (source, source_targets, engine_memory) = source_of(&job.source, loader, &engines)?;
     let (sink, sink_target, sink_memory) = sink_of(&job.sink, &mut notes, loader, &engines)?;
     translate::check_sink_not_source(&sink_target, &source_targets)?;
+    if let SinkDoc::Peql {
+        excluded_url: Some(excluded),
+        ..
+    } = &job.sink
+    {
+        governed::check_excluded(excluded, &sink_target, &source_targets)?;
+    }
 
     // Each entry is loaded and its pin checked on its own; adjacent standard kernels are then
     // fused where their combination is one stage (MH 4.9), and stage ids are counted after that.
@@ -707,7 +714,8 @@ fn source_of(
             contract,
             sql,
             caller,
-        } => governed::source(root, contract, sql, caller, loader, engines),
+            on_violation,
+        } => governed::source(root, contract, sql, caller, on_violation, loader, engines),
     }
 }
 
@@ -863,7 +871,20 @@ fn sink_of(
             contract,
             caller,
             mode,
-        } => governed::sink(root, contract, caller, mode, loader, engines),
+            on_violation,
+            excluded_url,
+        } => governed::sink(
+            governed::SinkFields {
+                root,
+                contract,
+                caller,
+                mode,
+                on_violation,
+                excluded_url,
+            },
+            loader,
+            engines,
+        ),
         // A user's sink names no location of its own, so the sink equals source rule has
         // nothing to compare (12 f.3).
         SinkDoc::Python => Ok((loader.python_sink()?, String::new(), None)),

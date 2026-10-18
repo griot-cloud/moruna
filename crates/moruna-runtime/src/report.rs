@@ -79,6 +79,8 @@ pub struct MetaInput {
     pub process_usage: moruna_kernel::ProcessUsage,
     /// What the sink's engine said about the write it committed, when the run completed.
     pub write: Option<moruna_kernel::SinkWrite>,
+    /// What the source's engine said about the read it planned, when the source was built.
+    pub read: Option<moruna_kernel::SourceRead>,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -114,6 +116,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         process_peak: input.process_peak,
         process_usage: input.process_usage,
         write: input.write,
+        read: input.read,
     }
 }
 
@@ -192,6 +195,7 @@ mod tests {
             },
             process_usage: moruna_kernel::ProcessUsage::default(),
             write: None,
+            read: None,
         });
         assert_eq!(meta.process_peak.bytes, 9);
         assert_eq!(meta.bottleneck_timeline.len(), all.len());
@@ -219,6 +223,7 @@ mod tests {
             process_peak: moruna_kernel::ProcessPeak::default(),
             process_usage: moruna_kernel::ProcessUsage::default(),
             write: None,
+            read: None,
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());
