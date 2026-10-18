@@ -5,7 +5,9 @@ use std::sync::Arc;
 use moruna_kernel::{ErrorPolicy, Guarantee, Kernel, MorunaError, SizerKind};
 use moruna_testkit::FakeKernel;
 
-use super::build::{self, BuildOptions, KernelLoader, LoadedKernel, NoKernels, env_reliance};
+use super::build::{
+    self, BuildOptions, CompiledKernel, KernelLoader, LoadedKernel, NoKernels, env_reliance,
+};
 use super::*;
 
 /// The example of MH 4.1, with every section present.
@@ -429,7 +431,7 @@ fn build_refusals() {
         _ => panic!("NoKernels refuses a kernel"),
     }
     job.kernels[0].kind = KernelKindDoc::Rust;
-    assert_refused(&job, "kernels[0].kind");
+    assert_refused(&job, "kernels[0].module");
     job.kernels[0].kind = KernelKindDoc::Python;
     job.kernels[0].fingerprint = Some("sha256:00".into());
     assert_refused(&job, "kernels[0].fingerprint");
@@ -878,6 +880,168 @@ fn pk_t11_strict_refuses_import_paths() {
     assert!(text.contains("kernels[0].module"), "{text}");
     assert!(text.contains("loads no kernel by import path"), "{text}");
     build::build(&job, &Fakes, opts(false, &no_env)).expect("not strict: built");
+}
+
+/// The kernels a binary that embeds Moruna compiles in, for the `rust` tests: one that takes no
+/// arguments and one that refuses any.
+struct Compiled;
+
+fn fake(_args: &serde_json::Value) -> moruna_kernel::Result<Arc<dyn Kernel>> {
+    Ok(Arc::new(FakeKernel::new()) as Arc<dyn Kernel>)
+}
+
+fn argless(args: &serde_json::Value) -> moruna_kernel::Result<Arc<dyn Kernel>> {
+    if args.is_null() {
+        return fake(args);
+    }
+    Err(MorunaError::Plan("argless takes no arguments".into()))
+}
+
+const DECLARED: [CompiledKernel; 2] = [
+    CompiledKernel {
+        krate: "embedder_kernels",
+        symbol: "fake",
+        build: fake,
+    },
+    CompiledKernel {
+        krate: "embedder_kernels",
+        symbol: "argless",
+        build: argless,
+    },
+];
+
+impl KernelLoader for Compiled {
+    fn load(&self, index: usize, _doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
+        Err(SpecError::new(format!("kernels[{index}]"), "this binary imports nothing").into())
+    }
+    fn compiled(&self) -> &[CompiledKernel] {
+        &DECLARED
+    }
+}
+
+fn strictly(job: &JobSpec) -> String {
+    match build::build(job, &Compiled, opts(true, &no_env)) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("built"),
+    }
+}
+
+/// A Rust kernel compiled into the binary is a `rust` entry, resolved against what the binary
+/// declares and nothing else; strict mode admits it, pinned or not, and the entry round-trips.
+#[test]
+fn strict_admits_a_declared_compiled_kernel() {
+    let mut job = JobSpec::from_json(FULL).expect("parses");
+    job.kernels = vec![KernelDoc::rust(
+        "embedder_kernels",
+        "fake",
+        serde_json::json!({"k": 1}),
+    )];
+    let text = job.to_json_pretty();
+    assert!(text.contains("\"kind\": \"rust\""), "{text}");
+    assert!(text.contains("\"crate\": \"embedder_kernels\""), "{text}");
+    assert!(text.contains("\"symbol\": \"fake\""), "{text}");
+    assert_eq!(JobSpec::from_json(&text).expect("parses"), job);
+
+    let built = build::build(&job, &Compiled, opts(true, &no_env)).expect("strict builds it");
+    assert_eq!(built.spec.kernels.len(), 1);
+
+    let good = FakeKernel::new().fingerprint().to_hex();
+    job.kernels[0].fingerprint = Some(format!("sha256:{good}"));
+    build::build(&job, &Compiled, opts(true, &no_env)).expect("pinned");
+    job.kernels[0].fingerprint = Some("sha256:00".into());
+    assert!(strictly(&job).contains("kernels[0].fingerprint"));
+}
+
+/// A `rust` entry the binary does not declare is refused, strict or not, naming the field and
+/// what the binary does declare; a binary that declares none refuses every one.
+#[test]
+fn an_undeclared_compiled_kernel_is_refused() {
+    let mut job = JobSpec::from_json(FULL).expect("parses");
+    job.kernels = vec![KernelDoc::rust(
+        "other_kernels",
+        "fake",
+        serde_json::Value::Null,
+    )];
+    let e = strictly(&job);
+    assert!(e.contains("kernels[0].crate"), "{e}");
+    assert!(
+        e.contains("embedder_kernels::fake, embedder_kernels::argless"),
+        "{e}"
+    );
+
+    job.kernels = vec![KernelDoc::rust(
+        "embedder_kernels",
+        "nope",
+        serde_json::Value::Null,
+    )];
+    let e = strictly(&job);
+    assert!(e.contains("kernels[0].symbol"), "{e}");
+    assert!(e.contains("no kernel `nope`"), "{e}");
+    let e = build::build(&job, &Compiled, opts(false, &no_env))
+        .err()
+        .expect("not strict: refused as well")
+        .to_string();
+    assert!(e.contains("kernels[0].symbol"), "{e}");
+
+    job.kernels = vec![KernelDoc::rust(
+        "embedder_kernels",
+        "fake",
+        serde_json::Value::Null,
+    )];
+    let e = build::build(&job, &NoKernels, opts(true, &no_env))
+        .err()
+        .expect("nothing declared")
+        .to_string();
+    assert!(e.contains("this binary has no compiled kernels"), "{e}");
+
+    job.kernels = vec![KernelDoc::rust(
+        "embedder_kernels",
+        "argless",
+        serde_json::json!({"x": 1}),
+    )];
+    let e = strictly(&job);
+    assert!(
+        e.contains("kernels[0]: ") && e.contains("argless takes no arguments"),
+        "{e}"
+    );
+}
+
+/// A `rust` entry names its kernel by crate and symbol only: an import path, a package path, a
+/// standard kernel's name or a hint is refused by name, and so is a missing crate or symbol.
+/// Strict mode still refuses every kernel named by import path.
+#[test]
+fn a_compiled_entry_names_nothing_else() {
+    let refused = |edit: &dyn Fn(&mut KernelDoc), field: &str| {
+        let mut job = JobSpec::from_json(FULL).expect("parses");
+        let mut doc = KernelDoc::rust("embedder_kernels", "fake", serde_json::Value::Null);
+        edit(&mut doc);
+        job.kernels = vec![doc];
+        let e = strictly(&job);
+        assert!(e.contains(field), "{field}: {e}");
+    };
+    refused(
+        &|d| d.module = Some("embedder_kernels".into()),
+        "kernels[0].module",
+    );
+    refused(&|d| d.callable = Some("fake".into()), "kernels[0].callable");
+    refused(&|d| d.path = Some("/k.wasm".into()), "kernels[0].path");
+    refused(&|d| d.assets = Some("/a".into()), "kernels[0].assets");
+    refused(&|d| d.name = Some("fake".into()), "kernels[0].name");
+    refused(
+        &|d| d.preferred_rows = Some(10),
+        "kernels[0].preferred_rows",
+    );
+    refused(&|d| d.krate = None, "kernels[0].crate");
+    refused(&|d| d.symbol = Some(String::new()), "kernels[0].symbol");
+
+    let mut job = JobSpec::from_json(FULL).expect("parses");
+    job.kernels = vec![
+        KernelDoc::rust("embedder_kernels", "fake", serde_json::Value::Null),
+        KernelDoc::python("embedder_kernels", "fake"),
+    ];
+    let e = strictly(&job);
+    assert!(e.contains("kernels[1].module"), "{e}");
+    assert!(e.contains("loads no kernel by import path"), "{e}");
 }
 
 /// PK-T12 package_entry_fields (16 d.4): a package entry has a path and a fingerprint and

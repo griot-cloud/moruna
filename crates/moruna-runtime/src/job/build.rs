@@ -46,11 +46,33 @@ pub struct LoadedKernel {
     pub python: Option<Arc<moruna_adapters::PyKernel>>,
 }
 
+/// A Rust kernel compiled into the binary that runs the document, as that binary declares it:
+/// what a `{"kind": "rust", "crate", "symbol"}` entry names (MH 4.1). Nothing is imported or
+/// opened to resolve one; an entry the binary does not declare is refused, so strict mode
+/// admits these and still loads no kernel by import path (16 PK-I8).
+#[derive(Clone, Copy)]
+pub struct CompiledKernel {
+    /// The entry's `crate`: the crate the kernel is compiled from.
+    pub krate: &'static str,
+    /// The entry's `symbol`: the kernel within that crate.
+    pub symbol: &'static str,
+    /// The kernel for the entry's `args` (`null` when the entry has none). A refusal is a
+    /// plan-time error naming the argument.
+    pub build: fn(&serde_json::Value) -> Result<Arc<dyn Kernel>>,
+}
+
 /// What turns a kernel entry into a kernel (MH 4.2). The Python surface's loader imports the
 /// module a file names; `moruna.run`'s hands back the objects it was given.
 pub trait KernelLoader {
     /// The kernel for `doc`, which is entry `index` of `kernels` (stage `index + 1`).
     fn load(&self, index: usize, doc: &KernelDoc) -> Result<LoadedKernel>;
+
+    /// The Rust kernels compiled into this binary, which a `rust` entry names by `crate` and
+    /// `symbol` (MH 4.1). A binary that embeds Moruna declares its own here; the default, and
+    /// `moruna` itself, declares none.
+    fn compiled(&self) -> &[CompiledKernel] {
+        &[]
+    }
 
     /// Where the contracts of the governed engine opened at `root` keep their files, when a
     /// caller knows more than the engine does: an authorized read-only root another party's
@@ -220,7 +242,8 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         None => None,
     };
 
-    // 16 PK-I8: a hosted run loads no kernel by import path; its kernels come from packages.
+    // 16 PK-I8: a hosted run loads no kernel by import path; its kernels come from packages,
+    // the standard kernels, and the Rust kernels compiled into the binary that runs it.
     if opts.strict
         && let Some(index) = job
             .kernels
@@ -230,7 +253,9 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         return Err(SpecError::new(
             format!("kernels[{index}].module"),
             "strict mode loads no kernel by import path: a hosted run loads its kernels from \
-             packages (moruna package, then {\"kind\": \"package\", \"path\", \"fingerprint\"})",
+             packages (moruna package, then {\"kind\": \"package\", \"path\", \"fingerprint\"}) \
+             or from the Rust kernels compiled into its binary ({\"kind\": \"rust\", \"crate\", \
+             \"symbol\"})",
         )
         .into());
     }
@@ -254,13 +279,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
     for (index, doc) in job.kernels.iter().enumerate() {
         let stage = match doc.kind {
-            KernelKindDoc::Rust => {
-                return Err(SpecError::new(
-                    format!("kernels[{index}].kind"),
-                    "rust kernels are reserved in moruna_spec 1",
-                )
-                .into());
-            }
+            KernelKindDoc::Rust => Stage::Loaded(compiled_of(index, doc, loader.compiled())?),
             KernelKindDoc::Std => {
                 let name = doc.name.as_deref().ok_or_else(|| {
                     SpecError::new(
@@ -449,6 +468,86 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
 
 /// A `package` entry (16 d.4): `path` and `fingerprint` and nothing else, opened and pinned
 /// (PK-I2) and its runtime made (16 f.8).
+/// A `rust` entry, resolved against the kernels the running binary declares (MH 4.1): a crate,
+/// a symbol, optionally args and a fingerprint. Its hints are the kernel's own.
+fn compiled_of(index: usize, doc: &KernelDoc, declared: &[CompiledKernel]) -> Result<LoadedKernel> {
+    let field = |name: &str| format!("kernels[{index}].{name}");
+    let set: [(&str, bool); 5] = [
+        ("path", doc.path.is_some()),
+        ("assets", doc.assets.is_some()),
+        ("module", doc.module.is_some()),
+        ("callable", doc.callable.is_some()),
+        ("name", doc.name.is_some()),
+    ];
+    let hints = doc.hints_set();
+    if let Some(name) = set
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(n, _)| *n)
+        .chain(hints.iter().copied())
+        .next()
+    {
+        return Err(SpecError::new(
+            field(name),
+            "a rust entry has a crate, a symbol, and optionally args and a fingerprint; its \
+             hints are the compiled kernel's own",
+        )
+        .into());
+    }
+    let named = |value: &Option<String>, name: &str| -> Result<String> {
+        value.clone().filter(|v| !v.is_empty()).ok_or_else(|| {
+            SpecError::new(
+                field(name),
+                format!("a rust entry names the compiled kernel's {name}"),
+            )
+            .into()
+        })
+    };
+    let krate = named(&doc.krate, "crate")?;
+    let symbol = named(&doc.symbol, "symbol")?;
+    let offered = || -> String {
+        if declared.is_empty() {
+            return "this binary has no compiled kernels".into();
+        }
+        let all: Vec<String> = declared
+            .iter()
+            .map(|k| format!("{}::{}", k.krate, k.symbol))
+            .collect();
+        format!("this binary has {}", all.join(", "))
+    };
+    if !declared.iter().any(|k| k.krate == krate) {
+        return Err(SpecError::new(
+            field("crate"),
+            format!(
+                "no kernel of crate `{krate}` is compiled into this binary; {}",
+                offered()
+            ),
+        )
+        .into());
+    }
+    let Some(kernel) = declared
+        .iter()
+        .find(|k| k.krate == krate && k.symbol == symbol)
+    else {
+        return Err(SpecError::new(
+            field("symbol"),
+            format!(
+                "crate `{krate}` compiled into this binary has no kernel `{symbol}`; {}",
+                offered()
+            ),
+        )
+        .into());
+    };
+    let args = doc.args.clone().unwrap_or(serde_json::Value::Null);
+    let kernel = (kernel.build)(&args)
+        .map_err(|e| SpecError::new(format!("kernels[{index}]"), e.to_string()))?;
+    Ok(LoadedKernel {
+        kernel,
+        #[cfg(feature = "python")]
+        python: None,
+    })
+}
+
 fn package_of(
     index: usize,
     doc: &KernelDoc,
