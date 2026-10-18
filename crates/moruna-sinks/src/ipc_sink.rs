@@ -692,7 +692,7 @@ impl Sink for ArrowIpcSink {
             rows,
             bytes,
             files: inner.ledger.names(),
-            snapshot: None,
+            write: None,
         })
     }
 

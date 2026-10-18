@@ -14,18 +14,20 @@ pub struct SinkSummary {
     pub bytes: u64,
     /// The files or objects produced.
     pub files: Vec<String>,
-    /// The snapshot the write committed, for a sink whose table keeps snapshots (a peQL
-    /// contract bound to an Iceberg table); `None` for every other write.
-    pub snapshot: Option<SinkSnapshot>,
+    /// What the engine behind the sink said about the write it committed, for a sink that
+    /// writes through an engine which judges its writes (a peQL contract); `None` for every
+    /// other write.
+    pub write: Option<SinkWrite>,
 }
 
-/// A snapshot a sink committed to a table with snapshots, and the one it followed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SinkSnapshot {
-    /// The snapshot the write committed.
-    pub snapshot_id: i64,
-    /// The table's snapshot before this one; `None` for a table's first.
-    pub parent_snapshot_id: Option<i64>,
+/// A write as the engine that committed it reports it, in that engine's own words: Moruna
+/// carries the report to the run's report and neither reads nor judges it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SinkWrite {
+    /// The engine, by the sink kind that names it in a job document: `peql`.
+    pub engine: String,
+    /// The engine's report of the write, as the engine serialises it.
+    pub report: serde_json::Value,
 }
 
 /// Where a run's output goes (component 8).

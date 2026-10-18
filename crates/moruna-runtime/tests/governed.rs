@@ -318,12 +318,14 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
             budget,
         );
         apart::within(&wrote, "the write", budget);
-        // A Parquet binding keeps no snapshots: the report has none.
-        assert!(
-            wrote["report"].get("snapshot").is_none(),
-            "{}",
-            wrote["report"]
-        );
+        // The run's report has peQL's report of the write: its verdict over the rows written.
+        // A Parquet binding keeps no snapshots, so the write committed none.
+        let said = &wrote["report"]["write"];
+        assert_eq!(said["engine"], "peql", "{}", wrote["report"]);
+        assert_eq!(said["report"]["rows_written"], ROWS);
+        assert_eq!(said["report"]["verdict"]["valid"], true, "{said}");
+        assert_eq!(said["report"]["verdict"]["row_count"], ROWS);
+        assert!(said["report"].get("snapshot").is_none(), "{said}");
         let engine = reader(&root);
         let manifest = engine.manifest("demo/big").expect("read").expect("written");
         assert!(manifest.valid, "{:?}", manifest.breached);
@@ -427,6 +429,66 @@ fn h6_a_governed_plan_is_a_source_and_a_contract_write_is_a_sink() {
         !root.join("_peql").join("contracts").exists(),
         "no run kept a contract on the disk"
     );
+}
+
+/// A peQL sink's write is judged once, by peQL, on the rows it writes, and the run reports what
+/// peQL said: rows that breach the contract are committed, the run completes, and its report
+/// carries the verdict (which rule, how many rows, the hash of the files written) beside the
+/// manifest peQL refreshed, which says the same.
+#[test]
+fn a_contract_writes_verdict_is_on_the_runs_report() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("write_verdict");
+    let root = scratch.path().join("disk");
+    disk(&root);
+    let file = scratch.path().join("in.parquet");
+    {
+        let out = std::fs::File::create(&file).expect("the input file");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(out, schema(), None).expect("a writer");
+        writer.write(&batch(-3, 97)).expect("a batch");
+        writer.close().expect("closed");
+    }
+
+    let wrote = run_apart(
+        scratch.path(),
+        serde_json::json!({"kind": "parquet", "url": file}),
+        serde_json::json!({"kind": "peql", "root": root, "contract": "demo/copy",
+                           "caller": caller("ana", "demo"), "mode": "overwrite"}),
+        BUDGETS[0],
+    );
+    let report = wrote
+        .get("report")
+        .unwrap_or_else(|| panic!("the run completes: {wrote}"));
+    assert_eq!(report["exit"], "Completed", "{report}");
+    let said = &report["write"];
+    assert_eq!(said["engine"], "peql", "{report}");
+    let said = &said["report"];
+    assert_eq!(said["rows_written"], 100);
+    let verdict = &said["verdict"];
+    assert_eq!(verdict["contract"], "demo/copy", "{verdict}");
+    assert_eq!(verdict["valid"], false, "{verdict}");
+    assert_eq!(verdict["breached"], serde_json::json!(["ids_positive"]));
+    assert_eq!(verdict["row_count"], 100);
+    assert_eq!(verdict["failures"]["ids_positive"], 3, "{verdict}");
+    assert!(verdict["stats"].is_object(), "{verdict}");
+    assert!(
+        !verdict["data_hash"].as_str().expect("a hash").is_empty(),
+        "{verdict}"
+    );
+    assert!(
+        !said["files"].as_array().expect("files").is_empty(),
+        "{said}"
+    );
+    assert!(said.get("snapshot").is_none(), "a Parquet binding: {said}");
+
+    let manifest = reader(&root)
+        .manifest("demo/copy")
+        .expect("read")
+        .expect("committed");
+    assert_eq!(manifest.row_count, 100, "the rows were committed");
+    assert!(!manifest.valid);
+    assert_eq!(manifest.breached, vec!["ids_positive".to_string()]);
 }
 
 /// The runs of H6 whose source cannot be re-read, into a Parquet sink, at 256 MiB and at 1 GiB:

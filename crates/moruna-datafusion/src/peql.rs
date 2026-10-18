@@ -5,8 +5,9 @@
 //! them in it (group and whole-result suppression, noise) and the privacy budgets charged when
 //! it is planned. Moruna runs that plan and sees only the batches it emits. The sink is peQL's
 //! write path, in parts: each morsel is conformed to the contract's row schema, enriched,
-//! flagged and written as Parquet under the contract's layout, and the manifest (the
-//! validation verdict a query is later answered from) is refreshed once, on `finish`.
+//! flagged and written as Parquet under the contract's layout, and on `finish` the write is
+//! committed and peQL's report of it (the verdict over the rows written, the files it added and
+//! the snapshot it committed) goes to the run's report as peQL wrote it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use datafusion::config::Dialect;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use moruna_kernel::{
-    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSnapshot,
-    SinkSummary, SourceSchema, TierPref,
+    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary,
+    SinkWrite, SourceSchema, TierPref,
 };
 use peql::{Caller, Engine, Location, PeqlError, WriteMode, Writing};
 
@@ -142,9 +143,15 @@ impl WriteMemory {
 }
 
 /// A contract write as a sink (MH 4.5): `Engine::begin_write` on `open`, one
-/// `Engine::write_part` per morsel, `Engine::finish_write` on `finish`, which validates the
-/// data and refreshes the manifest. Parts land in files of their own, so morsels are written as
-/// they arrive, in any order and concurrently, each inside its piece of `memory`.
+/// `Engine::write_part` per morsel, `Engine::finish_write` on `finish`, which validates the rows
+/// written, commits them and refreshes the manifest. Parts land in files of their own, so
+/// morsels are written as they arrive, in any order and concurrently, each inside its piece of
+/// `memory`.
+///
+/// What peQL said about the write is the summary's `write`, `{"engine": "peql", "report":
+/// <peQL's WriteReport>}`, whatever it said: a verdict that the rows breach the contract is
+/// peQL's account of data it committed, not a failure of the write, and the run that wrote them
+/// completes and reports it. Whether such data is served is peQL's to decide when it is read.
 pub struct PeqlSink {
     engine: Arc<Engine>,
     contract: String,
@@ -257,26 +264,21 @@ impl Sink for PeqlSink {
             .runtime
             .block_on(self.engine.finish_write(writing))
             .map_err(|e| finish_err(&self.contract, e))?;
-        if !report.verdict.valid {
-            return Err(MorunaError::Sink(format!(
-                "peQL: `{}` is written but not servable: {}",
-                self.contract,
-                report.verdict.breached.join(", ")
-            )));
-        }
-        let files = self
-            .engine
-            .manifest(&self.contract)
-            .map_err(sink_err)?
-            .map(|m| m.files.into_iter().map(|f| f.path).collect())
-            .unwrap_or_default();
+        let files = report.files.iter().map(|f| f.path.clone()).collect();
+        let rows = report.rows_written as u64;
+        let report = serde_json::to_value(&report).map_err(|e| {
+            MorunaError::Sink(format!(
+                "peQL: `{}` is committed, and its write report could not be serialised: {e}",
+                self.contract
+            ))
+        })?;
         Ok(SinkSummary {
-            rows: report.rows_written as u64,
+            rows,
             bytes: self.bytes.load(Ordering::SeqCst),
             files,
-            snapshot: report.snapshot.map(|s| SinkSnapshot {
-                snapshot_id: s.snapshot_id,
-                parent_snapshot_id: s.parent_snapshot_id,
+            write: Some(SinkWrite {
+                engine: "peql".into(),
+                report,
             }),
         })
     }
