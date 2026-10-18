@@ -16,8 +16,12 @@ moruna-sources = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 peql = { workspace = true, optional = true }
+# peql: peQL's report of a write, serialised as peQL serialises it, for the run report.
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The write report a `PeqlSink` hands the run, read back by `tests/peql_bridge.rs`.
+serde_json = { workspace = true }
 # AD-T10 drives a real DataFusion session, whose API is asynchronous.
 tokio = { workspace = true }
 moruna-testkit = { workspace = true }
@@ -28,7 +32,7 @@ default = []
 datafusion = ["dep:datafusion"]
 # `PlanSource` over a DataFusion plan and peQL's governed plans, `PeqlSink` over peQL's
 # contract writes (MH 4.5).
-peql = ["datafusion", "dep:moruna-sources", "dep:tokio", "dep:futures", "dep:peql"]
+peql = ["datafusion", "dep:moruna-sources", "dep:tokio", "dep:futures", "dep:peql", "dep:serde_json"]
 # Contracts bound to Iceberg tables, through a catalog the host gives peQL's engine; Moruna
 # constructs no catalog, it only writes through the engine it is handed.
 peql-iceberg = ["peql", "peql/iceberg"]

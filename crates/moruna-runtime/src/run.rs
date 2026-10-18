@@ -805,8 +805,8 @@ fn drive(
         drains,
         process_peak,
         process_usage,
-        snapshot: match &outcome {
-            RunOutcome::Completed { sink } => sink.snapshot,
+        write: match &outcome {
+            RunOutcome::Completed { sink } => sink.write.clone(),
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
         },
     });

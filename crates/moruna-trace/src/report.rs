@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use moruna_kernel::{
-    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, SinkSnapshot,
-    StageId, TraceRecord,
+    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, SinkWrite, StageId,
+    TraceRecord,
 };
 use serde::{Serialize, Serializer};
 
@@ -64,10 +64,10 @@ pub struct RunMeta {
     pub process_peak: ProcessPeak,
     /// What the whole process consumed over the run, measured (`Sampler::process_usage`).
     pub process_usage: ProcessUsage,
-    /// The snapshot the sink committed, for a sink whose table keeps snapshots
-    /// (`SinkSummary::snapshot`); `None` for every other run, and for a run that did not
-    /// complete.
-    pub snapshot: Option<SinkSnapshot>,
+    /// What the engine behind the sink said about the write it committed
+    /// (`SinkSummary::write`); `None` for a sink with no such engine, and for a run that did
+    /// not complete.
+    pub write: Option<SinkWrite>,
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -252,28 +252,23 @@ pub struct RunReport {
     pub overflow_failed: bool,
     /// Records that arrived after `finish` or after the writer failed (04 e.1, h).
     pub late_records: u64,
-    /// The snapshot the run's sink committed, for a table with snapshots (a peQL contract
-    /// bound to an Iceberg table). Absent from the JSON for every other run.
-    #[serde(
-        serialize_with = "snapshot_json",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub snapshot: Option<SinkSnapshot>,
+    /// The engine's own report of the write the run's sink committed (a peQL contract's
+    /// verdict over the rows written and the snapshot committed), as
+    /// `{"engine", "report"}`. Absent from the JSON for every other run.
+    #[serde(serialize_with = "write_json", skip_serializing_if = "Option::is_none")]
+    pub write: Option<SinkWrite>,
 }
 
-/// `SinkSnapshot` is the contracts' type (d.8); serialised here as
-/// `{"snapshot_id", "parent_snapshot_id"}`.
-fn snapshot_json<S: Serializer>(
-    v: &Option<SinkSnapshot>,
-    s: S,
-) -> core::result::Result<S::Ok, S::Error> {
+/// `SinkWrite` is the contracts' type (d.8); serialised here as `{"engine", "report"}`, the
+/// report exactly as the engine serialised it.
+fn write_json<S: Serializer>(v: &Option<SinkWrite>, s: S) -> core::result::Result<S::Ok, S::Error> {
     use serde::ser::SerializeStruct;
     match v {
         None => s.serialize_none(),
-        Some(snap) => {
-            let mut st = s.serialize_struct("SinkSnapshot", 2)?;
-            st.serialize_field("snapshot_id", &snap.snapshot_id)?;
-            st.serialize_field("parent_snapshot_id", &snap.parent_snapshot_id)?;
+        Some(write) => {
+            let mut st = s.serialize_struct("SinkWrite", 2)?;
+            st.serialize_field("engine", &write.engine)?;
+            st.serialize_field("report", &write.report)?;
             st.end()
         }
     }
@@ -658,7 +653,7 @@ impl RunReport {
             notes,
             overflow_failed: trace.overflow_failed(),
             late_records: trace.late_records(),
-            snapshot: meta.snapshot,
+            write: meta.write.clone(),
         }
     }
 

@@ -13,6 +13,8 @@ arrow = { workspace = true }
 dlpark = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+# A sink's engine's own report of a write (`SinkWrite`), carried to the run report unread.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The fakes of contracts d.15. A dev-dependency on a crate that depends on this one is not a

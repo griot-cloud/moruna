@@ -1,6 +1,6 @@
 //! peQL on both ends (MH 4.5): `PlanSource::peql` reads what peQL plans for a caller, shapes
-//! and charges included; `PeqlSink` writes under a contract, by its owner only, and refreshes
-//! the manifest on `finish`.
+//! and charges included; `PeqlSink` writes under a contract, by its owner only, refreshes the
+//! manifest on `finish`, and reports what peQL said about the rows it wrote.
 
 #![allow(clippy::result_large_err)]
 
@@ -294,15 +294,48 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
     );
     let summary = sink.finish().expect("finished");
     assert_eq!(summary.rows, 400);
-    // A Parquet binding keeps no snapshots, so the write commits none.
-    assert_eq!(summary.snapshot, None);
     assert!(summary.bytes > 0);
     let manifest = engine.manifest("demo/readings").unwrap().unwrap();
     assert!(manifest.valid);
     assert_eq!(manifest.row_count, 410);
-    assert_eq!(summary.files.len(), manifest.files.len());
+    // The files are the ones this write added, not the table's.
+    assert!(!summary.files.is_empty());
+    assert!(summary.files.len() < manifest.files.len());
+    for file in &summary.files {
+        assert!(
+            manifest.files.iter().any(|f| &f.path == file),
+            "{file} is in the table"
+        );
+    }
+    // peQL's report of the write, as peQL serialises it: a verdict over the 400 rows written,
+    // not the table's 410, with the hash of the files they landed in. A Parquet binding keeps
+    // no snapshots, so the write commits none.
+    let write = summary.write.as_ref().expect("peQL's report of the write");
+    assert_eq!(write.engine, "peql");
+    let said = &write.report;
+    assert_eq!(said["rows_written"], 400);
+    assert_eq!(said["verdict"]["valid"], true, "{said}");
+    assert_eq!(said["verdict"]["row_count"], 400);
+    assert_eq!(said["verdict"]["breached"], serde_json::json!([]));
+    assert!(said["verdict"]["stats"].is_object(), "{said}");
+    assert!(
+        !said["verdict"]["data_hash"]
+            .as_str()
+            .expect("a hash")
+            .is_empty(),
+        "{said}"
+    );
+    let paths: Vec<&str> = said["files"]
+        .as_array()
+        .expect("the files written")
+        .iter()
+        .map(|f| f["path"].as_str().expect("a path"))
+        .collect();
+    assert_eq!(paths, summary.files);
+    assert!(said.get("snapshot").is_none(), "{said}");
 
-    // Overwrite replaces; data that breaches the contract lands, and the run is told. A share of
+    // Overwrite replaces; rows that breach the contract land, and peQL's verdict on them is
+    // the write's report: the write completes and says which rule they breached. A share of
     // nothing leaves the write unbounded.
     let mut sink = PeqlSink::new(
         Arc::clone(&engine),
@@ -315,8 +348,16 @@ fn a_contract_write_in_morsels_refreshes_the_manifest_on_finish() {
     sink.open(&schema).expect("opened");
     rt.block_on(sink.write(0, payload(batch(0, 20, |i| i - 5), &alloc)))
         .expect("a morsel");
-    let breached = sink.finish().expect_err("unservable");
-    assert!(breached.to_string().contains("non_negative"), "{breached}");
+    let summary = sink.finish().expect("committed, and reported");
+    assert_eq!(summary.rows, 20);
+    let said = &summary.write.expect("peQL's report of the write").report;
+    assert_eq!(said["verdict"]["valid"], false, "{said}");
+    assert_eq!(said["verdict"]["row_count"], 20);
+    assert_eq!(
+        said["verdict"]["breached"],
+        serde_json::json!(["non_negative"])
+    );
+    assert_eq!(said["verdict"]["failures"]["non_negative"], 5, "{said}");
     assert!(!engine.manifest("demo/readings").unwrap().unwrap().valid);
 }
 

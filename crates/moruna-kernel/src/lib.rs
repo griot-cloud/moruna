@@ -66,7 +66,7 @@ pub use placement::{
     TierBudgets,
 };
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
-pub use sink::{Sink, SinkSnapshot, SinkSummary};
+pub use sink::{Sink, SinkSummary, SinkWrite};
 pub use source::{RowRange, Source, Split};
 pub use tensor::{DeleterHook, Dlpack, ManagedTensor};
 pub use tier::{RemoteRef, SegmentRef, StagingCodec, TIER_COUNT, Tier, TierKind};
