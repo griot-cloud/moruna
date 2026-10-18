@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- **A kernel compiled into the binary that runs it is a `rust` entry, and strict mode admits it.** A job names it `{"kind": "rust", "crate", "symbol", "args", "fingerprint"}` (the kind `moruna_spec` 1 reserved). The binary that embeds Moruna declares what it compiles in through `KernelLoader::compiled()` (`CompiledKernel { krate, symbol, build }`, exported from `moruna_runtime::job`); `build()` resolves a `rust` entry only against that table, so nothing is imported or opened. An undeclared crate or symbol is refused by name, strict or not, listing what the binary declares; a `rust` entry carrying `module`, `callable`, `path`, `assets`, `name` or a hint is refused by name. Strict mode still refuses every Python import-path entry, and its refusal now also names `rust` entries. `moruna` itself declares none (PR 44).
+
 ## 0.5.0
 
 - **A kernel can be one portable file.** A package is `.wasm` (any language with a wasm toolchain, exporting the `moruna:kernel` world) or `.pex` (Python with the wheels of its `function.lock`), with `moruna.json` inside and the file's sha256 as its fingerprint (`architecture/function-packages.md`, SDD 16). `moruna package` builds one (`--json` reports the path, fingerprint and manifest), `moruna check <package>` checks it through its runtime and reports the manifest, `moruna aot` precompiles it, `moruna.load` runs it on this machine. A kernel built by arguments declares `args`; a package may read a read-only assets directory.
