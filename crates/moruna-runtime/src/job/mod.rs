@@ -19,7 +19,9 @@ pub mod translate;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use build::{BuildOptions, Built, KernelLoader, LoadedKernel, NoKernels, build};
+pub use build::{
+    BuildOptions, Built, CompiledKernel, KernelLoader, LoadedKernel, NoKernels, build,
+};
 #[cfg(feature = "peql")]
 pub use governed::entry_of;
 
@@ -371,7 +373,8 @@ pub struct ArrowIpcSinkOptions {
 pub enum KernelKindDoc {
     /// A Python callable, by module and name.
     Python,
-    /// A Rust kernel by crate and symbol. Reserved in version 1 and refused.
+    /// A Rust kernel compiled into the binary that runs the document, by crate and symbol, as
+    /// that binary declares it ([`build::CompiledKernel`]).
     Rust,
     /// A standard kernel of `moruna-kernels` by `name` and `args` (MH 4.9).
     Std,
@@ -399,17 +402,17 @@ pub struct KernelDoc {
     /// The attribute of the module that is the kernel; dotted for a nested attribute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callable: Option<String>,
-    /// Reserved for `rust`.
+    /// For `rust`: the crate the compiled kernel is built from.
     #[serde(default, rename = "crate", skip_serializing_if = "Option::is_none")]
     pub krate: Option<String>,
-    /// Reserved for `rust`.
+    /// For `rust`: the compiled kernel within its crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     /// For `std`: the standard kernel's name (`cast`, `select`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// For `std`: its arguments, a JSON object; for `package`: the arguments of a kernel built
-    /// by them (16 b).
+    /// by them (16 b); for `rust`: the arguments the compiled kernel is built by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
     /// The fingerprint the loaded kernel must have, hex, optionally prefixed `algo:`.
@@ -486,6 +489,22 @@ impl KernelDoc {
         doc.module = None;
         doc.callable = None;
         doc.name = Some(name.into());
+        doc.args = Some(args);
+        doc
+    }
+
+    /// A Rust kernel compiled into the running binary, `symbol` of `krate`, built by `args`.
+    pub fn rust(
+        krate: impl Into<String>,
+        symbol: impl Into<String>,
+        args: serde_json::Value,
+    ) -> KernelDoc {
+        let mut doc = KernelDoc::python("", "");
+        doc.kind = KernelKindDoc::Rust;
+        doc.module = None;
+        doc.callable = None;
+        doc.krate = Some(krate.into());
+        doc.symbol = Some(symbol.into());
         doc.args = Some(args);
         doc
     }
