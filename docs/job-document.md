@@ -53,7 +53,7 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 
 **`tensor`**: `url` is a path or a list of paths to safetensors or aligned binary tensor files; `options.tensors` lists the tensors to read.
 
-**`datafusion`**: a query planned by peQL for a caller. `root` is the peQL workspace, where peQL keeps its manifests, privacy ledger and audit log; the contracts are the ones listed in [`contracts`](#contracts); exactly one of `contract`, to read one contract, or `sql`, a query over contracts; and `caller`, the caller as peQL reads it, with `id`, `tenant` and `purpose` and optionally `tier`, `clearance`, `classification`, `roles`, `now` and `other`. See the [peQL documentation](https://griot-cloud.github.io/peQL/).
+**`datafusion`**: a query planned by peQL for a caller. `root` is the peQL workspace, where peQL keeps its manifests, privacy ledger and audit log; the contracts are the ones listed in [`contracts`](#contracts); exactly one of `contract`, to read one contract, or `sql`, a query over contracts; and `caller`, the caller as peQL reads it, with `id`, `tenant` and `purpose` and optionally `tier`, `clearance`, `classification`, `roles`, `now` and `other`. `on_violation` says what the read does with rows that break a contract's row rules: `exclude` (default) leaves them out, and the run report's `read` counts them per rule for each contract; `refuse` refuses the read when the data holds any, naming each rule and how many rows broke it. See the [peQL documentation](https://griot-cloud.github.io/peQL/).
 
 ```json
 {"kind": "datafusion", "root": "/data/workspace", "contract": "purchasing/orders",
@@ -87,6 +87,20 @@ Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refus
 **`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB).
 
 **`peql`**: writes under a peQL contract listed in [`contracts`](#contracts). `root` is the peQL workspace, `contract` the contract, `caller` the writer, who must own the contract, and `mode` either `append` (default) or `overwrite`. peQL writes the data in the contract's layout and updates the contract's manifest when the job finishes.
+
+`on_violation` says what the write does with rows that break the contract's row rules:
+
+- `refuse` (default): nothing is committed when any row breaks a rule, and the job fails naming each rule and how many rows broke it.
+- `exclude`: the rows that pass are committed, and the others are written as Parquet under `excluded_url`, one file per morsel that had any, each row with a `_violations` column listing the rules it broke. `excluded_url` is a local directory, given only with `exclude`, that is empty or absent when the job starts and is apart from the contract's files and from the source.
+- `warn`: every row is committed, and peQL's verdict on the write marks it invalid.
+
+The run report's `write` says what was done: `report.violations` (rows by rule), `report.rows_excluded` and, for `exclude`, `excluded` with the directory, the files and their rows.
+
+```json
+{"kind": "peql", "root": "/data/workspace", "contract": "purchasing/orders",
+ "caller": {"id": "svc-ingest", "tenant": "acme", "purpose": "ingest"},
+ "on_violation": "exclude", "excluded_url": "/staging/excluded"}
+```
 
 ## contracts
 

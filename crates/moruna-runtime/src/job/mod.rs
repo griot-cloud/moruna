@@ -226,6 +226,11 @@ pub enum SourceDoc {
         /// The caller, as peQL reads it: `id`, `tenant`, `purpose`, and optionally `tier`,
         /// `clearance`, `classification`, `roles`, `now` and `other`.
         caller: serde_json::Map<String, serde_json::Value>,
+        /// What the read does with rows that break a contract's row rules: `exclude` (absent)
+        /// leaves them out and the run's report counts them per rule; `refuse` refuses the
+        /// read when the data holds any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_violation: Option<String>,
     },
 }
 
@@ -314,6 +319,16 @@ pub enum SinkDoc {
         /// `append` (absent) or `overwrite`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        /// What the write does with rows that break the contract's row rules: `refuse`
+        /// (absent) commits nothing when any does; `exclude` commits the others and keeps
+        /// these under `excluded_url`; `warn` commits every row and its verdict says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_violation: Option<String>,
+        /// The local directory an `exclude` write keeps the rows it excludes in, as Parquet
+        /// with the rules each broke; empty or absent when the run starts. Only `exclude`
+        /// takes it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        excluded_url: Option<String>,
     },
     /// A user's `moruna.Sink` subclass (08 f.10, 2026-09-29). Library only: the object lives in
     /// the caller's process, so a document from a file or a socket is refused (MH 4.1).

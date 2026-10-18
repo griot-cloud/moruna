@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use moruna_kernel::{
-    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, SinkWrite, StageId,
-    TraceRecord,
+    GilState, IoPaths, Limits, Outcome, ProcessPeak, ProcessUsage, RunId, Seq, SinkWrite,
+    SourceRead, StageId, TraceRecord,
 };
 use serde::{Serialize, Serializer};
 
@@ -68,6 +68,9 @@ pub struct RunMeta {
     /// (`SinkSummary::write`); `None` for a sink with no such engine, and for a run that did
     /// not complete.
     pub write: Option<SinkWrite>,
+    /// What the engine behind the source said about the read it planned
+    /// (`Source::read_report`); `None` for a source with no such engine.
+    pub read: Option<SourceRead>,
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -253,22 +256,55 @@ pub struct RunReport {
     /// Records that arrived after `finish` or after the writer failed (04 e.1, h).
     pub late_records: u64,
     /// The engine's own report of the write the run's sink committed (a peQL contract's
-    /// verdict over the rows written and the snapshot committed), as
-    /// `{"engine", "report"}`. Absent from the JSON for every other run.
+    /// verdict over the rows written, the rows that broke each rule, and the snapshot
+    /// committed), as `{"engine", "report"}`, with `"excluded": {"url", "files", "rows"}`
+    /// when the write set rows aside. Absent from the JSON for every other run.
     #[serde(serialize_with = "write_json", skip_serializing_if = "Option::is_none")]
     pub write: Option<SinkWrite>,
+    /// The engine's own report of the read the run's source planned (a peQL plan's
+    /// resolution of every contract it read, with the rows each view left out by rule), as
+    /// `{"engine", "report"}`. Absent from the JSON for every other run.
+    #[serde(serialize_with = "read_json", skip_serializing_if = "Option::is_none")]
+    pub read: Option<SourceRead>,
 }
 
 /// `SinkWrite` is the contracts' type (d.8); serialised here as `{"engine", "report"}`, the
-/// report exactly as the engine serialised it.
+/// report exactly as the engine serialised it, and `"excluded"` when the sink kept rows the
+/// engine handed back.
 fn write_json<S: Serializer>(v: &Option<SinkWrite>, s: S) -> core::result::Result<S::Ok, S::Error> {
     use serde::ser::SerializeStruct;
     match v {
         None => s.serialize_none(),
         Some(write) => {
-            let mut st = s.serialize_struct("SinkWrite", 2)?;
+            let fields = if write.excluded.is_some() { 3 } else { 2 };
+            let mut st = s.serialize_struct("SinkWrite", fields)?;
             st.serialize_field("engine", &write.engine)?;
             st.serialize_field("report", &write.report)?;
+            if let Some(excluded) = &write.excluded {
+                st.serialize_field(
+                    "excluded",
+                    &serde_json::json!({
+                        "url": excluded.url,
+                        "files": excluded.files,
+                        "rows": excluded.rows,
+                    }),
+                )?;
+            }
+            st.end()
+        }
+    }
+}
+
+/// `SourceRead` is the contracts' type (d.6); serialised here as `{"engine", "report"}`, the
+/// report exactly as the engine serialised it.
+fn read_json<S: Serializer>(v: &Option<SourceRead>, s: S) -> core::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    match v {
+        None => s.serialize_none(),
+        Some(read) => {
+            let mut st = s.serialize_struct("SourceRead", 2)?;
+            st.serialize_field("engine", &read.engine)?;
+            st.serialize_field("report", &read.report)?;
             st.end()
         }
     }
@@ -654,6 +690,7 @@ impl RunReport {
             overflow_failed: trace.overflow_failed(),
             late_records: trace.late_records(),
             write: meta.write.clone(),
+            read: meta.read.clone(),
         }
     }
 

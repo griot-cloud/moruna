@@ -462,7 +462,15 @@ pub trait Source: Send + Sync {
     /// (stages Q0 instead) and refuses `resume` for the run. Default true, which
     /// every file-backed source satisfies by construction.
     fn repeatable(&self) -> bool { true }
+    /// What the engine behind the source said about the read it planned (a peQL plan's
+    /// resolution of every contract it read); `None` for every other source.
+    fn read_report(&self) -> Option<SourceRead> { None }
 }
+
+/// A read as the engine that planned it reports it, in that engine's words; Moruna carries
+/// it to the run report (`read`) and neither reads nor judges it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceRead { pub engine: String, pub report: serde_json::Value }
 ```
 
 ### d.7 Kernel
@@ -592,7 +600,26 @@ pub trait Kernel: Send + Sync + 'static {
 
 ```rust
 #[derive(Clone, Debug, Default)]
-pub struct SinkSummary { pub rows: u64, pub bytes: u64, pub files: Vec<String> }
+pub struct SinkSummary {
+    pub rows: u64, pub bytes: u64, pub files: Vec<String>,
+    /// What the engine behind the sink said about the write it committed; `None` for a sink
+    /// with no such engine.
+    pub write: Option<SinkWrite>,
+}
+
+/// A write as the engine that committed it reports it, in that engine's words, and the rows
+/// it handed back rather than commit, as the sink kept them (a write that excludes rows
+/// breaking its contract's rules); Moruna carries it to the run report (`write`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SinkWrite {
+    pub engine: String,
+    pub report: serde_json::Value,
+    pub excluded: Option<ExcludedRows>,
+}
+
+/// Parquet files under a local directory, each row with the rules it broke.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExcludedRows { pub url: String, pub files: Vec<String>, pub rows: u64 }
 
 pub trait Sink: Send + Sync {
     fn open(&mut self, schema: &SourceSchema) -> Result<()>;

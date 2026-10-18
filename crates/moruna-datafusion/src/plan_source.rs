@@ -46,8 +46,8 @@ use futures::StreamExt;
 use moruna_kernel::arrow::array::{Array, RecordBatch, UInt32Array};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use moruna_kernel::{
-    Allocator, BoxFuture, MorunaError, Payload, Result, RowRange, Source, SourceSchema, Split,
-    SplitId, Tier,
+    Allocator, BoxFuture, MorunaError, Payload, Result, RowRange, Source, SourceRead, SourceSchema,
+    Split, SplitId, Tier,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -87,6 +87,8 @@ pub struct PlanSource {
     repeatable: bool,
     /// The live stream of each partition, opened by the first read of it.
     streams: Vec<Mutex<Option<Stream>>>,
+    /// What the engine that planned the read said of it, for a governed plan.
+    read: Option<SourceRead>,
 }
 
 impl PlanSource {
@@ -194,7 +196,14 @@ impl PlanSource {
             places,
             repeatable,
             streams,
+            read: None,
         })
+    }
+
+    /// The source with the engine's report of the read it plans.
+    pub(crate) fn with_read(mut self, read: SourceRead) -> PlanSource {
+        self.read = Some(read);
+        self
     }
 
     /// Open a partition's stream on a fresh copy of the plan: an operator keeps the state of
@@ -274,6 +283,10 @@ impl Source for PlanSource {
 
     fn repeatable(&self) -> bool {
         self.repeatable
+    }
+
+    fn read_report(&self) -> Option<SourceRead> {
+        self.read.clone()
     }
 }
 

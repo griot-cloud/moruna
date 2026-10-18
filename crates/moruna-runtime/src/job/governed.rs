@@ -94,35 +94,166 @@ fn overwrite_of(mode: &Option<String>) -> Result<bool> {
     }
 }
 
+/// What a read does with rows that break a contract's row rules: `exclude` (absent) leaves
+/// them out of the contract's view and counts them per rule; `refuse` refuses the read when the
+/// data holds any. A read is never only warned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OnRead {
+    Exclude,
+    Refuse,
+}
+
+pub(super) fn on_read_of(on_violation: &Option<String>) -> Result<OnRead> {
+    match on_violation.as_deref().unwrap_or("exclude") {
+        "exclude" => Ok(OnRead::Exclude),
+        "refuse" => Ok(OnRead::Refuse),
+        other => Err(SpecError::new(
+            "source.on_violation",
+            format!("unknown on_violation `{other}` (use \"exclude\" or \"refuse\")"),
+        )
+        .into()),
+    }
+}
+
+/// What a write does with rows that break its contract's row rules: `refuse` (absent) commits
+/// nothing when any does; `exclude` commits the others and keeps these under `excluded_url`, a
+/// local directory, which it needs and which no other mode takes; `warn` commits every row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum OnWrite {
+    Refuse,
+    Exclude(std::path::PathBuf),
+    Warn,
+}
+
+pub(super) fn on_write_of(
+    on_violation: &Option<String>,
+    excluded_url: &Option<String>,
+) -> Result<OnWrite> {
+    let on_write = match on_violation.as_deref().unwrap_or("refuse") {
+        "refuse" => OnWrite::Refuse,
+        "warn" => OnWrite::Warn,
+        "exclude" => {
+            let url = excluded_url.as_deref().ok_or_else(|| {
+                SpecError::new(
+                    "sink.excluded_url",
+                    "absent: a write that excludes rows keeps them in a directory it names",
+                )
+            })?;
+            return Ok(OnWrite::Exclude(excluded_dir(url)?));
+        }
+        other => {
+            return Err(SpecError::new(
+                "sink.on_violation",
+                format!("unknown on_violation `{other}` (use \"refuse\", \"exclude\" or \"warn\")"),
+            )
+            .into());
+        }
+    };
+    match excluded_url {
+        Some(_) => Err(SpecError::new(
+            "sink.excluded_url",
+            "given, and this write excludes no rows: only `\"on_violation\": \"exclude\"` keeps \
+             any",
+        )
+        .into()),
+        None => Ok(on_write),
+    }
+}
+
+/// The directory a write keeps the rows it excludes in: on the run's own disk, a bare path or a
+/// `file://` URL.
+fn excluded_dir(url: &str) -> Result<std::path::PathBuf> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(SpecError::new("sink.excluded_url", "empty: a directory is named").into());
+    }
+    if let Some(at) = url.find("://")
+        && !url[..at].eq_ignore_ascii_case("file")
+    {
+        return Err(SpecError::new(
+            "sink.excluded_url",
+            format!(
+                "`{url}` is not on the run's disk: excluded rows are kept in a local directory"
+            ),
+        )
+        .into());
+    }
+    Ok(super::translate::local_path(url))
+}
+
+/// Excluded rows are kept apart from the data: not where the contract keeps its files, nor
+/// where a source reads, nor in a directory that holds either.
+pub(super) fn check_excluded(excluded_url: &str, written: &str, sources: &[String]) -> Result<()> {
+    use super::translate::normalise_target;
+    let excluded = normalise_target(excluded_url);
+    for (what, other) in std::iter::once(("the contract's files", written))
+        .chain(sources.iter().map(|s| ("a source", s.as_str())))
+    {
+        let other = normalise_target(other);
+        if excluded == other
+            || excluded.starts_with(&format!("{other}/"))
+            || other.starts_with(&format!("{excluded}/"))
+        {
+            return Err(SpecError::new(
+                "sink.excluded_url",
+                format!(
+                    "`{excluded_url}` resolves to `{excluded}`, which overlaps {what} at \
+                     `{other}`: excluded rows are kept apart from the data"
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// The source's builder, where the contracts it reads keep their files, and its plan's memory.
 pub(super) fn source(
     root: &str,
     contract: &Option<String>,
     sql: &Option<String>,
     caller: &serde_json::Map<String, serde_json::Value>,
+    on_violation: &Option<String>,
     loader: &dyn KernelLoader,
     engines: &Engines,
 ) -> Result<Read> {
     check_read(contract, sql)?;
+    let on_read = on_read_of(on_violation)?;
     let root = root_of("source.root", root)?;
-    imp::source(root, contract, sql, caller, loader, engines)
+    imp::source(root, contract, sql, caller, on_read, loader, engines)
+}
+
+/// What a `peql` sink document says, as it says it.
+pub(super) struct SinkFields<'a> {
+    pub root: &'a str,
+    pub contract: &'a str,
+    pub caller: &'a serde_json::Map<String, serde_json::Value>,
+    pub mode: &'a Option<String>,
+    pub on_violation: &'a Option<String>,
+    pub excluded_url: &'a Option<String>,
 }
 
 /// The sink's builder, where the contract it writes keeps its files, and its writes' memory.
 pub(super) fn sink(
-    root: &str,
-    contract: &str,
-    caller: &serde_json::Map<String, serde_json::Value>,
-    mode: &Option<String>,
+    fields: SinkFields<'_>,
     loader: &dyn KernelLoader,
     engines: &Engines,
 ) -> Result<Write> {
-    if contract.is_empty() {
+    if fields.contract.is_empty() {
         return Err(SpecError::new("sink.contract", "empty: a write is under a contract").into());
     }
-    let overwrite = overwrite_of(mode)?;
-    let root = root_of("sink.root", root)?;
-    imp::sink(root, contract, caller, overwrite, loader, engines)
+    let overwrite = overwrite_of(fields.mode)?;
+    let on_write = on_write_of(fields.on_violation, fields.excluded_url)?;
+    let root = root_of("sink.root", fields.root)?;
+    imp::sink(
+        root,
+        fields.contract,
+        fields.caller,
+        overwrite,
+        on_write,
+        loader,
+        engines,
+    )
 }
 
 #[cfg(feature = "peql")]
@@ -136,14 +267,15 @@ mod imp {
     use moruna_datafusion::engine::audit::JsonlAudit;
     use moruna_datafusion::engine::budget::BudgetStore;
     use moruna_datafusion::engine::store::Registered;
-    use moruna_datafusion::engine::{Caller, Engine, PeqlError, WriteMode};
+    use moruna_datafusion::engine::{Caller, Engine, OnReadViolation, PeqlError, WriteMode};
     use moruna_datafusion::{
-        BudgetPool, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory, location_target,
+        BudgetPool, OnViolation, PeqlRead, PeqlSink, PlanMemory, PlanSource, WriteMemory,
+        location_target,
     };
     use moruna_kernel::{MorunaError, Result, Sink, Source};
     use parcel_runtime::compiled::CompiledBytes;
 
-    use super::{Engines, KernelLoader, Read, SpecError, Write};
+    use super::{Engines, KernelLoader, OnRead, OnWrite, Read, SpecError, Write};
     use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 
     /// The facade sizes a plan's pool; this is how it reaches it.
@@ -282,10 +414,15 @@ mod imp {
         contract: &Option<String>,
         sql: &Option<String>,
         caller: &serde_json::Map<String, serde_json::Value>,
+        on_read: OnRead,
         loader: &dyn KernelLoader,
         engines: &Engines,
     ) -> Result<Read> {
         let caller = caller_of("source.caller", caller)?;
+        let on_violation = match on_read {
+            OnRead::Exclude => OnReadViolation::Exclude,
+            OnRead::Refuse => OnReadViolation::Refuse,
+        };
         let (read, field) = match (contract, sql) {
             (Some(name), _) => (PeqlRead::Contract(name.clone()), "source.contract"),
             (None, sql) => (PeqlRead::Sql(sql.clone().unwrap_or_default()), "source.sql"),
@@ -307,10 +444,13 @@ mod imp {
                     pool: memory,
                     spill_dir: ctx.discovered.profile.staging_dir.clone(),
                 };
-                Ok(
-                    Arc::new(PlanSource::peql(&engine, &read, &caller, &memory)?)
-                        as Arc<dyn Source>,
-                )
+                Ok(Arc::new(PlanSource::peql(
+                    &engine,
+                    &read,
+                    &caller,
+                    on_violation,
+                    &memory,
+                )?) as Arc<dyn Source>)
             })),
             targets,
             Some(pool as Arc<dyn EngineMemory>),
@@ -342,10 +482,16 @@ mod imp {
         contract: &str,
         caller: &serde_json::Map<String, serde_json::Value>,
         overwrite: bool,
+        on_write: OnWrite,
         loader: &dyn KernelLoader,
         engines: &Engines,
     ) -> Result<Write> {
         let caller = caller_of("sink.caller", caller)?;
+        let on_violation = match on_write {
+            OnWrite::Refuse => OnViolation::Refuse,
+            OnWrite::Exclude(dir) => OnViolation::Exclude(dir),
+            OnWrite::Warn => OnViolation::Warn,
+        };
         let mode = if overwrite {
             WriteMode::Overwrite
         } else {
@@ -364,10 +510,14 @@ mod imp {
         let held = Arc::clone(&memory);
         Ok((
             SinkSpec::Build(Box::new(move |_ctx| {
-                Ok(
-                    Box::new(PeqlSink::new(engine, &contract, &caller, mode, held)?)
-                        as Box<dyn Sink>,
-                )
+                Ok(Box::new(PeqlSink::new(
+                    engine,
+                    &contract,
+                    &caller,
+                    mode,
+                    on_violation,
+                    held,
+                )?) as Box<dyn Sink>)
             })),
             written,
             Some(memory as Arc<dyn EngineMemory>),
@@ -377,7 +527,7 @@ mod imp {
 
 #[cfg(not(feature = "peql"))]
 mod imp {
-    use super::{Engines, KernelLoader, Read, SpecError};
+    use super::{Engines, KernelLoader, OnRead, OnWrite, Read, SpecError};
     use moruna_kernel::Result;
 
     const ABSENT: &str = "this build of moruna has no peQL bridge (feature `peql`)";
@@ -387,6 +537,7 @@ mod imp {
         _contract: &Option<String>,
         _sql: &Option<String>,
         _caller: &serde_json::Map<String, serde_json::Value>,
+        _on_read: OnRead,
         _loader: &dyn KernelLoader,
         _engines: &Engines,
     ) -> Result<Read> {
@@ -398,6 +549,7 @@ mod imp {
         _contract: &str,
         _caller: &serde_json::Map<String, serde_json::Value>,
         _overwrite: bool,
+        _on_write: OnWrite,
         _loader: &dyn KernelLoader,
         _engines: &Engines,
     ) -> Result<super::Write> {

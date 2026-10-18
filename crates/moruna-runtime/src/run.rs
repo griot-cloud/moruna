@@ -432,6 +432,9 @@ fn drive(
         sink_buffer: std::sync::atomic::AtomicU64::new(0),
     };
     let source = source_spec.build(&ctx)?;
+    // What an engine source's engine decided when it planned the read: true of the run whatever
+    // becomes of it, since the plan was made (and its budgets charged) when the source was built.
+    let source_read = source.read_report();
     let sink = sink_spec.build(&ctx)?;
     let sink_buffer_bytes = ctx.sink_buffer_bytes();
     // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
@@ -809,6 +812,7 @@ fn drive(
             RunOutcome::Completed { sink } => sink.write.clone(),
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
         },
+        read: source_read,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {
