@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2
+
+- **A peQL sink reports the write's verdict on the run report.** The report gains `"write": {"engine": "peql", "report": <peQL's WriteReport>}`, and the old top-level snapshot is gone. A write whose verdict is `valid: false` completes; the verdict is the report's to carry (PR 46).
+- **peQL at `16bc090`: a write validates only what it writes.** No whole-table rescan and no duplicate-file check on append (which read every manifest at once); a write decides no table-level rule. Table-level rules are decided by `validate`, recorded per rule with the snapshot and time they were decided; facts files are format 3, and earlier ones are rebuilt rather than refused. The write report carries the table's row and per-column null counts.
+
 ## 0.5.1
 
 - **A kernel compiled into the binary that runs it is a `rust` entry, and strict mode admits it.** A job names it `{"kind": "rust", "crate", "symbol", "args", "fingerprint"}` (the kind `moruna_spec` 1 reserved). The binary that embeds Moruna declares what it compiles in through `KernelLoader::compiled()` (`CompiledKernel { krate, symbol, build }`, exported from `moruna_runtime::job`); `build()` resolves a `rust` entry only against that table, so nothing is imported or opened. An undeclared crate or symbol is refused by name, strict or not, listing what the binary declares; a `rust` entry carrying `module`, `callable`, `path`, `assets`, `name` or a hint is refused by name. Strict mode still refuses every Python import-path entry, and its refusal now also names `rust` entries. `moruna` itself declares none (PR 44).
