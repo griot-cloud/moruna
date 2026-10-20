@@ -27,6 +27,12 @@ TEMPLATE_FD = 3
 # allocator's background threads), and a template that holds a thread cannot fork (SB-I10), so
 # a Polars kernel imports it inside its own child.
 PRELOAD = ("pyarrow", "pyarrow.compute", "pyarrow.ipc", "numpy")
+# pyarrow's Linux x86_64 wheels link a jemalloc (prefix `je_arrow_`) compiled with
+# `background_thread:true`, and jemalloc's library constructor starts that purging thread when
+# libarrow loads, before any allocation: `import pyarrow` alone leaves the template with two
+# threads. jemalloc reads `JE_ARROW_MALLOC_CONF` after the compiled-in options, so the template
+# turns the thread off before it imports anything; jemalloc then purges on its own allocations.
+ARROW_JEMALLOC = ("JE_ARROW_MALLOC_CONF", "background_thread:false")
 # How long ``status`` waits for a child to be reapable before saying it is still running.
 STATUS_WAIT = 2.0
 FRAME_MAX_BYTES = 1 << 20
@@ -118,6 +124,7 @@ FDS_PER_START = 2
 def _preload() -> dict[str, str]:
     """Import the data libraries (17 f.9) and the extension; their versions by name."""
     libraries: dict[str, str] = {}
+    os.environ[ARROW_JEMALLOC[0]] = ARROW_JEMALLOC[1]
     for name in PRELOAD:
         top = name.split(".")[0]
         if importlib.util.find_spec(top) is None:
