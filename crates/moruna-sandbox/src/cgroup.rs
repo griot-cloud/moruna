@@ -18,6 +18,22 @@ fn with_path(path: &Path, e: io::Error) -> io::Error {
     io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
+/// A refused write, named for what it is: a cgroup file the kernel does not provide cannot be
+/// created, and the kernel says EACCES for it, which reads as a permission it is not.
+fn write_refused(path: &Path, e: io::Error) -> io::Error {
+    if path.exists() {
+        return with_path(path, e);
+    }
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{}: this kernel has no such cgroup file (a controller or kernel option it was \
+             built without): {e}",
+            path.display()
+        ),
+    )
+}
+
 /// One stage's cgroup.
 #[derive(Debug)]
 pub struct StageCgroup {
@@ -66,7 +82,7 @@ impl StageCgroup {
 
     fn write(&self, file: &str, value: &str) -> io::Result<()> {
         let path = self.dir.join(file);
-        fs::write(&path, value).map_err(|e| with_path(&path, e))
+        fs::write(&path, value).map_err(|e| write_refused(&path, e))
     }
 
     fn read(&self, file: &str) -> io::Result<String> {
@@ -194,6 +210,74 @@ mod tests {
         cg.remove().unwrap();
         cg.remove().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_to_a_file_the_kernel_lacks_says_so() {
+        let dir = std::env::temp_dir().join(format!("moruna-cg-absent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let absent = dir.join("memory.swap.max");
+        let e = write_refused(&absent, denied());
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string()
+                .contains("memory.swap.max: this kernel has no such cgroup file"),
+            "{e}"
+        );
+        fs::write(&absent, "").unwrap();
+        let e = write_refused(&absent, denied());
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!e.to_string().contains("no such cgroup file"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every file `create` writes exists in the guest's cgroups (17 f.10): a cgroup file the
+    /// kernel was built without is absent, and writing it is refused with EACCES (kernfs has no
+    /// `create`), so the stage is refused (SB-I6). `memory.swap.max` exists only with SWAP.
+    #[test]
+    fn the_guest_kernel_has_every_file_a_stage_writes() {
+        let needs: [(&str, &[&str]); 4] = [
+            ("memory.max", &["CGROUPS", "MEMCG"]),
+            ("memory.swap.max", &["CGROUPS", "MEMCG", "SWAP"]),
+            (
+                "cpu.weight",
+                &["CGROUPS", "CGROUP_SCHED", "FAIR_GROUP_SCHED"],
+            ),
+            (
+                "cpu.max",
+                &[
+                    "CGROUPS",
+                    "CGROUP_SCHED",
+                    "FAIR_GROUP_SCHED",
+                    "CFS_BANDWIDTH",
+                ],
+            ),
+        ];
+        let common = include_str!("../../../guest/kernel/moruna.config");
+        for (arch, fragment) in [
+            (
+                "x86_64",
+                include_str!("../../../guest/kernel/x86_64.config"),
+            ),
+            ("arm64", include_str!("../../../guest/kernel/arm64.config")),
+        ] {
+            let mut on = std::collections::BTreeMap::new();
+            for line in common.lines().chain(fragment.lines()) {
+                if let Some((k, v)) = line.strip_prefix("CONFIG_").and_then(|l| l.split_once('=')) {
+                    on.insert(k, v == "y");
+                }
+            }
+            for (file, options) in needs {
+                for option in options {
+                    assert!(
+                        on.get(option).copied().unwrap_or(false),
+                        "the {arch} guest kernel has no {file}: CONFIG_{option} is not y"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
