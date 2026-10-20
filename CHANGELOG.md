@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.5
+
+- **The guest kernel has swap, so a stage's cgroup can be made in the VM.** The kernel was built without `CONFIG_SWAP`, so it had no `memory.swap.*` and every `.pex` stage refused writing `memory.swap.max` (EACCES on a file it cannot create). `CONFIG_SWAP=y`; no swap device is attached. A write to a cgroup file the kernel lacks now says so (PR 52).
+
 ## 0.5.4
 
 - **A `.pex` function's sandbox template starts single-threaded on x86_64 Linux.** pyarrow's x86_64 Linux wheel bundles jemalloc compiled with `background_thread:true`, so `import pyarrow` left a second thread and every template refused (`SB-I10`). The template sets `JE_ARROW_MALLOC_CONF=background_thread:false` before it loads anything (PR 50).
