@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.4
+
+- **A `.pex` function's sandbox template starts single-threaded on x86_64 Linux.** pyarrow's x86_64 Linux wheel bundles jemalloc compiled with `background_thread:true`, so `import pyarrow` left a second thread and every template refused (`SB-I10`). The template sets `JE_ARROW_MALLOC_CONF=background_thread:false` before it loads anything (PR 50).
+
 ## 0.5.3
 
 - **A contract is a guarantee: the peQL sink and source pass its violation modes.** A `peql` sink takes `on_violation` = `refuse` (the default: nothing commits, and the run fails naming each rule and how many rows broke it), `exclude` (passing rows commit; the rows that break a rule are kept as `excluded-<seq>.parquet` under `excluded_url`, with a `_violations` column naming the rules) or `warn` (every row commits). A `datafusion` source takes `on_violation` = `exclude` (the default: rows that break a rule are left out and counted) or `refuse`. The run report's `write.report` gains `on_violation`, `violations` and `rows_excluded`, with `write.excluded` for an exclude write, and a new `read` report carries each contract's excluded counts (PR 48).
