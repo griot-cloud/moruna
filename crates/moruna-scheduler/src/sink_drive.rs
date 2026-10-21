@@ -113,6 +113,13 @@ fn write_loop(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) -> Drained
             };
             match popped {
                 Ok(Some(morsel)) => {
+                    let ends = &shared.sink_in;
+                    ends.rows.fetch_add(morsel.payload.rows(), Ordering::SeqCst);
+                    ends.bytes
+                        .fetch_add(morsel.payload.bytes(), Ordering::SeqCst);
+                    if !ends.started.swap(true, Ordering::SeqCst) {
+                        shared.tell(moruna_kernel::StageEvent::SinkWriting);
+                    }
                     let future = sink.write(morsel.seq, morsel.payload);
                     shared.writes_in_flight.fetch_add(1, Ordering::SeqCst);
                     inflight.push((morsel.seq, future));
@@ -167,7 +174,10 @@ fn poll_writes(
                 shared.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
                 progressed = true;
                 match result {
-                    Ok(()) => advance(shared, sink),
+                    Ok(()) => {
+                        shared.sink_in.morsels.fetch_add(1, Ordering::SeqCst);
+                        advance(shared, sink)
+                    }
                     Err(e) => {
                         // h: a sink write failure ends the run; `finish` is not called.
                         crate::policy::terminate(shared, e);
@@ -228,6 +238,7 @@ fn finish(shared: &Shared) {
         return;
     }
     shared.set_run_state(RunState::Finishing);
+    shared.tell(moruna_kernel::StageEvent::SinkCommitting);
     let summary: Result<SinkSummary> = {
         let mut guard = shared.sink.write().unwrap_or_else(|e| e.into_inner());
         guard.finish()
@@ -238,6 +249,18 @@ fn finish(shared: &Shared) {
             if next_seq > 0 {
                 publish(shared, next_seq - 1);
             }
+            let ends = &shared.sink_in;
+            shared.tell(moruna_kernel::StageEvent::SinkFinished {
+                counters: moruna_kernel::StageCounters {
+                    morsels: ends.morsels.load(Ordering::SeqCst),
+                    rows_in: ends.rows.load(Ordering::SeqCst),
+                    rows_out: summary.rows,
+                    bytes_in: ends.bytes.load(Ordering::SeqCst),
+                    bytes_out: summary.bytes,
+                    skipped: 0,
+                    errors: 0,
+                },
+            });
             shared.publish_exit(Exit::Completed(summary));
         }
         // This thread already holds the exit claim, so `policy::terminate` would find it taken

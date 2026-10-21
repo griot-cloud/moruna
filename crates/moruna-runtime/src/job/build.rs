@@ -170,6 +170,9 @@ pub struct Built {
     pub discovery: DiscoveryInput,
     /// Every field the environment filled, as `(field, variable)`.
     pub env_resolved: Vec<(&'static str, &'static str)>,
+    /// The document's kernels each stage carries, in stage order: one each, or several adjacent
+    /// standard kernels fused into one stage (MH 4.9), which the task events tell as a group.
+    pub stage_kernels: Vec<Vec<usize>>,
 }
 
 /// The fields of `job` left `null` that an environment variable would fill (MH 4.1).
@@ -284,6 +287,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         Packaged(crate::packaged::Packaged),
     }
     let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
+    let mut stage_kernels: Vec<Vec<usize>> = Vec::with_capacity(job.kernels.len());
     for (index, doc) in job.kernels.iter().enumerate() {
         let stage = match doc.kind {
             KernelKindDoc::Rust => Stage::Loaded(compiled_of(index, doc, loader.compiled())?),
@@ -330,9 +334,11 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         {
             let len = stages.len();
             stages[len - 1] = Stage::Std(Box::new(fused));
+            stage_kernels[len - 1].push(index);
             continue;
         }
         stages.push(stage);
+        stage_kernels.push(vec![index]);
     }
     let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
     let mut packaged = Vec::new();
@@ -470,6 +476,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         digest,
         discovery,
         env_resolved,
+        stage_kernels,
     })
 }
 

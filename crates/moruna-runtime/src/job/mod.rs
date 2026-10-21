@@ -794,6 +794,55 @@ pub struct ReportDoc {
     /// `moruna-<run_id>.report.json` in the staging directory, else the working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// The ids the task events name the source, each kernel and the sink by (MH 4.3), opaque
+    /// to Moruna. Absent: `source`, `kernel-1` .. `kernel-n` and `sink`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<TaskIdsDoc>,
+    /// Which attempt of its job this process is, as its host counts them; every event carries
+    /// it, so a host can tell a later attempt's events from an earlier one's (MH 4.3). Absent:
+    /// 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+}
+
+/// `report.tasks`: one id for the source, one per kernel in stage order, one for the sink.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIdsDoc {
+    /// The source's.
+    pub source: TaskRefDoc,
+    /// Each kernel's, in stage order.
+    pub kernels: Vec<TaskRefDoc>,
+    /// The sink's.
+    pub sink: TaskRefDoc,
+}
+
+/// One element's task: its id, and, when the host fused several of its own tasks into this one
+/// element, theirs, which the events repeat so a host can show the group as the group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRefDoc {
+    /// The task's id: 1 to 128 of ASCII letters, digits, `_`, `-`, `.` and `:`, starting with a
+    /// letter or a digit.
+    pub id: String,
+    /// The host's tasks this element carries, by the same rule; empty when it is one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+/// Whether `id` may name a task in the events (MH 4.3).
+pub fn is_task_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    id.len() <= 128
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+impl ReportDoc {
+    /// The attempt the document names; 1 when it names none.
+    pub fn attempt(&self) -> u32 {
+        self.attempt.unwrap_or(1)
+    }
 }
 
 /// The top-level keys of version 1, in the order MH 4.1 lists them.
@@ -885,7 +934,77 @@ impl JobSpec {
             }
             check_section(key, section)?;
         }
-        serde_json::from_value(value).map_err(|e| SpecError::new("spec", e.to_string()))
+        let job: JobSpec =
+            serde_json::from_value(value).map_err(|e| SpecError::new("spec", e.to_string()))?;
+        job.check_report()?;
+        Ok(job)
+    }
+
+    /// `report.tasks` names the chain as it is, each task once; `report.attempt` counts from 1.
+    fn check_report(&self) -> Result<(), SpecError> {
+        if self.report.attempt == Some(0) {
+            return Err(SpecError::new(
+                "report.attempt",
+                "attempts are counted from 1",
+            ));
+        }
+        let Some(tasks) = &self.report.tasks else {
+            return Ok(());
+        };
+        if tasks.kernels.len() != self.kernels.len() {
+            return Err(SpecError::new(
+                "report.tasks.kernels",
+                format!(
+                    "{} ids for {} kernels: one id per kernel, in stage order",
+                    tasks.kernels.len(),
+                    self.kernels.len()
+                ),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let named = std::iter::once(("report.tasks.source".to_string(), &tasks.source))
+            .chain(
+                tasks
+                    .kernels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (format!("report.tasks.kernels[{i}]"), t)),
+            )
+            .chain(std::iter::once((
+                "report.tasks.sink".to_string(),
+                &tasks.sink,
+            )));
+        for (field, task) in named {
+            if !is_task_id(&task.id) {
+                return Err(SpecError::new(
+                    format!("{field}.id"),
+                    format!(
+                        "{:?} is not a task id: 1 to 128 of ASCII letters, digits, `_`, `-`, `.` \
+                         and `:`, starting with a letter or a digit",
+                        task.id
+                    ),
+                ));
+            }
+            if !seen.insert(task.id.as_str()) {
+                return Err(SpecError::new(
+                    format!("{field}.id"),
+                    format!("{:?} names two tasks", task.id),
+                ));
+            }
+            if task.members.len() > 256 {
+                return Err(SpecError::new(
+                    format!("{field}.members"),
+                    "at most 256 members",
+                ));
+            }
+            if let Some(bad) = task.members.iter().find(|m| !is_task_id(m)) {
+                return Err(SpecError::new(
+                    format!("{field}.members"),
+                    format!("{bad:?} is not a task id"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The document as indented JSON, for a person to read.

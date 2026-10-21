@@ -81,6 +81,7 @@ impl Rig {
             limits_subscribers: Vec::new(),
             checkpoint: None,
             observer: None,
+            stage_hook: None,
         }
     }
 }

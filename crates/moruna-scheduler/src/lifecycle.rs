@@ -32,6 +32,7 @@ pub(crate) fn run(
     }
     *shared.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     shared.set_run_state(RunState::Running);
+    shared.tell(moruna_kernel::StageEvent::Running);
     shared.source_mode.set(DRIVE_DRIVING);
     shared.sink_mode.set(DRIVE_DRIVING);
     checkpoint::start(shared);

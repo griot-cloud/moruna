@@ -135,6 +135,12 @@ impl Scheduler {
         self.shared.set_record_hook(hook);
     }
 
+    /// Installed by the facade before the controller probes, so a probe's read and task are
+    /// told too (MH 4.3 task events): called on the thread on which each fact became true.
+    pub fn set_stage_hook(&self, hook: moruna_kernel::StageHook) {
+        self.shared.set_stage_hook(hook);
+    }
+
     /// Sets cancel, unparks and joins the workers, stops the drives and the checkpoint thread
     /// (f.10). Idempotent; also called from `Drop`.
     pub fn shutdown(&self) {

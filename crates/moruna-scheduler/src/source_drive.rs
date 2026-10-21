@@ -391,6 +391,7 @@ fn submit<'a>(
         node: shared.cfg.node,
     };
     let range = if whole { None } else { Some(rows) };
+    shared.source_reading();
     let future = shared
         .source
         .read(split, range, shared.alloc.as_ref(), tier0(shared));
@@ -428,6 +429,7 @@ fn poll_inflight(
                 match result {
                     Ok(payload) => {
                         learn(shared, &entry, &payload, learned);
+                        let (rows, bytes) = (payload.rows(), payload.bytes());
                         let morsel = Morsel::new(entry.seq, 0, payload, entry.origin.clone());
                         let outcome = match entry.kind {
                             ReadKind::Replacement => shared.placement.replace(0, morsel),
@@ -442,6 +444,7 @@ fn poll_inflight(
                             Ok(()) => {
                                 if entry.kind != ReadKind::Replacement {
                                     pushed(shared, entry.seq);
+                                    shared.source_pushed(rows, bytes);
                                 }
                             }
                             Err(MorunaError::Cancelled) => {}
@@ -535,6 +538,7 @@ fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: 
         node: shared.cfg.node,
     };
     let range = if whole { None } else { Some(rows) };
+    shared.source_reading();
     let mut future = shared
         .source
         .read(split, range, shared.alloc.as_ref(), tier0(shared));
@@ -543,11 +547,13 @@ fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: 
     shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
     let answer = match result {
         Ok(payload) => {
+            let (rows, bytes) = (payload.rows(), payload.bytes());
             let pushed_ok = shared
                 .placement
                 .push(0, Morsel::new(seq, 0, payload, origin));
             if pushed_ok.is_ok() {
                 pushed(shared, seq);
+                shared.source_pushed(rows, bytes);
             }
             pushed_ok
         }
@@ -606,6 +612,7 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
         } else {
             None
         };
+        shared.source_reading();
         let mut future = shared
             .source
             .read(split, range, shared.alloc.as_ref(), tier0(shared));
@@ -614,12 +621,14 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
         shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
         match result {
             Ok(payload) => {
+                let (rows, bytes) = (payload.rows(), payload.bytes());
                 let morsel = Morsel::new(seq, 0, payload, origin);
                 if let Err(e) = shared.placement.push(0, morsel) {
                     crate::policy::terminate(shared, e);
                     return;
                 }
                 pushed(shared, seq);
+                shared.source_pushed(rows, bytes);
                 shared.recomputed.fetch_add(1, Ordering::SeqCst);
             }
             Err(e) => {

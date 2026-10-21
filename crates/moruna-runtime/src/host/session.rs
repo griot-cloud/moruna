@@ -1,10 +1,12 @@
 //! One job, from the document to the exit code (MH 4.3).
 //!
 //! The run happens on the calling thread. Beside it, one thread sends a heartbeat every
-//! [`HEARTBEAT`] and one reads the peer. Every message goes through [`Wire`], which drops the
-//! peer the first time a write fails and never lets that failure reach the run: a peer that is
-//! gone is a note in the report, not a reason to stop (H2). The report file is written before
-//! the `report` and `exit` messages are sent, so a host that hears `exit` can read the file.
+//! [`HEARTBEAT`], one reads the peer, and one writes the run's events in the order they became
+//! true ([`Events`]), so no worker or drive ever waits on the peer. Every message goes through
+//! [`Wire`], which drops the peer the first time a write fails and never lets that failure reach
+//! the run: a peer that is gone is a note in the report, not a reason to stop (H2). Every event
+//! is written before the report file, the `report` and the `exit`, so a host that hears `exit`
+//! has heard every task end and can read the file.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,11 +15,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use moruna_discovery::DiscoveryInput;
-use moruna_kernel::{CancelToken, RunId};
+use moruna_kernel::{CancelToken, MorunaError, RunId};
 use moruna_placement::PlacementEngine;
 use moruna_trace::RunReport;
 
-use super::protocol::{self, Heartbeat, Inbound, LimitsMsg, Outbound};
+use super::lifecycle::{Ending, EventOut, Lifecycle, task_refs};
+use super::protocol::{
+    self, EVENTS_VERSION, Event, EventMsg, Heartbeat, Inbound, LimitsMsg, Outbound,
+};
 use super::transport::{self, Address, Conn};
 use super::{VERSION, diagnostic, exit, exit_code};
 use crate::job::{BuildOptions, JobSpec, KernelLoader, SpecError, build};
@@ -107,6 +112,66 @@ impl Wire {
 
     fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// When the process began the run: the clock every `t_ms` and `t_us` counts from.
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+}
+
+/// The thread that writes a run's events (MH 4.3 `event`): each gets the next `seq` as it is
+/// written, so the peer reads them numbered from 1 with no gap, in the order they became true.
+struct Events {
+    tx: std::sync::mpsc::Sender<Option<(u64, Event)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Events {
+    fn start(wire: &Arc<Wire>, attempt: u32, start: String) -> Events {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<(u64, Event)>>();
+        let writer = wire.clone();
+        let thread = std::thread::Builder::new()
+            .name("moruna-events".to_string())
+            .spawn(move || {
+                let mut seq = 0u64;
+                while let Ok(Some((t_us, body))) = rx.recv() {
+                    seq += 1;
+                    writer.send(&Outbound::Event(EventMsg {
+                        v: EVENTS_VERSION,
+                        attempt,
+                        start: start.clone(),
+                        seq,
+                        t_us,
+                        body,
+                    }));
+                }
+            });
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                wire.note(format!(
+                    "the run's events cannot be written: no thread for them ({error})"
+                ));
+                None
+            }
+        };
+        Events { tx, thread }
+    }
+
+    fn out(&self) -> EventOut {
+        let tx = self.tx.clone();
+        Box::new(move |t_us, event| {
+            let _ = tx.send(Some((t_us, event)));
+        })
+    }
+
+    /// Every event told so far is written; later ones go nowhere.
+    fn close(mut self) {
+        let _ = self.tx.send(None);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -280,6 +345,26 @@ pub fn run_job(
         .or_else(|| crate::run::mint_run_id().ok())
         .unwrap_or(RunId([0; 16]));
     let digest = job.digest();
+    // This process's own id in its events: two processes of one attempt are two producers.
+    let start = match crate::run::mint_run_id() {
+        Ok(id) => id.to_hex(),
+        Err(error) => {
+            let file = report_path(&job, &fallback_id.to_hex());
+            let error = error.into_parts().error;
+            return finish(
+                wire,
+                Some(&file),
+                Some((&fallback_id.to_hex(), &digest)),
+                exit_code(&error),
+                Some(format!(
+                    "the run's events have no producer id: {}",
+                    diagnostic(&error)
+                )),
+                None,
+            );
+        }
+    };
+    let events = Events::start(wire, job.report.attempt(), start);
     let built = match build(
         &job,
         loader,
@@ -292,6 +377,11 @@ pub fn run_job(
     ) {
         Ok(built) => built,
         Err(error) => {
+            // Refused before a stage exists: the document's tasks as it names them, each skipped.
+            let lifecycle = Lifecycle::new(task_refs(&job, None), wire.started(), events.out());
+            lifecycle.begin(job.resume.is_some());
+            lifecycle.end(Ending::Failed(&error));
+            events.close();
             let file = report_path(&job, &fallback_id.to_hex());
             return finish(
                 wire,
@@ -303,6 +393,13 @@ pub fn run_job(
             );
         }
     };
+    // One task per stage: fused standard kernels are one group (MH 4.9).
+    let lifecycle = Lifecycle::new(
+        task_refs(&job, Some(&built.stage_kernels)),
+        wire.started(),
+        events.out(),
+    );
+    lifecycle.begin(job.resume.is_some());
     // The facade takes the run id from the manifest on a resume (12 f.7); the report file is
     // named for the same id.
     let run_id = match &built.spec.resume {
@@ -324,10 +421,15 @@ pub fn run_job(
             .ok()
     };
     if let Some(reader) = reader {
-        let (peer, observer, cancel) = (wire.clone(), observer.clone(), opts.cancel.clone());
+        let (peer, observer, cancel, told) = (
+            wire.clone(),
+            observer.clone(),
+            opts.cancel.clone(),
+            lifecycle.clone(),
+        );
         let spawned = std::thread::Builder::new()
             .name("moruna-peer".to_string())
-            .spawn(move || listen_to_peer(reader, &peer, &observer, &cancel, mode));
+            .spawn(move || listen_to_peer(reader, &peer, &observer, &cancel, &told, mode));
         if spawned.is_err() {
             wire.note("the peer's messages cannot be read: no thread for them".to_string());
         }
@@ -340,6 +442,7 @@ pub fn run_job(
             run_id: Some(run_id),
             observer: Some(observer),
             limits_subscribers: vec![limits_changed(wire.clone())],
+            stage_hook: Some(lifecycle.hook()),
             ..Components::default()
         },
     );
@@ -347,6 +450,16 @@ pub fn run_job(
     if let Some(beat) = beat {
         let _ = beat.join();
     }
+    lifecycle.end(match &result {
+        Ok(_) => Ending::Completed,
+        Err(failure)
+            if matches!(failure.error, MorunaError::Cancelled) && opts.cancel.is_cancelled() =>
+        {
+            Ending::Cancelled
+        }
+        Err(failure) => Ending::Failed(&failure.error),
+    });
+    events.close();
     let (code, diagnostic, report) = match result {
         Ok(report) => (exit::COMPLETED, None, Some(report)),
         Err(error) => {
@@ -485,6 +598,7 @@ fn listen_to_peer(
     wire: &Wire,
     observer: &RunObserver,
     cancel: &CancelToken,
+    lifecycle: &Lifecycle,
     mode: Mode,
 ) {
     loop {
@@ -500,6 +614,7 @@ fn listen_to_peer(
             Ok(Inbound::Cancel) => {
                 wire.note(format!("cancelled by the peer at {} ms", wire.elapsed_ms()));
                 cancel.cancel();
+                lifecycle.cancel_acknowledged();
             }
             Ok(Inbound::Checkpoint) => {
                 if !observer.request_checkpoint() {

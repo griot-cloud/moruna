@@ -7,6 +7,7 @@
 //! `moruna-py`'s, and it calls [`cli::main`] with a loader that can import Python kernels.
 
 pub mod cli;
+pub mod lifecycle;
 pub mod protocol;
 pub mod session;
 pub mod transport;
