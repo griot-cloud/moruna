@@ -427,3 +427,100 @@ impl Kernel for Sleeper {
         Ok(input)
     }
 }
+
+/// A secret a kernel prints, which must stay in the run's output store (MH 4.3 `log`).
+pub const SEEDED_SECRET: &str = "sk_live_SEEDED_SECRET_4f9a2c";
+
+/// A kernel that passes its input on and prints on the way, as a Rust kernel does through
+/// `moruna_kernel::output`: a row's value on standard output, the seeded secret and a traceback
+/// on standard error, a character split across two writes, a warning record, and `flood` lines
+/// of a kilobyte each; then it sleeps `ms`.
+pub struct Printer {
+    fingerprint: Fingerprint,
+    flood: usize,
+    ms: u64,
+}
+
+impl Printer {
+    /// One printer.
+    pub fn new(flood: usize, ms: u64) -> Printer {
+        Printer {
+            fingerprint: Fingerprint::compute("moruna-runtime::tests::Printer", b"v1"),
+            flood,
+            ms,
+        }
+    }
+}
+
+impl Kernel for Printer {
+    fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    fn kind(&self) -> KernelKind {
+        KernelKind::Stateless
+    }
+
+    fn hints(&self) -> KernelHints {
+        KernelHints {
+            expected_amplification: Some(1.0),
+            ..Default::default()
+        }
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        PayloadSpec {
+            kind: moruna_kernel::PayloadKind::Table,
+            tier: TierPref::Host,
+        }
+    }
+
+    fn output_schema(&self, input: &SourceSchema) -> moruna_kernel::Result<SourceSchema> {
+        Ok(input.clone())
+    }
+
+    fn init(&self, _ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
+        Ok(Box::new(NoState))
+    }
+
+    fn apply(
+        &self,
+        _state: &mut dyn KernelState,
+        input: Payload,
+    ) -> moruna_kernel::Result<Payload> {
+        use moruna_kernel::output::{Stream, log, write};
+        let first = match &input {
+            Payload::Table(batch, _) => batch
+                .column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .filter(|c| !c.is_empty())
+                .map(|c| c.value(0)),
+            _ => None,
+        };
+        write(
+            Stream::Stdout,
+            format!("row-value:{}\n", first.unwrap_or(-1)).as_bytes(),
+        );
+        write(
+            Stream::Stderr,
+            format!("the key is {SEEDED_SECRET}\n").as_bytes(),
+        );
+        let euro = "na\u{ef}ve \u{20ac}\n".as_bytes();
+        let cut = euro.len() - 3;
+        write(Stream::Stdout, &euro[..cut]);
+        write(Stream::Stdout, &euro[cut..]);
+        write(
+            Stream::Stderr,
+            b"Traceback (most recent call last):\n  File \"kernel.py\", line 7, in apply\nValueError: bad row\n",
+        );
+        log(moruna_kernel::Level::Warning, "a warning from the kernel");
+        let line = format!("{}\n", "f".repeat(1023));
+        for _ in 0..self.flood {
+            write(Stream::Stdout, line.as_bytes());
+        }
+        if self.ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.ms));
+        }
+        Ok(input)
+    }
+}

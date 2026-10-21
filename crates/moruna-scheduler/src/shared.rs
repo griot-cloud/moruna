@@ -313,6 +313,8 @@ pub(crate) struct Shared {
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
     /// Who hears the chain's facts as they become true (MH 4.3 task events).
     pub(crate) stage_hook: RwLock<Option<StageHook>>,
+    /// Where what the kernels print goes, attributed to their stage (MH 4.3 `log`).
+    pub(crate) output: RwLock<Option<Arc<dyn moruna_kernel::OutputSink>>>,
     /// Which stages wait on a port now (MH 4.10), set by the facade before the run starts.
     pub(crate) waits: RwLock<Option<Arc<moruna_kernel::StageWaits>>>,
     /// Called with each manifest once it is on disk (MH 4.7: the copy on an object store).
@@ -531,6 +533,7 @@ impl Shared {
             checkpoint_handle: Mutex::new(None),
             record_hook: RwLock::new(None),
             stage_hook: RwLock::new(None),
+            output: RwLock::new(None),
             waits: RwLock::new(None),
             manifest_hook: RwLock::new(None),
             fed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
@@ -622,6 +625,20 @@ impl Shared {
     pub(crate) fn set_stage_hook(&self, hook: StageHook) {
         let mut slot = self.stage_hook.write().unwrap_or_else(|e| e.into_inner());
         *slot = Some(hook);
+    }
+
+    pub(crate) fn set_output(&self, sink: Arc<dyn moruna_kernel::OutputSink>) {
+        *self.output.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    /// This thread works for `stage` until the guard drops: what its kernel prints is that
+    /// stage's (MH 4.3 `log`). Nothing when no sink is installed.
+    pub(crate) fn work_for(&self, stage: StageId) -> Option<moruna_kernel::output::Entered> {
+        self.output
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|sink| moruna_kernel::output::enter(sink, stage))
     }
 
     /// Tell the stage hook a fact, on this thread (MH 4.3).

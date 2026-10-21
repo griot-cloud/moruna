@@ -96,7 +96,8 @@ impl Template {
         // which are async-signal-safe; it touches no allocation of the parent.
         unsafe {
             command.pre_exec(move || {
-                // What the kernel prints goes to Moruna's stderr, never to its stdout.
+                // What the template itself prints goes to Moruna's stderr, never to its stdout; a
+                // stage's child prints to pipes of its own (MH 4.3 `log`).
                 if libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -169,12 +170,22 @@ impl Template {
     }
 
     /// Fork a child for a stage: `control` is the child's end of its control socket, `memfd`
-    /// the mapping. Returns the child's pid.
-    pub fn start(&self, request: &ToTemplate, control: RawFd, memfd: RawFd) -> Result<u32, String> {
+    /// the mapping, and `output` the write ends of the child's own standard output, standard
+    /// error and logging records (MH 4.3 `log`), which the child puts in place of the template's
+    /// before any of the package's code runs. Returns the child's pid.
+    pub fn start(
+        &self,
+        request: &ToTemplate,
+        control: RawFd,
+        memfd: RawFd,
+        output: [RawFd; 3],
+    ) -> Result<u32, String> {
         let socket = lock(&self.socket);
         let mut frame = Vec::new();
         write_frame(&mut frame, request).map_err(|e| e.to_string())?;
-        send_with_fds(&socket, &frame, &[control, memfd]).map_err(|e| format!("start: {e}"))?;
+        let [stdout, stderr, records] = output;
+        send_with_fds(&socket, &frame, &[control, memfd, stdout, stderr, records])
+            .map_err(|e| format!("start: {e}"))?;
         let mut reader = &*socket;
         match read_frame::<FromTemplate>(&mut reader).map_err(|e| format!("start: {e}"))? {
             FromTemplate::Started { pid } => Ok(pid),

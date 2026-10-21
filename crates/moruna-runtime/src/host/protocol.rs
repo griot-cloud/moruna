@@ -4,12 +4,17 @@
 //! and nothing else. No message a peer can send enlarges a run.
 //!
 //! An `event` is one fact of the run's execution, versioned on its own (`v`, [`EVENTS_VERSION`])
-//! and named by its `kind`: version 1 had the task lifecycle; version 2 adds a running task's
-//! wait on a port (`task_waiting` with `reason: port_call` and the `port`). A later version adds
-//! kinds (a task's output, its progress) to the same message; a peer refuses a version it does
-//! not read rather than guess at it.
+//! and named by its `kind`: version 1 had the task lifecycle; version 2 added `logs`, what the
+//! run's output store holds for each producer so far; version 3 adds a running task's wait on a
+//! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10). A peer refuses a
+//! version it does not read rather than guess at it.
 //!
-//! The port messages (MH 4.10) are versioned on their own too (`v`, [`PORTS_VERSION`]): a stage's
+//! What a task prints is never on the socket. Each record of it is an `event` of kind `log`
+//! ([`LogLine`]) in the run's output store (`report.logs`), numbered by its own producer; the
+//! socket says only how far each producer's records reach, how many bytes they hold, and how
+//! many were cut or dropped.
+//!
+//! The port messages (MH 4.10) are versioned on their own (`v`, [`PORTS_VERSION`]): a stage's
 //! call to a host port is a `port_call`, answered by the peer's `port_reply` for the same `call`;
 //! a call Moruna stops waiting for is a `port_cancel`. The bytes travel as standard base64.
 
@@ -82,7 +87,7 @@ impl Heartbeat {
 }
 
 /// The version of the `event` message this build writes (MH 4.3).
-pub const EVENTS_VERSION: u32 = 2;
+pub const EVENTS_VERSION: u32 = 3;
 
 /// The version of the port messages this build writes and reads (MH 4.10).
 pub const PORTS_VERSION: u32 = 1;
@@ -111,9 +116,9 @@ pub struct EventMsg {
     pub body: Event,
 }
 
-/// The facts of version 2: the task lifecycle and a running task's waits on its ports (MH 4.3,
-/// MH 4.10). A task is one element of the chain, named by the id the document's `report.tasks`
-/// gives it.
+/// The facts of version 3: the task lifecycle, the output store's reach (MH 4.3) and a running
+/// task's waits on its ports (MH 4.10). A task is one element of the chain, named by the id the
+/// document's `report.tasks` gives it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -213,6 +218,97 @@ pub enum Event {
         /// `cancelled`, or `completed` / `failed` when the run ended first.
         disposition: CancelDisposition,
     },
+    /// How far the output store reaches for each producer whose reach changed (at most one
+    /// such event every [`crate::host::logs::LOGS_EVERY`]), and, last, for every producer with
+    /// `drained` set. The counts only grow: a peer that hears one late or twice is not misled.
+    Logs {
+        /// One entry per producer.
+        producers: Vec<LogReach>,
+    },
+}
+
+/// One producer's records in the output store so far (MH 4.3 `logs`): a task's, or the
+/// engine's own (`task: null`), in this process.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct LogReach {
+    /// The task; `null` for output no task can be named for.
+    pub task: Option<String>,
+    /// Records `1..=records` of the producer are in the store, whole.
+    pub records: u64,
+    /// The bytes of their text.
+    pub bytes: u64,
+    /// Records the store cut short.
+    pub truncated: u64,
+    /// Records dropped before the store, written faster than it keeps or past what it holds.
+    pub dropped: u64,
+    /// Bytes dropped with them.
+    pub dropped_bytes: u64,
+    /// This process writes nothing more for the producer.
+    pub drained: bool,
+}
+
+/// What a record of output is: a task's stream, a logging framework's record, or Moruna's own
+/// word about the output (records dropped, the store's end). Only Moruna writes `platform`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error; it says nothing about severity.
+    Stderr,
+    /// A logging framework's record, with the level it said.
+    Structured,
+    /// Moruna's own.
+    Platform,
+}
+
+/// One record of a producer's output as the store keeps it (MH 4.3 `log`): an `event` whose
+/// `seq` counts the producer's records from 1 with no gap, never written to the socket.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LogLine {
+    /// `"event"`.
+    #[serde(rename = "type")]
+    pub kind_of: &'static str,
+    /// [`EVENTS_VERSION`].
+    pub v: u32,
+    /// The document's `report.attempt`.
+    pub attempt: u32,
+    /// This process's id.
+    pub start: String,
+    /// The producer's count, from 1.
+    pub seq: u64,
+    /// When the bytes were handed over, in microseconds since the process began the run.
+    pub t_us: u64,
+    /// `"log"`.
+    pub kind: &'static str,
+    /// `<start>/<producer>/<seq>`: the record's id, the same wherever it is read.
+    pub id: String,
+    /// The task; `null` for output no task can be named for.
+    pub task: Option<String>,
+    /// Which stream.
+    pub stream: LogStream,
+    /// The level a logging framework said; `null` for a stream, which says none.
+    pub level: Option<&'static str>,
+    /// Bytes of `text`, as UTF-8.
+    pub bytes: u64,
+    /// The record: one line without its newline, a group of lines (an exception), or a piece
+    /// of a longer line.
+    pub text: String,
+    /// The line goes on in the next record.
+    pub partial: bool,
+    /// This record goes on from the last one's line.
+    pub continued: bool,
+    /// Bytes of the record that were cut and are nowhere.
+    pub truncated: u64,
+}
+
+impl LogLine {
+    /// The record as one line, newline included.
+    pub fn line(&self) -> String {
+        let mut text = serde_json::to_string(self).unwrap_or_default();
+        text.push('\n');
+        text
+    }
 }
 
 /// What a task is (MH 4.3).
@@ -617,7 +713,7 @@ mod tests {
                 phase: Phase::Reading,
             }),
             format!(
-                "{{\"type\":\"event\",\"v\":2,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                "{{\"type\":\"event\",\"v\":3,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
                  \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
                 "0f".repeat(16)
             )
@@ -665,6 +761,72 @@ mod tests {
                  \"errors\":0},\"cause\":null}\n"
             ),
             "{done}"
+        );
+    }
+
+    /// `logs` on the socket and a `log` record in the store (MH 4.3): the same `event` framing,
+    /// every field written out, nulls included; the store's record carries the text, the socket
+    /// only counts.
+    #[test]
+    fn output_is_counted_on_the_socket_and_kept_in_the_store() {
+        let logs = Outbound::Event(EventMsg {
+            v: EVENTS_VERSION,
+            attempt: 1,
+            start: "0f".repeat(16),
+            seq: 9,
+            t_us: 10,
+            body: Event::Logs {
+                producers: vec![
+                    LogReach {
+                        task: Some("k1".into()),
+                        records: 3,
+                        bytes: 40,
+                        truncated: 1,
+                        dropped: 2,
+                        dropped_bytes: 7,
+                        drained: true,
+                    },
+                    LogReach::default(),
+                ],
+            },
+        })
+        .line();
+        assert!(
+            logs.ends_with(
+                "\"kind\":\"logs\",\"producers\":[{\"task\":\"k1\",\"records\":3,\"bytes\":40,\
+                 \"truncated\":1,\"dropped\":2,\"dropped_bytes\":7,\"drained\":true},\
+                 {\"task\":null,\"records\":0,\"bytes\":0,\"truncated\":0,\"dropped\":0,\
+                 \"dropped_bytes\":0,\"drained\":false}]}\n"
+            ),
+            "{logs}"
+        );
+        let record = LogLine {
+            kind_of: "event",
+            v: EVENTS_VERSION,
+            attempt: 1,
+            start: "0f".repeat(16),
+            seq: 4,
+            t_us: 77,
+            kind: "log",
+            id: format!("{}/k1/4", "0f".repeat(16)),
+            task: Some("k1".into()),
+            stream: LogStream::Stderr,
+            level: None,
+            bytes: 2,
+            text: "hi".into(),
+            partial: false,
+            continued: true,
+            truncated: 0,
+        };
+        assert_eq!(
+            record.line(),
+            format!(
+                "{{\"type\":\"event\",\"v\":3,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
+                 \"t_us\":77,\"kind\":\"log\",\"id\":\"{s}/k1/4\",\"task\":\"k1\",\
+                 \"stream\":\"stderr\",\"level\":null,\"bytes\":2,\"text\":\"hi\",\
+                 \"partial\":false,\"continued\":true,\"truncated\":0}}\n",
+                s = "0f".repeat(16)
+            )
         );
     }
 

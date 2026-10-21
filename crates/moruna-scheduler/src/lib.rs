@@ -160,6 +160,12 @@ impl Scheduler {
         self.shared.set_stage_hook(hook);
     }
 
+    /// Installed by the facade before the kernels' instances are made, so what a kernel prints
+    /// from its first `init` on is attributed to its stage (MH 4.3 `log`).
+    pub fn set_output(&self, sink: Arc<dyn moruna_kernel::OutputSink>) {
+        self.shared.set_output(sink);
+    }
+
     /// Sets cancel, unparks and joins the workers, stops the drives and the checkpoint thread
     /// (f.10). Idempotent; also called from `Drop`.
     pub fn shutdown(&self) {

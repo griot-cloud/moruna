@@ -838,6 +838,11 @@ pub struct ReportDoc {
     /// 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
+    /// The output store: the directory each attempt's captured output is written under (MH 4.3
+    /// `log`), `<run_id>` replaced by the run's id. Absent: `moruna-<run_id>.logs` in the staging
+    /// directory, else the working directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
 }
 
 /// `report.tasks`: one id for the source, one per kernel in stage order, one for the sink.

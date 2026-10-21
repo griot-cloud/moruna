@@ -42,8 +42,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 getrandom = { workspace = true }
 
-# The vsock transport of `moruna serve` (MH 4.3) is Linux only: AF_VSOCK has no other home.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The vsock transport of `moruna serve` (MH 4.3) is Linux only: AF_VSOCK has no other home. The
+# process's own standard output and error are captured into the run's output on any Unix.
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]

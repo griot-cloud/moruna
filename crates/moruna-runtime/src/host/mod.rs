@@ -8,6 +8,7 @@
 
 pub mod cli;
 pub mod lifecycle;
+pub mod logs;
 pub mod ports;
 pub mod protocol;
 pub mod session;

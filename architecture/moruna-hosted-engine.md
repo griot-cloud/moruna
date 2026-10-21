@@ -161,7 +161,7 @@ Newline-delimited JSON over the socket named in `report.socket` (vsock in a gues
 | `hello` | on connect | `moruna_version`, `spec_digest`, `limits` (as discovered) |
 | `heartbeat` | every ≤ 2 s | `committed_seq`, `rows_out`, `bytes_out`, `active_workers`, `ceiling_bytes`, `anon_bytes`, `bottleneck`, `staging_bytes` |
 | `limits_changed` | when discovery observes a change (§4.4) | old and new `Limits`, `reason` (`"memory"`, `"cpu"`) |
-| `event` | as each fact of the run becomes true, between `hello` and `report` | `v`, `attempt`, `start`, `seq`, `t_us`, then `kind` and its fields: the task lifecycle (`attempt_started`, `task_registered`, `task_waiting`, `task_ready`, `task_started`, `task_phase`, `task_completed`, `task_failed`, `task_skipped`, `cancel_acknowledged`, `cancel_ended`). Version 2 (amended 2026-10-21) adds a running task's wait on a port: `task_waiting` with `reason: "port_call"` and `port` (the name its entry lists; `null` for the other reasons), until a `task_phase` says what it does again (§4.10) |
+| `event` | as each fact of the run becomes true, between `hello` and `report` | `v`, `attempt`, `start`, `seq`, `t_us`, then `kind` and its fields: the task lifecycle (`attempt_started`, `task_registered`, `task_waiting`, `task_ready`, `task_started`, `task_phase`, `task_completed`, `task_failed`, `task_skipped`, `cancel_acknowledged`, `cancel_ended`). Version 2 added `logs`, how far the run's output store reaches for each producer. Version 3 (amended 2026-10-21) adds a running task's wait on a port: `task_waiting` with `reason: "port_call"` and `port` (the name its entry lists; `null` for the other reasons), until a `task_phase` says what it does again (§4.10) |
 | `port_call` | a stage calls a host port (§4.10) | `v` (1), `call` (unique in the process), `stage`, `port` (the host's name for it), `deadline_ms`, `request` (base64) |
 | `port_cancel` | Moruna stops waiting for a call: its deadline passed, or the run was cancelled | `v`, `call`, `reason` (`"deadline"`, `"cancelled"`) |
 | `report` | before exit | the full `RunReport` JSON |
@@ -323,7 +323,7 @@ A kernel that reasons over its batches (a model's agent, a lookup against a serv
 | `10-scheduler.md` (2026-10-21) | the checkpoint takes a waiting instance's `waiting_state` instead of waiting it out; `set_waits`; `set_manifest_hook`, a failure of which is a failed manifest write (§4.7, §4.10) |
 | `11-controller.md` (2026-10-21) | the `Waiting` class; busy over the workers free to compute; a waiting stage not halved, kept through a resize, not ended for its state (§4.4) |
 | `16-package.md`, `17-sandbox.md` (2026-10-21) | the world's `call` import and its verification; the host function, its trap, the entry state of a stateful stage with ports (§4.10) |
-| `13-host.md` (2026-10-21) | `port_call`, `port_reply`, `port_cancel`, version 1; `event` version 2's port wait; the port line bound (§4.3, §4.10) |
+| `13-host.md` (2026-10-21) | `port_call`, `port_reply`, `port_cancel`, version 1; `event` version 3's port wait; the port line bound (§4.3, §4.10) |
 
 ---
 

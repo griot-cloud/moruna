@@ -13,7 +13,9 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
+import io
 import json
+import logging
 import os
 import platform
 import socket
@@ -55,7 +57,7 @@ def _recv_exact(sock: socket.socket, n: int, first: bytes = b"") -> bytes | None
 
 def _receive(sock: socket.socket) -> tuple[dict | None, list[int]]:
     """One frame and the descriptors that came with its first bytes."""
-    head, fds, _flags, _addr = socket.recv_fds(sock, 4, 4)
+    head, fds, _flags, _addr = socket.recv_fds(sock, 4, FDS_PER_START)
     if not head:
         return None, list(fds)
     head = _recv_exact(sock, 4, head)
@@ -117,8 +119,47 @@ def _status(ended: dict[int, str], pid: int) -> str:
         time.sleep(0.01)
 
 
-# A start request carries the child's control socket and the memfd (17 e.3).
-FDS_PER_START = 2
+# A start request carries the child's control socket and the memfd (17 e.3), and the write ends
+# of the child's own standard output, standard error and logging records (MH 4.3 `log`).
+FDS_PER_START = 5
+
+
+class _Records(logging.Handler):
+    """A logging record, as the child's: its level and its whole text, the exception's lines
+    included, one JSON line on the records pipe (MH 4.3 `log`)."""
+
+    def __init__(self, fd: int) -> None:
+        super().__init__()
+        self._fd = fd
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = json.dumps({"level": record.levelno, "text": self.format(record)}) + "\n"
+            view = memoryview(line.encode())
+            while view:
+                view = view[os.write(self._fd, view) :]
+        except Exception:  # noqa: BLE001, logging's own way to report a broken handler
+            self.handleError(record)
+
+
+def _own_output(stdout: int, stderr: int, records: int) -> None:
+    """The child's standard output and error are its own pipes, written through as they come;
+    its logging records go to the third with their level (MH 4.3 `log`). Before any of the
+    package's code runs."""
+    os.dup2(stdout, 1)
+    os.dup2(stderr, 2)
+    os.close(stdout)
+    os.close(stderr)
+    for fd, name in ((1, "stdout"), (2, "stderr")):
+        stream = io.TextIOWrapper(
+            io.FileIO(fd, "w", closefd=False),
+            encoding="utf-8",
+            errors="backslashreplace",
+            line_buffering=True,
+            write_through=True,
+        )
+        setattr(sys, name, stream)
+    logging.getLogger().addHandler(_Records(records))
 
 
 def _preload() -> dict[str, str]:
@@ -159,6 +200,7 @@ def _start(sock: socket.socket, message: dict, fds: list[int], ended: dict[int, 
         sock.close()
         code = 3
         try:
+            _own_output(fds[2], fds[3], fds[4])
             from moruna import _core  # noqa: PLC0415
 
             code = _core._sandbox_child(json.dumps(message), fds[0], fds[1])

@@ -640,6 +640,9 @@ fn drive(
     if let Some(hook) = components.stage_hook.clone() {
         scheduler.set_stage_hook(hook);
     }
+    if let Some(sink) = components.output.clone() {
+        scheduler.set_output(sink);
+    }
     // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
     // scheduler's counters (which the controller reads) and to the stage hook (which the host
     // hears).

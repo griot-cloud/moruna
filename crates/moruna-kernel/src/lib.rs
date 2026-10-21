@@ -24,6 +24,7 @@ pub mod knobs;
 pub mod limits;
 pub mod morsel;
 pub mod mrb1;
+pub mod output;
 pub mod payload;
 pub mod placement;
 pub mod ports;
@@ -62,6 +63,7 @@ pub use limits::{
     Sample, Sampler,
 };
 pub use morsel::{Morsel, MorselFeatures, Origin};
+pub use output::{Level, OutputSink, Stream};
 pub use payload::{DType, Payload, PayloadKind, PayloadSpec, SourceSchema, TierPref};
 pub use placement::{
     CheckpointExtras, Locality, Placement, PlacementStats, QueueStats, ResumePoint, SourceCursor,

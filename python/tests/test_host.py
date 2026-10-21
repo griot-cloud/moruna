@@ -143,3 +143,67 @@ def test_ho_t14_the_command_says_its_version() -> None:
     )
     assert done.returncode == 0
     assert done.stdout.strip() == f"moruna {moruna.__version__}"
+
+
+PRINTING = """
+import logging
+import sys
+
+
+def loud(batch):
+    print("rows", batch.num_rows, "first id", batch.column("id")[0].as_py())
+    print("half a line", end="")
+    print(" and the rest")
+    sys.stderr.write("caf\\u00e9 on stderr\\n")
+    try:
+        raise ValueError("bad row")
+    except ValueError:
+        logging.getLogger("loud").exception("the call failed")
+    return batch
+"""
+
+
+def _records(logs: pathlib.Path, task: str) -> list[dict]:
+    [attempt] = [p for p in logs.iterdir() if p.name.startswith("a1-")]
+    records = []
+    for segment in sorted((attempt / task).glob("*.jsonl")):
+        records.extend(json.loads(line) for line in segment.read_text().splitlines())
+    return records
+
+
+def test_ho_t25_a_python_kernels_output_is_its_tasks(
+    dataset: tuple[str, str, int], scratch: pathlib.Path
+) -> None:
+    """MH 4.3 ``log``: what a Python kernel prints in process, on either stream and through
+    ``logging``, is its task's in the run's output store, each line whole and a logging record
+    with its level and its traceback; none of it is on the command's own streams."""
+    src_url, _, _ = dataset
+    (scratch / "kernels.py").write_text(PRINTING)
+    document = _document(scratch, src_url, scratch / "out", "loud")
+    logs = scratch / "logs"
+    document["report"]["logs"] = str(logs)
+    path = scratch / "job.json"
+    path.write_text(json.dumps(document))
+    done = subprocess.run(
+        [sys.executable, "-m", "moruna", "run", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "first id" not in done.stdout + done.stderr
+    assert "the call failed" not in done.stdout + done.stderr
+    records = _records(logs, "kernel-1")
+    assert records, "the kernel's output is in the store"
+    assert all(r["task"] == "kernel-1" and r["kind"] == "log" for r in records)
+    stdout = [r["text"] for r in records if r["stream"] == "stdout"]
+    assert any(t.startswith("rows ") and "first id" in t for t in stdout)
+    assert "half a line and the rest" in stdout
+    stderr = [r for r in records if r["stream"] == "stderr"]
+    assert any(r["text"] == "café on stderr" and r["level"] is None for r in stderr)
+    errors = [r for r in records if r["stream"] == "structured"]
+    assert errors and all(r["level"] == "error" for r in errors)
+    assert "the call failed" in errors[0]["text"]
+    assert "Traceback (most recent call last):" in errors[0]["text"]
+    assert "ValueError: bad row" in errors[0]["text"]

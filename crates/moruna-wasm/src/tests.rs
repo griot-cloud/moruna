@@ -1053,7 +1053,15 @@ fn the_call_import_is_admitted_with_its_type() {
     .unwrap();
     let said = verify(&c, false, false).unwrap_err().to_string();
     assert!(said.contains("`call` is imported as"), "{said}");
-    // The second import opens no stream: WASI's standard output and error stay refused.
+}
+
+/// MH 4.3 `log`, audited for `.wasm`: a component has no stream to print to. WASI's standard
+/// output and error are imports, and every import but `read-asset` and `call` is refused, so a
+/// Wasm kernel's only output is its batches, its traps, which the lifecycle tells, and the
+/// requests it hands the ports its stage lists (MH 4.10).
+#[test]
+fn a_wasm_kernel_has_no_output_stream() {
+    let engine = engine().unwrap();
     for interface in ["wasi:cli/stdout@0.2.0", "wasi:cli/stderr@0.2.0"] {
         let c = Component::new(
             engine,
