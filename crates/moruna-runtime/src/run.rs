@@ -636,6 +636,9 @@ fn drive(
         sampler.clone(),
     )?);
     started.scheduler = Some(scheduler.clone());
+    if let Some(hook) = components.stage_hook.clone() {
+        scheduler.set_stage_hook(hook);
+    }
     if let Some(handle) = &checkpoint_handle {
         handle.attach(&scheduler);
     }

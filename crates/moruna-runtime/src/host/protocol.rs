@@ -1,7 +1,12 @@
 //! The host protocol's messages (MH 4.3): newline-delimited JSON, one object per line,
-//! `type` first. Moruna sends `hello`, `heartbeat`, `limits_changed`, `report` and `exit`; it
-//! reads `spec`, `cancel` and `checkpoint`, and nothing else. No message a peer can send
-//! enlarges a run.
+//! `type` first. Moruna sends `hello`, `heartbeat`, `limits_changed`, `event`, `report` and
+//! `exit`; it reads `spec`, `cancel` and `checkpoint`, and nothing else. No message a peer can
+//! send enlarges a run.
+//!
+//! An `event` is one fact of the run's execution, versioned on its own (`v`, [`EVENTS_VERSION`])
+//! and named by its `kind`: version 1 has the task lifecycle. A later version adds kinds (a
+//! task's output, its progress) to the same message; a peer refuses a version it does not read
+//! rather than guess at it.
 
 use moruna_kernel::Limits;
 use serde::{Deserialize, Serialize};
@@ -71,6 +76,289 @@ impl Heartbeat {
     }
 }
 
+/// The version of the `event` message this build writes (MH 4.3).
+pub const EVENTS_VERSION: u32 = 1;
+
+/// One `event` (MH 4.3): who produced it and when, then the fact.
+///
+/// `attempt` is the document's `report.attempt`; `start` is this process's own id, minted when it
+/// starts, so an attempt that a host ran twice is two producers; `seq` counts this process's
+/// events from 1 with no gap, in the order they are written; `t_us` is microseconds on this
+/// process's monotonic clock since it began the run. A peer that has seen `(start, seq)` has
+/// seen the event, however often it is relayed.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EventMsg {
+    /// [`EVENTS_VERSION`].
+    pub v: u32,
+    /// The document's `report.attempt`.
+    pub attempt: u32,
+    /// This process's id: 32 lowercase hex characters.
+    pub start: String,
+    /// From 1, with no gap.
+    pub seq: u64,
+    /// When the fact became true, in microseconds since the process began the run.
+    pub t_us: u64,
+    /// The fact.
+    #[serde(flatten)]
+    pub body: Event,
+}
+
+/// The facts of version 1: the task lifecycle (MH 4.3). A task is one element of the chain,
+/// named by the id the document's `report.tasks` gives it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Event {
+    /// First: this process runs the document's attempt; `resumed` when from a manifest.
+    AttemptStarted {
+        /// A resume of an earlier process's run.
+        resumed: bool,
+    },
+    /// Once per task, before anything else is said of it.
+    TaskRegistered {
+        /// The task.
+        task: String,
+        /// `source`, `kernel` or `sink`.
+        element: Element,
+        /// Its place in the chain: 0 the source, 1..=n the kernels, n+1 the sink.
+        stage: u16,
+        /// The task whose output it takes; `null` for the source.
+        upstream: Option<String>,
+        /// The host's tasks it carries as one group (`report.tasks`); empty for one task.
+        members: Vec<String>,
+    },
+    /// It cannot start yet, and why.
+    TaskWaiting {
+        /// The task.
+        task: String,
+        /// Why.
+        reason: WaitReason,
+        /// The tasks it waits on.
+        blocking: Vec<String>,
+    },
+    /// Its input is there; it starts when a worker or a drive takes it.
+    TaskReady {
+        /// The task.
+        task: String,
+    },
+    /// It took its first input (a source: issued its first read; a sink: was handed its first
+    /// morsel, or began its commit with none).
+    TaskStarted {
+        /// The task.
+        task: String,
+        /// What it is doing.
+        phase: Phase,
+    },
+    /// What it is doing changed.
+    TaskPhase {
+        /// The task.
+        task: String,
+        /// What it is doing now.
+        phase: Phase,
+    },
+    /// It ended without failing itself: drained and done, stopped by another's failure, or
+    /// cancelled.
+    TaskCompleted {
+        /// The task.
+        task: String,
+        /// How.
+        outcome: TaskOutcome,
+        /// From its start to its end on this process's clock; `null` when it never started (a
+        /// stage that never had input).
+        duration_us: Option<u64>,
+        /// What it did, when it ran to its end (`succeeded`); `null` otherwise.
+        counters: Option<Counters>,
+        /// The task whose failure stopped it.
+        cause: Option<String>,
+    },
+    /// It failed, or the attempt did (`scope: attempt`, `task: null`) for a reason no one task
+    /// owns. `message` is the engine's own sentence about the failure and quotes no data; the
+    /// failure's full words are in the report.
+    TaskFailed {
+        /// The task; `null` when the scope is the attempt.
+        task: Option<String>,
+        /// A stable code.
+        code: FailureCode,
+        /// A sentence that names stages, morsels and sizes, never a value.
+        message: String,
+        /// `task` or `attempt`.
+        scope: FailureScope,
+        /// Whether the same document may succeed when run again.
+        retryable: bool,
+    },
+    /// It never started and never will.
+    TaskSkipped {
+        /// The task.
+        task: String,
+        /// Why.
+        reason: SkipReason,
+        /// The task whose failure skipped it.
+        blocking: Option<String>,
+    },
+    /// The peer's `cancel` reached the run.
+    CancelAcknowledged,
+    /// The run has stopped since a `cancel` reached it, and how it ended.
+    CancelEnded {
+        /// `cancelled`, or `completed` / `failed` when the run ended first.
+        disposition: CancelDisposition,
+    },
+}
+
+/// What a task is (MH 4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Element {
+    /// The chain's source.
+    Source,
+    /// One kernel stage.
+    Kernel,
+    /// The chain's sink.
+    Sink,
+}
+
+/// Why a task waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// The engine is still being made ready: discovery, the arena, the plan.
+    EnginePreparing,
+    /// No input has reached it yet.
+    AwaitingInput,
+}
+
+/// What a running task is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Working on the morsels the controller measures the chain with, before the run proper.
+    Calibrating,
+    /// A source reading.
+    Reading,
+    /// A kernel applying.
+    Applying,
+    /// A sink writing.
+    Writing,
+    /// Its input is closed: working through what is left.
+    Draining,
+    /// A sink committing what it wrote.
+    Committing,
+}
+
+/// How a task that did not fail itself ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    /// Drained and done: a source exhausted, a kernel through its last input, a sink committed.
+    Succeeded,
+    /// Running when another task's failure ended the attempt.
+    Stopped,
+    /// Running when a `cancel` ended the attempt.
+    Cancelled,
+}
+
+/// What a task did, measured where it happened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Counters {
+    /// Morsels taken (a kernel, the sink) or produced (the source).
+    pub morsels: u64,
+    /// Rows taken.
+    pub rows_in: u64,
+    /// Rows produced; the sink's, rows written.
+    pub rows_out: u64,
+    /// Bytes taken.
+    pub bytes_in: u64,
+    /// Bytes produced; the sink's, bytes written.
+    pub bytes_out: u64,
+    /// Morsels the error policy skipped.
+    pub skipped: u64,
+    /// Morsels whose kernel failed.
+    pub errors: u64,
+}
+
+impl Counters {
+    /// The protocol's view of the scheduler's counters.
+    pub fn of(c: &moruna_kernel::StageCounters) -> Counters {
+        Counters {
+            morsels: c.morsels,
+            rows_in: c.rows_in,
+            rows_out: c.rows_out,
+            bytes_in: c.bytes_in,
+            bytes_out: c.bytes_out,
+            skipped: c.skipped,
+            errors: c.errors,
+        }
+    }
+}
+
+/// A failure's stable code (MH 4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    /// The document was refused.
+    SpecRefused,
+    /// A kernel failed and the error policy ended the run.
+    KernelError,
+    /// A morsel's footprint exceeded the budget.
+    BudgetExceeded,
+    /// The allocator guard refused a kernel's allocation past the ceiling.
+    MemoryRefused,
+    /// The source could not read.
+    SourceError,
+    /// The sink could not write or commit.
+    SinkError,
+    /// An allocation exceeded its tier's budget.
+    AllocRefused,
+    /// An IO operation failed.
+    IoError,
+    /// Staging or placement failed.
+    StagingError,
+    /// A table-to-tensor conversion failed.
+    ConvertError,
+    /// A configuration value was refused.
+    ConfigRefused,
+    /// The plan was refused.
+    PlanRefused,
+    /// Resume was refused.
+    ResumeRefused,
+    /// The run needs something this build does not do.
+    Unsupported,
+    /// The engine stopped as cancelled with no cancel asked of it.
+    Cancelled,
+}
+
+/// Who a failure belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureScope {
+    /// The task the event names.
+    Task,
+    /// The attempt as a whole: no one task owns the cause.
+    Attempt,
+}
+
+/// Why a task was skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// Another task failed first (`blocking`).
+    FailedTask,
+    /// The attempt failed for a reason no task owns.
+    AttemptFailed,
+    /// The run was cancelled first.
+    Cancelled,
+}
+
+/// How a cancelled run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelDisposition {
+    /// The cancel stopped it.
+    Cancelled,
+    /// It completed before the cancel could stop it.
+    Completed,
+    /// It failed before the cancel could stop it.
+    Failed,
+}
+
 /// A message from Moruna to its peer (MH 4.3).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -95,6 +383,8 @@ pub enum Outbound {
         /// `memory` or `cpu`.
         reason: String,
     },
+    /// One fact of the run's execution (MH 4.3), between `hello` and `report`.
+    Event(EventMsg),
     /// The full run report, before `exit`, whenever the run produced one.
     Report {
         /// `RunReport` as JSON (04 d.1).
@@ -249,6 +539,65 @@ mod tests {
         assert_eq!(
             exit.line(),
             "{\"type\":\"exit\",\"code\":130,\"diagnostic\":\"cancelled\"}\n"
+        );
+    }
+
+    /// An `event` (MH 4.3): `type`, then who produced it and when, then its `kind` and the fact,
+    /// nulls written out.
+    #[test]
+    fn an_event_is_byte_exact() {
+        let event = |body| {
+            Outbound::Event(EventMsg {
+                v: EVENTS_VERSION,
+                attempt: 2,
+                start: "0f".repeat(16),
+                seq: 7,
+                t_us: 1500,
+                body,
+            })
+            .line()
+        };
+        assert_eq!(
+            event(Event::TaskStarted {
+                task: "orders".into(),
+                phase: Phase::Reading,
+            }),
+            format!(
+                "{{\"type\":\"event\",\"v\":1,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                 \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
+                "0f".repeat(16)
+            )
+        );
+        let failed = event(Event::TaskFailed {
+            task: None,
+            code: FailureCode::IoError,
+            message: "the read_file operation failed".into(),
+            scope: FailureScope::Attempt,
+            retryable: true,
+        });
+        assert!(
+            failed.ends_with(
+                "\"kind\":\"task_failed\",\"task\":null,\"code\":\"io_error\",\
+                 \"message\":\"the read_file operation failed\",\"scope\":\"attempt\",\
+                 \"retryable\":true}\n"
+            ),
+            "{failed}"
+        );
+        assert!(event(Event::CancelAcknowledged).ends_with("\"kind\":\"cancel_acknowledged\"}\n"));
+        let done = event(Event::TaskCompleted {
+            task: "t1".into(),
+            outcome: TaskOutcome::Succeeded,
+            duration_us: None,
+            counters: Some(Counters::default()),
+            cause: None,
+        });
+        assert!(
+            done.ends_with(
+                "\"outcome\":\"succeeded\",\"duration_us\":null,\"counters\":{\"morsels\":0,\
+                 \"rows_in\":0,\"rows_out\":0,\"bytes_in\":0,\"bytes_out\":0,\"skipped\":0,\
+                 \"errors\":0},\"cause\":null}\n"
+            ),
+            "{done}"
         );
     }
 

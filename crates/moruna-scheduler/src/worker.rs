@@ -233,6 +233,14 @@ pub(crate) fn run_task(
     } = morsel;
     let rows_in = features.rows;
     let tier_in = payload.tier().index() as u8;
+    // MH 4.3: counted while the claim on the stage is held, so the close of its output queue
+    // (f.7) sees this morsel in the stage's counters.
+    entry.taken.fetch_add(1, Ordering::SeqCst);
+    entry.rows_in.fetch_add(rows_in, Ordering::SeqCst);
+    entry.bytes_in.fetch_add(bytes_in, Ordering::SeqCst);
+    if !entry.started.swap(true, Ordering::SeqCst) {
+        shared.tell(moruna_kernel::StageEvent::StageStarted { stage });
+    }
 
     shared.heartbeat.start_task(worker, stage, seq);
     let q_before = tier_totals(&shared.placement_stats());
@@ -309,6 +317,9 @@ pub(crate) fn run_task(
             if let Err(e) = shared.placement.push(stage, out_morsel) {
                 push_error = Some(e);
             } else {
+                entry.rows_out.fetch_add(rows_out, Ordering::SeqCst);
+                entry.bytes_out.fetch_add(bytes_out, Ordering::SeqCst);
+                shared.fed(stage);
                 entry.tasks.fetch_add(1, Ordering::SeqCst);
                 entry
                     .busy_ns

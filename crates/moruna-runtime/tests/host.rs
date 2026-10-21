@@ -214,6 +214,16 @@ fn read_one(reader: &mut dyn BufRead) -> Value {
     serde_json::from_str(&line).expect("a JSON line")
 }
 
+/// The next message that is not an `event`.
+fn read_beside_events(reader: &mut dyn BufRead) -> Value {
+    loop {
+        let message = read_one(reader);
+        if message["type"] != "event" {
+            return message;
+        }
+    }
+}
+
 fn socket_path(scratch: &Path) -> PathBuf {
     // A Unix socket path is limited to about 100 bytes, which a temp directory may exceed.
     let short = std::env::temp_dir().join(format!(
@@ -328,7 +338,7 @@ fn ho_t7_peer_gone_the_run_continues() {
         let (reader, writer, close) = conn.into_parts();
         let mut reader = BufReader::new(reader);
         assert_eq!(read_one(&mut reader)["type"], "hello");
-        assert_eq!(read_one(&mut reader)["type"], "heartbeat");
+        assert_eq!(read_beside_events(&mut reader)["type"], "heartbeat");
         close();
         drop(writer);
     }
@@ -372,8 +382,8 @@ fn ho_t8_checkpoint_then_cancel() {
     let mut reader = BufReader::new(reader);
     assert_eq!(read_one(&mut reader)["type"], "hello");
     // Two heartbeats in, the probe is over and the scheduler is running.
-    assert_eq!(read_one(&mut reader)["type"], "heartbeat");
-    assert_eq!(read_one(&mut reader)["type"], "heartbeat");
+    assert_eq!(read_beside_events(&mut reader)["type"], "heartbeat");
+    assert_eq!(read_beside_events(&mut reader)["type"], "heartbeat");
     assert!(!manifest.exists(), "no manifest before it is asked for");
     writer
         .write_all(b"{\"type\":\"checkpoint\"}\n")
@@ -391,6 +401,25 @@ fn ho_t8_checkpoint_then_cancel() {
     let exit_msg = &messages.last().expect("exit").1;
     assert_eq!(exit_msg["type"], "exit");
     assert_eq!(exit_msg["code"], 130);
+    // The cancel reached the run, every task ended by it, and the cancel's end came last of the
+    // events: a task running was cancelled, one that never started was skipped.
+    let events = events_of(&messages);
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let acknowledged = kinds
+        .iter()
+        .position(|k| *k == "cancel_acknowledged")
+        .expect("the cancel was acknowledged");
+    assert_eq!(kinds.last(), Some(&"cancel_ended"), "{kinds:?}");
+    assert_eq!(events.last().unwrap()["disposition"], "cancelled");
+    for task in ["source", "kernel-1", "sink"] {
+        let end = ended(&events, task);
+        assert!(
+            (end["kind"] == "task_completed" && end["outcome"] == "cancelled")
+                || (end["kind"] == "task_skipped" && end["reason"] == "cancelled"),
+            "{task}: {end}"
+        );
+        assert!(position(&events, &end) > acknowledged);
+    }
     let on_disk = report_file(scratch.path());
     assert_eq!(on_disk["exit"]["code"], 130);
     assert_eq!(on_disk["report"]["exit"], json!("Cancelled"));
@@ -688,4 +717,263 @@ fn ho_t13_report_file_placement() {
         cli::summary(&outcome),
         format!("moruna: exit 0; report: {}", expected.display())
     );
+}
+
+/// The `event` messages of a conversation, in the order they arrived.
+fn events_of(messages: &[(Instant, Value)]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|(_, m)| m["type"] == "event")
+        .map(|(_, m)| m.clone())
+        .collect()
+}
+
+fn position(events: &[Value], event: &Value) -> usize {
+    events.iter().position(|e| e == event).expect("an event")
+}
+
+/// The one event that ended `task`.
+fn ended(events: &[Value], task: &str) -> Value {
+    let ends: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e["task"] == task
+                && matches!(
+                    e["kind"].as_str(),
+                    Some("task_completed" | "task_failed" | "task_skipped")
+                )
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "{task} ends once: {ends:?}");
+    ends[0].clone()
+}
+
+fn first(events: &[Value], task: &str, kind: &str) -> Option<usize> {
+    events
+        .iter()
+        .position(|e| e["task"] == task && e["kind"] == kind)
+}
+
+/// What every conversation's events are: version 1, the document's attempt, one producer, `seq`
+/// from 1 with no gap, time that never runs backwards, and between `hello` and `report`.
+fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
+    let events = events_of(messages);
+    assert!(!events.is_empty(), "the run told its events");
+    let start = events[0]["start"]
+        .as_str()
+        .expect("a producer id")
+        .to_string();
+    assert_eq!(start.len(), 32);
+    let mut last_t = 0;
+    for (i, e) in events.iter().enumerate() {
+        assert_eq!(e["v"], 1, "{e}");
+        assert_eq!(e["attempt"], attempt, "{e}");
+        assert_eq!(e["start"], start.as_str(), "{e}");
+        assert_eq!(e["seq"], i as u64 + 1, "{e}");
+        let t = e["t_us"].as_u64().expect("t_us");
+        assert!(t >= last_t, "time runs forward: {e}");
+        last_t = t;
+    }
+    let types: Vec<&str> = messages
+        .iter()
+        .map(|(_, m)| m["type"].as_str().unwrap_or(""))
+        .collect();
+    let last_event = types.iter().rposition(|t| *t == "event").expect("events");
+    assert!(
+        types[last_event + 1..].iter().all(|t| *t != "event"),
+        "no event after the report: {types:?}"
+    );
+    assert_eq!(types[0], "hello");
+    events
+}
+
+/// Run `doc` with a peer on its socket and every message it sent.
+fn converse(scratch: &Path, mut doc: Value) -> (i32, Vec<(Instant, Value)>) {
+    let socket = socket_path(scratch);
+    doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
+    let path = write_doc(scratch, &doc);
+    let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
+    let runner = std::thread::spawn(move || run_cli(&["run", &path.to_string_lossy()], &no_env));
+    let conn = listener.accept().expect("moruna connects");
+    let (reader, _writer, _close) = conn.into_parts();
+    let messages = drain(&mut BufReader::new(reader));
+    let code = runner.join().expect("the runner");
+    let _ = std::fs::remove_file(&socket);
+    (code, messages)
+}
+
+/// HO-T16 task_events (MH 4.3): a real source -> kernel -> sink run over Parquet tells each task
+/// by the id the document gives it, registered and waiting first, then ready, started and
+/// completed; the source completes once it is drained, before the kernel, which completes
+/// before the sink commits; the counters are the rows that went through.
+#[test]
+fn ho_t16_a_real_run_tells_its_task_lifecycle() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t16");
+    let rows = 20_000;
+    let mut doc = document(scratch.path(), rows, 4, Some("double"));
+    doc["report"]["tasks"] = json!({
+        "source": {"id": "orders"},
+        "kernels": [{"id": "double", "members": ["clean", "double"]}],
+        "sink": {"id": "refined"},
+    });
+    doc["report"]["attempt"] = json!(2);
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::COMPLETED);
+    let events = well_formed(&messages, 2);
+    assert_eq!(events[0]["kind"], "attempt_started");
+    assert_eq!(events[0]["resumed"], false);
+    let registered: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "task_registered")
+        .collect();
+    assert_eq!(
+        registered
+            .iter()
+            .map(|e| (e["task"].as_str().unwrap(), e["stage"].as_u64().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![("orders", 0), ("double", 1), ("refined", 2)]
+    );
+    assert_eq!(registered[1]["members"], json!(["clean", "double"]));
+    assert_eq!(registered[1]["upstream"], "orders");
+    for task in ["orders", "double", "refined"] {
+        let registered = first(&events, task, "task_registered").unwrap();
+        let waiting = first(&events, task, "task_waiting").unwrap();
+        let ready = first(&events, task, "task_ready").expect("ready");
+        let started = first(&events, task, "task_started").expect("started");
+        let end = ended(&events, task);
+        assert!(
+            registered < waiting && waiting < ready && ready < started,
+            "{task}"
+        );
+        assert!(started < position(&events, &end), "{task}");
+        assert_eq!(end["kind"], "task_completed", "{task}: {end}");
+        assert_eq!(end["outcome"], "succeeded");
+        assert!(end["duration_us"].is_u64(), "{task} ran: {end}");
+    }
+    let source = ended(&events, "orders");
+    let kernel = ended(&events, "double");
+    let sink = ended(&events, "refined");
+    assert!(position(&events, &source) < position(&events, &kernel));
+    assert!(position(&events, &kernel) < position(&events, &sink));
+    let committing = events
+        .iter()
+        .position(|e| e["task"] == "refined" && e["phase"] == "committing")
+        .expect("the sink committed");
+    assert!(position(&events, &kernel) < committing);
+    assert_eq!(source["counters"]["rows_out"], rows);
+    assert_eq!(kernel["counters"]["rows_in"], rows);
+    assert_eq!(kernel["counters"]["rows_out"], rows);
+    assert_eq!(sink["counters"]["rows_out"], rows);
+    assert!(kernel["counters"]["morsels"].as_u64().unwrap() >= 1);
+    assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
+}
+
+/// HO-T17 empty input (MH 4.3). A copy of an empty source completes: nothing is read, the
+/// source completes with no duration, having never started, and the sink starts at its commit.
+/// A chain with a kernel over the same empty source is refused by the controller's probe (SDD 11
+/// f.14: a fresh run with nothing to read is a plan error); the attempt fails, and every task is
+/// skipped for it, none claimed to have run.
+#[test]
+fn ho_t17_empty_input_ends_every_task() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t17");
+    let input = scratch.path().join("empty.parquet");
+    let mut doc = document(scratch.path(), 1, 1, None);
+    write_empty_parquet(&input);
+    doc["source"]["url"] = json!(format!("file://{}", input.display()));
+    let (code, messages) = converse(scratch.path(), doc.clone());
+    assert_eq!(code, exit::COMPLETED);
+    let events = well_formed(&messages, 1);
+    for task in ["source", "sink"] {
+        let end = ended(&events, task);
+        assert_eq!(end["kind"], "task_completed", "{task}: {end}");
+        assert_eq!(end["outcome"], "succeeded");
+        assert_eq!(end["counters"]["rows_out"], 0, "{task}");
+    }
+    assert!(first(&events, "source", "task_started").is_none());
+    assert_eq!(ended(&events, "source")["duration_us"], Value::Null);
+    let started = &events[first(&events, "sink", "task_started").expect("the sink commits")];
+    assert_eq!(started["phase"], "committing");
+
+    doc["kernels"] = json!([{"kind": "python", "module": "tests", "callable": "double"}]);
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::SPEC_REFUSED);
+    let events = well_formed(&messages, 1);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "task_failed")
+        .expect("the attempt failed");
+    assert_eq!(failed["scope"], "attempt");
+    assert_eq!(failed["code"], "plan_refused");
+    for task in ["source", "kernel-1", "sink"] {
+        assert!(first(&events, task, "task_started").is_none(), "{task}");
+        let end = ended(&events, task);
+        assert_eq!(end["kind"], "task_skipped", "{task}: {end}");
+        assert_eq!(end["reason"], "attempt_failed");
+    }
+}
+
+/// HO-T18 kernel failure (MH 4.3): the kernel fails on its first morsel under `terminate`; its
+/// task fails with the kernel's code and no word the kernel said, the source is stopped or
+/// completed by then, and the sink, which never started, is skipped for it.
+#[test]
+fn ho_t18_a_kernel_failure_fails_its_task() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t18");
+    let doc = document(scratch.path(), 4_000, 2, Some("fail"));
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::KERNEL_ERROR);
+    let events = well_formed(&messages, 1);
+    let failed = ended(&events, "kernel-1");
+    assert_eq!(failed["kind"], "task_failed", "{failed}");
+    assert_eq!(failed["code"], "kernel_error");
+    assert_eq!(failed["scope"], "task");
+    assert_eq!(failed["retryable"], false);
+    assert!(
+        failed["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("kernel stage 1 failed on morsel"),
+        "{failed}"
+    );
+    let source = ended(&events, "source");
+    assert!(
+        source["outcome"] == "succeeded"
+            || (source["outcome"] == "stopped" && source["cause"] == "kernel-1"),
+        "{source}"
+    );
+    let sink = ended(&events, "sink");
+    assert_eq!(sink["kind"], "task_skipped", "{sink}");
+    assert_eq!(sink["blocking"], "kernel-1");
+}
+
+/// HO-T19 a refused document's tasks (MH 4.3): a kernel no loader has refuses the document after
+/// its tasks were registered; the attempt fails, and every task is skipped for it.
+#[test]
+fn ho_t19_a_refused_document_skips_every_task() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t19");
+    let doc = document(scratch.path(), 4_000, 2, Some("unknown"));
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::SPEC_REFUSED);
+    let events = well_formed(&messages, 1);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "task_failed")
+        .expect("the attempt failed");
+    assert_eq!(failed["scope"], "attempt");
+    for task in ["source", "kernel-1", "sink"] {
+        let end = ended(&events, task);
+        assert_eq!(end["kind"], "task_skipped", "{task}: {end}");
+        assert_eq!(end["reason"], "attempt_failed");
+    }
+}
+
+/// A Parquet file of the support schema with no row.
+fn write_empty_parquet(path: &Path) {
+    let file = std::fs::File::create(path).expect("the input file");
+    let schema = support::schema();
+    let writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("a writer");
+    writer.close().expect("the footer is written");
 }

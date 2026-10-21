@@ -29,6 +29,7 @@ pub mod placement;
 pub mod reactor;
 pub mod sink;
 pub mod source;
+pub mod stages;
 pub mod tensor;
 pub mod tier;
 pub mod trace;
@@ -68,6 +69,7 @@ pub use placement::{
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
 pub use sink::{ExcludedRows, Sink, SinkSummary, SinkWrite};
 pub use source::{RowRange, Source, SourceRead, Split};
+pub use stages::{StageCounters, StageEvent, StageHook};
 pub use tensor::{DeleterHook, Dlpack, ManagedTensor};
 pub use tier::{RemoteRef, SegmentRef, StagingCodec, TIER_COUNT, Tier, TierKind};
 pub use trace::{LimitsChangeReason, LimitsChanged, Outcome, TraceRecord, TraceSink, TraceTail};

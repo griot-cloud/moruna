@@ -347,6 +347,9 @@ pub struct Components {
     /// A window onto the run for a host (MH 4.3); the facade attaches to it and detaches when
     /// the run ends.
     pub observer: Option<Arc<crate::observe::RunObserver>>,
+    /// Hears the chain's facts as they become true, the probes' included (MH 4.3 task events):
+    /// installed on the scheduler as soon as it exists.
+    pub stage_hook: Option<moruna_kernel::StageHook>,
 }
 
 /// The cancel token a run is driven with, re-exported so a caller needs one import.

@@ -1200,3 +1200,66 @@ fn pk_t12_package_entry_fields() {
     );
     assert_eq!(serde_json::from_str::<KernelDoc>(&text).unwrap(), doc);
 }
+
+/// `report.tasks` names the chain as it is (MH 4.3): one id per element, each once, each a
+/// token; `report.attempt` counts from 1. Neither is the job: the digest is blind to both.
+#[test]
+fn report_tasks_name_the_chain_and_are_not_the_job() {
+    let with = |report: serde_json::Value| {
+        let mut doc: serde_json::Value = serde_json::from_str(FULL).expect("the example");
+        doc["report"] = report;
+        JobSpec::from_value(doc)
+    };
+    let named = with(serde_json::json!({
+        "socket": "vsock://2:5000",
+        "tasks": {"source": {"id": "t0", "members": ["orders", "customers"]},
+                  "kernels": [{"id": "t1"}], "sink": {"id": "t2"}},
+        "attempt": 3
+    }))
+    .expect("a named chain");
+    assert_eq!(named.report.attempt(), 3);
+    let tasks = named.report.tasks.as_ref().expect("tasks");
+    assert_eq!(tasks.source.members, vec!["orders", "customers"]);
+    let plain = JobSpec::from_json(FULL).expect("the example");
+    assert_eq!(plain.report.attempt(), 1);
+    assert_eq!(
+        named.digest(),
+        plain.digest(),
+        "tasks and attempt are not the job"
+    );
+    let round = JobSpec::from_json(&named.canonical_json()).expect("round trip");
+    assert_eq!(round, named);
+
+    let refused = |report: serde_json::Value| with(report).expect_err("refused").field;
+    assert_eq!(
+        refused(
+            serde_json::json!({"tasks": {"source": {"id": "a"}, "kernels": [], "sink": {"id": "b"}}})
+        ),
+        "report.tasks.kernels"
+    );
+    assert_eq!(
+        refused(
+            serde_json::json!({"tasks": {"source": {"id": "a"}, "kernels": [{"id": "a"}], "sink": {"id": "b"}}})
+        ),
+        "report.tasks.kernels[0].id"
+    );
+    assert_eq!(
+        refused(
+            serde_json::json!({"tasks": {"source": {"id": "a b"}, "kernels": [{"id": "k"}], "sink": {"id": "b"}}})
+        ),
+        "report.tasks.source.id"
+    );
+    assert_eq!(
+        refused(
+            serde_json::json!({"tasks": {"source": {"id": "a"}, "kernels": [{"id": "k"}], "sink": {"id": "b", "members": ["x*"]}}})
+        ),
+        "report.tasks.sink.members"
+    );
+    assert_eq!(refused(serde_json::json!({"attempt": 0})), "report.attempt");
+    assert_eq!(
+        refused(
+            serde_json::json!({"tasks": {"source": {"id": "a", "extra": 1}, "kernels": [{"id": "k"}], "sink": {"id": "b"}}})
+        ),
+        "report"
+    );
+}

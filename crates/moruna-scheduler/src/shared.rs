@@ -11,7 +11,7 @@ use crossbeam::sync::{Parker, Unparker};
 use moruna_kernel::{
     Allocator, CancelToken, Kernel, KernelKind, KernelState, MorunaError, PayloadSpec, Placement,
     PlacementStats, RecordHook, Result, Sampler, Seq, Sink, SinkSummary, Source, SourceSchema,
-    Split, StageId, TraceSink,
+    Split, StageCounters, StageEvent, StageHook, StageId, TraceSink,
 };
 use moruna_sinks::SinkHandle;
 
@@ -105,6 +105,39 @@ pub(crate) struct StageEntry {
     pub(crate) errors: AtomicU32,
     pub(crate) skipped: AtomicU32,
     pub(crate) running: AtomicU32,
+    /// A worker has taken this stage's first morsel (MH 4.3 `task_started`).
+    pub(crate) started: AtomicBool,
+    /// Morsels taken, and their rows and bytes in and out: counted before the task lets go of
+    /// its claim on the stage, so a close of its output queue sees every one (f.7).
+    pub(crate) taken: AtomicU64,
+    pub(crate) rows_in: AtomicU64,
+    pub(crate) rows_out: AtomicU64,
+    pub(crate) bytes_in: AtomicU64,
+    pub(crate) bytes_out: AtomicU64,
+}
+
+impl StageEntry {
+    /// What the stage did so far.
+    pub(crate) fn counters(&self) -> StageCounters {
+        StageCounters {
+            morsels: self.taken.load(Ordering::SeqCst),
+            rows_in: self.rows_in.load(Ordering::SeqCst),
+            rows_out: self.rows_out.load(Ordering::SeqCst),
+            bytes_in: self.bytes_in.load(Ordering::SeqCst),
+            bytes_out: self.bytes_out.load(Ordering::SeqCst),
+            skipped: u64::from(self.skipped.load(Ordering::SeqCst)),
+            errors: u64::from(self.errors.load(Ordering::SeqCst)),
+        }
+    }
+}
+
+/// What the source produced and the sink wrote, for the task lifecycle (MH 4.3).
+#[derive(Default)]
+pub(crate) struct EndCounters {
+    pub(crate) started: AtomicBool,
+    pub(crate) morsels: AtomicU64,
+    pub(crate) rows: AtomicU64,
+    pub(crate) bytes: AtomicU64,
 }
 
 /// A job the scheduler asks one named worker to run, because the SDD says the call must happen
@@ -278,6 +311,14 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_handle: Mutex<Option<JoinHandle<()>>>,
 
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
+    /// Who hears the chain's facts as they become true (MH 4.3 task events).
+    pub(crate) stage_hook: RwLock<Option<StageHook>>,
+    /// Queue `k` has received a morsel; index 0..=n.
+    fed: Vec<AtomicBool>,
+    /// The source's reads pushed to Q0, and their rows and bytes.
+    pub(crate) source_out: EndCounters,
+    /// The sink's writes completed, and their rows and bytes as the sink's summary says.
+    pub(crate) sink_in: EndCounters,
     /// The seam the CPU limit tests use: called by a worker after `pick` has named a stage and
     /// before it claims a busy slot, which is the window a lowered limit must not slip through.
     #[cfg(test)]
@@ -403,6 +444,12 @@ impl Shared {
                     errors: AtomicU32::new(0),
                     skipped: AtomicU32::new(0),
                     running: AtomicU32::new(0),
+                    started: AtomicBool::new(false),
+                    taken: AtomicU64::new(0),
+                    rows_in: AtomicU64::new(0),
+                    rows_out: AtomicU64::new(0),
+                    bytes_in: AtomicU64::new(0),
+                    bytes_out: AtomicU64::new(0),
                 }
             })
             .collect();
@@ -479,6 +526,10 @@ impl Shared {
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_handle: Mutex::new(None),
             record_hook: RwLock::new(None),
+            stage_hook: RwLock::new(None),
+            fed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
+            source_out: EndCounters::default(),
+            sink_in: EndCounters::default(),
             #[cfg(test)]
             pick_hook: RwLock::new(None),
             stats_cache: Mutex::new(StatsCache {
@@ -543,6 +594,64 @@ impl Shared {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub(crate) fn set_stage_hook(&self, hook: StageHook) {
+        let mut slot = self.stage_hook.write().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(hook);
+    }
+
+    /// Tell the stage hook a fact, on this thread (MH 4.3).
+    pub(crate) fn tell(&self, event: StageEvent) {
+        let hook = self
+            .stage_hook
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(&event);
+        }
+    }
+
+    /// A morsel was pushed into `queue`: the first one is told (MH 4.3 `task_ready`).
+    pub(crate) fn fed(&self, queue: StageId) {
+        if let Some(flag) = self.fed.get(queue as usize)
+            && !flag.swap(true, Ordering::SeqCst)
+        {
+            self.tell(StageEvent::Fed { queue });
+        }
+    }
+
+    /// The source pushed one read of `rows` rows and `bytes` bytes into Q0.
+    pub(crate) fn source_pushed(&self, rows: u64, bytes: u64) {
+        self.source_out.morsels.fetch_add(1, Ordering::SeqCst);
+        self.source_out.rows.fetch_add(rows, Ordering::SeqCst);
+        self.source_out.bytes.fetch_add(bytes, Ordering::SeqCst);
+        self.fed(0);
+    }
+
+    /// The source drive is issuing a read: the first one is told (MH 4.3 `task_started`).
+    pub(crate) fn source_reading(&self) {
+        if !self.source_out.started.swap(true, Ordering::SeqCst) {
+            self.tell(StageEvent::SourceReading);
+        }
+    }
+
+    /// The counters of queue `queue`'s producer: the source for Q0, kernel stage `k` for Qk.
+    pub(crate) fn producer_counters(&self, queue: StageId) -> StageCounters {
+        match queue {
+            0 => StageCounters {
+                morsels: self.source_out.morsels.load(Ordering::SeqCst),
+                rows_out: self.source_out.rows.load(Ordering::SeqCst),
+                bytes_out: self.source_out.bytes.load(Ordering::SeqCst),
+                ..StageCounters::default()
+            },
+            k => self
+                .stages
+                .get(k as usize - 1)
+                .map(StageEntry::counters)
+                .unwrap_or_default(),
+        }
     }
 
     /// Claim the right to end the run. The first caller wins and is the only one that may act:
@@ -711,6 +820,16 @@ impl Shared {
             flag.store(true, Ordering::SeqCst);
         }
         tracing::debug!(target: "sched.close_stage", stage, "queue closed");
+        // Closed in the engine, so its producer has produced everything: its counters are
+        // final (f.7, MH 4.3 `task_completed`). Not once the run is ending: a kernel whose error
+        // ends the run claims the exit before it lets go of its stage (f.8), so the cascade
+        // that closes its queue after that is the run winding down, not the stage succeeding.
+        if !self.exit_claimed.load(Ordering::SeqCst) {
+            self.tell(StageEvent::QueueClosed {
+                queue: stage,
+                counters: self.producer_counters(stage),
+            });
+        }
     }
 
     /// Close a queue once, in order, and say whether this call did it (f.7).
