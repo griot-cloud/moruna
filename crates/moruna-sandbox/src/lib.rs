@@ -36,6 +36,8 @@ pub mod fdpass;
 mod kernel;
 #[cfg(target_os = "linux")]
 pub mod mapping;
+#[cfg(target_os = "linux")]
+pub mod output;
 #[cfg(all(target_os = "linux", feature = "python"))]
 pub mod python;
 #[cfg(target_os = "linux")]

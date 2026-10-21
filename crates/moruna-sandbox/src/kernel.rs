@@ -267,6 +267,8 @@ impl SandboxKernel {
             std::env::temp_dir().join(format!("moruna-sandbox-{}-{at}-{n}", std::process::id()));
         std::fs::create_dir_all(&root).map_err(|e| config(format!("{}: {e}", root.display())))?;
         let (ours, theirs) = UnixStream::pair().map_err(|e| config(format!("socketpair: {e}")))?;
+        let output = crate::output::ChildOutput::open()
+            .map_err(|e| config(format!("the child's output pipes: {e}")))?;
         let request = ToTemplate::Start {
             tree: self.tree.root.display().to_string(),
             target: self.target.clone(),
@@ -287,9 +289,20 @@ impl SandboxKernel {
         };
         let pid = self
             .template
-            .start(&request, theirs.as_raw_fd(), mapping.fd().as_raw_fd())
+            .start(
+                &request,
+                theirs.as_raw_fd(),
+                mapping.fd().as_raw_fd(),
+                output.write_ends(),
+            )
             .map_err(|e| config(format!("the sandbox template: {e}")))?;
         drop(theirs);
+        // What the child prints is the stage's whose worker started it (MH 4.3 `log`), read
+        // until the child is gone.
+        output.read(
+            moruna_kernel::output::current(),
+            &self.package.manifest.name,
+        );
         let pidfd = pidfd_open(pid).map_err(|e| config(format!("pidfd_open {pid}: {e}")))?;
         let data = (mapping.len() - PAGE) as u64;
         let shared = Arc::new(Shared { mapping, cgroup });

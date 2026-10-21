@@ -34,6 +34,9 @@ pub mod extend;
 pub mod inspect;
 #[cfg(feature = "python")]
 pub mod kernel;
+// A Python kernel's output, routed by stage (MH 4.3 `log`).
+#[cfg(feature = "python")]
+pub mod output;
 // The function package (SDD 16): the manifest, `check`, `aot`, `load` and `package --wasm`.
 #[cfg(feature = "python")]
 pub mod package;

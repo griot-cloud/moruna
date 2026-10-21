@@ -146,6 +146,8 @@ pub fn run_command(py: Python<'_>, args: Vec<String>) -> i32 {
             return exit::FAILED;
         }
     };
+    // The command's process is the run's: what a Python kernel prints is its stage's.
+    crate::output::install(py);
     let cancel = CancelToken::new();
     let thread_cancel = cancel.clone();
     let handle = match std::thread::Builder::new()

@@ -68,6 +68,7 @@ pub(crate) fn run_init(
         device: device_for(shared, stage_ix, instance),
         alloc: shared.alloc.clone(),
     };
+    let _working = shared.work_for(shared.stages[stage_ix].stage);
     let state = shared.stages[stage_ix].kernel.init(&ctx)?;
     store(shared, stage_ix, instance, worker, state);
     Ok(JobOutput::Done)
@@ -86,6 +87,7 @@ pub(crate) fn run_restore(
         device: device_for(shared, stage_ix, instance),
         alloc: shared.alloc.clone(),
     };
+    let _working = shared.work_for(shared.stages[stage_ix].stage);
     let state = shared.stages[stage_ix].kernel.restore(&ctx, bytes)?;
     store(shared, stage_ix, instance, worker, state);
     Ok(JobOutput::Done)

@@ -194,16 +194,28 @@ fn sandbox_option<'a>(
 /// Run a command line and return the process's exit code (MH 4.2). `cancel` is the surface's
 /// (a signal handler's) way in; a `cancel` message from the peer uses the same token.
 pub fn main(args: &[String], loader: &dyn KernelLoader, cancel: CancelToken) -> i32 {
-    main_with(args, loader, cancel, &process_env, HEARTBEAT)
+    main_as(args, loader, cancel, &process_env, HEARTBEAT, true)
 }
 
-/// [`main`] with the environment and the heartbeat cadence supplied, for tests.
+/// [`main`] with the environment and the heartbeat cadence supplied, for tests: the test's
+/// process is not the run's alone, so its own output is left where it goes.
 pub fn main_with(
     args: &[String],
     loader: &dyn KernelLoader,
     cancel: CancelToken,
     env: &dyn Fn(&str) -> Option<String>,
     heartbeat: Duration,
+) -> i32 {
+    main_as(args, loader, cancel, env, heartbeat, false)
+}
+
+fn main_as(
+    args: &[String],
+    loader: &dyn KernelLoader,
+    cancel: CancelToken,
+    env: &dyn Fn(&str) -> Option<String>,
+    heartbeat: Duration,
+    capture_process: bool,
 ) -> i32 {
     let command = match parse(args) {
         Ok(command) => command,
@@ -237,6 +249,7 @@ pub fn main_with(
                 cancel,
                 heartbeat,
                 packages,
+                capture_process,
             },
         ),
         Command::Serve {
@@ -252,6 +265,7 @@ pub fn main_with(
                 cancel,
                 heartbeat,
                 packages,
+                capture_process,
             },
         ),
     };
