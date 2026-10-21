@@ -35,7 +35,7 @@ One WIT world, `moruna:kernel`:
 - `process(batch: list<u8>) -> result<list<u8>, string>`: one Arrow record batch in as an IPC stream, one out; an error is the kernel's refusal of that batch, named;
 - `open(state: list<u8>) -> result<_, string>` and `close() -> list<u8>` for a stateful kernel (`stateful` hint), so state crosses a checkpoint (MH §4.7) as bytes.
 
-The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. (Amended 2026-10-15, for a host's kernels built by arguments, model inference first: a kernel may export `configure(args: string)` to receive its arguments once, and import the world's own `read-asset(name)`, which reads a file of a read-only assets directory the host names and nothing else; a `.pex` sees the same directory read-only at `/assets` in its child. SDD 16 e.5, 17 f.11.) Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
+The component imports nothing that reaches the machine: no filesystem, no sockets, no clock beyond what the interface passes in. A loader refuses a module with any other import. (Amended 2026-10-15, for a host's kernels built by arguments, model inference first: a kernel may export `configure(args: string)` to receive its arguments once, and import the world's own `read-asset(name)`, which reads a file of a read-only assets directory the host names and nothing else; a `.pex` sees the same directory read-only at `/assets` in its child. SDD 16 e.5, 17 f.11.) (Amended 2026-10-21, MH §4.10: a `.wasm` may also import the world's `call(port: string, request: list<u8>) -> result<list<u8>, string>`, which hands a request to a port its stage's entry in the job document lists, by name, and waits for the answer; the port goes to the host over the host protocol or to a handler the program embedding Moruna registered, and a name the entry does not list, a missed deadline and the run's cancel end the stage instead. Moruna reads none of the bytes. A `.pex` calls no port. SDD 16 e.5, 17 f.13.) Arrow IPC bytes are the interface because every language has an Arrow IPC reader and none shares a memory layout with the host; the copy is one per batch each way and is what the profile measures.
 
 ## 4. The two runtimes, neither with Moruna's access to the machine
 
@@ -55,7 +55,7 @@ Today a Python kernel is imported into Moruna's own interpreter and sees what Mo
 | guarantee | `.wasm` in `moruna-wasm` | `.pex` in `moruna-sandbox` |
 |---|---|---|
 | cannot read a disk, the job document or the host socket | it has no way to name them | its namespace holds only its own tree; Landlock and seccomp refuse the rest |
-| cannot open a connection | no such import | no socket call but the inherited one |
+| cannot open a connection | no such import; `call` reaches only the ports its stage's entry lists, through Moruna (MH §4.10) | no socket call but the inherited one |
 | memory capped, Moruna told before the cap | the linear-memory limit and the resource limiter | the guard in the child, and the cgroup for what the guard cannot see |
 | CPU bounded and measured | fuel | the cgroup |
 | per-call counts, refusal, shrink | yes | yes, over the socket and the shared page |
