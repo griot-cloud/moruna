@@ -178,6 +178,9 @@ pub(crate) fn run_task(
         }
     };
     let entry = &shared.stages[stage_ix];
+    // MH 4.3 `log`: what the kernel prints while this worker works for the stage, an instance
+    // made for it here included, is the stage's.
+    let _working = shared.work_for(stage);
 
     // f.9: the probe resets the peak and samples before it pops, so the peak it reports is its
     // own; a normal task samples immediately before `apply` (f.2).
@@ -330,6 +333,13 @@ pub(crate) fn run_task(
             // The record carries the diagnostic with the morsel named, not the adapter's
             // sentinels (CT-I10).
             let enriched = enrich(e, stage, seq, &features);
+            // The failure's own words (a Python traceback, every line of it) are the stage's
+            // output, recorded at the level the failure is; they may quote the data, so they go
+            // where the stage's output goes and nowhere else.
+            if matches!(enriched, MorunaError::Kernel { .. }) {
+                let _ =
+                    moruna_kernel::output::log(moruna_kernel::Level::Error, &enriched.to_string());
+            }
             error = Some(enriched.to_string());
             failure = Some(enriched);
         }

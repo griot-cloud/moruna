@@ -350,6 +350,9 @@ pub struct Components {
     /// Hears the chain's facts as they become true, the probes' included (MH 4.3 task events):
     /// installed on the scheduler as soon as it exists.
     pub stage_hook: Option<moruna_kernel::StageHook>,
+    /// Where what the kernels print goes, attributed to their stage (MH 4.3 `log`): installed
+    /// on the scheduler before any kernel instance is made.
+    pub output: Option<Arc<dyn moruna_kernel::OutputSink>>,
 }
 
 /// The cancel token a run is driven with, re-exported so a caller needs one import.

@@ -24,7 +24,8 @@ use moruna_runtime::job::{KernelDoc, KernelLoader, LoadedKernel};
 use moruna_runtime::{JobSpec, RunSpec, Runtime, SinkSpec, SourceSpec};
 use serde_json::{Value, json};
 use support::{
-    Doubler, FailOnce, Scratch, Sleeper, one_run_at_a_time, read_back_rows, write_parquet,
+    Doubler, FailOnce, Printer, SEEDED_SECRET, Scratch, Sleeper, one_run_at_a_time, read_back_rows,
+    write_parquet,
 };
 
 const RUN_ID: &str = "00112233445566778899aabbccddeeff";
@@ -38,6 +39,8 @@ impl KernelLoader for TestKernels {
             Some("double") => Arc::new(Doubler::new()),
             Some("sleep") => Arc::new(Sleeper::new(700)),
             Some("fail") => Arc::new(FailOnce::new(1)),
+            Some("print") => Arc::new(Printer::new(0, 0)),
+            Some("flood") => Arc::new(Printer::new(4_000, 200)),
             other => {
                 return Err(moruna_kernel::MorunaError::Plan(format!(
                     "kernels[{index}]: no test kernel `{other:?}`"
@@ -409,8 +412,15 @@ fn ho_t8_checkpoint_then_cancel() {
         .iter()
         .position(|k| *k == "cancel_acknowledged")
         .expect("the cancel was acknowledged");
-    assert_eq!(kinds.last(), Some(&"cancel_ended"), "{kinds:?}");
-    assert_eq!(events.last().unwrap()["disposition"], "cancelled");
+    // The store's last reach follows the lifecycle: the output drains after its tasks ended.
+    assert_eq!(kinds.last(), Some(&"logs"), "{kinds:?}");
+    let lifecycle: Vec<&Value> = events.iter().filter(|e| e["kind"] != "logs").collect();
+    assert_eq!(
+        lifecycle.last().unwrap()["kind"],
+        "cancel_ended",
+        "{kinds:?}"
+    );
+    assert_eq!(lifecycle.last().unwrap()["disposition"], "cancelled");
     for task in ["source", "kernel-1", "sink"] {
         let end = ended(&events, task);
         assert!(
@@ -695,6 +705,7 @@ fn ho_t13_report_file_placement() {
             cancel: CancelToken::new(),
             heartbeat: HEARTBEAT,
             packages: moruna_runtime::packaged::PackageHost::default(),
+            capture_process: false,
         },
     );
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
@@ -754,7 +765,7 @@ fn first(events: &[Value], task: &str, kind: &str) -> Option<usize> {
         .position(|e| e["task"] == task && e["kind"] == kind)
 }
 
-/// What every conversation's events are: version 1, the document's attempt, one producer, `seq`
+/// What every conversation's events are: version 2, the document's attempt, one producer, `seq`
 /// from 1 with no gap, time that never runs backwards, and between `hello` and `report`.
 fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     let events = events_of(messages);
@@ -766,7 +777,7 @@ fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     assert_eq!(start.len(), 32);
     let mut last_t = 0;
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e["v"], 1, "{e}");
+        assert_eq!(e["v"], 2, "{e}");
         assert_eq!(e["attempt"], attempt, "{e}");
         assert_eq!(e["start"], start.as_str(), "{e}");
         assert_eq!(e["seq"], i as u64 + 1, "{e}");
@@ -1017,4 +1028,222 @@ fn ho_t20_fused_kernels_are_one_group() {
     let group = ended(&events, "rename");
     assert_eq!(group["outcome"], "succeeded");
     assert_eq!(group["counters"]["rows_out"], rows);
+}
+
+/// The store's last reach: the last `logs` event, by task (`null` for the engine).
+fn last_reach(events: &[Value]) -> Vec<Value> {
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "logs")
+        .expect("the store's reach was told");
+    last["producers"].as_array().expect("producers").clone()
+}
+
+fn reach_of<'a>(reach: &'a [Value], task: &str) -> &'a Value {
+    reach
+        .iter()
+        .find(|r| r["task"] == task)
+        .unwrap_or_else(|| panic!("no reach for {task}: {reach:?}"))
+}
+
+/// Every record a producer of the attempt wrote, in order.
+fn stored(logs: &Path, events: &[Value], producer: &str) -> Vec<Value> {
+    let start = events[0]["start"].as_str().expect("a producer id");
+    let attempt = events[0]["attempt"].as_u64().expect("an attempt") as u32;
+    moruna_runtime::host::logs::read_producer(
+        &moruna_runtime::host::logs::attempt_dir(logs, attempt, start).join(producer),
+    )
+    .expect("the store reads back")
+}
+
+/// HO-T21 a task's output (MH 4.3 `log`, `logs`): what a kernel prints is kept in the output
+/// store under its task, each line whole, a traceback as one record, a character never split
+/// and a logging record with its level; the socket carries only the store's reach, whose last
+/// word counts every record, drained; nothing the kernel printed (a row's value, a secret) is on
+/// the socket.
+#[test]
+fn ho_t21_a_tasks_output_is_kept_in_the_store_and_only_counted_on_the_socket() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t21");
+    let mut doc = document(scratch.path(), 4_000, 2, Some("print"));
+    doc["report"]["tasks"] = json!({
+        "source": {"id": "read"},
+        "kernels": [{"id": "shout"}],
+        "sink": {"id": "write"},
+    });
+    let logs = scratch.path().join("logs").join("<run_id>");
+    doc["report"]["logs"] = json!(logs.to_string_lossy());
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::COMPLETED);
+    let events = well_formed(&messages, 1);
+    for (_, message) in &messages {
+        let text = message.to_string();
+        for forbidden in [
+            SEEDED_SECRET,
+            "row-value:",
+            "a warning from the kernel",
+            "bad row",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} is on the socket: {text}"
+            );
+        }
+    }
+    let reach = last_reach(&events);
+    assert!(reach.iter().all(|r| r["drained"] == true), "{reach:?}");
+    let shout = reach_of(&reach, "shout");
+    let logs = scratch.path().join("logs").join(RUN_ID);
+    let records = stored(&logs, &events, "shout");
+    assert_eq!(shout["records"], records.len() as u64);
+    assert_eq!(shout["dropped"], 0);
+    assert_eq!(
+        shout["bytes"],
+        records
+            .iter()
+            .map(|r| r["bytes"].as_u64().unwrap())
+            .sum::<u64>()
+    );
+    assert_eq!(reach_of(&reach, "read")["records"], 0);
+    assert_eq!(reach_of(&reach, "write")["records"], 0);
+    let morsels = records
+        .iter()
+        .filter(|r| r["text"].as_str().unwrap().starts_with("row-value:"))
+        .count();
+    assert!(morsels >= 1);
+    for r in &records {
+        assert_eq!(r["task"], "shout");
+        assert_eq!(r["attempt"], 1);
+    }
+    let of = |stream: &str, text: &str| {
+        records
+            .iter()
+            .filter(|r| r["stream"] == stream && r["text"].as_str().unwrap().contains(text))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(of("stdout", "na\u{ef}ve \u{20ac}").len(), morsels);
+    assert!(
+        of("stdout", "na\u{ef}ve")
+            .iter()
+            .all(|r| r["text"] == "na\u{ef}ve \u{20ac}")
+    );
+    let secret = of("stderr", SEEDED_SECRET);
+    assert_eq!(secret.len(), morsels);
+    assert!(
+        secret.iter().all(|r| r["level"].is_null()),
+        "stderr says no level"
+    );
+    let tracebacks = of("stderr", "Traceback");
+    assert_eq!(tracebacks.len(), morsels);
+    assert_eq!(
+        tracebacks[0]["text"],
+        "Traceback (most recent call last):\n  File \"kernel.py\", line 7, in apply\nValueError: bad row"
+    );
+    let warnings = of("structured", "a warning from the kernel");
+    assert_eq!(warnings.len(), morsels);
+    assert_eq!(warnings[0]["level"], "warning");
+}
+
+/// HO-T22 a failing kernel's words (MH 4.3): the socket says the task failed in the engine's own
+/// sentence; the failure's whole text is the task's output, an error record in the store.
+#[test]
+fn ho_t22_a_kernels_failure_is_its_output() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t22");
+    let mut doc = document(scratch.path(), 4_000, 2, Some("fail"));
+    let logs = scratch.path().join("logs");
+    doc["report"]["logs"] = json!(logs.to_string_lossy());
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::KERNEL_ERROR);
+    let events = well_formed(&messages, 1);
+    let records = stored(&logs, &events, "kernel-1");
+    let errors: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["stream"] == "structured" && r["level"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{records:?}");
+    // The kernel's own words, which the socket's sentence never quotes.
+    assert!(
+        errors[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("the test asked this apply to fail")
+    );
+    // The report and the exit carry the failure's words as they always have, for the host to
+    // scrub; no event does.
+    for event in &events {
+        assert!(
+            !event
+                .to_string()
+                .contains("the test asked this apply to fail")
+        );
+    }
+    assert_eq!(reach_of(&last_reach(&events), "kernel-1")["records"], 1);
+}
+
+/// HO-T23 a flood and a cancel (MH 4.3): a kernel printing megabytes a morsel is held to its
+/// rate, its drops counted and marked in the store, the reach told while it floods; the peer's
+/// cancel is acknowledged and the run ends cancelled as promptly as without the flood.
+#[test]
+fn ho_t23_a_flood_does_not_hold_back_the_lifecycle_or_a_cancel() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t23");
+    let socket = socket_path(scratch.path());
+    let mut doc = document(scratch.path(), 64_000, 32, Some("flood"));
+    doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
+    let logs = scratch.path().join("logs");
+    doc["report"]["logs"] = json!(logs.to_string_lossy());
+    doc["budget"]["cpu"] = json!(1.0);
+    let path = write_doc(scratch.path(), &doc);
+    let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
+    let runner = std::thread::spawn(move || run_cli(&["run", &path.to_string_lossy()], &no_env));
+    let conn = listener.accept().expect("moruna connects");
+    let (reader, mut writer, _close) = conn.into_parts();
+    let mut reader = BufReader::new(reader);
+    let mut early = Vec::new();
+    // Until the store's reach is told twice while the kernel floods.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while early
+        .iter()
+        .filter(|m: &&Value| m["type"] == "event" && m["kind"] == "logs")
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the reach was not told while the run flooded"
+        );
+        early.push(read_one(&mut reader));
+    }
+    writer
+        .write_all(b"{\"type\":\"cancel\"}\n")
+        .expect("cancel");
+    let cancelled_at = Instant::now();
+    let rest = drain(&mut reader);
+    assert_eq!(runner.join().expect("the runner"), exit::CANCELLED);
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?}",
+        cancelled_at.elapsed()
+    );
+    let mut messages: Vec<(Instant, Value)> =
+        early.into_iter().map(|m| (cancelled_at, m)).collect();
+    messages.extend(rest);
+    let events = well_formed(&messages, 1);
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"cancel_acknowledged"), "{kinds:?}");
+    assert!(kinds.contains(&"cancel_ended"), "{kinds:?}");
+    let reach = last_reach(&events);
+    let kernel = reach_of(&reach, "kernel-1");
+    assert!(kernel["dropped"].as_u64().unwrap() > 0, "{kernel}");
+    assert_eq!(kernel["drained"], true);
+    let records = stored(&logs, &events, "kernel-1");
+    assert_eq!(kernel["records"], records.len() as u64);
+    assert!(
+        records.iter().any(|r| r["stream"] == "platform"
+            && r["text"].as_str().unwrap().contains("were dropped here")),
+        "the store says where output was dropped"
+    );
+    let _ = std::fs::remove_file(&socket);
 }

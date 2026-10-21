@@ -20,6 +20,7 @@ use moruna_placement::PlacementEngine;
 use moruna_trace::RunReport;
 
 use super::lifecycle::{Ending, EventOut, Lifecycle, task_refs};
+use super::logs::{Capture, FINISH_WAIT, Tell, attempt_dir};
 use super::protocol::{
     self, EVENTS_VERSION, Event, EventMsg, Heartbeat, Inbound, LimitsMsg, Outbound,
 };
@@ -45,6 +46,9 @@ pub struct HostOptions<'a> {
     pub heartbeat: Duration,
     /// What a `.pex` package's sandbox needs from the host (17 e.6).
     pub packages: crate::packaged::PackageHost,
+    /// Capture the process's own standard output and error into the run's output store while
+    /// the run lasts, as the engine's (MH 4.3 `log`): the process is the run's alone.
+    pub capture_process: bool,
 }
 
 /// How a job ended.
@@ -364,7 +368,7 @@ pub fn run_job(
             );
         }
     };
-    let events = Events::start(wire, job.report.attempt(), start);
+    let events = Events::start(wire, job.report.attempt(), start.clone());
     let built = match build(
         &job,
         loader,
@@ -394,11 +398,9 @@ pub fn run_job(
         }
     };
     // One task per stage: fused standard kernels are one group (MH 4.9).
-    let lifecycle = Lifecycle::new(
-        task_refs(&job, Some(&built.stage_kernels)),
-        wire.started(),
-        events.out(),
-    );
+    let refs = task_refs(&job, Some(&built.stage_kernels));
+    let tasks: Vec<String> = refs.iter().map(|r| r.id.clone()).collect();
+    let lifecycle = Lifecycle::new(refs, wire.started(), events.out());
     lifecycle.begin(job.resume.is_some());
     // The facade takes the run id from the manifest on a resume (12 f.7); the report file is
     // named for the same id.
@@ -409,6 +411,39 @@ pub fn run_job(
         None => built.run_id.unwrap_or(fallback_id),
     };
     let file = report_path(&job, &run_id.to_hex());
+
+    // What the tasks print goes to the output store, by stage; the peer hears its reach.
+    let capture = Capture::start(
+        attempt_dir(
+            &logs_path(&job, &run_id.to_hex()),
+            job.report.attempt(),
+            &start,
+        ),
+        job.report.attempt(),
+        start,
+        tasks,
+        wire.started(),
+        Tell {
+            event: events.out(),
+            note: {
+                let wire = wire.clone();
+                Box::new(move |note| wire.note(note))
+            },
+        },
+    );
+    #[cfg(unix)]
+    let process = match opts.capture_process {
+        false => None,
+        true => match super::logs::ProcessStreams::redirect(capture.sink()) {
+            Ok(streams) => Some(streams),
+            Err(error) => {
+                wire.note(format!(
+                    "the process's own output is not captured ({error}): it goes where it went"
+                ));
+                None
+            }
+        },
+    };
 
     let observer = RunObserver::new();
     let stop = Arc::new(AtomicBool::new(false));
@@ -443,6 +478,7 @@ pub fn run_job(
             observer: Some(observer),
             limits_subscribers: vec![limits_changed(wire.clone())],
             stage_hook: Some(lifecycle.hook()),
+            output: Some(capture.sink()),
             ..Components::default()
         },
     );
@@ -459,6 +495,18 @@ pub fn run_job(
         }
         Err(failure) => Ending::Failed(&failure.error),
     });
+    // Output that came after its task ended is still its task's: the last of it is written
+    // before the store's reach is told for the last time, and that before the report.
+    #[cfg(unix)]
+    if let Some(process) = process {
+        process.restore();
+    }
+    if !capture.finish(FINISH_WAIT) {
+        wire.note(format!(
+            "the run's output store did not finish within {FINISH_WAIT:?}: its last reach is not \
+             told and what was not written is not kept"
+        ));
+    }
     events.close();
     let (code, diagnostic, report) = match result {
         Ok(report) => (exit::COMPLETED, None, Some(report)),
@@ -659,6 +707,20 @@ fn limits_for(job: &JobSpec) -> Option<LimitsMsg> {
     })
     .ok()
     .map(|d| LimitsMsg::of(&d.limits))
+}
+
+/// Where a document's output store is (MH 4.3 `log`).
+pub fn logs_path(job: &JobSpec, run_id: &str) -> PathBuf {
+    match &job.report.logs {
+        Some(template) => PathBuf::from(template.replace("<run_id>", run_id)),
+        None => {
+            let name = format!("moruna-{run_id}.logs");
+            match job.staging.dir.as_deref() {
+                Some(dir) => Path::new(dir).join(name),
+                None => PathBuf::from(name),
+            }
+        }
+    }
 }
 
 /// Where a document's report file goes (MH 4.1).

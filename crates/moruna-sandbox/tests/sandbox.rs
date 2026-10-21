@@ -995,3 +995,98 @@ class fragile:
     assert!(e.contains("open") && e.contains("bad bytes"), "{e}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// What a test's run keeps of a child's output: each piece with its stage, and records with
+/// their level.
+#[derive(Default)]
+struct Kept {
+    got: std::sync::Mutex<Vec<(Option<u16>, String)>>,
+}
+
+impl moruna_kernel::OutputSink for Kept {
+    fn bytes(&self, stage: Option<u16>, stream: moruna_kernel::Stream, bytes: &[u8]) {
+        self.got.lock().unwrap().push((
+            stage,
+            format!("{stream:?}:{}", String::from_utf8_lossy(bytes)),
+        ));
+    }
+    fn record(&self, stage: Option<u16>, level: Option<moruna_kernel::Level>, text: &str) {
+        self.got
+            .lock()
+            .unwrap()
+            .push((stage, format!("{level:?}:{text}")));
+    }
+    fn hold(&self) -> Box<dyn Send> {
+        Box::new(())
+    }
+}
+
+/// SB-T23 a child's output (MH 4.3 `log`): what a `.pex` prints, at import and in its calls, on
+/// standard output with no newline and no flush, on standard error, and through `logging` with
+/// an exception, is the stage's whose worker started the child, as it is written, never on
+/// Moruna's own streams; a logging record keeps its level and its traceback whole.
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn sb_t23_a_childs_output_is_its_stages() {
+    let dir = scratch();
+    let k = kernel(
+        pex(
+            &dir,
+            "loud",
+            "import logging, sys\n\
+             print('imported')\n\
+             def loud(batch):\n\
+             \x20   print('partial', end='')\n\
+             \x20   print('on stderr', file=sys.stderr)\n\
+             \x20   try:\n\
+             \x20       raise ValueError('bad row')\n\
+             \x20   except ValueError:\n\
+             \x20       logging.getLogger('loud').exception('the call failed')\n\
+             \x20   return batch\n",
+            json!({}),
+            &[],
+        ),
+        2 * GIB,
+    );
+    let kept = Arc::new(Kept::default());
+    let sink: Arc<dyn moruna_kernel::OutputSink> = kept.clone();
+    let mut state = {
+        let _working = moruna_kernel::output::enter(&sink, 2);
+        k.init(&ctx()).unwrap()
+    };
+    {
+        let _working = moruna_kernel::output::enter(&sink, 2);
+        assert_eq!(call(&k, state.as_mut()).unwrap(), batch());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let joined = || {
+        kept.got
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect::<String>()
+    };
+    while !joined().contains("the call failed") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let got = kept.got.lock().unwrap().clone();
+    assert!(got.iter().all(|(stage, _)| *stage == Some(2)), "{got:?}");
+    let all = joined();
+    assert!(all.contains("Stdout:imported\n"), "{all}");
+    // Written through: the partial line arrives without its newline or a flush.
+    assert!(all.contains("Stdout:partial"), "{all}");
+    assert!(all.contains("Stderr:on stderr\n"), "{all}");
+    let record = got
+        .iter()
+        .find(|(_, t)| t.starts_with("Some(Error):"))
+        .expect("the logging record, at its level");
+    assert!(record.1.contains("the call failed"), "{record:?}");
+    assert!(
+        record.1.contains("Traceback (most recent call last):"),
+        "{record:?}"
+    );
+    assert!(record.1.contains("ValueError: bad row"), "{record:?}");
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}

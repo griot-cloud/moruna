@@ -831,3 +831,20 @@ fn an_import_other_than_read_asset_is_refused() {
             .contains("imports `env`")
     );
 }
+
+/// MH 4.3 `log`, audited for `.wasm`: a component has no stream to print to. WASI's standard
+/// output and error are imports, and every import but `read-asset` is refused, so a Wasm
+/// kernel's only output is its batches and its traps, which the lifecycle tells.
+#[test]
+fn a_wasm_kernel_has_no_output_stream() {
+    let engine = engine().unwrap();
+    for interface in ["wasi:cli/stdout@0.2.0", "wasi:cli/stderr@0.2.0"] {
+        let c = Component::new(
+            engine,
+            wat::parse_str(format!(r#"(component (import "{interface}" (instance)))"#)).unwrap(),
+        )
+        .unwrap();
+        let said = verify(&c, false, false).unwrap_err().to_string();
+        assert!(said.contains(&format!("imports `{interface}`")), "{said}");
+    }
+}

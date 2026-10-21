@@ -82,6 +82,7 @@ impl Rig {
             checkpoint: None,
             observer: None,
             stage_hook: None,
+            output: None,
         }
     }
 }
