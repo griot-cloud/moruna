@@ -2,6 +2,8 @@
 
 ## 0.5.6
 
+- **A task's output is captured where it leaves the task and kept in the run's output store.** stdout, stderr and logging records, attributed per task (`event` v2, kind `log`), bounded and counted; the socket carries only cumulative counts (`logs` events). `.pex`, in-process Python, Rust (`moruna_kernel::output`) and Wasm (WASI stdout/stderr refused) each captured on their own terms (PR 56).
+
 - **The engine reports each task's lifecycle to its host as it happens.** A new host-protocol message, `type: "event"` (v1; envelope `attempt`, `start`, `seq`, `t_us`), sent between `hello` and `report`, carries `attempt_started`, `task_registered` (task, element, stage, upstream, members), `task_waiting` (reason, blocking), `task_ready`, `task_started` and `task_phase` (calibrating, reading, applying, writing, draining, committing), `task_completed` (outcome, duration, counters, cause), `task_failed` (code, safe message, scope, retryable), `task_skipped`, `cancel_acknowledged` and `cancel_ended`. The facts come from a `StageHook` in the scheduler on the thread where each becomes true; a source completes only when drained; adjacent standard kernels fused into one stage are one task listing its `members`. The job document gains `report.tasks` (opaque task ids) and `report.attempt`, neither changing its digest. Later kinds (logs, progress, outputs) ride the same message (PR 54).
 
 ## 0.5.5
