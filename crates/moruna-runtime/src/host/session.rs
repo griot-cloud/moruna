@@ -365,8 +365,6 @@ pub fn run_job(
         }
     };
     let events = Events::start(wire, job.report.attempt(), start);
-    let lifecycle = Lifecycle::new(task_refs(&job), wire.started(), events.out());
-    lifecycle.begin(job.resume.is_some());
     let built = match build(
         &job,
         loader,
@@ -379,6 +377,9 @@ pub fn run_job(
     ) {
         Ok(built) => built,
         Err(error) => {
+            // Refused before a stage exists: the document's tasks as it names them, each skipped.
+            let lifecycle = Lifecycle::new(task_refs(&job, None), wire.started(), events.out());
+            lifecycle.begin(job.resume.is_some());
             lifecycle.end(Ending::Failed(&error));
             events.close();
             let file = report_path(&job, &fallback_id.to_hex());
@@ -392,6 +393,13 @@ pub fn run_job(
             );
         }
     };
+    // One task per stage: fused standard kernels are one group (MH 4.9).
+    let lifecycle = Lifecycle::new(
+        task_refs(&job, Some(&built.stage_kernels)),
+        wire.started(),
+        events.out(),
+    );
+    lifecycle.begin(job.resume.is_some());
     // The facade takes the run id from the manifest on a resume (12 f.7); the report file is
     // named for the same id.
     let run_id = match &built.spec.resume {

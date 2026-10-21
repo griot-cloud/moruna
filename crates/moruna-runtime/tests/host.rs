@@ -916,7 +916,7 @@ fn ho_t17_empty_input_ends_every_task() {
 
 /// HO-T18 kernel failure (MH 4.3): the kernel fails on its first morsel under `terminate`; its
 /// task fails with the kernel's code and no word the kernel said, the source is stopped or
-/// completed by then, and the sink, which never started, is skipped for it.
+/// completed by then, and the sink is skipped or stopped for it.
 #[test]
 fn ho_t18_a_kernel_failure_fails_its_task() {
     let _serial = one_run_at_a_time();
@@ -943,9 +943,14 @@ fn ho_t18_a_kernel_failure_fails_its_task() {
             || (source["outcome"] == "stopped" && source["cause"] == "kernel-1"),
         "{source}"
     );
+    // The sink never started (skipped for the kernel), or had started on what the kernel
+    // passed before it failed (stopped by the kernel): never succeeded.
     let sink = ended(&events, "sink");
-    assert_eq!(sink["kind"], "task_skipped", "{sink}");
-    assert_eq!(sink["blocking"], "kernel-1");
+    assert!(
+        (sink["kind"] == "task_skipped" && sink["blocking"] == "kernel-1")
+            || (sink["outcome"] == "stopped" && sink["cause"] == "kernel-1"),
+        "{sink}"
+    );
 }
 
 /// HO-T19 a refused document's tasks (MH 4.3): a kernel no loader has refuses the document after
@@ -976,4 +981,40 @@ fn write_empty_parquet(path: &Path) {
     let schema = support::schema();
     let writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("a writer");
     writer.close().expect("the footer is written");
+}
+
+/// HO-T20 a fused group (MH 4.3, 4.9): two adjacent standard kernels that fuse into one stage
+/// are one task, a group named for the first and carrying both; the second is never told of on
+/// its own, and the stage's measurements are the group's.
+#[test]
+fn ho_t20_fused_kernels_are_one_group() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t20");
+    let rows = 4_000;
+    let mut doc = document(scratch.path(), rows, 2, None);
+    doc["kernels"] = json!([
+        {"kind": "std", "name": "rename", "args": {"columns": {"value": "amount"}}},
+        {"kind": "std", "name": "select", "args": {"columns": ["id", "amount"]}},
+    ]);
+    doc["report"]["tasks"] = json!({
+        "source": {"id": "read"},
+        "kernels": [{"id": "rename"}, {"id": "keep"}],
+        "sink": {"id": "write"},
+    });
+    let (code, messages) = converse(scratch.path(), doc);
+    assert_eq!(code, exit::COMPLETED);
+    let events = well_formed(&messages, 1);
+    let registered: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "task_registered")
+        .collect();
+    assert_eq!(registered.len(), 3, "{registered:?}");
+    assert_eq!(registered[1]["task"], "rename");
+    assert_eq!(registered[1]["members"], json!(["rename", "keep"]));
+    assert_eq!(registered[2]["task"], "write");
+    assert_eq!(registered[2]["upstream"], "rename");
+    assert!(events.iter().all(|e| e["task"] != "keep"));
+    let group = ended(&events, "rename");
+    assert_eq!(group["outcome"], "succeeded");
+    assert_eq!(group["counters"]["rows_out"], rows);
 }

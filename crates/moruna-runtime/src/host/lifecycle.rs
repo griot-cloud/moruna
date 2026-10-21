@@ -66,22 +66,52 @@ pub struct Lifecycle {
 }
 
 /// The tasks of `job`, source first: `report.tasks` when the document names them, otherwise
-/// `source`, `kernel-1` .. `kernel-n` and `sink`.
-pub fn task_refs(job: &JobSpec) -> Vec<TaskRefDoc> {
+/// `source`, `kernel-1` .. `kernel-n` and `sink`. With `stages` (the document's kernels each
+/// stage carries, once the document is built), a stage that carries several kernels is one task,
+/// a group: the first one's id, and as its members the tasks each carried (a kernel's own members,
+/// or its id).
+pub fn task_refs(job: &JobSpec, stages: Option<&[Vec<usize>]>) -> Vec<TaskRefDoc> {
     let one = |id: String| TaskRefDoc {
         id,
         members: Vec::new(),
     };
-    match &job.report.tasks {
-        Some(tasks) => std::iter::once(tasks.source.clone())
-            .chain(tasks.kernels.iter().cloned())
-            .chain(std::iter::once(tasks.sink.clone()))
+    let (source, kernels, sink) = match &job.report.tasks {
+        Some(tasks) => (
+            tasks.source.clone(),
+            tasks.kernels.clone(),
+            tasks.sink.clone(),
+        ),
+        None => (
+            one("source".into()),
+            (1..=job.kernels.len())
+                .map(|k| one(format!("kernel-{k}")))
+                .collect(),
+            one("sink".into()),
+        ),
+    };
+    let staged: Vec<TaskRefDoc> = match stages {
+        None => kernels,
+        Some(stages) => stages
+            .iter()
+            .map(|carried| match carried.as_slice() {
+                [only] => kernels[*only].clone(),
+                many => TaskRefDoc {
+                    id: kernels[many[0]].id.clone(),
+                    members: many
+                        .iter()
+                        .flat_map(|k| match kernels[*k].members.as_slice() {
+                            [] => vec![kernels[*k].id.clone()],
+                            members => members.to_vec(),
+                        })
+                        .collect(),
+                },
+            })
             .collect(),
-        None => std::iter::once(one("source".into()))
-            .chain((1..=job.kernels.len()).map(|k| one(format!("kernel-{k}"))))
-            .chain(std::iter::once(one("sink".into())))
-            .collect(),
-    }
+    };
+    std::iter::once(source)
+        .chain(staged)
+        .chain(std::iter::once(sink))
+        .collect()
 }
 
 impl Lifecycle {
