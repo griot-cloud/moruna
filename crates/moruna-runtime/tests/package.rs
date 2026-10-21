@@ -186,6 +186,7 @@ fn run_document(job: &JobSpec, host: PackageHost) -> moruna_runtime::RunReport {
             env: &no_env,
             notes: Vec::new(),
             packages: host,
+            host_ports: None,
         },
     )
     .expect("the document builds");
@@ -378,6 +379,7 @@ fn pk_t17_package_entry_args_and_assets() {
                 env: &no_env,
                 notes: Vec::new(),
                 packages: PackageHost::default(),
+                host_ports: None,
             },
         )
         .map(|_| ())

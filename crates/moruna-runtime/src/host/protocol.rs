@@ -1,12 +1,17 @@
 //! The host protocol's messages (MH 4.3): newline-delimited JSON, one object per line,
-//! `type` first. Moruna sends `hello`, `heartbeat`, `limits_changed`, `event`, `report` and
-//! `exit`; it reads `spec`, `cancel` and `checkpoint`, and nothing else. No message a peer can
-//! send enlarges a run.
+//! `type` first. Moruna sends `hello`, `heartbeat`, `limits_changed`, `event`, `port_call`,
+//! `port_cancel`, `report` and `exit`; it reads `spec`, `cancel`, `checkpoint` and `port_reply`,
+//! and nothing else. No message a peer can send enlarges a run.
 //!
 //! An `event` is one fact of the run's execution, versioned on its own (`v`, [`EVENTS_VERSION`])
-//! and named by its `kind`: version 1 has the task lifecycle. A later version adds kinds (a
-//! task's output, its progress) to the same message; a peer refuses a version it does not read
-//! rather than guess at it.
+//! and named by its `kind`: version 1 had the task lifecycle; version 2 adds a running task's
+//! wait on a port (`task_waiting` with `reason: port_call` and the `port`). A later version adds
+//! kinds (a task's output, its progress) to the same message; a peer refuses a version it does
+//! not read rather than guess at it.
+//!
+//! The port messages (MH 4.10) are versioned on their own too (`v`, [`PORTS_VERSION`]): a stage's
+//! call to a host port is a `port_call`, answered by the peer's `port_reply` for the same `call`;
+//! a call Moruna stops waiting for is a `port_cancel`. The bytes travel as standard base64.
 
 use moruna_kernel::Limits;
 use serde::{Deserialize, Serialize};
@@ -77,7 +82,10 @@ impl Heartbeat {
 }
 
 /// The version of the `event` message this build writes (MH 4.3).
-pub const EVENTS_VERSION: u32 = 1;
+pub const EVENTS_VERSION: u32 = 2;
+
+/// The version of the port messages this build writes and reads (MH 4.10).
+pub const PORTS_VERSION: u32 = 1;
 
 /// One `event` (MH 4.3): who produced it and when, then the fact.
 ///
@@ -103,8 +111,9 @@ pub struct EventMsg {
     pub body: Event,
 }
 
-/// The facts of version 1: the task lifecycle (MH 4.3). A task is one element of the chain,
-/// named by the id the document's `report.tasks` gives it.
+/// The facts of version 2: the task lifecycle and a running task's waits on its ports (MH 4.3,
+/// MH 4.10). A task is one element of the chain, named by the id the document's `report.tasks`
+/// gives it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -126,7 +135,8 @@ pub enum Event {
         /// The host's tasks it carries as one group (`report.tasks`); empty for one task.
         members: Vec<String>,
     },
-    /// It cannot start yet, and why.
+    /// It cannot start yet, and why; or, running, it waits on a port's answer (`port_call`), until
+    /// a `task_phase` says what it does again.
     TaskWaiting {
         /// The task.
         task: String,
@@ -134,6 +144,8 @@ pub enum Event {
         reason: WaitReason,
         /// The tasks it waits on.
         blocking: Vec<String>,
+        /// The port it waits on, for `port_call`; `null` otherwise.
+        port: Option<String>,
     },
     /// Its input is there; it starts when a worker or a drive takes it.
     TaskReady {
@@ -223,6 +235,8 @@ pub enum WaitReason {
     EnginePreparing,
     /// No input has reached it yet.
     AwaitingInput,
+    /// It called a port and waits for the answer (MH 4.10).
+    PortCall,
 }
 
 /// What a running task is doing.
@@ -385,6 +399,30 @@ pub enum Outbound {
     },
     /// One fact of the run's execution (MH 4.3), between `hello` and `report`.
     Event(EventMsg),
+    /// A stage calls a host port (MH 4.10); the peer answers with `port_reply`.
+    PortCall {
+        /// [`PORTS_VERSION`].
+        v: u32,
+        /// The call's id, unique in this process.
+        call: u64,
+        /// The kernel stage that calls, 1..=n.
+        stage: u16,
+        /// The host's name for the port, as the stage's entry gives it (`{"host": "<name>"}`).
+        port: String,
+        /// How long the stage waits for the answer, in milliseconds.
+        deadline_ms: u64,
+        /// The request, standard base64.
+        request: String,
+    },
+    /// Moruna stopped waiting for a call (MH 4.10); a `port_reply` that still comes is ignored.
+    PortCancel {
+        /// [`PORTS_VERSION`].
+        v: u32,
+        /// The call.
+        call: u64,
+        /// `deadline` or `cancelled`.
+        reason: String,
+    },
     /// The full run report, before `exit`, whenever the run produced one.
     Report {
         /// `RunReport` as JSON (04 d.1).
@@ -422,6 +460,19 @@ pub enum Inbound {
     Cancel,
     /// Write the manifest now.
     Checkpoint,
+    /// The answer to a `port_call` (MH 4.10): exactly one of `ok` and `error`.
+    PortReply {
+        /// [`PORTS_VERSION`].
+        v: u32,
+        /// The call it answers.
+        call: u64,
+        /// The answer, standard base64.
+        #[serde(default)]
+        ok: Option<String>,
+        /// The port's refusal, handed to the stage.
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 impl Inbound {
@@ -436,6 +487,9 @@ impl Inbound {
 pub const MAX_SPEC_LINE: usize = 16 << 20;
 /// The longest line read once the run is going: a `cancel` or a `checkpoint` is a few bytes.
 pub const MAX_CONTROL_LINE: usize = 64 << 10;
+/// The longest line read from a peer that serves host ports: a `port_reply` carrying the largest
+/// answer a call may have, in base64 (MH 4.10).
+pub const MAX_PORT_LINE: usize = moruna_kernel::ports::PORT_BYTES_MAX / 3 * 4 + (64 << 10);
 
 /// Read one line of at most `max` bytes. `Ok(None)` at the end of the stream; a longer line is
 /// an error, so a peer cannot make the process hold an unbounded buffer.
@@ -563,7 +617,7 @@ mod tests {
                 phase: Phase::Reading,
             }),
             format!(
-                "{{\"type\":\"event\",\"v\":1,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                "{{\"type\":\"event\",\"v\":2,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
                  \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
                 "0f".repeat(16)
             )
@@ -584,6 +638,19 @@ mod tests {
             "{failed}"
         );
         assert!(event(Event::CancelAcknowledged).ends_with("\"kind\":\"cancel_acknowledged\"}\n"));
+        let waiting = event(Event::TaskWaiting {
+            task: "triage".into(),
+            reason: WaitReason::PortCall,
+            blocking: Vec::new(),
+            port: Some("model".into()),
+        });
+        assert!(
+            waiting.ends_with(
+                "\"kind\":\"task_waiting\",\"task\":\"triage\",\"reason\":\"port_call\",\
+                 \"blocking\":[],\"port\":\"model\"}\n"
+            ),
+            "{waiting}"
+        );
         let done = event(Event::TaskCompleted {
             task: "t1".into(),
             outcome: TaskOutcome::Succeeded,
@@ -601,9 +668,9 @@ mod tests {
         );
     }
 
-    /// The three inbound messages and nothing else; an unknown type is refused.
+    /// The four inbound messages and nothing else; an unknown type is refused.
     #[test]
-    fn inbound_is_three_messages() {
+    fn inbound_is_four_messages() {
         assert_eq!(
             Inbound::parse("{\"type\":\"cancel\"}\n"),
             Ok(Inbound::Cancel)
@@ -626,6 +693,45 @@ mod tests {
         );
         assert!(Inbound::parse("{\"type\":\"spec\",\"spec\":{},\"budget\":1}").is_err());
         assert!(Inbound::parse("not json").is_err());
+        assert_eq!(
+            Inbound::parse("{\"type\":\"port_reply\",\"v\":1,\"call\":7,\"ok\":\"aGk=\"}"),
+            Ok(Inbound::PortReply {
+                v: 1,
+                call: 7,
+                ok: Some("aGk=".into()),
+                error: None
+            })
+        );
+        assert!(
+            Inbound::parse("{\"type\":\"port_reply\",\"v\":1,\"call\":7,\"budget\":1}").is_err()
+        );
+    }
+
+    /// MH 4.10, byte for byte: a `port_call` and a `port_cancel`.
+    #[test]
+    fn the_port_messages_are_byte_exact() {
+        let call = Outbound::PortCall {
+            v: PORTS_VERSION,
+            call: 3,
+            stage: 1,
+            port: "mcp".into(),
+            deadline_ms: 600_000,
+            request: "aGk=".into(),
+        };
+        assert_eq!(
+            call.line(),
+            "{\"type\":\"port_call\",\"v\":1,\"call\":3,\"stage\":1,\"port\":\"mcp\",\
+             \"deadline_ms\":600000,\"request\":\"aGk=\"}\n"
+        );
+        let cancel = Outbound::PortCancel {
+            v: PORTS_VERSION,
+            call: 3,
+            reason: "deadline".into(),
+        };
+        assert_eq!(
+            cancel.line(),
+            "{\"type\":\"port_cancel\",\"v\":1,\"call\":3,\"reason\":\"deadline\"}\n"
+        );
     }
 
     #[test]

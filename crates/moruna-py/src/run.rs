@@ -229,6 +229,7 @@ pub fn run(
                 env: &process_env,
                 notes,
                 packages,
+                host_ports: None,
             },
         ),
     )?;

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Moruna's runtime for a .wasm function package: wasmtime, no imports, the resource limiter and fuel (SDD 17)"
+description = "Moruna's runtime for a .wasm function package: wasmtime, the world's two imports, the resource limiter and fuel (SDD 17, MH 4.10)"
 
 [dependencies]
 moruna-kernel = { workspace = true }

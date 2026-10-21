@@ -371,26 +371,32 @@ pub(crate) fn enforce(state: &ControllerState, targets: &[u64]) -> Vec<u64> {
     // this terminates: at worst every stage reaches the floor, and a floor that still does not
     // fit is a budget the run cannot be sized for, which f.7 turns into a diagnostic rather
     // than into an unbounded loop here.
+    // MH 4.10: the stages waiting on a port are taken down last, only when every other stage is
+    // at the floor and the set still does not fit.
+    let waiting: Vec<bool> = (0..targets.len())
+        .map(|at| state.stages.get(at).is_some_and(|ctl| ctl.waiting))
+        .collect();
     for _ in 0..64 {
         if fits(state, &targets) {
             break;
         }
-        let Some(largest) = largest_index(&targets) else {
+        let floor = state.cfg.morsel_min;
+        let Some(largest) = largest_index(&targets, |at| !waiting[at], floor)
+            .or_else(|| largest_index(&targets, |at| waiting[at], floor))
+        else {
             break;
         };
-        let reduced = (targets[largest] / 2).max(state.cfg.morsel_min);
-        if reduced == targets[largest] {
-            break;
-        }
-        targets[largest] = reduced;
+        targets[largest] = (targets[largest] / 2).max(floor);
     }
     targets
 }
 
-fn largest_index(targets: &[u64]) -> Option<usize> {
+/// The largest target above `floor` among the stages `eligible` admits.
+fn largest_index(targets: &[u64], eligible: impl Fn(usize) -> bool, floor: u64) -> Option<usize> {
     targets
         .iter()
         .enumerate()
+        .filter(|(at, bytes)| eligible(*at) && **bytes > floor)
         .max_by_key(|(_, bytes)| **bytes)
         .map(|(at, _)| at)
 }
@@ -775,7 +781,18 @@ pub(crate) fn resize(state: &mut ControllerState, actions: &mut Actions) {
         actions.knobs.push(Knob::ReadAhead(state.read_ahead));
     }
 
-    let targets = enforce(state, &solution.targets);
+    // MH 4.10: a stage waiting on a port keeps its target through a resize; `enforce` takes it
+    // down only when nothing else is left to take.
+    let proposed: Vec<u64> = solution
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(at, target)| match state.stages.get(at) {
+            Some(ctl) if ctl.waiting => ctl.target,
+            _ => *target,
+        })
+        .collect();
+    let targets = enforce(state, &proposed);
     fit_scalars(state, &targets);
 
     for (at, target) in targets.iter().enumerate() {

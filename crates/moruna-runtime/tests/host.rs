@@ -754,7 +754,7 @@ fn first(events: &[Value], task: &str, kind: &str) -> Option<usize> {
         .position(|e| e["task"] == task && e["kind"] == kind)
 }
 
-/// What every conversation's events are: version 1, the document's attempt, one producer, `seq`
+/// What every conversation's events are: version 2, the document's attempt, one producer, `seq`
 /// from 1 with no gap, time that never runs backwards, and between `hello` and `report`.
 fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     let events = events_of(messages);
@@ -766,7 +766,7 @@ fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     assert_eq!(start.len(), 32);
     let mut last_t = 0;
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e["v"], 1, "{e}");
+        assert_eq!(e["v"], 2, "{e}");
         assert_eq!(e["attempt"], attempt, "{e}");
         assert_eq!(e["start"], start.as_str(), "{e}");
         assert_eq!(e["seq"], i as u64 + 1, "{e}");

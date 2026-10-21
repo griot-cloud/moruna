@@ -168,6 +168,14 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
     };
     // Nothing of this component is locked here, which is what preamble 4.2 requires.
     let path = shared.placement.checkpoint(&extras)?;
+    let hook = shared
+        .manifest_hook
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(&path)?;
+    }
     let took = started.elapsed().as_micros() as u64;
     shared.checkpoints.fetch_add(1, Ordering::SeqCst);
     shared.last_checkpoint_us.store(took, Ordering::SeqCst);

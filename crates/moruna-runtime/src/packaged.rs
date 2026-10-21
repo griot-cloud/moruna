@@ -89,6 +89,29 @@ impl Packaged {
         Ok(())
     }
 
+    /// The stage's ports (MH 4.10): a `.wasm`'s `call` reaches them; a `.pex` calls none, and a
+    /// document that lists ports for one is refused before this.
+    pub fn bind_ports(&self, ports: Arc<moruna_kernel::StagePorts>) {
+        match self {
+            Packaged::Wasm(k) => k.bind_ports(ports),
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(_) => {}
+        }
+    }
+
+    /// The run starts (MH 4.10): its cancel and its waits, for the stage's ports.
+    pub fn bind_run_ports(&self, run: &moruna_kernel::RunPorts) {
+        match self {
+            Packaged::Wasm(k) => {
+                if let Some(ports) = k.ports() {
+                    ports.bind_run(run.clone());
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Packaged::Pex(_) => {}
+        }
+    }
+
     /// Memory the stage holds outside this process (SB-I9): a `.pex`'s child.
     pub fn outside(&self) -> Option<Arc<dyn OutsideMemory>> {
         match self {

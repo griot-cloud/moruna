@@ -467,6 +467,35 @@ pub struct KernelDoc {
     /// kernel's requests past the ceiling; absent means on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_guard: Option<bool>,
+    /// For a `.wasm` package: the ports its `call` may name, and where each goes (MH 4.10).
+    /// A name not listed here is refused when the stage calls it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<std::collections::BTreeMap<String, PortDoc>>,
+}
+
+/// One port a stage may call (`kernels[i].ports.<name>`, MH 4.10): exactly one of `host` and
+/// `guest`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortDoc {
+    /// A port the host serves, by the name the host knows it by: the stage's calls go to the
+    /// host protocol's peer as `port_call` (MH 4.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// A port answered inside the machine, by the handler the program running the document
+    /// registered under this name ([`build::KernelLoader::guest_port`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<String>,
+    /// How long one call may wait for its answer; absent: half an hour
+    /// (`moruna_kernel::ports::PORT_DEADLINE_MS`), at most a day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+}
+
+/// Whether `name` may name a port (MH 4.10): 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and
+/// `:`, starting with a letter or a digit.
+pub fn is_port_name(name: &str) -> bool {
+    name.len() <= 64 && is_task_id(name)
 }
 
 impl KernelDoc {
@@ -494,6 +523,7 @@ impl KernelDoc {
             resume: None,
             state_bytes: None,
             memory_guard: None,
+            ports: None,
         }
     }
 
@@ -597,6 +627,11 @@ pub struct StagingDoc {
     /// Where staging segments and the manifest go; absent: discovered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// An object-store prefix every manifest is copied to as it is written, and read back from
+    /// by a resume on any machine (MH 4.7): `s3://`, `gs://`, `az://` or `file://`. Needs `dir`,
+    /// where the run works.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// `budget.disk` in bytes; absent: 20% of the free space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_bytes: Option<u64>,

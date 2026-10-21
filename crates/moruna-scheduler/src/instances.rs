@@ -252,20 +252,31 @@ pub(crate) fn checkpoint_states(shared: &Shared, stage_ix: usize) -> Result<Vec<
     // never returns costs a failed manifest write rather than a wedged checkpoint thread.
     let deadline = std::time::Instant::now() + ACQUIRE_TIMEOUT;
     for instance in 0..pool.max {
-        let mut taken = loop {
+        let taken = loop {
             let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
             let Some(slot) = slots.get_mut(instance) else {
-                break None;
+                break Taken::Nothing;
             };
             if slot.retired {
                 // Nothing to save: the slot is rebuilt by `init` on the next acquire (f.4).
-                break None;
+                break Taken::Nothing;
             }
             if !slot.in_use {
-                slot.in_use = true;
-                break slot.state.take();
+                break match slot.state.take() {
+                    Some(state) => {
+                        slot.in_use = true;
+                        Taken::Held(state)
+                    }
+                    None => Taken::Nothing,
+                };
             }
             drop(slots);
+            // MH 4.10: an instance waiting on a port may wait for minutes; its checkpoint is its
+            // state as that `apply` began, which a resume restores before applying the morsel
+            // again. Waiting it out would fail the manifest.
+            if let Some(bytes) = shared.stages[stage_ix].kernel.waiting_state(instance) {
+                break Taken::Waiting(bytes);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(MorunaError::Resume(format!(
                     "stage {} instance {instance} was busy for the whole checkpoint",
@@ -274,20 +285,21 @@ pub(crate) fn checkpoint_states(shared: &Shared, stage_ix: usize) -> Result<Vec<
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
-        let held = taken.is_some();
-        let result = match taken.as_mut() {
-            Some(state) => state.checkpoint(),
-            None => Ok(None),
+        let mut state = match taken {
+            Taken::Nothing => continue,
+            Taken::Waiting(bytes) => {
+                out.push((instance, bytes));
+                continue;
+            }
+            Taken::Held(state) => state,
         };
-        if held {
+        let result = state.checkpoint();
+        {
             let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slot) = slots.get_mut(instance) {
                 slot.in_use = false;
-                slot.state = taken;
+                slot.state = Some(state);
             }
-        }
-        if !held {
-            continue;
         }
         match result? {
             Some(bytes) => out.push((instance, bytes)),
@@ -300,4 +312,15 @@ pub(crate) fn checkpoint_states(shared: &Shared, stage_ix: usize) -> Result<Vec<
         }
     }
     Ok(out)
+}
+
+/// What the checkpoint found in one slot.
+enum Taken {
+    /// Nothing to save: no slot, a retired one, or one with no state.
+    Nothing,
+    /// The instance, acquired for the call.
+    Held(Box<dyn KernelState>),
+    /// The state of an instance waiting on a port, as its `apply` began (MH 4.10); its worker
+    /// still holds it.
+    Waiting(Vec<u8>),
 }

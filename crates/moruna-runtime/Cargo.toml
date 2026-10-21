@@ -15,6 +15,7 @@ moruna-discovery = { workspace = true }
 moruna-trace = { workspace = true }
 moruna-adapters = { workspace = true }
 moruna-reactor = { workspace = true }
+base64 = { workspace = true }
 moruna-sources = { workspace = true }
 moruna-sinks = { workspace = true }
 moruna-placement = { workspace = true }

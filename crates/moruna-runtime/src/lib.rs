@@ -32,6 +32,7 @@ pub mod cancel;
 pub mod check;
 pub mod checkpoint;
 pub mod config;
+pub mod durable;
 pub mod elastic;
 pub mod error;
 pub mod host;

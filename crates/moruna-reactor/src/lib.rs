@@ -22,6 +22,7 @@ mod copy;
 mod fdcache;
 mod file_blocking;
 mod file_uring;
+pub mod files;
 mod gds;
 mod object;
 mod paths;
@@ -53,6 +54,7 @@ use crate::runtime::{
 use crate::segments::{SegmentEntry, Segments};
 use crate::stats::Counters;
 
+pub use crate::files::ObjectFiles;
 pub use crate::stats::ReactorStats;
 
 /// How long `shutdown` waits for what is in flight before it resolves the rest `Cancelled`

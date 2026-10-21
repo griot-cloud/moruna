@@ -4398,6 +4398,7 @@ version = "0.5.5"
 dependencies = [
  "arrow",
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "datafusion",
  "getrandom 0.4.3",

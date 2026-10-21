@@ -112,8 +112,12 @@ pub struct SchedulerStats {
     pub per_stage: Vec<StageStats>,
     /// Workers allowed to take tasks.
     pub workers_active: u16,
-    /// Workers inside `apply`.
+    /// Workers inside `apply`, those waiting on a port included.
     pub workers_busy: u16,
+    /// Workers inside `apply` that wait on a port's answer (MH 4.10): busy, and using no CPU.
+    pub workers_waiting: u16,
+    /// The kernel stages with a call to a port waiting, ascending (MH 4.10).
+    pub stages_waiting: Vec<StageId>,
     /// Source reads in flight.
     pub reads_in_flight: u16,
     /// Sink writes in flight.

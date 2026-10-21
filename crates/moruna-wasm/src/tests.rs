@@ -831,3 +831,236 @@ fn an_import_other_than_read_asset_is_refused() {
             .contains("imports `env`")
     );
 }
+
+/// MH 4.10: the stub port the call tests answer with: it keeps each request's count and answers
+/// with the rest of the request, so the stage is an identity whose batches crossed the port.
+struct Stub {
+    counts: std::sync::Mutex<Vec<u64>>,
+    /// Waits this long before answering, unless the call is given up first.
+    delay: std::time::Duration,
+    /// Answers with this refusal instead.
+    refuse: Option<String>,
+}
+
+impl moruna_kernel::GuestPort for Stub {
+    fn call(&self, request: Vec<u8>, call: &moruna_kernel::GuestCall) -> moruna_kernel::Answer {
+        let count = u64::from_le_bytes(request[..8].try_into().unwrap());
+        self.counts.lock().unwrap().push(count);
+        let until = std::time::Instant::now() + self.delay;
+        while std::time::Instant::now() < until {
+            if call.cancel.is_cancelled() {
+                return moruna_kernel::Answer::Error("given up".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        match &self.refuse {
+            Some(said) => moruna_kernel::Answer::Error(said.clone()),
+            None => moruna_kernel::Answer::Ok(request[8..].to_vec()),
+        }
+    }
+}
+
+fn stub(delay_ms: u64, refuse: Option<&str>) -> Arc<Stub> {
+    Arc::new(Stub {
+        counts: std::sync::Mutex::new(Vec::new()),
+        delay: std::time::Duration::from_millis(delay_ms),
+        refuse: refuse.map(str::to_string),
+    })
+}
+
+/// A caller kernel at stage 1 whose entry lists `listed` as the guest port `stub`, bound to a run.
+fn caller(
+    port: &str,
+    stateful: bool,
+    listed: &str,
+    port_impl: Arc<Stub>,
+    deadline_ms: u64,
+) -> (
+    WasmKernel,
+    PathBuf,
+    Arc<moruna_kernel::StageWaits>,
+    moruna_kernel::CancelToken,
+) {
+    let dir = scratch();
+    let m = manifest("caller", stateful, true);
+    let bytes = caller_component(&m.to_json(), port, stateful);
+    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m), Inputs::default()).unwrap();
+    let mut routes = std::collections::BTreeMap::new();
+    routes.insert(
+        listed.to_string(),
+        moruna_kernel::Route {
+            place: "guest",
+            port: moruna_kernel::GuestRoute::new(port_impl),
+            deadline: std::time::Duration::from_millis(deadline_ms),
+        },
+    );
+    let ports = moruna_kernel::StagePorts::new(1, routes);
+    let waits = moruna_kernel::StageWaits::new(None);
+    let cancel = moruna_kernel::CancelToken::new();
+    ports.bind_run(moruna_kernel::RunPorts {
+        cancel: cancel.clone(),
+        waits: Arc::clone(&waits),
+    });
+    kernel.bind_ports(ports);
+    (kernel, dir, waits, cancel)
+}
+
+fn apply(kernel: &WasmKernel, state: &mut dyn KernelState) -> moruna_kernel::Result<RecordBatch> {
+    match kernel.apply(state, Payload::Table(batch(), moruna_kernel::Tier::Host))? {
+        Payload::Table(out, _) => Ok(out),
+        _ => panic!("a table"),
+    }
+}
+
+/// MH 4.10: a component calls a listed port, and the port's answer is its output.
+#[test]
+fn a_component_calls_a_listed_port() {
+    let port = stub(0, None);
+    let (kernel, dir, waits, _) = caller("stub", false, "stub", Arc::clone(&port), 10_000);
+    let mut state = state_of(&kernel);
+    assert_eq!(apply(&kernel, state.as_mut()).unwrap(), batch());
+    assert_eq!(apply(&kernel, state.as_mut()).unwrap(), batch());
+    assert_eq!(*port.counts.lock().unwrap(), vec![1, 2]);
+    assert!(waits.stages().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: the port's own refusal is the component's to answer; this one refuses the batch
+/// with it.
+#[test]
+fn a_ports_refusal_is_handed_to_the_component() {
+    let (kernel, dir, _, _) = caller("stub", false, "stub", stub(0, Some("no model")), 10_000);
+    let mut state = state_of(&kernel);
+    let said = apply(&kernel, state.as_mut()).unwrap_err().to_string();
+    assert!(said.contains("no model"), "{said}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: a name the stage's entry does not list is refused by name, and fails the stage.
+#[test]
+fn an_unlisted_port_is_refused_by_name() {
+    let port = stub(0, None);
+    let (kernel, dir, _, _) = caller("model", false, "stub", Arc::clone(&port), 10_000);
+    let mut state = state_of(&kernel);
+    let said = apply(&kernel, state.as_mut()).unwrap_err().to_string();
+    assert!(
+        said.contains("port `model` is not listed for this stage (it lists stub)"),
+        "{said}"
+    );
+    assert!(port.counts.lock().unwrap().is_empty(), "nothing was called");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: a call past its deadline fails the stage, naming the port and the deadline.
+#[test]
+fn a_call_past_its_deadline_fails_the_stage() {
+    let (kernel, dir, _, _) = caller("stub", false, "stub", stub(60_000, None), 100);
+    let mut state = state_of(&kernel);
+    let t = std::time::Instant::now();
+    let said = apply(&kernel, state.as_mut()).unwrap_err().to_string();
+    assert!(
+        said.contains("port `stub`: no answer within its deadline of 100 ms"),
+        "{said}"
+    );
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: the run's cancel ends a call that waits, and the stage ends cancelled.
+#[test]
+fn a_cancel_ends_a_waiting_call() {
+    let (kernel, dir, waits, cancel) = caller("stub", false, "stub", stub(600_000, None), 600_000);
+    let mut state = state_of(&kernel);
+    let t = std::thread::spawn(move || {
+        while waits.stages().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cancel.cancel();
+        std::time::Instant::now()
+    });
+    let error = apply(&kernel, state.as_mut()).unwrap_err();
+    let cancelled_at = t.join().unwrap();
+    assert!(matches!(error, MorunaError::Cancelled), "{error}");
+    assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: a component with no ports bound (a check, a load) is told so by name.
+#[test]
+fn a_call_outside_a_run_is_refused() {
+    let dir = scratch();
+    let m = manifest("caller", false, true);
+    let bytes = caller_component(&m.to_json(), "stub", false);
+    let kernel = WasmKernel::new(package_at(&dir, &bytes, &m), Inputs::default()).unwrap();
+    let mut state = state_of(&kernel);
+    let said = apply(&kernel, state.as_mut()).unwrap_err().to_string();
+    assert!(said.contains("outside a run"), "{said}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: while a stateful stage waits, its checkpoint is its state as the call's `process`
+/// began; once the call is answered there is none, and the instance's own checkpoint follows.
+#[test]
+fn a_waiting_stateful_stage_checkpoints_its_entry_state() {
+    let port = stub(300, None);
+    let (kernel, dir, waits, _) = caller("stub", true, "stub", Arc::clone(&port), 10_000);
+    let kernel = Arc::new(kernel);
+    let mut state = state_of(&kernel);
+    apply(&kernel, state.as_mut()).unwrap();
+    assert_eq!(kernel.waiting_state(0), None, "not waiting");
+    let seen = std::thread::spawn({
+        let kernel = Arc::clone(&kernel);
+        move || {
+            while waits.stages().is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            kernel.waiting_state(0)
+        }
+    });
+    apply(&kernel, state.as_mut()).unwrap();
+    let entry = seen.join().unwrap().expect("a state while waiting");
+    assert_eq!(u64::from_le_bytes(entry[..].try_into().unwrap()), 1);
+    assert_eq!(kernel.waiting_state(0), None);
+    let saved = state.checkpoint().unwrap().unwrap();
+    assert_eq!(u64::from_le_bytes(saved[..].try_into().unwrap()), 2);
+    // Restored from the entry state, the instance counts on from it.
+    let mut restored = kernel
+        .restore(
+            &InitCtx {
+                instance: 0,
+                device: None,
+                alloc: alloc(),
+            },
+            &entry,
+        )
+        .unwrap();
+    apply(&kernel, restored.as_mut()).unwrap();
+    assert_eq!(*port.counts.lock().unwrap(), vec![1, 2, 2]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// MH 4.10: `call` is the world's, with the world's type; `verify` admits it.
+#[test]
+fn the_call_import_is_admitted_with_its_type() {
+    let engine = engine().unwrap();
+    let m = manifest("caller", false, true);
+    let c = Component::new(engine, caller_component(&m.to_json(), "x", false)).unwrap();
+    verify(&c, false, false).unwrap();
+    let c = Component::new(
+        engine,
+        wat::parse_str(r#"(component (import "call" (func (param "port" string))))"#).unwrap(),
+    )
+    .unwrap();
+    let said = verify(&c, false, false).unwrap_err().to_string();
+    assert!(said.contains("`call` is imported as"), "{said}");
+    // The second import opens no stream: WASI's standard output and error stay refused.
+    for interface in ["wasi:cli/stdout@0.2.0", "wasi:cli/stderr@0.2.0"] {
+        let c = Component::new(
+            engine,
+            wat::parse_str(format!(r#"(component (import "{interface}" (instance)))"#)).unwrap(),
+        )
+        .unwrap();
+        let said = verify(&c, false, false).unwrap_err().to_string();
+        assert!(said.contains(&format!("imports `{interface}`")), "{said}");
+    }
+}

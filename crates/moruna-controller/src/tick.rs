@@ -105,6 +105,9 @@ pub(crate) fn tick(ctl: &Inner) {
         }
 
         state.source_exhausted = stats.source_exhausted;
+        for ctl_stage in state.stages.iter_mut() {
+            ctl_stage.waiting = stats.stages_waiting.contains(&ctl_stage.stage);
+        }
         for stage_stats in &stats.per_stage {
             if let Some(ctl_stage) = state.stage_mut(stage_stats.stage) {
                 ctl_stage.instances_live = stage_stats.instances_live;

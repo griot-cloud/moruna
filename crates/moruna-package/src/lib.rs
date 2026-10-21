@@ -42,6 +42,10 @@ world kernel {
   /// A file of the assets directory the host named, by its path relative to it; refused when
   /// there is none, or the path leaves it.
   import read-asset: func(name: string) -> result<list<u8>, string>;
+  /// A request to a port the stage's entry lists, by name, and the port's answer; an error is
+  /// the port's own refusal. A name the entry does not list, a missed deadline or the run's
+  /// cancel ends the stage instead.
+  import call: func(port: string, request: list<u8>) -> result<list<u8>, string>;
   /// The package's manifest, moruna.json, as text.
   export declare: func() -> string;
   /// One Arrow record batch as an IPC stream in, one out; an error refuses this batch, named.

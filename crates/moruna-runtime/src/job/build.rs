@@ -1,12 +1,14 @@
 //! From a document to a `RunSpec` (MH 4.1): the precedence rule, strict mode, the range checks
 //! and the component builders. The only place a `RunSpec` is built from a description.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use moruna_discovery::DiscoveryInput;
 use moruna_kernel::{
-    ErrorPolicy, Guarantee, HostProfile, Kernel, MorunaError, Result, RunId, SizerKind, Source,
+    ErrorPolicy, Guarantee, HostProfile, Kernel, MorunaError, Result, Route, RunId, SizerKind,
+    Source,
 };
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 use moruna_sinks::{
@@ -93,6 +95,14 @@ pub trait KernelLoader {
         Ok(())
     }
 
+    /// The handler of the guest port `name` (`{"guest": "<name>"}`, MH 4.10): what the program
+    /// embedding Moruna answers inside the machine. The default, and `moruna` itself, registers
+    /// none, so a document that names one is refused by name.
+    fn guest_port(&self, name: &str) -> Option<Arc<dyn moruna_kernel::GuestPort>> {
+        let _ = name;
+        None
+    }
+
     /// The source for `"kind": "iterator"`, which only a library caller can supply.
     fn iterator_source(&self) -> Result<SourceSpec> {
         Err(SpecError::new(
@@ -150,6 +160,9 @@ pub struct BuildOptions<'a> {
     pub notes: Vec<String>,
     /// What a `.pex` package's sandbox needs from the host (17 e.6).
     pub packages: crate::packaged::PackageHost,
+    /// The host protocol's ports, when a peer is there to serve them (MH 4.10); a document that
+    /// lists a host port is refused without one.
+    pub host_ports: Option<std::sync::Arc<crate::host::ports::HostPorts>>,
 }
 
 /// The process environment, for [`BuildOptions::env`].
@@ -288,7 +301,9 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     }
     let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
     let mut stage_kernels: Vec<Vec<usize>> = Vec::with_capacity(job.kernels.len());
+    let mut stage_routes: Vec<BTreeMap<String, Route>> = Vec::with_capacity(job.kernels.len());
     for (index, doc) in job.kernels.iter().enumerate() {
+        let routes = routes_of(index, doc, loader, opts.host_ports.as_ref())?;
         let stage = match doc.kind {
             KernelKindDoc::Rust => Stage::Loaded(compiled_of(index, doc, loader.compiled())?),
             KernelKindDoc::Std => {
@@ -307,6 +322,13 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
             KernelKindDoc::Package => {
                 let packaged = package_of(index, doc, &opts.packages)?;
                 notes.extend(packaged.notes());
+                if doc.ports.is_some() && packaged.kind() != "wasm" {
+                    return Err(SpecError::new(
+                        format!("kernels[{index}].ports"),
+                        "only a .wasm package calls ports, through its `call` import",
+                    )
+                    .into());
+                }
                 Stage::Packaged(packaged)
             }
         };
@@ -339,6 +361,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         }
         stages.push(stage);
         stage_kernels.push(vec![index]);
+        stage_routes.push(routes);
     }
     let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
     let mut packaged = Vec::new();
@@ -348,6 +371,13 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         match stage {
             Stage::Std(k) => kernels.push(Arc::new(*k) as Arc<dyn Kernel>),
             Stage::Packaged(p) => {
+                // MH 4.10: every package stage knows its ports, none listed or some, so a call
+                // to a name it does not list is refused by name.
+                let routes = std::mem::take(&mut stage_routes[at]);
+                p.bind_ports(moruna_kernel::StagePorts::new(
+                    (at + 1) as moruna_kernel::StageId,
+                    routes,
+                ));
                 kernels.push(p.kernel());
                 packaged.push(p);
             }
@@ -407,6 +437,37 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     // needs a staging directory to look in.
     let resume_arg = job.resume.as_deref().map(translate::resume_arg);
     let resume_auto = matches!(resume_arg, Some(translate::ResumeArg::Auto));
+    // MH 4.7: with `staging.url`, the run works in `staging.dir` and copies each manifest to the
+    // prefix; a resume by "auto" or by run id reads the copies into the directory first.
+    if let Some(url) = &job.staging.url {
+        let Some(dir) = &staging_dir else {
+            return Err(SpecError::new(
+                "staging.url",
+                "needs staging.dir: the run works in a directory and copies its manifests to the \
+                 prefix",
+            )
+            .into());
+        };
+        if !job.checkpoint.enabled {
+            return Err(SpecError::new(
+                "staging.url",
+                "copies manifests, and checkpoint.enabled is false: there are none",
+            )
+            .into());
+        }
+        if matches!(
+            resume_arg,
+            Some(translate::ResumeArg::Auto | translate::ResumeArg::RunId(_))
+        ) {
+            let files = moruna_reactor::ObjectFiles::new(object_store_of(&job.object_store))?;
+            std::fs::create_dir_all(dir).map_err(|e| MorunaError::Io {
+                op: "create_dir",
+                target: dir.display().to_string(),
+                msg: e.to_string(),
+            })?;
+            notes.extend(crate::durable::fetch(&files, url, dir)?);
+        }
+    }
     let resume = if resume_auto {
         if staging_dir.is_none() {
             return Err(MorunaError::Resume(
@@ -447,6 +508,7 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     spec.trace_path = trace_path;
     spec.staging_dir = staging_dir;
     spec.staging_limit = staging_limit;
+    spec.staging_url = job.staging.url.clone();
     spec.error_policy = match job.error_policy {
         ErrorPolicyDoc::Terminate => ErrorPolicy::Terminate,
         ErrorPolicyDoc::Skip => ErrorPolicy::Skip,
@@ -560,6 +622,104 @@ fn compiled_of(index: usize, doc: &KernelDoc, declared: &[CompiledKernel]) -> Re
         #[cfg(feature = "python")]
         python: None,
     })
+}
+
+/// `kernels[index].ports` (MH 4.10): each name valid, each going to exactly one place, each
+/// place there to go to; only a package lists any.
+fn routes_of(
+    index: usize,
+    doc: &KernelDoc,
+    loader: &dyn KernelLoader,
+    host: Option<&Arc<crate::host::ports::HostPorts>>,
+) -> Result<BTreeMap<String, Route>> {
+    let mut routes = BTreeMap::new();
+    let Some(ports) = &doc.ports else {
+        return Ok(routes);
+    };
+    let field = |name: &str| format!("kernels[{index}].ports.{name}");
+    if doc.kind != KernelKindDoc::Package {
+        return Err(SpecError::new(
+            format!("kernels[{index}].ports"),
+            "only a function package calls ports: a .wasm component, through its `call` import",
+        )
+        .into());
+    }
+    for (name, port) in ports {
+        if !super::is_port_name(name) {
+            return Err(SpecError::new(
+                format!("kernels[{index}].ports"),
+                format!(
+                    "{name:?} is not a port name: 1 to 64 of ASCII letters, digits, `_`, `-`, `.` \
+                     and `:`, starting with a letter or a digit"
+                ),
+            )
+            .into());
+        }
+        let deadline_ms = port
+            .deadline_ms
+            .unwrap_or(moruna_kernel::ports::PORT_DEADLINE_MS);
+        if deadline_ms == 0 || deadline_ms > moruna_kernel::ports::PORT_DEADLINE_MAX_MS {
+            return Err(SpecError::new(
+                format!("{}.deadline_ms", field(name)),
+                format!(
+                    "{deadline_ms} is outside 1 to {} ms",
+                    moruna_kernel::ports::PORT_DEADLINE_MAX_MS
+                ),
+            )
+            .into());
+        }
+        let deadline = std::time::Duration::from_millis(deadline_ms);
+        let route = match (&port.host, &port.guest) {
+            (Some(host_name), None) => {
+                if !super::is_port_name(host_name) {
+                    return Err(SpecError::new(
+                        format!("{}.host", field(name)),
+                        format!("{host_name:?} is not a port name"),
+                    )
+                    .into());
+                }
+                let Some(hub) = host else {
+                    return Err(SpecError::new(
+                        format!("{}.host", field(name)),
+                        "a host port needs a peer to serve it: report.socket under moruna run, or \
+                         moruna serve",
+                    )
+                    .into());
+                };
+                Route {
+                    place: "host",
+                    port: hub.port(host_name),
+                    deadline,
+                }
+            }
+            (None, Some(handler)) => {
+                let Some(answers) = loader.guest_port(handler) else {
+                    return Err(SpecError::new(
+                        format!("{}.guest", field(name)),
+                        format!(
+                            "no guest handler {handler:?} is registered by the program running \
+                             this document"
+                        ),
+                    )
+                    .into());
+                };
+                Route {
+                    place: "guest",
+                    port: moruna_kernel::GuestRoute::new(answers),
+                    deadline,
+                }
+            }
+            _ => {
+                return Err(SpecError::new(
+                    field(name),
+                    "a port goes to exactly one of `host` and `guest`",
+                )
+                .into());
+            }
+        };
+        routes.insert(name.clone(), route);
+    }
+    Ok(routes)
 }
 
 fn package_of(
