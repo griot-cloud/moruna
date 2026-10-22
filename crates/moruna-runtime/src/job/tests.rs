@@ -52,6 +52,7 @@ fn opts(strict: bool, env: &dyn Fn(&str) -> Option<String>) -> BuildOptions<'_> 
         env,
         notes: Vec::new(),
         packages: crate::packaged::PackageHost::default(),
+        host_ports: None,
     }
 }
 

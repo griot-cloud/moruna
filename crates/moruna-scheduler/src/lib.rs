@@ -79,6 +79,10 @@ pub enum RunOutcome {
     },
 }
 
+/// Called on the checkpoint thread with each manifest the placement engine has written, before
+/// the write counts as done (MH 4.7): a failure is a failed manifest write (f.12).
+pub type ManifestHook = Arc<dyn Fn(&std::path::Path) -> Result<()> + Send + Sync>;
+
 /// The workers, the drives, the stage table and the admission rule (a).
 pub struct Scheduler {
     shared: Arc<Shared>,
@@ -106,6 +110,21 @@ impl Scheduler {
     /// controller's `prepare`, so the baseline it samples includes every loaded model.
     pub fn init_instances(&self) -> Result<()> {
         instances::init_instances(&self.shared)
+    }
+
+    /// What every manifest is handed once it is on disk (MH 4.7).
+    pub fn set_manifest_hook(&self, hook: ManifestHook) {
+        *self
+            .shared
+            .manifest_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// The run's record of which stages wait on a port (MH 4.10): read into the counters the
+    /// controller classifies from, so a stage that waits is neither idle nor computing.
+    pub fn set_waits(&self, waits: Arc<moruna_kernel::StageWaits>) {
+        self.shared.set_waits(waits);
     }
 
     /// Resume, step one (f.13): refuses when `!checkpoint_enabled`, resumes the sink instead of

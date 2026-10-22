@@ -27,6 +27,7 @@ pub mod mrb1;
 pub mod output;
 pub mod payload;
 pub mod placement;
+pub mod ports;
 pub mod reactor;
 pub mod sink;
 pub mod source;
@@ -67,6 +68,10 @@ pub use payload::{DType, Payload, PayloadKind, PayloadSpec, SourceSchema, TierPr
 pub use placement::{
     CheckpointExtras, Locality, Placement, PlacementStats, QueueStats, ResumePoint, SourceCursor,
     TierBudgets,
+};
+pub use ports::{
+    Abandon, Answer, CallFailure, GuestCall, GuestPort, GuestRoute, Port, PortCall, Route,
+    RunPorts, StagePorts, StageWaits,
 };
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
 pub use sink::{ExcludedRows, Sink, SinkSummary, SinkWrite};

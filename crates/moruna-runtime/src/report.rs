@@ -45,6 +45,7 @@ pub(crate) fn bottleneck_name(b: Bottleneck) -> String {
         Bottleneck::CpuQuota => "CpuQuota",
         Bottleneck::Idle => "Idle",
         Bottleneck::StateGrowth => "StateGrowth",
+        Bottleneck::Waiting => "Waiting",
     }
     .to_string()
 }

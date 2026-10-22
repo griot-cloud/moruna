@@ -517,6 +517,9 @@ fn pk_t6_platform_compatibility() {
     assert_eq!(Format::Pex.as_str(), "pex");
     assert!(WIT.contains("export process: func(batch: list<u8>) -> result<list<u8>, string>;"));
     assert!(WIT.contains("import read-asset: func(name: string) -> result<list<u8>, string>;"));
+    assert!(WIT.contains(
+        "import call: func(port: string, request: list<u8>) -> result<list<u8>, string>;"
+    ));
 }
 
 #[test]

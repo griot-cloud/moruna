@@ -185,6 +185,9 @@ pub struct RunSpec {
     /// or overlay directory declared so (03 e.4). A `host_profile` that declares
     /// `durable_staging` otherwise is a `Config` error naming both.
     pub staging_durable: bool,
+    /// `staging.url` (MH 4.7): the object-store prefix every manifest is copied to before its
+    /// write counts as done, so a resume on any machine finds it.
+    pub staging_url: Option<String>,
     /// What happens after a kernel error.
     pub error_policy: ErrorPolicy,
     /// Deliver morsels to the sink in sequence order.
@@ -245,6 +248,7 @@ impl RunSpec {
             staging_dir: None,
             staging_limit: None,
             staging_durable: false,
+            staging_url: None,
             error_policy: ErrorPolicy::Terminate,
             ordered: false,
             sizer: SizerKind::Rule,

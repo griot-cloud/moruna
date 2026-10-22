@@ -254,3 +254,92 @@ pub fn asset_component(declared: &str, name: &str) -> Vec<u8> {
     );
     wat::parse_str(text).expect("the asset component")
 }
+
+/// A kernel that calls a port (MH 4.10). Each `process` counts its calls in the i64 at 64 (the
+/// state, when `stateful`), calls `port` with the count, eight bytes little-endian, followed by
+/// its input batch, and answers with what the port answered: the port's bytes as its output, the
+/// port's refusal as its own. A port that echoes all but the first eight bytes of its request
+/// makes the stage an identity whose every batch went through the port.
+pub fn caller_component(declared: &str, port: &str, stateful: bool) -> Vec<u8> {
+    let (state_funcs, state_lifts) = if stateful {
+        (
+            r#"
+    (func (export "open") (param $ptr i32) (param $len i32) (result i32)
+      (if (i32.eq (local.get $len) (i32.const 8))
+        (then (i64.store (i32.const 64) (i64.load (local.get $ptr))))
+        (else (i64.store (i32.const 64) (i64.const 0))))
+      (i32.store8 (i32.const 48) (i32.const 0))
+      (i32.const 48))
+    (func (export "close") (result i32)
+      (i32.store (i32.const 40) (i32.const 64))
+      (i32.store (i32.const 44) (i32.const 8))
+      (i32.const 40))"#,
+            r#"
+  (func (export "open") (param "state" (list u8)) (result (result (error string)))
+    (canon lift (core func $i "open") (memory $m "memory") (realloc (func $m "cabi_realloc"))))
+  (func (export "close") (result (list u8))
+    (canon lift (core func $i "close") (memory $m "memory") (realloc (func $m "cabi_realloc"))))"#,
+        )
+    } else {
+        ("", "")
+    };
+    let text = format!(
+        r#"(component
+  (import "call" (func $call (param "port" string) (param "request" (list u8))
+    (result (result (list u8) (error string)))))
+  (core module $mem
+    (memory (export "memory") 2)
+    (global $bump (mut i32) (i32.const 65536))
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ptr i32)
+      (local.set $ptr (i32.and (i32.add (global.get $bump) (i32.sub (local.get 2) (i32.const 1)))
+                               (i32.sub (i32.const 0) (local.get 2))))
+      (global.set $bump (i32.add (local.get $ptr) (local.get 3)))
+      (block $ok
+        (loop $grow
+          (br_if $ok (i32.le_u (global.get $bump) (i32.mul (memory.size) (i32.const 65536))))
+          (if (i32.eq (memory.grow (i32.const 1)) (i32.const -1)) (then (unreachable)))
+          (br $grow)))
+      (local.get $ptr)))
+  (core instance $m (instantiate $mem))
+  (core func $lowered (canon lower (func $call) (memory $m "memory") (realloc (func $m "cabi_realloc"))))
+  (core module $main
+    (import "env" "memory" (memory 1))
+    (import "env" "call" (func $call (param i32 i32 i32 i32 i32)))
+    (import "env" "realloc" (func $realloc (param i32 i32 i32 i32) (result i32)))
+    (data (i32.const 512) "{port}")
+    (data (i32.const 1024) "{manifest}")
+    (func (export "declare") (result i32)
+      (i32.store (i32.const 32) (i32.const 1024))
+      (i32.store (i32.const 36) (i32.const {len}))
+      (i32.const 32))
+    (func (export "process") (param $ptr i32) (param $len i32) (result i32)
+      (local $req i32)
+      (i64.store (i32.const 64) (i64.add (i64.load (i32.const 64)) (i64.const 1)))
+      (local.set $req (call $realloc (i32.const 0) (i32.const 0) (i32.const 8)
+                                     (i32.add (local.get $len) (i32.const 8))))
+      (i64.store (local.get $req) (i64.load (i32.const 64)))
+      (memory.copy (i32.add (local.get $req) (i32.const 8)) (local.get $ptr) (local.get $len))
+      (call $call (i32.const 512) (i32.const {port_len}) (local.get $req)
+                  (i32.add (local.get $len) (i32.const 8)) (i32.const 128))
+      (i32.store8 (i32.const 16) (i32.load8_u (i32.const 128)))
+      (i32.store (i32.const 20) (i32.load (i32.const 132)))
+      (i32.store (i32.const 24) (i32.load (i32.const 136)))
+      (i32.const 16)){state_funcs})
+  (core instance $i (instantiate $main
+    (with "env" (instance
+      (export "memory" (memory $m "memory"))
+      (export "call" (func $lowered))
+      (export "realloc" (func $m "cabi_realloc"))))))
+  (func (export "declare") (result string)
+    (canon lift (core func $i "declare") (memory $m "memory") (realloc (func $m "cabi_realloc"))))
+  (func (export "process") (param "batch" (list u8)) (result (result (list u8) (error string)))
+    (canon lift (core func $i "process") (memory $m "memory") (realloc (func $m "cabi_realloc")))){state_lifts}
+)"#,
+        port = data(port.as_bytes()),
+        port_len = port.len(),
+        manifest = data(declared.as_bytes()),
+        len = declared.len(),
+    );
+    wat::parse_str(text).expect("the caller component")
+}

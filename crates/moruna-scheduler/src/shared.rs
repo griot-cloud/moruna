@@ -315,6 +315,10 @@ pub(crate) struct Shared {
     pub(crate) stage_hook: RwLock<Option<StageHook>>,
     /// Where what the kernels print goes, attributed to their stage (MH 4.3 `log`).
     pub(crate) output: RwLock<Option<Arc<dyn moruna_kernel::OutputSink>>>,
+    /// Which stages wait on a port now (MH 4.10), set by the facade before the run starts.
+    pub(crate) waits: RwLock<Option<Arc<moruna_kernel::StageWaits>>>,
+    /// Called with each manifest once it is on disk (MH 4.7: the copy on an object store).
+    pub(crate) manifest_hook: RwLock<Option<crate::ManifestHook>>,
     /// Queue `k` has received a morsel; index 0..=n.
     fed: Vec<AtomicBool>,
     /// The source's reads pushed to Q0, and their rows and bytes.
@@ -530,6 +534,8 @@ impl Shared {
             record_hook: RwLock::new(None),
             stage_hook: RwLock::new(None),
             output: RwLock::new(None),
+            waits: RwLock::new(None),
+            manifest_hook: RwLock::new(None),
             fed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
             source_out: EndCounters::default(),
             sink_in: EndCounters::default(),
@@ -597,6 +603,23 @@ impl Shared {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub(crate) fn set_waits(&self, waits: Arc<moruna_kernel::StageWaits>) {
+        *self.waits.write().unwrap_or_else(|e| e.into_inner()) = Some(waits);
+    }
+
+    /// The stages waiting on a port now and the calls that wait (MH 4.10).
+    pub(crate) fn waiting(&self) -> (Vec<moruna_kernel::StageId>, u32) {
+        match self
+            .waits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(waits) => (waits.stages(), waits.calls()),
+            None => (Vec::new(), 0),
+        }
     }
 
     pub(crate) fn set_stage_hook(&self, hook: StageHook) {

@@ -1,7 +1,7 @@
 //! What the scheduler says about the chain's stages as each fact becomes true (MH 4.3 task
 //! events): the source's first read and its exhaustion, the first morsel each queue receives,
-//! each kernel stage's first task, each queue's close, and the sink's writing, commit and
-//! finish. The facade turns these into the host protocol's task lifecycle; nothing here knows a
+//! each kernel stage's first task, each queue's close, the sink's writing, commit and finish,
+//! and each kernel stage's waits on its ports (MH 4.10). The facade turns these into the host protocol's task lifecycle; nothing here knows a
 //! task id.
 //!
 //! Every event is told once, by the thread on which the fact became true, and none is told by
@@ -67,6 +67,18 @@ pub enum StageEvent {
     SinkFinished {
         /// What the sink wrote.
         counters: StageCounters,
+    },
+    /// Kernel stage `stage` called a port and waits for its answer (MH 4.10).
+    PortWaiting {
+        /// The kernel stage.
+        stage: StageId,
+        /// The name its entry lists the port under.
+        port: String,
+    },
+    /// Kernel stage `stage` has no call waiting any more: it is working again.
+    PortAnswered {
+        /// The kernel stage.
+        stage: StageId,
     },
 }
 

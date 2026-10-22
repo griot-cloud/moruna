@@ -180,6 +180,7 @@ fn child_run() {
                 env: &env,
                 notes: Vec::new(),
                 packages: moruna_runtime::packaged::PackageHost::default(),
+                host_ports: None,
             },
         ) {
             Err(e) => json!({"error": e.to_string()}),

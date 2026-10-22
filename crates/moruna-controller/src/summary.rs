@@ -21,6 +21,9 @@ pub enum Bottleneck {
     Idle,
     /// A kernel's state is growing with morsels seen.
     StateGrowth,
+    /// A stage waits on a port's answer, and the rest of the chain is not saturated (MH 4.10):
+    /// nothing a knob does makes the answer come sooner.
+    Waiting,
 }
 
 /// The controller's contribution to the run report (d.1, j).

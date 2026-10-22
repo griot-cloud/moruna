@@ -5,7 +5,9 @@
 //! against the `moruna:kernel` world with no imports at all (f.2, SB-I1), compiled or read from
 //! its `.cwasm` (f.3), and one instance per stage whose every memory growth passes the resource
 //! limiter, which is where Moruna refuses (SB-I2), and whose every call has fuel (SB-I3). Batches
-//! cross as Arrow IPC streams (16 e.5) and the output is landed into the arena once (05 f.3).
+//! cross as Arrow IPC streams (16 e.5) and the output is landed into the arena once (05 f.3). A
+//! component reaches outside its memory through two imports only: `read-asset` and the stage's
+//! ports through `call` (MH 4.10).
 
 #![deny(missing_docs)]
 // `cwasm.rs` deserialises a precompiled component, which wasmtime marks unsafe; nothing else is.
@@ -13,27 +15,30 @@
 // Every fallible call returns the contract's `MorunaError`, whose size is the contract's.
 #![allow(clippy::result_large_err)]
 
+mod calls;
 pub mod cwasm;
 mod ipc;
 pub(crate) mod limiter;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-use std::sync::{Arc, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use moruna_adapters::guard::MemoryGate;
 use moruna_adapters::{UNKNOWN_SEQ, UNKNOWN_STAGE};
 use moruna_kernel::declare::Declared;
 use moruna_kernel::{
     Allocator, Fingerprint, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind, KernelState,
-    MorunaError, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
-    set_kernel_alloc,
+    MorunaError, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, StagePorts,
+    TierPref, set_kernel_alloc,
 };
 use moruna_package::{Format, Inputs, Manifest, Package};
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, Func, Instance, Linker, Type};
 use wasmtime::{Config, Engine, OptLevel, Store, Trap};
 
+pub use calls::CALL;
 pub use cwasm::aot;
 use limiter::Limits;
 
@@ -53,8 +58,11 @@ pub const WASM32_MAX_BYTES: u64 = 1 << 32;
 /// The exports of the world (16 e.5).
 const EXPORTS: [&str; 5] = ["declare", "process", "open", "close", "configure"];
 
-/// The world's one import (16 e.5).
+/// The world's import of an asset (16 e.5).
 pub const READ_ASSET: &str = "read-asset";
+
+/// The world's imports: an asset, and a port (MH 4.10).
+const IMPORTS: [&str; 2] = [READ_ASSET, CALL];
 
 static ENGINE: OnceLock<std::result::Result<Engine, String>> = OnceLock::new();
 
@@ -145,41 +153,39 @@ fn expected(name: &str) -> &'static str {
         "open" => "(list<u8>) -> result<_, string>",
         "configure" => "(string) -> result<_, string>",
         "read-asset" => "(string) -> result<list<u8>, string>",
+        "call" => "(string, list<u8>) -> result<list<u8>, string>",
         _ => "() -> list<u8>",
     }
 }
 
-/// f.2: no import but `read-asset`; exactly `declare` and `process`, `open` and `close` when
+/// f.2: no import but `read-asset` and `call`; exactly `declare` and `process`, `open` and `close` when
 /// `stateful`, `configure` when built by `args`; each with the world's type (16 PK-I4).
 pub fn verify(component: &Component, stateful: bool, args: bool) -> Result<()> {
     let engine = engine()?;
     let ty = component.component_type();
     for (name, item) in ty.imports(engine) {
-        let ComponentItem::ComponentFunc(f) = item.ty else {
-            return Err(refused(
+        let refused_import = || {
+            refused(
                 "wasm",
                 format!(
                     "the component imports `{name}`; a moruna:kernel component imports \
-                     `{READ_ASSET}` and nothing else"
+                     `{READ_ASSET}` and `{CALL}` and nothing else"
                 ),
-            ));
+            )
         };
-        if name != READ_ASSET {
-            return Err(refused(
-                "wasm",
-                format!(
-                    "the component imports `{name}`; a moruna:kernel component imports \
-                     `{READ_ASSET}` and nothing else"
-                ),
-            ));
+        let ComponentItem::ComponentFunc(f) = item.ty else {
+            return Err(refused_import());
+        };
+        if !IMPORTS.contains(&name) {
+            return Err(refused_import());
         }
         let found = signature(&f);
-        if found != expected(READ_ASSET) {
+        if found != expected(name) {
             return Err(refused(
                 "wasm",
                 format!(
                     "`{name}` is imported as `{found}` and the world's is `{}`",
-                    expected(READ_ASSET)
+                    expected(name)
                 ),
             ));
         }
@@ -255,8 +261,8 @@ pub fn verify(component: &Component, stateful: bool, args: bool) -> Result<()> {
     }
 }
 
-/// A store for one instance of `component`, with the limiter installed and `read-asset` the
-/// only import defined.
+/// A store for one instance of `component`, with the limiter installed and the world's two
+/// imports defined: `read-asset` and `call`.
 fn instantiate(component: &Component, limits: Limits) -> Result<(Store<Limits>, Instance)> {
     let engine = engine()?;
     let mut store = Store::new(engine, limits);
@@ -274,6 +280,15 @@ fn instantiate(component: &Component, limits: Limits) -> Result<(Store<Limits>, 
             },
         )
         .map_err(|e| kernel_error(format!("wasm: defining `{READ_ASSET}`: {e}")))?;
+    linker
+        .root()
+        .func_wrap(
+            CALL,
+            |store: wasmtime::StoreContextMut<'_, Limits>, (port, request): (String, Vec<u8>)| {
+                calls::call(store, port, request)
+            },
+        )
+        .map_err(|e| kernel_error(format!("wasm: defining `{CALL}`: {e}")))?;
     let instance = linker
         .instantiate(&mut store, component)
         .map_err(|e| kernel_error(format!("wasm: instantiating the component: {e}")))?;
@@ -344,6 +359,10 @@ pub struct WasmKernel {
     notes: Vec<String>,
     gate: OnceLock<Arc<MemoryGate>>,
     inputs: Inputs,
+    /// The stage's ports (MH 4.10), bound by the build of a run.
+    ports: OnceLock<Arc<StagePorts>>,
+    /// The entry states of the instances waiting on a port now (MH 4.10).
+    waiting: Arc<Mutex<BTreeMap<usize, Vec<u8>>>>,
 }
 
 impl std::fmt::Debug for WasmKernel {
@@ -388,6 +407,8 @@ impl WasmKernel {
             notes,
             gate: OnceLock::new(),
             inputs,
+            ports: OnceLock::new(),
+            waiting: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -407,24 +428,51 @@ impl WasmKernel {
         let _ = self.gate.set(gate);
     }
 
-    fn limits(&self) -> Limits {
+    /// The stage's ports (MH 4.10): the names its entry lists, where each goes, and the stage
+    /// it calls from; a second binding is ignored. A kernel with none bound calls no port.
+    pub fn bind_ports(&self, ports: Arc<StagePorts>) {
+        let _ = self.ports.set(ports);
+    }
+
+    /// The stage's ports, once bound.
+    pub fn ports(&self) -> Option<&Arc<StagePorts>> {
+        self.ports.get()
+    }
+
+    fn limits(&self, instance: usize) -> Limits {
+        let calls = self.ports.get().map(|ports| calls::Calls {
+            ports: Arc::clone(ports),
+            instance,
+            entry: None,
+            waiting: Arc::clone(&self.waiting),
+        });
         Limits::new(
             self.gate.get().cloned(),
             self.package.manifest.hints().memory_guard,
         )
         .with_assets(self.inputs.assets.clone())
+        .with_calls(calls)
     }
 
-    fn new_state(&self, alloc: Arc<dyn Allocator>, state: Option<&[u8]>) -> Result<WasmState> {
-        let (mut store, instance) = instantiate(&self.component, self.limits())?;
-        let process = func(&instance, &mut store, "process")?;
+    fn new_state(
+        &self,
+        alloc: Arc<dyn Allocator>,
+        state: Option<&[u8]>,
+        instance: usize,
+    ) -> Result<WasmState> {
+        let (mut store, instance_handle) = instantiate(&self.component, self.limits(instance))?;
+        let process = func(&instance_handle, &mut store, "process")?;
+        // A stateful stage that lists ports keeps its state as each `process` begins, so a
+        // checkpoint taken while it waits has one (MH 4.10).
+        let keeps_entry = self.stateful && self.ports.get().is_some_and(|p| !p.is_empty());
         let mut st = WasmState {
             store,
-            instance,
+            instance: instance_handle,
             process,
             alloc,
             name: self.package.manifest.name.clone(),
             stateful: self.stateful,
+            keeps_entry,
         };
         if self.package.manifest.hints().args {
             st.configure(&self.inputs.args_json())?;
@@ -450,6 +498,7 @@ pub struct WasmState {
     alloc: Arc<dyn Allocator>,
     name: String,
     stateful: bool,
+    keeps_entry: bool,
 }
 
 impl WasmState {
@@ -461,6 +510,9 @@ impl WasmState {
     /// What a trap or a call error is (f.4): a refusal when the limiter refused during the call,
     /// fuel, or the trap as wasmtime said it.
     fn failure(&mut self, error: wasmtime::Error) -> MorunaError {
+        if let Some(trap) = error.downcast_ref::<calls::CallTrap>() {
+            return trap.0.clone().into_error(UNKNOWN_STAGE);
+        }
         if let Some(refusal) = self.store.data().refusal() {
             return MorunaError::Refused {
                 stage: UNKNOWN_STAGE,
@@ -499,6 +551,21 @@ impl WasmState {
     }
 
     fn process(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        if self.keeps_entry {
+            let state = self.close()?;
+            self.open(&state)?;
+            if let Some(calls) = self.store.data_mut().calls.as_mut() {
+                calls.entry = Some(state);
+            }
+        }
+        let out = self.process_once(input);
+        if let Some(calls) = self.store.data_mut().calls.as_mut() {
+            calls.entry = None;
+        }
+        out
+    }
+
+    fn process_once(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         self.begin(input.len() as u64)?;
         let typed = self
             .process
@@ -613,7 +680,11 @@ impl Kernel for WasmKernel {
     }
 
     fn init(&self, ctx: &InitCtx) -> Result<Box<dyn KernelState>> {
-        Ok(Box::new(self.new_state(ctx.alloc.clone(), None)?))
+        Ok(Box::new(self.new_state(
+            ctx.alloc.clone(),
+            None,
+            ctx.instance,
+        )?))
     }
 
     fn restore(&self, ctx: &InitCtx, state: &[u8]) -> Result<Box<dyn KernelState>> {
@@ -623,7 +694,11 @@ impl Kernel for WasmKernel {
                 self.package.manifest.name
             )));
         }
-        Ok(Box::new(self.new_state(ctx.alloc.clone(), Some(state))?))
+        Ok(Box::new(self.new_state(
+            ctx.alloc.clone(),
+            Some(state),
+            ctx.instance,
+        )?))
     }
 
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
@@ -642,6 +717,16 @@ impl Kernel for WasmKernel {
         let batch = ipc::read_one(out)?;
         let (payload, _) = moruna_adapters::land::land_table(batch, &st.alloc)?;
         Ok(payload)
+    }
+
+    /// MH 4.10: the instance's state as its `process` began, while that `process` waits on a
+    /// port.
+    fn waiting_state(&self, instance: usize) -> Option<Vec<u8>> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&instance)
+            .cloned()
     }
 }
 

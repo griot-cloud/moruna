@@ -120,6 +120,7 @@ fn drive(
         staging_dir: explicit_staging_dir,
         staging_limit,
         staging_durable,
+        staging_url,
         error_policy,
         ordered,
         sizer,
@@ -391,7 +392,7 @@ fn drive(
                         page_bytes: limits.page_bytes,
                         profile: discovered.profile.clone(),
                         devices: limits.devices.iter().map(|d| d.id).collect(),
-                        object_store,
+                        object_store: object_store.clone(),
                     },
                     alloc.clone(),
                 )?;
@@ -642,6 +643,43 @@ fn drive(
     if let Some(sink) = components.output.clone() {
         scheduler.set_output(sink);
     }
+    // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
+    // scheduler's counters (which the controller reads) and to the stage hook (which the host
+    // hears).
+    let waits = moruna_kernel::StageWaits::new(components.stage_hook.clone());
+    scheduler.set_waits(waits.clone());
+    let run_ports = moruna_kernel::RunPorts {
+        cancel: guard.token(),
+        waits,
+    };
+    for stage in &packaged {
+        stage.bind_run_ports(&run_ports);
+    }
+    // MH 4.7: each manifest is copied to `staging.url` before its write counts as done.
+    let durable_copy = match (&staging_url, checkpoint_enabled) {
+        (Some(prefix), true) => {
+            let files = Arc::new(
+                moruna_reactor::ObjectFiles::new(object_store.clone()).map_err(RunError::bare)?,
+            );
+            let url = crate::durable::manifest_url(prefix, &run_id);
+            let (hook_files, hook_url) = (files.clone(), url.clone());
+            scheduler.set_manifest_hook(Arc::new(move |path| {
+                crate::durable::copy_manifest(&hook_files, path, &hook_url)
+            }));
+            notes.push(format!("staging.url: every manifest is copied to {url}"));
+            Some((files, url))
+        }
+        (Some(prefix), false) => {
+            return Err(RunError::bare(MorunaError::Config {
+                name: "staging.url",
+                msg: format!(
+                    "{prefix}: the run writes no manifests to copy (checkpointing is off: it \
+                     needs a staging directory, a disk budget and a repeatable source)"
+                ),
+            }));
+        }
+        (None, _) => None,
+    };
     if let Some(handle) = &checkpoint_handle {
         handle.attach(&scheduler);
     }
@@ -794,6 +832,18 @@ fn drive(
         notes.push(format!(
             "the run directory {} was not removed: {error}",
             dir.display()
+        ));
+    }
+    // MH 4.7: a completed run's copy goes with its directory, so a resume of the job finds no
+    // run to continue.
+    if matches!(exit, moruna_trace::ExitReason::Completed)
+        && !checkpoint_keep
+        && let Some((files, url)) = &durable_copy
+        && let Err(error) = files.delete(url)
+    {
+        notes.push(format!(
+            "the manifest's copy {url} was not removed, so a resume of this job would find it: \
+             {error}"
         ));
     }
     let gil = gil_states(

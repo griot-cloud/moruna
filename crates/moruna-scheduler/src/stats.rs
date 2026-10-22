@@ -22,8 +22,11 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
             instances_live: instances::live(shared, index),
         })
         .collect();
+    let (stages_waiting, calls_waiting) = shared.waiting();
     SchedulerStats {
         per_stage,
+        workers_waiting: u16::try_from(calls_waiting).unwrap_or(u16::MAX),
+        stages_waiting,
         // f.9 parks every worker but one for the length of a probe, so while a probe runs the
         // count the controller reads is the one worker that may take work.
         workers_active: if shared.probing.load(Ordering::SeqCst) {

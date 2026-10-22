@@ -22,6 +22,8 @@ pub struct Limits {
     refusal: Option<Refusal>,
     /// The assets directory the host named (16 b), read by `read-asset`.
     assets: Option<std::path::PathBuf>,
+    /// The stage's ports, reached by `call` (MH 4.10).
+    pub(crate) calls: Option<crate::calls::Calls>,
 }
 
 impl Limits {
@@ -35,12 +37,19 @@ impl Limits {
             counts: AllocCounts::default(),
             refusal: None,
             assets: None,
+            calls: None,
         }
     }
 
     /// The same limits, with the assets directory `read-asset` reads.
     pub fn with_assets(mut self, assets: Option<std::path::PathBuf>) -> Limits {
         self.assets = assets;
+        self
+    }
+
+    /// The same limits, with the stage's ports `call` reaches.
+    pub(crate) fn with_calls(mut self, calls: Option<crate::calls::Calls>) -> Limits {
+        self.calls = calls;
         self
     }
 

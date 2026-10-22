@@ -49,7 +49,7 @@ It refuses to know: how a package is run (SDD 17), where a host keeps packages o
 
 **PK-I3. The manifest is complete and closed.** Every field of e.1 is present, no other field is, every hint is one e.2 lists, and `format` agrees with the extension; anything else refuses the package naming the field.
 
-**PK-I4. A component imports nothing but the world's `read-asset`.** A `.wasm` whose component imports anything else, or `read-asset` with another type, is refused naming the import; one that does not export `declare` and `process` with the world's types, that exports `open` without `close` or the reverse, that exports `configure` without the hint `args` or lacks it with the hint, or that exports anything else, is refused naming the export. A component whose `declare()` disagrees with its embedded manifest on `name`, `declaration`, `abi` or `format` is refused naming the field. FP 3.
+**PK-I4. A component imports nothing but the world's `read-asset` and `call`.** A `.wasm` whose component imports anything else, or either with another type, is refused naming the import; one that does not export `declare` and `process` with the world's types, that exports `open` without `close` or the reverse, that exports `configure` without the hint `args` or lacks it with the hint, or that exports anything else, is refused naming the export. A component whose `declare()` disagrees with its embedded manifest on `name`, `declaration`, `abi` or `format` is refused naming the field. FP 3.
 
 **PK-I5. Wheels are resolved for the named targets and never for the packaging machine.** `moruna package` calls `pip download` once per target with `--platform`, `--implementation cp`, `--python-version`, `--abi`, `--only-binary=:all:`, `--no-deps` and `--require-hashes`; a requirement with no wheel for a target refuses the package naming the requirement and the target. FP 6, FP 7.
 
@@ -230,6 +230,10 @@ world kernel {
   /// A file of the assets directory the host named, by its path relative to it; refused when
   /// there is none, or the path leaves it.
   import read-asset: func(name: string) -> result<list<u8>, string>;
+  /// A request to a port the stage's entry lists, by name, and the port's answer; an error is
+  /// the port's own refusal. A name the entry does not list, a missed deadline or the run's
+  /// cancel ends the stage instead.
+  import call: func(port: string, request: list<u8>) -> result<list<u8>, string>;
   /// The package's manifest, moruna.json, as text.
   export declare: func() -> string;
   /// One Arrow record batch as an IPC stream in, one out; an error refuses this batch, named.
@@ -243,7 +247,7 @@ world kernel {
 }
 ```
 
-`open` and `close` are exported by a stateful kernel and by no other; `configure` by a kernel with the hint `args` and by no other. The component may import `read-asset` and nothing else. The manifest is embedded as a custom section named `moruna.json` placed at the end of the component (f.3).
+`open` and `close` are exported by a stateful kernel and by no other; `configure` by a kernel with the hint `args` and by no other. The component may import `read-asset` and `call` (amended 2026-10-21, MH 4.10; the job document's `kernels[i].ports` lists the names `call` may use, and a component that imports `call` needs no hint for it) and nothing else. The manifest is embedded as a custom section named `moruna.json` placed at the end of the component (f.3).
 
 ### e.6 `.cwasm` layout
 
@@ -322,7 +326,7 @@ world kernel {
 
 **PK-T9 lockfile_rules.** An unpinned line, a URL, a line with no hash, `cp314t`, `macosx_14_0_arm64` and a bytecode version that differs from the interpreter's: each refused, named. e.3, f.4.
 
-**PK-T10 package_a_component.** `moruna package --wasm` on the identity component (SDD 17 SB-T1) writes `<name>.wasm` whose section and `declare()` agree; a `function.yaml` naming another column type is refused naming `declaration`; a component importing a function is refused naming the import. PK-I4.
+**PK-T10 package_a_component.** `moruna package --wasm` on the identity component (SDD 17 SB-T1) writes `<name>.wasm` whose section and `declare()` agree; a `function.yaml` naming another column type is refused naming `declaration`; a component importing a function other than `read-asset` and `call`, or `call` with another type, is refused naming the import. PK-I4.
 
 **PK-T11 strict_refuses_import_paths.** A document with a `python` kernel built with `strict` is refused naming `kernels[0].module`; the same document without `strict` builds. PK-I8.
 
@@ -357,6 +361,7 @@ None.
 | FP 2 (the file is the pin) | PK-I1, PK-I2 | PK-T2 |
 | FP 2 (`moruna.json`) | PK-I3, e.1, e.2 | PK-T1, PK-T3 |
 | FP 3 (the world) | PK-I4, e.5 | PK-T4, PK-T10 |
+| MH 4.10 (the `call` import, 2026-10-21) | PK-I4, e.5 | PK-T10 |
 | FP 6, FP 7 (wheels for the named platforms) | PK-I5, PK-I6 | PK-T7, PK-T8, PK-T9 |
 | FP 6 (`aot`, `load`) | PK-I7, f.10, f.11 | PK-T5, PK-T15 |
 | FP 6 (`check` through the runtime) | PK-I9 | PK-T13, PK-T14 |

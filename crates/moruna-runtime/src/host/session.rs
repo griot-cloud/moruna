@@ -21,6 +21,7 @@ use moruna_trace::RunReport;
 
 use super::lifecycle::{Ending, EventOut, Lifecycle, task_refs};
 use super::logs::{Capture, FINISH_WAIT, Tell, attempt_dir};
+use super::ports::HostPorts;
 use super::protocol::{
     self, EVENTS_VERSION, Event, EventMsg, Heartbeat, Inbound, LimitsMsg, Outbound,
 };
@@ -100,6 +101,37 @@ impl Wire {
                 self.elapsed_ms()
             ));
         }
+    }
+
+    /// Send one message the caller must know arrived (a `port_call`, MH 4.10): `Err` when there is
+    /// no peer or the write failed, which also drops the peer as [`Wire::send`] does.
+    pub fn try_send(&self, message: &Outbound) -> Result<(), String> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = writer.as_mut() else {
+            return Err("there is no peer: it never connected or it stopped receiving".to_string());
+        };
+        let line = message.line();
+        match w.write_all(line.as_bytes()).and_then(|()| w.flush()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *writer = None;
+                drop(writer);
+                self.note(format!(
+                    "the peer stopped receiving at {} ms ({error}); the run continued and the \
+                     report is on disk",
+                    self.elapsed_ms()
+                ));
+                Err(format!("the peer stopped receiving ({error})"))
+            }
+        }
+    }
+
+    /// Whether a peer is there to write to.
+    pub fn has_peer(&self) -> bool {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Record something about the peer for the report.
@@ -316,6 +348,10 @@ pub fn serve_conn(conn: Conn, loader: &dyn KernelLoader, opts: &HostOptions<'_>)
                     "checkpoint before a spec arrived: there was nothing to write".to_string(),
                 );
             }
+            Ok(Inbound::PortReply { call, .. }) => wire.note(format!(
+                "a port_reply for call {call} before a spec arrived was ignored: nothing had \
+                 called"
+            )),
             Err(reason) => wire.note(format!("an unreadable message was ignored: {reason}")),
         }
     };
@@ -369,6 +405,8 @@ pub fn run_job(
         }
     };
     let events = Events::start(wire, job.report.attempt(), start.clone());
+    // MH 4.10: host ports ride this connection, when there is one to read replies from.
+    let host_ports = (wire.has_peer() && reader.is_some()).then(|| HostPorts::new(wire.clone()));
     let built = match build(
         &job,
         loader,
@@ -377,6 +415,7 @@ pub fn run_job(
             env: opts.env,
             notes: Vec::new(),
             packages: opts.packages.clone(),
+            host_ports: host_ports.clone(),
         },
     ) {
         Ok(built) => built,
@@ -456,17 +495,34 @@ pub fn run_job(
             .ok()
     };
     if let Some(reader) = reader {
-        let (peer, observer, cancel, told) = (
+        let (peer, observer, cancel, told, ports) = (
             wire.clone(),
             observer.clone(),
             opts.cancel.clone(),
             lifecycle.clone(),
+            host_ports.clone(),
         );
         let spawned = std::thread::Builder::new()
             .name("moruna-peer".to_string())
-            .spawn(move || listen_to_peer(reader, &peer, &observer, &cancel, &told, mode));
+            .spawn(move || {
+                listen_to_peer(
+                    reader,
+                    &Peer {
+                        wire: &peer,
+                        observer: &observer,
+                        cancel: &cancel,
+                        lifecycle: &told,
+                        ports: ports.as_deref(),
+                    },
+                    mode,
+                )
+            });
         if spawned.is_err() {
-            wire.note("the peer's messages cannot be read: no thread for them".to_string());
+            let reason = "the peer's messages cannot be read: no thread for them".to_string();
+            if let Some(ports) = &host_ports {
+                ports.close(reason.clone());
+            }
+            wire.note(reason);
         }
     }
 
@@ -639,21 +695,43 @@ fn heartbeat(wire: &Wire, observer: &RunObserver, stop: &AtomicBool, every: Dura
     }
 }
 
-/// The peer's thread: `cancel` and `checkpoint` act, anything else is a note (MH 4.3). It ends
-/// when the peer closes or the connection is shut down at exit.
-fn listen_to_peer(
-    mut reader: Box<dyn BufRead + Send>,
-    wire: &Wire,
-    observer: &RunObserver,
-    cancel: &CancelToken,
-    lifecycle: &Lifecycle,
-    mode: Mode,
-) {
+/// What the peer's thread acts on.
+struct Peer<'a> {
+    wire: &'a Wire,
+    observer: &'a RunObserver,
+    cancel: &'a CancelToken,
+    lifecycle: &'a Lifecycle,
+    ports: Option<&'a HostPorts>,
+}
+
+/// The peer's thread: `cancel`, `checkpoint` and `port_reply` act, anything else is a note
+/// (MH 4.3, MH 4.10). It ends when the peer closes or the connection is shut down at exit, and
+/// the host ports' calls still waiting then are lost.
+fn listen_to_peer(mut reader: Box<dyn BufRead + Send>, peer: &Peer<'_>, mode: Mode) {
+    let Peer {
+        wire,
+        observer,
+        cancel,
+        lifecycle,
+        ports,
+    } = *peer;
+    let max = match ports {
+        Some(_) => protocol::MAX_PORT_LINE,
+        None => protocol::MAX_CONTROL_LINE,
+    };
     loop {
-        let line = match protocol::read_line(reader.as_mut(), protocol::MAX_CONTROL_LINE) {
+        let line = match protocol::read_line(reader.as_mut(), max) {
             Ok(Some(line)) => line,
-            Ok(None) => return,
+            Ok(None) => {
+                if let Some(ports) = ports {
+                    ports.close("the host closed the connection".to_string());
+                }
+                return;
+            }
             Err(error) => {
+                if let Some(ports) = ports {
+                    ports.close(format!("the host's messages stopped: {error}"));
+                }
                 wire.note(format!("the peer's messages stopped: {error}"));
                 return;
             }
@@ -673,6 +751,12 @@ fn listen_to_peer(
                     );
                 }
             }
+            Ok(Inbound::PortReply { v, call, ok, error }) => match ports {
+                Some(ports) => ports.reply(v, call, ok, error),
+                None => wire.note(format!(
+                    "a port_reply for call {call} was ignored: this run serves no host port"
+                )),
+            },
             Ok(Inbound::Spec { .. }) => wire.note(match mode {
                 Mode::Serve => "a second spec was refused: one job per process".to_string(),
                 Mode::Run => {

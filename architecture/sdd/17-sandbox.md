@@ -7,7 +7,7 @@
 **Component location:** `crates/moruna-wasm`, `crates/moruna-sandbox`, `python/moruna/_sandbox.py` (the template), `crates/moruna-py/src/sandbox.rs` (the child's runner), `guest/` (the standard-build interpreter, the cgroup and the kernel options)
 **Consumes:** contracts (1), the guard and the boundary copy (5), the package (16). **Consumed by:** the job document and the facade (12), `moruna check` (16 f.9).
 
-**Decisions worth your eye:** (1) neither runtime has Moruna's access to the machine: a `.wasm` runs in wasmtime with no imports, a `.pex` in a separate process confined by a mount namespace, Landlock, seccomp, no capabilities and a cgroup (FP 4, decided by Brackly 2026-10-15); (2) the child is a fork of a warm template interpreter that holds the data libraries imported and no thread, and batches reach it through a shared mapping, read in place (decided by Brackly 2026-10-15); (3) the allocator guard is Moruna's code and goes where the kernel goes: the same hooks, frame and gate run inside the child against the child's own memory and a ceiling Moruna writes (05 b, E13); (4) wasm linear memory is a fourth source of a call's counts (`linear`), so a wasm call's growth, peak and refusals reach the trace exactly as a Python call's do.
+**Decisions worth your eye:** (1) neither runtime has Moruna's access to the machine: a `.wasm` runs in wasmtime with no imports but the world's `read-asset` and `call` (the latter reaching only its stage's listed ports through Moruna, MH 4.10), a `.pex` in a separate process confined by a mount namespace, Landlock, seccomp, no capabilities and a cgroup (FP 4, decided by Brackly 2026-10-15); (2) the child is a fork of a warm template interpreter that holds the data libraries imported and no thread, and batches reach it through a shared mapping, read in place (decided by Brackly 2026-10-15); (3) the allocator guard is Moruna's code and goes where the kernel goes: the same hooks, frame and gate run inside the child against the child's own memory and a ceiling Moruna writes (05 b, E13); (4) wasm linear memory is a fourth source of a call's counts (`linear`), so a wasm call's growth, peak and refusals reach the trace exactly as a Python call's do.
 
 ---
 
@@ -37,7 +37,7 @@ It refuses to know: the package format (16), how the run is planned or scheduled
 
 ## c. Invariants
 
-**SB-I1. A wasm kernel reaches nothing but its world.** The linker defines `read-asset` and nothing else; a component with any other import is refused before instantiation (16 PK-I4). The instance's only inputs are the bytes `process`, `open` and `configure` are given and the files of the assets directory `read-asset` reads, by a relative path that cannot leave it (no `..`, no absolute path, no symbolic link out).
+**SB-I1. A wasm kernel reaches nothing but its world.** The linker defines `read-asset` and `call` and nothing else; a component with any other import is refused before instantiation (16 PK-I4). The instance's only inputs are the bytes `process`, `open` and `configure` are given, the files of the assets directory `read-asset` reads, by a relative path that cannot leave it (no `..`, no absolute path, no symbolic link out), and the answers of the ports its stage's entry lists, which `call` returns (f.13, MH 4.10).
 
 **SB-I2. Every growth of a wasm instance's memory is decided by Moruna first.** The resource limiter sees every `memory.grow` and table growth; growth past the stage ceiling, or a growth the run's gate refuses (05 f.9), is refused before the memory exists, counted in the call's `linear.refused`, and a call that then traps ends as `MorunaError::Refused` naming the request (05 AD-I13).
 
@@ -179,7 +179,7 @@ and these with a condition: `clone` when its flags hold no namespace flag (`CLON
 
 **f.1 The engine.** One `wasmtime::Engine` per process, built on first use with e.2's configuration; `.cwasm` files are valid only for an engine with that configuration, which the Moruna version pins.
 
-**f.2 Verification.** No imports (`component_type().imports()` empty). Exports exactly `declare: func() -> string`, `process: func(list<u8>) -> result<list<u8>, string>`, and, when the manifest says `stateful`, `open: func(list<u8>) -> result<_, string>` and `close: func() -> list<u8>`; when it does not, neither. Each mismatch is refused naming the export and the type found. `declare()` is called on a fresh instance with no imports and its manifest compared as 16 f.5.
+**f.2 Verification.** No imports but `read-asset: func(string) -> result<list<u8>, string>` and `call: func(string, list<u8>) -> result<list<u8>, string>` (amended 2026-10-21; each refused naming it when its type differs, every other import refused naming it). Exports exactly `declare: func() -> string`, `process: func(list<u8>) -> result<list<u8>, string>`, and, when the manifest says `stateful`, `open: func(list<u8>) -> result<_, string>` and `close: func() -> list<u8>`; when it does not, neither. Each mismatch is refused naming the export and the type found. `declare()` is called on a fresh instance with no imports and its manifest compared as 16 f.5.
 
 **f.3 Compile or reuse.** When `<package>.cwasm` exists and its header (16 e.6) names the package's fingerprint and this Moruna's version, the component is `Component::deserialize`d from the bytes after the header; a refusal by wasmtime, a mismatching header or a missing file compiles from the package's bytes with the note `"<package>: compiled (<reason>)"`.
 
@@ -200,6 +200,8 @@ and these with a condition: `clone` when its flags hold no namespace flag (`CLON
 **f.11 Arguments and assets (16 b).** A `.wasm` with the hint `args` is called `configure(<arguments as JSON>)` on every new instance, before `open`; an error refuses the stage. `read-asset(name)` reads `<assets>/<name>` whole when `name` is relative, has no `..` component and resolves inside the assets directory; anything else is the `Err` naming why. A `.pex` child bind-mounts the assets directory at `/assets` (17 f.5 step 3) and, for a kernel with `args`, calls the entry once with the arguments as a `dict` after import; what it returns is the kernel (a callable, or for a stateful kernel an object with `setup` and `__call__`).
 
 **f.12 Loopback.** Nothing of Moruna's needs a network interface in the guest, loopback included: the control socket is a socket pair and batches cross a memfd. A host may bring `lo` up for its own use; Moruna neither needs nor uses it.
+
+**f.13 Ports (amended 2026-10-21, MH 4.10).** A run's build binds each `.wasm` stage to its ports (`StagePorts`: the names its entry lists, each a host or a guest route with its deadline, and the stage id), the facade binds them to the run's cancel and its record of waits, and the linker's `call` hands the request to the named route and blocks the call until the answer, the deadline or the cancel. `ok` and the port's refusal return to the component; an unlisted name, a request or answer past 64 MiB, a missed deadline, a lost answer and the cancel trap, and the trap becomes the stage's error (`MorunaError::Kernel` naming the port and the cause; `Cancelled` for the cancel). A stage with no ports bound (a check, a load) refuses every call, saying it called outside a run. A stateful stage that lists ports runs `close` then `open` as each `process` begins and keeps the bytes; while a call of it waits they are its `Kernel::waiting_state`, which the checkpoint writes instead of waiting for the busy instance (MH 4.7). The `.pex` runtime has no `call` and a document that lists ports for a `.pex` is refused.
 
 ## g. Concurrency within the component
 
@@ -238,7 +240,7 @@ The run report's per-stage `alloc` gains the `linear` source (04). A child's sta
 
 **SB-T1 identity_component.** A component written in the WAT text format whose `process` returns its input runs through `WasmKernel` and the output equals the input, with `linear.measured`. SB-I1.
 
-**SB-T2 import_refused.** A component importing a function is refused naming the import; one with an extra export, a wrong `process` type, or `open` without `close`: each refused naming it. f.2, PK-I4.
+**SB-T2 import_refused.** A component importing a function other than the world's two is refused naming the import, and `call` with another type is refused naming its type; one with an extra export, a wrong `process` type, or `open` without `close`: each refused naming it. f.2, PK-I4.
 
 **SB-T3 growth_past_the_ceiling_refused.** A component whose `process` grows its memory one page at a time until `memory.grow` fails and then traps: the call ends as `Refused`, `linear.refused` ≥ 1, `linear.bytes` is the growth admitted. SB-I2.
 
@@ -284,6 +286,8 @@ The following run on Linux with a sandbox host (a privileged container: tests ta
 
 **SB-T23 regions.** Leases split the free ranges, releases join them back, the largest free range starts aligned, a range inside a lease or outside the area cannot be leased, and a release twice is nothing. e.4.
 
+**SB-T24 the_call_import (MH 4.10).** A component that calls a listed guest port gets its answer as its output; the port's refusal is the component's; an unlisted name is refused naming it and the list; a call past its deadline fails naming the deadline; the run's cancel ends a waiting call as `Cancelled`; a call outside a run is refused; a waiting stateful instance's `waiting_state` is its state as the call's `process` began, and a restore from it counts on from there. f.13, SB-I1.
+
 ## l. Implementation notes for the agent
 
 `unsafe` is permitted in `moruna-sandbox`'s `mapping.rs` (`mmap`, `memfd_create`, `fallocate`, the atomics over the mapping), `confine.rs` (`unshare`, `mount`, `pivot_root`, `prctl`, `capset`), `fdpass.rs` (`sendmsg` with `SCM_RIGHTS`), `template.rs` (`dup2` and `fcntl` in `pre_exec`), `kernel.rs` (`pidfd_open`, `pidfd_send_signal`), `python.rs` (taking the two descriptors the template passed, the memoryviews and foreign buffers over the mapping) the test of `seccomp.rs` (a forked child that installs the filters) and `coverage.rs` (the profile runtime's buffer), and in `moruna-wasm`'s `cwasm.rs` (`Component::deserialize`, whose bytes are trusted as the tree is: written beside the package by whoever ran `aot` with write access there, 16 PK-I7). The Linux-only modules are `#[cfg(target_os = "linux")]`; on other systems the crate builds and `SandboxKernel::new` refuses.
@@ -307,6 +311,7 @@ None.
 | FP 4 the shared mapping | SB-I7, SB-I13, e.4 | SB-T9, SB-T11, SB-T21, SB-T22, SB-T23 |
 | FP 4 the guard across the boundary | SB-I8, SB-I9 | SB-T14, SB-T17 |
 | MH 4.7 (state across a checkpoint) | SB-I12 | SB-T6 |
+| MH 4.10 (a stage's ports, 2026-10-21) | SB-I1, f.2, f.13 | SB-T2, SB-T24 |
 | FP 2, MH 4.8 (the guest) | f.10 | the guest build |
 
 ## o. Deferred (post-v1)

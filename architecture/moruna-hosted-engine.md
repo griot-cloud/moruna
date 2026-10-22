@@ -85,6 +85,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
 - **H10. The guest has no network and the monitor cannot give it one.** `moruna-vmm`'s device model has no network device type; a guest boots with `lo` only. *Test:* `ip link` in the guest; the monitor's configuration type has no field for a NIC.
 - **H11. A run in a VM costs one boot.** `moruna run --vm spec.json` boots the guest, runs the spec with a disk attached, and returns the report; time from invocation to `hello` is under 300 ms on x86 and under 1 s on a Raspberry Pi 5, measured and written into this document. *Test:* the same spec run as a process and as a VM produce the same report modulo timing.
 - **H13. A kernel is checkable without a platform or data.** A kernel declares its input and output schema; `moruna check` loads it, runs it on a synthetic batch derived from the declared input schema, compares the output schema to the declaration, and reports its first profile (amplification, state footprint, wall time per row), with no source, no sink and no platform. A Polars-signature function is accepted and checked as a kernel through the Polars bridge. *Test:* a kernel whose output disagrees with its declaration is refused naming the column; the profile row `moruna check` writes is read by a subsequent `moruna run`'s sizer.
+- **H14. A stage calls its host, and waits as long as the call takes** (amended 2026-10-21, §4.10). A `.wasm` stage hands a port its entry lists a request and gets the answer; a name not listed, a missed deadline and the run's cancel end the call, each named. A stage that waits keeps the peer hearing heartbeats, is reported `Waiting`, is not shrunk, and keeps its manifests written; a run killed while it waits resumes, from the copy of its manifest on an object-store prefix if its disk is gone, with the stage's state as the waiting batch began. *Test:* `crates/moruna-runtime/tests/ports.rs` (PO-T1 to PO-T8; PO-T7 waits twenty seconds by default and ten minutes in the cgroup job); `crates/moruna-controller/tests/rc_t21_a_waiting_stage.rs`.
 - **H12. Resize is real hardware.** Memory and vCPUs added by `moruna-vmm resize` appear in the guest's `/proc/meminfo` and `cpu/online` within one second, and H3/H4 then hold. *Test:* H3/H4 under `moruna-vmm`, not only under a cgroup.
 
 ---
@@ -108,7 +109,10 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
     { "kind": "python", "module": "/job/kernels.py", "callable": "shout",
       "fingerprint": "sha256:…",           // from `moruna check`; refused if the loaded kernel's differs
       "expected_amplification": 1.5, "releases_gil": true },
-    { "kind": "rust",   "crate": "…", "symbol": "…" }                // reserved
+    { "kind": "rust",   "crate": "…", "symbol": "…" },               // reserved
+    { "kind": "package", "path": "/opt/kernels/agent.wasm", "fingerprint": "sha256:…",
+      "ports": { "mcp":  { "host": "mcp" },                              // §4.10
+                 "read": { "guest": "read", "deadline_ms": 600000 } } }
   ],
   "sink":   { "kind": "parquet", "url": "file:///data/refined/events/" },   // parquet | vortex | tensor | arrow_ipc | peql (on_violation, excluded_url: §4.5)
   "budget": {
@@ -116,7 +120,8 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
     "cpu": null,
     "elastic": { "memory_max_bytes": 34359738368, "cpu_max": 32 }    // §4.4
   },
-  "staging": { "dir": "/staging", "limit_bytes": null, "durable": true },
+  "staging": { "dir": "/staging", "limit_bytes": null, "durable": true,
+               "url": "s3://bucket/workspace/_staging" },   // §4.7: the manifest's copy, on any machine
   "object_store": { "s3": { "endpoint": "unix:///run/moruna/egress.sock", "…": "…" } },
   "checkpoint": { "enabled": true, "interval_ms": 5000, "keep": false },
   "resume": null,                          // or a manifest path
@@ -134,6 +139,8 @@ Rules:
 - **Precedence:** a spec field set → the spec wins; a spec field `null` → discovery, then the environment variable if the field has one, then the default. `moruna run` prints every field it resolved from the environment as a `notes` entry, and **refuses** when `--strict` (the hosted default) and any such resolution happened (H8).
 - The spec is content-addressed: `sha256(canonical JSON)` is the `plan digest` the manifest already records (parent §10), so a resume with a changed spec is refused as today.
 - `report.file` is always written, even when the socket is unset; the socket is additive.
+- `kernels[].ports` (amended 2026-10-21, §4.10) lists, for one `.wasm` package stage, every name its `call` may use and where each goes: `{"host": "<name>"}`, a port the host serves over the protocol of §4.3, or `{"guest": "<name>"}`, a handler the program running the document registered; `deadline_ms` bounds one call (absent: 30 minutes; 1 ms to a day). A name is 1 to 64 of ASCII letters, digits, `_ - . :`. Exactly one of `host` and `guest`; a `host` port needs a peer (`report.socket`, or `moruna serve`); a `guest` port needs its handler registered; any other kernel kind, and a `.pex`, lists none. Each is refused by its field.
+- `staging.url` (amended 2026-10-21, §4.7) is an object-store prefix every manifest is copied to; it needs `staging.dir`, where the run still works, and checkpointing on.
 - `contracts` is the job's whole contract store (§4.5): each entry is a contract's document, its compiled bytes exactly as parcel wrote them, the function modules they pin, and the tenants it is published to for this run. It is part of the spec, so it is covered by the digest. A document that carries contracts and has no `datafusion` source or `peql` sink is refused.
 
 ### 4.2 `moruna run` and `moruna serve`
@@ -154,6 +161,9 @@ Newline-delimited JSON over the socket named in `report.socket` (vsock in a gues
 | `hello` | on connect | `moruna_version`, `spec_digest`, `limits` (as discovered) |
 | `heartbeat` | every ≤ 2 s | `committed_seq`, `rows_out`, `bytes_out`, `active_workers`, `ceiling_bytes`, `anon_bytes`, `bottleneck`, `staging_bytes` |
 | `limits_changed` | when discovery observes a change (§4.4) | old and new `Limits`, `reason` (`"memory"`, `"cpu"`) |
+| `event` | as each fact of the run becomes true, between `hello` and `report` | `v`, `attempt`, `start`, `seq`, `t_us`, then `kind` and its fields: the task lifecycle (`attempt_started`, `task_registered`, `task_waiting`, `task_ready`, `task_started`, `task_phase`, `task_completed`, `task_failed`, `task_skipped`, `cancel_acknowledged`, `cancel_ended`). Version 2 added `logs`, how far the run's output store reaches for each producer. Version 3 (amended 2026-10-21) adds a running task's wait on a port: `task_waiting` with `reason: "port_call"` and `port` (the name its entry lists; `null` for the other reasons), until a `task_phase` says what it does again (§4.10) |
+| `port_call` | a stage calls a host port (§4.10) | `v` (1), `call` (unique in the process), `stage`, `port` (the host's name for it), `deadline_ms`, `request` (base64) |
+| `port_cancel` | Moruna stops waiting for a call: its deadline passed, or the run was cancelled | `v`, `call`, `reason` (`"deadline"`, `"cancelled"`) |
 | `report` | before exit | the full `RunReport` JSON |
 | `exit` | last message | `code`, `diagnostic?` |
 
@@ -164,6 +174,9 @@ Messages to Moruna:
 | `spec` (serve mode only) | the `RunSpec`; a second `spec` is refused |
 | `cancel` | the existing `CancelToken`; manifest written; exit 130 |
 | `checkpoint` | write the manifest now (the host is about to destroy the guest) |
+| `port_reply` | the answer to `port_call` `call`: `v` (1), `call`, and exactly one of `ok` (base64) or `error` (the port's refusal, handed to the stage); one that answers nothing waiting is a note in the report (§4.10) |
+
+The port messages carry their own version, `v`, separate from `event`'s; a reply of a version this build does not read ends its call as lost, named. While a peer serves host ports, Moruna reads lines of up to the largest answer a call may carry (64 MiB, in base64); otherwise a line past 64 KiB ends the peer. A peer that closes with calls waiting loses them: their stages fail, naming the closed connection.
 
 The protocol is deliberately dumb: Moruna never receives a resize *command*. The host resizes the machine; Moruna notices (§4.4). This keeps Moruna free of any host API and keeps the guest's trust boundary at the hardware: a hostile peer on the socket can cancel a run, not enlarge one.
 
@@ -186,6 +199,8 @@ The sizing arithmetic (ceiling − baseline − reserve − expected kernel stat
 
 **What does not change:** the controller's decision rules, the morsel model, the placement engine, the sinks. Elasticity is a moving ceiling under the same controller, which is why it is small.
 
+**A stage waiting on its host (amended 2026-10-21, §4.10).** A worker whose stage waits on a port is inside `apply` and uses no CPU, so the scheduler's counters carry `workers_waiting` and `stages_waiting`, and the classifier reads busy as the computing workers over the workers free to compute. After the memory rows, a tick with a stage waiting and the rest of the chain unsaturated is `Waiting` (the heartbeat's `bottleneck`) and moves no knob. Under memory pressure the stage halved is the largest that is not waiting; a resize keeps a waiting stage's target, and the working-set check takes it down only when every other stage is at the floor; the state-growth row does not end the run for a waiting stage's state. The machine's ceiling is the host's: a host that resizes the guest while a stage waits does so knowing it waits, from the heartbeat.
+
 ### 4.5 A DataFusion plan is a source
 
 `moruna-datafusion` gains `PlanSource`: it takes an `Arc<dyn ExecutionPlan>` and a `SessionContext`; `schema()` is the plan's schema; `plan()` returns one `Split` per output partition (partition index, no row count until read, so the manifest digest covers partition ids); `read(split)` executes that partition's stream on the reactor, allocating each `RecordBatch` into the arena via the C data interface, morsel by morsel, never holding the partition in memory. `repeatable()` is `true` only when the plan's provider declares deterministic partition order (file-backed scans do; a plan with a hash exchange does not), so an unrepeatable plan stages Q0 and refuses resume, exactly as `IteratorSource` does today.
@@ -205,6 +220,10 @@ The `ObjectStoreConfig` endpoint accepts `unix://` and `vsock://` in addition to
 ### 4.7 Resume on a surviving disk
 
 Nothing new is designed; F4.7 is finished and Q9 is decided by the spec: `staging.durable = true` sets `durable_staging=present`, the manifest cadence is `checkpoint.interval_ms`, and the `checkpoint` message (§4.3) lets a cooperative host flush before it destroys the guest. `moruna run --resume auto` looks for `staging.dir/moruna-*/manifest.json` and resumes the newest whose spec digest matches. The one known gap, a read in flight at checkpoint time is lost because the cursor is "next to issue" (`10-scheduler.md:287`), is closed by recording *issued* splits in the manifest and re-issuing them on resume; re-reading an issued split is safe because `read` is deterministic for repeatable sources (CT-I12).
+
+**A stateful stage's state (amended 2026-10-21).** A `Checkpoint` stage's instances are saved with every manifest (`kernel_states`, base64 of `KernelState::checkpoint`) and restored by `Kernel::restore` on resume; a `.wasm` package's are its `close()` bytes, given back to `open(state)` (FP-M §3). The checkpoint acquires each instance for the call, as a task does, and gives up a manifest when one stays busy for five seconds; three such in a row end the run (10 f.12). A stage that waits on a port is busy for as long as its call takes, so a stateful stage that lists ports keeps its state as each `process` begins, and while it waits that is its checkpoint (`Kernel::waiting_state`): the state before the batch in flight, which a resume restores and then applies the batch again, as it applies every batch the watermark does not cover.
+
+**Durable staging on an object-store prefix (amended 2026-10-21).** `staging.url` names a prefix of an object store, reached as every object URL is (§4.6). The run works in `staging.dir` as always; each manifest, once on disk, is copied to `<staging.url>/moruna-<run_id>/manifest.json` in one put before its write counts as done, so a failed copy is a failed manifest write. The copy leaves the staging segments out (they stay on the machine that wrote them) and says `durable_staging`: a morsel that had a copy in a segment is read again from its source on resume, which the lineage always allows. A resume by `"auto"` or by run id first reads every copy under the prefix into `staging.dir`, where the directory has none of that run or an older one, and then resumes as from its own; so a host that loses the machine resumes on another with an empty staging disk at the same path. A completed run's copy is removed with its directory, unless `checkpoint.keep`.
 
 ### 4.8 `moruna-vmm`: Moruna packaged as a microVM
 
@@ -269,6 +288,18 @@ Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, a
 
 **Packaging (2026-10-15).** A kernel as one file, `.wasm` or `.pex`, its two out-of-process runtimes, `moruna package`, `moruna aot` and `moruna load` are `architecture/function-packages.md`, which consumes this section.
 
+### 4.10 Host calls: a stage's ports (amended 2026-10-21)
+
+A kernel that reasons over its batches (a model's agent, a lookup against a service) needs to ask something outside its memory and wait for the answer, without a socket, a file or a credential of its own. Moruna gives a `.wasm` stage exactly that and nothing more: named ports, opaque bytes, a deadline, and the run's cancel. Moruna reads none of the bytes and knows no host, model or protocol behind a name.
+
+**The import.** The `moruna:kernel` world gains its second import: `call(port: string, request: list<u8>) -> result<list<u8>, string>`. `ok` is the port's answer; `err` is the port's own refusal, for the component to decide about. Every other ending is a trap that fails the stage with its cause: a name the stage's entry does not list (`port <name> is not listed for this stage (it lists …)`), a request or answer past 64 MiB, no answer within the port's deadline (`port <name>: no answer within its deadline of <n> ms`), an answer that never came (the peer closed, a handler panicked), and the run's cancel, which ends the run as cancelled. A component under `moruna check` or `moruna load` has no ports, and a call is refused, said so. `verify` admits `call` with exactly that type beside `read-asset`, and refuses every other import, WASI's streams included.
+
+**The ports.** `kernels[].ports` (§4.1) maps each name to where it goes. A `host` port is served by the host protocol's peer: the call is a `port_call`, the answer a `port_reply`, a call given up a `port_cancel` (§4.3), all on the one connection the run already has, so the guest needs no second channel. A `guest` port is answered inside the machine by a handler the program embedding Moruna registered (`KernelLoader::guest_port`), each call on a thread of its own, told the deadline and a cancel that is set when the stage stops waiting; whatever the handler does, the stage's deadline and the run's cancel hold. Every package stage of a run knows its list, empty or not, so an unlisted name is refused by name and reported against the stage (`task_failed`, `kernel_error`).
+
+**A stage that waits.** A call blocks its worker inside `apply` for as long as it takes; the other workers go on. While a call waits: Moruna's heartbeat thread keeps the peer hearing a heartbeat at least every 2 s; the task is told `task_waiting` with `reason: "port_call"` and the port, and `task_phase` when no call of it waits any more; the controller classifies `Waiting` and does not shrink the stage (§4.4); the checkpoint writes the stage's state as the batch began (§4.7). The wait is bounded by the port's `deadline_ms` and by nothing else Moruna has: fuel counts the component's own instructions, not its host's time.
+
+**Why the host protocol and not a vsock port per name.** One peer and one connection is §4.3's shape: the host already holds the run's connection, reads it on one thread and answers on it, and a port is one more pair of messages, versioned on its own. A second listener per port would be a second channel to secure, multiplex and close for no gain a host has asked for.
+
 ---
 
 ## 5. Component amendments, by SDD
@@ -288,6 +319,11 @@ Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, a
 | **new `15-check.md`** | `moruna check`: synthetic batch generation (byte-exact, seeded), the schema comparison rules (`adds`/`drops`/`changes`), the profile row it writes, the JSON report, exit codes (§4.9) |
 | **new `13-host.md`** | the protocol of §4.3, byte-exact; `moruna serve`; exit codes; the strict-mode refusal texts |
 | **new `14-vmm.md`** | `moruna-vmm`: the device model trait and the five devices, boot, the control socket, resize, the guest image recipe, the release artefacts (§4.8) |
+| `01-contracts.md` (2026-10-21) | `ports`: `Port`, `GuestPort`, `StagePorts`, `StageWaits`, `Answer`, `CallFailure`; `StageEvent::PortWaiting`/`PortAnswered`; `SchedulerStats.workers_waiting`, `stages_waiting`; `Kernel::waiting_state` (§4.10) |
+| `10-scheduler.md` (2026-10-21) | the checkpoint takes a waiting instance's `waiting_state` instead of waiting it out; `set_waits`; `set_manifest_hook`, a failure of which is a failed manifest write (§4.7, §4.10) |
+| `11-controller.md` (2026-10-21) | the `Waiting` class; busy over the workers free to compute; a waiting stage not halved, kept through a resize, not ended for its state (§4.4) |
+| `16-package.md`, `17-sandbox.md` (2026-10-21) | the world's `call` import and its verification; the host function, its trap, the entry state of a stateful stage with ports (§4.10) |
+| `13-host.md` (2026-10-21) | `port_call`, `port_reply`, `port_cancel`, version 1; `event` version 3's port wait; the port line bound (§4.3, §4.10) |
 
 ---
 
@@ -305,6 +341,12 @@ Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, a
 | Object-store proxy socket absent | `IoError` naming the socket at the first read | Immediate | Host wiring; FAIL LOUD |
 | `/dev/kvm` absent or not permitted | `moruna-vmm boot` exits 2 naming the device and the reason | Immediate | The host's responsibility (§4.8.8); `moruna run` without `--vm` still works as a process |
 | Guest kernel panics | The monitor exits with the serial log on stderr and code 6 | Immediate | The image is pinned and released; a panic is a release defect |
+| A stage calls a port its entry does not list | The call traps; the stage fails, naming the port and the list; nothing reaches the host | `task_failed` `kernel_error`, exit 4 | The document lists the port, or the component stops calling it |
+| A port call passes its deadline | The call is given up (`port_cancel` `deadline` to a host port, the handler's cancel set for a guest one); the stage fails naming the port and the deadline | exit 4 | The host answers sooner or the document gives the port a longer `deadline_ms` |
+| The run is cancelled while a call waits | The call is given up at once (`port_cancel` `cancelled`); the run ends cancelled | exit 130 | By design |
+| The peer closes with calls waiting | Every waiting call is lost, its stage fails naming the closed connection; a later call fails at once | exit 4 | The host keeps the connection for as long as the run |
+| A document lists a host port and there is no peer | Refused before the run, naming `kernels[i].ports.<name>.host` | exit 2 | `report.socket`, or `moruna serve` |
+| The copy of a manifest cannot be written to `staging.url` | A failed manifest write; three in a row end the run (10 f.12) | Exit and diagnostic name the URL | Host wiring; FAIL LOUD |
 
 ---
 
@@ -332,6 +374,8 @@ Each phase is one or more features on `BOARD.md` under a new epic **E8, Hosted e
 - **E8.6. No network.** Socket endpoints for object stores. *Gate:* H7.
 
 - **E8.8. The kernel is checkable.** Schema declarations on the decorator and the trait; the Polars-signature path; `moruna check` with the synthetic batch, the comparison, the profile row and the fingerprint; `RunSpec.kernels[].fingerprint` enforced at load. *Gate:* H13. Starts now; depends on nothing else in E8.
+- **E8.9. Host calls** (2026-10-21). The `call` import, `kernels[].ports` for host and guest ports, the port messages, a waiting stage's heartbeats, events, classification and checkpoint, `staging.url`. *Gate:* H14. Depends on nothing else in E8.
+
 - **E8.7. `moruna-vmm`.** The device-model trait; block, vsock, serial; boot with `linux-loader`; the guest image; then `virtio-mem` and vCPU hot-add; the control socket; `moruna run --vm`; the release artefacts. *Gate:* H10, H11, H12 on the Nairobi reference host; then boot on a Raspberry Pi 5 (§4.8.8) or a written finding that it cannot.
 
 E8.0–E8.2 can start now and in parallel; E8.3 after E8.2 (it reuses the watcher); E8.4 and E8.5 are independent of the others. E8.7 starts after E8.1 (it needs `moruna serve`) and runs beside everything else. Nothing in E8.0–E8.6 waits for the monitor: every gate but the second half of E8.3 and H12 runs under a cgroup.

@@ -464,6 +464,9 @@ pub(crate) struct StageCtl {
     pub var_count: u64,
     pub var_mean: f64,
     pub var_m2: f64,
+    /// A call of this stage waits on a port (MH 4.10): its target is not taken down, and its
+    /// state is not what a memory row ends the run for, while it waits.
+    pub waiting: bool,
 }
 
 impl StageCtl {
@@ -530,6 +533,7 @@ impl StageCtl {
             var_count: 0,
             var_mean: 0.0,
             var_m2: 0.0,
+            waiting: false,
         }
     }
 

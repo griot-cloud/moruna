@@ -1,4 +1,4 @@
-//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 1).
+//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 2).
 //!
 //! A task is one element of the chain, named by the document's `report.tasks`: the source, each
 //! kernel stage, the sink. The scheduler says what happened to the chain on the thread on which it
@@ -9,7 +9,8 @@
 //!
 //! A task's states, in order: waiting, ready, running (with its phase), then one end: completed
 //! (succeeded, stopped, cancelled), failed or skipped. Each is told once, in that order, and an
-//! ended task is never told of again.
+//! ended task is never told of again. A running kernel task that calls a port is told waiting on
+//! it (`port_call`, MH 4.10) and, when no call of it waits any more, its phase again.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -48,6 +49,8 @@ struct Task {
     state: State,
     /// Its input is closed: everything upstream has produced all it will.
     input_closed: bool,
+    /// It was told waiting on a port, and not yet working again (MH 4.10).
+    on_port: bool,
 }
 
 struct Inner {
@@ -123,6 +126,7 @@ impl Lifecycle {
                 id: r.id.clone(),
                 state: State::Waiting,
                 input_closed: false,
+                on_port: false,
             })
             .collect();
         Arc::new(Lifecycle {
@@ -187,6 +191,7 @@ impl Lifecycle {
                     task: task.id.clone(),
                     reason,
                     blocking,
+                    port: None,
                 },
             );
         }
@@ -351,6 +356,37 @@ impl Lifecycle {
             StageEvent::SinkCommitting => {
                 self.start(inner, t, sink, Phase::Committing);
                 self.phase(inner, t, sink, Phase::Committing);
+            }
+            StageEvent::PortWaiting { stage, port } => {
+                let pos = usize::from(*stage);
+                if pos >= 1 && pos < sink && matches!(inner.tasks[pos].state, State::Running { .. })
+                {
+                    inner.tasks[pos].on_port = true;
+                    self.tell(
+                        t,
+                        Event::TaskWaiting {
+                            task: inner.tasks[pos].id.clone(),
+                            reason: WaitReason::PortCall,
+                            blocking: Vec::new(),
+                            port: Some(port.clone()),
+                        },
+                    );
+                }
+            }
+            StageEvent::PortAnswered { stage } => {
+                let pos = usize::from(*stage);
+                if pos >= 1 && pos < sink && inner.tasks[pos].on_port {
+                    inner.tasks[pos].on_port = false;
+                    if let State::Running { phase, .. } = inner.tasks[pos].state {
+                        self.tell(
+                            t,
+                            Event::TaskPhase {
+                                task: inner.tasks[pos].id.clone(),
+                                phase,
+                            },
+                        );
+                    }
+                }
             }
             StageEvent::SinkFinished { counters } => {
                 self.complete(

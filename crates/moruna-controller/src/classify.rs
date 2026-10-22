@@ -53,10 +53,20 @@ pub(crate) fn classify(
     let ceiling = state.cfg.limits.memory_ceiling;
     let trip = ceiling.saturating_sub(model::scale(state.budgets.reserve, RESERVE_TRIP));
     let anon = inputs.sample.anon_bytes;
-    let busy = if inputs.stats.workers_active == 0 {
+    // MH 4.10: a worker waiting on a port is inside `apply` and uses no CPU; it is neither the
+    // compute the busy rows read nor a worker free to take a morsel.
+    let computing = inputs
+        .stats
+        .workers_busy
+        .saturating_sub(inputs.stats.workers_waiting);
+    let available = inputs
+        .stats
+        .workers_active
+        .saturating_sub(inputs.stats.workers_waiting);
+    let busy = if available == 0 {
         0.0
     } else {
-        f64::from(inputs.stats.workers_busy) / f64::from(inputs.stats.workers_active)
+        f64::from(computing) / f64::from(available)
     };
     let low_water = state.high_water / 2;
     let last_stage = u16::try_from(state.stage_count()).unwrap_or(u16::MAX);
@@ -77,6 +87,13 @@ pub(crate) fn classify(
     if anon >= trip {
         memory_pressure(state, last_stage, actions);
         return Bottleneck::Memory;
+    }
+    // MH 4.10: a stage waiting on its host with the rest of the chain unsaturated is waiting,
+    // not idle and not short of reads: no knob moves for it.
+    if !inputs.stats.stages_waiting.is_empty() && (available == 0 || busy <= BUSY_HIGH) {
+        // The tick still reads the throttle counter, so the next tick's delta is its own.
+        let _ = throttled(state, inputs);
+        return Bottleneck::Waiting;
     }
     if throttled(state, inputs) {
         if state.active_workers > 1 {
@@ -228,11 +245,13 @@ fn state_growth(state: &mut ControllerState, actions: &mut Actions) {
     model::resize(state, actions);
 }
 
-/// The stage holding the most state, with the sequence number of its last record.
+/// The stage holding the most state, with the sequence number of its last record. A stage
+/// waiting on a port is not ended for its state while it waits (MH 4.10).
 fn worst_state(state: &ControllerState) -> Option<(u16, u64, u64)> {
     state
         .stages
         .iter()
+        .filter(|ctl| !ctl.waiting)
         .max_by_key(|ctl| ctl.state_bytes)
         .map(|ctl| {
             (
@@ -245,7 +264,7 @@ fn worst_state(state: &ControllerState) -> Option<(u16, u64, u64)> {
 
 /// The Memory row: halve the largest stage, raise its safety and turn staging on. A run with no
 /// kernel stage has no target to halve: its reads are what it holds, so the read-ahead drops to
-/// one instead.
+/// one instead. A stage waiting on a port is not the one halved (MH 4.10).
 pub(crate) fn memory_pressure(state: &mut ControllerState, last_stage: u16, actions: &mut Actions) {
     if state.stages.is_empty() && state.read_ahead > 1 {
         state.read_ahead = 1;
@@ -255,6 +274,7 @@ pub(crate) fn memory_pressure(state: &mut ControllerState, last_stage: u16, acti
         .stages
         .iter()
         .enumerate()
+        .filter(|(_, ctl)| !ctl.waiting)
         .max_by_key(|(_, ctl)| ctl.target)
         .map(|(at, _)| at);
     if let Some(at) = largest {
