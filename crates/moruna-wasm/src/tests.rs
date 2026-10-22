@@ -809,7 +809,7 @@ fn pk_t17_read_asset() {
 }
 
 #[test]
-fn an_import_other_than_read_asset_is_refused() {
+fn sb_t2_an_import_outside_the_world_is_refused() {
     let engine = engine().unwrap();
     let c = Component::new(
         engine,
@@ -914,7 +914,7 @@ fn apply(kernel: &WasmKernel, state: &mut dyn KernelState) -> moruna_kernel::Res
 
 /// MH 4.10: a component calls a listed port, and the port's answer is its output.
 #[test]
-fn a_component_calls_a_listed_port() {
+fn sb_t24_a_component_calls_a_listed_port() {
     let port = stub(0, None);
     let (kernel, dir, waits, _) = caller("stub", false, "stub", Arc::clone(&port), 10_000);
     let mut state = state_of(&kernel);
@@ -928,7 +928,7 @@ fn a_component_calls_a_listed_port() {
 /// MH 4.10: the port's own refusal is the component's to answer; this one refuses the batch
 /// with it.
 #[test]
-fn a_ports_refusal_is_handed_to_the_component() {
+fn sb_t24_a_ports_refusal_is_handed_to_the_component() {
     let (kernel, dir, _, _) = caller("stub", false, "stub", stub(0, Some("no model")), 10_000);
     let mut state = state_of(&kernel);
     let said = apply(&kernel, state.as_mut()).unwrap_err().to_string();
@@ -938,7 +938,7 @@ fn a_ports_refusal_is_handed_to_the_component() {
 
 /// MH 4.10: a name the stage's entry does not list is refused by name, and fails the stage.
 #[test]
-fn an_unlisted_port_is_refused_by_name() {
+fn sb_t24_an_unlisted_port_is_refused_by_name() {
     let port = stub(0, None);
     let (kernel, dir, _, _) = caller("model", false, "stub", Arc::clone(&port), 10_000);
     let mut state = state_of(&kernel);
@@ -953,7 +953,7 @@ fn an_unlisted_port_is_refused_by_name() {
 
 /// MH 4.10: a call past its deadline fails the stage, naming the port and the deadline.
 #[test]
-fn a_call_past_its_deadline_fails_the_stage() {
+fn sb_t24_a_call_past_its_deadline_fails_the_stage() {
     let (kernel, dir, _, _) = caller("stub", false, "stub", stub(60_000, None), 100);
     let mut state = state_of(&kernel);
     let t = std::time::Instant::now();
@@ -968,7 +968,7 @@ fn a_call_past_its_deadline_fails_the_stage() {
 
 /// MH 4.10: the run's cancel ends a call that waits, and the stage ends cancelled.
 #[test]
-fn a_cancel_ends_a_waiting_call() {
+fn sb_t24_a_cancel_ends_a_waiting_call() {
     let (kernel, dir, waits, cancel) = caller("stub", false, "stub", stub(600_000, None), 600_000);
     let mut state = state_of(&kernel);
     let t = std::thread::spawn(move || {
@@ -987,7 +987,7 @@ fn a_cancel_ends_a_waiting_call() {
 
 /// MH 4.10: a component with no ports bound (a check, a load) is told so by name.
 #[test]
-fn a_call_outside_a_run_is_refused() {
+fn sb_t24_a_call_outside_a_run_is_refused() {
     let dir = scratch();
     let m = manifest("caller", false, true);
     let bytes = caller_component(&m.to_json(), "stub", false);
@@ -1001,7 +1001,7 @@ fn a_call_outside_a_run_is_refused() {
 /// MH 4.10: while a stateful stage waits, its checkpoint is its state as the call's `process`
 /// began; once the call is answered there is none, and the instance's own checkpoint follows.
 #[test]
-fn a_waiting_stateful_stage_checkpoints_its_entry_state() {
+fn sb_t24_a_waiting_stateful_stage_checkpoints_its_entry_state() {
     let port = stub(300, None);
     let (kernel, dir, waits, _) = caller("stub", true, "stub", Arc::clone(&port), 10_000);
     let kernel = Arc::new(kernel);
@@ -1041,7 +1041,7 @@ fn a_waiting_stateful_stage_checkpoints_its_entry_state() {
 
 /// MH 4.10: `call` is the world's, with the world's type; `verify` admits it.
 #[test]
-fn the_call_import_is_admitted_with_its_type() {
+fn sb_t2_the_call_import_is_admitted_with_its_type() {
     let engine = engine().unwrap();
     let m = manifest("caller", false, true);
     let c = Component::new(engine, caller_component(&m.to_json(), "x", false)).unwrap();
