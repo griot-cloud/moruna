@@ -82,7 +82,7 @@ jobs:
           cargo fmt --all -- --check
           tools/lint/no_tier_wildcard.sh
           tools/docs/check_docs.py
-      - name: JB-I10, the job document's generated code is what its schema generates
+      - name: JB-I12, the job document's generated code is what its schema generates
         run: tools/flatc/generate.sh --check
       - name: The documentation site builds, warnings as errors
         run: |
