@@ -10,10 +10,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Role, RunnableKind, Stage,
-    settings_schema,
-};
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
+
+use super::{Context, Entry, RunnableKind, Stage};
 
 /// The `image` kind.
 pub struct Image;

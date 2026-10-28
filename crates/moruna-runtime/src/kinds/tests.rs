@@ -316,7 +316,10 @@ fn im_t16_the_image_kind_is_declared() {
     let build = |value: Value| {
         let doc = doc(value);
         let mut cx = Context::new(Arc::new(Standalone));
-        refusal(kind.stage(&Entry::new("kernels[0]", Some(0), &doc), &mut cx)).to_string()
+        kind.stage(&Entry::new("kernels[0]", Some(0), &doc), &mut cx)
+            .err()
+            .expect("refused")
+            .to_string()
     };
     let e = build(json!({"kind": "image", "layout": "/l"}));
     assert!(e.contains("kernels[0]") && e.contains("reference"), "{e}");
