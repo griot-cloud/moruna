@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{Context, Entry};
+use crate::job::refusal;
 
 /// One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -30,7 +31,7 @@ pub struct PortDoc {
 /// Whether `name` may name a port (MH 4.10): 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and
 /// `:`, starting with a letter or a digit.
 pub fn is_port_name(name: &str) -> bool {
-    name.len() <= 64 && crate::job::is_task_id(name)
+    name.len() <= 64 && moruna_job::is_task_id(name)
 }
 
 /// The routes of an entry's `ports` (MH 4.10): each name valid, each going to exactly one place,
@@ -56,32 +57,29 @@ pub fn routes(
             .deadline_ms
             .unwrap_or(moruna_kernel::ports::PORT_DEADLINE_MS);
         if deadline_ms == 0 || deadline_ms > moruna_kernel::ports::PORT_DEADLINE_MAX_MS {
-            return Err(crate::job::SpecError::new(
+            return Err(refusal(moruna_job::SpecError::new(
                 format!("{}.deadline_ms", field(name)),
                 format!(
                     "{deadline_ms} is outside 1 to {} ms",
                     moruna_kernel::ports::PORT_DEADLINE_MAX_MS
                 ),
-            )
-            .into());
+            )));
         }
         let deadline = std::time::Duration::from_millis(deadline_ms);
         let route = match (&port.host, &port.guest) {
             (Some(host_name), None) => {
                 if !is_port_name(host_name) {
-                    return Err(crate::job::SpecError::new(
+                    return Err(refusal(moruna_job::SpecError::new(
                         format!("{}.host", field(name)),
                         format!("{host_name:?} is not a port name"),
-                    )
-                    .into());
+                    )));
                 }
                 let Some(hub) = cx.host_port_hub() else {
-                    return Err(crate::job::SpecError::new(
+                    return Err(refusal(moruna_job::SpecError::new(
                         format!("{}.host", field(name)),
                         "a host port needs a peer to serve it: report.socket under moruna run, or \
                          moruna serve",
-                    )
-                    .into());
+                    )));
                 };
                 Route {
                     place: "host",
@@ -91,14 +89,13 @@ pub fn routes(
             }
             (None, Some(handler)) => {
                 let Some(answers) = cx.embedding().guest_port(handler) else {
-                    return Err(crate::job::SpecError::new(
+                    return Err(refusal(moruna_job::SpecError::new(
                         format!("{}.guest", field(name)),
                         format!(
                             "no guest handler {handler:?} is registered by the program running \
                              this document"
                         ),
-                    )
-                    .into());
+                    )));
                 };
                 Route {
                     place: "guest",
@@ -107,11 +104,10 @@ pub fn routes(
                 }
             }
             _ => {
-                return Err(crate::job::SpecError::new(
+                return Err(refusal(moruna_job::SpecError::new(
                     field(name),
                     "a port goes to exactly one of `host` and `guest`",
-                )
-                .into());
+                )));
             }
         };
         routes.insert(name.clone(), route);

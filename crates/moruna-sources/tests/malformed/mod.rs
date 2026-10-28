@@ -307,3 +307,110 @@ fn so_t32_parquet_malformed_never_panics() {
         &failures[..failures.len().min(10)]
     );
 }
+
+/// Standard base64 with padding, as the Arrow writer encodes `ARROW:schema`.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let word = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |w, (i, b)| w | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(word >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A Parquet file of one `i64` column whose footer carries `schema` (an IPC schema message
+/// behind its framing) under `ARROW:schema` in place of the one the writer would put there.
+fn with_arrow_schema(schema: &[u8]) -> Vec<u8> {
+    use moruna_kernel::arrow::array::Int64Array;
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    use moruna_kernel::arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_writer::ArrowWriterOptions;
+    use parquet::file::metadata::KeyValue;
+
+    let fields = Schema::new(vec![Field::new("i", DataType::Int64, true)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(fields),
+        vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            Some(4),
+        ]))],
+    )
+    .expect("a batch");
+    let mut out = Vec::new();
+    let options = ArrowWriterOptions::new().with_skip_arrow_metadata(true);
+    let mut writer =
+        ArrowWriter::try_new_with_options(&mut out, batch.schema(), options).expect("a writer");
+    writer.write(&batch).expect("the batch");
+    writer.append_key_value_metadata(KeyValue::new("ARROW:schema".into(), base64(schema)));
+    writer.close().expect("the footer");
+    out
+}
+
+// SO-T33 parquet_arrow_schema_checked. SO-I10, contracts CT-I13.
+#[test]
+fn so_t33_parquet_arrow_schema_checked() {
+    use moruna_kernel::arrow::ipc::MetadataVersion;
+    use moruna_testkit::ipc::{Rng, VALUES, messages, small, stream, unknown_type};
+
+    let dir = scratch();
+    let path = dir.join("t33.parquet");
+    let valid = stream(&[small()], MetadataVersion::V5);
+    let ((start, len), _) = messages(&valid)[0];
+
+    // The crafted footer: its schema names a type id no Arrow type has.
+    let crafted = unknown_type(&valid);
+    let bytes = with_arrow_schema(&crafted[start - 8..start + len]);
+    std::fs::write(&path, &bytes).expect("the crafted file");
+    let Err(err) = planned(&path, bytes) else {
+        panic!("the crafted footer is refused");
+    };
+    let MorunaError::Source { msg, .. } = &err else {
+        panic!("expected a Source error, got {err}");
+    };
+    assert!(msg.contains("the Arrow schema in the footer"), "{msg}");
+    assert!(msg.contains("field \"i\""), "{msg}");
+
+    // Every byte of the schema message set to each of the values, and random replacements:
+    // each file is planned and read or refused, never a panic.
+    let mut failures = Vec::new();
+    let mut cases = Vec::new();
+    for at in start..start + len {
+        for value in VALUES {
+            let mut schema = valid[start - 8..start + len].to_vec();
+            schema[at - start + 8] = value;
+            cases.push((format!("schema byte {at}={value:#04x}"), schema));
+        }
+    }
+    let mut rng = Rng::new(0x5033_0000_0000_0033);
+    for case in 0..300 {
+        let mut schema = valid[start - 8..start + len].to_vec();
+        for _ in 0..1 + rng.below(4) {
+            let at = rng.below(schema.len());
+            schema[at] = rng.next_u64() as u8;
+        }
+        cases.push((format!("random {case}"), schema));
+    }
+    for (label, schema) in cases {
+        let bytes = with_arrow_schema(&schema);
+        failures.extend(exercise(&path, &bytes, &bytes, &label).err());
+    }
+    assert!(
+        failures.is_empty(),
+        "{} footers panicked; the first: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(10)]
+    );
+}

@@ -11,15 +11,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use moruna_adapters::python_gil_enabled;
-use moruna_kernel::{CancelToken, DType, MorunaError, SourceSchema};
-use moruna_runtime::job::build::process_env;
-use moruna_runtime::job::{
-    AzureDoc, BuildOptions, ErrorPolicyDoc, GcsDoc, JobSpec, KindDoc, ObjectStoreDoc, S3Doc,
-    SizerDoc, SpecError,
+use moruna_job::{
+    AzureDoc, ErrorPolicyDoc, GcsDoc, JobSpec, KindDoc, ObjectStoreDoc, S3Doc, SizerDoc, SpecError,
+    Urls,
 };
+use moruna_kernel::{CancelToken, DType, MorunaError, SourceSchema};
+use moruna_runtime::job::BuildOptions;
+use moruna_runtime::job::build::process_env;
+use moruna_runtime::job::refusal;
 use moruna_runtime::kinds::parquet::compression_name;
 use moruna_runtime::kinds::tensor::tensor_format_name;
-use moruna_runtime::kinds::{Urls, arrow_ipc, parquet, tensor, vortex};
+use moruna_runtime::kinds::{arrow_ipc, parquet, tensor, vortex};
 use moruna_runtime::{RunSpec, Runtime};
 use moruna_sources::{RowFilter, ScalarValue};
 use pyo3::exceptions::PyKeyboardInterrupt;
@@ -198,7 +200,7 @@ pub fn run(
             described,
             object_store,
         )
-        .map_err(MorunaError::from),
+        .map_err(refusal),
     )?;
     let iterable = match (&source_spec, iterator) {
         (SourceSpec::Iterator { schema }, Some(object)) => {
@@ -448,7 +450,7 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KindDoc
                 ),
             )
         };
-        docs.push(doc.map_err(|e| map_err(py, &MorunaError::from(e)))?);
+        docs.push(doc.map_err(|e| map_err(py, &refusal(e)))?);
     }
     Ok(docs)
 }

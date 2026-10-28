@@ -47,7 +47,6 @@ pub mod spec;
 pub use checkpoint::CheckpointHandle;
 pub use elastic::ElasticBudget;
 pub use error::{Result, RunError};
-pub use job::JobSpec;
 pub use observe::{Progress, RunObserver};
 pub use run::Runtime;
 pub use spec::{BuildCtx, Components, EngineMemory, RunSpec, SinkSpec, SourceSpec};

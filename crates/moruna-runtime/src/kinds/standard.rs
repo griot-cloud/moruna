@@ -10,10 +10,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    Context, Declaration, Entry, Fact, Flow, Fuse, Isolation, Needs, Role, RunnableKind, Stage,
-    check_pin, settings_schema,
-};
+use super::{Context, Entry, Fuse, RunnableKind, Stage, check_pin};
+use crate::job::refusal;
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
 
 /// The `std` kind.
 pub struct Std;
@@ -64,8 +63,12 @@ impl RunnableKind for Std {
     fn stage(&self, entry: &Entry<'_>, _cx: &mut Context) -> Result<Stage> {
         let settings: Settings = entry.settings()?;
         let args = settings.args.unwrap_or(serde_json::Value::Null);
-        let kernel = StdKernel::new(&settings.name, &args)
-            .map_err(|e| crate::job::SpecError::new(entry.field().to_string(), e.to_string()))?;
+        let kernel = StdKernel::new(&settings.name, &args).map_err(|e| {
+            refusal(moruna_job::SpecError::new(
+                entry.field().to_string(),
+                e.to_string(),
+            ))
+        })?;
         check_pin(entry, settings.fingerprint.as_deref(), &kernel)?;
         Ok(stage(kernel))
     }

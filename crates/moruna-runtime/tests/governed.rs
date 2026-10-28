@@ -17,11 +17,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use moruna_datafusion::engine::{Caller, Engine};
+use moruna_job::JobSpec;
 use moruna_kernel::CancelToken;
 use moruna_kernel::arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use moruna_runtime::Runtime;
-use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::Registry;
 use moruna_runtime::kinds::governed::entry_of;
 use support::apart::{self, BUDGETS};
