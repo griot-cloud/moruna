@@ -952,3 +952,110 @@ impl PickGate {
         self.changed.notify_all();
     }
 }
+
+/// A test-local `Source` (k): a plan whose splits hold the row counts the test names, one per
+/// split, zeros included, which `FakeSource::splits` cannot give because it makes every split
+/// alike (SC-T24, SC-T25). Its reads are `FakeSource`'s, eight bytes a row; it records which
+/// splits were read.
+pub struct RowsSource {
+    inner: FakeSource,
+    splits: Vec<Split>,
+}
+
+impl RowsSource {
+    pub fn new(rows: &[u64], sub_splittable: bool) -> RowsSource {
+        let splits = rows
+            .iter()
+            .enumerate()
+            .map(|(id, rows)| Split {
+                id: id as u32,
+                rows: *rows,
+                uncompressed_bytes: rows * 8,
+                estimated: false,
+                column_bytes: vec![rows * 8],
+                null_counts: vec![Some(0)],
+                sub_splittable,
+            })
+            .collect();
+        RowsSource {
+            inner: FakeSource::new().sub_splittable(sub_splittable),
+            splits,
+        }
+    }
+
+    /// The splits a read named, in call order.
+    pub fn read_splits(&self) -> Vec<u32> {
+        self.inner.reads().iter().map(|(split, _)| *split).collect()
+    }
+}
+
+impl Source for RowsSource {
+    fn schema(&self) -> SourceSchema {
+        Source::schema(&self.inner)
+    }
+
+    fn plan(&self) -> Result<Vec<Split>> {
+        Ok(self.splits.clone())
+    }
+
+    fn read<'a>(
+        &'a self,
+        split: &'a Split,
+        rows: Option<RowRange>,
+        alloc: &'a dyn Allocator,
+        tier: moruna_kernel::Tier,
+    ) -> BoxFuture<'a, Result<Payload>> {
+        self.inner.read(split, rows, alloc, tier)
+    }
+
+    fn repeatable(&self) -> bool {
+        true
+    }
+}
+
+/// Run `rig` to its end, or fail the test naming `what` when it has not ended within
+/// `deadline`: a run that never finishes is the defect, so the test must not hang with it.
+/// The run is cancelled before the failure, so its threads end.
+pub fn run_within(rig: &Rig, deadline: Duration, what: &str) -> crate::RunOutcome {
+    let cancel = moruna_kernel::CancelToken::new();
+    let token = cancel.clone();
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| rig.scheduler.run(token));
+        let finished = wait_for(deadline, || handle.is_finished());
+        if !finished {
+            cancel.cancel();
+        }
+        let outcome = match handle.join() {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => panic!("{what}: the run failed before Running: {e}"),
+            Err(_) => panic!("{what}: the run thread panicked"),
+        };
+        assert!(
+            finished,
+            "{what}: the run had not finished after {deadline:?}"
+        );
+        outcome
+    })
+}
+
+/// xorshift64*: the cases of a property test, seeded so a failing case is the same case on
+/// every machine.
+pub struct Cases(u64);
+
+impl Cases {
+    pub fn seeded(seed: u64) -> Cases {
+        Cases(seed.max(1))
+    }
+
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A value in `0..n`.
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+}

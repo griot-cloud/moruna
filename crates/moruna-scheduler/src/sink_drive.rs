@@ -156,6 +156,18 @@ fn write_loop(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) -> Drained
     }
 }
 
+/// f.6, h: the sink drive panicked, in the sink's code or in its own. The run ends with a sink
+/// diagnostic saying what the panic said; `finish` is not called. Without this the run waited
+/// for ever on a drive that was gone, and its tasks never ended (MA2).
+pub(crate) fn panicked(shared: &Shared, panic: &(dyn std::any::Any + Send)) {
+    let msg = format!(
+        "the sink drive panicked: {}",
+        crate::worker::panic_message(panic)
+    );
+    tracing::error!(target: "sched.drive_panicked", %msg, "the sink drive died");
+    crate::policy::terminate(shared, MorunaError::Sink(msg));
+}
+
 /// Poll every write once; each completion moves the watermark (f.11).
 fn poll_writes(
     shared: &Shared,
@@ -239,9 +251,18 @@ fn finish(shared: &Shared) {
     }
     shared.set_run_state(RunState::Finishing);
     shared.tell(moruna_kernel::StageEvent::SinkCommitting);
+    // A panic in `finish` would leave the exit claimed and never published, and the run waiting
+    // for ever; it ends the run as the sink's failure instead, like an `Err` (h).
     let summary: Result<SinkSummary> = {
         let mut guard = shared.sink.write().unwrap_or_else(|e| e.into_inner());
-        guard.finish()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.finish())).unwrap_or_else(
+            |panic| {
+                Err(MorunaError::Sink(format!(
+                    "the sink panicked in finish: {}",
+                    crate::worker::panic_message(panic.as_ref())
+                )))
+            },
+        )
     };
     match summary {
         Ok(summary) => {
