@@ -308,6 +308,85 @@
   ],
   "kernels": [
     {
+      "name": "image",
+      "role": "kernel",
+      "summary": "An OCI image's command in a sandboxed process, Arrow IPC over its standard input and output",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "layout": {
+            "type": "string",
+            "description": "A local OCI image layout: a directory holding `oci-layout`, `index.json` and `blobs/`."
+          },
+          "reference": {
+            "type": "string",
+            "description": "The image to run: a manifest digest (`sha256:...`) or the name the layout's `index.json`\ngives it (`org.opencontainers.image.ref.name`)."
+          },
+          "command": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The command to run, replacing the image's entrypoint and cmd."
+          },
+          "env": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment added to the image's own; the process gets nothing else."
+          },
+          "cache": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where unpacked images are kept; `images` beside the run's output when it is a directory."
+          }
+        },
+        "required": [
+          "layout",
+          "reference"
+        ],
+        "description": "An `image` entry's settings (SDD 19 d.2).",
+        "title": "image",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "layout": "/disk/images/scorer",
+            "reference": "scorer:1",
+            "command": [
+              "/usr/bin/scorer",
+              "--column",
+              "text"
+            ],
+            "env": {
+              "MODEL": "small"
+            }
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "no",
+      "preserves_columns": "no",
+      "isolation": "confined"
+    },
+    {
       "name": "package",
       "role": "kernel",
       "summary": "A function package, one .wasm or .pex file pinned by its sha256",
