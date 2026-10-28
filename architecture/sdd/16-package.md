@@ -57,7 +57,7 @@ It refuses to know: how a package is run (SDD 17), where a host keeps packages o
 
 **PK-I7. A tree is used only for the package it was extracted from.** A tree is used when its marker (e.4) names the package's fingerprint and this Moruna's version; otherwise it is extracted anew, and a tree that cannot be written beside the package is written to a private directory and the note says so.
 
-**PK-I8. A hosted run loads no kernel by import path.** Under strict mode a job document entry of kind `python` is refused naming `kernels[i].module`, with the reason that a hosted run loads kernels from packages. FP 4.
+**PK-I8. A hosted run loads no kernel by import path.** Under strict mode a job document entry whose kind declares its code imported by path (`isolation: imported`, SDD 18 e.1; the Python surface's `python` kind) is refused naming `kernels[i].kind`, with the reason that a hosted run loads kernels from packages. FP 4; SDD 18 KD-I6.
 
 **PK-I9. `moruna check <package>` gives the hosted verdict.** It runs the seven steps of MH 4.9 through the package's runtime (SDD 17), never in-process, and the fingerprint it prints is the package's.
 
@@ -272,7 +272,7 @@ world kernel {
 
 **f.7 Platform compatibility.** The host's target for a `.pex` is `cp3NN-manylinux_<glibc major>_<glibc minor>_<arch>` from the sandbox interpreter's version, its C library's version (`os.confstr("CS_GNU_LIBC_VERSION")`) and the machine's architecture, which the template reports in its `hello` (17 e.3); on a host that is not Linux with glibc, `host_target` is refused ("a .pex runs in the sandbox, which needs Linux with glibc"). `manylinux_<a>_<b>_<arch>` is compatible with a host `manylinux_<c>_<d>_<arch>` when the interpreter tags are equal, the architectures are equal, and `(a, b) <= (c, d)`.
 
-**f.8 The job document.** `KernelKindDoc::Package` entries are built by SDD 17's runtimes: open the package (f.1), check the pin (f.2), check the entry's `args` against the hint (an object only for a kernel with `args`; a kernel with it gets `{}` when the document gives none) and its `assets` (an existing directory), then `moruna_wasm::WasmKernel::new` or `moruna_sandbox::SandboxKernel::new` by format, each given the arguments and the assets. A `.pex` entry without the sandbox host of d.2 (`--sandbox-python`, `--sandbox-cgroup`) is refused naming the missing option. Strict mode refuses `kind: python` before any kernel is loaded (PK-I8).
+**f.8 The job document.** Entries of the runnable kind `package` (SDD 18, `kinds/package.rs`) are built by SDD 17's runtimes: open the package (f.1), check the pin (f.2), check the entry's `args` against the hint (an object only for a kernel with `args`; a kernel with it gets `{}` when the document gives none) and its `assets` (an existing directory), then `moruna_wasm::WasmKernel::new` or `moruna_sandbox::SandboxKernel::new` by format, each given the arguments and the assets. A `.pex` entry without the sandbox host of d.2 (`--sandbox-python`, `--sandbox-cgroup`) is refused naming the missing option. Strict mode refuses an imported kind before any kernel is loaded (PK-I8).
 
 **f.9 `moruna check <package>`.** Open the package; build its kernel as f.8 does; run `moruna_runtime::check::check` with `kind` `wasm` or `pex` and `fingerprint_scheme` `sha256`; the report's `fingerprint` is the package's (PK-I9). The kernel's `Fingerprint` (contracts e.6) is the package's 32 bytes, so the profile row is keyed by the file and a later run of the same file sizes from it.
 
@@ -328,9 +328,9 @@ world kernel {
 
 **PK-T10 package_a_component.** `moruna package --wasm` on the identity component (SDD 17 SB-T1) writes `<name>.wasm` whose section and `declare()` agree; a `function.yaml` naming another column type is refused naming `declaration`; a component importing a function other than `read-asset` and `call`, or `call` with another type, is refused naming the import. PK-I4.
 
-**PK-T11 strict_refuses_import_paths.** A document with a `python` kernel built with `strict` is refused naming `kernels[0].module`; the same document without `strict` builds. PK-I8.
+**PK-T11 strict_refuses_import_paths.** A document with a `python` kernel built with `strict` is refused naming `kernels[0].kind`; the same document without `strict` builds. PK-I8; run as SDD 18 KD-T7.
 
-**PK-T12 package_entry_fields.** A `package` entry with `module`, `callable`, `name` or any hint set is refused naming that field; `path` or `fingerprint` absent is refused; `args` for a package without the hint `args`, or `assets` that is not a directory, is refused naming it. d.4.
+**PK-T12 package_entry_fields.** A `package` entry with `module`, `callable`, `name` or any hint set is refused naming the entry and the field (its settings schema is closed, SDD 18 KD-I4); `path` or `fingerprint` absent is refused; `args` for a package without the hint `args`, or `assets` that is not a directory, is refused naming it. d.4.
 
 **PK-T13 check_through_the_runtime.** `moruna check` on the identity `.wasm` agrees and prints `sha256:<file hash>`; on the column-adding `.wasm` that disagrees with its declaration it is refused naming the column; the profile row it wrote is keyed by the package's fingerprint. PK-I9.
 

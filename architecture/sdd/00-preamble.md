@@ -40,6 +40,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 12 | Python surface | `12-python.md` | all | the only component that knows what a user is |
 | 16 | Function package | `16-package.md` | 1, 12's check harness, 17 | a package is one file whose fingerprint is `sha256` of its bytes, read once; its manifest is complete and closed; a hosted run loads no kernel by import path (added 2026-10-15, `architecture/function-packages.md`) |
 | 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
+| 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -468,6 +469,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `zip` | 16 | the `.pex` archive | `default-features = false`, feature `deflate`; added 2026-10-15 |
 | `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |
 | `vm-fdt`, `acpi_tables` | `moruna-vmm` | the aarch64 device tree and the x86_64 ACPI tables that describe the guest's devices and hot-pluggable CPUs | |
+| `schemars` | 18 (runtime), 12 | the settings schema each kind declares: JSON Schema 2020-12 derived from the type its adapter reads its settings with (18 e.2, decision KD1) | already in the graph through `parcel-core` at this version; default features (`derive`, `std`); added 2026-10-28, named in 18 d.5 |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
 
@@ -500,7 +502,7 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `acpi_tables` | 0.2.1 | `vortex` | 0.86.1 (E2, 2026-09-29: the newest release; it builds on 1.98.1 and declares `rust-version = 1.95`) |
 | `wasmtime` | 47.0.4 (2026-10-15: the version `parcel-runtime` brings, so the graph has one; 49.0.3 was the newest) | `wat` (dev) | 1.252.0 (the `wasmparser` wasmtime 47 uses) |
 | `zip` | 9.0.3 | `landlock` | 0.4.7 |
-| `seccompiler` | 0.5.0 | | |
+| `seccompiler` | 0.5.0 | `schemars` | 1.2.2 (2026-10-28: the version `parcel-core` brings, so the graph has one) |
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 

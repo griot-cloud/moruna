@@ -34,6 +34,9 @@ pub mod extend;
 pub mod inspect;
 #[cfg(feature = "python")]
 pub mod kernel;
+// The Python kinds of the job document (SDD 18): the command's and the library's.
+#[cfg(feature = "python")]
+pub mod kinds;
 // A Python kernel's output, routed by stage (MH 4.3 `log`).
 #[cfg(feature = "python")]
 pub mod output;

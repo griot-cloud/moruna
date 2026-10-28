@@ -28,7 +28,8 @@ use super::protocol::{
 };
 use super::transport::{self, Address, Conn};
 use super::{VERSION, diagnostic, exit, exit_code};
-use crate::job::{BuildOptions, JobSpec, KernelLoader, SpecError, build};
+use crate::job::{BuildOptions, JobSpec, SpecError, build};
+use crate::kinds::Registry;
 use crate::observe::RunObserver;
 use crate::run::Runtime;
 use crate::spec::Components;
@@ -218,7 +219,7 @@ impl Drop for Events {
 
 /// `moruna run <spec.json>`: read the document, then [`run_job`], connecting to
 /// `report.socket` when the document names one.
-pub fn run_file(path: &Path, loader: &dyn KernelLoader, opts: &HostOptions<'_>) -> Outcome {
+pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
     let started = Instant::now();
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -264,7 +265,7 @@ pub fn run_file(path: &Path, loader: &dyn KernelLoader, opts: &HostOptions<'_>) 
         spec_digest: Some(job.digest()),
         limits: limits_for(&job),
     });
-    let outcome = run_job(job, loader, opts, &wire, reader, Mode::Run);
+    let outcome = run_job(job, kinds, opts, &wire, reader, Mode::Run);
     if let Some(close) = closer {
         close();
     }
@@ -273,7 +274,7 @@ pub fn run_file(path: &Path, loader: &dyn KernelLoader, opts: &HostOptions<'_>) 
 
 /// `moruna serve --listen <address>`: wait for one peer, say `hello`, wait for its `spec`, run
 /// it as `moruna run` would, and exit (MH 4.2). One job per process.
-pub fn serve(address: &Address, loader: &dyn KernelLoader, opts: &HostOptions<'_>) -> Outcome {
+pub fn serve(address: &Address, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
     let listener = match transport::listen(address) {
         Ok(listener) => listener,
         Err(error) => {
@@ -289,11 +290,11 @@ pub fn serve(address: &Address, loader: &dyn KernelLoader, opts: &HostOptions<'_
         }
     };
     drop(listener);
-    serve_conn(conn, loader, opts)
+    serve_conn(conn, kinds, opts)
 }
 
 /// [`serve`] once the peer has connected.
-pub fn serve_conn(conn: Conn, loader: &dyn KernelLoader, opts: &HostOptions<'_>) -> Outcome {
+pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
     let started = Instant::now();
     let (reader, writer, closer) = conn.into_parts();
     let wire = Wire::new(Some(writer), started);
@@ -333,7 +334,7 @@ pub fn serve_conn(conn: Conn, loader: &dyn KernelLoader, opts: &HostOptions<'_>)
                                     .to_string(),
                             );
                         }
-                        break run_job(job, loader, opts, &wire, Some(reader), Mode::Serve);
+                        break run_job(job, kinds, opts, &wire, Some(reader), Mode::Serve);
                     }
                     Err(refusal) => break refused_without_document(Some(&raw), &refusal, &wire),
                 }
@@ -377,7 +378,7 @@ pub enum Mode {
 /// peer's inbound half, read on its own thread for `cancel` and `checkpoint`.
 pub fn run_job(
     job: JobSpec,
-    loader: &dyn KernelLoader,
+    kinds: &Registry,
     opts: &HostOptions<'_>,
     wire: &Arc<Wire>,
     reader: Option<Box<dyn BufRead + Send>>,
@@ -414,7 +415,7 @@ pub fn run_job(
     let host_ports = (wire.has_peer() && reader.is_some()).then(|| HostPorts::new(wire.clone()));
     let built = match build(
         &job,
-        loader,
+        kinds,
         BuildOptions {
             strict: opts.strict,
             env: opts.env,

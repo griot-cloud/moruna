@@ -1,6 +1,6 @@
-//! The `moruna` command line (MH 4.2, 4.8.4): `run`, `run --vm`, `serve`, `--version`. The
-//! binary is a thin `main` over [`main`]; the Python adapter's binary passes a loader that
-//! imports Python kernels, and a build without it passes [`crate::job::NoKernels`].
+//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3): `run`, `run --vm`, `serve`, `kinds`,
+//! `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
+//! run: the Python adapter's binary adds the Python kinds to [`Registry::standard`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,14 +13,15 @@ use moruna_kernel::CancelToken;
 use super::session::{self, HEARTBEAT, HostOptions, Outcome};
 use super::transport::Address;
 use super::{VERSION, exit};
-use crate::job::KernelLoader;
 use crate::job::build::process_env;
+use crate::kinds::Registry;
 use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
 pub const USAGE: &str = "usage: moruna run <spec.json> [--strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
        moruna run --vm <spec.json> --image <dir-or-oci> [--disk <path>[:ro|:rw]]...
        moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
+       moruna kinds
        moruna --version";
 
 /// A parsed command line.
@@ -56,6 +57,8 @@ pub enum Command {
         /// What a `.pex` package's sandbox needs (17 e.6).
         packages: PackageHost,
     },
+    /// `moruna kinds` (SDD 18 e.3): every kind this binary can run, its declaration, as JSON.
+    Kinds,
     /// `moruna --version`.
     Version,
     /// `moruna --help`.
@@ -165,6 +168,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 packages,
             })
         }
+        Some("kinds") => match rest.next() {
+            None => Ok(Command::Kinds),
+            Some(extra) => Err(format!(
+                "moruna kinds: takes no arguments, and was given `{extra}`"
+            )),
+        },
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
         Some(other) => Err(format!("moruna: unknown command `{other}`")),
@@ -193,25 +202,25 @@ fn sandbox_option<'a>(
 
 /// Run a command line and return the process's exit code (MH 4.2). `cancel` is the surface's
 /// (a signal handler's) way in; a `cancel` message from the peer uses the same token.
-pub fn main(args: &[String], loader: &dyn KernelLoader, cancel: CancelToken) -> i32 {
-    main_as(args, loader, cancel, &process_env, HEARTBEAT, true)
+pub fn main(args: &[String], kinds: &Registry, cancel: CancelToken) -> i32 {
+    main_as(args, kinds, cancel, &process_env, HEARTBEAT, true)
 }
 
 /// [`main`] with the environment and the heartbeat cadence supplied, for tests: the test's
 /// process is not the run's alone, so its own output is left where it goes.
 pub fn main_with(
     args: &[String],
-    loader: &dyn KernelLoader,
+    kinds: &Registry,
     cancel: CancelToken,
     env: &dyn Fn(&str) -> Option<String>,
     heartbeat: Duration,
 ) -> i32 {
-    main_as(args, loader, cancel, env, heartbeat, false)
+    main_as(args, kinds, cancel, env, heartbeat, false)
 }
 
 fn main_as(
     args: &[String],
-    loader: &dyn KernelLoader,
+    kinds: &Registry,
     cancel: CancelToken,
     env: &dyn Fn(&str) -> Option<String>,
     heartbeat: Duration,
@@ -233,6 +242,10 @@ fn main_as(
             println!("{USAGE}");
             return exit::COMPLETED;
         }
+        Command::Kinds => {
+            println!("{}", kinds.listing().to_json());
+            return exit::COMPLETED;
+        }
         Command::RunVm { spec, image, disks } => {
             return run_vm(Path::new(&spec), &image, &disks);
         }
@@ -242,7 +255,7 @@ fn main_as(
             packages,
         } => session::run_file(
             Path::new(&spec),
-            loader,
+            kinds,
             &HostOptions {
                 strict,
                 env,
@@ -258,7 +271,7 @@ fn main_as(
             packages,
         } => session::serve(
             &listen,
-            loader,
+            kinds,
             &HostOptions {
                 strict,
                 env,
@@ -524,16 +537,20 @@ mod tests {
 
     #[test]
     fn version_help_and_nonsense_exit_as_documented() {
-        let loader = crate::job::NoKernels;
+        let kinds = Registry::standard();
         let env = |_: &str| None;
-        let run = |a: &[&str]| main_with(&args(a), &loader, CancelToken::new(), &env, HEARTBEAT);
+        let run = |a: &[&str]| main_with(&args(a), &kinds, CancelToken::new(), &env, HEARTBEAT);
         assert_eq!(run(&["--version"]), exit::COMPLETED);
         assert_eq!(run(&["--help"]), exit::COMPLETED);
         assert_eq!(run(&["frobnicate"]), exit::SPEC_REFUSED);
+        // KD-T6: `moruna kinds` prints the listing and takes nothing else.
+        assert_eq!(parse(&args(&["kinds"])), Ok(Command::Kinds));
+        assert_eq!(run(&["kinds"]), exit::COMPLETED);
+        assert_eq!(run(&["kinds", "--json"]), exit::SPEC_REFUSED);
         assert_eq!(
             main(
                 &args(&["run", "/no/such/moruna/spec.json"]),
-                &loader,
+                &kinds,
                 CancelToken::new()
             ),
             exit::SPEC_REFUSED
@@ -682,11 +699,11 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn run_vm_off_linux_is_refused_by_name() {
-        let loader = crate::job::NoKernels;
+        let kinds = Registry::standard();
         let env = |_: &str| None;
         let code = main_with(
             &args(&["run", "--vm", "/no/such/spec.json", "--image", "/no/img"]),
-            &loader,
+            &kinds,
             CancelToken::new(),
             &env,
             HEARTBEAT,
