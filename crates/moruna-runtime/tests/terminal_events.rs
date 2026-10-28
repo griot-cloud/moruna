@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use moruna_job::{JobSpec, KindDoc};
 use moruna_kernel::{
     Allocator, BoxFuture, CancelToken, Kernel, Payload, PayloadSpec, Result, RowRange, Seq, Sink,
     SinkSummary, Source, SourceSchema, Split, StageEvent,
@@ -26,9 +27,9 @@ use moruna_kernel::{
 use moruna_runtime::host::exit;
 use moruna_runtime::host::lifecycle::{Lifecycle, task_refs};
 use moruna_runtime::host::session::{self, HEARTBEAT, HostOptions, Mode, Outcome, Wire};
-use moruna_runtime::job::{BuildOptions, KindDoc, build};
+use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::Registry;
-use moruna_runtime::{Components, JobSpec, Runtime, SinkSpec, SourceSpec};
+use moruna_runtime::{Components, Runtime, SinkSpec, SourceSpec};
 use moruna_testkit::FakeSink;
 use serde_json::{Value, json};
 use support::{FailOnce, Scratch, Sleeper, one_run_at_a_time, write_parquet};
@@ -601,7 +602,7 @@ fn py_t27_a_crash_before_any_task_started_fails_the_attempt() {
 }
 
 /// The scheduler's facts of a real run of two kernel stages, recorded, and the run's tasks.
-fn recorded_run(scratch: &Scratch) -> (Vec<moruna_runtime::job::TaskRefDoc>, Vec<StageEvent>) {
+fn recorded_run(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<StageEvent>) {
     let job = document(scratch, &["pass", "pass"], json!("terminate"));
     let built = build(
         &job,
@@ -637,9 +638,7 @@ fn recorded_run(scratch: &Scratch) -> (Vec<moruna_runtime::job::TaskRefDoc>, Vec
 }
 
 /// A lifecycle whose events are kept as JSON, as the peer reads them.
-fn kept_lifecycle(
-    refs: Vec<moruna_runtime::job::TaskRefDoc>,
-) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+fn kept_lifecycle(refs: Vec<moruna_job::TaskRefDoc>) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();
     let kept = told.clone();
     let lifecycle = Lifecycle::new(

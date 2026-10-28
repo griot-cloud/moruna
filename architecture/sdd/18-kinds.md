@@ -4,8 +4,8 @@
 **Status:** DRAFT · 2026-10-28 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/agents/briefs/waves-a-b-c.md` section 1 law 2, section 4 MB3 and MB4, section 5 MC1 and MC2; decisions AP1, FB1, KD1 (`DECISIONS.md`); `architecture/moruna-hosted-engine.md` (MH) section 4.1
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.7 (`Kernel`, `Fingerprint`), `Source`, `Sink`; **Cited:** 12 f.3 (the sink equals source rule), 16 PK-I8 and f.8, 17 (the packaged runtimes), MH 4.5 (the governed ends), MH 4.9 (standard kernels and fusion), MH 4.10 (ports)
-**Component location:** `crates/moruna-runtime/src/kinds/` (the ports, the declaration, the registry, the suites, and one module per technology: `parquet.rs`, `vortex.rs`, `tensor.rs`, `arrow_ipc.rs`, `governed.rs`, `standard.rs`, `package.rs`, `ports.rs`), `crates/moruna-runtime/src/job/build.rs` (the build that resolves a document through the registry), `crates/moruna-py/src/kinds.rs` (the Python kinds), `crates/moruna-runtime/src/host/cli.rs` (`moruna kinds`)
-**Consumes:** contracts (1), sources (7), sinks (8), the standard kernels (`moruna-kernels`), the package and its runtimes (16, 17), the peQL bridge (`moruna-datafusion`, feature `peql`). **Consumed by:** the job document's build (12, MH 4.1), the command line (MH 4.2), the Python surface (12), every embedder that reads `moruna kinds`, MC2 (the job spec v2) and MC3 (the planner).
+**Component location:** `crates/moruna-runtime/src/kinds/` (the ports, the registry, the suites, and one module per technology: `parquet.rs`, `vortex.rs`, `tensor.rs`, `arrow_ipc.rs`, `governed.rs`, `standard.rs`, `package.rs`, `ports.rs`), `crates/moruna-job/src/kind.rs` (the declaration, its role, flows and facts, the settings schema format and the listing, which an embedder reads without the runtime: SDD 22), `crates/moruna-runtime/src/job/build.rs` (the build that resolves a document through the registry), `crates/moruna-py/src/kinds.rs` (the Python kinds), `crates/moruna-runtime/src/host/cli.rs` (`moruna kinds`)
+**Consumes:** `moruna-job` (22: the declaration, the listing and the document), contracts (1), sources (7), sinks (8), the standard kernels (`moruna-kernels`), the package and its runtimes (16, 17), the peQL bridge (`moruna-datafusion`, feature `peql`). **Consumed by:** the job document's build (12, MH 4.1), the command line (MH 4.2), the Python surface (12), every embedder that reads `moruna kinds`, MC2 (the job spec v2) and MC3 (the planner).
 
 **Decisions worth your eye:** (1) a document names every part of a run by a string, and a registry the running program assembles resolves it; the closed enums at the boundary are gone, and the document format names no kind; (2) three ports, one per role (source, runnable kind, sink), one declaration shape for all three, one registry; (3) a kind's settings schema is JSON Schema 2020-12 derived from the type its adapter reads its settings with, so the published schema and the check cannot drift (decision KD1); (4) `rust` is not a kind this build registers, so a v1 `rust` entry is refused as any unregistered kind is, and an embedder that compiles a kernel into its binary registers it as a kind of its own.
 
@@ -15,7 +15,9 @@
 
 What Moruna can run will keep growing: files of several formats, governed plans, standard kernels, packages, and next containers, VMs, API calls, binaries and Rust (MB3, MB4). Before this component the job document named those through three closed enums, so every new kind was an edit to the document's types, to the builder's `match`, and to every caller that built documents. This component makes "a kind Moruna can run" a port: each kind is one adapter, the only code that knows its technology, registered under its name with a declaration of what it is; a document names a kind by string; the registry resolves it or refuses with the kinds it knows.
 
-It owns: the three ports and the declaration; the registry, its resolution and its refusals; the conformance suite of each port; the standard adapters (the sources and sinks of 7 and 8, the governed ends of MH 4.5, the standard kernels, packages); the settings schema format; `moruna kinds`; how a document's parts are built through the registry (f.2).
+It owns: the three ports; the registry, its resolution and its refusals; the conformance suite of each port; the standard adapters (the sources and sinks of 7 and 8, the governed ends of MH 4.5, the standard kernels, packages); the settings schema format; `moruna kinds`; how a document's parts are built through the registry (f.2).
+
+The declaration (`Declaration`, `Role`, `Flow`, `Fact`, `Isolation`, `Needs`), the listing (`Listing`), the settings schema format (`settings_schema`, `SCHEMA_DIALECT`) and the job document (`JobSpec`, `KindDoc`) are `moruna-job`'s, so an embedder that only reads the kinds or checks a document depends on that crate and not on the runtime (SDD 22); this component uses them from there.
 
 It refuses to know: what a kind does with its settings beyond reading them (each adapter's), how a source reads or a sink writes (7, 8), how a package runs (17), and any embedder: a kind is described in Moruna's terms and an embedder draws its screens from the declaration.
 
@@ -137,7 +139,7 @@ prints the registry's listing (e.3) as indented JSON and exits 0; any argument i
 
 ### d.4 The document (MH 4.1)
 
-`JobSpec.source` and `JobSpec.sink` are `KindDoc`s and `JobSpec.kernels` a list of them: `{ "kind": "<name>", <settings> }`. The parser checks only that an entry is an object with a non-empty string `kind`; what its settings may be is the kind's, checked when the document is built (KD-I4). `KindDoc::of(kind, &settings)` writes an entry from a kind's typed settings.
+`JobSpec.source` and `JobSpec.sink` are `KindDoc`s and `JobSpec.kernels` a list of them (`moruna_job`): `{ "kind": "<name>", <settings> }`. The parser checks only that an entry is an object with a non-empty string `kind`; what its settings may be is the kind's, checked when the document is built (KD-I4). `KindDoc::of(kind, &settings)` writes an entry from a kind's typed settings.
 
 ### d.5 Consumed
 
@@ -188,7 +190,7 @@ Isolation: `builtin`, code compiled into the program, in its process; `imported`
 
 ### e.2 The settings schema (decision KD1)
 
-JSON Schema, dialect 2020-12 (`"$schema": "https://json-schema.org/draft/2020-12/schema"`), of the entry's keys other than `kind`: a closed object (`additionalProperties: false`) with `title` the kind's name, `properties` with each setting's type and description, `required`, nested types under `$defs`, and `examples`, each an object of settings that builds. It is derived (`kinds::settings_schema::<T>`) from the type the adapter reads its settings with (KD-I4), so a schema cannot describe settings the adapter does not read; an adapter may add constraints the type cannot say (the `std` kind lists the standard kernel names as `enum`). Values that are open by nature are described as such: a standard kernel's or a package's `args` (any JSON), a peQL `caller` (an object), a filter's value (a number, a string or a boolean), a `url` that is one string or several.
+JSON Schema, dialect 2020-12 (`"$schema": "https://json-schema.org/draft/2020-12/schema"`), of the entry's keys other than `kind`: a closed object (`additionalProperties: false`) with `title` the kind's name, `properties` with each setting's type and description, `required`, nested types under `$defs`, and `examples`, each an object of settings that builds. It is derived (`moruna_job::settings_schema::<T>`) from the type the adapter reads its settings with (KD-I4), so a schema cannot describe settings the adapter does not read; an adapter may add constraints the type cannot say (the `std` kind lists the standard kernel names as `enum`). Values that are open by nature are described as such: a standard kernel's or a package's `args` (any JSON), a peQL `caller` (an object), a filter's value (a number, a string or a boolean), a `url` that is one string or several.
 
 In the job spec v2 (MC2, FlatBuffers, decision FB1), a node is a kind name and its settings, and the settings are a value of this same data model carried in the spec (FlexBuffers, the FlatBuffers project's schemaless encoding of it, is the natural carrier), checked against this schema; the JSON entry of d.4 is its rendering for people. A FlatBuffers union of per-kind tables is not used: it is a closed enum, and adding a kind would change the spec's schema (KD-I5).
 
@@ -199,7 +201,7 @@ In the job spec v2 (MC2, FlatBuffers, decision FB1), a node is a kind name and i
   "sources": [ /* e.1, by name */ ], "kernels": [ ... ], "sinks": [ ... ] }
 ```
 
-`Listing` serialises and deserialises as itself, so an embedder in Rust reads it back.
+`Listing` (`moruna_job`) serialises and deserialises as itself, so an embedder in Rust reads it back, and `moruna_job::Catalogue` is the declarations of one, which the embedder checks a document against (SDD 22). The standard kinds' listing is embedded in `moruna-job` and a runtime test proves it equal to this registry's (SDD 22 JB-I3).
 
 ## f. Algorithms and policies
 
@@ -267,7 +269,7 @@ The tests that were the builder's keep their ids and now run through the registr
 
 ## l. Implementation notes for the agent
 
-A new kind: write its adapter in a module of its own (or its own crate), derive its settings type with `serde` and `schemars` (`deny_unknown_fields`), build its declaration with `settings_schema::<T>(name, examples)`, register it, and run its port's suite in its tests. Change nothing else. A kind that calls ports reads `ports: Option<BTreeMap<String, PortDoc>>` and builds its routes with `kinds::ports::routes`, binding them in `Stage::placed`.
+A new kind: write its adapter in a module of its own (or its own crate), derive its settings type with `serde` and `schemars` (`deny_unknown_fields`), build its declaration with `moruna_job::settings_schema::<T>(name, examples)`, register it, and run its port's suite in its tests. Change nothing else. A kind that calls ports reads `ports: Option<BTreeMap<String, PortDoc>>` and builds its routes with `kinds::ports::routes`, binding them in `Stage::placed`.
 
 ## m. Open items
 

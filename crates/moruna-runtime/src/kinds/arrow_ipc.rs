@@ -6,12 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    BuiltSink, Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Role, SinkKind,
-    settings_schema,
-};
+use super::{BuiltSink, Context, Entry, SinkKind};
 use crate::job::translate;
 use crate::spec::SinkSpec;
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
 
 /// The `arrow_ipc` kind, a sink.
 pub struct ArrowIpc;

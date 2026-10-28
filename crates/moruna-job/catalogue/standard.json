@@ -1,0 +1,792 @@
+{
+  "moruna_kinds": 1,
+  "moruna": "0.5.7",
+  "sources": [
+    {
+      "name": "parquet",
+      "role": "source",
+      "summary": "Parquet files or prefixes, local or in an object store",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "$ref": "#/$defs/Urls",
+            "description": "`file://`, `s3://`, `gs://`, `az://` or a bare local path: files or prefixes."
+          },
+          "options": {
+            "$ref": "#/$defs/SourceOptions",
+            "description": "Projection and row-group pruning.",
+            "default": {
+              "filters": []
+            }
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "A `parquet` source's settings.",
+        "title": "parquet",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "Urls": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "One location, or a list of them."
+          },
+          "SourceOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "The projection; absent is every column."
+              },
+              "filters": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Filter"
+                },
+                "description": "Row-group predicates, each `[column, op, value]` with `op` one of `>`, `<`, `==`.",
+                "default": []
+              }
+            },
+            "description": "`source.options` for `parquet`."
+          },
+          "Filter": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              },
+              true
+            ],
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "One row-group predicate: `[column, op, value]`."
+          }
+        },
+        "examples": [
+          {
+            "url": "file:///data/in/"
+          },
+          {
+            "url": [
+              "/data/a.parquet",
+              "s3://bucket/b/"
+            ],
+            "options": {
+              "columns": [
+                "id"
+              ],
+              "filters": [
+                [
+                  "id",
+                  ">",
+                  5
+                ]
+              ]
+            }
+          }
+        ]
+      },
+      "inputs": "files",
+      "outputs": "batches",
+      "needs": {
+        "network": "by_settings",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    },
+    {
+      "name": "tensor",
+      "role": "source",
+      "summary": "Safetensors or aligned binary tensor files on a local disk",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "$ref": "#/$defs/Urls",
+            "description": "Local paths or `file://` URLs of safetensors or aligned binary tensor files."
+          },
+          "options": {
+            "$ref": "#/$defs/SourceOptions",
+            "description": "Which tensors.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "A `tensor` source's settings.",
+        "title": "tensor",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "Urls": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "One location, or a list of them."
+          },
+          "SourceOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "tensors": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Tensor names; absent is every tensor."
+              }
+            },
+            "description": "`source.options` for `tensor`."
+          }
+        },
+        "examples": [
+          {
+            "url": "/data/weights.safetensors"
+          },
+          {
+            "url": [
+              "/data/a.safetensors",
+              "file:///data/b.safetensors"
+            ],
+            "options": {
+              "tensors": [
+                "w"
+              ]
+            }
+          }
+        ]
+      },
+      "inputs": "files",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    },
+    {
+      "name": "vortex",
+      "role": "source",
+      "summary": "Vortex files or prefixes, local or in an object store",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "$ref": "#/$defs/Urls",
+            "description": "`file://`, `s3://`, `gs://`, `az://` or a bare local path: files or prefixes."
+          },
+          "options": {
+            "$ref": "#/$defs/SourceOptions",
+            "description": "Projection and split size.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "A `vortex` source's settings.",
+        "title": "vortex",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "Urls": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "One location, or a list of them."
+          },
+          "SourceOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "The projection; absent is every column."
+              },
+              "split_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "The uncompressed bytes a split is cut toward; absent is 128 MiB (07 e.7)."
+              }
+            },
+            "description": "`source.options` for `vortex`."
+          }
+        },
+        "examples": [
+          {
+            "url": "file:///data/in/"
+          },
+          {
+            "url": [
+              "/data/a.vortex",
+              "s3://bucket/in/"
+            ],
+            "options": {
+              "columns": [
+                "id"
+              ],
+              "split_bytes": 134217728
+            }
+          }
+        ]
+      },
+      "inputs": "files",
+      "outputs": "batches",
+      "needs": {
+        "network": "by_settings",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    }
+  ],
+  "kernels": [
+    {
+      "name": "package",
+      "role": "kernel",
+      "summary": "A function package, one .wasm or .pex file pinned by its sha256",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The package's file, `.wasm` or `.pex`, on a disk the run attaches."
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "The file's `sha256`, as `moruna check` prints it (`sha256:<hex>`)."
+          },
+          "args": {
+            "description": "The arguments of a kernel built by them (16 b)."
+          },
+          "assets": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A directory the kernel reads, read only (16 b)."
+          },
+          "ports": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/$defs/PortDoc"
+            },
+            "description": "For a `.wasm`: the ports its `call` may name, and where each goes (MH 4.10). A name not\nlisted here is refused when the stage calls it."
+          }
+        },
+        "required": [
+          "path",
+          "fingerprint"
+        ],
+        "description": "A `package` entry's settings (16 d.4).",
+        "title": "package",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "PortDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port the host serves, by the name the host knows it by: the stage's calls go to the\nhost protocol's peer as `port_call` (MH 4.3)."
+              },
+              "guest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name ([`super::Embedding::guest_port`])."
+              },
+              "deadline_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_kernel::ports::PORT_DEADLINE_MS`), at most a day."
+              }
+            },
+            "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          }
+        },
+        "examples": [
+          {
+            "path": "/disk/functions/shout.wasm",
+            "fingerprint": "sha256:9f2c0d6a58e1b7c3f4a5e6d7c8b9a0f1e2d3c4b5a6978899aabbccddeeff0011"
+          },
+          {
+            "path": "/disk/functions/classify.pex",
+            "fingerprint": "sha256:0011ffeeddccbbaa99887766554433221100ffeeddccbbaa9988776655443322",
+            "args": {
+              "threshold": 0.5
+            },
+            "assets": "/disk/models/classifier"
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "by_settings",
+        "contracts": "no"
+      },
+      "deterministic": "by_settings",
+      "preserves_columns": "by_settings",
+      "isolation": "confined"
+    },
+    {
+      "name": "std",
+      "role": "kernel",
+      "summary": "A standard kernel of moruna-kernels, built by name and arguments",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The standard kernel's name.",
+            "enum": [
+              "cast",
+              "rename",
+              "select",
+              "drop",
+              "filter",
+              "fill_null",
+              "dedupe",
+              "hash",
+              "mask",
+              "explode",
+              "concat_str",
+              "date_trunc"
+            ]
+          },
+          "args": {
+            "description": "Its arguments, a JSON object whose keys the kernel's name decides (MH 4.9)."
+          },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The fingerprint the kernel must have, hex, optionally prefixed `algo:`."
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "description": "A `std` entry's settings.",
+        "title": "std",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "name": "cast",
+            "args": {
+              "columns": {
+                "a": "double"
+              }
+            }
+          },
+          {
+            "name": "select",
+            "args": {
+              "columns": [
+                "a",
+                "b"
+              ]
+            }
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    }
+  ],
+  "sinks": [
+    {
+      "name": "arrow_ipc",
+      "role": "sink",
+      "summary": "Page-aligned Arrow IPC files in a local directory",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "A local directory."
+          },
+          "options": {
+            "$ref": "#/$defs/SinkOptions",
+            "description": "Sizes.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "An `arrow_ipc` sink's settings.",
+        "title": "arrow_ipc",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "SinkOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "file_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "`sink.file_bytes`; absent is 1 GiB."
+              }
+            },
+            "description": "`sink.options` for `arrow_ipc`."
+          }
+        },
+        "examples": [
+          {
+            "url": "/data/out"
+          },
+          {
+            "url": "file:///data/out",
+            "options": {
+              "file_bytes": 268435456
+            }
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "files",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    },
+    {
+      "name": "parquet",
+      "role": "sink",
+      "summary": "Parquet files under a prefix, local or in an object store",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "`file://`, `s3://`, `gs://`, `az://` or a bare local directory."
+          },
+          "options": {
+            "$ref": "#/$defs/SinkOptions",
+            "description": "Sizes and compression.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "A `parquet` sink's settings.",
+        "title": "parquet",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "SinkOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "row_group_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "`sink.row_group_bytes`; absent is 128 MiB."
+              },
+              "file_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "`sink.file_bytes`; absent is 1 GiB."
+              },
+              "compression": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`zstd` (absent), `snappy`, `gzip`, `lz4` or `none`."
+              }
+            },
+            "description": "`sink.options` for `parquet`."
+          }
+        },
+        "examples": [
+          {
+            "url": "file:///data/out/"
+          },
+          {
+            "url": "s3://bucket/out/",
+            "options": {
+              "row_group_bytes": 33554432,
+              "compression": "snappy"
+            }
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "files",
+      "needs": {
+        "network": "by_settings",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    },
+    {
+      "name": "tensor",
+      "role": "sink",
+      "summary": "Tensor files in a local directory, `mrb1` or safetensors",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "A local directory."
+          },
+          "options": {
+            "$ref": "#/$defs/SinkOptions",
+            "description": "Format and naming.",
+            "default": {
+              "one_file_per_morsel": false
+            }
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "A `tensor` sink's settings.",
+        "title": "tensor",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "SinkOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "format": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`mrb1` (absent) or `safetensors`."
+              },
+              "one_file_per_morsel": {
+                "type": "boolean",
+                "description": "One file per morsel rather than one per size bound.",
+                "default": false
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The tensor name; absent is `tensor`."
+              }
+            },
+            "description": "`sink.options` for `tensor`."
+          }
+        },
+        "examples": [
+          {
+            "url": "/data/out"
+          },
+          {
+            "url": "file:///data/out",
+            "options": {
+              "format": "safetensors",
+              "one_file_per_morsel": true,
+              "name": "embeddings"
+            }
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "files",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    },
+    {
+      "name": "vortex",
+      "role": "sink",
+      "summary": "Vortex files under a prefix, local or in an object store",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "`file://`, `s3://`, `gs://`, `az://` or a bare local directory."
+          },
+          "options": {
+            "$ref": "#/$defs/SinkOptions",
+            "description": "Sizes.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "A `vortex` sink's settings.",
+        "title": "vortex",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "SinkOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "file_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "`sink.file_bytes`; absent is 1 GiB."
+              }
+            },
+            "description": "`sink.options` for `vortex`."
+          }
+        },
+        "examples": [
+          {
+            "url": "file:///data/out/"
+          },
+          {
+            "url": "/data/out",
+            "options": {
+              "file_bytes": 1073741824
+            }
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "files",
+      "needs": {
+        "network": "by_settings",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    }
+  ]
+}
