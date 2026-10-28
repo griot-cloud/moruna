@@ -4,6 +4,8 @@
 [workspace]
 resolver = "3"
 members = ["bench", "crates/*"]
+# The microkernel is its own workspace on its own toolchain and target (kernel/Cargo.toml).
+exclude = ["kernel"]
 
 [workspace.package]
 version = "0.5.7"

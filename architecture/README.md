@@ -24,6 +24,7 @@ Design documents for Moruna. Code is written from these documents; a change in b
 | [sdd/12-python.md](sdd/12-python.md) | Component 12: Python surface and runtime facade | Draft |
 | [sdd/16-package.md](sdd/16-package.md) | Component 16: the function package (`.wasm`, `.pex`, `moruna.json`, the `moruna:kernel` world, `moruna package`, `check`, `aot`, `load`, the `package` kind) | Draft |
 | [sdd/17-sandbox.md](sdd/17-sandbox.md) | Component 17: the two runtimes of a packaged kernel (`moruna-wasm`, `moruna-sandbox`: the template, the fork, the confinement, the shared mapping, the guard in the child) | Draft |
+| [sdd/20-microkernel.md](sdd/20-microkernel.md) | Component 20: the microkernel core (`kernel/`: objects, handles and rights, the native ABI, the boot manifest, ELF loading, `moruna-sys`, the KB1 boot tests) | Draft |
 | [agents/pm.md](agents/pm.md) | Agent prompt: the PM agent that drives the build (reading order, waves, gate rule, review checklist, escalation routing, decisions) | Draft |
 | [agents/executor.md](agents/executor.md) | Agent prompt template: filled per component by the PM for the executor agent that builds it | Draft |
 | [../DECISIONS.md](../DECISIONS.md) | Decision log: the architecture document's open questions Q1 to Q10 with owner, status and date; the PM updates it | Living |

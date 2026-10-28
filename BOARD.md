@@ -543,7 +543,7 @@ Waves are gates, not start order: an item starts when what it needs is merged. T
 | A. Any language on Linux, today | KA1 | `image` kind: OCI unpack (layers, whiteouts, digest cache), run the image's command under `moruna-sandbox`, Arrow IPC over stdin and stdout (SDD 19; IM-T1 to IM-T27, SC-T27) | in review (`feat/ka1-image-kind`, `bf2de62`, draft PR against `v1`) |
 | | KA2 | the data-plane port: `batch_get`, `batch_put`, `port_call` as one trait the engine uses; today's sandbox channel is its first adapter | todo |
 | | KA3 | the Python builder: `@moruna.kernel` to a four-layer image (runtime, locked dependencies, shim, function) | todo |
-| B. The kernel boots | KB1 | microkernel core on OSTD: boot, address spaces, processes, threads, IPC, capability handles, timers; boots under QEMU in CI on x86_64 | in progress |
+| B. The kernel boots | KB1 | microkernel core on OSTD: boot, address spaces, processes, threads, IPC, capability handles, timers; boots under QEMU in CI on x86_64 | in review (draft PR #67; SDD 20) |
 | | KB2 | `moruna-svc`: the SDK for servers and drivers, the boot manifest, the protocol schema and its conformance harness | todo |
 | | KB3 | first drivers as processes: virtio console, virtio block, vsock | todo |
 | C. Linux programs run | KC1 | the Linux personality server: the 60 syscalls; static musl, then glibc, then CPython | todo |

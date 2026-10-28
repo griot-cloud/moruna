@@ -1,0 +1,10 @@
+[package]
+name = "moruna-sys"
+description = "Safe wrappers over the Moruna microkernel's native syscalls, for no_std userland processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
