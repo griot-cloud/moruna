@@ -465,12 +465,16 @@ fn enumerate(ecam: &Handle, table: &Table) -> Result<Vec<Function>, String> {
     Ok(found)
 }
 
+/// What a function's driver holds: its windows, its MSI slots, its DMA right.
+struct Resources {
+    config: Handle,
+    bars: Vec<(usize, Handle)>,
+    msi: Handle,
+    dma: Handle,
+}
+
 /// The resources of a function the table names, narrowed to it.
-fn assign(
-    roots: &Roots,
-    function: &Function,
-    msi_next: &mut u64,
-) -> Result<(Handle, Vec<(usize, Handle)>, Handle, Handle), String> {
+fn assign(roots: &Roots, function: &Function, msi_next: &mut u64) -> Result<Resources, String> {
     let config = roots
         .ecam
         .narrow(function.config, CONFIG_SIZE as u64)
@@ -500,7 +504,12 @@ fn assign(
         .dma
         .narrow(function.address.requester_id() as u64, 1)
         .map_err(|e| format!("narrowing DMA: {}", e.name()))?;
-    Ok((config, bars, msi, dma))
+    Ok(Resources {
+        config,
+        bars,
+        msi,
+        dma,
+    })
 }
 
 /// Whether two functions' BARs share a page: a driver of one could reach the other.
@@ -576,7 +585,12 @@ fn serve(out: &Console) -> Result<String, String> {
             }
         };
         let name = format!("{}{}", driver.service, n);
-        let (config, bars, msi, dma) = assign(&roots, &function, &mut msi_next)
+        let Resources {
+            config,
+            bars,
+            msi,
+            dma,
+        } = assign(&roots, &function, &mut msi_next)
             .map_err(|e| format!("{name} at {}: {e}", function.address))?;
         devices.push(Device {
             name,

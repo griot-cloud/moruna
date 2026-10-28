@@ -474,10 +474,10 @@ impl Vsock {
                 }
             }
             op::SHUTDOWN => {
-                if let Some(s) = self.streams.get_mut(&id) {
-                    if h.flags & SHUTDOWN_SEND != 0 {
-                        s.peer_eof = true;
-                    }
+                if let Some(s) = self.streams.get_mut(&id)
+                    && h.flags & SHUTDOWN_SEND != 0
+                {
+                    s.peer_eof = true;
                 }
                 if h.flags & SHUTDOWN_BOTH == SHUTDOWN_BOTH {
                     self.reset_to(&h);

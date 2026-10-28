@@ -231,8 +231,8 @@ fn driver_calls(
         .map_err(|e| kb3(out, "resource_info of root.ecam", e))?;
     if ecam.kind != ResourceKind::DeviceMemory
         || ecam.len == 0
-        || ecam.len % (1 << 20) != 0
-        || ecam.base % (1 << 20) != 0
+        || !ecam.len.is_multiple_of(1 << 20)
+        || !ecam.base.is_multiple_of(1 << 20)
     {
         return Err(kb3(out, "root.ecam is not whole buses", Error::BadState));
     }
@@ -318,8 +318,8 @@ fn driver_calls(
     let (pin, n) =
         Pin::create(&domain, &memory.0, true, &mut pages).map_err(|e| kb3(out, "memory_pin", e))?;
     if n != 2
-        || pages[0] % 4096 != 0
-        || pages[1] % 4096 != 0
+        || !pages[0].is_multiple_of(4096)
+        || !pages[1].is_multiple_of(4096)
         || pages[0] == pages[1]
         || pages[0] == 0
     {

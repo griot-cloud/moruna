@@ -75,7 +75,7 @@ fn run() -> i64 {
         println!(out, "KB3 console: FAIL: no directory");
         return 1;
     };
-    let mut dir = match directory::Client::connect(Channel(d), deadline_in(300 * SECONDS)) {
+    let mut dir = match devices_protocol::open_directory(Channel(d), deadline_in(300 * SECONDS)) {
         Ok(c) => c,
         Err(e) => {
             println!(out, "KB3 console: FAIL: the directory: {:?}", e);

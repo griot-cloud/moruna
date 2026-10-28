@@ -204,7 +204,7 @@ fn run() -> i64 {
         println!(out, "KB3 block: FAIL: no directory or control");
         return 1;
     };
-    let connect = |channel| directory::Client::connect(channel, deadline_in(300 * SECONDS));
+    let connect = |channel| devices_protocol::open_directory(channel, deadline_in(300 * SECONDS));
     let mut dir = match connect(Channel(d)) {
         Ok(c) => c,
         Err(e) => {
@@ -213,7 +213,7 @@ fn run() -> i64 {
         }
     };
     dir.core().set_timeout(300 * SECONDS);
-    let mut ctl = match control::Client::connect(Channel(c), deadline_in(300 * SECONDS)) {
+    let mut ctl = match devices_protocol::open_control(Channel(c), deadline_in(300 * SECONDS)) {
         Ok(c) => c,
         Err(e) => {
             println!(out, "KB3 block: FAIL: control: {:?}", e);

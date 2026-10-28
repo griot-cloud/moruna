@@ -115,7 +115,7 @@ fn run() -> i64 {
         println!(out, "KB3 driver isolation: FAIL: no control");
         return 1;
     };
-    let mut ctl = match control::Client::connect(Channel(c), deadline_in(300 * SECONDS)) {
+    let mut ctl = match devices_protocol::open_control(Channel(c), deadline_in(300 * SECONDS)) {
         Ok(c) => c,
         Err(e) => {
             println!(out, "KB3 driver isolation: FAIL: control: {:?}", e);

@@ -14,7 +14,7 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 
-use moruna_svc::{Channel, Handle};
+use moruna_svc::{CallError, Channel, Handle};
 
 /// One published service: its name, the device's `vendor << 16 | device`, the driver
 /// program, and how many times the driver has been started.
@@ -71,4 +71,24 @@ moruna_svc::protocol! {
             2 => Failed;
         }
     }
+}
+
+/// A directory client through `listener`, an endpoint the boot description linked to
+/// one of the device manager's `directory*` slots: a connection is opened through it
+/// (SDD 23 f.4), and the handshake made on that, until `deadline`.
+pub fn open_directory(
+    listener: Channel,
+    deadline: u64,
+) -> Result<directory::Client, CallError<directory::Error>> {
+    let channel = moruna_svc::connect(&listener).map_err(CallError::typed)?;
+    directory::Client::connect(channel, deadline)
+}
+
+/// A control client through `listener`, linked to one of the `control*` slots.
+pub fn open_control(
+    listener: Channel,
+    deadline: u64,
+) -> Result<control::Client, CallError<control::Error>> {
+    let channel = moruna_svc::connect(&listener).map_err(CallError::typed)?;
+    control::Client::connect(channel, deadline)
 }
