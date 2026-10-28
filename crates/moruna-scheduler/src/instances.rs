@@ -74,6 +74,72 @@ pub(crate) fn run_init(
     Ok(JobOutput::Done)
 }
 
+/// `Kernel::finish` for every live instance of every stateful stage, in stage order, once the
+/// last queue is closed and drained (f.6, contracts d.7). The first `Err` is returned as it is,
+/// with the stage named; a panic in `finish` is that stage's failure like an `Err`.
+pub(crate) fn finish_instances(shared: &Shared) -> Result<()> {
+    for (stage_ix, entry) in shared.stages.iter().enumerate() {
+        let Some(pool) = entry.pool.as_ref() else {
+            continue;
+        };
+        for instance in 0..pool.max {
+            let taken = {
+                let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+                match slots.get_mut(instance) {
+                    Some(slot) if !slot.retired && !slot.in_use => {
+                        slot.in_use = true;
+                        slot.state.take()
+                    }
+                    _ => None,
+                }
+            };
+            let Some(mut state) = taken else {
+                continue;
+            };
+            let kernel = entry.kernel.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                kernel.finish(state.as_mut())
+            }));
+            {
+                let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(slot) = slots.get_mut(instance) {
+                    slot.in_use = false;
+                    slot.state = Some(state);
+                }
+            }
+            let stage = shared.stages[stage_ix].stage;
+            let last = crate::source_drive::cursor(shared)
+                .0
+                .next_seq
+                .saturating_sub(1);
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(MorunaError::Kernel { msg, features, .. })) => {
+                    return Err(MorunaError::Kernel {
+                        stage,
+                        seq: last,
+                        msg,
+                        features,
+                    });
+                }
+                Ok(Err(other)) => return Err(other),
+                Err(panic) => {
+                    return Err(MorunaError::Kernel {
+                        stage,
+                        seq: last,
+                        msg: format!(
+                            "panic in finish: {}",
+                            crate::worker::panic_message(panic.as_ref())
+                        ),
+                        features: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The body of `WorkerJob::Restore`, run on the owning worker (f.13).
 pub(crate) fn run_restore(
     shared: &Shared,

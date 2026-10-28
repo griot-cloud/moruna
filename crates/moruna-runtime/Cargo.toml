@@ -26,6 +26,8 @@ moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }
 moruna-sandbox = { workspace = true }
+# An image kernel's root (SDD 19).
+moruna-image = { workspace = true }
 # `moruna run --vm` (MH 4.8.4): the monitor's library seam, `boot_and_run`.
 moruna-vmm = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.

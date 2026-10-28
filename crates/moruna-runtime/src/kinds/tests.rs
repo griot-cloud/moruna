@@ -157,7 +157,7 @@ fn kd_t2_rust_is_not_registered() {
         e.to_string(),
         MorunaError::from(SpecError::new(
             "kernels[0].kind",
-            "no kernel kind `rust` is registered; this build runs package, std",
+            "no kernel kind `rust` is registered; this build runs image, package, std",
         ))
         .to_string()
     );
@@ -288,6 +288,49 @@ fn kd_t4_standard_conformance() {
     assert!(passed.properties.contains(&"KD-C7"));
 }
 
+/// IM-T16 the_image_kind_is_declared (SDD 19 d.2, e.5): the declaration is one the registry
+/// accepts and says what an image is; its settings are read, and refused, before anything is
+/// unpacked, on every platform; where there is no sandbox the stage is refused by name, and where
+/// there is, without a cgroup it says what it needs. The conformance suite runs over a real layout
+/// in `crates/moruna-image/tests/image_kind.rs`, on Linux.
+#[test]
+fn im_t16_the_image_kind_is_declared() {
+    let kind = image::Image;
+    let declared = kind.declaration();
+    assert_eq!(declared.check(Role::Kernel), Ok(()));
+    assert_eq!(declared, kind.declaration());
+    assert_eq!(declared.name, "image");
+    assert_eq!(declared.isolation, Isolation::Confined);
+    assert_eq!(declared.needs, Needs::nothing());
+    assert_eq!(declared.deterministic, Fact::No);
+    assert_eq!(declared.preserves_columns, Fact::No);
+    assert_eq!(
+        (declared.inputs, declared.outputs),
+        (Flow::Batches, Flow::Batches)
+    );
+    assert_eq!(declared.examples().len(), 1);
+    assert!(Registry::standard().kernel("kernels[0]", "image").is_ok());
+
+    let build = |value: Value| {
+        let doc = doc(value);
+        let mut cx = Context::new(Arc::new(Standalone));
+        refusal(kind.stage(&Entry::new("kernels[0]", Some(0), &doc), &mut cx)).to_string()
+    };
+    let e = build(json!({"kind": "image", "layout": "/l"}));
+    assert!(e.contains("kernels[0]") && e.contains("reference"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "volume": "/v"}));
+    assert!(e.contains("kernels[0]") && e.contains("volume"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "command": "ls"}));
+    assert!(e.contains("kernels[0]"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "env": {"A": 1}}));
+    assert!(e.contains("kernels[0]"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r"}));
+    #[cfg(not(target_os = "linux"))]
+    assert!(e.contains("needs Linux"), "{e}");
+    #[cfg(target_os = "linux")]
+    assert!(e.contains("--sandbox-cgroup"), "{e}");
+}
+
 /// KD-T6 listing (e.3): every declaration, by role, in name order; it reads back as itself, and
 /// every standard declaration is one the registry accepts.
 #[test]
@@ -297,7 +340,7 @@ fn kd_t6_listing() {
     assert_eq!(listing.moruna, env!("CARGO_PKG_VERSION"));
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
-    assert_eq!(names(&listing.kernels), ["package", "std"]);
+    assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
     let mut sinks = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
     let mut sources = vec!["parquet", "tensor", "vortex"];
     if cfg!(feature = "peql") {

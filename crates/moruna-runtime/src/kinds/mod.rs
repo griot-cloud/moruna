@@ -25,6 +25,7 @@ pub mod arrow_ipc;
 pub mod conformance;
 #[cfg(feature = "peql")]
 pub mod governed;
+pub mod image;
 pub mod package;
 pub mod parquet;
 pub mod ports;
@@ -421,6 +422,7 @@ pub struct Context {
     embedding: Arc<dyn Embedding>,
     notes: Vec<String>,
     source_targets: Vec<String>,
+    sink_target: String,
     shared: HashMap<TypeId, Box<dyn Any + Send>>,
 }
 
@@ -435,6 +437,7 @@ impl Context {
             embedding,
             notes: Vec::new(),
             source_targets: Vec::new(),
+            sink_target: String::new(),
             shared: HashMap::new(),
         }
     }
@@ -490,6 +493,18 @@ impl Context {
     /// Where the run's source reads, once the source is built: what a sink keeps apart from.
     pub fn source_targets(&self) -> &[String] {
         &self.source_targets
+    }
+
+    /// Where the run's sink writes, once the sink is built: the store a kernel that keeps
+    /// something of its own (an image's unpacked root) keeps it beside. Empty before then, and
+    /// for a sink with no location.
+    pub fn sink_target(&self) -> &str {
+        &self.sink_target
+    }
+
+    /// Record where the sink writes.
+    pub fn set_sink_target(&mut self, target: String) {
+        self.sink_target = target;
     }
 
     /// Record where the source reads.
@@ -656,6 +671,7 @@ impl Registry {
         kinds.put_source(Arc::new(tensor::Tensor));
         kinds.put_kernel(Arc::new(standard::Std));
         kinds.put_kernel(Arc::new(package::Package));
+        kinds.put_kernel(Arc::new(image::Image));
         kinds.put_sink(Arc::new(parquet::Parquet));
         kinds.put_sink(Arc::new(vortex::Vortex));
         kinds.put_sink(Arc::new(tensor::Tensor));

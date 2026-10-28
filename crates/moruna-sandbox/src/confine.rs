@@ -57,11 +57,11 @@ fn step<T>(step: &'static str, r: io::Result<T>) -> Result<T, Failed> {
     })
 }
 
-fn c(path: &Path) -> io::Result<CString> {
+pub(crate) fn c(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("a path with a NUL"))
 }
 
-fn check(r: libc::c_int, what: &str) -> io::Result<()> {
+pub(crate) fn check(r: libc::c_int, what: &str) -> io::Result<()> {
     if r == 0 {
         Ok(())
     } else {
@@ -70,7 +70,7 @@ fn check(r: libc::c_int, what: &str) -> io::Result<()> {
     }
 }
 
-fn mount(
+pub(crate) fn mount(
     source: Option<&Path>,
     target: &Path,
     fstype: Option<&str>,
@@ -234,7 +234,7 @@ fn c_path(p: &Path) -> io::Result<CString> {
 }
 
 /// No capabilities in any set, and `no_new_privs` (f.5 step 5).
-fn drop_privileges() -> io::Result<()> {
+pub(crate) fn drop_privileges() -> io::Result<()> {
     // SAFETY: prctl with integer arguments.
     check(
         unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },

@@ -906,7 +906,7 @@ fn kd_t9_v1_documents_resolve() {
         assert!(
             e.to_string().contains(
                 "kernels[0].kind: no kernel kind `rust` is registered; this build runs \
-                 package, std"
+                 image, package, std"
             ),
             "{e}"
         );

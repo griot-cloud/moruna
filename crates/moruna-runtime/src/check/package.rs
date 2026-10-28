@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use moruna_kernel::Result;
+use moruna_kernel::{MorunaError, Result};
 
 use super::{CheckOptions, CheckReport, check};
 use crate::packaged::{self, PackageHost};
@@ -18,7 +18,9 @@ pub fn check_package(
 ) -> Result<CheckReport> {
     let packaged = packaged::open(path, None, host, inputs)?;
     packaged.bind_here()?;
-    let package = packaged.package();
+    let package = packaged.package().ok_or_else(|| {
+        MorunaError::Plan("a check opens a package, and an image is not one".into())
+    })?;
     let mut opts = CheckOptions::new(package.manifest.name.clone());
     opts.kind = packaged.kind();
     opts.fingerprint_scheme = "sha256";

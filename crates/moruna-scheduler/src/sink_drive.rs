@@ -249,6 +249,14 @@ fn finish(shared: &Shared) {
     if !shared.claim_exit() {
         return;
     }
+    // Every stage's input has ended: a kernel that runs something apart ends it and answers for
+    // how it ended, before the sink commits anything (contracts d.7 `finish`).
+    if let Err(e) = crate::instances::finish_instances(shared) {
+        shared.set_run_state(RunState::Terminating);
+        shared.publish_exit(Exit::Terminated(e));
+        shared.unpark_all();
+        return;
+    }
     shared.set_run_state(RunState::Finishing);
     shared.tell(moruna_kernel::StageEvent::SinkCommitting);
     // A panic in `finish` would leave the exit claimed and never published, and the run waiting

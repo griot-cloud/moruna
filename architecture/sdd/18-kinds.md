@@ -51,7 +51,7 @@ It refuses to know: what a kind does with its settings beyond reading them (each
 
 **KD-I6. A hosted run loads no code by import path.** Under strict mode an entry whose kind declares `isolation: imported` is refused at `<field>.kind`, whatever its role, before anything is built. 16 PK-I8.
 
-**KD-I7. `rust` is not registered.** The standard registry registers no `rust` kind, so a v1 entry `{"kind": "rust", "crate", "symbol"}` is refused by KD-I1 as ``kernels[i].kind: no kernel kind `rust` is registered; this build runs package, std``, strict or not. A Rust kernel compiled into the program running a document is a kind that program registers (d.1). MB4 builds `rust` as an adapter of the runnable-kind port, isolated like the other packaged kernels (decision FP1).
+**KD-I7. `rust` is not registered.** The standard registry registers no `rust` kind, so a v1 entry `{"kind": "rust", "crate", "symbol"}` is refused by KD-I1 as ``kernels[i].kind: no kernel kind `rust` is registered; this build runs image, package, std``, strict or not. A Rust kernel compiled into the program running a document is a kind that program registers (d.1). MB4 builds `rust` as an adapter of the runnable-kind port, isolated like the other packaged kernels (decision FP1).
 
 **KD-I8. Contracts are carried only for a kind that needs them.** A document that carries `contracts` and none of whose kinds declares `needs.contracts: yes` is refused at `contracts`.
 

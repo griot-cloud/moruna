@@ -214,7 +214,7 @@ A stage's instance is used by one worker at a time (`Stateful { max_instances: 1
 - A kernel that tries to read `/etc/passwd`, the disk or `/proc`: `ENOENT` (not in its namespace) or `EACCES` (Landlock).
 - A kernel that tries `socket()`: `EPERM`.
 - The template dies: every child it forked keeps running; the next `start` request restarts it.
-- A run on a host that is not Linux: a `.pex` stage is refused when built ("a .pex runs in the sandbox, which needs Linux"); a `.wasm` runs.
+- A run on a host that is not Linux: a `.pex` stage is refused when built ("a .pex runs in the sandbox, which needs Linux (so does an image's command, SDD 19)"); a `.wasm` runs.
 - A kernel that keeps a reference to its input batch past the call (a stateful kernel's buffer, a cache, a closure): the batch keeps its own bytes, because its region stays leased until the last buffer over it goes (SB-I13); the stage holds that much of the mapping, which its footprint and the profile show. When the kept inputs fill the data area, a call waits for releases (`lease_wait_us`) and is refused after `LEASE_WAIT`; a kernel that must keep many batches copies the rows it needs.
 
 ## i. Configuration
