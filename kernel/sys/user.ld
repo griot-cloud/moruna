@@ -1,5 +1,6 @@
-/* A static user program for the Moruna microkernel: one segment per permission, each
-   on its own pages, as the kernel's loader requires (SDD 20 f.2). */
+/* A static user program for the Moruna microkernel (every userland crate, linked by
+   kernel/tools/build.sh): one segment per permission, each on its own pages, as the
+   kernel's loader requires (SDD 20 f.2). */
 ENTRY(_start)
 
 PHDRS

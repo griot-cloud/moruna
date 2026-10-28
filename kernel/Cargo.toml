@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["abi", "loader", "handles", "core", "boot", "sys", "svc", "programs"]
+members = ["abi", "loader", "handles", "core", "boot", "sys", "svc", "programs", "tools/image"]
 
 [workspace.package]
 version = "0.1.0"

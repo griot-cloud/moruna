@@ -1,0 +1,69 @@
+# The boot CI runs (SDD 20 k, SDD 23 k): the supervisor first, then one process per
+# test. kernel/tools/build.sh builds it with moruna-image, which renders the manifest,
+# packs the initramfs and writes the lines the boot must print (the expect, exits and
+# faults lines below) for kernel/tools/check-boot.sh. Adding a server to the image is
+# adding its process, its handles and its links here.
+moruna-image 1
+
+# KK-T11, SV-T13: the root resources, a child started from its image, and a driver
+# started holding only a narrowed device page and interrupt line.
+process supervisor
+  handle console console
+  handle root.process root.process
+  handle root.device root.device
+  handle root.interrupt root.interrupt
+  handle program:child child-image
+  handle program:driver driver-image
+  expect KB1 spawn: ok: child runs, started by the supervisor with 1 handle
+  expect kk: process child exited with code 0 (
+  expect KB1 supervisor: ok:
+  expect KB2 narrowing: ok:
+  expect kk: process driver exited with code 0 (
+  exits 0
+
+# KK-T10: a fault ends its process and nothing else.
+process fault
+  handle console console
+  expect KB1 fault: about to read address 0
+  faults page fault at 0x0 on read
+
+# KK-T6: ping-pong over one channel.
+process ping
+  handle console console
+  expect KB1 ping-pong: ok: 10000 round trips over one channel
+  exits 0
+process pong
+  exits 0
+link ping.peer pong.peer:read,write,wait
+
+# KK-T7: a read-only memory object travels over a channel.
+process xfer-a
+  handle console console
+  exits 0
+process xfer-b
+  handle console console
+  expect KB1 handle-transfer: ok: 2 pages arrived through a read-only handle with the pattern intact; mapping them writable was refused with access denied
+  exits 0
+link xfer-a.peer xfer-b.peer
+
+# KK-T8: no value names another process's object.
+process iso-holder
+  handle console console
+  exits 0
+process isolation
+  handle console console
+  expect KB1 isolation: ok:
+  exits 0
+link iso-holder.peer isolation.peer
+
+# KK-T9: a timer wakes a waiting thread at its deadline.
+process deadline
+  handle console console
+  expect KB1 wait-deadline: ok: the timer woke the waiting thread
+  exits 0
+
+# SV-T14: the cycle rule.
+process cycles
+  handle console console
+  expect KB2 cycles: ok:
+  exits 0

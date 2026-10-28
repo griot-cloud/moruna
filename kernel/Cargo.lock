@@ -270,6 +270,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-image"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-loader",
+]
+
+[[package]]
 name = "moruna-kb1-programs"
 version = "0.1.0"
 dependencies = [
