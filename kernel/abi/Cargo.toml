@@ -1,0 +1,12 @@
+[package]
+name = "moruna-abi"
+description = "The Moruna microkernel's native ABI: syscall numbers, errors, rights, signals, layouts and the boot manifest format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+manifest = []
+
+[dependencies]
