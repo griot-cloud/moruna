@@ -715,7 +715,10 @@ fn calc_suite() -> conformance::Suite {
     }
 }
 
-fn run_suite(listener: Channel) -> (conformance::Summary, Vec<(String, Result<(), String>)>) {
+/// Each check's name and result, in the order they ran.
+type Checks = Vec<(String, Result<(), String>)>;
+
+fn run_suite(listener: Channel) -> (conformance::Summary, Checks) {
     let mut checks = Vec::new();
     let mut connector = conformance::Listener(listener);
     let summary = conformance::run(&calc_suite(), &mut connector, &mut |c| {
