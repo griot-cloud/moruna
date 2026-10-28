@@ -31,6 +31,7 @@ fn ipc_sink(
         ArrowIpcSinkConfig {
             path: scratch.path().to_path_buf(),
             file_bytes,
+            ..ArrowIpcSinkConfig::default()
         },
         Arc::new(reactor.clone()),
         Arc::new(alloc.clone()),

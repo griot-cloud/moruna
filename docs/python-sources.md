@@ -28,7 +28,7 @@ moruna.VortexSource(urls, *, columns=None, split_bytes=None)
 moruna.ArrowIpcSource(urls, *, columns=None, split_rows=None)
 ```
 
-`urls` is a local file, a local directory, or a nonempty sequence of them; a directory is read for its `.arrow` files in name order. The files must be in the Arrow IPC file format, not the stream format, and share one schema. `columns: list[str] | None` projects columns, which come back in the order the file stores them. `split_rows: int | None` sets the rows each piece of work is cut toward, from whole record batches; it must be positive and by default each record batch is one piece.
+`urls` is a local file, a local directory, or a nonempty sequence of them; a directory is read for its `.arrow` files in name order. The files must be in the Arrow IPC file format, not the stream format, and share one schema. A file compressed with `zstd` or `lz4` (`pyarrow`'s `compression=`) is read as any other. `columns: list[str] | None` projects columns, which come back in the order the file stores them. `split_rows: int | None` sets the rows each piece of work is cut toward, from whole record batches; it must be positive and by default each record batch is one piece.
 
 ## `moruna.TensorSource`
 

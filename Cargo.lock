@@ -4299,9 +4299,12 @@ dependencies = [
  "arrow",
  "blake3",
  "dlpark",
+ "flatbuffers",
+ "lz4_flex",
  "moruna-testkit",
  "serde_json",
  "thiserror 2.0.20",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -4524,7 +4527,10 @@ dependencies = [
 name = "moruna-testkit"
 version = "0.5.8"
 dependencies = [
+ "flatbuffers",
+ "lz4_flex",
  "moruna-kernel",
+ "zstd 0.13.3",
 ]
 
 [[package]]

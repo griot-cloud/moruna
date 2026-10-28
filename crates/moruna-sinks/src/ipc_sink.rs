@@ -4,7 +4,9 @@
 //! `moruna_kernel::ipc::encode_framing` and by nothing else, so a segment body and an IPC file
 //! record batch are byte-identical for the same batch and the two cannot drift. Each body is
 //! written from the payload's own arena buffer at a page-aligned offset, so the sink copies no
-//! payload bytes at all (SI-I4).
+//! payload bytes at all (SI-I4). With `compression` set the records are
+//! `moruna_kernel::ipc::encode_compressed`'s instead: the format's own 8-byte alignment, each
+//! buffer compressed, which is an encode copy of the payload (e.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use moruna_kernel::arrow::datatypes::SchemaRef;
 use moruna_kernel::arrow::ipc::writer::FileWriter;
 use moruna_kernel::arrow::record_batch::RecordBatch;
+use moruna_kernel::ipc::Compression;
 use moruna_kernel::{
     Allocator, BoxFuture, Buffer, BufferView, Completion, MorunaError, Payload, PayloadKind,
     PayloadSpec, Reactor, Result, RunId, Seq, Sink, SinkSummary, SourceSchema, TierPref, ipc,
@@ -38,14 +41,18 @@ pub struct ArrowIpcSinkConfig {
     pub path: PathBuf,
     /// File roll size.
     pub file_bytes: u64,
+    /// How each body buffer is compressed: not at all, which keeps every buffer at a page
+    /// boundary, or `zstd` or `lz4`, which write the format's own 8-byte alignment (e.3).
+    pub compression: Compression,
 }
 
 impl Default for ArrowIpcSinkConfig {
-    /// The default of preamble section 5: 1 GiB files.
+    /// The default of preamble section 5: 1 GiB files, uncompressed.
     fn default() -> ArrowIpcSinkConfig {
         ArrowIpcSinkConfig {
             path: PathBuf::new(),
             file_bytes: 1 << 30,
+            compression: Compression::None,
         }
     }
 }
@@ -113,6 +120,7 @@ impl ArrowIpcSink {
         reactor: Arc<dyn Reactor>,
         alloc: Arc<dyn Allocator>,
     ) -> Result<ArrowIpcSink> {
+        cfg.compression.checked()?;
         let dir = LocalDir::new(&cfg.path)?;
         Ok(ArrowIpcSink {
             cfg,
@@ -212,17 +220,29 @@ impl ArrowIpcSink {
         payload: Payload,
     ) -> Result<Record> {
         let page = self.alloc.page_bytes() as u64;
+        let compression = self.cfg.compression;
+        // A compressed record is inflated into memory when it is read, never read into place by
+        // direct IO, so it needs no page boundaries: the format's own 8 bytes are all it keeps.
+        let align = if compression == Compression::None {
+            page
+        } else {
+            8
+        };
+        let payload_bytes = payload.bytes();
         let Some(file_id) = inner.current else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
         let Some(file) = inner.files.get(&file_id) else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
-        let base = round_up(file.cursor, page);
+        let base = round_up(file.cursor, align);
         let first = file.blocks.is_empty();
         let tmp = file.tmp.clone();
 
-        let (framing, bodies) = ipc::encode_framing(batch, page as usize, base, &*self.alloc)?;
+        let (framing, bodies) = match compression {
+            Compression::None => ipc::encode_framing(batch, page as usize, base, &*self.alloc)?,
+            other => ipc::encode_compressed(batch, other, base, &*self.alloc)?,
+        };
         let lengths = MessageLengths::of(&framing)?;
         match inner.schema_len {
             Some(known) if known != lengths.schema => {
@@ -290,6 +310,12 @@ impl ArrowIpcSink {
             completions.push(self.reactor.write_file(&tmp, *offset as u64, view));
         }
         let _ = tier;
+        if compression != Compression::None {
+            // The compressor read every byte of the payload and wrote its own: an encode copy
+            // (G-I2 allows a sink that encodes to another format).
+            self.alloc.note_payload_copy(payload_bytes);
+            copied += payload_bytes;
+        }
 
         // The format wants a block's offset, metadata length and body length each a multiple
         // of 8, and a reader holds the footer's block to the message's own `bodyLength`

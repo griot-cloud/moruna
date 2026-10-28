@@ -138,7 +138,7 @@ class IteratorSource:  def __init__(self, iterable, *, schema: pyarrow.Schema | 
 class ParquetSink:     def __init__(self, url: str, *, row_group_bytes=None, file_bytes=None, compression="zstd")
 class VortexSink:      def __init__(self, url: str, *, file_bytes=None)                                 # 08 f.11; 2026-09-29
 class TensorSink:      def __init__(self, path: str, *, format="mrb1", one_file_per_morsel=False, name="tensor")
-class ArrowIpcSink:    def __init__(self, path: str, *, file_bytes=None)
+class ArrowIpcSink:    def __init__(self, path: str, *, file_bytes=None, compression="none", level=None)   # "none", "zstd" (at `level`) or "lz4" (08 e.3); a ValueError for anything else
 
 # A source and a sink of the user's own (2026-09-29; 07 e.6 and f.7, 08 f.10 and e.6). `run`
 # accepts an instance of a subclass wherever it accepts the built-in ones.
