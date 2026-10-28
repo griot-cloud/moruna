@@ -302,10 +302,12 @@ fn events_in(text: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
         .collect()
 }
 
-/// The property, on one run's events: every registered task ends exactly once; a task that
+/// The property, on one run's events: each task is told its states in order (PY-I12,
+/// [`told_in_order`]); every registered task ends exactly once (PY-I11); a task that
 /// started ends completed or failed, never skipped; nothing is told of a task after its end;
 /// and a failed task carries its cause.
 fn one_end_each(events: &[Value], what: &str) {
+    told_in_order(events, what);
     let registered: Vec<String> = events
         .iter()
         .filter(|e| e["kind"] == "task_registered")
@@ -745,4 +747,378 @@ fn py_t26_a_run_dropped_without_a_cancel_at_any_point() {
         told.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "a second end, and the drop after it, tell nothing"
     );
+}
+
+/// PY-I12 on one run's events: each registered task's lifecycle is one order, each state told
+/// once. `task_registered` first, then `task_waiting`; `task_ready` at most once and after it;
+/// `task_started` at most once, and a task that started was told ready before it; what a
+/// running task is told (its phases, a wait on a port, MH 4.10) comes after its start; and
+/// the instants stamped on the events never run backwards.
+fn told_in_order(events: &[Value], what: &str) {
+    let registered: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "task_registered")
+        .filter_map(|e| e["task"].as_str())
+        .collect();
+    for task in registered {
+        let told: Vec<&Value> = events.iter().filter(|e| e["task"] == task).collect();
+        let kinds: Vec<&str> = told.iter().filter_map(|e| e["kind"].as_str()).collect();
+        let count = |kind: &str| kinds.iter().filter(|k| **k == kind).count();
+        let at = |kind: &str| kinds.iter().position(|k| *k == kind);
+        let order = format!("{what}: task {task} was told {kinds:?}");
+        assert_eq!(count("task_registered"), 1, "{order}");
+        assert_eq!(kinds.first(), Some(&"task_registered"), "{order}");
+        assert_eq!(kinds.get(1), Some(&"task_waiting"), "{order}");
+        assert!(count("task_ready") <= 1, "{order}");
+        assert!(count("task_started") <= 1, "{order}");
+        if let Some(started) = at("task_started") {
+            assert!(
+                at("task_ready").is_some_and(|ready| ready < started),
+                "{order}"
+            );
+        }
+        for (i, (kind, event)) in kinds.iter().zip(&told).enumerate() {
+            let on_port = *kind == "task_waiting" && event["reason"] == "port_call";
+            if *kind == "task_phase" || on_port {
+                assert!(
+                    at("task_started").is_some_and(|started| started < i),
+                    "{order}"
+                );
+            } else if *kind == "task_waiting" {
+                assert_eq!(i, 1, "{order}");
+            }
+        }
+    }
+    let mut last = 0;
+    for event in events {
+        if let Some(t) = event["t_us"].as_u64() {
+            assert!(t >= last, "{what}: time runs forward: {event}");
+            last = t;
+        }
+    }
+}
+
+/// A run's tasks and the scheduler's facts of it, each list the facts one thread told, in the
+/// order it told them: a real run of two kernel stages, recorded by the thread each fact was
+/// told on.
+fn recorded_by_thread(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<Vec<StageEvent>>) {
+    let job = document(scratch, &["pass", "pass"], json!("terminate"));
+    let built = build(
+        &job,
+        &test_kinds(),
+        BuildOptions {
+            strict: false,
+            env: &no_env,
+            notes: Vec::new(),
+            packages: Default::default(),
+            host_ports: None,
+        },
+    )
+    .expect("the document builds");
+    let refs = task_refs(&job, Some(&built.stage_kernels));
+    type Told = Vec<(std::thread::ThreadId, StageEvent)>;
+    let facts: Arc<Mutex<Told>> = Arc::default();
+    let kept = facts.clone();
+    Runtime::run_with(
+        built.spec,
+        CancelToken::new(),
+        Components {
+            stage_hook: Some(Arc::new(move |event: &StageEvent| {
+                kept.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((std::thread::current().id(), event.clone()));
+            })),
+            ..Components::default()
+        },
+    )
+    .expect("the recorded run completes");
+    let facts = facts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut threads: Vec<(std::thread::ThreadId, Vec<StageEvent>)> = Vec::new();
+    for (thread, fact) in facts {
+        match threads.iter_mut().find(|(t, _)| *t == thread) {
+            Some((_, told)) => told.push(fact),
+            None => threads.push((thread, vec![fact])),
+        }
+    }
+    assert!(
+        threads.len() > 1,
+        "the run told its facts on several threads"
+    );
+    (refs, threads.into_iter().map(|(_, told)| told).collect())
+}
+
+/// The facts each thread of a chain of `kernels` kernel stages tells, in the order it tells
+/// them, as the scheduler's code tells them: the facade's `Running`; the source drive's first
+/// read, its first push and its queue's close; each kernel stage's first morsel, a wait on a
+/// port and its answer, its first push and its queue's close (the facts of one stage are told
+/// by several workers, so they are kept apart, a list each); the sink drive's first write, its
+/// commit and its finish.
+fn chain_by_thread(kernels: u16) -> Vec<Vec<StageEvent>> {
+    let mut threads = vec![
+        vec![StageEvent::Running],
+        vec![
+            StageEvent::SourceReading,
+            StageEvent::Fed { queue: 0 },
+            StageEvent::QueueClosed {
+                queue: 0,
+                counters: Default::default(),
+            },
+        ],
+    ];
+    for stage in 1..=kernels {
+        threads.push(vec![
+            StageEvent::StageStarted { stage },
+            StageEvent::PortWaiting {
+                stage,
+                port: "lookup".into(),
+            },
+            StageEvent::PortAnswered { stage },
+        ]);
+        threads.push(vec![
+            StageEvent::Fed { queue: stage },
+            StageEvent::QueueClosed {
+                queue: stage,
+                counters: Default::default(),
+            },
+        ]);
+    }
+    threads.push(vec![
+        StageEvent::SinkWriting,
+        StageEvent::SinkCommitting,
+        StageEvent::SinkFinished {
+            counters: Default::default(),
+        },
+    ]);
+    threads
+}
+
+/// SplitMix64: the interleavings are the same on every machine, and a failing one is named by
+/// its seed.
+struct Draw(u64);
+
+impl Draw {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) % n as u64) as usize
+    }
+}
+
+/// One interleaving of `threads`: each thread's facts in its own order, the threads' merged as
+/// `draw` decides, which is every order the threads' own orders allow.
+fn interleave(threads: &[Vec<StageEvent>], draw: &mut Draw) -> Vec<StageEvent> {
+    let mut next = vec![0usize; threads.len()];
+    let mut merged = Vec::new();
+    loop {
+        let open: Vec<usize> = (0..threads.len())
+            .filter(|t| next[*t] < threads[*t].len())
+            .collect();
+        if open.is_empty() {
+            return merged;
+        }
+        let t = open[draw.below(open.len())];
+        merged.push(threads[t][next[t]].clone());
+        next[t] += 1;
+    }
+}
+
+/// A lifecycle whose events are kept as JSON with the instant stamped on each.
+fn stamped_lifecycle(
+    refs: Vec<moruna_job::TaskRefDoc>,
+) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+    let told: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let kept = told.clone();
+    let lifecycle = Lifecycle::new(
+        refs,
+        Instant::now(),
+        Box::new(move |t_us, event| {
+            let mut value = serde_json::to_value(&event).expect("an event is JSON");
+            value["t_us"] = json!(t_us);
+            kept.lock().unwrap_or_else(|e| e.into_inner()).push(value);
+        }),
+    );
+    (lifecycle, told)
+}
+
+/// Interleavings each run of PY-T28 replays.
+const INTERLEAVINGS: u64 = 400;
+
+/// PY-T28 any_interleaving: the scheduler's facts, recorded from a real run by the thread each
+/// was told on, and those of chains of no, one and three kernel stages that wait on a port, are
+/// merged in random orders that keep each thread's own, told to a fresh lifecycle up to a
+/// random point, and the run ended there: completed when every fact was told, otherwise
+/// cancelled, failed by its first kernel, crashed or let go of. Every interleaving satisfies
+/// PY-I12 and PY-I11.
+#[test]
+fn py_t28_any_interleaving_tells_each_task_in_order() {
+    use moruna_runtime::host::lifecycle::Ending;
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("py_t28");
+    let (refs, recorded) = recorded_by_thread(&scratch);
+    let ids = |n: usize| -> Vec<moruna_job::TaskRefDoc> {
+        (0..n)
+            .map(|i| moruna_job::TaskRefDoc {
+                id: format!("task-{i}"),
+                members: Vec::new(),
+            })
+            .collect()
+    };
+    let mut chains = vec![(refs, recorded)];
+    for kernels in [0u16, 1, 3] {
+        chains.push((ids(usize::from(kernels) + 2), chain_by_thread(kernels)));
+    }
+    let kernel_failed = moruna_kernel::MorunaError::Kernel {
+        stage: 1,
+        seq: 0,
+        msg: "the first kernel failed".into(),
+        features: None,
+    };
+    for (chain, (refs, threads)) in chains.iter().enumerate() {
+        for seed in 0..INTERLEAVINGS {
+            let mut draw = Draw(seed);
+            let facts = interleave(threads, &mut draw);
+            let upto = draw.below(facts.len() + 1);
+            let how = if upto == facts.len() {
+                0
+            } else {
+                1 + draw.below(4)
+            };
+            let what = format!("chain {chain}, seed {seed}, {upto} facts, ending {how}");
+            let (lifecycle, told) = stamped_lifecycle(refs.clone());
+            lifecycle.begin(false);
+            for fact in &facts[..upto] {
+                lifecycle.on(fact);
+            }
+            match how {
+                0 => lifecycle.end(Ending::Completed),
+                1 => {
+                    lifecycle.cancel_acknowledged();
+                    lifecycle.end(Ending::Cancelled);
+                }
+                2 => lifecycle.end(Ending::Failed(&kernel_failed)),
+                3 => lifecycle.end(Ending::Crashed("the run broke")),
+                _ => {}
+            }
+            drop(lifecycle);
+            let events = told.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            one_end_each(&events, &what);
+            if how == 0 {
+                for end in events.iter().filter(|e| {
+                    matches!(
+                        e["kind"].as_str(),
+                        Some("task_completed" | "task_failed" | "task_skipped")
+                    )
+                }) {
+                    assert_eq!(end["kind"], "task_completed", "{what}: {end}");
+                    assert_eq!(end["outcome"], "succeeded", "{what}: {end}");
+                }
+            }
+        }
+    }
+}
+
+/// PY-T29 a_start_that_outruns_its_feed (HO-T16): a real run of one kernel stage whose every
+/// producer, on its own thread, is held where it tells its queue's first `Fed` until the
+/// consumer, on another thread, has taken that morsel and told its start. The interleaving
+/// that left HO-T16 without a `task_ready` happens on every run here, once for each queue, and
+/// every task is still told registered, waiting, ready and started, in that order, once each.
+#[test]
+fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
+    use moruna_runtime::host::lifecycle::Ending;
+    use std::sync::Condvar;
+    use std::time::Duration;
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("py_t29");
+    let job = document(&scratch, &["pass"], json!("terminate"));
+    let built = build(
+        &job,
+        &test_kinds(),
+        BuildOptions {
+            strict: false,
+            env: &no_env,
+            notes: Vec::new(),
+            packages: Default::default(),
+            host_ports: None,
+        },
+    )
+    .expect("the document builds");
+    let refs = task_refs(&job, Some(&built.stage_kernels));
+    let sink = refs.len() - 1;
+    let (lifecycle, told) = stamped_lifecycle(refs);
+    lifecycle.begin(false);
+    let tell = lifecycle.hook();
+    let starts = Arc::new((Mutex::new(vec![false; sink + 1]), Condvar::new()));
+    let forced = Arc::new(AtomicUsize::new(0));
+    let (seen, held) = (starts.clone(), forced.clone());
+    let started = move |pos: usize| {
+        let (lock, signal) = &*seen;
+        lock.lock().unwrap_or_else(|e| e.into_inner())[pos] = true;
+        signal.notify_all();
+    };
+    let hook = move |event: &StageEvent| match event {
+        StageEvent::Fed { queue } => {
+            let consumer = usize::from(*queue) + 1;
+            let (lock, signal) = &*starts;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (_guard, waited) = signal
+                .wait_timeout_while(guard, Duration::from_secs(20), |s| !s[consumer])
+                .unwrap_or_else(|e| e.into_inner());
+            if !waited.timed_out() {
+                held.fetch_add(1, Ordering::SeqCst);
+            }
+            tell(event);
+        }
+        StageEvent::StageStarted { stage } => {
+            tell(event);
+            started(usize::from(*stage));
+        }
+        StageEvent::SinkWriting => {
+            tell(event);
+            started(sink);
+        }
+        _ => tell(event),
+    };
+    Runtime::run_with(
+        built.spec,
+        CancelToken::new(),
+        Components {
+            stage_hook: Some(Arc::new(hook)),
+            ..Components::default()
+        },
+    )
+    .expect("the held run completes");
+    lifecycle.end(Ending::Completed);
+    assert_eq!(
+        forced.load(Ordering::SeqCst),
+        sink,
+        "every consumer told its start before its feed was told"
+    );
+    let events = told.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    one_end_each(&events, "a start that outran its feed");
+    for task in events.iter().filter(|e| e["kind"] == "task_registered") {
+        let id = &task["task"];
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter(|e| e["task"] == *id)
+            .filter_map(|e| e["kind"].as_str())
+            .filter(|k| {
+                matches!(
+                    *k,
+                    "task_registered" | "task_waiting" | "task_ready" | "task_started"
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "task_registered",
+                "task_waiting",
+                "task_ready",
+                "task_started"
+            ],
+            "{id}"
+        );
+    }
 }

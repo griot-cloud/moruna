@@ -10,8 +10,13 @@
 //!
 //! A task's states, in order: waiting, ready, running (with its phase), then one end: completed
 //! (succeeded, stopped, cancelled), failed or skipped. Each is told once, in that order, and an
-//! ended task is never told of again. A running kernel task that calls a port is told waiting on
-//! it (`port_call`, MH 4.10) and, when no call of it waits any more, its phase again.
+//! ended task is never told of again, whatever the order the scheduler's threads tell their
+//! facts in (PY-I12): a producer tells `Fed` after it pushed, so its consumer, on another
+//! thread, can tell its start first. A fact that moves a task past a state not yet told tells
+//! that state first, at the same instant; a fact for a state the task has passed tells nothing.
+//! Every event is stamped and told with the lock held, so the instants never run backwards. A
+//! running kernel task that calls a port is told waiting on it (`port_call`, MH 4.10) and, when
+//! no call of it waits any more, its phase again.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -152,7 +157,9 @@ impl Lifecycle {
         })
     }
 
-    fn now(&self) -> u64 {
+    /// The instant, read with the lock held, so events told in the lock's order are stamped in
+    /// it too.
+    fn now(&self, _held: &Inner) -> u64 {
         self.clock.elapsed().as_micros() as u64
     }
 
@@ -166,8 +173,8 @@ impl Lifecycle {
 
     /// The attempt starts: every task is registered, and waits.
     pub fn begin(&self, resumed: bool) {
-        let t = self.now();
         let inner = self.lock();
+        let t = self.now(&inner);
         self.tell(t, Event::AttemptStarted { resumed });
         let last = self.refs.len() - 1;
         for (pos, r) in self.refs.iter().enumerate() {
@@ -245,9 +252,13 @@ impl Lifecycle {
         }
     }
 
+    /// The task at `pos` starts. One still waiting had what it needed, and its readiness may
+    /// not have been told yet (its producer's `Fed` comes from another thread, after the push
+    /// this start took from): it is told ready first (PY-I12).
     fn start(&self, inner: &mut Inner, t: u64, pos: usize, phase: Phase) {
+        self.ready(inner, t, pos);
         let task = &mut inner.tasks[pos];
-        if matches!(task.state, State::Waiting | State::Ready) {
+        if task.state == State::Ready {
             task.state = State::Running { since_us: t, phase };
             self.tell(
                 t,
@@ -308,8 +319,8 @@ impl Lifecycle {
 
     /// One fact from the scheduler.
     pub fn on(&self, event: &StageEvent) {
-        let t = self.now();
         let mut inner = self.lock();
+        let t = self.now(&inner);
         let inner = &mut *inner;
         let sink = inner.tasks.len() - 1;
         match event {
@@ -414,8 +425,8 @@ impl Lifecycle {
 
     /// The peer's `cancel` reached the run.
     pub fn cancel_acknowledged(&self) {
-        let t = self.now();
         let mut inner = self.lock();
+        let t = self.now(&inner);
         if !inner.cancel_acknowledged {
             inner.cancel_acknowledged = true;
             self.tell(t, Event::CancelAcknowledged);
@@ -426,8 +437,8 @@ impl Lifecycle {
     /// run, how the cancel ended. Told once: a second call tells nothing, so no task ends twice
     /// and the cancel's end is told at most once (PY-I11).
     pub fn end(&self, ending: Ending<'_>) {
-        let t = self.now();
         let mut inner = self.lock();
+        let t = self.now(&inner);
         let inner = &mut *inner;
         if inner.ended {
             return;
