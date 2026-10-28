@@ -35,6 +35,14 @@ pub enum CatalogueError {
         /// The name.
         name: String,
     },
+    /// One of the catalogue files this crate carries could not be read as a catalogue.
+    #[error("moruna-job's embedded catalogue/{file} is not a catalogue: {why}")]
+    Embedded {
+        /// The file, under `catalogue/`.
+        file: String,
+        /// Why it was refused.
+        why: String,
+    },
     /// The settings schema uses what the validator does not read (SDD 22 e.3).
     #[error("the {role} kind `{name}`'s settings schema cannot be checked against: {fault}")]
     Schema {
@@ -69,13 +77,13 @@ impl Catalogue {
 
     /// Moruna's standard kinds: what a build of `moruna-runtime` with default features lists
     /// (`moruna kinds`), without the governed ends the `peql` feature adds.
-    pub fn standard() -> Catalogue {
+    pub fn standard() -> Result<Catalogue, CatalogueError> {
         Catalogue::embedded(&[("standard.json", STANDARD)])
     }
 
     /// The standard kinds and the two the `peql` feature adds, the `datafusion` source and the
     /// `peql` sink: what a build with that feature lists.
-    pub fn standard_with_peql() -> Catalogue {
+    pub fn standard_with_peql() -> Result<Catalogue, CatalogueError> {
         Catalogue::embedded(&[("standard.json", STANDARD), ("peql.json", PEQL)])
     }
 
@@ -175,19 +183,21 @@ impl Catalogue {
         }
     }
 
-    /// The catalogue of the embedded files. They are checked by JB-T2 and by the runtime's
-    /// JB-T25, so one that is not a catalogue is a defect of this crate that no release carries;
-    /// a program that meets one stops, saying which.
-    fn embedded(files: &[(&str, &str)]) -> Catalogue {
+    /// The catalogue of the embedded files. JB-T2 and the runtime's JB-T25 check them, so a
+    /// refusal here is a defect of this crate; it is returned, naming the file, never a panic.
+    fn embedded(files: &[(&str, &str)]) -> Result<Catalogue, CatalogueError> {
         let mut catalogue = Catalogue::empty();
         for (file, text) in files {
-            let read = serde_json::from_str::<Listing>(text)
-                .map_err(|e| e.to_string())
-                .and_then(|listing| catalogue.extend(listing).map_err(|e| e.to_string()));
-            if let Err(why) = read {
-                panic!("moruna-job's embedded catalogue/{file} is not a catalogue: {why}");
-            }
+            let embedded = |why: String| CatalogueError::Embedded {
+                file: (*file).to_string(),
+                why,
+            };
+            let listing =
+                serde_json::from_str::<Listing>(text).map_err(|e| embedded(e.to_string()))?;
+            catalogue
+                .extend(listing)
+                .map_err(|e| embedded(e.to_string()))?;
         }
-        catalogue
+        Ok(catalogue)
     }
 }

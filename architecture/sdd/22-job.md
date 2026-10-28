@@ -95,8 +95,8 @@ What changed in moving: `Role::verb` and `Flow::as_str` are public, `Role` has `
 pub struct Catalogue { /* declarations by role and name */ }
 impl Catalogue {
     pub fn empty() -> Catalogue;
-    pub fn standard() -> Catalogue;                        // catalogue/standard.json
-    pub fn standard_with_peql() -> Catalogue;              // standard.json and peql.json
+    pub fn standard() -> Result<Catalogue, CatalogueError>;            // catalogue/standard.json
+    pub fn standard_with_peql() -> Result<Catalogue, CatalogueError>;              // standard.json and peql.json
     pub fn from_listing(listing: Listing) -> Result<Catalogue, CatalogueError>;
     pub fn add(&mut self, declaration: Declaration) -> Result<(), CatalogueError>;   // JB-I4
     pub fn get(&self, role: Role, name: &str) -> Option<&Declaration>;

@@ -18,9 +18,9 @@ use serde_json::{Map, Value, json};
 /// `peql` feature, which is what `Registry::standard()` registers.
 fn catalogue() -> Catalogue {
     if cfg!(feature = "peql") {
-        Catalogue::standard_with_peql()
+        Catalogue::standard_with_peql().expect("the governed catalogue")
     } else {
-        Catalogue::standard()
+        Catalogue::standard().expect("the standard catalogue")
     }
 }
 
@@ -47,7 +47,10 @@ fn jb_t25_catalogue_is_the_registry() {
     // is what it is.
     if !cfg!(feature = "peql") {
         assert!(from_registry.get(Role::Sink, "peql").is_none());
-        assert_eq!(from_registry, Catalogue::standard());
+        assert_eq!(
+            from_registry,
+            Catalogue::standard().expect("the standard catalogue")
+        );
     }
 }
 

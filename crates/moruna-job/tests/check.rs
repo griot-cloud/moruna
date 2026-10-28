@@ -24,7 +24,7 @@ fn good() -> JobSpec {
 }
 
 fn refusals(job: &JobSpec) -> Vec<Refusal> {
-    check(job, &Catalogue::standard()).expect_err("refused")
+    check(job, &Catalogue::standard().expect("the standard catalogue")).expect_err("refused")
 }
 
 fn text(refusals: &[Refusal]) -> Vec<String> {
@@ -44,7 +44,7 @@ fn contract() -> ContractEntry {
 /// document made of them passes, whatever the roles around it.
 #[test]
 fn jb_t6_every_example_passes() {
-    let governed = Catalogue::standard_with_peql();
+    let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
     let mut cases = 0;
     for role in [Role::Source, Role::Kernel, Role::Sink] {
         for declared in governed.declarations(role) {
@@ -69,13 +69,25 @@ fn jb_t6_every_example_passes() {
         }
     }
     assert!(cases >= 20, "{cases}");
-    assert_eq!(check(&good(), &Catalogue::standard()), Ok(()));
+    assert_eq!(
+        check(
+            &good(),
+            &Catalogue::standard().expect("the standard catalogue")
+        ),
+        Ok(())
+    );
     let copy = job(
         json!({"kind": "tensor", "url": ["/a", "/b"]}),
         Vec::new(),
         json!({"kind": "arrow_ipc", "url": "/out"}),
     );
-    assert_eq!(check(&copy, &Catalogue::standard()), Ok(()));
+    assert_eq!(
+        check(
+            &copy,
+            &Catalogue::standard().expect("the standard catalogue")
+        ),
+        Ok(())
+    );
 }
 
 /// JB-T7 unknown_kinds: a kind no declaration of its role has is refused at `<field>.kind` with
@@ -209,7 +221,13 @@ fn jb_t8_settings_refusals() {
         json!({"kind": "parquet", "url": "/o",
                "options": {"row_group_bytes": 18446744073709551615u64}}),
     );
-    assert_eq!(check(&widest, &Catalogue::standard()), Ok(()));
+    assert_eq!(
+        check(
+            &widest,
+            &Catalogue::standard().expect("the standard catalogue")
+        ),
+        Ok(())
+    );
     let fractional = sink(json!({"kind": "parquet", "url": "/o", "options": {"file_bytes": 1.5}}));
     assert!(
         fractional[0]
@@ -246,7 +264,7 @@ fn jb_t8_settings_refusals() {
                 vec![json!({"kind": "std", "name": "cast", "args": 7})],
                 json!({"kind": "parquet", "url": "/out"})
             ),
-            &Catalogue::standard()
+            &Catalogue::standard().expect("the standard catalogue")
         ),
         Ok(())
     );
@@ -284,7 +302,7 @@ fn jb_t9_every_refusal_is_collected() {
 /// passes. A kind that needs none is not refused for carrying none.
 #[test]
 fn jb_t10_contracts_are_needed() {
-    let governed = Catalogue::standard_with_peql();
+    let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
     let example = |role: Role, name: &str| {
         let mut settings = governed
             .get(role, name)
@@ -319,6 +337,12 @@ fn jb_t10_contracts_are_needed() {
     doc.contracts = vec![contract()];
     assert_eq!(check(&doc, &governed), Ok(()));
     // The standard catalogue does not have them at all.
-    assert!(check(&doc, &Catalogue::standard()).is_err());
+    assert!(
+        check(
+            &doc,
+            &Catalogue::standard().expect("the standard catalogue")
+        )
+        .is_err()
+    );
     assert_eq!(check(&good(), &governed), Ok(()));
 }

@@ -75,7 +75,7 @@ fn jb_t1_dependencies_are_the_four() {
 /// the registry accepts with an example; the `peql` kinds are two more and nothing else changes.
 #[test]
 fn jb_t2_embedded_catalogues() {
-    let standard = Catalogue::standard();
+    let standard = Catalogue::standard().expect("the standard catalogue");
     assert_eq!(
         names(&standard, Role::Source),
         ["parquet", "tensor", "vortex"]
@@ -85,7 +85,7 @@ fn jb_t2_embedded_catalogues() {
         names(&standard, Role::Sink),
         ["arrow_ipc", "parquet", "tensor", "vortex"]
     );
-    let governed = Catalogue::standard_with_peql();
+    let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
     assert_eq!(
         names(&governed, Role::Source),
         ["datafusion", "parquet", "tensor", "vortex"]
@@ -123,13 +123,14 @@ fn jb_t2_embedded_catalogues() {
 /// and no kind of that role has its name; the refusal names the role and the name.
 #[test]
 fn jb_t3_add_refusals() {
-    let mut catalogue = Catalogue::standard();
+    let mut catalogue = Catalogue::standard().expect("the standard catalogue");
     catalogue
         .add(declaration(Role::Kernel, "test.scale"))
         .expect("a kind of the embedder's own");
     assert!(catalogue.get(Role::Kernel, "test.scale").is_some());
     assert!(
         Catalogue::standard()
+            .expect("the standard catalogue")
             .get(Role::Kernel, "test.scale")
             .is_none()
     );
