@@ -4395,6 +4395,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-record"
+version = "0.5.7"
+
+[[package]]
 name = "moruna-runtime"
 version = "0.5.7"
 dependencies = [
