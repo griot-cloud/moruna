@@ -37,6 +37,15 @@ impl Decoder {
         Decoder::default()
     }
 
+    /// A decoder whose schema is already known, as an IPC file's footer gives it
+    /// ([`super::footer_schema`]): each block of the file is then one message to `message`.
+    pub fn with_schema(schema: SchemaRef) -> Decoder {
+        Decoder {
+            schema: Some(schema),
+            dictionaries: HashMap::new(),
+        }
+    }
+
     /// The stream's schema, once its schema message has been read.
     pub fn schema(&self) -> Option<&SchemaRef> {
         self.schema.as_ref()

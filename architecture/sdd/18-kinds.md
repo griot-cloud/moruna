@@ -57,7 +57,7 @@ It refuses to know: what a kind does with its settings beyond reading them (each
 
 **KD-I8. Contracts are carried only for a kind that needs them.** A document that carries `contracts` and none of whose kinds declares `needs.contracts: yes` is refused at `contracts`.
 
-**KD-I9. v1 documents read and run unchanged.** Every `moruna_spec: 1` document 0.5.7 read is read by the same parser into entries of its kinds, unchanged, and its kinds resolve through the registry: `parquet`, `vortex`, `tensor`, `datafusion` (with `peql`) sources; `parquet`, `vortex`, `tensor`, `arrow_ipc`, `peql` (with `peql`) sinks; `std`, `package`, and in a program with the Python adapter, `python` kernels; in the library, `iterator` and `python` sources and the `python` sink. What each setting means is what it meant.
+**KD-I9. v1 documents read and run unchanged.** Every `moruna_spec: 1` document 0.5.7 read is read by the same parser into entries of its kinds, unchanged, and its kinds resolve through the registry: `parquet`, `vortex`, `tensor`, `arrow_ipc` (2026-10-28), `datafusion` (with `peql`) sources; `parquet`, `vortex`, `tensor`, `arrow_ipc`, `peql` (with `peql`) sinks; `std`, `package`, and in a program with the Python adapter, `python` kernels; in the library, `iterator` and `python` sources and the `python` sink. What each setting means is what it meant.
 
 **KD-I10. One stage per fused run of stages, by the kinds' own word.** Adjacent stages are joined into one when the earlier stage's `Fuse` returns a stage for the later one's (MH 4.9); the build never inspects a kernel to decide it, and `Built::stage_kernels` says which entries each stage carries.
 
@@ -174,6 +174,7 @@ Isolation: `builtin`, code compiled into the program, in its process; `imported`
 
 | Kind | Role | Inputs, outputs | Network | Contracts | Deterministic | Preserves columns | Isolation |
 |---|---|---|---|---|---|---|---|
+| `arrow_ipc` | source | files, batches | no | no | yes | by settings | builtin |
 | `parquet` | source | files, batches | by settings | no | yes | by settings | builtin |
 | `vortex` | source | files, batches | by settings | no | yes | by settings | builtin |
 | `tensor` | source | files, batches | no | no | yes | by settings | builtin |
@@ -205,7 +206,7 @@ In the job spec v2 (MC2, FlatBuffers, decision FB1), a node is a kind name and i
 
 ## f. Algorithms and policies
 
-**f.1 The standard registry.** `Registry::standard()` registers: sources `parquet`, `tensor`, `vortex`, and with `peql` `datafusion`; kernels `package`, `std`; sinks `arrow_ipc`, `parquet`, `tensor`, `vortex`, and with `peql` `peql`. A build without `peql` has no governed kinds, so a document naming them is refused by KD-I1 (the stub that refused them by text is gone). The Python surface adds its kinds (`crates/moruna-py/src/kinds.rs`): the command registers `python` (`Imported`, which imports the module an entry names); `moruna.run` registers `python` (`Given`, which hands back the kernels it was given by the entry's place), `iterator`, the `python` source and the `python` sink (the objects it holds). A program that registers none of them refuses documents naming them by KD-I1.
+**f.1 The standard registry.** `Registry::standard()` registers: sources `arrow_ipc`, `parquet`, `tensor`, `vortex`, and with `peql` `datafusion`; kernels `package`, `std`; sinks `arrow_ipc`, `parquet`, `tensor`, `vortex`, and with `peql` `peql`. A build without `peql` has no governed kinds, so a document naming them is refused by KD-I1 (the stub that refused them by text is gone). The Python surface adds its kinds (`crates/moruna-py/src/kinds.rs`): the command registers `python` (`Imported`, which imports the module an entry names); `moruna.run` registers `python` (`Given`, which hands back the kernels it was given by the entry's place), `iterator`, the `python` source and the `python` sink (the objects it holds). A program that registers none of them refuses documents naming them by KD-I1.
 
 **f.2 The build.** In order, each step's refusal before the next is tried: the environment (MH 4.1); the run id; every kind resolved (KD-I1: source, sink, then each kernel); strict mode over the declarations (KD-I6); the contracts over the declarations (KD-I8); a `Context` made with the program's hooks, the package host, the host ports and the carried contracts; the source built; its targets recorded on the context; the sink built; the sink equals source rule (12 f.3); each kernel's stage built and joined with the previous one when their fuses say so (KD-I10); the kinds' notes appended to the build's; then every stage given its id (`placed`), its packaged kernel and its Python kernel collected; then the ranges, resume and the rest of MH 4.1, unchanged.
 

@@ -260,3 +260,103 @@ fn a_failed_ipc_write_is_reported_by_finish() {
     };
     assert!(msg.contains("committed files:"), "{msg}");
 }
+
+/// A batch whose buffers have no 8-byte multiple of bytes: a nullable `Int32`, a string, a
+/// boolean and a list of `Int32`, so the last buffer of the body is unpadded for most `rows`.
+fn ragged_batch(rows: usize, base: i32) -> moruna_kernel::arrow::record_batch::RecordBatch {
+    use moruna_kernel::arrow::array::{
+        ArrayRef, BooleanArray, Int32Array, ListArray, StringArray, types::Int32Type,
+    };
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    let ints: ArrayRef = Arc::new(Int32Array::from_iter(
+        (0..rows).map(|i| (i % 4 != 0).then_some(base + i as i32)),
+    ));
+    let text: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..rows).map(|i| format!("row {base}-{i}")),
+    ));
+    let flags: ArrayRef = Arc::new(BooleanArray::from_iter((0..rows).map(|i| Some(i % 3 == 0))));
+    let lists: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+        (0..rows).map(|i| Some((0..(i % 3)).map(|j| Some(j as i32)).collect::<Vec<_>>())),
+    ));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int32, true),
+        Field::new("s", DataType::Utf8, false),
+        Field::new("f", DataType::Boolean, false),
+        Field::new("l", lists.data_type().clone(), true),
+    ]));
+    moruna_kernel::arrow::record_batch::RecordBatch::try_new(schema, vec![ints, text, flags, lists])
+        .expect("ragged batch")
+}
+
+/// SI-T27. Every block of the footer is what the Arrow IPC file format requires and what
+/// pyarrow (Arrow C++) refuses a file for lacking: an offset, a `metaDataLength` and a
+/// `bodyLength` that are multiples of 8, and an offset that points at a continuation marker.
+/// Row counts that are odd make the last buffer of a body unpadded, which is where the lengths
+/// went wrong. e.3, f.2, KA11.
+#[test]
+fn si_t27_ipc_blocks_are_eight_aligned() {
+    for rows in [3usize, 7, 301, 1001, 1] {
+        let scratch = Scratch::new("t27");
+        let (mut sink, reactor, _alloc) = new_sink(&scratch, 1 << 30);
+        sink.open(&table_source_schema()).expect("open");
+        for seq in 0..5u64 {
+            let batch = ragged_batch(rows, seq as i32 * 7);
+            block_on(sink.write(seq, moruna_kernel::Payload::table(batch).expect("payload")))
+                .expect("write");
+        }
+        sink.finish().expect("finish");
+        let bytes = written(&reactor, scratch.path(), "part-00000.arrow");
+
+        let footer_len = u32::from_le_bytes([
+            bytes[bytes.len() - 10],
+            bytes[bytes.len() - 9],
+            bytes[bytes.len() - 8],
+            bytes[bytes.len() - 7],
+        ]) as usize;
+        assert_eq!(&bytes[bytes.len() - 6..], b"ARROW1");
+        let footer = &bytes[bytes.len() - 10 - footer_len..bytes.len() - 10];
+        let parsed = root_as_footer(footer).expect("the footer parses");
+        let blocks = parsed.recordBatches().expect("record batch blocks");
+        assert_eq!(blocks.len(), 5);
+        for i in 0..blocks.len() {
+            let block = blocks.get(i);
+            let at = block.offset() as usize;
+            assert_eq!(block.offset() % 8, 0, "rows {rows} block {i}: offset");
+            assert_eq!(
+                block.metaDataLength() % 8,
+                0,
+                "rows {rows} block {i}: metaDataLength"
+            );
+            assert_eq!(
+                block.bodyLength() % 8,
+                0,
+                "rows {rows} block {i}: bodyLength"
+            );
+            assert_eq!(
+                &bytes[at..at + 4],
+                &[0xff; 4],
+                "rows {rows} block {i}: the offset is not at a continuation marker"
+            );
+            // Arrow C++ holds the block to the message's own body length.
+            let message = moruna_kernel::arrow::ipc::root_as_message(
+                &bytes[at + 8..at + block.metaDataLength() as usize],
+            )
+            .expect("the record batch message parses");
+            assert_eq!(
+                message.bodyLength(),
+                block.bodyLength(),
+                "rows {rows} block {i}: the message and the block disagree about the body"
+            );
+            let end = at + block.metaDataLength() as usize + block.bodyLength() as usize;
+            assert!(
+                end <= bytes.len() - 10 - footer_len,
+                "block {i} runs into the footer"
+            );
+        }
+        let reader = FileReader::try_new(std::io::Cursor::new(bytes), None).expect("arrow reads");
+        assert_eq!(
+            reader.map(|b| b.expect("batch").num_rows()).sum::<usize>(),
+            rows * 5
+        );
+    }
+}
