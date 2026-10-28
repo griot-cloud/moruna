@@ -319,7 +319,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-14]
+        # A named image, not ubuntu-latest: 0.5.7's wheels were built on ubuntu-26.04 when
+        # ubuntu-latest moved, maturin found no manylinux tag for its glibc, and PyPI refused them.
+        os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
@@ -341,6 +343,10 @@ jobs:
           python -m pip install --upgrade pip maturin
           maturin build --release --out dist --interpreter "$STANDARD" "$FREETHREADED"
           ls dist/*-cp314-cp314-* dist/*-cp314-cp314t-*
+          if ls dist/*-linux_*.whl 2>/dev/null; then
+            echo "a wheel with no manylinux tag cannot be published to PyPI" >&2
+            exit 1
+          fi
           ls -la dist
       - name: The wheel installs and runs before it is published
         # A wheel that has never been imported is not a release candidate. The tests
