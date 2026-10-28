@@ -11,10 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::ports::{self, PortDoc};
-use super::{
-    Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Role, RunnableKind, Stage,
-    check_pin, settings_schema,
-};
+use super::{Context, Entry, RunnableKind, Stage, check_pin};
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
 
 /// The `package` kind.
 pub struct Package;

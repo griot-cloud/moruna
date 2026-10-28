@@ -4283,6 +4283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-job"
+version = "0.5.7"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "moruna-kernel"
 version = "0.5.7"
 dependencies = [
@@ -4352,6 +4362,7 @@ dependencies = [
  "moruna-adapters",
  "moruna-arena",
  "moruna-discovery",
+ "moruna-job",
  "moruna-kernel",
  "moruna-kernels",
  "moruna-package",
@@ -4413,6 +4424,7 @@ dependencies = [
  "moruna-controller",
  "moruna-datafusion",
  "moruna-discovery",
+ "moruna-job",
  "moruna-kernel",
  "moruna-kernels",
  "moruna-package",

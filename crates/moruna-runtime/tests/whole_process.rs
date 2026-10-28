@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use moruna_job::JobSpec;
 use moruna_kernel::{
     BoxFuture, CancelToken, MorunaError, Payload, PayloadKind, PayloadSpec, Seq, Sink, SinkSummary,
     SourceSchema, TierPref,
 };
-use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::Registry;
 use moruna_runtime::{RunSpec, Runtime, SinkSpec};
 use serde_json::json;

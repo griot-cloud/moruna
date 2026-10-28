@@ -18,12 +18,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use moruna_job::JobSpec;
 use moruna_kernel::{Answer, CancelToken, GuestCall, GuestPort};
 use moruna_runtime::host::cli;
 use moruna_runtime::host::exit;
 use moruna_runtime::host::session::{HEARTBEAT, read_report_file};
 use moruna_runtime::host::transport::{self, Address};
-use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::job::{BuildOptions, build};
 use moruna_wasm::testing::{caller_component, manifest, package_at};
 use serde_json::{Value, json};
 use support::{Scratch, one_run_at_a_time, read_back_rows, write_parquet};

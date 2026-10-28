@@ -259,7 +259,7 @@ impl RunSpec {
             host_profile: None,
             allow_gil: false,
             checkpoint: true,
-            checkpoint_interval_ms: crate::config::CHECKPOINT_INTERVAL_MS,
+            checkpoint_interval_ms: moruna_job::CHECKPOINT_INTERVAL_MS,
             checkpoint_keep: false,
             resume: None,
             resume_auto: false,
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(spec.sizer, SizerKind::Rule);
         assert_eq!(
             spec.checkpoint_interval_ms,
-            crate::config::CHECKPOINT_INTERVAL_MS
+            moruna_job::CHECKPOINT_INTERVAL_MS
         );
     }
 

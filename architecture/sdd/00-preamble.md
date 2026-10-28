@@ -41,6 +41,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 16 | Function package | `16-package.md` | 1, 12's check harness, 17 | a package is one file whose fingerprint is `sha256` of its bytes, read once; its manifest is complete and closed; a hosted run loads no kernel by import path (added 2026-10-15, `architecture/function-packages.md`) |
 | 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
 | 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
+| 22 | The job document and the catalogue, for embedders | `22-job.md` | 18 | an embedder reads Moruna's kinds and checks a job document against them, collecting every refusal, with a crate that depends on `serde`, `serde_json`, `schemars` and `thiserror` only; the declaration and document types have one home there; the embedded catalogue equals the registry's listing (added 2026-10-28, board item KA4) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -414,6 +415,7 @@ moruna/
     moruna-package/           component 16: the function package: manifest, reader, fingerprint, tree (added 2026-10-15)
     moruna-wasm/              component 17: a `.wasm` package in wasmtime
     moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux)
+    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars and thiserror only (added 2026-10-28)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent

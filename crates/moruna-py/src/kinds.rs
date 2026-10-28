@@ -12,11 +12,12 @@
 use std::sync::{Arc, Mutex};
 
 use moruna_adapters::PyKernel;
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, SpecError, settings_schema};
 use moruna_kernel::{Kernel, MorunaError, Result, SourceSchema};
-use moruna_runtime::job::SpecError;
+use moruna_runtime::job::refusal;
 use moruna_runtime::kinds::{
-    BuiltSink, BuiltSource, Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Registry,
-    Role, RunnableKind, SinkKind, SourceKind, Stage, check_pin, settings_schema,
+    BuiltSink, BuiltSource, Context, Entry, Registry, RunnableKind, SinkKind, SourceKind, Stage,
+    check_pin,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -201,7 +202,7 @@ impl RunnableKind for Imported {
                 None,
                 doc.memory_guard.unwrap_or(true),
             )
-            .map_err(|e| SpecError::new(entry.field().to_string(), e.to_string()))?;
+            .map_err(|e| refusal(SpecError::new(entry.field().to_string(), e.to_string())))?;
             Ok(handle.kernel)
         })?;
         check_pin(entry, doc.fingerprint.as_deref(), kernel.as_ref())?;
