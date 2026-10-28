@@ -184,8 +184,8 @@ impl Watch for Driver {
         let name = s.devices[self.index].name.clone();
         let started = s.start(self.index);
         let d = &mut s.devices[self.index];
-        let lookups: Vec<Pending> = d.lookups.drain(..).collect();
-        let restarts: Vec<Pending> = d.restarts.drain(..).collect();
+        let lookups = core::mem::take(&mut d.lookups);
+        let restarts = core::mem::take(&mut d.restarts);
         match started {
             Ok(process) => {
                 let starts = d.starts;
