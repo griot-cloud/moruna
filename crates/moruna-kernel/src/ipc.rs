@@ -1,4 +1,6 @@
-//! The page-aligned Arrow IPC record encoding (contracts e.7).
+//! The page-aligned Arrow IPC record encoding (contracts e.7), and every Arrow IPC read Moruna
+//! makes: each message checked before arrow-ipc sees it (`check`, CT-I13), and streams read
+//! message by message through that check (`read_stream`, `ReadStream`, e.8).
 //!
 //! It is the Arrow IPC stream framing with one deviation the format permits: every body buffer
 //! of a record batch is placed at a multiple of `page_bytes` rather than of 8, so each can be
@@ -13,6 +15,12 @@ use arrow::ipc::reader::RecordBatchDecoder;
 use arrow::ipc::writer::{IpcWriteOptions, StreamEncoder};
 use arrow::ipc::{MetadataVersion, root_as_message};
 use arrow::record_batch::RecordBatch;
+
+mod check;
+mod stream;
+
+pub use check::{Checked, check};
+pub use stream::{Decoder, ReadStream, read_stream};
 
 use crate::buffer::{Allocator, Buffer};
 use crate::error::MorunaError;
@@ -174,9 +182,9 @@ pub fn decode(buf: ArrowBuffer, page_bytes: usize) -> crate::Result<RecordBatch>
     let schema_len = message_len(bytes)?;
     let schema_message = root_as_message(&bytes[8..8 + schema_len])
         .map_err(|e| bad(format!("schema message: {e}")))?;
-    let schema_fb = schema_message
-        .header_as_schema()
-        .ok_or_else(|| bad("the first message is not a schema"))?;
+    let Checked::Schema(schema_fb) = check(&schema_message, &[], None).map_err(bad)? else {
+        return Err(bad("the first message is not a schema"));
+    };
     let schema = std::sync::Arc::new(arrow::ipc::convert::fb_to_schema(schema_fb));
     let rb_start = 8 + schema_len;
     let rb_len = message_len(&bytes[rb_start..])?;
@@ -187,10 +195,13 @@ pub fn decode(buf: ArrowBuffer, page_bytes: usize) -> crate::Result<RecordBatch>
         MetadataVersion::V5 => MetadataVersion::V5,
         other => return Err(bad(format!("unsupported IPC metadata version {other:?}"))),
     };
-    let record_batch = rb_message
-        .header_as_record_batch()
-        .ok_or_else(|| bad("the second message is not a record batch"))?;
     let body_start = (rb_start + 8 + rb_len) as u64;
+    // CT-I13: the body is the rest of the record, as the decoder reads it below.
+    let Checked::Batch(record_batch) =
+        check(&rb_message, &bytes[body_start as usize..], Some(&schema)).map_err(bad)?
+    else {
+        return Err(bad("the second message is not a record batch"));
+    };
     for (offset, length) in buffer_entries(&bytes[rb_start..rb_start + 8 + rb_len])? {
         if length == 0 {
             continue;
