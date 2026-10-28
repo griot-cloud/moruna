@@ -363,9 +363,9 @@ fn kd_t6_listing() {
     let back: Listing = serde_json::from_str(&text).expect("reads back");
     assert_eq!(back, listing);
     let json: Value = serde_json::from_str(&text).expect("json");
-    assert_eq!(json["kernels"][1]["settings"]["$schema"], SCHEMA_DIALECT);
+    assert_eq!(json["kernels"][2]["settings"]["$schema"], SCHEMA_DIALECT);
     assert_eq!(
-        json["kernels"][1]["settings"]["properties"]["name"]["enum"],
+        json["kernels"][2]["settings"]["properties"]["name"]["enum"],
         json!(moruna_kernels::NAMES)
     );
     assert_eq!(

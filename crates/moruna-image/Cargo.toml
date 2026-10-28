@@ -28,9 +28,7 @@ testing = []
 
 [dev-dependencies]
 moruna-image = { workspace = true, features = ["testing"] }
-moruna-kernel = { workspace = true }
 moruna-runtime = { workspace = true }
-moruna-sandbox = { workspace = true }
 parquet = { workspace = true }
 
 # A program an image's command runs in the image kind's tests (SDD 19 k): it reads an Arrow IPC

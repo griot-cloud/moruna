@@ -950,6 +950,152 @@ mod tests {
         assert_eq!(filters(std::process::id()).unwrap().len(), 2);
     }
 
+    /// IM-T25: the image's lists in code are the lists in 19 e.4, name for name, none of the
+    /// calls that section names as fatal is on them, and the filter built from them kills the
+    /// calls it should, in a forked child of the test.
+    #[test]
+    fn im_t25_the_filter_is_the_documents() {
+        let sdd = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../architecture/sdd/19-image.md"),
+        )
+        .unwrap();
+        let start = sdd.find("### e.4").unwrap();
+        let blocks: Vec<Vec<&str>> = sdd[start..]
+            .split("```text")
+            .skip(1)
+            .take(2)
+            .map(|b| b.split("```").next().unwrap().split_whitespace().collect())
+            .collect();
+        assert_eq!(blocks[0], IMAGE_ALLOWED, "19 e.4's first list");
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(blocks[1], IMAGE_ALLOWED_ARCH, "19 e.4's x86_64 list");
+        } else {
+            assert!(IMAGE_ALLOWED_ARCH.is_empty());
+        }
+        for name in IMAGE_ALLOWED.iter().chain(IMAGE_ALLOWED_ARCH) {
+            assert!(image_number(name).is_some(), "{name}");
+        }
+        let fatal = sdd[start..]
+            .split("Not on the list, and so fatal:")
+            .nth(1)
+            .and_then(|t| t.split("and every call not named above").next())
+            .unwrap();
+        let mut named = 0;
+        for word in fatal.split('`').skip(1).step_by(2) {
+            named += 1;
+            assert!(
+                !IMAGE_ALLOWED.contains(&word) && !IMAGE_ALLOWED_ARCH.contains(&word),
+                "{word} is fatal in 19 e.4"
+            );
+        }
+        assert!(named > 30, "the fatal list was read: {named}");
+        assert_eq!(image_filters().unwrap().len(), 2);
+    }
+
+    /// Fork a child that applies the image's filter, runs `probe`, and ends with the code it
+    /// returns; the status the parent sees.
+    fn under_image_filter(probe: fn() -> i32) -> i32 {
+        // SAFETY: the child installs the filter and makes one or two system calls, then `_exit`s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let programs = image_filters().unwrap_or_else(|_| unsafe { libc::_exit(90) });
+            // SAFETY: prctl with integers, then the probe's own calls.
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(91);
+                }
+                if apply_programs(&programs).is_err() {
+                    libc::_exit(92);
+                }
+                libc::_exit(probe())
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting for the child this test forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        if libc::WIFSIGNALED(status) {
+            return -libc::WTERMSIG(status);
+        }
+        libc::WEXITSTATUS(status)
+    }
+
+    #[test]
+    fn im_t25_the_filter_kills_what_is_not_listed() {
+        // SAFETY (all probes): plain system calls with integer arguments.
+        // Ordinary calls pass.
+        assert_eq!(
+            under_image_filter(|| unsafe { i32::from(libc::getpid() <= 0) }),
+            0
+        );
+        // A TCP socket, any socket, a connection: SIGSYS.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                0
+            }),
+            -libc::SIGSYS,
+            "`socket` is not on the list for any family"
+        );
+        // A socket pair of `AF_UNIX` passes; of `AF_INET` it does not.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                let mut fds = [0; 2];
+                i32::from(
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0,
+                )
+            }),
+            0
+        );
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                let mut fds = [0; 2];
+                libc::socketpair(libc::AF_INET, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+                0
+            }),
+            -libc::SIGSYS
+        );
+        // Mounting, tracing and namespaces: SIGSYS.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::unshare(libc::CLONE_NEWNS);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        // A thread's `clone` passes the flags test; one that makes a namespace is killed.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::syscall(libc::SYS_clone, libc::CLONE_NEWUTS as u64, 0, 0, 0, 0);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        // `clone3` is `ENOSYS`, which the C library answers by trying `clone`.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                let r = libc::syscall(libc::SYS_clone3, core::ptr::null::<u8>(), 0);
+                i32::from(!(r == -1 && *libc::__errno_location() == libc::ENOSYS))
+            }),
+            0
+        );
+    }
+
     /// The filters install, in a forked child of the test, and refuse what they should.
     #[test]
     fn filters_install_and_refuse() {

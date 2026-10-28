@@ -101,7 +101,7 @@ fn main() {
     let mut output = StreamWriter::try_new(std::io::stdout().lock(), &out_schema)
         .unwrap_or_else(|e| die("writing the output schema", e));
     let _ = output.get_mut().flush();
-    while let Some(batch) = input.next() {
+    for batch in input.by_ref() {
         let batch = batch.unwrap_or_else(|e| die("reading a batch", e));
         let rows = batch.num_rows() as i64;
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();

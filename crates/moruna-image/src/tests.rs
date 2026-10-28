@@ -827,3 +827,59 @@ fn im_t15_the_config_is_read() {
     ));
     assert!(e.contains("`/proc`, which is not a directory"), "{e}");
 }
+
+/// IM-T14: links with no target, a hard link to the root, a cache that cannot be made and a
+/// global header in a layer are each named or passed over, never half done.
+#[test]
+fn im_t14_odd_entries_and_a_cache_that_cannot_be_made() {
+    for (entry, said) in [
+        (Entry::Symlink("s", ""), "symbolic link with no target"),
+        (Entry::Hardlink("h", ""), "hard link with no target"),
+        (Entry::Hardlink("h", "."), "an earlier entry must make"),
+    ] {
+        let scratch = Scratch::new("im_t14_odd");
+        let e = refused(unpacked(&scratch, &[tar_layer(vec![entry])]));
+        assert!(e.contains(said), "{said}: {e}");
+    }
+
+    let scratch = Scratch::new("im_t14_global");
+    let mut header = tar::Header::new_gnu();
+    header.set_path("pax_global_header").unwrap();
+    header.set_entry_type(tar::EntryType::XGlobalHeader);
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_cksum();
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.append(&header, &[][..]).unwrap();
+    let mut file = tar::Header::new_gnu();
+    file.set_mode(0o644);
+    file.set_size(1);
+    builder.append_data(&mut file, "kept", &b"1"[..]).unwrap();
+    let bytes = builder.into_inner().unwrap();
+    let layout = scratch.path().join("layout");
+    LayoutBuilder::new(&layout)
+        .layer_bytes(media::TAR, &bytes)
+        .finish(Some("app"));
+    let image = unpack(
+        &OciLayout::open(&layout).unwrap(),
+        "app",
+        &scratch.path().join("cache"),
+    )
+    .unwrap();
+    assert_eq!(text(&image.rootfs, "kept"), "1");
+
+    // A cache that is a file cannot be made into a directory, and the refusal says where.
+    let file = scratch.path().join("a-file");
+    fs::write(&file, b"x").unwrap();
+    let e = unpack(
+        &OciLayout::open(&layout).unwrap(),
+        "app",
+        &file.join("cache"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("making the cache") && e.contains("a-file"),
+        "{e}"
+    );
+}

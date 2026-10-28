@@ -219,10 +219,11 @@ mod tests {
         .unwrap();
         assert_eq!(cg.oom_kills(), 2);
         cg.kill();
-        assert!(
-            !cg.dir().join("cgroup.kill").exists(),
-            "no such file is made"
+        assert_eq!(
+            fs::read_to_string(cg.dir().join("cgroup.kill")).unwrap(),
+            "1"
         );
+        fs::remove_file(cg.dir().join("cgroup.kill")).unwrap();
         fs::remove_file(cg.dir().join("memory.events")).unwrap();
         // Made twice: refused naming the directory.
         let e = StageCgroup::create(&dir, "stage", 1, 1.0).unwrap_err();

@@ -41,6 +41,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 16 | Function package | `16-package.md` | 1, 12's check harness, 17 | a package is one file whose fingerprint is `sha256` of its bytes, read once; its manifest is complete and closed; a hosted run loads no kernel by import path (added 2026-10-15, `architecture/function-packages.md`) |
 | 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
 | 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
+| 19 | An OCI image as a kind | `19-image.md` | 1, 17, 18 | an image is a read, verified and unpacked OCI layout and its command; the `image` kind runs the command in the sandbox as one confined process per stage, Arrow IPC over its standard input and output, and it ends the run when the process does not end as it should (added 2026-10-28, board KA1) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -413,7 +414,8 @@ moruna/
     moruna-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on moruna-kernel and datafusion only (feature: datafusion)
     moruna-package/           component 16: the function package: manifest, reader, fingerprint, tree (added 2026-10-15)
     moruna-wasm/              component 17: a `.wasm` package in wasmtime
-    moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux)
+    moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux); component 19's `ImageKernel`
+    moruna-image/             component 19: an OCI layout read, verified and unpacked into a root (pure Rust; added 2026-10-28)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
@@ -469,6 +471,8 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `zip` | 16 | the `.pex` archive | `default-features = false`, feature `deflate`; added 2026-10-15 |
 | `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |
 | `vm-fdt`, `acpi_tables` | `moruna-vmm` | the aarch64 device tree and the x86_64 ACPI tables that describe the guest's devices and hot-pluggable CPUs | |
+| `tar` | 19 (`moruna-image`) | OCI layers are tar | `default-features = false` (no `xattr`: entries are read and written by the crate itself); added 2026-10-28, named in 19 d.4 |
+| `flate2`, `zstd` | 19 (`moruna-image`) | OCI layers are gzip or zstd compressed | already in the graph at these versions (`zstd` 0.14.0, the one `zstd-sys` 2.1.0 serves); `zstd` with `default-features = false`; added 2026-10-28, named in 19 d.4 |
 | `schemars` | 18 (runtime), 12 | the settings schema each kind declares: JSON Schema 2020-12 derived from the type its adapter reads its settings with (18 e.2, decision KD1) | already in the graph through `parcel-core` at this version; default features (`derive`, `std`); added 2026-10-28, named in 18 d.5 |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
