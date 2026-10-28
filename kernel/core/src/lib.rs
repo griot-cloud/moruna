@@ -18,6 +18,7 @@ mod interrupt;
 mod memory;
 mod object;
 mod process;
+mod sched;
 mod signal;
 mod syscall;
 mod usercopy;

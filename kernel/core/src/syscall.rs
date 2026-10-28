@@ -88,6 +88,7 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::INTERRUPT_CREATE => interrupt_create(p, a[0], a[1]),
         nr::INTERRUPT_ACK => interrupt_ack(p, a[0]),
         nr::DEVICE_MEMORY_CREATE => device_memory_create(p, a[0], a[1], a[2]),
+        nr::RESOURCE_NARROW => resource_narrow(p, a[0], a[1], a[2]),
         _ => Err(Error::BadSyscall.into()),
     };
     match result {
@@ -238,16 +239,19 @@ fn channel_write(
     let values = values_of(&usercopy::read(&p.vm, handles, nhandles as usize * 4)?);
 
     let mut table = p.handles.lock();
+    let mut carried: Vec<Arc<Endpoint>> = Vec::new();
     for (i, v) in values.iter().enumerate() {
         let handle = table.get(*v)?;
         if !handle.rights.contains(Rights::TRANSFER) {
             return Err(Error::AccessDenied.into());
         }
-        if let Object::Channel(e) = &handle.object
-            && Arc::ptr_eq(&e.channel, &endpoint.channel)
-        {
-            // A channel's own endpoints never travel through it.
-            return Err(Error::InvalidArgs.into());
+        if let Object::Channel(e) = &handle.object {
+            if Arc::ptr_eq(&e.channel, &endpoint.channel) {
+                // A channel's own endpoints never travel through it.
+                return Err(Error::InvalidArgs.into());
+            }
+            carried.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            carried.push(e.clone());
         }
         if values[..i].contains(v) {
             return Err(Error::InvalidArgs.into());
@@ -265,12 +269,26 @@ fn channel_write(
     moved
         .try_reserve_exact(values.len())
         .map_err(|_| Error::NoMemory)?;
+    // The cycle rule (SDD 20, f.4): an endpoint travels only while no message queued
+    // towards it carries an endpoint, checked and counted under one global lock so
+    // that two writes cannot each pass the check and close a cycle together.
+    let _carrying = if carried.is_empty() {
+        None
+    } else {
+        let guard = channel::TRANSFER.lock();
+        if carried.iter().any(|e| e.carried() != 0) {
+            return Err(Error::BadState.into());
+        }
+        endpoint.channel.carry(peer, carried.len());
+        Some(guard)
+    };
     for v in &values {
         moved.push(table.remove(*v)?);
     }
     inner.queues[peer].push_back(Message {
         bytes: payload,
         handles: moved,
+        endpoints: carried.len(),
     });
     endpoint.channel.refresh(&inner);
     one(0)
@@ -324,6 +342,9 @@ fn channel_read(p: &Process, value: u64, bytes: u64, cap: u64, handles: u64, hca
         return Err(e.into());
     }
     let popped = inner.queues[side].pop_front();
+    if let Some(message) = &popped {
+        endpoint.channel.uncarry(side, message.endpoints);
+    }
     endpoint.channel.refresh(&inner);
     drop(inner);
     drop(table);
@@ -551,10 +572,16 @@ fn debug_write(p: &Process, value: u64, ptr: u64, len: u64) -> Ret {
 }
 
 fn interrupt_create(p: &Process, resource: u64, gsi: u64) -> Ret {
-    typed(p, resource, Rights::WRITE, |h| {
+    let resource = typed(p, resource, Rights::WRITE, |h| {
         as_resource(h, ResourceKind::Interrupt)
     })?;
     let gsi = u32::try_from(gsi).map_err(|_| Error::InvalidArgs)?;
+    if gsi > crate::interrupt::GSI_MAX {
+        return Err(Error::InvalidArgs.into());
+    }
+    if !resource.covers(gsi as u64, 1) {
+        return Err(Error::AccessDenied.into());
+    }
     let line = Interrupt::new(gsi)?;
     insert(p, Object::Interrupt(Arc::new(line)))
 }
@@ -569,9 +596,55 @@ fn interrupt_ack(p: &Process, value: u64) -> Ret {
 }
 
 fn device_memory_create(p: &Process, resource: u64, paddr: u64, len: u64) -> Ret {
-    typed(p, resource, Rights::WRITE, |h| {
+    let resource = typed(p, resource, Rights::WRITE, |h| {
         as_resource(h, ResourceKind::DeviceMemory)
     })?;
+    if len == 0
+        || !paddr.is_multiple_of(PAGE_SIZE)
+        || !len.is_multiple_of(PAGE_SIZE)
+        || paddr.checked_add(len).is_none()
+    {
+        return Err(Error::InvalidArgs.into());
+    }
+    if !resource.covers(paddr, len) {
+        return Err(Error::AccessDenied.into());
+    }
     let region = DeviceMemory::new(paddr, len)?;
     insert(p, Object::DeviceMemory(Arc::new(region)))
+}
+
+/// `resource_narrow` (SDD 20, f.10): a new handle to a resource of the same kind over
+/// `base .. base + len`, which must lie inside the source's range. The new handle
+/// carries the source handle's rights. A process resource has no range to narrow.
+fn resource_narrow(p: &Process, value: u64, base: u64, len: u64) -> Ret {
+    let handle = lookup(p, value, Rights::NONE)?;
+    let source = match &handle.object {
+        Object::Resource(r) => r.clone(),
+        _ => return Err(Error::WrongType.into()),
+    };
+    if !handle.rights.contains(Rights::DUPLICATE) {
+        return Err(Error::AccessDenied.into());
+    }
+    let aligned = match source.kind {
+        ResourceKind::Process => return Err(Error::InvalidArgs.into()),
+        ResourceKind::DeviceMemory => {
+            base.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE)
+        }
+        ResourceKind::Interrupt => true,
+    };
+    if len == 0 || !aligned || base.checked_add(len).is_none() {
+        return Err(Error::InvalidArgs.into());
+    }
+    if !source.covers(base, len) {
+        return Err(Error::AccessDenied.into());
+    }
+    let narrowed = Resource {
+        kind: source.kind,
+        range: base..base + len,
+    };
+    let value = p.handles.lock().insert(Handle {
+        object: Object::Resource(Arc::new(narrowed)),
+        rights: handle.rights,
+    })?;
+    one(value as u64)
 }

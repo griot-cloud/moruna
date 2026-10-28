@@ -6,5 +6,10 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# A global allocator over memory objects, so a program has `alloc` (moruna-svc turns
+# it on).
+heap = []
+
 [dependencies]
 moruna-abi.workspace = true

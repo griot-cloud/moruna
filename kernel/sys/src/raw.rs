@@ -194,6 +194,15 @@ pub fn device_memory_create(resource: RawHandle, paddr: u64, len: u64) -> u64 {
     call3(nr::DEVICE_MEMORY_CREATE, resource as u64, paddr, len).0
 }
 
+pub fn resource_narrow(resource: RawHandle, base: u64, len: u64) -> u64 {
+    call3(nr::RESOURCE_NARROW, resource as u64, base, len).0
+}
+
+/// `memory_unmap`, for the heap, which unmaps only mappings it made itself.
+pub(crate) fn memory_unmap(addr: u64, len: u64) -> u64 {
+    call2(nr::MEMORY_UNMAP, addr, len).0
+}
+
 /// Reads one byte of a live mapping.
 pub(crate) fn peek(addr: u64) -> u8 {
     // SAFETY: callers pass an address inside a `Mapping` they hold, which the kernel

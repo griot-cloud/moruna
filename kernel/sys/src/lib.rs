@@ -17,6 +17,11 @@
 // attribute a program needs; the macro carries it so the program can forbid unsafe code.
 #![expect(internal_features)]
 
+#[cfg(feature = "heap")]
+extern crate alloc;
+
+#[cfg(feature = "heap")]
+mod heap;
 pub mod raw;
 pub mod start;
 
@@ -105,6 +110,13 @@ impl Handle {
         let v = self.into_raw();
         check(raw::call1(nr::HANDLE_CLOSE, v as u64).0).map(|_| ())
     }
+
+    /// A resource over `base .. base + len`, inside this resource's range, with this
+    /// handle's rights (`resource_narrow`, ABI 1.1): physical addresses, page aligned,
+    /// for a device memory resource; GSIs for an interrupt resource.
+    pub fn narrow(&self, base: u64, len: u64) -> Result<Handle> {
+        check(raw::resource_narrow(self.0, base, len)).map(|v| Handle(v as RawHandle))
+    }
 }
 
 impl Drop for Handle {
@@ -148,6 +160,30 @@ impl Channel {
             }
             Err(e) => Err((e, handles)),
         }
+    }
+
+    /// Sends `bytes` and moves every handle in `handles` to the peer: on success each
+    /// slot is left `None`; on failure every handle stays where it was. A `None` slot
+    /// is `InvalidArgs`, as are more than `limits::CHANNEL_MAX_HANDLES` slots.
+    pub fn write_with(&self, bytes: &[u8], handles: &mut [Option<Handle>]) -> Result<()> {
+        if handles.len() > limits::CHANNEL_MAX_HANDLES {
+            return Err(Error::Limit);
+        }
+        let mut values = [0 as RawHandle; limits::CHANNEL_MAX_HANDLES];
+        for (value, slot) in values.iter_mut().zip(handles.iter()) {
+            *value = slot.as_ref().ok_or(Error::InvalidArgs)?.raw();
+        }
+        check(raw::channel_write(
+            self.0.raw(),
+            bytes,
+            &values[..handles.len()],
+        ))?;
+        for slot in handles.iter_mut() {
+            if let Some(h) = slot.take() {
+                core::mem::forget(h);
+            }
+        }
+        Ok(())
     }
 
     /// Reads one message into `bytes`; the handles it carries land in `handles`.
