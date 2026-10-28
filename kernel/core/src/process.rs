@@ -50,7 +50,7 @@ fn map_end() -> u64 {
 
 /// Whether `addr` is a user address (used for entry points and stack tops).
 pub fn is_user(addr: u64) -> bool {
-    addr >= IMAGE_RANGE.start && addr <= map_end()
+    (IMAGE_RANGE.start..=map_end()).contains(&addr)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -41,6 +41,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 16 | Function package | `16-package.md` | 1, 12's check harness, 17 | a package is one file whose fingerprint is `sha256` of its bytes, read once; its manifest is complete and closed; a hosted run loads no kernel by import path (added 2026-10-15, `architecture/function-packages.md`) |
 | 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
 | 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
+| 20 | The microkernel core | `20-microkernel.md` | none (its own workspace, `kernel/`, on OSTD) | a process names objects only through handles in its own table, and rights never grow; the kernel holds processes, threads, memory, channels, timers, interrupts and device memory, and every other service is a process started from the boot manifest (added 2026-10-28, BOARD EK KB1, decision MK1) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 

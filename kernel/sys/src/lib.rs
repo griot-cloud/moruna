@@ -34,6 +34,9 @@ use moruna_abi::{nr, start_entry, wait_item};
 
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// The result of a call that moves handles: on failure they come back with the error.
+pub type Moved<T> = core::result::Result<(), (Error, T)>;
+
 fn check(raw: u64) -> Result<u64> {
     Error::from_raw(raw)
 }
@@ -133,11 +136,7 @@ impl Channel {
     }
 
     /// Sends `bytes` and moves `handles` to the peer. On failure the handles come back.
-    pub fn write<const N: usize>(
-        &self,
-        bytes: &[u8],
-        handles: [Handle; N],
-    ) -> core::result::Result<(), (Error, [Handle; N])> {
+    pub fn write<const N: usize>(&self, bytes: &[u8], handles: [Handle; N]) -> Moved<[Handle; N]> {
         let values: [RawHandle; N] = core::array::from_fn(|i| handles[i].raw());
         let r = raw::channel_write(self.0.raw(), bytes, &values);
         match check(r) {
@@ -369,7 +368,7 @@ impl Process {
         &self,
         entry: u64,
         handles: [(Handle, &'n str); N],
-    ) -> core::result::Result<(), (Error, [(Handle, &'n str); N])> {
+    ) -> Moved<[(Handle, &'n str); N]> {
         let mut entries = [[0u8; start_entry::SIZE]; N];
         for (e, (h, name)) in entries.iter_mut().zip(handles.iter()) {
             e[start_entry::HANDLE..start_entry::HANDLE + 4].copy_from_slice(&h.raw().to_le_bytes());

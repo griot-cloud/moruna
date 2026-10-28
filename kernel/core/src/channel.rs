@@ -66,13 +66,13 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        let dropped;
-        {
+        let dropped = {
             let mut inner = self.channel.inner.lock();
             inner.open[self.side] = false;
-            dropped = core::mem::take(&mut inner.queues[self.side]);
+            let queued = core::mem::take(&mut inner.queues[self.side]);
             self.channel.refresh(&inner);
-        }
+            queued
+        };
         // The queued messages and the handles they carry are dropped here, outside the
         // lock, because dropping a handle may close another channel's endpoint.
         drop(dropped);

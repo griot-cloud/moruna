@@ -99,6 +99,12 @@ pub struct Timer {
     deadline: AtomicU64,
 }
 
+impl Default for Timer {
+    fn default() -> Timer {
+        Timer::new()
+    }
+}
+
 impl Timer {
     pub fn new() -> Timer {
         Timer {

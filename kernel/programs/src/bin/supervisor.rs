@@ -8,13 +8,16 @@
 
 use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
-    DeviceMemory, Error, Interrupt, Process, Rights, Signals, abi_version, now, println, wait_one,
+    DeviceMemory, Error, Interrupt, Process, Rights, Signals, abi_version, map, now, println,
+    wait_one,
 };
 
 moruna_sys::main!(run);
 
-/// A page of high MMIO, above any RAM the test machine has.
-const DEVICE_PAGE: u64 = 0x10_0000_0000;
+/// Pages of high MMIO, above any RAM the test machine has: one below the range QEMU
+/// reserves on AMD hosts (1012 GiB to 1 TiB) and one above it, since OSTD's window
+/// starts above the highest reserved region. The region is mapped, never read.
+const DEVICE_PAGES: [u64; 2] = [0x10_0000_0000, 0x110_0000_0000];
 /// A physical address inside RAM.
 const RAM_PAGE: u64 = 0x10_0000;
 /// An interrupt line no device on the test machine drives.
@@ -56,17 +59,38 @@ fn run() -> i64 {
         Err(e) => return fail(&out, "wait on the child", e),
     }
 
-    let device = match DeviceMemory::create(&root_device, DEVICE_PAGE, 4096) {
-        Ok(d) => d,
-        Err(e) => return fail(&out, "device_memory_create", e),
-    };
-    match device.map(0, 4096, 0) {
-        Ok(m) => {
-            if let Err(e) = m.read_u32(0) {
-                return fail(&out, "read device memory", e);
+    let mut claimed = None;
+    for page in DEVICE_PAGES {
+        match DeviceMemory::create(&root_device, page, 4096) {
+            Ok(d) => {
+                claimed = Some((page, d));
+                break;
             }
+            Err(Error::AccessDenied) => {}
+            Err(e) => return fail(&out, "device_memory_create", e),
         }
+    }
+    let Some((device_page, device)) = claimed else {
+        return fail(
+            &out,
+            "no high MMIO page could be claimed",
+            Error::AccessDenied,
+        );
+    };
+    match device.map(0, 4096, map::WRITE) {
+        Ok(mapping) => drop(mapping),
         Err(e) => return fail(&out, "memory_map of device memory", e),
+    }
+    match DeviceMemory::create(&root_device, device_page, 4096) {
+        Err(Error::AccessDenied) => {}
+        Ok(_) => {
+            return fail(
+                &out,
+                "a claimed device page was granted twice",
+                Error::BadState,
+            );
+        }
+        Err(e) => return fail(&out, "device memory claimed twice", e),
     }
     match DeviceMemory::create(&root_device, RAM_PAGE, 4096) {
         Err(Error::AccessDenied) => {}
@@ -97,8 +121,8 @@ fn run() -> i64 {
 
     println!(
         out,
-        "KB1 supervisor: ok: started a child from its image and saw it end; mapped device memory at {:#x} and was refused RAM; waited on gsi {} until its deadline",
-        DEVICE_PAGE,
+        "KB1 supervisor: ok: started a child from its image and saw it end; mapped device memory at {:#x}, and was refused it a second time and refused RAM; waited on gsi {} until its deadline",
+        device_page,
         QUIET_GSI
     );
     0

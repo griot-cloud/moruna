@@ -216,6 +216,17 @@ jobs:
             -p moruna-abi -p moruna-loader -p moruna-handles --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" \
             -p moruna-abi -p moruna-loader -p moruna-handles --features moruna-abi/manifest
+      - name: Build the kernel, the programs and the initramfs
+        if: steps.changed.outputs.kernel == 'true'
+        run: kernel/tools/build.sh "$RUNNER_TEMP/boot"
+      - name: Boot under QEMU and judge the serial line
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          set +e
+          kernel/tools/boot.sh "$RUNNER_TEMP/boot" 600 | tee "$RUNNER_TEMP/serial.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          kernel/tools/check-boot.sh "$RUNNER_TEMP/serial.log" "$status"
       - name: Clippy for x86_64-unknown-none (the kernel, moruna-sys, the programs)
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
@@ -234,17 +245,6 @@ jobs:
           tool: cargo-deny@0.20.2
       - if: steps.changed.outputs.kernel == 'true'
         run: cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
-      - name: Build the kernel, the programs and the initramfs
-        if: steps.changed.outputs.kernel == 'true'
-        run: kernel/tools/build.sh "$RUNNER_TEMP/boot"
-      - name: Boot under QEMU and judge the serial line
-        if: steps.changed.outputs.kernel == 'true'
-        run: |
-          set +e
-          kernel/tools/boot.sh "$RUNNER_TEMP/boot" 600 | tee "$RUNNER_TEMP/serial.log"
-          status="${PIPESTATUS[0]}"
-          set -e
-          kernel/tools/check-boot.sh "$RUNNER_TEMP/serial.log" "$status"
       - if: always() && steps.changed.outputs.kernel == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

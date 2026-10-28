@@ -278,7 +278,6 @@ fn channel_write(
 
 fn channel_read(p: &Process, value: u64, bytes: u64, cap: u64, handles: u64, hcap: u64) -> Ret {
     let endpoint = typed(p, value, Rights::READ, as_channel)?;
-    let popped;
     let mut table = p.handles.lock();
     let mut inner = endpoint.channel.inner.lock();
     let side = endpoint.side;
@@ -324,7 +323,7 @@ fn channel_read(p: &Process, value: u64, bytes: u64, cap: u64, handles: u64, hca
         }
         return Err(e.into());
     }
-    popped = inner.queues[side].pop_front();
+    let popped = inner.queues[side].pop_front();
     endpoint.channel.refresh(&inner);
     drop(inner);
     drop(table);
@@ -409,13 +408,11 @@ fn process_start(p: &Process, process: u64, entry: u64, entries: u64, count: u64
     if count > limits::START_HANDLES_MAX as u64 {
         return Err(Error::Limit.into());
     }
-    if !child.ready_to_start() || !process::is_user(entry) {
-        return Err(if child.ready_to_start() {
-            Error::InvalidArgs
-        } else {
-            Error::BadState
-        }
-        .into());
+    if !child.ready_to_start() {
+        return Err(Error::BadState.into());
+    }
+    if !process::is_user(entry) {
+        return Err(Error::InvalidArgs.into());
     }
     let raw_entries = usercopy::read(&p.vm, entries, count as usize * start_entry::SIZE)?;
     let mut specs: Vec<(RawHandle, Vec<u8>)> = Vec::new();
