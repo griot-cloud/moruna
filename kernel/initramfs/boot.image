@@ -102,6 +102,7 @@ process devices
   driver 1af4:1042 virtio-blk block
   driver 1af4:1043 virtio-console console
   driver 1af4:1053 virtio-vsock vsock
+  driver 1234:11e8 edu edu
   expect KB3 devices: started
   expect KB3 block0: virtio-blk up: 8192 sectors of 512 bytes
   expect KB3 console0: virtio-console up
@@ -111,6 +112,8 @@ process devices
   expect kk: process block0 exited with code 0 (
   expect kk: process console0 exited with code 0 (
   expect kk: process console1 exited with code 0 (
+  expect KB3 edu0: edu up: identification 0x10000ed
+  expect kk: process edu0 exited with code 0 (
   expect KB3 devices: ok:
   exits 0
 link supervisor.devices devices.supervisor
@@ -151,3 +154,11 @@ process driver-isolation
   expect KB3 driver isolation: ok:
   exits 0
 link driver-isolation.control devices.control-isolation
+
+# DR-T17: a fourth driver, for QEMU's edu test device, added as one line of the
+# device manager's table above and this process, with no kernel change.
+process edu-test
+  handle console console
+  expect KB3 edu: ok:
+  exits 0
+link edu-test.directory devices.directory-edu
