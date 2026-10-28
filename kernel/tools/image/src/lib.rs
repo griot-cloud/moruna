@@ -9,6 +9,7 @@
 //! moruna-image 1
 //! process NAME [PROGRAM]            # PROGRAM defaults to NAME
 //!   handle SOURCE SLOT [rights=R,...]
+//!   driver VVVV:DDDD PROGRAM SERVICE  # a line of the process's driver table
 //!   expect TEXT                     # a line the boot's console must carry
 //!   exits CODE                      # the process ends with CODE
 //!   faults TEXT                     # the process faults, as the kernel words it
@@ -16,9 +17,13 @@
 //! expect TEXT                       # before any process: a line of the boot itself
 //! ```
 //!
-//! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`, or
-//! `program:PROGRAM`, a read-only memory object holding that program's image, for a
-//! process that starts others. A `link` is a channel: the first process gets endpoint
+//! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`, `root.ecam`,
+//! `root.msi`, `root.dma`, or `program:PROGRAM`, a read-only memory object holding that
+//! program's image, for a process that starts others. A process with `driver` lines
+//! is a device manager (SDD 25, e.3): the tool renders its driver table
+//! (`moruna_driver_table`) to `etc/NAME.drivers` and gives it as the slot `drivers`,
+//! and gives each driver program's image as the slot `driver.PROGRAM`, so a new
+//! driver is one line here. A `link` is a channel: the first process gets endpoint
 //! 0 under its slot, the second endpoint 1. `expect`, `exits` and `faults` are what a
 //! boot of the image must print; the tool writes them, with the kernel's own boot and
 //! power-off lines, to the expectations file the boot check reads.
@@ -30,6 +35,7 @@ use moruna_abi::{
     manifest::{HandleSpec, Manifest, ProcessSpec, Source},
     valid_name,
 };
+use moruna_driver_table::{Driver, Table};
 use moruna_loader::{cpio, elf};
 
 /// The description format version this tool reads.
@@ -68,6 +74,9 @@ pub enum DescSource {
     RootProcess,
     RootDevice,
     RootInterrupt,
+    RootEcam,
+    RootMsi,
+    RootDma,
     Program(String),
 }
 
@@ -83,8 +92,17 @@ pub struct DescProcess {
     pub name: String,
     pub program: String,
     pub handles: Vec<DescHandle>,
+    /// The process's driver table, if it manages devices.
+    pub drivers: Table,
     pub expect: Vec<String>,
     pub line: usize,
+}
+
+impl DescProcess {
+    /// Where the process's driver table goes in the initramfs.
+    pub fn table_path(&self) -> String {
+        format!("etc/{}.drivers", self.name)
+    }
 }
 
 /// One end of a link.
@@ -188,6 +206,7 @@ impl Description {
                         name: process,
                         program: name(program, line, "program")?,
                         handles: Vec::new(),
+                        drivers: Table::default(),
                         expect: Vec::new(),
                         line,
                     });
@@ -208,6 +227,9 @@ impl Description {
                         "root.process" => DescSource::RootProcess,
                         "root.device" => DescSource::RootDevice,
                         "root.interrupt" => DescSource::RootInterrupt,
+                        "root.ecam" => DescSource::RootEcam,
+                        "root.msi" => DescSource::RootMsi,
+                        "root.dma" => DescSource::RootDma,
                         other => match other.strip_prefix("program:") {
                             Some(p) => DescSource::Program(name(p, line, "program")?),
                             None => return err(line, format!("`{other}` is not a handle source")),
@@ -222,6 +244,41 @@ impl Description {
                         slot,
                         rights,
                     });
+                }
+                "driver" => {
+                    let [ids, program, service] = fields.as_slice() else {
+                        return err(line, "`driver VVVV:DDDD PROGRAM SERVICE`");
+                    };
+                    let Some((vendor, device)) = moruna_driver_table::parse_ids(ids) else {
+                        return err(line, format!("`{ids}` is not VVVV:DDDD in hex"));
+                    };
+                    if !moruna_driver_table::valid_program(program) {
+                        return err(
+                            line,
+                            format!("program `{program}` is not 1 to 25 bytes of [a-z0-9._-]"),
+                        );
+                    }
+                    if !moruna_driver_table::valid_service(service) {
+                        return err(
+                            line,
+                            format!("service `{service}` is not 1 to 30 bytes of [a-z0-9._-]"),
+                        );
+                    }
+                    let Some(process) = d.processes.last_mut() else {
+                        return err(line, "a `driver` line must follow a `process` line");
+                    };
+                    process.drivers.drivers.push(Driver {
+                        vendor,
+                        device,
+                        program: String::from(*program),
+                        service: String::from(*service),
+                    });
+                    // The table's own rules (one driver a device, one line a service),
+                    // checked here so the refusal names this line.
+                    let rendered = process.drivers.to_string();
+                    if let Err(e) = Table::parse(&rendered) {
+                        return err(line, format!("the driver table: {}", e.reason));
+                    }
                 }
                 "link" => {
                     let [a, b] = fields.as_slice() else {
@@ -282,8 +339,20 @@ impl Description {
                     programs.insert(name.clone());
                 }
             }
+            for d in &p.drivers.drivers {
+                programs.insert(d.program.clone());
+            }
         }
         programs
+    }
+
+    /// Every driver table the image carries: its path and its text.
+    pub fn tables(&self) -> Vec<(String, String)> {
+        self.processes
+            .iter()
+            .filter(|p| !p.drivers.drivers.is_empty())
+            .map(|p| (p.table_path(), p.drivers.to_string()))
+            .collect()
     }
 
     /// The boot manifest the description renders to, checked by parsing what it
@@ -294,7 +363,7 @@ impl Description {
             processes: Vec::new(),
         };
         for p in &self.processes {
-            let handles = p
+            let mut handles: Vec<HandleSpec> = p
                 .handles
                 .iter()
                 .map(|h| HandleSpec {
@@ -303,6 +372,9 @@ impl Description {
                         DescSource::RootProcess => Source::RootProcess,
                         DescSource::RootDevice => Source::RootDevice,
                         DescSource::RootInterrupt => Source::RootInterrupt,
+                        DescSource::RootEcam => Source::RootEcam,
+                        DescSource::RootMsi => Source::RootMsi,
+                        DescSource::RootDma => Source::RootDma,
                         DescSource::Program(program) => Source::File {
                             path: format!("{BIN}/{program}"),
                         },
@@ -311,6 +383,24 @@ impl Description {
                     rights: h.rights,
                 })
                 .collect();
+            if !p.drivers.drivers.is_empty() {
+                handles.push(HandleSpec {
+                    source: Source::File {
+                        path: p.table_path(),
+                    },
+                    slot: String::from("drivers"),
+                    rights: None,
+                });
+                for program in p.drivers.programs() {
+                    handles.push(HandleSpec {
+                        source: Source::File {
+                            path: format!("{BIN}/{program}"),
+                        },
+                        slot: format!("{}{program}", moruna_driver_table::IMAGE_SLOT),
+                        rights: None,
+                    });
+                }
+            }
             manifest.processes.push(ProcessSpec {
                 name: p.name.clone(),
                 path: format!("{BIN}/{}", p.program),
@@ -473,6 +563,11 @@ pub fn build(description: &str, programs: &Path) -> Result<Image, DescError> {
         })?;
         files.push((format!("{BIN}/{program}"), bytes));
     }
+    files.extend(
+        d.tables()
+            .into_iter()
+            .map(|(path, text)| (path, text.into_bytes())),
+    );
     files.push((
         String::from(moruna_abi::manifest::FILE_NAME),
         manifest.clone().into_bytes(),

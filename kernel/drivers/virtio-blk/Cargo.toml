@@ -1,0 +1,13 @@
+[package]
+name = "virtio-blk"
+description = "The virtio block driver: a process on the Moruna microkernel serving moruna.driver.block, moving data by DMA straight into its clients' memory objects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-mmio = { path = "../mmio", version = "=0.1.0" }
+moruna-virtio = { path = "../virtio", version = "=0.1.0" }
+block-protocol = { path = "../block-protocol", version = "=0.1.0" }

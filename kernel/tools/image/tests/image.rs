@@ -95,7 +95,7 @@ fn sv_t9_a_description_renders_the_manifest_the_kernel_parses() {
     let expect = d.expectations();
     assert_eq!(expect[0], "kk: 1 CPUs online");
     assert!(expect.contains(
-        &"kk: moruna microkernel, abi 1.1: started 3 processes from the manifest".to_string()
+        &"kk: moruna microkernel, abi 1.2: started 3 processes from the manifest".to_string()
     ));
     assert!(expect.contains(&"kk: process supervisor exited with code 0 (".to_string()));
     assert!(expect.contains(&"kk: process pong faulted: page fault at 0x0 on read".to_string()));
@@ -141,6 +141,36 @@ fn sv_t9_a_bad_description_is_refused_by_line() {
         ("moruna-image 1\nexits 0\n", 2, "must follow"),
         ("moruna-image 1\nexpect\n", 2, "needs its text"),
         ("moruna-image 1\nfrobnicate\n", 2, "not a directive"),
+        (
+            "moruna-image 1\ndriver 1af4:1042 virtio-blk block\n",
+            2,
+            "must follow",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 virtio-blk\n",
+            3,
+            "driver VVVV",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4-1042 virtio-blk block\n",
+            3,
+            "in hex",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 Blk block\n",
+            3,
+            "program `Blk`",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 blk Block\n",
+            3,
+            "service `Block`",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 blk block\ndriver 1af4:1042 blk disk\n",
+            4,
+            "two drivers",
+        ),
     ];
     for (text, line, words) in cases {
         let e = Description::parse(text).expect_err(text);
@@ -249,5 +279,52 @@ fn sv_t9_the_command_writes_the_image_and_says_why_it_cannot() {
         .output()
         .expect("runs");
     assert!(!blocked.status.success());
+    fs::remove_dir_all(dir).expect("clean");
+}
+
+const DEVICES: &str = "\
+moruna-image 1
+process supervisor
+  handle console console
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma rights=write,duplicate
+  exits 0
+process devices
+  handle console console
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1043 virtio-console console
+  driver 1af4:1049 virtio-console entropy
+link supervisor.devices devices.supervisor
+";
+
+#[test]
+fn dr_t8_driver_lines_render_a_table_and_give_the_images() {
+    let d = Description::parse(DEVICES).expect("parses");
+    assert_eq!(d.processes[1].drivers.drivers.len(), 3);
+    assert_eq!(
+        d.programs().into_iter().collect::<Vec<_>>(),
+        ["devices", "supervisor", "virtio-blk", "virtio-console"]
+    );
+    let tables = d.tables();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].0, "etc/devices.drivers");
+    let table = moruna_driver_table::Table::parse(&tables[0].1).expect("table");
+    assert_eq!(table, d.processes[1].drivers);
+    let (_, text) = d.manifest().expect("manifest");
+    assert!(text.contains("handle root.ecam root.ecam\n"));
+    assert!(text.contains("handle root.msi root.msi\n"));
+    assert!(text.contains("handle root.dma root.dma rights=write,duplicate\n"));
+    assert!(text.contains("handle file:etc/devices.drivers drivers\n"));
+    assert!(text.contains("handle file:bin/virtio-blk driver.virtio-blk\n"));
+    assert_eq!(text.matches("driver.virtio-console").count(), 1);
+    let dir = programs(&["supervisor", "devices", "virtio-blk", "virtio-console"]);
+    let image = build(DEVICES, &dir).expect("builds");
+    let read = cpio::files(&image.initramfs).expect("reads");
+    assert_eq!(
+        cpio::find(&read, "etc/devices.drivers"),
+        Some(tables[0].1.as_bytes())
+    );
+    assert!(cpio::find(&read, "bin/virtio-console").is_some());
     fs::remove_dir_all(dir).expect("clean");
 }

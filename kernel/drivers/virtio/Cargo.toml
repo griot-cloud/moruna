@@ -1,0 +1,13 @@
+[package]
+name = "moruna-virtio"
+description = "Modern virtio 1.x over PCI for Moruna drivers: capabilities, the common configuration, feature negotiation, split virtqueues, notification and the ISR, in safe Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-svc.workspace = true
+moruna-mmio = { path = "../mmio", version = "=0.1.0" }
+moruna-pci = { path = "../pci", version = "=0.1.0" }

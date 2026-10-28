@@ -1,0 +1,11 @@
+[package]
+name = "driver-isolation"
+description = "DR-T14: a driver's resources reach its own device and nothing else"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

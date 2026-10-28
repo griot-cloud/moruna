@@ -1,0 +1,18 @@
+[package]
+name = "devices"
+description = "The supervisor's device manager on the Moruna microkernel: enumerates PCI, starts a driver process per device from the driver table, gives each only its own device, restarts drivers that end, and serves the directory of their services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "devices"
+path = "src/main.rs"
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-mmio = { path = "../../drivers/mmio", version = "=0.1.0" }
+moruna-pci = { path = "../../drivers/pci", version = "=0.1.0" }
+moruna-driver-table = { path = "../table", version = "=0.1.0" }
+devices-protocol = { path = "../protocol", version = "=0.1.0" }

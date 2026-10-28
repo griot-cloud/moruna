@@ -1,0 +1,12 @@
+[package]
+name = "moruna-pci"
+description = "PCI configuration space for Moruna drivers and their supervisor: functions, BARs, capabilities and MSI-X, over a mapped window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-mmio = { path = "../mmio", version = "=0.1.0" }
+moruna-svc.workspace = true
