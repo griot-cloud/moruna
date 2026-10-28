@@ -247,7 +247,7 @@ world kernel {
 }
 ```
 
-`open` and `close` are exported by a stateful kernel and by no other; `configure` by a kernel with the hint `args` and by no other. The component may import `read-asset` and `call` (amended 2026-10-21, MH 4.10; the job document's `kernels[i].ports` lists the names `call` may use, and a component that imports `call` needs no hint for it) and nothing else. The manifest is embedded as a custom section named `moruna.json` placed at the end of the component (f.3).
+`process` takes one record batch as an uncompressed Arrow IPC stream and returns one the same way; Moruna checks every message of what it returns before decoding it (contracts CT-I13, e.8; 17 SB-I14), so a malformed or compressed output refuses the batch as the kernel's error naming what is wrong. `open` and `close` are exported by a stateful kernel and by no other; `configure` by a kernel with the hint `args` and by no other. The component may import `read-asset` and `call` (amended 2026-10-21, MH 4.10; the job document's `kernels[i].ports` lists the names `call` may use, and a component that imports `call` needs no hint for it) and nothing else. The manifest is embedded as a custom section named `moruna.json` placed at the end of the component (f.3).
 
 ### e.6 `.cwasm` layout
 
@@ -369,6 +369,7 @@ None.
 | FP 5 (the job document) | PK-I2, d.4, f.8 | PK-T2, PK-T12, PK-T16 |
 | a host's kernels built by arguments and reading assets (2026-10-15, from Griot's function registry) | b, d.4, e.5 | PK-T17 |
 | a host reads the package's report, never the package (2026-10-15) | d.2 | PK-T18 |
+| a function's output is untrusted IPC (contracts CT-I13, 2026-10-28) | e.5 | 17 SB-T25, SB-T26 |
 
 ## o. Deferred (post-v1)
 

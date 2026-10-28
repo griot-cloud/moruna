@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use moruna_adapters::{UNKNOWN_SEQ, UNKNOWN_STAGE};
-use moruna_kernel::arrow::ipc::reader::StreamDecoder;
 use moruna_kernel::arrow::ipc::writer::StreamWriter;
 use moruna_kernel::declare::Declared;
 use moruna_kernel::{
@@ -807,7 +806,11 @@ impl Kernel for SandboxKernel {
                 released,
             } => {
                 counted(&alloc);
-                let batch = read_one(&st.child.shared, offset as usize, len as usize)?;
+                let batch = read_one(
+                    shared_mapping(&st.child.shared),
+                    offset as usize,
+                    len as usize,
+                )?;
                 let landed = moruna_adapters::land::land_table(batch, &st.alloc);
                 st.child.absorb(&released);
                 st.child.punch_free_at(offset);
@@ -844,29 +847,19 @@ impl Kernel for SandboxKernel {
     }
 }
 
-/// The output stream at `offset`, decoded in place over the mapping (SB-I7).
+/// The output stream at `offset`, decoded in place over the mapping (SB-I7). The child wrote
+/// it and the child runs the tenant's code, so every message is checked before arrow-ipc reads
+/// it, and a malformed stream is the kernel's error naming the fault, never a panic (SB-I14,
+/// contracts CT-I13).
 fn read_one(
-    shared: &Arc<Shared>,
+    owner: crate::mapping::Owner,
     offset: usize,
     len: usize,
 ) -> Result<moruna_kernel::arrow::record_batch::RecordBatch> {
-    let mut buffer = crate::mapping::arrow_buffer(shared_mapping(shared), offset, len)
+    let buffer = crate::mapping::arrow_buffer(owner, offset, len)
         .map_err(|e| kernel_error(format!("the output: {e}")))?;
-    let mut decoder = StreamDecoder::new();
-    let mut batches = Vec::new();
-    while !buffer.is_empty() {
-        match decoder
-            .decode(&mut buffer)
-            .map_err(|e| kernel_error(format!("the output is not an Arrow IPC stream: {e}")))?
-        {
-            Some(batch) => batches.push(batch),
-            None if buffer.is_empty() => break,
-            None => {}
-        }
-    }
-    decoder
-        .finish()
-        .map_err(|e| kernel_error(format!("the output stream ends inside a message: {e}")))?;
+    let mut batches = moruna_kernel::ipc::read_stream(&buffer)
+        .map_err(|e| kernel_error(format!("the output is not a valid Arrow IPC stream: {e}")))?;
     match batches.len() {
         1 => Ok(batches.remove(0)),
         n => Err(kernel_error(format!(
@@ -884,5 +877,63 @@ fn shared_mapping(shared: &Arc<Shared>) -> crate::mapping::Owner {
 impl crate::mapping::HasMapping for Shared {
     fn mapping(&self) -> &Mapping {
         &self.mapping
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moruna_kernel::arrow::ipc::MetadataVersion;
+    use moruna_testkit::ipc::{corruptions, panics, small, stream, streams, tally, unknown_type};
+
+    use super::*;
+    use crate::mapping::{HasMapping, Owner};
+
+    /// A mapping that holds one stream at the start of its data area, as a child leaves one.
+    struct Output(Mapping);
+
+    impl HasMapping for Output {
+        fn mapping(&self) -> &Mapping {
+            &self.0
+        }
+    }
+
+    fn output(bytes: &[u8]) -> (Owner, usize) {
+        let mapping = Mapping::create(bytes.len().max(4096) as u64).expect("a mapping");
+        let offset = mapping.data_offset();
+        mapping
+            .bytes_mut(offset, bytes.len())
+            .expect("the data area")
+            .copy_from_slice(bytes);
+        let owner: Owner = Arc::new(Output(mapping));
+        (owner, offset)
+    }
+
+    fn read(bytes: Vec<u8>) -> Result<moruna_kernel::arrow::record_batch::RecordBatch> {
+        let (owner, offset) = output(&bytes);
+        read_one(owner, offset, bytes.len())
+    }
+
+    /// SB-T26: a child's output whose schema names a type id no Arrow type has is the kernel's
+    /// error naming the field, not a panic in the IPC reader's schema converter.
+    #[test]
+    fn sb_t26_unknown_type_refused() {
+        let bytes = unknown_type(&stream(&[small()], MetadataVersion::V5));
+        let err = read(bytes).expect_err("an unknown type is refused");
+        assert!(matches!(err, MorunaError::Kernel { .. }), "{err:?}");
+        assert!(err.to_string().contains("field \"i\""), "{err}");
+    }
+
+    /// SB-T26: every corruption and truncation of valid output streams, read in place over a
+    /// mapping, is an error or a batch.
+    #[test]
+    fn sb_t26_malformed_output_never_panics() {
+        let mut failed = Vec::new();
+        for (label, valid) in streams() {
+            let cases = corruptions(&valid, 0x5B26_0000 ^ valid.len() as u64, 300);
+            for case in panics(cases, read) {
+                failed.push(format!("{label}, {case}"));
+            }
+        }
+        assert!(failed.is_empty(), "{}", tally(&failed));
     }
 }

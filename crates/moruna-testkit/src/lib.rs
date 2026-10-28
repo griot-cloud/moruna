@@ -21,6 +21,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod allocator;
+pub mod ipc;
 pub mod kernel;
 pub mod knobs;
 pub mod placement;
