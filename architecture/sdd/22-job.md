@@ -41,7 +41,7 @@ It refuses to know: how a kind is built or run (the runtime's), the registry (th
 
 **JB-I4. A catalogue holds only declarations it accepts.** `Catalogue::add` takes a declaration when it passes `Declaration::check` for its role (SDD 18 KD-I2), no kind of that role has its name, and its settings schema is in the subset (JB-I7). Otherwise it refuses, naming the role and the name; the catalogue is unchanged.
 
-**JB-I5. `check` collects every refusal.** It returns every refusal of a document, not the first, in the order the document is read: the source, each kernel, the sink, then the contracts. It builds nothing, runs nothing, reads no file and opens no connection.
+**JB-I5. `check` collects every refusal.** It returns every refusal of a document, not the first, in the order the document is read: the source, each kernel, the sink, then the contracts, and within one entry's settings the keys in key order, so the list does not depend on whether `serde_json` keeps a map in the order it was written (its `preserve_order` feature, which any crate in a build may switch on). It builds nothing, runs nothing, reads no file and opens no connection.
 
 **JB-I6. The validator and the kind give one verdict on settings.** For every declared kind, the validator refuses an entry's settings exactly when the kind cannot read them as the type its schema was derived from (SDD 18 KD-I4), with the two differences f.3 states: a value the schema leaves open and the kind judges after reading it, which the validator accepts; and an enum an adapter adds to its schema, which the validator refuses and the kind refuses by its own check. The runtime's JB-T26 proves it on every example and on seeded mutations of each.
 

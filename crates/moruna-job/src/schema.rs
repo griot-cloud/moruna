@@ -401,7 +401,13 @@ fn walk_object(
             }
         }
     }
-    for (key, member) in members {
+    // In key order, whatever order the map keeps: with `serde_json`'s `preserve_order` feature,
+    // which any crate in a build may switch on, a map keeps the order a key was written in, and a
+    // refusal's place in the list must not depend on a feature.
+    let mut keys: Vec<&String> = members.keys().collect();
+    keys.sort();
+    for key in keys {
+        let member = &members[key];
         path.push(Step::Key(key.clone()));
         match properties.and_then(|declared| declared.get(key)) {
             Some(declared) => walk(root, declared, member, path, found, depth + 1),
