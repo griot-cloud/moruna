@@ -11,12 +11,14 @@ use moruna_kernel::{
 };
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 
+use super::refusal;
 use super::translate::{self, ResumeArg};
-use super::{
-    ErrorPolicyDoc, GuaranteeDoc, HostProfileDoc, JobSpec, ObjectStoreDoc, SizerDoc, SpecError,
-};
-use crate::kinds::{Context, Declaration, Entry, Fact, Isolation, Registry, Stage};
+use crate::kinds::{Context, Entry, Registry, Stage};
 use crate::spec::RunSpec;
+use moruna_job::{
+    Declaration, ErrorPolicyDoc, Fact, GuaranteeDoc, HostProfileDoc, Isolation, JobSpec,
+    ObjectStoreDoc, SizerDoc, SpecError,
+};
 
 /// The fields whose `null` an environment variable may fill, and the variable (MH 4.1).
 pub const ENV_FIELDS: [(&str, &str); 5] = [
@@ -118,7 +120,7 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
     // its variable when one is set, and then to the default. Strict mode refuses the second.
     let env_resolved = env_reliance(job, opts.env);
     if opts.strict && !env_resolved.is_empty() {
-        return Err(strict_refusal(&env_resolved).into());
+        return Err(refusal(strict_refusal(&env_resolved)));
     }
     let mut notes = opts.notes;
     for (field, var) in &env_resolved {
@@ -127,10 +129,10 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
 
     let run_id = match &job.run_id {
         Some(hex) => Some(RunId::from_hex(hex).ok_or_else(|| {
-            SpecError::new(
+            refusal(SpecError::new(
                 "run_id",
                 format!("`{hex}` is not 32 lowercase hex characters"),
-            )
+            ))
         })?),
         None => None,
     };
@@ -155,7 +157,7 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
             .chain(std::iter::once(("sink".to_string(), sink_declared)));
         for (field, declared) in named {
             if declared.isolation == Isolation::Imported {
-                return Err(imported_refusal(&field, declared).into());
+                return Err(refusal(imported_refusal(&field, declared)));
             }
         }
     }
@@ -167,11 +169,10 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
             .chain(std::iter::once(sink_declared))
             .any(|declared| declared.needs.contracts == Fact::Yes)
     {
-        return Err(SpecError::new(
+        return Err(refusal(SpecError::new(
             "contracts",
             "carried, and no kind of this document reads or writes under contracts",
-        )
-        .into());
+        )));
     }
 
     let mut cx = Context::new(kinds.embedding())
@@ -247,21 +248,19 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
     if let Some(cpu) = job.budget.cpu
         && !(cpu.is_finite() && cpu > 0.0)
     {
-        return Err(SpecError::new(
+        return Err(refusal(SpecError::new(
             "budget.cpu",
             format!("`{cpu}` is not a positive number of cores"),
-        )
-        .into());
+        )));
     }
     if let Some(elastic) = &job.budget.elastic
         && let (Some(max), Some(start)) = (elastic.memory_max_bytes, job.budget.memory_bytes)
         && max < start
     {
-        return Err(SpecError::new(
+        return Err(refusal(SpecError::new(
             "budget.elastic.memory_max_bytes",
             format!("{max} is below budget.memory_bytes {start}"),
-        )
-        .into());
+        )));
     }
     let host_profile = host_profile_of(job)?;
     let staging_dir = job.staging.dir.as_deref().map(PathBuf::from);
@@ -274,19 +273,17 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
     // prefix; a resume by "auto" or by run id reads the copies into the directory first.
     if let Some(url) = &job.staging.url {
         let Some(dir) = &staging_dir else {
-            return Err(SpecError::new(
+            return Err(refusal(SpecError::new(
                 "staging.url",
                 "needs staging.dir: the run works in a directory and copies its manifests to the \
                  prefix",
-            )
-            .into());
+            )));
         };
         if !job.checkpoint.enabled {
-            return Err(SpecError::new(
+            return Err(refusal(SpecError::new(
                 "staging.url",
                 "copies manifests, and checkpoint.enabled is false: there are none",
-            )
-            .into());
+            )));
         }
         if matches!(
             resume_arg,
@@ -361,7 +358,7 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
     spec.checkpoint_keep = job.checkpoint.keep;
     spec.resume = resume;
     spec.resume_auto = resume_auto;
-    let digest = job.digest();
+    let digest = super::digest(job);
     spec.spec_digest = Some(digest.clone());
     spec.notes = notes;
 
@@ -417,11 +414,10 @@ fn host_profile_of(job: &JobSpec) -> Result<Option<HostProfile>> {
             if let Some(declared) = p.durable_staging
                 && declared != d
             {
-                return Err(SpecError::new(
+                return Err(refusal(SpecError::new(
                     "staging.durable",
                     "disagrees with host_profile.durable_staging",
-                )
-                .into());
+                )));
             }
             HostProfileDoc {
                 durable_staging: Some(d),
@@ -433,11 +429,10 @@ fn host_profile_of(job: &JobSpec) -> Result<Option<HostProfile>> {
         Some(dir) => {
             let path = PathBuf::from(dir);
             if !path.is_absolute() {
-                return Err(SpecError::new(
+                return Err(refusal(SpecError::new(
                     "host_profile.staging_dir",
                     format!("needs an absolute path, found `{dir}`"),
-                )
-                .into());
+                )));
             }
             Some(path)
         }

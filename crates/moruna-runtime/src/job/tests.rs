@@ -7,12 +7,14 @@ use moruna_kernel::{ErrorPolicy, Guarantee, Kernel, MorunaError, SizerKind};
 use moruna_testkit::FakeKernel;
 use serde_json::{Value, json};
 
+use moruna_job::*;
+
 use super::build::{self, BuildOptions, env_reliance};
 use super::*;
 use crate::kinds::{
-    Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Registry, Role, RunnableKind,
-    SinkKind, SourceKind, Stage, check_pin, settings_schema,
+    Context, Entry, Registry, RunnableKind, SinkKind, SourceKind, Stage, check_pin,
 };
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
 
 /// The example of MH 4.1, with every section present.
 const FULL: &str = r#"{
@@ -258,10 +260,10 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
 #[test]
 fn ho_t2_spec_digest() {
     let job = JobSpec::from_json(FULL).expect("parses");
-    let digest = job.digest();
+    let address = digest(&job);
     assert!(
-        digest.starts_with("sha256:") && digest.len() == 7 + 64,
-        "{digest}"
+        address.starts_with("sha256:") && address.len() == 7 + 64,
+        "{address}"
     );
 
     let reordered = r#"{"sink":{"url":"/out","kind":"parquet"},"moruna_spec":1,
@@ -270,25 +272,25 @@ fn ho_t2_spec_digest() {
                     "sink":{"kind":"parquet","url":"/out"}}"#;
     let a = JobSpec::from_json(reordered).expect("a");
     let b = JobSpec::from_json(plain).expect("b");
-    assert_eq!(a.digest(), b.digest());
+    assert_eq!(digest(&a), digest(&b));
 
     let mut resumed = b.clone();
     resumed.resume = Some("auto".into());
     resumed.report.file = Some("/elsewhere.json".into());
     assert_eq!(
-        resumed.digest(),
-        b.digest(),
+        digest(&resumed),
+        digest(&b),
         "resume and report are not the job"
     );
 
     let mut changed = b.clone();
     changed.ordered = true;
-    assert_ne!(changed.digest(), b.digest());
+    assert_ne!(digest(&changed), digest(&b));
     let mut hinted = job.clone();
     hinted.kernels[0]
         .settings
         .insert("expected_amplification".into(), json!(2.0));
-    assert_ne!(hinted.digest(), digest);
+    assert_ne!(digest(&hinted), address);
 }
 
 /// HO-T3 spec_refusals: a refusal names the field it was refused for. The document's own
@@ -354,7 +356,7 @@ fn ho_t3_spec_refusals_name_the_field() {
         err.to_string(),
         "spec refused: moruna_spec: this build reads version 1, the document says 2"
     );
-    let as_error: MorunaError = err.into();
+    let as_error: MorunaError = refusal(err);
     assert!(matches!(as_error, MorunaError::Config { name: "spec", .. }));
     // An entry's settings are an object.
     assert!(KindDoc::of("parquet", &3).is_err());
@@ -464,7 +466,7 @@ fn ho_t9_build_translates_every_field() {
         built.run_id.map(|r| r.to_hex()).as_deref(),
         job.run_id.as_deref()
     );
-    assert_eq!(built.digest, job.digest());
+    assert_eq!(built.digest, digest(&job));
     assert_eq!(spec.spec_digest.as_deref(), Some(built.digest.as_str()));
     assert_eq!(spec.kernels.len(), 1);
     assert_eq!(spec.budget, Some(1 << 30));
@@ -1012,8 +1014,8 @@ fn report_tasks_name_the_chain_and_are_not_the_job() {
     let plain = JobSpec::from_json(FULL).expect("the example");
     assert_eq!(plain.report.attempt(), 1);
     assert_eq!(
-        named.digest(),
-        plain.digest(),
+        digest(&named),
+        digest(&plain),
         "tasks and attempt are not the job"
     );
     let round = JobSpec::from_json(&named.canonical_json()).expect("round trip");

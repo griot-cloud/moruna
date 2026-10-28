@@ -28,11 +28,12 @@ use super::protocol::{
 };
 use super::transport::{self, Address, Conn};
 use super::{VERSION, diagnostic, exit, exit_code};
-use crate::job::{BuildOptions, JobSpec, SpecError, build};
+use crate::job::{BuildOptions, build};
 use crate::kinds::Registry;
 use crate::observe::RunObserver;
 use crate::run::Runtime;
 use crate::spec::Components;
+use moruna_job::{JobSpec, SpecError};
 
 /// The heartbeat cadence (MH 4.3: at least every 2 s; half that, so one late tick is not a gap).
 pub const HEARTBEAT: Duration = Duration::from_millis(1000);
@@ -262,7 +263,7 @@ pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcom
     };
     wire.send(&Outbound::Hello {
         moruna_version: VERSION.to_string(),
-        spec_digest: Some(job.digest()),
+        spec_digest: Some(crate::job::digest(&job)),
         limits: limits_for(&job),
     });
     let outcome = run_job(job, kinds, opts, &wire, reader, Mode::Run);
@@ -390,7 +391,7 @@ pub fn run_job(
         .and_then(RunId::from_hex)
         .or_else(|| crate::run::mint_run_id().ok())
         .unwrap_or(RunId([0; 16]));
-    let digest = job.digest();
+    let digest = crate::job::digest(&job);
     // This process's own id in its events: two processes of one attempt are two producers.
     let start = match crate::run::mint_run_id() {
         Ok(id) => id.to_hex(),

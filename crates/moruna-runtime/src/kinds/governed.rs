@@ -26,12 +26,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    BuiltSink, BuiltSource, Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Role,
-    SinkKind, SourceKind, settings_schema,
-};
-use crate::job::{ContractEntry, SpecError};
+use super::{BuiltSink, BuiltSource, Context, Entry, SinkKind, SourceKind};
+use crate::job::refusal;
 use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
+use moruna_job::{
+    ContractEntry, Declaration, Fact, Flow, Isolation, Needs, Role, SpecError, settings_schema,
+};
 
 /// The `datafusion` kind, a source: a governed DataFusion plan.
 pub struct Datafusion;
@@ -132,11 +132,11 @@ impl Engines {
             let (document, functions) = parts(&field, entry)?;
             let registered = engine
                 .register_compiled(document, entry.compiled.as_bytes(), &functions)
-                .map_err(|e| SpecError::new(&field, format!("peQL: {e}")))?;
+                .map_err(|e| refusal(SpecError::new(&field, format!("peQL: {e}"))))?;
             for audience in &entry.audiences {
-                engine
-                    .publish(registered.name(), audience)
-                    .map_err(|e| SpecError::new(format!("{field}.audiences"), e.to_string()))?;
+                engine.publish(registered.name(), audience).map_err(|e| {
+                    refusal(SpecError::new(format!("{field}.audiences"), e.to_string()))
+                })?;
             }
         }
         let engine = Arc::new(engine);
@@ -154,14 +154,18 @@ fn parts(
     Vec<parcel_runtime::compiled::BundledFunction>,
 )> {
     let document = serde_json::from_value(entry.document.clone())
-        .map_err(|e| SpecError::new(format!("{field}.document"), e.to_string()))?;
+        .map_err(|e| refusal(SpecError::new(format!("{field}.document"), e.to_string())))?;
     let functions = entry
         .functions
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            serde_json::from_value(f.clone())
-                .map_err(|e| SpecError::new(format!("{field}.functions[{i}]"), e.to_string()))
+            serde_json::from_value(f.clone()).map_err(|e| {
+                refusal(SpecError::new(
+                    format!("{field}.functions[{i}]"),
+                    e.to_string(),
+                ))
+            })
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((document, functions))
@@ -200,17 +204,17 @@ fn root_of(entry: &Entry<'_>, root: &str) -> Result<PathBuf> {
 /// that names it.
 fn target(engine: &Engine, field: &str, contract: &str) -> Result<Option<String>> {
     let location = engine.location(contract).map_err(|e| match e {
-        PeqlError::UnknownContract(name) => SpecError::new(
+        PeqlError::UnknownContract(name) => refusal(SpecError::new(
             field,
             format!("`{name}` is not among the contracts the document carries (`contracts`)"),
-        ),
-        e => SpecError::new(field, format!("peQL: {e}")),
+        )),
+        e => refusal(SpecError::new(field, format!("peQL: {e}"))),
     })?;
     location
         .as_ref()
         .map(location_target)
         .transpose()
-        .map_err(|e| SpecError::new(field, format!("peQL: {e}")).into())
+        .map_err(|e| refusal(SpecError::new(field, format!("peQL: {e}"))))
 }
 
 fn caller_of(
@@ -414,11 +418,10 @@ impl SourceKind for Datafusion {
             }
             (None, Some(s)) if !s.trim().is_empty() => (PeqlRead::Sql(s.clone()), entry.at("sql")),
             _ => {
-                return Err(SpecError::new(
+                return Err(refusal(SpecError::new(
                     entry.field().to_string(),
                     "a datafusion source names exactly one of `contract` and `sql`",
-                )
-                .into());
+                )));
             }
         };
         let on_violation = on_read_of(entry, settings.on_violation.as_deref())?;
@@ -532,9 +535,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::job::{BuildOptions, JobSpec, KindDoc, build};
+    use crate::job::{BuildOptions, build};
     use crate::kinds::conformance::{self, Harness};
     use crate::kinds::{Registry, Standalone};
+    use moruna_job::{JobSpec, KindDoc};
 
     fn no_env(_: &str) -> Option<String> {
         None

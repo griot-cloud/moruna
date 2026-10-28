@@ -10,6 +10,9 @@ description = "Moruna runtime facade"
 
 [dependencies]
 moruna-kernel = { workspace = true }
+# The kinds' declarations and the job document, which an embedder reads without running anything
+# (SDD 22).
+moruna-job = { workspace = true }
 moruna-arena = { workspace = true }
 moruna-discovery = { workspace = true }
 moruna-trace = { workspace = true }

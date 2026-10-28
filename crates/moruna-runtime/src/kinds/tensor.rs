@@ -9,12 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    BuiltSink, BuiltSource, Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Role,
-    SinkKind, SourceKind, Urls, settings_schema,
-};
+use super::{BuiltSink, BuiltSource, Context, Entry, SinkKind, SourceKind};
 use crate::job::translate;
 use crate::spec::{SinkSpec, SourceSpec};
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, Urls, settings_schema};
 
 /// The `tensor` kind, a source and a sink.
 pub struct Tensor;

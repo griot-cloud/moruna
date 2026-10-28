@@ -46,8 +46,6 @@ pub const STAGING_SEGMENT_BYTES: u64 = 128 << 20;
 pub const ORDERING_BUFFER_BYTES: u64 = 256 << 20;
 /// `sink.concurrency`.
 pub const SINK_CONCURRENCY: u16 = 2;
-/// `checkpoint.interval_ms`.
-pub const CHECKPOINT_INTERVAL_MS: u64 = 5000;
 /// `sizer.fallback_error_ratio`.
 pub const SIZER_FALLBACK_ERROR_RATIO: f32 = 2.0;
 /// The scheduler's heartbeat cadence (10 d.1, `heartbeat_interval_ms`).

@@ -44,6 +44,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 19 | An OCI image as a kind | `19-image.md` | 1, 17, 18 | an image is a read, verified and unpacked OCI layout and its command; the `image` kind runs the command in the sandbox as one confined process per stage, Arrow IPC over its standard input and output, and it ends the run when the process does not end as it should (added 2026-10-28, board KA1) |
 | 20 | The microkernel core | `20-microkernel.md` | none (its own workspace, `kernel/`, on OSTD) | a process names objects only through handles in its own table, and rights never grow; the kernel holds processes, threads, memory, channels, timers, interrupts and device memory, and every other service is a process started from the boot manifest (added 2026-10-28, BOARD EK KB1, decision MK1) |
 | 21 | The record and its ring | `21-record.md` | nothing internal | a record is byte for byte the layout of the event bus the node's records reach, and decodes as whole, incomplete or corrupt as that bus does; the ring takes records from many producers at once without blocking any of them, and returns each to its one consumer exactly once, or counts it as dropped (added 2026-10-28, KB4) |
+| 22 | The job document and the catalogue, for embedders | `22-job.md` | 18 | an embedder reads Moruna's kinds and checks a job document against them, collecting every refusal, with a crate that depends on `serde`, `serde_json`, `schemars` and `thiserror` only; the declaration and document types have one home there; the embedded catalogue equals the registry's listing (added 2026-10-28, board item KA4) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -419,6 +420,7 @@ moruna/
     moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux); component 19's `ImageKernel`
     moruna-image/             component 19: an OCI layout read, verified and unpacked into a root (pure Rust; added 2026-10-28)
     moruna-record/            component 21: the record layout and the multi-producer ring that carries it (no dependency; added 2026-10-28)
+    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars and thiserror only (added 2026-10-28)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent

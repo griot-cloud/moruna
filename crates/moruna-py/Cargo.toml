@@ -23,6 +23,7 @@ required-features = ["python"]
 moruna-kernel = { workspace = true }
 arrow = { workspace = true }
 moruna-runtime = { workspace = true }
+moruna-job = { workspace = true }
 moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }

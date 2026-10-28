@@ -10,15 +10,17 @@ use moruna_testkit::FakeKernel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use moruna_job::*;
+
 use super::conformance::{self, Harness, refused_field};
 use super::*;
-use crate::job::KindDoc;
+use crate::job::refusal;
 
 fn doc(value: Value) -> KindDoc {
     KindDoc::from_value(value).expect("an entry")
 }
 
-fn refusal(result: Result<impl Sized>) -> MorunaError {
+fn error_of(result: Result<impl Sized>) -> MorunaError {
     match result {
         Err(e) => e,
         Ok(_) => panic!("resolved"),
@@ -115,7 +117,7 @@ fn kd_t1_resolve_or_refuse() {
     let (declared, _) = kinds.kernel("kernels[0]", "std").expect("std runs");
     assert_eq!(declared.role, Role::Kernel);
     // A name is resolved within its role: no source is called `arrow_ipc`, no sink `std`.
-    let e = refusal(kinds.source("source", "arrow_ipc"));
+    let e = error_of(kinds.source("source", "arrow_ipc"));
     let sources = if cfg!(feature = "peql") {
         "datafusion, parquet, tensor, vortex"
     } else {
@@ -123,23 +125,23 @@ fn kd_t1_resolve_or_refuse() {
     };
     assert_eq!(
         e.to_string(),
-        MorunaError::from(SpecError::new(
+        refusal(SpecError::new(
             "source.kind",
             format!("no source kind `arrow_ipc` is registered; this build reads {sources}"),
         ))
         .to_string()
     );
-    let e = refusal(kinds.sink("sink", "std"));
+    let e = error_of(kinds.sink("sink", "std"));
     assert_eq!(refused_field(&e).as_deref(), Some("sink.kind"));
     assert!(
         e.to_string()
             .contains("this build writes arrow_ipc, parquet"),
         "{e}"
     );
-    let e = refusal(kinds.kernel("kernels[3]", "java"));
+    let e = error_of(kinds.kernel("kernels[3]", "java"));
     assert_eq!(refused_field(&e).as_deref(), Some("kernels[3].kind"));
     let empty = Registry::empty();
-    let e = refusal(empty.kernel("kernels[0]", "std"));
+    let e = error_of(empty.kernel("kernels[0]", "std"));
     assert!(
         e.to_string()
             .contains("no kernel kind `std` is registered; this build has no kernel kinds"),
@@ -152,10 +154,10 @@ fn kd_t1_resolve_or_refuse() {
 #[test]
 fn kd_t2_rust_is_not_registered() {
     let kinds = Registry::standard();
-    let e = refusal(kinds.kernel("kernels[0]", "rust"));
+    let e = error_of(kinds.kernel("kernels[0]", "rust"));
     assert_eq!(
         e.to_string(),
-        MorunaError::from(SpecError::new(
+        refusal(SpecError::new(
             "kernels[0].kind",
             "no kernel kind `rust` is registered; this build runs image, package, std",
         ))
@@ -427,7 +429,7 @@ fn kd_t10_suite_catches_violations() {
                         .settings
                         .contains_key("moruna_conformance_unknown")
                     {
-                        return Err(SpecError::new("budget", "not the entry").into());
+                        return Err(refusal(SpecError::new("budget", "not the entry")));
                     }
                 }
                 _ => {
@@ -479,7 +481,7 @@ fn kd_t10_suite_catches_violations() {
                 return Err(entry.refuse("moruna_conformance_unknown", "undeclared"));
             }
             let typed: Typed = serde_json::from_value(Value::Object(settings))
-                .map_err(|e| SpecError::new(entry.field().to_string(), e.to_string()))?;
+                .map_err(|e| refusal(SpecError::new(entry.field().to_string(), e.to_string())))?;
             let kernel = FakeKernel::new();
             check_pin(entry, typed.fingerprint.as_deref(), &kernel)?;
             Ok(Stage::of(Arc::new(kernel) as Arc<dyn Kernel>))
@@ -505,7 +507,7 @@ fn kd_t11_fusion_through_the_port() {
             ..Probe::named("probe")
         }))
         .expect("registers");
-    let mut job = crate::job::JobSpec::new(
+    let mut job = moruna_job::JobSpec::new(
         doc(json!({"kind": "parquet", "url": "/in"})),
         vec![
             doc(json!({"kind": "probe", "tag": "a"})),
@@ -550,7 +552,7 @@ fn a_context_shares_one_value_per_type() {
     assert!(cx.host_port_hub().is_none());
     assert_eq!(cx.package_host(), &crate::packaged::PackageHost::default());
     assert!(cx.embedding().guest_port("anything").is_none());
-    let contract = crate::job::ContractEntry {
+    let contract = moruna_job::ContractEntry {
         document: json!({}),
         compiled: String::new(),
         functions: Vec::new(),

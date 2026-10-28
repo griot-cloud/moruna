@@ -148,7 +148,8 @@ fn pk_t15_aot_then_no_compile() {
 
 mod support;
 
-use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_job::JobSpec;
+use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::Registry;
 use moruna_runtime::{CancelToken, Runtime};
 use serde_json::json;
