@@ -5,9 +5,10 @@
 //!
 //! An `event` is one fact of the run's execution, versioned on its own (`v`, [`EVENTS_VERSION`])
 //! and named by its `kind`: version 1 had the task lifecycle; version 2 added `logs`, what the
-//! run's output store holds for each producer so far; version 3 adds a running task's wait on a
-//! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10). A peer refuses a
-//! version it does not read rather than guess at it.
+//! run's output store holds for each producer so far; version 3 added a running task's wait on a
+//! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10); version 4 adds the
+//! failure code `internal`, a crash: a panic of Moruna's own that unwound the run. A peer refuses
+//! a version it does not read rather than guess at it.
 //!
 //! What a task prints is never on the socket. Each record of it is an `event` of kind `log`
 //! ([`LogLine`]) in the run's output store (`report.logs`), numbered by its own producer; the
@@ -87,7 +88,7 @@ impl Heartbeat {
 }
 
 /// The version of the `event` message this build writes (MH 4.3).
-pub const EVENTS_VERSION: u32 = 3;
+pub const EVENTS_VERSION: u32 = 4;
 
 /// The version of the port messages this build writes and reads (MH 4.10).
 pub const PORTS_VERSION: u32 = 1;
@@ -116,8 +117,8 @@ pub struct EventMsg {
     pub body: Event,
 }
 
-/// The facts of version 3: the task lifecycle, the output store's reach (MH 4.3) and a running
-/// task's waits on its ports (MH 4.10). A task is one element of the chain, named by the id the
+/// The facts of version 4: the task lifecycle, the output store's reach (MH 4.3), a running
+/// task's waits on its ports (MH 4.10) and a crash's failures (`internal`). A task is one element of the chain, named by the id the
 /// document's `report.tasks` gives it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -189,7 +190,8 @@ pub enum Event {
     },
     /// It failed, or the attempt did (`scope: attempt`, `task: null`) for a reason no one task
     /// owns. `message` is the engine's own sentence about the failure and quotes no data; the
-    /// failure's full words are in the report.
+    /// failure's full words are in the report. For `internal`, a crash, which has no report,
+    /// `message` is what Moruna's panic said.
     TaskFailed {
         /// The task; `null` when the scope is the attempt.
         task: Option<String>,
@@ -433,6 +435,9 @@ pub enum FailureCode {
     Unsupported,
     /// The engine stopped as cancelled with no cancel asked of it.
     Cancelled,
+    /// A crash: a panic of Moruna's own unwound the run, a defect of the engine and never a
+    /// cancel. Every task still running fails with it, or the attempt does when none was.
+    Internal,
 }
 
 /// Who a failure belongs to.
@@ -713,7 +718,7 @@ mod tests {
                 phase: Phase::Reading,
             }),
             format!(
-                "{{\"type\":\"event\",\"v\":3,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                "{{\"type\":\"event\",\"v\":4,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
                  \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
                 "0f".repeat(16)
             )
@@ -732,6 +737,20 @@ mod tests {
                  \"retryable\":true}\n"
             ),
             "{failed}"
+        );
+        let crashed = event(Event::TaskFailed {
+            task: Some("orders".into()),
+            code: FailureCode::Internal,
+            message: "index out of bounds".into(),
+            scope: FailureScope::Task,
+            retryable: false,
+        });
+        assert!(
+            crashed.ends_with(
+                "\"kind\":\"task_failed\",\"task\":\"orders\",\"code\":\"internal\",\
+                 \"message\":\"index out of bounds\",\"scope\":\"task\",\"retryable\":false}\n"
+            ),
+            "{crashed}"
         );
         assert!(event(Event::CancelAcknowledged).ends_with("\"kind\":\"cancel_acknowledged\"}\n"));
         let waiting = event(Event::TaskWaiting {
@@ -821,7 +840,7 @@ mod tests {
         assert_eq!(
             record.line(),
             format!(
-                "{{\"type\":\"event\",\"v\":3,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
+                "{{\"type\":\"event\",\"v\":4,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
                  \"t_us\":77,\"kind\":\"log\",\"id\":\"{s}/k1/4\",\"task\":\"k1\",\
                  \"stream\":\"stderr\",\"level\":null,\"bytes\":2,\"text\":\"hi\",\
                  \"partial\":false,\"continued\":true,\"truncated\":0}}\n",
