@@ -42,6 +42,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
 | 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
 | 19 | An OCI image as a kind | `19-image.md` | 1, 17, 18 | an image is a read, verified and unpacked OCI layout and its command; the `image` kind runs the command in the sandbox as one confined process per stage, Arrow IPC over its standard input and output, and it ends the run when the process does not end as it should (added 2026-10-28, board KA1) |
+| 21 | The record and its ring | `21-record.md` | nothing internal | a record is byte for byte the layout of the event bus the node's records reach, and decodes as whole, incomplete or corrupt as that bus does; the ring takes records from many producers at once without blocking any of them, and returns each to its one consumer exactly once, or counts it as dropped (added 2026-10-28, KB4) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -416,6 +417,7 @@ moruna/
     moruna-wasm/              component 17: a `.wasm` package in wasmtime
     moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux); component 19's `ImageKernel`
     moruna-image/             component 19: an OCI layout read, verified and unpacked into a root (pure Rust; added 2026-10-28)
+    moruna-record/            component 21: the record layout and the multi-producer ring that carries it (no dependency; added 2026-10-28)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
