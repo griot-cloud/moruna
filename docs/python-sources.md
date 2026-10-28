@@ -22,6 +22,14 @@ moruna.VortexSource(urls, *, columns=None, split_bytes=None)
 
 `urls` is a path, prefix, URL, or nonempty sequence of them. `columns: list[str] | None` projects columns. `split_bytes: int | None` sets target split size; it must be positive and defaults to about 128 MiB.
 
+## `moruna.ArrowIpcSource`
+
+```python
+moruna.ArrowIpcSource(urls, *, columns=None, split_rows=None)
+```
+
+`urls` is a local file, a local directory, or a nonempty sequence of them; a directory is read for its `.arrow` files in name order. The files must be in the Arrow IPC file format, not the stream format, and share one schema. `columns: list[str] | None` projects columns, which come back in the order the file stores them. `split_rows: int | None` sets the rows each piece of work is cut toward, from whole record batches; it must be positive and by default each record batch is one piece.
+
 ## `moruna.TensorSource`
 
 ```python

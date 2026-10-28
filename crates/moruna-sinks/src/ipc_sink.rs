@@ -265,6 +265,7 @@ impl ArrowIpcSink {
                 // A zero-length buffer entry has nothing to write and nothing to keep alive.
                 continue;
             }
+            end = end.max(*offset as u64 + body.len() as u64);
             let view = match BufferView::of_arrow(body, &*self.alloc) {
                 // The payload's own buffer, written straight out of the arena: no copy (SI-I4).
                 Ok(view) => view,
@@ -287,14 +288,27 @@ impl ArrowIpcSink {
                 }
             };
             completions.push(self.reactor.write_file(&tmp, *offset as u64, view));
-            end = end.max(*offset as u64 + body.len() as u64);
         }
         let _ = tier;
 
+        // The format wants a block's offset, metadata length and body length each a multiple
+        // of 8, and a reader holds the footer's block to the message's own `bodyLength`
+        // (KA11, 08 e.3). The offset is `base` plus the schema message and the metadata length
+        // is the record message, both multiples of 8 by the encoder; the body length is the one
+        // `encode_framing` wrote into the message, which reaches the end of the last buffer
+        // padded to 8. The cursor moves to that padded end, so the next record and the footer
+        // sit after bytes the file holds.
+        if end > body_base + lengths.body {
+            return Err(MorunaError::Sink(format!(
+                "a body buffer ends at {end}, past the {} bytes the message declares",
+                lengths.body
+            )));
+        }
+        let end = body_base + lengths.body;
         let block = (
             (base + lengths.schema) as i64,
             lengths.record as i32,
-            (end - body_base) as i64,
+            lengths.body as i64,
         );
         let Some(file) = inner.files.get_mut(&file_id) else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
@@ -436,6 +450,9 @@ fn own_buffers(batch: &RecordBatch) -> BTreeSet<usize> {
 struct MessageLengths {
     schema: u64,
     record: u64,
+    /// The `bodyLength` the record batch message declares: what the footer's block says too,
+    /// because a reader refuses a file in which the two differ (KA11).
+    body: u64,
 }
 
 impl MessageLengths {
@@ -443,7 +460,31 @@ impl MessageLengths {
         let bytes: &[u8] = framing;
         let schema = message_len(bytes, 0)?;
         let record = message_len(bytes, schema as usize)?;
-        Ok(MessageLengths { schema, record })
+        // The footer's blocks must be multiples of 8 (KA11): the encoder pads each message's
+        // flatbuffer so that its length prefix, marker and padding fill a multiple of 8, and a
+        // framing that is not is refused here rather than written into a file no reader opens.
+        if !schema.is_multiple_of(8) || !record.is_multiple_of(8) {
+            return Err(MorunaError::Sink(format!(
+                "the ipc messages are {schema} and {record} bytes, not multiples of 8"
+            )));
+        }
+        let flatbuffer = bytes
+            .get(schema as usize + 8..(schema + record) as usize)
+            .ok_or_else(|| MorunaError::Sink("the framing is shorter than its messages".into()))?;
+        let message = moruna_kernel::arrow::ipc::root_as_message(flatbuffer)
+            .map_err(|e| MorunaError::Sink(format!("the record batch message: {e}")))?;
+        let body = u64::try_from(message.bodyLength())
+            .map_err(|_| MorunaError::Sink("the record batch message's body is negative".into()))?;
+        if !body.is_multiple_of(8) {
+            return Err(MorunaError::Sink(format!(
+                "the record batch message declares a body of {body} bytes, not a multiple of 8"
+            )));
+        }
+        Ok(MessageLengths {
+            schema,
+            record,
+            body,
+        })
     }
 
     fn total(&self) -> u64 {

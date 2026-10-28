@@ -38,6 +38,7 @@ from moruna import _core, _declare
 # A function package under its own runtime on this machine (SDD 16 d.3, 12 f.8).
 from moruna._core import (
     ArrowIpcSink,
+    ArrowIpcSource,
     BudgetError,
     Cancelled,
     ConfigError,
@@ -69,6 +70,7 @@ __version__: str = _core.__version__
 __all__ = [
     "MorunaError",
     "ArrowIpcSink",
+    "ArrowIpcSource",
     "BudgetError",
     "Cancelled",
     "ConfigError",
