@@ -1,4 +1,4 @@
-//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 2).
+//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 3).
 //!
 //! A task is one element of the chain, named by the document's `report.tasks`: the source, each
 //! kernel stage, the sink. The scheduler says what happened to the chain on the thread on which it
@@ -58,6 +58,8 @@ struct Inner {
     /// The scheduler is `Running`: what runs now is the run proper, not calibration.
     running: bool,
     cancel_acknowledged: bool,
+    /// How the run ended was told ([`Lifecycle::end`]): nothing more is.
+    ended: bool,
 }
 
 /// One run's tasks and what has been told of them.
@@ -134,6 +136,7 @@ impl Lifecycle {
                 tasks,
                 running: false,
                 cancel_acknowledged: false,
+                ended: false,
             }),
             refs,
             clock,
@@ -412,11 +415,16 @@ impl Lifecycle {
     }
 
     /// How the run ended: the end of every task not yet ended, then, when a cancel reached the
-    /// run, how the cancel ended.
+    /// run, how the cancel ended. Told once: a second call tells nothing, so no task ends twice
+    /// and the cancel's end is told at most once (PY-I11).
     pub fn end(&self, ending: Ending<'_>) {
         let t = self.now();
         let mut inner = self.lock();
         let inner = &mut *inner;
+        if inner.ended {
+            return;
+        }
+        inner.ended = true;
         let disposition = match ending {
             Ending::Completed => {
                 // The scheduler tells every task's end on a completed run; one that was not is
@@ -513,6 +521,17 @@ impl Lifecycle {
                 );
             }
         }
+    }
+}
+
+/// A lifecycle dropped before its run's end was told, by a run that unwound or an embedder that
+/// let go of it, tells that end now, as a cancel: the scheduler's shutdown on drop is a cancel
+/// (preamble 4.3), so every task still running is cancelled and every task that never started
+/// is skipped as cancelled. Every task that started has its one end whatever ended the run
+/// (PY-I11).
+impl Drop for Lifecycle {
+    fn drop(&mut self) {
+        self.end(Ending::Cancelled);
     }
 }
 

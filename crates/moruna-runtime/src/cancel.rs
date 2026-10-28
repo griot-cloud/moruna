@@ -97,6 +97,20 @@ impl Started {
     }
 }
 
+/// Whatever was started is stopped when the record drops, in the same reverse order, so a run
+/// that unwinds (a panic between two steps) leaves no component running behind it: shutdown on
+/// drop (preamble 4.3). `unwind` takes what it stops, so after a run that unwound itself this
+/// stops nothing.
+impl Drop for Started {
+    fn drop(&mut self) {
+        let (_, notes) = self.unwind();
+        // A run that unwound has no report to carry these, so they go to the log.
+        for note in notes {
+            tracing::warn!(target: "moruna.shutdown", %note, "stopped on drop");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +131,35 @@ mod tests {
             guard.disarm();
         }
         assert!(!second.is_cancelled(), "a disarmed guard does not");
+    }
+
+    /// PY-T26: dropping the record of what started stops it, once, with no unwind called: a
+    /// run that unwinds leaves no component running behind it; and a record already unwound
+    /// stops nothing again when it drops.
+    #[test]
+    fn py_t26_a_run_dropped_without_a_cancel_stops_what_started() {
+        let reactor = moruna_testkit::FakeReactor::new();
+        let placement = moruna_testkit::FakePlacement::new();
+        let mut started = Started::default();
+        started.reactor = Some(Arc::new(reactor.clone()));
+        started.placement = Some(Arc::new(placement.clone()));
+        drop(started);
+        assert_eq!(reactor.shutdown_calls(), 1, "the reactor was stopped");
+        assert_eq!(
+            placement.shutdown_calls(),
+            1,
+            "the placement engine was stopped"
+        );
+
+        let mut unwound = Started::default();
+        unwound.reactor = Some(Arc::new(reactor.clone()));
+        let _ = unwound.unwind();
+        drop(unwound);
+        assert_eq!(
+            reactor.shutdown_calls(),
+            2,
+            "unwound once, not again on drop"
+        );
     }
 
     /// Unwinding nothing produces no view and no notes, and is safe to repeat.

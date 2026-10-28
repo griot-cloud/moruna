@@ -997,7 +997,15 @@ pub(crate) fn spawn_all(shared: &Arc<Shared>) -> Result<()> {
     let source_shared = Arc::clone(shared);
     let source = std::thread::Builder::new()
         .name("moruna-source-drive".into())
-        .spawn(move || crate::source_drive::drive(source_shared, helper_rx, source_parker))
+        .spawn(move || {
+            let drive = Arc::clone(&source_shared);
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                crate::source_drive::drive(drive, helper_rx, source_parker)
+            }));
+            if let Err(panic) = ran {
+                crate::source_drive::panicked(&source_shared, panic.as_ref());
+            }
+        })
         .map_err(|e| MorunaError::Plan(format!("the source drive could not start: {e}")))?;
     *shared
         .source_handle
@@ -1012,7 +1020,15 @@ pub(crate) fn spawn_all(shared: &Arc<Shared>) -> Result<()> {
     let sink_shared = Arc::clone(shared);
     let sink = std::thread::Builder::new()
         .name("moruna-sink-drive".into())
-        .spawn(move || crate::sink_drive::drive(sink_shared, sink_parker))
+        .spawn(move || {
+            let drive = Arc::clone(&sink_shared);
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                crate::sink_drive::drive(drive, sink_parker)
+            }));
+            if let Err(panic) = ran {
+                crate::sink_drive::panicked(&sink_shared, panic.as_ref());
+            }
+        })
         .map_err(|e| MorunaError::Plan(format!("the sink drive could not start: {e}")))?;
     *shared.sink_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     Ok(())
