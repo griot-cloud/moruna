@@ -80,7 +80,7 @@ fn jb_t2_embedded_catalogues() {
         names(&standard, Role::Source),
         ["parquet", "tensor", "vortex"]
     );
-    assert_eq!(names(&standard, Role::Kernel), ["package", "std"]);
+    assert_eq!(names(&standard, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&standard, Role::Sink),
         ["arrow_ipc", "parquet", "tensor", "vortex"]
@@ -90,7 +90,7 @@ fn jb_t2_embedded_catalogues() {
         names(&governed, Role::Source),
         ["datafusion", "parquet", "tensor", "vortex"]
     );
-    assert_eq!(names(&governed, Role::Kernel), ["package", "std"]);
+    assert_eq!(names(&governed, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&governed, Role::Sink),
         ["arrow_ipc", "parquet", "peql", "tensor", "vortex"]

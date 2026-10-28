@@ -108,7 +108,7 @@ fn jb_t7_unknown_kinds() {
         [
             "source.kind: no source kind `arrow_ipc` is declared; this catalogue reads parquet, \
              tensor, vortex",
-            "kernels[0].kind: no kernel kind `java` is declared; this catalogue runs package, std",
+            "kernels[0].kind: no kernel kind `java` is declared; this catalogue runs image, package, std",
             "sink.kind: no sink kind `std` is declared; this catalogue writes arrow_ipc, parquet, \
              tensor, vortex",
         ]
