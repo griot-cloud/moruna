@@ -238,7 +238,7 @@ A CPU fault or trap in user mode (OSTD's `ReturnReason::UserException`) ends the
 
 ### f.11 Several CPUs
 
-The kernel injects its own scheduler into OSTD before any task runs (OSTD 0.19's default queues every task on the boot processor): a run queue and an idle task per CPU, placement on the CPU with the fewest runnable tasks, a 10 ms slice, and a boot context that is never preempted. The application processors enter through OSTD's AP entry. The boot counts as a live process until it has started the whole manifest (KK-I12). Detail: SDD 23 f.12.
+The kernel injects its own scheduler into OSTD before any task runs (OSTD 0.19's default queues every task on the boot processor): a run queue and an idle task per CPU, a new task on the CPU with the fewest runnable tasks, a woken one on its waker's CPU when nothing else is runnable there, a 10 ms slice, and a boot context that is never preempted. The application processors enter through OSTD's AP entry. The boot counts as a live process until it has started the whole manifest (KK-I12). Detail: SDD 23 f.12.
 
 ## g. Concurrency within the component
 

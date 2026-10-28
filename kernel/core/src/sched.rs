@@ -2,9 +2,12 @@
 //! time slice, injected into OSTD before any task runs.
 //!
 //! OSTD's default scheduler queues every task on the boot processor, so a kernel that
-//! wants its other CPUs must bring its own. This one places a task that becomes
-//! runnable on the CPU with the fewest runnable tasks, preferring the current one on a
-//! tie; runs each CPU's queue first in, first out; preempts a task that has run for a
+//! wants its other CPUs must bring its own. This one places a new task on the CPU with
+//! the fewest runnable tasks, preferring the current one on a tie; places a woken task
+//! on the waker's CPU when nothing else is runnable there (the waker of a request or a
+//! reply usually blocks next, so the two take turns on one CPU instead of waking a
+//! halted one for every message), and on the least loaded CPU otherwise; runs each
+//! CPU's queue first in, first out; preempts a task that has run for a
 //! slice while another waits on its CPU; and gives each CPU an idle task that halts
 //! until an interrupt, so a CPU with nothing to run sleeps instead of spinning. A wake
 //! that queues a task on a CPU running its idle task asks that CPU to reschedule. A
@@ -119,11 +122,16 @@ struct Cpus {
 }
 
 impl Cpus {
-    /// The CPU with the fewest runnable tasks, the current one on a tie.
-    fn select(&self) -> CpuId {
+    /// Where a task that names no CPU goes: a woken one to this CPU if at most its
+    /// waker is runnable here, else (and a new one always) the CPU with the fewest
+    /// runnable tasks, this one on a tie.
+    fn select(&self, flags: EnqueueFlags) -> CpuId {
         let here = disable_preempt().current_cpu();
         let count = self.loads.len();
         let start = here.as_usize();
+        if flags == EnqueueFlags::Wake && self.loads[start].load(Ordering::Relaxed) <= 1 {
+            return here;
+        }
         let mut best = start;
         let mut best_load = self.loads[start].load(Ordering::Relaxed);
         for step in 1..count {
@@ -139,10 +147,10 @@ impl Cpus {
 }
 
 impl Scheduler for Cpus {
-    fn enqueue(&self, runnable: Arc<Task>, _flags: EnqueueFlags) -> Option<CpuId> {
+    fn enqueue(&self, runnable: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
         // As OSTD's own scheduler does: a task that still names a CPU is still in that
         // CPU's queue (it is parking, or was never dequeued), and goes back there.
-        let selected = self.select();
+        let selected = self.select(flags);
         let (still_queued, target) = match runnable.cpu().set_if_is_none(selected) {
             Ok(()) => (false, selected),
             Err(cpu) => (true, cpu),
