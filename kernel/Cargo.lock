@@ -301,6 +301,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-svc"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-sys",
+]
+
+[[package]]
 name = "moruna-sys"
 version = "0.1.0"
 dependencies = [

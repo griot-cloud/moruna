@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["abi", "loader", "handles", "core", "boot", "sys", "programs"]
+members = ["abi", "loader", "handles", "core", "boot", "sys", "svc", "programs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ moruna-loader = { path = "loader", version = "=0.1.0" }
 moruna-handles = { path = "handles", version = "=0.1.0" }
 moruna-microkernel = { path = "core", version = "=0.1.0" }
 moruna-sys = { path = "sys", version = "=0.1.0" }
+moruna-svc = { path = "svc", version = "=0.1.0" }
 # OSTD, the framework that holds the kernel's unsafe code, and the frame and heap
 # allocators OSDK links into an OSTD kernel (Asterinas 0.19.0, MPL-2.0, DECISIONS.md MK1).
 ostd = { version = "=0.19.0", default-features = false }
