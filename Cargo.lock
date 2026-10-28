@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-adapters"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "dlpark",
@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-arena"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "cudarc",
  "libc",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-bench"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "blake3",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-controller"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "moruna-kernel",
  "moruna-testkit",
@@ -4259,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-datafusion"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "datafusion",
  "futures",
@@ -4273,7 +4273,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-discovery"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arc-swap",
  "cudarc",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernel"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "blake3",
@@ -4296,7 +4296,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernels"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "blake3",
  "moruna-kernel",
@@ -4307,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-package"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "moruna-kernel",
  "serde",
@@ -4319,7 +4319,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-placement"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -4337,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-polars"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "moruna-kernel",
  "polars",
@@ -4346,7 +4346,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-py"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "moruna-adapters",
@@ -4366,6 +4366,8 @@ dependencies = [
  "parquet",
  "pyo3",
  "pyo3-arrow",
+ "schemars 1.2.2",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tracing",
@@ -4374,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-reactor"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "bytes",
  "cudarc",
@@ -4394,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-runtime"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4427,6 +4429,7 @@ dependencies = [
  "parcel-core",
  "parcel-runtime",
  "parquet",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4439,7 +4442,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sandbox"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "landlock",
  "libc",
@@ -4458,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-scheduler"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "crossbeam",
  "libc",
@@ -4471,7 +4474,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sinks"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "bytes",
@@ -4489,7 +4492,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sources"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "bytes",
@@ -4507,14 +4510,14 @@ dependencies = [
 
 [[package]]
 name = "moruna-testkit"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "moruna-kernel",
 ]
 
 [[package]]
 name = "moruna-trace"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arrow",
  "crossbeam",
@@ -4528,7 +4531,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-vmm"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "acpi_tables",
  "kvm-bindings",
@@ -4550,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-wasm"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "moruna-adapters",
  "moruna-kernel",

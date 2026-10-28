@@ -6,19 +6,20 @@
 //! thread by CPython's design, which is why the roles are not the other way round.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moruna_adapters::{PyKernel, python_gil_enabled};
-use moruna_kernel::{CancelToken, DType, Kernel, MorunaError, SourceSchema};
-use moruna_runtime::job::build::{compression_name, process_env, tensor_format_name};
+use moruna_adapters::python_gil_enabled;
+use moruna_kernel::{CancelToken, DType, MorunaError, SourceSchema};
+use moruna_runtime::job::build::process_env;
 use moruna_runtime::job::{
-    ArrowIpcSinkOptions, AzureDoc, BuildOptions, ErrorPolicyDoc, FilterDoc, GcsDoc, JobSpec,
-    KernelDoc, KernelLoader, LoadedKernel, ObjectStoreDoc, ParquetSinkOptions,
-    ParquetSourceOptions, S3Doc, SinkDoc, SizerDoc, SourceDoc, TensorSinkOptions,
-    TensorSourceOptions, Urls, VortexSinkOptions, VortexSourceOptions,
+    AzureDoc, BuildOptions, ErrorPolicyDoc, GcsDoc, JobSpec, KindDoc, ObjectStoreDoc, S3Doc,
+    SizerDoc, SpecError,
 };
+use moruna_runtime::kinds::parquet::compression_name;
+use moruna_runtime::kinds::tensor::tensor_format_name;
+use moruna_runtime::kinds::{Urls, arrow_ipc, parquet, tensor, vortex};
 use moruna_runtime::{RunSpec, Runtime};
 use moruna_sources::{RowFilter, ScalarValue};
 use pyo3::exceptions::PyKeyboardInterrupt;
@@ -188,42 +189,52 @@ pub fn run(
     let iterator = iterator_object(py, source)?;
     let trace_path = translated.trace_path.clone();
     let described = kernel_docs(py, kernels)?;
-    let (job, notes) = job_of(
-        translated,
-        &source_spec,
-        &sink_spec,
-        described,
-        object_store,
-    );
-    let loader = LibraryLoader {
-        kernels: stages
-            .into_iter()
-            .map(|s| match s {
-                Stage::Py(k) => Some(k),
-                Stage::Std(_) | Stage::Package(_) => None,
-            })
-            .collect(),
-        iterator: Mutex::new(match (&source_spec, iterator) {
-            (SourceSpec::Iterator { schema }, Some(object)) => {
-                Some((object, map(py, source_schema(clone_schema(schema)))?))
-            }
-            _ => None,
-        }),
-        // A user's `moruna.Source` and `moruna.Sink` (07 e.6, 08 f.10): the objects themselves.
-        python_source: Mutex::new(match source_spec {
-            SourceSpec::Python => Some(source.clone().unbind()),
-            _ => None,
-        }),
-        python_sink: Mutex::new(match sink_spec {
-            SinkSpec::Python => Some(sink.clone().unbind()),
-            _ => None,
-        }),
+    let (job, notes) = map(
+        py,
+        job_of(
+            translated,
+            &source_spec,
+            &sink_spec,
+            described,
+            object_store,
+        )
+        .map_err(MorunaError::from),
+    )?;
+    let iterable = match (&source_spec, iterator) {
+        (SourceSpec::Iterator { schema }, Some(object)) => {
+            Some((object, map(py, source_schema(clone_schema(schema)))?))
+        }
+        _ => None,
     };
+    // A user's `moruna.Source` and `moruna.Sink` (07 e.6, 08 f.10): the objects themselves.
+    let user_source = match source_spec {
+        SourceSpec::Python => Some(source.clone().unbind()),
+        _ => None,
+    };
+    let user_sink = match sink_spec {
+        SinkSpec::Python => Some(sink.clone().unbind()),
+        _ => None,
+    };
+    let kinds = map(
+        py,
+        crate::kinds::library(
+            stages
+                .into_iter()
+                .map(|s| match s {
+                    Stage::Py(k) => Some(k),
+                    Stage::Std(_) | Stage::Package(_) => None,
+                })
+                .collect(),
+            iterable,
+            user_source,
+            user_sink,
+        ),
+    )?;
     let built = map(
         py,
         moruna_runtime::job::build(
             &job,
-            &loader,
+            &kinds,
             BuildOptions {
                 strict: false,
                 env: &process_env,
@@ -244,10 +255,10 @@ fn job_of(
     t: Translated,
     source: &SourceSpec,
     sink: &SinkSpec,
-    kernels: Vec<KernelDoc>,
+    kernels: Vec<KindDoc>,
     object_store: ObjectStoreDoc,
-) -> (JobSpec, Vec<String>) {
-    let mut job = JobSpec::new(source_doc(source), kernels, sink_doc(sink));
+) -> Result<(JobSpec, Vec<String>), SpecError> {
+    let mut job = JobSpec::new(source_doc(source)?, kernels, sink_doc(sink)?);
     job.budget.memory_bytes = t.budget;
     job.budget.cpu = t.cpu;
     job.trace = t.trace_path.map(|p| p.to_string_lossy().into_owned());
@@ -274,42 +285,51 @@ fn job_of(
         ResumeArg::RunId(hex) => hex,
         ResumeArg::Path(p) => p.to_string_lossy().into_owned(),
     });
-    (job, t.notes)
+    Ok((job, t.notes))
 }
 
-fn source_doc(source: &SourceSpec) -> SourceDoc {
+fn source_doc(source: &SourceSpec) -> Result<KindDoc, SpecError> {
     match source {
-        SourceSpec::Parquet(cfg) => SourceDoc::Parquet {
-            url: Urls(cfg.urls.clone()),
-            options: ParquetSourceOptions {
-                columns: cfg.columns.clone(),
-                filters: cfg.filters.iter().map(filter_doc).collect(),
+        SourceSpec::Parquet(cfg) => KindDoc::of(
+            "parquet",
+            &parquet::SourceSettings {
+                url: Urls(cfg.urls.clone()),
+                options: parquet::SourceOptions {
+                    columns: cfg.columns.clone(),
+                    filters: cfg.filters.iter().map(filter_doc).collect(),
+                },
             },
-        },
-        SourceSpec::Vortex(cfg) => SourceDoc::Vortex {
-            url: Urls(cfg.urls.clone()),
-            options: VortexSourceOptions {
-                columns: cfg.columns.clone(),
-                split_bytes: cfg.split_bytes,
+        ),
+        SourceSpec::Vortex(cfg) => KindDoc::of(
+            "vortex",
+            &vortex::SourceSettings {
+                url: Urls(cfg.urls.clone()),
+                options: vortex::SourceOptions {
+                    columns: cfg.columns.clone(),
+                    split_bytes: cfg.split_bytes,
+                },
             },
-        },
-        SourceSpec::Tensor(cfg) => SourceDoc::Tensor {
-            url: Urls(
-                cfg.paths
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect(),
-            ),
-            options: TensorSourceOptions {
-                tensors: cfg.tensors.clone(),
+        ),
+        SourceSpec::Tensor(cfg) => KindDoc::of(
+            "tensor",
+            &tensor::SourceSettings {
+                url: Urls(
+                    cfg.paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect(),
+                ),
+                options: tensor::SourceOptions {
+                    tensors: cfg.tensors.clone(),
+                },
             },
-        },
-        SourceSpec::Iterator { .. } => SourceDoc::Iterator,
-        SourceSpec::Python => SourceDoc::Python,
+        ),
+        SourceSpec::Iterator { .. } => Ok(KindDoc::new("iterator", serde_json::Map::new())),
+        SourceSpec::Python => Ok(KindDoc::new("python", serde_json::Map::new())),
     }
 }
 
-fn filter_doc(filter: &RowFilter) -> FilterDoc {
+fn filter_doc(filter: &RowFilter) -> parquet::Filter {
     let (column, op, value) = match filter {
         RowFilter::Gt(c, v) => (c, ">", v),
         RowFilter::Lt(c, v) => (c, "<", v),
@@ -322,46 +342,59 @@ fn filter_doc(filter: &RowFilter) -> FilterDoc {
         ScalarValue::Str(s) => serde_json::json!(s),
         ScalarValue::Bool(b) => serde_json::json!(b),
     };
-    FilterDoc(column.clone(), op.to_string(), value)
+    parquet::Filter(column.clone(), op.to_string(), value)
 }
 
-fn sink_doc(sink: &SinkSpec) -> SinkDoc {
+fn sink_doc(sink: &SinkSpec) -> Result<KindDoc, SpecError> {
     match sink {
-        SinkSpec::Parquet(cfg) => SinkDoc::Parquet {
-            url: cfg.url.clone(),
-            options: ParquetSinkOptions {
-                row_group_bytes: Some(cfg.row_group_bytes),
-                file_bytes: Some(cfg.file_bytes),
-                compression: Some(compression_name(cfg.compression).to_string()),
+        SinkSpec::Parquet(cfg) => KindDoc::of(
+            "parquet",
+            &parquet::SinkSettings {
+                url: cfg.url.clone(),
+                options: parquet::SinkOptions {
+                    row_group_bytes: Some(cfg.row_group_bytes),
+                    file_bytes: Some(cfg.file_bytes),
+                    compression: Some(compression_name(cfg.compression).to_string()),
+                },
             },
-        },
-        SinkSpec::Vortex(cfg) => SinkDoc::Vortex {
-            url: cfg.url.clone(),
-            options: VortexSinkOptions {
-                file_bytes: Some(cfg.file_bytes),
+        ),
+        SinkSpec::Vortex(cfg) => KindDoc::of(
+            "vortex",
+            &vortex::SinkSettings {
+                url: cfg.url.clone(),
+                options: vortex::SinkOptions {
+                    file_bytes: Some(cfg.file_bytes),
+                },
             },
-        },
-        SinkSpec::Tensor(cfg) => SinkDoc::Tensor {
-            url: cfg.path.to_string_lossy().into_owned(),
-            options: TensorSinkOptions {
-                format: Some(tensor_format_name(cfg.format).to_string()),
-                one_file_per_morsel: cfg.one_file_per_morsel,
-                name: Some(cfg.name.clone()),
+        ),
+        SinkSpec::Tensor(cfg) => KindDoc::of(
+            "tensor",
+            &tensor::SinkSettings {
+                url: cfg.path.to_string_lossy().into_owned(),
+                options: tensor::SinkOptions {
+                    format: Some(tensor_format_name(cfg.format).to_string()),
+                    one_file_per_morsel: cfg.one_file_per_morsel,
+                    name: Some(cfg.name.clone()),
+                },
             },
-        },
-        SinkSpec::ArrowIpc(cfg) => SinkDoc::ArrowIpc {
-            url: cfg.path.to_string_lossy().into_owned(),
-            options: ArrowIpcSinkOptions {
-                file_bytes: Some(cfg.file_bytes),
+        ),
+        SinkSpec::ArrowIpc(cfg) => KindDoc::of(
+            "arrow_ipc",
+            &arrow_ipc::SinkSettings {
+                url: cfg.path.to_string_lossy().into_owned(),
+                options: arrow_ipc::SinkOptions {
+                    file_bytes: Some(cfg.file_bytes),
+                },
             },
-        },
-        SinkSpec::Python => SinkDoc::Python,
+        ),
+        SinkSpec::Python => Ok(KindDoc::new("python", serde_json::Map::new())),
     }
 }
 
-/// Each kernel `moruna.run` was given, described as a document names a Python kernel: its
-/// module and qualified name. The objects themselves are what [`LibraryLoader`] hands back.
-fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KernelDoc>> {
+/// Each kernel `moruna.run` was given, described as a document names it: a standard kernel by
+/// name and arguments, a package by path and pin, a Python kernel by its module and qualified
+/// name. The Python objects themselves are what [`crate::kinds::Given`] hands back.
+fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KindDoc>> {
     let items: Vec<Bound<'_, PyAny>> = if value.is_instance_of::<pyo3::types::PyList>()
         || value.is_instance_of::<pyo3::types::PyTuple>()
     {
@@ -374,100 +407,50 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KernelD
             .and_then(|v| v.extract::<String>())
             .unwrap_or_else(|_| format!("<{}>", type_name(obj)))
     };
-    Ok(items
-        .iter()
-        .map(|item| {
-            if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
-                let kernel = &std.get().kernel;
-                return KernelDoc::std(kernel.name(), kernel.args().clone());
-            }
-            if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
-                let package = package.get();
-                let mut doc = KernelDoc::package(package.path.clone(), package.fingerprint.clone());
-                doc.args = package.inputs.args.clone();
-                doc.assets = package
-                    .inputs
-                    .assets
-                    .as_ref()
-                    .map(|a| a.display().to_string());
-                return doc;
-            }
+    let mut docs = Vec::with_capacity(items.len());
+    for item in &items {
+        let doc = if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
+            let kernel = &std.get().kernel;
+            KindDoc::of(
+                "std",
+                &moruna_runtime::kinds::standard::Settings {
+                    name: kernel.name().to_string(),
+                    args: Some(kernel.args().clone()),
+                    fingerprint: None,
+                },
+            )
+        } else if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
+            let package = package.get();
+            KindDoc::of(
+                "package",
+                &moruna_runtime::kinds::package::Settings {
+                    path: package.path.clone(),
+                    fingerprint: package.fingerprint.clone(),
+                    args: package.inputs.args.clone(),
+                    assets: package
+                        .inputs
+                        .assets
+                        .as_ref()
+                        .map(|a| a.display().to_string()),
+                    ports: None,
+                },
+            )
+        } else {
             let target = match item.cast::<PyKernelHandle>() {
                 Ok(handle) => handle.get().callable.bind(py).clone(),
                 Err(_) => item.clone(),
             };
-            KernelDoc::python(text(&target, "__module__"), text(&target, "__qualname__"))
-        })
-        .collect())
-}
-
-/// The library's loader: the kernels and the iterable are objects `moruna.run` already holds,
-/// so loading is handing them back in stage order.
-struct LibraryLoader {
-    /// Entry by entry; `None` for a standard kernel, which the build makes itself.
-    kernels: Vec<Option<Arc<PyKernel>>>,
-    iterator: Mutex<Option<(Py<PyAny>, SourceSchema)>>,
-    /// A `moruna.Source` subclass instance, taken once by `python_source`.
-    python_source: Mutex<Option<Py<PyAny>>>,
-    /// A `moruna.Sink` subclass instance, taken once by `python_sink`.
-    python_sink: Mutex<Option<Py<PyAny>>>,
-}
-
-impl KernelLoader for LibraryLoader {
-    fn load(&self, index: usize, _doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        let kernel = self.kernels.get(index).cloned().flatten().ok_or_else(|| {
-            MorunaError::Plan(format!("kernels[{index}]: no such kernel was passed"))
-        })?;
-        Ok(LoadedKernel {
-            kernel: Arc::clone(&kernel) as Arc<dyn Kernel>,
-            python: Some(kernel),
-        })
+            KindDoc::of(
+                "python",
+                &crate::kinds::Settings::named(
+                    text(&target, "__module__"),
+                    text(&target, "__qualname__"),
+                ),
+            )
+        };
+        docs.push(doc.map_err(|e| map_err(py, &MorunaError::from(e)))?);
     }
-
-    fn iterator_source(&self) -> moruna_kernel::Result<moruna_runtime::SourceSpec> {
-        let taken = self
-            .iterator
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let (iterator, schema) = taken.ok_or_else(|| {
-            MorunaError::Plan("an IteratorSource was given without its iterable".into())
-        })?;
-        Ok(moruna_runtime::SourceSpec::Build(Box::new(move |ctx| {
-            Ok(Arc::new(moruna_sources::PyIteratorSource::new(
-                iterator,
-                schema,
-                ctx.reactor.clone(),
-            )?))
-        })))
-    }
-
-    fn python_source(&self) -> moruna_kernel::Result<moruna_runtime::SourceSpec> {
-        let object = take(&self.python_source, "a moruna.Source")?;
-        // `PySource::new` calls the user's `plan()` at the lifecycle's "sources built" step, so a
-        // plan error surfaces before a sink is opened or a morsel is read (12 f.1).
-        Ok(moruna_runtime::SourceSpec::Build(Box::new(move |ctx| {
-            Ok(Arc::new(moruna_sources::PySource::new(
-                object,
-                ctx.reactor.clone(),
-            )?))
-        })))
-    }
-
-    fn python_sink(&self) -> moruna_kernel::Result<moruna_runtime::SinkSpec> {
-        let object = take(&self.python_sink, "a moruna.Sink")?;
-        Ok(moruna_runtime::SinkSpec::Build(Box::new(move |_ctx| {
-            Ok(Box::new(moruna_sinks::PySink::new(object)?) as Box<dyn moruna_kernel::Sink>)
-        })))
-    }
-}
-
-/// Take the object `moruna.run` was given, once.
-fn take(slot: &Mutex<Option<Py<PyAny>>>, what: &str) -> moruna_kernel::Result<Py<PyAny>> {
-    slot.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .ok_or_else(|| MorunaError::Plan(format!("{what} was named without its object")))
+    Ok(docs)
 }
 
 fn clone_schema(schema: &IteratorSchema) -> IteratorSchema {

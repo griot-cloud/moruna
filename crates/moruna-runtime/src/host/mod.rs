@@ -4,7 +4,7 @@
 //! for one on a socket. Either way the process speaks the protocol of MH 4.3 to at most one
 //! peer, writes the report file of MH 4.1 whatever happens, and exits with a code of MH 4.2.
 //! Everything here is the Rust half; the binary with the Python adapter compiled in is
-//! `moruna-py`'s, and it calls [`cli::main`] with a loader that can import Python kernels.
+//! `moruna-py`'s, and it calls [`cli::main`] with a registry that adds the Python kinds.
 
 pub mod cli;
 pub mod lifecycle;

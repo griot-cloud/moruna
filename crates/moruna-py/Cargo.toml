@@ -39,6 +39,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+# The Python kinds' settings and their schemas (SDD 18 e.2).
+serde = { workspace = true }
+schemars = { workspace = true }
 parquet = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-arrow = { workspace = true, optional = true }

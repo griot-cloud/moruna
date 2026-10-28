@@ -509,6 +509,26 @@ Start order: F8.1 and F8.3 now, in parallel; F8.2 after F8.1; F8.4, F8.5, F8.6 a
 
 ---
 
+## EA. Wave A: blocking fixes, release 0.5.7
+
+The brief is `architecture/agents/briefs/waves-a-b-c.md` section 3. One pull request per component; the release is its own pull request on top of both. Waves B and C are not started.
+
+| Id | Item | Branch | Scope (SDD sections, tests by id) | Status |
+|---|---|---|---|---|
+| MA1 | A source with zero rows never finishes | `fix/ma1-zero-row-source` | 10 f.5 (splits with no rows), h; SC-T24 (with its end-to-end half in `moruna-runtime/tests/governed.rs`), SC-T25 | in review |
+| MA2 | Every task gets exactly one terminal event | `fix/ma2-terminal-events` (runtime), and the scheduler's half on `fix/ma1-zero-row-source` | 12 c PY-I11, k, n; PY-T23, PY-T24, PY-T25, PY-T26; 10 h (a drive that panics), SC-T26 | in review |
+| R0.5.7 | Release 0.5.7 | `chore/release-0.5.7` | version bump, CHANGELOG section; `DECISIONS.md` Q4, AP1, FB1, CM1 | in review |
+
+## EB. Wave B
+
+The brief is `architecture/agents/briefs/waves-a-b-c.md` section 4. MC1 (section 5) was pulled forward into wave B by Brackly on 2026-10-28, so that MB3's new kinds have a registry to plug into.
+
+| Id | Item | Branch | Scope (SDD sections, tests by id) | Status |
+|---|---|---|---|---|
+| MC1 | Moruna declares what it can run: one registry of kinds, a declaration per kind, a conformance suite per port, every existing kind moved onto it (pulled into wave B, 2026-10-28) | `feat/mc1-kinds-registry` | SDD 18 (new: KD-I1 to KD-I10, f.1 to f.5); 12 f.9; 16 PK-I8, f.8, PK-T11, PK-T12; MH 4.1; preamble 1 (component 18), 6.2 (`schemars`); `DECISIONS.md` KD1; KD-T1 to KD-T11, with HO-T1 to HO-T4, HO-T9, PK-T12, PO-T6 run through the registry | in review |
+
+---
+
 ## Escalations and findings
 
 Open items the PM found while reading, routed per preamble section 7. Ids: `N-` a documentation finding from the PM's read, `E1-env-` an environment gap for a wave, `D-B` a decision about the board itself.
