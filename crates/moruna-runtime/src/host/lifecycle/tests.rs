@@ -308,6 +308,59 @@ fn a_cancel_is_acknowledged_then_ends_every_task() {
     );
 }
 
+/// A crash (PY-I11): every task still running fails `internal` with what the panic said, one
+/// that ended stays ended, one that never started is skipped because the attempt failed, and a
+/// cancel the run heard ends `failed`, never `cancelled`.
+#[test]
+fn a_crash_fails_what_runs_and_is_never_a_cancel() {
+    let (lc, told) = lifecycle(&["src", "k1", "k2", "out"]);
+    lc.begin(false);
+    lc.on(&StageEvent::Running);
+    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::StageStarted { stage: 1 });
+    lc.on(&StageEvent::QueueClosed {
+        queue: 0,
+        counters: counters(10),
+    });
+    lc.cancel_acknowledged();
+    lc.end(Ending::Crashed("index out of bounds"));
+    let s = said(&told);
+    assert_eq!(
+        &s[s.len() - 4..],
+        &[
+            "task_failed k1 internal",
+            "task_skipped k2 attempt_failed",
+            "task_skipped out attempt_failed",
+            "cancel_ended -",
+        ]
+    );
+    let told = told.lock().unwrap();
+    let failed = told.iter().find(|e| e["kind"] == "task_failed").unwrap();
+    assert_eq!(failed["message"], "index out of bounds");
+    assert_eq!(failed["scope"], "task");
+    assert_eq!(failed["retryable"], false);
+    assert_eq!(told.last().unwrap()["disposition"], "failed");
+}
+
+/// A crash when no task is running is the attempt's: one `internal` failure naming no task.
+#[test]
+fn a_crash_with_nothing_running_fails_the_attempt() {
+    let (lc, told) = lifecycle(&["src", "out"]);
+    lc.begin(false);
+    lc.end(Ending::Crashed("the plan broke"));
+    lc.end(Ending::Crashed("a second crash"));
+    let s = said(&told);
+    assert_eq!(
+        &s[s.len() - 3..],
+        &[
+            "task_failed - internal",
+            "task_skipped src attempt_failed",
+            "task_skipped out attempt_failed",
+        ]
+    );
+    assert_eq!(told.lock().unwrap()[s.len() - 3]["scope"], "attempt");
+}
+
 /// A cancel that arrives as the run completes ends `completed`: the run was not stopped by it.
 #[test]
 fn a_cancel_the_run_outran_says_so() {
