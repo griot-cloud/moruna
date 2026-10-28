@@ -26,6 +26,7 @@ mod sc_t22_copy_behind_a_slow_sink;
 mod sc_t23_refusal_follows_the_policy;
 mod sc_t24_zero_row_splits;
 mod sc_t25_any_plan_finishes;
+mod sc_t26_a_drive_that_panics_ends_the_run;
 mod sc_t2_admission_rule;
 mod sc_t3_source_admission;
 mod sc_t4_one_record_per_morsel_stage;

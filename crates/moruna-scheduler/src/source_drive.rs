@@ -526,6 +526,30 @@ fn close_when_exhausted(shared: &Shared, inflight: &[InFlight<'_>]) {
     shared.advance_closes();
 }
 
+/// f.5, h: the source drive panicked, in the source's code or in its own. The run ends with a
+/// source diagnostic naming the split of the oldest read the drive had issued and not pushed
+/// (the read it was most likely serving), or the split at the cursor when none was in flight,
+/// and saying what the panic said. Nothing is left waiting for a drive that is gone: without
+/// this the run waited for ever, its tasks never ended (MA2).
+pub(crate) fn panicked(shared: &Shared, panic: &(dyn std::any::Any + Send)) {
+    let split = {
+        let cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        match cursor.issued.values().next() {
+            Some(origin) => origin.split,
+            None => shared
+                .plan
+                .get(cursor.split_index as usize)
+                .map_or(cursor.split_index, |split| split.id),
+        }
+    };
+    let msg = format!(
+        "the source drive panicked: {}",
+        crate::worker::panic_message(panic)
+    );
+    tracing::error!(target: "sched.drive_panicked", split, %msg, "the source drive died");
+    crate::policy::terminate(shared, MorunaError::Source { split, msg });
+}
+
 /// The drive-side helper of f.9: one read of about `bytes` at the cursor, issued and waited on
 /// here so the probing thread never waits on a completion itself.
 fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: &mut Context<'_>) {
