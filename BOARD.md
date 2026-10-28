@@ -539,7 +539,7 @@ Waves are gates, not start order: an item starts when what it needs is merged. T
 
 | wave | item | what | status |
 |---|---|---|---|
-| A. Any language on Linux, today | KA1 | `image` kind: OCI unpack (layers, whiteouts, digest cache), run the image's command under `moruna-sandbox`, Arrow IPC over stdin and stdout | in progress |
+| A. Any language on Linux, today | KA1 | `image` kind: OCI unpack (layers, whiteouts, digest cache), run the image's command under `moruna-sandbox`, Arrow IPC over stdin and stdout (SDD 19; IM-T1 to IM-T27, SC-T27) | in review (`feat/ka1-image-kind`, `bf2de62`, draft PR against `v1`) |
 | | KA2 | the data-plane port: `batch_get`, `batch_put`, `port_call` as one trait the engine uses; today's sandbox channel is its first adapter | todo |
 | | KA3 | the Python builder: `@moruna.kernel` to a four-layer image (runtime, locked dependencies, shim, function) | todo |
 | B. The kernel boots | KB1 | microkernel core on OSTD: boot, address spaces, processes, threads, IPC, capability handles, timers; boots under QEMU in CI on x86_64 | in progress |
