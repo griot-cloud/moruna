@@ -63,8 +63,8 @@ fn counters(rows: u64) -> StageCounters {
 }
 
 /// The source, one kernel and the sink of a run that probes, then runs, then completes: every
-/// task is registered and waits, the probe's work is calibrating, `Running` makes the source
-/// ready and moves the calibrating tasks to their own phases, each queue's close completes its
+/// task is registered and waits, each task the probe starts is ready and then calibrating,
+/// `Running` moves the calibrating tasks to their own phases, each queue's close completes its
 /// producer and drains its consumer, and the sink commits and completes.
 #[test]
 fn a_completed_run_tells_each_task_once_in_order() {
@@ -99,6 +99,7 @@ fn a_completed_run_tells_each_task_once_in_order() {
             "task_waiting src engine_preparing",
             "task_waiting k1 awaiting_input",
             "task_waiting out awaiting_input",
+            "task_ready src",
             "task_started src calibrating",
             "task_ready k1",
             "task_started k1 calibrating",
@@ -146,7 +147,7 @@ fn a_completed_run_tells_each_task_once_in_order() {
 
 /// Empty input: nothing is read, nothing is fed, every queue closes and the sink commits with
 /// no write. The source and the kernel complete without having started (no duration), the sink
-/// starts at its commit.
+/// is ready and starts at its commit.
 #[test]
 fn empty_input_completes_what_never_had_input() {
     let (lc, told) = lifecycle(&["src", "k1", "out"]);
@@ -172,6 +173,7 @@ fn empty_input_completes_what_never_had_input() {
             "task_ready src",
             "task_completed src succeeded",
             "task_completed k1 succeeded",
+            "task_ready out",
             "task_started out committing",
             "task_completed out succeeded",
         ]
@@ -419,4 +421,56 @@ fn a_group_is_registered_with_its_members() {
     assert_eq!(told[0]["resumed"], true);
     assert_eq!(told[1]["members"], json!(["orders", "customers"]));
     assert_eq!(told[2]["members"], json!([]));
+}
+
+/// PY-I12, the interleaving behind HO-T16's missing `task_ready`: a producer pushes its first
+/// morsel and only then tells `Fed` on its own thread, so the consumer, on another thread, can
+/// take the morsel and tell its start first. Each consumer is told ready and then started, the
+/// late `Fed` tells nothing, and nothing is told twice. The source read while the chain
+/// calibrates, before `Running`, is told ready before it is started the same way.
+#[test]
+fn a_start_that_outruns_its_feed_is_told_ready_first() {
+    let (lc, told) = lifecycle(&["src", "k1", "out"]);
+    lc.begin(false);
+    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::Running);
+    lc.on(&StageEvent::StageStarted { stage: 1 });
+    lc.on(&StageEvent::Fed { queue: 0 });
+    lc.on(&StageEvent::SinkWriting);
+    lc.on(&StageEvent::Fed { queue: 1 });
+    lc.on(&StageEvent::Fed { queue: 1 });
+    assert_eq!(
+        &said(&told)[7..],
+        &[
+            "task_ready src",
+            "task_started src calibrating",
+            "task_phase src reading",
+            "task_ready k1",
+            "task_started k1 applying",
+            "task_ready out",
+            "task_started out writing",
+        ]
+    );
+}
+
+/// A sink that commits with nothing written starts at its commit, and was ready for it first.
+#[test]
+fn a_sink_that_starts_at_its_commit_is_ready_first() {
+    let (lc, told) = lifecycle(&["src", "out"]);
+    lc.begin(false);
+    lc.on(&StageEvent::Running);
+    lc.on(&StageEvent::QueueClosed {
+        queue: 0,
+        counters: StageCounters::default(),
+    });
+    lc.on(&StageEvent::SinkCommitting);
+    assert_eq!(
+        &said(&told)[5..],
+        &[
+            "task_ready src",
+            "task_completed src succeeded",
+            "task_ready out",
+            "task_started out committing",
+        ]
+    );
 }
