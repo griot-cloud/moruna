@@ -62,12 +62,15 @@ fn read_now(
             .map_err(|e| source_err(split.id, format!("{}: {e}", file.path.display())))?
     };
 
-    // f.3: one contiguous range over the projected chunks while the gaps are small.
+    // f.3: one contiguous range over the projected chunks while the gaps are small. Every
+    // span lies inside the file as it is now (SO-I10), so the ranges below are well formed and
+    // the reader's own span arithmetic cannot fail.
     let mut spans: Vec<(u64, u64)> = Vec::new();
     for leaf in &file.projected {
-        let chunk = group.column(*leaf);
-        let (start, length) = chunk.byte_range();
-        spans.push((start, start + length));
+        let (_, span) =
+            super::plan::chunk_span(&file.path, group, entry.row_group, *leaf, file_len)
+                .map_err(|msg| source_err(split.id, msg))?;
+        spans.push(span);
     }
     spans.sort_unstable();
     let ranges = coalesce(&spans, page, file_len);
