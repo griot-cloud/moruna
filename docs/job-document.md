@@ -45,6 +45,12 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 {"kind": "parquet", "url": "s3://acme-data/reviews/", "options": {"columns": ["review_id", "text"]}}
 ```
 
+**`arrow_ipc`**: `url` is a local file, a local directory or a list of them; a directory is read for its `.arrow` files, in name order. Only the Arrow IPC file format is read, not the stream format, and every file must have the same schema. `options.columns` lists the columns to read, and `options.split_rows` sets the rows each piece of work is cut toward, from whole record batches (by default, one piece per record batch).
+
+```json
+{"kind": "arrow_ipc", "url": "/data/features/", "options": {"columns": ["id", "x"]}}
+```
+
 **`vortex`**: `url` is a path, a URL or a list of them; a directory or prefix is read for its `.vortex` files. `options.columns` lists the columns to read, and `options.split_bytes` sets the size each piece of work is cut toward (default 128 MiB).
 
 ```json

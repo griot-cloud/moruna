@@ -90,7 +90,7 @@ pub fn check<'m>(
 
 /// A schema `fb_to_schema` converts without panicking, whose fields arrow-ipc's decoder can
 /// build arrays of.
-fn check_schema(schema: ipc::Schema<'_>) -> Result<(), String> {
+pub(super) fn check_schema(schema: ipc::Schema<'_>) -> Result<(), String> {
     let fields = schema.fields().ok_or("the schema has no field list")?;
     let big_endian = schema.endianness() == ipc::Endianness::Big;
     for field in fields {

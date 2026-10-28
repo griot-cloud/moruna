@@ -316,3 +316,49 @@ fn find_first_entry(bytes: &[u8]) -> usize {
     let within = raw.as_ptr() as usize - message.as_ptr() as usize;
     rb_start + 8 + within
 }
+
+/// KA11: the record batch message declares the body length an IPC file's footer block must repeat
+/// (Arrow C++ refuses a file in which they differ). The length is a multiple of 8, reaches the end
+/// of the last buffer, and every entry, an empty one too, lies inside it.
+#[test]
+fn ct_t18_the_message_declares_its_body_length() {
+    let alloc = FakeAllocator::new();
+    let mut with_a_body = 0;
+    for batch in &batches() {
+        let (framing, bodies) = encode_framing(batch, PAGE, 0, &alloc).expect("the framing");
+        let bytes: &[u8] = &framing;
+        let first = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) as usize;
+        let rb = 8 + first;
+        let len = u32::from_le_bytes(bytes[rb + 4..rb + 8].try_into().expect("4 bytes")) as usize;
+        let message = arrow::ipc::root_as_message(&bytes[rb + 8..rb + 8 + len]).expect("message");
+        let declared = message.bodyLength() as usize;
+        assert_eq!(declared % 8, 0, "{:?}", batch.schema());
+        let body_base = rb + 8 + len;
+        let furthest = bodies
+            .iter()
+            .filter(|(_, body)| !body.is_empty())
+            .map(|(offset, body)| offset + body.len() - body_base)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            declared,
+            furthest.next_multiple_of(8),
+            "{:?}",
+            batch.schema()
+        );
+        let entries = message
+            .header_as_record_batch()
+            .and_then(|b| b.buffers())
+            .expect("buffers");
+        for entry in entries {
+            assert!(
+                (entry.offset() + entry.length()) as usize <= declared,
+                "an entry lies outside the declared body"
+            );
+        }
+        if declared > 0 {
+            with_a_body += 1;
+        }
+    }
+    assert!(with_a_body > 10);
+}

@@ -38,6 +38,14 @@ Moruna plans the work from the statistics a Vortex file keeps for every 8,192 ro
 
 When Vortex has stored a column uncompressed, because no encoding made it smaller, that column reaches your kernel without being copied: Moruna reads it from disk into its own memory and hands the kernel those same bytes. A compressed column is decompressed and then copied into Moruna's memory once, as a Parquet column is. Either way the memory counts against the budget.
 
+**Arrow IPC.** `moruna.ArrowIpcSource` reads Arrow IPC files, the format `pyarrow.ipc.new_file` writes and `moruna.ArrowIpcSink` produces, from a file or a directory of `.arrow` files:
+
+```python
+source = moruna.ArrowIpcSource("features/", columns=["id", "x"])
+```
+
+Only the file format is read, and a stream is refused. Each record batch is read from disk into Moruna's own memory and used where it lies, with no copy, so it counts against the budget as it is read. A column whose values are dictionary encoded is not read yet.
+
 **Tensor files.** `moruna.TensorSource` reads safetensors files, or files in Moruna's aligned binary format, and passes each tensor to kernels that declare `accepts="tensor"`. Name the files, not a directory:
 
 ```python

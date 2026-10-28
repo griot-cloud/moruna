@@ -1,4 +1,4 @@
-//! What `ParquetSource`, `VortexSource`, `TensorSource`, `IteratorSource`, `ParquetSink`,
+//! What `ParquetSource`, `VortexSource`, `ArrowIpcSource`, `TensorSource`, `IteratorSource`, `ParquetSink`,
 //! `VortexSink`, `TensorSink`, `ArrowIpcSink` and the user's `moruna.Source` and `moruna.Sink`
 //! subclasses carry from Python into the facade (d.2, b).
 //!
@@ -11,7 +11,9 @@
 use std::path::Path;
 
 use moruna_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorSinkConfig, VortexSinkConfig};
-use moruna_sources::{ParquetSourceConfig, TensorSourceConfig, VortexSourceConfig};
+use moruna_sources::{
+    ArrowIpcSourceConfig, ParquetSourceConfig, TensorSourceConfig, VortexSourceConfig,
+};
 
 /// Which source a run reads, and with what settings.
 pub enum SourceSpec {
@@ -19,6 +21,8 @@ pub enum SourceSpec {
     Parquet(ParquetSourceConfig),
     /// `moruna.VortexSource`.
     Vortex(VortexSourceConfig),
+    /// `moruna.ArrowIpcSource`.
+    ArrowIpc(ArrowIpcSourceConfig),
     /// `moruna.TensorSource`.
     Tensor(TensorSourceConfig),
     /// `moruna.IteratorSource`: the iterable and the schema it promises. The object is held by
@@ -70,6 +74,7 @@ impl SourceSpec {
         match self {
             SourceSpec::Parquet(cfg) => cfg.urls.clone(),
             SourceSpec::Vortex(cfg) => cfg.urls.clone(),
+            SourceSpec::ArrowIpc(cfg) => cfg.urls.clone(),
             SourceSpec::Tensor(cfg) => cfg
                 .paths
                 .iter()

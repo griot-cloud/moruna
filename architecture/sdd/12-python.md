@@ -27,7 +27,7 @@ It refuses to know: anything a component owns. If logic appears here that is not
 
 **Kernel object.** What `@moruna.kernel` produces: a frozen `#[pyclass]` carrying a `PyKernel` built from the `PyKernelSpec` (05 d.1), passed to `run`.
 
-**Handle.** A Python object wrapping a Rust source or sink (`ParquetSource`, `VortexSource`, `TensorSource`, `IteratorSource`, `ParquetSink`, `VortexSink`, `TensorSink`, `ArrowIpcSink`), constructed eagerly (Parquet footers are read at construction so errors surface early). An instance of a user's `moruna.Source` or `moruna.Sink` subclass (d.2, 2026-09-29) is not a handle: it is the user's object, passed to the runtime as it is and called through `moruna_sources::PySource` and `moruna_sinks::PySink` (07 e.6, 08 f.10).
+**Handle.** A Python object wrapping a Rust source or sink (`ParquetSource`, `VortexSource`, `ArrowIpcSource`, `TensorSource`, `IteratorSource`, `ParquetSink`, `VortexSink`, `TensorSink`, `ArrowIpcSink`), constructed eagerly (Parquet footers are read at construction so errors surface early). An instance of a user's `moruna.Source` or `moruna.Sink` subclass (d.2, 2026-09-29) is not a handle: it is the user's object, passed to the runtime as it is and called through `moruna_sources::PySource` and `moruna_sinks::PySink` (07 e.6, 08 f.10).
 
 **Runtime thread.** The helper thread `moruna.run` spawns to execute `Runtime::run`; the Python main thread waits on it while polling for signals (f.5).
 
@@ -132,6 +132,7 @@ def kernel(fn=None, *, stateful=False, instances=1, device_memory=False,
 
 class ParquetSource:   def __init__(self, urls: str | list[str], *, columns=None, filters=None)
 class VortexSource:    def __init__(self, urls: str | list[str], *, columns=None, split_bytes=None)   # 07 e.7, e.8; 2026-09-29
+class ArrowIpcSource:  def __init__(self, urls: str | list[str], *, columns=None, split_rows=None)    # 07 e.9, e.10; KA9, 2026-10-28
 class TensorSource:    def __init__(self, paths: str | list[str], *, tensors=None)
 class IteratorSource:  def __init__(self, iterable, *, schema: pyarrow.Schema | tuple[str, tuple[int, ...]])
 class ParquetSink:     def __init__(self, url: str, *, row_group_bytes=None, file_bytes=None, compression="zstd")

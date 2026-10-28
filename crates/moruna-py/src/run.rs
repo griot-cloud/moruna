@@ -312,6 +312,16 @@ fn source_doc(source: &SourceSpec) -> Result<KindDoc, SpecError> {
                 },
             },
         ),
+        SourceSpec::ArrowIpc(cfg) => KindDoc::of(
+            "arrow_ipc",
+            &arrow_ipc::SourceSettings {
+                url: Urls(cfg.urls.clone()),
+                options: arrow_ipc::SourceOptions {
+                    columns: cfg.columns.clone(),
+                    split_rows: cfg.split_rows,
+                },
+            },
+        ),
         SourceSpec::Tensor(cfg) => KindDoc::of(
             "tensor",
             &tensor::SourceSettings {
