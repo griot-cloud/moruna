@@ -538,3 +538,146 @@ impl Kernel for Printer {
         Ok(input)
     }
 }
+
+/// A `python` kernel kind for the tests (SDD 18): the kernel a document names as `{"kind":
+/// "python", "module", "callable"}` is the one `make` hands out for the entry's place and its
+/// callable. It stands in for the Python surface's kind, imported code as that is, so a strict
+/// build refuses it (KD-I6).
+pub struct TestKernels<F>(pub F);
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TestKernelSettings {
+    module: String,
+    callable: String,
+}
+
+impl<F> moruna_runtime::kinds::RunnableKind for TestKernels<F>
+where
+    F: Fn(usize, &str) -> moruna_kernel::Result<Arc<dyn Kernel>> + Send + Sync,
+{
+    fn declaration(&self) -> moruna_runtime::kinds::Declaration {
+        use moruna_runtime::kinds::{Declaration, Fact, Flow, Isolation, Needs, Role};
+        Declaration {
+            name: "python".into(),
+            role: Role::Kernel,
+            summary: "the tests' kernels, named by callable".into(),
+            settings: moruna_runtime::kinds::settings_schema::<TestKernelSettings>(
+                "python",
+                vec![serde_json::json!({"module": "tests", "callable": "pass"})],
+            ),
+            inputs: Flow::Batches,
+            outputs: Flow::Batches,
+            needs: Needs::nothing(),
+            deterministic: Fact::No,
+            preserves_columns: Fact::No,
+            isolation: Isolation::Imported,
+        }
+    }
+
+    fn stage(
+        &self,
+        entry: &moruna_runtime::kinds::Entry<'_>,
+        _cx: &mut moruna_runtime::kinds::Context,
+    ) -> moruna_kernel::Result<moruna_runtime::kinds::Stage> {
+        let settings: TestKernelSettings = entry.settings()?;
+        let _ = settings.module;
+        let kernel = (self.0)(entry.index().unwrap_or(0), &settings.callable)?;
+        Ok(moruna_runtime::kinds::Stage::of(kernel))
+    }
+}
+
+/// The standard kinds, with [`TestKernels`] over `make` as the `python` kernel kind.
+pub fn kinds_with<F>(make: F) -> moruna_runtime::kinds::Registry
+where
+    F: Fn(usize, &str) -> moruna_kernel::Result<Arc<dyn Kernel>> + Send + Sync + 'static,
+{
+    let mut kinds = moruna_runtime::kinds::Registry::standard();
+    if let Err(e) = kinds.register_kernel(Arc::new(TestKernels(make))) {
+        panic!("the tests' python kind registers: {e}");
+    }
+    kinds
+}
+
+/// A source or sink kind for the tests whose part is what `make` makes: what a library caller
+/// registers for an object it holds (`"kind": "python"`).
+pub struct Handed<T> {
+    name: &'static str,
+    make: Box<dyn Fn() -> T + Send + Sync>,
+}
+
+impl<T> Handed<T> {
+    /// The kind `name`, whose part `make` makes.
+    pub fn new(name: &'static str, make: impl Fn() -> T + Send + Sync + 'static) -> Handed<T> {
+        Handed {
+            name,
+            make: Box::new(make),
+        }
+    }
+
+    fn declared(&self, role: moruna_runtime::kinds::Role) -> moruna_runtime::kinds::Declaration {
+        use moruna_runtime::kinds::{Declaration, Fact, Flow, Isolation, Needs, Role};
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        struct Nothing {}
+        Declaration {
+            name: self.name.into(),
+            role,
+            summary: "an object the test holds".into(),
+            settings: moruna_runtime::kinds::settings_schema::<Nothing>(
+                self.name,
+                vec![serde_json::json!({})],
+            ),
+            inputs: if role == Role::Source {
+                Flow::Nothing
+            } else {
+                Flow::Batches
+            },
+            outputs: if role == Role::Source {
+                Flow::Batches
+            } else {
+                Flow::Nothing
+            },
+            needs: Needs::nothing(),
+            deterministic: Fact::No,
+            preserves_columns: Fact::No,
+            isolation: Isolation::Caller,
+        }
+    }
+}
+
+impl moruna_runtime::kinds::SourceKind for Handed<moruna_runtime::SourceSpec> {
+    fn declaration(&self) -> moruna_runtime::kinds::Declaration {
+        self.declared(moruna_runtime::kinds::Role::Source)
+    }
+
+    fn source(
+        &self,
+        _entry: &moruna_runtime::kinds::Entry<'_>,
+        _cx: &mut moruna_runtime::kinds::Context,
+    ) -> moruna_kernel::Result<moruna_runtime::kinds::BuiltSource> {
+        Ok(moruna_runtime::kinds::BuiltSource {
+            spec: (self.make)(),
+            targets: Vec::new(),
+            memory: None,
+        })
+    }
+}
+
+impl moruna_runtime::kinds::SinkKind for Handed<moruna_runtime::SinkSpec> {
+    fn declaration(&self) -> moruna_runtime::kinds::Declaration {
+        self.declared(moruna_runtime::kinds::Role::Sink)
+    }
+
+    fn sink(
+        &self,
+        _entry: &moruna_runtime::kinds::Entry<'_>,
+        _cx: &mut moruna_runtime::kinds::Context,
+    ) -> moruna_kernel::Result<moruna_runtime::kinds::BuiltSink> {
+        Ok(moruna_runtime::kinds::BuiltSink {
+            spec: (self.make)(),
+            target: String::new(),
+            memory: None,
+        })
+    }
+}

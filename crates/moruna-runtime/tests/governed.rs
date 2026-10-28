@@ -21,7 +21,9 @@ use moruna_kernel::CancelToken;
 use moruna_kernel::arrow::array::{AsArray, Int64Array, RecordBatch, StringArray};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use moruna_runtime::Runtime;
-use moruna_runtime::job::{BuildOptions, JobSpec, NoKernels, build, entry_of};
+use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::kinds::Registry;
+use moruna_runtime::kinds::governed::entry_of;
 use support::apart::{self, BUDGETS};
 use support::{Scratch, one_run_at_a_time};
 
@@ -236,7 +238,7 @@ fn child_run() {
     let env = |_: &str| None;
     let outcome = match build(
         &job,
-        &NoKernels,
+        &Registry::standard(),
         BuildOptions {
             strict: true,
             env: &env,
@@ -682,7 +684,7 @@ fn refusal(
     let env = |_: &str| None;
     build(
         &job,
-        &NoKernels,
+        &Registry::standard(),
         BuildOptions {
             strict: false,
             env: &env,
@@ -821,14 +823,7 @@ impl moruna_datafusion::engine::BindingResolver for MovedBindings {
     }
 }
 
-impl moruna_runtime::job::KernelLoader for Moved {
-    fn load(
-        &self,
-        index: usize,
-        doc: &moruna_runtime::job::KernelDoc,
-    ) -> moruna_kernel::Result<moruna_runtime::job::LoadedKernel> {
-        NoKernels.load(index, doc)
-    }
+impl moruna_runtime::kinds::Embedding for Moved {
     fn bindings(
         &self,
         root: &Path,
@@ -842,15 +837,15 @@ impl moruna_runtime::job::KernelLoader for Moved {
     }
 }
 
-/// A loader's binding resolution is the engine's: where it says a contract's files are is
+/// A program's binding resolution is the engine's: where it says a contract's files are is
 /// where the run reads them, so a sink over them is refused as a sink over its own source.
 #[test]
-fn a_loaders_bindings_decide_where_a_contract_is() {
+fn a_programs_bindings_decide_where_a_contract_is() {
     let scratch = Scratch::new("h6_bindings");
     let root = scratch.path().join("disk");
     disk(&root);
     let owner = caller("ana", "demo");
-    let job = |loader: &dyn moruna_runtime::job::KernelLoader| {
+    let job = |kinds: &Registry| {
         let job = JobSpec::from_value(serde_json::json!({
             "moruna_spec": 1,
             "source": {"kind": "datafusion", "root": root, "contract": "demo/big", "caller": owner},
@@ -861,7 +856,7 @@ fn a_loaders_bindings_decide_where_a_contract_is() {
         let env = |_: &str| None;
         build(
             &job,
-            loader,
+            kinds,
             BuildOptions {
                 strict: false,
                 env: &env,
@@ -873,8 +868,9 @@ fn a_loaders_bindings_decide_where_a_contract_is() {
         .map(|_| ())
         .map_err(|e| e.to_string())
     };
-    job(&NoKernels).expect("apart on the engine's own resolution");
-    let moved = job(&Moved).expect_err("together on the loader's");
+    job(&Registry::standard()).expect("apart on the engine's own resolution");
+    let moved = job(&Registry::standard().with_embedding(Arc::new(Moved)))
+        .expect_err("together on the program's");
     assert!(
         moved.contains("the sink writes where the source reads"),
         "{moved}"
@@ -908,7 +904,7 @@ fn sc_t24_a_query_with_no_rows_finishes() {
     let env = |_: &str| None;
     let built = build(
         &job,
-        &NoKernels,
+        &Registry::standard(),
         BuildOptions {
             strict: true,
             env: &env,

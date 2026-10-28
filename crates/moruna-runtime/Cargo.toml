@@ -37,6 +37,8 @@ parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "0af4c09
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The settings schema each kind declares (SDD 18 e.2).
+schemars = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

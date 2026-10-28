@@ -17,7 +17,8 @@ use moruna_kernel::{
     BoxFuture, CancelToken, MorunaError, Payload, PayloadKind, PayloadSpec, Seq, Sink, SinkSummary,
     SourceSchema, TierPref,
 };
-use moruna_runtime::job::{BuildOptions, JobSpec, NoKernels, build};
+use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::kinds::Registry;
 use moruna_runtime::{RunSpec, Runtime, SinkSpec};
 use serde_json::json;
 use support::apart::{self, BUDGETS};
@@ -174,7 +175,7 @@ fn child_run() {
         let env = |_: &str| None;
         let outcome = match build(
             &doc,
-            &NoKernels,
+            &Registry::standard(),
             BuildOptions {
                 strict: true,
                 env: &env,

@@ -101,7 +101,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
   "moruna_spec": 1,
   "run_id": "01J…",                      // host-assigned; default: generated
   "source": {
-    "kind": "parquet",                     // parquet | vortex | tensor | datafusion | iterator | python (the last two library only)
+    "kind": "parquet",                     // a source kind the registry resolves (SDD 18): parquet | vortex | tensor | datafusion; iterator | python, registered by the library only
     "url": "file:///data/raw/events/",     // or s3://…, gs://…; see object_store
     "options": {}
   },
@@ -109,12 +109,12 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
     { "kind": "python", "module": "/job/kernels.py", "callable": "shout",
       "fingerprint": "sha256:…",           // from `moruna check`; refused if the loaded kernel's differs
       "expected_amplification": 1.5, "releases_gil": true },
-    { "kind": "rust",   "crate": "…", "symbol": "…" },               // reserved
+    { "kind": "rust",   "crate": "…", "symbol": "…" },               // no such kind is registered: refused (SDD 18 KD-I7)
     { "kind": "package", "path": "/opt/kernels/agent.wasm", "fingerprint": "sha256:…",
       "ports": { "mcp":  { "host": "mcp" },                              // §4.10
                  "read": { "guest": "read", "deadline_ms": 600000 } } }
   ],
-  "sink":   { "kind": "parquet", "url": "file:///data/refined/events/" },   // parquet | vortex | tensor | arrow_ipc | peql (on_violation, excluded_url: §4.5)
+  "sink":   { "kind": "parquet", "url": "file:///data/refined/events/" },   // a sink kind: parquet | vortex | tensor | arrow_ipc | peql (on_violation, excluded_url: §4.5)
   "budget": {
     "memory_bytes": null,                  // null: discover
     "cpu": null,
@@ -135,6 +135,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
 ```
 
 Rules:
+- **Kinds are named, not enumerated.** `source.kind`, `kernels[].kind` and `sink.kind` are strings the program's registry of kinds resolves when the document is built, each to the adapter registered under it for that role, or a refusal at `<field>.kind` naming the kinds of that role the program has (SDD 18 KD-I1). The rest of an entry is that kind's settings, which the kind's declaration describes as a JSON Schema and its adapter reads (SDD 18 e.2); `moruna kinds` lists every declaration. The document itself names no kind.
 - Every field of the Rust `RunSpec` has a JSON field; the Python surface's `run(...)` becomes a constructor of the same struct, so there is one code path (H1).
 - **Precedence:** a spec field set → the spec wins; a spec field `null` → discovery, then the environment variable if the field has one, then the default. `moruna run` prints every field it resolved from the environment as a `notes` entry, and **refuses** when `--strict` (the hosted default) and any such resolution happened (H8).
 - The spec is content-addressed: `sha256(canonical JSON)` is the `plan digest` the manifest already records (parent §10), so a resume with a changed spec is refused as today.
@@ -207,7 +208,7 @@ The sizing arithmetic (ceiling − baseline − reserve − expected kernel stat
 
 A governed engine needs nothing from Moruna beyond this: it hands over the plan and Moruna sees only the batches the plan emits. The spec's `source.kind = "datafusion"` names the engine by crate feature; the first engine is peQL 0.4.0 (`github.com/griot-cloud/peQL`), whose `Engine::view(name, caller)` returns a `LogicalPlan` already wrapped in its `Gate` node with the caller's context bound (`src/engine.rs:621-670`), so `PlanSource` executes a plan that peQL's own `ensure_gated` invariant has approved. peQL's binding is a streaming `ListingTable` over the attached disk (`src/binding.rs:117-150`); its per-partition streams are what `read` consumes.
 
-**Contracts arrive compiled, in the job document.** The engine Moruna opens at the source's or sink's `root` keeps its manifests, privacy ledger and audit log on the attached disk, and its contracts in memory: exactly the ones the document carries in `contracts`, registered as compiled (`Engine::register_compiled`) when the document is built and gone when the process exits. peQL never compiles them and Moruna never compiles one. Moruna reads no contract from the disk and writes none there; a contract the job names that the document does not carry is refused by the field that names it, whatever the disk holds. Before registering an entry Moruna asks its kernel loader to admit it (`KernelLoader::admit`); the default admits what the document carries, and a host that knows where the contracts it trusts come from refuses the others there.
+**Contracts arrive compiled, in the job document.** The engine Moruna opens at the source's or sink's `root` keeps its manifests, privacy ledger and audit log on the attached disk, and its contracts in memory: exactly the ones the document carries in `contracts`, registered as compiled (`Engine::register_compiled`) when the document is built and gone when the process exits. peQL never compiles them and Moruna never compiles one. Moruna reads no contract from the disk and writes none there; a contract the job names that the document does not carry is refused by the field that names it, whatever the disk holds. Before registering an entry Moruna asks the program running the document to admit it (`Embedding::admit`, SDD 18 d.1); the default admits what the document carries, and a host that knows where the contracts it trusts come from refuses the others there.
 
 **The write side is the same seam in reverse.** `PeqlSink` wraps `Engine::write(name, batches, mode)` (`src/engine.rs:389-495`): Moruna's sink queue delivers morsels, peQL conforms them to the contract's row schema, computes the flag and derived columns its `WritePlan` demands, writes partitioned, clustered, bloom-filtered Parquet, and refreshes the manifest on `finish`. Moruna makes that path out-of-core; peQL's semantics are untouched. Both `PlanSource` and `PeqlSink` live in `moruna-datafusion` behind a `peql` feature, so the bridge crate depends on `peql` and `peql` never depends on Moruna.
 
@@ -294,7 +295,7 @@ A kernel that reasons over its batches (a model's agent, a lookup against a serv
 
 **The import.** The `moruna:kernel` world gains its second import: `call(port: string, request: list<u8>) -> result<list<u8>, string>`. `ok` is the port's answer; `err` is the port's own refusal, for the component to decide about. Every other ending is a trap that fails the stage with its cause: a name the stage's entry does not list (`port <name> is not listed for this stage (it lists …)`), a request or answer past 64 MiB, no answer within the port's deadline (`port <name>: no answer within its deadline of <n> ms`), an answer that never came (the peer closed, a handler panicked), and the run's cancel, which ends the run as cancelled. A component under `moruna check` or `moruna load` has no ports, and a call is refused, said so. `verify` admits `call` with exactly that type beside `read-asset`, and refuses every other import, WASI's streams included.
 
-**The ports.** `kernels[].ports` (§4.1) maps each name to where it goes. A `host` port is served by the host protocol's peer: the call is a `port_call`, the answer a `port_reply`, a call given up a `port_cancel` (§4.3), all on the one connection the run already has, so the guest needs no second channel. A `guest` port is answered inside the machine by a handler the program embedding Moruna registered (`KernelLoader::guest_port`), each call on a thread of its own, told the deadline and a cancel that is set when the stage stops waiting; whatever the handler does, the stage's deadline and the run's cancel hold. Every package stage of a run knows its list, empty or not, so an unlisted name is refused by name and reported against the stage (`task_failed`, `kernel_error`).
+**The ports.** `kernels[].ports` (§4.1) maps each name to where it goes. A `host` port is served by the host protocol's peer: the call is a `port_call`, the answer a `port_reply`, a call given up a `port_cancel` (§4.3), all on the one connection the run already has, so the guest needs no second channel. A `guest` port is answered inside the machine by a handler the program embedding Moruna registered (`Embedding::guest_port`, SDD 18 d.1), each call on a thread of its own, told the deadline and a cancel that is set when the stage stops waiting; whatever the handler does, the stage's deadline and the run's cancel hold. Every package stage of a run knows its list, empty or not, so an unlisted name is refused by name and reported against the stage (`task_failed`, `kernel_error`).
 
 **A stage that waits.** A call blocks its worker inside `apply` for as long as it takes; the other workers go on. While a call waits: Moruna's heartbeat thread keeps the peer hearing a heartbeat at least every 2 s; the task is told `task_waiting` with `reason: "port_call"` and the port, and `task_phase` when no call of it waits any more; the controller classifies `Waiting` and does not shrink the stage (§4.4); the checkpoint writes the stage's state as the batch began (§4.7). The wait is bounded by the port's `deadline_ms` and by nothing else Moruna has: fuel counts the component's own instructions, not its host's time.
 

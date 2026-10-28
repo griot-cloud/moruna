@@ -3,8 +3,8 @@
 //! listening, cancels and asks for a checkpoint (H1, H2, H8).
 //!
 //! The kernels are the Rust ones of `support`, named in the document as Python kernels are and
-//! handed out by a test loader; what is under test is the document, the session and the
-//! protocol, and the Python loader is `moruna-py`'s.
+//! handed out by a test kind registered as `python`; what is under test is the document, the
+//! session and the protocol, and the Python kinds are `moruna-py`'s.
 
 #![allow(clippy::result_large_err)]
 
@@ -20,7 +20,6 @@ use moruna_runtime::host::cli;
 use moruna_runtime::host::exit;
 use moruna_runtime::host::session::{self, HEARTBEAT, read_report_file};
 use moruna_runtime::host::transport::{self, Address};
-use moruna_runtime::job::{KernelDoc, KernelLoader, LoadedKernel};
 use moruna_runtime::{JobSpec, RunSpec, Runtime, SinkSpec, SourceSpec};
 use serde_json::{Value, json};
 use support::{
@@ -30,29 +29,25 @@ use support::{
 
 const RUN_ID: &str = "00112233445566778899aabbccddeeff";
 
-/// Hands out the support kernels by the callable a document names.
-struct TestKernels;
+/// The support kernels by the callable a document names.
+fn test_kernel(index: usize, callable: &str) -> moruna_kernel::Result<Arc<dyn Kernel>> {
+    Ok(match callable {
+        "double" => Arc::new(Doubler::new()),
+        "sleep" => Arc::new(Sleeper::new(700)),
+        "fail" => Arc::new(FailOnce::new(1)),
+        "print" => Arc::new(Printer::new(0, 0)),
+        "flood" => Arc::new(Printer::new(4_000, 200)),
+        other => {
+            return Err(moruna_kernel::MorunaError::Plan(format!(
+                "kernels[{index}]: no test kernel `{other:?}`"
+            )));
+        }
+    })
+}
 
-impl KernelLoader for TestKernels {
-    fn load(&self, index: usize, doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        let kernel: Arc<dyn Kernel> = match doc.callable.as_deref() {
-            Some("double") => Arc::new(Doubler::new()),
-            Some("sleep") => Arc::new(Sleeper::new(700)),
-            Some("fail") => Arc::new(FailOnce::new(1)),
-            Some("print") => Arc::new(Printer::new(0, 0)),
-            Some("flood") => Arc::new(Printer::new(4_000, 200)),
-            other => {
-                return Err(moruna_kernel::MorunaError::Plan(format!(
-                    "kernels[{index}]: no test kernel `{other:?}`"
-                )));
-            }
-        };
-        Ok(LoadedKernel {
-            kernel,
-            #[cfg(feature = "python")]
-            python: None,
-        })
-    }
+/// The standard kinds, and the support kernels as the `python` kind.
+fn kinds() -> moruna_runtime::kinds::Registry {
+    support::kinds_with(test_kernel)
 }
 
 fn no_env(_: &str) -> Option<String> {
@@ -93,7 +88,7 @@ fn write_doc(scratch: &Path, doc: &Value) -> PathBuf {
 
 fn run_cli(args: &[&str], env: &dyn Fn(&str) -> Option<String>) -> i32 {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    cli::main_with(&args, &TestKernels, CancelToken::new(), env, HEARTBEAT)
+    cli::main_with(&args, &kinds(), CancelToken::new(), env, HEARTBEAT)
 }
 
 fn report_file(scratch: &Path) -> Value {
@@ -566,7 +561,7 @@ fn ho_t11_strict_refusal() {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        cli::main_with(&args, &TestKernels, CancelToken::new(), &env, HEARTBEAT)
+        cli::main_with(&args, &kinds(), CancelToken::new(), &env, HEARTBEAT)
     });
     let conn = connect_when_ready(&socket);
     let (reader, mut writer, _close) = conn.into_parts();
@@ -636,7 +631,7 @@ fn ho_t12_exit_codes() {
         run_cli(&["run", &path.to_string_lossy()], &no_env),
         exit::RESUME_REFUSED
     );
-    // A kernel that no loader has is a refused document.
+    // A kernel the kind does not have is a refused document.
     let doc = document(scratch.path(), 4_000, 2, Some("unknown"));
     let path = write_doc(scratch.path(), &doc);
     assert_eq!(
@@ -698,7 +693,7 @@ fn ho_t13_report_file_placement() {
     let path = write_doc(scratch.path(), &doc);
     let outcome = session::run_file(
         &path,
-        &TestKernels,
+        &kinds(),
         &session::HostOptions {
             strict: true,
             env: &no_env,
@@ -964,7 +959,7 @@ fn ho_t18_a_kernel_failure_fails_its_task() {
     );
 }
 
-/// HO-T19 a refused document's tasks (MH 4.3): a kernel no loader has refuses the document after
+/// HO-T19 a refused document's tasks (MH 4.3): a kernel the kind does not have refuses the document after
 /// its tasks were registered; the attempt fails, and every task is skipped for it.
 #[test]
 fn ho_t19_a_refused_document_skips_every_task() {
