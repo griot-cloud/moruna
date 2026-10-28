@@ -383,7 +383,7 @@ enum Input {
     /// Nothing written yet: the schema goes with the first batch.
     Pending(File),
     /// The stream is open.
-    Open(StreamWriter<File>),
+    Open(Box<StreamWriter<File>>),
     /// The stream has ended.
     Closed,
 }
@@ -733,7 +733,7 @@ fn write_batch(
         && let Input::Pending(file) = std::mem::replace(input, Input::Closed)
     {
         let writer = StreamWriter::try_new(file, &batch.schema()).map_err(|e| e.to_string())?;
-        *input = Input::Open(writer);
+        *input = Input::Open(Box::new(writer));
     }
     match input {
         Input::Open(writer) => writer.write(batch).map_err(|e| e.to_string()),
