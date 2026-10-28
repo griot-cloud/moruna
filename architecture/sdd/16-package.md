@@ -291,7 +291,7 @@ world kernel {
 - A `.pex` whose `deps/` holds a library the sandbox's template already imported at another version: refused by the sandbox when the stage starts (SDD 17 f.6), naming both versions.
 - A `.wasm` with WASI imports (a `wasm32-wasip2` build): refused naming the first import (PK-I4).
 - A `.cwasm` from another version or for another fingerprint: ignored, compiled, noted (SDD 17 f.3).
-- `moruna check` on a `.pex` on macOS: refused, "a .pex runs in the sandbox, which needs Linux".
+- `moruna check` on a `.pex` on macOS: refused, "a .pex runs in the sandbox, which needs Linux (so does an image's command, SDD 19)".
 
 ## i. Configuration
 

@@ -273,7 +273,15 @@ pub fn load(
             Ok((packaged, arena, state))
         })
         .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
-    let package = packaged.package();
+    let package = packaged.package().cloned().ok_or_else(|| {
+        to_py_err(
+            py,
+            &moruna_kernel::MorunaError::Plan(
+                "moruna.load opens a package, and an image is not one".into(),
+            ),
+            Attachments::default(),
+        )
+    })?;
     Ok(PyPackageKernel {
         path: path.to_string(),
         fingerprint: package.fingerprint_string(),

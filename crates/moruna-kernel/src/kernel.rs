@@ -213,6 +213,15 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Payload>;
+    /// The end of the input (contracts d.7, amended 2026-10-28): called once per live instance,
+    /// after the last `apply` of the run and before the sink finishes. A kernel that runs
+    /// something apart (an image's process) ends its input here and answers for how it ended; an
+    /// `Err` ends the run. The default does nothing, which is every kernel that holds nothing
+    /// apart.
+    fn finish(&self, state: &mut dyn KernelState) -> crate::Result<()> {
+        let _ = state;
+        Ok(())
+    }
     /// The checkpoint of `instance` while it is inside `apply` and waiting on a port (MH 4.10):
     /// its state as it was when that `apply` began, which is what a resume restores before the
     /// morsel is applied again. `None` when the instance is not waiting on a port, and for every

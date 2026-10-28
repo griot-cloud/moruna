@@ -386,6 +386,513 @@ pub fn apply(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// The allow-list of an image's process (SDD 19 e.4, IM-I5): what any program in any language
+// needs to start and run, and nothing that reaches outside its own namespaces. A call not on it
+// kills the process (`SECCOMP_RET_KILL_PROCESS`, so the parent sees `SIGSYS`); `clone3` fails
+// with `ENOSYS` so the C library falls back to `clone`, whose flags the filter reads.
+// ---------------------------------------------------------------------------------------------
+
+/// The calls an image's process may make, by name, on every architecture (SDD 19 e.4).
+pub const IMAGE_ALLOWED: &[&str] = &[
+    "read",
+    "write",
+    "readv",
+    "writev",
+    "pread64",
+    "pwrite64",
+    "preadv",
+    "pwritev",
+    "preadv2",
+    "pwritev2",
+    "lseek",
+    "close",
+    "close_range",
+    "openat",
+    "openat2",
+    "newfstatat",
+    "fstat",
+    "statx",
+    "statfs",
+    "fstatfs",
+    "getdents64",
+    "readlinkat",
+    "faccessat",
+    "faccessat2",
+    "getcwd",
+    "chdir",
+    "fchdir",
+    "fcntl",
+    "ioctl",
+    "dup",
+    "dup3",
+    "pipe2",
+    "mkdirat",
+    "unlinkat",
+    "renameat",
+    "renameat2",
+    "linkat",
+    "symlinkat",
+    "ftruncate",
+    "truncate",
+    "fallocate",
+    "fadvise64",
+    "fsync",
+    "fdatasync",
+    "sync_file_range",
+    "syncfs",
+    "sync",
+    "flock",
+    "fchmod",
+    "fchmodat",
+    "fchown",
+    "fchownat",
+    "utimensat",
+    "umask",
+    "copy_file_range",
+    "sendfile",
+    "splice",
+    "tee",
+    "vmsplice",
+    "readahead",
+    "inotify_init1",
+    "inotify_add_watch",
+    "inotify_rm_watch",
+    "getxattr",
+    "lgetxattr",
+    "fgetxattr",
+    "listxattr",
+    "llistxattr",
+    "flistxattr",
+    "setxattr",
+    "lsetxattr",
+    "fsetxattr",
+    "removexattr",
+    "lremovexattr",
+    "fremovexattr",
+    "mmap",
+    "munmap",
+    "mremap",
+    "mprotect",
+    "madvise",
+    "mincore",
+    "brk",
+    "mlock",
+    "mlock2",
+    "munlock",
+    "mlockall",
+    "munlockall",
+    "msync",
+    "membarrier",
+    "memfd_create",
+    "get_mempolicy",
+    "set_mempolicy",
+    "mbind",
+    "pkey_alloc",
+    "pkey_free",
+    "pkey_mprotect",
+    "shmget",
+    "shmat",
+    "shmctl",
+    "shmdt",
+    "semget",
+    "semop",
+    "semctl",
+    "semtimedop",
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
+    "futex",
+    "futex_waitv",
+    "set_robust_list",
+    "get_robust_list",
+    "rseq",
+    "set_tid_address",
+    "clone3",
+    "exit",
+    "exit_group",
+    "wait4",
+    "waitid",
+    "execve",
+    "execveat",
+    "restart_syscall",
+    "prctl",
+    "capget",
+    "capset",
+    "getpid",
+    "gettid",
+    "getppid",
+    "getpgid",
+    "setpgid",
+    "getsid",
+    "setsid",
+    "getuid",
+    "geteuid",
+    "getgid",
+    "getegid",
+    "getresuid",
+    "getresgid",
+    "getgroups",
+    "setuid",
+    "setgid",
+    "setreuid",
+    "setregid",
+    "setresuid",
+    "setresgid",
+    "setgroups",
+    "setfsuid",
+    "setfsgid",
+    "getpriority",
+    "setpriority",
+    "sched_yield",
+    "sched_getaffinity",
+    "sched_setaffinity",
+    "sched_getparam",
+    "sched_setparam",
+    "sched_getscheduler",
+    "sched_setscheduler",
+    "sched_get_priority_max",
+    "sched_get_priority_min",
+    "sched_rr_get_interval",
+    "sched_getattr",
+    "sched_setattr",
+    "getcpu",
+    "prlimit64",
+    "getrusage",
+    "sysinfo",
+    "uname",
+    "times",
+    "personality",
+    "ioprio_get",
+    "ioprio_set",
+    "rt_sigaction",
+    "rt_sigprocmask",
+    "rt_sigreturn",
+    "rt_sigtimedwait",
+    "rt_sigsuspend",
+    "rt_sigpending",
+    "rt_sigqueueinfo",
+    "rt_tgsigqueueinfo",
+    "sigaltstack",
+    "kill",
+    "tkill",
+    "tgkill",
+    "signalfd4",
+    "setitimer",
+    "getitimer",
+    "pidfd_send_signal",
+    "pidfd_open",
+    "clock_gettime",
+    "clock_getres",
+    "clock_nanosleep",
+    "nanosleep",
+    "gettimeofday",
+    "timerfd_create",
+    "timerfd_settime",
+    "timerfd_gettime",
+    "timer_create",
+    "timer_settime",
+    "timer_gettime",
+    "timer_getoverrun",
+    "timer_delete",
+    "ppoll",
+    "pselect6",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_pwait",
+    "epoll_pwait2",
+    "eventfd2",
+    "socketpair",
+    "sendmsg",
+    "recvmsg",
+    "sendto",
+    "recvfrom",
+    "sendmmsg",
+    "recvmmsg",
+    "shutdown",
+    "getsockopt",
+    "setsockopt",
+    "getsockname",
+    "getpeername",
+    "getrandom",
+];
+
+/// The calls an image's process may make on x86_64 only: the older forms its C library still
+/// uses, which aarch64 never had.
+#[cfg(target_arch = "x86_64")]
+pub const IMAGE_ALLOWED_ARCH: &[&str] = &[
+    "open",
+    "stat",
+    "lstat",
+    "access",
+    "readlink",
+    "poll",
+    "select",
+    "pipe",
+    "dup2",
+    "mkdir",
+    "rmdir",
+    "unlink",
+    "rename",
+    "link",
+    "symlink",
+    "chmod",
+    "chown",
+    "lchown",
+    "creat",
+    "getdents",
+    "utime",
+    "utimes",
+    "futimesat",
+    "arch_prctl",
+    "epoll_wait",
+    "epoll_create",
+    "eventfd",
+    "signalfd",
+    "inotify_init",
+    "time",
+    "getrlimit",
+    "setrlimit",
+    "getpgrp",
+    "fork",
+    "vfork",
+    "pause",
+    "alarm",
+];
+/// The calls an image's process may make on aarch64 only.
+#[cfg(not(target_arch = "x86_64"))]
+pub const IMAGE_ALLOWED_ARCH: &[&str] = &[];
+
+/// The calls that exist in an image's list and not in the `.pex`'s, by name.
+fn image_number(name: &str) -> Option<i64> {
+    if let Some(n) = number(name) {
+        return Some(n);
+    }
+    let n = match name {
+        "preadv2" => libc::SYS_preadv2,
+        "pwritev2" => libc::SYS_pwritev2,
+        "linkat" => libc::SYS_linkat,
+        "symlinkat" => libc::SYS_symlinkat,
+        "truncate" => libc::SYS_truncate,
+        "sync_file_range" => libc::SYS_sync_file_range,
+        "syncfs" => libc::SYS_syncfs,
+        "sync" => libc::SYS_sync,
+        "fchown" => libc::SYS_fchown,
+        "fchownat" => libc::SYS_fchownat,
+        "sendfile" => libc::SYS_sendfile,
+        "splice" => libc::SYS_splice,
+        "tee" => libc::SYS_tee,
+        "vmsplice" => libc::SYS_vmsplice,
+        "readahead" => libc::SYS_readahead,
+        "inotify_init1" => libc::SYS_inotify_init1,
+        "inotify_add_watch" => libc::SYS_inotify_add_watch,
+        "inotify_rm_watch" => libc::SYS_inotify_rm_watch,
+        "getxattr" => libc::SYS_getxattr,
+        "lgetxattr" => libc::SYS_lgetxattr,
+        "fgetxattr" => libc::SYS_fgetxattr,
+        "listxattr" => libc::SYS_listxattr,
+        "llistxattr" => libc::SYS_llistxattr,
+        "flistxattr" => libc::SYS_flistxattr,
+        "setxattr" => libc::SYS_setxattr,
+        "lsetxattr" => libc::SYS_lsetxattr,
+        "fsetxattr" => libc::SYS_fsetxattr,
+        "removexattr" => libc::SYS_removexattr,
+        "lremovexattr" => libc::SYS_lremovexattr,
+        "fremovexattr" => libc::SYS_fremovexattr,
+        "mlock" => libc::SYS_mlock,
+        "mlock2" => libc::SYS_mlock2,
+        "munlock" => libc::SYS_munlock,
+        "mlockall" => libc::SYS_mlockall,
+        "munlockall" => libc::SYS_munlockall,
+        "msync" => libc::SYS_msync,
+        "memfd_create" => libc::SYS_memfd_create,
+        "get_mempolicy" => libc::SYS_get_mempolicy,
+        "set_mempolicy" => libc::SYS_set_mempolicy,
+        "mbind" => libc::SYS_mbind,
+        "pkey_alloc" => libc::SYS_pkey_alloc,
+        "pkey_free" => libc::SYS_pkey_free,
+        "pkey_mprotect" => libc::SYS_pkey_mprotect,
+        "shmget" => libc::SYS_shmget,
+        "shmat" => libc::SYS_shmat,
+        "shmctl" => libc::SYS_shmctl,
+        "shmdt" => libc::SYS_shmdt,
+        "semget" => libc::SYS_semget,
+        "semop" => libc::SYS_semop,
+        "semctl" => libc::SYS_semctl,
+        "semtimedop" => libc::SYS_semtimedop,
+        "msgget" => libc::SYS_msgget,
+        "msgsnd" => libc::SYS_msgsnd,
+        "msgrcv" => libc::SYS_msgrcv,
+        "msgctl" => libc::SYS_msgctl,
+        "waitid" => libc::SYS_waitid,
+        "execve" => libc::SYS_execve,
+        "execveat" => libc::SYS_execveat,
+        "capget" => libc::SYS_capget,
+        "capset" => libc::SYS_capset,
+        "getpgid" => libc::SYS_getpgid,
+        "setpgid" => libc::SYS_setpgid,
+        "getsid" => libc::SYS_getsid,
+        "setsid" => libc::SYS_setsid,
+        "setuid" => libc::SYS_setuid,
+        "setgid" => libc::SYS_setgid,
+        "setreuid" => libc::SYS_setreuid,
+        "setregid" => libc::SYS_setregid,
+        "setresuid" => libc::SYS_setresuid,
+        "setresgid" => libc::SYS_setresgid,
+        "setgroups" => libc::SYS_setgroups,
+        "setfsuid" => libc::SYS_setfsuid,
+        "setfsgid" => libc::SYS_setfsgid,
+        "setpriority" => libc::SYS_setpriority,
+        "sched_setaffinity" => libc::SYS_sched_setaffinity,
+        "sched_setparam" => libc::SYS_sched_setparam,
+        "sched_setscheduler" => libc::SYS_sched_setscheduler,
+        "sched_get_priority_max" => libc::SYS_sched_get_priority_max,
+        "sched_get_priority_min" => libc::SYS_sched_get_priority_min,
+        "sched_rr_get_interval" => libc::SYS_sched_rr_get_interval,
+        "sched_getattr" => libc::SYS_sched_getattr,
+        "sched_setattr" => libc::SYS_sched_setattr,
+        "times" => libc::SYS_times,
+        "personality" => libc::SYS_personality,
+        "ioprio_get" => libc::SYS_ioprio_get,
+        "ioprio_set" => libc::SYS_ioprio_set,
+        "rt_sigsuspend" => libc::SYS_rt_sigsuspend,
+        "rt_sigpending" => libc::SYS_rt_sigpending,
+        "rt_sigqueueinfo" => libc::SYS_rt_sigqueueinfo,
+        "rt_tgsigqueueinfo" => libc::SYS_rt_tgsigqueueinfo,
+        "tkill" => libc::SYS_tkill,
+        "signalfd4" => libc::SYS_signalfd4,
+        "setitimer" => libc::SYS_setitimer,
+        "getitimer" => libc::SYS_getitimer,
+        "pidfd_send_signal" => libc::SYS_pidfd_send_signal,
+        "pidfd_open" => libc::SYS_pidfd_open,
+        "timerfd_create" => libc::SYS_timerfd_create,
+        "timerfd_settime" => libc::SYS_timerfd_settime,
+        "timerfd_gettime" => libc::SYS_timerfd_gettime,
+        "timer_create" => libc::SYS_timer_create,
+        "timer_settime" => libc::SYS_timer_settime,
+        "timer_gettime" => libc::SYS_timer_gettime,
+        "timer_getoverrun" => libc::SYS_timer_getoverrun,
+        "timer_delete" => libc::SYS_timer_delete,
+        "socketpair" => libc::SYS_socketpair,
+        "sendmmsg" => libc::SYS_sendmmsg,
+        "recvmmsg" => libc::SYS_recvmmsg,
+        "setsockopt" => libc::SYS_setsockopt,
+        "getsockname" => libc::SYS_getsockname,
+        "getpeername" => libc::SYS_getpeername,
+        #[cfg(target_arch = "x86_64")]
+        other => return image_x86_64(other),
+        #[cfg(not(target_arch = "x86_64"))]
+        _ => return None,
+    };
+    Some(n)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn image_x86_64(name: &str) -> Option<i64> {
+    if let Some(n) = x86_64(name) {
+        return Some(n);
+    }
+    let n = match name {
+        "rmdir" => libc::SYS_rmdir,
+        "link" => libc::SYS_link,
+        "symlink" => libc::SYS_symlink,
+        "chmod" => libc::SYS_chmod,
+        "chown" => libc::SYS_chown,
+        "lchown" => libc::SYS_lchown,
+        "creat" => libc::SYS_creat,
+        "utime" => libc::SYS_utime,
+        "utimes" => libc::SYS_utimes,
+        "futimesat" => libc::SYS_futimesat,
+        "epoll_create" => libc::SYS_epoll_create,
+        "eventfd" => libc::SYS_eventfd,
+        "signalfd" => libc::SYS_signalfd,
+        "inotify_init" => libc::SYS_inotify_init,
+        "setrlimit" => libc::SYS_setrlimit,
+        "getpgrp" => libc::SYS_getpgrp,
+        "fork" => libc::SYS_fork,
+        "vfork" => libc::SYS_vfork,
+        "pause" => libc::SYS_pause,
+        "alarm" => libc::SYS_alarm,
+        _ => return None,
+    };
+    Some(n)
+}
+
+/// The two filters of an image's process, in the order they are installed: `clone3` as `ENOSYS`,
+/// then the allow-list, every call off it killing the process. Built before the fork, so the
+/// child only installs them (SDD 19 f.5).
+pub fn image_filters() -> Result<Vec<BpfProgram>, String> {
+    let arch = arch()?;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for name in IMAGE_ALLOWED.iter().chain(IMAGE_ALLOWED_ARCH) {
+        let n = image_number(name).ok_or_else(|| format!("no system call number for `{name}`"))?;
+        rules.entry(n).or_default();
+    }
+    // `socketpair` only for `AF_UNIX`; `socket`, `connect`, `bind`, `listen` and `accept` are not
+    // on the list at all.
+    let pair = image_number("socketpair").ok_or("no system call number for `socketpair`")?;
+    rules.insert(
+        pair,
+        vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(|e| e.to_string())?,
+            ])
+            .map_err(|e| e.to_string())?,
+        ],
+    );
+    // `clone` makes threads and processes, never a namespace.
+    let clone = number("clone").ok_or("no system call number for `clone`")?;
+    rules.insert(
+        clone,
+        vec![
+            SeccompRule::new(vec![condition(
+                0,
+                SeccompCmpOp::MaskedEq(NAMESPACE_FLAGS),
+                0,
+            )?])
+            .map_err(|e| e.to_string())?,
+        ],
+    );
+    let allow = SeccompFilter::new(
+        rules,
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        arch,
+    )
+    .map_err(|e| e.to_string())?;
+    let clone3 = number("clone3").ok_or("no system call number for `clone3`")?;
+    let enosys = SeccompFilter::new(
+        [(clone3, Vec::new())].into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(vec![
+        enosys
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| e.to_string())?,
+        allow
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| e.to_string())?,
+    ])
+}
+
+/// Install a program built by [`image_filters`] on the calling thread.
+pub fn apply_programs(programs: &[BpfProgram]) -> Result<(), String> {
+    for program in programs {
+        seccompiler::apply_filter(program).map_err(|e| format!("seccomp: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +948,152 @@ mod tests {
             );
         }
         assert_eq!(filters(std::process::id()).unwrap().len(), 2);
+    }
+
+    /// IM-T25: the image's lists in code are the lists in 19 e.4, name for name, none of the
+    /// calls that section names as fatal is on them, and the filter built from them kills the
+    /// calls it should, in a forked child of the test.
+    #[test]
+    fn im_t25_the_filter_is_the_documents() {
+        let sdd = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../architecture/sdd/19-image.md"),
+        )
+        .unwrap();
+        let start = sdd.find("### e.4").unwrap();
+        let blocks: Vec<Vec<&str>> = sdd[start..]
+            .split("```text")
+            .skip(1)
+            .take(2)
+            .map(|b| b.split("```").next().unwrap().split_whitespace().collect())
+            .collect();
+        assert_eq!(blocks[0], IMAGE_ALLOWED, "19 e.4's first list");
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(blocks[1], IMAGE_ALLOWED_ARCH, "19 e.4's x86_64 list");
+        } else {
+            assert!(IMAGE_ALLOWED_ARCH.is_empty());
+        }
+        for name in IMAGE_ALLOWED.iter().chain(IMAGE_ALLOWED_ARCH) {
+            assert!(image_number(name).is_some(), "{name}");
+        }
+        let fatal = sdd[start..]
+            .split("Not on the list, and so fatal:")
+            .nth(1)
+            .and_then(|t| t.split("and every call not named above").next())
+            .unwrap();
+        let mut named = 0;
+        for word in fatal.split('`').skip(1).step_by(2) {
+            named += 1;
+            assert!(
+                !IMAGE_ALLOWED.contains(&word) && !IMAGE_ALLOWED_ARCH.contains(&word),
+                "{word} is fatal in 19 e.4"
+            );
+        }
+        assert!(named > 30, "the fatal list was read: {named}");
+        assert_eq!(image_filters().unwrap().len(), 2);
+    }
+
+    /// Fork a child that applies the image's filter, runs `probe`, and ends with the code it
+    /// returns; the status the parent sees.
+    fn under_image_filter(probe: fn() -> i32) -> i32 {
+        // SAFETY: the child installs the filter and makes one or two system calls, then `_exit`s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let programs = image_filters().unwrap_or_else(|_| unsafe { libc::_exit(90) });
+            // SAFETY: prctl with integers, then the probe's own calls.
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(91);
+                }
+                if apply_programs(&programs).is_err() {
+                    libc::_exit(92);
+                }
+                libc::_exit(probe())
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting for the child this test forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        if libc::WIFSIGNALED(status) {
+            return -libc::WTERMSIG(status);
+        }
+        libc::WEXITSTATUS(status)
+    }
+
+    #[test]
+    fn im_t25_the_filter_kills_what_is_not_listed() {
+        // SAFETY (all probes): plain system calls with integer arguments.
+        // Ordinary calls pass.
+        assert_eq!(
+            under_image_filter(|| unsafe { i32::from(libc::getpid() <= 0) }),
+            0
+        );
+        // A TCP socket, any socket, a connection: SIGSYS.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                0
+            }),
+            -libc::SIGSYS,
+            "`socket` is not on the list for any family"
+        );
+        // A socket pair of `AF_UNIX` passes; of `AF_INET` it does not.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                let mut fds = [0; 2];
+                i32::from(
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0,
+                )
+            }),
+            0
+        );
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                let mut fds = [0; 2];
+                libc::socketpair(libc::AF_INET, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+                0
+            }),
+            -libc::SIGSYS
+        );
+        // Mounting, tracing and namespaces: SIGSYS.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::unshare(libc::CLONE_NEWNS);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        // A thread's `clone` passes the flags test; one that makes a namespace is killed.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                libc::syscall(libc::SYS_clone, libc::CLONE_NEWUTS as u64, 0, 0, 0, 0);
+                0
+            }),
+            -libc::SIGSYS
+        );
+        // `clone3` is `ENOSYS`, which the C library answers by trying `clone`.
+        assert_eq!(
+            under_image_filter(|| unsafe {
+                let r = libc::syscall(libc::SYS_clone3, core::ptr::null::<u8>(), 0);
+                i32::from(!(r == -1 && *libc::__errno_location() == libc::ENOSYS))
+            }),
+            0
+        );
     }
 
     /// The filters install, in a forked child of the test, and refuse what they should.

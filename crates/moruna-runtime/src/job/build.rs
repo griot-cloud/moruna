@@ -182,6 +182,7 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
     let source = source_kind.source(&Entry::new("source", None, &job.source), &mut cx)?;
     cx.set_source_targets(source.targets.clone());
     let sink = sink_kind.sink(&Entry::new("sink", None, &job.sink), &mut cx)?;
+    cx.set_sink_target(sink.target.clone());
     translate::check_sink_not_source(&sink.target, &source.targets)?;
 
     // Each entry is built on its own; an entry whose stage joins the previous one becomes part of

@@ -53,11 +53,11 @@ It refuses to know: what a kind does with its settings beyond reading them (each
 
 **KD-I6. A hosted run loads no code by import path.** Under strict mode an entry whose kind declares `isolation: imported` is refused at `<field>.kind`, whatever its role, before anything is built. 16 PK-I8.
 
-**KD-I7. `rust` is not registered.** The standard registry registers no `rust` kind, so a v1 entry `{"kind": "rust", "crate", "symbol"}` is refused by KD-I1 as ``kernels[i].kind: no kernel kind `rust` is registered; this build runs package, std``, strict or not. A Rust kernel compiled into the program running a document is a kind that program registers (d.1). MB4 builds `rust` as an adapter of the runnable-kind port, isolated like the other packaged kernels (decision FP1).
+**KD-I7. `rust` is not registered.** The standard registry registers no `rust` kind, so a v1 entry `{"kind": "rust", "crate", "symbol"}` is refused by KD-I1 as ``kernels[i].kind: no kernel kind `rust` is registered; this build runs image, package, std``, strict or not. A Rust kernel compiled into the program running a document is a kind that program registers (d.1). MB4 builds `rust` as an adapter of the runnable-kind port, isolated like the other packaged kernels (decision FP1).
 
 **KD-I8. Contracts are carried only for a kind that needs them.** A document that carries `contracts` and none of whose kinds declares `needs.contracts: yes` is refused at `contracts`.
 
-**KD-I9. v1 documents read and run unchanged.** Every `moruna_spec: 1` document 0.5.7 read is read by the same parser into entries of its kinds, unchanged, and its kinds resolve through the registry: `parquet`, `vortex`, `tensor`, `datafusion` (with `peql`) sources; `parquet`, `vortex`, `tensor`, `arrow_ipc`, `peql` (with `peql`) sinks; `std`, `package`, and in a program with the Python adapter, `python` kernels; in the library, `iterator` and `python` sources and the `python` sink. What each setting means is what it meant.
+**KD-I9. v1 documents read and run unchanged.** Every `moruna_spec: 1` document 0.5.7 read is read by the same parser into entries of its kinds, unchanged, and its kinds resolve through the registry: `parquet`, `vortex`, `tensor`, `datafusion` (with `peql`) sources; `parquet`, `vortex`, `tensor`, `arrow_ipc`, `peql` (with `peql`) sinks; `std`, `package`, `image` (a kind of the same version as these, added 2026-10-28; 19), and in a program with the Python adapter, `python` kernels; in the library, `iterator` and `python` sources and the `python` sink. What each setting means is what it meant.
 
 **KD-I10. One stage per fused run of stages, by the kinds' own word.** Adjacent stages are joined into one when the earlier stage's `Fuse` returns a stage for the later one's (MH 4.9); the build never inspects a kernel to decide it, and `Built::stage_kernels` says which entries each stage carries.
 
@@ -180,6 +180,7 @@ Isolation: `builtin`, code compiled into the program, in its process; `imported`
 | `datafusion` | source | files, batches | no | yes | yes | by settings | builtin |
 | `std` | kernel | batches, batches | no | no | yes | by settings | builtin |
 | `package` | kernel | batches, batches | no (model port by settings) | no | by settings | by settings | confined |
+| `image` | kernel | batches, batches | no | no | no | no | confined |
 | `parquet`, `vortex` | sink | batches, files | by settings | no | yes | yes | builtin |
 | `tensor`, `arrow_ipc` | sink | batches, files | no | no | yes | yes | builtin |
 | `peql` | sink | batches, files | no | yes | yes | yes | builtin |
@@ -205,7 +206,7 @@ In the job spec v2 (MC2, FlatBuffers, decision FB1), a node is a kind name and i
 
 ## f. Algorithms and policies
 
-**f.1 The standard registry.** `Registry::standard()` registers: sources `parquet`, `tensor`, `vortex`, and with `peql` `datafusion`; kernels `package`, `std`; sinks `arrow_ipc`, `parquet`, `tensor`, `vortex`, and with `peql` `peql`. A build without `peql` has no governed kinds, so a document naming them is refused by KD-I1 (the stub that refused them by text is gone). The Python surface adds its kinds (`crates/moruna-py/src/kinds.rs`): the command registers `python` (`Imported`, which imports the module an entry names); `moruna.run` registers `python` (`Given`, which hands back the kernels it was given by the entry's place), `iterator`, the `python` source and the `python` sink (the objects it holds). A program that registers none of them refuses documents naming them by KD-I1.
+**f.1 The standard registry.** `Registry::standard()` registers: sources `parquet`, `tensor`, `vortex`, and with `peql` `datafusion`; kernels `image` (19), `package`, `std`; sinks `arrow_ipc`, `parquet`, `tensor`, `vortex`, and with `peql` `peql`. A build without `peql` has no governed kinds, so a document naming them is refused by KD-I1 (the stub that refused them by text is gone). The Python surface adds its kinds (`crates/moruna-py/src/kinds.rs`): the command registers `python` (`Imported`, which imports the module an entry names); `moruna.run` registers `python` (`Given`, which hands back the kernels it was given by the entry's place), `iterator`, the `python` source and the `python` sink (the objects it holds). A program that registers none of them refuses documents naming them by KD-I1.
 
 **f.2 The build.** In order, each step's refusal before the next is tried: the environment (MH 4.1); the run id; every kind resolved (KD-I1: source, sink, then each kernel); strict mode over the declarations (KD-I6); the contracts over the declarations (KD-I8); a `Context` made with the program's hooks, the package host, the host ports and the carried contracts; the source built; its targets recorded on the context; the sink built; the sink equals source rule (12 f.3); each kernel's stage built and joined with the previous one when their fuses say so (KD-I10); the kinds' notes appended to the build's; then every stage given its id (`placed`), its packaged kernel and its Python kernel collected; then the ranges, resume and the rest of MH 4.1, unchanged.
 
@@ -249,7 +250,7 @@ None. The registry is code the program assembles; the settings are the document'
 
 **KD-T3 registration_refusals.** A duplicate, a name that is not a kind name (uppercase, a leading digit, 65 characters), a role other than the port's, an empty summary, flows the role cannot have, another dialect, a schema that is not an object, an open schema, a property `kind`, no examples or a non-object example: each refused at registration naming why; a second `parquet` source or sink, or `std`, is refused. KD-I2.
 
-**KD-T4 standard_conformance.** Every standard source and sink and `std` passes its port's suite over its declared examples (`kinds/tests.rs`); `package` passes over a real `.wasm` (`tests/package.rs`), `datafusion` and `peql` over carried contracts (`kinds/governed.rs`, feature `peql`); the Python kinds' declarations are ones the registry accepts (`crates/moruna-py/src/kinds.rs`). KD-I5.
+**KD-T4 standard_conformance.** Every standard source and sink and `std` passes its port's suite over its declared examples (`kinds/tests.rs`); `package` passes over a real `.wasm` (`tests/package.rs`), `image` over a real OCI layout on Linux (`crates/moruna-image/tests/image_kind.rs`, IM-T22), `datafusion` and `peql` over carried contracts (`kinds/governed.rs`, feature `peql`); the Python kinds' declarations are ones the registry accepts (`crates/moruna-py/src/kinds.rs`). KD-I5.
 
 **KD-T5 add_a_kind.** A kind written in the test, `test.scale`, passes the runnable-kind suite, is refused by the standard registry, registers beside the standard kinds, is listed, and a strict document naming it runs end to end and writes every value scaled (`tests/kinds.rs`). KD-I5, KD-I3.
 

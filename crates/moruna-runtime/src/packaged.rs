@@ -27,6 +27,9 @@ pub enum Packaged {
     /// A `.pex` in a confined child.
     #[cfg(target_os = "linux")]
     Pex(Arc<moruna_sandbox::SandboxKernel>),
+    /// An image's command in a confined process (SDD 19).
+    #[cfg(target_os = "linux")]
+    Image(Arc<moruna_sandbox::ImageKernel>),
 }
 
 impl Packaged {
@@ -36,15 +39,19 @@ impl Packaged {
             Packaged::Wasm(k) => Arc::clone(k) as Arc<dyn Kernel>,
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => Arc::clone(k) as Arc<dyn Kernel>,
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => Arc::clone(k) as Arc<dyn Kernel>,
         }
     }
 
-    /// The package.
-    pub fn package(&self) -> &Arc<Package> {
+    /// The package; an image has none.
+    pub fn package(&self) -> Option<&Arc<Package>> {
         match self {
-            Packaged::Wasm(k) => k.package(),
+            Packaged::Wasm(k) => Some(k.package()),
             #[cfg(target_os = "linux")]
-            Packaged::Pex(k) => k.package(),
+            Packaged::Pex(k) => Some(k.package()),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(_) => None,
         }
     }
 
@@ -54,12 +61,17 @@ impl Packaged {
             Packaged::Wasm(k) => k.notes().to_vec(),
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => k.notes(),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(_) => Vec::new(),
         }
     }
 
-    /// `wasm` or `pex`, for a check report.
+    /// `wasm`, `pex` or `image`, for a check report.
     pub fn kind(&self) -> &'static str {
-        self.package().format.as_str()
+        match self.package() {
+            Some(package) => package.format.as_str(),
+            None => "image",
+        }
     }
 
     /// Bind the run (17 f.4, f.7): a `.wasm` answers to the run's gate; a `.pex`'s stage
@@ -74,6 +86,8 @@ impl Packaged {
             Packaged::Wasm(k) => k.bind_gate(Arc::clone(gate)),
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => k.bind_run(Arc::clone(sampler), ceiling),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => k.bind_run(Arc::clone(sampler), ceiling),
         }
         let _ = (sampler, ceiling);
     }
@@ -95,7 +109,7 @@ impl Packaged {
         match self {
             Packaged::Wasm(k) => k.bind_ports(ports),
             #[cfg(target_os = "linux")]
-            Packaged::Pex(_) => {}
+            Packaged::Pex(_) | Packaged::Image(_) => {}
         }
     }
 
@@ -108,7 +122,7 @@ impl Packaged {
                 }
             }
             #[cfg(target_os = "linux")]
-            Packaged::Pex(_) => {}
+            Packaged::Pex(_) | Packaged::Image(_) => {}
         }
     }
 
@@ -118,6 +132,8 @@ impl Packaged {
             Packaged::Wasm(_) => None,
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => Some(k.outside()),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => Some(k.outside()),
         }
     }
 
@@ -127,6 +143,8 @@ impl Packaged {
             Packaged::Wasm(_) => {}
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => k.limits_changed(),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => k.limits_changed(),
         }
     }
 }

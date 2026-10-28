@@ -595,6 +595,12 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload>;
+    /// The end of the input (amended 2026-10-28, board KA1): called once per live instance of a
+    /// stateful stage, after the last `apply` of the run and before the sink finishes. A kernel
+    /// that runs something apart from the process (an image's command, 19) ends that thing's
+    /// input here and answers for how it ended; an `Err` ends the run as a kernel's failure
+    /// (10 f.6). The default does nothing, so no other kernel changes.
+    fn finish(&self, state: &mut dyn KernelState) -> Result<()> { let _ = state; Ok(()) }
 }
 ```
 

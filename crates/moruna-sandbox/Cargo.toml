@@ -21,6 +21,8 @@ pyo3 = { workspace = true, optional = true }
 moruna-arena = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# An image's root and what it runs (SDD 19).
+moruna-image = { workspace = true }
 libc = { workspace = true }
 landlock = { workspace = true }
 seccompiler = { workspace = true }

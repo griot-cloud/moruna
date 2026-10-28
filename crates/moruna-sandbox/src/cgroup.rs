@@ -118,6 +118,25 @@ impl StageCgroup {
         Ok(self.read("cpu.max")?.trim().to_string())
     }
 
+    /// Kill every process in the cgroup (`cgroup.kill`, Linux 5.14); a kernel without the file
+    /// leaves the caller's own signal as the only way.
+    pub fn kill(&self) {
+        let _ = self.write("cgroup.kill", "1");
+    }
+
+    /// How many of the cgroup's processes the kernel killed for exceeding `memory.max`.
+    pub fn oom_kills(&self) -> u64 {
+        self.read("memory.events")
+            .ok()
+            .and_then(|events| {
+                events
+                    .lines()
+                    .find_map(|l| l.strip_prefix("oom_kill "))
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
     /// Whether a process is still in the cgroup.
     pub fn populated(&self) -> io::Result<bool> {
         Ok(self
@@ -192,6 +211,20 @@ mod tests {
         assert!(cg.populated().unwrap());
         fs::write(cg.dir().join("cgroup.events"), "populated 0\n").unwrap();
         assert!(!cg.populated().unwrap());
+        assert_eq!(cg.oom_kills(), 0, "no memory.events yet");
+        fs::write(
+            cg.dir().join("memory.events"),
+            "low 0\nmax 4\noom 2\noom_kill 2\n",
+        )
+        .unwrap();
+        assert_eq!(cg.oom_kills(), 2);
+        cg.kill();
+        assert_eq!(
+            fs::read_to_string(cg.dir().join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        fs::remove_file(cg.dir().join("cgroup.kill")).unwrap();
+        fs::remove_file(cg.dir().join("memory.events")).unwrap();
         // Made twice: refused naming the directory.
         let e = StageCgroup::create(&dir, "stage", 1, 1.0).unwrap_err();
         assert!(e.to_string().contains("stage"), "{e}");

@@ -92,6 +92,19 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      - name: The image kind, for real (SDD 19 k)
+        # An image's command runs in its own namespaces, under Landlock and seccomp, in a cgroup
+        # Moruna made: that needs root and a cgroup v2 directory with `memory` and `cpu` handed to
+        # its children, which the runner has once it is asked. The tests are `--ignored` for a
+        # machine with neither; here they run, as root, with the directory.
+        run: |
+          bin="$(cargo test -p moruna-image --test image_kind --locked --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.name == "image_kind") | .executable')"
+          test -x "$bin"
+          sudo mkdir -p /sys/fs/cgroup/moruna-ci
+          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-ci/cgroup.subtree_control
+          sudo env MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-ci "$bin" --ignored --test-threads=1
       - name: peQL with its Iceberg binding compiled in (moruna-datafusion's peql-iceberg)
         # A host that embeds peQL with `iceberg` unifies that feature into Moruna's build, so the
         # governed ends must compile and pass with it on, not only in the default graph.

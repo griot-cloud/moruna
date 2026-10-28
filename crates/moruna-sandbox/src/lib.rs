@@ -33,6 +33,8 @@ pub mod coverage;
 #[cfg(target_os = "linux")]
 pub mod fdpass;
 #[cfg(target_os = "linux")]
+pub mod image;
+#[cfg(target_os = "linux")]
 mod kernel;
 #[cfg(target_os = "linux")]
 pub mod mapping;
@@ -45,6 +47,8 @@ pub mod seccomp;
 #[cfg(target_os = "linux")]
 pub mod template;
 
+#[cfg(target_os = "linux")]
+pub use image::{ImageKernel, ImageState};
 #[cfg(target_os = "linux")]
 pub use kernel::{LEASE_POLL, LEASE_WAIT, SandboxKernel, SandboxState};
 
@@ -62,9 +66,11 @@ pub struct SandboxHost {
 }
 
 /// The refusal on a system without the sandbox.
-pub const NOT_LINUX: &str = "a .pex runs in the sandbox, which needs Linux";
+pub const NOT_LINUX: &str =
+    "a .pex runs in the sandbox, which needs Linux (so does an image's command, SDD 19)";
 
-/// On a system that is not Linux there is no sandbox: building a `.pex` stage is refused.
+/// On a system that is not Linux there is no sandbox: building a `.pex` or an image stage is
+/// refused.
 #[cfg(not(target_os = "linux"))]
 pub fn unavailable() -> moruna_kernel::MorunaError {
     moruna_kernel::MorunaError::Config {

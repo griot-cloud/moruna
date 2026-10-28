@@ -37,6 +37,7 @@ moruna-kernels = { path = "crates/moruna-kernels", version = "0.5.7" }
 moruna-package = { path = "crates/moruna-package", version = "0.5.7" }
 moruna-wasm = { path = "crates/moruna-wasm", version = "0.5.7" }
 moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.5.7" }
+moruna-image = { path = "crates/moruna-image", version = "0.5.7" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -118,6 +119,13 @@ wat = { version = "=1.252.0" }
 zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
 landlock = { version = "=0.4.7" }
 seccompiler = { version = "=0.5.0" }
+
+# OCI images (SDD 19, preamble 6.2 table additions, 2026-10-28): layers are tar, gzip or zstd
+# compressed. `flate2` and `zstd` are in the graph already (at these versions); `tar` reads the
+# entries, and nothing of it writes to disk, so its `xattr` feature stays off.
+tar = { version = "=0.4.46", default-features = false }
+flate2 = { version = "=1.1.10" }
+zstd = { version = "=0.14.0", default-features = false }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six
