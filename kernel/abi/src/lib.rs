@@ -21,7 +21,7 @@ pub mod manifest;
 /// number when a call is added. `abi_version` returns `MAJOR << 16 | MINOR`.
 pub const ABI_MAJOR: u16 = 1;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 0;
+pub const ABI_MINOR: u16 = 1;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -51,8 +51,10 @@ pub mod nr {
     pub const INTERRUPT_CREATE: u64 = 21;
     pub const INTERRUPT_ACK: u64 = 22;
     pub const DEVICE_MEMORY_CREATE: u64 = 23;
+    /// Added in ABI 1.1: a resource over a sub-range of another (SDD 20, f.10).
+    pub const RESOURCE_NARROW: u64 = 24;
     /// One past the highest number; any number at or above it is `BadSyscall`.
-    pub const COUNT: u64 = 24;
+    pub const COUNT: u64 = 25;
 }
 
 /// Every error a syscall returns. A call returns `-(code)` in `rax`.
@@ -341,6 +343,16 @@ pub enum ResourceKind {
     Interrupt = 3,
 }
 
+/// The ranges a root resource covers (SDD 20, f.10). `resource_narrow` derives a
+/// resource over a sub-range; a process resource has no range and is never narrowed.
+pub mod resource_range {
+    /// Physical addresses a device memory resource may cover: the 52-bit physical
+    /// address space x86_64 defines.
+    pub const DEVICE_END: u64 = 1 << 52;
+    /// Global system interrupts an interrupt resource may cover: 0 to 255.
+    pub const INTERRUPT_END: u64 = 256;
+}
+
 /// The flags of `memory_map`.
 pub mod map {
     /// The mapping is readable. Every mapping is.
@@ -354,6 +366,11 @@ pub mod map {
 
 /// The page size every length and offset in this ABI is a multiple of.
 pub const PAGE_SIZE: u64 = 4096;
+
+/// Where a static image's segments may lie (SDD 20, f.2): above the null page, below
+/// the area the kernel maps stacks, the start page and `memory_map` into. The boot
+/// image tool checks every program against the same range.
+pub const IMAGE_RANGE: core::ops::Range<u64> = 0x1000..0x1000_0000_0000;
 
 /// Bounds the kernel enforces, published so a process can size its buffers.
 pub mod limits {
@@ -557,7 +574,8 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x1_0000);
+        assert_eq!(ABI_VERSION, 0x1_0001);
+        assert_eq!(nr::RESOURCE_NARROW + 1, nr::COUNT);
         assert_eq!(map::ALL, 7);
     }
 }

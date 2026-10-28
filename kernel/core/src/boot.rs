@@ -32,12 +32,16 @@ use crate::{
 
 pub fn boot() {
     match start() {
-        Ok(count) => early_println!(
-            "kk: moruna microkernel, abi {}.{}: started {} processes from the manifest",
-            ABI_MAJOR,
-            ABI_MINOR,
-            count
-        ),
+        Ok(count) => {
+            early_println!(
+                "kk: moruna microkernel, abi {}.{}: started {} processes from the manifest",
+                ABI_MAJOR,
+                ABI_MINOR,
+                count
+            );
+            // Only now may the last process to end power the machine off.
+            process::boot_done();
+        }
         Err(reason) => {
             early_println!("kk: boot refused: {}", reason);
             poweroff(ExitCode::Failure);
@@ -46,9 +50,15 @@ pub fn boot() {
 }
 
 fn start() -> Result<usize, String> {
+    crate::sched::init()?;
     crate::clock::init()?;
     ostd::task::inject_post_schedule_handler(process::activate_current);
+    early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
+    process::boot_begins();
+    start_manifest()
+}
 
+fn start_manifest() -> Result<usize, String> {
     let initramfs = ostd::boot::boot_info()
         .initramfs
         .ok_or("the bootloader passed no initramfs")?;
@@ -66,7 +76,7 @@ fn start() -> Result<usize, String> {
         })
         .collect();
     let console = Arc::new(Console);
-    let root = |kind| Object::Resource(Arc::new(Resource { kind }));
+    let root = |kind| Object::Resource(Arc::new(Resource::root(kind)));
 
     for (index, spec) in manifest.processes.iter().enumerate() {
         let elf = cpio::find(&files, &spec.path).ok_or_else(|| {

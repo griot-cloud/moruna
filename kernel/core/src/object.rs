@@ -5,8 +5,9 @@
 //! else is built by processes out of these.
 
 use alloc::sync::Arc;
+use core::ops::Range;
 
-use moruna_abi::{ObjectType, ResourceKind, Rights};
+use moruna_abi::{ObjectType, ResourceKind, Rights, resource_range};
 
 use crate::{
     channel::Endpoint,
@@ -21,9 +22,32 @@ use crate::{
 /// processes the manifest marks.
 pub struct Console;
 
-/// A root capability: the right to create objects of one kind out of nothing.
+/// A capability to create objects of one kind out of nothing: processes, or device
+/// memory and interrupt lines within `range` (physical addresses or GSIs). A root
+/// resource covers its kind's whole range; `resource_narrow` derives one over a
+/// sub-range, so a supervisor can hand an untrusted driver only its own device.
 pub struct Resource {
     pub kind: ResourceKind,
+    pub range: Range<u64>,
+}
+
+impl Resource {
+    /// The root resource of `kind`, covering everything of that kind.
+    pub fn root(kind: ResourceKind) -> Resource {
+        let range = match kind {
+            ResourceKind::Process => 0..0,
+            ResourceKind::DeviceMemory => 0..resource_range::DEVICE_END,
+            ResourceKind::Interrupt => 0..resource_range::INTERRUPT_END,
+        };
+        Resource { kind, range }
+    }
+
+    /// Whether `start .. start + len` lies inside this resource's range.
+    pub fn covers(&self, start: u64, len: u64) -> bool {
+        start
+            .checked_add(len)
+            .is_some_and(|end| start >= self.range.start && end <= self.range.end)
+    }
 }
 
 #[derive(Clone)]

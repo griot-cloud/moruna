@@ -1,0 +1,15 @@
+[package]
+name = "moruna-image"
+description = "Builds a Moruna microkernel boot image (the initramfs) from a description: the processes, their programs, the channels between them and the handles each gets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "moruna-image"
+path = "src/main.rs"
+
+[dependencies]
+moruna-abi = { workspace = true, features = ["manifest"] }
+moruna-loader.workspace = true

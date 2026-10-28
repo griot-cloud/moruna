@@ -150,11 +150,13 @@ jobs:
           cp -R python/tests /tmp/moruna-tests
           cd /tmp && python -m pytest -q /tmp/moruna-tests
 
-  # The microkernel (SDD 20, k), on a pull request that touches kernel/ or this file, and
-  # never on a push: kernel/ is its own Cargo workspace on a pinned nightly, built with
-  # plain cargo for x86_64-unknown-none and booted under QEMU with KVM when the runner
-  # has it (TCG otherwise). The serial line must carry a line for every KB1 test, no
-  # failure and no panic, and QEMU must exit with the kernel's success status.
+  # The microkernel (SDD 20 k, SDD 23 k), on a pull request that touches kernel/ or this
+  # file, and never on a push: kernel/ is its own Cargo workspace on a pinned nightly,
+  # built with plain cargo for x86_64-unknown-none and booted under QEMU with KVM when
+  # the runner has it (TCG otherwise), on one, two and four CPUs. Each boot's serial line
+  # must carry every line the boot description expects, every CPU online and having run
+  # a process, no failure and no panic, and QEMU must exit with the kernel's success
+  # status. A commit that changes kernel/examples/ must touch no file of the kernel.
   kernel:
     name: the microkernel builds and boots (KB1)
     if: github.event_name == 'pull_request'
@@ -219,38 +221,49 @@ jobs:
             sudo udevadm trigger --name-match=kvm
           fi
           ls -l /dev/kvm || echo "no /dev/kvm: the boot runs under TCG"
-      - name: Format, and the host tests of the ABI, the loaders and the handle table
+      - name: Format, and the host tests of the ABI, the loaders, the handle table, the SDK and the image tool
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
         run: |
           cargo fmt --all -- --check
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          cargo clippy --locked --target "$host" --all-targets \
-            -p moruna-abi -p moruna-loader -p moruna-handles --features moruna-abi/manifest -- -D warnings
-          cargo test --locked --target "$host" \
-            -p moruna-abi -p moruna-loader -p moruna-handles --features moruna-abi/manifest
-      - name: Build the kernel, the programs and the initramfs
+          packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-svc -p moruna-image)
+          cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
+          cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
+      - name: Examples touch no file of the kernel (SV-T15)
+        if: steps.changed.outputs.kernel == 'true'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: kernel/tools/check-examples.sh "$BASE" HEAD
+      - name: Build the kernel, the programs and the boot image
         if: steps.changed.outputs.kernel == 'true'
         run: kernel/tools/build.sh "$RUNNER_TEMP/boot"
-      - name: Boot under QEMU and judge the serial line
+      - name: Boot under QEMU on one, two and four CPUs and judge each serial line
         if: steps.changed.outputs.kernel == 'true'
         run: |
-          set +e
-          kernel/tools/boot.sh "$RUNNER_TEMP/boot" 600 | tee "$RUNNER_TEMP/serial.log"
-          status="${PIPESTATUS[0]}"
-          set -e
-          kernel/tools/check-boot.sh "$RUNNER_TEMP/serial.log" "$status"
-      - name: Clippy for x86_64-unknown-none (the kernel, moruna-sys, the programs)
+          fail=0
+          for cpus in 1 2 4; do
+            echo "::group::boot on $cpus CPUs"
+            set +e
+            kernel/tools/boot.sh "$RUNNER_TEMP/boot" 600 "$cpus" | tee "$RUNNER_TEMP/serial-$cpus.log"
+            status="${PIPESTATUS[0]}"
+            set -e
+            echo "::endgroup::"
+            echo "verdict of the boot on $cpus CPUs:"
+            kernel/tools/check-boot.sh "$RUNNER_TEMP/serial-$cpus.log" "$status" "$RUNNER_TEMP/boot/expect" "$cpus" || fail=1
+          done
+          exit "$fail"
+      - name: Clippy for x86_64-unknown-none (the kernel, and every userland crate)
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
         env:
           RUSTFLAGS: -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y
         run: |
-          for package in moruna-microkernel-boot moruna-kb1-programs; do
-            cargo clippy --release --locked --target x86_64-unknown-none \
-              -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem \
-              -p "$package" -- -D warnings
-          done
+          build_std=(-Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
+          cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" \
+            -p moruna-microkernel-boot -- -D warnings
+          cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" --workspace \
+            --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image -- -D warnings
       - name: Licences of the kernel workspace (MPL-2.0 for OSTD, DECISIONS.md MK1)
         if: steps.changed.outputs.kernel == 'true'
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
@@ -261,8 +274,11 @@ jobs:
       - if: always() && steps.changed.outputs.kernel == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: kernel-serial-log
-          path: ${{ runner.temp }}/serial.log
+          name: kernel-serial-logs
+          path: |
+            ${{ runner.temp }}/serial-*.log
+            ${{ runner.temp }}/boot/manifest
+            ${{ runner.temp }}/boot/expect
           if-no-files-found: warn
           retention-days: 14
 

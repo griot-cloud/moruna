@@ -1,13 +1,13 @@
 # Moruna SDD 20: The microkernel core (`kernel/`)
 
 **Document type:** software design document, component 20
-**Status:** DRAFT · 2026-10-28 (becomes HANDOFF-READY when section m is empty; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended by KB2 the same day (ABI 1.1, several CPUs, the cycle rule; SDD 23) (becomes HANDOFF-READY when section m is empty; the human flips it)
 **Parent:** `BOARD.md` section EK, item KB1 (Brackly, 2026-10-28); `architecture/optimized-runtime.md` section 3, as the EK direction amends it: the kernel is a microkernel, and Linux compatibility is a server (KC1), not kernel syscalls
 **Decisions:** MK1 (`DECISIONS.md`: OSTD as the hardware layer, MPL-2.0)
-**Component location:** `kernel/` (its own Cargo workspace): `abi/` (`moruna-abi`), `loader/` (`moruna-loader`), `handles/` (`moruna-handles`), `core/` (`moruna-microkernel`), `boot/` (`moruna-microkernel-boot`, the kernel image), `sys/` (`moruna-sys`), `programs/` (the KB1 test programs), `initramfs/manifest`, `tools/` (`build.sh`, `boot.sh`, `check-boot.sh`)
+**Component location:** `kernel/` (its own Cargo workspace): `abi/` (`moruna-abi`), `loader/` (`moruna-loader`), `handles/` (`moruna-handles`), `core/` (`moruna-microkernel`), `boot/` (`moruna-microkernel-boot`, the kernel image), `sys/` (`moruna-sys`), `programs/` (the test programs), `initramfs/boot.image` (the CI boot's description, built by `moruna-image`, SDD 23), `tools/` (`build.sh`, `boot.sh`, `check-boot.sh`)
 **Consumes:** OSTD 0.19.0 (boot, page tables, the frame allocator, interrupts, the timer, task switching, user mode entry), OSDK 0.19.0's frame and heap allocators and its x86_64 linker script. **Consumed by:** KB2 (`moruna-svc`, the SDK, which is built on `moruna-sys` and `moruna-abi`), KB3 (drivers as processes), KC1 (the Linux personality server), KD1 (the data plane on kernel channels), KE (the kernel as a node).
 
-**Decisions worth your eye:** (1) the kernel holds nine object types and 24 calls, and nothing else: no files, no names, no network, no Linux syscall; (2) a handle value is salted per process, so a value from another process names nothing here, and every call looks its handles up before it checks anything else; (3) the boot manifest is a line-oriented text file in the initramfs, so adding a server is a line and an ELF, and nothing in the kernel is rebuilt; (4) only the first process, the supervisor, may receive the three root resources (process creation, device memory, interrupts), and it delegates them by duplicating and sending handles; (5) the kernel builds with plain cargo: the crate `cargo osdk` would generate is written out in `boot/`.
+**Decisions worth your eye:** (1) the kernel holds nine object types and 25 calls (ABI 1.1), and nothing else: no files, no names, no network, no Linux syscall; (2) a handle value is salted per process, so a value from another process names nothing here, and every call looks its handles up before it checks anything else; (3) the boot manifest is a line-oriented text file in the initramfs, so adding a server is a line and an ELF, and nothing in the kernel is rebuilt; (4) only the first process, the supervisor, may receive the three root resources (process creation, device memory, interrupts), and it delegates them by duplicating and sending handles; (5) the kernel builds with plain cargo: the crate `cargo osdk` would generate is written out in `boot/`.
 
 ---
 
@@ -44,13 +44,13 @@ OSTD is the hardware layer: all the unsafe code (boot, paging, interrupts, the t
 - **KK-I3.** A handle value never names an object in another process's table: values are salted per process and carry a generation, so a value learned from another process, or one already closed, is `BadHandle` (f.3).
 - **KK-I4.** A thread runs, and the kernel copies to and from user memory, only with the thread's own process's address space active: OSTD's post-schedule hook activates it after every switch, and OSTD's user copies refuse an address space that is not the active one.
 - **KK-I5.** Rights never grow: `handle_duplicate` takes a subset of the source's rights, a transfer carries the sender's rights exactly, and `memory_map` maps writable only with `WRITE` and never writable and executable at once.
-- **KK-I6.** A transferred handle is removed from the sender's table in the same critical section that queues it; a write that fails moves nothing. A channel's own endpoints never travel through it.
-- **KK-I7.** Physical memory and interrupt lines are reached only through objects made from a resource. A device memory region is never RAM nor anything OSTD uses itself; an interrupt object is a line no one else has routed.
+- **KK-I6.** A transferred handle is removed from the sender's table in the same critical section that queues it; a write that fails moves nothing. A channel's own endpoints never travel through it, and an endpoint travels only while no message queued towards it carries an endpoint (the cycle rule, f.4), so endpoints in flight never keep each other alive.
+- **KK-I7.** Physical memory and interrupt lines are reached only through objects made from a resource, and only within that resource's range (a root resource covers its kind's whole space; `resource_narrow` derives a sub-range, f.10). A device memory region is never RAM nor anything OSTD uses itself; an interrupt object is a line no one else has routed.
 - **KK-I8.** Every queue and buffer is bounded: message bytes, handles per message, queue depth, handles per process, wait items, memory object size, image size, debug writes (d.5). Kernel buffers sized by a process are reserved fallibly, so an over-large request is `Limit` or `NoMemory`, never a kernel allocation failure.
 - **KK-I9.** The start page is mapped read-only before the first thread runs and stays mapped until the process has ended.
 - **KK-I10.** A fault in a process ends that process and nothing else: its threads stop, its handles close, its mappings go, `TERMINATED` is raised on it, and the kernel names the fault on the console.
 - **KK-I11.** Only the first process of the manifest may receive a resource; the kernel refuses a manifest that gives one to any other, and refuses to boot from a manifest it cannot parse or an image it cannot load, powering off with the reason.
-- **KK-I12.** When the last process ends, the kernel powers off: success if the supervisor exited with code 0, failure otherwise.
+- **KK-I12.** When the last process ends, and the boot has started every manifest process, the kernel powers off: success if the supervisor exited with code 0, failure otherwise.
 
 ## d. Interfaces
 
@@ -60,9 +60,9 @@ OSTD is the hardware layer: all the unsafe code (boot, paging, interrupts, the t
 
 A thread starts with `rip` at its entry, `rdi` its argument, and `rsp` 8 below a 16-byte boundary at the top of its stack, as if called. A process's first thread receives the start page's address in `rdi` and a 256 KiB stack the kernel maps.
 
-### d.2 The syscalls, ABI 1.0
+### d.2 The syscalls, ABI 1.1
 
-`abi_version` returns `MAJOR << 16 | MINOR`. The major number changes when a call's meaning changes; the minor number when a call is added. A number is never reused. Any number at or above 24 is `BadSyscall`.
+`abi_version` returns `MAJOR << 16 | MINOR`. The major number changes when a call's meaning changes; the minor number when a call is added. A number is never reused. Any number at or above 25 is `BadSyscall`. ABI 1.1 (KB2) added `resource_narrow`.
 
 | nr | call | arguments | returns | rights needed |
 |---|---|---|---|---|
@@ -87,9 +87,10 @@ A thread starts with `rip` at its entry, `rdi` its argument, and `rsp` 8 below a
 | 18 | `timer_create` | | timer | |
 | 19 | `timer_set` | timer, deadline (0 disarms) | 0 | `WRITE` |
 | 20 | `debug_write` | console, bytes, len | len | `WRITE` |
-| 21 | `interrupt_create` | interrupt resource, GSI | interrupt | `WRITE` on the resource |
+| 21 | `interrupt_create` | interrupt resource, GSI | interrupt | `WRITE` on the resource; the GSI inside the resource's range |
 | 22 | `interrupt_ack` | interrupt | 0 | `WRITE` |
-| 23 | `device_memory_create` | device resource, physical address, len | device memory region | `WRITE` on the resource |
+| 23 | `device_memory_create` | device resource, physical address, len | device memory region | `WRITE` on the resource; the range inside the resource's |
+| 24 | `resource_narrow` (1.1) | resource, base, len | resource over `base .. base + len` | `DUPLICATE`; the range inside the source's (f.10) |
 
 `channel_read` and `channel_write` never block: an empty queue is `ShouldWait` (or `PeerClosed`), a full peer queue is `ShouldWait`; a process waits for `READABLE` or `WRITABLE`. `wait` is the only call that blocks.
 
@@ -133,7 +134,7 @@ One page, read-only, at an address the kernel chooses, passed in `rdi`:
 
 ### d.6 `moruna-sys`
 
-Safe wrappers in `no_std` Rust: `Handle` (owned, closes on drop, `duplicate`, `info`), `Channel` (`create`, `write` moves an array of handles and gives them back on failure, `read`, `needed`), `Memory` and `DeviceMemory` (`map` returns a `Mapping` that unmaps on drop and is read and written by volatile byte accesses, never through a reference, because its pages may be shared), `Process` (`create`, `map_image`, `start`), `Thread::spawn`, `Timer`, `Interrupt`, `Console` and `println!`, `wait` and `wait_one`, `now`, `exit`, `thread_exit`, the start page (`start::take`, `start::peek`), `main!` (the entry), and a panic handler that prints on the `console` slot if there is one and exits with 101. `raw` carries one safe function per call that passes memory, taking slices; the unsafe `syscall` and the calls that could break the process's own memory (unmap, thread start) are private to the crate.
+Safe wrappers in `no_std` Rust: `Handle` (owned, closes on drop, `duplicate`, `info`, `narrow`), `Channel` (`create`, `write` moves an array of handles and gives them back on failure, `write_with` the same from a slice of `Option<Handle>`, `read`, `needed`), `Memory` and `DeviceMemory` (`map` returns a `Mapping` that unmaps on drop and is read and written by volatile byte accesses, never through a reference, because its pages may be shared), `Process` (`create`, `map_image`, `start`), `Thread::spawn`, `Timer`, `Interrupt`, `Console` and `println!`, `wait` and `wait_one`, `now`, `exit`, `thread_exit`, the start page (`start::take`, `start::peek`), `main!` (the entry), a panic handler that prints on the `console` slot if there is one and exits with 101, and, with the feature `heap`, a global allocator over memory objects (SDD 23 f.6). `raw` carries one safe function per call that passes memory, taking slices; the unsafe `syscall` and the calls that could break the process's own memory (unmap, thread start) are private to the crate.
 
 ## e. Data model, formats and state machines
 
@@ -149,7 +150,7 @@ Safe wrappers in `no_std` Rust: `Handle` (owned, closes on drop, `duplicate`, `i
 | interrupt | a global system interrupt routed to an OSTD IRQ line | `SIGNALED` until acknowledged | read, write, duplicate, transfer, wait |
 | device memory region | physical MMIO pages, mapped uncached | | read, write, map, duplicate, transfer |
 | console | the serial line, write only | | write, duplicate, transfer |
-| resource | the right to create processes, device memory or interrupts | | write, duplicate, transfer |
+| resource | the right to create processes, or device memory or interrupts within a range (physical addresses `0 .. 2^52`, GSIs `0 .. 256` for a root resource) | | write, duplicate, transfer |
 
 A file a manifest gives (`file:PATH`) is a memory object holding a copy of the file, with read, map, duplicate and transfer.
 
@@ -195,7 +196,7 @@ The first directive is `moruna-manifest 1`. `channel` declares a channel whose e
 
 ### f.1 Boot
 
-OSTD boots by multiboot, initialises memory, interrupts and the timer, and calls the boot crate's `#[ostd::main]`, which calls `moruna_microkernel::main`. The kernel starts its clock (the TSC, whose frequency OSTD measured; no frequency is a refusal), registers the deadline queue on OSTD's 1 kHz timer, installs the post-schedule hook of KK-I4, reads OSTD's initramfs (a cpio newc archive; only regular files and directories), parses `manifest`, creates its channels, and for each process in order loads its ELF, builds its start handles, and starts it. It prints `kk: moruna microkernel, abi 1.0: started N processes from the manifest` and returns, which hands the CPU to the processes. Any refusal prints `kk: boot refused: REASON` and powers off with failure.
+OSTD boots by multiboot, initialises memory, interrupts and the timer, and calls the boot crate's `#[ostd::main]`, which calls `moruna_microkernel::main`. The kernel injects its scheduler and registers the other CPUs' entry (f.11), starts its clock (the TSC, whose frequency OSTD measured; no frequency is a refusal), registers the deadline queue on OSTD's 1 kHz timer, installs the post-schedule hook of KK-I4, prints `kk: N CPUs online`, reads OSTD's initramfs (a cpio newc archive; only regular files and directories), parses `manifest`, creates its channels, and for each process in order loads its ELF, builds its start handles, and starts it. It prints `kk: moruna microkernel, abi 1.1: started N processes from the manifest`, stops counting itself as a live process (KK-I12), and returns, which hands the CPU to the processes. Any refusal prints `kk: boot refused: REASON` and powers off with failure.
 
 ### f.2 Loading an image
 
@@ -209,9 +210,11 @@ A value is `((generation << 16) | (slot + 1)) XOR salt`, the salt drawn per proc
 
 Two queues, one towards each endpoint, and an open flag per endpoint, under one lock. Signals are recomputed under that lock after every change: `READABLE` while an endpoint's queue is not empty, `WRITABLE` while its peer is open and the peer's queue has room, `PEER_CLOSED` once the peer is closed. A write copies its bytes and handle values in from user memory first, then, holding the caller's table lock and then the channel's lock (that order everywhere), checks every handle (present, `TRANSFER`, not an endpoint of this channel, not listed twice), the peer open and its queue not full, and only then moves the handles out of the table and queues the message. A read holds the same two locks, checks the caller's buffers and the table's room, copies the bytes out, inserts clones of the handles, copies their values out, and only then pops the message; a fault at any step leaves the message queued and removes the clones. When an endpoint closes, the messages queued to it are taken out under the lock and dropped outside it.
 
+**The cycle rule.** A message carrying endpoint `F` towards endpoint `E` keeps `F` alive for as long as `E` is open, so endpoints in flight could keep each other alive with no process holding any of them. A write may therefore move an endpoint only while no message queued towards it carries an endpoint (`BadState` otherwise). Each channel counts, per end, the endpoints its queued messages carry; a write that carries an endpoint takes the global `TRANSFER` lock after the table and the channel, checks every endpoint it moves has a count of zero, and adds what it queues to its peer's count; a read and a close subtract. Every endpoint in flight is then held by one that holds none, and no cycle forms (proof: SDD 23 f.11).
+
 ### f.5 Memory
 
-A memory object's pages are allocated, zeroed, at creation, and mapping maps those same frames, so every mapping of one object shares its bytes with no copy: a process can hand another a read-only view of a buffer by duplicating its handle without `WRITE` and sending it. `memory_unmap` takes exactly one mapping `memory_map` made; segments, stacks and the start page cannot be unmapped by a process. A device memory region is OSTD's `IoMem`: OSTD hands out only ranges in its MMIO windows that hold no RAM and nothing OSTD reserved (the APICs, the IOMMU), and refuses a range already handed out.
+A memory object's pages are allocated, zeroed, at creation, and mapping maps those same frames, so every mapping of one object shares its bytes with no copy: a process can hand another a read-only view of a buffer by duplicating its handle without `WRITE` and sending it. `memory_unmap` takes exactly one mapping `memory_map` made; segments, stacks and the start page cannot be unmapped by a process. A device memory region is OSTD's `IoMem`: OSTD hands out only ranges in its MMIO windows that hold no RAM and nothing OSTD reserved (the APICs, the IOMMU), and refuses a range already handed out. The kernel first refuses a range outside the resource's (`AccessDenied`).
 
 ### f.6 Time
 
@@ -219,7 +222,7 @@ A memory object's pages are allocated, zeroed, at creation, and mapping maps tho
 
 ### f.7 Interrupts
 
-`interrupt_create` allocates an OSTD IRQ line, has it raise `SIGNALED` on the object when it fires, and routes the GSI to it through the I/O APIC; a GSI the chip does not have or one already routed is `AccessDenied`. A driver waits for `SIGNALED`, services its device and calls `interrupt_ack`, which clears it.
+`interrupt_create` refuses a GSI above 255 (`InvalidArgs`) or outside the resource's range (`AccessDenied`), allocates an OSTD IRQ line, has it raise `SIGNALED` on the object when it fires, and routes the GSI to it through the I/O APIC; a GSI the chip does not have or one already routed is `AccessDenied`. A driver waits for `SIGNALED`, services its device and calls `interrupt_ack`, which clears it. OSTD 0.19 programs every line edge triggered and active high and cannot mask one, so a level-triggered line is not usable; KB3's virtio drivers use MSI-X (SDD 23 f.9).
 
 ### f.8 Waiting
 
@@ -229,9 +232,17 @@ A memory object's pages are allocated, zeroed, at creation, and mapping maps tho
 
 A CPU fault or trap in user mode (OSTD's `ReturnReason::UserException`) ends the faulting process with a description (for a page fault, the address, read or write, and the instruction pointer). Ending records the first reason, marks every thread killed and wakes any that sleeps in `wait`; each thread leaves user mode at its next kernel entry. The last thread to end runs the termination of KK-I10, prints `kk: process NAME exited with code N` or `kk: process NAME faulted: WHAT; it has ended and the others run on`, and, if it was the last process, powers off (KK-I12).
 
+### f.10 Narrowing a resource
+
+`resource_narrow` makes a resource of the source's kind over `base .. base + len` with the source handle's rights: page-aligned physical addresses for device memory, GSIs for interrupts. It is refused for a process resource or an empty or misaligned range (`InvalidArgs`) and for a range not inside the source's (`AccessDenied`), so rights and ranges never grow. A supervisor gives an untrusted driver a resource over its own device only.
+
+### f.11 Several CPUs
+
+The kernel injects its own scheduler into OSTD before any task runs (OSTD 0.19's default queues every task on the boot processor): a run queue and an idle task per CPU, a new task on the CPU with the fewest runnable tasks, a woken one on its waker's CPU when nothing else is runnable there, a 10 ms slice, and a boot context that is never preempted. The application processors enter through OSTD's AP entry. The boot counts as a live process until it has started the whole manifest (KK-I12). Detail: SDD 23 f.12.
+
 ## g. Concurrency within the component
 
-Locks, outermost first: a process's handle table; a channel's state; an object's signaller (interrupts disabled). The deadline queue (interrupts disabled) is taken alone, or before a timer's signaller in the tick. A process's region map and its state are leaves. No lock is held while a handle is dropped, except where the drop cannot be the last reference (the clones of f.4). User memory is copied with OSTD's fallible copies, which never sleep, so a copy may run under a spin lock. The kernel is written for several CPUs (every shared state is behind a lock, address spaces are activated per switch, and OSTD flushes TLBs on unmap), but KB1 boots and tests it on one (m.2).
+Locks, outermost first: a process's handle table; a channel's state; an object's signaller (interrupts disabled). The deadline queue (interrupts disabled) is taken alone, or before a timer's signaller in the tick. A process's region map and its state are leaves. No lock is held while a handle is dropped, except where the drop cannot be the last reference (the clones of f.4). User memory is copied with OSTD's fallible copies, which never sleep, so a copy may run under a spin lock. The kernel runs on several CPUs (every shared state is behind a lock, address spaces are activated per switch, OSTD flushes TLBs on unmap, and its scheduler is the kernel's, f.11); CI boots it on one, two and four. `TRANSFER` (f.4) is taken after a channel's state, only by writes that carry an endpoint; a run queue's lock is taken alone.
 
 ## h. Behaviour
 
@@ -243,11 +254,11 @@ None at run time. The bounds of d.5 are constants of `moruna-abi`. The toolchain
 
 ## j. Observability
 
-The kernel writes to the serial line: its boot line, a boot refusal, an image refusal, each process's end with its code or its fault, and the power-off line. Processes write only through a console handle. OSTD's own panic prints a backtrace and powers off with failure.
+The kernel writes to the serial line: the CPUs online, its boot line, a boot refusal, an image refusal, each process's end with its code or its fault and the CPUs it ran on, how many CPUs ran process threads, and the power-off line. Processes write only through a console handle. OSTD's own panic prints a backtrace and powers off with failure.
 
 ## k. Tests
 
-Host tests run with `cargo test` on the host target; boot tests run in CI's `kernel` job, which builds the image (`kernel/tools/build.sh`), boots it under QEMU 10.2.1 with KVM when the runner has it and TCG otherwise (`boot.sh`), and judges the serial line (`check-boot.sh`): every line below present, no `FAIL`, no `panic`, and QEMU's status 33, the kernel's success.
+Host tests run with `cargo test` on the host target; boot tests run in CI's `kernel` job, which builds the image from `kernel/initramfs/boot.image` (`kernel/tools/build.sh`, SDD 23 f.8), boots it under QEMU 10.2.1 with KVM when the runner has it and TCG otherwise on one, two and four CPUs (`boot.sh`), and judges each serial line (`check-boot.sh`): every line the description expects present, every CPU online and having run a process thread, no `FAIL`, no `panic`, and QEMU's status 33, the kernel's success. The KB2 boot tests are SDD 23's SV-T10 to SV-T14.
 
 | id | test | where | asserts |
 |---|---|---|---|
@@ -258,13 +269,13 @@ Host tests run with `cargo test` on the host target; boot tests run in CI's `ker
 | KK-T5 | `kk_t5_*` | `handles` | values name only live entries; a closed or reused slot's value is bad; values differ between salts; zero is never issued; the table is bounded and drains |
 | KK-T6 | ping-pong | `programs/ping`, `pong` | `KB1 ping-pong: ok: 10000 round trips over one channel`, each echo checked |
 | KK-T7 | handle transfer | `programs/xfer-a`, `xfer-b` | A writes a pattern, sends a duplicate without `WRITE` (and loses it from its table); B maps it, checks the pattern, is refused a writable mapping and a duplicate with `WRITE` with `AccessDenied` |
-| KK-T8 | isolation | `programs/iso-holder`, `isolation` | every handle-taking call (15) on every value 0 to 4096 and on six live values of another process returns `BadHandle`, first holding only a console, then holding nothing (the exit code counts failures; the kernel prints `exited with code 0`) |
+| KK-T8 | isolation | `programs/iso-holder`, `isolation` | every handle-taking call (16) on every value 0 to 4096 and on six live values of another process returns `BadHandle`, first holding only a console, then holding nothing (the exit code counts failures; the kernel prints `exited with code 0`) |
 | KK-T9 | wait with deadline | `programs/deadline` | a timer wakes a waiting second thread no earlier than its deadline and within 50 ms of it; a wait nothing satisfies is `TimedOut` no earlier than its deadline |
 | KK-T10 | a faulting process | `programs/fault` | reading address 0 ends the process; the kernel prints `faulted: page fault at 0x0 on read`; every other test's line and the final success line still appear |
 | KK-T11 | the supervisor | `programs/supervisor`, `child` | creates, loads and starts a child from a `file:` image and sees it end, after a start giving a handle without `TRANSFER` is refused with `AccessDenied` and the handle stays the supervisor's; maps a device memory region in high MMIO and is refused the same range a second time; is refused RAM as device memory, and an interrupt from the process resource; waits on an interrupt line until its deadline and acknowledges it |
-| KK-T12 | the boot | the whole log | the boot line with the manifest's 9 processes; every process but `fault` exits 0 (`isolation`'s code counts its failures); the power-off line says the supervisor succeeded |
+| KK-T12 | the boot | the whole log | the boot line (`abi 1.1`) with the description's process count; every process but `fault` exits 0 (`isolation`'s code counts its failures); the power-off line says the supervisor succeeded |
 
-Coverage: the repository's 90% line gate is for the root workspace; it is not applied here, because the kernel crate runs only under QEMU. What is measured is the host coverage of `moruna-abi`, `moruna-loader` and `moruna-handles` (`cargo llvm-cov`), and for the kernel, the boot tests above, which between them make each of the 24 calls; what they do not reach is listed in m (an interrupt that fires, a second CPU).
+Coverage: the repository's 90% line gate is for the root workspace; it is not applied here, because the kernel crate runs only under QEMU. What is measured is the host coverage of `moruna-abi`, `moruna-loader`, `moruna-handles`, `moruna-svc` and `moruna-image` (`cargo llvm-cov`), and for the kernel, the boot tests above and SDD 23's, which between them make each of the 25 calls on one, two and four CPUs; what they do not reach is an interrupt that fires.
 
 ## l. Implementation notes for the agent
 
@@ -275,11 +286,10 @@ Coverage: the repository's 90% line gate is for the root workspace; it is not ap
 
 ## m. Open items
 
-1. **Level-triggered interrupts.** OSTD 0.19's mapped IRQ line has no mask or unmask, so a level-triggered line that stays asserted refires until the device is serviced. KB3 needs mask-on-fire and unmask-on-ack, from OSTD or by routing virtio devices through MSI-X.
-2. **More than one CPU.** The kernel is written for SMP (g) but KB1 registers no AP entry and boots with one CPU; a multi-CPU boot test is KB2's.
-3. **Narrowing a resource.** The supervisor delegates a resource whole (duplicate and send). A call that derives a resource over a sub-range (a physical window, a GSI range) is needed before untrusted drivers get one (KB3).
-4. **Handle cycles.** An endpoint queued in a message on another channel whose endpoint is queued on the first keeps both alive until one side's process ends (no leak past a process's life, since ending drains the tables, but a leak while both run).
-5. **Partial unmap and protection changes.** `memory_unmap` takes whole mappings; `mprotect`-like changes and unmapping part of a mapping are the Linux personality's needs (KC1).
+1. **Level-triggered interrupts.** Not possible on OSTD 0.19 (no trigger mode, no mask or unmask; SDD 23 f.9). KB3 delivers virtio interrupts by MSI-X, with a call of its own that allocates a line and returns its MSI message.
+2. **Partial unmap and protection changes.** `memory_unmap` takes whole mappings; `mprotect`-like changes and unmapping part of a mapping are the Linux personality's needs (KC1).
+
+Resolved by KB2 (SDD 23): more than one CPU (f.11, booted on 2 and 4 CPUs); narrowing a resource (f.10, `resource_narrow`); handle cycles (the cycle rule, f.4).
 
 ## n. Traceability
 
@@ -296,4 +306,4 @@ Coverage: the repository's 90% line gate is for the root workspace; it is not ap
 
 ## o. Deferred (post-KB1)
 
-The SDK and protocol harness (KB2), drivers as processes (KB3), the Linux personality (KC1), the image filesystem (KC2), the data plane on kernel channels (KD1), the kernel as a node (KE), aarch64.
+Drivers as processes (KB3), the Linux personality (KC1), the image filesystem (KC2), the data plane on kernel channels (KD1), the kernel as a node (KE), aarch64.

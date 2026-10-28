@@ -12,7 +12,7 @@ use moruna_sys::{Channel, Error, RawHandle, Signals, WaitItem, map, now, println
 
 moruna_sys::main!(run);
 
-const CALLS: usize = 15;
+const CALLS: usize = 16;
 const SWEEP: RawHandle = 4096;
 
 /// The number of the first call that did not answer bad handle for `v`, if any.
@@ -34,6 +34,7 @@ fn probe(v: RawHandle) -> Option<usize> {
         raw::interrupt_create(v, 10),
         raw::interrupt_ack(v),
         raw::device_memory_create(v, 0x10_0000_0000, 4096),
+        raw::resource_narrow(v, 0x10_0000_0000, 4096),
     ];
     results
         .iter()

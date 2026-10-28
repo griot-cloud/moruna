@@ -39,10 +39,9 @@ use crate::{
     syscall::{self, Flow},
 };
 
-/// Where ELF segments may lie: above the null page, below the mapping area.
-pub const IMAGE_RANGE: core::ops::Range<u64> = 0x1000..0x1000_0000_0000;
+pub use moruna_abi::IMAGE_RANGE;
 /// Where `memory_map`, stacks and the start page are placed.
-pub const MAP_BASE: u64 = 0x1000_0000_0000;
+pub const MAP_BASE: u64 = IMAGE_RANGE.end;
 
 fn map_end() -> u64 {
     MAX_USERSPACE_VADDR as u64 & !(PAGE_SIZE - 1)
@@ -101,6 +100,54 @@ pub struct Process {
     state: SpinLock<State>,
     pub signaller: Signaller,
     supervisor: bool,
+    /// Bit `i` is set once one of this process's threads has run on CPU `i`.
+    cpus: AtomicU64,
+}
+
+/// Counts the boot as one live process while it starts the manifest's processes, so a
+/// process that ends on another CPU before the last one has started cannot power the
+/// machine off. The boot calls [`boot_done`] when it has started them all.
+pub fn boot_begins() {
+    LIVE.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The boot has started every process: it stops counting as one.
+pub fn boot_done() {
+    release_live();
+}
+
+fn release_live() {
+    if LIVE.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let failed = SUPERVISOR_FAILED.load(Ordering::Acquire);
+        early_println!(
+            "kk: process threads ran on {} of {} CPUs",
+            crate::sched::cpus_that_ran(),
+            ostd::cpu::num_cpus()
+        );
+        early_println!(
+            "kk: every process has ended; the supervisor {}; powering off",
+            if failed { "failed" } else { "succeeded" }
+        );
+        poweroff(if failed {
+            ExitCode::Failure
+        } else {
+            ExitCode::Success
+        });
+    }
+}
+
+/// The CPUs a bit set names, for the console: `0,2,3`.
+fn cpu_list(bits: u64) -> String {
+    let mut list = String::new();
+    for cpu in 0..64 {
+        if bits & (1 << cpu) != 0 {
+            if !list.is_empty() {
+                list.push(',');
+            }
+            list.push_str(&format!("{cpu}"));
+        }
+    }
+    list
 }
 
 fn salt(koid: u64) -> u32 {
@@ -144,6 +191,7 @@ impl Process {
             }),
             signaller: Signaller::new(Signals::NONE),
             supervisor,
+            cpus: AtomicU64::new(0),
         }))
     }
 
@@ -460,16 +508,23 @@ impl Process {
     }
 
     fn terminate(&self, exit: Exit) {
+        let cpus = cpu_list(self.cpus.load(Ordering::Relaxed));
         let failed = match &exit {
             Exit::Code(code) => {
-                early_println!("kk: process {} exited with code {}", self.name, code);
+                early_println!(
+                    "kk: process {} exited with code {} (it ran on cpus {})",
+                    self.name,
+                    code,
+                    cpus
+                );
                 *code != 0
             }
             Exit::Fault(what) => {
                 early_println!(
-                    "kk: process {} faulted: {}; it has ended and the others run on",
+                    "kk: process {} faulted: {}; it has ended and the others run on (it ran on cpus {})",
                     self.name,
-                    what
+                    what,
+                    cpus
                 );
                 true
             }
@@ -484,18 +539,7 @@ impl Process {
         if self.supervisor && failed {
             SUPERVISOR_FAILED.store(true, Ordering::Release);
         }
-        if LIVE.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let failed = SUPERVISOR_FAILED.load(Ordering::Acquire);
-            early_println!(
-                "kk: every process has ended; the supervisor {}; powering off",
-                if failed { "failed" } else { "succeeded" }
-            );
-            poweroff(if failed {
-                ExitCode::Failure
-            } else {
-                ExitCode::Success
-            });
-        }
+        release_live();
     }
 }
 
@@ -610,5 +654,7 @@ pub fn activate_current() {
         && let Some(thread) = task.data().downcast_ref::<Arc<Thread>>()
     {
         thread.process.vm.activate();
+        let bit = crate::sched::ran_process_thread();
+        thread.process.cpus.fetch_or(bit, Ordering::Relaxed);
     }
 }
