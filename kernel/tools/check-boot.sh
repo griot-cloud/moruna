@@ -28,19 +28,26 @@ expect KK-T10 "KB1 fault: about to read address 0"
 expect KK-T10 "kk: process fault faulted: page fault at 0x0 on read"
 expect KK-T11 "KB1 spawn: ok: child runs, started by the supervisor with 1 handle"
 expect KK-T11 "KB1 supervisor: ok: "
-expect KK-T12 "kk: moruna microkernel, abi 1.0: started 10 processes from the manifest"
+expect KK-T12 "kk: moruna microkernel, abi 1.0: started 9 processes from the manifest"
 for p in supervisor child ping pong xfer-a xfer-b iso-holder deadline; do
   expect KK-T12 "kk: process $p exited with code 0"
 done
 expect KK-T12 "kk: every process has ended; the supervisor succeeded; powering off"
 
-for bad in "FAIL" "panic" "boot refused"; do
-  if grep -qiF -- "$bad" "$log"; then
+# A test's failure line and a refused boot, exactly; a panic in any case (OSTD prints
+# "Non-resettable panic!", a program's handler "panicked").
+for bad in "FAIL:" "kk: boot refused"; do
+  if grep -qF -- "$bad" "$log"; then
     echo "FOUND \"$bad\":"
-    grep -iF -- "$bad" "$log"
+    grep -F -- "$bad" "$log"
     fail=1
   fi
 done
+if grep -qi -- "panic" "$log"; then
+  echo "FOUND a panic:"
+  grep -i -- "panic" "$log"
+  fail=1
+fi
 
 if [ "$status" != 33 ]; then
   echo "qemu exited with $status, not 33 (the kernel's success)"

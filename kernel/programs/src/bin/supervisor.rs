@@ -46,7 +46,24 @@ fn run() -> i64 {
         Ok(e) => e,
         Err(e) => return fail(&out, "process_map_image", e),
     };
-    let child_console = match out.0.duplicate(Rights::WRITE) {
+    // A handle without TRANSFER cannot be given: the start is refused and the handle
+    // comes back still owned by the caller.
+    let kept = match out.0.duplicate(Rights::WRITE) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "handle_duplicate", e),
+    };
+    match child.start(entry, [(kept, "console")]) {
+        Err((Error::AccessDenied, [(back, _)])) if back.info().is_ok() => {}
+        Err((e, _)) => return fail(&out, "process_start without TRANSFER", e),
+        Ok(()) => {
+            return fail(
+                &out,
+                "process_start moved a handle without TRANSFER",
+                Error::BadState,
+            );
+        }
+    }
+    let child_console = match out.0.duplicate(Rights::WRITE | Rights::TRANSFER) {
         Ok(h) => h,
         Err(e) => return fail(&out, "handle_duplicate", e),
     };
@@ -121,7 +138,7 @@ fn run() -> i64 {
 
     println!(
         out,
-        "KB1 supervisor: ok: started a child from its image and saw it end; mapped device memory at {:#x}, and was refused it a second time and refused RAM; waited on gsi {} until its deadline",
+        "KB1 supervisor: ok: started a child from its image (and was refused a handle without transfer) and saw it end; mapped device memory at {:#x}, and was refused it a second time and refused RAM; waited on gsi {} until its deadline",
         device_page,
         QUIET_GSI
     );
