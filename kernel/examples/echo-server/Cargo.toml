@@ -1,0 +1,11 @@
+[package]
+name = "echo-server"
+description = "The echo example's server: a process on the Moruna microkernel written only against moruna-svc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+echo-protocol = { path = "../echo-protocol" }

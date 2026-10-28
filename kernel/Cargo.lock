@@ -109,6 +109,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-client"
+version = "0.1.0"
+dependencies = [
+ "echo-protocol",
+ "moruna-svc",
+]
+
+[[package]]
+name = "echo-conformance"
+version = "0.1.0"
+dependencies = [
+ "echo-protocol",
+ "moruna-svc",
+]
+
+[[package]]
+name = "echo-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "echo-server"
+version = "0.1.0"
+dependencies = [
+ "echo-protocol",
+ "moruna-svc",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

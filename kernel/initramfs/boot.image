@@ -67,3 +67,21 @@ process cycles
   handle console console
   expect KB2 cycles: ok:
   exits 0
+
+# SV-T10, SV-T11: the echo example, written only against moruna-svc. The server
+# listens on each `listen*` slot; the client and the conformance suite each reach it
+# through one.
+process echo-server
+  handle console console
+  expect KB2 echo-server: ok:
+  exits 0
+process echo-client
+  handle console console
+  expect KB2 echo: ok:
+  exits 0
+process echo-conformance
+  handle console console
+  expect KB2 conformance moruna.example.echo: ok:
+  exits 0
+link echo-client.server echo-server.listen-client
+link echo-conformance.server echo-server.listen-conformance
