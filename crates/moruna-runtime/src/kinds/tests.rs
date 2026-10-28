@@ -116,18 +116,18 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(declared.role, Role::Sink);
     let (declared, _) = kinds.kernel("kernels[0]", "std").expect("std runs");
     assert_eq!(declared.role, Role::Kernel);
-    // A name is resolved within its role: no source is called `arrow_ipc`, no sink `std`.
-    let e = error_of(kinds.source("source", "arrow_ipc"));
+    // A name is resolved within its role: no source is called `std`, no sink `std`.
+    let e = error_of(kinds.source("source", "std"));
     let sources = if cfg!(feature = "peql") {
-        "datafusion, parquet, tensor, vortex"
+        "arrow_ipc, datafusion, parquet, tensor, vortex"
     } else {
-        "parquet, tensor, vortex"
+        "arrow_ipc, parquet, tensor, vortex"
     };
     assert_eq!(
         e.to_string(),
         refusal(SpecError::new(
             "source.kind",
-            format!("no source kind `arrow_ipc` is registered; this build reads {sources}"),
+            format!("no source kind `std` is registered; this build reads {sources}"),
         ))
         .to_string()
     );
@@ -267,7 +267,12 @@ fn kd_t3_registration_refusals() {
 #[test]
 fn kd_t4_standard_conformance() {
     let harness = Harness::new();
-    let sources: [&dyn SourceKind; 3] = [&parquet::Parquet, &vortex::Vortex, &tensor::Tensor];
+    let sources: [&dyn SourceKind; 4] = [
+        &arrow_ipc::ArrowIpc,
+        &parquet::Parquet,
+        &vortex::Vortex,
+        &tensor::Tensor,
+    ];
     for kind in sources {
         let passed = conformance::source(kind, &harness).unwrap_or_else(|v| panic!("{v}"));
         assert!(passed.cases > 4, "{passed:?}");
@@ -290,6 +295,41 @@ fn kd_t4_standard_conformance() {
     assert!(passed.properties.contains(&"KD-C7"));
 }
 
+/// SO-T39 ipc_source_conformance (07 e.9; KD-I5): the `arrow_ipc` kind passes the source port's
+/// suite and declares what the design says of it.
+#[test]
+fn so_t39_ipc_source_conformance() {
+    let harness = Harness::new();
+    let passed =
+        conformance::source(&arrow_ipc::ArrowIpc, &harness).unwrap_or_else(|v| panic!("{v}"));
+    assert!(passed.cases > 4, "{passed:?}");
+    let declared = SourceKind::declaration(&arrow_ipc::ArrowIpc);
+    assert_eq!(declared.role, Role::Source);
+    assert_eq!(
+        (declared.inputs, declared.outputs),
+        (Flow::Files, Flow::Batches)
+    );
+    assert_eq!(declared.needs, Needs::nothing());
+    assert_eq!(declared.deterministic, Fact::Yes);
+    assert_eq!(declared.preserves_columns, Fact::BySettings);
+    assert_eq!(declared.isolation, Isolation::Builtin);
+    assert!(!declared.examples().is_empty());
+    // The settings the document names are the ones the kind reads: a projection and a split
+    // size, and nothing else.
+    let settings: arrow_ipc::SourceSettings = serde_json::from_value(
+        serde_json::json!({"url": ["/a", "/b"], "options": {"columns": ["id"], "split_rows": 8}}),
+    )
+    .expect("the settings read");
+    assert_eq!(settings.url.0, ["/a", "/b"]);
+    assert_eq!(settings.options.split_rows, Some(8));
+    assert!(
+        serde_json::from_value::<arrow_ipc::SourceSettings>(
+            serde_json::json!({"url": "/a", "options": {"split_bytes": 8}})
+        )
+        .is_err()
+    );
+}
+
 /// KD-T6 listing (e.3): every declaration, by role, in name order; it reads back as itself, and
 /// every standard declaration is one the registry accepts.
 #[test]
@@ -301,10 +341,10 @@ fn kd_t6_listing() {
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
     assert_eq!(names(&listing.kernels), ["package", "std"]);
     let mut sinks = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
-    let mut sources = vec!["parquet", "tensor", "vortex"];
+    let mut sources = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
     if cfg!(feature = "peql") {
         sinks.insert(2, "peql");
-        sources.insert(0, "datafusion");
+        sources.insert(1, "datafusion");
     }
     assert_eq!(names(&listing.sinks), sinks);
     assert_eq!(names(&listing.sources), sources);
@@ -327,14 +367,17 @@ fn kd_t6_listing() {
         json["kernels"][1]["settings"]["properties"]["name"]["enum"],
         json!(moruna_kernels::NAMES)
     );
-    assert_eq!(
-        json["sources"][0]["needs"]["network"],
-        json!(if cfg!(feature = "peql") {
-            "no"
-        } else {
-            "by_settings"
-        })
-    );
+    // Listed by name, so a kind added before it does not move the check: Parquet reaches an
+    // object store when its settings say so, a local Arrow IPC file never does.
+    let source = |name: &str| {
+        json["sources"]
+            .as_array()
+            .and_then(|all| all.iter().find(|d| d["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("no source {name} in the listing"))
+    };
+    assert_eq!(source("parquet")["needs"]["network"], json!("by_settings"));
+    assert_eq!(source("arrow_ipc")["needs"]["network"], json!("no"));
 }
 
 /// KD-T10 suite_catches_violations (f.4): the suites have teeth. An adapter that breaks a

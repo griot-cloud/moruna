@@ -1304,10 +1304,10 @@ Used by staging segments (09 e.3) and by `ArrowIpcSink` (08 e.3); defined here, 
 | Piece | Content | Placement |
 |---|---|---|
 | framing | the IPC `Schema` message and the `RecordBatch` message (flatbuffers), continuation marker and lengths as in the IPC stream format, with each `Buffer` entry's offset rewritten to the page-aligned body layout below | one arena buffer, page-rounded, zero-padded; under 64 KiB in practice, `Staging` if over 1 MiB |
-| body | each Arrow buffer of the batch, in schema order, each starting at the next page boundary after the previous | written from the batch's own buffers through `BufferView::of_arrow`; no copy |
+| body | each Arrow buffer of the batch, in schema order, each starting at the next page boundary after the previous; the record batch message's `bodyLength` is the span from the end of the message to the end of the last non-empty buffer, padded to 8, and an empty buffer's entry offset is no further than that span (KA11) | written from the batch's own buffers through `BufferView::of_arrow`; no copy |
 | tail | zero padding to the next page boundary | not written; implied by the next record's offset |
 
-`moruna_kernel::ipc` provides `encode_framing(batch, page_bytes, base_offset, alloc: &dyn Allocator) -> Result<(Buffer /* framing */, Vec<(usize /* body offset */, arrow::buffer::Buffer)>)>` (allocating only the framing buffer from `alloc`) and `decode(buf: arrow::buffer::Buffer, page_bytes) -> Result<RecordBatch>`, whose arrays point into `buf` (arrow's IPC reader over an aligned buffer; verified by pointer comparison in CT-T18). A reader validates the continuation marker, message lengths and that every body offset is a page multiple, and puts the schema message and the record batch message, with the rest of the record as its body, through `check` (e.8) before arrow-ipc converts or decodes either (CT-I13); any failure is `Io { op: "ipc" }` with the check's sentence.
+A record that is one block of an IPC file must also satisfy the file format's block rules (08 e.3, KA11): the message declares the `bodyLength` the footer's block repeats, and Arrow C++ refuses a file in which they differ, so `encode_framing` rewrites it with the buffer entries. `moruna_kernel::ipc` provides `encode_framing(batch, page_bytes, base_offset, alloc: &dyn Allocator) -> Result<(Buffer /* framing */, Vec<(usize /* body offset */, arrow::buffer::Buffer)>)>` (allocating only the framing buffer from `alloc`) and `decode(buf: arrow::buffer::Buffer, page_bytes) -> Result<RecordBatch>`, whose arrays point into `buf` (arrow's IPC reader over an aligned buffer; verified by pointer comparison in CT-T18). A reader validates the continuation marker, message lengths and that every body offset is a page multiple, and puts the schema message and the record batch message, with the rest of the record as its body, through `check` (e.8) before arrow-ipc converts or decodes either (CT-I13); any failure is `Io { op: "ipc" }` with the check's sentence.
 
 ### e.8 Reading Arrow IPC (2026-10-28)
 
@@ -1316,7 +1316,8 @@ Every Arrow IPC read in Moruna goes through `moruna_kernel::ipc` (CT-I13):
 ```rust
 pub enum Checked<'m> { Schema(ipc::Schema<'m>), Batch(ipc::RecordBatch<'m>), Dictionary(ipc::DictionaryBatch<'m>), Empty }
 pub fn check<'m>(message: &ipc::Message<'m>, body: &[u8], schema: Option<&Schema>) -> Result<Checked<'m>, String>;
-pub struct Decoder;   // a stream's schema and dictionaries; `message(&mut self, &Message, body: &Buffer) -> Result<Option<RecordBatch>, String>`
+pub struct Decoder;   // a stream's schema and dictionaries; `message(&mut self, &Message, body: &Buffer) -> Result<Option<RecordBatch>, String>`; `Decoder::with_schema(SchemaRef)` starts from a known schema, as an IPC file's blocks are read
+pub fn footer_schema(schema: ipc::Schema<'_>) -> Result<SchemaRef, String>;   // an IPC file footer's schema, checked and converted (KA9)
 pub fn read_stream(bytes: &arrow::buffer::Buffer) -> Result<Vec<RecordBatch>, String>;   // in place: the batches point into `bytes`
 pub struct ReadStream<R: Read>;   // `new(reader, limit)`; an iterator of `Result<RecordBatch, String>`, one message read at a time
 ```

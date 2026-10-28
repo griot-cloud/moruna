@@ -27,6 +27,15 @@ class VortexSource:
         split_bytes: int | None = ...,
     ) -> None: ...
 
+class ArrowIpcSource:
+    def __init__(
+        self,
+        urls: str | Sequence[str],
+        *,
+        columns: Sequence[str] | None = ...,
+        split_rows: int | None = ...,
+    ) -> None: ...
+
 class TensorSource:
     def __init__(
         self, paths: str | Sequence[str], *, tensors: Sequence[str] | None = ...

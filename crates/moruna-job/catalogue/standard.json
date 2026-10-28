@@ -3,6 +3,103 @@
   "moruna": "0.5.7",
   "sources": [
     {
+      "name": "arrow_ipc",
+      "role": "source",
+      "summary": "Arrow IPC files (the file format) in local paths or directories",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "$ref": "#/$defs/Urls",
+            "description": "Local files, or directories whose `*.arrow` files are read in name order: a bare path or\n`file://`."
+          },
+          "options": {
+            "$ref": "#/$defs/SourceOptions",
+            "description": "Projection and split size.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "An `arrow_ipc` source's settings.",
+        "title": "arrow_ipc",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "Urls": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "One location, or a list of them."
+          },
+          "SourceOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "The projection; absent is every column."
+              },
+              "split_rows": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "The rows a split is cut toward, from whole record batches; absent is one split per\nrecord batch (07 e.9)."
+              }
+            },
+            "description": "`source.options` for `arrow_ipc`."
+          }
+        },
+        "examples": [
+          {
+            "url": "file:///data/in/"
+          },
+          {
+            "url": [
+              "/data/a.arrow",
+              "/data/more/"
+            ],
+            "options": {
+              "columns": [
+                "id"
+              ],
+              "split_rows": 65536
+            }
+          }
+        ]
+      },
+      "inputs": "files",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    },
+    {
       "name": "parquet",
       "role": "source",
       "summary": "Parquet files or prefixes, local or in an object store",

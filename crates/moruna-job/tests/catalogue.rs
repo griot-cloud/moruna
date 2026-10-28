@@ -86,7 +86,7 @@ fn jb_t2_embedded_catalogues() {
     let standard = Catalogue::standard().expect("the standard catalogue");
     assert_eq!(
         names(&standard, Role::Source),
-        ["parquet", "tensor", "vortex"]
+        ["arrow_ipc", "parquet", "tensor", "vortex"]
     );
     assert_eq!(names(&standard, Role::Kernel), ["package", "std"]);
     assert_eq!(
@@ -96,7 +96,7 @@ fn jb_t2_embedded_catalogues() {
     let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
     assert_eq!(
         names(&governed, Role::Source),
-        ["datafusion", "parquet", "tensor", "vortex"]
+        ["arrow_ipc", "datafusion", "parquet", "tensor", "vortex"]
     );
     assert_eq!(names(&governed, Role::Kernel), ["package", "std"]);
     assert_eq!(
@@ -115,8 +115,8 @@ fn jb_t2_embedded_catalogues() {
             }
         }
     }
-    // A name is a kind of a role: no source is called `arrow_ipc`, no sink `std`.
-    assert!(standard.get(Role::Source, "arrow_ipc").is_none());
+    // A name is a kind of a role: no source is called `std`, no sink `std`.
+    assert!(standard.get(Role::Source, "std").is_none());
     assert!(standard.get(Role::Sink, "std").is_none());
     assert!(standard.get(Role::Source, "datafusion").is_none());
     assert_eq!(Catalogue::empty().names(Role::Kernel).count(), 0);

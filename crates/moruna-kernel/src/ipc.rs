@@ -148,20 +148,38 @@ pub fn encode_framing(
     let mut placed = Vec::with_capacity(bodies.len());
     let mut cursor = base_offset + framing_padded;
     let body_base = base_offset + framing_len as u64;
-    for (i, body) in bodies.into_iter().enumerate() {
+    let mut layout = Vec::with_capacity(bodies.len());
+    let mut body_end = 0u64;
+    for body in bodies {
         let absolute = cursor;
         let relative = absolute - body_base;
-        write_entry(
-            &mut framing[rb_start..],
-            i,
-            relative as i64,
-            body.len() as i64,
-        )?;
+        if !body.is_empty() {
+            body_end = body_end.max(relative + body.len() as u64);
+        }
+        layout.push((relative, body.len() as u64));
         cursor = round_up(absolute + body.len() as u64, page);
         let offset = usize::try_from(absolute)
             .map_err(|_| bad(format!("body offset {absolute} does not fit this platform")))?;
         placed.push((offset, body));
     }
+
+    // The message declares the body's length, and a reader holds the block of an IPC file to it:
+    // Arrow C++ refuses a file whose footer block and message disagree about it, and one whose
+    // block lengths are not multiples of 8 (KA11). The deviation of this layout is where the
+    // buffers sit, not what the length means, so it is the span from the end of the message to
+    // the end of the last byte of a buffer, padded to 8, which is what the file holds. An empty
+    // buffer lies inside that span wherever the layout put it: its offset is clamped to the
+    // span's end, since a reader slices the body at every entry's offset, empty ones included.
+    let body_len = round_up(body_end, 8);
+    for (i, (relative, length)) in layout.into_iter().enumerate() {
+        let at = if length == 0 {
+            relative.min(body_len)
+        } else {
+            relative
+        };
+        write_entry(&mut framing[rb_start..], i, at as i64, length as i64)?;
+    }
+    write_body_length(&mut framing[rb_start..], body_len)?;
 
     let mut buf = alloc.alloc(framing_padded as usize, host_tier(alloc))?;
     let bytes: &mut [u8] = &mut buf;
@@ -218,6 +236,18 @@ pub fn decode(buf: ArrowBuffer, page_bytes: usize) -> crate::Result<RecordBatch>
     RecordBatchDecoder::try_new(&body, record_batch, schema, &dictionaries, &version)
         .and_then(|d| d.read_record_batch())
         .map_err(|e| bad(format!("decode: {e}")))
+}
+
+/// The schema an IPC file's footer holds: checked as a schema message is (CT-I13), then
+/// converted. The footer is untrusted input like every other byte of the file, and arrow-ipc's
+/// converter panics on a type it cannot map.
+pub fn footer_schema(
+    schema: arrow::ipc::Schema<'_>,
+) -> Result<arrow::datatypes::SchemaRef, String> {
+    check::check_schema(schema)?;
+    Ok(std::sync::Arc::new(arrow::ipc::convert::fb_to_schema(
+        schema,
+    )))
 }
 
 /// The tier a framing buffer is allocated in: the run's one host tier (e.1).
@@ -317,6 +347,64 @@ fn buffer_entries(message: &[u8]) -> crate::Result<Vec<(u64, u64)>> {
         out.push((offset as u64, length as u64));
     }
     Ok(out)
+}
+
+/// Where the record batch message's `bodyLength` lives in `message` (the 8-byte header and the
+/// flatbuffer), found through the flatbuffer's own vtable. `None` when the field is absent,
+/// which flatbuffers does for a value of zero.
+fn body_length_at(message: &[u8]) -> crate::Result<Option<usize>> {
+    /// The field slot of `Message.bodyLength` in the schema `Message.fbs`: version, header type,
+    /// header, body length, custom metadata.
+    const BODY_LENGTH_SLOT: usize = 3;
+    let len = message_len(message)?;
+    let flatbuffer = &message[8..8 + len];
+    let word = |at: usize, width: usize| -> crate::Result<&[u8]> {
+        flatbuffer
+            .get(at..at + width)
+            .ok_or_else(|| bad("the message flatbuffer is truncated"))
+    };
+    let root = u32::from_le_bytes(word(0, 4)?.try_into().map_err(|_| bad("root offset"))?) as usize;
+    let back = i32::from_le_bytes(
+        word(root, 4)?
+            .try_into()
+            .map_err(|_| bad("vtable offset"))?,
+    );
+    let vtable = (root as i64 - back as i64)
+        .try_into()
+        .map_err(|_| bad("the message's vtable is outside it"))?;
+    let vtable_len = u16::from_le_bytes(word(vtable, 2)?.try_into().map_err(|_| bad("vtable"))?);
+    let slot = 4 + 2 * BODY_LENGTH_SLOT;
+    if (vtable_len as usize) < slot + 2 {
+        return Ok(None);
+    }
+    let field = u16::from_le_bytes(
+        word(vtable + slot, 2)?
+            .try_into()
+            .map_err(|_| bad("vtable slot"))?,
+    ) as usize;
+    if field == 0 {
+        return Ok(None);
+    }
+    word(root + field, 8)?;
+    Ok(Some(8 + root + field))
+}
+
+/// Set the record batch message's `bodyLength` to `length`, in place (KA11). A flatbuffer omits
+/// a field that is zero, so a zero length is the message as the encoder wrote it, and a length
+/// the message has no room for is refused rather than written somewhere else.
+fn write_body_length(message: &mut [u8], length: u64) -> crate::Result<()> {
+    match body_length_at(message)? {
+        Some(at) => message[at..at + 8].copy_from_slice(&(length as i64).to_le_bytes()),
+        None if length == 0 => {}
+        None => return Err(bad("the record batch message has no body length to set")),
+    }
+    let flatbuffer_len = message_len(message)?;
+    let parsed = root_as_message(&message[8..8 + flatbuffer_len])
+        .map_err(|e| bad(format!("record batch message: {e}")))?;
+    if parsed.bodyLength() as u64 != length {
+        return Err(bad("the record batch message's body length did not take"));
+    }
+    Ok(())
 }
 
 /// Rewrite one buffer entry of a record batch message in place.

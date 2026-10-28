@@ -98,7 +98,7 @@ fn jb_t6_every_example_passes() {
 #[test]
 fn jb_t7_unknown_kinds() {
     let doc = job(
-        json!({"kind": "arrow_ipc", "url": "/in"}),
+        json!({"kind": "csv", "url": "/in"}),
         vec![
             json!({"kind": "java"}),
             json!({"kind": "std", "name": "cast"}),
@@ -109,8 +109,8 @@ fn jb_t7_unknown_kinds() {
     assert_eq!(
         text(&found),
         [
-            "source.kind: no source kind `arrow_ipc` is declared; this catalogue reads parquet, \
-             tensor, vortex",
+            "source.kind: no source kind `csv` is declared; this catalogue reads arrow_ipc, \
+             parquet, tensor, vortex",
             "kernels[0].kind: no kernel kind `java` is declared; this catalogue runs package, std",
             "sink.kind: no sink kind `std` is declared; this catalogue writes arrow_ipc, parquet, \
              tensor, vortex",
@@ -120,7 +120,12 @@ fn jb_t7_unknown_kinds() {
         found[0].code,
         RefusalCode::UnknownKind {
             role: Role::Source,
-            known: vec!["parquet".into(), "tensor".into(), "vortex".into()]
+            known: vec![
+                "arrow_ipc".into(),
+                "parquet".into(),
+                "tensor".into(),
+                "vortex".into()
+            ]
         }
     );
     assert_eq!(found[1].field, "kernels[0].kind");

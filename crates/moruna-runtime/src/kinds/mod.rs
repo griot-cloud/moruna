@@ -355,12 +355,13 @@ impl Registry {
         }
     }
 
-    /// Every kind this build of the runtime has (f.1): the Parquet, Vortex and tensor sources;
+    /// Every kind this build of the runtime has (f.1): the Arrow IPC, Parquet, Vortex and tensor sources;
     /// the Parquet, Vortex, tensor and Arrow IPC sinks; the standard kernels and function
     /// packages; and, with the `peql` feature, the `datafusion` source and the `peql` sink. No
     /// `rust` kind is among them (KD-I7). A program adds its own with the `register_` calls.
     pub fn standard() -> Registry {
         let mut kinds = Registry::empty();
+        kinds.put_source(Arc::new(arrow_ipc::ArrowIpc));
         kinds.put_source(Arc::new(parquet::Parquet));
         kinds.put_source(Arc::new(vortex::Vortex));
         kinds.put_source(Arc::new(tensor::Tensor));

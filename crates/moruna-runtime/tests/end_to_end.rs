@@ -768,3 +768,247 @@ fn read_back_vortex(dir: &std::path::Path) -> Vec<(i64, i64)> {
     }
     out
 }
+
+/// One input file of three columns, one of them a string with nulls in it and one a float that
+/// is not a multiple of anything: `id`, `name`, `x` (SO-T34).
+fn write_wide_parquet(path: &std::path::Path, rows: u64, row_group_rows: usize) {
+    use moruna_kernel::arrow::array::{
+        ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
+    };
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("x", DataType::Float64, false),
+    ]));
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .build();
+    let file = std::fs::File::create(path).expect("the input file");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("a writer");
+    let ids: Int64Array = (0..rows as i64).collect::<Vec<_>>().into();
+    let names: StringArray = (0..rows)
+        .map(|i| (i % 7 != 0).then(|| format!("name-{i}")))
+        .collect();
+    let xs: Float64Array = (0..rows)
+        .map(|i| i as f64 * 0.25)
+        .collect::<Vec<_>>()
+        .into();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids) as ArrayRef,
+            Arc::new(names) as ArrayRef,
+            Arc::new(xs) as ArrayRef,
+        ],
+    )
+    .expect("a batch");
+    writer.write(&batch).expect("the batch is written");
+    writer.close().expect("the footer is written");
+}
+
+/// Every Parquet file under `dir` as `(column names, rows)`, the rows `Debug`-printed per
+/// column so one comparison covers every type, ordered by `id`.
+fn read_back_table(dir: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
+    use moruna_kernel::arrow::array::{Array, AsArray};
+    use moruna_kernel::arrow::util::display::array_value_to_string;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("the output directory")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet"))
+        .collect();
+    files.sort();
+    let mut names = Vec::new();
+    let mut rows: Vec<(i64, Vec<String>)> = Vec::new();
+    for path in files {
+        let file = std::fs::File::open(&path).expect("an output file");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("a Parquet reader")
+            .build()
+            .expect("a Parquet reader");
+        for batch in reader {
+            let batch = batch.expect("a batch");
+            names = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let ids = batch
+                .column_by_name("id")
+                .expect("the id column")
+                .as_primitive::<moruna_kernel::arrow::datatypes::Int64Type>()
+                .clone();
+            for row in 0..batch.num_rows() {
+                let cells = batch
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        if c.is_null(row) {
+                            "null".to_string()
+                        } else {
+                            array_value_to_string(c, row).expect("a cell")
+                        }
+                    })
+                    .collect();
+                rows.push((ids.value(row), cells));
+            }
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    (names, rows.into_iter().map(|(_, cells)| cells).collect())
+}
+
+/// One run of `source` into `sink`, which must complete.
+fn run_to_completion(
+    scratch: &support::Scratch,
+    source: SourceSpec,
+    sink: SinkSpec,
+) -> moruna_runtime::RunReport {
+    let mut spec = RunSpec::new(source, Vec::new(), sink);
+    spec.budget = Some(1 << 30);
+    spec.cpu = Some(2.0);
+    spec.staging_dir = Some(scratch.path().join("staging"));
+    spec.staging_limit = Some(1 << 30);
+    spec.profiles_dir = Some(scratch.path().join("profiles"));
+    std::fs::create_dir_all(scratch.path().join("staging")).expect("the staging directory");
+    match Runtime::run(spec, CancelToken::new()) {
+        Ok(report) => {
+            assert_eq!(
+                report.exit,
+                moruna_runtime::ExitReason::Completed,
+                "notes: {:?}",
+                report.notes
+            );
+            report
+        }
+        Err(error) => panic!("the run did not complete: {error}"),
+    }
+}
+
+/// SO-T34. Parquet to the `arrow_ipc` sink to the `arrow_ipc` source to Parquet: every row and
+/// value comes back, over a directory of several files and over a projection, and the files the
+/// sink wrote are ones the format allows (the footer's blocks are 8-aligned, KA11). Every
+/// component is real (07 e.9, e.10; 08 e.3).
+#[test]
+fn so_t34_ipc_round_trip() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("so_t34");
+    let input = scratch.path().join("in.parquet");
+    let ipc = scratch.path().join("ipc");
+    let rows: u64 = 90_000;
+    write_wide_parquet(&input, rows, 10_000);
+
+    // Parquet into IPC files that roll after about every morsel, so there are several.
+    let parquet = input.clone();
+    let ipc_dir = ipc.clone();
+    run_to_completion(
+        &scratch,
+        SourceSpec::Build(Box::new(move |ctx| {
+            moruna_sources::ParquetSource::new(
+                moruna_sources::ParquetSourceConfig {
+                    urls: vec![format!("file://{}", parquet.display())],
+                    ..Default::default()
+                },
+                ctx.reactor.clone(),
+                ctx.object_metadata()?,
+            )
+            .map(|source| Arc::new(source) as Arc<dyn moruna_kernel::Source>)
+        })),
+        SinkSpec::Build(Box::new(move |ctx| {
+            moruna_sinks::ArrowIpcSink::new(
+                moruna_sinks::ArrowIpcSinkConfig {
+                    path: ipc_dir.clone(),
+                    file_bytes: 256 << 10,
+                },
+                ctx.reactor.clone(),
+                ctx.alloc.clone(),
+            )
+            .map(|sink| Box::new(sink.with_run_id(ctx.run_id)) as Box<dyn moruna_kernel::Sink>)
+        })),
+    );
+    let mut parts: Vec<_> = std::fs::read_dir(&ipc)
+        .expect("the IPC directory")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("arrow"))
+        .collect();
+    parts.sort();
+    assert!(parts.len() > 1, "the sink rolled: {parts:?}");
+
+    let (_, expected) = {
+        let all = scratch.path().join("expected");
+        std::fs::create_dir_all(&all).expect("a directory");
+        std::fs::copy(&input, all.join("part.parquet")).expect("a copy");
+        read_back_table(&all)
+    };
+    assert_eq!(expected.len() as u64, rows);
+
+    // IPC back into Parquet, the whole directory, with splits cut to 25,000 rows: more than
+    // one block to a split, so a read joins blocks.
+    for (label, columns, split_rows) in [
+        ("one split per block", None, None),
+        ("grouped splits", None, Some(25_000u64)),
+        (
+            "a projection",
+            Some(vec!["x".to_string(), "id".to_string()]),
+            None,
+        ),
+    ] {
+        let out = scratch
+            .path()
+            .join(format!("out-{}", label.replace(' ', "-")));
+        let ipc_in = ipc.clone();
+        let out_url = format!("file://{}", out.display());
+        let projected = columns.clone();
+        let report = run_to_completion(
+            &scratch,
+            SourceSpec::Build(Box::new(move |ctx| {
+                moruna_sources::ArrowIpcSource::new(
+                    moruna_sources::ArrowIpcSourceConfig {
+                        urls: vec![ipc_in.display().to_string()],
+                        columns: projected.clone(),
+                        split_rows,
+                    },
+                    ctx.reactor.clone(),
+                )
+                .map(|source| Arc::new(source) as Arc<dyn moruna_kernel::Source>)
+            })),
+            SinkSpec::Build(Box::new(move |ctx| {
+                moruna_sinks::ParquetSink::new(
+                    moruna_sinks::ParquetSinkConfig {
+                        url: out_url.clone(),
+                        row_group_bytes: 2 << 20,
+                        file_bytes: 8 << 20,
+                        ..Default::default()
+                    },
+                    ctx.reactor.clone(),
+                    ctx.alloc.clone(),
+                )
+                .map(|sink| Box::new(sink) as Box<dyn moruna_kernel::Sink>)
+            })),
+        );
+        assert!(!report.run_id.is_empty(), "{label}");
+        let (names, back) = read_back_table(&out);
+        assert_eq!(back.len() as u64, rows, "{label}: every row once");
+        match &columns {
+            None => {
+                assert_eq!(names, ["id", "name", "x"], "{label}");
+                assert_eq!(back, expected, "{label}: values");
+            }
+            Some(_) => {
+                // The projection keeps the file's order: `id` before `x`.
+                assert_eq!(names, ["id", "x"], "{label}");
+                let wanted: Vec<Vec<String>> = expected
+                    .iter()
+                    .map(|row| vec![row[0].clone(), row[2].clone()])
+                    .collect();
+                assert_eq!(back, wanted, "{label}: values");
+            }
+        }
+    }
+}
