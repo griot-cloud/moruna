@@ -297,7 +297,7 @@ Coverage on the host (`cargo llvm-cov`, lines): `moruna-mmio` 100%, `moruna-pci`
 
 ## m. Open items
 
-1. **Vsock in CI.** The data path runs only on a runner with `/dev/vhost-vsock`. Without it QEMU cannot create the device at all (`vhost-vsock-pci` opens `/dev/vhost-vsock` when it is realised), so not even negotiation and queue setup can run; the boot then records why and requires the test's no-device line. The CI result on GitHub's `ubuntu-24.04` runner is recorded on the board.
+1. **Vsock on another runner.** On GitHub's `ubuntu-24.04` runner `modprobe vhost_vsock` gives a usable `/dev/vhost-vsock`, and DR-T13's data path ran both ways on 1, 2 and 4 CPUs (PR #79). A runner without it cannot give QEMU the device at all (`vhost-vsock-pci` opens `/dev/vhost-vsock` when it is realised), so not even negotiation and queue setup can run there; the boot then records why and requires the test's no-device line, which means such a runner would not exercise the vsock driver.
 2. **Bus numbers.** Buses are numbered from the ECAM window's first bus, which is bus 0 on q35 and every machine Moruna targets; on a segment whose MCFG starts at another bus the names and requester ids would be off by that bus. `resource_info` could carry the first bus (KE1).
 3. **Per-device IOMMU domains.** OSTD 0.19 has one IOMMU domain for every device, so with an IOMMU a driver's device reaches every pinned page, not only its own driver's. KE1 needs a domain per DMA resource.
 4. **MSI destination.** Every MSI goes to local APIC 0. Spreading a device's interrupts over CPUs needs the CPU's APIC id from OSTD, which it does not export.
