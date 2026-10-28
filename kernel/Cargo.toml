@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["abi", "loader", "handles", "core", "boot", "sys", "programs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+moruna-abi = { path = "abi", version = "=0.1.0" }
+moruna-loader = { path = "loader", version = "=0.1.0" }
+moruna-handles = { path = "handles", version = "=0.1.0" }
+moruna-microkernel = { path = "core", version = "=0.1.0" }
+moruna-sys = { path = "sys", version = "=0.1.0" }
+# OSTD, the framework that holds the kernel's unsafe code, and the frame and heap
+# allocators OSDK links into an OSTD kernel (Asterinas 0.19.0, MPL-2.0, DECISIONS.md MK1).
+ostd = { version = "=0.19.0", default-features = false }
+osdk-frame-allocator = { version = "=0.19.0" }
+osdk-heap-allocator = { version = "=0.19.0" }
+
+# Both the kernel and the test programs abort on panic: OSTD's handler prints a
+# backtrace from the unwind tables (-C force-unwind-tables) and powers off, and a
+# program's handler ends its process.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,10 @@
+[package]
+name = "moruna-kb1-programs"
+description = "The KB1 test programs: userland processes the CI boot starts from the manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-sys.workspace = true

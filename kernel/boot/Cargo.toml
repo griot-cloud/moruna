@@ -1,0 +1,16 @@
+[package]
+name = "moruna-microkernel-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "moruna-microkernel"
+path = "src/main.rs"
+
+[dependencies]
+ostd.workspace = true
+osdk-frame-allocator.workspace = true
+osdk-heap-allocator.workspace = true
+moruna-microkernel.workspace = true

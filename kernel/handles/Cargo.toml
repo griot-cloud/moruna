@@ -1,0 +1,10 @@
+[package]
+name = "moruna-handles"
+description = "The Moruna microkernel's per-process handle table: salted, generation-checked handle values"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true

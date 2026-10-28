@@ -137,6 +137,122 @@ jobs:
           cp -R python/tests /tmp/moruna-tests
           cd /tmp && python -m pytest -q /tmp/moruna-tests
 
+  # The microkernel (SDD 20, k), on a pull request that touches kernel/ or this file, and
+  # never on a push: kernel/ is its own Cargo workspace on a pinned nightly, built with
+  # plain cargo for x86_64-unknown-none and booted under QEMU with KVM when the runner
+  # has it (TCG otherwise). The serial line must carry a line for every KB1 test, no
+  # failure and no panic, and QEMU must exit with the kernel's success status.
+  kernel:
+    name: the microkernel builds and boots (KB1)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      # Asterinas pins QEMU 10.2.1 for OSTD 0.19.0 (tools/dev_env/nix/packages/qemu.nix
+      # and osdk/tools/docker/Dockerfile, tag v0.19.0): Ubuntu 24.04's 8.2 has known
+      # problems with it. Built from the release tarball, checked by its digest, cached.
+      QEMU_VERSION: "10.2.1"
+      QEMU_SHA256: a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: changed
+        name: Did this pull request touch kernel/?
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --quiet "$BASE...HEAD" -- kernel/ .github/workflows/ci.yml; then
+            echo "kernel/ is unchanged, so its build and boot stand"
+            echo "kernel=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "kernel=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the kernel's pinned toolchain (kernel/rust-toolchain.toml)
+        if: steps.changed.outputs.kernel == 'true'
+        working-directory: kernel
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.changed.outputs.kernel == 'true'
+        with:
+          workspaces: kernel
+      - id: qemu-cache
+        if: steps.changed.outputs.kernel == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/qemu
+          key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-ubuntu-24.04-v1
+      - name: Build QEMU ${{ env.QEMU_VERSION }}
+        if: steps.changed.outputs.kernel == 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
+          curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
+          echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
+          mkdir qemu-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-src
+          cd qemu-src
+          ./configure --prefix=/opt/qemu --target-list=x86_64-softmmu \
+            --without-default-features --enable-kvm --enable-tcg --disable-docs --disable-werror
+          make -j"$(nproc)"
+          sudo make install
+      - name: QEMU on the path, and KVM for this user when the runner has it
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          echo /opt/qemu/bin >> "$GITHUB_PATH"
+          /opt/qemu/bin/qemu-system-x86_64 --version
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the boot runs under TCG"
+      - name: Format, and the host tests of the ABI, the loaders and the handle table
+        if: steps.changed.outputs.kernel == 'true'
+        working-directory: kernel
+        run: |
+          cargo fmt --all -- --check
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo clippy --locked --target "$host" --all-targets \
+            -p moruna-abi -p moruna-loader -p moruna-handles --features moruna-abi/manifest -- -D warnings
+          cargo test --locked --target "$host" \
+            -p moruna-abi -p moruna-loader -p moruna-handles --features moruna-abi/manifest
+      - name: Build the kernel, the programs and the initramfs
+        if: steps.changed.outputs.kernel == 'true'
+        run: kernel/tools/build.sh "$RUNNER_TEMP/boot"
+      - name: Boot under QEMU and judge the serial line
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          set +e
+          kernel/tools/boot.sh "$RUNNER_TEMP/boot" 600 | tee "$RUNNER_TEMP/serial.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          kernel/tools/check-boot.sh "$RUNNER_TEMP/serial.log" "$status"
+      - name: Clippy for x86_64-unknown-none (the kernel, moruna-sys, the programs)
+        if: steps.changed.outputs.kernel == 'true'
+        working-directory: kernel
+        env:
+          RUSTFLAGS: -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y
+        run: |
+          for package in moruna-microkernel-boot moruna-kb1-programs; do
+            cargo clippy --release --locked --target x86_64-unknown-none \
+              -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem \
+              -p "$package" -- -D warnings
+          done
+      - name: Licences of the kernel workspace (MPL-2.0 for OSTD, DECISIONS.md MK1)
+        if: steps.changed.outputs.kernel == 'true'
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: cargo-deny@0.20.2
+      - if: steps.changed.outputs.kernel == 'true'
+        run: cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
+      - if: always() && steps.changed.outputs.kernel == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-serial-log
+          path: ${{ runner.temp }}/serial.log
+          if-no-files-found: warn
+          retention-days: 14
+
   # Weekly and on demand: the checks that answer to the outside world rather
   # than to a commit, and the ones that need a real cgroup ceiling.
   slow:

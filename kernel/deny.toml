@@ -1,0 +1,46 @@
+# Supply-chain policy for the kernel workspace (kernel/), its own Cargo workspace and
+# so its own `cargo-deny` configuration. The root deny.toml's rules apply unchanged;
+# the one difference is MPL-2.0 on the licence allow list, for OSTD (DECISIONS.md MK1).
+#
+#   cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
+#
+# (cargo-deny reads the deny.toml beside the manifest it is given.)
+
+[graph]
+all-features = true
+# The kernel's target, and the hosts its pure crates are tested on.
+targets = [
+  "x86_64-unknown-none",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+]
+
+[licenses]
+# The root allow list, plus MPL-2.0. MPL-2.0 is file-level copyleft: a file taken from
+# an MPL project stays MPL and its source stays available, and nothing else in the
+# work is touched. OSTD and the crates published with it are MPL-2.0 (`ostd`,
+# `ostd-macros`, `ostd-pod`, `ostd-pod-macros`, `ostd-test`, `osdk-frame-allocator`,
+# `osdk-heap-allocator`, `linux-boot-params`, `id-alloc`, `align_ext`, `int-to-c-enum`,
+# `int-to-c-enum-derive`, `padding-struct`), as is the linker script
+# kernel/boot/x86_64.ld copied from OSDK. Brackly accepted it on 2026-10-28.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MPL-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
