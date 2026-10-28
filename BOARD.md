@@ -529,6 +529,38 @@ The brief is `architecture/agents/briefs/waves-a-b-c.md` section 4. MC1 (section
 
 ---
 
+## EK. The Moruna microkernel (Brackly, 2026-10-28)
+
+Moruna becomes a microkernel that runs tasks as processes, booted two ways from one codebase: inside a VM on a Linux node, or as the node itself. Tasks are OCI images, any language; wasm is not needed. Design: `architecture/optimized-runtime.md`.
+
+**Extensible by default.** The kernel holds only processes, memory, threads, interrupts, timers, messages and capability handles. Everything else is a process speaking a published protocol: drivers, the network stack, filesystems, the Linux personality, the supervisor. Adding a driver or a server is adding a process image to the boot manifest and implementing a protocol with the `moruna-svc` SDK; nothing in the kernel is rebuilt and nothing is forked. Every protocol has a conformance suite.
+
+Waves are gates, not start order: an item starts when what it needs is merged. Two agents at a time.
+
+| wave | item | what | status |
+|---|---|---|---|
+| A. Any language on Linux, today | KA1 | `image` kind: OCI unpack (layers, whiteouts, digest cache), run the image's command under `moruna-sandbox`, Arrow IPC over stdin and stdout | in progress |
+| | KA2 | the data-plane port: `batch_get`, `batch_put`, `port_call` as one trait the engine uses; today's sandbox channel is its first adapter | todo |
+| | KA3 | the Python builder: `@moruna.kernel` to a four-layer image (runtime, locked dependencies, shim, function) | todo |
+| B. The kernel boots | KB1 | microkernel core on OSTD: boot, address spaces, processes, threads, IPC, capability handles, timers; boots under QEMU in CI on x86_64 | in progress |
+| | KB2 | `moruna-svc`: the SDK for servers and drivers, the boot manifest, the protocol schema and its conformance harness | todo |
+| | KB3 | first drivers as processes: virtio console, virtio block, vsock | todo |
+| C. Linux programs run | KC1 | the Linux personality server: the 60 syscalls; static musl, then glibc, then CPython | todo |
+| | KC2 | the image filesystem server: layers as block devices, one overlay, whiteouts, paging on demand | todo |
+| D. Moruna on its kernel | KD1 | the data-plane adapter on kernel channels: shared pages, ownership handoff, the record check in `batch_put` | todo |
+| | KD2 | the engine as the first process after the supervisor | todo |
+| | KD3 | conformance across adapters: every kind on Linux and on the kernel, same rows, same refusals | todo |
+| | KD4 | launcher devices in `moruna-vmm`: shared memory, one block device per layer | todo |
+| | release | 0.6.0: the kernel runs real jobs inside a VM | todo |
+| E. The kernel as a node | KE1 | NVMe and the cloud network card as driver processes | todo |
+| | KE2 | the network server: TCP/IP and TLS (smoltcp, rustls) | todo |
+| | KE3 | the node image: bootloader, kernel, servers, a standalone supervisor; boots on Google Cloud | todo |
+| | release | 0.7.0: a node boots Moruna | todo |
+| F. Griot orchestrates (Griot repository) | KF1 | the pool port: Cluster API for Linux pools, Google Cloud for Moruna pools | todo |
+| | KF2 | isolation tiers (shared, node, hardware) and placement by a kind's declared needs | todo |
+| | KF3 | the shared tier on the control plane, under a ceiling | todo |
+| | KF4 | the launcher moves into Griot's node agent | todo |
+
 ## Escalations and findings
 
 Open items the PM found while reading, routed per preamble section 7. Ids: `N-` a documentation finding from the PM's read, `E1-env-` an environment gap for a wave, `D-B` a decision about the board itself.

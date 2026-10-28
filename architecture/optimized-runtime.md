@@ -1,6 +1,8 @@
 # An optimized runtime
 
-A runtime that runs untrusted code on data. Native code, any language, with the guarantee wasm gives: the code can do exactly what it is handed and nothing else, and the only thing that crosses its boundary is Arrow. Everything below is Rust.
+A runtime that runs untrusted code on data. Native code, any language, with the guarantee wasm gives: the code can do exactly what it is handed and nothing else, and the only thing that crosses its boundary is Arrow. Everything below is Rust. wasm is not needed: the kernel is the small, memory-safe boundary.
+
+One kernel, a microkernel, booted two ways: inside a VM on a Linux node, or as the node itself. Tasks are processes on it. Everything that is not processes, memory, threads, interrupts, timers, messages and capability handles is a process speaking a published protocol, so a driver, a filesystem or a whole new personality is added as a process, never by changing the kernel.
 
 ## The stack
 
