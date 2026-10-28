@@ -177,7 +177,7 @@ The CI boot's table: `1af4:1042 virtio-blk block`, `1af4:1043 virtio-console con
 
 ### e.4 The CI boot's devices
 
-`kernel/tools/boot.sh` gives QEMU's q35 machine: virtio consoles at 00:03 (output to `OUT/console0-CPUS.log`) and 00:04 (input from `OUT/console1-input.txt`), a 4 MiB raw disk as virtio-blk at 00:05 (`OUT/disk-CPUS.img`, pattern A written by `disk-image.py` before each boot), `vhost-vsock-pci` with guest cid 3 at 00:06 when `/dev/vhost-vsock` is usable (with `vsock-peer.py` as the host's side), and QEMU's `edu` test device at 00:07. Every virtio device is modern only (`disable-legacy=on`), so its device id is `0x1040 +` its virtio type. `OUT/vsock-CPUS` says whether the vsock was attached and, if not, why.
+`kernel/tools/boot.sh` gives QEMU's q35 machine: virtio consoles at 00:03 (output to `OUT/console0-CPUS.log`) and 00:04 (input from `OUT/console1-input.txt`), a 4 MiB raw disk as virtio-blk at 00:05 (`OUT/disk-CPUS.img`, pattern A written by `disk-image.py` before each boot; reads throttled to 8 MiB/s, so DR-T11's 32 MiB of reads take about four seconds and the kill always lands while they are in flight: unthrottled, a boot on four CPUs finished all 32 before the kill), `vhost-vsock-pci` with guest cid 3 at 00:06 when `/dev/vhost-vsock` is usable (with `vsock-peer.py` as the host's side), and QEMU's `edu` test device at 00:07. Every virtio device is modern only (`disable-legacy=on`), so its device id is `0x1040 +` its virtio type. `OUT/vsock-CPUS` says whether the vsock was attached and, if not, why.
 
 ### e.5 A driver's life
 

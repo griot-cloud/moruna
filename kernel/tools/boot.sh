@@ -11,7 +11,9 @@
 # The machine carries the devices SDD 25's tests drive, each at a fixed PCI slot:
 # two virtio consoles (00:03, whose output goes to OUT/console0-CPUS.log, and 00:04,
 # whose input is OUT/console1-input.txt), a virtio-blk disk (00:05,
-# OUT/disk-CPUS.img, written with pattern A by disk-image.py before the boot), a
+# OUT/disk-CPUS.img, written with pattern A by disk-image.py before the boot, reads
+# throttled to 8 MiB/s so DR-T11's 32 MiB of reads are still in flight when the
+# driver is killed, on any number of CPUs), a
 # vhost vsock with guest cid 3 (00:06) when /dev/vhost-vsock is usable, with
 # vsock-peer.py as the host's side (OUT/vsock-peer-CPUS.log), and QEMU's edu test
 # device (00:07). OUT/vsock-CPUS says whether the vsock was attached, and why not.
@@ -44,7 +46,7 @@ devices=(
   -device virtio-serial-pci,id=serial1,addr=0x4,disable-legacy=on
   -chardev "file,id=console1,path=$console1,input-path=$input"
   -device virtconsole,bus=serial1.0,chardev=console1
-  -drive "file=$disk,format=raw,if=none,id=disk0"
+  -drive "file=$disk,format=raw,if=none,id=disk0,throttling.bps-read=8388608"
   -device virtio-blk-pci,drive=disk0,addr=0x5,disable-legacy=on
   -device edu,addr=0x7
 )
