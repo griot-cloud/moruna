@@ -107,6 +107,9 @@ fn sv_t5_a_driver_answers_when_its_device_interrupts() {
         }))
         .expect("watch");
         assert_eq!(d.len(), 2);
+        // The watched line is not a channel: a server that watches objects for as long
+        // as it serves counts only its connections and listeners.
+        assert_eq!(d.channels(), 1);
         d.run().expect("run");
         device.borrow_mut().waiting.len()
     });

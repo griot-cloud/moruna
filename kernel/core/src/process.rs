@@ -69,6 +69,8 @@ struct Region {
 pub enum Exit {
     Code(i64),
     Fault(String),
+    /// A holder of a handle to it called `process_kill`.
+    Killed,
 }
 
 enum Life {
@@ -472,6 +474,19 @@ impl Process {
         }
     }
 
+    /// `process_kill`: ends a running process. `BadState` for one that has not started
+    /// or has already ended.
+    pub fn kill(&self) -> Result<(), Error> {
+        {
+            let state = self.state.lock();
+            if !matches!(state.life, Life::Running { .. }) || state.exit.is_some() {
+                return Err(Error::BadState);
+            }
+        }
+        self.end(Exit::Killed);
+        Ok(())
+    }
+
     /// Records why the process is ending (the first reason wins) and stops its threads.
     pub fn end(&self, exit: Exit) {
         let threads: Vec<Arc<Thread>> = {
@@ -524,6 +539,14 @@ impl Process {
                     "kk: process {} faulted: {}; it has ended and the others run on (it ran on cpus {})",
                     self.name,
                     what,
+                    cpus
+                );
+                true
+            }
+            Exit::Killed => {
+                early_println!(
+                    "kk: process {} was killed through a handle to it; it has ended and the others run on (it ran on cpus {})",
+                    self.name,
                     cpus
                 );
                 true

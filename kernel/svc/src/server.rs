@@ -247,6 +247,16 @@ impl Dispatcher {
         self.slots.is_empty()
     }
 
+    /// The channels held, connections and listeners, leaving out watched handles: a
+    /// server that watches objects for as long as it serves (a supervisor its
+    /// children) ends when this is zero.
+    pub fn channels(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| !matches!(s, Slot::Watch(_)))
+            .count()
+    }
+
     fn room(&self) -> Result<(), Error> {
         if self.slots.len() >= limits::WAIT_MAX_ITEMS {
             return Err(Error::Limit);

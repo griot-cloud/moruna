@@ -21,7 +21,7 @@ pub mod manifest;
 /// number when a call is added. `abi_version` returns `MAJOR << 16 | MINOR`.
 pub const ABI_MAJOR: u16 = 1;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 1;
+pub const ABI_MINOR: u16 = 2;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -53,8 +53,20 @@ pub mod nr {
     pub const DEVICE_MEMORY_CREATE: u64 = 23;
     /// Added in ABI 1.1: a resource over a sub-range of another (SDD 20, f.10).
     pub const RESOURCE_NARROW: u64 = 24;
+    /// Added in ABI 1.2: an interrupt delivered by message (MSI or MSI-X), and the
+    /// message a device writes to raise it (SDD 25, d.1).
+    pub const INTERRUPT_CREATE_MSI: u64 = 25;
+    /// Added in ABI 1.2: pins a DMA memory object for a device and returns the device
+    /// address of each of its pages (SDD 25, d.1).
+    pub const MEMORY_PIN: u64 = 26;
+    /// Added in ABI 1.2: releases the pins a DMA resource holds in quarantine.
+    pub const DMA_RELEASE: u64 = 27;
+    /// Added in ABI 1.2: the kind and range of a resource.
+    pub const RESOURCE_INFO: u64 = 28;
+    /// Added in ABI 1.2: ends a process through a handle to it.
+    pub const PROCESS_KILL: u64 = 29;
     /// One past the highest number; any number at or above it is `BadSyscall`.
-    pub const COUNT: u64 = 25;
+    pub const COUNT: u64 = 30;
 }
 
 /// Every error a syscall returns. A call returns `-(code)` in `rax`.
@@ -311,10 +323,12 @@ pub enum ObjectType {
     DeviceMemory = 7,
     Console = 8,
     Resource = 9,
+    /// A memory object pinned for a device (ABI 1.2, `memory_pin`).
+    Pin = 10,
 }
 
 impl ObjectType {
-    pub const ALL: [ObjectType; 9] = [
+    pub const ALL: [ObjectType; 10] = [
         ObjectType::Process,
         ObjectType::Thread,
         ObjectType::Channel,
@@ -324,6 +338,7 @@ impl ObjectType {
         ObjectType::DeviceMemory,
         ObjectType::Console,
         ObjectType::Resource,
+        ObjectType::Pin,
     ];
 
     pub fn from_raw(raw: u32) -> Option<ObjectType> {
@@ -341,6 +356,25 @@ pub enum ResourceKind {
     DeviceMemory = 2,
     /// `interrupt_create` over interrupt lines.
     Interrupt = 3,
+    /// `interrupt_create_msi` over message-signalled interrupt slots (ABI 1.2).
+    Msi = 4,
+    /// `memory_pin` for the devices whose PCI requester ids lie in its range (ABI 1.2):
+    /// the right to hand a device the physical pages of a memory object.
+    Dma = 5,
+}
+
+impl ResourceKind {
+    pub const ALL: [ResourceKind; 5] = [
+        ResourceKind::Process,
+        ResourceKind::DeviceMemory,
+        ResourceKind::Interrupt,
+        ResourceKind::Msi,
+        ResourceKind::Dma,
+    ];
+
+    pub fn from_raw(raw: u32) -> Option<ResourceKind> {
+        ResourceKind::ALL.iter().copied().find(|k| *k as u32 == raw)
+    }
 }
 
 /// The ranges a root resource covers (SDD 20, f.10). `resource_narrow` derives a
@@ -351,6 +385,59 @@ pub mod resource_range {
     pub const DEVICE_END: u64 = 1 << 52;
     /// Global system interrupts an interrupt resource may cover: 0 to 255.
     pub const INTERRUPT_END: u64 = 256;
+    /// Message-signalled interrupt slots an MSI resource may cover: one per vector the
+    /// kernel can route to a process (x86_64 vectors 32 to 255).
+    pub const MSI_END: u64 = 224;
+    /// PCI requester ids (`bus << 8 | device << 3 | function`) a DMA resource may cover.
+    pub const DMA_END: u64 = 1 << 16;
+}
+
+/// The flags of `memory_create` (ABI 1.2; zero is the call of ABI 1.0).
+pub mod memory_flags {
+    /// The object may be pinned for a device with `memory_pin`.
+    pub const DMA: u64 = 1 << 0;
+    pub const ALL: u64 = DMA;
+}
+
+/// The flags of `memory_pin`.
+pub mod pin_flags {
+    /// The device writes the pages, so the memory handle needs `WRITE` as well as
+    /// `READ`.
+    pub const DEVICE_WRITES: u64 = 1 << 0;
+    pub const ALL: u64 = DEVICE_WRITES;
+}
+
+/// What `interrupt_create_msi` returns in `rdx`: the message's data in the high half
+/// and the low 32 bits of its address in the low half. On x86_64 the address's high
+/// 32 bits are zero.
+pub mod msi {
+    /// The message address `rdx` carries.
+    pub const fn address(rdx: u64) -> u64 {
+        rdx & 0xffff_ffff
+    }
+    /// The message data `rdx` carries.
+    pub const fn data(rdx: u64) -> u32 {
+        (rdx >> 32) as u32
+    }
+    /// Packs a message as the kernel returns it.
+    pub const fn pack(address: u32, data: u32) -> u64 {
+        ((data as u64) << 32) | address as u64
+    }
+}
+
+/// The 24 bytes `resource_info` writes, little endian.
+///
+/// ```text
+/// offset 0   u32 kind (ResourceKind)
+/// offset 4   u32 reserved, zero
+/// offset 8   u64 base of the range
+/// offset 16  u64 length of the range (zero for a process resource)
+/// ```
+pub mod resource_info {
+    pub const SIZE: usize = 24;
+    pub const KIND: usize = 0;
+    pub const BASE: usize = 8;
+    pub const LEN: usize = 16;
 }
 
 /// The flags of `memory_map`.
@@ -394,6 +481,8 @@ pub mod limits {
     pub const DEBUG_WRITE_MAX: usize = 4096;
     /// The size of the stack the kernel gives a process's first thread.
     pub const MAIN_STACK_BYTES: u64 = 256 * 1024;
+    /// The most pages one `memory_pin` pins: a whole memory object of the largest size.
+    pub const PIN_MAX_PAGES: usize = (MEMORY_MAX_BYTES / 4096) as usize;
 }
 
 /// The deadline that never passes.
@@ -481,6 +570,29 @@ pub fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> bool {
     }
 }
 
+/// Reads a little-endian `u64` at `offset`, or `None` past the end.
+pub fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let b = bytes.get(offset..end)?;
+    let mut word = [0u8; 8];
+    word.copy_from_slice(b);
+    Some(u64::from_le_bytes(word))
+}
+
+/// Writes a little-endian `u64` at `offset`; returns `false` past the end.
+pub fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> bool {
+    let Some(end) = offset.checked_add(8) else {
+        return false;
+    };
+    match bytes.get_mut(offset..end) {
+        Some(b) => {
+            b.copy_from_slice(&value.to_le_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
 /// A name as stored in a fixed field: the bytes before the first zero.
 pub fn fixed_name(field: &[u8]) -> &[u8] {
     let len = field.iter().position(|&b| b == 0).unwrap_or(field.len());
@@ -555,7 +667,12 @@ mod tests {
             assert_eq!(ObjectType::from_raw(t as u32), Some(t));
         }
         assert_eq!(ObjectType::from_raw(0), None);
-        assert_eq!(ObjectType::from_raw(10), None);
+        assert_eq!(ObjectType::from_raw(11), None);
+        for k in ResourceKind::ALL {
+            assert_eq!(ResourceKind::from_raw(k as u32), Some(k));
+        }
+        assert_eq!(ResourceKind::from_raw(0), None);
+        assert_eq!(ResourceKind::from_raw(6), None);
     }
 
     #[test]
@@ -574,8 +691,28 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x1_0001);
-        assert_eq!(nr::RESOURCE_NARROW + 1, nr::COUNT);
+        assert_eq!(ABI_VERSION, 0x1_0002);
+        assert_eq!(nr::PROCESS_KILL + 1, nr::COUNT);
         assert_eq!(map::ALL, 7);
+        let mut word = [0u8; 16];
+        assert!(write_u64(&mut word, 8, 0x0123_4567_89ab_cdef));
+        assert_eq!(read_u64(&word, 8), Some(0x0123_4567_89ab_cdef));
+        assert!(!write_u64(&mut word, 9, 1));
+        assert_eq!(read_u64(&word, 9), None);
+        assert_eq!(read_u64(&word, usize::MAX), None);
+        assert!(!write_u64(&mut word, usize::MAX, 1));
+    }
+
+    #[test]
+    fn dr_t1_msi_message_packs_and_unpacks() {
+        let rdx = msi::pack(0xfee0_0000, 0x41);
+        assert_eq!(msi::address(rdx), 0xfee0_0000);
+        assert_eq!(msi::data(rdx), 0x41);
+        assert_eq!(memory_flags::ALL, 1);
+        assert_eq!(pin_flags::ALL, 1);
+        assert_eq!(resource_info::SIZE, 24);
+        assert_eq!(limits::PIN_MAX_PAGES, 65536);
+        assert_eq!(resource_range::MSI_END, 224);
+        assert_eq!(resource_range::DMA_END, 65536);
     }
 }

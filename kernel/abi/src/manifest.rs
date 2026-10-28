@@ -11,7 +11,8 @@
 //! ```
 //!
 //! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`,
-//! `channel:NAME.0`, `channel:NAME.1` or `file:PATH`. A `handle` line gives a handle to
+//! `root.ecam`, `root.msi`, `root.dma`, `channel:NAME.0`, `channel:NAME.1` or
+//! `file:PATH`. A `handle` line gives a handle to
 //! the process named by the `process` line above it. The first process is the
 //! supervisor: it alone may take a `root.*` source. Every endpoint of every declared
 //! channel is given exactly once. Names are 1 to 32 bytes of `[a-z0-9._-]`; paths are
@@ -48,6 +49,13 @@ pub enum Source {
     RootDevice,
     /// The root resource for `interrupt_create`.
     RootInterrupt,
+    /// A device memory resource over exactly the PCI configuration space the firmware
+    /// describes (ACPI MCFG), so the supervisor can find and enumerate it (ABI 1.2).
+    RootEcam,
+    /// The root resource for `interrupt_create_msi` (ABI 1.2).
+    RootMsi,
+    /// The root resource for `memory_pin` (ABI 1.2).
+    RootDma,
     /// One endpoint (0 or 1) of the channel declared at `channel` (an index into
     /// [`Manifest::channels`]).
     ChannelEnd { channel: usize, end: u8 },
@@ -60,7 +68,12 @@ impl Source {
     pub fn is_root(&self) -> bool {
         matches!(
             self,
-            Source::RootProcess | Source::RootDevice | Source::RootInterrupt
+            Source::RootProcess
+                | Source::RootDevice
+                | Source::RootInterrupt
+                | Source::RootEcam
+                | Source::RootMsi
+                | Source::RootDma
         )
     }
 }
@@ -194,9 +207,12 @@ fn parse_rights(field: &str, line: usize) -> Result<Rights, ManifestError> {
 pub fn source_rights(source: &Source) -> Rights {
     match source {
         Source::Console => Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
-        Source::RootProcess | Source::RootDevice | Source::RootInterrupt => {
-            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER
-        }
+        Source::RootProcess
+        | Source::RootDevice
+        | Source::RootInterrupt
+        | Source::RootEcam
+        | Source::RootMsi
+        | Source::RootDma => Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
         Source::ChannelEnd { .. } => {
             Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER | Rights::WAIT
         }
@@ -300,6 +316,9 @@ impl Manifest {
                         "root.process" => Source::RootProcess,
                         "root.device" => Source::RootDevice,
                         "root.interrupt" => Source::RootInterrupt,
+                        "root.ecam" => Source::RootEcam,
+                        "root.msi" => Source::RootMsi,
+                        "root.dma" => Source::RootDma,
                         other => {
                             if let Some(end) = other.strip_prefix("channel:") {
                                 let (name, which) = match end.rsplit_once('.') {
@@ -398,6 +417,9 @@ impl fmt::Display for Manifest {
                     Source::RootProcess => f.write_str("root.process")?,
                     Source::RootDevice => f.write_str("root.device")?,
                     Source::RootInterrupt => f.write_str("root.interrupt")?,
+                    Source::RootEcam => f.write_str("root.ecam")?,
+                    Source::RootMsi => f.write_str("root.msi")?,
+                    Source::RootDma => f.write_str("root.dma")?,
                     Source::ChannelEnd { channel, end } => {
                         let name = self.channels.get(*channel).ok_or(fmt::Error)?;
                         write!(f, "channel:{name}.{end}")?;
@@ -660,5 +682,36 @@ handle channel:pp.1 peer
         assert!(out.contains("handle root.device d rights=write,transfer\n"));
         assert!(out.contains("handle root.interrupt i\n"));
         assert_eq!(Manifest::parse(out.as_bytes()), Ok(m));
+    }
+
+    #[test]
+    fn dr_t2_manifest_driver_roots() {
+        let text = "moruna-manifest 1\nprocess s bin/s\nhandle root.ecam e\nhandle root.msi m\nhandle root.dma d rights=write,duplicate\n";
+        let m = Manifest::parse(text.as_bytes()).expect("parses");
+        let sources: Vec<&Source> = m.processes[0].handles.iter().map(|h| &h.source).collect();
+        assert_eq!(
+            sources,
+            [&Source::RootEcam, &Source::RootMsi, &Source::RootDma]
+        );
+        for source in sources {
+            assert!(source.is_root());
+            assert_eq!(
+                source_rights(source),
+                Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER
+            );
+        }
+        let out = m.to_string();
+        assert!(out.contains("handle root.ecam e\n"));
+        assert!(out.contains("handle root.msi m\n"));
+        assert!(out.contains("handle root.dma d rights=write,duplicate\n"));
+        assert_eq!(Manifest::parse(out.as_bytes()), Ok(m));
+        for root in ["root.ecam", "root.msi", "root.dma"] {
+            assert_eq!(
+                reason(&format!(
+                    "moruna-manifest 1\nprocess a bin/a\nprocess b bin/b\nhandle {root} r\n"
+                )),
+                Reason::RootOutsideSupervisor
+            );
+        }
     }
 }

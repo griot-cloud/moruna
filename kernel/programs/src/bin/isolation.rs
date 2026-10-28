@@ -1,4 +1,4 @@
-//! KK-T8, prober: every handle-taking call on every value from 0 to 4096, and on the
+//! KK-T8, prober: every handle-taking call (21, ABI 1.2) on every value from 0 to 4096, and on the
 //! holder's live values, must return bad handle. First with only the console, then,
 //! after closing it, with no handle at all; the exit code counts the second pass's
 //! failures and the kernel prints it.
@@ -12,7 +12,7 @@ use moruna_sys::{Channel, Error, RawHandle, Signals, WaitItem, map, now, println
 
 moruna_sys::main!(run);
 
-const CALLS: usize = 16;
+const CALLS: usize = 21;
 const SWEEP: RawHandle = 4096;
 
 /// The number of the first call that did not answer bad handle for `v`, if any.
@@ -35,6 +35,11 @@ fn probe(v: RawHandle) -> Option<usize> {
         raw::interrupt_ack(v),
         raw::device_memory_create(v, 0x10_0000_0000, 4096),
         raw::resource_narrow(v, 0x10_0000_0000, 4096),
+        raw::interrupt_create_msi(v, 0).0,
+        raw::memory_pin(v, v, 0, &mut []).0,
+        raw::dma_release(v),
+        raw::resource_info(v, &mut [0; 24]),
+        raw::process_kill(v),
     ];
     results
         .iter()

@@ -4,16 +4,17 @@
 //! has over it. The set of object types is the kernel's whole vocabulary; everything
 //! else is built by processes out of these.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
 
 use moruna_abi::{ObjectType, ResourceKind, Rights, resource_range};
+use ostd::sync::SpinLock;
 
 use crate::{
     channel::Endpoint,
     clock::Timer,
     interrupt::Interrupt,
-    memory::{DeviceMemory, MemoryObject},
+    memory::{DeviceMemory, MemoryObject, Pin, Pinned},
     process::{Process, Thread},
     signal::Signaller,
 };
@@ -23,23 +24,41 @@ use crate::{
 pub struct Console;
 
 /// A capability to create objects of one kind out of nothing: processes, or device
-/// memory and interrupt lines within `range` (physical addresses or GSIs). A root
-/// resource covers its kind's whole range; `resource_narrow` derives one over a
-/// sub-range, so a supervisor can hand an untrusted driver only its own device.
+/// memory, interrupt lines, message-signalled interrupts and device pins within
+/// `range` (physical addresses, GSIs, MSI slots or PCI requester ids). A root resource
+/// covers its kind's whole range; `resource_narrow` derives one over a sub-range, so a
+/// supervisor can hand an untrusted driver only its own device.
 pub struct Resource {
     pub kind: ResourceKind,
     pub range: Range<u64>,
+    /// A DMA resource's pins whose handles closed without the resource's holder saying
+    /// the device is done with them (SDD 25, f.4): their pages stay allocated, and
+    /// mapped for the device, until `dma_release`. Empty for every other kind.
+    pub quarantine: SpinLock<Vec<Pinned>>,
 }
 
+/// The most pins one DMA resource keeps in quarantine; `memory_pin` is `Limit` beyond.
+pub const QUARANTINE_MAX: usize = 4096;
+
 impl Resource {
+    pub fn new(kind: ResourceKind, range: Range<u64>) -> Resource {
+        Resource {
+            kind,
+            range,
+            quarantine: SpinLock::new(Vec::new()),
+        }
+    }
+
     /// The root resource of `kind`, covering everything of that kind.
     pub fn root(kind: ResourceKind) -> Resource {
         let range = match kind {
             ResourceKind::Process => 0..0,
             ResourceKind::DeviceMemory => 0..resource_range::DEVICE_END,
             ResourceKind::Interrupt => 0..resource_range::INTERRUPT_END,
+            ResourceKind::Msi => 0..resource_range::MSI_END,
+            ResourceKind::Dma => 0..resource_range::DMA_END,
         };
-        Resource { kind, range }
+        Resource::new(kind, range)
     }
 
     /// Whether `start .. start + len` lies inside this resource's range.
@@ -61,6 +80,8 @@ pub enum Object {
     DeviceMemory(Arc<DeviceMemory>),
     Console(Arc<Console>),
     Resource(Arc<Resource>),
+    /// Held for its drop, which hands the pages to the quarantine.
+    Pin(#[expect(dead_code, reason = "held for its drop")] Arc<Pin>),
 }
 
 impl Object {
@@ -75,6 +96,7 @@ impl Object {
             Object::DeviceMemory(_) => ObjectType::DeviceMemory,
             Object::Console(_) => ObjectType::Console,
             Object::Resource(_) => ObjectType::Resource,
+            Object::Pin(_) => ObjectType::Pin,
         }
     }
 
@@ -89,7 +111,8 @@ impl Object {
             Object::Memory(_)
             | Object::DeviceMemory(_)
             | Object::Console(_)
-            | Object::Resource(_) => None,
+            | Object::Resource(_)
+            | Object::Pin(_) => None,
         }
     }
 
@@ -106,6 +129,8 @@ impl Object {
                 base | Rights::READ | Rights::WRITE | Rights::MAP
             }
             ObjectType::Console | ObjectType::Resource => base | Rights::WRITE,
+            // A pin is only ever closed; closing needs no right.
+            ObjectType::Pin => Rights::NONE,
         }
     }
 }

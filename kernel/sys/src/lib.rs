@@ -32,10 +32,10 @@ use core::{
 };
 
 pub use moruna_abi::{
-    ABI_VERSION, DEADLINE_INFINITE, Error, ObjectType, PAGE_SIZE, RawHandle, Rights, Signals,
-    limits, map,
+    ABI_VERSION, DEADLINE_INFINITE, Error, ObjectType, PAGE_SIZE, RawHandle, ResourceKind, Rights,
+    Signals, limits, map, memory_flags, pin_flags,
 };
-use moruna_abi::{nr, start_entry, wait_item};
+use moruna_abi::{msi, nr, start_entry, wait_item};
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -113,9 +113,40 @@ impl Handle {
 
     /// A resource over `base .. base + len`, inside this resource's range, with this
     /// handle's rights (`resource_narrow`, ABI 1.1): physical addresses, page aligned,
-    /// for a device memory resource; GSIs for an interrupt resource.
+    /// for a device memory resource; GSIs for an interrupt resource; slots for an MSI
+    /// resource; PCI requester ids for a DMA resource.
     pub fn narrow(&self, base: u64, len: u64) -> Result<Handle> {
         check(raw::resource_narrow(self.0, base, len)).map(|v| Handle(v as RawHandle))
+    }
+
+    /// A resource's kind and range (`resource_info`, ABI 1.2).
+    pub fn resource_info(&self) -> Result<ResourceInfo> {
+        let mut out = [0u8; moruna_abi::resource_info::SIZE];
+        check(raw::resource_info(self.0, &mut out))?;
+        let kind = moruna_abi::read_u32(&out, moruna_abi::resource_info::KIND)
+            .and_then(ResourceKind::from_raw)
+            .ok_or(Error::InvalidArgs)?;
+        let base = moruna_abi::read_u64(&out, moruna_abi::resource_info::BASE);
+        let len = moruna_abi::read_u64(&out, moruna_abi::resource_info::LEN);
+        match (base, len) {
+            (Some(base), Some(len)) => Ok(ResourceInfo { kind, base, len }),
+            _ => Err(Error::InvalidArgs),
+        }
+    }
+}
+
+/// What a resource lets its holder create, and over which range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceInfo {
+    pub kind: ResourceKind,
+    pub base: u64,
+    pub len: u64,
+}
+
+impl ResourceInfo {
+    /// The first value past the range.
+    pub fn end(&self) -> u64 {
+        self.base + self.len
     }
 }
 
@@ -266,13 +297,74 @@ pub struct Memory(pub Handle);
 
 impl Memory {
     pub fn create(size: u64) -> Result<Memory> {
-        check(raw::call1(nr::MEMORY_CREATE, size).0).map(|v| Memory(Handle(v as RawHandle)))
+        check(raw::memory_create(size, 0)).map(|v| Memory(Handle(v as RawHandle)))
+    }
+
+    /// A memory object a holder of a DMA resource may pin for a device (ABI 1.2).
+    pub fn create_dma(size: u64) -> Result<Memory> {
+        check(raw::memory_create(size, memory_flags::DMA)).map(|v| Memory(Handle(v as RawHandle)))
     }
 
     /// Maps `len` bytes from `offset` with `flags` (`map::WRITE`, `map::EXECUTE`).
     pub fn map(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'_>> {
         mapping(&self.0, offset, len, flags)
     }
+
+    /// Maps as [`Memory::map`] does, with a mapping that does not borrow the handle:
+    /// a mapping keeps its pages whatever becomes of the handle it was made from.
+    pub fn map_detached(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'static>> {
+        mapping(&self.0, offset, len, flags)
+    }
+}
+
+/// A memory object pinned for a device (`memory_pin`, ABI 1.2). Dropping it closes
+/// the pin, whose pages wait in its DMA resource's quarantine until [`dma_release`].
+#[derive(Debug)]
+pub struct Pin(pub Handle);
+
+impl Pin {
+    /// Pins `memory` (made with [`Memory::create_dma`]) for the devices `dma` covers,
+    /// writing the device address of each page to `addrs`; returns the pin and the
+    /// page count. `device_writes` needs `WRITE` on `memory`. `BufferTooSmall` when
+    /// `addrs` has room for fewer addresses than the object has pages.
+    pub fn create(
+        dma: &Handle,
+        memory: &Handle,
+        device_writes: bool,
+        addrs: &mut [u64],
+    ) -> Result<(Pin, usize)> {
+        let flags = if device_writes {
+            pin_flags::DEVICE_WRITES
+        } else {
+            0
+        };
+        let (v, pages) = raw::memory_pin(dma.raw(), memory.raw(), flags, addrs);
+        check(v).map(|v| (Pin(Handle(v as RawHandle)), pages as usize))
+    }
+
+    /// How many page addresses pinning `memory` writes: every check of
+    /// [`Pin::create`] is made, and nothing is pinned.
+    pub fn pages(dma: &Handle, memory: &Handle, device_writes: bool) -> Result<usize> {
+        let flags = if device_writes {
+            pin_flags::DEVICE_WRITES
+        } else {
+            0
+        };
+        match raw::memory_pin(dma.raw(), memory.raw(), flags, &mut []) {
+            (v, needed) if Error::from_raw(v) == Err(Error::BufferTooSmall) => Ok(needed as usize),
+            (v, _) => match check(v) {
+                // A pin with no room for an address cannot succeed: an object has a page.
+                Ok(_) => Err(Error::BadState),
+                Err(e) => Err(e),
+            },
+        }
+    }
+}
+
+/// Drops the pins `dma` holds in quarantine (`dma_release`, ABI 1.2): its holder says
+/// the devices it covers no longer use their pages. Returns how many there were.
+pub fn dma_release(dma: &Handle) -> Result<u64> {
+    check(raw::dma_release(dma.raw()))
 }
 
 /// A device memory region (MMIO pages), created from the device root resource.
@@ -288,9 +380,17 @@ impl DeviceMemory {
     pub fn map(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'_>> {
         mapping(&self.0, offset, len, flags)
     }
+
+    /// Maps as [`DeviceMemory::map`] does, with a mapping that does not borrow the
+    /// handle.
+    pub fn map_detached(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'static>> {
+        mapping(&self.0, offset, len, flags)
+    }
 }
 
-fn mapping(handle: &Handle, offset: u64, len: u64, flags: u64) -> Result<Mapping<'_>> {
+/// Maps `handle`'s object. The mapping's lifetime is the caller's choice: the kernel
+/// keeps a mapping's pages for as long as it exists, whatever becomes of the handle.
+fn mapping<'a>(handle: &Handle, offset: u64, len: u64, flags: u64) -> Result<Mapping<'a>> {
     let (v, _) = raw::call4(
         nr::MEMORY_MAP,
         handle.raw() as u64,
@@ -368,6 +468,61 @@ impl Mapping<'_> {
         self.read(offset, &mut b)?;
         Ok(u32::from_le_bytes(b))
     }
+
+    /// The address of an access of `n` bytes at `offset`, which must be aligned to `n`.
+    fn aligned(&self, offset: usize, n: usize) -> Result<u64> {
+        if !offset.is_multiple_of(n) {
+            return Err(Error::InvalidArgs);
+        }
+        self.range(offset, n)
+    }
+
+    fn writable(&self, offset: usize, n: usize) -> Result<u64> {
+        if !self.writable {
+            return Err(Error::AccessDenied);
+        }
+        self.aligned(offset, n)
+    }
+
+    /// One 8-bit access.
+    pub fn read8(&self, offset: usize) -> Result<u8> {
+        Ok(raw::peek(self.aligned(offset, 1)?))
+    }
+
+    /// One 16-bit access at an offset aligned to 2.
+    pub fn read16(&self, offset: usize) -> Result<u16> {
+        Ok(raw::load16(self.aligned(offset, 2)?))
+    }
+
+    /// One 32-bit access at an offset aligned to 4.
+    pub fn read32(&self, offset: usize) -> Result<u32> {
+        Ok(raw::load32(self.aligned(offset, 4)?))
+    }
+
+    /// One 64-bit access at an offset aligned to 8.
+    pub fn read64(&self, offset: usize) -> Result<u64> {
+        Ok(raw::load64(self.aligned(offset, 8)?))
+    }
+
+    pub fn write8(&self, offset: usize, value: u8) -> Result<()> {
+        raw::poke(self.writable(offset, 1)?, value);
+        Ok(())
+    }
+
+    pub fn write16(&self, offset: usize, value: u16) -> Result<()> {
+        raw::store16(self.writable(offset, 2)?, value);
+        Ok(())
+    }
+
+    pub fn write32(&self, offset: usize, value: u32) -> Result<()> {
+        raw::store32(self.writable(offset, 4)?, value);
+        Ok(())
+    }
+
+    pub fn write64(&self, offset: usize, value: u64) -> Result<()> {
+        raw::store64(self.writable(offset, 8)?, value);
+        Ok(())
+    }
 }
 
 impl Drop for Mapping<'_> {
@@ -397,6 +552,35 @@ impl Process {
             )
             .0,
         )
+    }
+
+    /// Starts the process at `entry`, moving the handles of `handles` into it under
+    /// their slot names: on success every slot is left `None`, on failure every handle
+    /// stays where it was. A `None` slot is `InvalidArgs`.
+    pub fn start_with(&self, entry: u64, handles: &mut [(Option<Handle>, &str)]) -> Result<()> {
+        if handles.len() > limits::START_HANDLES_MAX {
+            return Err(Error::Limit);
+        }
+        let mut entries = [[0u8; start_entry::SIZE]; limits::START_HANDLES_MAX];
+        for (e, (h, name)) in entries.iter_mut().zip(handles.iter()) {
+            let h = h.as_ref().ok_or(Error::InvalidArgs)?;
+            e[start_entry::HANDLE..start_entry::HANDLE + 4].copy_from_slice(&h.raw().to_le_bytes());
+            let n = name.len().min(limits::NAME_MAX);
+            e[start_entry::NAME..start_entry::NAME + n].copy_from_slice(&name.as_bytes()[..n]);
+        }
+        let used = &entries[..handles.len()];
+        check(raw::process_start(self.0.raw(), entry, used.as_flattened()))?;
+        for (h, _) in handles.iter_mut() {
+            if let Some(h) = h.take() {
+                core::mem::forget(h);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the running process (`process_kill`, ABI 1.2).
+    pub fn kill(&self) -> Result<()> {
+        check(raw::process_kill(self.0.raw())).map(|_| ())
     }
 
     /// Starts the process at `entry`, moving `handles` into it under their slot names.
@@ -456,10 +640,32 @@ impl Timer {
 #[derive(Debug)]
 pub struct Interrupt(pub Handle);
 
+/// The message a device writes to raise an interrupt made by
+/// [`Interrupt::create_msi`]: the address and data of an MSI or MSI-X table entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msi {
+    pub address: u64,
+    pub data: u32,
+}
+
 impl Interrupt {
     pub fn create(resource: &Handle, gsi: u32) -> Result<Interrupt> {
         let (v, _) = raw::call2(nr::INTERRUPT_CREATE, resource.raw() as u64, gsi as u64);
         check(v).map(|v| Interrupt(Handle(v as RawHandle)))
+    }
+
+    /// An interrupt raised by a message, in slot `slot` of an MSI resource
+    /// (`interrupt_create_msi`, ABI 1.2), and the message.
+    pub fn create_msi(resource: &Handle, slot: u64) -> Result<(Interrupt, Msi)> {
+        let (v, rdx) = raw::interrupt_create_msi(resource.raw(), slot);
+        let v = check(v)?;
+        Ok((
+            Interrupt(Handle(v as RawHandle)),
+            Msi {
+                address: msi::address(rdx),
+                data: msi::data(rdx),
+            },
+        ))
     }
 
     /// Clears `SIGNALED` once the device is serviced.
