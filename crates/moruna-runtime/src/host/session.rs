@@ -201,9 +201,13 @@ impl Events {
             let _ = tx.send(Some((t_us, event)));
         })
     }
+}
 
-    /// Every event told so far is written; later ones go nowhere.
-    fn close(mut self) {
+/// Dropping the events writes every event told so far and ends the thread; later ones go
+/// nowhere. Dropping is the one way they close, so a run that unwinds past its events still
+/// writes every event told before, the ends its lifecycle told as it dropped included (PY-I11).
+impl Drop for Events {
+    fn drop(&mut self) {
         let _ = self.tx.send(None);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -424,7 +428,7 @@ pub fn run_job(
             let lifecycle = Lifecycle::new(task_refs(&job, None), wire.started(), events.out());
             lifecycle.begin(job.resume.is_some());
             lifecycle.end(Ending::Failed(&error));
-            events.close();
+            drop(events);
             let file = report_path(&job, &fallback_id.to_hex());
             return finish(
                 wire,
@@ -499,7 +503,7 @@ pub fn run_job(
             wire.clone(),
             observer.clone(),
             opts.cancel.clone(),
-            lifecycle.clone(),
+            Arc::downgrade(&lifecycle),
             host_ports.clone(),
         );
         let spawned = std::thread::Builder::new()
@@ -563,7 +567,7 @@ pub fn run_job(
              told and what was not written is not kept"
         ));
     }
-    events.close();
+    drop(events);
     let (code, diagnostic, report) = match result {
         Ok(report) => (exit::COMPLETED, None, Some(report)),
         Err(error) => {
@@ -700,7 +704,8 @@ struct Peer<'a> {
     wire: &'a Wire,
     observer: &'a RunObserver,
     cancel: &'a CancelToken,
-    lifecycle: &'a Lifecycle,
+    /// Weak, so a peer that outlives the run never keeps its lifecycle from ending on drop.
+    lifecycle: &'a std::sync::Weak<Lifecycle>,
     ports: Option<&'a HostPorts>,
 }
 
@@ -740,7 +745,9 @@ fn listen_to_peer(mut reader: Box<dyn BufRead + Send>, peer: &Peer<'_>, mode: Mo
             Ok(Inbound::Cancel) => {
                 wire.note(format!("cancelled by the peer at {} ms", wire.elapsed_ms()));
                 cancel.cancel();
-                lifecycle.cancel_acknowledged();
+                if let Some(lifecycle) = lifecycle.upgrade() {
+                    lifecycle.cancel_acknowledged();
+                }
             }
             Ok(Inbound::Checkpoint) => {
                 if !observer.request_checkpoint() {
