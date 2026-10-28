@@ -68,7 +68,14 @@ class TensorSink:
     ) -> None: ...
 
 class ArrowIpcSink:
-    def __init__(self, path: str, *, file_bytes: int | str | None = ...) -> None: ...
+    def __init__(
+        self,
+        path: str,
+        *,
+        file_bytes: int | str | None = ...,
+        compression: str = ...,
+        level: int | None = ...,
+    ) -> None: ...
 
 # The classes a user extends (07 e.6, 08 f.10, 2026-09-29).
 

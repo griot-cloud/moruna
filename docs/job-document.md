@@ -45,7 +45,7 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 {"kind": "parquet", "url": "s3://acme-data/reviews/", "options": {"columns": ["review_id", "text"]}}
 ```
 
-**`arrow_ipc`**: `url` is a local file, a local directory or a list of them; a directory is read for its `.arrow` files, in name order. Only the Arrow IPC file format is read, not the stream format, and every file must have the same schema. `options.columns` lists the columns to read, and `options.split_rows` sets the rows each piece of work is cut toward, from whole record batches (by default, one piece per record batch).
+**`arrow_ipc`**: `url` is a local file, a local directory or a list of them; a directory is read for its `.arrow` files, in name order. Only the Arrow IPC file format is read, not the stream format, and every file must have the same schema. A file compressed with `zstd` or `lz4` is read like any other. `options.columns` lists the columns to read, and `options.split_rows` sets the rows each piece of work is cut toward, from whole record batches (by default, one piece per record batch).
 
 ```json
 {"kind": "arrow_ipc", "url": "/data/features/", "options": {"columns": ["id", "x"]}}
@@ -90,7 +90,7 @@ Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refus
 
 **`tensor`**: `url` is a directory. `options.format` is `mrb1` (default) or `safetensors`; `options.one_file_per_morsel` and `options.name` (default `tensor`).
 
-**`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB).
+**`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB); `options.compression` is `none` (default), `zstd` or `lz4`, and `options.level` the zstd level (default 3). A compressed file is smaller and is opened by any Arrow reader, `pyarrow.ipc.open_file` included.
 
 **`peql`**: writes under a peQL contract listed in [`contracts`](#contracts). `root` is the peQL workspace, `contract` the contract, `caller` the writer, who must own the contract, and `mode` either `append` (default) or `overwrite`. peQL writes the data in the contract's layout and updates the contract's manifest when the job finishes.
 

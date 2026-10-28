@@ -10,15 +10,23 @@
 //! arrow-ipc relies on, and one it would panic on is refused with a sentence naming what is wrong.
 //! This is the one check; every decode site calls it, and there is no second copy.
 //!
-//! A compressed record batch is refused too: arrow-ipc allocates the decompressed length a buffer
-//! declares before it decompresses, so a few bytes can ask for any amount of memory, and the sizes
-//! a validity bitmap or a union's type ids decompress to cannot be checked without decompressing
-//! them. Moruna writes its own streams uncompressed and reads uncompressed streams only.
+//! A compressed record batch (`LZ4_FRAME` or `ZSTD`, method `BUFFER`) is inflated here, because
+//! arrow-ipc allocates the decompressed length a buffer declares before it decompresses, so a few
+//! bytes can ask for any amount of memory. Every buffer's expected size is worked out from the
+//! message alone (its column's length and type, or, for the data of a string or binary column,
+//! the last offset of its offsets, which are inflated first and checked), the declared size must
+//! be that size, and the sizes together must fit the ceiling the caller passed, all before the
+//! first byte is allocated for the batch. The batch is then inflated into one buffer of the
+//! arena, bounded at each buffer's expected size, and arrow-ipc is handed an uncompressed
+//! message and body exactly as for an uncompressed batch (`inflate.rs`).
 
 use std::collections::VecDeque;
 
+use arrow::buffer::Buffer as ArrowBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UnionFields, UnionMode};
 use arrow::ipc;
+
+use super::inflate::{Inflate, Inflated, Packed, Rule, Wrap};
 
 /// The header of a message that passed `check`, ready for arrow-ipc.
 #[derive(Debug)]
@@ -26,22 +34,90 @@ pub enum Checked<'m> {
     /// A schema message: `fb_to_schema` converts it without panicking.
     Schema(ipc::Schema<'m>),
     /// A record batch message: arrow-ipc's decoder reads it over the body without panicking.
-    Batch(ipc::RecordBatch<'m>),
+    Batch(Passed<'m>),
     /// A dictionary batch message: `read_dictionary` reads it over the body without panicking.
-    Dictionary(ipc::DictionaryBatch<'m>),
+    Dictionary(Passed<'m>),
     /// A message with no header, which a stream reader skips.
     Empty,
 }
 
-/// Refuse, naming the fault, a message arrow-ipc would panic on (CT-I13).
+/// A record batch or dictionary message that passed the check, with what arrow-ipc's decoders
+/// read it over: the message and body it came with, or, for a compressed batch, the uncompressed
+/// ones the check made of it.
+#[derive(Debug)]
+pub struct Passed<'m> {
+    message: ipc::Message<'m>,
+    inflated: Option<Inflated>,
+}
+
+impl Passed<'_> {
+    /// True when the batch was compressed and `with_batch` hands out the inflated copy.
+    pub fn is_inflated(&self) -> bool {
+        self.inflated.is_some()
+    }
+
+    /// Run `read` over the record batch header and body arrow-ipc decodes: `body` is the body
+    /// the message came with, which is used when the batch was not compressed.
+    pub fn with_batch<R>(
+        &self,
+        body: &ArrowBuffer,
+        read: impl FnOnce(ipc::RecordBatch<'_>, &ArrowBuffer) -> R,
+    ) -> Result<R, String> {
+        match &self.inflated {
+            None => {
+                let batch = self
+                    .message
+                    .header_as_record_batch()
+                    .ok_or("a record batch message has no record batch")?;
+                Ok(read(batch, body))
+            }
+            Some(inflated) => {
+                let message = inflated.message()?;
+                let batch = message
+                    .header_as_record_batch()
+                    .ok_or("an inflated record batch message has no record batch")?;
+                Ok(read(batch, inflated.body()))
+            }
+        }
+    }
+
+    /// Run `read` over the dictionary batch header and body arrow-ipc decodes, as `with_batch`
+    /// does for a record batch.
+    pub fn with_dictionary<R>(
+        &self,
+        body: &ArrowBuffer,
+        read: impl FnOnce(ipc::DictionaryBatch<'_>, &ArrowBuffer) -> R,
+    ) -> Result<R, String> {
+        match &self.inflated {
+            None => {
+                let dictionary = self
+                    .message
+                    .header_as_dictionary_batch()
+                    .ok_or("a dictionary message has no dictionary batch")?;
+                Ok(read(dictionary, body))
+            }
+            Some(inflated) => {
+                let message = inflated.message()?;
+                let dictionary = message
+                    .header_as_dictionary_batch()
+                    .ok_or("an inflated dictionary message has no dictionary batch")?;
+                Ok(read(dictionary, inflated.body()))
+            }
+        }
+    }
+}
+
+/// Refuse, naming the fault, a message arrow-ipc would panic on (CT-I13), and inflate a
+/// compressed batch within `inflate`'s ceiling (e.8).
 ///
 /// `body` is the message's body as the decoder will read it, at the address it will be read
 /// from; `schema` is the stream's schema once its schema message has been read (as
 /// `fb_to_schema` converted it), which a record batch or dictionary message is read against.
 pub fn check<'m>(
     message: &ipc::Message<'m>,
-    body: &[u8],
+    body: &ArrowBuffer,
     schema: Option<&Schema>,
+    inflate: &Inflate<'_>,
 ) -> Result<Checked<'m>, String> {
     let version = message.version();
     match message.header_type() {
@@ -57,8 +133,15 @@ pub fn check<'m>(
                 .header_as_record_batch()
                 .ok_or("a record batch message has no record batch")?;
             let schema = schema.ok_or("a record batch comes before the schema")?;
-            Walk::new(batch, body, version)?.columns(schema.fields().iter().map(|f| f.as_ref()))?;
-            Ok(Checked::Batch(batch))
+            let packed = Walk::new(batch, body.as_slice(), version, inflate)?
+                .columns(schema.fields().iter().map(|f| f.as_ref()))?;
+            let inflated = packed
+                .map(|packed| packed.finish(batch, version, Wrap::Batch))
+                .transpose()?;
+            Ok(Checked::Batch(Passed {
+                message: *message,
+                inflated,
+            }))
         }
         ipc::MessageHeader::DictionaryBatch => {
             let dictionary = message
@@ -78,8 +161,21 @@ pub fn check<'m>(
                 _ => return Err(format!("dictionary {id} is not in the schema")),
             };
             let field = Field::new("", value, true);
-            Walk::new(data, body, version)?.columns(std::iter::once(&field))?;
-            Ok(Checked::Dictionary(dictionary))
+            let packed = Walk::new(data, body.as_slice(), version, inflate)?
+                .columns(std::iter::once(&field))?;
+            let inflated = packed
+                .map(|packed| {
+                    let wrap = Wrap::Dictionary {
+                        id,
+                        is_delta: dictionary.isDelta(),
+                    };
+                    packed.finish(data, version, wrap)
+                })
+                .transpose()?;
+            Ok(Checked::Dictionary(Passed {
+                message: *message,
+                inflated,
+            }))
         }
         ipc::MessageHeader::NONE => Ok(Checked::Empty),
         other => Err(format!(
@@ -243,40 +339,45 @@ fn name<'a>(field: &ipc::Field<'a>) -> &'a str {
 
 /// One node of a record batch: its length and null count, both non-negative.
 #[derive(Clone, Copy)]
-struct Node {
-    len: usize,
-    nulls: usize,
+pub(super) struct Node {
+    pub(super) len: usize,
+    pub(super) nulls: usize,
 }
 
-/// One buffer of a record batch: where it starts in the body and how long it is.
+/// One buffer of a record batch: where it starts in the body and how long it is. For a compressed
+/// batch the length is the uncompressed one, which `Packed::take` has already held to the size
+/// the message implies, and `slot` names the buffer in the plan of what to inflate.
 #[derive(Clone, Copy)]
-struct Span {
-    offset: usize,
-    len: usize,
+pub(super) struct Span {
+    pub(super) offset: usize,
+    pub(super) len: usize,
+    pub(super) slot: usize,
 }
 
 /// The walk arrow-ipc's `RecordBatchDecoder::create_array` makes over a record batch's nodes and
-/// buffers, field by field in the same order, checking each thing it relies on.
-struct Walk<'a> {
+/// buffers, field by field in the same order, checking each thing it relies on. For a compressed
+/// batch the same walk plans the inflation: each buffer is taken with the size its column implies
+/// (a `Rule`), which `Packed` holds the declared size to.
+struct Walk<'a, 'i> {
     nodes: std::vec::IntoIter<ipc::FieldNode>,
     buffers: std::vec::IntoIter<ipc::Buffer>,
     variadic: VecDeque<i64>,
     body: &'a [u8],
     version: ipc::MetadataVersion,
+    packed: Option<Packed<'a, 'i>>,
 }
 
-impl<'a> Walk<'a> {
+impl<'a, 'i> Walk<'a, 'i> {
     fn new(
         batch: ipc::RecordBatch<'_>,
         body: &'a [u8],
         version: ipc::MetadataVersion,
-    ) -> Result<Walk<'a>, String> {
-        if let Some(compression) = batch.compression() {
-            return Err(format!(
-                "the record batch is compressed ({:?}) and Moruna reads uncompressed Arrow IPC only",
-                compression.codec()
-            ));
-        }
+        inflate: &Inflate<'i>,
+    ) -> Result<Walk<'a, 'i>, String> {
+        let packed = batch
+            .compression()
+            .map(|compression| Packed::new(compression, body, version, *inflate))
+            .transpose()?;
         if batch.length() < 0 {
             return Err(format!(
                 "the record batch has a negative row count ({})",
@@ -291,11 +392,16 @@ impl<'a> Walk<'a> {
             variadic: batch.variadicBufferCounts().into_iter().flatten().collect(),
             body,
             version,
+            packed,
         })
     }
 
-    /// Every top-level column, then what arrow asserts once they are built.
-    fn columns<'f>(mut self, fields: impl Iterator<Item = &'f Field>) -> Result<(), String> {
+    /// Every top-level column, then what arrow asserts once they are built. The plan of what to
+    /// inflate comes back when the batch is compressed.
+    fn columns<'f>(
+        mut self,
+        fields: impl Iterator<Item = &'f Field>,
+    ) -> Result<Option<Packed<'a, 'i>>, String> {
         for field in fields {
             self.array(field)?;
         }
@@ -305,19 +411,35 @@ impl<'a> Walk<'a> {
                 self.variadic.len()
             ));
         }
-        Ok(())
+        Ok(self.packed)
     }
 
-    fn array(&mut self, field: &Field) -> Result<(), String> {
+    /// One column, its children, and, for a primitive column, the span of its values.
+    fn array(&mut self, field: &Field) -> Result<Option<Span>, String> {
         use DataType::*;
         match field.data_type() {
             Utf8 | Binary | LargeBinary | LargeUtf8 => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
-                let offsets = self.buffer(field)?;
-                self.buffer(field)?;
-                whole(field, offsets, offset_width(field.data_type()), "offsets")?;
-                nulls(field, node, validity)
+                let width = offset_width(field.data_type());
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
+                let offsets = self.buffer(
+                    field,
+                    "offsets",
+                    Rule::Text {
+                        len: node.len,
+                        width,
+                    },
+                )?;
+                self.buffer(
+                    field,
+                    "data",
+                    Rule::Data {
+                        offsets: offsets.slot,
+                    },
+                )?;
+                whole(field, offsets, width, "offsets")?;
+                nulls(field, node, validity)?;
+                Ok(None)
             }
             BinaryView | Utf8View => {
                 let count = self.variadic.pop_front().ok_or_else(|| {
@@ -329,33 +451,48 @@ impl<'a> Walk<'a> {
                         field.name()
                     )
                 })?;
-                let validity = self.buffer(field)?;
-                let views = self.buffer(field)?;
-                self.buffers(field, count)?;
-                whole(field, views, 16, "views")?;
                 let node = self.node(field)?;
-                nulls(field, node, validity)
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
+                let views = self.buffer(field, "views", Rule::values(node.len, 16))?;
+                for _ in 0..count {
+                    self.buffer(field, "view data", Rule::Free)?;
+                }
+                whole(field, views, 16, "views")?;
+                nulls(field, node, validity)?;
+                Ok(None)
             }
             List(child) | LargeList(child) | Map(child, _) => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
-                let offsets = self.buffer(field)?;
-                whole(field, offsets, offset_width(field.data_type()), "offsets")?;
+                let width = offset_width(field.data_type());
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
+                let offsets = self.buffer(
+                    field,
+                    "offsets",
+                    Rule::Offsets {
+                        len: node.len,
+                        width,
+                    },
+                )?;
+                whole(field, offsets, width, "offsets")?;
                 nulls(field, node, validity)?;
-                self.array(child)
+                self.array(child)?;
+                Ok(None)
             }
             ListView(child) | LargeListView(child) => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
                 let width = offset_width(field.data_type());
-                whole(field, self.buffer(field)?, width, "offsets")?;
-                whole(field, self.buffer(field)?, width, "sizes")?;
+                let offsets = self.buffer(field, "offsets", Rule::values(node.len, width))?;
+                whole(field, offsets, width, "offsets")?;
+                let sizes = self.buffer(field, "sizes", Rule::values(node.len, width))?;
+                whole(field, sizes, width, "sizes")?;
                 nulls(field, node, validity)?;
-                self.array(child)
+                self.array(child)?;
+                Ok(None)
             }
             FixedSizeList(child, size) => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
                 nulls(field, node, validity)?;
                 // arrow's validation multiplies the two with `expect`.
                 let size = usize::try_from(*size).unwrap_or(0);
@@ -366,44 +503,54 @@ impl<'a> Walk<'a> {
                         node.len
                     ));
                 }
-                self.array(child)
+                self.array(child)?;
+                Ok(None)
             }
             Struct(children) => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
                 nulls(field, node, validity)?;
-                children.iter().try_for_each(|child| self.array(child))
+                children.iter().try_for_each(|child| {
+                    self.array(child)?;
+                    Ok::<(), String>(())
+                })?;
+                Ok(None)
             }
             RunEndEncoded(run_ends, values) => {
                 self.node(field)?;
                 // The run ends are a primitive column (validity, then values) that arrow's
                 // validation reads as typed values.
-                let ends = self.buffers.as_slice().get(1).copied();
-                let width = run_ends.data_type().primitive_width().unwrap_or(1);
-                self.array(run_ends)?;
+                let ends = self.array(run_ends)?;
                 if let Some(ends) = ends {
-                    let span = Span {
-                        offset: 0,
-                        len: usize::try_from(ends.length()).unwrap_or(0),
-                    };
-                    whole(run_ends, span, width, "values")?;
+                    let width = run_ends.data_type().primitive_width().unwrap_or(1);
+                    whole(run_ends, ends, width, "values")?;
                 }
-                self.array(values)
+                self.array(values)?;
+                Ok(None)
             }
             Dictionary(key, _) => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
-                let keys = self.buffer(field)?;
-                whole(field, keys, key.primitive_width().unwrap_or(1), "keys")?;
-                nulls(field, node, validity)
+                let width = key.primitive_width().unwrap_or(1);
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
+                let keys = self.buffer(field, "keys", Rule::values(node.len, width))?;
+                whole(field, keys, width, "keys")?;
+                nulls(field, node, validity)?;
+                Ok(None)
             }
-            Union(children, mode) => self.union(field, children, *mode),
-            Null => self.node(field).map(drop),
-            _ => {
+            Union(children, mode) => {
+                self.union(field, children, *mode)?;
+                Ok(None)
+            }
+            Null => {
+                self.node(field)?;
+                Ok(None)
+            }
+            other => {
                 let node = self.node(field)?;
-                let validity = self.buffer(field)?;
-                self.buffers(field, 1)?;
-                nulls(field, node, validity)
+                let validity = self.buffer(field, "validity", Rule::Validity(node.len))?;
+                let values = self.buffer(field, "values", Rule::of_values(other, node.len))?;
+                nulls(field, node, validity)?;
+                Ok(Some(values))
             }
         }
     }
@@ -418,9 +565,9 @@ impl<'a> Walk<'a> {
     ) -> Result<(), String> {
         let node = self.node(field)?;
         if self.version < ipc::MetadataVersion::V5 {
-            self.buffer(field)?;
+            self.buffer(field, "validity", Rule::Validity(node.len))?;
         }
-        let type_ids = self.buffer(field)?;
+        let type_ids = self.buffer(field, "type ids", Rule::values(node.len, 1))?;
         if type_ids.len < node.len {
             return Err(format!(
                 "column {:?} is a union of {} values with {} bytes of type ids",
@@ -430,7 +577,7 @@ impl<'a> Walk<'a> {
             ));
         }
         if mode == UnionMode::Dense {
-            let offsets = self.buffer(field)?;
+            let offsets = self.buffer(field, "offsets", Rule::values(node.len, 4))?;
             let need = node.len.checked_mul(4);
             if need.is_none_or(|need| offsets.len < need) {
                 return Err(format!(
@@ -440,15 +587,21 @@ impl<'a> Walk<'a> {
                     offsets.len
                 ));
             }
-            let address = self.body.as_ptr() as usize + offsets.offset;
-            if !address.is_multiple_of(4) {
-                return Err(format!(
-                    "column {:?} is a dense union whose offsets are not 4-byte aligned",
-                    field.name()
-                ));
+            // An inflated body places every buffer at a multiple of 64 from an arena buffer.
+            if self.packed.is_none() {
+                let address = self.body.as_ptr() as usize + offsets.offset;
+                if !address.is_multiple_of(4) {
+                    return Err(format!(
+                        "column {:?} is a dense union whose offsets are not 4-byte aligned",
+                        field.name()
+                    ));
+                }
             }
         }
-        children.iter().try_for_each(|(_, child)| self.array(child))
+        children.iter().try_for_each(|(_, child)| {
+            self.array(child)?;
+            Ok(())
+        })
     }
 
     fn node(&mut self, field: &Field) -> Result<Node, String> {
@@ -468,7 +621,9 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn buffer(&mut self, field: &Field) -> Result<Span, String> {
+    /// The next buffer of the message: inside the body, and for a compressed batch of the size
+    /// `rule` says its column needs (`what` names it in a refusal).
+    fn buffer(&mut self, field: &Field, what: &'static str, rule: Rule) -> Result<Span, String> {
         let buffer = self.buffers.next().ok_or_else(|| {
             format!(
                 "column {:?} has no buffer left; the record batch has too few",
@@ -477,31 +632,34 @@ impl<'a> Walk<'a> {
         })?;
         let (offset, len) = (buffer.offset(), buffer.length());
         let span = match (usize::try_from(offset), usize::try_from(len)) {
-            (Ok(offset), Ok(len)) => Some(Span { offset, len }),
+            (Ok(offset), Ok(len)) => Some(Span {
+                offset,
+                len,
+                slot: usize::MAX,
+            }),
             _ => None,
         };
-        match span {
+        let span = match span {
             Some(span)
                 if span
                     .offset
                     .checked_add(span.len)
                     .is_some_and(|end| end <= self.body.len()) =>
             {
-                Ok(span)
+                span
             }
-            _ => Err(format!(
-                "column {:?} has a buffer of {len} bytes at {offset}, outside the body of {} bytes",
-                field.name(),
-                self.body.len()
-            )),
+            _ => {
+                return Err(format!(
+                    "column {:?} has a buffer of {len} bytes at {offset}, outside the body of {} bytes",
+                    field.name(),
+                    self.body.len()
+                ));
+            }
+        };
+        match &mut self.packed {
+            Some(packed) => packed.take(field, what, span, rule),
+            None => Ok(span),
         }
-    }
-
-    fn buffers(&mut self, field: &Field, count: usize) -> Result<(), String> {
-        for _ in 0..count {
-            self.buffer(field)?;
-        }
-        Ok(())
     }
 }
 

@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use moruna_kernel::ipc::Compression;
 use moruna_kernel::{Result, Source};
 use moruna_sinks::{ArrowIpcSink, ArrowIpcSinkConfig};
 use moruna_sources::{ArrowIpcSource, ArrowIpcSourceConfig};
@@ -61,6 +62,12 @@ pub struct SinkOptions {
     /// `sink.file_bytes`; absent is 1 GiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_bytes: Option<u64>,
+    /// `none` (absent), `zstd` or `lz4`; a compressed file is 8-byte aligned, not page aligned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
+    /// The zstd level (absent is 3); `zstd` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
 }
 
 impl SourceKind for ArrowIpc {
@@ -117,12 +124,13 @@ impl SinkKind for ArrowIpc {
         Declaration {
             name: "arrow_ipc".into(),
             role: Role::Sink,
-            summary: "Page-aligned Arrow IPC files in a local directory".into(),
+            summary: "Arrow IPC files in a local directory, page-aligned or compressed".into(),
             settings: settings_schema::<SinkSettings>(
                 "arrow_ipc",
                 vec![
                     json!({"url": "/data/out"}),
                     json!({"url": "file:///data/out", "options": {"file_bytes": 268435456}}),
+                    json!({"url": "/data/out", "options": {"compression": "zstd", "level": 9}}),
                 ],
             ),
             inputs: Flow::Batches,
@@ -143,9 +151,15 @@ impl SinkKind for ArrowIpc {
                 .unwrap_or(translate::DEFAULT_FILE_BYTES),
             cx.notes(),
         );
+        let compression = Compression::parse(
+            settings.options.compression.as_deref().unwrap_or("none"),
+            settings.options.level,
+        )
+        .map_err(|reason| entry.refuse("options.compression", reason))?;
         let cfg = ArrowIpcSinkConfig {
             path: translate::local_path(&settings.url),
             file_bytes,
+            compression,
         };
         Ok(BuiltSink {
             spec: SinkSpec::Build(Box::new(move |ctx| {

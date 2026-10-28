@@ -39,7 +39,14 @@ moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.5.8" }
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
 # engine feature a component needs beyond these is set in that crate.
-arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc"] }
+arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc", "ipc_compression"] }
+# Arrow IPC LZ4_FRAME and ZSTD buffers (07 e.9, 08 e.3, contracts e.8): `moruna-kernel` inflates them
+# itself, after checking every declared size; the sink writes them through arrow-ipc.
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"] }
+zstd = { version = "=0.13.3", default-features = false }
+# The message arrow-ipc reads after a compressed batch has been inflated: built with the generated
+# builders, which need the flatbuffers crate arrow-ipc itself uses.
+flatbuffers = { version = "=25.12.19", default-features = false }
 parquet = { version = "=59.3.0", features = ["arrow", "async", "object_store"] }
 object_store = { version = "=0.13.2" }
 dlpark = { version = "=0.8.0" }

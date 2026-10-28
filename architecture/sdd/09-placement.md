@@ -216,7 +216,7 @@ A lineage record is created at the first `push` of a `seq` (Q0, by the source dr
 
 ### e.3 Segment file format
 
-Segment files live at `staging_dir/moruna-<run_id>/seg-<segment:06>.seg`, numbered from one engine-wide counter across all queues, created at `segment_bytes` (`fallocate` through `std::fs`, the one file operation besides the manifest that does not go through the reactor, because it moves no bytes) and then registered with the reactor (`register_segment`) before the first write; written sequentially by direct IO. The same directory holds `manifest.json` (e.5). `<run_id>` is the 32-character hex form of `RunId`. Each record begins at a page boundary with a header page:
+Segment files live at `staging_dir/moruna-<run_id>/seg-<segment:06>.seg`, numbered from one engine-wide counter across all queues, created at `segment_bytes` (`fallocate` through `std::fs`, the one file operation besides the manifest that does not go through the reactor, because it moves no bytes) and then registered with the reactor (`register_segment`) before the first write; written sequentially by direct IO. **Staging and spill stay uncompressed** (KA10): a segment record is the page-aligned record of contracts e.7, written by direct IO and read back into an arena buffer to be used where it lands, so a compressed record would be one more copy for a few bytes of disk, and `ipc::decode` refuses a compressed record (a ceiling of zero, contracts e.8) rather than inflate one. The same directory holds `manifest.json` (e.5). `<run_id>` is the 32-character hex form of `RunId`. Each record begins at a page boundary with a header page:
 
 | Offset | Size | Field |
 |---|---|---|
