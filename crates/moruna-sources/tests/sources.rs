@@ -3,6 +3,7 @@
 //! One integration test binary rather than one per file: each binary links the whole of arrow
 //! and parquet, and under `cargo llvm-cov` each is instrumented as well.
 
+mod malformed;
 mod support;
 mod vortex;
 

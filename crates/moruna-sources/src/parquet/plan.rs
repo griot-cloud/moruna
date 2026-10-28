@@ -11,12 +11,14 @@
 use std::sync::Arc;
 
 use moruna_kernel::{Allocator, ObjectMetadata, Reactor, Result, SourceSchema, Split, SplitId};
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{
+    ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
 use parquet::file::statistics::Statistics;
 
 use super::{ParquetSourceConfig, RowFilter, ScalarValue};
 use crate::stats::Counters;
-use crate::util::{is_local, local_path, plan_err};
+use crate::util::{is_local, local_path, plan_err, source_err};
 
 /// What reading an object's footer at plan time needs: the reactor and an allocator.
 pub(crate) type ObjectReader<'a> = (&'a Arc<dyn Reactor>, &'a Arc<dyn Allocator>);
@@ -147,6 +149,12 @@ pub(crate) fn files(
 
     let mut out = Vec::new();
     for (url, path, object, len, metadata) in parsed {
+        super::hint::check(metadata.file_metadata()).map_err(|why| {
+            source_err(
+                0,
+                format!("{}: the Arrow schema in the footer: {why}", path.display()),
+            )
+        })?;
         let metadata = Arc::new(metadata);
         let descr = metadata.file_metadata().schema_descr();
         let projected = project(descr, cfg.columns.as_deref(), &path)?;
@@ -329,14 +337,17 @@ pub(crate) fn splits(
             let mut column_bytes = Vec::with_capacity(file.projected.len());
             let mut null_counts = Vec::with_capacity(file.projected.len());
             for leaf in &file.projected {
-                let chunk = group.column(*leaf);
+                let (chunk, _) = chunk_span(&file.path, group, rg, *leaf, file.len)
+                    .map_err(|msg| source_err(next, msg))?;
                 column_bytes.push(chunk.uncompressed_size().max(0) as u64);
                 null_counts.push(chunk.statistics().and_then(|s| s.null_count_opt()));
             }
             splits.push(Split {
                 id: next,
                 rows: group.num_rows().max(0) as u64,
-                uncompressed_bytes: column_bytes.iter().sum(),
+                uncompressed_bytes: column_bytes
+                    .iter()
+                    .fold(0u64, |sum, b| sum.saturating_add(*b)),
                 estimated: false,
                 column_bytes,
                 null_counts,
@@ -350,6 +361,53 @@ pub(crate) fn splits(
         }
     }
     Ok((entries, splits, skipped))
+}
+
+/// One projected column chunk of row group `rg` and its byte span `[start, end)`, checked
+/// against `file_len` (SO-I10). The span is the one the Parquet reader fetches (the dictionary
+/// page's offset when there is one, else the first data page's, for the chunk's compressed
+/// size), and the reader asserts it is not negative, so a negative offset or size, or a span
+/// that does not lie inside the file, is refused here naming the file, the row group, the
+/// column, the offset and the file's length. At plan time `file_len` is the length the plan
+/// read; at read time it is the length then, which is shorter for a file cut after planning.
+pub(crate) fn chunk_span<'a>(
+    path: &std::path::Path,
+    group: &'a RowGroupMetaData,
+    rg: usize,
+    leaf: usize,
+    file_len: u64,
+) -> std::result::Result<(&'a ColumnChunkMetaData, (u64, u64)), String> {
+    let chunk = group.columns().get(leaf).ok_or_else(|| {
+        format!(
+            "{}: row group {rg} has no column chunk {leaf}",
+            path.display()
+        )
+    })?;
+    let what = format!(
+        "{}: column chunk {leaf} ({}) of row group {rg}",
+        path.display(),
+        chunk.column_path().string()
+    );
+    let offset = chunk
+        .dictionary_page_offset()
+        .unwrap_or_else(|| chunk.data_page_offset());
+    let start =
+        u64::try_from(offset).map_err(|_| format!("{what} has a negative offset ({offset})"))?;
+    let size = chunk.compressed_size();
+    let length = u64::try_from(size).map_err(|_| format!("{what} has a negative size ({size})"))?;
+    // Both came from non-negative `i64`s, so the sum fits a `u64`.
+    let end = start + length;
+    if length > 0 && start >= file_len {
+        return Err(format!(
+            "{what} starts at byte {start}, past the end of the file ({file_len} bytes)"
+        ));
+    }
+    if end > file_len {
+        return Err(format!(
+            "{what} runs to byte {end}, past the end of the file ({file_len} bytes)"
+        ));
+    }
+    Ok((chunk, (start, end)))
 }
 
 /// True when every `RowFilter` proves no row of the group can match (f.2). A filter on a

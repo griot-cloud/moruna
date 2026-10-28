@@ -9,6 +9,7 @@
 //! requested tier: that copy is the one exception G-I2 grants (SO-I5).
 
 pub(crate) mod decode_copy;
+mod hint;
 mod plan;
 mod read;
 mod reader;
@@ -126,15 +127,16 @@ impl ParquetSource {
         let schema = plan::schema(&files)?;
         Counters::add(&counters.splits, splits.len() as u64);
         Counters::add(&counters.groups_skipped, skipped);
-        Counters::add(
-            &counters.bytes_planned,
-            splits.iter().map(|s| s.uncompressed_bytes).sum(),
-        );
+        // A footer is untrusted input and its sizes may be anything (SO-I10).
+        let bytes = splits
+            .iter()
+            .fold(0u64, |sum, s| sum.saturating_add(s.uncompressed_bytes));
+        Counters::add(&counters.bytes_planned, bytes);
         tracing::info!(
             target: "source.plan",
             files = files.len(),
             splits = splits.len(),
-            bytes = splits.iter().map(|s| s.uncompressed_bytes).sum::<u64>(),
+            bytes,
             skipped,
             "parquet plan",
         );

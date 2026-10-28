@@ -28,8 +28,15 @@ impl ArenaChunks {
         ArenaChunks { file_len, ranges }
     }
 
+    /// `length` bytes at `start`. Both come from page headers, which are untrusted input
+    /// (SO-I10): a request whose end overflows, or that is not inside one fetched range, is the
+    /// decoder's error, never a panic.
     fn slice(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        let end = start + length as u64;
+        let Some(end) = start.checked_add(length as u64) else {
+            return Err(ParquetError::General(format!(
+                "a page of {length} bytes at byte {start} runs past any file"
+            )));
+        };
         for (offset, bytes) in &self.ranges {
             let range_end = offset + bytes.len() as u64;
             if start >= *offset && end <= range_end {
@@ -86,5 +93,6 @@ mod tests {
         chunks.get_read(15).unwrap().read_to_end(&mut out).unwrap();
         assert_eq!(out, b"56789");
         assert!(chunks.get_read(90).is_err());
+        assert!(chunks.get_bytes(u64::MAX - 1, 3).is_err());
     }
 }
