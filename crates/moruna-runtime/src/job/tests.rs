@@ -704,6 +704,39 @@ fn vortex_kinds_parse_and_build() {
     );
 }
 
+/// SI-T31 ipc_sink_compression_setting (08 e.3, KA10): the `arrow_ipc` sink reads `compression`
+/// (`none`, `zstd`, `lz4`) and a zstd `level`, and refuses a name it does not know, a level for
+/// a codec that has none, and a level zstd does not take, each at the field.
+#[test]
+fn si_t31_ipc_sink_compression_setting() {
+    let kinds = Registry::standard();
+    let sink = |options: serde_json::Value| {
+        let mut job = minimal("/out");
+        job.sink = doc(json!({"kind": "arrow_ipc", "url": "/out", "options": options}));
+        job
+    };
+    for options in [
+        json!({}),
+        json!({"compression": "none"}),
+        json!({"compression": "zstd"}),
+        json!({"compression": "zstd", "level": 9}),
+        json!({"compression": "lz4"}),
+        json!({"file_bytes": 268435456, "compression": "lz4"}),
+    ] {
+        build::build(&sink(options.clone()), &kinds, opts(false, &no_env))
+            .unwrap_or_else(|e| panic!("{options}: {e}"));
+    }
+    for options in [
+        json!({"compression": "gzip"}),
+        json!({"compression": "lz4", "level": 3}),
+        json!({"compression": "none", "level": 3}),
+        json!({"level": 3}),
+        json!({"compression": "zstd", "level": 100_000}),
+    ] {
+        assert_refused(&sink(options), "sink.options.compression");
+    }
+}
+
 /// Every sink kind builds, and the sink sizes are clamped with the library's notes.
 #[test]
 fn every_sink_kind_builds() {

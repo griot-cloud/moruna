@@ -589,7 +589,7 @@
     {
       "name": "arrow_ipc",
       "role": "sink",
-      "summary": "Page-aligned Arrow IPC files in a local directory",
+      "summary": "Arrow IPC files in a local directory, page-aligned or compressed",
       "settings": {
         "type": "object",
         "additionalProperties": false,
@@ -623,6 +623,21 @@
                 "format": "uint64",
                 "minimum": 0,
                 "description": "`sink.file_bytes`; absent is 1 GiB."
+              },
+              "compression": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`none` (absent), `zstd` or `lz4`; a compressed file is 8-byte aligned, not page aligned."
+              },
+              "level": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The zstd level (absent is 3); `zstd` only."
               }
             },
             "description": "`sink.options` for `arrow_ipc`."
@@ -636,6 +651,13 @@
             "url": "file:///data/out",
             "options": {
               "file_bytes": 268435456
+            }
+          },
+          {
+            "url": "/data/out",
+            "options": {
+              "compression": "zstd",
+              "level": 9
             }
           }
         ]

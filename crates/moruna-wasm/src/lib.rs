@@ -714,7 +714,7 @@ impl Kernel for WasmKernel {
         let bytes = ipc::write(&batch)?;
         drop(batch);
         let out = st.process(&bytes)?;
-        let batch = ipc::read_one(out)?;
+        let batch = ipc::read_one(out, &*st.alloc)?;
         let (payload, _) = moruna_adapters::land::land_table(batch, &st.alloc)?;
         Ok(payload)
     }

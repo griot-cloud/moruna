@@ -1,6 +1,7 @@
 """Arrow IPC files end to end from Python: the files `moruna.ArrowIpcSink` writes are files
 pyarrow opens (KA11, 08 e.3, SI-T27), and `moruna.ArrowIpcSource` reads files pyarrow wrote
-(KA9, 07 SO-T34 onward).
+(KA9, 07 SO-T34 onward). Either may be compressed (`zstd` or `lz4`, KA10, 08 e.3, SI-T32 and
+SO-T43): pyarrow opens what the sink compressed, and the source inflates what pyarrow compressed.
 
 pyarrow is Arrow C++, which holds an IPC file to the format where arrow-rs is lenient: every
 block of the footer has an offset, a metadata length and a body length that are multiples of 8,
@@ -11,6 +12,8 @@ reader that proves it fixed.
 
 from __future__ import annotations
 
+import datetime
+import decimal
 import pathlib
 
 import pyarrow as pa
@@ -41,7 +44,12 @@ def make_table(rows: int) -> pa.Table:
 
 
 def write_through_the_sink(
-    scratch: pathlib.Path, table: pa.Table, *, ordered: bool, row_group_size: int
+    scratch: pathlib.Path,
+    table: pa.Table,
+    *,
+    ordered: bool,
+    row_group_size: int,
+    **sink_options: object,
 ) -> pathlib.Path:
     src = scratch / "in"
     src.mkdir()
@@ -50,7 +58,7 @@ def write_through_the_sink(
     report = moruna.run(
         moruna.ParquetSource(f"file://{src}/part-0.parquet"),
         [],
-        moruna.ArrowIpcSink(str(out)),
+        moruna.ArrowIpcSink(str(out), **sink_options),
         budget=budget(),
         ordered=ordered,
     )
@@ -179,3 +187,128 @@ def test_so_t38_a_stream_is_refused(scratch: pathlib.Path) -> None:
     assert str(path) in str(raised.value)
     with pytest.raises(ValueError, match="split_rows"):
         moruna.ArrowIpcSource(str(path), split_rows=0)
+
+
+def make_wide_table(rows: int) -> pa.Table:
+    """A table of the types a user's files hold, every one the source reads: nulls, empty
+    strings, lists, a struct, decimals, timestamps and a column of one value."""
+    return pa.table(
+        {
+            "id": pa.array(range(rows), pa.int64()),
+            "text": pa.array([f"row {i}" if i % 5 else "" for i in range(rows)]),
+            "maybe": pa.array([None if i % 7 == 0 else f"v{i}" for i in range(rows)]),
+            "score": pa.array([None if i % 7 == 0 else i * 0.5 for i in range(rows)], pa.float32()),
+            "tags": pa.array([list(range(i % 4)) for i in range(rows)], pa.list_(pa.int32())),
+            "flag": pa.array([i % 3 == 0 for i in range(rows)]),
+            "blob": pa.array([bytes([i % 256]) * (i % 9) for i in range(rows)]),
+            "price": pa.array(
+                [decimal.Decimal(i) / 100 for i in range(rows)], pa.decimal128(12, 2)
+            ),
+            "at": pa.array(
+                [
+                    datetime.datetime(2026, 1, 1) + datetime.timedelta(seconds=i)
+                    for i in range(rows)
+                ],
+                pa.timestamp("us"),
+            ),
+            "pair": pa.array([{"x": i, "y": None if i % 2 else "s"} for i in range(rows)]),
+            "big": pa.array([f"{i}" * (i % 5) for i in range(rows)], pa.large_string()),
+            "same": pa.array([7] * rows, pa.int16()),
+            "none": pa.array([None] * rows, pa.int32()),
+        }
+    )
+
+
+COMPRESSIONS = [
+    pytest.param({"compression": "zstd"}, id="zstd"),
+    pytest.param({"compression": "zstd", "level": 19}, id="zstd-19"),
+    pytest.param({"compression": "lz4"}, id="lz4"),
+]
+
+
+@pytest.mark.parametrize("sink_options", COMPRESSIONS)
+@pytest.mark.parametrize("ordered", [True, False])
+def test_si_t32_pyarrow_opens_the_sinks_compressed_files(
+    scratch: pathlib.Path, sink_options: dict[str, object], ordered: bool
+) -> None:
+    """KA10: what the sink compresses, pyarrow (Arrow C++) opens and reads equal, memory mapped
+    too, in files smaller than the uncompressed ones."""
+    table = make_table(200_000)
+    out = write_through_the_sink(
+        scratch, table, ordered=ordered, row_group_size=50_000, **sink_options
+    )
+    back, batches = read_with_pyarrow(out)
+    assert batches >= 1, batches
+    assert back.schema.equals(table.schema), back.schema
+    if not ordered:
+        back = back.sort_by("id")
+    assert back.equals(table)
+
+    (scratch / "plain").mkdir()
+    plain = write_through_the_sink(scratch / "plain", table, ordered=ordered, row_group_size=50_000)
+    compressed_bytes = sum(p.stat().st_size for p in part_files(out))
+    plain_bytes = sum(p.stat().st_size for p in part_files(plain))
+    assert compressed_bytes < plain_bytes, (compressed_bytes, plain_bytes)
+
+    for part in part_files(out):
+        reader = pa.ipc.open_file(part)
+        assert reader.num_record_batches >= 1
+        # Arrow C++ holds a compressed file to the same block rules as an uncompressed one.
+        assert pa.ipc.open_file(pa.memory_map(str(part))).read_all().num_rows > 0
+
+
+@pytest.mark.parametrize("sink_options", COMPRESSIONS)
+def test_si_t32_the_sinks_compressed_files_read_back_through_the_source(
+    scratch: pathlib.Path, sink_options: dict[str, object]
+) -> None:
+    table = make_table(30_000)
+    out = write_through_the_sink(scratch, table, ordered=True, row_group_size=7_500, **sink_options)
+    back = run_to_parquet(moruna.ArrowIpcSource(str(out)), scratch / "back")
+    assert back.equals(table)
+
+
+def test_si_t32_compression_arguments(scratch: pathlib.Path) -> None:
+    moruna.ArrowIpcSink(str(scratch), compression="none")
+    moruna.ArrowIpcSink(str(scratch), compression="zstd", level=9)
+    moruna.ArrowIpcSink(str(scratch), compression="lz4")
+    for options, text in [
+        ({"compression": "gzip"}, "unknown compression"),
+        ({"compression": "lz4", "level": 3}, "level"),
+        ({"compression": "none", "level": 3}, "level"),
+        ({"compression": "zstd", "level": 100_000}, "level"),
+    ]:
+        with pytest.raises(ValueError, match=text):
+            moruna.ArrowIpcSink(str(scratch), **options)
+
+
+@pytest.mark.parametrize("codec", ["zstd", "lz4_frame"])
+def test_so_t43_a_compressed_file_pyarrow_wrote_is_read_in_full(
+    scratch: pathlib.Path, codec: str
+) -> None:
+    """KA10: pyarrow's own compression, with its own padding of buffers, every type the source
+    reads, a file of many batches and a file of slices and an empty batch."""
+    table = make_wide_table(30_000)
+    src = scratch / "in"
+    src.mkdir()
+    options = pa.ipc.IpcWriteOptions(compression=codec)
+    with (
+        pa.OSFile(str(src / "a.arrow"), "wb") as sink,
+        pa.ipc.new_file(sink, table.schema, options=options) as writer,
+    ):
+        for batch in table.to_batches(max_chunksize=7_000):
+            writer.write_batch(batch)
+    back = run_to_parquet(moruna.ArrowIpcSource(str(src / "a.arrow")), scratch / "out")
+    assert back.equals(table)
+
+    sliced = scratch / "sliced"
+    sliced.mkdir()
+    with (
+        pa.OSFile(str(sliced / "s.arrow"), "wb") as sink,
+        pa.ipc.new_file(sink, table.schema, options=options) as writer,
+    ):
+        writer.write_batch(table.slice(10, 1_000).to_batches()[0])
+        writer.write_batch(table.slice(5, 3).to_batches()[0])
+        writer.write_batch(pa.RecordBatch.from_pylist([], schema=table.schema))
+    again = run_to_parquet(moruna.ArrowIpcSource(str(sliced / "s.arrow")), scratch / "again")
+    expected = pa.concat_tables([table.slice(10, 1_000), table.slice(5, 3)]).sort_by("id")
+    assert again.equals(expected)

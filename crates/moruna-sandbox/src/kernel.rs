@@ -810,6 +810,7 @@ impl Kernel for SandboxKernel {
                     shared_mapping(&st.child.shared),
                     offset as usize,
                     len as usize,
+                    &*st.alloc,
                 )?;
                 let landed = moruna_adapters::land::land_table(batch, &st.alloc);
                 st.child.absorb(&released);
@@ -850,15 +851,18 @@ impl Kernel for SandboxKernel {
 /// The output stream at `offset`, decoded in place over the mapping (SB-I7). The child wrote
 /// it and the child runs the tenant's code, so every message is checked before arrow-ipc reads
 /// it, and a malformed stream is the kernel's error naming the fault, never a panic (SB-I14,
-/// contracts CT-I13).
+/// contracts CT-I13). A function may compress its output (`LZ4_FRAME` or `ZSTD`, 16 e.5): the
+/// check inflates it into `alloc`, within half of what the arena can still give (contracts e.8).
 fn read_one(
     owner: crate::mapping::Owner,
     offset: usize,
     len: usize,
+    alloc: &dyn Allocator,
 ) -> Result<moruna_kernel::arrow::record_batch::RecordBatch> {
     let buffer = crate::mapping::arrow_buffer(owner, offset, len)
         .map_err(|e| kernel_error(format!("the output: {e}")))?;
-    let mut batches = moruna_kernel::ipc::read_stream(&buffer)
+    let inflate = moruna_kernel::ipc::Inflate::share(alloc);
+    let mut batches = moruna_kernel::ipc::read_stream(&buffer, &inflate)
         .map_err(|e| kernel_error(format!("the output is not a valid Arrow IPC stream: {e}")))?;
     match batches.len() {
         1 => Ok(batches.remove(0)),
@@ -910,7 +914,12 @@ mod tests {
 
     fn read(bytes: Vec<u8>) -> Result<moruna_kernel::arrow::record_batch::RecordBatch> {
         let (owner, offset) = output(&bytes);
-        read_one(owner, offset, bytes.len())
+        read_one(
+            owner,
+            offset,
+            bytes.len(),
+            &moruna_testkit::FakeAllocator::new(),
+        )
     }
 
     /// SB-T26: a child's output whose schema names a type id no Arrow type has is the kernel's

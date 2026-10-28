@@ -22,6 +22,7 @@ fn new_sink(scratch: &Scratch, file_bytes: u64) -> (ArrowIpcSink, FakeReactor, A
         ArrowIpcSinkConfig {
             path: scratch.path().to_path_buf(),
             file_bytes,
+            ..ArrowIpcSinkConfig::default()
         },
         Arc::new(reactor.clone()),
         Arc::clone(&alloc) as Arc<dyn Allocator>,
@@ -223,6 +224,7 @@ fn a_failed_ipc_write_is_reported_by_finish() {
         ArrowIpcSinkConfig {
             path: scratch.path().to_path_buf(),
             file_bytes: 1 << 30,
+            ..ArrowIpcSinkConfig::default()
         },
         Arc::new(reactor),
         Arc::new(alloc.clone()),
@@ -241,6 +243,7 @@ fn a_failed_ipc_write_is_reported_by_finish() {
         ArrowIpcSinkConfig {
             path: scratch.path().to_path_buf(),
             file_bytes: 1 << 30,
+            ..ArrowIpcSinkConfig::default()
         },
         Arc::new(reactor.clone()),
         Arc::new(alloc.clone()),
@@ -359,4 +362,326 @@ fn si_t27_ipc_blocks_are_eight_aligned() {
             rows * 5
         );
     }
+}
+
+/// A sink writing with `compression`, over a reactor that keeps the files in memory.
+fn compressed_sink(
+    scratch: &Scratch,
+    compression: ipc::Compression,
+    file_bytes: u64,
+) -> (ArrowIpcSink, FakeReactor, Arc<CountingAlloc>) {
+    let reactor = FakeReactor::new();
+    let alloc = CountingAlloc::new(FakeAllocator::new());
+    let sink = ArrowIpcSink::new(
+        ArrowIpcSinkConfig {
+            path: scratch.path().to_path_buf(),
+            file_bytes,
+            compression,
+        },
+        Arc::new(reactor.clone()),
+        Arc::clone(&alloc) as Arc<dyn Allocator>,
+    )
+    .expect("arrow ipc sink");
+    (sink, reactor, alloc)
+}
+
+const COMPRESSIONS: [ipc::Compression; 3] = [
+    ipc::Compression::Zstd(3),
+    ipc::Compression::Zstd(19),
+    ipc::Compression::Lz4,
+];
+
+/// The footer of an Arrow IPC file: its blocks and the schema.
+fn footer_of(
+    bytes: &[u8],
+) -> (
+    Vec<(usize, usize, usize)>,
+    moruna_kernel::arrow::datatypes::SchemaRef,
+) {
+    let footer_len = u32::from_le_bytes([
+        bytes[bytes.len() - 10],
+        bytes[bytes.len() - 9],
+        bytes[bytes.len() - 8],
+        bytes[bytes.len() - 7],
+    ]) as usize;
+    let footer = &bytes[bytes.len() - 10 - footer_len..bytes.len() - 10];
+    let parsed = root_as_footer(footer).expect("the footer parses");
+    let blocks = parsed
+        .recordBatches()
+        .expect("blocks")
+        .iter()
+        .map(|b| {
+            (
+                b.offset() as usize,
+                b.metaDataLength() as usize,
+                b.bodyLength() as usize,
+            )
+        })
+        .collect();
+    let schema = ipc::footer_schema(parsed.schema().expect("a schema")).expect("a valid schema");
+    (blocks, schema)
+}
+
+/// Every block of an IPC file read the way Moruna reads one: its message through the check, a
+/// compressed body inflated into the arena within `ceiling`.
+fn moruna_reads(
+    bytes: &[u8],
+    alloc: &FakeAllocator,
+    ceiling: u64,
+) -> Vec<moruna_kernel::arrow::record_batch::RecordBatch> {
+    let (blocks, schema) = footer_of(bytes);
+    let mut decoder = ipc::Decoder::with_schema(schema);
+    let inflate = ipc::Inflate::new(alloc, ceiling);
+    blocks
+        .into_iter()
+        .map(|(offset, meta, body)| {
+            let message =
+                moruna_kernel::arrow::ipc::root_as_message(&bytes[offset + 8..offset + meta])
+                    .expect("a message");
+            let body = moruna_kernel::arrow::buffer::Buffer::from_vec(
+                bytes[offset + meta..offset + meta + body].to_vec(),
+            );
+            decoder
+                .message(&message, &body, &inflate)
+                .expect("the block decodes")
+                .expect("a record batch")
+        })
+        .collect()
+}
+
+/// SI-T28. With `compression` set the sink writes the files of 08 e.3: arrow's own reader and
+/// Moruna's read every column type back equal, and the batch the sink was given is not
+/// touched. Every type the IPC tests cover but dictionaries, which the sink does not write.
+#[test]
+fn si_t28_ipc_compressed_files_read_back_every_type() {
+    let every = moruna_testkit::ipc::batches()
+        .into_iter()
+        .find(|(label, _, _)| *label == "every_type")
+        .expect("the every_type batch")
+        .1
+        .remove(0);
+    let sliced = every.slice(1, 2);
+    for compression in COMPRESSIONS {
+        let scratch = Scratch::new("t28");
+        let (mut sink, reactor, _alloc) = compressed_sink(&scratch, compression, 1 << 30);
+        sink.open(&moruna_kernel::SourceSchema::Table(every.schema()))
+            .expect("open");
+        let inputs = [every.clone(), sliced.clone(), every.clone()];
+        // The slice is a different length from the whole, which is a different record, and the
+        // schema is the same.
+        for (seq, batch) in inputs.iter().enumerate() {
+            block_on(sink.write(
+                seq as u64,
+                moruna_kernel::Payload::table(batch.clone()).expect("payload"),
+            ))
+            .expect("write");
+        }
+        sink.finish().expect("finish");
+        let bytes = written(&reactor, scratch.path(), "part-00000.arrow");
+
+        let read: Vec<_> = FileReader::try_new(std::io::Cursor::new(bytes.clone()), None)
+            .expect("arrow reads the file")
+            .map(|b| b.expect("record batch"))
+            .collect();
+        assert_eq!(read, inputs, "{compression:?}: arrow's reader");
+
+        let alloc = FakeAllocator::new();
+        let ours = moruna_reads(&bytes, &alloc, 64 << 20);
+        assert_eq!(ours, inputs, "{compression:?}: Moruna's reader");
+        assert!(alloc.allocations_total() > 0);
+        drop(ours);
+        assert_eq!(alloc.in_use(Tier::Host), 0);
+    }
+}
+
+/// SI-T29. A compressed file keeps the format's 8-byte alignment and not the page's: every block
+/// is 8-aligned (KA11), the bodies sit close together where an uncompressed file puts each at a
+/// page boundary, the message names its codec, and the sink says what it encoded. e.3, f.2.
+#[test]
+fn si_t29_ipc_compressed_layout() {
+    let rows = 301;
+    let mut sizes = Vec::new();
+    for compression in [
+        ipc::Compression::None,
+        ipc::Compression::Zstd(3),
+        ipc::Compression::Lz4,
+    ] {
+        let scratch = Scratch::new("t29");
+        let (mut sink, reactor, alloc) = compressed_sink(&scratch, compression, 1 << 30);
+        sink.open(&table_source_schema()).expect("open");
+        let mut bytes_in = 0;
+        for seq in 0..4u64 {
+            let payload =
+                moruna_kernel::Payload::table(ragged_batch(rows, seq as i32 * 7)).expect("payload");
+            bytes_in += payload.bytes();
+            block_on(sink.write(seq, payload)).expect("write");
+        }
+        sink.finish().expect("finish");
+        let bytes = written(&reactor, scratch.path(), "part-00000.arrow");
+        let (blocks, _) = footer_of(&bytes);
+        assert_eq!(blocks.len(), 4);
+        for (i, (offset, meta, body)) in blocks.iter().enumerate() {
+            assert_eq!(offset % 8, 0, "{compression:?} block {i}: offset");
+            assert_eq!(meta % 8, 0, "{compression:?} block {i}: metaDataLength");
+            assert_eq!(body % 8, 0, "{compression:?} block {i}: bodyLength");
+            let message =
+                moruna_kernel::arrow::ipc::root_as_message(&bytes[offset + 8..offset + meta])
+                    .expect("the message parses");
+            let codec = message
+                .header_as_record_batch()
+                .and_then(|b| b.compression())
+                .map(|c| c.codec());
+            let expected = match compression {
+                ipc::Compression::None => None,
+                ipc::Compression::Zstd(_) => Some(moruna_kernel::arrow::ipc::CompressionType::ZSTD),
+                ipc::Compression::Lz4 => {
+                    Some(moruna_kernel::arrow::ipc::CompressionType::LZ4_FRAME)
+                }
+            };
+            assert_eq!(codec, expected, "{compression:?} block {i}");
+        }
+        let reader = FileReader::try_new(std::io::Cursor::new(bytes.clone()), None).expect("arrow");
+        assert_eq!(
+            reader.map(|b| b.expect("batch").num_rows()).sum::<usize>(),
+            rows * 4
+        );
+        if compression == ipc::Compression::None {
+            // Page-aligned: the second record starts at the next page after the first.
+            assert!(blocks[1].0 >= PAGE as usize, "{:?}", blocks);
+        } else {
+            // Compressed: the second record follows the first, without a page between.
+            let first_end = blocks[0].0 + blocks[0].1 + blocks[0].2;
+            // The record batch message of a later record sits one schema message into its base,
+            // which is where the Schema message would be.
+            let schema_len = blocks[0].0 - 8;
+            assert_eq!(
+                blocks[1].0 - schema_len,
+                first_end.next_multiple_of(8),
+                "{compression:?}"
+            );
+            // The payload went through the compressor: an encode copy.
+            assert_eq!(sink.stats().encode_bytes, bytes_in, "{compression:?}");
+            assert_eq!(alloc.payload_copy_bytes(), bytes_in, "{compression:?}");
+        }
+        sizes.push((compression, bytes.len()));
+    }
+    let none = sizes[0].1;
+    for (compression, size) in &sizes[1..] {
+        assert!(
+            *size < none,
+            "{compression:?} wrote {size} bytes where none wrote {none}"
+        );
+    }
+}
+
+/// SI-T30. The sink's `compression` shrinks a million rows of five columns: the files are
+/// smaller with zstd than without by the factor asserted here, and the factors are printed for
+/// the record. e.3, KA10.
+#[test]
+fn si_t30_ipc_compression_shrinks_a_million_rows() {
+    use moruna_kernel::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    use moruna_kernel::arrow::record_batch::RecordBatch;
+
+    const ROWS: usize = 1_000_000;
+    const MORSEL: usize = 100_000;
+    let words: Vec<String> = (0..200)
+        .map(|i| format!("w{:03}", (i * 37) % 997))
+        .collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("note", DataType::Utf8, false),
+    ]));
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut batches = Vec::new();
+    for first in (0..ROWS).step_by(MORSEL) {
+        let rows = first..first + MORSEL;
+        let id: ArrayRef = Arc::new(Int64Array::from_iter_values(rows.clone().map(|i| i as i64)));
+        let ts: ArrayRef =
+            Arc::new(Int64Array::from_iter_values(rows.clone().map(|i| {
+                1_700_000_000_000 + i as i64 * 1_000 + (next() % 900) as i64
+            })));
+        let category: ArrayRef = Arc::new(StringArray::from_iter_values(
+            rows.clone().map(|_| format!("category-{}", next() % 50)),
+        ));
+        let value: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            rows.clone().map(|_| (next() % 100_000) as f64 / 100.0),
+        ));
+        let note: ArrayRef = Arc::new(StringArray::from_iter_values(rows.clone().map(|_| {
+            format!(
+                "{} {} {}",
+                words[(next() % 200) as usize],
+                words[(next() % 200) as usize],
+                words[(next() % 200) as usize]
+            )
+        })));
+        batches.push(
+            RecordBatch::try_new(Arc::clone(&schema), vec![id, ts, category, value, note])
+                .expect("a batch"),
+        );
+    }
+
+    let mut sizes = Vec::new();
+    for compression in [
+        ipc::Compression::None,
+        ipc::Compression::Zstd(3),
+        ipc::Compression::Lz4,
+    ] {
+        let scratch = Scratch::new("t30");
+        let (mut sink, reactor, _alloc) = compressed_sink(&scratch, compression, 1 << 40);
+        sink.open(&moruna_kernel::SourceSchema::Table(Arc::clone(&schema)))
+            .expect("open");
+        for (seq, batch) in batches.iter().enumerate() {
+            block_on(sink.write(
+                seq as u64,
+                moruna_kernel::Payload::table(batch.clone()).expect("payload"),
+            ))
+            .expect("write");
+        }
+        let summary = sink.finish().expect("finish");
+        assert_eq!(summary.rows, ROWS as u64);
+        let bytes = written(&reactor, scratch.path(), "part-00000.arrow");
+        sizes.push((compression, bytes.len() as u64));
+    }
+    let none = sizes[0].1 as f64;
+    let zstd = none / sizes[1].1 as f64;
+    let lz4 = none / sizes[2].1 as f64;
+    println!(
+        "SI-T30 {ROWS} rows x 5 columns: none {} bytes, zstd(3) {} bytes ({zstd:.2}x smaller), \
+         lz4 {} bytes ({lz4:.2}x smaller)",
+        sizes[0].1, sizes[1].1, sizes[2].1
+    );
+    assert!(zstd >= 2.0, "zstd made the file {zstd:.2}x smaller");
+    assert!(lz4 >= 1.5, "lz4 made the file {lz4:.2}x smaller");
+    assert!(sizes[1].1 < sizes[2].1, "zstd beats lz4 on size");
+}
+
+/// A zstd level the library does not take is the sink's error when it is built, not a failed
+/// first write.
+#[test]
+fn a_bad_zstd_level_is_refused_when_the_sink_is_built() {
+    let scratch = Scratch::new("ipc-level");
+    let built = ArrowIpcSink::new(
+        ArrowIpcSinkConfig {
+            path: scratch.path().to_path_buf(),
+            compression: ipc::Compression::Zstd(1000),
+            ..ArrowIpcSinkConfig::default()
+        },
+        Arc::new(FakeReactor::new()),
+        Arc::new(FakeAllocator::new()),
+    );
+    assert!(
+        matches!(&built, Err(e) if e.to_string().contains("level")),
+        "{:?}",
+        built.err()
+    );
 }
