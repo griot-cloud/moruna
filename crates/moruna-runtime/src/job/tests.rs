@@ -1,14 +1,18 @@
-//! MH: the document's tests that need no run (HO-T1, HO-T2, HO-T3, HO-T4, HO-T9).
+//! MH: the document's tests that need no run (HO-T1, HO-T2, HO-T3, HO-T4, HO-T9), and the
+//! build's use of the registry of kinds (SDD 18: KD-T7, KD-T8, KD-T9).
 
 use std::sync::Arc;
 
 use moruna_kernel::{ErrorPolicy, Guarantee, Kernel, MorunaError, SizerKind};
 use moruna_testkit::FakeKernel;
+use serde_json::{Value, json};
 
-use super::build::{
-    self, BuildOptions, CompiledKernel, KernelLoader, LoadedKernel, NoKernels, env_reliance,
-};
+use super::build::{self, BuildOptions, env_reliance};
 use super::*;
+use crate::kinds::{
+    Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Registry, Role, RunnableKind,
+    SinkKind, SourceKind, Stage, check_pin, settings_schema,
+};
 
 /// The example of MH 4.1, with every section present.
 const FULL: &str = r#"{
@@ -56,30 +60,69 @@ fn opts(strict: bool, env: &dyn Fn(&str) -> Option<String>) -> BuildOptions<'_> 
     }
 }
 
-/// A loader that hands back a fake kernel for every entry, whatever it names.
-struct Fakes;
+fn doc(value: Value) -> KindDoc {
+    KindDoc::from_value(value).expect("an entry")
+}
 
-impl KernelLoader for Fakes {
-    fn load(&self, _index: usize, _doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        Ok(LoadedKernel {
-            kernel: Arc::new(FakeKernel::new()) as Arc<dyn Kernel>,
-            #[cfg(feature = "python")]
-            python: None,
-        })
+/// What these tests stand in for the Python surface's `python` kernel kind with: code imported
+/// by path, read from the settings v1 gives a Python kernel, run as a fake kernel.
+struct Imports;
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct ImportSettings {
+    module: String,
+    callable: String,
+    #[serde(default)]
+    fingerprint: Option<String>,
+    #[serde(default)]
+    expected_amplification: Option<f64>,
+    #[serde(default)]
+    releases_gil: Option<bool>,
+}
+
+impl RunnableKind for Imports {
+    fn declaration(&self) -> Declaration {
+        Declaration {
+            name: "python".into(),
+            role: Role::Kernel,
+            summary: "a Python callable imported by path, as the tests stand it in".into(),
+            settings: settings_schema::<ImportSettings>(
+                "python",
+                vec![json!({"module": "m", "callable": "k"})],
+            ),
+            inputs: Flow::Batches,
+            outputs: Flow::Batches,
+            needs: Needs::nothing(),
+            deterministic: Fact::No,
+            preserves_columns: Fact::No,
+            isolation: Isolation::Imported,
+        }
     }
+
+    fn stage(&self, entry: &Entry<'_>, _: &mut Context) -> moruna_kernel::Result<Stage> {
+        let settings: ImportSettings = entry.settings()?;
+        let kernel = FakeKernel::new();
+        check_pin(entry, settings.fingerprint.as_deref(), &kernel)?;
+        Ok(Stage::of(Arc::new(kernel) as Arc<dyn Kernel>))
+    }
+}
+
+/// The standard kinds and the stand-in `python` kernel kind.
+fn kinds() -> Registry {
+    let mut kinds = Registry::standard();
+    kinds
+        .register_kernel(Arc::new(Imports))
+        .expect("python registers");
+    kinds
 }
 
 fn minimal(sink: &str) -> JobSpec {
     JobSpec::new(
-        SourceDoc::Parquet {
-            url: Urls(vec!["file:///data/in/part.parquet".into()]),
-            options: ParquetSourceOptions::default(),
-        },
+        doc(json!({"kind": "parquet", "url": "file:///data/in/part.parquet"})),
         Vec::new(),
-        SinkDoc::Parquet {
-            url: sink.into(),
-            options: ParquetSinkOptions::default(),
-        },
+        doc(json!({"kind": "parquet", "url": sink})),
     )
 }
 
@@ -89,6 +132,7 @@ fn minimal(sink: &str) -> JobSpec {
 fn ho_t1_spec_round_trip() {
     let job = JobSpec::from_json(FULL).expect("the example parses");
     assert_eq!(job.kernels.len(), 1);
+    assert_eq!(job.kernels[0].kind, "python");
     assert_eq!(job.error_policy, ErrorPolicyDoc::Budget(3));
     assert_eq!(job.sizer, SizerDoc::Learned);
     assert_eq!(job.staging.durable, Some(true));
@@ -115,43 +159,97 @@ fn ho_t1_spec_round_trip() {
     assert!(job.canonical_json().contains(r#""url":["/a","/b"]"#));
     let iter = r#"{"moruna_spec":1,"source":{"kind":"iterator"},
                    "sink":{"kind":"tensor","url":"/out","options":{"format":"safetensors"}}}"#;
-    assert_eq!(
-        JobSpec::from_json(iter).expect("iterator").source,
-        SourceDoc::Iterator
-    );
+    let job = JobSpec::from_json(iter).expect("iterator");
+    assert_eq!(job.source, doc(json!({"kind": "iterator"})));
     let python = r#"{"moruna_spec":1,"source":{"kind":"python"},"sink":{"kind":"python"}}"#;
     let job = JobSpec::from_json(python).expect("python");
-    assert_eq!(job.source, SourceDoc::Python);
-    assert_eq!(job.sink, SinkDoc::Python);
+    assert_eq!(job.source.kind, "python");
+    assert!(job.sink.settings.is_empty());
     assert!(job.canonical_json().contains(r#""sink":{"kind":"python"}"#));
 }
 
-/// A library caller that supplies a user's source and sink (07 e.6, 08 f.10) builds a run whose
-/// sink names no location, so the sink equals source rule has nothing to refuse.
+/// A library caller registers the kinds only it can supply, a user's source and sink (07 e.6,
+/// 08 f.10), and builds a run whose sink names no location, so the sink equals source rule has
+/// nothing to refuse. A program that registers neither refuses both by kind.
 #[test]
-fn python_source_and_sink_come_from_the_loader() {
-    struct Library;
-    impl KernelLoader for Library {
-        fn load(&self, index: usize, doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-            Fakes.load(index, doc)
-        }
-        fn python_source(&self) -> moruna_kernel::Result<crate::SourceSpec> {
-            Ok(crate::SourceSpec::Built(Arc::new(
-                moruna_testkit::FakeSource::new().splits(1, 10, 1 << 10),
-            )))
-        }
-        fn python_sink(&self) -> moruna_kernel::Result<crate::SinkSpec> {
-            Ok(crate::SinkSpec::Built(Box::new(
-                moruna_testkit::FakeSink::new(),
-            )))
+fn python_source_and_sink_are_kinds_the_caller_registers() {
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct Nothing {}
+    fn declared(role: Role) -> Declaration {
+        Declaration {
+            name: "python".into(),
+            role,
+            summary: "an object the caller handed over".into(),
+            settings: settings_schema::<Nothing>("python", vec![json!({})]),
+            inputs: if role == Role::Source {
+                Flow::Nothing
+            } else {
+                Flow::Batches
+            },
+            outputs: if role == Role::Source {
+                Flow::Batches
+            } else {
+                Flow::Nothing
+            },
+            needs: Needs::nothing(),
+            deterministic: Fact::No,
+            preserves_columns: Fact::No,
+            isolation: Isolation::Caller,
         }
     }
+    struct Caller;
+    impl SourceKind for Caller {
+        fn declaration(&self) -> Declaration {
+            declared(Role::Source)
+        }
+        fn source(
+            &self,
+            entry: &Entry<'_>,
+            _: &mut Context,
+        ) -> moruna_kernel::Result<crate::kinds::BuiltSource> {
+            let Nothing {} = entry.settings()?;
+            Ok(crate::kinds::BuiltSource {
+                spec: crate::SourceSpec::Built(Arc::new(moruna_testkit::FakeSource::new().splits(
+                    1,
+                    10,
+                    1 << 10,
+                ))),
+                targets: Vec::new(),
+                memory: None,
+            })
+        }
+    }
+    impl SinkKind for Caller {
+        fn declaration(&self) -> Declaration {
+            declared(Role::Sink)
+        }
+        fn sink(
+            &self,
+            entry: &Entry<'_>,
+            _: &mut Context,
+        ) -> moruna_kernel::Result<crate::kinds::BuiltSink> {
+            let Nothing {} = entry.settings()?;
+            Ok(crate::kinds::BuiltSink {
+                spec: crate::SinkSpec::Built(Box::new(moruna_testkit::FakeSink::new())),
+                target: String::new(),
+                memory: None,
+            })
+        }
+    }
+    let mut library = kinds();
+    library.register_source(Arc::new(Caller)).expect("source");
+    library.register_sink(Arc::new(Caller)).expect("sink");
     let mut job = minimal("/out");
-    job.source = SourceDoc::Python;
-    job.sink = SinkDoc::Python;
-    assert!(build::build(&job, &Library, opts(false, &no_env)).is_ok());
-    // Only the library can: the default loader refuses both kinds by name.
-    assert!(build::build(&job, &NoKernels, opts(false, &no_env)).is_err());
+    job.source = doc(json!({"kind": "python"}));
+    job.sink = doc(json!({"kind": "python"}));
+    assert!(build::build(&job, &library, opts(false, &no_env)).is_ok());
+    // A strict build admits them: a caller's object is not code imported by path.
+    assert!(build::build(&job, &library, opts(true, &no_env)).is_ok());
+    // Only the library can: the standard registry refuses both kinds by name.
+    assert_refused_by(&job, &Registry::standard(), "source.kind");
+    job.source = minimal("/out").source;
+    assert_refused_by(&job, &Registry::standard(), "sink.kind");
 }
 
 /// HO-T2 spec_digest: the digest is the SHA-256 of the canonical form, independent of key
@@ -167,7 +265,7 @@ fn ho_t2_spec_digest() {
     );
 
     let reordered = r#"{"sink":{"url":"/out","kind":"parquet"},"moruna_spec":1,
-                        "source":{"url":"/in","kind":"parquet"},"trace":null}"#;
+                        "source":{"url":"/in","kind":"parquet","options":null},"trace":null}"#;
     let plain = r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/in"},
                     "sink":{"kind":"parquet","url":"/out"}}"#;
     let a = JobSpec::from_json(reordered).expect("a");
@@ -187,11 +285,15 @@ fn ho_t2_spec_digest() {
     changed.ordered = true;
     assert_ne!(changed.digest(), b.digest());
     let mut hinted = job.clone();
-    hinted.kernels[0].expected_amplification = Some(2.0);
+    hinted.kernels[0]
+        .settings
+        .insert("expected_amplification".into(), json!(2.0));
     assert_ne!(hinted.digest(), digest);
 }
 
-/// HO-T3 spec_refusals: a refusal names the field it was refused for.
+/// HO-T3 spec_refusals: a refusal names the field it was refused for. The document's own
+/// sections are refused as it is read; what a kind's settings may be is the kind's, refused
+/// when the document is built (KD-T9).
 #[test]
 fn ho_t3_spec_refusals_name_the_field() {
     let field = |text: &str| JobSpec::from_json(text).expect_err("refused").field;
@@ -223,16 +325,30 @@ fn ho_t3_spec_refusals_name_the_field() {
     assert_eq!(field(&base(r#","report":{"sock":"x"}"#)), "report");
     assert_eq!(field(&base(r#","kernels":{}"#)), "kernels");
     assert_eq!(
-        field(&base(r#","kernels":[{"kind":"java"}]"#)),
+        field(&base(r#","kernels":[{"name":"cast"}]"#)),
         "kernels[0]"
     );
+    assert_eq!(field(&base(r#","kernels":[{"kind":5}]"#)), "kernels[0]");
+    assert_eq!(field(&base(r#","kernels":[{"kind":""}]"#)), "kernels[0]");
+    assert_eq!(field(&base(r#","kernels":[3]"#)), "kernels[0]");
     assert_eq!(field(&base(r#","ordered":"yes""#)), "ordered");
     assert_eq!(field(&base(r#","trace":5"#)), "trace");
-    let bad_source =
-        r#"{"moruna_spec":1,"source":{"kind":"datafusion"},"sink":{"kind":"parquet","url":"/o"}}"#;
-    assert_eq!(field(bad_source), "source");
+    assert_eq!(
+        field(r#"{"moruna_spec":1,"source":{"url":"/i"},"sink":{"kind":"parquet","url":"/o"}}"#),
+        "source"
+    );
+    assert_eq!(
+        field(r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/i"},"sink":"parquet"}"#),
+        "sink"
+    );
+    // Kinds are the registry's: these read, and the build refuses them by field.
+    let job = JobSpec::from_json(&base(r#","kernels":[{"kind":"java"}]"#)).expect("reads");
+    assert_refused(&job, "kernels[0].kind");
     let bad_sink = r#"{"moruna_spec":1,"source":{"kind":"parquet","url":"/i"},"sink":{"kind":"csv","url":"/o"}}"#;
-    assert_eq!(field(bad_sink), "sink");
+    assert_refused(&JobSpec::from_json(bad_sink).expect("reads"), "sink.kind");
+    let bad_source =
+        r#"{"moruna_spec":1,"source":{"kind":"parquet"},"sink":{"kind":"parquet","url":"/o"}}"#;
+    assert_refused(&JobSpec::from_json(bad_source).expect("reads"), "source");
     let err = JobSpec::from_json(r#"{"moruna_spec":2}"#).expect_err("v2");
     assert_eq!(
         err.to_string(),
@@ -240,6 +356,10 @@ fn ho_t3_spec_refusals_name_the_field() {
     );
     let as_error: MorunaError = err.into();
     assert!(matches!(as_error, MorunaError::Config { name: "spec", .. }));
+    // An entry's settings are an object.
+    assert!(KindDoc::of("parquet", &3).is_err());
+    let entry = KindDoc::of("parquet", &json!({"url": "/in", "options": null})).expect("entry");
+    assert_eq!(entry, doc(json!({"kind": "parquet", "url": "/in"})));
 }
 
 /// HO-T4 strict_refusal_texts (H8): each field the environment would fill is named with its
@@ -259,7 +379,7 @@ fn ho_t4_strict_refusal_texts() {
             ("staging.dir", "MORUNA_SPILL_DIR")
         ]
     );
-    let Err(error) = build::build(&job, &NoKernels, opts(true, &env)) else {
+    let Err(error) = build::build(&job, &Registry::standard(), opts(true, &env)) else {
         panic!("strict refuses");
     };
     assert_eq!(
@@ -305,7 +425,7 @@ fn ho_t4_strict_refusal_texts() {
     assert!(env_reliance(&partial, &profile_env).is_empty());
 
     // Not strict: built, with a note per field.
-    let built = build::build(&job, &NoKernels, opts(false, &env)).expect("lenient builds");
+    let built = build::build(&job, &Registry::standard(), opts(false, &env)).expect("lenient");
     assert_eq!(
         built.spec.notes,
         vec![
@@ -337,8 +457,8 @@ fn ho_t9_build_translates_every_field() {
     job.staging.dir = Some(dir.to_string_lossy().into_owned());
     job.host_profile = None;
     // Not strict: the document names a Python kernel by import path, which strict mode refuses
-    // (16 PK-I8, PK-T11 below); with no environment the two modes build the same spec otherwise.
-    let built = build::build(&job, &Fakes, opts(false, &no_env)).expect("builds");
+    // (16 PK-I8, KD-T7 below); with no environment the two modes build the same spec otherwise.
+    let built = build::build(&job, &kinds(), opts(false, &no_env)).expect("builds");
     let spec = &built.spec;
     assert_eq!(
         built.run_id.map(|r| r.to_hex()).as_deref(),
@@ -388,7 +508,7 @@ fn ho_t9_build_translates_every_field() {
         staging_dir: Some("/staging".into()),
         ..HostProfileDoc::default()
     });
-    let built = build::build(&declared, &Fakes, opts(false, &no_env)).expect("declared");
+    let built = build::build(&declared, &kinds(), opts(false, &no_env)).expect("declared");
     let profile = built.spec.host_profile.expect("profile");
     assert_eq!(profile.gds, Guarantee::Absent);
     assert_eq!(profile.staging_dir, Some("/staging".into()));
@@ -402,11 +522,11 @@ fn ho_t9_build_translates_every_field() {
     assert_refused(&declared, "host_profile.staging_dir");
     let mut only_profile = minimal("/out");
     only_profile.host_profile = Some(HostProfileDoc::default());
-    assert!(build::build(&only_profile, &NoKernels, opts(false, &no_env)).is_ok());
+    assert!(build::build(&only_profile, &Registry::standard(), opts(false, &no_env)).is_ok());
 }
 
-fn assert_refused(job: &JobSpec, field: &str) {
-    match build::build(job, &Fakes, opts(false, &no_env)) {
+fn assert_refused_by(job: &JobSpec, kinds: &Registry, field: &str) {
+    match build::build(job, kinds, opts(false, &no_env)) {
         Err(MorunaError::Config { name: "spec", msg }) => {
             assert!(
                 msg.starts_with(&format!("spec refused: {field}: ")),
@@ -418,6 +538,10 @@ fn assert_refused(job: &JobSpec, field: &str) {
     }
 }
 
+fn assert_refused(job: &JobSpec, field: &str) {
+    assert_refused_by(job, &kinds(), field);
+}
+
 /// The refusals `build` makes after the document parsed.
 #[test]
 fn build_refusals() {
@@ -425,81 +549,64 @@ fn build_refusals() {
     job.run_id = Some("xyz".into());
     assert_refused(&job, "run_id");
 
+    // A Python kernel needs a program that registers the kind (KD-I1).
     let mut job = minimal("/out");
-    job.kernels.push(KernelDoc::python("m", "k"));
-    match build::build(&job, &NoKernels, opts(false, &no_env)) {
-        Err(MorunaError::Config { msg, .. }) => assert!(msg.contains("kernels[0]"), "{msg}"),
-        _ => panic!("NoKernels refuses a kernel"),
-    }
-    job.kernels[0].kind = KernelKindDoc::Rust;
-    assert_refused(&job, "kernels[0].module");
-    job.kernels[0].kind = KernelKindDoc::Python;
-    job.kernels[0].fingerprint = Some("sha256:00".into());
+    job.kernels.push(doc(
+        json!({"kind": "python", "module": "m", "callable": "k"}),
+    ));
+    assert_refused_by(&job, &Registry::standard(), "kernels[0].kind");
+    job.kernels[0]
+        .settings
+        .insert("fingerprint".into(), json!("sha256:00"));
     assert_refused(&job, "kernels[0].fingerprint");
     let good = FakeKernel::new().fingerprint().to_hex();
-    job.kernels[0].fingerprint = Some(format!("blake3:{good}"));
-    assert!(build::build(&job, &Fakes, opts(false, &no_env)).is_ok());
+    job.kernels[0]
+        .settings
+        .insert("fingerprint".into(), json!(format!("blake3:{good}")));
+    assert!(build::build(&job, &kinds(), opts(false, &no_env)).is_ok());
 
-    let mut job = minimal("/out");
-    job.source = SourceDoc::Parquet {
-        url: Urls(Vec::new()),
-        options: ParquetSourceOptions::default(),
+    let source = |value: Value| {
+        let mut job = minimal("/out");
+        job.source = doc(value);
+        job
     };
-    assert_refused(&job, "source.url");
-    job.source = SourceDoc::Tensor {
-        url: Urls(Vec::new()),
-        options: TensorSourceOptions::default(),
-    };
-    assert_refused(&job, "source.url");
-    job.source = SourceDoc::Iterator;
-    assert_refused(&job, "source.kind");
-    // A user's `moruna.Source` and `moruna.Sink` are objects in the caller's process too (07 e.6,
-    // 08 f.10): a document from a file or a socket cannot name one.
-    job.source = SourceDoc::Python;
-    assert_refused(&job, "source.kind");
+    assert_refused(&source(json!({"kind": "parquet", "url": []})), "source.url");
+    assert_refused(&source(json!({"kind": "tensor", "url": []})), "source.url");
+    // A Python iterable, and a user's `moruna.Source` and `moruna.Sink`, are objects in the
+    // caller's process (07 e.6, 08 f.10): a program that is not the library has no such kinds.
+    assert_refused(&source(json!({"kind": "iterator"})), "source.kind");
+    assert_refused(&source(json!({"kind": "python"})), "source.kind");
     let mut job = minimal("/out");
-    job.sink = SinkDoc::Python;
+    job.sink = doc(json!({"kind": "python"}));
     assert_refused(&job, "sink.kind");
 
-    let mut job = minimal("/out");
-    job.source = SourceDoc::Parquet {
-        url: Urls(vec!["/in".into()]),
-        options: ParquetSourceOptions {
-            columns: None,
-            filters: vec![FilterDoc("a".into(), "~".into(), serde_json::json!(1))],
-        },
-    };
-    assert_refused(&job, "source.options.filters[0]");
-    job.source = SourceDoc::Parquet {
-        url: Urls(vec!["/in".into()]),
-        options: ParquetSourceOptions {
-            columns: None,
-            filters: vec![
-                FilterDoc("a".into(), "<".into(), serde_json::json!(1.5)),
-                FilterDoc("b".into(), "gt".into(), serde_json::json!(u64::MAX)),
-                FilterDoc("c".into(), "eq".into(), serde_json::json!(true)),
-                FilterDoc("d".into(), "lt".into(), serde_json::json!(null)),
-            ],
-        },
-    };
-    assert_refused(&job, "source.options.filters[3]");
+    assert_refused(
+        &source(json!({"kind": "parquet", "url": "/in",
+                       "options": {"filters": [["a", "~", 1]]}})),
+        "source.options.filters[0]",
+    );
+    assert_refused(
+        &source(
+            json!({"kind": "parquet", "url": "/in", "options": {"filters": [
+                ["a", "<", 1.5], ["b", "gt", u64::MAX], ["c", "eq", true], ["d", "lt", null]
+            ]}}),
+        ),
+        "source.options.filters[3]",
+    );
+    assert!(
+        build::build(
+            &source(json!({"kind": "parquet", "url": "/in",
+                           "options": {"filters": [["a", "=", "x"], ["b", ">", -3]]}})),
+            &kinds(),
+            opts(false, &no_env)
+        )
+        .is_ok()
+    );
 
     let mut job = minimal("/out");
-    job.sink = SinkDoc::Parquet {
-        url: "/out".into(),
-        options: ParquetSinkOptions {
-            compression: Some("brotli".into()),
-            ..ParquetSinkOptions::default()
-        },
-    };
+    job.sink = doc(json!({"kind": "parquet", "url": "/out", "options": {"compression": "brotli"}}));
     assert_refused(&job, "sink.options.compression");
-    job.sink = SinkDoc::Tensor {
-        url: "/out".into(),
-        options: TensorSinkOptions {
-            format: Some("npy".into()),
-            ..TensorSinkOptions::default()
-        },
-    };
+    job.sink = doc(json!({"kind": "tensor", "url": "/out", "options": {"format": "npy"}}));
     assert_refused(&job, "sink.options.format");
 
     let mut job = minimal("/out");
@@ -516,14 +623,14 @@ fn build_refusals() {
     // The sink equals source rule is the library's: a `Plan` error (12 f.3, PY-T14).
     let same = minimal("file:///data/in");
     assert!(matches!(
-        build::build(&same, &NoKernels, opts(false, &no_env)),
+        build::build(&same, &Registry::standard(), opts(false, &no_env)),
         Err(MorunaError::Plan(_))
     ));
     // A trace path whose directory does not exist is the library's `trace.path` refusal.
     let mut job = minimal("/out");
     job.trace = Some("/no-such-moruna-dir/t.arrow".into());
     assert!(matches!(
-        build::build(&job, &NoKernels, opts(false, &no_env)),
+        build::build(&job, &Registry::standard(), opts(false, &no_env)),
         Err(MorunaError::Config {
             name: "trace.path",
             ..
@@ -533,7 +640,7 @@ fn build_refusals() {
     let mut job = minimal("/out");
     job.resume = Some("auto".into());
     assert!(matches!(
-        build::build(&job, &NoKernels, opts(false, &no_env)),
+        build::build(&job, &Registry::standard(), opts(false, &no_env)),
         Err(MorunaError::Resume(_))
     ));
     assert_eq!(build::resume_shape(&job), Some(translate::ResumeArg::Auto));
@@ -542,7 +649,7 @@ fn build_refusals() {
     let staging = std::env::temp_dir().join(format!("moruna-job-auto-{}", std::process::id()));
     std::fs::create_dir_all(&staging).expect("staging");
     job.staging.dir = Some(staging.display().to_string());
-    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("auto builds");
+    let built = build::build(&job, &Registry::standard(), opts(false, &no_env)).expect("auto");
     assert!(built.spec.resume_auto);
     assert!(built.spec.resume.is_none());
     let _ = std::fs::remove_dir_all(&staging);
@@ -550,7 +657,7 @@ fn build_refusals() {
 
 /// The Vortex kinds (07 e.6, 08 f.10): a document names them, the canonical form keeps their
 /// options, both build, a small `file_bytes` is clamped with the library's note, and an empty
-/// url or a zero split size is refused naming the field.
+/// url, a zero split size or an option Vortex does not have is refused naming the field.
 #[test]
 fn vortex_kinds_parse_and_build() {
     let text = r#"{"moruna_spec":1,
@@ -560,13 +667,10 @@ fn vortex_kinds_parse_and_build() {
     let job = JobSpec::from_json(text).expect("vortex source and sink");
     assert_eq!(
         job.source,
-        SourceDoc::Vortex {
-            url: Urls(vec!["/in/a.vortex".into(), "s3://b/in/".into()]),
-            options: VortexSourceOptions {
-                columns: Some(vec!["id".into()]),
-                split_bytes: Some(1 << 20),
-            },
-        }
+        doc(
+            json!({"kind": "vortex", "url": ["/in/a.vortex", "s3://b/in/"],
+                   "options": {"columns": ["id"], "split_bytes": 1048576}})
+        )
     );
     let canonical = job.canonical_json();
     assert!(canonical.contains(r#""kind":"vortex""#), "{canonical}");
@@ -574,54 +678,38 @@ fn vortex_kinds_parse_and_build() {
         JobSpec::from_json(&canonical).expect("the canonical form reads back"),
         job
     );
-    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("vortex builds");
+    let built = build::build(&job, &Registry::standard(), opts(false, &no_env)).expect("vortex");
     assert_eq!(
         built.spec.notes,
         vec!["clamped sink.file_bytes from 1048576 to 67108864".to_string()]
     );
-    let unknown = r#"{"moruna_spec":1,"source":{"kind":"vortex","url":"/i","options":{"filters":[]}},
-                     "sink":{"kind":"vortex","url":"/o"}}"#;
-    assert!(
-        JobSpec::from_json(unknown).is_err(),
-        "a vortex source has no filters"
+    let with_source = |value: Value| {
+        let mut j = job.clone();
+        j.source = doc(value);
+        j
+    };
+    assert_refused(
+        &with_source(json!({"kind": "vortex", "url": "/i", "options": {"filters": []}})),
+        "source",
     );
-
-    let mut empty = job.clone();
-    empty.source = SourceDoc::Vortex {
-        url: Urls(Vec::new()),
-        options: VortexSourceOptions::default(),
-    };
-    let error = build::build(&empty, &NoKernels, opts(false, &no_env))
-        .err()
-        .expect("an empty url");
-    assert!(error.to_string().contains("source.url"), "{error}");
-    let mut zero = job;
-    zero.source = SourceDoc::Vortex {
-        url: Urls(vec!["/in".into()]),
-        options: VortexSourceOptions {
-            columns: None,
-            split_bytes: Some(0),
-        },
-    };
-    let error = build::build(&zero, &NoKernels, opts(false, &no_env))
-        .err()
-        .expect("a zero split size");
-    assert!(error.to_string().contains("split_bytes"), "{error}");
+    assert_refused(
+        &with_source(json!({"kind": "vortex", "url": []})),
+        "source.url",
+    );
+    assert_refused(
+        &with_source(json!({"kind": "vortex", "url": "/in", "options": {"split_bytes": 0}})),
+        "source.options.split_bytes",
+    );
 }
 
 /// Every sink kind builds, and the sink sizes are clamped with the library's notes.
 #[test]
 fn every_sink_kind_builds() {
+    let kinds = Registry::standard();
     let mut job = minimal("/out");
-    job.sink = SinkDoc::Parquet {
-        url: "/out".into(),
-        options: ParquetSinkOptions {
-            row_group_bytes: Some(1 << 20),
-            file_bytes: Some(1 << 20),
-            compression: Some("none".into()),
-        },
-    };
-    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("parquet");
+    job.sink = doc(json!({"kind": "parquet", "url": "/out", "options": {
+        "row_group_bytes": 1048576, "file_bytes": 1048576, "compression": "none"}}));
+    let built = build::build(&job, &kinds, opts(false, &no_env)).expect("parquet");
     assert_eq!(
         built.spec.notes,
         vec![
@@ -629,26 +717,15 @@ fn every_sink_kind_builds() {
             "clamped sink.file_bytes from 1048576 to 67108864".to_string()
         ]
     );
-    job.sink = SinkDoc::Tensor {
-        url: "file:///out".into(),
-        options: TensorSinkOptions {
-            format: Some("safetensors".into()),
-            one_file_per_morsel: true,
-            name: Some("t".into()),
-        },
-    };
-    assert!(build::build(&job, &NoKernels, opts(false, &no_env)).is_ok());
-    job.sink = SinkDoc::ArrowIpc {
-        url: "/out".into(),
-        options: ArrowIpcSinkOptions { file_bytes: None },
-    };
-    assert!(build::build(&job, &NoKernels, opts(false, &no_env)).is_ok());
-    job.source = SourceDoc::Tensor {
-        url: Urls(vec!["file:///in/w.safetensors".into()]),
-        options: TensorSourceOptions {
-            tensors: Some(vec!["w".into()]),
-        },
-    };
+    job.sink = doc(json!({"kind": "tensor", "url": "file:///out", "options": {
+        "format": "safetensors", "one_file_per_morsel": true, "name": "t"}}));
+    assert!(build::build(&job, &kinds, opts(false, &no_env)).is_ok());
+    job.sink = doc(json!({"kind": "arrow_ipc", "url": "/out", "options": {}}));
+    assert!(build::build(&job, &kinds, opts(false, &no_env)).is_ok());
+    job.source = doc(
+        json!({"kind": "tensor", "url": ["file:///in/w.safetensors"],
+                            "options": {"tensors": ["w"]}}),
+    );
     let mut store = ObjectStoreDoc {
         gcs: Some(GcsDoc {
             service_account_path: Some("/sa.json".into()),
@@ -663,9 +740,10 @@ fn every_sink_kind_builds() {
     };
     store.s3 = Some(S3Doc::default());
     job.object_store = store;
-    let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("tensor source");
+    let built = build::build(&job, &kinds, opts(false, &no_env)).expect("tensor source");
     assert!(built.spec.object_store.gcs.is_some() && built.spec.object_store.azure.is_some());
 
+    use crate::kinds::{parquet, tensor};
     for (name, back) in [
         ("zstd", "zstd"),
         ("snappy", "snappy"),
@@ -673,533 +751,243 @@ fn every_sink_kind_builds() {
         ("lz4", "lz4"),
         ("none", "none"),
     ] {
-        let c = build::parse_compression(name).expect("known");
-        assert_eq!(build::compression_name(c), back);
+        let c = parquet::parse_compression(name).expect("known");
+        assert_eq!(parquet::compression_name(c), back);
     }
     for name in ["mrb1", "safetensors"] {
-        let f = build::parse_tensor_format(name).expect("known");
-        assert_eq!(build::tensor_format_name(f), name);
+        let f = tensor::parse_tensor_format(name).expect("known");
+        assert_eq!(tensor::tensor_format_name(f), name);
     }
     assert!(build::is_spec_refusal(&MorunaError::Plan(String::new())));
     assert!(!build::is_spec_refusal(&MorunaError::Cancelled));
 }
 
-/// `KernelDoc::hints_set` lists the decorator arguments an entry sets.
-#[test]
-fn hints_are_listed() {
-    let mut doc = KernelDoc::python("m", "k");
-    assert!(doc.hints_set().is_empty());
-    doc.stateful = Some(true);
-    doc.instances = Some(2);
-    doc.device_memory = Some(false);
-    doc.accepts = Some("table".into());
-    doc.tier = Some("host".into());
-    doc.releases_gil = Some(true);
-    doc.expected_amplification = Some(1.0);
-    doc.preferred_rows = Some(10);
-    doc.resume = Some("reinit".into());
-    doc.state_bytes = Some(1);
-    assert_eq!(doc.hints_set().len(), 10);
-    // PY-T21 (E13): the allocator guard's switch is a hint like the others, and a document
-    // carries it.
-    doc.memory_guard = Some(false);
-    assert_eq!(doc.hints_set().last(), Some(&"memory_guard"));
-    let json = serde_json::to_value(&doc).expect("serialises");
-    assert_eq!(json["memory_guard"], serde_json::Value::Bool(false));
-    let back: KernelDoc = serde_json::from_value(json).expect("reads back");
-    assert_eq!(back.memory_guard, Some(false));
-}
-
-/// MH 4.5: the governed ends of a run. The document reads and writes them, refuses a malformed
-/// one naming the field, and a build without the bridge refuses them by kind.
-#[test]
-fn governed_sources_and_sinks_are_documents() {
-    let text = r#"{"moruna_spec":1,
-        "source":{"kind":"datafusion","root":"/disk","contract":"demo/big",
-                  "caller":{"id":"gus","tenant":"partner","purpose":"analytics"}},
-        "sink":{"kind":"peql","root":"file:///disk","contract":"demo/copy","mode":"overwrite",
-                "caller":{"id":"ana","tenant":"demo","purpose":"analytics"}}}"#;
-    let job = JobSpec::from_json(text).expect("parses");
-    let again = JobSpec::from_json(&job.canonical_json()).expect("canonical parses");
-    assert_eq!(again, job);
-    assert!(job.canonical_json().contains(r#""kind":"datafusion""#));
-
-    let refusal = |job: &JobSpec| match build::build(job, &NoKernels, opts(false, &no_env)) {
-        Err(MorunaError::Config { msg, .. }) => msg,
-        Err(other) => panic!("not a document refusal: {other}"),
-        Ok(_) => panic!("built"),
-    };
-    let caller: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(r#"{"id":"a","tenant":"demo","purpose":"analytics"}"#).unwrap();
-    let with_source = |contract: Option<&str>, sql: Option<&str>, root: &str| {
-        let mut j = job.clone();
-        j.source = SourceDoc::Datafusion {
-            root: root.into(),
-            contract: contract.map(Into::into),
-            sql: sql.map(Into::into),
-            caller: caller.clone(),
-            on_violation: None,
-        };
-        j
-    };
-    for bad in [
-        with_source(Some("a"), Some("SELECT 1"), "/disk"),
-        with_source(None, None, "/disk"),
-        with_source(Some(""), None, "/disk"),
-    ] {
-        assert!(refusal(&bad).contains("exactly one of `contract` and `sql`"));
-    }
-    assert!(refusal(&with_source(Some("a"), None, " ")).contains("source.root"));
-    let with_sink = |contract: &str, mode: Option<&str>, root: &str| {
-        let mut j = job.clone();
-        j.source = minimal("/out").source;
-        j.sink = SinkDoc::Peql {
-            root: root.into(),
-            contract: contract.into(),
-            caller: caller.clone(),
-            mode: mode.map(Into::into),
-            on_violation: None,
-            excluded_url: None,
-        };
-        j
-    };
-    assert!(refusal(&with_sink("", None, "/disk")).contains("sink.contract"));
-    assert!(refusal(&with_sink("c", Some("upsert"), "/disk")).contains("unknown mode"));
-    assert!(refusal(&with_sink("c", None, "")).contains("sink.root"));
-
-    // What a read and a write do with rows that break a contract's row rules, refused by field
-    // before any engine is opened.
-    let with_read_violation = |on_violation: &str| {
-        let mut j = with_source(Some("a"), None, "/disk");
-        if let SourceDoc::Datafusion {
-            on_violation: o, ..
-        } = &mut j.source
-        {
-            *o = Some(on_violation.into());
-        }
-        j
-    };
-    for warn in ["warn", "Exclude", ""] {
-        let msg = refusal(&with_read_violation(warn));
-        assert!(
-            msg.contains(&format!(
-                "source.on_violation: unknown on_violation `{warn}` (use \"exclude\" or \"refuse\")"
-            )),
-            "{msg}"
-        );
-    }
-    let with_write_violation = |on_violation: Option<&str>, excluded_url: Option<&str>| {
-        let mut j = with_sink("c", None, "/disk");
-        if let SinkDoc::Peql {
-            on_violation: o,
-            excluded_url: e,
-            ..
-        } = &mut j.sink
-        {
-            *o = on_violation.map(Into::into);
-            *e = excluded_url.map(Into::into);
-        }
-        j
-    };
-    let msg = refusal(&with_write_violation(Some("drop"), None));
-    assert!(
-        msg.contains(
-            "sink.on_violation: unknown on_violation `drop` (use \"refuse\", \"exclude\" or \"warn\")"
-        ),
-        "{msg}"
-    );
-    let msg = refusal(&with_write_violation(Some("exclude"), None));
-    assert!(msg.contains("sink.excluded_url: absent"), "{msg}");
-    for given in [None, Some("refuse"), Some("warn")] {
-        let msg = refusal(&with_write_violation(given, Some("/scratch/excluded")));
-        assert!(msg.contains("sink.excluded_url: given"), "{msg}");
-    }
-    for remote in ["s3://bucket/excluded", "gs://b/x", ""] {
-        let msg = refusal(&with_write_violation(Some("exclude"), Some(remote)));
-        assert!(msg.contains("sink.excluded_url"), "{remote}: {msg}");
-    }
-    // Absent, a write refuses and a read excludes; the fields round-trip as written.
-    assert_eq!(
-        super::governed::on_write_of(&None, &None).expect("the default"),
-        super::governed::OnWrite::Refuse
-    );
-    assert_eq!(
-        super::governed::on_write_of(&Some("exclude".into()), &Some("file:///scratch/x".into()))
-            .expect("exclude"),
-        super::governed::OnWrite::Exclude("/scratch/x".into())
-    );
-    assert_eq!(
-        super::governed::on_read_of(&None).expect("the default"),
-        super::governed::OnRead::Exclude
-    );
-    let excluding = with_write_violation(Some("exclude"), Some("/scratch/excluded"));
-    let text = excluding.canonical_json();
-    assert!(
-        text.contains(r#""on_violation":"exclude""#)
-            && text.contains(r#""excluded_url":"/scratch/excluded""#),
-        "{text}"
-    );
-    assert_eq!(JobSpec::from_json(&text).expect("parses"), excluding);
-    assert!(
-        !with_sink("c", None, "/disk")
-            .canonical_json()
-            .contains("on_violation")
-    );
-
-    #[cfg(not(feature = "peql"))]
-    {
-        assert!(refusal(&job).contains("source.kind: this build of moruna has no peQL bridge"));
-        let mut parquet_source = job.clone();
-        parquet_source.source = minimal("/out").source;
-        assert!(refusal(&parquet_source).contains("sink.kind"));
-    }
-    #[cfg(feature = "peql")]
-    {
-        // The engine is opened when the document is built, to resolve where each contract's
-        // files are: a disk, and both contracts carried by the document.
-        let disk = std::env::temp_dir().join(format!("moruna-job-peql-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&disk);
-        let compiler = moruna_datafusion::engine::Engine::in_memory(&disk);
-        let schema = moruna_kernel::arrow::datatypes::Schema::new(vec![
-            moruna_kernel::arrow::datatypes::Field::new(
-                "id",
-                moruna_kernel::arrow::datatypes::DataType::Int64,
-                false,
-            ),
-        ]);
-        let mut carried = Vec::new();
-        for (name, dir) in [("demo/big", "big/"), ("demo/copy", "copy/")] {
-            let contract = format!(
-                "contract: {name}\nversion: 1\nowner: demo\nbinding: {{parquet: {dir}}}\n\
-                 expose:\n  - {{name: id, type: int64}}\n"
-            );
-            let registered = compiler
-                .register_contract(&contract, &schema)
-                .expect("compiles");
-            carried.push(super::entry_of(&registered).expect("an entry"));
-        }
-        let root = disk.display().to_string();
-        let mut job = job.clone();
-        job.contracts = carried;
-        let again = JobSpec::from_json(&job.canonical_json()).expect("carried contracts parse");
-        assert_eq!(again, job, "carried contracts round-trip");
-        if let SourceDoc::Datafusion { root: r, .. } = &mut job.source {
-            *r = root.clone();
-        }
-        if let SinkDoc::Peql { root: r, .. } = &mut job.sink {
-            *r = format!("file://{root}");
-        }
-        let built = build::build(&job, &NoKernels, opts(false, &no_env)).expect("builds");
-        assert!(built.spec.spec_digest.is_some());
-        let mut not_a_caller = job.clone();
-        not_a_caller.sink = SinkDoc::Peql {
-            root: "/disk".into(),
-            contract: "demo/copy".into(),
-            caller: serde_json::Map::new(),
-            mode: None,
-            on_violation: None,
-            excluded_url: None,
-        };
-        assert!(refusal(&not_a_caller).contains("sink.caller: not a caller"));
-        let mut bad_sql = job.clone();
-        bad_sql.source = with_source(None, Some("SELEC"), "/disk").source;
-        assert!(refusal(&bad_sql).contains("source.sql"));
-        // Excluded rows are kept apart from the data: not under the contract's files, nor
-        // over a source's, nor in a directory that holds them.
-        for (dir, overlaps) in [
-            (format!("{root}/copy/excluded"), "the contract's files"),
-            (format!("{root}/big"), "a source"),
-            (root.clone(), "the contract's files"),
-        ] {
-            let mut excluding = job.clone();
-            if let SinkDoc::Peql {
-                on_violation,
-                excluded_url,
-                ..
-            } = &mut excluding.sink
-            {
-                *on_violation = Some("exclude".into());
-                *excluded_url = Some(dir.clone());
-            }
-            let msg = refusal(&excluding);
-            assert!(
-                msg.contains("sink.excluded_url") && msg.contains(&format!("overlaps {overlaps}")),
-                "{dir}: {msg}"
-            );
-        }
-        let mut excluding = job.clone();
-        if let SinkDoc::Peql {
-            on_violation,
-            excluded_url,
-            ..
-        } = &mut excluding.sink
-        {
-            *on_violation = Some("exclude".into());
-            *excluded_url = Some(disk.join("scratch").join("excluded").display().to_string());
-        }
-        build::build(&excluding, &NoKernels, opts(false, &no_env)).expect("kept apart, it builds");
-        let _ = std::fs::remove_dir_all(&disk);
-    }
-}
-
-/// MH 4.1 and 4.9: `{"kind": "std", "name", "args"}` round-trips, builds without a loader,
-/// fuses adjacent standard kernels, and honours a pinned fingerprint.
+/// MH 4.1 and 4.9: `{"kind": "std", "name", "args"}` round-trips, builds without a program's own
+/// kinds, fuses adjacent standard kernels, and honours a pinned fingerprint.
 #[test]
 fn std_kernels_in_a_document() {
     let mut job = minimal("/out");
-    job.kernels.push(KernelDoc::std(
-        "cast",
-        serde_json::json!({"columns": {"a": "double"}}),
+    job.kernels.push(doc(json!({"kind": "std", "name": "cast",
+                                "args": {"columns": {"a": "double"}}})));
+    job.kernels.push(doc(
+        json!({"kind": "std", "name": "select", "args": {"columns": ["a"]}}),
     ));
-    job.kernels.push(KernelDoc::std(
-        "select",
-        serde_json::json!({"columns": ["a"]}),
+    job.kernels.push(doc(
+        json!({"kind": "python", "module": "m", "callable": "k"}),
     ));
-    job.kernels.push(KernelDoc::python("m", "k"));
-    job.kernels.push(KernelDoc::std(
-        "drop",
-        serde_json::json!({"columns": ["a"]}),
+    job.kernels.push(doc(
+        json!({"kind": "std", "name": "drop", "args": {"columns": ["a"]}}),
     ));
     let text = job.to_json_pretty();
     assert!(text.contains("\"kind\": \"std\""), "{text}");
     assert_eq!(JobSpec::from_json(&text).expect("parses"), job);
-    let built = build::build(&job, &Fakes, opts(false, &no_env)).expect("builds");
+    let built = build::build(&job, &kinds(), opts(false, &no_env)).expect("builds");
     assert_eq!(
         built.spec.kernels.len(),
         3,
         "cast and select fuse into one stage"
     );
+    assert_eq!(built.stage_kernels, vec![vec![0, 1], vec![2], vec![3]]);
     assert!(built.spec.kernels[0].declared().is_checkable());
 
-    let pinned = crate::spec::KernelEntry::std("drop", serde_json::json!({"columns": ["a"]}))
-        .expect("entry")
+    let pinned = moruna_kernels::StdKernel::new("drop", &json!({"columns": ["a"]}))
+        .expect("drop")
         .fingerprint()
         .to_hex();
-    job.kernels[3].fingerprint = Some(format!("sha256:{pinned}"));
-    assert!(build::build(&job, &Fakes, opts(false, &no_env)).is_ok());
-    job.kernels[3].fingerprint = Some("sha256:00".into());
+    job.kernels[3]
+        .settings
+        .insert("fingerprint".into(), json!(format!("sha256:{pinned}")));
+    assert!(build::build(&job, &kinds(), opts(false, &no_env)).is_ok());
+    job.kernels[3]
+        .settings
+        .insert("fingerprint".into(), json!("sha256:00"));
     assert_refused(&job, "kernels[3].fingerprint");
 
     let mut job = minimal("/out");
     job.kernels
-        .push(KernelDoc::std("nope", serde_json::Value::Null));
+        .push(doc(json!({"kind": "std", "name": "nope"})));
     assert_refused(&job, "kernels[0]");
-    job.kernels[0].name = None;
-    assert_refused(&job, "kernels[0].name");
+    job.kernels[0].settings.remove("name");
+    assert_refused(&job, "kernels[0]");
 }
 
-/// PK-T11 strict_refuses_import_paths (16 PK-I8): a hosted run loads no kernel by import path.
+/// KD-T7 strict_refuses_imported (KD-I6, 16 PK-I8): a hosted run loads no code by import path,
+/// read from the kind's declaration, at `<field>.kind`; not strict, the same document builds.
 #[test]
-fn pk_t11_strict_refuses_import_paths() {
+fn kd_t7_strict_refuses_imported() {
     let job = JobSpec::from_json(FULL).expect("parses");
-    let e = build::build(&job, &Fakes, opts(true, &no_env))
+    let e = build::build(&job, &kinds(), opts(true, &no_env))
         .err()
         .expect("strict refuses a python kernel");
     let text = e.to_string();
-    assert!(text.contains("kernels[0].module"), "{text}");
-    assert!(text.contains("loads no kernel by import path"), "{text}");
-    build::build(&job, &Fakes, opts(false, &no_env)).expect("not strict: built");
-}
-
-/// The kernels a binary that embeds Moruna compiles in, for the `rust` tests: one that takes no
-/// arguments and one that refuses any.
-struct Compiled;
-
-fn fake(_args: &serde_json::Value) -> moruna_kernel::Result<Arc<dyn Kernel>> {
-    Ok(Arc::new(FakeKernel::new()) as Arc<dyn Kernel>)
-}
-
-fn argless(args: &serde_json::Value) -> moruna_kernel::Result<Arc<dyn Kernel>> {
-    if args.is_null() {
-        return fake(args);
-    }
-    Err(MorunaError::Plan("argless takes no arguments".into()))
-}
-
-const DECLARED: [CompiledKernel; 2] = [
-    CompiledKernel {
-        krate: "embedder_kernels",
-        symbol: "fake",
-        build: fake,
-    },
-    CompiledKernel {
-        krate: "embedder_kernels",
-        symbol: "argless",
-        build: argless,
-    },
-];
-
-impl KernelLoader for Compiled {
-    fn load(&self, index: usize, _doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        Err(SpecError::new(format!("kernels[{index}]"), "this binary imports nothing").into())
-    }
-    fn compiled(&self) -> &[CompiledKernel] {
-        &DECLARED
-    }
-}
-
-fn strictly(job: &JobSpec) -> String {
-    match build::build(job, &Compiled, opts(true, &no_env)) {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("built"),
-    }
-}
-
-/// A Rust kernel compiled into the binary is a `rust` entry, resolved against what the binary
-/// declares and nothing else; strict mode admits it, pinned or not, and the entry round-trips.
-#[test]
-fn strict_admits_a_declared_compiled_kernel() {
-    let mut job = JobSpec::from_json(FULL).expect("parses");
-    job.kernels = vec![KernelDoc::rust(
-        "embedder_kernels",
-        "fake",
-        serde_json::json!({"k": 1}),
-    )];
-    let text = job.to_json_pretty();
-    assert!(text.contains("\"kind\": \"rust\""), "{text}");
-    assert!(text.contains("\"crate\": \"embedder_kernels\""), "{text}");
-    assert!(text.contains("\"symbol\": \"fake\""), "{text}");
-    assert_eq!(JobSpec::from_json(&text).expect("parses"), job);
-
-    let built = build::build(&job, &Compiled, opts(true, &no_env)).expect("strict builds it");
-    assert_eq!(built.spec.kernels.len(), 1);
-
-    let good = FakeKernel::new().fingerprint().to_hex();
-    job.kernels[0].fingerprint = Some(format!("sha256:{good}"));
-    build::build(&job, &Compiled, opts(true, &no_env)).expect("pinned");
-    job.kernels[0].fingerprint = Some("sha256:00".into());
-    assert!(strictly(&job).contains("kernels[0].fingerprint"));
-}
-
-/// A `rust` entry the binary does not declare is refused, strict or not, naming the field and
-/// what the binary does declare; a binary that declares none refuses every one.
-#[test]
-fn an_undeclared_compiled_kernel_is_refused() {
-    let mut job = JobSpec::from_json(FULL).expect("parses");
-    job.kernels = vec![KernelDoc::rust(
-        "other_kernels",
-        "fake",
-        serde_json::Value::Null,
-    )];
-    let e = strictly(&job);
-    assert!(e.contains("kernels[0].crate"), "{e}");
     assert!(
-        e.contains("embedder_kernels::fake, embedder_kernels::argless"),
-        "{e}"
+        text.contains(
+            "kernels[0].kind: strict mode loads no code by import path, and `python` \
+                       is imported from the interpreter's path"
+        ),
+        "{text}"
     );
+    build::build(&job, &kinds(), opts(false, &no_env)).expect("not strict: built");
+}
 
-    job.kernels = vec![KernelDoc::rust(
-        "embedder_kernels",
-        "nope",
-        serde_json::Value::Null,
-    )];
-    let e = strictly(&job);
-    assert!(e.contains("kernels[0].symbol"), "{e}");
-    assert!(e.contains("no kernel `nope`"), "{e}");
-    let e = build::build(&job, &Compiled, opts(false, &no_env))
+/// KD-T8 contracts_need_a_kind (KD-I8): contracts carried by a document none of whose kinds
+/// reads or writes under contracts are refused, at `contracts`.
+#[test]
+fn kd_t8_contracts_need_a_kind() {
+    let mut job = minimal("/out");
+    job.contracts.push(ContractEntry {
+        document: json!({}),
+        compiled: String::new(),
+        functions: Vec::new(),
+        audiences: Vec::new(),
+    });
+    let e = build::build(&job, &Registry::standard(), opts(false, &no_env))
         .err()
-        .expect("not strict: refused as well")
-        .to_string();
-    assert!(e.contains("kernels[0].symbol"), "{e}");
-
-    job.kernels = vec![KernelDoc::rust(
-        "embedder_kernels",
-        "fake",
-        serde_json::Value::Null,
-    )];
-    let e = build::build(&job, &NoKernels, opts(true, &no_env))
-        .err()
-        .expect("nothing declared")
-        .to_string();
-    assert!(e.contains("this binary has no compiled kernels"), "{e}");
-
-    job.kernels = vec![KernelDoc::rust(
-        "embedder_kernels",
-        "argless",
-        serde_json::json!({"x": 1}),
-    )];
-    let e = strictly(&job);
+        .expect("refused");
     assert!(
-        e.contains("kernels[0]: ") && e.contains("argless takes no arguments"),
+        e.to_string()
+            .contains("contracts: carried, and no kind of this document reads or writes"),
         "{e}"
     );
 }
 
-/// A `rust` entry names its kernel by crate and symbol only: an import path, a package path, a
-/// standard kernel's name or a hint is refused by name, and so is a missing crate or symbol.
-/// Strict mode still refuses every kernel named by import path.
+/// KD-T9 v1_documents_resolve (KD-I9): `moruna_spec: 1` documents as 0.5.7 read them read
+/// unchanged, and each kind they name resolves through the registry: every source and sink
+/// kind, the standard kernels, packages and Python kernels, and `rust` refused as a kind this
+/// build does not register.
 #[test]
-fn a_compiled_entry_names_nothing_else() {
-    let refused = |edit: &dyn Fn(&mut KernelDoc), field: &str| {
-        let mut job = JobSpec::from_json(FULL).expect("parses");
-        let mut doc = KernelDoc::rust("embedder_kernels", "fake", serde_json::Value::Null);
-        edit(&mut doc);
-        job.kernels = vec![doc];
-        let e = strictly(&job);
-        assert!(e.contains(field), "{field}: {e}");
+fn kd_t9_v1_documents_resolve() {
+    let v1 = |source: Value, kernels: Value, sink: Value| {
+        JobSpec::from_value(json!({"moruna_spec": 1, "source": source,
+                                   "kernels": kernels, "sink": sink}))
+        .expect("a v1 document")
     };
-    refused(
-        &|d| d.module = Some("embedder_kernels".into()),
-        "kernels[0].module",
+    let kinds = kinds();
+    for (source, sink) in [
+        (
+            json!({"kind": "parquet", "url": "file:///data/in/",
+                   "options": {"columns": ["id"], "filters": [["id", ">", 5]]}}),
+            json!({"kind": "parquet", "url": "file:///data/out/",
+                   "options": {"row_group_bytes": 33554432, "compression": "snappy"}}),
+        ),
+        (
+            json!({"kind": "vortex", "url": "/in"}),
+            json!({"kind": "vortex", "url": "/out"}),
+        ),
+        (
+            json!({"kind": "tensor", "url": "/in/w.safetensors"}),
+            json!({"kind": "tensor", "url": "/out"}),
+        ),
+        (
+            json!({"kind": "parquet", "url": "/in"}),
+            json!({"kind": "arrow_ipc", "url": "/out"}),
+        ),
+    ] {
+        let job = v1(
+            source,
+            json!([{"kind": "std", "name": "select", "args": {"columns": ["id"]}},
+                   {"kind": "python", "module": "/job/k.py", "callable": "shout",
+                    "releases_gil": true}]),
+            sink,
+        );
+        let again = JobSpec::from_json(&job.canonical_json()).expect("reads back");
+        assert_eq!(again, job);
+        build::build(&job, &kinds, opts(false, &no_env)).expect("resolves and builds");
+    }
+    let rust = v1(
+        json!({"kind": "parquet", "url": "/in"}),
+        json!([{"kind": "rust", "crate": "embedder_kernels", "symbol": "fake"}]),
+        json!({"kind": "parquet", "url": "/out"}),
     );
-    refused(&|d| d.callable = Some("fake".into()), "kernels[0].callable");
-    refused(&|d| d.path = Some("/k.wasm".into()), "kernels[0].path");
-    refused(&|d| d.assets = Some("/a".into()), "kernels[0].assets");
-    refused(&|d| d.name = Some("fake".into()), "kernels[0].name");
-    refused(
-        &|d| d.preferred_rows = Some(10),
-        "kernels[0].preferred_rows",
+    for strict in [false, true] {
+        let e = build::build(&rust, &Registry::standard(), opts(strict, &no_env))
+            .err()
+            .expect("rust is refused");
+        assert!(
+            e.to_string().contains(
+                "kernels[0].kind: no kernel kind `rust` is registered; this build runs \
+                 package, std"
+            ),
+            "{e}"
+        );
+    }
+    let package = v1(
+        json!({"kind": "parquet", "url": "/in"}),
+        json!([{"kind": "package", "path": "/nowhere/k.wasm",
+                "fingerprint": format!("sha256:{}", "0".repeat(64))}]),
+        json!({"kind": "parquet", "url": "/out"}),
     );
-    refused(&|d| d.krate = None, "kernels[0].crate");
-    refused(&|d| d.symbol = Some(String::new()), "kernels[0].symbol");
-
-    let mut job = JobSpec::from_json(FULL).expect("parses");
-    job.kernels = vec![
-        KernelDoc::rust("embedder_kernels", "fake", serde_json::Value::Null),
-        KernelDoc::python("embedder_kernels", "fake"),
-    ];
-    let e = strictly(&job);
-    assert!(e.contains("kernels[1].module"), "{e}");
-    assert!(e.contains("loads no kernel by import path"), "{e}");
+    // Resolved, and refused only because the file is not there.
+    let e = build::build(&package, &kinds, opts(true, &no_env))
+        .err()
+        .expect("no such file");
+    assert!(e.to_string().contains("/nowhere/k.wasm"), "{e}");
 }
 
-/// PK-T12 package_entry_fields (16 d.4): a package entry has a path and a fingerprint and
-/// nothing else; each other field set is refused by name, and so is a missing path or pin.
+/// PK-T12 package_entry_fields (16 d.4): a package entry has a path and a fingerprint, and
+/// optionally args, assets and ports; any other field is refused naming the entry and the
+/// field, and so is a missing path or pin.
 #[test]
 fn pk_t12_package_entry_fields() {
-    let refused = |edit: &dyn Fn(&mut KernelDoc), field: &str| {
+    let refused = |edit: &dyn Fn(&mut serde_json::Map<String, Value>), field: &str, says: &str| {
         let mut job = JobSpec::from_json(FULL).expect("parses");
-        let mut doc = KernelDoc::package("/nowhere/k.wasm", format!("sha256:{}", "0".repeat(64)));
-        edit(&mut doc);
-        job.kernels = vec![doc];
-        let e = build::build(&job, &Fakes, opts(false, &no_env))
+        let mut entry = doc(json!({"kind": "package", "path": "/nowhere/k.wasm",
+                                   "fingerprint": format!("sha256:{}", "0".repeat(64))}));
+        edit(&mut entry.settings);
+        job.kernels = vec![entry];
+        let e = build::build(&job, &kinds(), opts(false, &no_env))
             .err()
-            .expect("refused");
-        assert!(e.to_string().contains(field), "{field}: {e}");
+            .expect("refused")
+            .to_string();
+        assert!(
+            e.contains(&format!("{field}: ")) && e.contains(says),
+            "{field}: {e}"
+        );
     };
-    refused(&|d| d.module = Some("m".into()), "kernels[0].module");
-    refused(&|d| d.callable = Some("c".into()), "kernels[0].callable");
-    refused(&|d| d.krate = Some("c".into()), "kernels[0].crate");
-    refused(&|d| d.symbol = Some("s".into()), "kernels[0].symbol");
-    refused(&|d| d.name = Some("n".into()), "kernels[0].name");
+    for other in [
+        "module",
+        "callable",
+        "crate",
+        "symbol",
+        "name",
+        "preferred_rows",
+    ] {
+        refused(
+            &|s| {
+                s.insert(other.into(), json!("x"));
+            },
+            "kernels[0]",
+            &format!("unknown field `{other}`"),
+        );
+    }
     refused(
-        &|d| d.preferred_rows = Some(10),
-        "kernels[0].preferred_rows",
+        &|s| {
+            s.remove("path");
+        },
+        "kernels[0]",
+        "missing field `path`",
     );
-    refused(&|d| d.path = None, "kernels[0].path");
-    refused(&|d| d.fingerprint = None, "kernels[0].fingerprint");
-    // The document's args reach a package not built by them: refused naming the field (the file
-    // must exist for that, so this one is checked in tests/package.rs, PK-T17).
+    refused(
+        &|s| {
+            s.remove("fingerprint");
+        },
+        "kernels[0]",
+        "missing field `fingerprint`",
+    );
     // A file that is not there is refused naming it.
-    refused(&|_| {}, "/nowhere/k.wasm");
-    // The document's spelling round-trips.
-    let doc = KernelDoc::package("/p.pex", "sha256:ab");
-    let text = serde_json::to_string(&doc).unwrap();
-    assert_eq!(
-        text,
-        r#"{"kind":"package","path":"/p.pex","fingerprint":"sha256:ab"}"#
-    );
-    assert_eq!(serde_json::from_str::<KernelDoc>(&text).unwrap(), doc);
+    let mut job = JobSpec::from_json(FULL).expect("parses");
+    job.kernels = vec![doc(json!({"kind": "package", "path": "/nowhere/k.wasm",
+                                  "fingerprint": format!("sha256:{}", "0".repeat(64))}))];
+    let e = build::build(&job, &kinds(), opts(false, &no_env))
+        .err()
+        .expect("no such file");
+    assert!(e.to_string().contains("/nowhere/k.wasm"), "{e}");
+    // The document's spelling round-trips: `kind` first, then the settings.
+    let entry = doc(json!({"kind": "package", "path": "/p.pex", "fingerprint": "sha256:ab"}));
+    let text = serde_json::to_string(&entry).unwrap();
+    assert!(text.starts_with(r#"{"kind":"package","#), "{text}");
+    assert!(text.contains(r#""path":"/p.pex""#), "{text}");
+    assert_eq!(serde_json::from_str::<KindDoc>(&text).unwrap(), entry);
 }
 
 /// `report.tasks` names the chain as it is (MH 4.3): one id per element, each once, each a

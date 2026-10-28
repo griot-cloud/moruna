@@ -26,42 +26,39 @@ use moruna_kernel::{
 use moruna_runtime::host::exit;
 use moruna_runtime::host::lifecycle::{Lifecycle, task_refs};
 use moruna_runtime::host::session::{self, HEARTBEAT, HostOptions, Mode, Outcome, Wire};
-use moruna_runtime::job::{BuildOptions, KernelDoc, KernelLoader, LoadedKernel, build};
+use moruna_runtime::job::{BuildOptions, KindDoc, build};
+use moruna_runtime::kinds::Registry;
 use moruna_runtime::{Components, JobSpec, Runtime, SinkSpec, SourceSpec};
 use moruna_testkit::FakeSink;
 use serde_json::{Value, json};
 use support::{FailOnce, Scratch, Sleeper, one_run_at_a_time, write_parquet};
 
-/// Hands out the support kernels by the callable a document names: `pass`, a sleeper of a few
+/// The support kernels by the callable a document names: `pass`, a sleeper of a few
 /// milliseconds, or `fail:<n>`, which fails its `n`-th apply.
-struct TestKernels;
+fn test_kernel(index: usize, callable: &str) -> Result<Arc<dyn Kernel>> {
+    Ok(match callable.split_once(':') {
+        None if callable == "pass" => Arc::new(Sleeper::new(3)),
+        Some(("fail", n)) => Arc::new(FailOnce::new(n.parse().map_err(|_| {
+            moruna_kernel::MorunaError::Plan(format!("kernels[{index}]: `{callable}`"))
+        })?)),
+        _ => {
+            return Err(moruna_kernel::MorunaError::Plan(format!(
+                "kernels[{index}]: no test kernel `{callable}`"
+            )));
+        }
+    })
+}
 
-impl KernelLoader for TestKernels {
-    fn load(&self, index: usize, doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        let callable = doc.callable.as_deref().unwrap_or("");
-        let kernel: Arc<dyn Kernel> = match callable.split_once(':') {
-            None if callable == "pass" => Arc::new(Sleeper::new(3)),
-            Some(("fail", n)) => Arc::new(FailOnce::new(n.parse().map_err(|_| {
-                moruna_kernel::MorunaError::Plan(format!("kernels[{index}]: `{callable}`"))
-            })?)),
-            _ => {
-                return Err(moruna_kernel::MorunaError::Plan(format!(
-                    "kernels[{index}]: no test kernel `{callable}`"
-                )));
-            }
-        };
-        Ok(LoadedKernel {
-            kernel,
-            #[cfg(feature = "python")]
-            python: None,
-        })
+/// The standard kinds, the support kernels as `python`, and a `python` source whose plan panics
+/// on the facade's own thread, after the run's tasks are registered, so the run unwinds out of
+/// the session (PY-T27).
+fn test_kinds() -> Registry {
+    let mut kinds = support::kinds_with(test_kernel);
+    let panics = support::Handed::new("python", || SourceSpec::Built(Arc::new(PlanPanics)));
+    if let Err(e) = kinds.register_source(Arc::new(panics)) {
+        panic!("{e}");
     }
-
-    /// `"kind": "python"`: a source whose plan panics on the facade's own thread, after the
-    /// run's tasks are registered, so the run unwinds out of the session (PY-T27).
-    fn python_source(&self) -> Result<SourceSpec> {
-        Ok(SourceSpec::Built(Arc::new(PlanPanics)))
-    }
+    kinds
 }
 
 /// A test-local `Source` (12 k): its `plan` panics.
@@ -91,39 +88,34 @@ impl Source for PlanPanics {
     }
 }
 
-/// The kernels of a run that crashes on the facade's thread while its tasks run (PY-T27): `fail`
+/// The kinds of a run that crashes on the facade's thread while its tasks run (PY-T27): `fail`
 /// fails its third apply, so the error policy ends the run, and `pass` is a sleeper; the sink,
 /// `"kind": "python"`, is a resumable fake whose checkpoint panics once that kernel has failed.
 /// The scheduler writes the last manifest of a terminated run on the facade's thread (SC f.12),
 /// so the panic is on that thread, after the tasks started and before the run's end is told.
-struct Crashes {
-    fail: support::FailOnce,
-}
-
-impl KernelLoader for Crashes {
-    fn load(&self, index: usize, doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        let kernel: Arc<dyn Kernel> = match doc.callable.as_deref() {
-            Some("fail") => Arc::new(self.fail.shared()),
-            Some("pass") => Arc::new(Sleeper::new(3)),
+fn crashes(fail: support::FailOnce) -> Registry {
+    let kernel = fail.shared();
+    let mut kinds = support::kinds_with(move |index, callable| -> Result<Arc<dyn Kernel>> {
+        Ok(match callable {
+            "fail" => Arc::new(kernel.shared()),
+            "pass" => Arc::new(Sleeper::new(3)),
             other => {
                 return Err(moruna_kernel::MorunaError::Plan(format!(
                     "kernels[{index}]: no test kernel {other:?}"
                 )));
             }
-        };
-        Ok(LoadedKernel {
-            kernel,
-            #[cfg(feature = "python")]
-            python: None,
         })
-    }
-
-    fn python_sink(&self) -> Result<SinkSpec> {
-        Ok(SinkSpec::Built(Box::new(CheckpointBreaks {
+    });
+    let sink = support::Handed::new("python", move || {
+        SinkSpec::Built(Box::new(CheckpointBreaks {
             inner: FakeSink::new().resumable(true),
-            fail: self.fail.shared(),
-        })))
+            fail: fail.shared(),
+        }))
+    });
+    if let Err(e) = kinds.register_sink(Arc::new(sink)) {
+        panic!("{e}");
     }
+    kinds
 }
 
 /// What the sink's checkpoint says as it panics.
@@ -168,6 +160,11 @@ impl Sink for CheckpointBreaks {
 
 fn no_env(_: &str) -> Option<String> {
     None
+}
+
+/// `{"kind": "python"}`: an object the caller holds.
+fn python_entry() -> KindDoc {
+    KindDoc::new("python", serde_json::Map::new())
 }
 
 /// Rows and row groups of the input: one morsel a row group, so a run has `GROUPS` applies a
@@ -284,7 +281,7 @@ fn run_cancelled(job: JobSpec, cancel_at: usize, how: Cancel) -> (Outcome, Vec<V
         packages: Default::default(),
         capture_process: false,
     };
-    let outcome = session::run_job(job, &TestKernels, &opts, &wire, reader, Mode::Run);
+    let outcome = session::run_job(job, &test_kinds(), &opts, &wire, reader, Mode::Run);
     (outcome, events_in(&text))
 }
 
@@ -456,9 +453,9 @@ fn py_t25_a_source_failure() {
     one_end_each(&told, "a broken source");
 }
 
-/// Run `job` as `moruna run` does, with `loader`, catching the panic that leaves the session:
+/// Run `job` as `moruna run` does, with `kinds`, catching the panic that leaves the session:
 /// what the panic said, and every event the peer read.
-fn run_crashing(job: JobSpec, loader: &dyn KernelLoader) -> (Option<String>, Vec<Value>) {
+fn run_crashing(job: JobSpec, kinds: &Registry) -> (Option<String>, Vec<Value>) {
     let text = Arc::new(Mutex::new(Vec::new()));
     let peer = Peer {
         text: text.clone(),
@@ -477,7 +474,7 @@ fn run_crashing(job: JobSpec, loader: &dyn KernelLoader) -> (Option<String>, Vec
             packages: Default::default(),
             capture_process: false,
         };
-        session::run_job(job, loader, &opts, &wire, None, Mode::Run)
+        session::run_job(job, kinds, &opts, &wire, None, Mode::Run)
     }));
     let said = match unwound {
         Ok(outcome) => panic!("the run did not unwind: exit {}", outcome.code),
@@ -516,12 +513,9 @@ fn py_t27_a_crash_on_the_facades_thread_fails_every_started_task() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("py_t27_facade");
     let mut job = document(&scratch, &["fail", "pass"], json!("terminate"));
-    job.sink = moruna_runtime::job::SinkDoc::Python;
+    job.sink = python_entry();
     job.checkpoint.interval_ms = 60_000;
-    let loader = Crashes {
-        fail: support::FailOnce::new(3),
-    };
-    let (said, events) = run_crashing(job, &loader);
+    let (said, events) = run_crashing(job, &crashes(support::FailOnce::new(3)));
     assert_eq!(
         said.as_deref(),
         Some(CHECKPOINT_BROKE),
@@ -577,8 +571,8 @@ fn py_t27_a_crash_before_any_task_started_fails_the_attempt() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("py_t27_plan");
     let mut job = document(&scratch, &["pass"], json!("terminate"));
-    job.source = moruna_runtime::job::SourceDoc::Python;
-    let (said, events) = run_crashing(job, &TestKernels);
+    job.source = python_entry();
+    let (said, events) = run_crashing(job, &test_kinds());
     assert_eq!(said.as_deref(), Some("the source's plan broke"));
     let what = "a crash before any task started";
     one_end_each(&events, what);
@@ -611,7 +605,7 @@ fn recorded_run(scratch: &Scratch) -> (Vec<moruna_runtime::job::TaskRefDoc>, Vec
     let job = document(scratch, &["pass", "pass"], json!("terminate"));
     let built = build(
         &job,
-        &TestKernels,
+        &test_kinds(),
         BuildOptions {
             strict: false,
             env: &no_env,

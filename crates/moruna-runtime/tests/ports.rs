@@ -23,7 +23,7 @@ use moruna_runtime::host::cli;
 use moruna_runtime::host::exit;
 use moruna_runtime::host::session::{HEARTBEAT, read_report_file};
 use moruna_runtime::host::transport::{self, Address};
-use moruna_runtime::job::{BuildOptions, JobSpec, KernelDoc, KernelLoader, LoadedKernel, build};
+use moruna_runtime::job::{BuildOptions, JobSpec, build};
 use moruna_wasm::testing::{caller_component, manifest, package_at};
 use serde_json::{Value, json};
 use support::{Scratch, one_run_at_a_time, read_back_rows, write_parquet};
@@ -41,20 +41,18 @@ impl GuestPort for Echo {
     }
 }
 
-/// A loader with no kernels and one guest handler, `echo`: what a program embedding Moruna
-/// registers.
-struct Embedding;
+/// A program that embeds Moruna with one guest handler, `echo`, and the standard kinds.
+struct Embedder;
 
-impl KernelLoader for Embedding {
-    fn load(&self, index: usize, _doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
-        Err(moruna_kernel::MorunaError::Plan(format!(
-            "kernels[{index}]: no kernels here"
-        )))
-    }
-
+impl moruna_runtime::kinds::Embedding for Embedder {
     fn guest_port(&self, name: &str) -> Option<Arc<dyn GuestPort>> {
         (name == "echo").then(|| Arc::new(Echo) as Arc<dyn GuestPort>)
     }
+}
+
+/// The registry of a program that answers `echo`.
+fn embedding() -> moruna_runtime::kinds::Registry {
+    moruna_runtime::kinds::Registry::standard().with_embedding(Arc::new(Embedder))
 }
 
 fn no_env(_: &str) -> Option<String> {
@@ -114,9 +112,9 @@ fn write_doc(scratch: &Path, doc: &Value) -> PathBuf {
     path
 }
 
-fn run_cli(path: &Path, loader: &dyn KernelLoader, cancel: CancelToken) -> i32 {
+fn run_cli(path: &Path, kinds: &moruna_runtime::kinds::Registry, cancel: CancelToken) -> i32 {
     let args = vec!["run".to_string(), path.to_string_lossy().into_owned()];
-    cli::main_with(&args, loader, cancel, &no_env, HEARTBEAT)
+    cli::main_with(&args, kinds, cancel, &no_env, HEARTBEAT)
 }
 
 fn report_file(scratch: &Path) -> Value {
@@ -259,7 +257,7 @@ fn converse(
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let path = write_doc(scratch, &doc);
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
-    let runner = std::thread::spawn(move || run_cli(&path, &Embedding, CancelToken::new()));
+    let runner = std::thread::spawn(move || run_cli(&path, &embedding(), CancelToken::new()));
     let host = Host::serve(listener, policy);
     let code = runner.join().expect("the runner");
     let messages = host.join();
@@ -350,7 +348,7 @@ fn po_t2_a_guest_port_is_answered_by_the_embedding() {
     );
     let path = write_doc(scratch.path(), &doc);
     assert_eq!(
-        run_cli(&path, &Embedding, CancelToken::new()),
+        run_cli(&path, &embedding(), CancelToken::new()),
         exit::COMPLETED
     );
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
@@ -451,7 +449,7 @@ fn po_t5_a_cancel_during_a_port_wait_ends_promptly() {
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let path = write_doc(scratch.path(), &doc);
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
-    let runner = std::thread::spawn(move || run_cli(&path, &Embedding, CancelToken::new()));
+    let runner = std::thread::spawn(move || run_cli(&path, &embedding(), CancelToken::new()));
     let host = Host::serve(listener, |_, _| Reply::Hold);
     assert!(
         host.wait_for(Duration::from_secs(30), |m| m
@@ -506,7 +504,7 @@ fn po_t6_the_document_refuses_ports_it_cannot_serve() {
         };
         match build(
             &job,
-            &Embedding,
+            &embedding(),
             BuildOptions {
                 strict: true,
                 env: &no_env,
@@ -546,9 +544,10 @@ fn po_t6_the_document_refuses_ports_it_cannot_serve() {
     let mut doc = base.clone();
     doc["kernels"] = json!([{"kind": "std", "name": "select", "args": {"columns": ["id"]},
                              "ports": {"stub": {"guest": "echo"}}}]);
+    // A kind whose settings declare no ports refuses them as any setting it does not have.
     let said = refusal(doc);
     assert!(
-        said.contains("kernels[0].ports") && said.contains("only a function package"),
+        said.contains("kernels[0]: `std` settings: unknown field `ports`"),
         "{said}"
     );
     let mut doc = base;
@@ -576,7 +575,7 @@ fn waits_and_keeps_heartbeating(name: &str, wait: Duration) {
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let path = write_doc(scratch.path(), &doc);
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
-    let runner = std::thread::spawn(move || run_cli(&path, &Embedding, CancelToken::new()));
+    let runner = std::thread::spawn(move || run_cli(&path, &embedding(), CancelToken::new()));
     // The probe's call and two more are answered; the fourth is held for `wait`.
     const HELD: usize = 4;
     let host = Host::serve(
@@ -694,7 +693,7 @@ fn po_t8_child() {
     let Ok(path) = std::env::var(CHILD) else {
         return;
     };
-    let code = run_cli(Path::new(&path), &Embedding, CancelToken::new());
+    let code = run_cli(Path::new(&path), &embedding(), CancelToken::new());
     println!("CHILD-EXIT {code}");
 }
 

@@ -1,33 +1,22 @@
-//! From a document to a `RunSpec` (MH 4.1): the precedence rule, strict mode, the range checks
-//! and the component builders. The only place a `RunSpec` is built from a description.
+//! From a document to a `RunSpec` (MH 4.1): the precedence rule, strict mode, the range checks,
+//! and each part built by the kind the document names, resolved through the registry of kinds
+//! (SDD 18). The only place a `RunSpec` is built from a description.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use moruna_discovery::DiscoveryInput;
 use moruna_kernel::{
-    ErrorPolicy, Guarantee, HostProfile, Kernel, MorunaError, Result, Route, RunId, SizerKind,
-    Source,
+    ErrorPolicy, Guarantee, HostProfile, Kernel, MorunaError, Result, RunId, SizerKind,
 };
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
-use moruna_sinks::{
-    ArrowIpcSink, ArrowIpcSinkConfig, ParquetSink, ParquetSinkConfig, TensorFormat, TensorSink,
-    TensorSinkConfig, VortexSink, VortexSinkConfig,
-};
-use moruna_sources::{
-    ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue, TensorSource, TensorSourceConfig,
-    VortexSource, VortexSourceConfig,
-};
-use parquet::basic::{Compression, ZstdLevel};
 
-use super::governed;
 use super::translate::{self, ResumeArg};
 use super::{
-    ErrorPolicyDoc, FilterDoc, GuaranteeDoc, HostProfileDoc, JobSpec, KernelDoc, KernelKindDoc,
-    ObjectStoreDoc, SinkDoc, SizerDoc, SourceDoc, SpecError,
+    ErrorPolicyDoc, GuaranteeDoc, HostProfileDoc, JobSpec, ObjectStoreDoc, SizerDoc, SpecError,
 };
-use crate::spec::{RunSpec, SinkSpec, SourceSpec};
+use crate::kinds::{Context, Declaration, Entry, Fact, Isolation, Registry, Stage};
+use crate::spec::RunSpec;
 
 /// The fields whose `null` an environment variable may fill, and the variable (MH 4.1).
 pub const ENV_FIELDS: [(&str, &str); 5] = [
@@ -37,118 +26,6 @@ pub const ENV_FIELDS: [(&str, &str); 5] = [
     ("staging.limit_bytes", "MORUNA_SPILL_LIMIT"),
     ("host_profile", "MORUNA_HOST_PROFILE"),
 ];
-
-/// A kernel a loader produced for one stage.
-pub struct LoadedKernel {
-    /// The kernel, as the facade runs it.
-    pub kernel: Arc<dyn Kernel>,
-    /// The same kernel as the Python adapter's type, when it is a Python kernel, for
-    /// `bind_allocator` and `gil_state` (05 d.1).
-    #[cfg(feature = "python")]
-    pub python: Option<Arc<moruna_adapters::PyKernel>>,
-}
-
-/// A Rust kernel compiled into the binary that runs the document, as that binary declares it:
-/// what a `{"kind": "rust", "crate", "symbol"}` entry names (MH 4.1). Nothing is imported or
-/// opened to resolve one; an entry the binary does not declare is refused, so strict mode
-/// admits these and still loads no kernel by import path (16 PK-I8).
-#[derive(Clone, Copy)]
-pub struct CompiledKernel {
-    /// The entry's `crate`: the crate the kernel is compiled from.
-    pub krate: &'static str,
-    /// The entry's `symbol`: the kernel within that crate.
-    pub symbol: &'static str,
-    /// The kernel for the entry's `args` (`null` when the entry has none). A refusal is a
-    /// plan-time error naming the argument.
-    pub build: fn(&serde_json::Value) -> Result<Arc<dyn Kernel>>,
-}
-
-/// What turns a kernel entry into a kernel (MH 4.2). The Python surface's loader imports the
-/// module a file names; `moruna.run`'s hands back the objects it was given.
-pub trait KernelLoader {
-    /// The kernel for `doc`, which is entry `index` of `kernels` (stage `index + 1`).
-    fn load(&self, index: usize, doc: &KernelDoc) -> Result<LoadedKernel>;
-
-    /// The Rust kernels compiled into this binary, which a `rust` entry names by `crate` and
-    /// `symbol` (MH 4.1). A binary that embeds Moruna declares its own here; the default, and
-    /// `moruna` itself, declares none.
-    fn compiled(&self) -> &[CompiledKernel] {
-        &[]
-    }
-
-    /// Where the contracts of the governed engine opened at `root` keep their files, when a
-    /// caller knows more than the engine does: an authorized read-only root another party's
-    /// contract is bound to, say. `None` (the default) is the engine's own resolution, every
-    /// contract on `root`.
-    #[cfg(feature = "peql")]
-    fn bindings(
-        &self,
-        _root: &std::path::Path,
-    ) -> Result<Option<std::sync::Arc<dyn moruna_datafusion::engine::BindingResolver>>> {
-        Ok(None)
-    }
-
-    /// Whether the run may register entry `index` of the document's `contracts` (MH 4.5), before
-    /// its governed engine registers it. A loader that knows where the contracts it trusts come
-    /// from refuses the others here; the default registers what the document carries.
-    fn admit(&self, _index: usize, _contract: &super::ContractEntry) -> Result<()> {
-        Ok(())
-    }
-
-    /// The handler of the guest port `name` (`{"guest": "<name>"}`, MH 4.10): what the program
-    /// embedding Moruna answers inside the machine. The default, and `moruna` itself, registers
-    /// none, so a document that names one is refused by name.
-    fn guest_port(&self, name: &str) -> Option<Arc<dyn moruna_kernel::GuestPort>> {
-        let _ = name;
-        None
-    }
-
-    /// The source for `"kind": "iterator"`, which only a library caller can supply.
-    fn iterator_source(&self) -> Result<SourceSpec> {
-        Err(SpecError::new(
-            "source.kind",
-            "`iterator` names a Python iterable in the caller's process and is library only; a \
-             document names a parquet, vortex or tensor source",
-        )
-        .into())
-    }
-
-    /// The source for `"kind": "python"`: a user's `moruna.Source` subclass, which only a
-    /// library caller can supply (07 e.6).
-    fn python_source(&self) -> Result<SourceSpec> {
-        Err(SpecError::new(
-            "source.kind",
-            "`python` names a moruna.Source object in the caller's process and is library \
-             only; a document names a parquet or tensor source",
-        )
-        .into())
-    }
-
-    /// The sink for `"kind": "python"`: a user's `moruna.Sink` subclass, which only a library
-    /// caller can supply (08 f.10).
-    fn python_sink(&self) -> Result<SinkSpec> {
-        Err(SpecError::new(
-            "sink.kind",
-            "`python` names a moruna.Sink object in the caller's process and is library only; a \
-             document names a parquet, tensor or arrow_ipc sink",
-        )
-        .into())
-    }
-}
-
-/// A loader with no kernels at all: every kernel entry is refused. What a build without the
-/// Python adapter runs with.
-pub struct NoKernels;
-
-impl KernelLoader for NoKernels {
-    fn load(&self, index: usize, _doc: &KernelDoc) -> Result<LoadedKernel> {
-        Err(SpecError::new(
-            format!("kernels[{index}]"),
-            "this build of moruna has no Python adapter, so it runs no Python kernels",
-        )
-        .into())
-    }
-}
 
 /// How a document is resolved (MH 4.1).
 pub struct BuildOptions<'a> {
@@ -232,18 +109,18 @@ pub fn strict_refusal(reliance: &[(&'static str, &'static str)]) -> SpecError {
     )
 }
 
-/// Build the facade's `RunSpec` from a document (MH 4.1). The order is the order a refusal is
-/// found in: the environment, the run id, the source, the sink, the kernels, the ranges, then
-/// resume, which reads the disk.
-pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -> Result<Built> {
-    let mut notes = opts.notes;
-
+/// Build the facade's `RunSpec` from a document (MH 4.1), each part by the kind `kinds` resolves
+/// its `kind` to (SDD 18 f.2). The order is the order a refusal is found in: the environment, the
+/// run id, the kinds, strict mode and the contracts by the kinds' declarations, the source, the
+/// sink, the kernels, the ranges, then resume, which reads the disk.
+pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Built> {
     // f.2: the precedence rule. A field set wins; a null field goes to discovery, which reads
     // its variable when one is set, and then to the default. Strict mode refuses the second.
     let env_resolved = env_reliance(job, opts.env);
     if opts.strict && !env_resolved.is_empty() {
         return Err(strict_refusal(&env_resolved).into());
     }
+    let mut notes = opts.notes;
     for (field, var) in &env_resolved {
         notes.push(format!("{field} resolved from {var}"));
     }
@@ -258,139 +135,94 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         None => None,
     };
 
-    // 16 PK-I8: a hosted run loads no kernel by import path; its kernels come from packages,
-    // the standard kernels, and the Rust kernels compiled into the binary that runs it.
-    if opts.strict
-        && let Some(index) = job
-            .kernels
-            .iter()
-            .position(|k| k.kind == KernelKindDoc::Python)
+    // KD-I1: every kind the document names, resolved before anything is built.
+    let (source_declared, source_kind) = kinds.source("source", &job.source.kind)?;
+    let (sink_declared, sink_kind) = kinds.sink("sink", &job.sink.kind)?;
+    let mut kernel_kinds = Vec::with_capacity(job.kernels.len());
+    for (index, doc) in job.kernels.iter().enumerate() {
+        kernel_kinds.push(kinds.kernel(&format!("kernels[{index}]"), &doc.kind)?);
+    }
+
+    // KD-I6, 16 PK-I8: a hosted run loads no code by import path.
+    if opts.strict {
+        let named = std::iter::once(("source".to_string(), source_declared))
+            .chain(
+                kernel_kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (declared, _))| (format!("kernels[{i}]"), *declared)),
+            )
+            .chain(std::iter::once(("sink".to_string(), sink_declared)));
+        for (field, declared) in named {
+            if declared.isolation == Isolation::Imported {
+                return Err(imported_refusal(&field, declared).into());
+            }
+        }
+    }
+
+    // KD-I8: contracts carried for no kind that reads or writes under them are refused.
+    if !job.contracts.is_empty()
+        && !std::iter::once(source_declared)
+            .chain(kernel_kinds.iter().map(|(declared, _)| *declared))
+            .chain(std::iter::once(sink_declared))
+            .any(|declared| declared.needs.contracts == Fact::Yes)
     {
         return Err(SpecError::new(
-            format!("kernels[{index}].module"),
-            "strict mode loads no kernel by import path: a hosted run loads its kernels from \
-             packages (moruna package, then {\"kind\": \"package\", \"path\", \"fingerprint\"}) \
-             or from the Rust kernels compiled into its binary ({\"kind\": \"rust\", \"crate\", \
-             \"symbol\"})",
+            "contracts",
+            "carried, and no kind of this document reads or writes under contracts",
         )
         .into());
     }
 
-    let engines = governed::Engines::carrying(&job.contracts);
-    engines.check_used(
-        matches!(job.source, SourceDoc::Datafusion { .. })
-            || matches!(job.sink, SinkDoc::Peql { .. }),
-    )?;
-    let (source, source_targets, engine_memory) = source_of(&job.source, loader, &engines)?;
-    let (sink, sink_target, sink_memory) = sink_of(&job.sink, &mut notes, loader, &engines)?;
-    translate::check_sink_not_source(&sink_target, &source_targets)?;
-    if let SinkDoc::Peql {
-        excluded_url: Some(excluded),
-        ..
-    } = &job.sink
-    {
-        governed::check_excluded(excluded, &sink_target, &source_targets)?;
-    }
+    let mut cx = Context::new(kinds.embedding())
+        .packages(opts.packages)
+        .host_ports(opts.host_ports)
+        .contracts(job.contracts.clone());
+    let source = source_kind.source(&Entry::new("source", None, &job.source), &mut cx)?;
+    cx.set_source_targets(source.targets.clone());
+    let sink = sink_kind.sink(&Entry::new("sink", None, &job.sink), &mut cx)?;
+    translate::check_sink_not_source(&sink.target, &source.targets)?;
 
-    // Each entry is loaded and its pin checked on its own; adjacent standard kernels are then
-    // fused where their combination is one stage (MH 4.9), and stage ids are counted after that.
-    enum Stage {
-        Std(Box<moruna_kernels::StdKernel>),
-        Loaded(LoadedKernel),
-        Packaged(crate::packaged::Packaged),
-    }
+    // Each entry is built on its own; an entry whose stage joins the previous one becomes part of
+    // it (MH 4.9), and stage ids are counted after that.
     let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
     let mut stage_kernels: Vec<Vec<usize>> = Vec::with_capacity(job.kernels.len());
-    let mut stage_routes: Vec<BTreeMap<String, Route>> = Vec::with_capacity(job.kernels.len());
-    for (index, doc) in job.kernels.iter().enumerate() {
-        let routes = routes_of(index, doc, loader, opts.host_ports.as_ref())?;
-        let stage = match doc.kind {
-            KernelKindDoc::Rust => Stage::Loaded(compiled_of(index, doc, loader.compiled())?),
-            KernelKindDoc::Std => {
-                let name = doc.name.as_deref().ok_or_else(|| {
-                    SpecError::new(
-                        format!("kernels[{index}].name"),
-                        "a std kernel needs a name",
-                    )
-                })?;
-                let args = doc.args.clone().unwrap_or(serde_json::Value::Null);
-                let kernel = moruna_kernels::StdKernel::new(name, &args)
-                    .map_err(|e| SpecError::new(format!("kernels[{index}]"), e.to_string()))?;
-                Stage::Std(Box::new(kernel))
-            }
-            KernelKindDoc::Python => Stage::Loaded(loader.load(index, doc)?),
-            KernelKindDoc::Package => {
-                let packaged = package_of(index, doc, &opts.packages)?;
-                notes.extend(packaged.notes());
-                if doc.ports.is_some() && packaged.kind() != "wasm" {
-                    return Err(SpecError::new(
-                        format!("kernels[{index}].ports"),
-                        "only a .wasm package calls ports, through its `call` import",
-                    )
-                    .into());
-                }
-                Stage::Packaged(packaged)
-            }
+    for (index, (doc, (_, kind))) in job.kernels.iter().zip(&kernel_kinds).enumerate() {
+        let field = format!("kernels[{index}]");
+        let stage = kind.stage(&Entry::new(field, Some(index), doc), &mut cx)?;
+        let joined = match (stages.last().and_then(|s| s.fuse.as_ref()), &stage.fuse) {
+            (Some(last), Some(next)) => last.fuse(next.as_ref()),
+            _ => None,
         };
-        if let Some(pinned) = &doc.fingerprint {
-            let want = pinned
-                .rsplit(':')
-                .next()
-                .unwrap_or(pinned)
-                .to_ascii_lowercase();
-            let have = match &stage {
-                Stage::Std(k) => k.fingerprint().to_hex(),
-                Stage::Loaded(l) => l.kernel.fingerprint().to_hex(),
-                Stage::Packaged(p) => p.kernel().fingerprint().to_hex(),
-            };
-            if want != have {
-                return Err(SpecError::new(
-                    format!("kernels[{index}].fingerprint"),
-                    format!("the document pins {want} and the loaded kernel's is {have}"),
-                )
-                .into());
+        match (joined, stages.last_mut(), stage_kernels.last_mut()) {
+            (Some(joined), Some(last), Some(members)) => {
+                *last = joined;
+                members.push(index);
+            }
+            _ => {
+                stages.push(stage);
+                stage_kernels.push(vec![index]);
             }
         }
-        if let (Some(Stage::Std(last)), Stage::Std(next)) = (stages.last(), &stage)
-            && let Some(fused) = moruna_kernels::fuse(last, next)
-        {
-            let len = stages.len();
-            stages[len - 1] = Stage::Std(Box::new(fused));
-            stage_kernels[len - 1].push(index);
-            continue;
-        }
-        stages.push(stage);
-        stage_kernels.push(vec![index]);
-        stage_routes.push(routes);
     }
+    notes.extend(cx.take_notes());
     let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
     let mut packaged = Vec::new();
     #[cfg(feature = "python")]
     let mut py_kernels = Vec::new();
     for (at, stage) in stages.into_iter().enumerate() {
-        match stage {
-            Stage::Std(k) => kernels.push(Arc::new(*k) as Arc<dyn Kernel>),
-            Stage::Packaged(p) => {
-                // MH 4.10: every package stage knows its ports, none listed or some, so a call
-                // to a name it does not list is refused by name.
-                let routes = std::mem::take(&mut stage_routes[at]);
-                p.bind_ports(moruna_kernel::StagePorts::new(
-                    (at + 1) as moruna_kernel::StageId,
-                    routes,
-                ));
-                kernels.push(p.kernel());
-                packaged.push(p);
-            }
-            Stage::Loaded(loaded) => {
-                #[cfg(feature = "python")]
-                if let Some(py) = loaded.python {
-                    py_kernels.push(((at + 1) as moruna_kernel::StageId, py));
-                }
-                #[cfg(not(feature = "python"))]
-                let _ = at;
-                kernels.push(loaded.kernel);
-            }
+        let id = (at + 1) as moruna_kernel::StageId;
+        if let Some(placed) = stage.placed {
+            placed(id);
         }
+        if let Some(p) = stage.packaged {
+            packaged.push(p);
+        }
+        #[cfg(feature = "python")]
+        if let Some(py) = stage.python {
+            py_kernels.push((id, py));
+        }
+        kernels.push(stage.kernel);
     }
 
     let checkpoint_interval_ms = translate::clamp(
@@ -487,10 +319,10 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
         profile_override: host_profile.clone(),
     };
 
-    let mut spec = RunSpec::new(source, kernels, sink);
-    spec.engine_memory = engine_memory;
+    let mut spec = RunSpec::new(source.spec, kernels, sink.spec);
+    spec.engine_memory = source.memory;
     spec.packaged = packaged;
-    spec.sink_memory = sink_memory;
+    spec.sink_memory = sink.memory;
     #[cfg(feature = "python")]
     {
         spec.py_kernels = py_kernels;
@@ -542,566 +374,18 @@ pub fn build(job: &JobSpec, loader: &dyn KernelLoader, opts: BuildOptions<'_>) -
     })
 }
 
-/// A `package` entry (16 d.4): `path` and `fingerprint` and nothing else, opened and pinned
-/// (PK-I2) and its runtime made (16 f.8).
-/// A `rust` entry, resolved against the kernels the running binary declares (MH 4.1): a crate,
-/// a symbol, optionally args and a fingerprint. Its hints are the kernel's own.
-fn compiled_of(index: usize, doc: &KernelDoc, declared: &[CompiledKernel]) -> Result<LoadedKernel> {
-    let field = |name: &str| format!("kernels[{index}].{name}");
-    let set: [(&str, bool); 5] = [
-        ("path", doc.path.is_some()),
-        ("assets", doc.assets.is_some()),
-        ("module", doc.module.is_some()),
-        ("callable", doc.callable.is_some()),
-        ("name", doc.name.is_some()),
-    ];
-    let hints = doc.hints_set();
-    if let Some(name) = set
-        .iter()
-        .filter(|(_, on)| *on)
-        .map(|(n, _)| *n)
-        .chain(hints.iter().copied())
-        .next()
-    {
-        return Err(SpecError::new(
-            field(name),
-            "a rust entry has a crate, a symbol, and optionally args and a fingerprint; its \
-             hints are the compiled kernel's own",
-        )
-        .into());
-    }
-    let named = |value: &Option<String>, name: &str| -> Result<String> {
-        value.clone().filter(|v| !v.is_empty()).ok_or_else(|| {
-            SpecError::new(
-                field(name),
-                format!("a rust entry names the compiled kernel's {name}"),
-            )
-            .into()
-        })
-    };
-    let krate = named(&doc.krate, "crate")?;
-    let symbol = named(&doc.symbol, "symbol")?;
-    let offered = || -> String {
-        if declared.is_empty() {
-            return "this binary has no compiled kernels".into();
-        }
-        let all: Vec<String> = declared
-            .iter()
-            .map(|k| format!("{}::{}", k.krate, k.symbol))
-            .collect();
-        format!("this binary has {}", all.join(", "))
-    };
-    if !declared.iter().any(|k| k.krate == krate) {
-        return Err(SpecError::new(
-            field("crate"),
-            format!(
-                "no kernel of crate `{krate}` is compiled into this binary; {}",
-                offered()
-            ),
-        )
-        .into());
-    }
-    let Some(kernel) = declared
-        .iter()
-        .find(|k| k.krate == krate && k.symbol == symbol)
-    else {
-        return Err(SpecError::new(
-            field("symbol"),
-            format!(
-                "crate `{krate}` compiled into this binary has no kernel `{symbol}`; {}",
-                offered()
-            ),
-        )
-        .into());
-    };
-    let args = doc.args.clone().unwrap_or(serde_json::Value::Null);
-    let kernel = (kernel.build)(&args)
-        .map_err(|e| SpecError::new(format!("kernels[{index}]"), e.to_string()))?;
-    Ok(LoadedKernel {
-        kernel,
-        #[cfg(feature = "python")]
-        python: None,
-    })
-}
-
-/// `kernels[index].ports` (MH 4.10): each name valid, each going to exactly one place, each
-/// place there to go to; only a package lists any.
-fn routes_of(
-    index: usize,
-    doc: &KernelDoc,
-    loader: &dyn KernelLoader,
-    host: Option<&Arc<crate::host::ports::HostPorts>>,
-) -> Result<BTreeMap<String, Route>> {
-    let mut routes = BTreeMap::new();
-    let Some(ports) = &doc.ports else {
-        return Ok(routes);
-    };
-    let field = |name: &str| format!("kernels[{index}].ports.{name}");
-    if doc.kind != KernelKindDoc::Package {
-        return Err(SpecError::new(
-            format!("kernels[{index}].ports"),
-            "only a function package calls ports: a .wasm component, through its `call` import",
-        )
-        .into());
-    }
-    for (name, port) in ports {
-        if !super::is_port_name(name) {
-            return Err(SpecError::new(
-                format!("kernels[{index}].ports"),
-                format!(
-                    "{name:?} is not a port name: 1 to 64 of ASCII letters, digits, `_`, `-`, `.` \
-                     and `:`, starting with a letter or a digit"
-                ),
-            )
-            .into());
-        }
-        let deadline_ms = port
-            .deadline_ms
-            .unwrap_or(moruna_kernel::ports::PORT_DEADLINE_MS);
-        if deadline_ms == 0 || deadline_ms > moruna_kernel::ports::PORT_DEADLINE_MAX_MS {
-            return Err(SpecError::new(
-                format!("{}.deadline_ms", field(name)),
-                format!(
-                    "{deadline_ms} is outside 1 to {} ms",
-                    moruna_kernel::ports::PORT_DEADLINE_MAX_MS
-                ),
-            )
-            .into());
-        }
-        let deadline = std::time::Duration::from_millis(deadline_ms);
-        let route = match (&port.host, &port.guest) {
-            (Some(host_name), None) => {
-                if !super::is_port_name(host_name) {
-                    return Err(SpecError::new(
-                        format!("{}.host", field(name)),
-                        format!("{host_name:?} is not a port name"),
-                    )
-                    .into());
-                }
-                let Some(hub) = host else {
-                    return Err(SpecError::new(
-                        format!("{}.host", field(name)),
-                        "a host port needs a peer to serve it: report.socket under moruna run, or \
-                         moruna serve",
-                    )
-                    .into());
-                };
-                Route {
-                    place: "host",
-                    port: hub.port(host_name),
-                    deadline,
-                }
-            }
-            (None, Some(handler)) => {
-                let Some(answers) = loader.guest_port(handler) else {
-                    return Err(SpecError::new(
-                        format!("{}.guest", field(name)),
-                        format!(
-                            "no guest handler {handler:?} is registered by the program running \
-                             this document"
-                        ),
-                    )
-                    .into());
-                };
-                Route {
-                    place: "guest",
-                    port: moruna_kernel::GuestRoute::new(answers),
-                    deadline,
-                }
-            }
-            _ => {
-                return Err(SpecError::new(
-                    field(name),
-                    "a port goes to exactly one of `host` and `guest`",
-                )
-                .into());
-            }
-        };
-        routes.insert(name.clone(), route);
-    }
-    Ok(routes)
-}
-
-fn package_of(
-    index: usize,
-    doc: &KernelDoc,
-    host: &crate::packaged::PackageHost,
-) -> Result<crate::packaged::Packaged> {
-    let field = |name: &str| format!("kernels[{index}].{name}");
-    let set: [(&str, bool); 5] = [
-        ("module", doc.module.is_some()),
-        ("callable", doc.callable.is_some()),
-        ("crate", doc.krate.is_some()),
-        ("symbol", doc.symbol.is_some()),
-        ("name", doc.name.is_some()),
-    ];
-    let hints = doc.hints_set();
-    if let Some(name) = set
-        .iter()
-        .filter(|(_, on)| *on)
-        .map(|(n, _)| *n)
-        .chain(hints.iter().copied())
-        .next()
-    {
-        return Err(SpecError::new(
-            field(name),
-            "a package entry has a path, a fingerprint, and optionally args and assets; its hints \
-             are its manifest's",
-        )
-        .into());
-    }
-    let path = doc
-        .path
-        .as_deref()
-        .ok_or_else(|| SpecError::new(field("path"), "a package entry names its file"))?;
-    let pin = doc.fingerprint.as_deref().ok_or_else(|| {
-        SpecError::new(
-            field("fingerprint"),
-            "a package entry pins its file's sha256 (moruna check prints it)",
-        )
-    })?;
-    let inputs = moruna_package::Inputs {
-        args: doc.args.clone(),
-        assets: doc.assets.as_deref().map(std::path::PathBuf::from),
-    };
-    crate::packaged::open(std::path::Path::new(path), Some(pin), host, inputs).map_err(
-        |e| match e {
-            MorunaError::Plan(msg) => SpecError::new(field("fingerprint"), msg).into(),
-            MorunaError::Config { msg, .. } if msg.starts_with("package: args:") => {
-                SpecError::new(field("args"), msg).into()
-            }
-            MorunaError::Config { msg, .. } if msg.starts_with("package: assets:") => {
-                SpecError::new(field("assets"), msg).into()
-            }
-            other => other,
-        },
-    )
-}
-
-/// The source's builder, the locations it reads for the sink equals source rule, and the memory
-/// its engine's operators hold when it is an engine that runs operators of its own.
-fn source_of(
-    doc: &SourceDoc,
-    loader: &dyn KernelLoader,
-    engines: &governed::Engines,
-) -> Result<governed::Read> {
-    match doc {
-        SourceDoc::Parquet { url, options } => {
-            if url.0.is_empty() {
-                return Err(
-                    SpecError::new("source.url", "empty: a source needs at least one url").into(),
-                );
-            }
-            let mut filters = Vec::with_capacity(options.filters.len());
-            for (i, filter) in options.filters.iter().enumerate() {
-                filters.push(row_filter(i, filter)?);
-            }
-            let cfg = ParquetSourceConfig {
-                urls: url.0.clone(),
-                columns: options.columns.clone(),
-                filters,
-                batch_rows_hint: None,
-            };
-            let targets = url.0.clone();
-            Ok((
-                SourceSpec::Build(Box::new(move |ctx| {
-                    let meta = ctx.object_metadata()?;
-                    // With the arena, so an object URL's footer can be read (MH 4.6).
-                    Ok(Arc::new(ParquetSource::with_allocator(
-                        cfg,
-                        ctx.reactor.clone(),
-                        meta,
-                        ctx.alloc.clone(),
-                    )?) as Arc<dyn Source>)
-                })),
-                targets,
-                None,
-            ))
-        }
-        SourceDoc::Tensor { url, options } => {
-            if url.0.is_empty() {
-                return Err(SpecError::new(
-                    "source.url",
-                    "empty: a source needs at least one path",
-                )
-                .into());
-            }
-            let cfg = TensorSourceConfig {
-                paths: url.0.iter().map(|u| translate::local_path(u)).collect(),
-                tensors: options.tensors.clone(),
-                slice_rows_hint: None,
-            };
-            let targets = url.0.clone();
-            Ok((
-                SourceSpec::Build(Box::new(move |ctx| {
-                    Ok(Arc::new(TensorSource::new(cfg, ctx.reactor.clone())?) as Arc<dyn Source>)
-                })),
-                targets,
-                None,
-            ))
-        }
-        SourceDoc::Vortex { url, options } => {
-            if url.0.is_empty() {
-                return Err(
-                    SpecError::new("source.url", "empty: a source needs at least one url").into(),
-                );
-            }
-            if options.split_bytes == Some(0) {
-                return Err(SpecError::new(
-                    "source.options.split_bytes",
-                    "0: a split holds at least one zone",
-                )
-                .into());
-            }
-            let cfg = VortexSourceConfig {
-                urls: url.0.clone(),
-                columns: options.columns.clone(),
-                split_bytes: options.split_bytes,
-            };
-            let targets = url.0.clone();
-            Ok((
-                SourceSpec::Build(Box::new(move |ctx| {
-                    let meta = ctx.object_metadata()?;
-                    // With the arena, so an object URL's footer and zone maps can be read.
-                    Ok(Arc::new(VortexSource::with_allocator(
-                        cfg,
-                        ctx.reactor.clone(),
-                        meta,
-                        ctx.alloc.clone(),
-                    )?) as Arc<dyn Source>)
-                })),
-                targets,
-                None,
-            ))
-        }
-        SourceDoc::Iterator => Ok((loader.iterator_source()?, Vec::new(), None)),
-        SourceDoc::Python => Ok((loader.python_source()?, Vec::new(), None)),
-        SourceDoc::Datafusion {
-            root,
-            contract,
-            sql,
-            caller,
-            on_violation,
-        } => governed::source(root, contract, sql, caller, on_violation, loader, engines),
-    }
-}
-
-/// `[column, op, value]` to a row-group predicate (07 d.1).
-fn row_filter(index: usize, doc: &FilterDoc) -> Result<RowFilter> {
-    let field = || format!("source.options.filters[{index}]");
-    let FilterDoc(column, op, value) = doc;
-    let scalar = match value {
-        serde_json::Value::Bool(b) => ScalarValue::Bool(*b),
-        serde_json::Value::String(s) => ScalarValue::Str(s.clone()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                ScalarValue::I64(i)
-            } else if let Some(u) = n.as_u64() {
-                ScalarValue::U64(u)
-            } else {
-                ScalarValue::F64(n.as_f64().unwrap_or(f64::NAN))
-            }
-        }
-        other => {
-            return Err(SpecError::new(
-                field(),
-                format!("a filter value is a number, a string or a boolean, not {other}"),
-            )
-            .into());
-        }
-    };
-    Ok(match op.as_str() {
-        ">" | "gt" => RowFilter::Gt(column.clone(), scalar),
-        "<" | "lt" => RowFilter::Lt(column.clone(), scalar),
-        "==" | "=" | "eq" => RowFilter::Eq(column.clone(), scalar),
-        other => {
-            return Err(SpecError::new(
-                field(),
-                format!("unknown operator `{other}` (use \">\", \"<\" or \"==\")"),
-            )
-            .into());
-        }
-    })
-}
-
-/// The sink's builder and where it writes.
-fn sink_of(
-    doc: &SinkDoc,
-    notes: &mut Vec<String>,
-    loader: &dyn KernelLoader,
-    engines: &governed::Engines,
-) -> Result<governed::Write> {
-    match doc {
-        SinkDoc::Parquet { url, options } => {
-            let url = translate::local_url(url);
-            let row_group_bytes = translate::clamp_row_group_bytes(
-                options
-                    .row_group_bytes
-                    .unwrap_or(translate::DEFAULT_ROW_GROUP_BYTES),
-                notes,
-            );
-            let file_bytes = translate::clamp_file_bytes(
-                options.file_bytes.unwrap_or(translate::DEFAULT_FILE_BYTES),
-                notes,
-            );
-            let compression =
-                parse_compression(options.compression.as_deref().unwrap_or("zstd"))
-                    .map_err(|reason| SpecError::new("sink.options.compression", reason))?;
-            let target = url.clone();
-            Ok((
-                SinkSpec::Build(Box::new(move |ctx| {
-                    // The sink encodes each file in the arena, in one of two buffers: together
-                    // they are the share the facade sets aside for it.
-                    let cfg = ParquetSinkConfig {
-                        url,
-                        row_group_bytes,
-                        file_bytes: file_bytes.min(ctx.claim_file_buffer() / 2),
-                        compression,
-                        writer_props: None,
-                    };
-                    // The run id goes into every file's footer (08 e.2).
-                    let sink = ParquetSink::new(cfg, ctx.reactor.clone(), ctx.alloc.clone())?
-                        .with_run_id(ctx.run_id);
-                    Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
-                })),
-                target,
-                None,
-            ))
-        }
-        SinkDoc::Tensor { url, options } => {
-            let format = parse_tensor_format(options.format.as_deref().unwrap_or("mrb1"))
-                .map_err(|reason| SpecError::new("sink.options.format", reason))?;
-            let cfg = TensorSinkConfig {
-                path: translate::local_path(url),
-                format,
-                one_file_per_morsel: options.one_file_per_morsel,
-                name: options.name.clone().unwrap_or_else(|| "tensor".to_string()),
-            };
-            Ok((
-                SinkSpec::Build(Box::new(move |ctx| {
-                    Ok(Box::new(TensorSink::new(
-                        cfg,
-                        ctx.reactor.clone(),
-                        ctx.alloc.clone(),
-                    )?) as Box<dyn moruna_kernel::Sink>)
-                })),
-                url.clone(),
-                None,
-            ))
-        }
-        SinkDoc::Vortex { url, options } => {
-            let url = translate::local_url(url);
-            let file_bytes = translate::clamp_file_bytes(
-                options.file_bytes.unwrap_or(translate::DEFAULT_FILE_BYTES),
-                notes,
-            );
-            let target = url.clone();
-            Ok((
-                SinkSpec::Build(Box::new(move |ctx| {
-                    // As for Parquet: the sink encodes each file in the arena, in one of two
-                    // buffers, which together are the share the facade sets aside for it.
-                    let cfg = VortexSinkConfig {
-                        url,
-                        file_bytes: file_bytes.min(ctx.claim_file_buffer() / 2),
-                    };
-                    let sink = VortexSink::new(cfg, ctx.reactor.clone(), ctx.alloc.clone())?
-                        .with_run_id(ctx.run_id);
-                    Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
-                })),
-                target,
-                None,
-            ))
-        }
-        SinkDoc::ArrowIpc { url, options } => {
-            let file_bytes = translate::clamp_file_bytes(
-                options.file_bytes.unwrap_or(translate::DEFAULT_FILE_BYTES),
-                notes,
-            );
-            let cfg = ArrowIpcSinkConfig {
-                path: translate::local_path(url),
-                file_bytes,
-            };
-            Ok((
-                SinkSpec::Build(Box::new(move |ctx| {
-                    Ok(Box::new(ArrowIpcSink::new(
-                        cfg,
-                        ctx.reactor.clone(),
-                        ctx.alloc.clone(),
-                    )?) as Box<dyn moruna_kernel::Sink>)
-                })),
-                url.clone(),
-                None,
-            ))
-        }
-        SinkDoc::Peql {
-            root,
-            contract,
-            caller,
-            mode,
-            on_violation,
-            excluded_url,
-        } => governed::sink(
-            governed::SinkFields {
-                root,
-                contract,
-                caller,
-                mode,
-                on_violation,
-                excluded_url,
-            },
-            loader,
-            engines,
+/// KD-I6: the strict-mode refusal of a kind whose code is imported by path (16 PK-I8).
+fn imported_refusal(field: &str, declared: &Declaration) -> SpecError {
+    SpecError::new(
+        format!("{field}.kind"),
+        format!(
+            "strict mode loads no code by import path, and `{}` is imported from the \
+             interpreter's path: a hosted run loads its kernels from packages (moruna package, \
+             then {{\"kind\": \"package\", \"path\", \"fingerprint\"}}) or from the kinds the \
+             program running it registers",
+            declared.name
         ),
-        // A user's sink names no location of its own, so the sink equals source rule has
-        // nothing to compare (12 f.3).
-        SinkDoc::Python => Ok((loader.python_sink()?, String::new(), None)),
-    }
-}
-
-/// A Parquet compression by the name a document and `ParquetSink(compression=)` use.
-pub fn parse_compression(name: &str) -> core::result::Result<Compression, String> {
-    Ok(match name.to_ascii_lowercase().as_str() {
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
-        "snappy" => Compression::SNAPPY,
-        "gzip" => Compression::GZIP(Default::default()),
-        "lz4" => Compression::LZ4_RAW,
-        "none" | "uncompressed" => Compression::UNCOMPRESSED,
-        other => {
-            return Err(format!(
-                "unknown compression `{other}` (use \"zstd\", \"snappy\", \"gzip\", \"lz4\" or \"none\")"
-            ));
-        }
-    })
-}
-
-/// The name [`parse_compression`] reads for a compression, so a built sink can be described.
-pub fn compression_name(compression: Compression) -> &'static str {
-    match compression {
-        Compression::SNAPPY => "snappy",
-        Compression::GZIP(_) => "gzip",
-        Compression::LZ4_RAW | Compression::LZ4 => "lz4",
-        Compression::UNCOMPRESSED => "none",
-        _ => "zstd",
-    }
-}
-
-/// A tensor file format by the name a document and `TensorSink(format=)` use.
-pub fn parse_tensor_format(name: &str) -> core::result::Result<TensorFormat, String> {
-    match name.to_ascii_lowercase().as_str() {
-        "mrb1" => Ok(TensorFormat::Amb1),
-        "safetensors" => Ok(TensorFormat::SafeTensors),
-        other => Err(format!(
-            "unknown tensor format `{other}` (use \"mrb1\" or \"safetensors\")"
-        )),
-    }
-}
-
-/// The name [`parse_tensor_format`] reads for a format.
-pub fn tensor_format_name(format: TensorFormat) -> &'static str {
-    match format {
-        TensorFormat::Amb1 => "mrb1",
-        TensorFormat::SafeTensors => "safetensors",
-    }
+    )
 }
 
 /// `host_profile` and `staging.durable` to the profile discovery is handed (03 d.1). `durable`

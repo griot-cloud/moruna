@@ -148,7 +148,8 @@ fn pk_t15_aot_then_no_compile() {
 
 mod support;
 
-use moruna_runtime::job::{BuildOptions, JobSpec, NoKernels, build};
+use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::kinds::Registry;
 use moruna_runtime::{CancelToken, Runtime};
 use serde_json::json;
 use support::{Scratch, one_run_at_a_time, read_back_rows, write_parquet};
@@ -180,7 +181,7 @@ fn package_document(scratch: &std::path::Path, rows: u64, package: &str, pin: &s
 fn run_document(job: &JobSpec, host: PackageHost) -> moruna_runtime::RunReport {
     let built = build(
         job,
-        &NoKernels,
+        &Registry::standard(),
         BuildOptions {
             strict: true,
             env: &no_env,
@@ -191,6 +192,28 @@ fn run_document(job: &JobSpec, host: PackageHost) -> moruna_runtime::RunReport {
     )
     .expect("the document builds");
     Runtime::run(built.spec, CancelToken::new()).expect("the run completes")
+}
+
+/// KD-T4 for the `package` kind (SDD 18): its port's suite over a real `.wasm`, so every case,
+/// a wrong pin included, reaches the file.
+#[test]
+fn kd_t4_package_conformance() {
+    use moruna_runtime::kinds::conformance::{self, Harness};
+    let scratch = Scratch::new("kd_t4_package");
+    let m = manifest("echo", false, true);
+    let package = package_at(
+        scratch.path(),
+        &component(&m.to_json(), IDENTITY, &[], "", ""),
+        &m,
+    );
+    let harness = Harness::new().examples(vec![json!({
+        "path": package.path.display().to_string(),
+        "fingerprint": package.fingerprint_string(),
+    })]);
+    let passed = conformance::kernel(&moruna_runtime::kinds::package::Package, &harness)
+        .unwrap_or_else(|v| panic!("{v}"));
+    assert!(passed.properties.contains(&"KD-C7"), "{passed:?}");
+    assert!(passed.cases > 4, "{passed:?}");
 }
 
 /// PK-T16 run_a_package (16 f.8): a hosted document with a `.wasm` stage writes every row of
@@ -373,7 +396,7 @@ fn pk_t17_package_entry_args_and_assets() {
         let job = JobSpec::from_value(doc).unwrap();
         build(
             &job,
-            &NoKernels,
+            &Registry::standard(),
             BuildOptions {
                 strict: true,
                 env: &no_env,

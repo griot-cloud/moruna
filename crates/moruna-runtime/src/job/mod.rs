@@ -14,16 +14,11 @@
 
 pub mod build;
 pub mod canonical;
-mod governed;
 pub mod translate;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use build::{
-    BuildOptions, Built, CompiledKernel, KernelLoader, LoadedKernel, NoKernels, build,
-};
-#[cfg(feature = "peql")]
-pub use governed::entry_of;
+pub use build::{BuildOptions, Built, build};
 
 /// The one version of the document this build reads (MH 4.1).
 pub const SPEC_VERSION: u32 = 1;
@@ -74,13 +69,14 @@ pub struct JobSpec {
     /// The run's identity, 32 lowercase hex characters; absent: minted at start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    /// The input.
-    pub source: SourceDoc,
-    /// Stages 1..=n, in order; empty is a copy from source to sink.
+    /// The input: a source kind and its settings.
+    pub source: KindDoc,
+    /// Stages 1..=n, in order, each a runnable kind and its settings; empty is a copy from source
+    /// to sink.
     #[serde(default)]
-    pub kernels: Vec<KernelDoc>,
-    /// The output.
-    pub sink: SinkDoc,
+    pub kernels: Vec<KindDoc>,
+    /// The output: a sink kind and its settings.
+    pub sink: KindDoc,
     /// Memory and CPU.
     #[serde(default)]
     pub budget: BudgetDoc,
@@ -120,8 +116,8 @@ pub struct JobSpec {
     /// Where the report goes.
     #[serde(default)]
     pub report: ReportDoc,
-    /// The contracts a `datafusion` source reads and a `peql` sink writes under (MH 4.5), each
-    /// as its compiler wrote it. They are the job's whole contract store: the engine holds them
+    /// The contracts the document's kinds read and write under (MH 4.5; a `datafusion` source, a
+    /// `peql` sink), each as its compiler wrote it. They are the job's whole contract store: the engine holds them
     /// in memory for this run alone and reads no contract from its root, so a contract the job
     /// names and does not carry is refused by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -131,7 +127,7 @@ pub struct JobSpec {
 /// One contract a job carries (`contracts[i]`, MH 4.5): its document, its compiled form exactly
 /// as the compiler wrote it, and the function modules that form pins. Registered as given, never
 /// compiled; whoever writes the document vouches that `compiled` is what `document` compiles to,
-/// and a loader may refuse any entry ([`KernelLoader::admit`]).
+/// and the program running it may refuse any entry ([`crate::kinds::Embedding::admit`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractEntry {
@@ -147,449 +143,78 @@ pub struct ContractEntry {
     pub audiences: Vec<String>,
 }
 
-/// Files or prefixes: one string or a list of them. The canonical form writes one as a
-/// string and several as a list (MH 4.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Urls(pub Vec<String>);
-
-impl Serialize for Urls {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self.0.as_slice() {
-            [one] => s.serialize_str(one),
-            many => many.serialize(s),
-        }
-    }
+/// One part of a run as the document names it (MH 4.1, SDD 18 d.1): its `kind`, a string the
+/// registry of kinds resolves when the document is built (KD-I1), and the rest of the object,
+/// which is that kind's settings. A setting spelled `null` is a setting left out, so the two have
+/// one canonical form (MH 4.1). What the settings may be is the kind's declaration (SDD 18 e.2);
+/// the document itself knows no kind.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KindDoc {
+    /// The kind's name, as the registry knows it (`parquet`, `std`, `package`, ...).
+    pub kind: String,
+    /// Every other key of the entry, `null`s left out.
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
-impl<'de> Deserialize<'de> for Urls {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Urls, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum OneOrMany {
-            One(String),
-            Many(Vec<String>),
-        }
-        Ok(match OneOrMany::deserialize(d)? {
-            OneOrMany::One(one) => Urls(vec![one]),
-            OneOrMany::Many(many) => Urls(many),
-        })
-    }
-}
-
-/// Where the input comes from (MH 4.1).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SourceDoc {
-    /// Parquet files or prefixes, local or in an object store.
-    Parquet {
-        /// `file://`, `s3://`, `gs://`, `az://` or a bare local path.
-        url: Urls,
-        /// Projection and row-group pruning.
-        #[serde(default)]
-        options: ParquetSourceOptions,
-    },
-    /// Safetensors or aligned binary tensor files.
-    Tensor {
-        /// Local paths or `file://` URLs.
-        url: Urls,
-        /// Which tensors.
-        #[serde(default)]
-        options: TensorSourceOptions,
-    },
-    /// Vortex files or prefixes, local or in an object store (07 e.7).
-    Vortex {
-        /// `file://`, `s3://`, `gs://`, `az://` or a bare local path.
-        url: Urls,
-        /// Projection and split size.
-        #[serde(default)]
-        options: VortexSourceOptions,
-    },
-    /// A Python iterable. Library only: the iterable is an object in the caller's process and
-    /// cannot be named in a file, so a document from a file or a socket is refused (MH 4.1).
-    Iterator,
-    /// A user's `moruna.Source` subclass (07 e.6, 2026-09-29). Library only, for the reason
-    /// `iterator` is: the object lives in the caller's process.
-    Python,
-    /// A governed DataFusion plan (MH 4.5): what peQL, opened on the disk at `root` with the
-    /// job's `contracts`, plans for `caller` over one contract or over SQL in which every table
-    /// is a contract. Exactly one of `contract` and `sql`. Needs a build with the `peql` feature.
-    Datafusion {
-        /// The engine's root: the disk, with peQL's manifests, ledger and audit log under
-        /// `<root>/_peql/`. Its contracts are the job's `contracts`, never a store on the disk.
-        root: String,
-        /// One contract, every row and column the caller may see.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        contract: Option<String>,
-        /// SQL in which every table is a contract.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sql: Option<String>,
-        /// The caller, as peQL reads it: `id`, `tenant`, `purpose`, and optionally `tier`,
-        /// `clearance`, `classification`, `roles`, `now` and `other`.
-        caller: serde_json::Map<String, serde_json::Value>,
-        /// What the read does with rows that break a contract's row rules: `exclude` (absent)
-        /// leaves them out and the run's report counts them per rule; `refuse` refuses the
-        /// read when the data holds any.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        on_violation: Option<String>,
-    },
-}
-
-/// `source.options` for `parquet`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ParquetSourceOptions {
-    /// The projection; absent is every column.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub columns: Option<Vec<String>>,
-    /// Row-group predicates, each `[column, op, value]` with `op` one of `>`, `<`, `==`.
-    pub filters: Vec<FilterDoc>,
-}
-
-/// `source.options` for `vortex`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct VortexSourceOptions {
-    /// The projection; absent is every column.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub columns: Option<Vec<String>>,
-    /// The uncompressed bytes a split is cut toward; absent is 128 MiB (07 e.7).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub split_bytes: Option<u64>,
-}
-
-/// One row-group predicate: `[column, op, value]`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FilterDoc(pub String, pub String, pub serde_json::Value);
-
-/// `source.options` for `tensor`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TensorSourceOptions {
-    /// Tensor names; absent is every tensor.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tensors: Option<Vec<String>>,
-}
-
-/// Where the output goes (MH 4.1).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SinkDoc {
-    /// Parquet files under a prefix.
-    Parquet {
-        /// `file://`, `s3://`, `gs://`, `az://` or a bare local directory.
-        url: String,
-        /// Sizes and compression.
-        #[serde(default)]
-        options: ParquetSinkOptions,
-    },
-    /// Tensor files.
-    Tensor {
-        /// A local directory.
-        url: String,
-        /// Format and naming.
-        #[serde(default)]
-        options: TensorSinkOptions,
-    },
-    /// Vortex files under a prefix (08 f.11).
-    Vortex {
-        /// `file://`, `s3://`, `gs://`, `az://` or a bare local directory.
-        url: String,
-        /// Sizes.
-        #[serde(default)]
-        options: VortexSinkOptions,
-    },
-    /// Page-aligned Arrow IPC files.
-    ArrowIpc {
-        /// A local directory.
-        url: String,
-        /// Sizes.
-        #[serde(default)]
-        options: ArrowIpcSinkOptions,
-    },
-    /// A write under a peQL contract the job carries in `contracts` (MH 4.5), by `caller`, who
-    /// must be the contract's owner.
-    /// The manifest is refreshed when the run finishes. Needs a build with the `peql` feature.
-    Peql {
-        /// The engine's root: the disk.
-        root: String,
-        /// The contract written under.
-        contract: String,
-        /// The writer, as peQL reads a caller.
-        caller: serde_json::Map<String, serde_json::Value>,
-        /// `append` (absent) or `overwrite`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mode: Option<String>,
-        /// What the write does with rows that break the contract's row rules: `refuse`
-        /// (absent) commits nothing when any does; `exclude` commits the others and keeps
-        /// these under `excluded_url`; `warn` commits every row and its verdict says so.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        on_violation: Option<String>,
-        /// The local directory an `exclude` write keeps the rows it excludes in, as Parquet
-        /// with the rules each broke; empty or absent when the run starts. Only `exclude`
-        /// takes it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        excluded_url: Option<String>,
-    },
-    /// A user's `moruna.Sink` subclass (08 f.10, 2026-09-29). Library only: the object lives in
-    /// the caller's process, so a document from a file or a socket is refused (MH 4.1).
-    Python,
-}
-
-/// `sink.options` for `parquet`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ParquetSinkOptions {
-    /// `sink.row_group_bytes`; absent is 128 MiB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub row_group_bytes: Option<u64>,
-    /// `sink.file_bytes`; absent is 1 GiB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_bytes: Option<u64>,
-    /// `zstd` (absent), `snappy`, `gzip`, `lz4` or `none`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compression: Option<String>,
-}
-
-/// `sink.options` for `tensor`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TensorSinkOptions {
-    /// `mrb1` (absent) or `safetensors`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
-    /// One file per morsel rather than one per size bound.
-    pub one_file_per_morsel: bool,
-    /// The tensor name; absent is `tensor`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-/// `sink.options` for `vortex`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct VortexSinkOptions {
-    /// `sink.file_bytes`; absent is 1 GiB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_bytes: Option<u64>,
-}
-
-/// `sink.options` for `arrow_ipc`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ArrowIpcSinkOptions {
-    /// `sink.file_bytes`; absent is 1 GiB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_bytes: Option<u64>,
-}
-
-/// Which language a kernel is written in (MH 4.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KernelKindDoc {
-    /// A Python callable, by module and name.
-    Python,
-    /// A Rust kernel compiled into the binary that runs the document, by crate and symbol, as
-    /// that binary declares it ([`build::CompiledKernel`]).
-    Rust,
-    /// A standard kernel of `moruna-kernels` by `name` and `args` (MH 4.9).
-    Std,
-    /// A function package by `path`, pinned by `fingerprint` (16 d.4): its runtime is its
-    /// extension's (17).
-    Package,
-}
-
-/// One stage (MH 4.1). A Python kernel is named by `module` and `callable`; the hints are the
-/// decorator's arguments (12 d.2) and apply to a callable that is not already decorated.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KernelDoc {
-    /// `python`, `rust`, `std` or `package`.
-    pub kind: KernelKindDoc,
-    /// For `package`: the package's file, on a disk the run attaches (16 d.4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    /// For `package`: a directory the kernel reads, read only (16 b, d.4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assets: Option<String>,
-    /// A module name on the interpreter's path, or a path to a `.py` file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub module: Option<String>,
-    /// The attribute of the module that is the kernel; dotted for a nested attribute.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub callable: Option<String>,
-    /// For `rust`: the crate the compiled kernel is built from.
-    #[serde(default, rename = "crate", skip_serializing_if = "Option::is_none")]
-    pub krate: Option<String>,
-    /// For `rust`: the compiled kernel within its crate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-    /// For `std`: the standard kernel's name (`cast`, `select`, ...).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// For `std`: its arguments, a JSON object; for `package`: the arguments of a kernel built
-    /// by them (16 b); for `rust`: the arguments the compiled kernel is built by.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<serde_json::Value>,
-    /// The fingerprint the loaded kernel must have, hex, optionally prefixed `algo:`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
-    /// The decorator's `stateful`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stateful: Option<bool>,
-    /// The decorator's `instances`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instances: Option<u16>,
-    /// The decorator's `device_memory`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_memory: Option<bool>,
-    /// The decorator's `accepts`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepts: Option<String>,
-    /// The decorator's `tier`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
-    /// The decorator's `releases_gil`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub releases_gil: Option<bool>,
-    /// The decorator's `expected_amplification`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_amplification: Option<f64>,
-    /// The decorator's `preferred_rows`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preferred_rows: Option<u64>,
-    /// The decorator's `resume`: `reinit`, `checkpoint` or `forbid`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume: Option<String>,
-    /// The decorator's `state_bytes`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_bytes: Option<u64>,
-    /// The decorator's `memory_guard` (E13): whether the allocator guard may refuse this
-    /// kernel's requests past the ceiling; absent means on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_guard: Option<bool>,
-    /// For a `.wasm` package: the ports its `call` may name, and where each goes (MH 4.10).
-    /// A name not listed here is refused when the stage calls it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ports: Option<std::collections::BTreeMap<String, PortDoc>>,
-}
-
-/// One port a stage may call (`kernels[i].ports.<name>`, MH 4.10): exactly one of `host` and
-/// `guest`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PortDoc {
-    /// A port the host serves, by the name the host knows it by: the stage's calls go to the
-    /// host protocol's peer as `port_call` (MH 4.3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    /// A port answered inside the machine, by the handler the program running the document
-    /// registered under this name ([`build::KernelLoader::guest_port`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guest: Option<String>,
-    /// How long one call may wait for its answer; absent: half an hour
-    /// (`moruna_kernel::ports::PORT_DEADLINE_MS`), at most a day.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_ms: Option<u64>,
-}
-
-/// Whether `name` may name a port (MH 4.10): 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and
-/// `:`, starting with a letter or a digit.
-pub fn is_port_name(name: &str) -> bool {
-    name.len() <= 64 && is_task_id(name)
-}
-
-impl KernelDoc {
-    /// A Python kernel named by module and callable, with no hints.
-    pub fn python(module: impl Into<String>, callable: impl Into<String>) -> KernelDoc {
-        KernelDoc {
-            kind: KernelKindDoc::Python,
-            path: None,
-            assets: None,
-            module: Some(module.into()),
-            callable: Some(callable.into()),
-            krate: None,
-            symbol: None,
-            name: None,
-            args: None,
-            fingerprint: None,
-            stateful: None,
-            instances: None,
-            device_memory: None,
-            accepts: None,
-            tier: None,
-            releases_gil: None,
-            expected_amplification: None,
-            preferred_rows: None,
-            resume: None,
-            state_bytes: None,
-            memory_guard: None,
-            ports: None,
+impl KindDoc {
+    /// An entry of kind `kind` with `settings`; a `null` setting is left out.
+    pub fn new(
+        kind: impl Into<String>,
+        mut settings: serde_json::Map<String, serde_json::Value>,
+    ) -> KindDoc {
+        settings.retain(|_, value| !value.is_null());
+        KindDoc {
+            kind: kind.into(),
+            settings,
         }
     }
 
-    /// A standard kernel named by `name` with `args` (MH 4.9).
-    pub fn std(name: impl Into<String>, args: serde_json::Value) -> KernelDoc {
-        let mut doc = KernelDoc::python("", "");
-        doc.kind = KernelKindDoc::Std;
-        doc.module = None;
-        doc.callable = None;
-        doc.name = Some(name.into());
-        doc.args = Some(args);
-        doc
+    /// An entry of kind `kind` whose settings are `settings` as its kind reads them. Refused,
+    /// naming `kind`, when they are not an object.
+    pub fn of<T: Serialize>(kind: impl Into<String>, settings: &T) -> Result<KindDoc, SpecError> {
+        let kind = kind.into();
+        match serde_json::to_value(settings) {
+            Ok(serde_json::Value::Object(map)) => Ok(KindDoc::new(kind, map)),
+            Ok(other) => Err(SpecError::new(
+                kind,
+                format!("a kind's settings are an object, not {other}"),
+            )),
+            Err(e) => Err(SpecError::new(kind, e.to_string())),
+        }
     }
 
-    /// A Rust kernel compiled into the running binary, `symbol` of `krate`, built by `args`.
-    pub fn rust(
-        krate: impl Into<String>,
-        symbol: impl Into<String>,
-        args: serde_json::Value,
-    ) -> KernelDoc {
-        let mut doc = KernelDoc::python("", "");
-        doc.kind = KernelKindDoc::Rust;
-        doc.module = None;
-        doc.callable = None;
-        doc.krate = Some(krate.into());
-        doc.symbol = Some(symbol.into());
-        doc.args = Some(args);
-        doc
-    }
-
-    /// A function package at `path`, pinned to `fingerprint` (16 d.4).
-    pub fn package(path: impl Into<String>, fingerprint: impl Into<String>) -> KernelDoc {
-        let mut doc = KernelDoc::python("", "");
-        doc.kind = KernelKindDoc::Package;
-        doc.module = None;
-        doc.callable = None;
-        doc.path = Some(path.into());
-        doc.fingerprint = Some(fingerprint.into());
-        doc
-    }
-
-    /// The names of the decorator hints this entry sets, in document order.
-    pub fn hints_set(&self) -> Vec<&'static str> {
-        let mut set = Vec::new();
-        let flags: [(&'static str, bool); 11] = [
-            ("stateful", self.stateful.is_some()),
-            ("instances", self.instances.is_some()),
-            ("device_memory", self.device_memory.is_some()),
-            ("accepts", self.accepts.is_some()),
-            ("tier", self.tier.is_some()),
-            ("releases_gil", self.releases_gil.is_some()),
-            (
-                "expected_amplification",
-                self.expected_amplification.is_some(),
-            ),
-            ("preferred_rows", self.preferred_rows.is_some()),
-            ("resume", self.resume.is_some()),
-            ("state_bytes", self.state_bytes.is_some()),
-            ("memory_guard", self.memory_guard.is_some()),
-        ];
-        for (name, on) in flags {
-            if on {
-                set.push(name);
+    /// An entry from its JSON: an object with a non-empty string `kind`.
+    pub fn from_value(value: serde_json::Value) -> Result<KindDoc, String> {
+        let serde_json::Value::Object(mut map) = value else {
+            return Err(format!(
+                "an entry is an object naming its `kind`, not {value}"
+            ));
+        };
+        match map.remove("kind") {
+            Some(serde_json::Value::String(kind)) if !kind.is_empty() => {
+                Ok(KindDoc::new(kind, map))
             }
+            Some(other) => Err(format!("`kind` is a kind's name, not {other}")),
+            None => Err("missing `kind`: an entry names the kind it is".to_string()),
         }
-        set
+    }
+}
+
+impl Serialize for KindDoc {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.settings.len() + 1))?;
+        map.serialize_entry("kind", &self.kind)?;
+        for (key, value) in &self.settings {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for KindDoc {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<KindDoc, D::Error> {
+        KindDoc::from_value(serde_json::Value::deserialize(d)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -911,7 +536,7 @@ const TOP_LEVEL: [&str; 19] = [
 impl JobSpec {
     /// A document over `source`, `kernels` and `sink` with every other field absent or at its
     /// default: what `moruna.run(source, kernels, sink)` describes (PY-I3).
-    pub fn new(source: SourceDoc, kernels: Vec<KernelDoc>, sink: SinkDoc) -> JobSpec {
+    pub fn new(source: KindDoc, kernels: Vec<KindDoc>, sink: KindDoc) -> JobSpec {
         JobSpec {
             moruna_spec: SPEC_VERSION,
             run_id: None,
@@ -1083,8 +708,7 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
             .map_err(|e| SpecError::new(key, e.to_string()))
     }
     match key {
-        "source" => read::<SourceDoc>(key, section),
-        "sink" => read::<SinkDoc>(key, section),
+        "source" | "sink" => read::<KindDoc>(key, section),
         "budget" => read::<BudgetDoc>(key, section),
         "staging" => read::<StagingDoc>(key, section),
         "object_store" => read::<ObjectStoreDoc>(key, section),
@@ -1098,7 +722,7 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
                 return Err(SpecError::new(key, "a list of kernels"));
             };
             for (i, item) in items.iter().enumerate() {
-                read::<KernelDoc>(&format!("kernels[{i}]"), item)?;
+                read::<KindDoc>(&format!("kernels[{i}]"), item)?;
             }
             Ok(())
         }

@@ -14,8 +14,8 @@ use moruna_kernel::{
     CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, Payload,
     PayloadSpec, Sampler as _, SourceSchema,
 };
+use moruna_kernels::{StdKernel, fuse_chain};
 use moruna_runtime::check::{CheckOptions, Verdict, check};
-use moruna_runtime::spec::{KernelEntry, build_kernels};
 use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
 use serde_json::{Value, json};
 use support::{Appender, Doubler, Scratch, one_run_at_a_time, write_parquet};
@@ -317,9 +317,9 @@ fn ck_t5_every_standard_kernel_passes_check() {
     ];
     let scratch = Scratch::new("ck_t5");
     for (name, args) in chain {
-        let entry = KernelEntry::std(name, args.clone()).expect(name);
-        let fingerprint = entry.fingerprint();
-        let kernel = build_kernels(vec![entry]).pop().expect("one kernel");
+        let kernel = StdKernel::new(name, &args).expect(name);
+        let fingerprint = kernel.fingerprint();
+        let kernel: Arc<dyn Kernel> = Arc::new(kernel);
         let mut opts = CheckOptions::new(name);
         opts.kind = "std";
         opts.fingerprint_scheme = "sha256";
@@ -334,14 +334,15 @@ fn ck_t5_every_standard_kernel_passes_check() {
         assert!(report.profile.expect("row").written, "{name}");
     }
     // Fused chains are checkable too.
-    let fused = build_kernels(vec![
-        KernelEntry::std("cast", json!({"columns": {"a": "double"}})).expect("cast"),
-        KernelEntry::std("select", json!({"columns": ["a"]})).expect("select"),
-        KernelEntry::std("fill_null", json!({"values": {"a": 0.5}})).expect("fill"),
-        KernelEntry::std("filter", json!({"expr": "a > 0"})).expect("filter"),
+    let fused = fuse_chain(vec![
+        StdKernel::new("cast", &json!({"columns": {"a": "double"}})).expect("cast"),
+        StdKernel::new("select", &json!({"columns": ["a"]})).expect("select"),
+        StdKernel::new("fill_null", &json!({"values": {"a": 0.5}})).expect("fill"),
+        StdKernel::new("filter", &json!({"expr": "a > 0"})).expect("filter"),
     ]);
     assert_eq!(fused.len(), 2);
     for kernel in fused {
+        let kernel: Arc<dyn Kernel> = Arc::new(kernel);
         let report = check(kernel, CheckOptions::new("fused")).expect("runs");
         assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
     }
