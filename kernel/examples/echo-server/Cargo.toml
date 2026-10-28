@@ -8,4 +8,4 @@ publish.workspace = true
 
 [dependencies]
 moruna-svc.workspace = true
-echo-protocol = { path = "../echo-protocol" }
+echo-protocol = { path = "../echo-protocol", version = "=0.1.0" }
