@@ -20,8 +20,8 @@ use std::sync::Arc;
 use moruna_kernel::{MorunaError, Result};
 use serde_json::{Map, Value};
 
-use super::{Context, Declaration, Entry, Role, RunnableKind, SinkKind, SourceKind, Standalone};
-use crate::job::KindDoc;
+use super::{Context, Entry, RunnableKind, SinkKind, SourceKind, Standalone};
+use moruna_job::{Declaration, KindDoc, Role};
 
 /// A setting no declaration has.
 const UNKNOWN_SETTING: &str = "moruna_conformance_unknown";

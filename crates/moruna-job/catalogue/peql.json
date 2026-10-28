@@ -1,0 +1,178 @@
+{
+  "moruna_kinds": 1,
+  "moruna": "0.5.7",
+  "sources": [
+    {
+      "name": "datafusion",
+      "role": "source",
+      "summary": "A governed DataFusion plan over the contracts the job carries",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "root": {
+            "type": "string",
+            "description": "The engine's root: the disk, with peQL's manifests, ledger and audit log under\n`<root>/_peql/`. Its contracts are the job's `contracts`, never a store on the disk."
+          },
+          "contract": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One contract, every row and column the caller may see."
+          },
+          "sql": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SQL in which every table is a contract."
+          },
+          "caller": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The caller, as peQL reads it: `id`, `tenant`, `purpose`, and optionally `tier`,\n`clearance`, `classification`, `roles`, `now` and `other`."
+          },
+          "on_violation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the read does with rows that break a contract's row rules: `exclude` (absent)\nleaves them out and the run's report counts them per rule; `refuse` refuses the read\nwhen the data holds any."
+          }
+        },
+        "required": [
+          "root",
+          "caller"
+        ],
+        "description": "A `datafusion` source's settings: what peQL, opened on the disk at `root` with the job's\n`contracts`, plans for `caller` over one contract or over SQL in which every table is a\ncontract. Exactly one of `contract` and `sql`.",
+        "title": "datafusion",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "root": "/disk",
+            "contract": "sales/orders",
+            "caller": {
+              "id": "ana",
+              "tenant": "demo",
+              "purpose": "analytics"
+            }
+          },
+          {
+            "root": "/disk",
+            "sql": "SELECT region, sum(total) FROM \"sales/orders\" GROUP BY region",
+            "caller": {
+              "id": "ana",
+              "tenant": "demo",
+              "purpose": "analytics"
+            },
+            "on_violation": "refuse"
+          }
+        ]
+      },
+      "inputs": "files",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "yes"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    }
+  ],
+  "kernels": [],
+  "sinks": [
+    {
+      "name": "peql",
+      "role": "sink",
+      "summary": "A write under a contract the job carries, by the contract's owner",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "root": {
+            "type": "string",
+            "description": "The engine's root: the disk."
+          },
+          "contract": {
+            "type": "string",
+            "description": "The contract written under."
+          },
+          "caller": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The writer, as peQL reads a caller."
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`append` (absent) or `overwrite`."
+          },
+          "on_violation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the write does with rows that break the contract's row rules: `refuse` (absent)\ncommits nothing when any does; `exclude` commits the others and keeps these under\n`excluded_url`; `warn` commits every row and its verdict says so."
+          },
+          "excluded_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The local directory an `exclude` write keeps the rows it excludes in, as Parquet with the\nrules each broke; empty or absent when the run starts. Only `exclude` takes it."
+          }
+        },
+        "required": [
+          "root",
+          "contract",
+          "caller"
+        ],
+        "description": "A `peql` sink's settings: a write under a contract the job carries, by `caller`, who must be\nthe contract's owner. The manifest is refreshed when the run finishes.",
+        "title": "peql",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "root": "/disk",
+            "contract": "sales/orders_clean",
+            "caller": {
+              "id": "ana",
+              "tenant": "demo",
+              "purpose": "analytics"
+            }
+          },
+          {
+            "root": "file:///disk",
+            "contract": "sales/orders_clean",
+            "caller": {
+              "id": "ana",
+              "tenant": "demo",
+              "purpose": "analytics"
+            },
+            "mode": "overwrite",
+            "on_violation": "exclude",
+            "excluded_url": "/scratch/excluded"
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "files",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "yes"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    }
+  ]
+}

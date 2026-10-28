@@ -527,6 +527,7 @@ The brief is `architecture/agents/briefs/waves-a-b-c.md` section 4. MC1 (section
 |---|---|---|---|---|
 | MC1 | Moruna declares what it can run: one registry of kinds, a declaration per kind, a conformance suite per port, every existing kind moved onto it (pulled into wave B, 2026-10-28) | `feat/mc1-kinds-registry` | SDD 18 (new: KD-I1 to KD-I10, f.1 to f.5); 12 f.9; 16 PK-I8, f.8, PK-T11, PK-T12; MH 4.1; preamble 1 (component 18), 6.2 (`schemars`); `DECISIONS.md` KD1; KD-T1 to KD-T11, with HO-T1 to HO-T4, HO-T9, PK-T12, PO-T6 run through the registry | in review |
 | KB4 | moruna-record: the record layout and the multi-producer ring the node's logs, events and metrics travel in | `feat/kb4-record-ring` | SDD 21 (new: RC-I1 to RC-I21, a to o); preamble 1 (component 21); RC-T1 to RC-T22 | in review |
+| KA4 | `moruna-job`: declarations, the job document, the catalogue and `check`, for embedders | `feat/ka4-moruna-job` | SDD 22 (new: JB-I1 to JB-I9, JB-T1 to JB-T28); 18 e.1 to e.3, KD1, KD-I1, KD-I4, KD-I8; 12 f.9; MH 4.1; preamble 1 (component 22) | in review |
 
 ---
 

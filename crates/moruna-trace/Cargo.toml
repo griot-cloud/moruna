@@ -17,5 +17,9 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# The malformed IPC streams of TR-T15 (contracts d.15).
+moruna-testkit = { workspace = true }
+
 [features]
 default = []

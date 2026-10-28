@@ -43,6 +43,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
 | 20 | The microkernel core | `20-microkernel.md` | none (its own workspace, `kernel/`, on OSTD) | a process names objects only through handles in its own table, and rights never grow; the kernel holds processes, threads, memory, channels, timers, interrupts and device memory, and every other service is a process started from the boot manifest (added 2026-10-28, BOARD EK KB1, decision MK1) |
 | 21 | The record and its ring | `21-record.md` | nothing internal | a record is byte for byte the layout of the event bus the node's records reach, and decodes as whole, incomplete or corrupt as that bus does; the ring takes records from many producers at once without blocking any of them, and returns each to its one consumer exactly once, or counts it as dropped (added 2026-10-28, KB4) |
+| 22 | The job document and the catalogue, for embedders | `22-job.md` | 18 | an embedder reads Moruna's kinds and checks a job document against them, collecting every refusal, with a crate that depends on `serde`, `serde_json`, `schemars` and `thiserror` only; the declaration and document types have one home there; the embedded catalogue equals the registry's listing (added 2026-10-28, board item KA4) |
 | 23 | The SDK for servers and drivers | `23-svc.md` | 20 (`moruna-abi`, `moruna-sys`, `moruna-loader`; its own workspace, `kernel/`) | a protocol is declared once and the declaration is both ends; a connection opens with a handshake refused on a mismatch of name or major; a body decodes to exactly one value or nothing; a server never blocks on one client; an example server is added to a boot by its description alone, touching no kernel file (added 2026-10-28, BOARD EK KB2) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
@@ -418,6 +419,7 @@ moruna/
     moruna-wasm/              component 17: a `.wasm` package in wasmtime
     moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux)
     moruna-record/            component 21: the record layout and the multi-producer ring that carries it (no dependency; added 2026-10-28)
+    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars and thiserror only (added 2026-10-28)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent

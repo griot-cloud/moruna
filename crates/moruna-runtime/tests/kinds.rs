@@ -9,16 +9,14 @@ mod support;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array};
+use moruna_job::{Declaration, Fact, Flow, Isolation, JobSpec, Needs, Role, settings_schema};
 use moruna_kernel::{
     Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError, NoState,
     Payload, PayloadSpec, SourceSchema, TierPref,
 };
-use moruna_runtime::job::{BuildOptions, JobSpec, build};
+use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::conformance::{self, Harness};
-use moruna_runtime::kinds::{
-    Context, Declaration, Entry, Fact, Flow, Isolation, Needs, Registry, Role, RunnableKind, Stage,
-    check_pin, settings_schema,
-};
+use moruna_runtime::kinds::{Context, Entry, Registry, RunnableKind, Stage, check_pin};
 use moruna_runtime::{CancelToken, Runtime};
 use serde_json::json;
 use support::{Scratch, one_run_at_a_time, read_back_rows, write_parquet};

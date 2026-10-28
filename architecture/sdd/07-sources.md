@@ -174,7 +174,7 @@ for each url (after listing prefixes through `list_prefix`, or `read_dir` for a 
 
 Split ids are assigned in file order then row-group order. The plan is cached in the source; `plan()` returns a clone.
 
-A footer's figures are untrusted (SO-I10, 2026-10-28): each projected column chunk of a planned row group must lie inside the file (the check of e.2, against the planned length), negative uncompressed sizes and row counts plan as zero, and sums of sizes saturate rather than overflow. An Arrow schema the footer carries under `ARROW:schema` is converted by the Arrow IPC reader, which panics on a schema it cannot map (an unknown type id, a missing type table, a nested type without its children, a decimal precision that does not fit a byte, a bad union); each field is checked for exactly what that conversion relies on before it runs, and a schema it would panic on is `Source` naming the file and the field. A value that is not base64 or not a schema message is left to the Parquet reader, which refuses it with an error.
+A footer's figures are untrusted (SO-I10, 2026-10-28): each projected column chunk of a planned row group must lie inside the file (the check of e.2, against the planned length), negative uncompressed sizes and row counts plan as zero, and sums of sizes saturate rather than overflow. An Arrow schema the footer carries under `ARROW:schema` is converted by the Arrow IPC reader, which panics on a schema it cannot map (an unknown type id, a missing type table, a nested type without its children, a decimal precision that does not fit a byte, a bad union); after the base64 decoding and the framing the Parquet reader applies (`src/parquet/hint.rs`), the schema message goes through Moruna's one check of IPC messages, `moruna_kernel::ipc::check` (contracts CT-I13, e.8; moved there from this component on 2026-10-28, so there is no copy here), and a schema it would panic on is `Source` naming the file and the field. A value that is not base64 or not a schema message is left to the Parquet reader, which refuses it with an error.
 
 ### e.2 Parquet read
 
@@ -353,7 +353,9 @@ The Vortex tests (SO-T23 to SO-T29, 2026-09-29) write their files with the `vort
 
 **SO-T31 parquet_truncated_file.** (2026-10-28; `tests/malformed/mod.rs`) A three row group file cut on disk after planning at the end of the first group: the first split reads the ledger's rows, the last is `Source` naming the split, the file, `row group 2`, `starts at byte <offset>` and the file's length then, with nothing left allocated; cut through the middle of the second group's `f64_0` chunk: `Source` naming that column and `runs to byte <end>`; the first group's data followed by the original footer: the plan is `Source` naming the file, `row group 1` and the file's length. Fails before 2026-10-28 with a subtraction overflow in the range arithmetic of e.2. SO-I10, e.2, h.
 
-**SO-T32 parquet_malformed_never_panics.** (2026-10-28; `tests/malformed/mod.rs`, with the IPC half in `src/parquet/hint.rs`) Over a valid three row group file, each case planned and every split read, with any panic caught and named: truncation to every length at and around each column chunk's edges and the footer and to 200 random lengths, cut before planning and cut after it; 600 corruptions of one to four random bytes of the metadata and its trailer; every metadata byte set to `0x00` and to `0xFF`; 20 random byte corruptions of the page headers at each column chunk's start. Every case is a `Source` error naming its split or a payload of exactly the split's rows with the declared columns; none panics. And every single-byte corruption, to eight values, of an Arrow schema message holding every kind of field: what the `ARROW:schema` check passes the IPC reader converts without a panic, and some it refuses. SO-I10, e.1, e.2.
+**SO-T32 parquet_malformed_never_panics.** (2026-10-28; `tests/malformed/mod.rs`) Over a valid three row group file, each case planned and every split read, with any panic caught and named: truncation to every length at and around each column chunk's edges and the footer and to 200 random lengths, cut before planning and cut after it; 600 corruptions of one to four random bytes of the metadata and its trailer; every metadata byte set to `0x00` and to `0xFF`; 20 random byte corruptions of the page headers at each column chunk's start. Every case is a `Source` error naming its split or a payload of exactly the split's rows with the declared columns; none panics. The Arrow schema half moved with the check to contracts CT-T22 (2026-10-28) and is SO-T33 here. SO-I10, e.1, e.2.
+
+**SO-T33 parquet_arrow_schema_checked.** (2026-10-28; `tests/malformed/mod.rs`) A Parquet file whose footer's `ARROW:schema` is an IPC schema message naming type id 229 is `Source` at plan time naming the Arrow schema in the footer and field `i`; the same file with every byte of that schema message set to each of contracts d.15's eight `VALUES`, and with 300 random replacements of one to four bytes, is planned and read or refused, never a panic. SO-I10, e.1, contracts CT-I13.
 
 ## l. Implementation notes for the agent
 
@@ -394,7 +396,7 @@ None. (SO-O1, the Vortex source, was built on 2026-09-29: e.7, e.8, f.8.)
 | h (Vortex failures and plan errors) | SO-I3, f.8 | SO-T27, SO-T28 |
 | contracts d.9 (Vortex over local paths and objects) | d.1, e.7 | SO-T29 |
 | o SO-O1 (source and sink together), S2 | e.7, e.8, 08 f.11 | SO-T30 |
-| h (Parquet failures) | SO-I10, e.1, e.2 | SO-T31, SO-T32 |
+| h (Parquet failures) | SO-I10, e.1, e.2 | SO-T31, SO-T32, SO-T33 |
 
 ## o. Deferred (post-v1)
 
