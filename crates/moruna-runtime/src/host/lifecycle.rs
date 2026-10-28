@@ -1,11 +1,12 @@
-//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 3).
+//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 4).
 //!
 //! A task is one element of the chain, named by the document's `report.tasks`: the source, each
 //! kernel stage, the sink. The scheduler says what happened to the chain on the thread on which it
 //! happened ([`StageEvent`]); this turns each into the task's transition and hands it on with the
 //! instant it became true. How the run ended is told once the facade returns ([`Lifecycle::end`]):
 //! the task a failure belongs to fails, a task still running is stopped or cancelled, and one
-//! that never started is skipped. Nothing here reads a log, a record or a report.
+//! that never started is skipped. A run that a panic of Moruna's own unwound fails every task
+//! still running, `internal` (PY-I11). Nothing here reads a log, a record or a report.
 //!
 //! A task's states, in order: waiting, ready, running (with its phase), then one end: completed
 //! (succeeded, stopped, cancelled), failed or skipped. Each is told once, in that order, and an
@@ -34,7 +35,14 @@ pub enum Ending<'a> {
     Failed(&'a MorunaError),
     /// A cancel stopped it.
     Cancelled,
+    /// A panic of Moruna's own unwound it, saying this: a crash, a defect of the engine, which
+    /// is never told as a cancel.
+    Crashed(&'a str),
 }
+
+/// What a lifecycle dropped by an unwind that no one caught tells as the panic's words.
+pub const PANIC_NOT_CAPTURED: &str =
+    "Moruna panicked and the run unwound past its end; what the panic said was not captured";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -451,6 +459,42 @@ impl Lifecycle {
                 }
                 CancelDisposition::Cancelled
             }
+            Ending::Crashed(said) => {
+                // Every task still running fails with what the panic said; when none was, the
+                // attempt does, so a crash is always told. One that never started is skipped:
+                // the attempt failed under it.
+                let running: Vec<usize> = (0..inner.tasks.len())
+                    .filter(|p| matches!(inner.tasks[*p].state, State::Running { .. }))
+                    .collect();
+                let failed = |task: Option<String>| Event::TaskFailed {
+                    task: task.clone(),
+                    code: FailureCode::Internal,
+                    message: said.to_string(),
+                    scope: match task {
+                        Some(_) => FailureScope::Task,
+                        None => FailureScope::Attempt,
+                    },
+                    retryable: false,
+                };
+                if running.is_empty() {
+                    self.tell(t, failed(None));
+                }
+                for p in running {
+                    inner.tasks[p].state = State::Ended;
+                    self.tell(t, failed(Some(inner.tasks[p].id.clone())));
+                }
+                for p in 0..inner.tasks.len() {
+                    self.stop(
+                        inner,
+                        t,
+                        p,
+                        TaskOutcome::Stopped,
+                        SkipReason::AttemptFailed,
+                        None,
+                    );
+                }
+                CancelDisposition::Failed
+            }
             Ending::Failed(error) => {
                 let (owner, code, message, retryable) = attribute(error, inner.tasks.len());
                 // A task already ended cannot end again: its failure is the attempt's then, said
@@ -524,14 +568,20 @@ impl Lifecycle {
     }
 }
 
-/// A lifecycle dropped before its run's end was told, by a run that unwound or an embedder that
-/// let go of it, tells that end now, as a cancel: the scheduler's shutdown on drop is a cancel
+/// A lifecycle dropped before its run's end was told tells that end now. Let go of by an
+/// embedder, with no panic, it is a cancel: the scheduler's shutdown on drop is a cancel
 /// (preamble 4.3), so every task still running is cancelled and every task that never started
-/// is skipped as cancelled. Every task that started has its one end whatever ended the run
-/// (PY-I11).
+/// is skipped as cancelled. Dropped by an unwind, it is a crash: the session catches Moruna's
+/// panics where it drives the run and tells their words first, so this is an unwind no one
+/// caught, and every task still running fails `internal`, saying the panic's words were not
+/// captured. Every task that started has its one end whatever ended the run (PY-I11).
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        self.end(Ending::Cancelled);
+        if std::thread::panicking() {
+            self.end(Ending::Crashed(PANIC_NOT_CAPTURED));
+        } else {
+            self.end(Ending::Cancelled);
+        }
     }
 }
 

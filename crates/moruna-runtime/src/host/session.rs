@@ -9,6 +9,7 @@
 //! has heard every task end and can read the file.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -444,130 +445,153 @@ pub fn run_job(
     let refs = task_refs(&job, Some(&built.stage_kernels));
     let tasks: Vec<String> = refs.iter().map(|r| r.id.clone()).collect();
     let lifecycle = Lifecycle::new(refs, wire.started(), events.out());
-    lifecycle.begin(job.resume.is_some());
-    // The facade takes the run id from the manifest on a resume (12 f.7); the report file is
-    // named for the same id.
-    let run_id = match &built.spec.resume {
-        Some(path) => PlacementEngine::read_manifest_header(path)
-            .map(|h| h.run_id)
-            .unwrap_or(fallback_id),
-        None => built.run_id.unwrap_or(fallback_id),
-    };
-    let file = report_path(&job, &run_id.to_hex());
-
-    // What the tasks print goes to the output store, by stage; the peer hears its reach.
-    let capture = Capture::start(
-        attempt_dir(
-            &logs_path(&job, &run_id.to_hex()),
-            job.report.attempt(),
-            &start,
-        ),
-        job.report.attempt(),
-        start,
-        tasks,
-        wire.started(),
-        Tell {
-            event: events.out(),
-            note: {
-                let wire = wire.clone();
-                Box::new(move |note| wire.note(note))
-            },
-        },
-    );
-    #[cfg(unix)]
-    let process = match opts.capture_process {
-        false => None,
-        true => match super::logs::ProcessStreams::redirect(capture.sink()) {
-            Ok(streams) => Some(streams),
-            Err(error) => {
-                wire.note(format!(
-                    "the process's own output is not captured ({error}): it goes where it went"
-                ));
-                None
-            }
-        },
-    };
-
-    let observer = RunObserver::new();
+    // What the run starts beside itself, held out here so a run that crashes still stops it.
     let stop = Arc::new(AtomicBool::new(false));
-    let beat = {
-        let (wire, observer, stop, every) =
-            (wire.clone(), observer.clone(), stop.clone(), opts.heartbeat);
-        std::thread::Builder::new()
-            .name("moruna-heartbeat".to_string())
-            .spawn(move || heartbeat(&wire, &observer, &stop, every))
-            .ok()
-    };
-    if let Some(reader) = reader {
-        let (peer, observer, cancel, told, ports) = (
-            wire.clone(),
-            observer.clone(),
-            opts.cancel.clone(),
-            Arc::downgrade(&lifecycle),
-            host_ports.clone(),
-        );
-        let spawned = std::thread::Builder::new()
-            .name("moruna-peer".to_string())
-            .spawn(move || {
-                listen_to_peer(
-                    reader,
-                    &Peer {
-                        wire: &peer,
-                        observer: &observer,
-                        cancel: &cancel,
-                        lifecycle: &told,
-                        ports: ports.as_deref(),
-                    },
-                    mode,
-                )
-            });
-        if spawned.is_err() {
-            let reason = "the peer's messages cannot be read: no thread for them".to_string();
-            if let Some(ports) = &host_ports {
-                ports.close(reason.clone());
-            }
-            wire.note(reason);
-        }
-    }
+    let mut capture: Option<Capture> = None;
+    #[cfg(unix)]
+    let mut process: Option<super::logs::ProcessStreams> = None;
+    let mut beat: Option<std::thread::JoinHandle<()>> = None;
+    // From the tasks' registration to the run's end, a panic on this thread, the session's and
+    // the facade's (`Runtime::run_with` runs here), is a crash of Moruna's own: it is caught,
+    // every task still running fails `internal` with what the panic said, and then the panic
+    // leaves the session as it came (PY-I11).
+    let driven = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        lifecycle.begin(job.resume.is_some());
+        // The facade takes the run id from the manifest on a resume (12 f.7); the report file
+        // is named for the same id.
+        let run_id = match &built.spec.resume {
+            Some(path) => PlacementEngine::read_manifest_header(path)
+                .map(|h| h.run_id)
+                .unwrap_or(fallback_id),
+            None => built.run_id.unwrap_or(fallback_id),
+        };
+        let file = report_path(&job, &run_id.to_hex());
 
-    let result = Runtime::run_with(
-        built.spec,
-        opts.cancel.clone(),
-        Components {
-            run_id: Some(run_id),
-            observer: Some(observer),
-            limits_subscribers: vec![limits_changed(wire.clone())],
-            stage_hook: Some(lifecycle.hook()),
-            output: Some(capture.sink()),
-            ..Components::default()
-        },
-    );
+        // What the tasks print goes to the output store, by stage; the peer hears its reach.
+        let output = capture.insert(Capture::start(
+            attempt_dir(
+                &logs_path(&job, &run_id.to_hex()),
+                job.report.attempt(),
+                &start,
+            ),
+            job.report.attempt(),
+            start,
+            tasks,
+            wire.started(),
+            Tell {
+                event: events.out(),
+                note: {
+                    let wire = wire.clone();
+                    Box::new(move |note| wire.note(note))
+                },
+            },
+        ));
+        #[cfg(unix)]
+        if opts.capture_process {
+            process = match super::logs::ProcessStreams::redirect(output.sink()) {
+                Ok(streams) => Some(streams),
+                Err(error) => {
+                    wire.note(format!(
+                        "the process's own output is not captured ({error}): it goes where it \
+                         went"
+                    ));
+                    None
+                }
+            };
+        }
+
+        let observer = RunObserver::new();
+        beat = {
+            let (wire, observer, stop, every) =
+                (wire.clone(), observer.clone(), stop.clone(), opts.heartbeat);
+            std::thread::Builder::new()
+                .name("moruna-heartbeat".to_string())
+                .spawn(move || heartbeat(&wire, &observer, &stop, every))
+                .ok()
+        };
+        if let Some(reader) = reader {
+            let (peer, observer, cancel, told, ports) = (
+                wire.clone(),
+                observer.clone(),
+                opts.cancel.clone(),
+                Arc::downgrade(&lifecycle),
+                host_ports.clone(),
+            );
+            let spawned = std::thread::Builder::new()
+                .name("moruna-peer".to_string())
+                .spawn(move || {
+                    listen_to_peer(
+                        reader,
+                        &Peer {
+                            wire: &peer,
+                            observer: &observer,
+                            cancel: &cancel,
+                            lifecycle: &told,
+                            ports: ports.as_deref(),
+                        },
+                        mode,
+                    )
+                });
+            if spawned.is_err() {
+                let reason = "the peer's messages cannot be read: no thread for them".to_string();
+                if let Some(ports) = &host_ports {
+                    ports.close(reason.clone());
+                }
+                wire.note(reason);
+            }
+        }
+
+        let result = Runtime::run_with(
+            built.spec,
+            opts.cancel.clone(),
+            Components {
+                run_id: Some(run_id),
+                observer: Some(observer),
+                limits_subscribers: vec![limits_changed(wire.clone())],
+                stage_hook: Some(lifecycle.hook()),
+                output: Some(output.sink()),
+                ..Components::default()
+            },
+        );
+        (run_id, file, result)
+    }));
     stop.store(true, Ordering::SeqCst);
     if let Some(beat) = beat {
         let _ = beat.join();
     }
-    lifecycle.end(match &result {
-        Ok(_) => Ending::Completed,
-        Err(failure)
+    match &driven {
+        Ok((_, _, Ok(_))) => lifecycle.end(Ending::Completed),
+        Ok((_, _, Err(failure)))
             if matches!(failure.error, MorunaError::Cancelled) && opts.cancel.is_cancelled() =>
         {
-            Ending::Cancelled
+            lifecycle.end(Ending::Cancelled)
         }
-        Err(failure) => Ending::Failed(&failure.error),
-    });
+        Ok((_, _, Err(failure))) => lifecycle.end(Ending::Failed(&failure.error)),
+        Err(panic) => lifecycle.end(Ending::Crashed(&panic_message(&**panic))),
+    }
     // Output that came after its task ended is still its task's: the last of it is written
     // before the store's reach is told for the last time, and that before the report.
     #[cfg(unix)]
     if let Some(process) = process {
         process.restore();
     }
-    if !capture.finish(FINISH_WAIT) {
+    if let Some(capture) = &capture
+        && !capture.finish(FINISH_WAIT)
+    {
         wire.note(format!(
             "the run's output store did not finish within {FINISH_WAIT:?}: its last reach is not \
              told and what was not written is not kept"
         ));
     }
     drop(events);
+    // A crash surfaces as the panic it is, once its ends are written: neither the facade's
+    // result (12 d.1) nor an exit code (MH 4.2) names a defect of Moruna's own, and a crash is
+    // never told as one of them. The process that ran Moruna sees the panic, as it would have
+    // with no session.
+    let (run_id, file, result) = match driven {
+        Ok(driven) => driven,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     let (code, diagnostic, report) = match result {
         Ok(report) => (exit::COMPLETED, None, Some(report)),
         Err(error) => {
@@ -587,6 +611,17 @@ pub fn run_job(
         diagnostic,
         report,
     )
+}
+
+/// What a panic said, when it said it in text.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = panic.downcast_ref::<&'static str>() {
+        return (*text).to_string();
+    }
+    if let Some(text) = panic.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "Moruna panicked with something other than text".to_string()
 }
 
 /// The report file, then `report` and `exit` (MH 4.1, f.5).

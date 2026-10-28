@@ -1,8 +1,10 @@
 //! PY-I11 (12 c, MH 4.3 `event`): every task a run registers gets exactly one end, and a task
 //! that started ends completed, failed with its cause, or cancelled, never skipped, whatever ends
 //! the run: a cancel at any point, a kernel failure at any point under each error policy, a
-//! source failure, and a run dropped without a cancel. Properties over many points of a real run,
-//! each checked on the events the session wrote to its peer.
+//! source failure, a run dropped without a cancel, and a crash. Properties over many points of a
+//! real run, each checked on the events the session wrote to its peer. A run let go of ends its
+//! tasks cancelled (PY-T26); a run that a panic of Moruna's own unwound ends them failed,
+//! `internal`, with what the panic said, and the panic still leaves the session (PY-T27).
 //!
 //! The session is `moruna run`'s own (`session::run_job`), over a Parquet source, the support
 //! kernels and a Parquet sink, with the peer an in-memory writer that also cancels the run when a
@@ -18,14 +20,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use moruna_kernel::{
-    Allocator, BoxFuture, CancelToken, Kernel, Payload, Result, RowRange, Source, SourceSchema,
-    Split, StageEvent,
+    Allocator, BoxFuture, CancelToken, Kernel, Payload, PayloadSpec, Result, RowRange, Seq, Sink,
+    SinkSummary, Source, SourceSchema, Split, StageEvent,
 };
 use moruna_runtime::host::exit;
 use moruna_runtime::host::lifecycle::{Lifecycle, task_refs};
 use moruna_runtime::host::session::{self, HEARTBEAT, HostOptions, Mode, Outcome, Wire};
 use moruna_runtime::job::{BuildOptions, KernelDoc, KernelLoader, LoadedKernel, build};
-use moruna_runtime::{Components, JobSpec, Runtime, SourceSpec};
+use moruna_runtime::{Components, JobSpec, Runtime, SinkSpec, SourceSpec};
+use moruna_testkit::FakeSink;
 use serde_json::{Value, json};
 use support::{FailOnce, Scratch, Sleeper, one_run_at_a_time, write_parquet};
 
@@ -55,7 +58,7 @@ impl KernelLoader for TestKernels {
     }
 
     /// `"kind": "python"`: a source whose plan panics on the facade's own thread, after the
-    /// run's tasks are registered, so the run unwinds out of the session (PY-T26).
+    /// run's tasks are registered, so the run unwinds out of the session (PY-T27).
     fn python_source(&self) -> Result<SourceSpec> {
         Ok(SourceSpec::Built(Arc::new(PlanPanics)))
     }
@@ -85,6 +88,81 @@ impl Source for PlanPanics {
 
     fn repeatable(&self) -> bool {
         true
+    }
+}
+
+/// The kernels of a run that crashes on the facade's thread while its tasks run (PY-T27): `fail`
+/// fails its third apply, so the error policy ends the run, and `pass` is a sleeper; the sink,
+/// `"kind": "python"`, is a resumable fake whose checkpoint panics once that kernel has failed.
+/// The scheduler writes the last manifest of a terminated run on the facade's thread (SC f.12),
+/// so the panic is on that thread, after the tasks started and before the run's end is told.
+struct Crashes {
+    fail: support::FailOnce,
+}
+
+impl KernelLoader for Crashes {
+    fn load(&self, index: usize, doc: &KernelDoc) -> moruna_kernel::Result<LoadedKernel> {
+        let kernel: Arc<dyn Kernel> = match doc.callable.as_deref() {
+            Some("fail") => Arc::new(self.fail.shared()),
+            Some("pass") => Arc::new(Sleeper::new(3)),
+            other => {
+                return Err(moruna_kernel::MorunaError::Plan(format!(
+                    "kernels[{index}]: no test kernel {other:?}"
+                )));
+            }
+        };
+        Ok(LoadedKernel {
+            kernel,
+            #[cfg(feature = "python")]
+            python: None,
+        })
+    }
+
+    fn python_sink(&self) -> Result<SinkSpec> {
+        Ok(SinkSpec::Built(Box::new(CheckpointBreaks {
+            inner: FakeSink::new().resumable(true),
+            fail: self.fail.shared(),
+        })))
+    }
+}
+
+/// What the sink's checkpoint says as it panics.
+const CHECKPOINT_BROKE: &str = "the sink's checkpoint broke";
+
+/// A test-local `Sink` (12 k): a resumable fake whose `checkpoint` panics once `fail` has
+/// failed. Before the run starts, the facade and the scheduler ask it whether it checkpoints,
+/// and it answers as the fake does.
+struct CheckpointBreaks {
+    inner: FakeSink,
+    fail: support::FailOnce,
+}
+
+impl Sink for CheckpointBreaks {
+    fn open(&mut self, schema: &SourceSchema) -> Result<()> {
+        self.inner.open(schema)
+    }
+
+    fn accepts(&self) -> PayloadSpec {
+        self.inner.accepts()
+    }
+
+    fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, Result<()>> {
+        self.inner.write(seq, payload)
+    }
+
+    fn finish(&mut self) -> Result<SinkSummary> {
+        self.inner.finish()
+    }
+
+    fn committed_seq(&self) -> Option<Seq> {
+        self.inner.committed_seq()
+    }
+
+    fn checkpoint(&self) -> Result<Option<Vec<u8>>> {
+        if self.fail.failed() {
+            panic!("{CHECKPOINT_BROKE}");
+        }
+        self.inner.checkpoint()
     }
 }
 
@@ -378,22 +456,15 @@ fn py_t25_a_source_failure() {
     one_end_each(&told, "a broken source");
 }
 
-/// PY-T26 a_run_dropped_without_a_cancel, as the session sees it: a run that unwinds out of
-/// `run_job` (the source's plan panics on the facade's thread, after the tasks are registered)
-/// still writes every task's one end to its peer before the panic leaves the session.
-#[test]
-fn py_t26_a_run_dropped_without_a_cancel_by_unwinding() {
-    let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("py_t26_unwind");
-    let mut job = document(&scratch, &["pass"], json!("terminate"));
-    job.source = moruna_runtime::job::SourceDoc::Python;
-    let cancel = CancelToken::new();
+/// Run `job` as `moruna run` does, with `loader`, catching the panic that leaves the session:
+/// what the panic said, and every event the peer read.
+fn run_crashing(job: JobSpec, loader: &dyn KernelLoader) -> (Option<String>, Vec<Value>) {
     let text = Arc::new(Mutex::new(Vec::new()));
     let peer = Peer {
         text: text.clone(),
         events: Arc::new(AtomicUsize::new(0)),
         cancel_at: 0,
-        cancel: cancel.clone(),
+        cancel: CancelToken::new(),
         inbound: None,
     };
     let wire = Wire::new(Some(Box::new(peer)), Instant::now());
@@ -401,33 +472,143 @@ fn py_t26_a_run_dropped_without_a_cancel_by_unwinding() {
         let opts = HostOptions {
             strict: false,
             env: &no_env,
-            cancel,
+            cancel: CancelToken::new(),
             heartbeat: HEARTBEAT,
             packages: Default::default(),
             capture_process: false,
         };
-        session::run_job(job, &TestKernels, &opts, &wire, None, Mode::Run)
+        session::run_job(job, loader, &opts, &wire, None, Mode::Run)
     }));
-    assert!(
-        unwound.is_err(),
-        "the source's plan panics out of the session"
-    );
-    let events = events_in(&text);
-    one_end_each(&events, "a run that unwound");
-    for end in events.iter().filter(|e| e["kind"] == "task_skipped") {
-        assert_eq!(end["reason"], "cancelled", "{end}");
+    let said = match unwound {
+        Ok(outcome) => panic!("the run did not unwind: exit {}", outcome.code),
+        Err(panic) => panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())),
+    };
+    (said, events_in(&text))
+}
+
+/// Nothing of a crash is told as a cancel: no task completes `cancelled`, none is skipped as
+/// cancelled, and no cancel is acknowledged or ended.
+fn nothing_cancelled(events: &[Value], what: &str) {
+    for e in events {
+        assert_ne!(e["outcome"], "cancelled", "{what}: {e}");
+        assert_ne!(e["reason"], "cancelled", "{what}: {e}");
+        assert!(
+            !matches!(
+                e["kind"].as_str(),
+                Some("cancel_acknowledged" | "cancel_ended")
+            ),
+            "{what}: {e}"
+        );
     }
 }
 
-/// PY-T26 a_run_dropped_without_a_cancel, at every point: the scheduler's facts of a real run
-/// of two kernel stages are recorded, then told to a fresh lifecycle up to each point of the run
-/// and the lifecycle dropped there with no end told and no cancel asked; every task ends exactly
-/// once, a task that started is cancelled, and a second end told after the first tells nothing.
+/// PY-T27 a_crash_is_a_failure, on the facade's thread while the tasks run: the kernel fails
+/// its third apply, the error policy ends the run, and the scheduler, writing the terminated
+/// run's last manifest on the facade's thread, calls the sink's checkpoint, which panics. Every
+/// task that started and had not ended fails `internal` with what the panic said, never
+/// cancelled; a task that never started is skipped because the attempt failed; and the panic
+/// still leaves the session, as it was.
 #[test]
-fn py_t26_a_run_dropped_without_a_cancel_at_any_point() {
+fn py_t27_a_crash_on_the_facades_thread_fails_every_started_task() {
     let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("py_t26_drop");
-    let job = document(&scratch, &["pass", "pass"], json!("terminate"));
+    let scratch = Scratch::new("py_t27_facade");
+    let mut job = document(&scratch, &["fail", "pass"], json!("terminate"));
+    job.sink = moruna_runtime::job::SinkDoc::Python;
+    job.checkpoint.interval_ms = 60_000;
+    let loader = Crashes {
+        fail: support::FailOnce::new(3),
+    };
+    let (said, events) = run_crashing(job, &loader);
+    assert_eq!(
+        said.as_deref(),
+        Some(CHECKPOINT_BROKE),
+        "the panic leaves the session as it was"
+    );
+    let what = "a crash on the facade's thread";
+    one_end_each(&events, what);
+    nothing_cancelled(&events, what);
+    let started: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "task_started")
+        .filter_map(|e| e["task"].as_str())
+        .collect();
+    assert!(
+        started.len() >= 3,
+        "{what}: the tasks were running: {started:?}"
+    );
+    let mut crashed = 0;
+    for task in &started {
+        let end = events
+            .iter()
+            .find(|e| {
+                e["task"] == *task
+                    && matches!(e["kind"].as_str(), Some("task_completed" | "task_failed"))
+            })
+            .expect("one end, by the property");
+        if end["kind"] == "task_completed" {
+            // Only a task that ran to its end before the crash completes.
+            assert_eq!(end["outcome"], "succeeded", "{what}: {end}");
+            continue;
+        }
+        crashed += 1;
+        assert_eq!(end["code"], "internal", "{what}: {end}");
+        assert_eq!(end["message"], CHECKPOINT_BROKE, "{what}: {end}");
+        assert_eq!(end["scope"], "task", "{what}: {end}");
+        assert_eq!(end["retryable"], false, "{what}: {end}");
+    }
+    assert!(
+        crashed >= 2,
+        "{what}: the kernel and the sink were running and fail: {events:#?}"
+    );
+    assert!(
+        events.iter().all(|e| e["code"] != "kernel_error"),
+        "{what}: the run never told its end, so the kernel's failure is not told as one"
+    );
+}
+
+/// PY-T27 a_crash_is_a_failure, before any task started: the source's plan panics on the
+/// facade's thread after the tasks are registered. No task started, so each is skipped because
+/// the attempt failed, and the attempt fails `internal` with what the panic said.
+#[test]
+fn py_t27_a_crash_before_any_task_started_fails_the_attempt() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("py_t27_plan");
+    let mut job = document(&scratch, &["pass"], json!("terminate"));
+    job.source = moruna_runtime::job::SourceDoc::Python;
+    let (said, events) = run_crashing(job, &TestKernels);
+    assert_eq!(said.as_deref(), Some("the source's plan broke"));
+    let what = "a crash before any task started";
+    one_end_each(&events, what);
+    nothing_cancelled(&events, what);
+    let skipped: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "task_skipped")
+        .collect();
+    assert!(!skipped.is_empty(), "{what}: {events:#?}");
+    for end in skipped {
+        assert_eq!(end["reason"], "attempt_failed", "{end}");
+    }
+    let failed: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "task_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{what}: {failed:?}");
+    assert_eq!(failed[0]["task"], Value::Null, "{}", failed[0]);
+    assert_eq!(failed[0]["scope"], "attempt", "{}", failed[0]);
+    assert_eq!(failed[0]["code"], "internal", "{}", failed[0]);
+    assert_eq!(
+        failed[0]["message"], "the source's plan broke",
+        "{}",
+        failed[0]
+    );
+}
+
+/// The scheduler's facts of a real run of two kernel stages, recorded, and the run's tasks.
+fn recorded_run(scratch: &Scratch) -> (Vec<moruna_runtime::job::TaskRefDoc>, Vec<StageEvent>) {
+    let job = document(scratch, &["pass", "pass"], json!("terminate"));
     let built = build(
         &job,
         &TestKernels,
@@ -458,19 +639,81 @@ fn py_t26_a_run_dropped_without_a_cancel_at_any_point() {
     .expect("the recorded run completes");
     let facts = facts.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(facts.len() > 4, "the run told its facts: {facts:?}");
+    (refs, facts)
+}
+
+/// A lifecycle whose events are kept as JSON, as the peer reads them.
+fn kept_lifecycle(
+    refs: Vec<moruna_runtime::job::TaskRefDoc>,
+) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+    let told: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let kept = told.clone();
+    let lifecycle = Lifecycle::new(
+        refs,
+        Instant::now(),
+        Box::new(move |_, event| {
+            let mut value = serde_json::to_value(&event).expect("an event is JSON");
+            value["type"] = json!("event");
+            kept.lock().unwrap_or_else(|e| e.into_inner()).push(value);
+        }),
+    );
+    (lifecycle, told)
+}
+
+/// PY-T27 a_crash_is_a_failure, at every point, where no one caught the panic: the recorded
+/// facts are told to a fresh lifecycle up to each point of the run, and a panic unwinds past it
+/// there. Every task ends once; a task that started and had not ended fails `internal`, saying
+/// that what the panic said was not captured; none is cancelled.
+#[test]
+fn py_t27_a_lifecycle_unwound_at_any_point_fails_what_ran() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("py_t27_unwound");
+    let (refs, facts) = recorded_run(&scratch);
+    for at in 0..=facts.len() {
+        let what = format!("unwound after fact {at} of {}", facts.len());
+        let (lifecycle, told) = kept_lifecycle(refs.clone());
+        let upto = facts[..at].to_vec();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            lifecycle.begin(false);
+            for fact in &upto {
+                lifecycle.on(fact);
+            }
+            panic!("the run broke after fact {at}");
+        }));
+        assert!(unwound.is_err(), "{what}");
+        let events = told.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        one_end_each(&events, &what);
+        nothing_cancelled(&events, &what);
+        let failed: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["kind"] == "task_failed")
+            .collect();
+        assert!(!failed.is_empty(), "{what}: the crash is told: {events:#?}");
+        for end in failed {
+            assert_eq!(end["code"], "internal", "{what}: {end}");
+            assert!(
+                end["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not captured")),
+                "{what}: {end}"
+            );
+        }
+    }
+}
+
+/// PY-T26 a_run_dropped_without_a_cancel, at every point: the scheduler's facts of a real run
+/// of two kernel stages are recorded, then told to a fresh lifecycle up to each point of the run
+/// and the lifecycle let go of there, with no panic, no end told and no cancel asked; every task
+/// ends exactly once, a task that started is cancelled, and a second end told after the first
+/// tells nothing.
+#[test]
+fn py_t26_a_run_dropped_without_a_cancel_at_any_point() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("py_t26_drop");
+    let (refs, facts) = recorded_run(&scratch);
     for at in 0..=facts.len() {
         let what = format!("dropped after fact {at} of {}", facts.len());
-        let told: Arc<Mutex<Vec<Value>>> = Arc::default();
-        let kept = told.clone();
-        let lifecycle = Lifecycle::new(
-            refs.clone(),
-            Instant::now(),
-            Box::new(move |_, event| {
-                let mut value = serde_json::to_value(&event).expect("an event is JSON");
-                value["type"] = json!("event");
-                kept.lock().unwrap_or_else(|e| e.into_inner()).push(value);
-            }),
-        );
+        let (lifecycle, told) = kept_lifecycle(refs.clone());
         lifecycle.begin(false);
         for fact in &facts[..at] {
             lifecycle.on(fact);
@@ -484,6 +727,13 @@ fn py_t26_a_run_dropped_without_a_cancel_at_any_point() {
                 "{what}: {end}"
             );
         }
+        for end in events.iter().filter(|e| e["kind"] == "task_skipped") {
+            assert_eq!(end["reason"], "cancelled", "{what}: {end}");
+        }
+        assert!(
+            events.iter().all(|e| e["kind"] != "task_failed"),
+            "{what}: a run let go of fails nothing: {events:#?}"
+        );
     }
     // Told once: an end after the end tells nothing.
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();

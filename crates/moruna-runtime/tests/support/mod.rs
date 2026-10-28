@@ -201,6 +201,20 @@ impl FailOnce {
         }
     }
 
+    /// Whether it has failed: its `fail_at`-th apply has been called.
+    pub fn failed(&self) -> bool {
+        self.applies.load(Ordering::SeqCst) >= self.fail_at.load(Ordering::SeqCst)
+    }
+
+    /// The same kernel, sharing the counters and the failure.
+    pub fn shared(&self) -> FailOnce {
+        FailOnce {
+            fingerprint: self.fingerprint,
+            applies: self.applies.clone(),
+            fail_at: self.fail_at.clone(),
+        }
+    }
+
     /// The same kernel, sharing the counters, with failure turned off.
     pub fn without_failing(&self) -> FailOnce {
         self.fail_at.store(u64::MAX, Ordering::SeqCst);
