@@ -326,6 +326,7 @@ A kernel that reasons over its batches (a model's agent, a lookup against a serv
 | `16-package.md`, `17-sandbox.md` (2026-10-21) | the world's `call` import and its verification; the host function, its trap, the entry state of a stateful stage with ports (§4.10) |
 | `13-host.md` (2026-10-21) | `port_call`, `port_reply`, `port_cancel`, version 1; `event` version 3's port wait; the port line bound (§4.3, §4.10) |
 | `12-python.md` (2026-10-28) | PY-I11: a crash fails every running task `internal` with the panic's words, then the panic leaves the session; a run let go of is a cancel; `event` version 4 (§4.3) |
+| `12-python.md` (2026-10-28, HO-T16) | PY-I12: each task's lifecycle events are one order whatever the order of the threads that told its facts; a task that starts while it waits is told `task_ready` first; `t_us` never runs backwards (§4.3) |
 
 ---
 
