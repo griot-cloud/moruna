@@ -1,0 +1,16 @@
+[package]
+name = "moruna-record"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna records: the fixed binary record layout and the multi-producer ring that carries it"
+
+[dependencies]
+
+[features]
+default = ["std"]
+# Adds the `std::error::Error` impls; the crate is `no_std` with `alloc` without it.
+std = []
