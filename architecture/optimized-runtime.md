@@ -24,10 +24,10 @@ A VM with virtual CPUs, memory, and three virtual devices: a block device for th
 
 ## 2. The monitor: `moruna-vmm`
 
-The host-side program that launches a VM. It exists today. It does four things:
+The program on the node that launches a VM. It exists today. It does four things:
 
 - maps the VM's memory and starts its CPUs through KVM;
-- attaches the data disk as virtio-blk, with io_uring and direct IO on the host side;
+- attaches the data disk as virtio-blk, with io_uring and direct IO on the node side;
 - opens one vsock to the embedder's agent;
 - exposes a shared-memory region (virtio-shm) that the kernel uses for the data plane.
 
@@ -45,10 +45,10 @@ A Rust `no_std` kernel, the only kernel in the VM. It replaces Linux. It is buil
 |---|---|---|
 | memory | `mmap`, `munmap`, `mprotect`, `brk`, `madvise` | huge pages by default for anything over 2 MiB; Arrow buffers land on them |
 | tasks | `clone` (threads and processes), `exit`, `wait`, `futex`, `sched_yield`, `getpid` | a process is an address space; threads share one |
-| time | `clock_gettime`, `nanosleep` | the clock comes from the host at boot |
+| time | `clock_gettime`, `nanosleep` | the clock comes from the node at boot |
 | files | `openat`, `read`, `pread`, `close`, `fstat`, `lseek`, `getdents`, `readlink`, `mmap` on files | the read-only image filesystem, and one scratch directory with a byte quota |
 | output | `write` to fd 1 and 2 only | captured as log records |
-| random | `getrandom` | seeded from the host |
+| random | `getrandom` | seeded from the node |
 | signals | `rt_sigaction`, `rt_sigprocmask`, `kill` to self | enough for language runtimes to install handlers |
 | process start | `execve`, `exit_group`, `set_tid_address`, `arch_prctl` | what glibc and musl need to start |
 | channels | `batch_get`, `batch_put`, `port_call` | the three that are ours; section 4 |
@@ -152,13 +152,13 @@ Layers live on the node by digest. The monitor hands a VM the layer devices it n
 
 ## 9. The guarantee
 
-What a task can do is the table in section 3, and nothing else. What stands between a task and the host is: the Moruna kernel (under 100k lines of Rust), the monitor, and KVM. That is the same order of size as a wasm engine, which is the point.
+What a task can do is the table in section 3, and nothing else. What stands between a task and the node is: the Moruna kernel (under 100k lines of Rust), the monitor, and KVM. That is the same order of size as a wasm engine, which is the point.
 
 | boundary | enforced by |
 |---|---|
 | task to task | address spaces and the absence of any cross-process syscall |
 | task to engine | the three channel syscalls, with the record check in `batch_put` |
-| task to host | nothing reaches the host but vsock from the engine and virtio-blk from the engine |
+| task to node | nothing reaches the node but vsock from the engine and virtio-blk from the engine |
 | tenant to tenant | the hypervisor |
 
 ## 10. What exists and what is built
