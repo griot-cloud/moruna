@@ -35,7 +35,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [main]
+    # v1 is the 1.0 line (BOARD EK): its pull requests are checked like main's, and
+    # nothing on it releases, because the release path below runs only on a push to main.
+    branches: [main, v1]
   # A merge to main, which is the only way a commit reaches it: the branch is
   # protected and takes pull requests. This is the release path's trigger, and it
   # does nothing unless the version in Cargo.toml has no tag yet.
