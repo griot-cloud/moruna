@@ -2,7 +2,7 @@
 //! whatever went to the overflow file or, after `finish`, the final Arrow IPC file (d.1, e.2).
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use arrow::array::{
     Array, Float32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
     UInt64Array,
 };
-use arrow::ipc::reader::{FileReader, StreamReader};
+use moruna_kernel::ipc::ReadStream;
 use moruna_kernel::{KernelAlloc, MorunaError, Outcome, StageId, TraceRecord};
 
 use crate::Result;
@@ -82,13 +82,14 @@ impl TraceView {
     }
 
     /// Every chunk of the trace, oldest first. Reads the overflow file (or the final file)
-    /// lazily, one message at a time, so a trace larger than memory is still readable.
+    /// lazily, one message at a time, so a trace larger than memory is still readable. Both
+    /// files are read back from disk, where either may have been damaged since it was written,
+    /// so each message is checked before it is decoded (TR-I7, contracts CT-I13).
     pub fn batches(&self) -> Batches {
         let memory = self.set.memory.clone();
         if self.finished
             && let Some(path) = self.shared.final_path.as_ref()
-            && let Ok(file) = File::open(path)
-            && let Ok(reader) = FileReader::try_new(BufReader::new(file), None)
+            && let Some(reader) = final_stream(path)
         {
             return Batches {
                 reader: Reader::Final(Box::new(reader)),
@@ -96,15 +97,13 @@ impl TraceView {
             };
         }
         let reader = if self.set.overflow_chunks > 0 {
-            match File::open(&self.shared.overflow_path)
-                .map_err(|_| ())
-                .and_then(|f| StreamReader::try_new(BufReader::new(f), None).map_err(|_| ()))
+            match File::open(&self.shared.overflow_path).and_then(|f| Ok((f.metadata()?.len(), f)))
             {
-                Ok(r) => Reader::Overflow {
-                    reader: Box::new(r),
+                Ok((len, file)) => Reader::Overflow {
+                    reader: Box::new(ReadStream::new(BufReader::new(file), len)),
                     left: self.set.overflow_chunks,
                 },
-                Err(()) => Reader::None,
+                Err(_) => Reader::None,
             }
         } else {
             Reader::None
@@ -192,13 +191,41 @@ impl TraceView {
     }
 }
 
+/// The magic an Arrow IPC file starts and ends with.
+const MAGIC: &[u8; 6] = b"ARROW1";
+
+/// The stream inside a complete final file (e.2): an Arrow IPC file is the magic, zero padding
+/// to the writer's alignment, the stream with its end-of-stream marker, then the footer, its
+/// length and the magic again. `None` when the file is not a complete Arrow IPC file, which
+/// leaves the view to memory and the overflow file, as for a run that wrote no final file.
+fn final_stream(path: &Path) -> Option<ReadStream<BufReader<File>>> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut tail = [0u8; 6];
+    file.seek(SeekFrom::Start(len.checked_sub(6)?)).ok()?;
+    file.read_exact(&mut tail).ok()?;
+    let mut head = [0u8; 72];
+    let got = usize::try_from(len.min(72)).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_exact(&mut head[..got]).ok()?;
+    if &tail != MAGIC || &head[..6] != MAGIC {
+        return None;
+    }
+    // The padding is zeros up to an aligned offset; the stream starts with its first message.
+    let start = (8..got)
+        .step_by(8)
+        .find(|&at| head[at..at + 8] != [0u8; 8])? as u64;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    Some(ReadStream::new(BufReader::new(file), len - start))
+}
+
 enum Reader {
     None,
     Overflow {
-        reader: Box<StreamReader<BufReader<File>>>,
+        reader: Box<ReadStream<BufReader<File>>>,
         left: usize,
     },
-    Final(Box<FileReader<BufReader<File>>>),
+    Final(Box<ReadStream<BufReader<File>>>),
 }
 
 /// The iterator `TraceView::batches` returns: the spilled chunks first, then what is still

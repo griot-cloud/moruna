@@ -47,6 +47,8 @@ It refuses to know: what a morsel is beyond its record; why a knob changed; anyt
 
 **TR-I6. The schema hash is checked at open.** The writer asserts `TraceRecord::SCHEMA_HASH` against the schema it builds; mismatch is a `Config` error at start (a build inconsistency), never a silent divergence.
 
+**TR-I7. A trace file read back is untrusted (2026-10-28).** The view reads the overflow file and the final file back from disk, where either may have been damaged since the writer closed it. Both are read through contracts e.8 (`moruna_kernel::ipc::ReadStream`), so every message is checked before arrow-ipc decodes it (contracts CT-I13): a damaged file ends the part of the trace it holds where the damage starts, never with a panic.
+
 ## d. Interfaces
 
 ### d.1 Exposed
@@ -211,7 +213,7 @@ impl core::fmt::Display for RunReport { /* section e.3 layout */ }
 
 ### e.2 Files
 
-Overflow: Arrow IPC stream format, one message per chunk, in `staging_dir/trace-overflow-<run_id>.arrow` (`run_id` as 32 lowercase hex characters); deleted on `finish` after the final file is written, or kept if no `path` was given and `TraceView` is still referenced (the view reads it lazily). Final: Arrow IPC **file** format (random access) at `path`, schema per contracts e.5, one batch per chunk, footer written on `finish`.
+Overflow: Arrow IPC stream format, one message per chunk, in `staging_dir/trace-overflow-<run_id>.arrow` (`run_id` as 32 lowercase hex characters); deleted on `finish` after the final file is written, or kept if no `path` was given and `TraceView` is still referenced (the view reads it lazily). Final: Arrow IPC **file** format (random access) at `path`, schema per contracts e.5, one batch per chunk, footer written on `finish`. The view reads both back one message at a time through `moruna_kernel::ipc::ReadStream` (TR-I7), each bounded by the file's length: the overflow file as the stream it is, for as many chunks as the writer had put there; the final file, when it starts and ends with the magic `ARROW1` (a complete file), as the stream it holds after the magic and its zero padding, which ends with its end-of-stream marker before the footer. A final file that is not complete leaves the view to memory and the overflow file. A message that does not check or decode ends that file's part of the view.
 
 ### e.3 Report rendering
 
@@ -289,6 +291,8 @@ The trace is the observability. `tracing` events: `trace.overflow` (debug, chunk
 
 **TR-T11 flush_then_finish.** From four threads, `record` 100,000 records, then each thread calls `flush` concurrently; after every `flush` returns, `snapshot().len() == 400,000`; `finish` once afterwards writes the footer; a second `finish` is a no-op; `record` after `finish` counts in `late_records`. TR-I5, e.1.
 
+**TR-T15 malformed_files_never_panic.** (2026-10-28; `tests/tr_t15_malformed_files.rs`) A final file whose schema, in its stream and in its footer, names type id 229 gives a finished view no batches, and an overflow file whose schema does gives a snapshot only its in-memory chunks (before TR-I7, the view's `FileReader` and `StreamReader` panicked in arrow-ipc's `fb_to_schema`); every case of `moruna_testkit::ipc::corruptions` over an Arrow IPC file of each of `batches()` (its stream, and the whole file) put where the final file is, and over each of `streams()` put where the overflow file is, reads as far as it is valid, never a panic. TR-I7.
+
 ## l. Implementation notes for the agent
 
 Files: `src/lib.rs`, `src/writer.rs` (f.1, e.1, the `TraceSink` and `TraceTail` impls, `flush`, `finish`), `src/view.rs` (`TraceView`, overflow reader), `src/report.rs` (f.2, e.3, JSON, `RunMeta`, `ExitReason`), `src/render.rs` (`Display`). No `unsafe`.
@@ -311,6 +315,7 @@ None. (`trace.memory_limit` is in the preamble's table.)
 | architecture 7 (spill directory on the source's device) | f.2 bandwidths, e.3 | TR-T10 |
 | D2, RC (controller window) | f.3 `TraceTail` | TR-T8 |
 | E13 (per-function allocation figures, refusal on or off) | d.1 `StageReport::alloc`, f.2 | TR-T14 |
+| untrusted IPC read back (contracts CT-I13, 2026-10-28) | TR-I7, e.2 | TR-T15 |
 
 ## o. Deferred (post-v1)
 
