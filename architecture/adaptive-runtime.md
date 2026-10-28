@@ -1,8 +1,30 @@
 # The adaptive runtime: cost model and scheduler
 
-What decides what Moruna runs next, and how a job's cost is known before it runs. Built as wave D items KD6 (the cost model, warm-up, `explain`) and KD7 (the adaptive scheduler). The research proposal it answers is `research/residency-aware-adaptive-scheduling.md` (cited RA §n). Decided by Brackly 2026-10-28.
+Built as wave D items KD6 (the cost model, warm-up, `explain`) and KD7 (the adaptive scheduler). It answers the research proposal `research/residency-aware-adaptive-scheduling.md` (cited RA §n). This document is the north star for both; Brackly, 2026-10-28.
 
-A kernel's cost is the resources it takes from what the run is given, and for how long: worker time, memory, and disk traffic. Nothing else is modelled. The machine is standard (the embedder chooses it), and what a kernel calls outside is not part of its cost.
+## 0. The objective
+
+Moruna runs a job with the lowest latency and the highest throughput the run's resources allow. So, while work is ready, every worker is busy and the memory budget is in use. Idle workers and unused memory with ready work are waste, measured and reported as waste.
+
+The scheduler holds that by making four decisions continuously, all from one view of the run:
+
+| decision | what it decides | what it needs to know |
+|---|---|---|
+| **what runs next** | which task, on which batch | each unit's predicted time and memory; which inputs are already in memory; what is on the critical path |
+| **where it runs** | which worker (core) takes it | which workers are free; whether that worker already holds the input in cache or in the same memory node; how much a kind gains from another worker |
+| **where memory goes** | what is reserved, kept, prefetched, spilled or released | every batch's size, location and remaining consumers; each unit's predicted peak |
+| **how big a morsel is** | the batch size for each task | per-batch overhead against per-row cost; the memory left; how many workers are waiting for work |
+
+Everything below exists to make those four decisions well and fast:
+- the cost model predicts the numbers they need;
+- warm-up gives the model its first numbers;
+- the buffer catalog is the view of memory;
+- the simulator compares choices;
+- the policy port lets a better decision procedure replace a worse one without touching the rest.
+
+A mechanism that does not improve one of the four decisions, or that costs more decision time than it saves in run time, does not belong.
+
+A kernel's cost is the resources it takes from what the run is given, and for how long: worker time, memory, disk traffic. The machine is standard and calls outside are not a kernel's cost, so neither is modelled.
 
 ## 1. Decisions
 
@@ -12,6 +34,7 @@ A kernel's cost is the resources it takes from what the run is given, and for ho
 4. **The scheduling policy is a port.** RA §9's arms (FIFO, pipeline-first, residency-greedy, bounded lookahead) are adapters of one trait, benchmarked against each other on the same runs. The default is whichever wins on measurements.
 5. **Warm-up runs automatically when a function is registered**, charged to the workspace that registers it.
 6. **The cost of an action is its effect on the job's predicted finish, found by simulation**, never by adding task durations (RA §11, first open question).
+7. **Utilisation is the check on every decision.** A run reports worker-idle time and unused memory while work was ready, per decision kind; a policy that leaves either on the table loses to one that doesn't, on the benchmark matrix.
 
 ## 2. What the research proposal leaves open, and the answer here
 
@@ -26,7 +49,6 @@ A kernel's cost is the resources it takes from what the run is given, and for ho
 | G7 | "Residency value" is open (RA §11). | The DAG is known, so every buffer's remaining consumers and their earliest start are known. Eviction uses that future (Belady's rule with known consumers): the buffer whose next use is furthest away, weighted by its reload cost, goes first. |
 | G8 | Fairness is open (RA §11). | Critical-path priority with ageing: a ready unit's priority grows with its wait, bounded so no ready branch waits more than a set multiple of its predicted duration. |
 | G9 | Scheduler overhead can outweigh gains for small batches (RA §8, H4). | A decision budget: a fraction of the median unit duration (default 1%). Lookahead falls to greedy, then to the plain admission rule, when it would be exceeded. Reported per run. |
-| G10 | Only finish time is an objective (RA §13). | The objective is a setting (section 10): finish time, resources held, or finish time within a ceiling on resources held. Holding less memory for longer can cost less than more for shorter. |
 | G11 | Synthetic warm-up data has no real value distribution. | Value-dependent quantities (selectivity, skew) are marked as such. Warm-up measures the kernel's sensitivity to skew (uniform and skewed keys); real runs supply actual values. Every estimate records its source. |
 | G12 | The run's resources are assumed fixed. | They are read at run start and on every resize; the simulator and the policy use what the run has now. |
 | G13 | The first run of anything has no estimates. | Fallbacks (section 5.4): this function's history, the kind's prior, a default. The controller's calibration phase measures the first batches before the run commits. |
@@ -75,7 +97,6 @@ Collected without reading tenant values outside a run. Inside a run the engine s
 | input | from |
 |---|---|
 | the DAG: dependencies, contract barriers, consumers of each output | the job |
-| the objective (section 10) | the job |
 
 ## 4. The output
 
@@ -230,7 +251,7 @@ The policy is a setting.
 Each time a worker frees, a read completes or a unit finishes:
 
 1. **Feasible set:** every ready unit whose reserved memory plus its predicted peak (the 95th percentile) fits the budget. This is a hard rule (RA §5): a unit that does not fit is never admitted, whatever its score.
-2. **Score** each feasible action with the simulator, by the change in the objective's measure. Then:
+2. **Score** each feasible action with the simulator, by its change to the predicted finish. Then:
    - add the reload cost of any input that must come back from disk;
    - add the reload cost of whatever admitting it would push out, when that buffer's next consumer is near;
    - subtract the memory freed by being a buffer's last consumer;
@@ -263,14 +284,9 @@ Each time a worker frees, a read completes or a unit finishes:
   - spill and reload bytes;
   - peak and reserved memory.
 
-## 10. The objective
+## 10. The measure
 
-`cost.objective` in the job:
-- `time`: the earliest finish; the default.
-- `resources`: the least memory × time plus worker time.
-- `time_within { resources }`: the earliest finish whose predicted p95 resources held stay under a ceiling.
-
-The simulator scores with the objective's measure; nothing else changes.
+One measure, the job's finish (section 0), and its consequence, utilisation. The simulator scores every action by its change to the predicted finish. The run reports finish time, throughput (rows per second per stage), and idle worker time and unused memory while work was ready. A policy is judged on those four numbers.
 
 ## 11. Where it lives
 
@@ -287,7 +303,7 @@ An embedder depends on `moruna-job` and `moruna-cost` to plan in its own process
 1. **The simulator against reality:** for every benchmark run, the simulated finish, peak memory and spill bytes are compared with the measured ones, within an error budget per workload class.
 2. **The default model's accuracy:** median absolute percentage error per target on a held-out split of warm-up and run observations, reported per release.
 3. **The swap:** a second model adapter (a test model) is registered, configured, fitted from the store and used by `explain` and the scheduler, with no change outside its own module.
-4. **The policies:** RA §9's matrix runs every policy adapter on RA §7's workloads, varying memory-to-data ratio, batch size, branching, reuse, CPU-to-I/O ratio, skew, selectivity and workers. The default is the one that wins on finish time with correct output. The matrix runs in the benchmark suite on every release.
+4. **The policies:** RA §9's matrix runs every policy adapter on RA §7's workloads, varying memory-to-data ratio, batch size, branching, reuse, CPU-to-I/O ratio, skew, selectivity and workers. The default is the one with the earliest finish and the least idle worker time and unused memory while work was ready, with correct output. The matrix runs in the benchmark suite on every release.
 5. **The hard rule:** a property test that under any sequence of predictions, wrong by any factor, the scheduler never reserves past the budget. When an outcome exceeds its prediction, the run resizes or spills; it never runs out of memory.
 
 ## 13. Build order
