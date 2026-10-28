@@ -1,7 +1,7 @@
 # Moruna SDD 22: The job document and the catalogue, for embedders (`moruna-job`)
 
 **Document type:** software design document, component 22
-**Status:** DRAFT · 2026-10-28, amended 2026-10-29 by KA5 (the job document version 2, a DAG of tasks: d.4, e.4, e.5, JB-I10 to JB-I14, JB-T29 to JB-T38) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended 2026-10-29 by KA5 (the job document version 2, a DAG of tasks: d.4, e.4, e.5, JB-I10 to JB-I14, JB-T29 to JB-T39) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** board items KA4 and KA5 (`BOARD.md`, wave B); SDD 18 (the kinds a run is made of); `architecture/moruna-hosted-engine.md` (MH) section 4.1; brief MC2 (`architecture/agents/briefs/waves-a-b-c.md` section 5)
 **Preamble:** `00-preamble.md`; **Cited:** 18 (KD-I1, KD-I2, KD-I4, KD-I8, e.1 to e.3, decision KD1), 12 f.9, MH 4.1, MH 4.5
 **Component location:** `crates/moruna-job/` (`src/kind.rs`, `src/doc.rs`, `src/job.rs`, `src/flatbuffer.rs`, `src/flex.rs`, `src/canonical.rs`, `src/catalogue.rs`, `src/check.rs`, `src/schema.rs`, `schema/job.fbs`, `src/generated/job_generated.rs` (generated, committed), `catalogue/standard.json`, `catalogue/peql.json`), `tools/flatc/generate.sh`, `crates/moruna-runtime/src/host/cli.rs` (`moruna check-job`), `crates/moruna-runtime/tests/job.rs` (the tests that need the registry)
@@ -349,6 +349,8 @@ Test names are the ids' lowercase with a slug (`jb_t6_every_example_passes`).
 
 **JB-T38 the_build_refuses_to_go_around_a_barrier** (`moruna-runtime`, `tests/dag.rs`). The runtime's build refuses a document whose edge goes around a barrier before any kind is built, naming the edge; the document through the barrier builds. JB-I9, JB-I13.
 
+**JB-T39 every_table_at_its_defaults** (`tests/dag.rs`). A version 2 document whose every table is present and holds only its schema defaults, with the strings the schema requires, is read or refused at its field and never panics; the verified document's rendering names every table, for a diagnosis; every enum value this build writes has its schema name, and an unknown one renders as unknown. JB-I11, JB-I12.
+
 ## l. Implementation notes for the agent
 
 A new kind adds nothing here: its declaration is in the runtime, and the catalogue files are regenerated from `moruna kinds` (e.1); JB-T25 fails until they are. A kind whose settings type needs a JSON Schema keyword outside the subset adds the keyword to `schema.rs` (`VALIDATING`, `walk`, `admit_at`), to the table in e.3, and to JB-T12 to JB-T17, and JB-T26 proves the validator and the kind still agree. Do not add a JSON Schema crate: the subset is closed on purpose (JB-I7).
@@ -368,7 +370,7 @@ None.
 | SDD 18 KD-I8 (contracts are carried for a kind that needs them) | JB-I5 | JB-T10 |
 | MH 4.1 (the document) | JB-I9 | JB-T21 to JB-T24 |
 | SDD 18 d.3 (the command line) | JB-I5, JB-I8 | JB-T28 |
-| KA5 (the job is a DAG, in FlatBuffers) | JB-I10 to JB-I14 | JB-T29 to JB-T38 |
+| KA5 (the job is a DAG, in FlatBuffers) | JB-I10 to JB-I14 | JB-T29 to JB-T39 |
 
 ## o. Deferred (post-v1)
 

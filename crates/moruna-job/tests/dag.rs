@@ -1,4 +1,4 @@
-//! SDD 22 k: the job document version 2, a DAG of tasks (JB-T29 to JB-T36).
+//! SDD 22 k: the job document version 2, a DAG of tasks (JB-T29 to JB-T37, JB-T39).
 
 use moruna_job::{
     BudgetDoc, Catalogue, CheckpointDoc, ContractEntry, Edge, ElasticDoc, ErrorPolicyDoc,
@@ -590,4 +590,179 @@ fn jb_t37_task_ids() {
         &"tasks[2].id: \"in\" names tasks[0] already: a task id names one task".to_string()
     ));
     assert!(said.contains(&"tasks[4].members: \"no spaces\" is not a task id".to_string()));
+}
+
+/// JB-T39 every_table_at_its_defaults: a version 2 document whose every table is present and
+/// holds only its schema defaults (and the strings the schema requires) reads, or is refused by
+/// its field, and never panics; the verified document renders every table for a diagnosis; and
+/// every enum value this build writes has its schema name.
+#[test]
+fn jb_t39_every_table_at_its_defaults() {
+    use moruna_job::fb;
+    let mut b = flatbuffers::FlatBufferBuilder::new();
+    let (id, kind) = (b.create_string("only"), b.create_string("parquet"));
+    let task = fb::Task::create(
+        &mut b,
+        &fb::TaskArgs {
+            id: Some(id),
+            kind: Some(kind),
+            ..Default::default()
+        },
+    );
+    let tasks = b.create_vector(&[task]);
+    let ends: Vec<_> = (0..2)
+        .map(|_| {
+            let (task, port) = (b.create_string("only"), b.create_string("out"));
+            fb::Endpoint::create(
+                &mut b,
+                &fb::EndpointArgs {
+                    task: Some(task),
+                    port: Some(port),
+                },
+            )
+        })
+        .collect();
+    let edge = fb::Edge::create(
+        &mut b,
+        &fb::EdgeArgs {
+            from: Some(ends[0]),
+            to: Some(ends[1]),
+            ..Default::default()
+        },
+    );
+    let edges = b.create_vector(&[edge]);
+    let elastic = fb::Elastic::create(&mut b, &fb::ElasticArgs::default());
+    let budget = fb::Budget::create(
+        &mut b,
+        &fb::BudgetArgs {
+            elastic: Some(elastic),
+            ..Default::default()
+        },
+    );
+    let staging = fb::Staging::create(&mut b, &fb::StagingArgs::default());
+    let s3 = fb::S3::create(&mut b, &fb::S3Args::default());
+    let gcs = fb::Gcs::create(&mut b, &fb::GcsArgs::default());
+    let azure = fb::Azure::create(&mut b, &fb::AzureArgs::default());
+    let object_store = fb::ObjectStore::create(
+        &mut b,
+        &fb::ObjectStoreArgs {
+            s3: Some(s3),
+            gcs: Some(gcs),
+            azure: Some(azure),
+            ..Default::default()
+        },
+    );
+    let checkpoint = fb::Checkpoint::create(&mut b, &fb::CheckpointArgs::default());
+    let error_policy = fb::ErrorPolicy::create(&mut b, &fb::ErrorPolicyArgs::default());
+    let host_profile = fb::HostProfile::create(&mut b, &fb::HostProfileArgs::default());
+    let report = fb::Report::create(&mut b, &fb::ReportArgs::default());
+    let compiled = b.create_string("c");
+    let document = {
+        let mut map = flexbuffers::Builder::default();
+        map.start_map().end_map();
+        b.create_vector(map.view())
+    };
+    let contract = fb::Contract::create(
+        &mut b,
+        &fb::ContractArgs {
+            document: Some(document),
+            compiled: Some(compiled),
+            ..Default::default()
+        },
+    );
+    let contracts = b.create_vector(&[contract]);
+    let root = fb::Job::create(
+        &mut b,
+        &fb::JobArgs {
+            version: JOB_VERSION,
+            tasks: Some(tasks),
+            edges: Some(edges),
+            budget: Some(budget),
+            staging: Some(staging),
+            object_store: Some(object_store),
+            checkpoint: Some(checkpoint),
+            error_policy: Some(error_policy),
+            host_profile: Some(host_profile),
+            report: Some(report),
+            contracts: Some(contracts),
+            ..Default::default()
+        },
+    );
+    fb::finish_job_buffer(&mut b, root);
+    let bytes = b.finished_data().to_vec();
+
+    match Job::from_flatbuffer(&bytes) {
+        Ok(job) => {
+            assert_eq!(job.tasks.len(), 1);
+            assert_eq!(job.tasks[0].id, "only");
+        }
+        Err(JobError::Field { field, reason }) => {
+            assert!(!field.is_empty() && !reason.is_empty(), "{field}: {reason}");
+        }
+        Err(other) => panic!("a verified document is read or refused by its field: {other}"),
+    }
+
+    let verified = fb::root_as_job(&bytes).expect("verifies");
+    let rendered = format!("{verified:?}");
+    for table in [
+        "Job {",
+        "Task {",
+        "Edge {",
+        "Endpoint {",
+        "Budget {",
+        "Elastic {",
+        "Staging {",
+        "ObjectStore {",
+        "S3 {",
+        "Gcs {",
+        "Azure {",
+        "Checkpoint {",
+        "ErrorPolicy {",
+        "HostProfile {",
+        "Report {",
+        "Contract {",
+    ] {
+        assert!(rendered.contains(table), "{table} in {rendered}");
+    }
+
+    let names = |values: Vec<Option<&'static str>>| values.into_iter().all(|n| n.is_some());
+    assert!(names(
+        fb::Role::ENUM_VALUES
+            .iter()
+            .map(|v| v.variant_name())
+            .collect()
+    ));
+    assert!(names(
+        fb::Flow::ENUM_VALUES
+            .iter()
+            .map(|v| v.variant_name())
+            .collect()
+    ));
+    assert!(names(
+        fb::Guarantee::ENUM_VALUES
+            .iter()
+            .map(|v| v.variant_name())
+            .collect()
+    ));
+    assert!(names(
+        fb::ErrorPolicyKind::ENUM_VALUES
+            .iter()
+            .map(|v| v.variant_name())
+            .collect()
+    ));
+    assert!(names(
+        fb::Sizer::ENUM_VALUES
+            .iter()
+            .map(|v| v.variant_name())
+            .collect()
+    ));
+    for unknown in [
+        format!("{:?}", fb::Role(9)),
+        format!("{:?}", fb::Flow(9)),
+        format!("{:?}", fb::Guarantee(9)),
+        format!("{:?}", fb::ErrorPolicyKind(9)),
+        format!("{:?}", fb::Sizer(9)),
+    ] {
+        assert!(unknown.contains("UNKNOWN"), "{unknown}");
+    }
 }
