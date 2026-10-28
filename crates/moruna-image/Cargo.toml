@@ -28,6 +28,7 @@ testing = []
 
 [dev-dependencies]
 moruna-image = { workspace = true, features = ["testing"] }
+moruna-job = { workspace = true }
 moruna-runtime = { workspace = true }
 parquet = { workspace = true }
 

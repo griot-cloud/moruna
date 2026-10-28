@@ -4300,6 +4300,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "moruna-image",
+ "moruna-job",
  "moruna-runtime",
  "parquet",
  "serde",
