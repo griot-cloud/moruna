@@ -556,13 +556,13 @@ impl<F> moruna_runtime::kinds::RunnableKind for TestKernels<F>
 where
     F: Fn(usize, &str) -> moruna_kernel::Result<Arc<dyn Kernel>> + Send + Sync,
 {
-    fn declaration(&self) -> moruna_runtime::kinds::Declaration {
-        use moruna_runtime::kinds::{Declaration, Fact, Flow, Isolation, Needs, Role};
+    fn declaration(&self) -> moruna_job::Declaration {
+        use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role};
         Declaration {
             name: "python".into(),
             role: Role::Kernel,
             summary: "the tests' kernels, named by callable".into(),
-            settings: moruna_runtime::kinds::settings_schema::<TestKernelSettings>(
+            settings: moruna_job::settings_schema::<TestKernelSettings>(
                 "python",
                 vec![serde_json::json!({"module": "tests", "callable": "pass"})],
             ),
@@ -615,8 +615,8 @@ impl<T> Handed<T> {
         }
     }
 
-    fn declared(&self, role: moruna_runtime::kinds::Role) -> moruna_runtime::kinds::Declaration {
-        use moruna_runtime::kinds::{Declaration, Fact, Flow, Isolation, Needs, Role};
+    fn declared(&self, role: moruna_job::Role) -> moruna_job::Declaration {
+        use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role};
         #[derive(serde::Deserialize, schemars::JsonSchema)]
         #[serde(deny_unknown_fields)]
         struct Nothing {}
@@ -624,7 +624,7 @@ impl<T> Handed<T> {
             name: self.name.into(),
             role,
             summary: "an object the test holds".into(),
-            settings: moruna_runtime::kinds::settings_schema::<Nothing>(
+            settings: moruna_job::settings_schema::<Nothing>(
                 self.name,
                 vec![serde_json::json!({})],
             ),
@@ -647,8 +647,8 @@ impl<T> Handed<T> {
 }
 
 impl moruna_runtime::kinds::SourceKind for Handed<moruna_runtime::SourceSpec> {
-    fn declaration(&self) -> moruna_runtime::kinds::Declaration {
-        self.declared(moruna_runtime::kinds::Role::Source)
+    fn declaration(&self) -> moruna_job::Declaration {
+        self.declared(moruna_job::Role::Source)
     }
 
     fn source(
@@ -665,8 +665,8 @@ impl moruna_runtime::kinds::SourceKind for Handed<moruna_runtime::SourceSpec> {
 }
 
 impl moruna_runtime::kinds::SinkKind for Handed<moruna_runtime::SinkSpec> {
-    fn declaration(&self) -> moruna_runtime::kinds::Declaration {
-        self.declared(moruna_runtime::kinds::Role::Sink)
+    fn declaration(&self) -> moruna_job::Declaration {
+        self.declared(moruna_job::Role::Sink)
     }
 
     fn sink(

@@ -5,7 +5,7 @@ use moruna_kernel::{MorunaError, StageCounters, StageEvent};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::job::TaskRefDoc;
+use moruna_job::TaskRefDoc;
 
 fn refs(ids: &[&str]) -> Vec<TaskRefDoc> {
     ids.iter()

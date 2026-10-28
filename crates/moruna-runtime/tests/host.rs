@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use moruna_job::JobSpec;
 use moruna_kernel::{CancelToken, Kernel};
 use moruna_runtime::host::cli;
 use moruna_runtime::host::exit;
 use moruna_runtime::host::session::{self, HEARTBEAT, read_report_file};
 use moruna_runtime::host::transport::{self, Address};
-use moruna_runtime::{JobSpec, RunSpec, Runtime, SinkSpec, SourceSpec};
+use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
 use serde_json::{Value, json};
 use support::{
     Doubler, FailOnce, Printer, SEEDED_SECRET, Scratch, Sleeper, one_run_at_a_time, read_back_rows,
@@ -140,7 +141,7 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(from_file["exit"]["code"], 0);
     assert_eq!(from_file["run_id"], RUN_ID);
     let job = JobSpec::from_value(doc.clone()).expect("the document");
-    assert_eq!(from_file["spec_digest"], job.digest());
+    assert_eq!(from_file["spec_digest"], moruna_runtime::job::digest(&job));
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
 
     // The same run through the library's own construction.
@@ -248,7 +249,8 @@ fn ho_t6_heartbeat_cadence_and_report_delivery() {
     let socket = socket_path(scratch.path());
     let mut doc = document(scratch.path(), 16_000, 8, Some("sleep"));
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
-    let digest = JobSpec::from_value(doc.clone()).expect("doc").digest();
+    let digest = JobSpec::from_value(doc.clone()).expect("doc");
+    let digest = moruna_runtime::job::digest(&digest);
     let path = write_doc(scratch.path(), &doc);
 
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");

@@ -27,7 +27,7 @@ use super::protocol::{
     CancelDisposition, Counters, Element, Event, FailureCode, FailureScope, Phase, SkipReason,
     TaskOutcome, WaitReason,
 };
-use crate::job::{JobSpec, TaskRefDoc};
+use moruna_job::{JobSpec, TaskRefDoc};
 
 /// Where the lifecycle's events go, each with the microsecond it became true.
 pub type EventOut = Box<dyn Fn(u64, Event) + Send + Sync>;

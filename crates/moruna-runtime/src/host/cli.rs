@@ -1,5 +1,5 @@
-//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3): `run`, `run --vm`, `serve`, `kinds`,
-//! `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
+//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3, SDD 22 d.3): `run`, `run --vm`, `serve`,
+//! `kinds`, `check-job`, `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
 //! run: the Python adapter's binary adds the Python kinds to [`Registry::standard`].
 
 use std::io::Write;
@@ -22,6 +22,7 @@ pub const USAGE: &str = "usage: moruna run <spec.json> [--strict] [--sandbox-pyt
        moruna run --vm <spec.json> --image <dir-or-oci> [--disk <path>[:ro|:rw]]...
        moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
        moruna kinds
+       moruna check-job <spec.json>
        moruna --version";
 
 /// A parsed command line.
@@ -59,6 +60,12 @@ pub enum Command {
     },
     /// `moruna kinds` (SDD 18 e.3): every kind this binary can run, its declaration, as JSON.
     Kinds,
+    /// `moruna check-job <spec.json>` (SDD 22 d.3): read a document and check it against the
+    /// kinds this binary has, without running it.
+    CheckJob {
+        /// The document.
+        spec: String,
+    },
     /// `moruna --version`.
     Version,
     /// `moruna --help`.
@@ -174,6 +181,19 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 "moruna kinds: takes no arguments, and was given `{extra}`"
             )),
         },
+        Some("check-job") => {
+            let spec = rest
+                .next()
+                .ok_or_else(|| "moruna check-job: which document?".to_string())?;
+            match rest.next() {
+                None => Ok(Command::CheckJob {
+                    spec: spec.to_string(),
+                }),
+                Some(extra) => Err(format!(
+                    "moruna check-job: one document, and `{extra}` is a second"
+                )),
+            }
+        }
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
         Some(other) => Err(format!("moruna: unknown command `{other}`")),
@@ -246,6 +266,9 @@ fn main_as(
             println!("{}", kinds.listing().to_json());
             return exit::COMPLETED;
         }
+        Command::CheckJob { spec } => {
+            return check_job(Path::new(&spec), kinds, &mut std::io::stderr().lock());
+        }
         Command::RunVm { spec, image, disks } => {
             return run_vm(Path::new(&spec), &image, &disks);
         }
@@ -286,6 +309,42 @@ fn main_as(
     outcome.code
 }
 
+/// `moruna check-job` (SDD 22 d.3): the document at `spec` against the kinds of `kinds`, every
+/// refusal written to `out` as `<field>: <message>`. Exits 0 when there is none, with the exit
+/// code of a refused document (2) when there is one or the document cannot be read, and 1 when
+/// the kinds themselves cannot be checked against.
+pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
+    let read = std::fs::read_to_string(spec)
+        .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
+        .and_then(|text| moruna_job::JobSpec::from_json(&text));
+    let job = match read {
+        Ok(job) => job,
+        Err(refused) => {
+            let _ = writeln!(out, "{refused}");
+            return exit::SPEC_REFUSED;
+        }
+    };
+    let catalogue = match moruna_job::Catalogue::from_listing(kinds.listing()) {
+        Ok(catalogue) => catalogue,
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "moruna check-job: the kinds of this binary cannot be checked against: {e}"
+            );
+            return exit::FAILED;
+        }
+    };
+    match moruna_job::check(&job, &catalogue) {
+        Ok(()) => exit::COMPLETED,
+        Err(refusals) => {
+            for refusal in &refusals {
+                let _ = writeln!(out, "{refusal}");
+            }
+            exit::SPEC_REFUSED
+        }
+    }
+}
+
 /// `moruna run --vm` (MH 4.8.4) on the monitor this build has: KVM, which is Linux-only.
 #[cfg(target_os = "linux")]
 fn run_vm(spec: &Path, image: &Path, disks: &[DiskConfig]) -> i32 {
@@ -313,8 +372,8 @@ fn run_vm(_spec: &Path, _image: &Path, _disks: &[DiskConfig]) -> i32 {
 /// `budget.cpu` rounded up to whole vCPUs, and may be grown to `budget.elastic`'s maxima. A
 /// document that leaves either to discovery is refused: a guest has no machine to discover
 /// until it is booted with one.
-pub fn vm_budget(spec: &crate::job::JobSpec) -> Result<moruna_vmm::Budget, crate::job::SpecError> {
-    use crate::job::SpecError;
+pub fn vm_budget(spec: &moruna_job::JobSpec) -> Result<moruna_vmm::Budget, moruna_job::SpecError> {
+    use moruna_job::SpecError;
     let memory = spec.budget.memory_bytes.ok_or_else(|| {
         SpecError::new(
             "budget.memory_bytes",
@@ -354,8 +413,8 @@ pub fn run_vm_with(
     monitor: fn(&VmConfig) -> moruna_vmm::error::Result<i32>,
 ) -> i32 {
     let doc = match std::fs::read_to_string(spec)
-        .map_err(|e| crate::job::SpecError::new("spec", format!("{}: {e}", spec.display())))
-        .and_then(|text| crate::job::JobSpec::from_json(&text))
+        .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
+        .and_then(|text| moruna_job::JobSpec::from_json(&text))
         .and_then(|doc| vm_budget(&doc))
     {
         Ok(budget) => budget,
@@ -665,7 +724,7 @@ mod tests {
         ] {
             std::fs::write(&spec, doc(budget)).unwrap();
             let parsed =
-                crate::job::JobSpec::from_json(&std::fs::read_to_string(&spec).unwrap()).unwrap();
+                moruna_job::JobSpec::from_json(&std::fs::read_to_string(&spec).unwrap()).unwrap();
             assert_eq!(vm_budget(&parsed).unwrap_err().field, field);
             assert_eq!(
                 run_vm_with(&spec, &img, &[], 1, &mut out, never),

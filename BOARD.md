@@ -526,8 +526,41 @@ The brief is `architecture/agents/briefs/waves-a-b-c.md` section 4. MC1 (section
 | Id | Item | Branch | Scope (SDD sections, tests by id) | Status |
 |---|---|---|---|---|
 | MC1 | Moruna declares what it can run: one registry of kinds, a declaration per kind, a conformance suite per port, every existing kind moved onto it (pulled into wave B, 2026-10-28) | `feat/mc1-kinds-registry` | SDD 18 (new: KD-I1 to KD-I10, f.1 to f.5); 12 f.9; 16 PK-I8, f.8, PK-T11, PK-T12; MH 4.1; preamble 1 (component 18), 6.2 (`schemars`); `DECISIONS.md` KD1; KD-T1 to KD-T11, with HO-T1 to HO-T4, HO-T9, PK-T12, PO-T6 run through the registry | in review |
+| KA4 | `moruna-job`: declarations, the job document, the catalogue and `check`, for embedders | `feat/ka4-moruna-job` | SDD 22 (new: JB-I1 to JB-I9, JB-T1 to JB-T28); 18 e.1 to e.3, KD1, KD-I1, KD-I4, KD-I8; 12 f.9; MH 4.1; preamble 1 (component 22) | in review |
 
 ---
+
+## EK. The Moruna microkernel (Brackly, 2026-10-28)
+
+Moruna becomes a microkernel that runs tasks as processes, booted two ways from one codebase: inside a VM on a Linux node, or as the node itself. Tasks are OCI images, any language; wasm is not needed. Design: `architecture/optimized-runtime.md`.
+
+**Extensible by default.** The kernel holds only processes, memory, threads, interrupts, timers, messages and capability handles. Everything else is a process speaking a published protocol: drivers, the network stack, filesystems, the Linux personality, the supervisor. Adding a driver or a server is adding a process image to the boot manifest and implementing a protocol with the `moruna-svc` SDK; nothing in the kernel is rebuilt and nothing is forked. Every protocol has a conformance suite.
+
+Waves are gates, not start order: an item starts when what it needs is merged. Two agents at a time.
+
+| wave | item | what | status |
+|---|---|---|---|
+| A. Any language on Linux, today | KA1 | `image` kind: OCI unpack (layers, whiteouts, digest cache), run the image's command under `moruna-sandbox`, Arrow IPC over stdin and stdout | in progress |
+| | KA2 | the data-plane port: `batch_get`, `batch_put`, `port_call` as one trait the engine uses; today's sandbox channel is its first adapter | todo |
+| | KA3 | the Python builder: `@moruna.kernel` to a four-layer image (runtime, locked dependencies, shim, function) | todo |
+| B. The kernel boots | KB1 | microkernel core on OSTD: boot, address spaces, processes, threads, IPC, capability handles, timers; boots under QEMU in CI on x86_64 | in progress |
+| | KB2 | `moruna-svc`: the SDK for servers and drivers, the boot manifest, the protocol schema and its conformance harness | todo |
+| | KB3 | first drivers as processes: virtio console, virtio block, vsock | todo |
+| C. Linux programs run | KC1 | the Linux personality server: the 60 syscalls; static musl, then glibc, then CPython | todo |
+| | KC2 | the image filesystem server: layers as block devices, one overlay, whiteouts, paging on demand | todo |
+| D. Moruna on its kernel | KD1 | the data-plane adapter on kernel channels: shared pages, ownership handoff, the record check in `batch_put` | todo |
+| | KD2 | the engine as the first process after the supervisor | todo |
+| | KD3 | conformance across adapters: every kind on Linux and on the kernel, same rows, same refusals | todo |
+| | KD4 | launcher devices in `moruna-vmm`: shared memory, one block device per layer | todo |
+| | release | 0.6.0: the kernel runs real jobs inside a VM | todo |
+| E. The kernel as a node | KE1 | NVMe and the cloud network card as driver processes | todo |
+| | KE2 | the network server: TCP/IP and TLS (smoltcp, rustls) | todo |
+| | KE3 | the node image: bootloader, kernel, servers, a standalone supervisor; boots on Google Cloud | todo |
+| | release | 0.7.0: a node boots Moruna | todo |
+| F. Griot orchestrates (Griot repository) | KF1 | the pool port: Cluster API for Linux pools, Google Cloud for Moruna pools | todo |
+| | KF2 | isolation tiers (shared, node, hardware) and placement by a kind's declared needs | todo |
+| | KF3 | the shared tier on the control plane, under a ceiling | todo |
+| | KF4 | the launcher moves into Griot's node agent | todo |
 
 ## Escalations and findings
 
