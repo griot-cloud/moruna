@@ -755,7 +755,7 @@ fn si_t31_ipc_sink_compression_setting() {
         json!({"compression": "lz4"}),
         json!({"file_bytes": 268435456, "compression": "lz4"}),
     ] {
-        build::build(&sink(options.clone()), &kinds, opts(false, &no_env))
+        v1::build(&sink(options.clone()), &kinds, opts(false, &no_env))
             .unwrap_or_else(|e| panic!("{options}: {e}"));
     }
     for options in [

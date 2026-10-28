@@ -1,7 +1,7 @@
 # Moruna SDD 01: Contracts crate (`moruna-kernel`)
 
 **Document type:** software design document, component 1 of 12
-**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I14, CT-T23) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I15, CT-T28) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
 **Parent:** `architecture/moruna-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
 **Preamble:** `00-preamble.md` (read first)
 **Component location:** `crates/moruna-kernel`, Rust 2024 edition
@@ -62,7 +62,7 @@ Beyond the preamble's global vocabulary:
 **CT-I13. Malformed Arrow IPC is an error, never a panic (2026-10-28).** Every Arrow IPC byte Moruna reads is untrusted: a function's output (16 e.5, 17 f.4, f.8), a Parquet footer's Arrow schema (07 SO-I10), a record or a trace read back from disk (e.7, 04 e.2). arrow-ipc panics on some messages it cannot read rather than returning an error, so no IPC message reaches arrow-ipc's converter or decoder before `ipc::check` (e.8) has passed it, and whatever the bytes are, a decode returns the site's error naming what is wrong, or a valid batch. There is one check, in this crate; no component keeps a copy of it. Rationale: a tenant's function, or a bit flipped on a disk, must not end a run by panicking inside a library.
 **CT-I14. A compressed Arrow IPC batch costs what its message says and no more (KA10, 2026-10-28).** arrow-ipc reserves the uncompressed length a compressed buffer declares before it decompresses, so a few bytes could ask for any amount of memory. A record batch compressed with `LZ4_FRAME` or `ZSTD` (method `BUFFER`) is therefore inflated by `ipc::check` (e.8) and by nothing else: every buffer's size is worked out from the message alone and the declared size held to it, the sizes together are held to a ceiling the caller passes (its stage's share of the memory budget), and not a byte is allocated for the batch until all of that has passed. What is allocated is allocated through the `Allocator`, as one arena buffer of the checked size; decompression stops at each buffer's size and refuses output past it or short of it; and arrow-ipc is handed an uncompressed message and body, exactly as for an uncompressed batch. A refusal leaves nothing held. Rationale: an embedder measured uncompressed IPC at 3.7 times the size of Parquet for the same rows, so Moruna must accept compression; a tenant's function or a damaged file must not be able to use it to exhaust the host.
 
-**CT-I14. A batch handed to a consumer may be shared (KA5, 2026-10-29).** A batch a source or a stage fans out to several queues is one set of bytes every consumer reads (`Payload::share`, d.16): a kernel and a sink read their input and never write into it, and the bytes are released when the last holder drops its share. Rationale: a fan-out that copied would double the memory of every branch, and the budget (G-I1) counts the batch once (placement PL-I16).
+**CT-I15. A batch handed to a consumer may be shared (KA5, 2026-10-29).** A batch a source or a stage fans out to several queues is one set of bytes every consumer reads (`Payload::share`, d.16): a kernel and a sink read their input and never write into it, and the bytes are released when the last holder drops its share. Rationale: a fan-out that copied would double the memory of every branch, and the budget (G-I1) counts the batch once (placement PL-I16).
 
 **CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read (in a DAG, the kernels on the path `Topology::parent` traces from its queue back to its source, d.16). `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
 
@@ -612,7 +612,7 @@ pub trait Kernel: Send + Sync + 'static {
 }
 ```
 
-The scheduler calls `apply_port` and `output_schema_of` and nothing else of the two; a kernel of one input implements neither and sees `apply` and `output_schema` as before. A kernel's input may be shared with another consumer (d.16, CT-I14): it reads its input and never writes into it.
+The scheduler calls `apply_port` and `output_schema_of` and nothing else of the two; a kernel of one input implements neither and sees `apply` and `output_schema` as before. A kernel's input may be shared with another consumer (d.16, CT-I15): it reads its input and never writes into it.
 
 ### d.8 Sink
 
@@ -1208,7 +1208,7 @@ pub const MAX_PATHS: usize = 4096;
 
 **Numbers.** Each source numbers what it reads from 0. A stage of one input gives its output for input `s` the number `s`; a stage of `k` inputs gives its output for `s` taken on port `p` the number `s · k + p`. So the morsels on one queue have distinct numbers, the numbers on a queue are a function of its sources' numbers, `parent` and `root` invert the map, and each path from a source to a sink is an `Affine` map (the product of the port counts on it, and an offset). A sink reached by one path from one source (every chain's sink) receives `0, 1, 2, ...`; one reached by several, or by a source shorter than another it is joined with, may have numbers no morsel will ever have, which the scheduler skips once the sources they would come from are read to the end (10 f.16).
 
-**Sharing.** `Payload::share` is the same bytes a second time (a `RecordBatch` clone, `ManagedTensor::share`): what a fan-out pushes into its second and later queues (CT-I14).
+**Sharing.** `Payload::share` is the same bytes a second time (a `RecordBatch` clone, `ManagedTensor::share`): what a fan-out pushes into its second and later queues (CT-I15).
 
 **`StageEvent`** names sources and sinks by number: `SourceReading { source }`, `SinkWriting { sink }`, `SinkCommitting { sink }`, `SinkFinished { sink, counters }`; `Fed` and `QueueClosed` name the queue, and a producer of several queues closes each.
 
@@ -1423,8 +1423,6 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T21 refused_names_the_request.** (E13, 2026-10-02) `MorunaError::Refused` displays exactly the d.14 text with its kernel, stage, morsel, request, memory in use and ceiling; `KernelAlloc::default()` is all zero and unmeasured; `take_kernel_alloc` returns what `set_kernel_alloc` left on the same thread once and the default after it, and nothing set on another thread. d.7, d.13, d.14, CT-I10.
 
-**CT-T23 topology** (`graph.rs`, KA5). The chain keeps every number and equals `Topology::new` over its own links; a diamond numbers its join `2s` and `2s + 1`, `parent` and `root` invert it, `paths` and `to_sinks` follow it, `reaches` and `last_at_sink` read it against the sources' counts; a fan-out and a fan-in; every shape a run cannot have is refused naming what is wrong; `Affine` composes, inverts and refuses an overflow. d.16.
-
 **CT-T22 ipc_malformed_never_panics.** (2026-10-28; `tests/ct_t22_ipc_malformed.rs`) A page-aligned record whose schema names type id 229 is `Io { op: "ipc" }` naming the field (before CT-I13, `decode` panicked in arrow-ipc's `fb_to_schema` with `Type <UNKNOWN 229> not supported`); every case of `moruna_testkit::ipc::corruptions` over each record of `batches()` but the dictionaries (a record carries none) through `decode`, and over each of `streams()` through `read_stream` and `ReadStream`, returns an error or batches, never a panic (before CT-I13, 13,426 of the record cases panicked, with 44 distinct panic messages from arrow-ipc, arrow-data and arrow-buffer); every valid stream reads back equal through both. Proves CT-I13, e.8.
 **CT-T23 ipc_compressed_round_trip.** (KA10, 2026-10-28; `tests/ct_t23_ipc_inflate.rs`) Every batch of `batches()` written with metadata V5, each with ZSTD (at the default level, 1 and 19) and with LZ4_FRAME by arrow-ipc's writer, reads back equal through `read_stream` with an `Inflate` over a `FakeAllocator`: the body was inflated into the arena (`allocations_total() > 0`, the peak within the ceiling) and the arena has its bytes back when the batches drop. A slice of the every-type batch (whose offsets do not start at 0 in memory), an empty batch and a batch of incompressible 16-byte values (whose every buffer is stored, -1) read back equal; a data buffer padded to 64, a values buffer padded to 8 and a validity bitmap padded to 8, as Arrow C++ writes them, are read, and one byte past the padding, or short of the data, is refused naming "7 to 64". Proves CT-I14, e.8.
 
@@ -1435,6 +1433,8 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 **CT-T26 ipc_inflate_refusals.** (`tests/ct_t23_ipc_inflate.rs`) A codec Moruna does not read, a method it does not read and metadata V4 are refused naming what the message says, with nothing allocated; `ReadStream` and `read_stream(.., &Inflate::none())` refuse a compressed batch with a ceiling of zero as the reason, and `decode` refuses a compressed staging record (e.7) the same way; `encode_compressed` refuses `Compression::None`, a zstd level outside the library's and a base offset that is not a multiple of 8; `Compression::parse` reads `none`, `zstd`, `zstd` with a level and `lz4`, and refuses the rest. Proves CT-I14.
 
 **CT-T27 ipc_bombs_cost_the_heap_little.** (`tests/ct_t27_ipc_inflate_heap.rs`, one test in its binary, behind a counting global allocator) Every stream of CT-T24 is refused while the process's heap rises by less than 1 MiB over what the stream itself holds (a decoder's working memory is not the arena's); the worst figure is printed. Proves CT-I14.
+
+**CT-T28 topology** (`graph.rs`, KA5). The chain keeps every number and equals `Topology::new` over its own links; a diamond numbers its join `2s` and `2s + 1`, `parent` and `root` invert it, `paths` and `to_sinks` follow it, `reaches` and `last_at_sink` read it against the sources' counts; a fan-out and a fan-in; every shape a run cannot have is refused naming what is wrong; `Affine` composes, inverts and refuses an overflow. d.16.
 
 **CT-T15 resume_defaults.** A kernel with the default `restore` returns `Resume`; a `KernelState` with the default `checkpoint` returns `Ok(None)`; a sink with the default `resume` returns `Resume` and `committed_seq() == None`; `ResumePolicy::default() == Reinit`. Proves the resume defaults are refusals, not silent successes (l, anti-patterns).
 
@@ -1472,6 +1472,7 @@ None. (Four E10 items the wave 0 agent raised, issues #5 to #8, were resolved by
 | G-I8 | CT-I10 | (exercised by RC and PL tests) |
 | untrusted IPC (2026-10-28) | CT-I13, e.7, e.8 | CT-T22 |
 | compressed IPC (KA10, 2026-10-28) | CT-I14, e.7, e.8 | CT-T23, CT-T24, CT-T25, CT-T26, CT-T27 |
+| the run as a DAG (KA5, 2026-10-29) | CT-I15, d.7, d.10, d.16 | CT-T28 |
 
 ## o. Deferred (post-v1)
 

@@ -490,10 +490,10 @@ mod tests {
         Consumer::Kernel { stage, port }
     }
 
-    /// CT-T23: the chain is the topology of a version 1 document: queue k from stage k to k + 1, every
+    /// CT-T28: the chain is the topology of a version 1 document: queue k from stage k to k + 1, every
     /// number kept, one path.
     #[test]
-    fn ct_t23_the_chain_keeps_every_number() {
+    fn ct_t28_the_chain_keeps_every_number() {
         let chain = Topology::chain(2);
         assert_eq!(chain.queue_count(), 3);
         assert!(chain.is_chain());
@@ -517,7 +517,7 @@ mod tests {
     /// A diamond: the source feeds stages 1 and 2, both feed stage 3's two ports, stage 3 the
     /// sink. Stage 3 numbers port 0's `s` as `2s` and port 1's as `2s + 1`.
     #[test]
-    fn ct_t23_a_diamond_numbers_its_join() {
+    fn ct_t28_a_diamond_numbers_its_join() {
         let links = vec![
             Link {
                 from: Producer::Source(0),
@@ -562,7 +562,7 @@ mod tests {
 
     /// Fan-out of one source to two sinks, and fan-in of two sources into one stage.
     #[test]
-    fn ct_t23_fan_out_and_fan_in() {
+    fn ct_t28_fan_out_and_fan_in() {
         let out = Topology::new(
             1,
             2,
@@ -618,7 +618,7 @@ mod tests {
 
     /// Every shape a run cannot have is refused, naming what is wrong.
     #[test]
-    fn ct_t23_shapes_a_run_cannot_have_are_refused() {
+    fn ct_t28_shapes_a_run_cannot_have_are_refused() {
         let refused = |sources, stages, sinks, links: Vec<Link>| match Topology::new(
             sources, stages, sinks, links,
         ) {
@@ -740,7 +740,7 @@ mod tests {
 
     /// The maps compose, invert and refuse what overflows.
     #[test]
-    fn ct_t23_affine_maps() {
+    fn ct_t28_affine_maps() {
         let map = Affine { a: 4, b: 3 };
         assert_eq!(map.apply(5), Some(23));
         assert_eq!(map.floor_inverse(23), Some(5));

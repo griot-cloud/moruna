@@ -306,7 +306,7 @@ Tests use `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeTrace`, 
 
 **SC-T26 a_drive_that_panics_ends_the_run.** (added 2026-10-28, MA2) A test-local `Source` that panics on its n-th read, in the call or when its future is polled, for every n of a six-split plan, with no kernel and with one: the run returns `Ok(Terminated)` within a deadline with a `Source` diagnostic naming a split of the plan and saying the drive panicked and what the panic said, and `finish` never ran. A test-local `Sink` that panics on its n-th write for every n, and one that panics in `finish`: `Ok(Terminated)` within the deadline with a `Sink` diagnostic saying the same. Each case waited until cancelled before h's amendment. h, f.5, f.6, SC-I9.
 
-**SC-T27 fan_out_shares_the_batch** (`moruna-runtime/tests/dag.rs`, KA5). One Parquet source to two kernels to two sinks: each sink holds every row; the source read every range once and no range twice (the rows read are the file's rows); the two kernels were handed the same batches at the same addresses. f.16, PL-I16, CT-I14.
+**SC-T27 fan_out_shares_the_batch** (`moruna-runtime/tests/dag.rs`, KA5). One Parquet source to two kernels to two sinks: each sink holds every row; the source read every range once and no range twice (the rows read are the file's rows); the two kernels were handed the same batches at the same addresses. f.16, PL-I16, CT-I15.
 
 **SC-T28 fan_in_of_two_sources.** Two Parquet sources of 50,000 and 7,000 rows into the two ports of a `union` and an ordered sink: the sink holds every row of both, and the run completes past the numbers the shorter source never gives. f.16 items 4 and 7.
 
