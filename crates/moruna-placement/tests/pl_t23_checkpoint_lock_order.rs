@@ -90,7 +90,7 @@ fn pl_t23_checkpoint_lock_order() {
                 while !stop.load(Ordering::Relaxed) {
                     let reached = committed.load(Ordering::Acquire);
                     if published.is_none_or(|last| reached > last) {
-                        engine.set_committed(reached);
+                        engine.set_committed(0, reached);
                         published = Some(reached);
                         commits.fetch_add(1, Ordering::Relaxed);
                     }
@@ -108,10 +108,10 @@ fn pl_t23_checkpoint_lock_order() {
                 while !stop.load(Ordering::Relaxed) {
                     let extras = CheckpointExtras {
                         kernel_states: Vec::new(),
-                        sink_state: None,
-                        committed_seq: None,
-                        source_cursor: SourceCursor::default(),
-                        issued: Vec::new(),
+                        sink_states: vec![None],
+                        committed: vec![None],
+                        source_cursors: vec![SourceCursor::default()],
+                        issued: vec![Vec::new()],
                     };
                     if engine.checkpoint(&extras).is_ok() {
                         manifests.fetch_add(1, Ordering::Relaxed);

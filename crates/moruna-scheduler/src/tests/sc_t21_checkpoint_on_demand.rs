@@ -169,22 +169,22 @@ fn sc_t21_a_read_in_flight_is_named_in_the_manifest() {
             Err(e) => panic!("plan: {e}"),
         };
         let restored = FakePlacement::new().with_manifest_store();
-        let point = match moruna_kernel::Placement::restore(&restored, &path, &plan, &[]) {
+        let point = match moruna_kernel::Placement::restore(&restored, &path, &[plan], &[]) {
             Ok(point) => point,
             Err(e) => panic!("restore: {e}"),
         };
         assert!(
-            !point.extras.issued.is_empty(),
+            !point.extras.issued[0].is_empty(),
             "the held reads are in the manifest"
         );
-        for (seq, origin) in &point.extras.issued {
+        for (seq, origin) in &point.extras.issued[0] {
             assert!(
-                *seq < point.extras.source_cursor.next_seq,
+                *seq < point.extras.source_cursors[0].next_seq,
                 "behind the cursor"
             );
             if origin.split == 1 {
                 assert!(
-                    point.to_recompute.iter().any(|(s, _)| s == seq),
+                    point.to_recompute[0].iter().any(|(s, _)| s == seq),
                     "held read {seq} comes back to be read again"
                 );
             }

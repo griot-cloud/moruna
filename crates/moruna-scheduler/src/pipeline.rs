@@ -1,20 +1,41 @@
-//! The chain the scheduler runs and its validation (d.1, f.1).
+//! The run the scheduler drives and its validation (d.1, f.1): sources, kernel stages and sinks
+//! joined by queues, the run's DAG (contracts d.16). A linear chain is [`Pipeline::chain`].
 
 use std::sync::Arc;
 
 use moruna_kernel::{
-    ErrorPolicy, Kernel, MorunaError, NodeId, PayloadSpec, Result, Sink, Source, SourceSchema,
+    ErrorPolicy, Kernel, MorunaError, NodeId, PayloadSpec, Producer, Result, Sink, Source,
+    SourceSchema, Topology,
 };
 use moruna_sinks::SinkHandle;
 
-/// The linear chain: one source, zero or more kernels, one sink (d.1).
+/// The run: its sources, its kernel stages, its sinks and the queues between them (d.1).
 pub struct Pipeline {
-    /// Where the run's input comes from.
-    pub source: Arc<dyn Source>,
-    /// Stages 1..=n; may be empty (h, zero kernels).
+    /// Where the run's input comes from, source 0 first.
+    pub sources: Vec<Arc<dyn Source>>,
+    /// Stages 1..=n, in the order the topology numbers them; may be empty (h, zero kernels).
     pub kernels: Vec<Arc<dyn Kernel>>,
-    /// `Plain` or `Ordered` (08 d.1); the scheduler never names the inner type.
-    pub sink: SinkHandle,
+    /// Where the run's output goes, sink 0 first; `Plain` or `Ordered` (08 d.1).
+    pub sinks: Vec<SinkHandle>,
+    /// How they are joined: one queue per edge (contracts d.16).
+    pub topology: Topology,
+}
+
+impl Pipeline {
+    /// The linear chain: one source, `kernels` in stage order, one sink.
+    pub fn chain(
+        source: Arc<dyn Source>,
+        kernels: Vec<Arc<dyn Kernel>>,
+        sink: SinkHandle,
+    ) -> Pipeline {
+        let topology = Topology::chain(kernels.len() as u16);
+        Pipeline {
+            sources: vec![source],
+            kernels,
+            sinks: vec![sink],
+            topology,
+        }
+    }
 }
 
 /// Everything the scheduler is configured with at `new` (d.1).
@@ -24,9 +45,9 @@ pub struct SchedulerConfig {
     pub workers_max: u16,
     /// Workers allowed to take tasks at start (`workers.active`).
     pub workers_active: u16,
-    /// Source splits in flight (`readahead.splits`).
+    /// Source splits in flight (`readahead.splits`), per source.
     pub read_ahead: u16,
-    /// Sink writes in flight (`sink.concurrency`).
+    /// Sink writes in flight (`sink.concurrency`), per sink.
     pub sink_concurrency: u16,
     /// What happens after a kernel error (`errors.policy`).
     pub error_policy: ErrorPolicy,
@@ -109,25 +130,85 @@ impl SchedulerConfig {
     }
 }
 
-/// The schema each stage produces, stage 0 first, checked with `PayloadSpec::check` as it goes
-/// (f.1, CT-I5). The last entry is what the sink receives.
-pub(crate) fn validate_chain(
-    source: &dyn Source,
-    kernels: &[Arc<dyn Kernel>],
-    sink: &SinkHandle,
-) -> Result<Vec<SourceSchema>> {
-    let mut schemas = Vec::with_capacity(kernels.len() + 1);
-    let mut schema = source.schema();
-    schemas.push(schema.clone());
-    for (index, kernel) in kernels.iter().enumerate() {
-        let spec: PayloadSpec = kernel.accepts();
-        spec.check(&schema)
-            .map_err(|e| MorunaError::Plan(format!("stage {}: {e}", index as u16 + 1)))?;
-        schema = kernel.output_schema(&schema)?;
-        schemas.push(schema.clone());
+/// The schema each queue carries, by queue id, each checked with `PayloadSpec::check` against
+/// its consumer as it goes (f.1, CT-I5): a source's queues carry its schema, a stage's what
+/// `Kernel::output_schema_of` gives for its inputs' schemas in port order. The stages are taken
+/// in their numbered order, which the topology guarantees is one in which every queue goes
+/// forward, so each stage's inputs are known before it is.
+pub fn validate_graph(pipeline: &Pipeline) -> Result<Vec<SourceSchema>> {
+    let topology = &pipeline.topology;
+    if pipeline.sources.len() != usize::from(topology.sources())
+        || pipeline.kernels.len() != usize::from(topology.stages())
+        || pipeline.sinks.len() != usize::from(topology.sinks())
+    {
+        return Err(MorunaError::Plan(format!(
+            "the topology has {} sources, {} stages and {} sinks, and the run {}, {} and {}",
+            topology.sources(),
+            topology.stages(),
+            topology.sinks(),
+            pipeline.sources.len(),
+            pipeline.kernels.len(),
+            pipeline.sinks.len()
+        )));
     }
-    sink.accepts()
-        .check(&schema)
-        .map_err(|e| MorunaError::Plan(format!("sink: {e}")))?;
-    Ok(schemas)
+    let mut schemas: Vec<Option<SourceSchema>> = vec![None; topology.links().len()];
+    for (q, link) in topology.links().iter().enumerate() {
+        if let Producer::Source(s) = link.from {
+            schemas[q] = Some(pipeline.sources[usize::from(s)].schema());
+        }
+    }
+    for (index, kernel) in pipeline.kernels.iter().enumerate() {
+        let stage = index as u16 + 1;
+        let spec: PayloadSpec = kernel.accepts();
+        let inputs = topology.inputs(stage);
+        if inputs.len() > usize::from(kernel.max_inputs()) {
+            return Err(MorunaError::Plan(format!(
+                "stage {stage} is given {} inputs and its kernel takes at most {}",
+                inputs.len(),
+                kernel.max_inputs()
+            )));
+        }
+        let mut given = Vec::with_capacity(inputs.len());
+        for (port, &q) in inputs.iter().enumerate() {
+            let Some(schema) = schemas[usize::from(q)].clone() else {
+                return Err(MorunaError::Plan(format!(
+                    "stage {stage}'s port {port} is fed before its producer is known"
+                )));
+            };
+            spec.check(&schema).map_err(|e| {
+                MorunaError::Plan(if inputs.len() == 1 {
+                    format!("stage {stage}: {e}")
+                } else {
+                    format!("stage {stage} port {port}: {e}")
+                })
+            })?;
+            given.push(schema);
+        }
+        let out = kernel.output_schema_of(&given)?;
+        for &q in topology.outputs(stage) {
+            schemas[usize::from(q)] = Some(out.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(schemas.len());
+    for (q, schema) in schemas.into_iter().enumerate() {
+        match schema {
+            Some(schema) => out.push(schema),
+            None => {
+                return Err(MorunaError::Plan(format!("queue {q} carries no schema")));
+            }
+        }
+    }
+    for (index, sink) in pipeline.sinks.iter().enumerate() {
+        let Some(q) = topology.sink_input(index as u16) else {
+            continue;
+        };
+        sink.accepts().check(&out[usize::from(q)]).map_err(|e| {
+            MorunaError::Plan(if pipeline.sinks.len() == 1 {
+                format!("sink: {e}")
+            } else {
+                format!("sink {index}: {e}")
+            })
+        })?;
+    }
+    Ok(out)
 }

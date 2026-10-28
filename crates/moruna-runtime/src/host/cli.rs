@@ -314,9 +314,9 @@ fn main_as(
 /// code of a refused document (2) when there is one or the document cannot be read, and 1 when
 /// the kinds themselves cannot be checked against.
 pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
-    let read = std::fs::read_to_string(spec)
+    let read = std::fs::read(spec)
         .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
-        .and_then(|text| moruna_job::JobSpec::from_json(&text));
+        .and_then(|bytes| super::session::read_document(&bytes).map_err(|(_, refused)| refused));
     let job = match read {
         Ok(job) => job,
         Err(refused) => {
@@ -372,7 +372,7 @@ fn run_vm(_spec: &Path, _image: &Path, _disks: &[DiskConfig]) -> i32 {
 /// `budget.cpu` rounded up to whole vCPUs, and may be grown to `budget.elastic`'s maxima. A
 /// document that leaves either to discovery is refused: a guest has no machine to discover
 /// until it is booted with one.
-pub fn vm_budget(spec: &moruna_job::JobSpec) -> Result<moruna_vmm::Budget, moruna_job::SpecError> {
+pub fn vm_budget(spec: &moruna_job::Job) -> Result<moruna_vmm::Budget, moruna_job::SpecError> {
     use moruna_job::SpecError;
     let memory = spec.budget.memory_bytes.ok_or_else(|| {
         SpecError::new(
@@ -412,9 +412,9 @@ pub fn run_vm_with(
     out: &mut dyn Write,
     monitor: fn(&VmConfig) -> moruna_vmm::error::Result<i32>,
 ) -> i32 {
-    let doc = match std::fs::read_to_string(spec)
+    let doc = match std::fs::read(spec)
         .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
-        .and_then(|text| moruna_job::JobSpec::from_json(&text))
+        .and_then(|bytes| super::session::read_document(&bytes).map_err(|(_, refused)| refused))
         .and_then(|doc| vm_budget(&doc))
     {
         Ok(budget) => budget,
@@ -723,8 +723,9 @@ mod tests {
             ),
         ] {
             std::fs::write(&spec, doc(budget)).unwrap();
-            let parsed =
-                moruna_job::JobSpec::from_json(&std::fs::read_to_string(&spec).unwrap()).unwrap();
+            let parsed = moruna_job::Job::from_v1(
+                &moruna_job::JobSpec::from_json(&std::fs::read_to_string(&spec).unwrap()).unwrap(),
+            );
             assert_eq!(vm_budget(&parsed).unwrap_err().field, field);
             assert_eq!(
                 run_vm_with(&spec, &img, &[], 1, &mut out, never),

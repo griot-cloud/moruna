@@ -1,8 +1,10 @@
 //! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 4).
 //!
-//! A task is one element of the chain, named by the document's `report.tasks`: the source, each
-//! kernel stage, the sink. The scheduler says what happened to the chain on the thread on which it
-//! happened ([`StageEvent`]); this turns each into the task's transition and hands it on with the
+//! A task is one task of the job's DAG, named by the id the document gives it: each source, each
+//! kernel stage (several fused standard kernels being one task, a group), each sink. The
+//! scheduler says what happened to the run on the thread on which it happened ([`StageEvent`]),
+//! naming queues, stages, sources and sinks by their numbers in the run's topology; this turns
+//! each into the task's transition and hands it on with the
 //! instant it became true. How the run ended is told once the facade returns ([`Lifecycle::end`]):
 //! the task a failure belongs to fails, a task still running is stopped or cancelled, and one
 //! that never started is skipped. A run that a panic of Moruna's own unwound fails every task
@@ -27,7 +29,8 @@ use super::protocol::{
     CancelDisposition, Counters, Element, Event, FailureCode, FailureScope, Phase, SkipReason,
     TaskOutcome, WaitReason,
 };
-use moruna_job::{JobSpec, TaskRefDoc};
+use crate::job::Parts;
+use moruna_job::{Job, Role, TaskRefDoc};
 
 /// Where the lifecycle's events go, each with the microsecond it became true.
 pub type EventOut = Box<dyn Fn(u64, Event) + Send + Sync>;
@@ -62,6 +65,8 @@ struct Task {
     state: State,
     /// Its input is closed: everything upstream has produced all it will.
     input_closed: bool,
+    /// Its input queues still open.
+    open_inputs: usize,
     /// It was told waiting on a port, and not yet working again (MH 4.10).
     on_port: bool,
 }
@@ -78,69 +83,183 @@ struct Inner {
 /// One run's tasks and what has been told of them.
 pub struct Lifecycle {
     inner: Mutex<Inner>,
-    refs: Vec<TaskRefDoc>,
+    plan: Plan,
     clock: Instant,
     out: EventOut,
 }
 
-/// The tasks of `job`, source first: `report.tasks` when the document names them, otherwise
-/// `source`, `kernel-1` .. `kernel-n` and `sink`. With `stages` (the document's kernels each
-/// stage carries, once the document is built), a stage that carries several kernels is one task,
-/// a group: the first one's id, and as its members the tasks each carried (a kernel's own members,
-/// or its id).
-pub fn task_refs(job: &JobSpec, stages: Option<&[Vec<usize>]>) -> Vec<TaskRefDoc> {
-    let one = |id: String| TaskRefDoc {
-        id,
-        members: Vec::new(),
-    };
-    let (source, kernels, sink) = match &job.report.tasks {
-        Some(tasks) => (
-            tasks.source.clone(),
-            tasks.kernels.clone(),
-            tasks.sink.clone(),
-        ),
-        None => (
-            one("source".into()),
-            (1..=job.kernels.len())
-                .map(|k| one(format!("kernel-{k}")))
-                .collect(),
-            one("sink".into()),
-        ),
-    };
-    let staged: Vec<TaskRefDoc> = match stages {
-        None => kernels,
-        Some(stages) => stages
-            .iter()
-            .map(|carried| match carried.as_slice() {
-                [only] => kernels[*only].clone(),
+/// One task of the run as its events name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    /// Its id, and the members of a group.
+    pub task: TaskRefDoc,
+    /// `source`, `kernel` or `sink`.
+    pub element: Element,
+    /// Its place: 0 a source, the stage's number for a kernel, the stages plus one for a sink.
+    pub stage: u16,
+    /// The tasks whose output it takes, by its input ports, as places in [`Plan::nodes`].
+    pub upstream: Vec<usize>,
+}
+
+/// The run's tasks for its events: the sources, then the kernel stages in their numbered order,
+/// then the sinks; and which of them each queue of the run's topology joins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Every task.
+    pub nodes: Vec<Node>,
+    /// Source `i`'s place.
+    pub sources: Vec<usize>,
+    /// Stage `s`'s place (`stages[s - 1]`).
+    pub stages: Vec<usize>,
+    /// Sink `i`'s place.
+    pub sinks: Vec<usize>,
+    /// Queue `q`'s producer and consumer, by place.
+    pub queues: Vec<(usize, usize)>,
+}
+
+impl Plan {
+    /// The plan of `job` as it was built (`parts`), or, refused before it was built, as it was
+    /// written: each kernel its own stage, in an order in which every edge goes forward.
+    pub fn of(job: &Job, parts: Option<&Parts>) -> Plan {
+        let parts = match parts {
+            Some(parts) => parts.clone(),
+            None => {
+                let order = job
+                    .topological_order()
+                    .unwrap_or_else(|_| (0..job.tasks.len()).collect());
+                let of = |role: Role| -> Vec<usize> {
+                    (0..job.tasks.len())
+                        .filter(|&i| job.tasks[i].role == role)
+                        .collect()
+                };
+                Parts {
+                    sources: of(Role::Source),
+                    stages: order
+                        .into_iter()
+                        .filter(|&i| job.tasks[i].role == Role::Kernel)
+                        .map(|i| vec![i])
+                        .collect(),
+                    sinks: of(Role::Sink),
+                }
+            }
+        };
+        // The place of each of the job's tasks: a fused kernel's is its stage's.
+        let mut place: Vec<Option<usize>> = vec![None; job.tasks.len()];
+        let mut nodes = Vec::new();
+        let one = |i: usize| TaskRefDoc {
+            id: job.tasks[i].id.clone(),
+            members: job.tasks[i].members.clone(),
+        };
+        let mut sources = Vec::new();
+        for &i in &parts.sources {
+            place[i] = Some(nodes.len());
+            sources.push(nodes.len());
+            nodes.push(Node {
+                task: one(i),
+                element: Element::Source,
+                stage: 0,
+                upstream: Vec::new(),
+            });
+        }
+        let mut stages = Vec::new();
+        for (at, carried) in parts.stages.iter().enumerate() {
+            for &i in carried {
+                place[i] = Some(nodes.len());
+            }
+            stages.push(nodes.len());
+            let task = match carried.as_slice() {
+                [only] => one(*only),
                 many => TaskRefDoc {
-                    id: kernels[many[0]].id.clone(),
+                    id: job.tasks[many[0]].id.clone(),
                     members: many
                         .iter()
-                        .flat_map(|k| match kernels[*k].members.as_slice() {
-                            [] => vec![kernels[*k].id.clone()],
+                        .flat_map(|&k| match job.tasks[k].members.as_slice() {
+                            [] => vec![job.tasks[k].id.clone()],
                             members => members.to_vec(),
                         })
                         .collect(),
                 },
-            })
-            .collect(),
-    };
-    std::iter::once(source)
-        .chain(staged)
-        .chain(std::iter::once(sink))
-        .collect()
+            };
+            nodes.push(Node {
+                task,
+                element: Element::Kernel,
+                stage: (at + 1) as u16,
+                upstream: Vec::new(),
+            });
+        }
+        let last = (parts.stages.len() + 1) as u16;
+        let mut sinks = Vec::new();
+        for &i in &parts.sinks {
+            place[i] = Some(nodes.len());
+            sinks.push(nodes.len());
+            nodes.push(Node {
+                task: one(i),
+                element: Element::Sink,
+                stage: last,
+                upstream: Vec::new(),
+            });
+        }
+        // Each task's upstream, by its input ports; an edge inside a fused stage is no input.
+        let mut queues = Vec::new();
+        for (i, task) in job.tasks.iter().enumerate() {
+            let Some(at) = place[i] else {
+                continue;
+            };
+            for port in &task.inputs {
+                for e in job.edges_into(&task.id, port) {
+                    let Some(from) = job
+                        .task_index(&job.edges[e].from.task)
+                        .and_then(|f| place[f])
+                    else {
+                        continue;
+                    };
+                    if from == at {
+                        continue;
+                    }
+                    if !nodes[at].upstream.contains(&from) {
+                        nodes[at].upstream.push(from);
+                    }
+                }
+            }
+        }
+        for edge in &job.edges {
+            let (Some(from), Some(to)) = (
+                job.task_index(&edge.from.task).and_then(|f| place[f]),
+                job.task_index(&edge.to.task).and_then(|t| place[t]),
+            ) else {
+                continue;
+            };
+            if from != to {
+                queues.push((from, to));
+            }
+        }
+        Plan {
+            nodes,
+            sources,
+            stages,
+            sinks,
+            queues,
+        }
+    }
+
+    /// The ids of the tasks, in place order.
+    pub fn ids(&self) -> Vec<String> {
+        self.nodes.iter().map(|n| n.task.id.clone()).collect()
+    }
 }
 
 impl Lifecycle {
-    /// The lifecycle of a chain of `refs` (source, kernels, sink), on `clock`, told to `out`.
-    pub fn new(refs: Vec<TaskRefDoc>, clock: Instant, out: EventOut) -> Arc<Lifecycle> {
-        let tasks = refs
+    /// The lifecycle of the tasks of `plan`, on `clock`, told to `out`.
+    pub fn new(plan: Plan, clock: Instant, out: EventOut) -> Arc<Lifecycle> {
+        let tasks = plan
+            .nodes
             .iter()
-            .map(|r| Task {
-                id: r.id.clone(),
+            .enumerate()
+            .map(|(at, n)| Task {
+                id: n.task.id.clone(),
                 state: State::Waiting,
                 input_closed: false,
+                open_inputs: plan.queues.iter().filter(|(_, to)| *to == at).count(),
                 on_port: false,
             })
             .collect();
@@ -151,7 +270,7 @@ impl Lifecycle {
                 cancel_acknowledged: false,
                 ended: false,
             }),
-            refs,
+            plan,
             clock,
             out,
         })
@@ -176,31 +295,32 @@ impl Lifecycle {
         let inner = self.lock();
         let t = self.now(&inner);
         self.tell(t, Event::AttemptStarted { resumed });
-        let last = self.refs.len() - 1;
-        for (pos, r) in self.refs.iter().enumerate() {
-            let element = match pos {
-                0 => Element::Source,
-                p if p == last => Element::Sink,
-                _ => Element::Kernel,
-            };
-            let upstream = (pos > 0).then(|| self.refs[pos - 1].id.clone());
+        for node in &self.plan.nodes {
             self.tell(
                 t,
                 Event::TaskRegistered {
-                    task: r.id.clone(),
-                    element,
-                    stage: pos as u16,
-                    upstream: upstream.clone(),
-                    members: r.members.clone(),
+                    task: node.task.id.clone(),
+                    element: node.element,
+                    stage: node.stage,
+                    upstream: node
+                        .upstream
+                        .iter()
+                        .map(|&u| self.plan.nodes[u].task.id.clone())
+                        .collect(),
+                    members: node.task.members.clone(),
                 },
             );
         }
         for (pos, task) in inner.tasks.iter().enumerate() {
-            let (reason, blocking) = match pos {
-                0 => (WaitReason::EnginePreparing, Vec::new()),
+            let node = &self.plan.nodes[pos];
+            let (reason, blocking) = match node.element {
+                Element::Source => (WaitReason::EnginePreparing, Vec::new()),
                 _ => (
                     WaitReason::AwaitingInput,
-                    vec![inner.tasks[pos - 1].id.clone()],
+                    node.upstream
+                        .iter()
+                        .map(|&u| inner.tasks[u].id.clone())
+                        .collect(),
                 ),
             };
             self.tell(
@@ -227,13 +347,14 @@ impl Lifecycle {
             return Phase::Calibrating;
         }
         let task = &inner.tasks[pos];
-        if pos > 0 && task.input_closed {
+        let element = self.plan.nodes[pos].element;
+        if element != Element::Source && task.input_closed {
             return Phase::Draining;
         }
-        match pos {
-            0 => Phase::Reading,
-            p if p == inner.tasks.len() - 1 => Phase::Writing,
-            _ => Phase::Applying,
+        match element {
+            Element::Source => Phase::Reading,
+            Element::Sink => Phase::Writing,
+            Element::Kernel => Phase::Applying,
         }
     }
 
@@ -322,11 +443,19 @@ impl Lifecycle {
         let mut inner = self.lock();
         let t = self.now(&inner);
         let inner = &mut *inner;
-        let sink = inner.tasks.len() - 1;
+        let plan = &self.plan;
+        let stage_at = |stage: StageId| {
+            usize::from(stage)
+                .checked_sub(1)
+                .and_then(|i| plan.stages.get(i))
+                .copied()
+        };
         match event {
             StageEvent::Running => {
                 inner.running = true;
-                self.ready(inner, t, 0);
+                for &pos in &plan.sources {
+                    self.ready(inner, t, pos);
+                }
                 for pos in 0..inner.tasks.len() {
                     if let State::Running {
                         phase: Phase::Calibrating,
@@ -338,23 +467,28 @@ impl Lifecycle {
                     }
                 }
             }
-            StageEvent::SourceReading => {
-                let phase = self.phase_of(inner, 0);
-                self.start(inner, t, 0, phase);
+            StageEvent::SourceReading { source } => {
+                if let Some(&pos) = plan.sources.get(usize::from(*source)) {
+                    let phase = self.phase_of(inner, pos);
+                    self.start(inner, t, pos, phase);
+                }
             }
-            StageEvent::Fed { queue } => self.ready(inner, t, usize::from(*queue) + 1),
+            StageEvent::Fed { queue } => {
+                if let Some(&(_, consumer)) = plan.queues.get(usize::from(*queue)) {
+                    self.ready(inner, t, consumer);
+                }
+            }
             StageEvent::StageStarted { stage } => {
-                let pos = usize::from(*stage);
-                if pos >= 1 && pos < sink {
+                if let Some(pos) = stage_at(*stage) {
                     let phase = self.phase_of(inner, pos);
                     self.start(inner, t, pos, phase);
                 }
             }
             StageEvent::QueueClosed { queue, counters } => {
-                let producer = usize::from(*queue);
-                if producer >= sink {
+                let Some(&(producer, consumer)) = plan.queues.get(usize::from(*queue)) else {
                     return;
-                }
+                };
+                // A producer's queues close together: the first close ends it.
                 self.complete(
                     inner,
                     t,
@@ -363,25 +497,32 @@ impl Lifecycle {
                     Some(Counters::of(counters)),
                     None,
                 );
-                let consumer = producer + 1;
-                inner.tasks[consumer].input_closed = true;
-                if let State::Running { phase, .. } = inner.tasks[consumer].state
-                    && matches!(phase, Phase::Applying | Phase::Writing)
-                {
-                    self.phase(inner, t, consumer, Phase::Draining);
+                let task = &mut inner.tasks[consumer];
+                task.open_inputs = task.open_inputs.saturating_sub(1);
+                if task.open_inputs == 0 {
+                    task.input_closed = true;
+                    if let State::Running { phase, .. } = task.state
+                        && matches!(phase, Phase::Applying | Phase::Writing)
+                    {
+                        self.phase(inner, t, consumer, Phase::Draining);
+                    }
                 }
             }
-            StageEvent::SinkWriting => {
-                let phase = self.phase_of(inner, sink);
-                self.start(inner, t, sink, phase);
+            StageEvent::SinkWriting { sink } => {
+                if let Some(&pos) = plan.sinks.get(usize::from(*sink)) {
+                    let phase = self.phase_of(inner, pos);
+                    self.start(inner, t, pos, phase);
+                }
             }
-            StageEvent::SinkCommitting => {
-                self.start(inner, t, sink, Phase::Committing);
-                self.phase(inner, t, sink, Phase::Committing);
+            StageEvent::SinkCommitting { sink } => {
+                if let Some(&pos) = plan.sinks.get(usize::from(*sink)) {
+                    self.start(inner, t, pos, Phase::Committing);
+                    self.phase(inner, t, pos, Phase::Committing);
+                }
             }
             StageEvent::PortWaiting { stage, port } => {
-                let pos = usize::from(*stage);
-                if pos >= 1 && pos < sink && matches!(inner.tasks[pos].state, State::Running { .. })
+                if let Some(pos) = stage_at(*stage)
+                    && matches!(inner.tasks[pos].state, State::Running { .. })
                 {
                     inner.tasks[pos].on_port = true;
                     self.tell(
@@ -396,8 +537,9 @@ impl Lifecycle {
                 }
             }
             StageEvent::PortAnswered { stage } => {
-                let pos = usize::from(*stage);
-                if pos >= 1 && pos < sink && inner.tasks[pos].on_port {
+                if let Some(pos) = stage_at(*stage)
+                    && inner.tasks[pos].on_port
+                {
                     inner.tasks[pos].on_port = false;
                     if let State::Running { phase, .. } = inner.tasks[pos].state {
                         self.tell(
@@ -410,15 +552,17 @@ impl Lifecycle {
                     }
                 }
             }
-            StageEvent::SinkFinished { counters } => {
-                self.complete(
-                    inner,
-                    t,
-                    sink,
-                    TaskOutcome::Succeeded,
-                    Some(Counters::of(counters)),
-                    None,
-                );
+            StageEvent::SinkFinished { sink, counters } => {
+                if let Some(&pos) = plan.sinks.get(usize::from(*sink)) {
+                    self.complete(
+                        inner,
+                        t,
+                        pos,
+                        TaskOutcome::Succeeded,
+                        Some(Counters::of(counters)),
+                        None,
+                    );
+                }
             }
         }
     }
@@ -507,7 +651,7 @@ impl Lifecycle {
                 CancelDisposition::Failed
             }
             Ending::Failed(error) => {
-                let (owner, code, message, retryable) = attribute(error, inner.tasks.len());
+                let (owner, code, message, retryable) = attribute(error, &self.plan);
                 // A task already ended cannot end again: its failure is the attempt's then, said
                 // as the defect it is.
                 let pos = owner.filter(|p| inner.tasks[*p].state != State::Ended);
@@ -596,14 +740,20 @@ impl Drop for Lifecycle {
     }
 }
 
-/// The task an error belongs to (its position in a chain of `tasks`, source first), its code,
-/// the engine's sentence about it, which names stages, morsels and sizes and quotes nothing a
-/// kernel or a source said, and whether running the document again may succeed.
-pub fn attribute(error: &MorunaError, tasks: usize) -> (Option<usize>, FailureCode, String, bool) {
-    let sink = tasks - 1;
+/// The task an error belongs to (its place in `plan`), its code, the engine's sentence about
+/// it, which names stages, morsels and sizes and quotes nothing a kernel or a source said, and
+/// whether running the document again may succeed. A source's or a sink's failure belongs to it
+/// when the run has one; with several, the error does not say which, and it is the attempt's.
+pub fn attribute(error: &MorunaError, plan: &Plan) -> (Option<usize>, FailureCode, String, bool) {
     let kernel = |stage: StageId| {
-        let pos = usize::from(stage);
-        (pos >= 1 && pos < sink).then_some(pos)
+        usize::from(stage)
+            .checked_sub(1)
+            .and_then(|i| plan.stages.get(i))
+            .copied()
+    };
+    let only = |of: &[usize]| match of {
+        [one] => Some(*one),
+        _ => None,
     };
     match error {
         MorunaError::Kernel { stage, seq, .. } => (
@@ -643,13 +793,13 @@ pub fn attribute(error: &MorunaError, tasks: usize) -> (Option<usize>, FailureCo
             false,
         ),
         MorunaError::Source { split, .. } => (
-            Some(0),
+            only(&plan.sources),
             FailureCode::SourceError,
             format!("the source could not read split {split}"),
             true,
         ),
         MorunaError::Sink(_) => (
-            Some(sink),
+            only(&plan.sinks),
             FailureCode::SinkError,
             "the sink could not write or commit".to_string(),
             true,

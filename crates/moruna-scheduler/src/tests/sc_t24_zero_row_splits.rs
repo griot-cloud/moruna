@@ -29,9 +29,10 @@ fn sc_t24_zero_row_splits() {
                 .stages(stages)
                 .go();
             let outcome = run_within(&rig, Duration::from_secs(10), &what);
-            let RunOutcome::Completed { sink } = outcome else {
+            let RunOutcome::Completed { sinks } = outcome else {
                 panic!("{what}: expected Completed, got {outcome:?}");
             };
+            let sink = &sinks[0];
             assert_eq!(
                 sink.rows,
                 rows.iter().sum::<u64>(),

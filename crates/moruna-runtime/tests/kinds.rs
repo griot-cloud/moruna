@@ -185,9 +185,13 @@ fn kd_t5_add_a_kind() {
         packages: Default::default(),
         host_ports: None,
     };
-    let refused = build(&job, &Registry::standard(), opts())
-        .err()
-        .expect("the standard kinds do not have it");
+    let refused = build(
+        &moruna_job::Job::from_v1(&job),
+        &Registry::standard(),
+        opts(),
+    )
+    .err()
+    .expect("the standard kinds do not have it");
     assert!(
         refused
             .to_string()
@@ -205,7 +209,8 @@ fn kd_t5_add_a_kind() {
             .any(|d| d.name == "test.scale"),
         "it is listed"
     );
-    let built = build(&job, &kinds, opts()).expect("the document builds");
+    let built =
+        build(&moruna_job::Job::from_v1(&job), &kinds, opts()).expect("the document builds");
     let report = Runtime::run(built.spec, CancelToken::new()).expect("the run completes");
     assert_eq!(read_back_rows(&out), rows);
     let written: i64 = (0..rows as i64).map(|v| v * 2 * 3).sum();

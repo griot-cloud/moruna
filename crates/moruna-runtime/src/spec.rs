@@ -6,7 +6,7 @@ use std::sync::Arc;
 use moruna_discovery::Discovered;
 use moruna_kernel::{
     Allocator, CancelToken, ErrorPolicy, HostProfile, Kernel, ObjectMetadata, Placement, Reactor,
-    RunId, Sampler, Sink, SizerKind, Source, TraceSink, TraceTail,
+    RunId, Sampler, Sink, SizerKind, Source, Topology, TraceSink, TraceTail,
 };
 use moruna_reactor::ObjectStoreConfig;
 
@@ -30,29 +30,38 @@ pub struct BuildCtx {
     pub run_id: RunId,
     /// The arena's host capacity when the run started.
     pub arena_bytes: u64,
-    /// The file buffer a sink claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
+    /// How many sinks the run has: they share the arena's file buffer share (contracts d.16).
+    pub sinks: u16,
+    /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
     pub(crate) sink_buffer: std::sync::atomic::AtomicU64,
 }
 
 impl BuildCtx {
-    /// The most a sink that encodes files in the arena (Parquet) may hold for its file buffers,
-    /// claimed: `config::SINK_BUFFER_SHARE` of the arena, rounded down to the arena's size
-    /// class so the buffer the sink asks for is the one it is given. The facade takes the claim
-    /// out of what the controller plans morsels and queues into, so a sink that grabbed the
-    /// largest buffer the arena would give can no longer leave the queues and the staging of an
-    /// unrepeatable source with nothing (F8.5's finding at 256 MiB).
-    pub fn claim_file_buffer(&self) -> u64 {
-        let share = (self.arena_bytes as f64 * crate::config::SINK_BUFFER_SHARE) as u64;
-        let bytes = match share {
+    /// The most one sink that encodes files in the arena (Parquet) may hold for its file
+    /// buffers: `config::SINK_BUFFER_SHARE` of the arena, divided among the run's sinks and
+    /// rounded down to the arena's size class so the buffer the sink asks for is the one it is
+    /// given.
+    pub fn file_buffer_share(&self) -> u64 {
+        let share = (self.arena_bytes as f64 * crate::config::SINK_BUFFER_SHARE) as u64
+            / u64::from(self.sinks.max(1));
+        match share {
             0 => 0,
             n => 1u64 << (63 - n.leading_zeros()),
-        };
+        }
+    }
+
+    /// Claim [`BuildCtx::file_buffer_share`] for one sink. The facade takes every claim out of
+    /// what the controller plans morsels and queues into, so a sink that grabbed the largest
+    /// buffer the arena would give can no longer leave the queues and the staging of an
+    /// unrepeatable source with nothing (F8.5's finding at 256 MiB).
+    pub fn claim_file_buffer(&self) -> u64 {
+        let bytes = self.file_buffer_share();
         self.sink_buffer
-            .store(bytes, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         bytes
     }
 
-    /// What a sink claimed with [`BuildCtx::claim_file_buffer`]; zero when it claimed nothing.
+    /// What the sinks claimed with [`BuildCtx::claim_file_buffer`]; zero when none claimed.
     pub fn sink_buffer_bytes(&self) -> u64 {
         self.sink_buffer.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -145,26 +154,30 @@ pub trait EngineMemory: Send + Sync {
     fn note(&self) -> String;
 }
 
-/// One run, as the surface describes it (12 d.1).
+/// One run, as the surface describes it (12 d.1): sources, kernel stages and sinks joined by
+/// the queues of `topology` (contracts d.16). [`RunSpec::new`] describes the linear chain.
 pub struct RunSpec {
-    /// The input.
-    pub source: SourceSpec,
-    /// Stages 1..=n; may be empty, in which case the pipeline is source to sink (12 h).
+    /// The inputs, source 0 first.
+    pub sources: Vec<SourceSpec>,
+    /// Stages 1..=n, numbered as `topology` numbers them; may be empty, in which case each
+    /// source feeds sinks directly (12 h).
     pub kernels: Vec<Arc<dyn Kernel>>,
+    /// How the sources, stages and sinks are joined.
+    pub topology: Topology,
     /// The Python kernels among them, for `bind_allocator` and `gil_state` (05 d.1).
     #[cfg(feature = "python")]
     pub py_kernels: Vec<(moruna_kernel::StageId, Arc<moruna_adapters::PyKernel>)>,
     /// The packaged kernels among them (16, 17), which the facade binds to the run's gate,
     /// sampler and limits.
     pub packaged: Vec<crate::packaged::Packaged>,
-    /// The output; wrapped into a `SinkHandle` by the facade.
-    pub sink: SinkSpec,
-    /// The source's engine memory, when the source is an engine that runs operators of its own
-    /// (a DataFusion plan); `None` for every other source.
-    pub engine_memory: Option<Arc<dyn EngineMemory>>,
-    /// The sink's engine memory, when the sink is an engine that encodes outside the arena (a
-    /// peQL contract write); `None` for every other sink.
-    pub sink_memory: Option<Arc<dyn EngineMemory>>,
+    /// The outputs, sink 0 first; each wrapped into a `SinkHandle` by the facade.
+    pub sinks: Vec<SinkSpec>,
+    /// The engine memory of each source that is an engine running operators of its own (a
+    /// DataFusion plan); empty when none is.
+    pub engine_memory: Vec<Arc<dyn EngineMemory>>,
+    /// The engine memory of each sink that is an engine encoding outside the arena (a peQL
+    /// contract write); empty when none is.
+    pub sink_memory: Vec<Arc<dyn EngineMemory>>,
     /// An explicit host ceiling in bytes; discovery clamps it.
     pub budget: Option<u64>,
     /// An explicit CPU quota in cores; discovery clamps it.
@@ -190,7 +203,7 @@ pub struct RunSpec {
     pub staging_url: Option<String>,
     /// What happens after a kernel error.
     pub error_policy: ErrorPolicy,
-    /// Deliver morsels to the sink in sequence order.
+    /// Deliver morsels to each sink in sequence order.
     pub ordered: bool,
     /// Which decision function sizes morsels.
     pub sizer: SizerKind,
@@ -224,23 +237,37 @@ pub struct RunSpec {
 }
 
 impl RunSpec {
-    /// A run over `source`, `kernels` and `sink` with every other field at the preamble's
-    /// default (section 5). This is what `moruna.run(source, kernels, sink)` translates to
-    /// before the surface applies its own arguments (PY-I3).
+    /// The linear chain over `source`, `kernels` and `sink` with every other field at the
+    /// preamble's default (section 5). This is what `moruna.run(source, kernels, sink)`
+    /// translates to before the surface applies its own arguments (PY-I3).
     pub fn new(
         source: impl Into<SourceSpec>,
         kernels: Vec<Arc<dyn Kernel>>,
         sink: impl Into<SinkSpec>,
     ) -> RunSpec {
+        let topology = Topology::chain(kernels.len() as u16);
+        RunSpec::graph(vec![source.into()], kernels, vec![sink.into()], topology)
+    }
+
+    /// The run over `sources`, `kernels` and `sinks` joined as `topology` says (contracts d.16),
+    /// with every other field at the preamble's default. The topology is checked against the
+    /// three lists when the run starts.
+    pub fn graph(
+        sources: Vec<SourceSpec>,
+        kernels: Vec<Arc<dyn Kernel>>,
+        sinks: Vec<SinkSpec>,
+        topology: Topology,
+    ) -> RunSpec {
         RunSpec {
-            source: source.into(),
+            sources,
             kernels,
+            topology,
             #[cfg(feature = "python")]
             py_kernels: Vec::new(),
             packaged: Vec::new(),
-            sink: sink.into(),
-            engine_memory: None,
-            sink_memory: None,
+            sinks,
+            engine_memory: Vec::new(),
+            sink_memory: Vec::new(),
             budget: None,
             cpu: None,
             elastic: crate::elastic::ElasticBudget::default(),
@@ -349,6 +376,7 @@ mod tests {
             object_metadata: metadata,
             run_id: RunId([3; 16]),
             arena_bytes: 139_198_464,
+            sinks: 1,
             sink_buffer: std::sync::atomic::AtomicU64::new(0),
         }
     }

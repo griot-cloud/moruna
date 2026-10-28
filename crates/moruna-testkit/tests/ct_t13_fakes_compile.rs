@@ -380,7 +380,7 @@ fn fake_placement() {
     placement.set_promotion_window(0, 4);
     assert_eq!(placement.budgets_set().len(), 1);
     assert_eq!(placement.budgets_set()[0].host, 1 << 20);
-    placement.set_committed(1);
+    placement.set_committed(0, 1);
     assert_eq!(placement.committed(), Some(1));
 
     // is_full follows the water mark, and close drains the queue.
@@ -454,29 +454,29 @@ fn fake_placement() {
     writer.push(0, morsel(&alloc, 30, 3)).expect("pushed");
     let extras = CheckpointExtras {
         kernel_states: vec![(1, 0, vec![1, 2, 3])],
-        sink_state: Some(vec![9]),
-        committed_seq: Some(29),
-        source_cursor: SourceCursor {
+        sink_states: vec![Some(vec![9])],
+        committed: vec![Some(29)],
+        source_cursors: vec![SourceCursor {
             split_index: 3,
             row_offset: 4,
             next_seq: 31,
-        },
-        issued: Vec::new(),
+        }],
+        issued: vec![Vec::new()],
     };
     let path = writer.checkpoint(&extras).expect("a manifest");
     assert_eq!(writer.manifests_written(), vec![path.clone()]);
     let reader = FakePlacement::new().with_manifest_store();
     let point = reader.restore(&path, &[], &[]).expect("restored");
-    assert_eq!(point.extras.committed_seq, Some(29));
-    assert_eq!(point.extras.source_cursor.next_seq, 31);
+    assert_eq!(point.extras.committed, vec![Some(29)]);
+    assert_eq!(point.extras.source_cursors[0].next_seq, 31);
     assert_eq!(point.extras.kernel_states.len(), 1);
-    assert_eq!(point.extras.sink_state, Some(vec![9]));
+    assert_eq!(point.extras.sink_states, vec![Some(vec![9])]);
     assert_eq!(
-        point.to_recompute.len(),
+        point.to_recompute[0].len(),
         1,
         "a morsel with no disk copy is recomputed"
     );
-    assert_eq!(point.to_recompute[0].0, 30);
+    assert_eq!(point.to_recompute[0][0].0, 30);
     assert!(reader.restore(Path::new("/nowhere"), &[], &[]).is_err());
     assert!(
         FakePlacement::new().checkpoint(&extras).is_err(),

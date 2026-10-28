@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn every_outcome_has_an_exit() {
         let (exit, manifest) = exit_of(&RunOutcome::Completed {
-            sink: moruna_kernel::SinkSummary::default(),
+            sinks: vec![moruna_kernel::SinkSummary::default()],
         });
         assert_eq!(exit, ExitReason::Completed);
         assert!(manifest.is_none());

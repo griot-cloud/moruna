@@ -2,7 +2,7 @@
 //! written (MH 4.9).
 //!
 //! `cast`, `rename`, `select`, `drop`, `filter(expr)`, `fill_null`, `dedupe(keys)`,
-//! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str` and `date_trunc`, each a
+//! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str`, `date_trunc` and `union`, each a
 //! [`StdKernel`] built from its name and a JSON object of arguments. Each declares its input and
 //! output schemas as a function of its arguments, so every one of them is checkable; each ships
 //! a first profile as its hints; none enters Python, so each releases the GIL by construction;
@@ -43,7 +43,7 @@ use crate::ops::{Algo, MaskMode, Step, TruncUnit};
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every standard kernel's name, in the order of MH 4.9.
-pub const NAMES: [&str; 12] = [
+pub const NAMES: [&str; 13] = [
     "cast",
     "rename",
     "select",
@@ -56,6 +56,7 @@ pub const NAMES: [&str; 12] = [
     "explode",
     "concat_str",
     "date_trunc",
+    "union",
 ];
 
 /// What a standard kernel does.
@@ -96,6 +97,9 @@ enum Op {
         unit: TruncUnit,
         output: Option<String>,
     },
+    /// `union`: the batches of every input port, each as it came, into one output (a stage of
+    /// several inputs, contracts d.16).
+    Union,
 }
 
 /// A standard kernel: its name, its canonical arguments, what it does and what it declares.
@@ -405,6 +409,17 @@ impl StdKernel {
                     1.0,
                 )
             }
+            "union" => {
+                args::only(name, args, &[])?;
+                (
+                    Op::Union,
+                    Declared {
+                        input: None,
+                        output: unchanged(),
+                    },
+                    0.0,
+                )
+            }
             other => {
                 return Err(MorunaError::Plan(format!(
                     "moruna.std has no kernel `{other}` (the standard kernels are {})",
@@ -480,6 +495,7 @@ impl StdKernel {
                 columns, output, ..
             } => ops::concat_schema(columns, output, input),
             Op::Trunc { column, output, .. } => ops::trunc_schema(column, output.as_deref(), input),
+            Op::Union => Ok(Arc::new(input.clone())),
         }
     }
 }
@@ -653,6 +669,59 @@ impl Kernel for StdKernel {
         }
     }
 
+    /// `union` takes any number of inputs; every other standard kernel one.
+    fn max_inputs(&self) -> u16 {
+        match self.op {
+            Op::Union => u16::MAX,
+            _ => 1,
+        }
+    }
+
+    /// `union` gives what each of its inputs gives, so every input has one schema; every other
+    /// standard kernel takes one input.
+    fn output_schema_of(&self, inputs: &[SourceSchema]) -> Result<SourceSchema> {
+        match (&self.op, inputs) {
+            (_, [one]) => self.output_schema(one),
+            (Op::Union, [first, rest @ ..]) => {
+                let first = self.output_schema(first)?;
+                for (port, schema) in rest.iter().enumerate() {
+                    let other = self.output_schema(schema)?;
+                    if let (SourceSchema::Table(a), SourceSchema::Table(b)) = (&first, &other)
+                        && a.fields() != b.fields()
+                    {
+                        return Err(MorunaError::Plan(format!(
+                            "moruna.std.union takes inputs of one schema, and its port {} gives \
+                             {b:?} where port 0 gives {a:?}",
+                            port + 1
+                        )));
+                    }
+                }
+                Ok(first)
+            }
+            (_, many) => Err(MorunaError::Plan(format!(
+                "moruna.std.{} takes one input and is given {}",
+                self.name,
+                many.len()
+            ))),
+        }
+    }
+
+    /// `union` takes a batch on any port as it came; every other standard kernel takes port 0.
+    fn apply_port(
+        &self,
+        state: &mut dyn KernelState,
+        port: u16,
+        input: Payload,
+    ) -> Result<Payload> {
+        match (&self.op, port) {
+            (Op::Union, _) | (_, 0) => self.apply(state, input),
+            (_, other) => Err(MorunaError::Plan(format!(
+                "moruna.std.{} takes one input and was handed a batch on its port {other}",
+                self.name
+            ))),
+        }
+    }
+
     fn init(&self, _ctx: &InitCtx) -> Result<Box<dyn KernelState>> {
         Ok(match self.op {
             Op::Dedupe(_) => Box::new(Seen {
@@ -731,6 +800,7 @@ impl Kernel for StdKernel {
                 unit,
                 output,
             } => ops::date_trunc(column, *unit, output.as_deref(), batch)?,
+            Op::Union => return Ok(input),
         };
         drop(input);
         Payload::table(out)

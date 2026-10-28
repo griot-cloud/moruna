@@ -1,7 +1,7 @@
 # Moruna SDD 01: Contracts crate (`moruna-kernel`)
 
 **Document type:** software design document, component 1 of 12
-**Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I14, CT-T23) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
 **Parent:** `architecture/moruna-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
 **Preamble:** `00-preamble.md` (read first)
 **Component location:** `crates/moruna-kernel`, Rust 2024 edition
@@ -61,7 +61,9 @@ Beyond the preamble's global vocabulary:
 
 **CT-I13. Malformed Arrow IPC is an error, never a panic (2026-10-28).** Every Arrow IPC byte Moruna reads is untrusted: a function's output (16 e.5, 17 f.4, f.8), a Parquet footer's Arrow schema (07 SO-I10), a record or a trace read back from disk (e.7, 04 e.2). arrow-ipc panics on some messages it cannot read rather than returning an error, so no IPC message reaches arrow-ipc's converter or decoder before `ipc::check` (e.8) has passed it, and whatever the bytes are, a decode returns the site's error naming what is wrong, or a valid batch. There is one check, in this crate; no component keeps a copy of it. Rationale: a tenant's function, or a bit flipped on a disk, must not end a run by panicking inside a library.
 
-**CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read. `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
+**CT-I14. A batch handed to a consumer may be shared (KA5, 2026-10-29).** A batch a source or a stage fans out to several queues is one set of bytes every consumer reads (`Payload::share`, d.16): a kernel and a sink read their input and never write into it, and the bytes are released when the last holder drops its share. Rationale: a fan-out that copied would double the memory of every branch, and the budget (G-I1) counts the batch once (placement PL-I16).
+
+**CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read (in a DAG, the kernels on the path `Topology::parent` traces from its queue back to its source, d.16). `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
 
 ## d. Interfaces
 
@@ -595,8 +597,21 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload>;
+    /// How many input ports the kernel takes at most (d.16; KA5, 2026-10-29). A stage given
+    /// more is refused at build. Default 1.
+    fn max_inputs(&self) -> u16 { 1 }
+    /// `apply` for a batch that came in on input port `port` (d.16). The default is `apply` for
+    /// port 0 and a `Plan` refusal for any other, so a kernel of one input is unchanged; a kernel
+    /// of several overrides it and is told on every call which input the batch is. The batches
+    /// of different ports arrive in no particular order, each once.
+    fn apply_port(&self, state: &mut dyn KernelState, port: u16, input: Payload) -> Result<Payload> { .. }
+    /// The output schema for the input schemas, port 0 first (d.16). The default is
+    /// `output_schema` for one input and a `Plan` refusal for several.
+    fn output_schema_of(&self, inputs: &[SourceSchema]) -> Result<SourceSchema> { .. }
 }
 ```
+
+The scheduler calls `apply_port` and `output_schema_of` and nothing else of the two; a kernel of one input implements neither and sees `apply` and `output_schema` as before. A kernel's input may be shared with another consumer (d.16, CT-I14): it reads its input and never writes into it.
 
 ### d.8 Sink
 
@@ -778,7 +793,13 @@ pub struct QueueStats {
     pub promotions: u64,
 }
 #[derive(Clone, Debug, Default)]
-pub struct PlacementStats { pub queues: Vec<QueueStats>, pub in_flight_bytes: u64 }
+pub struct PlacementStats {
+    pub queues: Vec<QueueStats>,          // by queue id
+    pub in_flight_bytes: u64,
+    /// Per tier, the bytes counted in more than one queue's figure: a batch fanned out to `m`
+    /// queues is resident once and each counts it (d.16; KA5). Zero with no fan-out.
+    pub shared_by_tier: [u64; TIER_COUNT],
+}
 
 /// Which node's memory a pop may be satisfied from. Reserved for the multi-node
 /// extension; v1 callers pass `Any` and, with one node, the two are equivalent.
@@ -791,18 +812,20 @@ pub enum Locality {
 }
 
 /// Pieces of a checkpoint the placement engine does not own but records in the
-/// manifest on behalf of the scheduler (placement e.5).
+/// manifest on behalf of the scheduler (placement e.5). Sources and sinks by their numbers in
+/// the run's topology (d.16; KA5, 2026-10-29).
 #[derive(Clone, Debug, Default)]
 pub struct CheckpointExtras {
     /// `(stage, instance, bytes)` from `KernelState::checkpoint` for `Checkpoint` kernels.
     pub kernel_states: Vec<(StageId, usize, Vec<u8>)>,
-    /// From `Sink::checkpoint`.
-    pub sink_state: Option<Vec<u8>>,
-    /// From `Sink::committed_seq` at the moment of the checkpoint.
-    pub committed_seq: Option<Seq>,
-    /// Where the source drive is: the index into the plan and the next row within
-    /// that split, plus the next sequence number to assign.
-    pub source_cursor: SourceCursor,
+    /// From each sink's `Sink::checkpoint`.
+    pub sink_states: Vec<Option<Vec<u8>>>,
+    /// From each sink's `Sink::committed_seq` at the moment of the checkpoint.
+    pub committed: Vec<Option<Seq>>,
+    /// Where each source's drive is.
+    pub source_cursors: Vec<SourceCursor>,
+    /// Per source, the reads issued behind its cursor that have not reached its queues.
+    pub issued: Vec<Vec<(Seq, Origin)>>,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -812,16 +835,22 @@ pub struct SourceCursor { pub split_index: u32, pub row_offset: u64, pub next_se
 #[derive(Clone, Debug, Default)]
 pub struct ResumePoint {
     pub extras: CheckpointExtras,
-    /// Morsels the manifest knew about that have no disk copy and are not
-    /// committed: the scheduler re-reads each from its origin and pushes it to
-    /// Q0 with its original `seq` before restarting the source drive.
-    pub to_recompute: Vec<(Seq, Origin)>,
+    /// Per source, the morsels it read that the manifest could not restore from disk and some
+    /// sink had not committed, and its issued reads the lineage does not hold: the scheduler
+    /// re-reads each from its origin and pushes it into the source's queues with its original
+    /// `seq` before restarting the source's drive; each sink drops what its own watermark covers.
+    pub to_recompute: Vec<Vec<(Seq, Origin)>>,
 }
 
 pub trait Placement: Send + Sync {
     /// Never blocks. Ok(()) even if the queue is above high water; the caller
     /// consults `is_full` for admission.
     fn push(&self, stage: StageId, morsel: Morsel) -> Result<()>;
+    /// Push one morsel into every queue of `stages`, its producer's fan-out (d.16): the payload
+    /// is shared by each (`Payload::share`), never copied, and resident once until the last
+    /// consumer has taken it. The default pushes a share into each in order; the engine counts
+    /// the bytes once and records the lineage at every queue in one step (placement f.17).
+    fn push_to(&self, stages: &[StageId], morsel: Morsel) -> Result<()> { .. }
     /// Returns the head if it is resident in a tier satisfying `want` and `locality`;
     /// `Ok(None)` if the queue is empty or the head is not yet resident. Never blocks.
     fn pop(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> Result<Option<Morsel>>;
@@ -840,18 +869,19 @@ pub trait Placement: Send + Sync {
     fn replace(&self, stage: StageId, morsel: Morsel) -> Result<()>;
     /// Cancel every in-flight move, stop planning, release reservations (preamble 4.3). Idempotent.
     fn shutdown(&self);
-    /// The sink has committed every morsel with a sequence number at or below `seq`.
-    /// Lets the engine forget the lineage of committed morsels (placement f.11).
-    fn set_committed(&self, seq: Seq);
+    /// Sink `sink` has committed every morsel with a sequence number at or below `seq`. The
+    /// engine forgets a source morsel's lineage once every sink it reaches has committed what it
+    /// became there (placement f.11, f.17).
+    fn set_committed(&self, sink: u16, seq: Seq);
     /// Write the run manifest atomically to the staging directory (placement e.5).
     /// Returns the manifest path. An engine without a staging directory returns
     /// `Err(Resume("no staging directory"))`.
     fn checkpoint(&self, extras: &CheckpointExtras) -> Result<std::path::PathBuf>;
     /// Rebuild queues from a manifest written by `checkpoint`: entries with a disk
     /// copy come back `OnDisk`; the rest are listed in `ResumePoint::to_recompute`.
-    /// Must be called before any `push`. Validates the manifest against the plan
-    /// and kernel fingerprints it is given.
-    fn restore(&self, manifest: &std::path::Path, plan: &[Split], fingerprints: &[Fingerprint]) -> Result<ResumePoint>;
+    /// Must be called before any `push`. Validates the manifest against each source's plan
+    /// (`plans[i]`) and the kernel fingerprints it is given.
+    fn restore(&self, manifest: &std::path::Path, plans: &[Vec<Split>], fingerprints: &[Fingerprint]) -> Result<ResumePoint>;
     fn is_full(&self, stage: StageId) -> bool;
     /// Declare the consumer of a queue so promotion targets the right tier.
     fn set_consumer(&self, stage: StageId, want: PayloadSpec);
@@ -1146,6 +1176,41 @@ pub enum ConvertError {
 }
 ```
 
+### d.16 The run's shape (KA5, 2026-10-29)
+
+`moruna_kernel::graph`: a run is a DAG of sources, kernel stages and sinks, and each **queue** is one edge of it. `StageId` keeps naming a queue in the placement contract (d.10) and a kernel stage in the knobs and the trace; in a linear chain queue `k` is stage `k`'s output.
+
+```rust
+pub enum Producer { Source(u16), Kernel(StageId) }          // sources from 0, stages from 1
+pub enum Consumer { Kernel { stage: StageId, port: u16 }, Sink(u16) }
+pub struct Link { pub from: Producer, pub to: Consumer }    // one queue
+pub struct Affine { pub a: u64, pub b: u64 }                 // seq ↦ seq · a + b
+pub struct Topology { /* links by queue id; each stage's inputs by port and outputs; each
+                         source's outputs; each sink's input; every path to each sink */ }
+impl Topology {
+    pub fn new(sources: u16, stages: u16, sinks: u16, links: Vec<Link>) -> Result<Topology>;
+    pub fn chain(kernels: u16) -> Topology;                  // Q0 .. Qn, every number kept
+    pub fn queue_count, links, link, sources, stages, sinks, inputs, outputs, source_outputs,
+           sink_input, sink_of, source_of, is_chain;
+    pub fn out_seq(&self, stage: StageId, port: u16, seq: Seq) -> Seq;
+    pub fn parent(&self, q: StageId, seq: Seq) -> Option<(StageId, Seq)>;
+    pub fn root(&self, q: StageId, seq: Seq) -> Option<(u16, Seq)>;
+    pub fn paths(&self, sink: u16) -> &[(u16, Affine)];
+    pub fn to_sinks(&self, q: StageId, seq: Seq) -> Vec<(u16, Seq)>;
+    pub fn reaches(&self, q: StageId, seq: Seq, read: &[Option<Seq>]) -> Option<bool>;
+    pub fn last_at_sink(&self, sink: u16, read: &[Seq]) -> Option<Seq>;
+}
+pub const MAX_PATHS: usize = 4096;
+```
+
+`Topology::new` refuses (`Plan`) a link to a source, stage or sink the run does not have; a stage whose input ports are not `0..k` each fed by one queue, or that gives nothing; a source that gives nothing; a sink that takes other than one queue; a link between stages that does not go from a lower stage to a higher one (so the numbering is an order in which every queue goes forward, and the graph has no cycle); a run with no source or no sink; more than `MAX_PATHS` paths from the sources to the sinks.
+
+**Numbers.** Each source numbers what it reads from 0. A stage of one input gives its output for input `s` the number `s`; a stage of `k` inputs gives its output for `s` taken on port `p` the number `s · k + p`. So the morsels on one queue have distinct numbers, the numbers on a queue are a function of its sources' numbers, `parent` and `root` invert the map, and each path from a source to a sink is an `Affine` map (the product of the port counts on it, and an offset). A sink reached by one path from one source (every chain's sink) receives `0, 1, 2, ...`; one reached by several, or by a source shorter than another it is joined with, may have numbers no morsel will ever have, which the scheduler skips once the sources they would come from are read to the end (10 f.16).
+
+**Sharing.** `Payload::share` is the same bytes a second time (a `RecordBatch` clone, `ManagedTensor::share`): what a fan-out pushes into its second and later queues (CT-I14).
+
+**`StageEvent`** names sources and sinks by number: `SourceReading { source }`, `SinkWriting { sink }`, `SinkCommitting { sink }`, `SinkFinished { sink, counters }`; `Fed` and `QueueClosed` name the queue, and a producer of several queues closes each.
+
 ### d.15 Test fakes (`moruna-testkit`)
 
 The testkit is built by this component's agent in wave 0 (preamble 6.4) because every later component's tests depend on it and CT-T13 requires it. It implements every trait above with the knobs below; a component SDD's test names a fake and a knob from this list and nothing else.
@@ -1339,6 +1404,8 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 **CT-T19 tensor_from_buffer.** `ManagedTensor::from_buffer` over an `MRB1` body: `data_ptr == buf.host_ptr() + offset`, shape and dtype as given; a short buffer or misaligned offset is `Convert`/`Io`, not a panic. Proves d.4.
 
 **CT-T21 refused_names_the_request.** (E13, 2026-10-02) `MorunaError::Refused` displays exactly the d.14 text with its kernel, stage, morsel, request, memory in use and ceiling; `KernelAlloc::default()` is all zero and unmeasured; `take_kernel_alloc` returns what `set_kernel_alloc` left on the same thread once and the default after it, and nothing set on another thread. d.7, d.13, d.14, CT-I10.
+
+**CT-T23 topology** (`graph.rs`, KA5). The chain keeps every number and equals `Topology::new` over its own links; a diamond numbers its join `2s` and `2s + 1`, `parent` and `root` invert it, `paths` and `to_sinks` follow it, `reaches` and `last_at_sink` read it against the sources' counts; a fan-out and a fan-in; every shape a run cannot have is refused naming what is wrong; `Affine` composes, inverts and refuses an overflow. d.16.
 
 **CT-T22 ipc_malformed_never_panics.** (2026-10-28; `tests/ct_t22_ipc_malformed.rs`) A page-aligned record whose schema names type id 229 is `Io { op: "ipc" }` naming the field (before CT-I13, `decode` panicked in arrow-ipc's `fb_to_schema` with `Type <UNKNOWN 229> not supported`); every case of `moruna_testkit::ipc::corruptions` over each record of `batches()` but the dictionaries (a record carries none) through `decode`, and over each of `streams()` through `read_stream` and `ReadStream`, returns an error or batches, never a panic (before CT-I13, 13,426 of the record cases panicked, with 44 distinct panic messages from arrow-ipc, arrow-data and arrow-buffer); every valid stream reads back equal through both. Proves CT-I13, e.8.
 

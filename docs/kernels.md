@@ -121,6 +121,7 @@ kernels = [
 | `explode(column)` | Produce one row for each element of a list column |
 | `concat_str(columns, separator, output)` | Join columns into one text column |
 | `date_trunc(column, unit, output)` | Truncate timestamps to a year, month, day, hour, minute or second |
+| `union()` | Pass on the batches of every input port, each as it came; every input has one schema. In a job document version 2, a task with one input port for each producer |
 
 Every standard kernel declares its schemas, so `moruna check` checks them too.
 

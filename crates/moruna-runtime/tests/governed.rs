@@ -238,7 +238,7 @@ fn child_run() {
     let job = JobSpec::from_value(job).expect("the document parses");
     let env = |_: &str| None;
     let outcome = match build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -684,7 +684,7 @@ fn refusal(
     .expect("parses");
     let env = |_: &str| None;
     build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
         &Registry::standard(),
         BuildOptions {
             strict: false,
@@ -856,7 +856,7 @@ fn a_programs_bindings_decide_where_a_contract_is() {
         .expect("parses");
         let env = |_: &str| None;
         build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
             kinds,
             BuildOptions {
                 strict: false,
@@ -904,7 +904,7 @@ fn sc_t24_a_query_with_no_rows_finishes() {
     .expect("the document parses");
     let env = |_: &str| None;
     let built = build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
         &Registry::standard(),
         BuildOptions {
             strict: true,

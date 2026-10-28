@@ -1,7 +1,8 @@
-//! Building a run from a job document (MH 4.1).
+//! Building a run from a job document (MH 4.1, SDD 22 e.4).
 //!
-//! The document itself, [`moruna_job::JobSpec`], is `moruna-job`'s: reading it, writing it and its
-//! canonical form run nothing. [`build::build`] turns it into the facade's [`crate::RunSpec`],
+//! The document itself, [`moruna_job::Job`] (a version 1 [`moruna_job::JobSpec`] read as one with
+//! `Job::from_v1`), is `moruna-job`'s: reading it, writing it and its canonical form run nothing.
+//! [`build::build`] turns it into the facade's [`crate::RunSpec`],
 //! and it is the only place a `RunSpec` is built from a description, whether the description
 //! came from a file (`moruna run`), from a socket (`moruna serve`) or from the arguments of
 //! `moruna.run(...)` (12 f.3). One code path, so a run from a file and the same run from Python
@@ -14,7 +15,7 @@ pub mod translate;
 use moruna_job::SpecError;
 use moruna_kernel::MorunaError;
 
-pub use build::{BuildOptions, Built, build};
+pub use build::{BuildOptions, Built, Parts, build};
 pub use canonical::digest;
 
 /// A refusal of the document as the runtime's error, `Config { name: "spec" }`: the text is the

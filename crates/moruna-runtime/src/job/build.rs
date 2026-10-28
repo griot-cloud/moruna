@@ -1,13 +1,16 @@
-//! From a document to a `RunSpec` (MH 4.1): the precedence rule, strict mode, the range checks,
-//! and each part built by the kind the document names, resolved through the registry of kinds
-//! (SDD 18). The only place a `RunSpec` is built from a description.
+//! From a document to a `RunSpec` (MH 4.1, SDD 22 e.4): the precedence rule, strict mode, the
+//! range checks, and each task built by the kind the document names, resolved through the
+//! registry of kinds (SDD 18). The document is a DAG of tasks; a version 1 document is the DAG
+//! with one path it reads as (`Job::from_v1`). The only place a `RunSpec` is built from a
+//! description.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use moruna_discovery::DiscoveryInput;
 use moruna_kernel::{
-    ErrorPolicy, Guarantee, HostProfile, Kernel, MorunaError, Result, RunId, SizerKind,
+    Consumer, ErrorPolicy, Guarantee, HostProfile, Kernel, Link, MorunaError, Producer, Result,
+    RunId, SizerKind, StageId, Topology,
 };
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 
@@ -16,8 +19,8 @@ use super::translate::{self, ResumeArg};
 use crate::kinds::{Context, Entry, Registry, Stage};
 use crate::spec::RunSpec;
 use moruna_job::{
-    Declaration, ErrorPolicyDoc, Fact, GuaranteeDoc, HostProfileDoc, Isolation, JobSpec,
-    ObjectStoreDoc, SizerDoc, SpecError,
+    Declaration, ErrorPolicyDoc, Fact, Flow, GuaranteeDoc, HostProfileDoc, Isolation, Job, KindDoc,
+    ObjectStoreDoc, Role, SizerDoc, SpecError,
 };
 
 /// The fields whose `null` an environment variable may fill, and the variable (MH 4.1).
@@ -49,11 +52,24 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// Which of the document's tasks each part of the built run is, by their places in
+/// `Job::tasks`: what the task events name (MH 4.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parts {
+    /// Source `i`'s task.
+    pub sources: Vec<usize>,
+    /// The tasks stage `s` carries (`stages[s - 1]`), one each, or several adjacent standard
+    /// kernels fused into one stage (MH 4.9), which the task events tell as a group.
+    pub stages: Vec<Vec<usize>>,
+    /// Sink `i`'s task.
+    pub sinks: Vec<usize>,
+}
+
 /// A document, built.
 pub struct Built {
     /// What the facade runs.
     pub spec: RunSpec,
-    /// `run_id` from the document, when it named one.
+    /// `id` from the document, when it named one.
     pub run_id: Option<RunId>,
     /// The document's content address (MH 4.1).
     pub digest: String,
@@ -62,14 +78,13 @@ pub struct Built {
     pub discovery: DiscoveryInput,
     /// Every field the environment filled, as `(field, variable)`.
     pub env_resolved: Vec<(&'static str, &'static str)>,
-    /// The document's kernels each stage carries, in stage order: one each, or several adjacent
-    /// standard kernels fused into one stage (MH 4.9), which the task events tell as a group.
-    pub stage_kernels: Vec<Vec<usize>>,
+    /// Which task each source, stage and sink is.
+    pub parts: Parts,
 }
 
 /// The fields of `job` left `null` that an environment variable would fill (MH 4.1).
 pub fn env_reliance(
-    job: &JobSpec,
+    job: &Job,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
@@ -111,11 +126,21 @@ pub fn strict_refusal(reliance: &[(&'static str, &'static str)]) -> SpecError {
     )
 }
 
-/// Build the facade's `RunSpec` from a document (MH 4.1), each part by the kind `kinds` resolves
-/// its `kind` to (SDD 18 f.2). The order is the order a refusal is found in: the environment, the
-/// run id, the kinds, strict mode and the contracts by the kinds' declarations, the source, the
-/// sink, the kernels, the ranges, then resume, which reads the disk.
-pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Built> {
+/// One stage as the build assembles it: what it runs, the tasks it carries, the queues it takes
+/// by port, the task its output goes from.
+struct Assembling {
+    stage: Stage,
+    tasks: Vec<usize>,
+    /// The task whose output port the stage's output is (the last one fused in).
+    output_task: usize,
+}
+
+/// Build the facade's `RunSpec` from a document (MH 4.1, SDD 22 e.4), each task by the kind
+/// `kinds` resolves its `kind` to for its role (SDD 18 f.2). The order is the order a refusal
+/// is found in: the environment, the run id, the graph (`moruna_job::check_graph`), the kinds,
+/// strict mode and the contracts by the kinds' declarations, the sources, the sinks, the kernels
+/// in an order in which every edge goes forward, the ranges, then resume, which reads the disk.
+pub fn build(job: &Job, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Built> {
     // f.2: the precedence rule. A field set wins; a null field goes to discovery, which reads
     // its variable when one is set, and then to the default. Strict mode refuses the second.
     let env_resolved = env_reliance(job, opts.env);
@@ -127,7 +152,7 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
         notes.push(format!("{field} resolved from {var}"));
     }
 
-    let run_id = match &job.run_id {
+    let run_id = match &job.id {
         Some(hex) => Some(RunId::from_hex(hex).ok_or_else(|| {
             refusal(SpecError::new(
                 "run_id",
@@ -137,38 +162,51 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
         None => None,
     };
 
+    // SDD 22 e.5: the graph is a DAG of tasks whose ports and edges fit, before any kind is
+    // asked anything.
+    if let Err(refusals) = moruna_job::check_graph(job) {
+        let first = &refusals[0];
+        return Err(refusal(SpecError::new(
+            first.field.clone(),
+            first.message.clone(),
+        )));
+    }
+    for (i, edge) in job.edges.iter().enumerate() {
+        if edge.flow != Flow::Batches {
+            return Err(refusal(SpecError::new(
+                format!("edges[{i}].flow"),
+                format!(
+                    "carries {}, and a run carries batches between its tasks",
+                    edge.flow.as_str()
+                ),
+            )));
+        }
+    }
+
     // KD-I1: every kind the document names, resolved before anything is built.
-    let (source_declared, source_kind) = kinds.source("source", &job.source.kind)?;
-    let (sink_declared, sink_kind) = kinds.sink("sink", &job.sink.kind)?;
-    let mut kernel_kinds = Vec::with_capacity(job.kernels.len());
-    for (index, doc) in job.kernels.iter().enumerate() {
-        kernel_kinds.push(kinds.kernel(&format!("kernels[{index}]"), &doc.kind)?);
+    let entries: Vec<KindDoc> = job.tasks.iter().map(|t| t.entry()).collect();
+    let mut declared: Vec<&Declaration> = Vec::with_capacity(job.tasks.len());
+    for (i, task) in job.tasks.iter().enumerate() {
+        let field = job.field(i);
+        let found = match task.role {
+            Role::Source => kinds.source(&field, &task.kind)?.0,
+            Role::Kernel => kinds.kernel(&field, &task.kind)?.0,
+            Role::Sink => kinds.sink(&field, &task.kind)?.0,
+        };
+        declared.push(found);
     }
 
     // KD-I6, 16 PK-I8: a hosted run loads no code by import path.
     if opts.strict {
-        let named = std::iter::once(("source".to_string(), source_declared))
-            .chain(
-                kernel_kinds
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (declared, _))| (format!("kernels[{i}]"), *declared)),
-            )
-            .chain(std::iter::once(("sink".to_string(), sink_declared)));
-        for (field, declared) in named {
-            if declared.isolation == Isolation::Imported {
-                return Err(refusal(imported_refusal(&field, declared)));
+        for (i, found) in declared.iter().enumerate() {
+            if found.isolation == Isolation::Imported {
+                return Err(refusal(imported_refusal(&job.field(i), found)));
             }
         }
     }
 
     // KD-I8: contracts carried for no kind that reads or writes under them are refused.
-    if !job.contracts.is_empty()
-        && !std::iter::once(source_declared)
-            .chain(kernel_kinds.iter().map(|(declared, _)| *declared))
-            .chain(std::iter::once(sink_declared))
-            .any(|declared| declared.needs.contracts == Fact::Yes)
-    {
+    if !job.contracts.is_empty() && !declared.iter().any(|d| d.needs.contracts == Fact::Yes) {
         return Err(refusal(SpecError::new(
             "contracts",
             "carried, and no kind of this document reads or writes under contracts",
@@ -179,40 +217,89 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
         .packages(opts.packages)
         .host_ports(opts.host_ports)
         .contracts(job.contracts.clone());
-    let source = source_kind.source(&Entry::new("source", None, &job.source), &mut cx)?;
-    cx.set_source_targets(source.targets.clone());
-    let sink = sink_kind.sink(&Entry::new("sink", None, &job.sink), &mut cx)?;
-    translate::check_sink_not_source(&sink.target, &source.targets)?;
 
-    // Each entry is built on its own; an entry whose stage joins the previous one becomes part of
-    // it (MH 4.9), and stage ids are counted after that.
-    let mut stages: Vec<Stage> = Vec::with_capacity(job.kernels.len());
-    let mut stage_kernels: Vec<Vec<usize>> = Vec::with_capacity(job.kernels.len());
-    for (index, (doc, (_, kind))) in job.kernels.iter().zip(&kernel_kinds).enumerate() {
-        let field = format!("kernels[{index}]");
-        let stage = kind.stage(&Entry::new(field, Some(index), doc), &mut cx)?;
-        let joined = match (stages.last().and_then(|s| s.fuse.as_ref()), &stage.fuse) {
-            (Some(last), Some(next)) => last.fuse(next.as_ref()),
-            _ => None,
-        };
-        match (joined, stages.last_mut(), stage_kernels.last_mut()) {
-            (Some(joined), Some(last), Some(members)) => {
-                *last = joined;
-                members.push(index);
+    // The sources, in document order.
+    let source_tasks: Vec<usize> = (0..job.tasks.len())
+        .filter(|&i| job.tasks[i].role == Role::Source)
+        .collect();
+    let mut sources = Vec::with_capacity(source_tasks.len());
+    let mut targets: Vec<String> = Vec::new();
+    for &i in &source_tasks {
+        let (_, kind) = kinds.source(&job.field(i), &job.tasks[i].kind)?;
+        let built = kind.source(&Entry::new(job.field(i), None, &entries[i]), &mut cx)?;
+        targets.extend(built.targets.iter().cloned());
+        sources.push(built);
+    }
+    cx.set_source_targets(targets.clone());
+
+    // The sinks, in document order: none writes where a source reads.
+    let sink_tasks: Vec<usize> = (0..job.tasks.len())
+        .filter(|&i| job.tasks[i].role == Role::Sink)
+        .collect();
+    let mut sinks = Vec::with_capacity(sink_tasks.len());
+    for &i in &sink_tasks {
+        let (_, kind) = kinds.sink(&job.field(i), &job.tasks[i].kind)?;
+        let built = kind.sink(&Entry::new(job.field(i), None, &entries[i]), &mut cx)?;
+        translate::check_sink_not_source(&built.target, &targets)?;
+        sinks.push(built);
+    }
+
+    // The kernels, in an order in which every edge goes forward (ties in document order), each
+    // built on its own. A kernel that takes its one input from a kernel whose one output goes to
+    // it alone joins that kernel's stage when the two kinds say their combination is one (MH
+    // 4.9); stages are numbered after that, in the same order.
+    let order = job
+        .topological_order()
+        .map_err(|_| MorunaError::Plan("the job's edges go round in a cycle".into()))?;
+    let kernel_tasks: Vec<usize> = (0..job.tasks.len())
+        .filter(|&i| job.tasks[i].role == Role::Kernel)
+        .collect();
+    let mut assembled: Vec<Assembling> = Vec::with_capacity(kernel_tasks.len());
+    // Which stage (by place in `assembled`) each kernel task is part of.
+    let mut stage_of: Vec<Option<usize>> = vec![None; job.tasks.len()];
+    for &i in order.iter().filter(|&&i| job.tasks[i].role == Role::Kernel) {
+        let task = &job.tasks[i];
+        let ordinal = kernel_tasks.iter().position(|&k| k == i);
+        let (_, kind) = kinds.kernel(&job.field(i), &task.kind)?;
+        let stage = kind.stage(&Entry::new(job.field(i), ordinal, &entries[i]), &mut cx)?;
+        let joins = fusable_predecessor(job, i, &stage_of);
+        let fused = joins.and_then(|at| {
+            let last = assembled[at].stage.fuse.as_ref()?;
+            let next = stage.fuse.as_ref()?;
+            last.fuse(next.as_ref()).map(|joined| (at, joined))
+        });
+        match fused {
+            Some((at, joined)) => {
+                assembled[at].stage = joined;
+                assembled[at].tasks.push(i);
+                assembled[at].output_task = i;
+                stage_of[i] = Some(at);
             }
-            _ => {
-                stages.push(stage);
-                stage_kernels.push(vec![index]);
+            None => {
+                stage_of[i] = Some(assembled.len());
+                assembled.push(Assembling {
+                    stage,
+                    tasks: vec![i],
+                    output_task: i,
+                });
             }
         }
     }
     notes.extend(cx.take_notes());
-    let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(stages.len());
+
+    let topology = topology_of(job, &source_tasks, &sink_tasks, &assembled, &stage_of)?;
+    let parts = Parts {
+        sources: source_tasks.clone(),
+        stages: assembled.iter().map(|a| a.tasks.clone()).collect(),
+        sinks: sink_tasks.clone(),
+    };
+    let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(assembled.len());
     let mut packaged = Vec::new();
     #[cfg(feature = "python")]
     let mut py_kernels = Vec::new();
-    for (at, stage) in stages.into_iter().enumerate() {
-        let id = (at + 1) as moruna_kernel::StageId;
+    for (at, assembling) in assembled.into_iter().enumerate() {
+        let stage = assembling.stage;
+        let id = (at + 1) as StageId;
         if let Some(placed) = stage.placed {
             placed(id);
         }
@@ -316,10 +403,22 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
         profile_override: host_profile.clone(),
     };
 
-    let mut spec = RunSpec::new(source.spec, kernels, sink.spec);
-    spec.engine_memory = source.memory;
+    let mut engine_memory = Vec::new();
+    let mut source_specs = Vec::with_capacity(sources.len());
+    for built in sources {
+        engine_memory.extend(built.memory);
+        source_specs.push(built.spec);
+    }
+    let mut sink_memory = Vec::new();
+    let mut sink_specs = Vec::with_capacity(sinks.len());
+    for built in sinks {
+        sink_memory.extend(built.memory);
+        sink_specs.push(built.spec);
+    }
+    let mut spec = RunSpec::graph(source_specs, kernels, sink_specs, topology);
+    spec.engine_memory = engine_memory;
     spec.packaged = packaged;
-    spec.sink_memory = sink.memory;
+    spec.sink_memory = sink_memory;
     #[cfg(feature = "python")]
     {
         spec.py_kernels = py_kernels;
@@ -367,8 +466,106 @@ pub fn build(job: &JobSpec, kinds: &Registry, opts: BuildOptions<'_>) -> Result<
         digest,
         discovery,
         env_resolved,
-        stage_kernels,
+        parts,
     })
+}
+
+/// The stage kernel task `i` may join (MH 4.9): the stage of the kernel its one input comes from,
+/// when that kernel's one output goes to it alone.
+fn fusable_predecessor(job: &Job, i: usize, stage_of: &[Option<usize>]) -> Option<usize> {
+    let task = &job.tasks[i];
+    let [port] = task.inputs.as_slice() else {
+        return None;
+    };
+    let [edge] = job.edges_into(&task.id, port)[..] else {
+        return None;
+    };
+    let from = &job.edges[edge].from;
+    let p = job.task_index(&from.task)?;
+    let producer = &job.tasks[p];
+    if producer.role != Role::Kernel || producer.outputs.len() != 1 {
+        return None;
+    }
+    if job.edges_from(&producer.id, &from.port).len() != 1 {
+        return None;
+    }
+    stage_of[p]
+}
+
+/// The run's topology (contracts d.16): one queue per edge, in document order, from the source or
+/// the stage whose output it carries to the stage port or the sink it feeds. An edge inside a
+/// fused stage is no queue.
+fn topology_of(
+    job: &Job,
+    source_tasks: &[usize],
+    sink_tasks: &[usize],
+    assembled: &[Assembling],
+    stage_of: &[Option<usize>],
+) -> Result<Topology> {
+    let mut links = Vec::with_capacity(job.edges.len());
+    for edge in &job.edges {
+        let (Some(from), Some(to)) = (
+            job.task_index(&edge.from.task),
+            job.task_index(&edge.to.task),
+        ) else {
+            return Err(MorunaError::Plan(format!(
+                "the edge from {} to {} names a task the job does not have",
+                edge.from, edge.to
+            )));
+        };
+        let producer = match job.tasks[from].role {
+            Role::Source => Producer::Source(position(source_tasks, from)?),
+            Role::Kernel => {
+                let at = stage_of[from].ok_or_else(|| missing(from))?;
+                if assembled[at].output_task != from {
+                    // An edge from a kernel fused into the next: inside the stage, no queue.
+                    continue;
+                }
+                Producer::Kernel((at + 1) as StageId)
+            }
+            Role::Sink => return Err(MorunaError::Plan(format!("{} gives nothing", edge.from))),
+        };
+        let consumer = match job.tasks[to].role {
+            Role::Sink => Consumer::Sink(position(sink_tasks, to)?),
+            Role::Kernel => {
+                let at = stage_of[to].ok_or_else(|| missing(to))?;
+                if assembled[at].tasks.first() != Some(&to) {
+                    continue;
+                }
+                let port = job.tasks[to]
+                    .inputs
+                    .iter()
+                    .position(|p| *p == edge.to.port)
+                    .ok_or_else(|| MorunaError::Plan(format!("no input port {}", edge.to)))?;
+                Consumer::Kernel {
+                    stage: (at + 1) as StageId,
+                    port: port as u16,
+                }
+            }
+            Role::Source => return Err(MorunaError::Plan(format!("{} takes nothing", edge.to))),
+        };
+        links.push(Link {
+            from: producer,
+            to: consumer,
+        });
+    }
+    Topology::new(
+        source_tasks.len() as u16,
+        assembled.len() as u16,
+        sink_tasks.len() as u16,
+        links,
+    )
+}
+
+fn position(of: &[usize], task: usize) -> Result<u16> {
+    of.iter()
+        .position(|&t| t == task)
+        .map(|at| at as u16)
+        .ok_or_else(|| missing(task))
+}
+
+fn missing(task: usize) -> MorunaError {
+    MorunaError::Plan(format!("task {task} was not built"))
 }
 
 /// KD-I6: the strict-mode refusal of a kind whose code is imported by path (16 PK-I8).
@@ -387,7 +584,7 @@ fn imported_refusal(field: &str, declared: &Declaration) -> SpecError {
 
 /// `host_profile` and `staging.durable` to the profile discovery is handed (03 d.1). `durable`
 /// is `durable_staging` spelled where a host thinks of it; the two may not disagree.
-fn host_profile_of(job: &JobSpec) -> Result<Option<HostProfile>> {
+fn host_profile_of(job: &Job) -> Result<Option<HostProfile>> {
     fn guarantee(g: Option<GuaranteeDoc>) -> Guarantee {
         match g {
             Some(GuaranteeDoc::Present) => Guarantee::Present,
@@ -476,7 +673,7 @@ fn object_store_of(doc: &ObjectStoreDoc) -> ObjectStoreConfig {
 
 /// The shape of a resume argument, for a caller that must know it before building (the host
 /// session reads the manifest's run id to name the report file).
-pub fn resume_shape(job: &JobSpec) -> Option<ResumeArg> {
+pub fn resume_shape(job: &Job) -> Option<ResumeArg> {
     job.resume.as_deref().map(translate::resume_arg)
 }
 

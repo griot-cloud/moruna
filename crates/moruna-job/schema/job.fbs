@@ -1,0 +1,176 @@
+// Moruna's job document, version 2 (SDD 22 e.4): a run as a DAG of tasks.
+//
+// A task is a kind (a source, a kernel or a sink, resolved by the registry of kinds) with its
+// settings and its named ports; an edge joins one task's output port to another task's input
+// port and carries the flow the producer declares. A task or an edge marked as a barrier is an
+// enforcement point: nothing may be moved across it, and no edge may go around it.
+//
+// The Rust in `src/generated/job_generated.rs` is generated from this file by
+// `tools/flatc/generate.sh` (flatc 25.12.19, the version of the `flatbuffers` crate) and is
+// committed; CI regenerates it and fails when it differs. Change this file, then run the script.
+
+namespace moruna.job.fb;
+
+file_identifier "MJB2";
+file_extension "mjob";
+
+// Which part of a run a task is, and so which port its kind's adapter implements.
+enum Role : ubyte { Source = 0, Kernel = 1, Sink = 2 }
+
+// What an edge carries: what its producer gives and its consumer takes.
+enum Flow : ubyte { Batches = 0, Files = 1, Nothing = 2 }
+
+// A platform's declaration about one guarantee; `Unset` is a guarantee left to discovery.
+enum Guarantee : ubyte { Unset = 0, Present = 1, Absent = 2 }
+
+// What happens after a kernel error; `Budget` skips up to `ErrorPolicy.budget` morsels.
+enum ErrorPolicyKind : ubyte { Terminate = 0, Skip = 1, Budget = 2 }
+
+// Which decision function sizes morsels.
+enum Sizer : ubyte { Rule = 0, Learned = 1 }
+
+table Task {
+  // The task's stable id: 1 to 128 of ASCII letters, digits, `_`, `-`, `.` and `:`, starting
+  // with a letter or a digit. Events and the report name the task by it.
+  id: string (required);
+  role: Role;
+  // The kind's name, as the registry knows it (`parquet`, `std`, `package`, ...).
+  kind: string (required);
+  // The kind's settings, a FlexBuffers map, checked against the kind's JSON Schema (KD1).
+  settings: [ubyte] (flexbuffer);
+  // Its input ports by name, in the order the kernel numbers them (port 0 first).
+  inputs: [string];
+  // Its output ports by name.
+  outputs: [string];
+  // An enforcement point: nothing is moved across it and no edge goes around it.
+  barrier: bool;
+  // The embedder's tasks this one carries, when the embedder fused several into it.
+  members: [string];
+}
+
+table Endpoint {
+  task: string (required);
+  port: string (required);
+}
+
+table Edge {
+  // A task's output port.
+  from: Endpoint (required);
+  // A task's input port.
+  to: Endpoint (required);
+  // The batch-flow contract the producer declares.
+  flow: Flow;
+  // An enforcement point between the two tasks.
+  barrier: bool;
+}
+
+table Elastic {
+  memory_max_bytes: ulong = null;
+  cpu_max: uint = null;
+}
+
+table Budget {
+  memory_bytes: ulong = null;
+  cpu: double = null;
+  elastic: Elastic;
+}
+
+table Staging {
+  dir: string;
+  url: string;
+  limit_bytes: ulong = null;
+  durable: bool = null;
+}
+
+table S3 {
+  endpoint: string;
+  region: string;
+  access_key_id: string;
+  secret_access_key: string;
+  session_token: string;
+  bucket: string;
+}
+
+table Gcs {
+  service_account_path: string;
+  service_account_json: string;
+  bucket: string;
+}
+
+table Azure {
+  account: string;
+  access_key: string;
+  container: string;
+}
+
+table ObjectStore {
+  s3: S3;
+  gcs: Gcs;
+  azure: Azure;
+  local_root: string;
+  allow_http: bool;
+}
+
+table Checkpoint {
+  enabled: bool = true;
+  interval_ms: ulong = 5000;
+  keep: bool;
+}
+
+table ErrorPolicy {
+  kind: ErrorPolicyKind;
+  budget: uint;
+}
+
+table HostProfile {
+  huge_pages: Guarantee;
+  memlock: Guarantee;
+  io_uring: Guarantee;
+  direct_io: Guarantee;
+  gds: Guarantee;
+  rdma: Guarantee;
+  durable_staging: Guarantee;
+  staging_dir: string;
+}
+
+table Report {
+  socket: string;
+  file: string;
+  attempt: uint = null;
+  logs: string;
+}
+
+table Contract {
+  // The contract's document, a FlexBuffers value.
+  document: [ubyte] (flexbuffer, required);
+  // The compiled contract, exactly as the compiler wrote it.
+  compiled: string (required);
+  // The function modules the compiled contract pins, a FlexBuffers list.
+  functions: [ubyte] (flexbuffer);
+  audiences: [string];
+}
+
+table Job {
+  // The document's version: 2.
+  version: uint;
+  // The run's identity, 32 lowercase hex characters; absent: minted at start.
+  id: string;
+  tasks: [Task];
+  edges: [Edge];
+  budget: Budget;
+  staging: Staging;
+  object_store: ObjectStore;
+  checkpoint: Checkpoint;
+  resume: string;
+  error_policy: ErrorPolicy;
+  ordered: bool;
+  sizer: Sizer;
+  trace: string;
+  profiles_dir: string;
+  host_profile: HostProfile;
+  allow_gil: bool;
+  report: Report;
+  contracts: [Contract];
+}
+
+root_type Job;

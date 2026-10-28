@@ -25,7 +25,7 @@ use moruna_kernel::{
     SinkSummary, Source, SourceSchema, Split, StageEvent,
 };
 use moruna_runtime::host::exit;
-use moruna_runtime::host::lifecycle::{Lifecycle, task_refs};
+use moruna_runtime::host::lifecycle::{Lifecycle, Plan};
 use moruna_runtime::host::session::{self, HEARTBEAT, HostOptions, Mode, Outcome, Wire};
 use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::Registry;
@@ -282,7 +282,14 @@ fn run_cancelled(job: JobSpec, cancel_at: usize, how: Cancel) -> (Outcome, Vec<V
         packages: Default::default(),
         capture_process: false,
     };
-    let outcome = session::run_job(job, &test_kinds(), &opts, &wire, reader, Mode::Run);
+    let outcome = session::run_job(
+        moruna_job::Job::from_v1(&job),
+        &test_kinds(),
+        &opts,
+        &wire,
+        reader,
+        Mode::Run,
+    );
     (outcome, events_in(&text))
 }
 
@@ -477,7 +484,14 @@ fn run_crashing(job: JobSpec, kinds: &Registry) -> (Option<String>, Vec<Value>) 
             packages: Default::default(),
             capture_process: false,
         };
-        session::run_job(job, kinds, &opts, &wire, None, Mode::Run)
+        session::run_job(
+            moruna_job::Job::from_v1(&job),
+            kinds,
+            &opts,
+            &wire,
+            None,
+            Mode::Run,
+        )
     }));
     let said = match unwound {
         Ok(outcome) => panic!("the run did not unwind: exit {}", outcome.code),
@@ -604,8 +618,9 @@ fn py_t27_a_crash_before_any_task_started_fails_the_attempt() {
 }
 
 /// The scheduler's facts of a real run of two kernel stages, recorded, and the run's tasks.
-fn recorded_run(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<StageEvent>) {
+fn recorded_run(scratch: &Scratch) -> (Plan, Vec<StageEvent>) {
     let job = document(scratch, &["pass", "pass"], json!("terminate"));
+    let job = moruna_job::Job::from_v1(&job);
     let built = build(
         &job,
         &test_kinds(),
@@ -618,7 +633,7 @@ fn recorded_run(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<StageEve
         },
     )
     .expect("the document builds");
-    let refs = task_refs(&job, Some(&built.stage_kernels));
+    let refs = Plan::of(&job, Some(&built.parts));
     let facts: Arc<Mutex<Vec<StageEvent>>> = Arc::default();
     let kept = facts.clone();
     Runtime::run_with(
@@ -640,7 +655,7 @@ fn recorded_run(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<StageEve
 }
 
 /// A lifecycle whose events are kept as JSON, as the peer reads them.
-fn kept_lifecycle(refs: Vec<moruna_job::TaskRefDoc>) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+fn kept_lifecycle(refs: Plan) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();
     let kept = told.clone();
     let lifecycle = Lifecycle::new(
@@ -801,8 +816,9 @@ fn told_in_order(events: &[Value], what: &str) {
 /// A run's tasks and the scheduler's facts of it, each list the facts one thread told, in the
 /// order it told them: a real run of two kernel stages, recorded by the thread each fact was
 /// told on.
-fn recorded_by_thread(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<Vec<StageEvent>>) {
+fn recorded_by_thread(scratch: &Scratch) -> (Plan, Vec<Vec<StageEvent>>) {
     let job = document(scratch, &["pass", "pass"], json!("terminate"));
+    let job = moruna_job::Job::from_v1(&job);
     let built = build(
         &job,
         &test_kinds(),
@@ -815,7 +831,7 @@ fn recorded_by_thread(scratch: &Scratch) -> (Vec<moruna_job::TaskRefDoc>, Vec<Ve
         },
     )
     .expect("the document builds");
-    let refs = task_refs(&job, Some(&built.stage_kernels));
+    let refs = Plan::of(&job, Some(&built.parts));
     type Told = Vec<(std::thread::ThreadId, StageEvent)>;
     let facts: Arc<Mutex<Told>> = Arc::default();
     let kept = facts.clone();
@@ -857,7 +873,7 @@ fn chain_by_thread(kernels: u16) -> Vec<Vec<StageEvent>> {
     let mut threads = vec![
         vec![StageEvent::Running],
         vec![
-            StageEvent::SourceReading,
+            StageEvent::SourceReading { source: 0 },
             StageEvent::Fed { queue: 0 },
             StageEvent::QueueClosed {
                 queue: 0,
@@ -883,9 +899,10 @@ fn chain_by_thread(kernels: u16) -> Vec<Vec<StageEvent>> {
         ]);
     }
     threads.push(vec![
-        StageEvent::SinkWriting,
-        StageEvent::SinkCommitting,
+        StageEvent::SinkWriting { sink: 0 },
+        StageEvent::SinkCommitting { sink: 0 },
         StageEvent::SinkFinished {
+            sink: 0,
             counters: Default::default(),
         },
     ]);
@@ -925,9 +942,7 @@ fn interleave(threads: &[Vec<StageEvent>], draw: &mut Draw) -> Vec<StageEvent> {
 }
 
 /// A lifecycle whose events are kept as JSON with the instant stamped on each.
-fn stamped_lifecycle(
-    refs: Vec<moruna_job::TaskRefDoc>,
-) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+fn stamped_lifecycle(refs: Plan) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();
     let kept = told.clone();
     let lifecycle = Lifecycle::new(
@@ -957,13 +972,24 @@ fn py_t28_any_interleaving_tells_each_task_in_order() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("py_t28");
     let (refs, recorded) = recorded_by_thread(&scratch);
-    let ids = |n: usize| -> Vec<moruna_job::TaskRefDoc> {
-        (0..n)
-            .map(|i| moruna_job::TaskRefDoc {
-                id: format!("task-{i}"),
-                members: Vec::new(),
+    // A chain of `n` tasks: the first the source, the last the sink.
+    let ids = |n: usize| -> Plan {
+        let entry = || moruna_job::KindDoc::new("any", serde_json::Map::new());
+        let names: Vec<String> = (0..n).map(|i| format!("task-{i}")).collect();
+        let tasks = names
+            .iter()
+            .enumerate()
+            .map(|(at, id)| match at {
+                0 => moruna_job::Task::source(id.clone(), entry()),
+                at if at == n - 1 => moruna_job::Task::sink(id.clone(), entry()),
+                _ => moruna_job::Task::kernel(id.clone(), entry()),
             })
-            .collect()
+            .collect();
+        let edges = names
+            .windows(2)
+            .map(|w| moruna_job::Edge::between(w[0].clone(), w[1].clone()))
+            .collect();
+        Plan::of(&moruna_job::Job::new(tasks, edges), None)
     };
     let mut chains = vec![(refs, recorded)];
     for kernels in [0u16, 1, 3] {
@@ -1032,6 +1058,7 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("py_t29");
     let job = document(&scratch, &["pass"], json!("terminate"));
+    let job = moruna_job::Job::from_v1(&job);
     let built = build(
         &job,
         &test_kinds(),
@@ -1044,8 +1071,8 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
         },
     )
     .expect("the document builds");
-    let refs = task_refs(&job, Some(&built.stage_kernels));
-    let sink = refs.len() - 1;
+    let refs = Plan::of(&job, Some(&built.parts));
+    let sink = refs.nodes.len() - 1;
     let (lifecycle, told) = stamped_lifecycle(refs);
     lifecycle.begin(false);
     let tell = lifecycle.hook();
@@ -1074,7 +1101,7 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
             tell(event);
             started(usize::from(*stage));
         }
-        StageEvent::SinkWriting => {
+        StageEvent::SinkWriting { .. } => {
             tell(event);
             started(sink);
         }

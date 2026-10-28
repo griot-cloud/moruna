@@ -390,7 +390,7 @@ impl PlacementEngine {
                     entry.payload = None;
                     entry.state = State::OnDisk(seg);
                     let (seq, bytes) = (entry.seq, entry.bytes);
-                    self.sub_bytes(index, tier, bytes);
+                    self.drop_resident(index, tier, entry);
                     counters.demotions.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(target: "placement.demote", stage = stage_id, seq, from = ?tier, to = "Disk", bytes, no_io = true);
                 }
@@ -405,7 +405,7 @@ impl PlacementEngine {
                     entry.state = State::Evicted;
                     entry.disk = None;
                     let (seq, bytes) = (entry.seq, entry.bytes);
-                    self.sub_bytes(index, tier, bytes);
+                    self.drop_resident(index, tier, entry);
                     counters.evictions.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(target: "placement.evict", stage = stage_id, seq, from = ?tier, bytes);
                 }
@@ -675,7 +675,7 @@ impl PlacementEngine {
             if is_write && disk_bound && entry.recomputable {
                 // No room for the record and the bytes can be read again (f.2 step 4).
                 if let Some(tier) = entry.state.resident_tier() {
-                    self.sub_bytes(task.stage, tier, entry.bytes);
+                    self.drop_resident(task.stage, tier, entry);
                 }
                 entry.payload = None;
                 entry.state = State::Evicted;
@@ -701,7 +701,7 @@ impl PlacementEngine {
         }
         tracing::warn!(target: "placement.move_failed", stage = task.stage, seq = task.seq, error = %error, issued = false);
         if evicted {
-            self.lineage_set_disk(task.seq, None);
+            self.lineage_set_disk(task.stage as StageId, task.seq, None);
         }
         self.unpark_all(task.stage);
     }
@@ -785,14 +785,14 @@ impl PlacementEngine {
             } else {
                 entry.payload = None;
                 entry.state = State::OnDisk(seg);
-                self.sub_bytes(stage, from, entry.bytes);
+                self.drop_resident(stage, from, entry);
             }
         }
         self.counters[stage]
             .demotions
             .fetch_add(1, Ordering::Relaxed);
         self.record_written(segment);
-        self.lineage_set_disk(seq, Some(seg));
+        self.lineage_set_disk(stage as StageId, seq, Some(seg));
         self.unpark_all(stage);
         self.plan_and_issue(stage);
     }
@@ -950,7 +950,7 @@ impl PlacementEngine {
                 None => State::Resident(tier),
             };
             if let Some(previous) = previous {
-                self.sub_bytes(stage, previous, entry.bytes);
+                self.drop_resident(stage, previous, entry);
             }
             self.add_bytes(stage, tier, entry.bytes);
         }

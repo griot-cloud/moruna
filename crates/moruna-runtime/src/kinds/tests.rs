@@ -482,16 +482,18 @@ fn kd_t11_fusion_through_the_port() {
         packages: crate::packaged::PackageHost::default(),
         host_ports: None,
     };
-    let built = crate::job::build(&job, &kinds, opts()).expect("builds");
-    assert_eq!(built.stage_kernels, vec![vec![0, 1], vec![2, 3], vec![4]]);
+    let dag = |job: &moruna_job::JobSpec| moruna_job::Job::from_v1(job);
+    let built = crate::job::build(&dag(&job), &kinds, opts()).expect("builds");
+    // The document's tasks each stage carries: the kernels are tasks 1 to 5.
+    assert_eq!(built.parts.stages, vec![vec![1, 2], vec![3, 4], vec![5]]);
     assert_eq!(built.spec.kernels.len(), 3);
     job.kernels.swap(1, 2);
-    let built = crate::job::build(&job, &kinds, opts()).expect("builds");
+    let built = crate::job::build(&dag(&job), &kinds, opts()).expect("builds");
     assert_eq!(
-        built.stage_kernels.len(),
+        built.parts.stages.len(),
         5,
         "no two neighbours join: {:?}",
-        built.stage_kernels
+        built.parts.stages
     );
 }
 

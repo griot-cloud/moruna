@@ -68,6 +68,11 @@ peql = { git = "https://github.com/griot-cloud/peQL", rev = "ff69290", version =
 # Streams of record batches out of a DataFusion plan; already in the graph through datafusion
 # at this version.
 futures = { version = "=0.3.34" }
+# The job document's form (SDD 22 e.4, KA5): its FlatBuffers schema read through the code flatc
+# generates (`tools/flatc/generate.sh`, flatc at this version), and each task's settings as a
+# FlexBuffers map. flatbuffers is already in the graph through arrow-ipc at this version.
+flatbuffers = { version = "=25.12.19" }
+flexbuffers = { version = "=25.12.19" }
 tracing-subscriber = { version = "=0.3.23" }
 # Added by F8.2: the one-writer, many-reader cell the limits watcher publishes
 # into and the sampler reads on every sample. E2 table addition, preamble 6.2.

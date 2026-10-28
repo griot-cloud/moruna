@@ -175,7 +175,7 @@ fn child_run() {
         let doc = JobSpec::from_value(job).expect("the document parses");
         let env = |_: &str| None;
         let outcome = match build(
-            &doc,
+            &moruna_job::Job::from_v1(&doc),
             &Registry::standard(),
             BuildOptions {
                 strict: true,

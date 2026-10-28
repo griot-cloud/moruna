@@ -419,6 +419,7 @@ fn rc_t19_a_sample_older_than_the_watcher() {
             sampler.clone(),
             Arc::new(trace.clone()),
             Arc::new(FakePlacement::new()),
+            moruna_kernel::Topology::chain(1),
             vec![kernel(1, KernelHints::default())],
         )
         .expect("controller"),

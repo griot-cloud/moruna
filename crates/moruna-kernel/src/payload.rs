@@ -327,6 +327,17 @@ impl Payload {
         Payload::Tensor(t, tier)
     }
 
+    /// The same bytes as a second payload, for a second consumer (d.16): a batch fanned out to
+    /// several queues is resident once and shared by each, never copied. The bytes are read-only
+    /// from here on (CT-I14): a kernel never writes into its input, and each holder's drop
+    /// releases its share, the last one the bytes.
+    pub fn share(&self) -> Payload {
+        match self {
+            Payload::Table(batch, tier) => Payload::Table(batch.clone(), *tier),
+            Payload::Tensor(tensor, tier) => Payload::Tensor(tensor.share(), *tier),
+        }
+    }
+
     /// The tier the bytes are in.
     pub fn tier(&self) -> Tier {
         match self {

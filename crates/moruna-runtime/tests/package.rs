@@ -181,7 +181,7 @@ fn package_document(scratch: &std::path::Path, rows: u64, package: &str, pin: &s
 
 fn run_document(job: &JobSpec, host: PackageHost) -> moruna_runtime::RunReport {
     let built = build(
-        job,
+        &moruna_job::Job::from_v1(job),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -396,7 +396,7 @@ fn pk_t17_package_entry_args_and_assets() {
         edit(&mut doc["kernels"][0]);
         let job = JobSpec::from_value(doc).unwrap();
         build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
             &Registry::standard(),
             BuildOptions {
                 strict: true,

@@ -68,10 +68,11 @@ pub(crate) struct WatchCtx {
     pub(crate) arena: Option<Arc<Arena>>,
     pub(crate) controller: Arc<Controller>,
     pub(crate) scheduler: Arc<Scheduler>,
-    /// The source's engine memory, moved to its share of each new ceiling.
-    pub(crate) engine: Option<Arc<dyn EngineMemory>>,
-    /// The sink's engine memory, likewise.
-    pub(crate) sink: Option<Arc<dyn EngineMemory>>,
+    /// The engine memory of each engine source, moved to its part of the source share of each
+    /// new ceiling.
+    pub(crate) engine: Vec<Arc<dyn EngineMemory>>,
+    /// The engine memory of each engine sink, likewise.
+    pub(crate) sink: Vec<Arc<dyn EngineMemory>>,
     pub(crate) sizing: Sizing,
     pub(crate) start_ns: u64,
     pub(crate) workers_max: u16,
@@ -233,11 +234,11 @@ fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
     if (shares.engine, shares.sink) != (state.shares.engine, state.shares.sink) {
         // Before the arena moves: a lowered share refuses the engines' growth at once, so their
         // operators spill rather than hold what the ceiling no longer allows.
-        if let Some(engine) = &ctx.engine {
-            engine.set_limit(shares.engine);
+        for engine in &ctx.engine {
+            engine.set_limit(shares.engine / ctx.engine.len() as u64);
         }
-        if let Some(sink) = &ctx.sink {
-            sink.set_limit(shares.sink);
+        for sink in &ctx.sink {
+            sink.set_limit(shares.sink / ctx.sink.len() as u64);
         }
         state.shares = shares;
         ctx.controller

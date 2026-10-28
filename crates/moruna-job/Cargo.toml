@@ -11,6 +11,9 @@ description = "Moruna's kinds and job document, read and checked without running
 # What an embedder depends on to read Moruna's kinds and check a job document (SDD 22). Nothing
 # from Arrow, DataFusion or the runtime: it compiles in a service that never runs a job.
 [dependencies]
+# The job document version 2 is FlatBuffers, its tasks' settings FlexBuffers (SDD 22 e.4).
+flatbuffers = { workspace = true }
+flexbuffers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The settings schema each kind declares (SDD 18 e.2).

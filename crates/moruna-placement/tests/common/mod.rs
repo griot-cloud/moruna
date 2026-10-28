@@ -78,7 +78,7 @@ pub fn config(stages: u16, dir: Option<PathBuf>, budgets: TierBudgets) -> Placem
     PlacementConfig {
         run_id: RunId([7; 16]),
         node: moruna_kernel::LOCAL_NODE,
-        stages,
+        topology: moruna_kernel::Topology::chain(stages - 1),
         budgets,
         staging_dir: dir,
         durable_staging: false,
@@ -88,7 +88,7 @@ pub fn config(stages: u16, dir: Option<PathBuf>, budgets: TierBudgets) -> Placem
         page_bytes: PAGE,
         gds: false,
         devices: vec![DeviceId(0)],
-        plan_digest: moruna_placement::manifest::plan_digest(&plan()),
+        plan_digests: vec![moruna_placement::manifest::plan_digest(&plan())],
         fingerprints: vec![Fingerprint::compute("test", b"1")],
         resume_policy: vec![ResumePolicy::Reinit],
         config: serde_json::json!({

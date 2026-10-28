@@ -262,7 +262,7 @@ fn schema_refusals(catalogue: &Catalogue, role: Role, doc: &KindDoc) -> Vec<moru
     let (field, _) = place(role);
     // A kind that is not declared, or one that needs a contract this test does not carry, is not
     // a verdict on the settings.
-    check(&job, catalogue)
+    check(&moruna_job::Job::from_v1(&job), catalogue)
         .err()
         .unwrap_or_default()
         .into_iter()
