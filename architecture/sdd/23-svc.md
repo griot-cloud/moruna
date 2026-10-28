@@ -42,7 +42,7 @@ It refuses to know: any particular protocol beyond the example (drivers' protoco
 - **SV-I5.** A frame larger than `limits::CHANNEL_MAX_BYTES` or with more than `limits::CHANNEL_MAX_HANDLES` handles is refused by the sender's SDK before any call is made.
 - **SV-I6.** A handle that arrives in a frame and is not taken by the handler is closed when the request has been answered; a handle the handler takes is the handler's.
 - **SV-I7.** A server never blocks on one client: a reply or event that finds the client's queue full closes that connection, and a connection that sends a frame a client may not send is closed; the dispatcher serves the others on.
-- **SV-I8.** A dispatcher holds at most `limits::WAIT_MAX_ITEMS` channels, waited on with one `wait`; it reads at most 16 frames from one channel per turn; it returns when it holds none.
+- **SV-I8.** A dispatcher holds at most `limits::WAIT_MAX_ITEMS` handles (connections, listeners and watched objects), waited on with one `wait`; it reads at most 16 frames from one channel per turn; it returns when it holds none.
 - **SV-I9.** The schema refuses at compile time a protocol name outside 1 to 64 bytes of `[a-z0-9._-]`, a request or event ordinal that is zero or repeated, an error code outside 1 to 65535 or repeated, and a `since` above the protocol's minor.
 - **SV-I10.** A boot image's manifest is rendered by `moruna_abi::manifest` and parsed back with the kernel's parser before the image is written; every program in it parses with the kernel's ELF loader against `IMAGE_RANGE`; the archive reads back with the kernel's cpio reader.
 - **SV-I11.** A commit that changes `kernel/examples/` changes no file of `kernel/core`, `kernel/abi`, `kernel/sys`, `kernel/handles`, `kernel/loader` or `kernel/boot`.
@@ -50,6 +50,7 @@ It refuses to know: any particular protocol beyond the example (drivers' protoco
 - **SV-I13.** (Kernel.) An endpoint is moved into a message only while no message queued towards it carries an endpoint; so every endpoint in flight is held by an endpoint that holds no endpoint, and no set of endpoints in flight keeps itself alive (f.11).
 - **SV-I14.** (Kernel.) Every CPU OSTD reports runs process threads; a CPU's boot context is never preempted; a CPU with nothing to run halts until an interrupt.
 - **SV-I15.** (Kernel.) The machine powers off only when every process has ended and the boot has started every manifest process.
+- **SV-I16.** A deferred request is answered exactly once: a handler that defers must answer `Deferred`, one that answers `Deferred` must have deferred (the connection closes otherwise), and the dispatcher refuses a second answer to a `Pending` (`Malformed`) and an answer to a connection that has gone (`PeerClosed`).
 
 ## d. Interfaces
 
@@ -99,7 +100,9 @@ The declarative macro is the simplest that meets every requirement: the declarat
 
 ### d.4 The server
 
-`Handler` (`protocol`, `handle(cx, ordinal, body) -> Outcome`, `closed`), `Outcome` (`Reply`, `Failure(code)`, `Status`), `Context` (`connection`, `client_minor`, `emit`, `close`), `Dispatcher` (`serve`, `listen`, `turn(deadline)`, `run`).
+`Handler` (`protocol`, `handle(cx, ordinal, body) -> Outcome`, `closed`), `Outcome` (`Reply`, `Failure(code)`, `Status`, `Deferred`), `Context` (`connection`, `client_minor`, `emit`, `defer`, `complete`, `close`), `Dispatcher` (`serve`, `listen`, `watch`, `complete`, `turn(deadline)`, `run`), `Watch` (`handle`, `signals`, `signaled(seen, completions) -> keep`), `Pending`, `Completions`.
+
+A driver is the case that needs the last four: it waits on its interrupt alongside its clients (`watch`, with an object that owns the interrupt and acknowledges it), and answers a request when its device completes it, not when it arrives (`defer` in the handler, `complete` from the watch). The generated `Server` trait answers synchronously; a server that defers implements `Handler` itself, using the generated `ID`, `REQUESTS` and `Event`.
 
 ### d.5 The conformance harness
 
@@ -173,7 +176,7 @@ The client sends `Hello` and waits for one frame. The server accepts a `Hello` w
 
 ### f.2 The dispatch loop
 
-Each turn waits on every channel for `READABLE` or `PEER_CLOSED`; for each that is ready it reads up to 16 frames. On a listener, each `Connect` brings an endpoint, served with a fresh handler from the listener's factory; a malformed frame or a closed peer closes the listener. On a connection, the first frame is the handshake (f.1); after it, each `Request` is decoded and handed to the handler, whatever handles the handler did not take are closed (SV-I6), and the answer is sent with the request's id. A `Reply` that does not fit the bound becomes `Failure(ReplyTooLarge)`. A send that finds the client's queue full, a closed peer, or a frame a client may not send closes the connection (SV-I7). New connections that arrive while the dispatcher holds 64 channels are closed.
+Each turn waits on every channel for `READABLE` or `PEER_CLOSED`; for each that is ready it reads up to 16 frames. On a listener, each `Connect` brings an endpoint, served with a fresh handler from the listener's factory; a malformed frame or a closed peer closes the listener. On a connection, the first frame is the handshake (f.1); after it, each `Request` is decoded and handed to the handler, whatever handles the handler did not take are closed (SV-I6), and the answer is sent with the request's id. A `Reply` that does not fit the bound becomes `Failure(ReplyTooLarge)`. A send that finds the client's queue full, a closed peer, or a frame a client may not send closes the connection (SV-I7). New connections that arrive while the dispatcher holds 64 handles are closed. A watched object is called with the signals observed when one it waits for is raised, and dropped when it says so. A handler that defers gets a `Pending` (its connection and the request's id), which the connection records; the answer, given through `Context::complete` or a watch's `Completions` during a turn, or `Dispatcher::complete` between turns, is sent at the end of the turn, once (SV-I16).
 
 ### f.3 Calls
 
@@ -268,7 +271,7 @@ Host tests run with `cargo test` in `kernel/` for `moruna-svc` and `moruna-image
 | SV-T2 | `sv_t2_*` | `svc/tests/model.rs`, `service.rs` | a frame at the bound passes and one byte over is refused before sending (SV-I5); malformed frames; a typed call over the bound is `TooLarge` and the connection serves on |
 | SV-T3 | `sv_t3_*` | `svc/tests/service.rs` | refusals with their reasons; minor negotiation both ways (SV-I1, SV-I2) |
 | SV-T4 | `sv_t4_*` | `svc/tests/service.rs` | typed calls, typed errors, statuses, handles in requests, events before replies, replies matched out of order (SV-I3), a gone server |
-| SV-T5 | `sv_t5_*` | `svc/tests/service.rs` | several protocols and listeners on one dispatcher; protocol violations close; the 64-channel bound; timeouts (SV-I7, SV-I8) |
+| SV-T5 | `sv_t5_*` | `svc/tests/service.rs`, `driver.rs` | several protocols and listeners on one dispatcher; protocol violations close; the 64-handle bound; timeouts; a driver's shape: an interrupt watched beside the clients, requests answered when it fires, a deferred request answered once and only to a live connection (SV-I7, SV-I8, SV-I16) |
 | SV-T6 | the schema's `const` assertions | every `protocol!` use | a declaration that breaks SV-I9 does not compile; the `const fn`s are tested in SV-T1 |
 | SV-T7 | `sv_t7_*` | `svc/tests/service.rs` | the reference server passes its suite; a server that answers everything, one that keeps handles, one of another protocol, and one that never answers each fail the checks aimed at them |
 | SV-T8 | `sv_t8_*` | `svc/tests/model.rs` | the host model keeps the kernel's channel rules, the cycle rule included, and `wait`'s |
@@ -280,7 +283,7 @@ Host tests run with `cargo test` in `kernel/` for `moruna-svc` and `moruna-image
 | SV-T14 | the cycle rule | boot: `cycles` | `KB2 cycles: ok:`: own-channel refusal, refusal while the queue carries an endpoint, passage once drained, and closing the holder closes the held endpoint (SV-I13) |
 | SV-T15 | the examples touch no kernel file | CI: `tools/check-examples.sh` | SV-I11 over every commit of the pull request |
 
-Coverage on the host (`cargo llvm-cov`): `moruna-svc` 93.8% of lines, `moruna-image` 97.4%. The kernel additions are covered by the boot tests above.
+Coverage on the host (`cargo llvm-cov`): `moruna-svc` 93.3% of lines, `moruna-image` 97.4%. The kernel additions are covered by the boot tests above.
 
 ## l. Implementation notes for the agent
 
@@ -300,7 +303,7 @@ Coverage on the host (`cargo llvm-cov`): `moruna-svc` 93.8% of lines, `moruna-im
 | a protocol: named, versioned requests, replies, events, handles | d.1, e.1, e.2 |
 | one schema format with versioning, compatibility checks, generated types, no generator binary, justified | d.2, SV-I9 |
 | handshake with refusal; request ids; typed errors; handles in messages; bound refused at the sender | f.1, f.3, d.3, e.2, SV-I1 to SV-I5 |
-| dispatch loop over many channels with `wait`; typed proxies | f.2, d.3, d.4 |
+| dispatch loop over many channels and other handles with `wait`; typed proxies | f.2, d.3, d.4 |
 | a userland heap | f.6 |
 | boot manifest tooling with `moruna_abi::manifest`, replacing the hand-written manifest, built in CI | e.4, f.8; `kernel/initramfs/boot.image` |
 | the conformance harness, one suite per protocol | f.5, SV-T7, SV-T11 |

@@ -37,7 +37,9 @@ pub use frame::{Kind, Transport};
 pub use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Rights, Signals, limits};
 pub use os::{Channel, Handle, WaitItem, now, wait, wait_one};
 pub use protocol::{Hello, NoError, ProtocolError, ProtocolId, Refusal, Refused, Status};
-pub use server::{ConnectionId, Context, Dispatcher, Factory, Handler, Outcome, Turn};
+pub use server::{
+    Completions, ConnectionId, Context, Dispatcher, Factory, Handler, Outcome, Pending, Turn, Watch,
+};
 pub use wire::{Decoder, Encoder, Wire, WireError};
 
 /// What a program on the kernel needs besides the SDK: its entry, its console, its

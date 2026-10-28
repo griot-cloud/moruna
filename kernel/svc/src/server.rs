@@ -11,14 +11,25 @@
 //! request with no id, a second `Hello`) is closed. So is one whose client does not
 //! read: a reply or event that finds the client's queue full closes the connection
 //! rather than block the server, since one client must not stall the others.
+//!
+//! A driver waits on its device as well as its clients: [`Dispatcher::watch`] adds any
+//! waitable object it owns (an interrupt, a timer) to the same `wait`, and is called
+//! when it signals. A request the device answers later is deferred: the handler takes a
+//! [`Pending`] from [`Context::defer`] and returns [`Outcome::Deferred`], and whoever
+//! holds the `Pending` (the watch callback, another request, or the program between
+//! turns) completes it with the answer.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeSet, VecDeque},
+    vec::Vec,
+};
 
 use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Signals, limits};
 
 use crate::{
     frame::{self, Frame, Kind, Transport},
-    os::{Channel, WaitItem, wait},
+    os::{Channel, Handle, WaitItem, wait},
     protocol::{Hello, ProtocolId, Refusal, Refused, Status},
     wire::{Decoder, Encoder, Wire},
 };
@@ -31,6 +42,9 @@ pub enum Outcome {
     Failure(u32),
     /// One of the SDK's statuses.
     Status(Status),
+    /// The answer comes later, through the [`Pending`] the handler took with
+    /// [`Context::defer`].
+    Deferred,
 }
 
 impl Outcome {
@@ -58,13 +72,42 @@ pub trait Handler {
 /// A connection's number within its dispatcher.
 pub type ConnectionId = u64;
 
+/// A request whose answer was deferred: the connection and the request's id. The
+/// dispatcher takes one answer for it and refuses a second.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    connection: ConnectionId,
+    txid: u32,
+}
+
+impl Pending {
+    pub fn connection(&self) -> ConnectionId {
+        self.connection
+    }
+}
+
+/// Answers to deferred requests, sent by the dispatcher at the end of the turn.
+#[derive(Default)]
+pub struct Completions(VecDeque<(Pending, Outcome)>);
+
+impl Completions {
+    /// Answers `pending` with `outcome` (not `Deferred`).
+    pub fn complete(&mut self, pending: Pending, outcome: Outcome) {
+        self.0.push_back((pending, outcome));
+    }
+}
+
 /// What a handler may do besides answering: know its connection, send events on it,
-/// and close it after the reply.
+/// defer its answer, answer other deferred requests, and close the connection after
+/// the reply.
 pub struct Context<'a> {
     channel: &'a Channel,
     connection: ConnectionId,
     client_minor: u16,
     close: bool,
+    txid: u32,
+    deferred: bool,
+    completions: &'a mut Completions,
 }
 
 impl Context<'_> {
@@ -96,6 +139,34 @@ impl Context<'_> {
     pub fn close(&mut self) {
         self.close = true;
     }
+
+    /// Defers the answer to this request: the handler returns `Outcome::Deferred`, and
+    /// the answer is whatever the returned `Pending` is later completed with.
+    pub fn defer(&mut self) -> Pending {
+        self.deferred = true;
+        Pending {
+            connection: self.connection,
+            txid: self.txid,
+        }
+    }
+
+    /// Answers another deferred request, at the end of this turn.
+    pub fn complete(&mut self, pending: Pending, outcome: Outcome) {
+        self.completions.complete(pending, outcome);
+    }
+}
+
+/// Something a dispatcher waits on besides its channels: a driver's interrupt, a timer.
+/// It owns its handle, so it can acknowledge what it is told.
+pub trait Watch {
+    /// The handle waited on.
+    fn handle(&self) -> &Handle;
+    /// The signals waited for.
+    fn signals(&self) -> Signals;
+    /// One of the signals is raised (`seen` is what the wait observed). Returns
+    /// whether to keep watching; the object is dropped when it does not. A signal that
+    /// stays raised (an interrupt not acknowledged) calls this again every turn.
+    fn signaled(&mut self, seen: Signals, done: &mut Completions) -> bool;
 }
 
 /// Makes a handler for each new connection a listener brings.
@@ -108,17 +179,32 @@ enum Slot {
         id: ConnectionId,
         /// The client's minor version, once its `Hello` is welcomed.
         welcomed: Option<u16>,
+        /// The ids of the requests whose answers are deferred.
+        deferred: BTreeSet<u32>,
     },
     Listener {
         channel: Channel,
         factory: Factory,
     },
+    Watch(Box<dyn Watch>),
 }
 
 impl Slot {
-    fn channel(&self) -> &Channel {
+    fn waited(&self) -> (&Handle, Signals) {
         match self {
-            Slot::Connection { channel, .. } | Slot::Listener { channel, .. } => channel,
+            Slot::Connection { channel, .. } | Slot::Listener { channel, .. } => {
+                (&channel.0, Signals::READABLE | Signals::PEER_CLOSED)
+            }
+            Slot::Watch(w) => (w.handle(), w.signals()),
+        }
+    }
+
+    fn ready(&self, seen: Signals) -> bool {
+        match self {
+            Slot::Connection { .. } | Slot::Listener { .. } => {
+                seen.intersects(Signals::READABLE | Signals::PEER_CLOSED)
+            }
+            Slot::Watch(w) => seen.intersects(w.signals()),
         }
     }
 }
@@ -138,12 +224,13 @@ pub enum Turn {
     Empty,
 }
 
-/// The dispatch loop: at most `limits::WAIT_MAX_ITEMS` channels, connections and
-/// listeners together, waited on at once.
+/// The dispatch loop: at most `limits::WAIT_MAX_ITEMS` handles (connections,
+/// listeners and watched handles together), waited on at once.
 #[derive(Default)]
 pub struct Dispatcher {
     slots: Vec<Slot>,
     next_id: ConnectionId,
+    completions: Completions,
 }
 
 impl Dispatcher {
@@ -151,7 +238,7 @@ impl Dispatcher {
         Dispatcher::default()
     }
 
-    /// The channels held: connections and listeners.
+    /// The handles held: connections, listeners and watched handles.
     pub fn len(&self) -> usize {
         self.slots.len()
     }
@@ -182,8 +269,53 @@ impl Dispatcher {
             handler,
             id,
             welcomed: None,
+            deferred: BTreeSet::new(),
         });
         Ok(id)
+    }
+
+    /// Waits on `watch`'s handle in the same `wait` as the channels, calling it
+    /// whenever one of its signals is raised.
+    pub fn watch(&mut self, watch: Box<dyn Watch>) -> Result<(), Error> {
+        self.room()?;
+        self.slots.push(Slot::Watch(watch));
+        Ok(())
+    }
+
+    /// Answers a deferred request now. `PeerClosed` when its connection has gone (the
+    /// answer and any handles in it are dropped); `Malformed` when the request was not
+    /// deferred or was already answered.
+    pub fn complete(&mut self, pending: Pending, outcome: Outcome) -> Result<(), Transport> {
+        let mut result = Err(Transport::PeerClosed);
+        let mut closed = None;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            let Slot::Connection {
+                channel,
+                id,
+                deferred,
+                handler,
+                ..
+            } = slot
+            else {
+                continue;
+            };
+            if *id != pending.connection {
+                continue;
+            }
+            if matches!(outcome, Outcome::Deferred) || !deferred.remove(&pending.txid) {
+                return Err(Transport::Malformed);
+            }
+            result = answer(channel, pending.txid, outcome);
+            if result.is_err() {
+                handler.closed();
+                closed = Some(index);
+            }
+            break;
+        }
+        if let Some(index) = closed {
+            self.slots.remove(index);
+        }
+        result
     }
 
     /// Accepts connections arriving on `channel`, serving each with a handler from
@@ -209,7 +341,10 @@ impl Dispatcher {
             let mut items: Vec<WaitItem> = self
                 .slots
                 .iter()
-                .map(|s| WaitItem::new(&s.channel().0, Signals::READABLE | Signals::PEER_CLOSED))
+                .map(|s| {
+                    let (handle, signals) = s.waited();
+                    WaitItem::new(handle, signals)
+                })
                 .collect();
             match wait(&mut items, deadline) {
                 Ok(_) => {}
@@ -221,8 +356,8 @@ impl Dispatcher {
         let mut keep = Vec::with_capacity(self.slots.len());
         let mut arrived = Vec::new();
         for (slot, seen) in core::mem::take(&mut self.slots).into_iter().zip(observed) {
-            let kept = if seen.intersects(Signals::READABLE | Signals::PEER_CLOSED) {
-                self.serve_slot(slot, &mut arrived)
+            let kept = if slot.ready(seen) {
+                self.serve_slot(slot, seen, &mut arrived)
             } else {
                 Some(slot)
             };
@@ -234,6 +369,11 @@ impl Dispatcher {
             // the peer close instead of a welcome.
             let _ = self.serve(channel, handler);
         }
+        // Answers deferred this turn and completed this turn. One whose connection has
+        // gone is dropped with it, which `complete` reports to a caller between turns.
+        while let Some((pending, outcome)) = self.completions.0.pop_front() {
+            let _ = self.complete(pending, outcome);
+        }
         Ok(Turn::Served)
     }
 
@@ -241,9 +381,13 @@ impl Dispatcher {
     fn serve_slot(
         &mut self,
         slot: Slot,
+        seen: Signals,
         arrived: &mut Vec<(Channel, Box<dyn Handler>)>,
     ) -> Option<Slot> {
         match slot {
+            Slot::Watch(mut w) => w
+                .signaled(seen, &mut self.completions)
+                .then_some(Slot::Watch(w)),
             Slot::Listener {
                 channel,
                 mut factory,
@@ -262,6 +406,7 @@ impl Dispatcher {
                 mut handler,
                 id,
                 mut welcomed,
+                mut deferred,
             } => {
                 for _ in 0..FRAMES_PER_TURN {
                     let open = match (frame::recv(&channel), welcomed) {
@@ -271,7 +416,16 @@ impl Dispatcher {
                             welcomed.is_some()
                         }
                         (Ok(Some(f)), Some(minor)) => {
-                            request(&channel, id, minor, handler.as_mut(), f)
+                            let cx = Context {
+                                channel: &channel,
+                                connection: id,
+                                client_minor: minor,
+                                close: false,
+                                txid: f.txid,
+                                deferred: false,
+                                completions: &mut self.completions,
+                            };
+                            request(cx, handler.as_mut(), f, &mut deferred)
                         }
                         (Err(_), _) => false,
                     };
@@ -285,6 +439,7 @@ impl Dispatcher {
                     handler,
                     id,
                     welcomed,
+                    deferred,
                 })
             }
         }
@@ -349,37 +504,47 @@ fn handshake(channel: &Channel, id: ProtocolId, mut f: Frame) -> Option<u16> {
 
 /// Answers one request; returns whether the connection stays open.
 fn request(
-    channel: &Channel,
-    connection: ConnectionId,
-    client_minor: u16,
+    mut cx: Context<'_>,
     handler: &mut dyn Handler,
     mut f: Frame,
+    deferred: &mut BTreeSet<u32>,
 ) -> bool {
-    if f.kind != Kind::Request || f.txid == 0 {
+    // A request id already deferred is one the client reused while it is in flight.
+    if f.kind != Kind::Request || f.txid == 0 || deferred.contains(&f.txid) {
         return false;
     }
     let (ordinal, txid) = (f.ordinal, f.txid);
-    let mut cx = Context {
-        channel,
-        connection,
-        client_minor,
-        close: false,
-    };
     let outcome = {
         let mut d = f.decoder();
         handler.handle(&mut cx, ordinal, &mut d)
     };
     // Whatever the handler did not take of the request's handles closes here.
     drop(f);
-    let sent = match outcome {
+    let sent = match (outcome, cx.deferred) {
+        (Outcome::Deferred, true) => {
+            deferred.insert(txid);
+            Ok(())
+        }
+        // A handler that defers and answers, or answers `Deferred` without deferring,
+        // has broken its own contract: the connection closes rather than leave the
+        // client with two answers or none.
+        (Outcome::Deferred, false) | (_, true) => Err(Transport::Malformed),
+        (outcome, false) => answer(cx.channel, txid, outcome),
+    };
+    sent.is_ok() && !cx.close
+}
+
+/// Sends the answer to request `txid`.
+fn answer(channel: &Channel, txid: u32, outcome: Outcome) -> Result<(), Transport> {
+    match outcome {
         Outcome::Reply(body) => match frame::send(channel, Kind::Reply, 0, txid, body) {
             Err(Transport::TooLarge) => failure(channel, txid, Status::ReplyTooLarge as u32),
             other => other,
         },
         Outcome::Failure(code) => failure(channel, txid, code),
         Outcome::Status(status) => failure(channel, txid, status as u32),
-    };
-    sent.is_ok() && !cx.close
+        Outcome::Deferred => Err(Transport::Malformed),
+    }
 }
 
 fn failure(channel: &Channel, txid: u32, code: u32) -> Result<(), Transport> {
