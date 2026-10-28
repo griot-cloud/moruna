@@ -509,6 +509,18 @@ Start order: F8.1 and F8.3 now, in parallel; F8.2 after F8.1; F8.4, F8.5, F8.6 a
 
 ---
 
+## EA. Wave A: blocking fixes, release 0.5.7
+
+The brief is `architecture/agents/briefs/waves-a-b-c.md` section 3. One pull request per component; the release is its own pull request on top of both. Waves B and C are not started.
+
+| Id | Item | Branch | Scope (SDD sections, tests by id) | Status |
+|---|---|---|---|---|
+| MA1 | A source with zero rows never finishes | `fix/ma1-zero-row-source` | 10 f.5 (splits with no rows), h; SC-T24 (with its end-to-end half in `moruna-runtime/tests/governed.rs`), SC-T25 | in review |
+| MA2 | Every task gets exactly one terminal event | `fix/ma2-terminal-events` (runtime), and the scheduler's half on `fix/ma1-zero-row-source` | 12 c PY-I11, k, n; PY-T23, PY-T24, PY-T25, PY-T26; 10 h (a drive that panics), SC-T26 | in review |
+| R0.5.7 | Release 0.5.7 | `chore/release-0.5.7` | version bump, CHANGELOG section; `DECISIONS.md` Q4, AP1, FB1, CM1 | in review |
+
+---
+
 ## Escalations and findings
 
 Open items the PM found while reading, routed per preamble section 7. Ids: `N-` a documentation finding from the PM's read, `E1-env-` an environment gap for a wave, `D-B` a decision about the board itself.
