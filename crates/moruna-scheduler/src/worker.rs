@@ -450,14 +450,15 @@ fn enrich(e: MorunaError, stage: StageId, seq: Seq, features: &MorselFeatures) -
     }
 }
 
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+/// What a panic said, when it said it in text.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     if let Some(text) = panic.downcast_ref::<&'static str>() {
         return (*text).to_string();
     }
     if let Some(text) = panic.downcast_ref::<String>() {
         return text.clone();
     }
-    "a kernel panicked".to_string()
+    "a panic with no message".to_string()
 }
 
 /// One record to the trace, then the controller's hook on the same thread (f.2).

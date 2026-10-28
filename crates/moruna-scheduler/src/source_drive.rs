@@ -17,7 +17,7 @@ use moruna_kernel::{
     BoxFuture, Morsel, MorunaError, Origin, Payload, Result, RowRange, Seq, Split, Tier,
 };
 
-use crate::shared::{DRIVE_DRIVING, DRIVE_STOP, HelperRequest, Shared};
+use crate::shared::{Cursor, DRIVE_DRIVING, DRIVE_STOP, HelperRequest, Shared};
 
 /// Wakes the drive thread when a completion resolves; the drive owns no runtime of its own (l).
 struct DriveWake(Unparker);
@@ -81,55 +81,59 @@ fn range_end(shared: &Shared, split: &Split, start: u64, bytes: Option<u64>) -> 
     (start + rows_for(split, target)).min(split.rows)
 }
 
+/// Step the cursor past every split it has no rows left in: a split it has read to the end,
+/// and a split that holds no rows at all (f.5). Every reader of the cursor settles it first, so
+/// "the plan is exhausted" and "the cursor is past the last split" are one fact: a plan whose
+/// remaining splits hold no rows is exhausted, and its queue closes (SC-T24).
+fn settle(cursor: &mut Cursor, plan: &[Split]) {
+    while let Some(split) = plan.get(cursor.split_index as usize)
+        && cursor.row_offset >= split.rows
+    {
+        cursor.split_index += 1;
+        cursor.row_offset = 0;
+    }
+}
+
 /// The next range to issue, and the cursor advanced past it (f.5). `None` when the plan is
 /// exhausted. The range is recorded as issued under the same lock that advances the cursor, so
 /// a checkpoint never sees the cursor past a read it cannot find (MH 4.7).
 fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRange, Seq, bool)> {
     let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        let index = cursor.split_index as usize;
-        let split = shared.plan.get(index)?;
-        if cursor.row_offset >= split.rows {
-            cursor.split_index += 1;
-            cursor.row_offset = 0;
-            continue;
-        }
-        let start = cursor.row_offset;
-        let whole = !split.sub_splittable;
-        let end = range_end(shared, split, start, bytes);
-        let seq = cursor.next_seq;
-        cursor.next_seq += 1;
-        cursor.row_offset = end;
-        if end >= split.rows {
-            cursor.split_index += 1;
-            cursor.row_offset = 0;
-        }
-        let origin = Origin {
-            split: split.id,
-            row_start: start,
-            row_end: end,
-            node: shared.cfg.node,
-        };
-        cursor.issued.insert(seq, origin);
-        return Some((index, RowRange { start, end }, seq, whole));
-    }
+    settle(&mut cursor, &shared.plan);
+    let index = cursor.split_index as usize;
+    let split = shared.plan.get(index)?;
+    let start = cursor.row_offset;
+    let whole = !split.sub_splittable;
+    let end = range_end(shared, split, start, bytes);
+    let seq = cursor.next_seq;
+    cursor.next_seq += 1;
+    cursor.row_offset = end;
+    settle(&mut cursor, &shared.plan);
+    let origin = Origin {
+        split: split.id,
+        row_start: start,
+        row_end: end,
+        node: shared.cfg.node,
+    };
+    cursor.issued.insert(seq, origin);
+    Some((index, RowRange { start, end }, seq, whole))
 }
 
 /// The range `take_next_range(shared, None)` would issue next, without taking it: its split's
 /// index and its rows. `None` when the plan is exhausted.
 fn peek_next_range(shared: &Shared) -> Option<(usize, RowRange)> {
-    let cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut index, mut start) = (cursor.split_index as usize, cursor.row_offset);
-    loop {
-        let split = shared.plan.get(index)?;
-        if start >= split.rows {
-            index += 1;
-            start = 0;
-            continue;
-        }
-        let end = range_end(shared, split, start, None);
-        return Some((index, RowRange { start, end }));
-    }
+    let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    settle(&mut cursor, &shared.plan);
+    let index = cursor.split_index as usize;
+    let split = shared.plan.get(index)?;
+    let end = range_end(shared, split, cursor.row_offset, None);
+    Some((
+        index,
+        RowRange {
+            start: cursor.row_offset,
+            end,
+        },
+    ))
 }
 
 /// The split's estimate of the bytes `rows` of it decode to: its share of the split's
@@ -504,13 +508,15 @@ fn source_diagnostic(e: MorunaError, split: u32, rows: RowRange) -> MorunaError 
     }
 }
 
-/// f.5: when the plan is exhausted and no read is in flight, close Q0 and say so.
+/// f.5: when the plan is exhausted (no split at or after the cursor has a row left) and no read
+/// is in flight, close Q0 and say so.
 fn close_when_exhausted(shared: &Shared, inflight: &[InFlight<'_>]) {
     if !inflight.is_empty() {
         return;
     }
     {
-        let cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        settle(&mut cursor, &shared.plan);
         if (cursor.split_index as usize) < shared.plan.len() {
             return;
         }
@@ -518,6 +524,30 @@ fn close_when_exhausted(shared: &Shared, inflight: &[InFlight<'_>]) {
     shared.source_exhausted.store(true, Ordering::SeqCst);
     shared.close_queue(0);
     shared.advance_closes();
+}
+
+/// f.5, h: the source drive panicked, in the source's code or in its own. The run ends with a
+/// source diagnostic naming the split of the oldest read the drive had issued and not pushed
+/// (the read it was most likely serving), or the split at the cursor when none was in flight,
+/// and saying what the panic said. Nothing is left waiting for a drive that is gone: without
+/// this the run waited for ever, its tasks never ended (MA2).
+pub(crate) fn panicked(shared: &Shared, panic: &(dyn std::any::Any + Send)) {
+    let split = {
+        let cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        match cursor.issued.values().next() {
+            Some(origin) => origin.split,
+            None => shared
+                .plan
+                .get(cursor.split_index as usize)
+                .map_or(cursor.split_index, |split| split.id),
+        }
+    };
+    let msg = format!(
+        "the source drive panicked: {}",
+        crate::worker::panic_message(panic)
+    );
+    tracing::error!(target: "sched.drive_panicked", split, %msg, "the source drive died");
+    crate::policy::terminate(shared, MorunaError::Source { split, msg });
 }
 
 /// The drive-side helper of f.9: one read of about `bytes` at the cursor, issued and waited on

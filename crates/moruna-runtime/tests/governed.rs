@@ -880,3 +880,60 @@ fn a_loaders_bindings_decide_where_a_contract_is() {
         "{moved}"
     );
 }
+
+/// SC-T24, end to end (10 k): a query whose result has no rows is a plan of one split with no
+/// rows, and the run over it finishes with nothing written rather than waiting for a read that
+/// will never be issued. `SELECT 42 AS answer WHERE false` through a `datafusion` source into
+/// Parquet; the run is given a deadline and is cancelled past it, so a hang fails the test.
+#[test]
+fn sc_t24_a_query_with_no_rows_finishes() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("sc_t24_no_rows");
+    let root = scratch.path().join("disk");
+    disk(&root);
+    let staging = scratch.path().join("staging");
+    std::fs::create_dir_all(&staging).expect("staging");
+    let out = scratch.path().join("out");
+    let job = JobSpec::from_value(serde_json::json!({
+        "moruna_spec": 1,
+        "source": {"kind": "datafusion", "root": root,
+                   "sql": "SELECT 42 AS answer WHERE false",
+                   "caller": caller("ana", "demo")},
+        "sink": {"kind": "parquet", "url": out},
+        "budget": {"memory_bytes": 256u64 << 20, "cpu": 2.0},
+        "staging": {"dir": staging, "limit_bytes": 1u64 << 30},
+        "profiles_dir": scratch.path().join("profiles"),
+    }))
+    .expect("the document parses");
+    let env = |_: &str| None;
+    let built = build(
+        &job,
+        &NoKernels,
+        BuildOptions {
+            strict: true,
+            env: &env,
+            notes: Vec::new(),
+            packages: moruna_runtime::packaged::PackageHost::default(),
+            host_ports: None,
+        },
+    )
+    .expect("the document builds");
+    let cancel = CancelToken::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let token = cancel.clone();
+    let runner = std::thread::spawn(move || {
+        let _ = tx.send(Runtime::run(built.spec, token));
+    });
+    let outcome = rx.recv_timeout(std::time::Duration::from_secs(30));
+    if outcome.is_err() {
+        cancel.cancel();
+    }
+    let _ = runner.join();
+    let report = match outcome {
+        Ok(Ok(report)) => report,
+        Ok(Err(e)) => panic!("the run failed: {e}"),
+        Err(_) => panic!("the run over a query with no rows had not finished after 30 s"),
+    };
+    assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
+    assert_eq!(support::read_back_rows(&out), 0, "the output holds no rows");
+}
