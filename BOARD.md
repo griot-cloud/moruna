@@ -554,6 +554,7 @@ Waves are gates, not start order: an item starts when what it needs is merged. T
 | | KD2 | the engine as the first process after the supervisor | todo |
 | | KD3 | conformance across adapters: every kind on Linux and on the kernel, same rows, same refusals | todo |
 | | KD4 | launcher devices in `moruna-vmm`: shared memory, one block device per layer | todo |
+| | KD6a | `moruna-cost` (`feat/kd6a-moruna-cost`): the inputs, `Estimate`, `UnitCost` and `Outcome`; the `CostModel` port and the `CostModels` registry, chosen by a setting, with shadow mode; the default `loglinear` model (RLS on logarithms with forgetting, a fixed overhead, ratios, fallbacks); the observation store and its local adapter. SDD 24 (new: CM-I1 to CM-I11, CM-T1 to CM-T21); `architecture/adaptive-runtime.md` sections 3 to 5, 7 | in review |
 | | release | 0.6.0: the kernel runs real jobs inside a VM | todo |
 | E. The kernel as a node | KE1 | NVMe and the cloud network card as driver processes | todo |
 | | KE2 | the network server: TCP/IP and TLS (smoltcp, rustls) | todo |

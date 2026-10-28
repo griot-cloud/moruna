@@ -1,0 +1,21 @@
+[package]
+name = "moruna-cost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna's cost model: what a unit of work takes from a run, predicted and learned"
+
+# What the planner and the scheduler ask what a unit costs (SDD 24, architecture/adaptive-runtime.md
+# sections 3 to 7). It compiles in an embedder's process beside `moruna-job` and nothing heavier:
+# no Arrow, no runtime, no linear-algebra crate.
+[dependencies]
+# The role a kind plays and the rule for a kind's name, which a model's name follows.
+moruna-job = { workspace = true }
+serde = { workspace = true }
+# The observation records and the fitted state are JSON (preamble 6.2: the only text format in
+# the runtime); a float in the fitted state is written as its bits so a load is exact.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
