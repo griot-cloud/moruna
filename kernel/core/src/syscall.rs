@@ -10,7 +10,8 @@ use alloc::{sync::Arc, vec::Vec};
 
 use moruna_abi::{
     ABI_VERSION, DEADLINE_INFINITE, Error, PAGE_SIZE, RawHandle, ResourceKind, Rights, Signals,
-    fixed_name, limits, map, nr, read_u32, start_entry, valid_name, wait_item, write_u32,
+    fixed_name, limits, map, memory_flags, msi, nr, pin_flags, read_u32, resource_info,
+    start_entry, valid_name, wait_item, write_u32, write_u64,
 };
 use ostd::{arch::cpu::context::UserContext, early_print, sync::Waiter};
 
@@ -18,7 +19,7 @@ use crate::{
     channel::{self, Endpoint, Message},
     clock::{self, Timer},
     interrupt::Interrupt,
-    memory::{DeviceMemory, MemoryObject},
+    memory::{self, DeviceMemory, MemoryObject, Pin},
     object::{Console, Handle, Object, Resource},
     process::{self, Process, Thread},
     usercopy,
@@ -71,7 +72,7 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::CHANNEL_CREATE => channel_create(p),
         nr::CHANNEL_WRITE => channel_write(p, a[0], a[1], a[2], a[3], a[4]),
         nr::CHANNEL_READ => channel_read(p, a[0], a[1], a[2], a[3], a[4]),
-        nr::MEMORY_CREATE => memory_create(p, a[0]),
+        nr::MEMORY_CREATE => memory_create(p, a[0], a[1]),
         nr::MEMORY_MAP => memory_map(p, a[0], a[1], a[2], a[3]),
         nr::MEMORY_UNMAP => p.unmap(a[0], a[1]).map(|_| (0, 0)).map_err(Fail::from),
         nr::PROCESS_CREATE => process_create(p, a[0], a[1], a[2]),
@@ -89,6 +90,11 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::INTERRUPT_ACK => interrupt_ack(p, a[0]),
         nr::DEVICE_MEMORY_CREATE => device_memory_create(p, a[0], a[1], a[2]),
         nr::RESOURCE_NARROW => resource_narrow(p, a[0], a[1], a[2]),
+        nr::INTERRUPT_CREATE_MSI => interrupt_create_msi(p, a[0], a[1]),
+        nr::MEMORY_PIN => memory_pin(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::DMA_RELEASE => dma_release(p, a[0]),
+        nr::RESOURCE_INFO => resource_info(p, a[0], a[1]),
+        nr::PROCESS_KILL => process_kill(p, a[0]),
         _ => Err(Error::BadSyscall.into()),
     };
     match result {
@@ -352,8 +358,12 @@ fn channel_read(p: &Process, value: u64, bytes: u64, cap: u64, handles: u64, hca
     Ok((nb, nh))
 }
 
-fn memory_create(p: &Process, size: u64) -> Ret {
-    let object = MemoryObject::new(size)?;
+/// `memory_create` (ABI 1.2 adds `flags`; zero is the call ABI 1.0 made).
+fn memory_create(p: &Process, size: u64, flags: u64) -> Ret {
+    if flags & !memory_flags::ALL != 0 {
+        return Err(Error::InvalidArgs.into());
+    }
+    let object = MemoryObject::with_dma(size, flags & memory_flags::DMA != 0)?;
     insert(p, Object::Memory(Arc::new(object)))
 }
 
@@ -630,7 +640,7 @@ fn resource_narrow(p: &Process, value: u64, base: u64, len: u64) -> Ret {
         ResourceKind::DeviceMemory => {
             base.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE)
         }
-        ResourceKind::Interrupt => true,
+        ResourceKind::Interrupt | ResourceKind::Msi | ResourceKind::Dma => true,
     };
     if len == 0 || !aligned || base.checked_add(len).is_none() {
         return Err(Error::InvalidArgs.into());
@@ -638,13 +648,115 @@ fn resource_narrow(p: &Process, value: u64, base: u64, len: u64) -> Ret {
     if !source.covers(base, len) {
         return Err(Error::AccessDenied.into());
     }
-    let narrowed = Resource {
-        kind: source.kind,
-        range: base..base + len,
-    };
+    let narrowed = Resource::new(source.kind, base..base + len);
     let value = p.handles.lock().insert(Handle {
         object: Object::Resource(Arc::new(narrowed)),
         rights: handle.rights,
     })?;
     one(value as u64)
+}
+
+/// `interrupt_create_msi` (ABI 1.2; SDD 25, f.2): an interrupt a device raises by
+/// writing a message, in MSI slot `slot` of the resource's range. Returns the
+/// interrupt, and in `rdx` the message (`moruna_abi::msi`).
+fn interrupt_create_msi(p: &Process, resource: u64, slot: u64) -> Ret {
+    let resource = typed(p, resource, Rights::WRITE, |h| {
+        as_resource(h, ResourceKind::Msi)
+    })?;
+    if slot >= moruna_abi::resource_range::MSI_END {
+        return Err(Error::InvalidArgs.into());
+    }
+    if !resource.covers(slot, 1) {
+        return Err(Error::AccessDenied.into());
+    }
+    let (line, address, data) = Interrupt::msi(slot)?;
+    let (value, _) = insert(p, Object::Interrupt(Arc::new(line)))?;
+    Ok((value, msi::pack(address, data)))
+}
+
+/// `memory_pin` (ABI 1.2; SDD 25, f.4): pins a DMA memory object for the devices the
+/// DMA resource covers and writes the device address of each page to `addrs`, room
+/// for `cap` of them. Returns the pin and, in `rdx`, the page count; on
+/// `BufferTooSmall`, `rdx` is the count needed.
+fn memory_pin(p: &Process, dma: u64, memory: u64, flags: u64, addrs: u64, cap: u64) -> Ret {
+    let domain_handle = lookup(p, dma, Rights::NONE)?;
+    let memory_handle = lookup(p, memory, Rights::NONE)?;
+    let domain = as_resource(&domain_handle, ResourceKind::Dma)?;
+    let object = as_memory(&memory_handle)?;
+    if !domain_handle.rights.contains(Rights::WRITE) {
+        return Err(Error::AccessDenied.into());
+    }
+    let mut needed = Rights::READ;
+    if flags & pin_flags::DEVICE_WRITES != 0 {
+        needed = needed | Rights::WRITE;
+    }
+    if !memory_handle.rights.contains(needed) {
+        return Err(Error::AccessDenied.into());
+    }
+    if flags & !pin_flags::ALL != 0 || !object.is_dma() {
+        return Err(Error::InvalidArgs.into());
+    }
+    let pages = object.frames().len() as u64;
+    if cap < pages {
+        return Err(Fail {
+            error: Error::BufferTooSmall,
+            rdx: pages,
+        });
+    }
+    let (pin, addresses) = Pin::new(domain, object)?;
+    let mut out = Vec::new();
+    if out.try_reserve_exact(addresses.len() * 8).is_err() {
+        pin.abandon();
+        return Err(Error::NoMemory.into());
+    }
+    out.resize(addresses.len() * 8, 0);
+    for (i, a) in addresses.iter().enumerate() {
+        write_u64(&mut out, i * 8, *a);
+    }
+    // No device has the addresses until the caller reads them, so a pin that cannot
+    // be reported ends without quarantine.
+    if let Err(e) = usercopy::write(&p.vm, addrs, &out) {
+        pin.abandon();
+        return Err(e.into());
+    }
+    let pin = Arc::new(pin);
+    let value = p.handles.lock().insert(Handle::new(Object::Pin(pin)));
+    match value {
+        Ok(v) => Ok((v as u64, pages)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `dma_release` (ABI 1.2): drops the pins a DMA resource holds in quarantine. The
+/// caller says its device no longer uses them; returns how many there were.
+fn dma_release(p: &Process, dma: u64) -> Ret {
+    let domain = typed(p, dma, Rights::WRITE, |h| as_resource(h, ResourceKind::Dma))?;
+    one(memory::release_quarantine(&domain) as u64)
+}
+
+/// `resource_info` (ABI 1.2): writes a resource's kind and range (24 bytes,
+/// `moruna_abi::resource_info`) to `out`.
+fn resource_info(p: &Process, value: u64, out: u64) -> Ret {
+    let resource = typed(p, value, Rights::NONE, |h| match &h.object {
+        Object::Resource(r) => Ok(r.clone()),
+        _ => wrong(),
+    })?;
+    let mut bytes = [0u8; resource_info::SIZE];
+    write_u32(&mut bytes, resource_info::KIND, resource.kind as u32);
+    write_u64(&mut bytes, resource_info::BASE, resource.range.start);
+    write_u64(
+        &mut bytes,
+        resource_info::LEN,
+        resource.range.end - resource.range.start,
+    );
+    usercopy::write(&p.vm, out, &bytes)?;
+    one(0)
+}
+
+/// `process_kill` (ABI 1.2): ends a running process through a handle to it, as a
+/// fault ends it (KK-I10).
+fn process_kill(p: &Process, value: u64) -> Ret {
+    let target = typed(p, value, Rights::WRITE, as_process)?;
+    target.kill()?;
+    one(0)
 }

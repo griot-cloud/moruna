@@ -1,0 +1,13 @@
+[package]
+name = "virtio-console"
+description = "The virtio console driver: a process on the Moruna microkernel serving moruna.driver.console on a virtio console's first port"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-mmio = { path = "../mmio", version = "=0.1.0" }
+moruna-virtio = { path = "../virtio", version = "=0.1.0" }
+console-protocol = { path = "../console-protocol", version = "=0.1.0" }

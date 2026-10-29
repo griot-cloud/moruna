@@ -6,12 +6,16 @@
 moruna-image 1
 
 # KK-T11, SV-T13: the root resources, a child started from its image, and a driver
-# started holding only a narrowed device page and interrupt line.
+# started holding only a narrowed device page and interrupt line. DR-T7: the calls ABI
+# 1.2 added; then the supervisor hands the device manager the device roots.
 process supervisor
   handle console console
   handle root.process root.process
   handle root.device root.device
   handle root.interrupt root.interrupt
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma
   handle program:child child-image
   handle program:driver driver-image
   expect KB1 spawn: ok: child runs, started by the supervisor with 1 handle
@@ -19,6 +23,8 @@ process supervisor
   expect KB1 supervisor: ok:
   expect KB2 narrowing: ok:
   expect kk: process driver exited with code 0 (
+  expect KB3 kernel calls: ok:
+  expect kk: process killee was killed through a handle to it
   exits 0
 
 # KK-T10: a fault ends its process and nothing else.
@@ -85,3 +91,74 @@ process echo-conformance
   exits 0
 link echo-client.server echo-server.listen-client
 link echo-conformance.server echo-server.listen-conformance
+
+# SDD 25: the device manager. It enumerates PCI and starts one driver process per
+# device its table names (a driver is a line here), each holding only its own device;
+# its directory publishes block0, console0, console1 and vsock0 (when the boot has a
+# vsock). Clients reach the directory, and only the tests reach control, through the
+# links below.
+process devices
+  handle console console
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1043 virtio-console console
+  driver 1af4:1053 virtio-vsock vsock
+  driver 1234:11e8 edu edu
+  expect KB3 devices: started
+  expect KB3 block0: virtio-blk up: 8192 sectors of 512 bytes
+  expect KB3 console0: virtio-console up
+  expect KB3 console1: virtio-console up
+  expect KB3 devices: block0 ended; started it again (start 2)
+  expect kk: process block0 was killed through a handle to it
+  expect kk: process block0 exited with code 0 (
+  expect kk: process console0 exited with code 0 (
+  expect kk: process console1 exited with code 0 (
+  expect KB3 edu0: edu up: identification 0x10000ed
+  expect kk: process edu0 exited with code 0 (
+  expect KB3 devices: ok:
+  exits 0
+link supervisor.devices devices.supervisor
+
+# DR-T9 to DR-T11: the disk through block0, its conformance suite, and block0 killed
+# under 32 reads and restarted.
+process block-test
+  handle console console
+  expect KB3 block: ok:
+  expect KB3 conformance moruna.driver.block: ok:
+  expect KB3 driver crash: ok:
+  exits 0
+link block-test.directory devices.directory-block
+link block-test.control devices.control-block
+
+# DR-T12: lines through console0 (its file is judged with the serial log), a line
+# read from console1, and the console conformance suite.
+process console-test
+  handle console console
+  expect KB3 console: ok:
+  expect KB3 conformance moruna.driver.console: ok:
+  expect KB3 console0: line 1 of 3 through the driver
+  expect KB3 console0: line 3 of 3 through the driver
+  expect KB3 console1 read: KB3 console input: hello from the host
+  exits 0
+link console-test.directory devices.directory-console
+
+# DR-T13: vsock to the host; check-boot.sh requires its lines when the boot attached a
+# vsock, and the line saying there is none when it did not.
+process vsock-test
+  handle console console
+  exits 0
+link vsock-test.directory devices.directory-vsock
+
+# DR-T14: a driver's resources reach its own device only.
+process driver-isolation
+  handle console console
+  expect KB3 driver isolation: ok:
+  exits 0
+link driver-isolation.control devices.control-isolation
+
+# DR-T17: a fourth driver, for QEMU's edu test device, added as one line of the
+# device manager's table above and this process, with no kernel change.
+process edu-test
+  handle console console
+  expect KB3 edu: ok:
+  exits 0
+link edu-test.directory devices.directory-edu

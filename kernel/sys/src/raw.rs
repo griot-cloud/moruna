@@ -53,6 +53,8 @@ fn plain(n: u64, a: [u64; 6]) -> (u64, u64) {
             | nr::PROCESS_START
             | nr::WAIT
             | nr::DEBUG_WRITE
+            | nr::MEMORY_PIN
+            | nr::RESOURCE_INFO
     ));
     // SAFETY: only calls that read no memory through their arguments reach here: the
     // crate's own wrappers call `plain` with those numbers and no other.
@@ -198,6 +200,47 @@ pub fn resource_narrow(resource: RawHandle, base: u64, len: u64) -> u64 {
     call3(nr::RESOURCE_NARROW, resource as u64, base, len).0
 }
 
+/// `memory_create` with its ABI 1.2 flags (`moruna_abi::memory_flags`).
+pub fn memory_create(size: u64, flags: u64) -> u64 {
+    call2(nr::MEMORY_CREATE, size, flags).0
+}
+
+/// `interrupt_create_msi`: the interrupt in `rax`, the message in `rdx`
+/// (`moruna_abi::msi`).
+pub fn interrupt_create_msi(resource: RawHandle, slot: u64) -> (u64, u64) {
+    call2(nr::INTERRUPT_CREATE_MSI, resource as u64, slot)
+}
+
+/// `memory_pin`: the pin in `rax`, the page count in `rdx`; the device address of
+/// each page lands in `addrs`.
+pub fn memory_pin(dma: RawHandle, memory: RawHandle, flags: u64, addrs: &mut [u64]) -> (u64, u64) {
+    let a = [
+        dma as u64,
+        memory as u64,
+        flags,
+        addrs.as_mut_ptr() as u64,
+        addrs.len() as u64,
+        0,
+    ];
+    // SAFETY: the kernel writes at most `addrs.len()` 8-byte values into the slice.
+    unsafe { syscall(nr::MEMORY_PIN, a) }
+}
+
+pub fn dma_release(dma: RawHandle) -> u64 {
+    call1(nr::DMA_RELEASE, dma as u64).0
+}
+
+/// `resource_info`: the kind and range land in `out` (`moruna_abi::resource_info`).
+pub fn resource_info(resource: RawHandle, out: &mut [u8; moruna_abi::resource_info::SIZE]) -> u64 {
+    let a = [resource as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0];
+    // SAFETY: the kernel writes exactly `resource_info::SIZE` bytes into `out`.
+    unsafe { syscall(nr::RESOURCE_INFO, a) }.0
+}
+
+pub fn process_kill(process: RawHandle) -> u64 {
+    call1(nr::PROCESS_KILL, process as u64).0
+}
+
 /// `memory_unmap`, for the heap, which unmaps only mappings it made itself.
 pub(crate) fn memory_unmap(addr: u64, len: u64) -> u64 {
     call2(nr::MEMORY_UNMAP, addr, len).0
@@ -217,3 +260,26 @@ pub(crate) fn poke(addr: u64, value: u8) {
     // because another process may read the same page.
     unsafe { core::ptr::write_volatile(addr as *mut u8, value) }
 }
+
+macro_rules! sized {
+    ($load:ident, $store:ident, $t:ty) => {
+        /// One access of exactly this width to a live mapping: a device register is
+        /// read and written at its own width, never byte by byte.
+        pub(crate) fn $load(addr: u64) -> $t {
+            // SAFETY: callers pass an address inside a `Mapping` they hold, aligned to
+            // the type's size (checked by `Mapping`), which the kernel keeps mapped
+            // readable until the `Mapping` is dropped.
+            unsafe { core::ptr::read_volatile(addr as *const $t) }
+        }
+
+        pub(crate) fn $store(addr: u64, value: $t) {
+            // SAFETY: callers pass an aligned address inside a writable `Mapping` they
+            // hold, which the kernel keeps mapped writable until it is dropped.
+            unsafe { core::ptr::write_volatile(addr as *mut $t, value) }
+        }
+    };
+}
+
+sized!(load16, store16, u16);
+sized!(load32, store32, u32);
+sized!(load64, store64, u64);

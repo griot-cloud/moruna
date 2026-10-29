@@ -58,6 +58,21 @@ fn start() -> Result<usize, String> {
     start_manifest()
 }
 
+/// The PCI configuration space the firmware describes (ACPI MCFG, its first segment),
+/// from its first bus to the end of its last: the range `root.ecam` covers.
+fn ecam() -> Result<core::ops::Range<u64>, String> {
+    let region = ostd::arch::kernel::ACPI_INFO
+        .get()
+        .and_then(|info| info.pci_ecam_region.as_ref())
+        .ok_or("root.ecam: the firmware describes no PCI configuration space (ACPI MCFG)")?;
+    let start = region.base_address + ((region.bus_start as u64) << 20);
+    let end = region.base_address + ((region.bus_end as u64 + 1) << 20);
+    if end <= start {
+        return Err(String::from("root.ecam: the MCFG's bus range is empty"));
+    }
+    Ok(start..end)
+}
+
 fn start_manifest() -> Result<usize, String> {
     let initramfs = ostd::boot::boot_info()
         .initramfs
@@ -102,6 +117,12 @@ fn start_manifest() -> Result<usize, String> {
                 Source::RootProcess => root(ResourceKind::Process),
                 Source::RootDevice => root(ResourceKind::DeviceMemory),
                 Source::RootInterrupt => root(ResourceKind::Interrupt),
+                Source::RootMsi => root(ResourceKind::Msi),
+                Source::RootDma => root(ResourceKind::Dma),
+                Source::RootEcam => Object::Resource(Arc::new(Resource::new(
+                    ResourceKind::DeviceMemory,
+                    ecam().map_err(|e| format!("process {}: {e}", spec.name))?,
+                ))),
                 Source::ChannelEnd { channel, end } => {
                     let endpoint = ends
                         .get_mut(*channel)

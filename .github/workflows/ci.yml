@@ -195,7 +195,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /opt/qemu
-          key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-ubuntu-24.04-v1
+          key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-vhost-kernel-ubuntu-24.04-v2
       - name: Build QEMU ${{ env.QEMU_VERSION }}
         if: steps.changed.outputs.kernel == 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -205,8 +205,10 @@ jobs:
           echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
           mkdir qemu-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-src
           cd qemu-src
+          # vhost-kernel builds vhost-vsock-pci, the vsock SDD 25's DR-T13 boots with.
           ./configure --prefix=/opt/qemu --target-list=x86_64-softmmu \
-            --without-default-features --enable-kvm --enable-tcg --disable-docs --disable-werror
+            --without-default-features --enable-kvm --enable-tcg --enable-vhost-kernel \
+            --disable-docs --disable-werror
           make -j"$(nproc)"
           sudo make install
       - name: QEMU on the path, and KVM for this user when the runner has it
@@ -221,16 +223,26 @@ jobs:
             sudo udevadm trigger --name-match=kvm
           fi
           ls -l /dev/kvm || echo "no /dev/kvm: the boot runs under TCG"
+          # DR-T13 (SDD 25): a vsock needs the host's vhost_vsock module. Without it the
+          # boot has no vsock, and check-boot.sh requires the test's line saying so.
+          sudo modprobe vhost_vsock || echo "no vhost_vsock module on this runner"
+          if [ -e /dev/vhost-vsock ]; then
+            sudo chmod 0666 /dev/vhost-vsock
+            ls -l /dev/vhost-vsock
+          else
+            echo "no /dev/vhost-vsock: the boot runs without a vsock"
+          fi
       - name: Format, and the host tests of the ABI, the loaders, the handle table, the SDK and the image tool
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
         run: |
           cargo fmt --all -- --check
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-svc -p moruna-image)
+          packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-svc -p moruna-image
+            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
-      - name: Examples touch no file of the kernel (SV-T15)
+      - name: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)
         if: steps.changed.outputs.kernel == 'true'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -279,6 +291,8 @@ jobs:
             ${{ runner.temp }}/serial-*.log
             ${{ runner.temp }}/boot/manifest
             ${{ runner.temp }}/boot/expect
+            ${{ runner.temp }}/boot/console*.log
+            ${{ runner.temp }}/boot/vsock*
           if-no-files-found: warn
           retention-days: 14
 

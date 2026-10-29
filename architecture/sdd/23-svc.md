@@ -293,8 +293,9 @@ Coverage on the host (`cargo llvm-cov`): `moruna-svc` 93.3% of lines, `moruna-im
 
 ## m. Open items
 
-1. **MSI-X for KB3.** The call that allocates an interrupt line for a message-signalled device and returns its message (f.9) is KB3's, as is the PCI configuration access a virtio driver needs.
-2. **Partial unmap and protection changes** stay KC1's (SDD 20 m.5).
+1. **Partial unmap and protection changes** stay KC1's (SDD 20 m.1).
+
+Resolved by KB3 (SDD 25): MSI-X (`interrupt_create_msi`, ABI 1.2) and PCI configuration access (`root.ecam` and `resource_info`, narrowed per function).
 
 ## n. Traceability
 

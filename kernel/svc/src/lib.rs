@@ -43,9 +43,13 @@ pub use server::{
 pub use wire::{Decoder, Encoder, Wire, WireError};
 
 /// What a program on the kernel needs besides the SDK: its entry, its console, its
-/// start handles, and the objects a driver maps.
+/// start handles, the objects a driver maps, and the calls a driver and its
+/// supervisor make (SDD 25).
 #[cfg(target_os = "none")]
-pub use moruna_sys::{Console, DeviceMemory, Interrupt, Memory, exit, main, println, start};
+pub use moruna_sys::{
+    Console, DeviceMemory, Interrupt, Mapping, Memory, Msi, Pin, Process, ResourceInfo,
+    ResourceKind, Timer, dma_release, exit, main, map, println, start,
+};
 
 #[doc(hidden)]
 pub mod __private {

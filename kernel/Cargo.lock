@@ -56,10 +56,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "block-test"
+version = "0.1.0"
+dependencies = [
+ "block-protocol",
+ "devices-protocol",
+ "moruna-svc",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "console-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "console-test"
+version = "0.1.0"
+dependencies = [
+ "console-protocol",
+ "devices-protocol",
+ "moruna-svc",
+]
 
 [[package]]
 name = "const_fn"
@@ -109,6 +141,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "devices"
+version = "0.1.0"
+dependencies = [
+ "devices-protocol",
+ "moruna-driver-table",
+ "moruna-mmio",
+ "moruna-pci",
+ "moruna-svc",
+]
+
+[[package]]
+name = "devices-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "driver-isolation"
+version = "0.1.0"
+dependencies = [
+ "devices-protocol",
+ "moruna-svc",
+]
+
+[[package]]
 name = "echo-client"
 version = "0.1.0"
 dependencies = [
@@ -136,6 +194,31 @@ name = "echo-server"
 version = "0.1.0"
 dependencies = [
  "echo-protocol",
+ "moruna-svc",
+]
+
+[[package]]
+name = "edu"
+version = "0.1.0"
+dependencies = [
+ "edu-protocol",
+ "moruna-pci",
+ "moruna-svc",
+]
+
+[[package]]
+name = "edu-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "edu-test"
+version = "0.1.0"
+dependencies = [
+ "devices-protocol",
+ "edu-protocol",
  "moruna-svc",
 ]
 
@@ -294,6 +377,13 @@ name = "moruna-abi"
 version = "0.1.0"
 
 [[package]]
+name = "moruna-driver-table"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+]
+
+[[package]]
 name = "moruna-handles"
 version = "0.1.0"
 dependencies = [
@@ -305,6 +395,7 @@ name = "moruna-image"
 version = "0.1.0"
 dependencies = [
  "moruna-abi",
+ "moruna-driver-table",
  "moruna-loader",
 ]
 
@@ -340,6 +431,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-mmio"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-svc",
+]
+
+[[package]]
+name = "moruna-pci"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-mmio",
+ "moruna-svc",
+]
+
+[[package]]
 name = "moruna-svc"
 version = "0.1.0"
 dependencies = [
@@ -352,6 +460,16 @@ name = "moruna-sys"
 version = "0.1.0"
 dependencies = [
  "moruna-abi",
+]
+
+[[package]]
+name = "moruna-virtio"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-mmio",
+ "moruna-pci",
+ "moruna-svc",
 ]
 
 [[package]]
@@ -790,6 +908,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "block-protocol",
+ "moruna-mmio",
+ "moruna-svc",
+ "moruna-virtio",
+]
+
+[[package]]
+name = "virtio-console"
+version = "0.1.0"
+dependencies = [
+ "console-protocol",
+ "moruna-mmio",
+ "moruna-svc",
+ "moruna-virtio",
+]
+
+[[package]]
+name = "virtio-vsock"
+version = "0.1.0"
+dependencies = [
+ "moruna-mmio",
+ "moruna-svc",
+ "moruna-virtio",
+ "vsock-protocol",
+]
+
+[[package]]
 name = "volatile"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -800,6 +948,22 @@ name = "volatile"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
+
+[[package]]
+name = "vsock-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "vsock-test"
+version = "0.1.0"
+dependencies = [
+ "devices-protocol",
+ "moruna-svc",
+ "vsock-protocol",
+]
 
 [[package]]
 name = "wasip2"

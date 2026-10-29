@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 moruna-abi = { workspace = true, features = ["manifest"] }
 moruna-loader.workspace = true
+moruna-driver-table = { path = "../../devices/table", version = "=0.1.0" }
