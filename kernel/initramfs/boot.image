@@ -114,6 +114,10 @@ process devices
   expect kk: process console1 exited with code 0 (
   expect KB3 edu0: edu up: identification 0x10000ed
   expect kk: process edu0 exited with code 0 (
+  expect KB3 block1: virtio-blk up:
+  expect KB3 block2: virtio-blk up:
+  expect kk: process block1 exited with code 0 (
+  expect kk: process block2 exited with code 0 (
   expect KB3 devices: ok:
   exits 0
 link supervisor.devices devices.supervisor
@@ -162,3 +166,28 @@ process edu-test
   expect KB3 edu: ok:
   exits 0
 link edu-test.directory devices.directory-edu
+
+# SDD 27: the image filesystem server over the two read-only layer disks the boot
+# attaches (block1 and block2, written by build.sh), lowest first as its layer list
+# says; and IF-T12 to IF-T17 against it: the cold start counted, the merged tree
+# checked against the host's list, map against read, a second client served from the
+# cache, the scratch directory's quota and the image read only, and the protocol's
+# conformance suite.
+process imagefs
+  handle console console
+  handle data:layers/imagefs.layers layers
+  expect KC2 imagefs: up: 2 layers, lowest first: block1
+  expect KC2 imagefs: served
+  exits 0
+link imagefs.directory devices.directory-imagefs
+process imagefs-test
+  handle console console
+  handle data:layers/imagefs.checks checks
+  expect KC2 cold start: ok:
+  expect KC2 tree: ok:
+  expect KC2 map: ok:
+  expect KC2 cache: ok:
+  expect KC2 scratch: ok:
+  expect KC2 conformance moruna.imagefs: ok:
+  exits 0
+link imagefs-test.fs imagefs.listen-test

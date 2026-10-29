@@ -15,8 +15,11 @@
 # throttled to 8 MiB/s so DR-T11's 32 MiB of reads are still in flight when the
 # driver is killed, on any number of CPUs), a
 # vhost vsock with guest cid 3 (00:06) when /dev/vhost-vsock is usable, with
-# vsock-peer.py as the host's side (OUT/vsock-peer-CPUS.log), and QEMU's edu test
-# device (00:07). OUT/vsock-CPUS says whether the vsock was attached, and why not.
+# vsock-peer.py as the host's side (OUT/vsock-peer-CPUS.log), QEMU's edu test
+# device (00:07), and the image filesystem's two layer disks, read only, as virtio-blk
+# at 00:08 and 00:09 (OUT/layers/layer-1.img and layer-2.img, written by build.sh;
+# the device manager names them block1 and block2, SDD 27 k). OUT/vsock-CPUS says
+# whether the vsock was attached, and why not.
 set -euo pipefail
 
 kernel="$(cd "$(dirname "$0")/.." && pwd)"
@@ -49,6 +52,10 @@ devices=(
   -drive "file=$disk,format=raw,if=none,id=disk0,throttling.bps-read=8388608"
   -device virtio-blk-pci,drive=disk0,addr=0x5,disable-legacy=on
   -device edu,addr=0x7
+  -drive "file=$out/layers/layer-1.img,format=raw,if=none,id=layer1,readonly=on"
+  -device virtio-blk-pci,drive=layer1,addr=0x8,disable-legacy=on
+  -drive "file=$out/layers/layer-2.img,format=raw,if=none,id=layer2,readonly=on"
+  -device virtio-blk-pci,drive=layer2,addr=0x9,disable-legacy=on
 )
 peer=""
 if [ -r /dev/vhost-vsock ] && [ -w /dev/vhost-vsock ]; then

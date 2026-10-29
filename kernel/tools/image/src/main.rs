@@ -1,5 +1,6 @@
 //! `moruna-image DESCRIPTION PROGRAMS OUT`: builds the boot image DESCRIPTION names
-//! from the programs in the directory PROGRAMS, and writes into OUT the initramfs
+//! from the programs in the directory PROGRAMS and the data files OUT already holds
+//! (a `data:PATH` handle is OUT/PATH), and writes into OUT the initramfs
 //! (`initramfs.cpio`), the boot manifest it carries (`manifest`), and the lines a boot
 //! of it must print (`expect`), one per line.
 
@@ -25,7 +26,7 @@ fn main() -> ExitCode {
 
 fn run(description: &Path, programs: &Path, out: &Path) -> Result<String, String> {
     let text = fs::read_to_string(description).map_err(|e| e.to_string())?;
-    let image = moruna_image::build(&text, programs).map_err(|e| e.to_string())?;
+    let image = moruna_image::build(&text, programs, out).map_err(|e| e.to_string())?;
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     let write = |name: &str, bytes: &[u8]| {
         let path = out.join(name);

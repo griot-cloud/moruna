@@ -209,7 +209,7 @@ fn sv_t9_the_archive_reads_back_with_the_kernels_reader() {
 #[test]
 fn sv_t9_build_checks_every_program_and_writes_the_image() {
     let dir = programs(&["supervisor", "child", "ping", "pong-program"]);
-    let image = build(DESCRIPTION, &dir).expect("builds");
+    let image = build(DESCRIPTION, &dir, &dir).expect("builds");
     let read = cpio::files(&image.initramfs).expect("reads");
     assert_eq!(
         cpio::find(&read, "manifest"),
@@ -218,16 +218,16 @@ fn sv_t9_build_checks_every_program_and_writes_the_image() {
     assert!(cpio::find(&read, "bin/pong-program").is_some());
     assert_eq!(image.expect.len(), 7);
     fs::write(dir.join("child"), b"not an elf").expect("write");
-    let e = build(DESCRIPTION, &dir).err().expect("refused");
+    let e = build(DESCRIPTION, &dir, &dir).err().expect("refused");
     assert!(
         e.reason
             .contains("program `child` is not an image the kernel loads"),
         "{e}"
     );
     fs::remove_file(dir.join("child")).expect("remove");
-    let e = build(DESCRIPTION, &dir).err().expect("refused");
+    let e = build(DESCRIPTION, &dir, &dir).err().expect("refused");
     assert!(e.reason.starts_with("program `child`:"), "{e}");
-    assert!(build("moruna-image 9", &dir).is_err());
+    assert!(build("moruna-image 9", &dir, &dir).is_err());
     fs::remove_dir_all(dir).expect("clean");
 }
 
@@ -319,12 +319,62 @@ fn dr_t8_driver_lines_render_a_table_and_give_the_images() {
     assert!(text.contains("handle file:bin/virtio-blk driver.virtio-blk\n"));
     assert_eq!(text.matches("driver.virtio-console").count(), 1);
     let dir = programs(&["supervisor", "devices", "virtio-blk", "virtio-console"]);
-    let image = build(DEVICES, &dir).expect("builds");
+    let image = build(DEVICES, &dir, &dir).expect("builds");
     let read = cpio::files(&image.initramfs).expect("reads");
     assert_eq!(
         cpio::find(&read, "etc/devices.drivers"),
         Some(tables[0].1.as_bytes())
     );
     assert!(cpio::find(&read, "bin/virtio-console").is_some());
+    fs::remove_dir_all(dir).expect("clean");
+}
+
+/// SDD 27: a `data:` handle carries a file of the build's data directory, at
+/// `data/PATH`; a path that could leave the directory, and a file that is not there,
+/// are refused.
+#[test]
+fn if_t18_data_handles_carry_the_builds_files() {
+    let dir = programs(&["imagefs", "imagefs-test"]);
+    fs::create_dir_all(dir.join("layers")).expect("dir");
+    fs::write(dir.join("layers/imagefs.layers"), b"moruna-layers 1\n").expect("data");
+    let text = "\
+moruna-image 1
+process imagefs
+  handle data:layers/imagefs.layers layers
+process imagefs-test
+  handle data:layers/imagefs.layers checks
+link imagefs-test.fs imagefs.listen-test
+";
+    let image = build(text, &dir, &dir).expect("builds");
+    let read = cpio::files(&image.initramfs).expect("reads");
+    assert_eq!(
+        cpio::find(&read, "data/layers/imagefs.layers"),
+        Some(&b"moruna-layers 1\n"[..])
+    );
+    assert!(
+        image
+            .manifest
+            .contains("handle file:data/layers/imagefs.layers layers")
+    );
+    assert_eq!(
+        read.iter()
+            .filter(|f| f.path == "data/layers/imagefs.layers")
+            .count(),
+        1,
+        "one copy for two handles"
+    );
+    for bad in ["../x", "/abs", "a//b", "a/./b", "UPPER", ""] {
+        let text = format!("moruna-image 1\nprocess imagefs\n  handle data:{bad} layers\n");
+        let e = Description::parse(&text).expect_err("refused");
+        assert_eq!(e.line, 3, "{bad}: {e}");
+    }
+    let e = build(
+        "moruna-image 1\nprocess imagefs\n  handle data:missing layers\n",
+        &dir,
+        &dir,
+    )
+    .err()
+    .expect("refused");
+    assert!(e.reason.starts_with("data `missing`:"), "{e}");
     fs::remove_dir_all(dir).expect("clean");
 }

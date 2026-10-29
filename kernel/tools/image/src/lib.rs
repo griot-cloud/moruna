@@ -18,8 +18,11 @@
 //! ```
 //!
 //! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`, `root.ecam`,
-//! `root.msi`, `root.dma`, or `program:PROGRAM`, a read-only memory object holding that
-//! program's image, for a process that starts others. A process with `driver` lines
+//! `root.msi`, `root.dma`, `program:PROGRAM`, a read-only memory object holding that
+//! program's image, for a process that starts others, or `data:PATH`, a read-only
+//! memory object holding the file PATH of the build's data directory (the files a
+//! build makes for its boot, such as the image filesystem's layer list, SDD 27), at
+//! `data/PATH` in the initramfs. A process with `driver` lines
 //! is a device manager (SDD 25, e.3): the tool renders its driver table
 //! (`moruna_driver_table`) to `etc/NAME.drivers` and gives it as the slot `drivers`,
 //! and gives each driver program's image as the slot `driver.PROGRAM`, so a new
@@ -78,6 +81,8 @@ pub enum DescSource {
     RootMsi,
     RootDma,
     Program(String),
+    /// A file of the build's data directory, by its relative path.
+    Data(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +151,30 @@ fn name(text: &str, line: usize, what: &str) -> Result<String, DescError> {
         err(
             line,
             format!("{what} `{text}` is not 1 to 32 bytes of [a-z0-9._-]"),
+        )
+    }
+}
+
+/// Where data files go in the initramfs.
+pub const DATA: &str = "data";
+
+/// A data file's path: relative, parts of `[a-z0-9._-]` and no `..`.
+fn data_path(path: &str, line: usize) -> Result<String, DescError> {
+    let ok = !path.is_empty()
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+        });
+    if ok {
+        Ok(String::from(path))
+    } else {
+        err(
+            line,
+            format!("data path `{path}` is not relative parts of [a-z0-9._-] without `..`"),
         )
     }
 }
@@ -230,10 +259,13 @@ impl Description {
                         "root.ecam" => DescSource::RootEcam,
                         "root.msi" => DescSource::RootMsi,
                         "root.dma" => DescSource::RootDma,
-                        other => match other.strip_prefix("program:") {
-                            Some(p) => DescSource::Program(name(p, line, "program")?),
-                            None => return err(line, format!("`{other}` is not a handle source")),
-                        },
+                        other => {
+                            match (other.strip_prefix("program:"), other.strip_prefix("data:")) {
+                                (Some(p), _) => DescSource::Program(name(p, line, "program")?),
+                                (_, Some(path)) => DescSource::Data(data_path(path, line)?),
+                                _ => return err(line, format!("`{other}` is not a handle source")),
+                            }
+                        }
                     };
                     let slot = name(slot, line, "slot")?;
                     let Some(process) = d.processes.last_mut() else {
@@ -346,6 +378,18 @@ impl Description {
         programs
     }
 
+    /// Every data file the image carries, by its path in the data directory.
+    pub fn data(&self) -> BTreeSet<String> {
+        self.processes
+            .iter()
+            .flat_map(|p| &p.handles)
+            .filter_map(|h| match &h.source {
+                DescSource::Data(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every driver table the image carries: its path and its text.
     pub fn tables(&self) -> Vec<(String, String)> {
         self.processes
@@ -377,6 +421,9 @@ impl Description {
                         DescSource::RootDma => Source::RootDma,
                         DescSource::Program(program) => Source::File {
                             path: format!("{BIN}/{program}"),
+                        },
+                        DescSource::Data(path) => Source::File {
+                            path: format!("{DATA}/{path}"),
                         },
                     },
                     slot: h.slot.clone(),
@@ -545,8 +592,9 @@ pub struct Image {
     pub expect: Vec<String>,
 }
 
-/// Builds the image a description names, its programs read from `programs`.
-pub fn build(description: &str, programs: &Path) -> Result<Image, DescError> {
+/// Builds the image a description names, its programs read from `programs` and its
+/// data files from `data`.
+pub fn build(description: &str, programs: &Path, data: &Path) -> Result<Image, DescError> {
     let d = Description::parse(description)?;
     let (_, manifest) = d.manifest()?;
     let mut files = Vec::new();
@@ -562,6 +610,12 @@ pub fn build(description: &str, programs: &Path) -> Result<Image, DescError> {
             ),
         })?;
         files.push((format!("{BIN}/{program}"), bytes));
+    }
+    for path in d.data() {
+        let at = data.join(&path);
+        let bytes =
+            fs::read(&at).or_else(|e| err(0, format!("data `{path}`: {}: {e}", at.display())))?;
+        files.push((format!("{DATA}/{path}"), bytes));
     }
     files.extend(
         d.tables()
