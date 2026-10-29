@@ -1,0 +1,10 @@
+[package]
+name = "imagefs-protocol"
+description = "moruna.imagefs: the image filesystem's protocol (open, stat, readdir, readlink, read, map, and the scratch directory's writes) and its conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
