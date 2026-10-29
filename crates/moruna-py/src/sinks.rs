@@ -157,7 +157,7 @@ impl PyTensorSink {
     }
 }
 
-/// A sink that writes page-aligned Arrow IPC files.
+/// A sink that writes Arrow IPC files, page-aligned or compressed.
 #[pyclass(frozen, module = "moruna._core", name = "ArrowIpcSink")]
 pub struct PyArrowIpcSink {
     pub(crate) cfg: ArrowIpcSinkConfig,
@@ -167,17 +167,25 @@ pub struct PyArrowIpcSink {
 #[pymethods]
 impl PyArrowIpcSink {
     #[new]
-    #[pyo3(signature = (path, *, file_bytes = None))]
-    fn new(path: String, file_bytes: Option<&Bound<'_, PyAny>>) -> PyResult<PyArrowIpcSink> {
+    #[pyo3(signature = (path, *, file_bytes = None, compression = "none", level = None))]
+    fn new(
+        path: String,
+        file_bytes: Option<&Bound<'_, PyAny>>,
+        compression: &str,
+        level: Option<i32>,
+    ) -> PyResult<PyArrowIpcSink> {
         let mut notes = Vec::new();
         let file_bytes = match file_bytes {
             Some(v) => clamp_file_bytes(size(v, "sink.file_bytes")?, &mut notes),
             None => 1 << 30,
         };
+        let compression = moruna_kernel::ipc::Compression::parse(compression, level)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(PyArrowIpcSink {
             cfg: ArrowIpcSinkConfig {
                 path: PathBuf::from(path),
                 file_bytes,
+                compression,
             },
             notes,
         })
@@ -225,6 +233,7 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<(SinkSpec, Vec<String>)> {
             SinkSpec::ArrowIpc(ArrowIpcSinkConfig {
                 path: h.cfg.path.clone(),
                 file_bytes: h.cfg.file_bytes,
+                compression: h.cfg.compression,
             }),
             h.notes.clone(),
         ));

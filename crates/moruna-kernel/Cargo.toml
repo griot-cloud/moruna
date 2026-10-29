@@ -13,6 +13,11 @@ arrow = { workspace = true }
 dlpark = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+# Arrow IPC LZ4_FRAME and ZSTD buffers, inflated into arena buffers after every declared size is
+# checked (contracts e.8); the message that describes the inflated batch is built with flatbuffers.
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+flatbuffers = { workspace = true }
 # A sink's engine's own report of a write (`SinkWrite`), carried to the run report unread.
 serde_json = { workspace = true }
 

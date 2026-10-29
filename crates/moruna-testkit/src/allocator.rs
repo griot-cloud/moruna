@@ -28,6 +28,8 @@ struct State {
     host_in_use: u64,
     pinned_in_use: u64,
     device_in_use: [u64; 8],
+    /// The most each tier has held at once (`peak`).
+    peak: [u64; 2],
     fail_next: u64,
 }
 
@@ -128,6 +130,18 @@ impl FakeAllocator {
             Tier::PinnedHost => state.pinned_in_use,
             Tier::Device(id) => state.device_in_use[id.0 as usize],
             Tier::Disk(_) | Tier::Remote(_, _) => 0,
+        }
+    }
+
+    /// Observable: the most bytes `tier` has held at once since this allocator was created. A
+    /// refusal that allocated nothing leaves it at zero, which is what a test of a refusal
+    /// asserts; the device tiers are not tracked and read zero.
+    pub fn peak(&self, tier: Tier) -> u64 {
+        let state = self.lock();
+        match tier {
+            Tier::Host => state.peak[0],
+            Tier::PinnedHost => state.peak[1],
+            Tier::Device(_) | Tier::Disk(_) | Tier::Remote(_, _) => 0,
         }
     }
 
@@ -338,8 +352,14 @@ impl Allocator for FakeAllocator {
             },
         );
         match tier {
-            Tier::Host => state.host_in_use += len as u64,
-            Tier::PinnedHost => state.pinned_in_use += len as u64,
+            Tier::Host => {
+                state.host_in_use += len as u64;
+                state.peak[0] = state.peak[0].max(state.host_in_use);
+            }
+            Tier::PinnedHost => {
+                state.pinned_in_use += len as u64;
+                state.peak[1] = state.peak[1].max(state.pinned_in_use);
+            }
             Tier::Device(id) => state.device_in_use[id.0 as usize] += len as u64,
             Tier::Disk(_) | Tier::Remote(_, _) => {}
         }

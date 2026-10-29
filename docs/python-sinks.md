@@ -29,10 +29,10 @@ moruna.TensorSink(path, *, format="mrb1", one_file_per_morsel=False, name="tenso
 ## `moruna.ArrowIpcSink`
 
 ```python
-moruna.ArrowIpcSink(path, *, file_bytes=None)
+moruna.ArrowIpcSink(path, *, file_bytes=None, compression="none", level=None)
 ```
 
-`path: str` is the output directory. `file_bytes: int | str | None` defaults to 1 GiB. Size settings may be clamped to supported bounds, with a note in the run report. Unknown formats and compression names raise `ValueError` at construction.
+`path: str` is the output directory. `file_bytes: int | str | None` defaults to 1 GiB. `compression: str` is `"none"`, `"zstd"` or `"lz4"`; a compressed file is smaller and `pyarrow.ipc.open_file` reads it. `level: int | None` is the zstd level (default 3) and is refused with any other compression. Size settings may be clamped to supported bounds, with a note in the run report. Unknown formats and compression names raise `ValueError` at construction.
 
 ## `moruna.Sink`
 

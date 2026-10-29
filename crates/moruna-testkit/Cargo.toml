@@ -10,6 +10,11 @@ description = "Moruna test fakes for every contracts interface"
 
 [dependencies]
 moruna-kernel = { workspace = true }
+# Compressed IPC streams, built by hand to carry the lengths a test wants them to lie about
+# (`ipc::crafted`).
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+flatbuffers = { workspace = true }
 
 [features]
 default = []

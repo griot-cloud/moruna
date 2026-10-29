@@ -34,7 +34,16 @@ fn check_message(bytes: &[u8]) -> Result<(), String> {
     let framed = bytes.len() > 8 && bytes.get(..4) == Some(&[0xFF; 4][..]);
     let body = if framed { &bytes[8..] } else { bytes };
     match ipc::root_as_message(body) {
-        Ok(message) => moruna_kernel::ipc::check(&message, &[], None).map(drop),
+        Ok(message) => {
+            let nothing = moruna_kernel::arrow::buffer::Buffer::from_vec(Vec::<u8>::new());
+            moruna_kernel::ipc::check(
+                &message,
+                &nothing,
+                None,
+                &moruna_kernel::ipc::Inflate::none(),
+            )
+            .map(drop)
+        }
         Err(_) => Ok(()),
     }
 }

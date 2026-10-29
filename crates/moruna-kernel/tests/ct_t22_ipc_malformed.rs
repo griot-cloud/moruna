@@ -12,7 +12,7 @@ use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use common::FakeAllocator;
 use moruna_kernel::MorunaError;
-use moruna_kernel::ipc::{ReadStream, decode, encode_framing, read_stream};
+use moruna_kernel::ipc::{Inflate, ReadStream, decode, encode_framing, read_stream};
 use moruna_testkit::ipc::{
     batches, corruptions, panics, small, stream, streams, tally, unknown_type,
 };
@@ -72,7 +72,9 @@ fn ct_t22_stream_never_panics() {
     for (label, valid) in streams() {
         let seed = 0xC722_5000 ^ valid.len() as u64;
         let cases = corruptions(&valid, seed, 300);
-        for case in panics(cases, |bytes| read_stream(&Buffer::from_vec(bytes))) {
+        for case in panics(cases, |bytes| {
+            read_stream(&Buffer::from_vec(bytes), &Inflate::none())
+        }) {
             failed.push(format!("{label}, read_stream, {case}"));
         }
         let lazily = |bytes: Vec<u8>| {
@@ -90,7 +92,7 @@ fn ct_t22_stream_never_panics() {
 fn ct_t22_valid_streams_read_back() {
     for (label, batches, version) in batches() {
         let bytes = stream(&batches, version);
-        let read = read_stream(&Buffer::from_vec(bytes.clone())).expect(label);
+        let read = read_stream(&Buffer::from_vec(bytes.clone()), &Inflate::none()).expect(label);
         assert_eq!(read, batches, "{label}");
         let limit = bytes.len() as u64;
         let lazily = ReadStream::new(std::io::Cursor::new(bytes), limit)

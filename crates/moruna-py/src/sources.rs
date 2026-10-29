@@ -1,4 +1,5 @@
-//! The source handles: `ParquetSource`, `VortexSource`, `TensorSource`, `IteratorSource` (d.2).
+//! The source handles: `ParquetSource`, `VortexSource`, `ArrowIpcSource`, `TensorSource`,
+//! `IteratorSource` (d.2).
 //!
 //! Each is a frozen `#[pyclass]` (PY-I7) holding the configuration component 7 builds from, and
 //! the arguments are validated where the user can see the traceback: a projection that is not a
@@ -9,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use moruna_sources::{
-    ParquetSourceConfig, RowFilter, ScalarValue, TensorSourceConfig, VortexSourceConfig,
+    ArrowIpcSourceConfig, ParquetSourceConfig, RowFilter, ScalarValue, TensorSourceConfig,
+    VortexSourceConfig,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyList, PyModule, PySequence, PyString, PyTuple};
@@ -80,6 +82,40 @@ impl PyVortexSource {
 
     fn __repr__(&self) -> String {
         format!("VortexSource({} url(s))", self.cfg.urls.len())
+    }
+}
+
+/// A source over Arrow IPC files (the file format) or directories of `*.arrow` files (07 e.9).
+#[pyclass(frozen, module = "moruna._core", name = "ArrowIpcSource")]
+pub struct PyArrowIpcSource {
+    pub(crate) cfg: ArrowIpcSourceConfig,
+}
+
+#[pymethods]
+impl PyArrowIpcSource {
+    #[new]
+    #[pyo3(signature = (urls, *, columns = None, split_rows = None))]
+    fn new(
+        urls: &Bound<'_, PyAny>,
+        columns: Option<Vec<String>>,
+        split_rows: Option<u64>,
+    ) -> PyResult<PyArrowIpcSource> {
+        if split_rows == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "split_rows must be positive: a split holds at least one record batch",
+            ));
+        }
+        Ok(PyArrowIpcSource {
+            cfg: ArrowIpcSourceConfig {
+                urls: string_or_list(urls, "urls")?,
+                columns,
+                split_rows,
+            },
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ArrowIpcSource({} url(s))", self.cfg.urls.len())
     }
 }
 
@@ -154,6 +190,9 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<SourceSpec> {
         let cfg = &v.get().cfg;
         return Ok(SourceSpec::Vortex(cfg.clone()));
     }
+    if let Ok(a) = handle.cast::<PyArrowIpcSource>() {
+        return Ok(SourceSpec::ArrowIpc(a.get().cfg.clone()));
+    }
     if let Ok(t) = handle.cast::<PyTensorSource>() {
         let cfg = &t.get().cfg;
         return Ok(SourceSpec::Tensor(TensorSourceConfig {
@@ -172,8 +211,8 @@ pub fn spec_of(handle: &Bound<'_, PyAny>) -> PyResult<SourceSpec> {
         return Ok(SourceSpec::Python);
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "source must be a moruna.ParquetSource, moruna.VortexSource, moruna.TensorSource, \
-         moruna.IteratorSource or a moruna.Source subclass, not {}",
+        "source must be a moruna.ParquetSource, moruna.VortexSource, moruna.ArrowIpcSource, \
+         moruna.TensorSource, moruna.IteratorSource or a moruna.Source subclass, not {}",
         type_name(handle)
     )))
 }
@@ -307,10 +346,11 @@ fn iterator_schema(value: &Bound<'_, PyAny>) -> PyResult<IteratorSchema> {
     Ok(IteratorSchema::Table(schema.into_inner()))
 }
 
-/// Add the four source classes to the module.
+/// Add the source classes to the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyParquetSource>()?;
     m.add_class::<PyVortexSource>()?;
+    m.add_class::<PyArrowIpcSource>()?;
     m.add_class::<PyTensorSource>()?;
     m.add_class::<PyIteratorSourceHandle>()?;
     Ok(())

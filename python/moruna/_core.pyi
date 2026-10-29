@@ -27,6 +27,15 @@ class VortexSource:
         split_bytes: int | None = ...,
     ) -> None: ...
 
+class ArrowIpcSource:
+    def __init__(
+        self,
+        urls: str | Sequence[str],
+        *,
+        columns: Sequence[str] | None = ...,
+        split_rows: int | None = ...,
+    ) -> None: ...
+
 class TensorSource:
     def __init__(
         self, paths: str | Sequence[str], *, tensors: Sequence[str] | None = ...
@@ -59,7 +68,14 @@ class TensorSink:
     ) -> None: ...
 
 class ArrowIpcSink:
-    def __init__(self, path: str, *, file_bytes: int | str | None = ...) -> None: ...
+    def __init__(
+        self,
+        path: str,
+        *,
+        file_bytes: int | str | None = ...,
+        compression: str = ...,
+        level: int | None = ...,
+    ) -> None: ...
 
 # The classes a user extends (07 e.6, 08 f.10, 2026-09-29).
 

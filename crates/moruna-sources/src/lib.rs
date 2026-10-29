@@ -21,6 +21,7 @@
 // large `Err`. The shape of the error type is the contract's (d.14), not this crate's.
 #![allow(clippy::result_large_err)]
 
+pub mod ipc;
 pub mod parquet;
 pub mod stats;
 pub mod tensor;
@@ -34,6 +35,7 @@ pub mod py_source;
 
 mod util;
 
+pub use crate::ipc::{ArrowIpcSource, ArrowIpcSourceConfig};
 pub use crate::parquet::decode_copy::copy_batch;
 pub use crate::parquet::{ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue};
 pub use crate::tensor::{TensorSource, TensorSourceConfig};

@@ -4,7 +4,9 @@
 //! `moruna_kernel::ipc::encode_framing` and by nothing else, so a segment body and an IPC file
 //! record batch are byte-identical for the same batch and the two cannot drift. Each body is
 //! written from the payload's own arena buffer at a page-aligned offset, so the sink copies no
-//! payload bytes at all (SI-I4).
+//! payload bytes at all (SI-I4). With `compression` set the records are
+//! `moruna_kernel::ipc::encode_compressed`'s instead: the format's own 8-byte alignment, each
+//! buffer compressed, which is an encode copy of the payload (e.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use moruna_kernel::arrow::datatypes::SchemaRef;
 use moruna_kernel::arrow::ipc::writer::FileWriter;
 use moruna_kernel::arrow::record_batch::RecordBatch;
+use moruna_kernel::ipc::Compression;
 use moruna_kernel::{
     Allocator, BoxFuture, Buffer, BufferView, Completion, MorunaError, Payload, PayloadKind,
     PayloadSpec, Reactor, Result, RunId, Seq, Sink, SinkSummary, SourceSchema, TierPref, ipc,
@@ -38,14 +41,18 @@ pub struct ArrowIpcSinkConfig {
     pub path: PathBuf,
     /// File roll size.
     pub file_bytes: u64,
+    /// How each body buffer is compressed: not at all, which keeps every buffer at a page
+    /// boundary, or `zstd` or `lz4`, which write the format's own 8-byte alignment (e.3).
+    pub compression: Compression,
 }
 
 impl Default for ArrowIpcSinkConfig {
-    /// The default of preamble section 5: 1 GiB files.
+    /// The default of preamble section 5: 1 GiB files, uncompressed.
     fn default() -> ArrowIpcSinkConfig {
         ArrowIpcSinkConfig {
             path: PathBuf::new(),
             file_bytes: 1 << 30,
+            compression: Compression::None,
         }
     }
 }
@@ -113,6 +120,7 @@ impl ArrowIpcSink {
         reactor: Arc<dyn Reactor>,
         alloc: Arc<dyn Allocator>,
     ) -> Result<ArrowIpcSink> {
+        cfg.compression.checked()?;
         let dir = LocalDir::new(&cfg.path)?;
         Ok(ArrowIpcSink {
             cfg,
@@ -212,17 +220,29 @@ impl ArrowIpcSink {
         payload: Payload,
     ) -> Result<Record> {
         let page = self.alloc.page_bytes() as u64;
+        let compression = self.cfg.compression;
+        // A compressed record is inflated into memory when it is read, never read into place by
+        // direct IO, so it needs no page boundaries: the format's own 8 bytes are all it keeps.
+        let align = if compression == Compression::None {
+            page
+        } else {
+            8
+        };
+        let payload_bytes = payload.bytes();
         let Some(file_id) = inner.current else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
         let Some(file) = inner.files.get(&file_id) else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
-        let base = round_up(file.cursor, page);
+        let base = round_up(file.cursor, align);
         let first = file.blocks.is_empty();
         let tmp = file.tmp.clone();
 
-        let (framing, bodies) = ipc::encode_framing(batch, page as usize, base, &*self.alloc)?;
+        let (framing, bodies) = match compression {
+            Compression::None => ipc::encode_framing(batch, page as usize, base, &*self.alloc)?,
+            other => ipc::encode_compressed(batch, other, base, &*self.alloc)?,
+        };
         let lengths = MessageLengths::of(&framing)?;
         match inner.schema_len {
             Some(known) if known != lengths.schema => {
@@ -265,6 +285,7 @@ impl ArrowIpcSink {
                 // A zero-length buffer entry has nothing to write and nothing to keep alive.
                 continue;
             }
+            end = end.max(*offset as u64 + body.len() as u64);
             let view = match BufferView::of_arrow(body, &*self.alloc) {
                 // The payload's own buffer, written straight out of the arena: no copy (SI-I4).
                 Ok(view) => view,
@@ -287,14 +308,33 @@ impl ArrowIpcSink {
                 }
             };
             completions.push(self.reactor.write_file(&tmp, *offset as u64, view));
-            end = end.max(*offset as u64 + body.len() as u64);
         }
         let _ = tier;
+        if compression != Compression::None {
+            // The compressor read every byte of the payload and wrote its own: an encode copy
+            // (G-I2 allows a sink that encodes to another format).
+            self.alloc.note_payload_copy(payload_bytes);
+            copied += payload_bytes;
+        }
 
+        // The format wants a block's offset, metadata length and body length each a multiple
+        // of 8, and a reader holds the footer's block to the message's own `bodyLength`
+        // (KA11, 08 e.3). The offset is `base` plus the schema message and the metadata length
+        // is the record message, both multiples of 8 by the encoder; the body length is the one
+        // `encode_framing` wrote into the message, which reaches the end of the last buffer
+        // padded to 8. The cursor moves to that padded end, so the next record and the footer
+        // sit after bytes the file holds.
+        if end > body_base + lengths.body {
+            return Err(MorunaError::Sink(format!(
+                "a body buffer ends at {end}, past the {} bytes the message declares",
+                lengths.body
+            )));
+        }
+        let end = body_base + lengths.body;
         let block = (
             (base + lengths.schema) as i64,
             lengths.record as i32,
-            (end - body_base) as i64,
+            lengths.body as i64,
         );
         let Some(file) = inner.files.get_mut(&file_id) else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
@@ -436,6 +476,9 @@ fn own_buffers(batch: &RecordBatch) -> BTreeSet<usize> {
 struct MessageLengths {
     schema: u64,
     record: u64,
+    /// The `bodyLength` the record batch message declares: what the footer's block says too,
+    /// because a reader refuses a file in which the two differ (KA11).
+    body: u64,
 }
 
 impl MessageLengths {
@@ -443,7 +486,31 @@ impl MessageLengths {
         let bytes: &[u8] = framing;
         let schema = message_len(bytes, 0)?;
         let record = message_len(bytes, schema as usize)?;
-        Ok(MessageLengths { schema, record })
+        // The footer's blocks must be multiples of 8 (KA11): the encoder pads each message's
+        // flatbuffer so that its length prefix, marker and padding fill a multiple of 8, and a
+        // framing that is not is refused here rather than written into a file no reader opens.
+        if !schema.is_multiple_of(8) || !record.is_multiple_of(8) {
+            return Err(MorunaError::Sink(format!(
+                "the ipc messages are {schema} and {record} bytes, not multiples of 8"
+            )));
+        }
+        let flatbuffer = bytes
+            .get(schema as usize + 8..(schema + record) as usize)
+            .ok_or_else(|| MorunaError::Sink("the framing is shorter than its messages".into()))?;
+        let message = moruna_kernel::arrow::ipc::root_as_message(flatbuffer)
+            .map_err(|e| MorunaError::Sink(format!("the record batch message: {e}")))?;
+        let body = u64::try_from(message.bodyLength())
+            .map_err(|_| MorunaError::Sink("the record batch message's body is negative".into()))?;
+        if !body.is_multiple_of(8) {
+            return Err(MorunaError::Sink(format!(
+                "the record batch message declares a body of {body} bytes, not a multiple of 8"
+            )));
+        }
+        Ok(MessageLengths {
+            schema,
+            record,
+            body,
+        })
     }
 
     fn total(&self) -> u64 {

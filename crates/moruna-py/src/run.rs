@@ -312,6 +312,16 @@ fn source_doc(source: &SourceSpec) -> Result<KindDoc, SpecError> {
                 },
             },
         ),
+        SourceSpec::ArrowIpc(cfg) => KindDoc::of(
+            "arrow_ipc",
+            &arrow_ipc::SourceSettings {
+                url: Urls(cfg.urls.clone()),
+                options: arrow_ipc::SourceOptions {
+                    columns: cfg.columns.clone(),
+                    split_rows: cfg.split_rows,
+                },
+            },
+        ),
         SourceSpec::Tensor(cfg) => KindDoc::of(
             "tensor",
             &tensor::SourceSettings {
@@ -386,6 +396,11 @@ fn sink_doc(sink: &SinkSpec) -> Result<KindDoc, SpecError> {
                 url: cfg.path.to_string_lossy().into_owned(),
                 options: arrow_ipc::SinkOptions {
                     file_bytes: Some(cfg.file_bytes),
+                    compression: Some(cfg.compression.name().to_string()),
+                    level: match cfg.compression {
+                        moruna_kernel::ipc::Compression::Zstd(level) => Some(level),
+                        _ => None,
+                    },
                 },
             },
         ),

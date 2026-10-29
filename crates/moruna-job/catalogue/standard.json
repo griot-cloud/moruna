@@ -1,7 +1,104 @@
 {
   "moruna_kinds": 1,
-  "moruna": "0.5.7",
+  "moruna": "0.5.9",
   "sources": [
+    {
+      "name": "arrow_ipc",
+      "role": "source",
+      "summary": "Arrow IPC files (the file format) in local paths or directories",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "$ref": "#/$defs/Urls",
+            "description": "Local files, or directories whose `*.arrow` files are read in name order: a bare path or\n`file://`."
+          },
+          "options": {
+            "$ref": "#/$defs/SourceOptions",
+            "description": "Projection and split size.",
+            "default": {}
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "description": "An `arrow_ipc` source's settings.",
+        "title": "arrow_ipc",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "Urls": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "One location, or a list of them."
+          },
+          "SourceOptions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "The projection; absent is every column."
+              },
+              "split_rows": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "The rows a split is cut toward, from whole record batches; absent is one split per\nrecord batch (07 e.9)."
+              }
+            },
+            "description": "`source.options` for `arrow_ipc`."
+          }
+        },
+        "examples": [
+          {
+            "url": "file:///data/in/"
+          },
+          {
+            "url": [
+              "/data/a.arrow",
+              "/data/more/"
+            ],
+            "options": {
+              "columns": [
+                "id"
+              ],
+              "split_rows": 65536
+            }
+          }
+        ]
+      },
+      "inputs": "files",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "by_settings",
+      "isolation": "builtin"
+    },
     {
       "name": "parquet",
       "role": "source",
@@ -571,7 +668,7 @@
     {
       "name": "arrow_ipc",
       "role": "sink",
-      "summary": "Page-aligned Arrow IPC files in a local directory",
+      "summary": "Arrow IPC files in a local directory, page-aligned or compressed",
       "settings": {
         "type": "object",
         "additionalProperties": false,
@@ -605,6 +702,21 @@
                 "format": "uint64",
                 "minimum": 0,
                 "description": "`sink.file_bytes`; absent is 1 GiB."
+              },
+              "compression": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`none` (absent), `zstd` or `lz4`; a compressed file is 8-byte aligned, not page aligned."
+              },
+              "level": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The zstd level (absent is 3); `zstd` only."
               }
             },
             "description": "`sink.options` for `arrow_ipc`."
@@ -618,6 +730,13 @@
             "url": "file:///data/out",
             "options": {
               "file_bytes": 268435456
+            }
+          },
+          {
+            "url": "/data/out",
+            "options": {
+              "compression": "zstd",
+              "level": 9
             }
           }
         ]
