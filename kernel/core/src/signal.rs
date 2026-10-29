@@ -46,6 +46,16 @@ impl Signaller {
     }
 
     /// Registers `waker`, and returns the bits as they are now.
+    /// Wakes every observer with the bits unchanged: for waiters that share one bit
+    /// and each look for their own part of what raised it (a forward's replies, SDD 28
+    /// f.1), when one has taken its part and more is left.
+    pub fn poke(&self) {
+        let state = self.state.lock();
+        for waker in &state.observers {
+            waker.wake_up();
+        }
+    }
+
     pub fn observe(&self, waker: &Arc<Waker>) -> Signals {
         let mut state = self.state.lock();
         state.observers.push(waker.clone());

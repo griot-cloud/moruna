@@ -33,6 +33,13 @@ pub fn count() -> usize {
         .map_or(0, |n| (n as usize).min(limits::START_HANDLES_MAX))
 }
 
+/// The CPUs online, as the kernel wrote them on the start page (ABI 2.0).
+pub fn cpus() -> usize {
+    page()
+        .and_then(|p| read_u32(p, start_page::CPUS_OFFSET))
+        .map_or(0, |n| n as usize)
+}
+
 /// Entry `i`: the raw value, its rights and its slot name.
 pub fn entry(i: usize) -> Option<(RawHandle, Rights, &'static str)> {
     if i >= count() {

@@ -551,7 +551,7 @@ Waves are gates, not start order: an item starts when what it needs is merged. T
 | B. The kernel boots | KB1 | microkernel core on OSTD: boot, address spaces, processes, threads, IPC, capability handles, timers; boots under QEMU in CI on x86_64 | in review (draft PR #67; SDD 20) |
 | | KB2 | `moruna-svc`: the SDK for servers and drivers, the boot manifest, the protocol schema and its conformance harness | in review (draft PR #74; SDD 23; ABI 1.1; boots on 1, 2 and 4 CPUs) |
 | | KB3 | first drivers as processes: virtio console, virtio block, vsock | in review (draft PR #79; SDD 25; ABI 1.2; DR-T1 to DR-T17 green on 1, 2 and 4 CPUs, vsock data path included) |
-| C. Linux programs run | KC1 | the Linux personality server: the 60 syscalls; static musl, then glibc, then CPython | todo |
+| C. Linux programs run | KC1 | the Linux personality server: the 60 syscalls; static musl, then glibc, then CPython | in review (`feat/kc1-linux-personality`, local; SDD 28; ABI 2.0, SDD 20 rows 30 to 42; LX-T1 to LX-T17, KK-T13, KK-T14 green, booted on 1, 2 and 4 CPUs under TCG in the build container: static musl, its threads, dynamic glibc 2.41 and CPython 3.14 from python:3.14-slim's layers) |
 | | KC2 | the image filesystem server: layers as block devices, one overlay, whiteouts, paging on demand | in review (`feat/kc2-image-filesystem`, local; SDD 27; block protocol 1.1; IF-T1 to IF-T19 green, booted on 1, 2 and 4 CPUs under TCG in the build container) |
 | D. Moruna on its kernel | KD1 | the data-plane adapter on kernel channels: shared pages, ownership handoff, the record check in `batch_put` | todo |
 | | KD2 | the engine as the first process after the supervisor | todo |

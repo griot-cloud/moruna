@@ -14,6 +14,8 @@ extern crate alloc;
 mod boot;
 mod channel;
 mod clock;
+mod foreign;
+mod futex;
 mod interrupt;
 mod memory;
 mod object;
@@ -22,6 +24,7 @@ mod sched;
 mod signal;
 mod syscall;
 mod usercopy;
+mod vm;
 
 /// The kernel's entry point, called by the boot crate from OSTD's `#[ostd::main]`.
 /// It starts the manifest's processes and returns, which hands the CPU to them.

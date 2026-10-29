@@ -18,17 +18,22 @@ use ostd::{arch::cpu::context::UserContext, early_print, sync::Waiter};
 use crate::{
     channel::{self, Endpoint, Message},
     clock::{self, Timer},
+    foreign::{self, Forward},
+    futex,
     interrupt::Interrupt,
     memory::{self, DeviceMemory, MemoryObject, Pin},
     object::{Console, Handle, Object, Resource},
     process::{self, Process, Thread},
     usercopy,
+    vm::{self, Backing, Kind},
 };
 
 /// What the thread does after a syscall.
 pub enum Flow {
     Continue,
     ThreadExit,
+    /// The thread ends, and if it is the last, the process ends with this code.
+    ThreadExitCode(i64),
     ProcessExit(i64),
 }
 
@@ -74,7 +79,7 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::CHANNEL_READ => channel_read(p, a[0], a[1], a[2], a[3], a[4]),
         nr::MEMORY_CREATE => memory_create(p, a[0], a[1]),
         nr::MEMORY_MAP => memory_map(p, a[0], a[1], a[2], a[3]),
-        nr::MEMORY_UNMAP => p.unmap(a[0], a[1]).map(|_| (0, 0)).map_err(Fail::from),
+        nr::MEMORY_UNMAP => memory_unmap(p, a[0], a[1]),
         nr::PROCESS_CREATE => process_create(p, a[0], a[1], a[2]),
         nr::PROCESS_MAP_IMAGE => process_map_image(p, a[0], a[1]),
         nr::PROCESS_START => process_start(p, a[0], a[1], a[2], a[3]),
@@ -95,6 +100,20 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::DMA_RELEASE => dma_release(p, a[0]),
         nr::RESOURCE_INFO => resource_info(p, a[0], a[1]),
         nr::PROCESS_KILL => process_kill(p, a[0]),
+        nr::MEMORY_PROTECT => memory_protect(p, a[0], a[1], a[2]),
+        nr::PROCESS_FORWARD => process_forward(p, a[0], a[1], a[2], a[3]),
+        nr::PROCESS_LAUNCH => process_launch(p, a[0], a[1], a[2], a[3]),
+        nr::PROCESS_MAP => process_map(p, a),
+        nr::PROCESS_UNMAP => process_unmap(p, a[0], a[1], a[2]),
+        nr::PROCESS_PROTECT => process_protect(p, a[0], a[1], a[2], a[3]),
+        nr::PROCESS_READ => process_read(p, a[0], a[1], a[2], a[3]),
+        nr::PROCESS_WRITE => process_write(p, a[0], a[1], a[2], a[3]),
+        nr::FUTEX_WAIT => futex_wait(thread, a[0], a[1], a[2]),
+        nr::FUTEX_WAKE => futex_wake(p, a[0], a[1]),
+        nr::THREAD_SET_FS => thread_set_fs(thread, a[0]),
+        nr::FORWARD_CLONE => forward_clone(p, a),
+        nr::RANDOM_READ => random_read(p, a[0], a[1]),
+        // The data plane's numbers (KD1) and any other: no such call yet.
         _ => Err(Error::BadSyscall.into()),
     };
     match result {
@@ -241,8 +260,8 @@ fn channel_write(
     if nbytes > limits::CHANNEL_MAX_BYTES as u64 || nhandles > limits::CHANNEL_MAX_HANDLES as u64 {
         return Err(Error::Limit.into());
     }
-    let payload = usercopy::read(&p.vm, bytes, nbytes as usize)?;
-    let values = values_of(&usercopy::read(&p.vm, handles, nhandles as usize * 4)?);
+    let payload = usercopy::read(&p.space, bytes, nbytes as usize)?;
+    let values = values_of(&usercopy::read(&p.space, handles, nhandles as usize * 4)?);
 
     let mut table = p.handles.lock();
     let mut carried: Vec<Arc<Endpoint>> = Vec::new();
@@ -323,7 +342,7 @@ fn channel_read(p: &Process, value: u64, bytes: u64, cap: u64, handles: u64, hca
     if table.room() < front.handles.len() {
         return Err(Error::Limit.into());
     }
-    usercopy::write(&p.vm, bytes, &front.bytes)?;
+    usercopy::write(&p.space, bytes, &front.bytes)?;
     let mut inserted: Vec<RawHandle> = Vec::new();
     let mut out = Vec::new();
     for h in &front.handles {
@@ -340,7 +359,7 @@ fn channel_read(p: &Process, value: u64, bytes: u64, cap: u64, handles: u64, hca
             }
         }
     }
-    if let Err(e) = usercopy::write(&p.vm, handles, &out) {
+    if let Err(e) = usercopy::write(&p.space, handles, &out) {
         // The clones go; the message keeps its handles and stays queued.
         for v in &inserted {
             let _ = table.remove(*v);
@@ -394,13 +413,14 @@ fn memory_map(p: &Process, value: u64, offset: u64, len: u64, flags: u64) -> Ret
     if offset.checked_add(len).is_none_or(|end| end > size) {
         return Err(Error::OutOfRange.into());
     }
+    let writable = handle.rights.contains(Rights::WRITE);
     let va = match &handle.object {
-        Object::Memory(m) => p.map_memory(m, offset, len, write, execute)?,
+        Object::Memory(m) => p.map_memory(m, offset, len, write, execute, writable)?,
         Object::DeviceMemory(d) => {
             if execute {
                 return Err(Error::InvalidArgs.into());
             }
-            p.map_device(d, offset, len, write)?
+            p.map_device(d, offset, len, write, writable)?
         }
         _ => return Err(Error::WrongType.into()),
     };
@@ -414,7 +434,7 @@ fn process_create(p: &Process, resource: u64, name: u64, len: u64) -> Ret {
     if len == 0 || len > limits::NAME_MAX as u64 {
         return Err(Error::InvalidArgs.into());
     }
-    let name = usercopy::read(&p.vm, name, len as usize)?;
+    let name = usercopy::read(&p.space, name, len as usize)?;
     let child = Process::new(&name, false)?;
     insert(p, Object::Process(child))
 }
@@ -445,7 +465,7 @@ fn process_start(p: &Process, process: u64, entry: u64, entries: u64, count: u64
     if !process::is_user(entry) {
         return Err(Error::InvalidArgs.into());
     }
-    let raw_entries = usercopy::read(&p.vm, entries, count as usize * start_entry::SIZE)?;
+    let raw_entries = usercopy::read(&p.space, entries, count as usize * start_entry::SIZE)?;
     let mut specs: Vec<(RawHandle, Vec<u8>)> = Vec::new();
     for i in 0..count as usize {
         let at = i * start_entry::SIZE;
@@ -486,7 +506,7 @@ fn wait(thread: &Arc<Thread>, items: u64, count: u64, deadline: u64) -> Ret {
     if count == 0 || count > limits::WAIT_MAX_ITEMS as u64 {
         return Err(Error::InvalidArgs.into());
     }
-    let mut raw_items = usercopy::read(&p.vm, items, count as usize * wait_item::SIZE)?;
+    let mut raw_items = usercopy::read(&p.space, items, count as usize * wait_item::SIZE)?;
     let mut watched: Vec<(Object, Signals)> = Vec::new();
     for i in 0..count as usize {
         let at = i * wait_item::SIZE;
@@ -554,7 +574,7 @@ fn wait(thread: &Arc<Thread>, items: u64, count: u64, deadline: u64) -> Ret {
             seen.bits(),
         );
     }
-    usercopy::write(&p.vm, items, &raw_items)?;
+    usercopy::write(&p.space, items, &raw_items)?;
     one(result?)
 }
 
@@ -575,7 +595,7 @@ fn debug_write(p: &Process, value: u64, ptr: u64, len: u64) -> Ret {
     if len > limits::DEBUG_WRITE_MAX as u64 {
         return Err(Error::Limit.into());
     }
-    let bytes = usercopy::read(&p.vm, ptr, len as usize)?;
+    let bytes = usercopy::read(&p.space, ptr, len as usize)?;
     let text = core::str::from_utf8(&bytes).map_err(|_| Error::InvalidArgs)?;
     early_print!("{}", text);
     one(len)
@@ -715,7 +735,7 @@ fn memory_pin(p: &Process, dma: u64, memory: u64, flags: u64, addrs: u64, cap: u
     }
     // No device has the addresses until the caller reads them, so a pin that cannot
     // be reported ends without quarantine.
-    if let Err(e) = usercopy::write(&p.vm, addrs, &out) {
+    if let Err(e) = usercopy::write(&p.space, addrs, &out) {
         pin.abandon();
         return Err(e.into());
     }
@@ -749,7 +769,7 @@ fn resource_info(p: &Process, value: u64, out: u64) -> Ret {
         resource_info::LEN,
         resource.range.end - resource.range.start,
     );
-    usercopy::write(&p.vm, out, &bytes)?;
+    usercopy::write(&p.space, out, &bytes)?;
     one(0)
 }
 
@@ -758,5 +778,206 @@ fn resource_info(p: &Process, value: u64, out: u64) -> Ret {
 fn process_kill(p: &Process, value: u64) -> Ret {
     let target = typed(p, value, Rights::WRITE, as_process)?;
     target.kill()?;
+    one(0)
+}
+
+/// `memory_unmap` (ABI 2.0: any whole pages of the caller's own mappings).
+fn memory_unmap(p: &Process, addr: u64, len: u64) -> Ret {
+    let len = vm::pages(len)?;
+    p.space.unmap(addr, len, Some(Kind::Mapping))?;
+    one(0)
+}
+
+/// `memory_protect` (ABI 2.0): the protection of whole pages of the caller's own
+/// mappings; `map::PROTECTION` bits, none of them meaning no access.
+fn memory_protect(p: &Process, addr: u64, len: u64, flags: u64) -> Ret {
+    if flags & !map::PROTECTION != 0 {
+        return Err(Error::InvalidArgs.into());
+    }
+    let len = vm::pages(len)?;
+    p.space.protect(addr, len, flags, Some(Kind::Mapping))?;
+    one(0)
+}
+
+/// `process_forward` (ABI 2.0; SDD 28 d.1): gives a created process a forward over the
+/// endpoint, which leaves the caller's table, with the table at `table`.
+fn process_forward(p: &Process, process: u64, endpoint: u64, table: u64, len: u64) -> Ret {
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    let end = typed(
+        p,
+        endpoint,
+        Rights::READ | Rights::WRITE | Rights::TRANSFER,
+        as_channel,
+    )?;
+    if len != moruna_abi::forward::table::SIZE as u64 {
+        return Err(Error::InvalidArgs.into());
+    }
+    if !target.is_created() {
+        return Err(Error::BadState.into());
+    }
+    let bytes = usercopy::read(&p.space, table, len as usize)?;
+    let forward = Forward::new(end, &bytes)?;
+    let moved = p.handles.lock().remove(raw(endpoint)?)?;
+    if let Err(e) = target.set_forward(forward) {
+        // Put back what the call took: nothing changed.
+        let _ = p.handles.lock().insert(moved);
+        return Err(e.into());
+    }
+    drop(moved);
+    one(0)
+}
+
+/// `process_launch` (ABI 2.0): starts a created process whose address space the caller
+/// built; returns its first thread's id.
+fn process_launch(p: &Process, process: u64, entry: u64, stack: u64, brk: u64) -> Ret {
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    one(target.launch(entry, stack, brk)?)
+}
+
+/// `process_map` (ABI 2.0): maps `len` bytes of a memory object from `offset`, or zero
+/// pages filled on first touch when `memory` is zero, into a process: at `addr` when it
+/// is not zero (replacing what is there with `map::FIXED`, refused with `BadState`
+/// without), where the kernel chooses otherwise. Returns where.
+fn process_map(p: &Process, a: [u64; 6]) -> Ret {
+    let [process, memory, offset, len, addr, flags] = a;
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    let backing = if memory == 0 {
+        if offset != 0 {
+            return Err(Error::InvalidArgs.into());
+        }
+        Backing::Zero
+    } else {
+        let handle = lookup(p, memory, Rights::NONE)?;
+        let object = as_memory(&handle)?;
+        if !handle.rights.contains(Rights::MAP | Rights::READ) {
+            return Err(Error::AccessDenied.into());
+        }
+        if !offset.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::InvalidArgs.into());
+        }
+        let span = vm::pages(len)?;
+        if offset
+            .checked_add(span)
+            .is_none_or(|end| end > object.size())
+        {
+            return Err(Error::OutOfRange.into());
+        }
+        Backing::Object {
+            memory: object,
+            first: (offset / PAGE_SIZE) as usize,
+            writable: handle.rights.contains(Rights::WRITE),
+        }
+    };
+    if flags & !map::PROCESS_ALL != 0 {
+        return Err(Error::InvalidArgs.into());
+    }
+    let fixed = flags & map::FIXED != 0;
+    let at = (addr != 0).then_some(addr);
+    if fixed && at.is_none() {
+        return Err(Error::InvalidArgs.into());
+    }
+    let va = target.space.map(
+        at,
+        len,
+        Kind::Mapping,
+        flags & map::PROTECTION,
+        backing,
+        fixed,
+    )?;
+    one(va)
+}
+
+fn process_unmap(p: &Process, process: u64, addr: u64, len: u64) -> Ret {
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    let len = vm::pages(len)?;
+    target.space.unmap(addr, len, None)?;
+    one(0)
+}
+
+fn process_protect(p: &Process, process: u64, addr: u64, len: u64, flags: u64) -> Ret {
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    if flags & !map::PROTECTION != 0 {
+        return Err(Error::InvalidArgs.into());
+    }
+    let len = vm::pages(len)?;
+    target.space.protect(addr, len, flags, None)?;
+    one(0)
+}
+
+/// `process_read` (ABI 2.0): copies `len` bytes at `addr` of a process to `buf`.
+fn process_read(p: &Process, process: u64, addr: u64, buf: u64, len: u64) -> Ret {
+    let target = typed(p, process, Rights::READ, as_process)?;
+    if len > limits::PROCESS_COPY_MAX as u64 {
+        return Err(Error::Limit.into());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len as usize)
+        .map_err(|_| Error::NoMemory)?;
+    bytes.resize(len as usize, 0);
+    target.space.copy_out(addr, &mut bytes)?;
+    usercopy::write(&p.space, buf, &bytes)?;
+    one(0)
+}
+
+/// `process_write` (ABI 2.0): copies `len` bytes from `buf` to `addr` of a process,
+/// whose pages there must be writable.
+fn process_write(p: &Process, process: u64, addr: u64, buf: u64, len: u64) -> Ret {
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    if len > limits::PROCESS_COPY_MAX as u64 {
+        return Err(Error::Limit.into());
+    }
+    let bytes = usercopy::read(&p.space, buf, len as usize)?;
+    target.space.copy_in(addr, &bytes)?;
+    one(0)
+}
+
+/// `futex_wait` (ABI 2.0): sleeps while the `u32` at `addr` holds `expected`, until a
+/// `futex_wake` on it or the deadline; `ShouldWait` when it holds another value.
+fn futex_wait(thread: &Arc<Thread>, addr: u64, expected: u64, deadline: u64) -> Ret {
+    let expected = u32::try_from(expected).map_err(|_| Error::InvalidArgs)?;
+    futex::wait(thread, addr, expected, deadline, futex::ALL)?;
+    one(0)
+}
+
+/// `futex_wake` (ABI 2.0): wakes at most `count` threads waiting on `addr`; how many.
+fn futex_wake(p: &Process, addr: u64, count: u64) -> Ret {
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    one(futex::wake(p.koid, addr, count, futex::ALL)? as u64)
+}
+
+/// `thread_set_fs` (ABI 2.0): the calling thread's FS base, a lower-half address.
+fn thread_set_fs(thread: &Arc<Thread>, base: u64) -> Ret {
+    if !foreign::canonical(base) {
+        return Err(Error::InvalidArgs.into());
+    }
+    thread.set_fs(base);
+    one(0)
+}
+
+/// `forward_clone` (ABI 2.0; SDD 28 f.4): a thread of a forwarded process from the
+/// registers of its thread `tid`, which is waiting on the forward.
+fn forward_clone(p: &Process, a: [u64; 6]) -> Ret {
+    let [process, tid, stack, tls, clear_tid, set_tid] = a;
+    let target = typed(p, process, Rights::WRITE, as_process)?;
+    one(target.clone_thread(tid, stack, tls, clear_tid, set_tid)?)
+}
+
+/// `random_read` (ABI 2.0): `len` bytes from the CPU's random source to `buf`;
+/// `BadState` when the CPU has none.
+fn random_read(p: &Process, buf: u64, len: u64) -> Ret {
+    if len > limits::RANDOM_MAX as u64 {
+        return Err(Error::Limit.into());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len as usize)
+        .map_err(|_| Error::NoMemory)?;
+    while (bytes.len() as u64) < len {
+        let word = ostd::arch::read_random().ok_or(Error::BadState)?;
+        let take = (len as usize - bytes.len()).min(8);
+        bytes.extend_from_slice(&word.to_le_bytes()[..take]);
+    }
+    usercopy::write(&p.space, buf, &bytes)?;
     one(0)
 }

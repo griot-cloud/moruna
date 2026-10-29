@@ -1,4 +1,4 @@
-//! Processes and threads (SDD 20, f.2, f.8 and f.9).
+//! Processes and threads (SDD 20, f.2, f.8, f.9 and f.12 to f.14).
 //!
 //! A process is an address space and a handle table. A thread is an OSTD task that
 //! runs user code in its process's address space and returns to the kernel on every
@@ -6,64 +6,48 @@
 //! threads calls `process_exit`, or when one of them faults; ending closes every handle
 //! it holds, unmaps its address space and raises `TERMINATED`. Nothing else in the
 //! system stops: the kernel reports the end on the console and the others run on.
+//!
+//! A process with a forward (SDD 28) has its foreign calls answered by a server and a
+//! few by the kernel itself (`foreign`). Each thread keeps its FPU registers and its FS
+//! base across switches, so threads of any program, Rust or C, can share a CPU.
 
 use alloc::{
-    collections::BTreeMap,
     format,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-use moruna_abi::{ABI_VERSION, Error, PAGE_SIZE, Signals, limits, start_page, valid_name};
+use moruna_abi::{ABI_VERSION, Error, PAGE_SIZE, Signals, limits, map, start_page, valid_name};
 use moruna_handles::HandleTable;
 use moruna_loader::elf;
 use ostd::{
     arch::{
-        cpu::context::{CpuException, UserContext},
+        cpu::context::{CpuException, FpuContext, FsBase, UserContext},
         read_random, read_tsc,
     },
     early_println,
-    mm::{CachePolicy, MAX_USERSPACE_VADDR, PageFlags, PageProperty, UFrame, VmSpace},
+    irq::DisabledLocalIrqGuard,
     power::{ExitCode, poweroff},
-    sync::{SpinLock, Waker},
-    task::{Task, TaskOptions, disable_preempt},
+    sync::{LocalIrqDisabled, SpinLock, Waker},
+    task::{Task, TaskOptions},
     user::{ReturnReason, UserContextApi, UserMode, UserModeHooks},
 };
 
 use crate::{
+    clock,
+    foreign::{self, Forward},
+    futex,
     memory::{DeviceMemory, MemoryObject},
     object::Handle,
     signal::Signaller,
     syscall::{self, Flow},
+    usercopy,
+    vm::{Access, Backing, Kind, Space},
 };
 
-pub use moruna_abi::IMAGE_RANGE;
-/// Where `memory_map`, stacks and the start page are placed.
-pub const MAP_BASE: u64 = IMAGE_RANGE.end;
-
-fn map_end() -> u64 {
-    MAX_USERSPACE_VADDR as u64 & !(PAGE_SIZE - 1)
-}
-
-/// Whether `addr` is a user address (used for entry points and stack tops).
-pub fn is_user(addr: u64) -> bool {
-    (IMAGE_RANGE.start..=map_end()).contains(&addr)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RegionKind {
-    Image,
-    Stack,
-    StartPage,
-    Mapping,
-}
-
-struct Region {
-    end: u64,
-    kind: RegionKind,
-}
+pub use crate::vm::{IMAGE_RANGE, is_user};
 
 /// How a process ended.
 pub enum Exit {
@@ -96,14 +80,23 @@ static SUPERVISOR_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub struct Process {
     pub name: String,
-    pub vm: Arc<VmSpace>,
+    /// The kernel's own number for the process, never reused; futex queues are keyed
+    /// by it.
+    pub koid: u64,
+    pub space: Space,
     pub handles: SpinLock<HandleTable<Handle>>,
-    regions: SpinLock<BTreeMap<u64, Region>>,
     state: SpinLock<State>,
     pub signaller: Signaller,
     supervisor: bool,
     /// Bit `i` is set once one of this process's threads has run on CPU `i`.
     cpus: AtomicU64,
+    /// Its forward, given before it started (SDD 28).
+    forward: SpinLock<Option<Arc<Forward>>>,
+    /// CPU time its threads have used, in nanoseconds, kernel time included.
+    pub cpu_ns: AtomicU64,
+    /// The code the last thread to end by a fast `exit` gave: a process whose last
+    /// thread ends that way ends with it.
+    last_code: AtomicI64,
 }
 
 /// Counts the boot as one live process while it starts the manifest's processes, so a
@@ -157,21 +150,15 @@ fn salt(koid: u64) -> u32 {
     (r ^ (r >> 32)) as u32
 }
 
-fn pages(len: u64) -> Result<u64, Error> {
-    len.checked_add(PAGE_SIZE - 1)
-        .map(|v| v & !(PAGE_SIZE - 1))
-        .ok_or(Error::OutOfRange)
-}
-
-fn flags(write: bool, execute: bool) -> PageFlags {
-    let mut f = PageFlags::R;
+fn prot(write: bool, execute: bool) -> u64 {
+    let mut p = map::READ;
     if write {
-        f |= PageFlags::W;
+        p |= map::WRITE;
     }
     if execute {
-        f |= PageFlags::X;
+        p |= map::EXECUTE;
     }
-    f
+    p
 }
 
 impl Process {
@@ -183,9 +170,9 @@ impl Process {
         let koid = NEXT_KOID.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Process {
             name: String::from(name),
-            vm: Arc::new(VmSpace::new()),
+            koid,
+            space: Space::new(),
             handles: SpinLock::new(HandleTable::new(salt(koid))),
-            regions: SpinLock::new(BTreeMap::new()),
             state: SpinLock::new(State {
                 life: Life::Created { entry: None },
                 exit: None,
@@ -194,133 +181,60 @@ impl Process {
             signaller: Signaller::new(Signals::NONE),
             supervisor,
             cpus: AtomicU64::new(0),
+            forward: SpinLock::new(None),
+            cpu_ns: AtomicU64::new(0),
+            last_code: AtomicI64::new(0),
         }))
     }
 
-    /// Reserves `len` bytes (whole pages) in the mapping area, with an unmapped guard
-    /// page on each side.
-    fn reserve(&self, len: u64, kind: RegionKind) -> Result<u64, Error> {
-        let len = pages(len)?;
-        if len == 0 {
-            return Err(Error::InvalidArgs);
-        }
-        let mut regions = self.regions.lock();
-        let mut candidate = MAP_BASE + PAGE_SIZE;
-        for (&start, region) in regions.range(MAP_BASE..) {
-            let fits = candidate
-                .checked_add(len)
-                .and_then(|e| e.checked_add(PAGE_SIZE))
-                .is_some_and(|e| e <= start);
-            if fits {
-                break;
-            }
-            candidate = region.end + PAGE_SIZE;
-        }
-        let end = candidate.checked_add(len).ok_or(Error::Limit)?;
-        if end > map_end() {
-            return Err(Error::Limit);
-        }
-        regions.insert(candidate, Region { end, kind });
-        Ok(candidate)
+    /// Its forward, if it has one.
+    pub fn forward(&self) -> Option<Arc<Forward>> {
+        self.forward.lock().clone()
     }
 
-    fn release(&self, start: u64) {
-        self.regions.lock().remove(&start);
-    }
-
-    fn map_frames(&self, va: u64, frames: &[UFrame], f: PageFlags) -> Result<(), Error> {
-        let len = frames.len() as u64 * PAGE_SIZE;
-        let guard = disable_preempt();
-        let range = va as usize..(va + len) as usize;
-        let mut cursor = self
-            .vm
-            .cursor_mut(&guard, &range)
-            .map_err(|_| Error::InvalidArgs)?;
-        for frame in frames {
-            cursor.map(
-                frame.clone(),
-                PageProperty::new_user(f, CachePolicy::Writeback),
-            );
-        }
-        Ok(())
-    }
-
-    fn unmap_range(&self, va: u64, len: u64) {
-        let guard = disable_preempt();
-        let range = va as usize..(va + len) as usize;
-        if let Ok(mut cursor) = self.vm.cursor_mut(&guard, &range) {
-            cursor.unmap(len as usize);
-        }
-    }
-
-    /// Maps `len` bytes of `object` from `offset` into this process; returns where.
+    /// Maps `len` bytes of `object` from `offset` into this process where the kernel
+    /// chooses (`memory_map`); returns where.
     pub fn map_memory(
         &self,
-        object: &MemoryObject,
+        object: &Arc<MemoryObject>,
         offset: u64,
         len: u64,
         write: bool,
         execute: bool,
+        writable: bool,
     ) -> Result<u64, Error> {
         let first = (offset / PAGE_SIZE) as usize;
-        let count = (len / PAGE_SIZE) as usize;
-        let frames = object
-            .frames()
-            .get(first..first + count)
-            .ok_or(Error::OutOfRange)?;
-        let va = self.reserve(len, RegionKind::Mapping)?;
-        if let Err(e) = self.map_frames(va, frames, flags(write, execute)) {
-            self.release(va);
-            return Err(e);
-        }
-        Ok(va)
+        let backing = Backing::Object {
+            memory: object.clone(),
+            first,
+            writable,
+        };
+        self.space.map(
+            None,
+            len,
+            Kind::Mapping,
+            prot(write, execute),
+            backing,
+            false,
+        )
     }
 
     /// Maps `len` bytes of a device memory region from `offset`, uncached.
     pub fn map_device(
         &self,
-        device: &DeviceMemory,
+        device: &Arc<DeviceMemory>,
         offset: u64,
         len: u64,
         write: bool,
+        writable: bool,
     ) -> Result<u64, Error> {
-        let va = self.reserve(len, RegionKind::Mapping)?;
-        let mapped = {
-            let guard = disable_preempt();
-            let range = va as usize..(va + len) as usize;
-            match self.vm.cursor_mut(&guard, &range) {
-                Ok(mut cursor) => {
-                    cursor.map_iomem(
-                        device.io.clone(),
-                        PageProperty::new_user(flags(write, false), CachePolicy::Uncacheable),
-                        len as usize,
-                        offset as usize,
-                    );
-                    true
-                }
-                Err(_) => false,
-            }
+        let backing = Backing::Device {
+            device: device.clone(),
+            offset,
+            writable,
         };
-        if !mapped {
-            self.release(va);
-            return Err(Error::InvalidArgs);
-        }
-        Ok(va)
-    }
-
-    /// Unmaps exactly one mapping made by `memory_map`.
-    pub fn unmap(&self, va: u64, len: u64) -> Result<(), Error> {
-        let len = pages(len)?;
-        {
-            let mut regions = self.regions.lock();
-            match regions.get(&va) {
-                Some(r) if r.kind == RegionKind::Mapping && r.end - va == len => {}
-                _ => return Err(Error::InvalidArgs),
-            }
-            regions.remove(&va);
-        }
-        self.unmap_range(va, len);
-        Ok(())
+        self.space
+            .map(None, len, Kind::Mapping, prot(write, false), backing, false)
     }
 
     /// Loads a static ELF image into this not yet started process; returns its entry.
@@ -338,33 +252,24 @@ impl Process {
         for segment in &parsed.segments {
             let start = segment.page_start();
             let len = segment.page_end() - start;
-            let object = MemoryObject::new(len)?;
+            let object = Arc::new(MemoryObject::new(len)?);
             let from = segment.offset as usize;
             let bytes = image
                 .get(from..from + segment.filesz as usize)
                 .ok_or(Error::InvalidArgs)?;
             object.write(segment.vaddr - start, bytes)?;
-            {
-                let mut regions = self.regions.lock();
-                if regions
-                    .range(..start + len)
-                    .next_back()
-                    .is_some_and(|(_, r)| r.end > start)
-                {
-                    return Err(Error::InvalidArgs);
-                }
-                regions.insert(
-                    start,
-                    Region {
-                        end: start + len,
-                        kind: RegionKind::Image,
-                    },
-                );
-            }
-            self.map_frames(
-                start,
-                object.frames(),
-                flags(segment.write, segment.execute),
+            let backing = Backing::Object {
+                memory: object,
+                first: 0,
+                writable: true,
+            };
+            self.space.map(
+                Some(start),
+                len,
+                Kind::Image,
+                prot(segment.write, segment.execute),
+                backing,
+                false,
             )?;
         }
         let mut state = self.state.lock();
@@ -384,6 +289,35 @@ impl Process {
         matches!(self.state.lock().life, Life::Created { entry: Some(_) })
     }
 
+    /// Whether the process was created and has not started (it may have no image).
+    pub fn is_created(&self) -> bool {
+        matches!(self.state.lock().life, Life::Created { .. })
+    }
+
+    /// Gives a created process its forward (`process_forward`), once.
+    pub fn set_forward(&self, forward: Forward) -> Result<(), Error> {
+        if !self.is_created() {
+            return Err(Error::BadState);
+        }
+        let mut slot = self.forward.lock();
+        if slot.is_some() {
+            return Err(Error::BadState);
+        }
+        *slot = Some(Arc::new(forward));
+        Ok(())
+    }
+
+    fn begin_running(&self) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        match state.life {
+            Life::Created { .. } => {
+                state.life = Life::Running { live: 1 };
+                Ok(())
+            }
+            _ => Err(Error::BadState),
+        }
+    }
+
     /// Starts a created process whose image is mapped: gives it `handles` under the
     /// slot names given, maps its stack and start page, and runs its first thread.
     pub fn start(
@@ -401,14 +335,29 @@ impl Process {
         if !is_user(entry) || handles.len() > limits::START_HANDLES_MAX {
             return Err(Error::InvalidArgs);
         }
-        let stack = MemoryObject::new(limits::MAIN_STACK_BYTES)?;
-        let stack_va = self.reserve(limits::MAIN_STACK_BYTES, RegionKind::Stack)?;
-        self.map_frames(stack_va, stack.frames(), flags(true, false))?;
+        let stack = Arc::new(MemoryObject::new(limits::MAIN_STACK_BYTES)?);
+        let stack_va = self.space.map(
+            None,
+            limits::MAIN_STACK_BYTES,
+            Kind::Stack,
+            prot(true, false),
+            Backing::Object {
+                memory: stack,
+                first: 0,
+                writable: true,
+            },
+            false,
+        )?;
 
         let mut page = [0u8; PAGE_SIZE as usize];
         moruna_abi::write_u32(&mut page, start_page::MAGIC_OFFSET, start_page::MAGIC);
         moruna_abi::write_u32(&mut page, start_page::VERSION_OFFSET, ABI_VERSION as u32);
         moruna_abi::write_u32(&mut page, start_page::COUNT_OFFSET, handles.len() as u32);
+        moruna_abi::write_u32(
+            &mut page,
+            start_page::CPUS_OFFSET,
+            ostd::cpu::num_cpus() as u32,
+        );
         let name = self.name.as_bytes();
         page[start_page::NAME_OFFSET..start_page::NAME_OFFSET + name.len()].copy_from_slice(name);
         {
@@ -424,18 +373,30 @@ impl Process {
                 page[name_at..name_at + n].copy_from_slice(&slot[..n]);
             }
         }
-        let start = MemoryObject::new(PAGE_SIZE)?;
+        let start = Arc::new(MemoryObject::new(PAGE_SIZE)?);
         start.write(0, &page)?;
-        let start_va = self.reserve(PAGE_SIZE, RegionKind::StartPage)?;
-        self.map_frames(start_va, start.frames(), flags(false, false))?;
+        let start_va = self.space.map(
+            None,
+            PAGE_SIZE,
+            Kind::StartPage,
+            map::READ,
+            Backing::Object {
+                memory: start,
+                first: 0,
+                writable: false,
+            },
+            false,
+        )?;
 
-        {
-            let mut state = self.state.lock();
-            state.life = Life::Running { live: 1 };
-        }
+        self.begin_running()?;
         LIVE.fetch_add(1, Ordering::AcqRel);
         let stack_top = stack_va + limits::MAIN_STACK_BYTES;
-        if let Err(e) = Thread::spawn(self, entry, stack_top, start_va) {
+        let mut context = UserContext::default();
+        context.set_instruction_pointer(entry as usize);
+        // The thread starts as if called: its stack pointer is 8 below a 16-byte boundary.
+        context.set_stack_pointer((stack_top & !0xf) as usize - 8);
+        context.set_rdi(start_va as usize);
+        if let Err(e) = Thread::spawn(self, context, 0) {
             self.end(Exit::Fault(String::from(
                 "its first thread could not be created",
             )));
@@ -443,6 +404,51 @@ impl Process {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Starts a created process whose address space its creator built
+    /// (`process_launch`): its first thread at `entry` with its stack pointer at
+    /// `stack` exactly and every other register zero; no start page and no handles.
+    /// `brk`, when not zero, is where its heap begins. Returns the thread's id.
+    pub fn launch(self: &Arc<Self>, entry: u64, stack: u64, brk: u64) -> Result<u64, Error> {
+        if !self.is_created() {
+            return Err(Error::BadState);
+        }
+        if !is_user(entry) || !is_user(stack) {
+            return Err(Error::InvalidArgs);
+        }
+        if brk != 0 {
+            self.space.set_brk(brk)?;
+        }
+        self.begin_running()?;
+        LIVE.fetch_add(1, Ordering::AcqRel);
+        let mut context = UserContext::default();
+        context.set_instruction_pointer(entry as usize);
+        context.set_stack_pointer(stack as usize);
+        match Thread::spawn(self, context, 0) {
+            Ok(thread) => Ok(thread.tid),
+            Err(e) => {
+                self.end(Exit::Fault(String::from(
+                    "its first thread could not be created",
+                )));
+                self.thread_ended();
+                Err(e)
+            }
+        }
+    }
+
+    fn count_thread(&self) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        if state.exit.is_some() {
+            return Err(Error::BadState);
+        }
+        match &mut state.life {
+            Life::Running { live } => {
+                *live += 1;
+                Ok(())
+            }
+            _ => Err(Error::BadState),
+        }
     }
 
     /// Adds a thread to this running process (`thread_create`).
@@ -455,22 +461,86 @@ impl Process {
         if !is_user(entry) || !is_user(stack) {
             return Err(Error::InvalidArgs);
         }
-        {
-            let mut state = self.state.lock();
-            if state.exit.is_some() {
-                return Err(Error::BadState);
-            }
-            match &mut state.life {
-                Life::Running { live } => *live += 1,
-                _ => return Err(Error::BadState),
-            }
-        }
-        match Thread::spawn(self, entry, stack, arg) {
+        self.count_thread()?;
+        let mut context = UserContext::default();
+        context.set_instruction_pointer(entry as usize);
+        context.set_stack_pointer((stack & !0xf) as usize - 8);
+        context.set_rdi(arg as usize);
+        match Thread::spawn(self, context, 0) {
             Ok(thread) => Ok(thread),
             Err(e) => {
                 self.thread_ended();
                 Err(e)
             }
+        }
+    }
+
+    /// The live thread with id `tid`.
+    fn thread(&self, tid: u64) -> Option<Arc<Thread>> {
+        self.state
+            .lock()
+            .threads
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|t| t.tid == tid)
+    }
+
+    /// `forward_clone`: a new thread of this forwarded process with the registers of
+    /// thread `tid`, which is waiting on the forward: its result register zero, its
+    /// stack pointer `stack`, its FS base `tls` (the parent's when zero), `clear_tid`
+    /// the word cleared and woken when it ends, and its id written to `set_tid` before
+    /// it runs (neither when zero). Returns its id.
+    pub fn clone_thread(
+        self: &Arc<Self>,
+        tid: u64,
+        stack: u64,
+        tls: u64,
+        clear_tid: u64,
+        set_tid: u64,
+    ) -> Result<u64, Error> {
+        if !is_user(stack) || !foreign::canonical(tls) {
+            return Err(Error::InvalidArgs);
+        }
+        let parent = self.thread(tid).ok_or(Error::InvalidArgs)?;
+        let mut context = parent.parked.lock().clone().ok_or(Error::BadState)?;
+        context.set_rax(0);
+        context.set_stack_pointer(stack as usize);
+        let fs = if tls != 0 {
+            tls
+        } else {
+            parent.fs_base.load(Ordering::Relaxed)
+        };
+        self.count_thread()?;
+        match Thread::spawn_with(self, context, fs, clear_tid, set_tid) {
+            Ok(thread) => Ok(thread.tid),
+            Err(e) => {
+                self.thread_ended();
+                Err(e)
+            }
+        }
+    }
+
+    /// The process's threads but `keep` end: an `execve` replaces the program under one
+    /// thread.
+    pub fn end_others(&self, keep: &Thread) {
+        let others: Vec<Arc<Thread>> = self
+            .state
+            .lock()
+            .threads
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|t| t.tid != keep.tid)
+            .collect();
+        for t in others {
+            t.kill();
+        }
+    }
+
+    /// Its live threads.
+    pub fn live_threads(&self) -> u32 {
+        match self.state.lock().life {
+            Life::Running { live } => live as u32,
+            _ => 0,
         }
     }
 
@@ -501,6 +571,11 @@ impl Process {
         }
     }
 
+    /// Whether the process is ending (a reason has been recorded).
+    fn ending(&self) -> bool {
+        self.state.lock().exit.is_some()
+    }
+
     /// Called by each thread as it ends; the last one ends the process.
     fn thread_ended(&self) {
         let exit = {
@@ -514,7 +589,10 @@ impl Process {
                 Life::Running { .. } => {
                     state.life = Life::Ended;
                     state.threads.clear();
-                    state.exit.take().unwrap_or(Exit::Code(0))
+                    state
+                        .exit
+                        .take()
+                        .unwrap_or(Exit::Code(self.last_code.load(Ordering::Relaxed)))
                 }
                 Life::Created { .. } | Life::Ended => return,
             }
@@ -554,10 +632,10 @@ impl Process {
         };
         let handles = self.handles.lock().drain();
         drop(handles);
-        let regions = core::mem::take(&mut *self.regions.lock());
-        for (start, region) in regions {
-            self.unmap_range(start, region.end - start);
-        }
+        // The forward goes with the process: its server sees the channel close.
+        let forward = self.forward.lock().take();
+        drop(forward);
+        self.space.clear();
         self.signaller.update(Signals::NONE, Signals::TERMINATED);
         if self.supervisor && failed {
             SUPERVISOR_FAILED.store(true, Ordering::Release);
@@ -569,8 +647,21 @@ impl Process {
 pub struct Thread {
     pub process: Arc<Process>,
     pub signaller: Signaller,
+    /// The thread's id: a forwarded process's `gettid`, and its forward token.
+    pub tid: u64,
     killed: AtomicBool,
     waker: SpinLock<Option<Arc<Waker>>>,
+    /// The FS base user code runs with.
+    fs_base: AtomicU64,
+    /// The FPU registers, saved while the thread is off its CPU.
+    fpu: SpinLock<FpuContext, LocalIrqDisabled>,
+    /// The word cleared and woken when the thread ends (`set_tid_address`).
+    pub clear_tid: AtomicU64,
+    /// The registers of a thread waiting on its forward, for `forward_clone`.
+    pub parked: SpinLock<Option<UserContext>>,
+    /// CPU time the thread has used, in nanoseconds, and when it last took a CPU.
+    pub cpu_ns: AtomicU64,
+    on_cpu_since: AtomicU64,
 }
 
 struct Hooks<'a>(&'a Thread);
@@ -584,22 +675,40 @@ impl UserModeHooks for Hooks<'_> {
 impl Thread {
     fn spawn(
         process: &Arc<Process>,
-        entry: u64,
-        stack: u64,
-        arg: u64,
+        context: UserContext,
+        fs_base: u64,
+    ) -> Result<Arc<Thread>, Error> {
+        Thread::spawn_with(process, context, fs_base, 0, 0)
+    }
+
+    /// Spawns a thread whose `set_tid_address` word is `clear_tid`, and which writes its
+    /// id to `set_tid` in its process's memory before it runs (neither when zero).
+    fn spawn_with(
+        process: &Arc<Process>,
+        context: UserContext,
+        fs_base: u64,
+        clear_tid: u64,
+        set_tid: u64,
     ) -> Result<Arc<Thread>, Error> {
         let thread = Arc::new(Thread {
             process: process.clone(),
             signaller: Signaller::new(Signals::NONE),
+            tid: NEXT_KOID.fetch_add(1, Ordering::Relaxed),
             killed: AtomicBool::new(false),
             waker: SpinLock::new(None),
+            fs_base: AtomicU64::new(fs_base),
+            fpu: SpinLock::new(FpuContext::new()),
+            clear_tid: AtomicU64::new(clear_tid),
+            parked: SpinLock::new(None),
+            cpu_ns: AtomicU64::new(0),
+            on_cpu_since: AtomicU64::new(0),
         });
+        if set_tid != 0 {
+            process
+                .space
+                .copy_in(set_tid, &(thread.tid as u32).to_le_bytes())?;
+        }
         process.state.lock().threads.push(Arc::downgrade(&thread));
-        let mut context = UserContext::default();
-        context.set_instruction_pointer(entry as usize);
-        // The thread starts as if called: its stack pointer is 8 below a 16-byte boundary.
-        context.set_stack_pointer((stack & !0xf) as usize - 8);
-        context.set_rdi(arg as usize);
         let runner = thread.clone();
         TaskOptions::new(move || run(runner, context))
             .data(thread.clone())
@@ -623,11 +732,33 @@ impl Thread {
     pub fn set_waker(&self, waker: Option<Arc<Waker>>) {
         *self.waker.lock() = waker;
     }
+
+    /// Sets the FS base the thread runs with, now: it is on its CPU, in a call.
+    pub fn set_fs(&self, base: u64) {
+        self.fs_base.store(base, Ordering::Relaxed);
+        FsBase::new(base as usize).load();
+    }
+
+    pub fn fs(&self) -> u64 {
+        self.fs_base.load(Ordering::Relaxed)
+    }
+
+    /// The time since the thread last took its CPU: the slice it is running now,
+    /// which its CPU time does not count yet.
+    pub fn slice(&self) -> u64 {
+        clock::now().saturating_sub(self.on_cpu_since.load(Ordering::Relaxed))
+    }
+
+    /// The CPU time this thread has used, the current slice included.
+    pub fn cpu_time(&self) -> u64 {
+        self.cpu_ns
+            .load(Ordering::Relaxed)
+            .saturating_add(self.slice())
+    }
 }
 
-fn describe(context: &mut UserContext) -> String {
-    let ip = context.instruction_pointer();
-    match context.take_exception() {
+fn describe(exception: Option<CpuException>, ip: usize) -> String {
+    match exception {
         Some(CpuException::PageFault(info)) => format!(
             "page fault at {:#x} on {} (ip {:#x})",
             info.addr,
@@ -643,40 +774,124 @@ fn describe(context: &mut UserContext) -> String {
     }
 }
 
+/// A page fault on a page with no entry that the area allows: a zero page's first
+/// touch (SDD 20, f.12). Anything else is the process's fault.
+fn first_touch(space: &Space, exception: &Option<CpuException>) -> bool {
+    let Some(CpuException::PageFault(info)) = exception else {
+        return false;
+    };
+    let code = info.error_code.bits();
+    // Bit 0: the page was present (a protection fault, never a first touch).
+    if code & 0b1 != 0 {
+        return false;
+    }
+    let access = if code & 0b1_0000 != 0 {
+        Access::Execute
+    } else if code & 0b10 != 0 {
+        Access::Write
+    } else {
+        Access::Read
+    };
+    space.fault(info.addr as u64, access)
+}
+
 fn run(thread: Arc<Thread>, context: UserContext) {
-    thread.process.vm.activate();
+    thread.process.vm().activate();
+    FsBase::new(thread.fs() as usize).load();
     let mut user = UserMode::new(context);
     let hooks = Hooks(&thread);
     while !thread.killed() {
         match user.execute(&hooks) {
-            ReturnReason::UserSyscall => match syscall::dispatch(&thread, user.context_mut()) {
-                Flow::Continue => {}
-                Flow::ThreadExit => break,
-                Flow::ProcessExit(code) => {
-                    thread.process.end(Exit::Code(code));
-                    break;
+            ReturnReason::UserSyscall => {
+                let number = user.context_mut().rax() as u64;
+                let flow = if moruna_abi::nr::is_native(number) {
+                    syscall::dispatch(&thread, user.context_mut())
+                } else if let Some(forward) = thread.process.forward() {
+                    foreign::call(&thread, &forward, user.context_mut())
+                } else {
+                    user.context_mut()
+                        .set_rax(Error::BadSyscall.to_raw() as usize);
+                    Flow::Continue
+                };
+                match flow {
+                    Flow::Continue => {}
+                    Flow::ThreadExit => break,
+                    Flow::ThreadExitCode(code) => {
+                        thread.process.last_code.store(code, Ordering::Relaxed);
+                        break;
+                    }
+                    Flow::ProcessExit(code) => {
+                        thread.process.end(Exit::Code(code));
+                        break;
+                    }
                 }
-            },
+            }
             ReturnReason::UserException => {
-                let what = describe(user.context_mut());
-                thread.process.end(Exit::Fault(what));
+                let context = user.context_mut();
+                let ip = context.instruction_pointer();
+                let exception = context.take_exception();
+                if first_touch(&thread.process.space, &exception) {
+                    continue;
+                }
+                thread.process.end(Exit::Fault(describe(exception, ip)));
                 break;
             }
             ReturnReason::KernelEvent => {}
         }
     }
+    clear_child_tid(&thread);
     thread.set_waker(None);
     thread.signaller.update(Signals::NONE, Signals::TERMINATED);
     thread.process.thread_ended();
 }
 
+/// A thread that ends on its own, its process going on, clears its `set_tid_address`
+/// word and wakes one waiter on it, which is how a thread library learns it has gone.
+fn clear_child_tid(thread: &Thread) {
+    let word = thread.clear_tid.swap(0, Ordering::Relaxed);
+    if word == 0 || thread.process.ending() {
+        return;
+    }
+    if usercopy::write_u32(&thread.process.space, word, 0).is_ok() {
+        let _ = futex::wake(thread.process.koid, word, 1, futex::ALL);
+    }
+}
+
+impl Process {
+    pub fn vm(&self) -> &Arc<ostd::mm::VmSpace> {
+        &self.space.vm
+    }
+}
+
+fn current_thread() -> Option<Arc<Thread>> {
+    let task = Task::current()?;
+    task.data().downcast_ref::<Arc<Thread>>().cloned()
+}
+
+/// OSTD's pre-schedule hook: the thread leaving its CPU keeps its FPU registers and FS
+/// base, and is charged the CPU time of its slice.
+pub fn deactivate_current(_guard: &DisabledLocalIrqGuard) {
+    if let Some(thread) = current_thread() {
+        thread.fpu.lock().save();
+        let mut fs = FsBase::default();
+        fs.save();
+        thread.fs_base.store(fs.addr() as u64, Ordering::Relaxed);
+        let since = thread.on_cpu_since.load(Ordering::Relaxed);
+        let used = clock::now().saturating_sub(since);
+        thread.cpu_ns.fetch_add(used, Ordering::Relaxed);
+        thread.process.cpu_ns.fetch_add(used, Ordering::Relaxed);
+    }
+}
+
 /// OSTD's post-schedule hook: the address space of the thread now on this CPU is the
-/// active one, so user copies and user mode always see their own process (KK-I4).
+/// active one, so user copies and user mode always see their own process (KK-I4), and
+/// its FPU registers and FS base are back.
 pub fn activate_current() {
-    if let Some(task) = Task::current()
-        && let Some(thread) = task.data().downcast_ref::<Arc<Thread>>()
-    {
-        thread.process.vm.activate();
+    if let Some(thread) = current_thread() {
+        thread.process.vm().activate();
+        thread.fpu.lock().load();
+        FsBase::new(thread.fs() as usize).load();
+        thread.on_cpu_since.store(clock::now(), Ordering::Relaxed);
         let bit = crate::sched::ran_process_thread();
         thread.process.cpus.fetch_or(bit, Ordering::Relaxed);
     }

@@ -55,6 +55,12 @@ fn plain(n: u64, a: [u64; 6]) -> (u64, u64) {
             | nr::DEBUG_WRITE
             | nr::MEMORY_PIN
             | nr::RESOURCE_INFO
+            | nr::PROCESS_FORWARD
+            | nr::PROCESS_READ
+            | nr::PROCESS_WRITE
+            | nr::FUTEX_WAIT
+            | nr::FUTEX_WAKE
+            | nr::RANDOM_READ
     ));
     // SAFETY: only calls that read no memory through their arguments reach here: the
     // crate's own wrappers call `plain` with those numbers and no other.
@@ -79,6 +85,10 @@ pub(crate) fn call3(n: u64, a: u64, b: u64, c: u64) -> (u64, u64) {
 
 pub(crate) fn call4(n: u64, a: u64, b: u64, c: u64, d: u64) -> (u64, u64) {
     plain(n, [a, b, c, d, 0, 0])
+}
+
+pub(crate) fn call6(n: u64, a: [u64; 6]) -> (u64, u64) {
+    plain(n, a)
 }
 
 pub fn handle_close(v: RawHandle) -> u64 {
@@ -239,6 +249,128 @@ pub fn resource_info(resource: RawHandle, out: &mut [u8; moruna_abi::resource_in
 
 pub fn process_kill(process: RawHandle) -> u64 {
     call1(nr::PROCESS_KILL, process as u64).0
+}
+
+/// `process_forward` (ABI 2.0): the table is `moruna_abi::forward::table::SIZE` bytes.
+pub fn process_forward(process: RawHandle, endpoint: RawHandle, table: &[u8]) -> u64 {
+    let a = [
+        process as u64,
+        endpoint as u64,
+        table.as_ptr() as u64,
+        table.len() as u64,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `table.len()` bytes from `table`.
+    unsafe { syscall(nr::PROCESS_FORWARD, a) }.0
+}
+
+/// `process_launch` (ABI 2.0).
+pub fn process_launch(process: RawHandle, entry: u64, stack: u64, brk: u64) -> u64 {
+    call4(nr::PROCESS_LAUNCH, process as u64, entry, stack, brk).0
+}
+
+/// `process_map` (ABI 2.0), of a memory object or, with `memory` zero, zero pages.
+pub fn process_map(
+    process: RawHandle,
+    memory: RawHandle,
+    offset: u64,
+    len: u64,
+    addr: u64,
+    flags: u64,
+) -> u64 {
+    call6(
+        nr::PROCESS_MAP,
+        [process as u64, memory as u64, offset, len, addr, flags],
+    )
+    .0
+}
+
+/// `process_unmap` (ABI 2.0).
+pub fn process_unmap(process: RawHandle, addr: u64, len: u64) -> u64 {
+    call3(nr::PROCESS_UNMAP, process as u64, addr, len).0
+}
+
+/// `process_protect` (ABI 2.0).
+pub fn process_protect(process: RawHandle, addr: u64, len: u64, flags: u64) -> u64 {
+    call4(nr::PROCESS_PROTECT, process as u64, addr, len, flags).0
+}
+
+/// `forward_clone` (ABI 2.0).
+pub fn forward_clone(
+    process: RawHandle,
+    tid: u64,
+    stack: u64,
+    tls: u64,
+    clear: u64,
+    set: u64,
+) -> u64 {
+    call6(
+        nr::FORWARD_CLONE,
+        [process as u64, tid, stack, tls, clear, set],
+    )
+    .0
+}
+
+/// `process_read` (ABI 2.0): bytes of another process's memory into `buf`.
+pub fn process_read(process: RawHandle, addr: u64, buf: &mut [u8]) -> u64 {
+    let a = [
+        process as u64,
+        addr,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`.
+    unsafe { syscall(nr::PROCESS_READ, a) }.0
+}
+
+/// `process_write` (ABI 2.0): `data` into another process's memory.
+pub fn process_write(process: RawHandle, addr: u64, data: &[u8]) -> u64 {
+    let a = [
+        process as u64,
+        addr,
+        data.as_ptr() as u64,
+        data.len() as u64,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `data.len()` bytes from `data`.
+    unsafe { syscall(nr::PROCESS_WRITE, a) }.0
+}
+
+/// `futex_wait` (ABI 2.0) on a word this process owns.
+pub fn futex_wait(word: &core::sync::atomic::AtomicU32, expected: u32, deadline: u64) -> u64 {
+    let a = [word.as_ptr() as u64, expected as u64, deadline, 0, 0, 0];
+    // SAFETY: the kernel reads the four bytes of `word`, which the reference keeps
+    // alive for the call.
+    unsafe { syscall(nr::FUTEX_WAIT, a) }.0
+}
+
+/// `futex_wake` (ABI 2.0) on a word this process owns.
+pub fn futex_wake(word: &core::sync::atomic::AtomicU32, count: u32) -> u64 {
+    let a = [word.as_ptr() as u64, count as u64, 0, 0, 0, 0];
+    // SAFETY: the kernel only uses the word's address as a key; it reads nothing.
+    unsafe { syscall(nr::FUTEX_WAKE, a) }.0
+}
+
+/// `random_read` (ABI 2.0): fills `buf` from the CPU's random source.
+pub fn random_read(buf: &mut [u8]) -> u64 {
+    let a = [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0];
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`.
+    unsafe { syscall(nr::RANDOM_READ, a) }.0
+}
+
+/// `thread_set_fs` (ABI 2.0). Safe for this crate's programs, which keep nothing at
+/// the FS base.
+pub fn thread_set_fs(base: u64) -> u64 {
+    call1(nr::THREAD_SET_FS, base).0
+}
+
+/// `memory_protect` (ABI 2.0), for whole pages of a mapping the caller holds.
+pub(crate) fn memory_protect(addr: u64, len: u64, flags: u64) -> u64 {
+    call3(nr::MEMORY_PROTECT, addr, len, flags).0
 }
 
 /// `memory_unmap`, for the heap, which unmaps only mappings it made itself.

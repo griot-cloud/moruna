@@ -2,8 +2,10 @@
 //!
 //! The kernel loads only what it can load without a dynamic linker: `ET_EXEC`, little
 //! endian, `EM_X86_64`, `PT_LOAD` segments on their own pages, no interpreter, no
-//! dynamic section, no thread-local storage, and no segment both writable and
-//! executable. Anything else is refused by name, never loaded partly.
+//! dynamic section, and no segment both writable and executable. Anything else is
+//! refused by name, never loaded partly. Since ABI 2.0 (which gave a thread its FS
+//! base, `thread_set_fs`) a `PT_TLS` template is taken and reported: it lies in a
+//! loaded segment, and the program sets up its own thread-local storage from it.
 
 use alloc::vec::Vec;
 
@@ -35,7 +37,8 @@ pub enum ElfError {
     WrongMachine,
     BadProgramHeaders,
     Dynamic,
-    ThreadLocal,
+    /// The thread-local storage template is not inside a loaded segment.
+    BadTls,
     NoSegments,
     /// A segment's file bytes are larger than its memory size, or reach past the file.
     BadSegment,
@@ -60,7 +63,7 @@ impl ElfError {
             ElfError::WrongMachine => "not an x86_64 image",
             ElfError::BadProgramHeaders => "the program headers are malformed or too many",
             ElfError::Dynamic => "the image needs a dynamic linker",
-            ElfError::ThreadLocal => "the image declares thread-local storage",
+            ElfError::BadTls => "the thread-local storage template is outside the loaded segments",
             ElfError::NoSegments => "the image has no loadable segment",
             ElfError::BadSegment => "a segment's sizes or offsets are inconsistent",
             ElfError::OutOfRange => "a segment lies outside the allowed address range",
@@ -96,12 +99,23 @@ impl Segment {
     }
 }
 
+/// A thread-local storage template (`PT_TLS`): where its initial bytes are, and the
+/// size and alignment of each thread's block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tls {
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
 /// A parsed image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
     pub entry: u64,
     /// In ascending address order.
     pub segments: Vec<Segment>,
+    pub tls: Option<Tls>,
 }
 
 fn u16_at(b: &[u8], o: usize) -> Result<u16, ElfError> {
@@ -157,13 +171,22 @@ pub fn parse(bytes: &[u8], allowed: core::ops::Range<u64>) -> Result<Image, ElfE
     }
 
     let mut segments = Vec::new();
+    let mut tls = None;
     for i in 0..phnum {
         let at = phoff + i * PHDR;
         let kind = u32_at(bytes, at)?;
         match kind {
             PT_LOAD => {}
             PT_DYNAMIC | PT_INTERP => return Err(ElfError::Dynamic),
-            PT_TLS => return Err(ElfError::ThreadLocal),
+            PT_TLS => {
+                tls = Some(Tls {
+                    vaddr: u64_at(bytes, at + 16)?,
+                    filesz: u64_at(bytes, at + 32)?,
+                    memsz: u64_at(bytes, at + 40)?,
+                    align: u64_at(bytes, at + 48)?,
+                });
+                continue;
+            }
             _ => continue,
         }
         let flags = u32_at(bytes, at + 4)?;
@@ -217,7 +240,22 @@ pub fn parse(bytes: &[u8], allowed: core::ops::Range<u64>) -> Result<Image, ElfE
     {
         return Err(ElfError::BadEntry);
     }
-    Ok(Image { entry, segments })
+    if let Some(t) = &tls {
+        let inside = t.filesz <= t.memsz
+            && t.vaddr.checked_add(t.filesz).is_some_and(|end| {
+                segments
+                    .iter()
+                    .any(|s| t.vaddr >= s.vaddr && end <= s.vaddr + s.filesz)
+            });
+        if !inside {
+            return Err(ElfError::BadTls);
+        }
+    }
+    Ok(Image {
+        entry,
+        segments,
+        tls,
+    })
 }
 
 #[cfg(test)]
@@ -348,17 +386,37 @@ pub(crate) mod tests {
             parse(&image(0x20_0000, &[text(0x20_0000), interp], 0x100), RANGE),
             Err(ElfError::Dynamic)
         );
+        // A thread-local template outside every loaded segment.
         let tls = Ph {
             kind: PT_TLS,
             flags: PF_R,
             offset: 0,
-            vaddr: 0,
-            filesz: 0,
+            vaddr: 0x30_0000,
+            filesz: 4,
             memsz: 8,
         };
         assert_eq!(
             parse(&image(0x20_0000, &[text(0x20_0000), tls], 0x100), RANGE),
-            Err(ElfError::ThreadLocal)
+            Err(ElfError::BadTls)
+        );
+        // One inside the text segment is taken and reported.
+        let tls = Ph {
+            kind: PT_TLS,
+            flags: PF_R,
+            offset: 0,
+            vaddr: 0x20_0004,
+            filesz: 4,
+            memsz: 8,
+        };
+        let parsed = parse(&image(0x20_0000, &[text(0x20_0000), tls], 0x100), RANGE).unwrap();
+        assert_eq!(
+            parsed.tls,
+            Some(Tls {
+                vaddr: 0x20_0004,
+                filesz: 4,
+                memsz: 8,
+                align: 0
+            })
         );
         assert_eq!(
             parse(&image(0x20_0000, &[], 0x100), RANGE),
@@ -465,7 +523,7 @@ pub(crate) mod tests {
             ElfError::WrongMachine,
             ElfError::BadProgramHeaders,
             ElfError::Dynamic,
-            ElfError::ThreadLocal,
+            ElfError::BadTls,
             ElfError::NoSegments,
             ElfError::BadSegment,
             ElfError::OutOfRange,

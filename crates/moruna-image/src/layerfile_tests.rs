@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use moruna_imagefs::format::{Header, Kind, Node, OPAQUE, PAGE};
 
-use super::{Data, Entry, Item, convert, read, write};
+use super::{Data, Entry, Item, convert, read, tree, write};
 use crate::testing::{Entry as Tar, LayoutBuilder, Scratch, media};
 use crate::{Digest, OciLayout, unpack};
 
@@ -552,5 +552,50 @@ fn if_t13_the_fixture_lists_what_its_layers_hold() {
     );
     for (p, id) in &f.layers {
         assert_eq!(Digest::of(&fs::read(p).unwrap()), *id);
+    }
+}
+
+/// LX-T17 (SDD 28, k): a host directory as one layer, as the boot's Linux image puts
+/// its test programs above an image's layers: files with their modes, directories and
+/// links read back as they were; a special file is refused.
+#[test]
+fn lx_t17_a_directory_as_a_layer() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("lx_t17");
+    let root = scratch.path().join("programs");
+    fs::create_dir_all(root.join("kc1/bin")).unwrap();
+    fs::write(root.join("kc1/bin/hello"), b"\x7fELF a program").unwrap();
+    fs::set_permissions(
+        root.join("kc1/bin/hello"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.join("kc1/greeting.txt"), b"greetings\n").unwrap();
+    std::os::unix::fs::symlink("bin/hello", root.join("kc1/run")).unwrap();
+    let out = scratch.path().join("top.layer");
+    let written = write(&tree(&root).unwrap(), &out).unwrap();
+    assert_eq!(written.id, Digest::of(&fs::read(&out).unwrap()));
+    let merged = read(&[out]).unwrap();
+    assert_eq!(
+        merged.get("/kc1/bin/hello"),
+        Some(&Item::File(0o755, b"\x7fELF a program".to_vec()))
+    );
+    assert_eq!(
+        merged.get("/kc1/greeting.txt"),
+        Some(&Item::File(0o644, b"greetings\n".to_vec()))
+    );
+    assert_eq!(
+        merged.get("/kc1/run"),
+        Some(&Item::Symlink(b"bin/hello".to_vec()))
+    );
+    assert!(matches!(merged.get("/kc1/bin"), Some(Item::Directory(_))));
+    // Not a directory, and a special file inside one, are refused.
+    assert!(tree(&root.join("kc1/greeting.txt")).is_err());
+    let odd = scratch.path().join("odd");
+    fs::create_dir_all(&odd).unwrap();
+    let fifo = odd.join("pipe");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if made.is_ok_and(|s| s.success()) {
+        assert!(tree(&odd).is_err());
     }
 }

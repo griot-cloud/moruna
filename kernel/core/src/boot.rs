@@ -50,8 +50,19 @@ pub fn boot() {
 }
 
 fn start() -> Result<usize, String> {
+    use ostd::arch::cpu::extension::{IsaExtensions, has_extensions};
+    // OSTD logs at the debug level by default, a line on the serial port for every FPU
+    // save and restore; the kernel's own lines are its console's (SDD 20 j).
+    ostd::log::set_max_level(ostd::log::LevelFilter::Info);
+    // A thread's FS base is saved and restored with RDFSBASE and WRFSBASE.
+    if !has_extensions(IsaExtensions::FSGSBASE) {
+        return Err(String::from(
+            "the CPU has no FSGSBASE, which keeping each thread's FS base needs",
+        ));
+    }
     crate::sched::init()?;
     crate::clock::init()?;
+    ostd::task::inject_pre_schedule_handler(process::deactivate_current);
     ostd::task::inject_post_schedule_handler(process::activate_current);
     early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
     process::boot_begins();

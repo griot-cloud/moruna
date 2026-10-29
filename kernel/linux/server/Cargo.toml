@@ -1,0 +1,15 @@
+[package]
+name = "linux"
+description = "The Linux personality server: an unmodified Linux program as a process on the Moruna microkernel, its files from the image filesystem (SDD 28)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-abi.workspace = true
+moruna-linux = { path = "../core", version = "=0.1.0" }
+linux-protocol = { path = "../protocol", version = "=0.1.0" }
+imagefs-protocol = { path = "../../imagefs/protocol", version = "=0.1.0" }
+moruna-sys = { workspace = true, features = ["heap"] }

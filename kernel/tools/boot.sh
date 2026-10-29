@@ -16,9 +16,11 @@
 # driver is killed, on any number of CPUs), a
 # vhost vsock with guest cid 3 (00:06) when /dev/vhost-vsock is usable, with
 # vsock-peer.py as the host's side (OUT/vsock-peer-CPUS.log), QEMU's edu test
-# device (00:07), and the image filesystem's two layer disks, read only, as virtio-blk
+# device (00:07), the image filesystem's two layer disks, read only, as virtio-blk
 # at 00:08 and 00:09 (OUT/layers/layer-1.img and layer-2.img, written by build.sh;
-# the device manager names them block1 and block2, SDD 27 k). OUT/vsock-CPUS says
+# the device manager names them block1 and block2, SDD 27 k), and the Linux
+# personality's image, one read-only virtio-blk disk a layer from 00:0a on
+# (OUT/linux/stack-N.img, lowest first; block3 onward, SDD 28 k). OUT/vsock-CPUS says
 # whether the vsock was attached, and why not.
 set -euo pipefail
 
@@ -57,6 +59,14 @@ devices=(
   -drive "file=$out/layers/layer-2.img,format=raw,if=none,id=layer2,readonly=on"
   -device virtio-blk-pci,drive=layer2,addr=0x9,disable-legacy=on
 )
+n=1
+while [ -r "$out/linux/stack-$n.img" ]; do
+  devices+=(
+    -drive "file=$out/linux/stack-$n.img,format=raw,if=none,id=stack$n,readonly=on"
+    -device "virtio-blk-pci,drive=stack$n,addr=$(printf '0x%x' $((9 + n))),disable-legacy=on"
+  )
+  n=$((n + 1))
+done
 peer=""
 if [ -r /dev/vhost-vsock ] && [ -w /dev/vhost-vsock ]; then
   devices+=(-device vhost-vsock-pci,guest-cid=3,addr=0x6)
@@ -72,7 +82,7 @@ fi
 set +e
 timeout "$seconds" qemu-system-x86_64 \
   "${accel[@]}" \
-  -m 1G -smp "$cpus" \
+  -m 2G -smp "$cpus" \
   -nographic -display none -monitor none -serial stdio -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   "${devices[@]}" \

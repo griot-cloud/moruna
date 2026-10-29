@@ -242,7 +242,8 @@ jobs:
           cargo fmt --all -- --check
           host="$(rustc -vV | sed -n 's/^host: //p')"
           packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-svc -p moruna-image
-            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs)
+            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
+            -p moruna-linux -p linux-protocol)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
       - name: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)
@@ -250,9 +251,14 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: kernel/tools/check-examples.sh "$BASE" HEAD
+      - name: The Linux personality's image (SDD 28 k), musl for its static programs, and python:3.14-slim's layers
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+          kernel/tools/python-layout.sh "$RUNNER_TEMP/python"
       - name: Build the kernel, the programs and the boot image
         if: steps.changed.outputs.kernel == 'true'
-        run: kernel/tools/build.sh "$RUNNER_TEMP/boot"
+        run: kernel/tools/build.sh "$RUNNER_TEMP/boot" kernel/initramfs/boot.image "$RUNNER_TEMP/python"
       - name: Boot under QEMU on one, two and four CPUs and judge each serial line
         if: steps.changed.outputs.kernel == 'true'
         run: |
@@ -260,7 +266,7 @@ jobs:
           for cpus in 1 2 4; do
             echo "::group::boot on $cpus CPUs"
             set +e
-            kernel/tools/boot.sh "$RUNNER_TEMP/boot" 600 "$cpus" | tee "$RUNNER_TEMP/serial-$cpus.log"
+            kernel/tools/boot.sh "$RUNNER_TEMP/boot" 900 "$cpus" | tee "$RUNNER_TEMP/serial-$cpus.log"
             status="${PIPESTATUS[0]}"
             set -e
             echo "::endgroup::"

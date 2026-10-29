@@ -334,6 +334,50 @@ impl<W: Write> Pager<W> {
     }
 }
 
+/// The tree of the directory `dir` on the host, as a layer adds it: every directory,
+/// regular file and symbolic link below it, with its permission bits; anything else is
+/// refused.
+pub fn tree(dir: &Path) -> Result<Entry> {
+    let meta = fs::symlink_metadata(dir).map_err(io_at(dir, "reading"))?;
+    if !meta.is_dir() {
+        return Err(bad(format!("{} is not a directory", dir.display())));
+    }
+    let mut children = BTreeMap::new();
+    for child in fs::read_dir(dir).map_err(io_at(dir, "listing"))? {
+        let child = child.map_err(io_at(dir, "listing"))?;
+        let path = child.path();
+        let meta = fs::symlink_metadata(&path).map_err(io_at(&path, "reading"))?;
+        let name = child.file_name().as_encoded_bytes().to_vec();
+        let entry = if meta.file_type().is_symlink() {
+            Entry::Symlink {
+                target: fs::read_link(&path)
+                    .map_err(io_at(&path, "reading"))?
+                    .into_os_string()
+                    .into_encoded_bytes(),
+            }
+        } else if meta.is_dir() {
+            tree(&path)?
+        } else if meta.is_file() {
+            Entry::File {
+                mode: meta.permissions().mode() & 0o777,
+                data: Data::Path(path.clone(), meta.len()),
+                link: None,
+            }
+        } else {
+            return Err(bad(format!(
+                "{} is not a file, a directory or a link",
+                path.display()
+            )));
+        };
+        children.insert(name, entry);
+    }
+    Ok(Entry::Directory {
+        mode: meta.permissions().mode() & 0o777,
+        opaque: false,
+        children,
+    })
+}
+
 /// Writes `root` as a layer file at `out`.
 pub fn write(root: &Entry, out: &Path) -> Result<LayerFile> {
     let mut flat = flatten(root)?;
