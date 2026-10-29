@@ -46,6 +46,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 21 | The record and its ring | `21-record.md` | nothing internal | a record is byte for byte the layout of the event bus the node's records reach, and decodes as whole, incomplete or corrupt as that bus does; the ring takes records from many producers at once without blocking any of them, and returns each to its one consumer exactly once, or counts it as dropped (added 2026-10-28, KB4) |
 | 22 | The job document and the catalogue, for embedders | `22-job.md` | 18 | an embedder reads Moruna's kinds and checks a job document against them, collecting every refusal, with a crate that depends on `serde`, `serde_json`, `schemars` and `thiserror` only; the declaration and document types have one home there; the embedded catalogue equals the registry's listing (added 2026-10-28, board item KA4) |
 | 23 | The SDK for servers and drivers | `23-svc.md` | 20 (`moruna-abi`, `moruna-sys`, `moruna-loader`; its own workspace, `kernel/`) | a protocol is declared once and the declaration is both ends; a connection opens with a handshake refused on a mismatch of name or major; a body decodes to exactly one value or nothing; a server never blocks on one client; an example server is added to a boot by its description alone, touching no kernel file (added 2026-10-28, BOARD EK KB2) |
+| 24 | The cost model's foundation | `24-cost.md` | 22 | what a unit takes from a run is predicted as a distribution with its basis, by a model chosen by a setting from a registry, learned from raw observations a store keeps so a new model learns the same history; the default model is recursive least squares on logarithms with forgetting; a crate that depends on `moruna-job`, `serde`, `serde_json` and `thiserror` only (added 2026-10-29, board item KD6a; `architecture/adaptive-runtime.md` sections 3 to 7) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -454,8 +455,8 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `thiserror` | all | error types | |
 | `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a), and, since KA10, on `lz4_flex`, `zstd` and `flatbuffers` to inflate compressed Arrow IPC (01 e.8) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
-| `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
-| `serde_json` | 4, 7, 8, 9, 11, 12 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config` | the only text format in the runtime |
+| `serde` | 4, 8, 9, 11, 24 | derive for the manifest, sink checkpoint, profile records, run meta, the cost model's observations and fitted state | features: `derive` |
+| `serde_json` | 4, 7, 8, 9, 11, 12, 24 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config`, the cost model's observation records and fitted state (24 e.2, e.4) | the only text format in the runtime; component 24 writes a float of fitted state as its bits rather than enable `float_roundtrip`, a feature every crate in the build would share |
 | `base64` | 8, 9 | kernel and sink state bytes inside the JSON manifest and checkpoint | |
 | `libc` | 2, 3, 6, 10 | `mmap`, `madvise`, `mlock`, `O_DIRECT`, `pread`/`pwrite`, cgroup and rlimit calls | |
 | `bytes` | 6, 7, 8, bench | `object_store` payloads on the write path (a `Bytes` over an arena view, no copy) | |
