@@ -187,6 +187,7 @@ fn kd_t5_add_a_kind() {
     };
     let refused = build(
         &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         opts(),
     )
@@ -209,8 +210,17 @@ fn kd_t5_add_a_kind() {
             .any(|d| d.name == "test.scale"),
         "it is listed"
     );
-    let built =
-        build(&moruna_job::Job::from_v1(&job), &kinds, opts()).expect("the document builds");
+    let job = moruna_job::Job::from_v1(&job);
+    let plan = moruna_runtime::job::plan::levels(
+        &job,
+        moruna_plan::Resources {
+            workers: 4,
+            memory_start_bytes: 1 << 30,
+            memory_ceiling_bytes: 1 << 30,
+        },
+    )
+    .expect("planned");
+    let built = build(&job, &plan, &kinds, opts()).expect("the document builds");
     let report = Runtime::run(built.spec, CancelToken::new()).expect("the run completes");
     assert_eq!(read_back_rows(&out), rows);
     let written: i64 = (0..rows as i64).map(|v| v * 2 * 3).sum();

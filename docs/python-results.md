@@ -31,6 +31,14 @@ moruna.inspect_host() -> dict
 
 Runs host discovery without a job. The dictionary contains `limits` (`memory_ceiling`, `memory_kill`, `cpu_quota`, `page_bytes`, `source`, `devices`), `anon_bytes` (memory already held), `host_profile` (feature guarantees and staging location), `host_tier`, `cgroup_path`, and `notes`. Discovery failures raise a `MorunaError` subclass.
 
+## `moruna.explain`
+
+```python
+moruna.explain(job, *, planner=None) -> dict
+```
+
+Returns the plan Moruna would run the job document `job` by (a path, or the document's bytes), without running it. The dictionary contains `id`, `job_digest`, `planner`, `resources`, `steps` (each with `id`, `tasks`, `depends_on`, `group`, `resources` and `cost`, every cost field a `p50`, `p95`, `unit`, `basis` and `observations`), `groups` (the steps that may run side by side, in the order they start) and `totals` (`finish`, `critical_path`, `peak_memory_bytes` and the resources held). The same document gives the same step ids every time, and the events of its run name them. A refused document raises `moruna.ConfigError` naming the field; an unknown planner raises `moruna.PlanError`.
+
 ## Exceptions
 
 Runtime exceptions inherit from `moruna.MorunaError`, which inherits from `Exception`. Runtime-created instances expose `kind: str`, `message: str`, `diagnostic: dict`, `run_id: str | None`, `manifest: str | None`, and `report: RunReport | None`. Constructor validation can instead raise ordinary `TypeError` or `ValueError`.

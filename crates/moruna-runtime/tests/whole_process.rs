@@ -176,6 +176,7 @@ fn child_run() {
         let env = |_: &str| None;
         let outcome = match build(
             &moruna_job::Job::from_v1(&doc),
+            &support::planned(&moruna_job::Job::from_v1(&doc)),
             &Registry::standard(),
             BuildOptions {
                 strict: true,

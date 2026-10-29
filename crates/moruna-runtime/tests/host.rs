@@ -143,7 +143,7 @@ fn ho_t5_file_run_equals_library_run() {
     let job = JobSpec::from_value(doc.clone()).expect("the document");
     assert_eq!(
         from_file["spec_digest"],
-        moruna_runtime::job::digest(&moruna_job::Job::from_v1(&job))
+        moruna_plan::job_digest(&moruna_job::Job::from_v1(&job))
     );
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
 
@@ -253,7 +253,7 @@ fn ho_t6_heartbeat_cadence_and_report_delivery() {
     let mut doc = document(scratch.path(), 16_000, 8, Some("sleep"));
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let digest = JobSpec::from_value(doc.clone()).expect("doc");
-    let digest = moruna_runtime::job::digest(&moruna_job::Job::from_v1(&digest));
+    let digest = moruna_plan::job_digest(&moruna_job::Job::from_v1(&digest));
     let path = write_doc(scratch.path(), &doc);
 
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
@@ -698,6 +698,7 @@ fn ho_t13_report_file_placement() {
     let path = write_doc(scratch.path(), &doc);
     let outcome = session::run_file(
         &path,
+        None,
         &kinds(),
         &session::HostOptions {
             strict: true,
@@ -777,7 +778,7 @@ fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     assert_eq!(start.len(), 32);
     let mut last_t = 0;
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e["v"], 5, "{e}");
+        assert_eq!(e["v"], 6, "{e}");
         assert_eq!(e["attempt"], attempt, "{e}");
         assert_eq!(e["start"], start.as_str(), "{e}");
         assert_eq!(e["seq"], i as u64 + 1, "{e}");

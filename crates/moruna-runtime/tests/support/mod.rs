@@ -27,6 +27,20 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// re-entrant; the Rust facade does not enforce it, which is in the report).
 static RUNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The default planner's plan of `job` for a run of four workers and a GiB where the job's
+/// budget leaves either to discovery (SDD 26 f.5): what the build is given in these tests.
+pub fn planned(job: &moruna_job::Job) -> moruna_plan::Plan {
+    moruna_runtime::job::plan::levels(
+        job,
+        moruna_plan::Resources {
+            workers: 4,
+            memory_start_bytes: 1 << 30,
+            memory_ceiling_bytes: 1 << 30,
+        },
+    )
+    .expect("planned")
+}
+
 /// Hold this for the length of a run that builds a real arena.
 pub fn one_run_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     RUNS.lock().unwrap_or_else(|e| e.into_inner())

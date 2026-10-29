@@ -20,7 +20,7 @@ use moruna_kernel::{CancelToken, MorunaError, RunId};
 use moruna_placement::PlacementEngine;
 use moruna_trace::RunReport;
 
-use super::lifecycle::{Ending, EventOut, Lifecycle, Plan};
+use super::lifecycle::{Ending, EventOut, Layout, Lifecycle, PlanRun, Steps};
 use super::logs::{Capture, FINISH_WAIT, Tell, attempt_dir};
 use super::ports::HostPorts;
 use super::protocol::{
@@ -34,6 +34,7 @@ use crate::observe::RunObserver;
 use crate::run::Runtime;
 use crate::spec::Components;
 use moruna_job::{Job, JobError, JobSpec, SpecError};
+use moruna_plan::Plan;
 
 /// The heartbeat cadence (MH 4.3: at least every 2 s; half that, so one late tick is not a gap).
 pub const HEARTBEAT: Duration = Duration::from_millis(1000);
@@ -68,6 +69,8 @@ pub struct Outcome {
     pub report_file: Option<PathBuf>,
     /// What happened between Moruna and its peer.
     pub notes: Vec<String>,
+    /// How the run went against its plan, when it had one (SDD 26 e.3).
+    pub plan: Option<PlanRun>,
 }
 
 /// The outbound half of the connection, shared by the run and the heartbeat.
@@ -251,9 +254,21 @@ pub fn read_document(bytes: &[u8]) -> Result<Job, (Option<serde_json::Value>, Sp
         .map_err(|refusal| (serde_json::from_str(text).ok(), refusal))
 }
 
-/// `moruna run <job>`: read the document, then [`run_job`], connecting to `report.socket` when
-/// the document names one.
-pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+/// A plan document as bytes (SDD 26 e.1), refused as the document's field `plan` when it is not
+/// one this build reads.
+pub fn read_plan(bytes: &[u8]) -> Result<Plan, SpecError> {
+    Plan::from_flatbuffer(bytes).map_err(|e| SpecError::new("plan", e.to_string()))
+}
+
+/// `moruna run <job> [--plan <plan>]`: read the document (and the plan, when one is given), then
+/// [`run_plan`] with the plan or [`run_job`] without one, connecting to `report.socket` when the
+/// document names one.
+pub fn run_file(
+    path: &Path,
+    plan: Option<&Path>,
+    kinds: &Registry,
+    opts: &HostOptions<'_>,
+) -> Outcome {
     let started = Instant::now();
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -270,6 +285,24 @@ pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcom
         Err((raw, refusal)) => {
             return refused_without_document(raw.as_ref(), &refusal, &Wire::new(None, started));
         }
+    };
+    let plan = match plan {
+        None => None,
+        Some(file) => match std::fs::read(file)
+            .map_err(|e| {
+                SpecError::new(
+                    "plan",
+                    format!("`{}` could not be read: {e}", file.display()),
+                )
+            })
+            .and_then(|bytes| read_plan(&bytes))
+        {
+            Ok(plan) => Some(plan),
+            Err(refusal) => {
+                let raw = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+                return refused_without_document(raw.as_ref(), &refusal, &Wire::new(None, started));
+            }
+        },
     };
     let (wire, reader, closer) = match &job.report.socket {
         None => (Wire::new(None, started), None, None),
@@ -295,10 +328,13 @@ pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcom
     };
     wire.send(&Outbound::Hello {
         moruna_version: VERSION.to_string(),
-        spec_digest: Some(crate::job::digest(&job)),
+        spec_digest: Some(moruna_plan::job_digest(&job)),
         limits: limits_for(&job),
     });
-    let outcome = run_job(job, kinds, opts, &wire, reader, Mode::Run);
+    let outcome = match plan {
+        Some(plan) => run_plan(plan, job, kinds, opts, &wire, reader, Mode::Run),
+        None => run_job(job, kinds, opts, &wire, reader, Mode::Run),
+    };
     if let Some(close) = closer {
         close();
     }
@@ -356,7 +392,7 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
             }
         };
         match Inbound::parse(&line) {
-            Ok(Inbound::Spec { spec }) => {
+            Ok(Inbound::Spec { spec, plan }) => {
                 let raw = spec.clone();
                 // Version 1 is the document as JSON; version 2 is its FlatBuffers, as base64.
                 let read = match spec {
@@ -371,8 +407,21 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
                     }
                     other => JobSpec::from_value(other).map(|spec| Job::from_v1(&spec)),
                 };
-                match read {
-                    Ok(job) => {
+                let plan = match plan {
+                    None => Ok(None),
+                    Some(encoded) => {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded.as_bytes())
+                            .map_err(|e| {
+                                SpecError::new("plan", format!("not base64 FlatBuffers: {e}"))
+                            })
+                            .and_then(|bytes| read_plan(&bytes))
+                            .map(Some)
+                    }
+                };
+                match read.and_then(|job| plan.map(|plan| (job, plan))) {
+                    Ok((job, plan)) => {
                         if job.report.socket.is_some() {
                             wire.note(
                                 "report.socket is ignored under moruna serve: the peer that sent \
@@ -380,7 +429,12 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
                                     .to_string(),
                             );
                         }
-                        break run_job(job, kinds, opts, &wire, Some(reader), Mode::Serve);
+                        break match plan {
+                            Some(plan) => {
+                                run_plan(plan, job, kinds, opts, &wire, Some(reader), Mode::Serve)
+                            }
+                            None => run_job(job, kinds, opts, &wire, Some(reader), Mode::Serve),
+                        };
                     }
                     Err(refusal) => break refused_without_document(Some(&raw), &refusal, &wire),
                 }
@@ -392,6 +446,7 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
                     None,
                     exit::CANCELLED,
                     Some("cancelled before a spec arrived".to_string()),
+                    None,
                     None,
                 );
             }
@@ -420,9 +475,41 @@ pub enum Mode {
     Serve,
 }
 
-/// Run one document to its exit code (MH 4.3). `wire` is the peer, or nobody; `reader` is the
-/// peer's inbound half, read on its own thread for `cancel` and `checkpoint`.
+/// Run one document to its exit code (MH 4.3) from the default planner's plan of it
+/// (`crate::job::plan::default_plan`, SDD 26 f.5): `run(job)` is `run(levels(job))`. `wire` is
+/// the peer, or nobody; `reader` is the peer's inbound half, read on its own thread for `cancel`
+/// and `checkpoint`.
 pub fn run_job(
+    job: Job,
+    kinds: &Registry,
+    opts: &HostOptions<'_>,
+    wire: &Arc<Wire>,
+    reader: Option<Box<dyn BufRead + Send>>,
+    mode: Mode,
+) -> Outcome {
+    let plan = crate::job::plan::default_plan(&job);
+    run_planned(plan, job, kinds, opts, wire, reader, mode)
+}
+
+/// Run one document to its exit code from `plan` (SDD 26 f.5). The plan is checked against the
+/// job before anything is built from it, and a plan that is not one of it is refused naming its
+/// first step at fault; the scheduler starts the job's kernels in the plan's order; every task
+/// event names its step, each step's start and end is told, and the report says how the run
+/// went against the plan.
+pub fn run_plan(
+    plan: Plan,
+    job: Job,
+    kinds: &Registry,
+    opts: &HostOptions<'_>,
+    wire: &Arc<Wire>,
+    reader: Option<Box<dyn BufRead + Send>>,
+    mode: Mode,
+) -> Outcome {
+    run_planned(Ok(plan), job, kinds, opts, wire, reader, mode)
+}
+
+fn run_planned(
+    plan: moruna_kernel::Result<Plan>,
     job: Job,
     kinds: &Registry,
     opts: &HostOptions<'_>,
@@ -436,7 +523,7 @@ pub fn run_job(
         .and_then(RunId::from_hex)
         .or_else(|| crate::run::mint_run_id().ok())
         .unwrap_or(RunId([0; 16]));
-    let digest = crate::job::digest(&job);
+    let digest = moruna_plan::job_digest(&job);
     // This process's own id in its events: two processes of one attempt are two producers.
     let start = match crate::run::mint_run_id() {
         Ok(id) => id.to_hex(),
@@ -453,27 +540,39 @@ pub fn run_job(
                     diagnostic(&error)
                 )),
                 None,
+                None,
             );
         }
     };
     let events = Events::start(wire, job.report.attempt(), start.clone());
     // MH 4.10: host ports ride this connection, when there is one to read replies from.
     let host_ports = (wire.has_peer() && reader.is_some()).then(|| HostPorts::new(wire.clone()));
-    let built = match build(
-        &job,
-        kinds,
-        BuildOptions {
-            strict: opts.strict,
-            env: opts.env,
-            notes: Vec::new(),
-            packages: opts.packages.clone(),
-            host_ports: host_ports.clone(),
+    let built = match plan {
+        Err(error) => Err((None, error)),
+        Ok(plan) => match build(
+            &job,
+            &plan,
+            kinds,
+            BuildOptions {
+                strict: opts.strict,
+                env: opts.env,
+                notes: Vec::new(),
+                packages: opts.packages.clone(),
+                host_ports: host_ports.clone(),
+            },
+        ) {
+            Ok(built) => Ok((plan, built)),
+            Err(error) => Err((Some(plan), error)),
         },
-    ) {
+    };
+    let (plan, built) = match built {
         Ok(built) => built,
-        Err(error) => {
-            // Refused before a stage exists: the document's tasks as it names them, each skipped.
-            let lifecycle = Lifecycle::new(Plan::of(&job, None), wire.started(), events.out());
+        Err((plan, error)) => {
+            // Refused before a stage exists: the document's tasks as it names them, each skipped,
+            // each naming its step when the document was planned.
+            let layout = Layout::of(&job, None);
+            let steps = plan.as_ref().map(|p| Steps::of(p, &job, &layout));
+            let lifecycle = Lifecycle::new(layout, steps, wire.started(), events.out());
             lifecycle.begin(job.resume.is_some());
             lifecycle.end(Ending::Failed(&error));
             drop(events);
@@ -485,13 +584,15 @@ pub fn run_job(
                 exit_code(&error),
                 Some(diagnostic(&error)),
                 None,
+                None,
             );
         }
     };
     // One task per stage: fused standard kernels are one group (MH 4.9).
-    let plan = Plan::of(&job, Some(&built.parts));
-    let tasks: Vec<String> = plan.ids();
-    let lifecycle = Lifecycle::new(plan, wire.started(), events.out());
+    let layout = Layout::of(&job, Some(&built.parts));
+    let tasks: Vec<String> = layout.ids();
+    let steps = Steps::of(&plan, &job, &layout);
+    let lifecycle = Lifecycle::new(layout, Some(steps), wire.started(), events.out());
     // What the run starts beside itself, held out here so a run that crashes still stops it.
     let stop = Arc::new(AtomicBool::new(false));
     let mut capture: Option<Capture> = None;
@@ -650,6 +751,9 @@ pub fn run_job(
             )
         }
     };
+    let ran = lifecycle
+        .plan_run()
+        .map(|ran| with_stage_use(ran, report.as_ref()));
     finish(
         wire,
         Some(&file),
@@ -657,7 +761,26 @@ pub fn run_job(
         code,
         diagnostic,
         report,
+        ran,
     )
+}
+
+/// What each step's kernel stages used, from the run report's stages: the worker seconds they
+/// were busy and the largest state they held (SDD 26 e.3).
+fn with_stage_use(mut ran: PlanRun, report: Option<&RunReport>) -> PlanRun {
+    let Some(report) = report else {
+        return ran;
+    };
+    for step in &mut ran.steps {
+        for stage in &step.used.stages {
+            if let Some(s) = report.stages.iter().find(|s| s.stage == *stage) {
+                *step.used.worker_seconds.get_or_insert(0.0) += s.kernel_busy_s;
+                let held = step.used.state_bytes_max.get_or_insert(0);
+                *held = (*held).max(s.state_bytes_max);
+            }
+        }
+    }
+    ran
 }
 
 /// What a panic said, when it said it in text.
@@ -679,6 +802,7 @@ fn finish(
     code: i32,
     diagnostic: Option<String>,
     mut report: Option<RunReport>,
+    plan: Option<PlanRun>,
 ) -> Outcome {
     let notes = wire.take_notes();
     if let Some(report) = report.as_mut() {
@@ -693,6 +817,7 @@ fn finish(
             code,
             diagnostic.as_deref(),
             report.as_ref(),
+            plan.as_ref(),
             &notes,
         );
         match write_file(path, &envelope) {
@@ -706,6 +831,7 @@ fn finish(
     if let Some(report) = &report {
         wire.send(&Outbound::Report {
             report: serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            plan: plan.as_ref().and_then(|p| serde_json::to_value(p).ok()),
         });
     }
     wire.send(&Outbound::Exit {
@@ -720,6 +846,7 @@ fn finish(
         report,
         report_file: written,
         notes,
+        plan,
     }
 }
 
@@ -756,6 +883,7 @@ fn refused_without_document(
         Some((&run_id, "")),
         exit::SPEC_REFUSED,
         Some(refusal.to_string()),
+        None,
         None,
     )
 }
@@ -925,6 +1053,7 @@ fn envelope(
     code: i32,
     diagnostic: Option<&str>,
     report: Option<&RunReport>,
+    plan: Option<&PlanRun>,
     notes: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
@@ -935,6 +1064,10 @@ fn envelope(
         "host_notes": notes,
         "report": match report {
             Some(r) => serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
+            None => serde_json::Value::Null,
+        },
+        "plan": match plan {
+            Some(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
             None => serde_json::Value::Null,
         },
     })

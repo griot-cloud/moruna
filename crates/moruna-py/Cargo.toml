@@ -24,6 +24,8 @@ moruna-kernel = { workspace = true }
 arrow = { workspace = true }
 moruna-runtime = { workspace = true }
 moruna-job = { workspace = true }
+# `moruna.explain(...)` and the plan every run starts from (SDD 26).
+moruna-plan = { workspace = true }
 moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }

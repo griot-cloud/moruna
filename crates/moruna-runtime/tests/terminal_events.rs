@@ -25,7 +25,7 @@ use moruna_kernel::{
     SinkSummary, Source, SourceSchema, Split, StageEvent,
 };
 use moruna_runtime::host::exit;
-use moruna_runtime::host::lifecycle::{Lifecycle, Plan};
+use moruna_runtime::host::lifecycle::{Layout, Lifecycle};
 use moruna_runtime::host::session::{self, HEARTBEAT, HostOptions, Mode, Outcome, Wire};
 use moruna_runtime::job::{BuildOptions, build};
 use moruna_runtime::kinds::Registry;
@@ -157,6 +157,19 @@ impl Sink for CheckpointBreaks {
         }
         self.inner.checkpoint()
     }
+}
+
+/// The default planner's plan of `job` for a run of four workers and a GiB (SDD 26 f.5).
+fn planned(job: &moruna_job::Job) -> moruna_plan::Plan {
+    moruna_runtime::job::plan::levels(
+        job,
+        moruna_plan::Resources {
+            workers: 4,
+            memory_start_bytes: 1 << 30,
+            memory_ceiling_bytes: 1 << 30,
+        },
+    )
+    .expect("planned")
 }
 
 fn no_env(_: &str) -> Option<String> {
@@ -618,11 +631,12 @@ fn py_t27_a_crash_before_any_task_started_fails_the_attempt() {
 }
 
 /// The scheduler's facts of a real run of two kernel stages, recorded, and the run's tasks.
-fn recorded_run(scratch: &Scratch) -> (Plan, Vec<StageEvent>) {
+fn recorded_run(scratch: &Scratch) -> (Layout, Vec<StageEvent>) {
     let job = document(scratch, &["pass", "pass"], json!("terminate"));
     let job = moruna_job::Job::from_v1(&job);
     let built = build(
         &job,
+        &planned(&job),
         &test_kinds(),
         BuildOptions {
             strict: false,
@@ -633,7 +647,7 @@ fn recorded_run(scratch: &Scratch) -> (Plan, Vec<StageEvent>) {
         },
     )
     .expect("the document builds");
-    let refs = Plan::of(&job, Some(&built.parts));
+    let refs = Layout::of(&job, Some(&built.parts));
     let facts: Arc<Mutex<Vec<StageEvent>>> = Arc::default();
     let kept = facts.clone();
     Runtime::run_with(
@@ -655,11 +669,12 @@ fn recorded_run(scratch: &Scratch) -> (Plan, Vec<StageEvent>) {
 }
 
 /// A lifecycle whose events are kept as JSON, as the peer reads them.
-fn kept_lifecycle(refs: Plan) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+fn kept_lifecycle(refs: Layout) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();
     let kept = told.clone();
     let lifecycle = Lifecycle::new(
         refs,
+        None,
         Instant::now(),
         Box::new(move |_, event| {
             let mut value = serde_json::to_value(&event).expect("an event is JSON");
@@ -750,6 +765,7 @@ fn py_t26_a_run_dropped_without_a_cancel_at_any_point() {
     let kept = told.clone();
     let lifecycle = Lifecycle::new(
         refs,
+        None,
         Instant::now(),
         Box::new(move |_, _| *kept.lock().unwrap_or_else(|e| e.into_inner()) = vec![json!(1)]),
     );
@@ -816,11 +832,12 @@ fn told_in_order(events: &[Value], what: &str) {
 /// A run's tasks and the scheduler's facts of it, each list the facts one thread told, in the
 /// order it told them: a real run of two kernel stages, recorded by the thread each fact was
 /// told on.
-fn recorded_by_thread(scratch: &Scratch) -> (Plan, Vec<Vec<StageEvent>>) {
+fn recorded_by_thread(scratch: &Scratch) -> (Layout, Vec<Vec<StageEvent>>) {
     let job = document(scratch, &["pass", "pass"], json!("terminate"));
     let job = moruna_job::Job::from_v1(&job);
     let built = build(
         &job,
+        &planned(&job),
         &test_kinds(),
         BuildOptions {
             strict: false,
@@ -831,7 +848,7 @@ fn recorded_by_thread(scratch: &Scratch) -> (Plan, Vec<Vec<StageEvent>>) {
         },
     )
     .expect("the document builds");
-    let refs = Plan::of(&job, Some(&built.parts));
+    let refs = Layout::of(&job, Some(&built.parts));
     type Told = Vec<(std::thread::ThreadId, StageEvent)>;
     let facts: Arc<Mutex<Told>> = Arc::default();
     let kept = facts.clone();
@@ -942,11 +959,12 @@ fn interleave(threads: &[Vec<StageEvent>], draw: &mut Draw) -> Vec<StageEvent> {
 }
 
 /// A lifecycle whose events are kept as JSON with the instant stamped on each.
-fn stamped_lifecycle(refs: Plan) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
+fn stamped_lifecycle(refs: Layout) -> (Arc<Lifecycle>, Arc<Mutex<Vec<Value>>>) {
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();
     let kept = told.clone();
     let lifecycle = Lifecycle::new(
         refs,
+        None,
         Instant::now(),
         Box::new(move |t_us, event| {
             let mut value = serde_json::to_value(&event).expect("an event is JSON");
@@ -973,7 +991,7 @@ fn py_t28_any_interleaving_tells_each_task_in_order() {
     let scratch = Scratch::new("py_t28");
     let (refs, recorded) = recorded_by_thread(&scratch);
     // A chain of `n` tasks: the first the source, the last the sink.
-    let ids = |n: usize| -> Plan {
+    let ids = |n: usize| -> Layout {
         let entry = || moruna_job::KindDoc::new("any", serde_json::Map::new());
         let names: Vec<String> = (0..n).map(|i| format!("task-{i}")).collect();
         let tasks = names
@@ -989,7 +1007,7 @@ fn py_t28_any_interleaving_tells_each_task_in_order() {
             .windows(2)
             .map(|w| moruna_job::Edge::between(w[0].clone(), w[1].clone()))
             .collect();
-        Plan::of(&moruna_job::Job::new(tasks, edges), None)
+        Layout::of(&moruna_job::Job::new(tasks, edges), None)
     };
     let mut chains = vec![(refs, recorded)];
     for kernels in [0u16, 1, 3] {
@@ -1061,6 +1079,7 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
     let job = moruna_job::Job::from_v1(&job);
     let built = build(
         &job,
+        &planned(&job),
         &test_kinds(),
         BuildOptions {
             strict: false,
@@ -1071,7 +1090,7 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
         },
     )
     .expect("the document builds");
-    let refs = Plan::of(&job, Some(&built.parts));
+    let refs = Layout::of(&job, Some(&built.parts));
     let sink = refs.nodes.len() - 1;
     let (lifecycle, told) = stamped_lifecycle(refs);
     lifecycle.begin(false);
