@@ -1,7 +1,7 @@
 # Moruna SDD 25: Drivers as processes (`kernel/drivers`, `kernel/devices`), and the kernel calls drivers need
 
 **Document type:** software design document, component 25
-**Status:** DRAFT · 2026-10-29 (becomes HANDOFF-READY when section m is empty; the human flips it)
+**Status:** DRAFT · 2026-10-29, amended by KC2 the same day (block protocol 1.1, registered buffers; the layer disks; SDD 27) (becomes HANDOFF-READY when section m is empty; the human flips it)
 **Parent:** `BOARD.md` section EK, item KB3 (Brackly, 2026-10-28): "first drivers as processes: virtio console, virtio block, vsock", each an ordinary unprivileged process written only against `moruna-svc` and the generic kernel calls drivers need; SDD 23 section m item 1 and f.9 (MSI-X instead of level-triggered lines)
 **Decisions:** none new; MK1 (OSTD) stands
 **Component location:** `kernel/drivers/` (`moruna-mmio`, `moruna-pci`, `moruna-virtio`; the protocols `block-protocol`, `console-protocol`, `vsock-protocol`; the drivers `virtio-blk`, `virtio-console`, `virtio-vsock`; the tests `block-test`, `console-test`, `vsock-test`, `driver-isolation`), `kernel/devices/` (`moruna-driver-table`, `devices-protocol`, `devices`, the device manager); the kernel additions in `kernel/core/src/{syscall,interrupt,memory,object,process,boot}.rs`, `kernel/abi` (ABI 1.2), `kernel/sys`; `kernel/tools/{boot,check-boot,check-examples}.sh`, `kernel/tools/{disk-image,vsock-peer}.py`, `kernel/tools/image` (the `driver` directive), `kernel/initramfs/boot.image`
@@ -79,15 +79,22 @@ Errors, in the order checked (SDD 20 e.5): every handle is looked up first (KK-I
 
 `root.ecam`, `root.msi` and `root.dma` are given to the first process only (KK-I11). A boot whose manifest gives `root.ecam` on firmware with no MCFG is refused.
 
-### d.3 `moruna.driver.block` 1.0
+### d.3 `moruna.driver.block` 1.1
 
 ```rust
 1 => fn info() -> Info;                                     // sector_size, sectors, max_sectors, read_only
 2 => fn read(sector: u64, count: u32, buffer: Memory) -> Memory;
 3 => fn write(sector: u64, count: u32, data: Memory) -> Memory;
 4 => fn flush() -> ();
-errors { 1 => OutOfRange; 2 => BadCount; 3 => BadBuffer; 4 => ReadOnly; 5 => Io; }
+5 since 1 => fn register(buffer: Memory) -> (u32, u32);     // registration, pages
+6 since 1 => fn read_at(id: u32, page: u32, sector: u64, count: u32) -> ();
+7 since 1 => fn write_at(id: u32, page: u32, sector: u64, count: u32) -> ();
+8 since 1 => fn unregister(id: u32) -> ();
+errors { 1 => OutOfRange; 2 => BadCount; 3 => BadBuffer; 4 => ReadOnly; 5 => Io;
+         6 => NoRegistration; 7 => TooManyRegistrations; }
 ```
+
+Since 1.1 a client may register a DMA memory object once (`READ` and `WRITE` on its handle): the driver pins it then, keeps the pin and its pages' device addresses with the connection, and answers its number and its pages. `read_at` and `write_at` move `count` sectors between the disk and the registration's pages from page `page`, pinning nothing; the pages must lie inside the registration (`BadBuffer`), and a number the connection does not hold is `NoRegistration`. A connection holds at most 64 registrations (`TooManyRegistrations`); `unregister` or the connection's end drops them (f.9). The image filesystem's page cache is one such registration with each layer's driver (SDD 27 f.8).
 
 A sector is 512 bytes. `buffer` and `data` are DMA memory objects (`Memory::create_dma`) at least `count * 512` bytes long; the transfer uses their first bytes, and the reply hands the same object back. A read needs `READ` and `WRITE` on the handle (the device writes it), a write needs `READ`. `max_sectors` is what one descriptor chain carries: `min(seg_max, queue size - 2, 256)` pages. `flush` is answered once every write answered before it is on stable storage; a device without a write cache answers it at once.
 
@@ -177,7 +184,7 @@ The CI boot's table: `1af4:1042 virtio-blk block`, `1af4:1043 virtio-console con
 
 ### e.4 The CI boot's devices
 
-`kernel/tools/boot.sh` gives QEMU's q35 machine: virtio consoles at 00:03 (output to `OUT/console0-CPUS.log`) and 00:04 (input from `OUT/console1-input.txt`), a 4 MiB raw disk as virtio-blk at 00:05 (`OUT/disk-CPUS.img`, pattern A written by `disk-image.py` before each boot; reads throttled to 8 MiB/s, so DR-T11's 32 MiB of reads take about four seconds and the kill always lands while they are in flight: unthrottled, a boot on four CPUs finished all 32 before the kill), `vhost-vsock-pci` with guest cid 3 at 00:06 when `/dev/vhost-vsock` is usable (with `vsock-peer.py` as the host's side), and QEMU's `edu` test device at 00:07. Every virtio device is modern only (`disable-legacy=on`), so its device id is `0x1040 +` its virtio type. `OUT/vsock-CPUS` says whether the vsock was attached and, if not, why.
+`kernel/tools/boot.sh` gives QEMU's q35 machine: virtio consoles at 00:03 (output to `OUT/console0-CPUS.log`) and 00:04 (input from `OUT/console1-input.txt`), a 4 MiB raw disk as virtio-blk at 00:05 (`OUT/disk-CPUS.img`, pattern A written by `disk-image.py` before each boot; reads throttled to 8 MiB/s, so DR-T11's 32 MiB of reads take about four seconds and the kill always lands while they are in flight: unthrottled, a boot on four CPUs finished all 32 before the kill), `vhost-vsock-pci` with guest cid 3 at 00:06 when `/dev/vhost-vsock` is usable (with `vsock-peer.py` as the host's side), QEMU's `edu` test device at 00:07, and, since KC2, the image filesystem's two layer disks, read only, as virtio-blk at 00:08 and 00:09 (`OUT/layers/layer-1.img` and `layer-2.img`), which the device manager names `block1` and `block2` (SDD 27 k). Every virtio device is modern only (`disable-legacy=on`), so its device id is `0x1040 +` its virtio type. `OUT/vsock-CPUS` says whether the vsock was attached and, if not, why.
 
 ### e.5 A driver's life
 
@@ -224,6 +231,8 @@ A split queue keeps its free descriptors and each chain's length in the driver; 
 ### f.9 The block driver
 
 A request is validated (count `1 ..= max_sectors`, the sectors inside the device, not a write to a read-only device), the client's memory object is pinned (`Pin::pages` then `Pin::create`; any refusal is `BadBuffer`, as is a buffer smaller than the transfer), and the request queued. It goes to the device as one chain: a 16-byte header in a slot of the driver's header page (type, zero, sector), one part per page of the transfer, and a status byte in the same slot. Requests that find no free slot or too few free descriptors wait in order. When the device returns a chain, its status byte decides the answer (`Io` for anything but zero), the pin is closed (to the quarantine), the memory object goes back in the reply, the quarantine is released, and waiting requests go to the device.
+
+A registration (1.1) is pinned when it is made, with `Pin::pages` and `Pin::create` as above, and held by the connection behind a reference count; a `read_at` or `write_at` takes the pages it names from the registration's addresses and holds a reference to the registration until the device returns its chain. So a registration ended, or a connection closed, under a transfer keeps its pin until that transfer is done, and only then does the pin go to the quarantine; the quarantine is released after each completion, as above, and when a registration is dropped with nothing in flight, so every pin it releases is one no device holds.
 
 ### f.10 The console driver
 
@@ -277,7 +286,7 @@ Host tests run with `cargo test` in `kernel/` for `moruna-mmio`, `moruna-pci`, `
 | KK-T8 | isolation (extended) | boot: `isolation` | the five new handle-taking calls, with the sixteen before, answer `BadHandle` for every value that names nothing in the caller |
 | DR-T8 | `dr_t8_*` | `tools/image` | `driver` lines render the table, give it and each image once, and are refused by line |
 | DR-T9 | the disk | boot: `block-test`; host: `disk-image.py check` | `KB3 block: ok:`: every sector of pattern A read through `block0` by DMA into a memory object and checked; pattern B written, flushed and read back; after the boot the image file holds pattern B |
-| DR-T10 | the block suite | boot: `block-test` | `KB3 conformance moruna.driver.block: ok:`: SV-T7's shared checks and the protocol's own (info, reads at the start and at the end at the largest size, out of range, bad counts, bad buffers of each kind, a write read back and restored, flush, a handle not a memory object) |
+| DR-T10 | the block suite | boot: `block-test` | `KB3 conformance moruna.driver.block: ok:`: SV-T7's shared checks and the protocol's own (info, reads at the start and at the end at the largest size, out of range, bad counts, bad buffers of each kind, a write read back and restored, flush, a handle not a memory object; since 1.1, SDD 27 IF-T19, a registered buffer's page holding what `read` gives, every refusal of the registered requests, a write and a read through two registrations, the bound on registrations) |
 | DR-T11 | a crashed driver | boot: `block-test`, `devices` | `KB3 driver crash: ok:`: 32 reads in flight, `block0` killed through control; each read answered or ended `PeerClosed`, at least one closed, none waits past its deadline; `devices` starts it again (`start 2`); a read through a new connection returns the disk's data |
 | DR-T12 | the consoles | boot: `console-test`; `console0`'s file | `KB3 console: ok:`, the three lines and the line read from `console1`'s input in `console0`'s file, `KB3 conformance moruna.driver.console: ok:` |
 | DR-T13 | vsock | boot: `vsock-test`; host: `vsock-peer.py` | with a vsock: `KB3 vsock: ok:`, `KB3 conformance moruna.driver.vsock: ok:`, and both of the peer's `ok` lines (the guest connected to port 5000; the host connected to the guest's port 5001 and was answered); without one: `KB3 vsock: no device:` and the boot's reason |
@@ -319,4 +328,4 @@ Coverage on the host (`cargo llvm-cov`, lines): `moruna-mmio` 100%, `moruna-pci`
 
 ## o. Deferred
 
-The image filesystem over the block protocol (KC2) needs: the block protocol as it is (d.3); a way to share one pinned buffer across requests without a pin each time (a long-lived pin a client registers, for the page cache); the layer disks QEMU attaches as more virtio-blk devices, which the table already serves as `block1`, `block2`; and read-only devices (`info().read_only`). NVMe and the cloud network card (KE1) need: the same driver shape over `moruna-pci` without virtio (NVMe's admin and I/O queues are rings like a virtqueue's, in pinned memory); several MSI-X vectors a device, one per queue, which the MSI resource already allows (raise `MSI_PER_FUNCTION`); per-device IOMMU domains (m.3); the first bus of a segment (m.2); and, for the network card, the network server (KE2) as its client.
+The image filesystem over the block protocol (KC2) is built (SDD 27): the long-lived pin a client registers for the page cache is block 1.1's registration (d.3, f.9), which needed no kernel call, and the layer disks are `block1` and `block2`, read only. NVMe and the cloud network card (KE1) need: the same driver shape over `moruna-pci` without virtio (NVMe's admin and I/O queues are rings like a virtqueue's, in pinned memory); several MSI-X vectors a device, one per queue, which the MSI resource already allows (raise `MSI_PER_FUNCTION`); per-device IOMMU domains (m.3); the first bus of a segment (m.2); and, for the network card, the network server (KE2) as its client.
