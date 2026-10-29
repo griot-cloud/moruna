@@ -25,6 +25,7 @@ Design documents for Moruna. Code is written from these documents; a change in b
 | [sdd/16-package.md](sdd/16-package.md) | Component 16: the function package (`.wasm`, `.pex`, `moruna.json`, the `moruna:kernel` world, `moruna package`, `check`, `aot`, `load`, the `package` kind) | Draft |
 | [sdd/17-sandbox.md](sdd/17-sandbox.md) | Component 17: the two runtimes of a packaged kernel (`moruna-wasm`, `moruna-sandbox`: the template, the fork, the confinement, the shared mapping, the guard in the child) | Draft |
 | [sdd/22-job.md](sdd/22-job.md) | Component 22: the job document and the catalogue for embedders (`moruna-job`: the declaration and document types, the catalogue of every kind an embedder can name, `check` without running, the validator of the settings schemas) | Draft |
+| [sdd/24-cost.md](sdd/24-cost.md) | Component 24: the cost model's foundation (`moruna-cost`: the inputs, the estimate and the outcome, the model port and its registry, the default `loglinear` model, the observation store and its local adapter) | Draft |
 | [agents/pm.md](agents/pm.md) | Agent prompt: the PM agent that drives the build (reading order, waves, gate rule, review checklist, escalation routing, decisions) | Draft |
 | [agents/executor.md](agents/executor.md) | Agent prompt template: filled per component by the PM for the executor agent that builds it | Draft |
 | [../DECISIONS.md](../DECISIONS.md) | Decision log: the architecture document's open questions Q1 to Q10 with owner, status and date; the PM updates it | Living |

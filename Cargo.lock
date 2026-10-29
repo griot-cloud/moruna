@@ -4258,6 +4258,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-cost"
+version = "0.5.9"
+dependencies = [
+ "moruna-job",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "moruna-datafusion"
 version = "0.5.9"
 dependencies = [
