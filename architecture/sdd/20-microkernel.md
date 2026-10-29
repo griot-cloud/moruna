@@ -1,13 +1,13 @@
 # Moruna SDD 20: The microkernel core (`kernel/`)
 
 **Document type:** software design document, component 20
-**Status:** DRAFT · 2026-10-28, amended by KB2 the same day (ABI 1.1, several CPUs, the cycle rule; SDD 23) and by KB3 on 2026-10-29 (ABI 1.2, the calls drivers need; SDD 25) (becomes HANDOFF-READY when section m is empty; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended by KB2 the same day (ABI 1.1, several CPUs, the cycle rule; SDD 23), by KB3 on 2026-10-29 (ABI 1.2, the calls drivers need; SDD 25) and by KC1 the same day (ABI 2.0: the native numbers moved to `0x1_0000 + n`, the forward and its fast calls, an address space of areas, futexes, a thread's FS base and FPU registers, the realtime clock; SDD 28) (becomes HANDOFF-READY when section m is empty; the human flips it)
 **Parent:** `BOARD.md` section EK, item KB1 (Brackly, 2026-10-28); `architecture/optimized-runtime.md` section 3, as the EK direction amends it: the kernel is a microkernel, and Linux compatibility is a server (KC1), not kernel syscalls
 **Decisions:** MK1 (`DECISIONS.md`: OSTD as the hardware layer, MPL-2.0)
 **Component location:** `kernel/` (its own Cargo workspace): `abi/` (`moruna-abi`), `loader/` (`moruna-loader`), `handles/` (`moruna-handles`), `core/` (`moruna-microkernel`), `boot/` (`moruna-microkernel-boot`, the kernel image), `sys/` (`moruna-sys`), `programs/` (the test programs), `initramfs/boot.image` (the CI boot's description, built by `moruna-image`, SDD 23), `tools/` (`build.sh`, `boot.sh`, `check-boot.sh`)
 **Consumes:** OSTD 0.19.0 (boot, page tables, the frame allocator, interrupts, the timer, task switching, user mode entry), OSDK 0.19.0's frame and heap allocators and its x86_64 linker script. **Consumed by:** KB2 (`moruna-svc`, the SDK, which is built on `moruna-sys` and `moruna-abi`), KB3 (drivers as processes), KC1 (the Linux personality server), KD1 (the data plane on kernel channels), KE (the kernel as a node).
 
-**Decisions worth your eye:** (1) the kernel holds ten object types and 30 calls (ABI 1.2), and nothing else: no files, no names, no network, no Linux syscall; (2) a handle value is salted per process, so a value from another process names nothing here, and every call looks its handles up before it checks anything else; (3) the boot manifest is a line-oriented text file in the initramfs, so adding a server is a line and an ELF, and nothing in the kernel is rebuilt; (4) only the first process, the supervisor, may receive the three root resources (process creation, device memory, interrupts), and it delegates them by duplicating and sending handles; (5) the kernel builds with plain cargo: the crate `cargo osdk` would generate is written out in `boot/`.
+**Decisions worth your eye:** (1) the kernel holds ten object types and 43 calls (ABI 2.0), and nothing else: no files, no names, no network, no Linux syscall number (a forward's table, given by its server, says which foreign numbers reach which fast call, f.14); (2) a handle value is salted per process, so a value from another process names nothing here, and every call looks its handles up before it checks anything else; (3) the boot manifest is a line-oriented text file in the initramfs, so adding a server is a line and an ELF, and nothing in the kernel is rebuilt; (4) only the first process, the supervisor, may receive the three root resources (process creation, device memory, interrupts), and it delegates them by duplicating and sending handles; (5) the kernel builds with plain cargo: the crate `cargo osdk` would generate is written out in `boot/`.
 
 ---
 
@@ -51,18 +51,22 @@ OSTD is the hardware layer: all the unsafe code (boot, paging, interrupts, the t
 - **KK-I10.** A fault in a process ends that process and nothing else: its threads stop, its handles close, its mappings go, `TERMINATED` is raised on it, and the kernel names the fault on the console.
 - **KK-I11.** Only the first process of the manifest may receive a resource (the three of KB1 and, since ABI 1.2, `root.ecam`, `root.msi` and `root.dma`); the kernel refuses a manifest that gives one to any other, and refuses to boot from a manifest it cannot parse or an image it cannot load, powering off with the reason.
 - **KK-I12.** When the last process ends, and the boot has started every manifest process, the kernel powers off: success if the supervisor exited with code 0, failure otherwise.
+- **KK-I13.** (2.0) A page has an entry in a process's page table only while its area allows access to it; a page made inaccessible and accessible again holds the bytes it held, and a zero page reads zero until it is written (f.5, f.12).
+- **KK-I14.** (2.0) Protection never grows past the handle: an area of a memory object mapped through a handle without `WRITE` can never be made writable, and no area is ever writable and executable at once (f.5).
+- **KK-I15.** (2.0) A forwarded process's call reaches its server or the kernel's fast calls and nothing else: a fast call acts only on its caller's thread and process, and the forward's channel is the kernel's, never in any process's table (f.14).
+- **KK-I16.** (2.0) Every thread runs with its own FPU registers and FS base, whatever ran on its CPU before it (f.15).
 
 ## d. Interfaces
 
 ### d.1 The calling convention
 
-`syscall` with the number in `rax` and up to six arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`. The kernel returns a value in `rax` (and, where the table says, a second one in `rdx`), or an error as `-(code)` in `rax` (e.5). `rcx` and `r11` are clobbered by the instruction; every other register is preserved. Lengths and offsets of mappings are whole pages (4096 bytes). Deadlines are absolute nanoseconds on `clock_get`'s clock; `0` polls and `u64::MAX` never passes.
+`syscall` with the number in `rax` and up to six arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`. Call `n` of the table is number `nr::BASE + n`, `BASE = 0x1_0000` (ABI 2.0); every number outside the table and the data plane's reserved range (`BASE + 0x100 .. BASE + 0x110`, KD1) is foreign: `BadSyscall` for a native process, and for a forwarded one a message to its server or a fast call (f.14, SDD 28). The kernel returns a value in `rax` (and, where the table says, a second one in `rdx`), or an error as `-(code)` in `rax` (e.5). `rcx` and `r11` are clobbered by the instruction; every other register is preserved. Lengths and offsets of mappings are whole pages (4096 bytes). Deadlines are absolute nanoseconds on `clock_get`'s clock; `0` polls and `u64::MAX` never passes.
 
 A thread starts with `rip` at its entry, `rdi` its argument, and `rsp` 8 below a 16-byte boundary at the top of its stack, as if called. A process's first thread receives the start page's address in `rdi` and a 256 KiB stack the kernel maps.
 
-### d.2 The syscalls, ABI 1.2
+### d.2 The syscalls, ABI 2.0
 
-`abi_version` returns `MAJOR << 16 | MINOR`. The major number changes when a call's meaning changes; the minor number when a call is added. A number is never reused. Any number at or above 30 is `BadSyscall`. ABI 1.1 (KB2) added `resource_narrow`. ABI 1.2 (KB3, SDD 25 d.1) added calls 25 to 29 and `memory_create`'s flags, whose zero is the call ABI 1.0 made.
+`abi_version` returns `MAJOR << 16 | MINOR`. The major number changes when a call's meaning changes; the minor number when a call is added. A number is never reused. Any number at or above `BASE + 43` outside the data plane's range is `BadSyscall` for a native process. ABI 1.1 (KB2) added `resource_narrow`. ABI 1.2 (KB3, SDD 25 d.1) added calls 25 to 29 and `memory_create`'s flags, whose zero is the call ABI 1.0 made. ABI 2.0 (KC1, SDD 28) moved every call to `BASE + n` (so a forwarded process keeps the low numbers for its own ABI), made `memory_unmap` take any whole pages of a mapping, and added calls 30 to 42. The table's `nr` column is `n`.
 
 | nr | call | arguments | returns | rights needed |
 |---|---|---|---|---|
@@ -96,6 +100,19 @@ A thread starts with `rip` at its entry, `rdi` its argument, and `rsp` 8 below a
 | 27 | `dma_release` (1.2) | DMA resource | pins released from its quarantine | `WRITE` |
 | 28 | `resource_info` (1.2) | resource, 24-byte buffer | 0; `u32` kind, `u32` zero, `u64` base, `u64` length written | |
 | 29 | `process_kill` (1.2) | process | 0 | `WRITE`; the process running (`BadState` otherwise) |
+| 30 | `memory_protect` (2.0) | address, length, `map` protection bits (none is no access) | 0 | whole pages of the caller's own `memory_map` mappings, every page mapped (`OutOfRange` otherwise); `WRITE` only through a handle that had it (`AccessDenied`), never with `EXECUTE` (`InvalidArgs`) |
+| 31 | `process_forward` (2.0) | process, endpoint, table, table length | 0 | `WRITE` on the process, created and not started (`BadState`); `READ`, `WRITE` and `TRANSFER` on the endpoint, which leaves the caller's table; the table of SDD 28 d.1 (`InvalidArgs`) |
+| 32 | `process_launch` (2.0) | process, entry, stack pointer, heap start (0 none) | the first thread's id | `WRITE`; the process created and not started; no start page and no handles: its creator built its memory |
+| 33 | `process_map` (2.0) | process, memory object (0: zero pages filled on first touch), offset, length, address (0: the kernel chooses), flags (`map` protection bits, `map::FIXED`) | address | `WRITE` on the process; `MAP` and `READ` on the memory, `WRITE` for a writable mapping; at a given address without `FIXED` a range in use is `BadState`, with `FIXED` it is unmapped first |
+| 34 | `process_unmap` (2.0) | process, address, length | 0 | `WRITE`; whole pages, any mapped or not |
+| 35 | `process_protect` (2.0) | process, address, length, protection bits | 0 | `WRITE`; as `memory_protect`, on any of the process's areas |
+| 36 | `process_read` (2.0) | process, address, buffer, length (at most 1 MiB) | 0 | `READ`; every page mapped and readable (`Fault`) |
+| 37 | `process_write` (2.0) | process, address, buffer, length (at most 1 MiB) | 0 | `WRITE`; every page mapped and writable (`Fault`) |
+| 38 | `futex_wait` (2.0) | address of a `u32`, expected value, deadline | 0 when woken | the word holding another value is `ShouldWait`; the deadline `TimedOut` (f.13) |
+| 39 | `futex_wake` (2.0) | address, count | threads woken | (the caller's own words) |
+| 40 | `thread_set_fs` (2.0) | FS base | 0 | a lower-half address (`InvalidArgs`) |
+| 41 | `forward_clone` (2.0) | process, thread id, stack pointer, FS base (0: the parent's), clear-tid word (0 none), set-tid word (0 none) | the new thread's id | `WRITE`; a forwarded process whose thread `id` waits on its forward (`InvalidArgs` for no such thread, `BadState` for one not waiting) (f.14) |
+| 42 | `random_read` (2.0) | buffer, length (at most 4096) | 0 | `BadState` when the CPU has no random source |
 
 `channel_read` and `channel_write` never block: an empty queue is `ShouldWait` (or `PeerClosed`), a full peer queue is `ShouldWait`; a process waits for `READABLE` or `WRITABLE`. `wait` is the only call that blocks.
 
@@ -114,7 +131,7 @@ One page, read-only, at an address the kernel chooses, passed in `rdi`:
 | 0 | `u32` magic `0x31534b4d` ("MKS1") |
 | 4 | `u32` ABI version |
 | 8 | `u32` count of entries |
-| 12 | `u32` reserved |
+| 12 | `u32` CPUs online (ABI 2.0; reserved before) |
 | 16 | `[u8; 32]` process name |
 | 48 + 40 i | entry i: `u32` handle, `u32` rights, `[u8; 32]` slot name |
 
@@ -139,6 +156,9 @@ One page, read-only, at an address the kernel chooses, passed in `rdi`:
 | pages one `memory_pin` pins | 65536 (a memory object of the largest size) |
 | pins in one DMA resource's quarantine | 4096 |
 | MSI slots | 224 |
+| `process_read`, `process_write` (2.0) | 1 MiB a call |
+| `random_read` (2.0) | 4096 bytes a call |
+| a forward's table (2.0) | foreign numbers `0 .. 512` |
 
 ### d.6 `moruna-sys`
 
@@ -206,11 +226,11 @@ The first directive is `moruna-manifest 1`. `channel` declares a channel whose e
 
 ### f.1 Boot
 
-OSTD boots by multiboot, initialises memory, interrupts and the timer, and calls the boot crate's `#[ostd::main]`, which calls `moruna_microkernel::main`. The kernel injects its scheduler and registers the other CPUs' entry (f.11), starts its clock (the TSC, whose frequency OSTD measured; no frequency is a refusal), registers the deadline queue on OSTD's 1 kHz timer, installs the post-schedule hook of KK-I4, prints `kk: N CPUs online`, reads OSTD's initramfs (a cpio newc archive; only regular files and directories), parses `manifest`, creates its channels, and for each process in order loads its ELF, builds its start handles, and starts it. It prints `kk: moruna microkernel, abi 1.1: started N processes from the manifest`, stops counting itself as a live process (KK-I12), and returns, which hands the CPU to the processes. Any refusal prints `kk: boot refused: REASON` and powers off with failure.
+OSTD boots by multiboot, initialises memory, interrupts and the timer, and calls the boot crate's `#[ostd::main]`, which calls `moruna_microkernel::main`. The kernel sets OSTD's log level to info (at its default, debug, OSTD prints a line for every FPU save and restore), refuses a CPU without FSGSBASE (f.15), injects its scheduler and registers the other CPUs' entry (f.11), starts its clock (the TSC, whose frequency OSTD measured; no frequency is a refusal) and reads the CMOS clock (f.16), registers the deadline queue on OSTD's 1 kHz timer, installs the pre- and post-schedule hooks of KK-I4 and f.15, prints `kk: N CPUs online`, reads OSTD's initramfs (a cpio newc archive; only regular files and directories), parses `manifest`, creates its channels, and for each process in order loads its ELF, builds its start handles, and starts it. It prints `kk: moruna microkernel, abi 2.0: started N processes from the manifest`, stops counting itself as a live process (KK-I12), and returns, which hands the CPU to the processes. Any refusal prints `kk: boot refused: REASON` and powers off with failure.
 
 ### f.2 Loading an image
 
-`moruna-loader::elf` accepts `ET_EXEC`, ELF64, little endian, `EM_X86_64`, at most 64 program headers; refuses `PT_INTERP` and `PT_DYNAMIC` (a dynamic linker is a server's job, KC1), `PT_TLS`, a segment with more file bytes than memory bytes or reaching past the file, a segment outside `0x1000 .. 0x1000_0000_0000`, two segments sharing a page, a segment both writable and executable, and an entry outside an executable segment. Each segment gets fresh zeroed pages, its file bytes copied in, mapped with its permissions. Mappings, stacks and the start page go in `0x1000_0000_0000` up to the top of user space, first fit, with an unmapped guard page on each side.
+`moruna-loader::elf` accepts `ET_EXEC`, ELF64, little endian, `EM_X86_64`, at most 64 program headers; takes a `PT_TLS` template (ABI 2.0: a program sets up its own thread-local storage from it with `thread_set_fs`) and refuses one outside the loaded segments; refuses `PT_INTERP` and `PT_DYNAMIC` (a dynamic linker is a server's job, SDD 28), a segment with more file bytes than memory bytes or reaching past the file, a segment outside `0x1000 .. 0x1000_0000_0000`, two segments sharing a page, a segment both writable and executable, and an entry outside an executable segment. Each segment gets fresh zeroed pages, its file bytes copied in, mapped with its permissions. Mappings, stacks and the start page go in `0x1000_0000_0000` up to the top of user space, first fit, with an unmapped guard page on each side.
 
 ### f.3 Handle values
 
@@ -224,7 +244,7 @@ Two queues, one towards each endpoint, and an open flag per endpoint, under one 
 
 ### f.5 Memory
 
-A memory object's pages are allocated, zeroed, at creation, and mapping maps those same frames, so every mapping of one object shares its bytes with no copy: a process can hand another a read-only view of a buffer by duplicating its handle without `WRITE` and sending it. `memory_unmap` takes exactly one mapping `memory_map` made; segments, stacks and the start page cannot be unmapped by a process. A device memory region is OSTD's `IoMem`: OSTD hands out only ranges in its MMIO windows that hold no RAM and nothing OSTD reserved (the APICs, the IOMMU), and the kernel first refuses a range outside the resource's (`AccessDenied`) and a range a live region holds (`AccessDenied`). OSTD never takes a range back, so the kernel keeps the ranges it acquired and hands out slices of them again once no live region holds them (SDD 25 f.3).
+A memory object's pages are allocated, zeroed, at creation, and mapping maps those same frames, so every mapping of one object shares its bytes with no copy: a process can hand another a read-only view of a buffer by duplicating its handle without `WRITE` and sending it. A process's address space (`core/src/vm.rs`, ABI 2.0) is a map of areas, each a run of whole pages with one protection and one backing: pages of a memory object (writable only if the handle mapped through carried `WRITE`), zero pages (f.12), or device memory. Unmapping or protecting part of an area splits it, so any whole pages can be unmapped or protected; `memory_unmap` and `memory_protect` act on the caller's own `memory_map` mappings only, so segments, stacks and the start page cannot be unmapped or changed by a native process, while the `process_*` calls act on any area of a process their caller holds with `WRITE`. The page table holds an entry only for a page that is accessible (an area with no access has none), because OSTD tracks a frame only while its entry is present; making pages accessible again maps them again from their backing, so they keep their bytes. A device memory region is OSTD's `IoMem`: OSTD hands out only ranges in its MMIO windows that hold no RAM and nothing OSTD reserved (the APICs, the IOMMU), and the kernel first refuses a range outside the resource's (`AccessDenied`) and a range a live region holds (`AccessDenied`). OSTD never takes a range back, so the kernel keeps the ranges it acquired and hands out slices of them again once no live region holds them (SDD 25 f.3).
 
 ### f.6 Time
 
@@ -249,6 +269,26 @@ A CPU fault or trap in user mode (OSTD's `ReturnReason::UserException`) ends the
 ### f.11 Several CPUs
 
 The kernel injects its own scheduler into OSTD before any task runs (OSTD 0.19's default queues every task on the boot processor): a run queue and an idle task per CPU, a new task on the CPU with the fewest runnable tasks, a woken one on its waker's CPU when nothing else is runnable there, a 10 ms slice, and a boot context that is never preempted. The application processors enter through OSTD's AP entry. The boot counts as a live process until it has started the whole manifest (KK-I12). Detail: SDD 23 f.12.
+
+### f.12 Zero pages (ABI 2.0)
+
+A zero-page area (`process_map` with no memory object, a forwarded process's anonymous `mmap`, its heap and stack) allocates nothing when mapped. A thread's first touch of one of its pages is a page fault on a page with no entry; the kernel finds the area, checks the access against its protection, allocates a zeroed frame, keeps it with the space under the page's address and maps it, and the thread goes on. Any other fault ends the process (KK-I10). A copy the kernel makes into or out of such a page (a syscall's argument, `process_read`, `process_write`) populates it first. Unmapping the page frees its frame; `madvise(DONTNEED)` (f.14) frees it so it reads zero again.
+
+### f.13 Futexes (ABI 2.0)
+
+A futex queue is keyed by the process and a word's address, so no word of one process names a queue of another (KK-I1). A wait reads the word and queues the thread under the queues' lock, after populating the word's page so the read needs no other lock; a wake takes the lock, so no wake falls between a wait's read and its sleep. Each waiter carries a bitset (all ones for the native call); a wake wakes the first `count` waiters whose set meets its own, in arrival order. A requeue moves waiters between words and records the move on each, so a timed-out waiter leaves the queue it is in. A waiter killed while it sleeps returns `BadState` and its thread ends.
+
+### f.14 Forwarded processes and fast calls (ABI 2.0; SDD 28 f.1)
+
+`process_forward` gives a created process a forward: the kernel's end of a channel and a table naming, for each foreign number below 512, a fast call or none. A forwarded thread's foreign call is either a fast call, which the kernel answers itself in the x86-64 System V convention (arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, a result or `-errno` in `rax`), or a request on the forward's channel (SDD 28 d.1) after which the thread waits for the reply with its token; replies for other waiting threads stay queued for them, anything else is dropped, and the server's end closing ends the process with the reason. While a thread waits its registers are kept, so `forward_clone` can start a thread from them (result register zero, the stack pointer given) and write its id to the set-tid word before it runs. A thread that ends while its process goes on clears its clear-tid word and wakes one waiter on it. The fast calls are `futex` (wait, wake, their bitset forms, requeue and compare-requeue), `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, anonymous `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `sched_yield`, `arch_prctl` (the FS base), `set_tid_address`, `getrandom`, `exit` and `gettid`: each acts only on the calling thread and its process, and one it does not take (a mapping of a file, a futex operation it does not know, another `arch_prctl` code) is forwarded instead. No foreign number is the kernel's: the table is the server's.
+
+### f.15 A thread's registers across switches (ABI 2.0)
+
+OSTD's pre-schedule hook saves the leaving thread's FPU registers (XSAVE) and FS base (RDFSBASE), and charges it the CPU time of its slice; the post-schedule hook activates the arriving thread's address space and loads its FPU registers and FS base. A thread starts with the FPU's reset state and an FS base of zero (or its parent's, or the `forward_clone` argument). A boot on a CPU without FSGSBASE is refused with the reason. The process and thread CPU clocks of `clock_gettime` are these charges.
+
+### f.16 The realtime clock (ABI 2.0)
+
+At boot the kernel reads the CMOS clock once (the node's time, in UTC; the century register when ACPI's FADT names one), and the realtime clock is that instant plus the monotonic clock. A CMOS clock that holds no valid date refuses the boot with the reason.
 
 ## g. Concurrency within the component
 
@@ -279,13 +319,15 @@ Host tests run with `cargo test` on the host target; boot tests run in CI's `ker
 | KK-T5 | `kk_t5_*` | `handles` | values name only live entries; a closed or reused slot's value is bad; values differ between salts; zero is never issued; the table is bounded and drains |
 | KK-T6 | ping-pong | `programs/ping`, `pong` | `KB1 ping-pong: ok: 10000 round trips over one channel`, each echo checked |
 | KK-T7 | handle transfer | `programs/xfer-a`, `xfer-b` | A writes a pattern, sends a duplicate without `WRITE` (and loses it from its table); B maps it, checks the pattern, is refused a writable mapping and a duplicate with `WRITE` with `AccessDenied` |
-| KK-T8 | isolation | `programs/iso-holder`, `isolation` | every handle-taking call (21, ABI 1.2) on every value 0 to 4096 and on six live values of another process returns `BadHandle`, first holding only a console, then holding nothing (the exit code counts failures; the kernel prints `exited with code 0`) |
+| KK-T8 | isolation | `programs/iso-holder`, `isolation` | every handle-taking call (29, ABI 2.0) on every value 0 to 4096 and on six live values of another process returns `BadHandle`, first holding only a console, then holding nothing (the exit code counts failures; the kernel prints `exited with code 0`) |
 | KK-T9 | wait with deadline | `programs/deadline` | a timer wakes a waiting second thread no earlier than its deadline and within 50 ms of it; a wait nothing satisfies is `TimedOut` no earlier than its deadline |
 | KK-T10 | a faulting process | `programs/fault` | reading address 0 ends the process; the kernel prints `faulted: page fault at 0x0 on read`; every other test's line and the final success line still appear |
 | KK-T11 | the supervisor | `programs/supervisor`, `child` | creates, loads and starts a child from a `file:` image and sees it end, after a start giving a handle without `TRANSFER` is refused with `AccessDenied` and the handle stays the supervisor's; maps a device memory region in high MMIO and is refused the same range a second time; is refused RAM as device memory, and an interrupt from the process resource; waits on an interrupt line until its deadline and acknowledges it |
-| KK-T12 | the boot | the whole log | the boot line (`abi 1.2`) with the description's process count; every process but `fault` exits 0 (`isolation`'s code counts its failures); the power-off line says the supervisor succeeded |
+| KK-T12 | the boot | the whole log | the boot line (`abi 2.0`) with the description's process count; every process but `fault` exits 0 (`isolation`'s code counts its failures); the power-off line says the supervisor succeeded |
+| KK-T13 | ABI 2.0's own calls | `programs/vm` | `KC1 kernel calls: ok:`: a mapping made read only keeps its bytes and made writable again takes writes; one of a handle without `WRITE` cannot be made writable; a partial `memory_unmap` keeps the first page and the object the rest; a futex wake wakes a sleeping thread, a wait on a changed word is `ShouldWait`, one nothing wakes `TimedOut` at its deadline; `thread_set_fs` takes a lower-half address and refuses a non-canonical one; `random_read` gives bytes that are not all zero and refuses a request past its bound |
+| KK-T14 | another process's memory | `programs/supervisor` | `KC1 remote memory: ok:`: zero pages mapped at a chosen address, written and read across a page boundary, zero where untouched; a second mapping there refused without `FIXED` and replacing with it; an object's pages through a read-only handle readable, not writable, not protectable to writable; writable and executable refused; pages protected to no access unreadable and back again readable; a partial `process_unmap` faults the page gone and keeps the next; protecting over a hole `OutOfRange`; a handle without `WRITE` reads and nothing more |
 
-Coverage: the repository's 90% line gate is for the root workspace; it is not applied here, because the kernel crate runs only under QEMU. What is measured is the host coverage of `moruna-abi`, `moruna-loader`, `moruna-handles`, `moruna-svc` and `moruna-image` (`cargo llvm-cov`), and for the kernel, the boot tests above and SDD 23's, which between them make each of the 30 calls on one, two and four CPUs; SDD 25's DR-T7 makes the five of ABI 1.2, and its driver tests take MSI interrupts that fire.
+Coverage: the repository's 90% line gate is for the root workspace; it is not applied here, because the kernel crate runs only under QEMU. What is measured is the host coverage of `moruna-abi`, `moruna-loader`, `moruna-handles`, `moruna-svc` and `moruna-image` (`cargo llvm-cov`), and for the kernel, the boot tests above and SDD 23's, which between them make each of the 43 calls on one, two and four CPUs; SDD 25's DR-T7 makes the five of ABI 1.2, and its driver tests take MSI interrupts that fire; KK-T13 and KK-T14 make the native calls of ABI 2.0 and SDD 28's LX-T10 to LX-T16 make the forward, `process_launch`, `forward_clone` and every fast call under real programs.
 
 ## l. Implementation notes for the agent
 
@@ -296,9 +338,9 @@ Coverage: the repository's 90% line gate is for the root workspace; it is not ap
 
 ## m. Open items
 
-1. **Partial unmap and protection changes.** `memory_unmap` takes whole mappings; `mprotect`-like changes and unmapping part of a mapping are the Linux personality's needs (KC1).
+1. **A pager.** Zero pages fill on first touch (f.12), but a memory object's pages are all allocated when it is made, so a file mapping is read whole before it is mapped (SDD 27 m.2). A memory object whose pages a server fills on a fault is the next kernel change (SDD 28 m.1).
 
-Resolved by KB2 (SDD 23): more than one CPU (f.11, booted on 2 and 4 CPUs); narrowing a resource (f.10, `resource_narrow`); handle cycles (the cycle rule, f.4). Resolved by KB3 (SDD 25): level-triggered interrupts, by MSI (`interrupt_create_msi`).
+Resolved by KC1 (SDD 28): partial unmap and protection changes (f.5, `memory_protect`, `process_protect`, a partial `memory_unmap`). Resolved by KB2 (SDD 23): more than one CPU (f.11, booted on 2 and 4 CPUs); narrowing a resource (f.10, `resource_narrow`); handle cycles (the cycle rule, f.4). Resolved by KB3 (SDD 25): level-triggered interrupts, by MSI (`interrupt_create_msi`).
 
 ## n. Traceability
 
@@ -315,4 +357,4 @@ Resolved by KB2 (SDD 23): more than one CPU (f.11, booted on 2 and 4 CPUs); narr
 
 ## o. Deferred (post-KB1)
 
-The Linux personality (KC1), the data plane on kernel channels (KD1), the kernel as a node (KE), aarch64. The image filesystem (KC2) is SDD 27; it added no call: the long-lived pin its page cache needs is a pin its driver keeps (SDD 27 m.1, SDD 25 d.3). What it needs of the kernel later is a pager, a memory object whose pages a server fills when a task first touches them (SDD 27 m.2), which is a kernel change of its own.
+The data plane on kernel channels (KD1, whose three calls have the reserved numbers `BASE + 0x100` onward), the kernel as a node (KE), aarch64. The Linux personality is SDD 28. The image filesystem (KC2) is SDD 27; it added no call: the long-lived pin its page cache needs is a pin its driver keeps (SDD 27 m.1, SDD 25 d.3). What it needs of the kernel later is a pager, a memory object whose pages a server fills when a task first touches them (SDD 27 m.2), which is a kernel change of its own.

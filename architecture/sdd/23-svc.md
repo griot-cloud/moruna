@@ -166,7 +166,7 @@ link PROCESS.SLOT[:R,...] PROCESS.SLOT[:R,...]
 expect TEXT                             (before any process: a line of the boot itself)
 ```
 
-`#` begins a comment line. A process's program is the ELF `PROGRAM` (default `NAME`) in the programs directory, placed at `bin/PROGRAM`. `program:PROGRAM` gives a read-only memory object holding that program's image, for a process that starts others. A `link` is a channel named `PROCESS.SLOT` of its first end (or `linkN` when that is not a valid name or is taken), endpoint 0 to the first end, 1 to the second, each with its own rights. `exits CODE` expects `kk: process NAME exited with code CODE (`, `faults TEXT` expects `kk: process NAME faulted: TEXT`. The tool adds the kernel's boot line (`... abi 1.1: started N processes from the manifest`) and power-off line to the expectations.
+`#` begins a comment line. A process's program is the ELF `PROGRAM` (default `NAME`) in the programs directory, placed at `bin/PROGRAM`. `program:PROGRAM` gives a read-only memory object holding that program's image, for a process that starts others. A `link` is a channel named `PROCESS.SLOT` of its first end (or `linkN` when that is not a valid name or is taken), endpoint 0 to the first end, 1 to the second, each with its own rights. `exits CODE` expects `kk: process NAME exited with code CODE (`, `faults TEXT` expects `kk: process NAME faulted: TEXT`. The tool adds the kernel's boot line (`... abi MAJOR.MINOR: started N processes from the manifest`, the ABI it was built against) and power-off line to the expectations.
 
 ## f. Algorithms and policies
 
