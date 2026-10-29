@@ -316,6 +316,11 @@ fn leak(s: String) -> &'static str {
 /// lower layer's link followed by an upper layer's path, a file of mode 0, holes, and
 /// eighty small files of varied lengths.
 pub fn fixture(out: &Path) -> Result<Fixture> {
+    fixture_with(out, 100 << 20)
+}
+
+/// [`fixture`] with a big file of `big` bytes.
+pub fn fixture_with(out: &Path, big: usize) -> Result<Fixture> {
     fs::create_dir_all(out)
         .map_err(|e| crate::Error::io(format!("making {}", out.display()), e))?;
     let mut lower = vec![
@@ -370,7 +375,7 @@ pub fn fixture(out: &Path) -> Result<Fixture> {
         Entry::dir("cold"),
         Entry::File("cold/a.txt", noise(5, 4096), 0o644),
         Entry::dir("data"),
-        Entry::File("data/big.bin", noise(6, 100 << 20), 0o644),
+        Entry::File("data/big.bin", noise(6, big), 0o644),
         Entry::dir("data/small"),
     ];
     for i in 0..80usize {

@@ -498,3 +498,59 @@ fn if_t4_a_corrupted_layer_is_refused() {
     );
     assert!(read(&[scratch.path().join("absent")]).is_err());
 }
+
+/// The CI boot's fixture (with a small big file): the check list it writes is what the
+/// layer files it writes merge to, line for line, and the layer list names both.
+#[test]
+fn if_t13_the_fixture_lists_what_its_layers_hold() {
+    let scratch = Scratch::new("if_t13");
+    let f = crate::testing::fixture_with(scratch.path(), 3 * PAGE + 5).unwrap();
+    let paths: Vec<PathBuf> = f.layers.iter().map(|(p, _)| p.clone()).collect();
+    let merged = read(&paths).unwrap();
+    let text = fs::read_to_string(&f.checks).unwrap();
+    let mut lines = text.lines();
+    let header = lines.next().unwrap();
+    assert_eq!(header, format!("moruna-checks 1 {}", text.len()));
+    let mut listed = 0;
+    for line in lines {
+        let fields: Vec<&str> = line.split(' ').collect();
+        match fields.as_slice() {
+            ["cold", p] | ["big", p] => assert!(merged.contains_key(*p), "{p}"),
+            ["d", mode, p] => {
+                assert_eq!(
+                    merged[*p],
+                    Item::Directory(u32::from_str_radix(mode, 8).unwrap()),
+                    "{p}"
+                );
+                listed += 1;
+            }
+            ["f", mode, size, sha, p] => {
+                let Item::File(m, bytes) = &merged[*p] else {
+                    panic!("{p}")
+                };
+                assert_eq!(*m, u32::from_str_radix(mode, 8).unwrap(), "{p}");
+                assert_eq!(bytes.len(), size.parse::<usize>().unwrap(), "{p}");
+                assert_eq!(Digest::of(bytes).hex(), *sha, "{p}");
+                listed += 1;
+            }
+            ["l", target, p] => {
+                assert_eq!(merged[*p], Item::Symlink(target.as_bytes().to_vec()), "{p}");
+                listed += 1;
+            }
+            other => panic!("a line of the list: {other:?}"),
+        }
+    }
+    assert_eq!(listed, merged.len());
+    let list = fs::read_to_string(&f.list).unwrap();
+    assert_eq!(
+        list,
+        format!(
+            "moruna-layers 1\nlayer block1 {}\nlayer block2 {}\n",
+            f.layers[0].1.hex(),
+            f.layers[1].1.hex()
+        )
+    );
+    for (p, id) in &f.layers {
+        assert_eq!(Digest::of(&fs::read(p).unwrap()), *id);
+    }
+}

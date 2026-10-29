@@ -218,7 +218,7 @@ Host tests run with `cargo test -p moruna-imagefs` in `kernel/` (and in CI's ker
 | IF-T10 | `if_t10_*` | `moruna-imagefs` | a mapping's plan: runs bounded by the largest transfer, a cached page copied, holes, bad ranges |
 | IF-T11 | `if_t11_*` | `moruna-imagefs` | the scratch directory's files and directories, its quota (exact, fixed once used, a refused write changes nothing), a removed open file living until closed |
 | IF-T12 | the cold start | boot: `imagefs-test` | `KC2 cold start: ok:`: `/cold/a.txt` read first from the 101 MiB layer, its bytes the host's, at most 10 pages read (10 measured, f.5) |
-| IF-T13 | the tree | boot: `imagefs-test` | `KC2 tree: ok:`: every entry of the host's list stat'ed as listed, every directory listing the host's names (and `dev`, `proc`, `tmp` at the root), every file read whole with the host's SHA-256, every link's target the host's |
+| IF-T13 | the tree | boot: `imagefs-test`; host: `if_t13_*` in `moruna-image` | on the host, the fixture's check list is what its layer files merge to, line for line, and its layer list names both by id; in the boot, `KC2 tree: ok:`: every entry of the host's list stat'ed as listed, every directory listing the host's names (and `dev`, `proc`, `tmp` at the root), every file read whole with the host's SHA-256, every link's target the host's |
 | IF-T14 | map | boot: `imagefs-test` | `KC2 map: ok:`: every file of at most 1 MiB, and 1 MiB from the middle of the 100 MiB file, mapped hold what `read` gives; the same pages mapped again are the kept mapping, with no page read |
 | IF-T15 | the cache | boot: `imagefs-test` | `KC2 cache: ok:`: a second connection reads a file the first read with no block request and no page read, and at least a hit a page |
 | IF-T16 | scratch and read only | boot: `imagefs-test` | `KC2 scratch: ok:`: `/tmp` refuses the write past a 64 KiB quota with `NoSpace` and keeps its length; another connection does not see the file; opening an image file to write or truncate, making a file or a directory in the image, removing an image file and removing `/tmp` are each `ReadOnly`, and the file reads as before |
@@ -226,7 +226,7 @@ Host tests run with `cargo test -p moruna-imagefs` in `kernel/` (and in CI's ker
 | IF-T18 | `if_t18_*` | `tools/image` | `data:` handles carry a file of the build's data directory once at `data/PATH`; paths that could leave it, and a file that is not there, are refused |
 | IF-T19 | registered buffers | boot: `block-test` | DR-T10's suite (block 1.1) against `block0`: `read_at` into a registered buffer's third page holds what `read` gives; every refusal (not DMA, no `WRITE`, no registration, past the registration, bad count, past the disk, read only, after `unregister`); a sector written from one registration reads back through another; at most 64 registrations |
 
-Coverage on the host (`cargo llvm-cov`, lines): see m.4.
+Coverage on the host (`cargo llvm-cov`, lines): `moruna-imagefs` 98.3%, `moruna-image` 92.4% (m.4).
 
 ## l. Implementation notes for the agent
 
@@ -239,7 +239,7 @@ Coverage on the host (`cargo llvm-cov`, lines): see m.4.
 1. **The kernel call the brief named.** KC2's brief asked for the long-lived registered pin SDD 25 o listed as a kernel call. It needs none: `memory_pin` already makes a pin its holder may keep as long as it likes, and the quarantine already holds a closed pin until its device is done. What was missing was protocol: a client registering a buffer once, and the driver keeping the pin with the connection and moving sectors into any of its pages (block protocol 1.1, f.8). SDD 20's table is unchanged; this item records the choice for review.
 2. **A mapping is filled when it is made.** `map` reads its whole range before it answers, because the kernel has no pager: a page fault in a task ends the task (SDD 20 KK-I10). A mapping that pages in as it is touched needs the kernel to send a fault on a memory object to a server and wait for the page; until then KC1 should map the ranges a task touches (a loader maps segments, not whole files).
 3. **One request at a time.** The server waits for its devices inside a request (g).
-4. **Coverage.** `moruna-imagefs` and the writer are measured with `cargo llvm-cov` in the build container; the figures are in KC2's report.
+4. **Coverage.** Lines, `cargo llvm-cov` on the host: `moruna-imagefs` 98.3%; `moruna-image` 92.4% (`layerfile.rs` 94.9%), its `--lib` tests; the server and the test client are covered by the boot.
 
 ## n. Traceability
 
