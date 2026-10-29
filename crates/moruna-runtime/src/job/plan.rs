@@ -136,3 +136,80 @@ pub fn explain(
     )
     .map_err(ExplainError::Plan)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moruna_job::{Edge, KindDoc, Task};
+
+    fn chain() -> Job {
+        let entry = |kind: &str| KindDoc::new(kind, serde_json::Map::new());
+        Job::new(
+            vec![
+                Task::source("src", entry("parquet")),
+                Task::kernel("k", entry("std")),
+                Task::sink("out", entry("parquet")),
+            ],
+            vec![Edge::between("src", "k"), Edge::between("k", "out")],
+        )
+    }
+
+    fn machine() -> Resources {
+        Resources {
+            workers: 2,
+            memory_start_bytes: 1 << 30,
+            memory_ceiling_bytes: 1 << 30,
+        }
+    }
+
+    /// SDD 26 f.5: the plan's order is every task, step by step; a planning refusal of the job is
+    /// the build's refusal at the field; any other is the plan refused; `explain`'s errors say
+    /// what failed and become the runtime's error by kind.
+    #[test]
+    fn planning_and_its_refusals() {
+        let job = chain();
+        let plan = levels(&job, machine()).expect("planned");
+        assert_eq!(task_order(&job, &plan), [0, 1, 2]);
+        assert!(discovered(&job).expect("discovery").workers >= 1);
+
+        let mut broken = chain();
+        broken.edges.pop();
+        match levels(&broken, machine()) {
+            Err(MorunaError::Config { name: "spec", msg }) => {
+                assert!(msg.starts_with("spec refused: tasks[1]"), "{msg}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            plan_refusal(PlanError::Job(Vec::new())),
+            MorunaError::Plan(_)
+        ));
+        let unknown = PlanError::UnknownPlanner {
+            name: "x".into(),
+            known: vec!["levels".into()],
+        };
+        assert!(matches!(
+            plan_refusal(unknown.clone()),
+            MorunaError::Plan(_)
+        ));
+
+        let kinds = ExplainError::Kinds("a schema outside the subset".into());
+        assert!(kinds.to_string().contains("cannot be checked against"));
+        assert!(matches!(
+            kinds.into_error(),
+            MorunaError::Config { name: "kinds", .. }
+        ));
+        let found = ExplainError::Discovery(MorunaError::Plan("no machine".into()));
+        assert!(found.to_string().starts_with("discovery failed"));
+        assert!(matches!(found.into_error(), MorunaError::Plan(_)));
+        let planned = ExplainError::Plan(unknown);
+        assert!(planned.to_string().contains("no planner `x`"));
+        assert!(matches!(planned.into_error(), MorunaError::Plan(_)));
+
+        let kinds = crate::kinds::Registry::standard();
+        assert!(matches!(
+            explain(&job, Some("nobody"), &kinds),
+            Err(ExplainError::Plan(PlanError::UnknownPlanner { .. }))
+        ));
+    }
+}

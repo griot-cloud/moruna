@@ -540,6 +540,19 @@ mod tests {
     use crate::kinds::{Registry, Standalone};
     use moruna_job::{JobSpec, KindDoc};
 
+    /// The default planner's plan of `job` for a run of four workers and a GiB (SDD 26 f.5).
+    fn planned(job: &moruna_job::Job) -> moruna_plan::Plan {
+        crate::job::plan::levels(
+            job,
+            moruna_plan::Resources {
+                workers: 4,
+                memory_start_bytes: 1 << 30,
+                memory_ceiling_bytes: 1 << 30,
+            },
+        )
+        .expect("planned")
+    }
+
     fn no_env(_: &str) -> Option<String> {
         None
     }
@@ -561,6 +574,7 @@ mod tests {
     fn refusal(job: &JobSpec) -> String {
         match build(
             &moruna_job::Job::from_v1(job),
+            &planned(&moruna_job::Job::from_v1(job)),
             &Registry::standard(),
             opts(),
         ) {
@@ -705,6 +719,7 @@ mod tests {
             .insert("root".into(), json!(format!("file://{root}")));
         let built = build(
             &moruna_job::Job::from_v1(&job),
+            &planned(&moruna_job::Job::from_v1(&job)),
             &Registry::standard(),
             opts(),
         )
@@ -760,6 +775,7 @@ mod tests {
         );
         build(
             &moruna_job::Job::from_v1(&excluding),
+            &planned(&moruna_job::Job::from_v1(&excluding)),
             &Registry::standard(),
             opts(),
         )

@@ -239,6 +239,7 @@ fn child_run() {
     let env = |_: &str| None;
     let outcome = match build(
         &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -685,6 +686,7 @@ fn refusal(
     let env = |_: &str| None;
     build(
         &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         BuildOptions {
             strict: false,
@@ -857,6 +859,7 @@ fn a_programs_bindings_decide_where_a_contract_is() {
         let env = |_: &str| None;
         build(
             &moruna_job::Job::from_v1(&job),
+            &support::planned(&moruna_job::Job::from_v1(&job)),
             kinds,
             BuildOptions {
                 strict: false,
@@ -905,6 +908,7 @@ fn sc_t24_a_query_with_no_rows_finishes() {
     let env = |_: &str| None;
     let built = build(
         &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         BuildOptions {
             strict: true,
