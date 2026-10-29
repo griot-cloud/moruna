@@ -27,14 +27,14 @@ fn at(seq: u64, split: u32) -> (u64, Origin) {
 fn extras(committed: Option<u64>, issued: Vec<(u64, Origin)>) -> CheckpointExtras {
     CheckpointExtras {
         kernel_states: Vec::new(),
-        sink_state: None,
-        committed_seq: committed,
-        source_cursor: SourceCursor {
+        sink_states: vec![None],
+        committed: vec![committed],
+        source_cursors: vec![SourceCursor {
             split_index: 0,
             row_offset: 0,
             next_seq: 10,
-        },
-        issued,
+        }],
+        issued: vec![issued],
     }
 }
 
@@ -89,16 +89,15 @@ fn pl_t25_issued_reads_round_trip() {
 
     let second = common::engine(cfg.clone(), &alloc, &reactor);
     let point = second
-        .restore(&path, &common::plan(), &cfg.fingerprints)
+        .restore(&path, &[common::plan()], &cfg.fingerprints)
         .expect("restore");
-    let back: Vec<u64> = point.to_recompute.iter().map(|(seq, _)| *seq).collect();
+    let back: Vec<u64> = point.to_recompute[0].iter().map(|(seq, _)| *seq).collect();
     assert_eq!(
         back,
         vec![2, 3, 5, 6],
         "the lineage without a disk copy, then the issued reads it did not hold, once each"
     );
-    let origin_of_5 = point
-        .to_recompute
+    let origin_of_5 = point.to_recompute[0]
         .iter()
         .find(|(seq, _)| *seq == 5)
         .map(|(_, origin)| origin.clone())
@@ -113,22 +112,8 @@ fn pl_t25_issued_reads_round_trip() {
         (expected.split, expected.row_start, expected.row_end),
         "with the origin the scheduler gave"
     );
-    let extras_back: Vec<u64> = point.extras.issued.iter().map(|(seq, _)| *seq).collect();
+    let extras_back: Vec<u64> = point.extras.issued[0].iter().map(|(seq, _)| *seq).collect();
     assert_eq!(extras_back, vec![3, 5, 6]);
-
-    // A manifest written before F8.4 has no `issued` key and restores as it always did.
-    let mut old: serde_json::Value = raw.clone();
-    if let Some(map) = old.as_object_mut() {
-        map.remove("issued");
-    }
-    std::fs::write(&path, serde_json::to_string(&old).expect("json")).expect("rewrite");
-    let third = common::engine(cfg.clone(), &alloc, &reactor);
-    let point = third
-        .restore(&path, &common::plan(), &cfg.fingerprints)
-        .expect("an old manifest restores");
-    assert!(point.extras.issued.is_empty());
-    let back: Vec<u64> = point.to_recompute.iter().map(|(seq, _)| *seq).collect();
-    assert_eq!(back, vec![2, 3]);
 }
 
 /// PL-T26: a morsel committed after the scheduler read the watermark it hands `checkpoint` is
@@ -149,7 +134,7 @@ fn pl_t26_committed_since_the_watermark_is_kept() {
             .expect("pop_blocking")
             .expect("a morsel");
     }
-    engine.set_committed(4);
+    engine.set_committed(0, 4);
     assert_eq!(
         engine.detailed_stats().lineage_len,
         1,
@@ -177,9 +162,9 @@ fn pl_t26_committed_since_the_watermark_is_kept() {
     );
     let second = common::engine(cfg.clone(), &alloc, &reactor);
     let point = second
-        .restore(&path, &common::plan(), &cfg.fingerprints)
+        .restore(&path, &[common::plan()], &cfg.fingerprints)
         .expect("restore");
-    let back: Vec<u64> = point.to_recompute.iter().map(|(seq, _)| *seq).collect();
+    let back: Vec<u64> = point.to_recompute[0].iter().map(|(seq, _)| *seq).collect();
     assert!(
         back.starts_with(&[2, 3, 4]),
         "the morsels the sink state does not hold come back: {back:?}"
@@ -216,7 +201,7 @@ fn pl_t26_without_checkpoints_committed_lineage_goes_at_once() {
             .push(0, common::table_morsel(&alloc, seq, 0, 16))
             .expect("push");
     }
-    engine.set_committed(1);
+    engine.set_committed(0, 1);
     assert_eq!(engine.detailed_stats().lineage_len, 1);
     drop(scratch);
 }
@@ -238,7 +223,7 @@ fn find_resumable_manifest_picks_the_newest_that_matches() {
         cfg.run_id = moruna_kernel::RunId([run; 16]);
         cfg.fingerprints = vec![Fingerprint::compute("test", fingerprint)];
         if !digest_plan {
-            cfg.plan_digest = [9; 32];
+            cfg.plan_digests = vec![[9; 32]];
         }
         if let (Some(spec), serde_json::Value::Object(map)) = (spec, &mut cfg.config) {
             map.insert("spec.digest".into(), serde_json::Value::String(spec.into()));
@@ -253,7 +238,7 @@ fn find_resumable_manifest_picks_the_newest_that_matches() {
     let fingerprints = vec![Fingerprint::compute("test", b"1")];
     let want = ManifestMatch {
         fingerprints: &fingerprints,
-        plan_digest: Some(plan_digest(&common::plan())),
+        plan_digests: Some(vec![plan_digest(&common::plan())]),
         spec_digest: None,
     };
     assert_eq!(
@@ -287,7 +272,7 @@ fn find_resumable_manifest_picks_the_newest_that_matches() {
     // Without a plan digest to compare (a source not yet built), a newer manifest of another
     // plan is taken, and restore is left to refuse it by name.
     let loose = ManifestMatch {
-        plan_digest: None,
+        plan_digests: None,
         spec_digest: Some("sha256:a"),
         ..want.clone()
     };
@@ -313,7 +298,7 @@ fn find_resumable_manifest_picks_the_newest_that_matches() {
     let elsewhere = write(7, b"1", true, Some("sha256:a"));
     edit(&elsewhere, "hostname", serde_json::json!("another-host"));
     let future = write(8, b"1", true, Some("sha256:a"));
-    edit(&future, "version", serde_json::json!(2));
+    edit(&future, "version", serde_json::json!(9));
     let garbage = staging.join(format!("moruna-{}", "f".repeat(32)));
     std::fs::create_dir_all(&garbage).expect("dir");
     std::fs::write(garbage.join("manifest.json"), "not json").expect("write");

@@ -48,14 +48,16 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     crate::model::refresh_envelopes(state);
     tracing::warn!(target: "ctl.device_oom", stage, seq = r.seq, device, "device out of memory");
     actions.knobs.push(Knob::MorselTarget { stage, bytes });
-    // The input queue of the failing stage is the one holding promoted device bytes.
-    let input = stage.saturating_sub(1);
-    actions.knobs.push(Knob::HighWater {
-        stage: input,
-        tier: TierKind::Device,
-        bytes: 0,
-    });
-    state.high_water_override = Some((input, 0));
+    // The input queues of the failing stage are the ones holding promoted device bytes.
+    let inputs = state.topology.inputs(stage).to_vec();
+    for &input in &inputs {
+        actions.knobs.push(Knob::HighWater {
+            stage: input,
+            tier: TierKind::Device,
+            bytes: 0,
+        });
+    }
+    state.high_water_override = inputs.first().map(|&input| (input, 0));
     state.note(format!("device OOM retry on stage {stage}"));
 }
 

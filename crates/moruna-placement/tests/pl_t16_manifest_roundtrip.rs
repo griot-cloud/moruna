@@ -17,14 +17,14 @@ use std::sync::Arc;
 fn extras() -> CheckpointExtras {
     CheckpointExtras {
         kernel_states: vec![(1, 0, vec![1, 2, 3])],
-        sink_state: Some(vec![9, 9]),
-        committed_seq: Some(2),
-        source_cursor: SourceCursor {
+        sink_states: vec![Some(vec![9, 9])],
+        committed: vec![Some(2)],
+        source_cursors: vec![SourceCursor {
             split_index: 0,
             row_offset: 40,
             next_seq: 12,
-        },
-        issued: Vec::new(),
+        }],
+        issued: vec![Vec::new()],
     }
 }
 
@@ -65,7 +65,7 @@ fn drive(
             .expect("a morsel");
     }
     common::settle(&reactor);
-    engine.set_committed(2);
+    engine.set_committed(0, 2);
     (engine, alloc, reactor, cfg)
 }
 
@@ -91,13 +91,13 @@ fn pl_t16_manifest_matches_e5_and_restores() {
         "hostname",
         "nodes",
         "durable_staging",
-        "plan_digest",
+        "plan_digests",
         "kernels",
         "resume_policy",
-        "stages",
-        "committed_seq",
-        "source_cursor",
-        "sink_state",
+        "queues",
+        "committed",
+        "source_cursors",
+        "sink_states",
         "kernel_states",
         "lineage",
         "segments",
@@ -106,11 +106,11 @@ fn pl_t16_manifest_matches_e5_and_restores() {
         assert!(raw.get(key).is_some(), "the manifest has no {key} (e.5)");
     }
     let manifest: Manifest = serde_json::from_str(&text).expect("the e.5 shape");
-    assert_eq!(manifest.version, 1);
+    assert_eq!(manifest.version, 2);
     assert_eq!(manifest.run_id, RunId([7; 16]).to_hex());
     assert_eq!(manifest.nodes, vec![0]);
-    assert_eq!(manifest.committed_seq, Some(2));
-    assert_eq!(manifest.source_cursor.next_seq, 12);
+    assert_eq!(manifest.committed[0], Some(2));
+    assert_eq!(manifest.source_cursors[0].next_seq, 12);
     assert_eq!(manifest.resume_policy, vec!["reinit".to_string()]);
     assert_eq!(
         manifest.hostname,
@@ -153,7 +153,7 @@ fn pl_t16_manifest_matches_e5_and_restores() {
     let alloc = FakeAllocator::new();
     let second = common::engine(cfg.clone(), &alloc, &reactor);
     let point = second
-        .restore(&path, &common::plan(), &cfg.fingerprints)
+        .restore(&path, &[common::plan()], &cfg.fingerprints)
         .expect("restore");
     let restored: Vec<(u64, State)> = second.entry_states(0);
     // Every entry the manifest records with a disk copy comes back `OnDisk` (f.13); an
@@ -191,13 +191,13 @@ fn pl_t16_manifest_matches_e5_and_restores() {
         .filter(|row| row.disk.is_none())
         .map(|row| row.seq)
         .collect();
-    let listed: Vec<u64> = point.to_recompute.iter().map(|(seq, _)| *seq).collect();
+    let listed: Vec<u64> = point.to_recompute[0].iter().map(|(seq, _)| *seq).collect();
     assert_eq!(
         listed, expected,
         "the rest is listed for recomputation (f.13)"
     );
-    assert_eq!(point.extras.source_cursor.next_seq, 12);
-    assert_eq!(point.extras.sink_state, Some(vec![9, 9]));
+    assert_eq!(point.extras.source_cursors[0].next_seq, 12);
+    assert_eq!(point.extras.sink_states[0], Some(vec![9, 9]));
     assert_eq!(
         point.extras.kernel_states,
         vec![(1u16, 0usize, vec![1, 2, 3])]
@@ -218,7 +218,7 @@ fn pl_t16_manifest_matches_e5_and_restores() {
                 .unwrap_or(0),
         "the counter continues above every restored number"
     );
-    assert_eq!(detail.committed_seq, Some(2));
+    assert_eq!(detail.committed, vec![Some(2)]);
 
     // And the restored queue drains in order.
     second.close(0);
@@ -252,7 +252,7 @@ fn refuse(
         common::budgets(1 << 30, 0, 1 << 30),
     );
     let engine = common::engine(cfg.clone(), &alloc, &reactor);
-    match engine.restore(&edited, &common::plan(), &cfg.fingerprints) {
+    match engine.restore(&edited, &[common::plan()], &cfg.fingerprints) {
         Ok(_) => panic!("the manifest should have been refused"),
         Err(MorunaError::Resume(message)) => message,
         Err(other) => panic!("expected Resume, got {other}"),
@@ -265,14 +265,14 @@ fn pl_t16_every_refusal_is_named() {
     let (engine, _alloc, _reactor, _cfg) = drive(&scratch);
     let path = engine.checkpoint(&extras()).expect("checkpoint");
 
-    let message = refuse(&scratch, &path, |raw| raw["version"] = serde_json::json!(2));
+    let message = refuse(&scratch, &path, |raw| raw["version"] = serde_json::json!(9));
     assert!(message.contains("version"), "{message}");
     let message = refuse(&scratch, &path, |raw| {
         raw["run_id"] = serde_json::json!("0".repeat(32))
     });
     assert!(message.contains("run id"), "{message}");
     let message = refuse(&scratch, &path, |raw| {
-        raw["plan_digest"] = serde_json::json!("f".repeat(64))
+        raw["plan_digests"] = serde_json::json!(["f".repeat(64)])
     });
     assert!(message.contains("plan digest"), "{message}");
     let message = refuse(&scratch, &path, |raw| {
@@ -323,7 +323,7 @@ fn pl_t16_every_refusal_is_named() {
     );
     let engine = common::engine(cfg.clone(), &alloc, &reactor);
     let error = engine
-        .restore(&path, &different, &cfg.fingerprints)
+        .restore(&path, &[different], &cfg.fingerprints)
         .expect_err("a different plan is refused");
     assert!(error.to_string().contains("plan digest"), "{error}");
 
@@ -345,20 +345,21 @@ fn pl_t16_find_manifest_takes_the_newest() {
     for (dir, written, id) in [(&older, 10u64, "aa"), (&newer, 20u64, "bb")] {
         std::fs::create_dir_all(dir).expect("dir");
         let manifest = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "run_id": id.repeat(16),
             "written_ns": written,
             "node": 0,
             "hostname": "here",
             "nodes": [0],
             "durable_staging": false,
-            "plan_digest": "00",
+            "plan_digests": ["00"],
             "kernels": [],
             "resume_policy": [],
-            "stages": 1,
-            "committed_seq": null,
-            "source_cursor": { "split_index": 0, "row_offset": 0, "next_seq": 0 },
-            "sink_state": null,
+            "queues": 1,
+            "committed": [null],
+            "source_cursors": [{ "split_index": 0, "row_offset": 0, "next_seq": 0 }],
+            "issued": [],
+            "sink_states": [null],
             "kernel_states": [],
             "lineage": [],
             "segments": [],
@@ -437,7 +438,7 @@ fn pl_t16_the_manifest_names_every_policy_and_both_payload_kinds() {
         manifest.durable_staging,
         "the platform's guarantee is recorded"
     );
-    assert_eq!(manifest.committed_seq, None, "nothing is committed yet");
+    assert_eq!(manifest.committed[0], None, "nothing is committed yet");
     let kinds: Vec<&str> = manifest
         .lineage
         .iter()

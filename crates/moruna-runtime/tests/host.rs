@@ -141,7 +141,10 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(from_file["exit"]["code"], 0);
     assert_eq!(from_file["run_id"], RUN_ID);
     let job = JobSpec::from_value(doc.clone()).expect("the document");
-    assert_eq!(from_file["spec_digest"], moruna_runtime::job::digest(&job));
+    assert_eq!(
+        from_file["spec_digest"],
+        moruna_runtime::job::digest(&moruna_job::Job::from_v1(&job))
+    );
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
 
     // The same run through the library's own construction.
@@ -250,7 +253,7 @@ fn ho_t6_heartbeat_cadence_and_report_delivery() {
     let mut doc = document(scratch.path(), 16_000, 8, Some("sleep"));
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let digest = JobSpec::from_value(doc.clone()).expect("doc");
-    let digest = moruna_runtime::job::digest(&digest);
+    let digest = moruna_runtime::job::digest(&moruna_job::Job::from_v1(&digest));
     let path = write_doc(scratch.path(), &doc);
 
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
@@ -774,7 +777,7 @@ fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     assert_eq!(start.len(), 32);
     let mut last_t = 0;
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e["v"], 4, "{e}");
+        assert_eq!(e["v"], 5, "{e}");
         assert_eq!(e["attempt"], attempt, "{e}");
         assert_eq!(e["start"], start.as_str(), "{e}");
         assert_eq!(e["seq"], i as u64 + 1, "{e}");
@@ -843,7 +846,7 @@ fn ho_t16_a_real_run_tells_its_task_lifecycle() {
         vec![("orders", 0), ("double", 1), ("refined", 2)]
     );
     assert_eq!(registered[1]["members"], json!(["clean", "double"]));
-    assert_eq!(registered[1]["upstream"], "orders");
+    assert_eq!(registered[1]["upstream"], json!(["orders"]));
     for task in ["orders", "double", "refined"] {
         let registered = first(&events, task, "task_registered").unwrap();
         let waiting = first(&events, task, "task_waiting").unwrap();
@@ -1020,7 +1023,7 @@ fn ho_t20_fused_kernels_are_one_group() {
     assert_eq!(registered[1]["task"], "rename");
     assert_eq!(registered[1]["members"], json!(["rename", "keep"]));
     assert_eq!(registered[2]["task"], "write");
-    assert_eq!(registered[2]["upstream"], "rename");
+    assert_eq!(registered[2]["upstream"], json!(["rename"]));
     assert!(events.iter().all(|e| e["task"] != "keep"));
     let group = ended(&events, "rename");
     assert_eq!(group["outcome"], "succeeded");

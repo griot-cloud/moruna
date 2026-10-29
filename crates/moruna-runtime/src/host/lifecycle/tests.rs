@@ -5,15 +5,23 @@ use moruna_kernel::{MorunaError, StageCounters, StageEvent};
 use serde_json::{Value, json};
 
 use super::*;
-use moruna_job::TaskRefDoc;
+use moruna_job::{Edge, Job, KindDoc, Task};
 
-fn refs(ids: &[&str]) -> Vec<TaskRefDoc> {
-    ids.iter()
-        .map(|id| TaskRefDoc {
-            id: id.to_string(),
-            members: Vec::new(),
+/// The plan of a linear chain of tasks named `ids`: the first the source, the last the sink.
+fn refs(ids: &[&str]) -> Plan {
+    let entry = || KindDoc::new("any", serde_json::Map::new());
+    let last = ids.len() - 1;
+    let tasks = ids
+        .iter()
+        .enumerate()
+        .map(|(at, id)| match at {
+            0 => Task::source(*id, entry()),
+            at if at == last => Task::sink(*id, entry()),
+            _ => Task::kernel(*id, entry()),
         })
-        .collect()
+        .collect();
+    let edges = ids.windows(2).map(|w| Edge::between(w[0], w[1])).collect();
+    Plan::of(&Job::new(tasks, edges), None)
 }
 
 /// A lifecycle whose events are kept, as the wire would write them (kind and fields).
@@ -70,12 +78,12 @@ fn counters(rows: u64) -> StageCounters {
 fn a_completed_run_tells_each_task_once_in_order() {
     let (lc, told) = lifecycle(&["src", "k1", "out"]);
     lc.begin(false);
-    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::SourceReading { source: 0 });
     lc.on(&StageEvent::Fed { queue: 0 });
     lc.on(&StageEvent::StageStarted { stage: 1 });
     lc.on(&StageEvent::Fed { queue: 1 });
     lc.on(&StageEvent::Running);
-    lc.on(&StageEvent::SinkWriting);
+    lc.on(&StageEvent::SinkWriting { sink: 0 });
     lc.on(&StageEvent::QueueClosed {
         queue: 0,
         counters: counters(10),
@@ -84,8 +92,9 @@ fn a_completed_run_tells_each_task_once_in_order() {
         queue: 1,
         counters: counters(10),
     });
-    lc.on(&StageEvent::SinkCommitting);
+    lc.on(&StageEvent::SinkCommitting { sink: 0 });
     lc.on(&StageEvent::SinkFinished {
+        sink: 0,
         counters: counters(10),
     });
     lc.end(Ending::Completed);
@@ -121,10 +130,10 @@ fn a_completed_run_tells_each_task_once_in_order() {
         .filter(|e| e["kind"] == "task_registered")
         .collect();
     assert_eq!(registered[0]["element"], "source");
-    assert_eq!(registered[0]["upstream"], Value::Null);
+    assert_eq!(registered[0]["upstream"], json!([]));
     assert_eq!(registered[1]["element"], "kernel");
     assert_eq!(registered[1]["stage"], 1);
-    assert_eq!(registered[1]["upstream"], "src");
+    assert_eq!(registered[1]["upstream"], json!(["src"]));
     assert_eq!(registered[2]["element"], "sink");
     assert_eq!(registered[2]["stage"], 2);
     let waits = told
@@ -161,8 +170,9 @@ fn empty_input_completes_what_never_had_input() {
         queue: 1,
         counters: StageCounters::default(),
     });
-    lc.on(&StageEvent::SinkCommitting);
+    lc.on(&StageEvent::SinkCommitting { sink: 0 });
     lc.on(&StageEvent::SinkFinished {
+        sink: 0,
         counters: StageCounters::default(),
     });
     lc.end(Ending::Completed);
@@ -196,7 +206,7 @@ fn a_kernel_failure_fails_its_task_and_ends_the_others_by_it() {
     let (lc, told) = lifecycle(&["src", "k1", "k2", "out"]);
     lc.begin(false);
     lc.on(&StageEvent::Running);
-    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::SourceReading { source: 0 });
     lc.on(&StageEvent::Fed { queue: 0 });
     lc.on(&StageEvent::StageStarted { stage: 1 });
     lc.end(Ending::Failed(&MorunaError::Kernel {
@@ -289,7 +299,7 @@ fn a_cancel_is_acknowledged_then_ends_every_task() {
     let (lc, told) = lifecycle(&["src", "k1", "out"]);
     lc.begin(false);
     lc.on(&StageEvent::Running);
-    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::SourceReading { source: 0 });
     lc.cancel_acknowledged();
     lc.cancel_acknowledged();
     lc.end(Ending::Cancelled);
@@ -318,7 +328,7 @@ fn a_crash_fails_what_runs_and_is_never_a_cancel() {
     let (lc, told) = lifecycle(&["src", "k1", "k2", "out"]);
     lc.begin(false);
     lc.on(&StageEvent::Running);
-    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::SourceReading { source: 0 });
     lc.on(&StageEvent::StageStarted { stage: 1 });
     lc.on(&StageEvent::QueueClosed {
         queue: 0,
@@ -373,8 +383,9 @@ fn a_cancel_the_run_outran_says_so() {
         queue: 0,
         counters: StageCounters::default(),
     });
-    lc.on(&StageEvent::SinkCommitting);
+    lc.on(&StageEvent::SinkCommitting { sink: 0 });
     lc.on(&StageEvent::SinkFinished {
+        sink: 0,
         counters: StageCounters::default(),
     });
     lc.cancel_acknowledged();
@@ -396,7 +407,7 @@ fn an_ended_task_stays_ended() {
         counters: StageCounters::default(),
     });
     let before = told.lock().unwrap().len();
-    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::SourceReading { source: 0 });
     lc.on(&StageEvent::QueueClosed {
         queue: 0,
         counters: StageCounters::default(),
@@ -410,7 +421,7 @@ fn a_group_is_registered_with_its_members() {
     let told: Arc<Mutex<Vec<Value>>> = Arc::default();
     let kept = told.clone();
     let mut tasks = refs(&["src", "out"]);
-    tasks[0].members = vec!["orders".into(), "customers".into()];
+    tasks.nodes[0].task.members = vec!["orders".into(), "customers".into()];
     let lc = Lifecycle::new(
         tasks,
         Instant::now(),
@@ -432,11 +443,11 @@ fn a_group_is_registered_with_its_members() {
 fn a_start_that_outruns_its_feed_is_told_ready_first() {
     let (lc, told) = lifecycle(&["src", "k1", "out"]);
     lc.begin(false);
-    lc.on(&StageEvent::SourceReading);
+    lc.on(&StageEvent::SourceReading { source: 0 });
     lc.on(&StageEvent::Running);
     lc.on(&StageEvent::StageStarted { stage: 1 });
     lc.on(&StageEvent::Fed { queue: 0 });
-    lc.on(&StageEvent::SinkWriting);
+    lc.on(&StageEvent::SinkWriting { sink: 0 });
     lc.on(&StageEvent::Fed { queue: 1 });
     lc.on(&StageEvent::Fed { queue: 1 });
     assert_eq!(
@@ -463,7 +474,7 @@ fn a_sink_that_starts_at_its_commit_is_ready_first() {
         queue: 0,
         counters: StageCounters::default(),
     });
-    lc.on(&StageEvent::SinkCommitting);
+    lc.on(&StageEvent::SinkCommitting { sink: 0 });
     assert_eq!(
         &said(&told)[5..],
         &[

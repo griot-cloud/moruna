@@ -235,7 +235,7 @@ pub fn run(
     let built = map(
         py,
         moruna_runtime::job::build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
             &kinds,
             BuildOptions {
                 strict: false,

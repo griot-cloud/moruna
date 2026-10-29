@@ -78,8 +78,11 @@ pub struct PlacementDetail {
     pub disk_budget_effective: u64,
     /// Uncommitted morsels the engine is tracking (PL-I11).
     pub lineage_len: u64,
-    /// The committed watermark.
-    pub committed_seq: Option<Seq>,
+    /// Each sink's watermark, sink 0 first.
+    pub committed: Vec<Option<Seq>>,
+    /// Each source's watermark: the highest number it read that every sink it reaches has
+    /// committed (f.11, d.16).
+    pub source_committed: Vec<Option<Seq>>,
     /// Manifests written since `new`.
     pub manifests_written: u64,
     /// How long the last manifest write took.
@@ -109,6 +112,9 @@ pub fn stats(engine: &PlacementEngine) -> PlacementStats {
     PlacementStats {
         queues,
         in_flight_bytes: engine.in_flight_bytes.load(Ordering::Acquire),
+        shared_by_tier: std::array::from_fn(|slot| {
+            engine.shared_bytes[slot].load(Ordering::Acquire)
+        }),
     }
 }
 
@@ -162,7 +168,8 @@ pub fn detailed(engine: &PlacementEngine) -> PlacementDetail {
         disk_bytes: engine.disk_bytes.load(Ordering::Acquire),
         disk_budget_effective: engine.disk_budget.load(Ordering::Acquire),
         lineage_len,
-        committed_seq: engine.committed_seq(),
+        committed: engine.sink_watermarks(),
+        source_committed: engine.source_watermarks(),
         manifests_written: engine.manifests_written.load(Ordering::Relaxed),
         last_manifest_us: engine.last_manifest_us.load(Ordering::Relaxed),
         host_tier: engine.host_tier,

@@ -9,8 +9,40 @@ use serde_json::{Value, json};
 
 use moruna_job::*;
 
-use super::build::{self, BuildOptions, env_reliance};
+use super::build::BuildOptions;
 use super::*;
+
+/// The build of a version 1 document, which is the build of the DAG with one path it reads as
+/// (SDD 22 e.4): what every version 1 test here goes through.
+mod v1 {
+    use moruna_job::{Job, JobSpec};
+
+    use crate::job::build::{self, BuildOptions, Built};
+    use crate::kinds::Registry;
+
+    pub fn build(
+        job: &JobSpec,
+        kinds: &Registry,
+        opts: BuildOptions<'_>,
+    ) -> moruna_kernel::Result<Built> {
+        build::build(&Job::from_v1(job), kinds, opts)
+    }
+
+    pub fn env_reliance(
+        job: &JobSpec,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<(&'static str, &'static str)> {
+        build::env_reliance(&Job::from_v1(job), env)
+    }
+
+    pub fn digest(job: &JobSpec) -> String {
+        crate::job::digest(&Job::from_v1(job))
+    }
+
+    pub fn resume_shape(job: &JobSpec) -> Option<crate::job::translate::ResumeArg> {
+        build::resume_shape(&Job::from_v1(job))
+    }
+}
 use crate::kinds::{
     Context, Entry, Registry, RunnableKind, SinkKind, SourceKind, Stage, check_pin,
 };
@@ -245,9 +277,9 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
     let mut job = minimal("/out");
     job.source = doc(json!({"kind": "python"}));
     job.sink = doc(json!({"kind": "python"}));
-    assert!(build::build(&job, &library, opts(false, &no_env)).is_ok());
+    assert!(v1::build(&job, &library, opts(false, &no_env)).is_ok());
     // A strict build admits them: a caller's object is not code imported by path.
-    assert!(build::build(&job, &library, opts(true, &no_env)).is_ok());
+    assert!(v1::build(&job, &library, opts(true, &no_env)).is_ok());
     // Only the library can: the standard registry refuses both kinds by name.
     assert_refused_by(&job, &Registry::standard(), "source.kind");
     job.source = minimal("/out").source;
@@ -260,7 +292,7 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
 #[test]
 fn ho_t2_spec_digest() {
     let job = JobSpec::from_json(FULL).expect("parses");
-    let address = digest(&job);
+    let address = v1::digest(&job);
     assert!(
         address.starts_with("sha256:") && address.len() == 7 + 64,
         "{address}"
@@ -272,25 +304,25 @@ fn ho_t2_spec_digest() {
                     "sink":{"kind":"parquet","url":"/out"}}"#;
     let a = JobSpec::from_json(reordered).expect("a");
     let b = JobSpec::from_json(plain).expect("b");
-    assert_eq!(digest(&a), digest(&b));
+    assert_eq!(v1::digest(&a), v1::digest(&b));
 
     let mut resumed = b.clone();
     resumed.resume = Some("auto".into());
     resumed.report.file = Some("/elsewhere.json".into());
     assert_eq!(
-        digest(&resumed),
-        digest(&b),
+        v1::digest(&resumed),
+        v1::digest(&b),
         "resume and report are not the job"
     );
 
     let mut changed = b.clone();
     changed.ordered = true;
-    assert_ne!(digest(&changed), digest(&b));
+    assert_ne!(v1::digest(&changed), v1::digest(&b));
     let mut hinted = job.clone();
     hinted.kernels[0]
         .settings
         .insert("expected_amplification".into(), json!(2.0));
-    assert_ne!(digest(&hinted), address);
+    assert_ne!(v1::digest(&hinted), address);
 }
 
 /// HO-T3 spec_refusals: a refusal names the field it was refused for. The document's own
@@ -375,13 +407,13 @@ fn ho_t4_strict_refusal_texts() {
         _ => None,
     };
     assert_eq!(
-        env_reliance(&job, &env),
+        v1::env_reliance(&job, &env),
         vec![
             ("budget.memory_bytes", "MORUNA_BUDGET"),
             ("staging.dir", "MORUNA_SPILL_DIR")
         ]
     );
-    let Err(error) = build::build(&job, &Registry::standard(), opts(true, &env)) else {
+    let Err(error) = v1::build(&job, &Registry::standard(), opts(true, &env)) else {
         panic!("strict refuses");
     };
     assert_eq!(
@@ -397,12 +429,12 @@ fn ho_t4_strict_refusal_texts() {
     let mut explicit = job.clone();
     explicit.budget.memory_bytes = Some(1 << 30);
     explicit.staging.dir = Some("/tmp".into());
-    assert!(env_reliance(&explicit, &env).is_empty());
+    assert!(v1::env_reliance(&explicit, &env).is_empty());
 
     // Every variable, one at a time.
     for (field, var) in build::ENV_FIELDS {
         let one = |name: &str| (name == var).then(|| "x".to_string());
-        assert_eq!(env_reliance(&job, &one), vec![(field, var)], "{var}");
+        assert_eq!(v1::env_reliance(&job, &one), vec![(field, var)], "{var}");
     }
     // A complete host profile leaves nothing to MORUNA_HOST_PROFILE; a partial one does.
     let profile_env =
@@ -412,7 +444,7 @@ fn ho_t4_strict_refusal_texts() {
         gds: Some(GuaranteeDoc::Absent),
         ..HostProfileDoc::default()
     });
-    assert_eq!(env_reliance(&partial, &profile_env).len(), 1);
+    assert_eq!(v1::env_reliance(&partial, &profile_env).len(), 1);
     let all = Some(GuaranteeDoc::Absent);
     partial.host_profile = Some(HostProfileDoc {
         huge_pages: all,
@@ -424,10 +456,10 @@ fn ho_t4_strict_refusal_texts() {
         durable_staging: all,
         staging_dir: None,
     });
-    assert!(env_reliance(&partial, &profile_env).is_empty());
+    assert!(v1::env_reliance(&partial, &profile_env).is_empty());
 
     // Not strict: built, with a note per field.
-    let built = build::build(&job, &Registry::standard(), opts(false, &env)).expect("lenient");
+    let built = v1::build(&job, &Registry::standard(), opts(false, &env)).expect("lenient");
     assert_eq!(
         built.spec.notes,
         vec![
@@ -460,13 +492,13 @@ fn ho_t9_build_translates_every_field() {
     job.host_profile = None;
     // Not strict: the document names a Python kernel by import path, which strict mode refuses
     // (16 PK-I8, KD-T7 below); with no environment the two modes build the same spec otherwise.
-    let built = build::build(&job, &kinds(), opts(false, &no_env)).expect("builds");
+    let built = v1::build(&job, &kinds(), opts(false, &no_env)).expect("builds");
     let spec = &built.spec;
     assert_eq!(
         built.run_id.map(|r| r.to_hex()).as_deref(),
         job.run_id.as_deref()
     );
-    assert_eq!(built.digest, digest(&job));
+    assert_eq!(built.digest, v1::digest(&job));
     assert_eq!(spec.spec_digest.as_deref(), Some(built.digest.as_str()));
     assert_eq!(spec.kernels.len(), 1);
     assert_eq!(spec.budget, Some(1 << 30));
@@ -510,7 +542,7 @@ fn ho_t9_build_translates_every_field() {
         staging_dir: Some("/staging".into()),
         ..HostProfileDoc::default()
     });
-    let built = build::build(&declared, &kinds(), opts(false, &no_env)).expect("declared");
+    let built = v1::build(&declared, &kinds(), opts(false, &no_env)).expect("declared");
     let profile = built.spec.host_profile.expect("profile");
     assert_eq!(profile.gds, Guarantee::Absent);
     assert_eq!(profile.staging_dir, Some("/staging".into()));
@@ -524,11 +556,11 @@ fn ho_t9_build_translates_every_field() {
     assert_refused(&declared, "host_profile.staging_dir");
     let mut only_profile = minimal("/out");
     only_profile.host_profile = Some(HostProfileDoc::default());
-    assert!(build::build(&only_profile, &Registry::standard(), opts(false, &no_env)).is_ok());
+    assert!(v1::build(&only_profile, &Registry::standard(), opts(false, &no_env)).is_ok());
 }
 
 fn assert_refused_by(job: &JobSpec, kinds: &Registry, field: &str) {
-    match build::build(job, kinds, opts(false, &no_env)) {
+    match v1::build(job, kinds, opts(false, &no_env)) {
         Err(MorunaError::Config { name: "spec", msg }) => {
             assert!(
                 msg.starts_with(&format!("spec refused: {field}: ")),
@@ -565,7 +597,7 @@ fn build_refusals() {
     job.kernels[0]
         .settings
         .insert("fingerprint".into(), json!(format!("blake3:{good}")));
-    assert!(build::build(&job, &kinds(), opts(false, &no_env)).is_ok());
+    assert!(v1::build(&job, &kinds(), opts(false, &no_env)).is_ok());
 
     let source = |value: Value| {
         let mut job = minimal("/out");
@@ -596,7 +628,7 @@ fn build_refusals() {
         "source.options.filters[3]",
     );
     assert!(
-        build::build(
+        v1::build(
             &source(json!({"kind": "parquet", "url": "/in",
                            "options": {"filters": [["a", "=", "x"], ["b", ">", -3]]}})),
             &kinds(),
@@ -625,14 +657,14 @@ fn build_refusals() {
     // The sink equals source rule is the library's: a `Plan` error (12 f.3, PY-T14).
     let same = minimal("file:///data/in");
     assert!(matches!(
-        build::build(&same, &Registry::standard(), opts(false, &no_env)),
+        v1::build(&same, &Registry::standard(), opts(false, &no_env)),
         Err(MorunaError::Plan(_))
     ));
     // A trace path whose directory does not exist is the library's `trace.path` refusal.
     let mut job = minimal("/out");
     job.trace = Some("/no-such-moruna-dir/t.arrow".into());
     assert!(matches!(
-        build::build(&job, &Registry::standard(), opts(false, &no_env)),
+        v1::build(&job, &Registry::standard(), opts(false, &no_env)),
         Err(MorunaError::Config {
             name: "trace.path",
             ..
@@ -642,16 +674,16 @@ fn build_refusals() {
     let mut job = minimal("/out");
     job.resume = Some("auto".into());
     assert!(matches!(
-        build::build(&job, &Registry::standard(), opts(false, &no_env)),
+        v1::build(&job, &Registry::standard(), opts(false, &no_env)),
         Err(MorunaError::Resume(_))
     ));
-    assert_eq!(build::resume_shape(&job), Some(translate::ResumeArg::Auto));
+    assert_eq!(v1::resume_shape(&job), Some(translate::ResumeArg::Auto));
     // With a staging directory, "auto" is left to the facade, which picks this job's newest
     // manifest after discovery or starts fresh (MH 4.7).
     let staging = std::env::temp_dir().join(format!("moruna-job-auto-{}", std::process::id()));
     std::fs::create_dir_all(&staging).expect("staging");
     job.staging.dir = Some(staging.display().to_string());
-    let built = build::build(&job, &Registry::standard(), opts(false, &no_env)).expect("auto");
+    let built = v1::build(&job, &Registry::standard(), opts(false, &no_env)).expect("auto");
     assert!(built.spec.resume_auto);
     assert!(built.spec.resume.is_none());
     let _ = std::fs::remove_dir_all(&staging);
@@ -680,7 +712,7 @@ fn vortex_kinds_parse_and_build() {
         JobSpec::from_json(&canonical).expect("the canonical form reads back"),
         job
     );
-    let built = build::build(&job, &Registry::standard(), opts(false, &no_env)).expect("vortex");
+    let built = v1::build(&job, &Registry::standard(), opts(false, &no_env)).expect("vortex");
     assert_eq!(
         built.spec.notes,
         vec!["clamped sink.file_bytes from 1048576 to 67108864".to_string()]
@@ -723,7 +755,7 @@ fn si_t31_ipc_sink_compression_setting() {
         json!({"compression": "lz4"}),
         json!({"file_bytes": 268435456, "compression": "lz4"}),
     ] {
-        build::build(&sink(options.clone()), &kinds, opts(false, &no_env))
+        v1::build(&sink(options.clone()), &kinds, opts(false, &no_env))
             .unwrap_or_else(|e| panic!("{options}: {e}"));
     }
     for options in [
@@ -744,7 +776,7 @@ fn every_sink_kind_builds() {
     let mut job = minimal("/out");
     job.sink = doc(json!({"kind": "parquet", "url": "/out", "options": {
         "row_group_bytes": 1048576, "file_bytes": 1048576, "compression": "none"}}));
-    let built = build::build(&job, &kinds, opts(false, &no_env)).expect("parquet");
+    let built = v1::build(&job, &kinds, opts(false, &no_env)).expect("parquet");
     assert_eq!(
         built.spec.notes,
         vec![
@@ -754,9 +786,9 @@ fn every_sink_kind_builds() {
     );
     job.sink = doc(json!({"kind": "tensor", "url": "file:///out", "options": {
         "format": "safetensors", "one_file_per_morsel": true, "name": "t"}}));
-    assert!(build::build(&job, &kinds, opts(false, &no_env)).is_ok());
+    assert!(v1::build(&job, &kinds, opts(false, &no_env)).is_ok());
     job.sink = doc(json!({"kind": "arrow_ipc", "url": "/out", "options": {}}));
-    assert!(build::build(&job, &kinds, opts(false, &no_env)).is_ok());
+    assert!(v1::build(&job, &kinds, opts(false, &no_env)).is_ok());
     job.source = doc(
         json!({"kind": "tensor", "url": ["file:///in/w.safetensors"],
                             "options": {"tensors": ["w"]}}),
@@ -775,7 +807,7 @@ fn every_sink_kind_builds() {
     };
     store.s3 = Some(S3Doc::default());
     job.object_store = store;
-    let built = build::build(&job, &kinds, opts(false, &no_env)).expect("tensor source");
+    let built = v1::build(&job, &kinds, opts(false, &no_env)).expect("tensor source");
     assert!(built.spec.object_store.gcs.is_some() && built.spec.object_store.azure.is_some());
 
     use crate::kinds::{parquet, tensor};
@@ -816,13 +848,13 @@ fn std_kernels_in_a_document() {
     let text = job.to_json_pretty();
     assert!(text.contains("\"kind\": \"std\""), "{text}");
     assert_eq!(JobSpec::from_json(&text).expect("parses"), job);
-    let built = build::build(&job, &kinds(), opts(false, &no_env)).expect("builds");
+    let built = v1::build(&job, &kinds(), opts(false, &no_env)).expect("builds");
     assert_eq!(
         built.spec.kernels.len(),
         3,
         "cast and select fuse into one stage"
     );
-    assert_eq!(built.stage_kernels, vec![vec![0, 1], vec![2], vec![3]]);
+    assert_eq!(built.parts.stages, vec![vec![1, 2], vec![3], vec![4]]);
     assert!(built.spec.kernels[0].declared().is_checkable());
 
     let pinned = moruna_kernels::StdKernel::new("drop", &json!({"columns": ["a"]}))
@@ -832,7 +864,7 @@ fn std_kernels_in_a_document() {
     job.kernels[3]
         .settings
         .insert("fingerprint".into(), json!(format!("sha256:{pinned}")));
-    assert!(build::build(&job, &kinds(), opts(false, &no_env)).is_ok());
+    assert!(v1::build(&job, &kinds(), opts(false, &no_env)).is_ok());
     job.kernels[3]
         .settings
         .insert("fingerprint".into(), json!("sha256:00"));
@@ -851,7 +883,7 @@ fn std_kernels_in_a_document() {
 #[test]
 fn kd_t7_strict_refuses_imported() {
     let job = JobSpec::from_json(FULL).expect("parses");
-    let e = build::build(&job, &kinds(), opts(true, &no_env))
+    let e = v1::build(&job, &kinds(), opts(true, &no_env))
         .err()
         .expect("strict refuses a python kernel");
     let text = e.to_string();
@@ -862,7 +894,7 @@ fn kd_t7_strict_refuses_imported() {
         ),
         "{text}"
     );
-    build::build(&job, &kinds(), opts(false, &no_env)).expect("not strict: built");
+    v1::build(&job, &kinds(), opts(false, &no_env)).expect("not strict: built");
 }
 
 /// KD-T8 contracts_need_a_kind (KD-I8): contracts carried by a document none of whose kinds
@@ -876,7 +908,7 @@ fn kd_t8_contracts_need_a_kind() {
         functions: Vec::new(),
         audiences: Vec::new(),
     });
-    let e = build::build(&job, &Registry::standard(), opts(false, &no_env))
+    let e = v1::build(&job, &Registry::standard(), opts(false, &no_env))
         .err()
         .expect("refused");
     assert!(
@@ -927,7 +959,7 @@ fn kd_t9_v1_documents_resolve() {
         );
         let again = JobSpec::from_json(&job.canonical_json()).expect("reads back");
         assert_eq!(again, job);
-        build::build(&job, &kinds, opts(false, &no_env)).expect("resolves and builds");
+        v1::build(&job, &kinds, opts(false, &no_env)).expect("resolves and builds");
     }
     let rust = v1(
         json!({"kind": "parquet", "url": "/in"}),
@@ -935,7 +967,7 @@ fn kd_t9_v1_documents_resolve() {
         json!({"kind": "parquet", "url": "/out"}),
     );
     for strict in [false, true] {
-        let e = build::build(&rust, &Registry::standard(), opts(strict, &no_env))
+        let e = v1::build(&rust, &Registry::standard(), opts(strict, &no_env))
             .err()
             .expect("rust is refused");
         assert!(
@@ -953,7 +985,7 @@ fn kd_t9_v1_documents_resolve() {
         json!({"kind": "parquet", "url": "/out"}),
     );
     // Resolved, and refused only because the file is not there.
-    let e = build::build(&package, &kinds, opts(true, &no_env))
+    let e = v1::build(&package, &kinds, opts(true, &no_env))
         .err()
         .expect("no such file");
     assert!(e.to_string().contains("/nowhere/k.wasm"), "{e}");
@@ -970,7 +1002,7 @@ fn pk_t12_package_entry_fields() {
                                    "fingerprint": format!("sha256:{}", "0".repeat(64))}));
         edit(&mut entry.settings);
         job.kernels = vec![entry];
-        let e = build::build(&job, &kinds(), opts(false, &no_env))
+        let e = v1::build(&job, &kinds(), opts(false, &no_env))
             .err()
             .expect("refused")
             .to_string();
@@ -1013,7 +1045,7 @@ fn pk_t12_package_entry_fields() {
     let mut job = JobSpec::from_json(FULL).expect("parses");
     job.kernels = vec![doc(json!({"kind": "package", "path": "/nowhere/k.wasm",
                                   "fingerprint": format!("sha256:{}", "0".repeat(64))}))];
-    let e = build::build(&job, &kinds(), opts(false, &no_env))
+    let e = v1::build(&job, &kinds(), opts(false, &no_env))
         .err()
         .expect("no such file");
     assert!(e.to_string().contains("/nowhere/k.wasm"), "{e}");
@@ -1047,8 +1079,8 @@ fn report_tasks_name_the_chain_and_are_not_the_job() {
     let plain = JobSpec::from_json(FULL).expect("the example");
     assert_eq!(plain.report.attempt(), 1);
     assert_eq!(
-        digest(&named),
-        digest(&plain),
+        v1::digest(&named),
+        v1::digest(&plain),
         "tasks and attempt are not the job"
     );
     let round = JobSpec::from_json(&named.canonical_json()).expect("round trip");

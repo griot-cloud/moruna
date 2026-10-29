@@ -1,7 +1,7 @@
 # Moruna SDD 09: Placement engine (`moruna-placement`)
 
 **Document type:** software design document, component 9 of 12, the load-bearing component
-**Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (a DAG's queues: PL-I16, PL-I17, f.17, manifest version 2, PL-T27, PL-T28) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/moruna-runtime-design.md` sections 5.6, 5.6a; decisions D5, D10, D11 (preconditions); criteria S10, S14, S15; global invariants G-I1, G-I2, G-I3
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.10 (`Placement`, `TierBudgets`, `QueueStats`, `PlacementStats`, `CheckpointExtras`, `ResumePoint`), d.2 (`Tier`, `TierKind`, `SegmentRef`), d.3 (`Buffer`, `BufferView`, `Allocator`), d.9 (`Reactor`, `Completion::then`, `CopySrc`, `CopyDst`), e.1 (tier transitions), e.7 (`moruna_kernel::ipc`)
 **Component location:** `crates/moruna-placement`, Rust; features `cuda`, `gds`
@@ -80,6 +80,10 @@ The engine is also the seam for the multi-node extension (architecture section 1
 **PL-I13. Resume is by lineage, never by replication.** The engine never writes a morsel to disk for the sake of recovery; the manifest records what is on disk because pressure put it there, and lists the rest for recomputation. Upholds CT-I12, S17. Rationale: the normal path pays nothing for the ability to resume.
 
 **PL-I14. The engine has no thread and never blocks a caller on IO.** Every reactor operation is issued from the thread that called `push`, `pop`, `replace`, a setter or `restore`, and returns at once (RE-I6); its outcome is observed through `Completion::then`, whose callback runs on the reactor thread that resolved it (contracts d.9). The engine never calls `Completion::wait`, never spawns a thread, and the only blocking call it offers is `pop_blocking`, which parks on a queue's unparker (CT-I7). Rationale: preamble 4.1; a placement thread would be a third party in every lock order.
+
+**PL-I16. A fanned-out batch is resident once and counted once (KA5, 2026-10-29).** `push_to(stages, morsel)` puts one entry in each queue, every entry holding a share of the one payload (contracts d.16, CT-I15). Each queue counts the bytes in its own figure (its water marks and `is_full` see what it holds), and the engine's `shared_bytes` holds what the queues count beyond the one residency, so `resident_of` (the tier's total, PL-I3) is exact: `Σ queue bytes − shared`. An entry leaves its fan-out's group when its share leaves the tier (popped, demoted, evicted, moved to another tier); while another entry still holds a share the bytes stay resident and the share falls from `shared`; the last to leave takes the bytes. `PlacementStats::shared_by_tier` reports it, and the trace's queue totals subtract it.
+
+**PL-I17. Lineage is by source morsel, at every position (KA5).** A lineage record is keyed by its root, the source and the number it read the morsel as (`Topology::root`), and holds a position for every queue a morsel derived from it is in, or was taken from by a consumer that has not produced from it yet. A push removes the position the morsel was taken from (`Topology::parent`) and adds one at each queue, in one step under the lineage lock, so a manifest sees the morsel before or after the move and never half way. A record is released when every sink its source reaches has committed what every path makes of it (f.11). In a chain a record has one position, which moves from queue to queue: the chain's lineage exactly.
 
 **PL-I15. Segment files are touched only through the reactor, and a descriptor never outlives its file.** The engine writes and reads segment bytes through `write_file`, `read_file` and `copy`, names each segment to the reactor with `register_segment` before its first write, and calls `unregister_segment` before `unlink`, so the reactor's cached descriptor is closed and the space returns to the filesystem at unlink (RE-I8). The manifest is the one file the engine writes itself, with `std::fs` (f.12), because it is small and needs `fsync` and `rename` on the calling thread.
 
@@ -251,30 +255,31 @@ Demotion target: one tier down from the current (`Device → host tier`, `host t
 
 ### e.5 Run manifest
 
-`staging_dir/moruna-<run_id>/manifest.json`, UTF-8 JSON, one object, written by f.12 and read by f.13. Version 1:
+`staging_dir/moruna-<run_id>/manifest.json`, UTF-8 JSON, one object, written by f.12 and read by f.13. Version 2 (KA5, 2026-10-29; version 1, the chain's, is refused by its version, and differs in naming one source, one sink and one position per morsel):
 
 | Key | Type | Meaning |
 |---|---|---|
-| `version` | integer | 1; an unknown version is refused, not skipped |
+| `version` | integer | 2; an unknown version is refused, not skipped |
 | `run_id` | string | 32 hex characters |
 | `written_ns` | integer | wall clock at the write, nanoseconds since the epoch |
 | `node` | integer | `NodeId` of the writer; `nodes` below lists every node of the run |
 | `hostname` | string | the writer's hostname from the OS (`hostname` crate); in v1 the only way to tell "same node" from "another node" (f.13) |
 | `nodes` | array of integer | `[0]` in v1 |
 | `durable_staging` | boolean | from `PlacementConfig`; a resume on a different node checks this and refuses with `Resume` when false, because the segments it references are on the dead node's local disk |
-| `plan_digest` | string | BLAKE3 hex over the source plan: for each split in order, `id` and `rows` as little-endian u64s (`uncompressed_bytes` is excluded because it may be an estimate that varies between plans); `PlacementConfig::plan_digest`, computed by the facade with the same rule, which `restore` recomputes from the `plan` it is given |
+| `plan_digests` | array of string | per source, BLAKE3 hex over its plan: for each split in order, `id` and `rows` as little-endian u64s (`uncompressed_bytes` is excluded because it may be an estimate that varies between plans); `PlacementConfig::plan_digests`, computed by the facade with the same rule, which `restore` recomputes from the `plans` it is given |
 | `kernels` | array of string | kernel fingerprints per stage 1..n, hex; `PlacementConfig::fingerprints` |
 | `resume_policy` | array of string | `reinit`, `checkpoint` or `forbid` per stage; `PlacementConfig::resume_policy` |
-| `stages` | integer | number of queues |
-| `committed_seq` | integer or null | the watermark at the write |
-| `source_cursor` | object `{split_index, row_offset, next_seq}` | from `CheckpointExtras` |
-| `sink_state` | string or null | base64 of `Sink::checkpoint` |
+| `queues` | integer | number of queues; `restore` refuses a manifest of another number of queues, sources or sinks |
+| `committed` | array of integer or null | each sink's watermark at the write |
+| `source_cursors` | array of `{split_index, row_offset, next_seq}` | each source's, from `CheckpointExtras` |
+| `issued` | array of `{source, seq, split, row_start, row_end, node}` | reads issued behind a cursor that had not reached their source's queues |
+| `sink_states` | array of string or null | each sink's `Sink::checkpoint`, base64 |
 | `kernel_states` | array of `{stage, instance, state}` | base64 of `KernelState::checkpoint`, `Checkpoint` kernels only |
-| `lineage` | array of `{seq, split, row_start, row_end, node, stage, kind, bytes, disk}` | one per uncommitted morsel, ascending `seq`; `disk` is `{segment, offset, len}` or null; `kind` is `table` or `tensor` |
+| `lineage` | array of `{source, root, seq, split, row_start, row_end, node, stage, kind, bytes, disk}` | one per position of each source morsel some sink has not committed (PL-I17), by source and root; `stage` is the queue and `seq` the morsel's number on it; `disk` is `{segment, offset, len}` or null; `kind` is `table` or `tensor` |
 | `segments` | array of `{stage, segment, bytes}` | every segment file the lineage references; `bytes` is the bytes written so far (`bytes_written`), which `restore` checks against the file (f.13) |
 | `config` | object | `PlacementConfig::config`, the resolved configuration table (preamble section 5) at the write, for the report and for refusing a resume with a different `staging.segment_bytes` or `page.bytes` |
 
-The manifest is small by construction: `lineage` holds only morsels between the committed watermark and the source cursor, which the queue budgets bound (a 32 GiB budget of 64 MiB morsels is about 500 entries, under 100 KiB of JSON). It is written to `manifest.json.tmp` and renamed (PL-I12). A run that ends normally leaves a final manifest with `committed_seq == next_seq − 1` and an empty `lineage`; `Runtime::run` deletes the run directory after `finish` unless `checkpoint.keep` is set (preamble section 5).
+The manifest is small by construction: `lineage` holds only morsels between the committed watermark and the source cursor, which the queue budgets bound (a 32 GiB budget of 64 MiB morsels is about 500 entries, under 100 KiB of JSON). It is written to `manifest.json.tmp` and renamed (PL-I12). A run that ends normally leaves a final manifest whose watermarks are each sink's last number and an empty `lineage`; `Runtime::run` deletes the run directory after `finish` unless `checkpoint.keep` is set (preamble section 5).
 
 ## f. Algorithms and policies
 
@@ -312,6 +317,8 @@ The manifest is small by construction: `lineage` holds only morsels between the 
 **f.14 `is_full(stage)`.** True when any of: the queue's `head_error` is set; the target tier's `bytes[target] > high[target]` and no demotion candidate exists, where "no candidate" means every entry outside the window either has a move in flight or cannot be demoted (staging off and not recomputable, or the disk bound of f.2 step 4 reached and not recomputable); the queue is closed. Otherwise false, including when the queue is above high water but demotion is making room (the scheduler's SC-I3 reads `is_full(0)` and the controller's `HighWater` knob sets the marks; a queue above high water with demotions in flight is not full, it is draining). Evaluated under the queue lock from the last `plan`'s outcome, which records whether it found a candidate; O(1).
 
 **f.15 `shutdown()`.** Set `shutting_down`; under each queue lock, mark every `Promoting` and `Demoting` entry as its source state (a promotion in flight stays where its bytes were; a demotion in flight stays resident), release every reservation as if the move had failed (f.9) and drop the moves map's entries; set every queue closed and unpark every waiter (so `pop_blocking` returns `Err(Cancelled)`, PL-I10 covers `close`, this is the cancellation exit of preamble 4.3); do not unlink segments (a manifest may reference them; the facade removes the run directory when the run ended normally, e.5). Late completions arriving after `shutdown` find no move id and return without touching a queue. Idempotent. The reactor's own `shutdown` (RE-I7) is the facade's to call, after this.
+
+**f.17 A DAG's queues (KA5, 2026-10-29).** `PlacementConfig::topology` (contracts d.16) replaces the number of queues: one queue per edge, a queue a source gives being recomputable (staging off by default, b) and every other staged. `push_to(stages, morsel)` with one queue is `push`; with several it checks every queue first (a closed one refuses the whole push, so nothing is pushed anywhere), then puts an entry holding a share of the payload in each, counted into each queue and joined to one group (PL-I16), then records the lineage at every queue in one step (PL-I17). `set_committed(sink, w)` records sink `sink`'s watermark and, for each source, computes the highest number `R` such that every path from it to every sink it reaches maps every number at or below `R` to one that sink has committed (`Affine::floor_inverse`, the least over the paths); the source's records at or below `R` are committed as f.11 commits a chain's (kept, marked, until a manifest no longer needs them when checkpointing is on). A chain's `R` is its sink's watermark. **Restore (f.13 for a DAG).** Rows are grouped by root, and roots a source's `R` covers are dropped. A root whose every position has a disk copy comes back at each of them, `OnDisk`; any other is listed in `to_recompute` for its source, and its disk copies are not restored (their records count as released, so the segment is reclaimed). The scheduler re-reads a listed root and replays it into every queue its source gives; a sink that had committed what it becomes there drops it (10 f.16), so every sink gets each morsel once. In a chain a root has one position, so this is the chain's rule exactly.
 
 **f.16 `evicted` and `replace`.** `evicted(stage)`: under the queue lock, the `(seq, origin)` of every `Evicted` entry in position order. `replace(stage, morsel)`: under the queue lock, find the `Evicted` entry with `morsel.seq` (else `Staging("replace: no evicted entry")`), set it `Resident(morsel.payload.tier())` with the new bytes in its original position, add bytes to the tier counter, `evictions_replaced += 1`; unlock; update the lineage record (stage, no disk); unpark; `plan`.
 
@@ -356,6 +363,10 @@ Unit tests use the testkit's `FakeReactor` (contracts d.15: `with_latency(Durati
 **PL-T4 fifo.** 10,000 entries with random demotion pressure; pops are in push order. PL-I5.
 
 **PL-T5 q0_evicts.** Staging off: Q0 pressure produces `Evicted` entries and no segment writes (`ops()` has no `write_file`); `evicted()` lists them oldest first; `replace` restores order and the replaced entry pops in its original position; `set_staging(0, true)` then makes the same pressure write instead. PL-I6, f.16.
+
+**PL-T27 fan_out_is_counted_once** (`tests/pl_t27_dag_queues.rs`, KA5). A batch pushed into two queues is counted in each queue's figure and once in the tier's (`shared_by_tier` is the second count); a pop leaves it resident once, in the other queue; both consumers are handed the same bytes; a fan-out into a closed queue pushes nothing anywhere; an empty fan-out and a batch in no tier of the run are refused; the contract's default `push_to` pushes a share into each. PL-I16, f.17.
+
+**PL-T28 lineage_by_root.** Four source morsels fanned out to two queues are four records; one taken through both stages to both sinks' queues moves; sink 0's commit alone releases nothing and both sinks' release it (`source_committed`); the manifest has a row per position by root; a restore brings back at each position a morsel whose every position is on disk and lists for its source one with a position off disk; a manifest of another shape is refused naming the queues. PL-I17, f.17, e.5.
 
 **PL-T25 a_zero_disk_budget_has_no_disk_tier.** With `disk_budget = 0` and `staging_enabled` on for a non-recomputable queue under sustained pressure, no `Demote { to: Disk }` is ever planned and no `Staging` error reaches a `pop`; the queue reports `is_full` and the run stalls on admission instead. PL-I7, f.2.
 

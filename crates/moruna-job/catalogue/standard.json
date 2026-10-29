@@ -531,7 +531,8 @@
               "mask",
               "explode",
               "concat_str",
-              "date_trunc"
+              "date_trunc",
+              "union"
             ]
           },
           "args": {

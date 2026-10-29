@@ -504,7 +504,7 @@ fn po_t6_the_document_refuses_ports_it_cannot_serve() {
             Err(refused) => return refused.to_string(),
         };
         match build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
             &embedding(),
             BuildOptions {
                 strict: true,

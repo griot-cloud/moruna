@@ -145,25 +145,34 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
             kernel_states.push((entry.stage, instance, bytes));
         }
     }
-    // The watermark is read before the sink's state, so the state holds at least every file
+    // Each watermark is read before its sink's state, so the state holds at least every file
     // at or below it: a file the sink commits in between is in the state and above the
     // watermark, which resume deletes and recomputes. Read the other way round, a file
     // committed in between was in neither, and its morsels were lost (MH 4.7, H5).
-    let committed_seq = shared
-        .committed
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .reached;
-    let sink_state = {
-        let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
-        sink.checkpoint()?
-    };
-    let (source_cursor, issued) = crate::source_drive::cursor(shared);
+    let mut committed = Vec::with_capacity(shared.sinks.len());
+    let mut sink_states = Vec::with_capacity(shared.sinks.len());
+    for end in &shared.sinks {
+        committed.push(
+            end.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reached,
+        );
+        let sink = end.sink.read().unwrap_or_else(|e| e.into_inner());
+        sink_states.push(sink.checkpoint()?);
+    }
+    let mut source_cursors = Vec::with_capacity(shared.sources.len());
+    let mut issued = Vec::with_capacity(shared.sources.len());
+    for end in &shared.sources {
+        let (cursor, reads) = crate::source_drive::cursor(end);
+        source_cursors.push(cursor);
+        issued.push(reads);
+    }
     let extras = CheckpointExtras {
         kernel_states,
-        sink_state,
-        committed_seq,
-        source_cursor,
+        sink_states,
+        committed: committed.clone(),
+        source_cursors: source_cursors.clone(),
         issued,
     };
     // Nothing of this component is locked here, which is what preamble 4.2 requires.
@@ -185,9 +194,8 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
         .unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
     tracing::debug!(
         target: "sched.checkpoint",
-        committed_seq = committed_seq.unwrap_or_default(),
-        split_index = source_cursor.split_index,
-        row_offset = source_cursor.row_offset,
+        committed = ?committed,
+        cursors = ?source_cursors,
         duration_us = took,
         "manifest written"
     );

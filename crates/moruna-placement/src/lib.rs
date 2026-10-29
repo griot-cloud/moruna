@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use moruna_kernel::{
     Allocator, CheckpointExtras, DeviceId, Fingerprint, Locality, Morsel, MorunaError, NodeId,
     PayloadKind, PayloadSpec, Placement, PlacementStats, Reactor, ResumePoint, ResumePolicy, RunId,
-    Seq, Split, StageId, StagingCodec, TIER_COUNT, Tier, TierBudgets, TierKind, TierPref,
+    Seq, Split, StageId, StagingCodec, TIER_COUNT, Tier, TierBudgets, TierKind, TierPref, Topology,
 };
 
 pub mod lineage;
@@ -88,8 +88,10 @@ pub struct PlacementConfig {
     pub run_id: RunId,
     /// `LOCAL_NODE` in v1.
     pub node: NodeId,
-    /// Number of queues: kernels plus one (Q0 .. Qn).
-    pub stages: u16,
+    /// The shape of the run (contracts d.16): its queues, one per edge of its DAG, which
+    /// sources give to which, and the paths to its sinks. A linear chain of `n` kernels is
+    /// `Topology::chain(n)`, with queues Q0 to Qn.
+    pub topology: Topology,
     /// Initial tier budgets; the controller updates them.
     pub budgets: TierBudgets,
     /// `None` means no disk tier and no manifest.
@@ -108,8 +110,8 @@ pub struct PlacementConfig {
     pub gds: bool,
     /// `devices[0]` is the promotion target for `Device` consumers (b).
     pub devices: Vec<DeviceId>,
-    /// BLAKE3 over the source plan (e.5), computed by the facade.
-    pub plan_digest: [u8; 32],
+    /// BLAKE3 over each source's plan (e.5), source 0 first, computed by the facade.
+    pub plan_digests: Vec<[u8; 32]>,
     /// Kernel fingerprints per stage 1..n.
     pub fingerprints: Vec<Fingerprint>,
     /// Resume policy per stage 1..n.
@@ -125,7 +127,7 @@ impl Default for PlacementConfig {
         PlacementConfig {
             run_id: RunId([0; 16]),
             node: moruna_kernel::LOCAL_NODE,
-            stages: 1,
+            topology: Topology::chain(0),
             budgets: TierBudgets::default(),
             staging_dir: None,
             durable_staging: false,
@@ -135,7 +137,7 @@ impl Default for PlacementConfig {
             page_bytes: 4096,
             gds: false,
             devices: Vec::new(),
-            plan_digest: [0; 32],
+            plan_digests: vec![[0; 32]],
             fingerprints: Vec::new(),
             resume_policy: Vec::new(),
             config: serde_json::Value::Null,
@@ -165,8 +167,14 @@ pub struct PlacementEngine {
     /// Serialises opening a segment so two demotions never create two files for one queue.
     pub(crate) roll: Mutex<()>,
     pub(crate) moves: Mutex<HashMap<u64, MoveInFlight>>,
-    pub(crate) lineage: Mutex<BTreeMap<Seq, Lineage>>,
-    pub(crate) committed: AtomicU64,
+    pub(crate) lineage: Mutex<BTreeMap<lineage::Root, Lineage>>,
+    /// Each sink's watermark (f.11), `NO_COMMIT` until it commits.
+    pub(crate) sink_watermarks: Vec<AtomicU64>,
+    /// Each source's watermark as the last commit computed it from the sinks' (f.11, d.16).
+    pub(crate) source_watermarks: Vec<AtomicU64>,
+    /// Per tier, the bytes counted in more than one queue: what a fanned-out batch is counted
+    /// over its one residency (d.16, f.9).
+    pub(crate) shared_bytes: [AtomicU64; TIER_COUNT],
     pub(crate) manifest_refs: Mutex<HashSet<u32>>,
     pub(crate) shutting_down: AtomicBool,
     pub(crate) restored: AtomicBool,
@@ -184,12 +192,6 @@ impl PlacementEngine {
         alloc: Arc<dyn Allocator>,
         reactor: Arc<dyn Reactor>,
     ) -> moruna_kernel::Result<Arc<PlacementEngine>> {
-        if cfg.stages == 0 {
-            return Err(MorunaError::Config {
-                name: "stages",
-                msg: "a run has at least one queue".into(),
-            });
-        }
         if cfg.page_bytes == 0 {
             return Err(MorunaError::Config {
                 name: "page.bytes",
@@ -219,12 +221,18 @@ impl PlacementEngine {
             }
             None => None,
         };
-        let stages = usize::from(cfg.stages);
+        let stages = usize::from(cfg.topology.queue_count());
         let page_bytes = cfg.page_bytes as u64;
         let disk_budget = cfg.disk_budget;
         let queues: Vec<Mutex<Queue>> = (0..stages)
-            .map(|stage| Mutex::new(Queue::new(stage as StageId, host_tier)))
+            .map(|stage| {
+                let stage = stage as StageId;
+                let recomputable = cfg.topology.source_of(stage).is_some();
+                Mutex::new(Queue::new(stage, host_tier, recomputable))
+            })
             .collect();
+        let sinks = usize::from(cfg.topology.sinks());
+        let sources = usize::from(cfg.topology.sources());
         let counters: Vec<QueueCounters> = (0..stages).map(|_| QueueCounters::default()).collect();
         let budgets = RwLock::new(cfg.budgets.clone());
         Ok(Arc::new_cyclic(|this| PlacementEngine {
@@ -246,7 +254,9 @@ impl PlacementEngine {
             roll: Mutex::new(()),
             moves: Mutex::new(HashMap::new()),
             lineage: Mutex::new(BTreeMap::new()),
-            committed: AtomicU64::new(NO_COMMIT),
+            sink_watermarks: (0..sinks).map(|_| AtomicU64::new(NO_COMMIT)).collect(),
+            source_watermarks: (0..sources).map(|_| AtomicU64::new(NO_COMMIT)).collect(),
+            shared_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
             manifest_refs: Mutex::new(HashSet::new()),
             shutting_down: AtomicBool::new(false),
             restored: AtomicBool::new(false),
@@ -329,12 +339,14 @@ impl PlacementEngine {
         }
     }
 
-    /// Resident bytes in one tier slot, summed over queues (f.9).
+    /// Resident bytes in one tier slot, summed over queues, a fanned-out batch once (f.9, d.16).
     pub(crate) fn resident_of(&self, slot: usize) -> u64 {
-        self.counters
+        let counted: u64 = self
+            .counters
             .iter()
             .map(|c| c.bytes[slot].load(Ordering::Relaxed))
-            .sum()
+            .sum();
+        counted.saturating_sub(self.shared_bytes[slot].load(Ordering::Relaxed))
     }
 
     /// Claim `bytes` against a destination tier's budget for a move in flight (PL-I3, f.9).
@@ -380,14 +392,6 @@ impl PlacementEngine {
         self.shutting_down.load(Ordering::Acquire)
     }
 
-    /// The committed watermark, or `None` when nothing has been committed (e.2).
-    pub(crate) fn committed_seq(&self) -> Option<Seq> {
-        match self.committed.load(Ordering::Acquire) {
-            NO_COMMIT => None,
-            seq => Some(seq),
-        }
-    }
-
     fn check_stage(&self, stage: StageId) -> moruna_kernel::Result<usize> {
         let index = usize::from(stage);
         if index >= self.queues.len() {
@@ -404,6 +408,19 @@ impl Placement for PlacementEngine {
     fn push(&self, stage: StageId, morsel: Morsel) -> moruna_kernel::Result<()> {
         let index = self.check_stage(stage)?;
         self.push_entry(index, morsel, false)
+    }
+
+    fn push_to(&self, stages: &[StageId], morsel: Morsel) -> moruna_kernel::Result<()> {
+        for stage in stages {
+            self.check_stage(*stage)?;
+        }
+        match stages {
+            [] => Err(MorunaError::Plan(
+                "a morsel is pushed into at least one queue".into(),
+            )),
+            [one] => self.push_entry(usize::from(*one), morsel, false),
+            many => self.push_shared(many, morsel),
+        }
     }
 
     fn pop(
@@ -449,8 +466,8 @@ impl Placement for PlacementEngine {
         self.shutdown_engine();
     }
 
-    fn set_committed(&self, seq: Seq) {
-        self.commit_to(seq);
+    fn set_committed(&self, sink: u16, seq: Seq) {
+        self.commit_to(sink, seq);
     }
 
     fn checkpoint(&self, extras: &CheckpointExtras) -> moruna_kernel::Result<PathBuf> {
@@ -460,10 +477,10 @@ impl Placement for PlacementEngine {
     fn restore(
         &self,
         manifest: &Path,
-        plan: &[Split],
+        plans: &[Vec<Split>],
         fingerprints: &[Fingerprint],
     ) -> moruna_kernel::Result<ResumePoint> {
-        self.restore_from(manifest, plan, fingerprints)
+        self.restore_from(manifest, plans, fingerprints)
     }
 
     fn is_full(&self, stage: StageId) -> bool {

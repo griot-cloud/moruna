@@ -1,14 +1,14 @@
-//! The digest of a job document (MH 4.1): `sha256` of the canonical form of what the job is
-//! ([`moruna_job::JobSpec::identity_json`]). The canonical form is `moruna-job`'s; the hash is
+//! The digest of a job document (MH 4.1, SDD 22 e.4): `sha256` of the canonical form of what the
+//! job is ([`moruna_job::Job::identity_json`]). The canonical form is `moruna-job`'s; the hash is
 //! here, so a crate that only reads and checks documents carries no hash.
 
 use sha2::{Digest, Sha256};
 
-use moruna_job::JobSpec;
+use moruna_job::Job;
 
 /// The content address of `job` (MH 4.1): `sha256:` and the hex digest of its identity, the
 /// canonical form with `resume` and `report` removed.
-pub fn digest(job: &JobSpec) -> String {
+pub fn digest(job: &Job) -> String {
     sha256_hex(job.identity_json().as_bytes())
 }
 

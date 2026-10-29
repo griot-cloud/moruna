@@ -54,7 +54,8 @@ impl ExitStatus {
     }
 }
 
-/// The `spec` message for a spec file's JSON.
+/// The `spec` message for a job document: a version 1 document's JSON, or a version 2
+/// document's FlatBuffers as a base64 string (SDD 22 e.4).
 pub fn spec_message(spec: &serde_json::Value) -> Vec<u8> {
     let mut line = serde_json::json!({"type": "spec", "spec": spec})
         .to_string()
@@ -63,10 +64,18 @@ pub fn spec_message(spec: &serde_json::Value) -> Vec<u8> {
     line
 }
 
-/// Read and parse the spec file.
+/// Read the job document: version 2's FlatBuffers (the identifier `MJB2` at bytes 4 to 8) as
+/// the base64 string the `spec` message carries them in, otherwise version 1's JSON. The guest
+/// reads either; this side only carries it.
 pub fn read_spec(path: &Path) -> Result<serde_json::Value> {
     let bytes = std::fs::read(path)
         .map_err(|e| VmmError::config("spec", format!("{}: {e}", path.display())))?;
+    if bytes.get(4..8) == Some(b"MJB2".as_slice()) {
+        use base64::Engine as _;
+        return Ok(serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+        ));
+    }
     serde_json::from_slice(&bytes)
         .map_err(|e| VmmError::config("spec", format!("{} is not JSON: {e}", path.display())))
 }

@@ -12,7 +12,7 @@ use moruna_discovery::{
 };
 use moruna_kernel::{
     Allocator, CancelToken, Kernel, Knobs, MorunaError, ObjectMetadata, Placement, Prober, Reactor,
-    RunId, Sampler, SourceSchema, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
+    RunId, Sampler, Sink, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
 };
 use moruna_placement::{PlacementConfig, PlacementEngine, manifest::plan_digest};
 use moruna_reactor::ReactorConfig;
@@ -77,24 +77,6 @@ pub(crate) fn mint_run_id() -> Result<RunId> {
     Ok(RunId(bytes))
 }
 
-/// The chain's schemas, stage 0 first (12 f.1: computed here so `KernelInfo::schema_hash` is
-/// the stage's input schema hash). The scheduler validates the chain again at `new`; this
-/// walk fails on the same errors and earlier.
-fn chain_schemas(
-    source_schema: SourceSchema,
-    kernels: &[Arc<dyn Kernel>],
-) -> moruna_kernel::Result<Vec<SourceSchema>> {
-    let mut schemas = Vec::with_capacity(kernels.len() + 1);
-    let mut schema = source_schema;
-    schemas.push(schema.clone());
-    for kernel in kernels {
-        kernel.accepts().check(&schema)?;
-        schema = kernel.output_schema(&schema)?;
-        schemas.push(schema.clone());
-    }
-    Ok(schemas)
-}
-
 /// The whole lifecycle. Every `?` leaves `started` holding what is running, so `run_with`
 /// unwinds it in reverse (PY-I1).
 fn drive(
@@ -105,12 +87,13 @@ fn drive(
 ) -> Result<RunReport> {
     let start_ns = report::now_ns();
     let RunSpec {
-        source: source_spec,
+        sources: source_specs,
         kernels,
+        topology,
         #[cfg(feature = "python")]
         py_kernels,
         packaged,
-        sink: sink_spec,
+        sinks: sink_specs,
         engine_memory,
         sink_memory,
         budget,
@@ -187,7 +170,7 @@ fn drive(
             let found = auto_manifest(
                 discovered.profile.staging_dir.as_deref(),
                 &kernels,
-                &source_spec,
+                &source_specs,
                 spec_digest.as_deref(),
             )?;
             match &found {
@@ -307,27 +290,28 @@ fn drive(
     let sizing = Sizing {
         baseline: baseline_bytes,
         kernel_state,
-        out_of_arena: expected_out_of_arena_amplification(&kernels, engine_memory.is_some()),
+        out_of_arena: expected_out_of_arena_amplification(&kernels, !engine_memory.is_empty()),
         page_bytes: limits.page_bytes,
-        engine: engine_memory.is_some(),
-        sink: sink_memory.is_some(),
+        engine: !engine_memory.is_empty(),
+        sink: !sink_memory.is_empty(),
     };
     let shares = sizing.divide(limits.memory_ceiling, &mut notes);
-    if let Some(engine) = &engine_memory {
-        engine.set_limit(shares.engine);
+    // Several engines at one end of a run share that end's share equally (contracts d.16).
+    for engine in &engine_memory {
+        let share = shares.engine / engine_memory.len() as u64;
+        engine.set_limit(share);
         notes.push(format!(
-            "the source's plan may hold {} bytes outside the arena: its operators reserve a \
-             tenth of it and spill to the staging directory past that, four tenths are held \
+            "the source's plan may hold {share} bytes outside the arena: its operators reserve \
+             a tenth of it and spill to the staging directory past that, four tenths are held \
              back for what they hold beyond their reservations, and half is its batches in \
-             flight",
-            shares.engine
+             flight"
         ));
     }
-    if let Some(sink) = &sink_memory {
-        sink.set_limit(shares.sink);
+    for sink in &sink_memory {
+        let share = shares.sink / sink_memory.len() as u64;
+        sink.set_limit(share);
         notes.push(format!(
-            "the sink's writes may hold {} bytes outside the arena",
-            shares.sink
+            "the sink's writes may hold {share} bytes outside the arena"
         ));
     }
     let engine_bytes = shares.engine.saturating_add(shares.sink);
@@ -430,18 +414,29 @@ fn drive(
         object_metadata,
         run_id,
         arena_bytes,
+        sinks: topology.sinks(),
         sink_buffer: std::sync::atomic::AtomicU64::new(0),
     };
-    let source = source_spec.build(&ctx)?;
+    let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
+    for spec in source_specs {
+        sources.push(spec.build(&ctx)?);
+    }
     // What an engine source's engine decided when it planned the read: true of the run whatever
     // becomes of it, since the plan was made (and its budgets charged) when the source was built.
-    let source_read = source.read_report();
-    let sink = sink_spec.build(&ctx)?;
+    let source_read = sources.iter().find_map(|source| source.read_report());
+    let mut built_sinks: Vec<Box<dyn Sink>> = Vec::with_capacity(sink_specs.len());
+    for spec in sink_specs {
+        built_sinks.push(spec.build(&ctx)?);
+    }
     let sink_buffer_bytes = ctx.sink_buffer_bytes();
     // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
     // is at most half a file, so every morsel fits an ordinary file and none needs a buffer of
     // its own that the arena may no longer be able to give.
-    let mut morsel_max = match sink_buffer_bytes {
+    let claim = match sink_buffer_bytes {
+        0 => 0,
+        _ => ctx.file_buffer_share(),
+    };
+    let mut morsel_max = match claim {
         0 => config::MORSEL_MAX_BYTES,
         claim => (claim / 4).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
     };
@@ -449,12 +444,16 @@ fn drive(
         notes.push(format!(
             "morsels are at most {morsel_max} bytes, half of one of the sink's two {} byte file \
              buffers",
-            sink_buffer_bytes / 2
+            claim / 2
         ));
     }
     // An engine sink holds working memory in proportion to the morsel it writes, so its share
     // bounds the morsel as well.
-    if let Some(bytes) = sink_memory.as_ref().and_then(|sink| sink.morsel_max()) {
+    if let Some(bytes) = sink_memory
+        .iter()
+        .filter_map(|sink| sink.morsel_max())
+        .min()
+    {
         let bytes = bytes.clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES);
         if bytes < morsel_max {
             morsel_max = bytes;
@@ -464,9 +463,12 @@ fn drive(
             ));
         }
     }
-    let plan = source.plan()?;
-    let plan_summary = summarise(&plan);
-    let repeatable = source.repeatable();
+    let mut plans = Vec::with_capacity(sources.len());
+    for source in &sources {
+        plans.push(source.plan()?);
+    }
+    let plan_summary = summarise(&plans.concat());
+    let repeatable = sources.iter().all(|source| source.repeatable());
     if resume.is_some() && !repeatable {
         return Err(RunError::bare(MorunaError::Resume(
             "the source is not repeatable, so this run cannot be resumed".into(),
@@ -475,10 +477,17 @@ fn drive(
     // 12 f.7, SC f.1: a sink whose checkpoint is `None` before it is opened cannot be resumed,
     // and the scheduler turns checkpointing off for it; the report says so, as it does for a
     // one-shot source (a user's `moruna.Sink` without `checkpoint`, 08 f.10, is the usual case).
-    if checkpoint && sink.checkpoint()?.is_none() {
-        notes.push("sink: no resume, the sink does not checkpoint".to_string());
+    let mut sink_handles = Vec::with_capacity(built_sinks.len());
+    for sink in built_sinks {
+        if checkpoint && sink.checkpoint()?.is_none() {
+            notes.push("sink: no resume, the sink does not checkpoint".to_string());
+        }
+        sink_handles.push(SinkHandle::wrap(
+            sink,
+            ordered,
+            config::ORDERING_BUFFER_BYTES,
+        ));
     }
-    let sink_handle = SinkHandle::wrap(sink, ordered, config::ORDERING_BUFFER_BYTES);
 
     // 6. Kernels built: bind the arena, walk the chain, build the controller's view of them.
     // 05 f.9, E13: one gate for the run, bound to every Python kernel and every packaged one; it
@@ -501,16 +510,28 @@ fn drive(
             stage.bind(gate, &sampler, limits.memory_ceiling);
         }
     }
-    let schemas = chain_schemas(source.schema(), &kernels)?;
+    // The run's DAG, checked here so `KernelInfo::schema_hash` is each stage's input schema hash
+    // (its port 0's, 12 f.1); the scheduler checks it again at `new`.
+    let pipeline = Pipeline {
+        sources: sources.clone(),
+        kernels: kernels.clone(),
+        sinks: sink_handles,
+        topology: topology.clone(),
+    };
+    let schemas = moruna_scheduler::validate_graph(&pipeline)?;
     let kernel_infos: Vec<KernelInfo> = kernels
         .iter()
         .enumerate()
-        .map(|(at, kernel)| KernelInfo {
-            stage: (at + 1) as moruna_kernel::StageId,
-            fingerprint: kernel.fingerprint(),
-            schema_hash: schemas[at].hash(),
-            hints: kernel.hints(),
-            kind: kernel.kind(),
+        .map(|(at, kernel)| {
+            let stage = (at + 1) as moruna_kernel::StageId;
+            let input = topology.inputs(stage).first().copied().unwrap_or(0);
+            KernelInfo {
+                stage,
+                fingerprint: kernel.fingerprint(),
+                schema_hash: schemas[usize::from(input)].hash(),
+                hints: kernel.hints(),
+                kind: kernel.kind(),
+            }
         })
         .collect();
 
@@ -526,7 +547,6 @@ fn drive(
                 .to_string(),
         );
     }
-    let stages = (kernels.len() + 1) as u16;
     let host_budget =
         (limits.memory_ceiling as f64 * (1.0 - config::RESERVE_FRACTION as f64)) as u64;
     let mut budgets = TierBudgets {
@@ -551,7 +571,7 @@ fn drive(
                 PlacementConfig {
                     run_id,
                     node,
-                    stages,
+                    topology: topology.clone(),
                     budgets: budgets.clone(),
                     staging_dir: staging_dir.clone(),
                     durable_staging: discovered.profile.durable_staging.is_guaranteed(),
@@ -563,7 +583,7 @@ fn drive(
                         && cfg!(feature = "gds")
                         && io_paths.gds,
                     devices: limits.devices.iter().map(|d| d.id).collect(),
-                    plan_digest: plan_digest(&plan),
+                    plan_digests: plans.iter().map(|plan| plan_digest(plan)).collect(),
                     fingerprints: kernels.iter().map(|k| k.fingerprint()).collect(),
                     resume_policy: kernels.iter().map(|k| k.hints().resume).collect(),
                     config: with_spec_digest(
@@ -590,10 +610,16 @@ fn drive(
         }
     };
     started.placement = Some(placement.clone());
-    if !repeatable {
-        // 07 SO-I8, PL-I6: a one-shot source's Q0 is staged rather than evicted. An iterator
-        // source is one; a `moruna.Source` that sets `repeatable = False` is the other (07 e.6).
-        placement.set_staging(0, true);
+    for (index, source) in sources.iter().enumerate() {
+        if source.repeatable() {
+            continue;
+        }
+        // 07 SO-I8, PL-I6: a one-shot source's queues are staged rather than evicted. An
+        // iterator source is one; a `moruna.Source` that sets `repeatable = False` is the other
+        // (07 e.6).
+        for &queue in topology.source_outputs(index as u16) {
+            placement.set_staging(queue, true);
+        }
         notes.push("source is not repeatable (an iterator source, or repeatable = False): no resume, Q0 staged".to_string());
     }
 
@@ -601,7 +627,7 @@ fn drive(
     let resume_point = match &resume {
         Some(path) => Some(placement.restore(
             path,
-            &plan,
+            &plans,
             &kernels.iter().map(|k| k.fingerprint()).collect::<Vec<_>>(),
         )?),
         None => None,
@@ -626,11 +652,7 @@ fn drive(
             resuming: resume.is_some(),
             node,
         },
-        Pipeline {
-            source: source.clone(),
-            kernels: kernels.clone(),
-            sink: sink_handle,
-        },
+        pipeline,
         placement.clone(),
         alloc.clone(),
         trace_sink,
@@ -726,6 +748,7 @@ fn drive(
         sampler.clone(),
         trace_tail,
         placement.clone(),
+        topology.clone(),
         kernel_infos,
     )?);
     started.controller = Some(controller.clone());
@@ -796,10 +819,10 @@ fn drive(
     };
     let outcome = outcome?;
     notes.extend(watch_notes);
-    if let Some(engine) = engine_after {
+    for engine in engine_after {
         notes.push(engine.note());
     }
-    if let Some(sink) = sink_after {
+    for sink in sink_after {
         notes.push(sink.note());
     }
 
@@ -865,7 +888,7 @@ fn drive(
         process_peak,
         process_usage,
         write: match &outcome {
-            RunOutcome::Completed { sink } => sink.write.clone(),
+            RunOutcome::Completed { sinks } => sinks.iter().find_map(|sink| sink.write.clone()),
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
         },
         read: source_read,
@@ -926,7 +949,7 @@ fn durable_profile(
 fn auto_manifest(
     staging_dir: Option<&std::path::Path>,
     kernels: &[Arc<dyn Kernel>],
-    source: &crate::spec::SourceSpec,
+    sources: &[crate::spec::SourceSpec],
     spec_digest: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let Some(dir) = staging_dir else {
@@ -934,13 +957,18 @@ fn auto_manifest(
     };
     let fingerprints: Vec<moruna_kernel::Fingerprint> =
         kernels.iter().map(|k| k.fingerprint()).collect();
-    let plan_digest = match source {
-        crate::spec::SourceSpec::Built(source) => Some(plan_digest(&source.plan()?)),
-        crate::spec::SourceSpec::Build(_) => None,
-    };
+    let mut plan_digests = Some(Vec::with_capacity(sources.len()));
+    for source in sources {
+        match (source, plan_digests.as_mut()) {
+            (crate::spec::SourceSpec::Built(source), Some(digests)) => {
+                digests.push(plan_digest(&source.plan()?));
+            }
+            _ => plan_digests = None,
+        }
+    }
     let want = moruna_placement::manifest::ManifestMatch {
         fingerprints: &fingerprints,
-        plan_digest,
+        plan_digests,
         spec_digest,
     };
     Ok(PlacementEngine::find_resumable_manifest(dir, &want)?)
@@ -1433,20 +1461,20 @@ mod tests {
             Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>
         );
         assert_eq!(
-            auto_manifest(None, &[], &built, None).expect("no dir"),
+            auto_manifest(None, &[], std::slice::from_ref(&built), None).expect("no dir"),
             None
         );
         let dir = std::env::temp_dir().join(format!("moruna-auto-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         assert_eq!(
-            auto_manifest(Some(&dir), &[], &built, None).expect("empty"),
+            auto_manifest(Some(&dir), &[], std::slice::from_ref(&built), None).expect("empty"),
             None
         );
         let later = crate::spec::SourceSpec::Build(Box::new(|_| {
             Ok(Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>)
         }));
         assert_eq!(
-            auto_manifest(Some(&dir), &[], &later, None).expect("empty"),
+            auto_manifest(Some(&dir), &[], std::slice::from_ref(&later), None).expect("empty"),
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1869,15 +1897,23 @@ mod tests {
         assert_eq!(summarise(&[]).max_split_bytes, 0);
     }
 
-    /// The chain walk refuses a kernel whose `accepts` does not match the schema it is given.
+    /// The run's DAG is walked before anything is built: a copy's one queue carries its
+    /// source's schema, and a topology that does not match the run's parts is refused.
     #[test]
-    fn the_chain_walk_checks_every_stage() {
-        let schema = SourceSchema::Tensor {
-            dtype: moruna_kernel::DType::F32,
-            shape: vec![-1, 8],
-        };
-        let schemas = chain_schemas(schema.clone(), &[]).expect("an empty chain is the source");
+    fn the_graph_walk_checks_every_stage() {
+        use moruna_testkit::{FakeSink, FakeSource};
+        let source = Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>;
+        let schema = source.schema();
+        let sink = || SinkHandle::wrap(Box::new(FakeSink::new()), false, 1 << 20);
+        let copy = Pipeline::chain(source.clone(), Vec::new(), sink());
+        let schemas = moruna_scheduler::validate_graph(&copy).expect("a copy is the source");
         assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].hash(), schema.hash());
+        let wrong = Pipeline {
+            topology: moruna_kernel::Topology::chain(2),
+            ..Pipeline::chain(source, Vec::new(), sink())
+        };
+        assert!(moruna_scheduler::validate_graph(&wrong).is_err());
     }
 
     /// A run id is 16 bytes and two of them differ.

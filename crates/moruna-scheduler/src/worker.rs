@@ -51,7 +51,7 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         }
-        let Some(stage) = crate::pick::pick(&shared, worker) else {
+        let Some((stage, port)) = crate::pick::pick(&shared, worker) else {
             idle(&shared, worker, &parker);
             continue;
         };
@@ -73,7 +73,7 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         };
-        match run_task(&shared, worker, stage, slot, false) {
+        match run_task(&shared, worker, stage, port, slot, false) {
             Ok(_) | Err(MorunaError::Cancelled) => {}
             Err(e) => crate::policy::terminate(&shared, e),
         }
@@ -110,9 +110,9 @@ fn run_job(shared: &Shared, worker: u16, job: WorkerJob) -> Result<JobOutput> {
             instance,
             bytes,
         } => instances::run_restore(shared, worker, stage_ix, instance, &bytes),
-        WorkerJob::Probe { stage } => {
+        WorkerJob::Probe { stage, port } => {
             let slot = shared.knobs.slots.claim();
-            run_task(shared, worker, stage, slot, true).map(|result| match result {
+            run_task(shared, worker, stage, port, slot, true).map(|result| match result {
                 Some(probe) => JobOutput::Probe(probe),
                 None => JobOutput::Done,
             })
@@ -130,13 +130,13 @@ const PROBE_POP_TIMEOUT: Duration = Duration::from_secs(5);
 /// to produce and the call must be deterministic (f.9).
 fn claim_and_pop(
     shared: &Shared,
-    stage: StageId,
+    queue: StageId,
     want: PayloadSpec,
     probing: bool,
 ) -> Result<Option<(Morsel, u64)>> {
     let started = std::time::Instant::now();
     loop {
-        if let Some(morsel) = shared.placement.pop(stage - 1, want, Locality::Any)? {
+        if let Some(morsel) = shared.placement.pop(queue, want, Locality::Any)? {
             // PL-I9's figure is the microseconds the caller waited on a move. A worker no longer
             // waits at all, so the only wait this can report is a probe's.
             let waited = if probing {
@@ -159,13 +159,15 @@ enum Applied {
     Failed(MorunaError),
 }
 
-/// One task: f.2's body. With `probing` it is also f.9's body, which is the same work with a
-/// peak reset in front, a sample taken before the pop and a `Probe` outcome on the record.
-/// `slot` is the busy slot the caller claimed for it, held until the task's counters are down.
+/// One task: f.2's body, on the batch at the head of input port `port`'s queue. With `probing`
+/// it is also f.9's body, which is the same work with a peak reset in front, a sample taken
+/// before the pop and a `Probe` outcome on the record. `slot` is the busy slot the caller
+/// claimed for it, held until the task's counters are down.
 pub(crate) fn run_task(
     shared: &Shared,
     worker: u16,
     stage: StageId,
+    port: u16,
     slot: BusySlot<'_>,
     probing: bool,
 ) -> Result<Option<ProbeResult>> {
@@ -178,6 +180,11 @@ pub(crate) fn run_task(
         }
     };
     let entry = &shared.stages[stage_ix];
+    let Some(&input) = entry.inputs.get(usize::from(port)) else {
+        return Err(MorunaError::Plan(format!(
+            "stage {stage} has no input port {port}"
+        )));
+    };
     // MH 4.3 `log`: what the kernel prints while this worker works for the stage, an instance
     // made for it here included, is the stage's.
     let _working = shared.work_for(stage);
@@ -200,7 +207,7 @@ pub(crate) fn run_task(
     // and a `None` here is the same race f.4 describes, answered by re-picking. Reported to the
     // PM as a finding on f.2, which names `pop_blocking`.
     entry.running.fetch_add(1, Ordering::SeqCst);
-    let popped = claim_and_pop(shared, stage, entry.spec, probing);
+    let popped = claim_and_pop(shared, input, entry.spec, probing);
     let Some((morsel, wait_us)) = popped.inspect_err(|_| {
         entry.running.fetch_sub(1, Ordering::SeqCst);
     })?
@@ -214,26 +221,29 @@ pub(crate) fn run_task(
         Ok(None) if entry.pool.is_some() => {
             // f.4: the stage was admissible only if a slot was free, so this is a race, not a
             // policy. The morsel goes back and the worker re-picks.
-            let _ = shared.placement.push(stage - 1, morsel);
+            let _ = shared.placement.push(input, morsel);
             entry.running.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
         Ok(None) => None,
         Err(e) => {
-            let _ = shared.placement.push(stage - 1, morsel);
+            let _ = shared.placement.push(input, morsel);
             entry.running.fetch_sub(1, Ordering::SeqCst);
             return Err(e);
         }
     };
 
     let Morsel {
-        seq,
-        stage: in_stage,
+        seq: seq_in,
+        stage: _,
         payload,
         bytes: bytes_in,
         origin,
         features,
     } = morsel;
+    // The unit's number: the input's, or for a stage of several inputs the one its output gets
+    // (contracts d.16), so the record and the diagnostic name one morsel of this stage.
+    let seq = shared.topology.out_seq(stage, port, seq_in);
     let rows_in = features.rows;
     let tier_in = payload.tier().index() as u8;
     // MH 4.3: counted while the claim on the stage is held, so the close of its output queue
@@ -265,7 +275,9 @@ pub(crate) fn run_task(
             None => &mut no_state,
         };
         let kernel = entry.kernel.clone();
-        std::panic::catch_unwind(AssertUnwindSafe(move || kernel.apply(state, payload)))
+        std::panic::catch_unwind(AssertUnwindSafe(move || {
+            kernel.apply_port(state, port, payload)
+        }))
     };
     let c1 = thread_cpu_ns();
     let t1 = now_ns();
@@ -316,13 +328,17 @@ pub(crate) fn run_task(
             rows_out = out.rows();
             bytes_out = out.bytes();
             tier_out = out.tier().index() as u8;
-            let out_morsel = Morsel::new(seq, in_stage.saturating_add(1), out, origin);
-            if let Err(e) = shared.placement.push(stage, out_morsel) {
+            let out_morsel = Morsel::new(seq, stage, out, origin);
+            // One push into every queue the stage gives to: the batch is shared, never copied
+            // (contracts d.16).
+            if let Err(e) = shared.placement.push_to(&entry.outputs, out_morsel) {
                 push_error = Some(e);
             } else {
                 entry.rows_out.fetch_add(rows_out, Ordering::SeqCst);
                 entry.bytes_out.fetch_add(bytes_out, Ordering::SeqCst);
-                shared.fed(stage);
+                for &q in &entry.outputs {
+                    shared.fed(q);
+                }
                 entry.tasks.fetch_add(1, Ordering::SeqCst);
                 entry
                     .busy_ns
@@ -395,7 +411,7 @@ pub(crate) fn run_task(
 
     if let Some(e) = failure {
         entry.errors.fetch_add(1, Ordering::SeqCst);
-        record.outcome = crate::policy::apply_policy(shared, stage_ix, seq, e);
+        record.outcome = crate::policy::apply_policy(shared, stage_ix, input, seq_in, e);
     }
     if probing {
         record.outcome = Outcome::Probe;
@@ -471,7 +487,8 @@ pub(crate) fn emit(shared: &Shared, record: TraceRecord) {
 
 /// Bytes per tier over every queue, for `q_bytes_before` and `q_bytes_after` (d.13). The trace
 /// field names queue bytes and the run report reads the pair as a delta, so the totals over
-/// every queue are what makes `staging_bytes_delta` the change one task caused.
+/// every queue are what makes `staging_bytes_delta` the change one task caused. A batch fanned
+/// out to several queues is resident once and counted once (contracts d.16).
 pub(crate) fn tier_totals(stats: &PlacementStats) -> Vec<u64> {
     let mut totals = vec![0u64; TIER_COUNT];
     for queue in &stats.queues {
@@ -480,6 +497,9 @@ pub(crate) fn tier_totals(stats: &PlacementStats) -> Vec<u64> {
                 *slot += bytes;
             }
         }
+    }
+    for (slot, shared) in totals.iter_mut().zip(stats.shared_by_tier.iter()) {
+        *slot = slot.saturating_sub(*shared);
     }
     totals
 }

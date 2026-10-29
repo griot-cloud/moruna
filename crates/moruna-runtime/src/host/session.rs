@@ -20,7 +20,7 @@ use moruna_kernel::{CancelToken, MorunaError, RunId};
 use moruna_placement::PlacementEngine;
 use moruna_trace::RunReport;
 
-use super::lifecycle::{Ending, EventOut, Lifecycle, task_refs};
+use super::lifecycle::{Ending, EventOut, Lifecycle, Plan};
 use super::logs::{Capture, FINISH_WAIT, Tell, attempt_dir};
 use super::ports::HostPorts;
 use super::protocol::{
@@ -33,7 +33,7 @@ use crate::kinds::Registry;
 use crate::observe::RunObserver;
 use crate::run::Runtime;
 use crate::spec::Components;
-use moruna_job::{JobSpec, SpecError};
+use moruna_job::{Job, JobError, JobSpec, SpecError};
 
 /// The heartbeat cadence (MH 4.3: at least every 2 s; half that, so one late tick is not a gap).
 pub const HEARTBEAT: Duration = Duration::from_millis(1000);
@@ -218,12 +218,45 @@ impl Drop for Events {
     }
 }
 
-/// `moruna run <spec.json>`: read the document, then [`run_job`], connecting to
-/// `report.socket` when the document names one.
+/// A job document's refusal as the document's: `spec refused: <field>: <reason>` (MH 4.1).
+pub fn job_refusal(error: JobError) -> SpecError {
+    match error {
+        JobError::Field { field, reason } => SpecError::new(field, reason),
+        JobError::Version(found) => SpecError::new(
+            "version",
+            format!(
+                "this build reads version {}, the document says {found}",
+                moruna_job::JOB_VERSION
+            ),
+        ),
+        other => SpecError::new("spec", other.to_string()),
+    }
+}
+
+/// A job document as bytes: version 2's FlatBuffers when they carry its identifier, otherwise
+/// version 1's JSON, read as the DAG with one path it is (SDD 22 e.4). On a refusal, the JSON
+/// value when the bytes were one, so the refusal's report goes where the document says.
+pub fn read_document(bytes: &[u8]) -> Result<Job, (Option<serde_json::Value>, SpecError)> {
+    if moruna_job::is_job_flatbuffer(bytes) {
+        return Job::from_flatbuffer(bytes).map_err(|e| (None, job_refusal(e)));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        (
+            None,
+            SpecError::new("spec", format!("neither a job document nor JSON: {e}")),
+        )
+    })?;
+    JobSpec::from_json(text)
+        .map(|spec| Job::from_v1(&spec))
+        .map_err(|refusal| (serde_json::from_str(text).ok(), refusal))
+}
+
+/// `moruna run <job>`: read the document, then [`run_job`], connecting to `report.socket` when
+/// the document names one.
 pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
     let started = Instant::now();
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             let refusal = SpecError::new(
                 "spec",
@@ -232,10 +265,9 @@ pub fn run_file(path: &Path, kinds: &Registry, opts: &HostOptions<'_>) -> Outcom
             return refused_without_document(None, &refusal, &Wire::new(None, started));
         }
     };
-    let job = match JobSpec::from_json(&text) {
+    let job = match read_document(&bytes) {
         Ok(job) => job,
-        Err(refusal) => {
-            let raw = serde_json::from_str::<serde_json::Value>(&text).ok();
+        Err((raw, refusal)) => {
             return refused_without_document(raw.as_ref(), &refusal, &Wire::new(None, started));
         }
     };
@@ -326,7 +358,20 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
         match Inbound::parse(&line) {
             Ok(Inbound::Spec { spec }) => {
                 let raw = spec.clone();
-                match JobSpec::from_value(spec) {
+                // Version 1 is the document as JSON; version 2 is its FlatBuffers, as base64.
+                let read = match spec {
+                    serde_json::Value::String(encoded) => {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded.as_bytes())
+                            .map_err(|e| {
+                                SpecError::new("spec", format!("not base64 FlatBuffers: {e}"))
+                            })
+                            .and_then(|bytes| Job::from_flatbuffer(&bytes).map_err(job_refusal))
+                    }
+                    other => JobSpec::from_value(other).map(|spec| Job::from_v1(&spec)),
+                };
+                match read {
                     Ok(job) => {
                         if job.report.socket.is_some() {
                             wire.note(
@@ -378,7 +423,7 @@ pub enum Mode {
 /// Run one document to its exit code (MH 4.3). `wire` is the peer, or nobody; `reader` is the
 /// peer's inbound half, read on its own thread for `cancel` and `checkpoint`.
 pub fn run_job(
-    job: JobSpec,
+    job: Job,
     kinds: &Registry,
     opts: &HostOptions<'_>,
     wire: &Arc<Wire>,
@@ -386,7 +431,7 @@ pub fn run_job(
     mode: Mode,
 ) -> Outcome {
     let fallback_id = job
-        .run_id
+        .id
         .as_deref()
         .and_then(RunId::from_hex)
         .or_else(|| crate::run::mint_run_id().ok())
@@ -428,7 +473,7 @@ pub fn run_job(
         Ok(built) => built,
         Err(error) => {
             // Refused before a stage exists: the document's tasks as it names them, each skipped.
-            let lifecycle = Lifecycle::new(task_refs(&job, None), wire.started(), events.out());
+            let lifecycle = Lifecycle::new(Plan::of(&job, None), wire.started(), events.out());
             lifecycle.begin(job.resume.is_some());
             lifecycle.end(Ending::Failed(&error));
             drop(events);
@@ -444,9 +489,9 @@ pub fn run_job(
         }
     };
     // One task per stage: fused standard kernels are one group (MH 4.9).
-    let refs = task_refs(&job, Some(&built.stage_kernels));
-    let tasks: Vec<String> = refs.iter().map(|r| r.id.clone()).collect();
-    let lifecycle = Lifecycle::new(refs, wire.started(), events.out());
+    let plan = Plan::of(&job, Some(&built.parts));
+    let tasks: Vec<String> = plan.ids();
+    let lifecycle = Lifecycle::new(plan, wire.started(), events.out());
     // What the run starts beside itself, held out here so a run that crashes still stops it.
     let stop = Arc::new(AtomicBool::new(false));
     let mut capture: Option<Capture> = None;
@@ -825,7 +870,7 @@ fn limits_changed(wire: Arc<Wire>) -> moruna_discovery::LimitsSubscriber {
 }
 
 /// The limits for `hello`, from the fields of the document discovery would be given.
-fn limits_for(job: &JobSpec) -> Option<LimitsMsg> {
+fn limits_for(job: &Job) -> Option<LimitsMsg> {
     Runtime::inspect(&DiscoveryInput {
         explicit_budget: job.budget.memory_bytes,
         explicit_cpu: job.budget.cpu,
@@ -838,7 +883,7 @@ fn limits_for(job: &JobSpec) -> Option<LimitsMsg> {
 }
 
 /// Where a document's output store is (MH 4.3 `log`).
-pub fn logs_path(job: &JobSpec, run_id: &str) -> PathBuf {
+pub fn logs_path(job: &Job, run_id: &str) -> PathBuf {
     match &job.report.logs {
         Some(template) => PathBuf::from(template.replace("<run_id>", run_id)),
         None => {
@@ -852,7 +897,7 @@ pub fn logs_path(job: &JobSpec, run_id: &str) -> PathBuf {
 }
 
 /// Where a document's report file goes (MH 4.1).
-pub fn report_path(job: &JobSpec, run_id: &str) -> PathBuf {
+pub fn report_path(job: &Job, run_id: &str) -> PathBuf {
     path_for(
         job.report.file.as_deref(),
         job.staging.dir.as_deref(),

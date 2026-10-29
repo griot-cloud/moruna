@@ -107,13 +107,13 @@ fn sc_t16_resume_equivalence() {
         Err(e) => panic!("plan: {e}"),
     };
     let point: ResumePoint =
-        match resumed_placement.restore(&manifest, &plan, &[] as &[Fingerprint]) {
+        match resumed_placement.restore(&manifest, &[plan], &[] as &[Fingerprint]) {
             Ok(point) => point,
             Err(e) => panic!("restore: {e}"),
         };
-    let committed = point.extras.committed_seq;
-    let point_next_seq = point.extras.source_cursor.next_seq;
-    let issued_at_kill: Vec<u64> = point.extras.issued.iter().map(|(seq, _)| *seq).collect();
+    let committed = point.extras.committed[0];
+    let point_next_seq = point.extras.source_cursors[0].next_seq;
+    let issued_at_kill: Vec<u64> = point.extras.issued[0].iter().map(|(seq, _)| *seq).collect();
     for seq in &issued_at_kill {
         assert!(
             *seq < point_next_seq,
@@ -121,11 +121,11 @@ fn sc_t16_resume_equivalence() {
         );
         assert!(
             committed.is_none_or(|watermark| *seq > watermark)
-                == point.to_recompute.iter().any(|(s, _)| s == seq),
+                == point.to_recompute[0].iter().any(|(s, _)| s == seq),
             "restore hands back every issued read above the watermark, and only those (MH 4.7)"
         );
     }
-    let to_recompute = point.to_recompute.len();
+    let to_recompute = point.to_recompute[0].len();
 
     assert!(
         to_recompute > 0,

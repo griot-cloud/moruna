@@ -23,9 +23,10 @@ fn sc_t8_completion_exact() {
             Ok(outcome) => outcome,
             Err(e) => panic!("run failed: {e}"),
         };
-        let RunOutcome::Completed { sink } = outcome else {
+        let RunOutcome::Completed { sinks } = outcome else {
             panic!("expected Completed, got {outcome:?}");
         };
+        let sink = &sinks[0];
         assert_eq!(
             sink.rows,
             splits as u64 * rows,

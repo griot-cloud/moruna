@@ -142,7 +142,7 @@ impl FakePlacement {
         self.lock().popped.get(&stage).cloned().unwrap_or_default()
     }
 
-    /// Observable: the commit watermark `set_committed` last recorded.
+    /// Observable: the commit watermark `set_committed` last recorded for sink 0.
     pub fn committed(&self) -> Option<Seq> {
         self.lock().committed
     }
@@ -390,9 +390,9 @@ impl Placement for FakePlacement {
         self.inner.waiters.notify_all();
     }
 
-    fn set_committed(&self, seq: Seq) {
+    fn set_committed(&self, sink: u16, seq: Seq) {
         let mut state = self.lock();
-        if state.committed.is_none_or(|watermark| seq >= watermark) {
+        if sink == 0 && state.committed.is_none_or(|watermark| seq >= watermark) {
             state.committed = Some(seq);
         }
     }
@@ -428,9 +428,11 @@ impl Placement for FakePlacement {
     fn restore(
         &self,
         manifest: &Path,
-        plan: &[Split],
+        plans: &[Vec<Split>],
         fingerprints: &[Fingerprint],
     ) -> Result<ResumePoint> {
+        // The fake is a chain's engine: one source, one sink, every number source 0's.
+        let plan: &[Split] = plans.first().map_or(&[], Vec::as_slice);
         let store = manifest_store().lock().unwrap_or_else(|e| e.into_inner());
         let Some(found) = store.get(manifest).cloned() else {
             return Err(MorunaError::Resume(format!(
@@ -463,7 +465,7 @@ impl Placement for FakePlacement {
             .collect();
         // Placement f.13 as amended by MH 4.7: a read the scheduler had issued and not pushed
         // is read again unless the queues held it too, and nothing the watermark covers is.
-        let committed = found.extras.committed_seq;
+        let committed = found.extras.committed.first().copied().flatten();
         let known: std::collections::HashSet<Seq> =
             found.lineage.iter().map(|(seq, _, _, _)| *seq).collect();
         to_recompute.extend(
@@ -471,6 +473,7 @@ impl Placement for FakePlacement {
                 .extras
                 .issued
                 .iter()
+                .flatten()
                 .filter(|(seq, _)| !known.contains(seq))
                 .cloned(),
         );
@@ -479,7 +482,7 @@ impl Placement for FakePlacement {
         to_recompute.dedup_by_key(|(seq, _)| *seq);
         Ok(ResumePoint {
             extras: found.extras,
-            to_recompute,
+            to_recompute: vec![to_recompute],
         })
     }
 
@@ -551,6 +554,7 @@ impl Placement for FakePlacement {
         PlacementStats {
             queues,
             in_flight_bytes: 0,
+            shared_by_tier: [0; moruna_kernel::TIER_COUNT],
         }
     }
 }

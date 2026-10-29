@@ -53,7 +53,7 @@ fn pl_t18_lineage_bounded() {
 
     // The watermark advancing at the sink's rate bounds it.
     for committed in 0..10u64 {
-        engine.set_committed(committed);
+        engine.set_committed(0, committed);
         assert_eq!(
             engine.detailed_stats().lineage_len,
             50 - (committed + 1),
@@ -64,7 +64,7 @@ fn pl_t18_lineage_bounded() {
     // A watermark below the current one is a `debug_assert` in f.11, so a test build cannot
     // exercise the ignoring branch without aborting; the watermark's monotonicity is what
     // the loop above asserts.
-    assert_eq!(engine.detailed_stats().committed_seq, Some(9));
+    assert_eq!(engine.detailed_stats().committed, vec![Some(9)]);
 
     engine.close(0);
     while engine
@@ -72,11 +72,11 @@ fn pl_t18_lineage_bounded() {
         .expect("pop_blocking")
         .is_some()
     {}
-    engine.set_committed(49);
+    engine.set_committed(0, 49);
     assert_eq!(
         engine.detailed_stats().lineage_len,
         0,
         "the lineage is empty at the end of a run (PL-I11)"
     );
-    assert_eq!(engine.detailed_stats().committed_seq, Some(49));
+    assert_eq!(engine.detailed_stats().committed, vec![Some(49)]);
 }

@@ -1,11 +1,11 @@
 # Moruna SDD 22: The job document and the catalogue, for embedders (`moruna-job`)
 
 **Document type:** software design document, component 22
-**Status:** DRAFT · 2026-10-28 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
-**Parent:** board item KA4 (`BOARD.md`, wave B); SDD 18 (the kinds a run is made of); `architecture/moruna-hosted-engine.md` (MH) section 4.1
+**Status:** DRAFT · 2026-10-28, amended 2026-10-29 by KA5 (the job document version 2, a DAG of tasks: d.4, e.4, e.5, JB-I10 to JB-I14, JB-T29 to JB-T39) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Parent:** board items KA4 and KA5 (`BOARD.md`, wave B); SDD 18 (the kinds a run is made of); `architecture/moruna-hosted-engine.md` (MH) section 4.1; brief MC2 (`architecture/agents/briefs/waves-a-b-c.md` section 5)
 **Preamble:** `00-preamble.md`; **Cited:** 18 (KD-I1, KD-I2, KD-I4, KD-I8, e.1 to e.3, decision KD1), 12 f.9, MH 4.1, MH 4.5
-**Component location:** `crates/moruna-job/` (`src/kind.rs`, `src/doc.rs`, `src/canonical.rs`, `src/catalogue.rs`, `src/check.rs`, `src/schema.rs`, `catalogue/standard.json`, `catalogue/peql.json`), `crates/moruna-runtime/src/host/cli.rs` (`moruna check-job`), `crates/moruna-runtime/tests/job.rs` (the tests that need the registry)
-**Consumes:** `serde`, `serde_json`, `schemars`, `thiserror`, and nothing from Arrow, DataFusion or the runtime. **Consumed by:** `moruna-runtime` (it builds a run from the document and registers the kinds the declarations describe), `moruna-py`, and every embedder that reads Moruna's kinds or checks a job document without running it.
+**Component location:** `crates/moruna-job/` (`src/kind.rs`, `src/doc.rs`, `src/job.rs`, `src/flatbuffer.rs`, `src/flex.rs`, `src/canonical.rs`, `src/catalogue.rs`, `src/check.rs`, `src/schema.rs`, `schema/job.fbs`, `src/generated/job_generated.rs` (generated, committed), `catalogue/standard.json`, `catalogue/peql.json`), `tools/flatc/generate.sh`, `crates/moruna-runtime/src/host/cli.rs` (`moruna check-job`), `crates/moruna-runtime/tests/job.rs` (the tests that need the registry)
+**Consumes:** `serde`, `serde_json`, `schemars`, `thiserror`, `flatbuffers` and `flexbuffers` (25.12.19, the version arrow-ipc already brings), and nothing from Arrow, DataFusion or the runtime. **Consumed by:** `moruna-runtime` (it builds a run from the document and registers the kinds the declarations describe), `moruna-py`, and every embedder that reads Moruna's kinds or checks a job document without running it.
 
 **Decisions worth your eye:** (1) an embedder that never runs a job, a service that authors and accepts jobs, depends on one small crate and gets the declaration of every kind, the job document and a checker; it does not compile Arrow; (2) the types have one home: `moruna-runtime` uses them from `moruna-job` and re-exports none; (3) the catalogue is two files `moruna kinds` printed, embedded, and a test in the runtime proves each file equals the registry's listing, so the files cannot drift from the code; (4) the checker reads the settings schema of each kind with a validator for exactly the subset of JSON Schema `schemars` writes for the settings types of this repository, and a test proves that validator and the kind give one verdict on seeded mutations of every example; (5) a schema outside the subset is refused when it is added to a catalogue, so the subset cannot silently grow.
 
@@ -33,7 +33,7 @@ It refuses to know: how a kind is built or run (the runtime's), the registry (th
 
 ## c. Invariants
 
-**JB-I1. The crate depends on four crates.** `serde`, `serde_json`, `schemars` and `thiserror`, in `[dependencies]`, and nothing else. In particular nothing from Arrow, DataFusion, the runtime or a hash.
+**JB-I1. The crate depends on six crates.** `serde`, `serde_json`, `schemars`, `thiserror`, `flatbuffers` and `flexbuffers`, in `[dependencies]`, and nothing else. In particular nothing from Arrow, DataFusion, the runtime or a hash. (Amended 2026-10-29, KA5: the document version 2 is FlatBuffers and its tasks' settings FlexBuffers; `flexbuffers` is used to write them and not to read them, JB-I11.)
 
 **JB-I2. The types have one home.** `Role`, `Flow`, `Fact`, `Isolation`, `Needs`, `Declaration`, `Listing`, `Urls`, `JobSpec`, `KindDoc`, `SpecError`, `ContractEntry` and every `*Doc` type are defined in `moruna-job`. `moruna-runtime`, `moruna-py` and the embedders use them from there; no crate re-exports them under another path, and none defines a second.
 
@@ -49,7 +49,17 @@ It refuses to know: how a kind is built or run (the runtime's), the registry (th
 
 **JB-I8. A refusal says where and what.** Its `field` names the part of the document at fault (`source.kind`, `kernels[2]`, `sink.settings.url`), its code the kind of fault, and its message one sentence that names the kind and the value and says what to change, in the voice of the runtime's refusals (SDD 18 KD-I1, KD-I4).
 
-**JB-I9. The document the runtime builds is the document this crate reads.** `moruna-runtime`'s build takes a `moruna_job::JobSpec`; a document `check` passes is a document the build reads. The build refuses more than `check` does: what a kind judges of a value (a kernel's arguments, a file that is not there, a pin) is not the schema's.
+**JB-I9. The document the runtime builds is the document this crate reads.** `moruna-runtime`'s build takes a `moruna_job::Job`, a version 1 document as `Job::from_v1` reads it; a document `check` passes is a document the build reads. The build refuses more than `check` does: what a kind judges of a value (a kernel's arguments, a file that is not there, a pin) is not the schema's, nor is how many inputs a kernel takes (`Kernel::max_inputs`) or a flow other than batches.
+
+**JB-I10. A version 1 document is a DAG with one path (KA5).** `Job::from_v1` reads `source`, `kernels` and `sink` as tasks in that order, each with the one port its role has (`in`, `out`), joined by an edge of batches from each to the next; the tasks' ids are `report.tasks`'s when the document names them (with their members), else `source`, `kernel-1` .. `kernel-n`, `sink`; every other field carries over. A refusal of one of its tasks names the field the document wrote it under (`source`, `kernels[i]`, `sink`); a version 2 task is `tasks[i]` (`Job::field`). Every version 1 document runs unchanged through the one build.
+
+**JB-I11. Bytes from anyone are verified before they are read (KA5).** `Job::from_flatbuffer` checks the file identifier (`MJB2`), runs the FlatBuffers verifier (bounded depth, tables and size) and checks the version before it reads a field; a task's settings and a contract's document are read from FlexBuffers by this crate's own reader (`flex::decode`), which checks every offset, width, length and type and refuses what JSON cannot hold, because the `flexbuffers` crate's reader indexes without checking and panics on hostile bytes. Whatever the bytes are, the result is a job or a typed `JobError`, never a panic.
+
+**JB-I12. The generated code is what the schema generates (KA5).** `src/generated/job_generated.rs` is the output of flatc 25.12.19 (the version of the `flatbuffers` crate in `Cargo.lock`) for `schema/job.fbs`, committed; `tools/flatc/generate.sh --check` regenerates it in a container and fails on a difference, and CI runs it on every pull request.
+
+**JB-I13. A job is a DAG whose ports and edges fit (KA5).** `check` and `check_graph` refuse, each at its field: a task id that is not one or names two tasks; ports a role does not have (a source has output ports and no input port, a sink input ports and no output port, a kernel both) or a port named twice; an edge to a task or a port the job does not have; an edge whose flow is not what its producer gives or its consumer takes; an input port no edge feeds, an output port no edge reads; two edges into one input port (a task that takes several inputs has a port for each); a cycle; a barrier with nothing on one side; an edge that goes around a barrier (e.5).
+
+**JB-I14. The identity is what the job does (KA5).** `Job::identity_json` is the canonical JSON rendering without `resume` and `report`, with each task named by its place (`#i`) rather than its id and without its members: a host that renames its tasks has the same job, as a version 1 document's `report.tasks` never changed its identity.
 
 ## d. Interfaces
 
@@ -134,6 +144,58 @@ moruna check-job <file.json>
 
 reads the document, checks it against the catalogue of the kinds of the binary's own registry (`Catalogue::from_listing(registry.listing())`, which for the standard registry is `Catalogue::standard()`, JB-T25, and which includes the kinds a binary adds, such as the Python adapter's), and writes each refusal to standard error as `<field>: <message>`. It exits 0 and writes nothing when there is none, with the exit code of a refused document (2) when there is one or the file is not there or not a document, and 1 when the binary's kinds cannot be checked against (a kind whose schema is outside the subset). `moruna kinds` is unchanged.
 
+### d.4 The job document version 2 (KA5, 2026-10-29)
+
+```rust
+pub const JOB_VERSION: u32 = 2;
+pub const JOB_IDENTIFIER: &str = "MJB2";       // bytes 4 to 8 of every buffer
+pub const IN: &str = "in";                      // the one input port of a task that has one
+pub const OUT: &str = "out";                    // the one output port
+
+pub struct Job {                                // the in-memory model
+    pub id: Option<String>,                     // the run's identity, 32 lowercase hex
+    pub tasks: Vec<Task>,
+    pub edges: Vec<Edge>,
+    pub budget: BudgetDoc, pub staging: StagingDoc, pub object_store: ObjectStoreDoc,
+    pub checkpoint: CheckpointDoc, pub resume: Option<String>, pub error_policy: ErrorPolicyDoc,
+    pub ordered: bool, pub sizer: SizerDoc, pub trace: Option<String>,
+    pub profiles_dir: Option<String>, pub host_profile: Option<HostProfileDoc>,
+    pub allow_gil: bool, pub report: Reporting, pub contracts: Vec<ContractEntry>,
+}
+pub struct Task {
+    pub id: String,                             // stable; events and the report name it
+    pub role: Role,                             // source, kernel or sink
+    pub kind: String,                           // resolved by the registry for the role
+    pub settings: Map<String, Value>,           // FlexBuffers on the wire, checked by the schema
+    pub inputs: Vec<String>, pub outputs: Vec<String>,   // named ports, port 0 first
+    pub barrier: bool,                          // an enforcement point
+    pub members: Vec<String>,                   // the embedder's tasks it carries
+    pub at: Option<String>,                     // where a version 1 task was written; not part of the job
+}
+pub struct Edge { pub from: PortRef, pub to: PortRef, pub flow: Flow, pub barrier: bool }
+pub struct PortRef { pub task: String, pub port: String }
+pub struct Reporting { pub socket, pub file, pub attempt, pub logs }   // report without `tasks`
+
+impl Job {
+    pub fn new(tasks: Vec<Task>, edges: Vec<Edge>) -> Job;
+    pub fn from_v1(spec: &JobSpec) -> Job;                  // JB-I10
+    pub fn from_flatbuffer(bytes: &[u8]) -> Result<Job, JobError>;   // JB-I11
+    pub fn to_flatbuffer(&self) -> Result<Vec<u8>, JobError>;        // deterministic
+    pub fn to_json(&self) -> String;                        // a rendering, never read back
+    pub fn canonical_json(&self) -> String;
+    pub fn identity_json(&self) -> String;                  // JB-I14
+    pub fn field(&self, index: usize) -> String;            // `tasks[i]`, or a v1 task's field
+    pub fn task_index, task, edges_into, edges_from, topological_order, descendants;
+}
+pub enum JobError { Identifier, Malformed(String), Version(u32), Field { field, reason } }
+pub fn is_job_flatbuffer(bytes: &[u8]) -> bool;
+pub fn check(job: &Job, catalogue: &Catalogue) -> Result<(), Vec<Refusal>>;
+pub fn check_graph(job: &Job) -> Result<(), Vec<Refusal>>;  // the refusals that need no catalogue
+pub mod fb;                                                 // the tables flatc generates
+```
+
+`check` takes a `Job`; a version 1 document is checked as `check(&Job::from_v1(&spec), ..)`, and `moruna check-job` reads either version (FlatBuffers when the bytes carry the identifier, JSON otherwise). `RefusalCode` gains `TaskId`, `UnknownPort`, `Unconnected`, `Crowded`, `Cycle` and `Barrier`; `Flow` covers an edge's flow too.
+
 ## e. Data model, formats and state machines
 
 ### e.1 The embedded files
@@ -171,6 +233,33 @@ The validator reads the subset of JSON Schema 2020-12 that `schemars` writes for
 A schema may also be `true` or `false`. The set is what the standard kinds' schemas use (`$defs`, `$ref`, `$schema`, `additionalProperties`, `anyOf`, `default`, `description`, `enum`, `examples`, `format`, `items`, `maxItems`, `minItems`, `minimum`, `prefixItems`, `properties`, `required`, `title`, `type`), plus the keywords `schemars` writes for other shapes the settings may take (`oneOf`, `allOf`, `const`, `maximum`, `minLength`) so a kind that uses them does not leave the subset. `format` is read for integer widths because `schemars` writes `minimum: 0` for an unsigned type and no `maximum`, and `serde` refuses a value past the width; a validator that ignored `format` would accept it.
 
 `Catalogue::add` runs `schema::admit` on the settings schema: any other keyword is `CatalogueError::Schema` naming the keyword and its JSON pointer; so is a `type` that names no type, a `required` that is not a list of strings, a `$ref` that is not `#/$defs/<name>` or names a definition the schema lacks, and any keyword whose value is not the shape it needs. A schema is checked against with `schema::validate(root, schema, value)`, which lists every violation with its path.
+
+### e.4 The FlatBuffers schema (KA5)
+
+`crates/moruna-job/schema/job.fbs`, namespace `moruna.job.fb`, file identifier `MJB2`, extension `mjob`, root `Job`:
+
+| Table | Fields |
+|---|---|
+| `Job` | `version: uint` (2; written always, a reader refuses any other), `id`, `tasks: [Task]`, `edges: [Edge]`, `budget`, `staging`, `object_store`, `checkpoint`, `resume`, `error_policy`, `ordered`, `sizer`, `trace`, `profiles_dir`, `host_profile`, `allow_gil`, `report`, `contracts: [Contract]` |
+| `Task` | `id` (required), `role: Role`, `kind` (required), `settings: [ubyte] (flexbuffer)` (a map), `inputs: [string]`, `outputs: [string]`, `barrier: bool`, `members: [string]` |
+| `Edge` | `from: Endpoint` (required), `to: Endpoint` (required), `flow: Flow`, `barrier: bool` |
+| `Endpoint` | `task`, `port` (both required) |
+| `Budget`, `Elastic`, `Staging` | optional scalars (`= null`) where version 1 has `null` |
+| `Checkpoint` | `enabled = true`, `interval_ms = 5000`, `keep` |
+| `ErrorPolicy` | `kind: ErrorPolicyKind` (`Terminate`, `Skip`, `Budget`), `budget: uint` |
+| `HostProfile` | each guarantee a `Guarantee` (`Unset`, `Present`, `Absent`), `staging_dir` |
+| `Report` | `socket`, `file`, `attempt = null`, `logs` |
+| `Contract` | `document: [ubyte] (flexbuffer, required)`, `compiled` (required), `functions: [ubyte] (flexbuffer)` (a list), `audiences: [string]` |
+
+Enums: `Role` (`Source`, `Kernel`, `Sink`), `Flow` (`Batches`, `Files`, `Nothing`), `Sizer` (`Rule`, `Learned`). The Rust in `src/generated/job_generated.rs` is flatc 25.12.19's (JB-I12). `tools/flatc/generate.sh` builds flatc from the release's source (pinned by SHA-256) with g++ in `gcc:14-bookworm` (pinned by its index digest), keeps it under `target/flatc`, and runs it in the same image; nothing is installed on the machine. A change to the schema is a run of the script and a commit of its output.
+
+JSON is a rendering of the document for people (`Job::to_json`, with `"moruna_job": 2`), and the canonical form the digest is taken over (JB-I14); nothing reads it back. A version 1 document stays JSON and is read by `JobSpec::from_json`.
+
+### e.5 The graph (KA5)
+
+A task's role decides its ports: a source has output ports and no input port, a sink input ports and no output port, a kernel both. An edge joins an output port to an input port; one output port may feed several input ports (fan-out), and a kernel may take several input ports (fan-in), port 0 first in the order its `inputs` list them, each fed by exactly one edge. Every output port is read by at least one edge and every input port fed by exactly one. The edges form no cycle; `Job::topological_order` orders the tasks so every edge goes forward, ties in document order (Kahn's algorithm).
+
+A **barrier** is an enforcement point (a contract boundary, masking): nothing may be moved across it, and what crosses it passes through it. A barrier task needs something on both sides. For a barrier task `B`, an edge from a task upstream of `B` to a task downstream of `B`, neither being `B`, goes around it and is refused at the edge. For a barrier edge `a -> b`, any other edge from `a` or a task upstream of it to `b` or a task downstream of it goes around it. The planner (KA7) reads the marks; this crate only refuses a document that bypasses one.
 
 ## f. Algorithms and policies
 
@@ -240,6 +329,28 @@ Test names are the ids' lowercase with a slug (`jb_t6_every_example_passes`).
 
 **JB-T28 check_job_command.** `moruna check-job` exits 0 and writes nothing for a document its binary's kinds accept; for another it writes each refusal as `<field>: <message>` and exits 2; a file that is not there, not JSON, or of another version is refused the same way; it takes one document; a binary with a kind whose schema is outside the subset exits 1 saying so. d.3.
 
+**JB-T29 job_round_trip** (`tests/dag.rs`). A job with every section set survives `to_flatbuffer` and `from_flatbuffer`; the bytes carry the identifier and are the same every time; a job of defaults reads back with `checkpoint.enabled` on; the JSON rendering names every task, port, barrier and edge; the identity is blind to `resume` and `report` and to nothing else. JB-I11, JB-I14.
+
+**JB-T30 verifier_refuses_corrupted_bytes.** 4,000 seeded corruptions of a whole document (one to four bytes set, and truncations) each read as a job or a `JobError`, never a panic, and most are refused; bytes without the identifier, a buffer shorter than one, a document of another version and settings that are a FlexBuffers list are refused by what they are. With `flex::tests::hostile_buffers_never_panic` (20,000 corruptions of a FlexBuffers value through `flex::decode`). JB-I11.
+
+**JB-T31 v1_reads_as_one_path.** A version 1 document reads as its source, kernels and sink with the ids version 1 gave them (or `report.tasks`'s, members included), one port each, an edge of batches from each to the next, every other field as it was; it passes `check`. JB-I10.
+
+**JB-T32 dags_pass.** A fan-out, a fan-in of two sources and a diamond pass `check`. e.5.
+
+**JB-T33 a_cycle_is_refused.** A cycle is refused at the first task on it, naming the tasks on it and not those downstream; a task feeding itself is a cycle. JB-I13.
+
+**JB-T34 port_refusals.** An edge to a port or a task the job does not have, an unfed input, an unread output, two edges into one input, a port named twice and ports a role does not have, each at its field. JB-I13.
+
+**JB-T35 flows_that_do_not_fit.** An edge whose flow is not what its producer gives is refused at the edge. JB-I13.
+
+**JB-T36 barriers.** A barrier task with nothing upstream or downstream is refused; an edge around a barrier task, and one around a barrier edge, is refused at the edge naming the barrier; edges through it pass. JB-I13, e.5.
+
+**JB-T37 task_ids.** A task id that is not one, one that names two tasks and a member that is not a task id are refused at the task. JB-I13.
+
+**JB-T38 the_build_refuses_to_go_around_a_barrier** (`moruna-runtime`, `tests/dag.rs`). The runtime's build refuses a document whose edge goes around a barrier before any kind is built, naming the edge; the document through the barrier builds. JB-I9, JB-I13.
+
+**JB-T39 every_table_at_its_defaults** (`tests/dag.rs`). A version 2 document whose every table is present and holds only its schema defaults, with the strings the schema requires, is read or refused at its field and never panics; the verified document's rendering names every table, for a diagnosis; every enum value this build writes has its schema name, and an unknown one renders as unknown. JB-I11, JB-I12.
+
 ## l. Implementation notes for the agent
 
 A new kind adds nothing here: its declaration is in the runtime, and the catalogue files are regenerated from `moruna kinds` (e.1); JB-T25 fails until they are. A kind whose settings type needs a JSON Schema keyword outside the subset adds the keyword to `schema.rs` (`VALIDATING`, `walk`, `admit_at`), to the table in e.3, and to JB-T12 to JB-T17, and JB-T26 proves the validator and the kind still agree. Do not add a JSON Schema crate: the subset is closed on purpose (JB-I7).
@@ -259,9 +370,10 @@ None.
 | SDD 18 KD-I8 (contracts are carried for a kind that needs them) | JB-I5 | JB-T10 |
 | MH 4.1 (the document) | JB-I9 | JB-T21 to JB-T24 |
 | SDD 18 d.3 (the command line) | JB-I5, JB-I8 | JB-T28 |
+| KA5 (the job is a DAG, in FlatBuffers) | JB-I10 to JB-I14 | JB-T29 to JB-T39 |
 
 ## o. Deferred (post-v1)
 
-**JB-O1. The job spec v2.** MC2 carries a node's settings in the FlatBuffers spec and checks them against the schema (SDD 18 KD-O1); `check` reads the JSON document of MH 4.1 only.
+**JB-O1. Retain, cost hints, partitioning and order (MC2).** MC2 names a per-edge `retain` (MB1 widened), per-task cost hints, a task's partitioning and whether its output order matters. Version 2 carries none of them yet: each is a field added to `Task` or `Edge` when the item that reads it is built (MB1, KD6, KA7).
 
 **JB-O2. Cost and placement.** A check that says what a document would cost, or whether a host could run it, is MC3's; `check` says only that the document names kinds Moruna has with settings they accept.

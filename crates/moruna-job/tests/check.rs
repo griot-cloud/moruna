@@ -1,6 +1,8 @@
 //! SDD 22 k: checking a document without running it (JB-T6 to JB-T10).
 
-use moruna_job::{Catalogue, ContractEntry, JobSpec, KindDoc, Refusal, RefusalCode, Role, check};
+use moruna_job::{
+    Catalogue, ContractEntry, Job, JobSpec, KindDoc, Refusal, RefusalCode, Role, check,
+};
 use serde_json::{Value, json};
 
 fn entry(value: Value) -> KindDoc {
@@ -23,8 +25,14 @@ fn good() -> JobSpec {
     )
 }
 
+/// A version 1 document is checked as the DAG with one path it reads as (SDD 22 e.4), each task
+/// refused at the field the document wrote it under: `source`, `kernels[i]`, `sink`.
+fn v1(spec: &JobSpec, catalogue: &Catalogue) -> Result<(), Vec<Refusal>> {
+    check(&Job::from_v1(spec), catalogue)
+}
+
 fn refusals(job: &JobSpec) -> Vec<Refusal> {
-    check(job, &Catalogue::standard().expect("the standard catalogue")).expect_err("refused")
+    v1(job, &Catalogue::standard().expect("the standard catalogue")).expect_err("refused")
 }
 
 fn text(refusals: &[Refusal]) -> Vec<String> {
@@ -58,19 +66,14 @@ fn jb_t6_every_example_passes() {
                     Role::Sink => doc.sink = entry(mine),
                 }
                 doc.contracts = vec![contract()];
-                assert_eq!(
-                    check(&doc, &governed),
-                    Ok(()),
-                    "{} {example}",
-                    declared.name
-                );
+                assert_eq!(v1(&doc, &governed), Ok(()), "{} {example}", declared.name);
                 cases += 1;
             }
         }
     }
     assert!(cases >= 20, "{cases}");
     assert_eq!(
-        check(
+        v1(
             &good(),
             &Catalogue::standard().expect("the standard catalogue")
         ),
@@ -82,7 +85,7 @@ fn jb_t6_every_example_passes() {
         json!({"kind": "arrow_ipc", "url": "/out"}),
     );
     assert_eq!(
-        check(
+        v1(
             &copy,
             &Catalogue::standard().expect("the standard catalogue")
         ),
@@ -127,7 +130,7 @@ fn jb_t7_unknown_kinds() {
     );
     assert_eq!(found[1].field, "kernels[0].kind");
     // Nothing is declared in an empty catalogue.
-    let none = check(&good(), &Catalogue::empty()).expect_err("nothing is declared");
+    let none = v1(&good(), &Catalogue::empty()).expect_err("nothing is declared");
     assert_eq!(none.len(), 3);
     assert_eq!(
         none[0].message,
@@ -227,7 +230,7 @@ fn jb_t8_settings_refusals() {
                "options": {"row_group_bytes": 18446744073709551615u64}}),
     );
     assert_eq!(
-        check(
+        v1(
             &widest,
             &Catalogue::standard().expect("the standard catalogue")
         ),
@@ -260,10 +263,14 @@ fn jb_t8_settings_refusals() {
         "{}",
         name[0]
     );
-    assert!(name[0].message.ends_with("\"date_trunc\""), "{}", name[0]);
+    assert!(
+        name[0].message.ends_with("\"date_trunc\" and 1 more"),
+        "{}",
+        name[0]
+    );
     // `args` is open by nature: any JSON.
     assert_eq!(
-        check(
+        v1(
             &job(
                 json!({"kind": "parquet", "url": "/in"}),
                 vec![json!({"kind": "std", "name": "cast", "args": 7})],
@@ -276,7 +283,7 @@ fn jb_t8_settings_refusals() {
 }
 
 /// JB-T9 every_refusal_is_collected: all of a document's refusals come back, in the order the
-/// document is read: the source, each kernel, the sink, then the contracts.
+/// document is read: each task, then the edges, the ports, the graph and the contracts.
 #[test]
 fn jb_t9_every_refusal_is_collected() {
     let doc = job(
@@ -322,7 +329,7 @@ fn jb_t10_contracts_are_needed() {
         Vec::new(),
         example(Role::Sink, "peql"),
     );
-    let found = check(&doc, &governed).expect_err("no contract is carried");
+    let found = v1(&doc, &governed).expect_err("no contract is carried");
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(
         found
@@ -331,8 +338,8 @@ fn jb_t10_contracts_are_needed() {
     );
     assert_eq!(
         found[0].message,
-        "`datafusion` at `source` reads or writes under a contract, and the job carries none: put \
-         it in `contracts`"
+        "`datafusion` at `source` reads or writes under a contract, and the job carries none: \
+         put it in `contracts`"
     );
     assert!(
         found[1].message.starts_with("`peql` at `sink` "),
@@ -340,14 +347,14 @@ fn jb_t10_contracts_are_needed() {
         found[1]
     );
     doc.contracts = vec![contract()];
-    assert_eq!(check(&doc, &governed), Ok(()));
+    assert_eq!(v1(&doc, &governed), Ok(()));
     // The standard catalogue does not have them at all.
     assert!(
-        check(
+        v1(
             &doc,
             &Catalogue::standard().expect("the standard catalogue")
         )
         .is_err()
     );
-    assert_eq!(check(&good(), &governed), Ok(()));
+    assert_eq!(v1(&good(), &governed), Ok(()));
 }

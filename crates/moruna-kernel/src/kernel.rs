@@ -213,6 +213,40 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Payload>;
+    /// How many input ports the kernel takes at most (d.16): a stage that takes several inputs
+    /// numbers them from 0 and is refused at build when it has more than this. One for a
+    /// kernel of one input, which is every kernel that does not say otherwise.
+    fn max_inputs(&self) -> u16 {
+        1
+    }
+    /// `apply` for a batch that came in on input port `port` (d.16). A kernel that takes one
+    /// input leaves it alone: port 0 is `apply`, and a stage of one input never sees another
+    /// port. A kernel that takes several overrides it and is told, on every call, which input
+    /// the batch is; the batches of different ports arrive in no particular order, each once.
+    fn apply_port(
+        &self,
+        state: &mut dyn KernelState,
+        port: u16,
+        input: Payload,
+    ) -> crate::Result<Payload> {
+        match port {
+            0 => self.apply(state, input),
+            other => Err(MorunaError::Plan(format!(
+                "the kernel takes one input and was handed a batch on its port {other}"
+            ))),
+        }
+    }
+    /// The output schema for the given input schemas, port 0 first (d.16); errors are plan-time
+    /// errors. A kernel of one input leaves it alone: one schema is `output_schema`.
+    fn output_schema_of(&self, inputs: &[SourceSchema]) -> crate::Result<SourceSchema> {
+        match inputs {
+            [one] => self.output_schema(one),
+            many => Err(MorunaError::Plan(format!(
+                "the kernel takes one input and is given {}",
+                many.len()
+            ))),
+        }
+    }
     /// The checkpoint of `instance` while it is inside `apply` and waiting on a port (MH 4.10):
     /// its state as it was when that `apply` began, which is what a resume restores before the
     /// morsel is applied again. `None` when the instance is not waiting on a port, and for every
