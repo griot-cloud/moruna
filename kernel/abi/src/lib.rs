@@ -18,55 +18,105 @@ extern crate alloc;
 pub mod manifest;
 
 /// The ABI version: the major number changes when a call's meaning changes, the minor
-/// number when a call is added. `abi_version` returns `MAJOR << 16 | MINOR`.
-pub const ABI_MAJOR: u16 = 1;
+/// number when a call is added. `abi_version` returns `MAJOR << 16 | MINOR`. ABI 2.0
+/// (KC1) moved every call to `nr::BASE + n`, so that a process whose foreign system
+/// calls are forwarded (SDD 28) keeps the whole low range for them.
+pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 2;
+pub const ABI_MINOR: u16 = 0;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
-/// The syscall numbers (SDD 20, d.2). A number is never reused for another meaning.
+/// The syscall numbers (SDD 20, d.2). Call `n` of the table is `BASE + n`; a number is
+/// never reused for another meaning.
 pub mod nr {
-    pub const ABI_VERSION: u64 = 0;
-    pub const HANDLE_CLOSE: u64 = 1;
-    pub const HANDLE_DUPLICATE: u64 = 2;
-    pub const HANDLE_INFO: u64 = 3;
-    pub const CHANNEL_CREATE: u64 = 4;
-    pub const CHANNEL_WRITE: u64 = 5;
-    pub const CHANNEL_READ: u64 = 6;
-    pub const MEMORY_CREATE: u64 = 7;
-    pub const MEMORY_MAP: u64 = 8;
-    pub const MEMORY_UNMAP: u64 = 9;
-    pub const PROCESS_CREATE: u64 = 10;
-    pub const PROCESS_MAP_IMAGE: u64 = 11;
-    pub const PROCESS_START: u64 = 12;
-    pub const PROCESS_EXIT: u64 = 13;
-    pub const THREAD_CREATE: u64 = 14;
-    pub const THREAD_EXIT: u64 = 15;
-    pub const WAIT: u64 = 16;
-    pub const CLOCK_GET: u64 = 17;
-    pub const TIMER_CREATE: u64 = 18;
-    pub const TIMER_SET: u64 = 19;
-    pub const DEBUG_WRITE: u64 = 20;
-    pub const INTERRUPT_CREATE: u64 = 21;
-    pub const INTERRUPT_ACK: u64 = 22;
-    pub const DEVICE_MEMORY_CREATE: u64 = 23;
+    /// The first native number. Every number below it, and every number at or above
+    /// `BASE + COUNT` outside `DATA_PLANE`, is foreign: `BadSyscall` for a native
+    /// process, forwarded for one with a forward (SDD 28).
+    pub const BASE: u64 = 0x1_0000;
+    pub const ABI_VERSION: u64 = BASE;
+    pub const HANDLE_CLOSE: u64 = BASE + 1;
+    pub const HANDLE_DUPLICATE: u64 = BASE + 2;
+    pub const HANDLE_INFO: u64 = BASE + 3;
+    pub const CHANNEL_CREATE: u64 = BASE + 4;
+    pub const CHANNEL_WRITE: u64 = BASE + 5;
+    pub const CHANNEL_READ: u64 = BASE + 6;
+    pub const MEMORY_CREATE: u64 = BASE + 7;
+    pub const MEMORY_MAP: u64 = BASE + 8;
+    /// Since 2.0 any whole pages of a mapping `memory_map` made, not only all of it.
+    pub const MEMORY_UNMAP: u64 = BASE + 9;
+    pub const PROCESS_CREATE: u64 = BASE + 10;
+    pub const PROCESS_MAP_IMAGE: u64 = BASE + 11;
+    pub const PROCESS_START: u64 = BASE + 12;
+    pub const PROCESS_EXIT: u64 = BASE + 13;
+    pub const THREAD_CREATE: u64 = BASE + 14;
+    pub const THREAD_EXIT: u64 = BASE + 15;
+    pub const WAIT: u64 = BASE + 16;
+    pub const CLOCK_GET: u64 = BASE + 17;
+    pub const TIMER_CREATE: u64 = BASE + 18;
+    pub const TIMER_SET: u64 = BASE + 19;
+    pub const DEBUG_WRITE: u64 = BASE + 20;
+    pub const INTERRUPT_CREATE: u64 = BASE + 21;
+    pub const INTERRUPT_ACK: u64 = BASE + 22;
+    pub const DEVICE_MEMORY_CREATE: u64 = BASE + 23;
     /// Added in ABI 1.1: a resource over a sub-range of another (SDD 20, f.10).
-    pub const RESOURCE_NARROW: u64 = 24;
+    pub const RESOURCE_NARROW: u64 = BASE + 24;
     /// Added in ABI 1.2: an interrupt delivered by message (MSI or MSI-X), and the
     /// message a device writes to raise it (SDD 25, d.1).
-    pub const INTERRUPT_CREATE_MSI: u64 = 25;
+    pub const INTERRUPT_CREATE_MSI: u64 = BASE + 25;
     /// Added in ABI 1.2: pins a DMA memory object for a device and returns the device
     /// address of each of its pages (SDD 25, d.1).
-    pub const MEMORY_PIN: u64 = 26;
+    pub const MEMORY_PIN: u64 = BASE + 26;
     /// Added in ABI 1.2: releases the pins a DMA resource holds in quarantine.
-    pub const DMA_RELEASE: u64 = 27;
+    pub const DMA_RELEASE: u64 = BASE + 27;
     /// Added in ABI 1.2: the kind and range of a resource.
-    pub const RESOURCE_INFO: u64 = 28;
+    pub const RESOURCE_INFO: u64 = BASE + 28;
     /// Added in ABI 1.2: ends a process through a handle to it.
-    pub const PROCESS_KILL: u64 = 29;
-    /// One past the highest number; any number at or above it is `BadSyscall`.
-    pub const COUNT: u64 = 30;
+    pub const PROCESS_KILL: u64 = BASE + 29;
+    /// Added in ABI 2.0: changes the protection of whole pages of the caller's own
+    /// mappings.
+    pub const MEMORY_PROTECT: u64 = BASE + 30;
+    /// Added in ABI 2.0: gives a created process a forward: its foreign calls go to a
+    /// channel, and the fast calls a table names are answered by the kernel (SDD 28).
+    pub const PROCESS_FORWARD: u64 = BASE + 31;
+    /// Added in ABI 2.0: starts a created process whose address space its creator
+    /// built, at an entry and a stack pointer it gives, with no start page.
+    pub const PROCESS_LAUNCH: u64 = BASE + 32;
+    /// Added in ABI 2.0: maps a memory object, or zero pages filled on first touch,
+    /// into a process at an address its caller chooses.
+    pub const PROCESS_MAP: u64 = BASE + 33;
+    /// Added in ABI 2.0: unmaps whole pages of a process.
+    pub const PROCESS_UNMAP: u64 = BASE + 34;
+    /// Added in ABI 2.0: changes the protection of whole pages of a process.
+    pub const PROCESS_PROTECT: u64 = BASE + 35;
+    /// Added in ABI 2.0: copies bytes out of a process's memory.
+    pub const PROCESS_READ: u64 = BASE + 36;
+    /// Added in ABI 2.0: copies bytes into a process's memory.
+    pub const PROCESS_WRITE: u64 = BASE + 37;
+    /// Added in ABI 2.0: sleeps while a 32-bit word of the caller's memory holds a
+    /// value.
+    pub const FUTEX_WAIT: u64 = BASE + 38;
+    /// Added in ABI 2.0: wakes threads sleeping on a word of the caller's memory.
+    pub const FUTEX_WAKE: u64 = BASE + 39;
+    /// Added in ABI 2.0: sets the calling thread's FS base, for thread-local storage.
+    pub const THREAD_SET_FS: u64 = BASE + 40;
+    /// Added in ABI 2.0: a new thread of a forwarded process, from the registers of a
+    /// thread waiting on its forward: `(process, tid, stack, tls, clear_tid, set_tid)`.
+    pub const FORWARD_CLONE: u64 = BASE + 41;
+    /// Added in ABI 2.0: bytes from the CPU's random source (at most
+    /// `limits::RANDOM_MAX` a call).
+    pub const RANDOM_READ: u64 = BASE + 42;
+    /// One past the highest call of the table.
+    pub const COUNT: u64 = 43;
+    /// Reserved for the data plane's calls (`batch_get`, `batch_put`, `port_call`,
+    /// KD1): native numbers, answered by the kernel, `BadSyscall` until they exist.
+    pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
+
+    /// Whether `number` is a native call: one of the table's, or the data plane's.
+    pub const fn is_native(number: u64) -> bool {
+        (number >= BASE && number < BASE + COUNT)
+            || (number >= DATA_PLANE.start && number < DATA_PLANE.end)
+    }
 }
 
 /// Every error a syscall returns. A call returns `-(code)` in `rax`.
@@ -440,15 +490,23 @@ pub mod resource_info {
     pub const LEN: usize = 16;
 }
 
-/// The flags of `memory_map`.
+/// The flags of `memory_map`, `memory_protect` and the `process_*` calls on another
+/// process's memory.
 pub mod map {
-    /// The mapping is readable. Every mapping is.
+    /// The mapping is readable. Every mapping that is not `NONE` is.
     pub const READ: u64 = 1 << 0;
     /// The mapping is writable; needs the `WRITE` right.
     pub const WRITE: u64 = 1 << 1;
     /// The mapping is executable; refused together with `WRITE`.
     pub const EXECUTE: u64 = 1 << 2;
+    /// `process_map` only: whatever the range holds is unmapped first.
+    pub const FIXED: u64 = 1 << 3;
+    /// The protection bits, of which none is no access.
+    pub const PROTECTION: u64 = READ | WRITE | EXECUTE;
+    /// Every flag `memory_map` takes.
     pub const ALL: u64 = READ | WRITE | EXECUTE;
+    /// Every flag `process_map` takes.
+    pub const PROCESS_ALL: u64 = PROTECTION | FIXED;
 }
 
 /// The page size every length and offset in this ABI is a multiple of.
@@ -483,6 +541,133 @@ pub mod limits {
     pub const MAIN_STACK_BYTES: u64 = 256 * 1024;
     /// The most pages one `memory_pin` pins: a whole memory object of the largest size.
     pub const PIN_MAX_PAGES: usize = (MEMORY_MAX_BYTES / 4096) as usize;
+    /// The most bytes one `process_read` or `process_write` copies.
+    pub const PROCESS_COPY_MAX: usize = 1024 * 1024;
+    /// The most bytes one `random_read` gives.
+    pub const RANDOM_MAX: usize = 4096;
+    /// The most foreign numbers a forward's table names: numbers `0 .. FORWARD_FAST`.
+    pub const FORWARD_FAST: usize = 512;
+}
+
+/// A process's forward (SDD 28, d.1): how its foreign system calls reach the server
+/// that gives it its personality, and which of them the kernel answers itself.
+///
+/// A forwarded process's thread that makes a call outside the native range sends a
+/// [`request`] on the forward's channel and waits; the server answers with a
+/// [`reply`] carrying the same token. A call whose number the forward's table names
+/// as a [`fast`] call is answered by the kernel with no message: those are the calls
+/// on the process's own memory, time and threads that a round trip would make slow.
+pub mod forward {
+    /// What `process_forward` reads: [`table::SIZE`] bytes.
+    pub mod table {
+        /// `u32` magic.
+        pub const MAGIC: usize = 0;
+        /// `u32` reserved, zero.
+        pub const RESERVED: usize = 4;
+        /// `[u8; FORWARD_FAST]`: entry `n` is the fast call foreign number `n` reaches,
+        /// or [`super::fast::NONE`] when it is forwarded.
+        pub const CALLS: usize = 8;
+        pub const SIZE: usize = CALLS + crate::limits::FORWARD_FAST;
+        /// "MKF1".
+        pub const MAGIC_VALUE: u32 = 0x3146_4b4d;
+    }
+
+    /// The calls the kernel answers for a forwarded process. They take their arguments
+    /// and give their results in the x86-64 System V system call convention, the one
+    /// the foreign programs they serve were built for: arguments in `rdi`, `rsi`,
+    /// `rdx`, `r10`, `r8`, `r9`, and a result in `rax` that is a value or `-errno`.
+    /// The kernel holds no personality's call numbers: the table maps them.
+    pub mod fast {
+        /// Forwarded: not a fast call.
+        pub const NONE: u8 = 0;
+        /// `futex(uaddr, op, val, timeout, uaddr2, val3)`: wait, wake, their bitset
+        /// forms, requeue and compare-requeue, on the process's own words.
+        pub const FUTEX: u8 = 1;
+        /// `clock_gettime(clock, timespec)`.
+        pub const CLOCK_GETTIME: u8 = 2;
+        /// `nanosleep(request, remaining)`.
+        pub const NANOSLEEP: u8 = 3;
+        /// `clock_nanosleep(clock, flags, request, remaining)`.
+        pub const CLOCK_NANOSLEEP: u8 = 4;
+        /// `mmap(addr, len, prot, flags, fd, offset)` of anonymous memory; a mapping of
+        /// a file is forwarded.
+        pub const MMAP: u8 = 5;
+        /// `munmap(addr, len)`.
+        pub const MUNMAP: u8 = 6;
+        /// `mprotect(addr, len, prot)`.
+        pub const MPROTECT: u8 = 7;
+        /// `brk(addr)`.
+        pub const BRK: u8 = 8;
+        /// `madvise(addr, len, advice)`.
+        pub const MADVISE: u8 = 9;
+        /// `sched_yield()`.
+        pub const SCHED_YIELD: u8 = 10;
+        /// `arch_prctl(code, addr)`: setting and reading the FS base; any other code is
+        /// forwarded.
+        pub const ARCH_PRCTL: u8 = 11;
+        /// `set_tid_address(word)`: the word the kernel clears and wakes when the
+        /// thread ends.
+        pub const SET_TID_ADDRESS: u8 = 12;
+        /// `getrandom(buf, len, flags)`, from the CPU's random source.
+        pub const GETRANDOM: u8 = 13;
+        /// `exit(code)`: the calling thread ends.
+        pub const EXIT: u8 = 14;
+        /// `gettid()`.
+        pub const GETTID: u8 = 15;
+        /// `gettimeofday(timeval, timezone)`.
+        pub const GETTIMEOFDAY: u8 = 16;
+        /// `time(seconds)`.
+        pub const TIME: u8 = 17;
+        /// `clock_getres(clock, timespec)`.
+        pub const CLOCK_GETRES: u8 = 18;
+        /// One past the highest.
+        pub const COUNT: u8 = 19;
+    }
+
+    /// A request, the kernel to the server: [`request::SIZE`] bytes.
+    pub mod request {
+        /// `u32` the call's kind, [`CALL`].
+        pub const KIND: usize = 0;
+        /// `u32` the process's live threads when the call was made.
+        pub const THREADS: usize = 4;
+        /// `u64` the calling thread's token, its thread id; the reply carries it back.
+        pub const TOKEN: usize = 8;
+        /// `u64` the foreign call number.
+        pub const NUMBER: usize = 16;
+        /// `[u64; 6]` the arguments.
+        pub const ARGS: usize = 24;
+        /// `u64` the instruction pointer after the call.
+        pub const IP: usize = 72;
+        pub const SIZE: usize = 80;
+        /// A system call.
+        pub const CALL: u32 = 1;
+    }
+
+    /// A reply, the server to the kernel: [`reply::SIZE`] bytes.
+    pub mod reply {
+        /// `u64` the token of the request answered.
+        pub const TOKEN: usize = 0;
+        /// `u64` the call's result (the value of `rax`), or an exit code.
+        pub const VALUE: usize = 8;
+        /// `u64` what the thread does: [`RETURN`], [`EXIT_THREAD`], [`EXIT_PROCESS`] or
+        /// [`RESTART`].
+        pub const ACTION: usize = 16;
+        /// `u64` with [`RESTART`], the new stack pointer (`VALUE` is the new entry).
+        pub const STACK: usize = 24;
+        /// `u64` with [`RESTART`], where the new heap begins (none when zero).
+        pub const BRK: usize = 32;
+        pub const SIZE: usize = 40;
+        /// The thread returns `VALUE` from its call.
+        pub const RETURN: u64 = 0;
+        /// The thread ends.
+        pub const EXIT_THREAD: u64 = 1;
+        /// The process ends with code `VALUE`.
+        pub const EXIT_PROCESS: u64 = 2;
+        /// The thread starts again at entry `VALUE` with stack `STACK`, every other
+        /// register zero, its FS base zero and its heap at `BRK`: the server rebuilt
+        /// the address space of a process with this one thread (an `execve`).
+        pub const RESTART: u64 = 3;
+    }
 }
 
 /// The deadline that never passes.
@@ -525,7 +710,7 @@ pub mod start_entry {
 /// offset 0   u32 magic, START_MAGIC
 /// offset 4   u32 ABI version (MAJOR << 16 | MINOR)
 /// offset 8   u32 count of entries
-/// offset 12  u32 reserved, zero
+/// offset 12  u32 CPUs online (ABI 2.0; zero before)
 /// offset 16  [u8; 32] process name, zero padded
 /// offset 48  count entries, each:
 ///              u32 handle, u32 rights, [u8; 32] slot name, zero padded
@@ -535,6 +720,8 @@ pub mod start_page {
     pub const MAGIC_OFFSET: usize = 0;
     pub const VERSION_OFFSET: usize = 4;
     pub const COUNT_OFFSET: usize = 8;
+    /// Since ABI 2.0: the CPUs online.
+    pub const CPUS_OFFSET: usize = 12;
     pub const NAME_OFFSET: usize = 16;
     pub const HEADER_SIZE: usize = 48;
     pub const ENTRY_SIZE: usize = 40;
@@ -691,9 +878,18 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x1_0002);
-        assert_eq!(nr::PROCESS_KILL + 1, nr::COUNT);
+        assert_eq!(ABI_VERSION, 0x2_0000);
+        assert_eq!(nr::RANDOM_READ + 1, nr::BASE + nr::COUNT);
+        assert!(nr::is_native(nr::BASE) && nr::is_native(nr::FORWARD_CLONE));
+        assert!(!nr::is_native(nr::BASE - 1) && !nr::is_native(nr::BASE + nr::COUNT));
+        assert!(nr::is_native(nr::DATA_PLANE.start) && !nr::is_native(nr::DATA_PLANE.end));
+        assert!(!nr::is_native(0) && !nr::is_native(511));
         assert_eq!(map::ALL, 7);
+        assert_eq!(map::PROCESS_ALL, 15);
+        assert_eq!(forward::table::SIZE, 8 + limits::FORWARD_FAST);
+        assert_eq!(forward::request::SIZE, forward::request::IP + 8);
+        assert_eq!(forward::reply::SIZE, forward::reply::BRK + 8);
+        const { assert!(forward::fast::CLOCK_GETRES < forward::fast::COUNT) };
         let mut word = [0u8; 16];
         assert!(write_u64(&mut word, 8, 0x0123_4567_89ab_cdef));
         assert_eq!(read_u64(&word, 8), Some(0x0123_4567_89ab_cdef));

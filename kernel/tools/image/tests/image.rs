@@ -95,7 +95,7 @@ fn sv_t9_a_description_renders_the_manifest_the_kernel_parses() {
     let expect = d.expectations();
     assert_eq!(expect[0], "kk: 1 CPUs online");
     assert!(expect.contains(
-        &"kk: moruna microkernel, abi 1.2: started 3 processes from the manifest".to_string()
+        &"kk: moruna microkernel, abi 2.0: started 3 processes from the manifest".to_string()
     ));
     assert!(expect.contains(&"kk: process supervisor exited with code 0 (".to_string()));
     assert!(expect.contains(&"kk: process pong faulted: page fault at 0x0 on read".to_string()));

@@ -33,7 +33,7 @@ use core::{
 
 pub use moruna_abi::{
     ABI_VERSION, DEADLINE_INFINITE, Error, ObjectType, PAGE_SIZE, RawHandle, ResourceKind, Rights,
-    Signals, limits, map, memory_flags, pin_flags,
+    Signals, forward, limits, map, memory_flags, pin_flags,
 };
 use moruna_abi::{msi, nr, start_entry, wait_item};
 
@@ -71,6 +71,35 @@ pub fn thread_exit() -> ! {
 /// Nanoseconds on the kernel's monotonic clock.
 pub fn now() -> u64 {
     raw::call0(nr::CLOCK_GET).0
+}
+
+/// Sleeps while `word` holds `expected`, until a [`futex_wake`] on it or the deadline
+/// (ABI 2.0): `ShouldWait` when it holds another value, `TimedOut` at the deadline.
+pub fn futex_wait(
+    word: &core::sync::atomic::AtomicU32,
+    expected: u32,
+    deadline: u64,
+) -> Result<()> {
+    check(raw::futex_wait(word, expected, deadline)).map(|_| ())
+}
+
+/// Wakes at most `count` threads sleeping on `word`; returns how many (ABI 2.0).
+pub fn futex_wake(word: &core::sync::atomic::AtomicU32, count: u32) -> Result<u32> {
+    check(raw::futex_wake(word, count)).map(|n| n as u32)
+}
+
+/// Fills `buf` from the CPU's random source (ABI 2.0), `limits::RANDOM_MAX` bytes at a
+/// time.
+pub fn random(buf: &mut [u8]) -> Result<()> {
+    for chunk in buf.chunks_mut(limits::RANDOM_MAX) {
+        check(raw::random_read(chunk))?;
+    }
+    Ok(())
+}
+
+/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there.
+pub fn set_fs(base: u64) -> Result<()> {
+    check(raw::thread_set_fs(base)).map(|_| ())
 }
 
 /// An owned handle. Dropping it closes it.
@@ -403,6 +432,7 @@ fn mapping<'a>(handle: &Handle, offset: u64, len: u64, flags: u64) -> Result<Map
         addr,
         len,
         writable: flags & map::WRITE != 0,
+        made_writable: flags & map::WRITE != 0,
         _object: PhantomData,
     })
 }
@@ -415,6 +445,7 @@ pub struct Mapping<'a> {
     addr: u64,
     len: u64,
     writable: bool,
+    made_writable: bool,
     _object: PhantomData<&'a Handle>,
 }
 
@@ -434,6 +465,34 @@ impl Mapping<'_> {
     /// The first address above the mapping: a stack top for [`Thread::spawn`].
     pub fn end(&self) -> u64 {
         self.addr + self.len
+    }
+
+    /// Makes the whole mapping read only, or writable again if it was made writable
+    /// (`memory_protect`, ABI 2.0).
+    pub fn protect(&mut self, writable: bool) -> Result<()> {
+        if writable && !self.made_writable {
+            return Err(Error::AccessDenied);
+        }
+        let flags = if writable {
+            map::READ | map::WRITE
+        } else {
+            map::READ
+        };
+        check(raw::memory_protect(self.addr, self.len, flags))?;
+        self.writable = writable;
+        Ok(())
+    }
+
+    /// Unmaps every page from page `keep` on, keeping the first `keep` pages (a partial
+    /// `memory_unmap`, ABI 2.0).
+    pub fn shrink(&mut self, keep: u64) -> Result<()> {
+        let kept = keep.checked_mul(PAGE_SIZE).ok_or(Error::InvalidArgs)?;
+        if keep == 0 || kept >= self.len {
+            return Err(Error::InvalidArgs);
+        }
+        check(raw::call2(nr::MEMORY_UNMAP, self.addr + kept, self.len - kept).0)?;
+        self.len = kept;
+        Ok(())
     }
 
     fn range(&self, offset: usize, n: usize) -> Result<u64> {
@@ -581,6 +640,82 @@ impl Process {
     /// Ends the running process (`process_kill`, ABI 1.2).
     pub fn kill(&self) -> Result<()> {
         check(raw::process_kill(self.0.raw())).map(|_| ())
+    }
+
+    /// Gives the created process a forward over `endpoint` with `table` (ABI 2.0,
+    /// SDD 28 d.1). The endpoint moves into the kernel; on failure it is given back.
+    pub fn forward(&self, endpoint: Channel, table: &[u8]) -> Moved<Channel> {
+        match check(raw::process_forward(self.0.raw(), endpoint.0.raw(), table)) {
+            Ok(_) => {
+                core::mem::forget(endpoint);
+                Ok(())
+            }
+            Err(e) => Err((e, endpoint)),
+        }
+    }
+
+    /// Starts the created process at `entry` with its stack pointer at `stack` and its
+    /// heap beginning at `brk` (none when zero); returns its first thread's id.
+    pub fn launch(&self, entry: u64, stack: u64, brk: u64) -> Result<u64> {
+        check(raw::process_launch(self.0.raw(), entry, stack, brk))
+    }
+
+    /// Maps `len` bytes of `memory` from `offset` (zero pages filled on first touch when
+    /// `None`) into the process at `addr` (where the kernel chooses when zero), with
+    /// `map` flags; returns where.
+    pub fn map(
+        &self,
+        memory: Option<&Handle>,
+        offset: u64,
+        len: u64,
+        addr: u64,
+        flags: u64,
+    ) -> Result<u64> {
+        let m = memory.map(|h| h.raw()).unwrap_or(0);
+        check(raw::process_map(self.0.raw(), m, offset, len, addr, flags))
+    }
+
+    /// Unmaps whole pages of the process.
+    pub fn unmap(&self, addr: u64, len: u64) -> Result<()> {
+        check(raw::process_unmap(self.0.raw(), addr, len)).map(|_| ())
+    }
+
+    /// Sets the protection (`map::PROTECTION` bits) of whole pages of the process.
+    pub fn protect(&self, addr: u64, len: u64, flags: u64) -> Result<()> {
+        check(raw::process_protect(self.0.raw(), addr, len, flags)).map(|_| ())
+    }
+
+    /// Copies bytes at `addr` of the process into `buf`.
+    pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        check(raw::process_read(self.0.raw(), addr, buf)).map(|_| ())
+    }
+
+    /// Copies `data` to `addr` of the process.
+    pub fn write(&self, addr: u64, data: &[u8]) -> Result<()> {
+        check(raw::process_write(self.0.raw(), addr, data)).map(|_| ())
+    }
+
+    /// A new thread of the forwarded process from the registers of its thread `tid`,
+    /// which waits on the forward (`forward_clone`, SDD 28 f.4): its stack pointer
+    /// `stack`, its FS base `tls` (the parent's when zero), the word `clear_tid` cleared
+    /// and woken when it ends, and its id written to `set_tid` before it runs (neither
+    /// when zero). Returns its id.
+    pub fn clone_thread(
+        &self,
+        tid: u64,
+        stack: u64,
+        tls: u64,
+        clear_tid: u64,
+        set_tid: u64,
+    ) -> Result<u64> {
+        check(raw::forward_clone(
+            self.0.raw(),
+            tid,
+            stack,
+            tls,
+            clear_tid,
+            set_tid,
+        ))
     }
 
     /// Starts the process at `entry`, moving `handles` into it under their slot names.

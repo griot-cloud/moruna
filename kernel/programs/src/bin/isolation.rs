@@ -1,4 +1,4 @@
-//! KK-T8, prober: every handle-taking call (21, ABI 1.2) on every value from 0 to 4096, and on the
+//! KK-T8, prober: every handle-taking call (29, ABI 2.0) on every value from 0 to 4096, and on the
 //! holder's live values, must return bad handle. First with only the console, then,
 //! after closing it, with no handle at all; the exit code counts the second pass's
 //! failures and the kernel prints it.
@@ -8,11 +8,14 @@
 #![forbid(unsafe_code)]
 
 use moruna_kb1_programs::{console, ms, slot};
-use moruna_sys::{Channel, Error, RawHandle, Signals, WaitItem, map, now, println, raw, wait_one};
+use moruna_sys::{
+    Channel, Error, RawHandle, Signals, WaitItem, forward::table as moruna_abi_table, map, now,
+    println, raw, wait_one,
+};
 
 moruna_sys::main!(run);
 
-const CALLS: usize = 21;
+const CALLS: usize = 29;
 const SWEEP: RawHandle = 4096;
 
 /// The number of the first call that did not answer bad handle for `v`, if any.
@@ -40,6 +43,14 @@ fn probe(v: RawHandle) -> Option<usize> {
         raw::dma_release(v),
         raw::resource_info(v, &mut [0; 24]),
         raw::process_kill(v),
+        raw::process_forward(v, v, &[0; moruna_abi_table::SIZE]),
+        raw::process_launch(v, 0x40_0000, 0x40_0000, 0),
+        raw::process_map(v, 0, 0, 4096, 0, map::READ),
+        raw::process_unmap(v, 0x40_0000, 4096),
+        raw::process_protect(v, 0x40_0000, 4096, map::READ),
+        raw::process_read(v, 0x40_0000, &mut [0; 8]),
+        raw::process_write(v, 0x40_0000, &[0; 8]),
+        raw::forward_clone(v, 1, 0x40_0000, 0, 0, 0),
     ];
     results
         .iter()
