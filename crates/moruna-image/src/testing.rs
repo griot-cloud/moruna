@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -271,4 +272,195 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = crate::layer::remove_any(&self.0, "scratch");
     }
+}
+
+/// Bytes no compression shrinks, the same every run: a xorshift stream from `seed`, with
+/// no zero byte (so no page of it is a hole).
+pub fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8 | 1
+        })
+        .collect()
+}
+
+/// What [`fixture`] wrote.
+#[derive(Clone, Debug)]
+pub struct Fixture {
+    /// The layer files, lowest first, and their ids.
+    pub layers: Vec<(PathBuf, Digest)>,
+    /// The list of the merged tree the boot's test checks against.
+    pub checks: PathBuf,
+    /// The layer list the image filesystem server starts with.
+    pub list: PathBuf,
+}
+
+/// The file the cold start reads, in the 100 MiB layer.
+pub const COLD: &str = "/cold/a.txt";
+/// The 100 MiB file.
+pub const BIG: &str = "/data/big.bin";
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// The CI boot's image (SDD 27, k): two layers converted to layer files (`layer-1.img`,
+/// the lower, and `layer-2.img`, over 100 MiB), the server's layer list naming them
+/// `block1` and `block2`, and the list of what SDD 19's unpacking of the same image
+/// holds, with each file's SHA-256, which the boot's test checks the merged tree
+/// against. Whiteouts, an opaque directory, replacements both ways, a hard link, a
+/// lower layer's link followed by an upper layer's path, a file of mode 0, holes, and
+/// eighty small files of varied lengths.
+pub fn fixture(out: &Path) -> Result<Fixture> {
+    fs::create_dir_all(out)
+        .map_err(|e| crate::Error::io(format!("making {}", out.display()), e))?;
+    let mut lower = vec![
+        Entry::dir("bin"),
+        Entry::File("bin/sh", noise(1, 20_000), 0o755),
+        Entry::Hardlink("bin/sh2", "bin/sh"),
+        Entry::File("bin/ls", b"ls\n".to_vec(), 0o755),
+        Entry::Symlink("bin/cat", "sh"),
+        Entry::dir("etc"),
+        Entry::file("etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n"),
+        Entry::file("etc/old", b"old\n"),
+        Entry::file("etc/hostname", b"lower\n"),
+        Entry::dir("gone"),
+        Entry::file("gone/a", b"a"),
+        Entry::dir("gone/b"),
+        Entry::file("gone/b/c", b"c"),
+        Entry::dir("opq"),
+        Entry::file("opq/lower1", b"1"),
+        Entry::file("opq/lower2", b"2"),
+        Entry::file("replaced", b"a file below"),
+        Entry::Symlink("lib", "usr/lib"),
+        Entry::dir("usr"),
+        Entry::dir("usr/lib"),
+        Entry::File("usr/lib/libc.so", noise(2, 300 * 1024), 0o755),
+        Entry::file("usr/lib/empty", b""),
+        Entry::dir("usr/share"),
+        Entry::dir("usr/share/doc"),
+        Entry::file("usr/share/doc/readme.txt", b"a document\n"),
+        Entry::File("data", Vec::new(), 0o755),
+    ];
+    // `data` is a file below and a directory above.
+    let mut sparse = vec![0u8; 1 << 20];
+    sparse.extend(noise(3, 8192));
+    sparse.extend(vec![0u8; 3000]);
+    lower.push(Entry::file("sparse.img", &sparse));
+    lower.push(Entry::File("locked", b"mode 0".to_vec(), 0o000));
+    let mut upper = vec![
+        Entry::file(
+            "etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\nmoruna:x:1:1::/:/bin/sh\n",
+        ),
+        Entry::file("etc/.wh.old", b""),
+        Entry::file("etc/new", b"new\n"),
+        Entry::file(".wh.gone", b""),
+        Entry::file("opq/.wh..wh..opq", b""),
+        Entry::file("opq/upper", b"upper"),
+        Entry::dir("replaced"),
+        Entry::file("replaced/inside", b"now a directory"),
+        Entry::File("lib/libextra.so", noise(4, 50_000), 0o755),
+        Entry::file("usr/lib/.wh.empty", b""),
+        Entry::Symlink("bin/ls", "sh"),
+        Entry::dir("cold"),
+        Entry::File("cold/a.txt", noise(5, 4096), 0o644),
+        Entry::dir("data"),
+        Entry::File("data/big.bin", noise(6, 100 << 20), 0o644),
+        Entry::dir("data/small"),
+    ];
+    for i in 0..80usize {
+        let len = (i * 1361) % 9000;
+        upper.push(Entry::File(
+            leak(format!("data/small/f{i:03}")),
+            noise(100 + i as u64, len),
+            0o640,
+        ));
+    }
+    let layout = out.join("layout");
+    let _ = crate::layer::remove_any(&layout, "fixture");
+    LayoutBuilder::new(&layout)
+        .layer(media::TAR, &lower)
+        .layer(media::TAR, &upper)
+        .finish(Some("kc2:1"));
+    let source = OciLayout::open(&layout)?;
+    let converted = crate::layerfile::convert(&source, "kc2:1", &out.join("converted"))?;
+    let mut layers = Vec::new();
+    let mut list = String::from("moruna-layers 1\n");
+    for (i, layer) in converted.layers.iter().enumerate() {
+        let to = out.join(format!("layer-{}.img", i + 1));
+        fs::rename(&layer.path, &to)
+            .map_err(|e| crate::Error::io(format!("moving {}", to.display()), e))?;
+        list.push_str(&format!("layer block{} {}\n", i + 1, layer.id.hex()));
+        layers.push((to, layer.id.clone()));
+    }
+    let cache = out.join("cache");
+    let _ = crate::layer::remove_any(&cache, "fixture");
+    let image = crate::unpack(&source, "kc2:1", &cache)?;
+    let mut lines = vec![format!("cold {COLD}"), format!("big {BIG}")];
+    let mut todo = vec![PathBuf::new()];
+    while let Some(rel) = todo.pop() {
+        let dir = image.rootfs.join(&rel);
+        let mut children: Vec<_> = fs::read_dir(&dir)
+            .map_err(|e| crate::Error::io(format!("listing {}", dir.display()), e))?
+            .collect::<std::io::Result<_>>()
+            .map_err(|e| crate::Error::io(format!("listing {}", dir.display()), e))?;
+        children.sort_by_key(|c| c.file_name());
+        for child in children {
+            let rel = rel.join(child.file_name());
+            let path = format!("/{}", rel.display());
+            if crate::MOUNT_POINTS.iter().any(|m| path == format!("/{m}")) {
+                continue;
+            }
+            let meta = fs::symlink_metadata(child.path())
+                .map_err(|e| crate::Error::io(format!("reading {path}"), e))?;
+            let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777;
+            if meta.file_type().is_symlink() {
+                let target = fs::read_link(child.path())
+                    .map_err(|e| crate::Error::io(format!("reading {path}"), e))?;
+                lines.push(format!("l {} {path}", target.display()));
+            } else if meta.is_dir() {
+                lines.push(format!("d {mode:o} {path}"));
+                todo.push(rel);
+            } else {
+                if mode & 0o400 == 0 {
+                    fs::set_permissions(child.path(), fs::Permissions::from_mode(0o600))
+                        .map_err(|e| crate::Error::io(format!("reading {path}"), e))?;
+                }
+                let bytes = fs::read(child.path())
+                    .map_err(|e| crate::Error::io(format!("reading {path}"), e))?;
+                lines.push(format!(
+                    "f {mode:o} {} {} {path}",
+                    bytes.len(),
+                    Digest::of(&bytes).hex()
+                ));
+            }
+        }
+    }
+    let body = lines.join("\n") + "\n";
+    // The header carries the list's length, so the test knows how much to map: its
+    // own length is counted, digits and all.
+    let header = (1..20)
+        .map(|digits| "moruna-checks 1 ".len() + digits + 1 + body.len())
+        .find(|total| format!("moruna-checks 1 {total}\n").len() + body.len() == *total)
+        .map(|total| format!("moruna-checks 1 {total}\n"))
+        .ok_or_else(|| crate::Error::Format("the check list's length has no fixed point".into()))?;
+    let checks = out.join("imagefs.checks");
+    fs::write(&checks, header + &body)
+        .map_err(|e| crate::Error::io(format!("writing {}", checks.display()), e))?;
+    let list_path = out.join("imagefs.layers");
+    fs::write(&list_path, list)
+        .map_err(|e| crate::Error::io(format!("writing {}", list_path.display()), e))?;
+    let _ = crate::layer::remove_any(&cache, "fixture");
+    let _ = crate::layer::remove_any(&layout, "fixture");
+    let _ = crate::layer::remove_any(&out.join("converted"), "fixture");
+    Ok(Fixture {
+        layers,
+        checks,
+        list: list_path,
+    })
 }

@@ -148,7 +148,7 @@ fn build(source: &dyn ImageSource, manifest: &Manifest, temp: &Path) -> Result<(
 }
 
 /// The bytes of a small blob, checked against its descriptor.
-fn blob_bytes(source: &dyn ImageSource, descriptor: &Descriptor) -> Result<Vec<u8>> {
+pub(crate) fn blob_bytes(source: &dyn ImageSource, descriptor: &Descriptor) -> Result<Vec<u8>> {
     let mut reader = Hashing::new(source.blob(&descriptor.digest)?);
     let mut bytes = Vec::new();
     (&mut reader)
@@ -186,7 +186,7 @@ fn check(descriptor: &Descriptor, reader: Hashing<impl Read>) -> Result<()> {
     Ok(())
 }
 
-fn apply_layer(
+pub(crate) fn apply_layer(
     source: &dyn ImageSource,
     descriptor: &Descriptor,
     rootfs: &Path,
@@ -221,7 +221,7 @@ fn apply_layer(
 }
 
 /// The directories the sandbox mounts onto exist, and are directories (SDD 19 f.3).
-fn mount_points(rootfs: &Path) -> Result<()> {
+pub(crate) fn mount_points(rootfs: &Path) -> Result<()> {
     for name in MOUNT_POINTS {
         let path = rootfs.join(name);
         match fs::symlink_metadata(&path) {
