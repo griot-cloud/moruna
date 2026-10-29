@@ -6,7 +6,7 @@ use moruna_kernel::arrow::array::{RecordBatch, RecordBatchOptions, new_empty_arr
 use moruna_kernel::arrow::compute::concat_batches;
 use moruna_kernel::arrow::ipc;
 use moruna_kernel::buffer::arena_tier_of;
-use moruna_kernel::ipc::Decoder;
+use moruna_kernel::ipc::{Decoder, Inflate};
 use moruna_kernel::{Allocator, Buffer, Completion, Payload, Result, RowRange, Split, Tier};
 
 use super::ArrowIpcSource;
@@ -81,7 +81,7 @@ pub(crate) async fn read(
     }
     let mut parts = Vec::with_capacity(take.len());
     for (pending, (_, from, to)) in pending.into_iter().zip(&take) {
-        let batch = decode(file, split, pending).await?;
+        let batch = decode(file, split, pending, alloc).await?;
         parts.push(batch.slice(*from as usize, (*to - *from) as usize));
     }
     let batch = match parts.len() {
@@ -182,8 +182,15 @@ fn land(
 }
 
 /// Decode one landed block: its message through the check (CT-I13) and then arrow-ipc, over
-/// the buffer the bytes landed in. Every failure names the file and the block.
-async fn decode(file: &FileMeta, split: &Split, pending: Pending) -> Result<RecordBatch> {
+/// the buffer the bytes landed in. A compressed block is inflated by the check into one arena
+/// buffer, within half of what the arena can still give (e.8), and decoded over that. Every
+/// failure names the file and the block.
+async fn decode(
+    file: &FileMeta,
+    split: &Split,
+    pending: Pending,
+    alloc: &dyn Allocator,
+) -> Result<RecordBatch> {
     let Pending {
         index,
         base,
@@ -216,7 +223,7 @@ async fn decode(file: &FileMeta, split: &Split, pending: Pending) -> Result<Reco
     let body = arrow.slice_with_length(at + block.meta_len as usize, block.body_len as usize);
     let mut decoder = Decoder::with_schema(Arc::clone(&file.schema));
     let batch = decoder
-        .message(&message, &body)
+        .message(&message, &body, &Inflate::share(alloc))
         .map_err(&named)?
         .ok_or_else(|| named("it is not a record batch".into()))?;
     if batch.num_rows() as u64 != block.rows {

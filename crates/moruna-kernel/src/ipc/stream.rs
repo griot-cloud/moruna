@@ -20,6 +20,7 @@ use arrow::ipc::reader::{RecordBatchDecoder, read_dictionary};
 use arrow::record_batch::RecordBatch;
 
 use super::check::{Checked, check};
+use super::inflate::Inflate;
 
 /// The continuation marker that may precede a message's length.
 const CONTINUATION: [u8; 4] = [0xff; 4];
@@ -52,14 +53,16 @@ impl Decoder {
     }
 
     /// One message and its body: checked (CT-I13), then decoded; `Some` for a record batch,
-    /// whose arrays point into `body`.
+    /// whose arrays point into `body`, or, when the batch was compressed, into the buffer of
+    /// `inflate`'s arena it was inflated into (e.8).
     pub fn message(
         &mut self,
         message: &ipc::Message<'_>,
         body: &ArrowBuffer,
+        inflate: &Inflate<'_>,
     ) -> Result<Option<RecordBatch>, String> {
         let version = message.version();
-        match check(message, body.as_slice(), self.schema.as_deref())? {
+        match check(message, body, self.schema.as_deref(), inflate)? {
             Checked::Schema(fb) => {
                 if self.schema.is_some() {
                     return Err("the stream has a second schema".into());
@@ -67,24 +70,28 @@ impl Decoder {
                 self.schema = Some(Arc::new(ipc::convert::fb_to_schema(fb)));
                 Ok(None)
             }
-            Checked::Batch(batch) => {
+            Checked::Batch(passed) => {
                 let schema = self
                     .schema
                     .clone()
                     .ok_or("a record batch comes before the schema")?;
-                RecordBatchDecoder::try_new(body, batch, schema, &self.dictionaries, &version)
-                    .and_then(|decoder| decoder.read_record_batch())
-                    .map(Some)
-                    .map_err(|e| format!("a record batch: {e}"))
+                passed.with_batch(body, |batch, body| {
+                    RecordBatchDecoder::try_new(body, batch, schema, &self.dictionaries, &version)
+                        .and_then(|decoder| decoder.read_record_batch())
+                        .map(Some)
+                        .map_err(|e| format!("a record batch: {e}"))
+                })?
             }
-            Checked::Dictionary(dictionary) => {
+            Checked::Dictionary(passed) => {
                 let schema = self
                     .schema
                     .clone()
                     .ok_or("a dictionary comes before the schema")?;
-                read_dictionary(body, dictionary, &schema, &mut self.dictionaries, &version)
-                    .map(|()| None)
-                    .map_err(|e| format!("dictionary {}: {e}", dictionary.id()))
+                passed.with_dictionary(body, |dictionary, body| {
+                    read_dictionary(body, dictionary, &schema, &mut self.dictionaries, &version)
+                        .map(|()| None)
+                        .map_err(|e| format!("dictionary {}: {e}", dictionary.id()))
+                })?
             }
             Checked::Empty => Ok(None),
         }
@@ -135,8 +142,9 @@ fn parse(bytes: &[u8]) -> Result<ipc::Message<'_>, String> {
 }
 
 /// Every record batch of a stream held whole in `bytes`, decoded in place: each batch's arrays
-/// point into `bytes`.
-pub fn read_stream(bytes: &ArrowBuffer) -> Result<Vec<RecordBatch>, String> {
+/// point into `bytes`, or, for a compressed batch, into the arena buffer it was inflated into
+/// within `inflate`'s ceiling.
+pub fn read_stream(bytes: &ArrowBuffer, inflate: &Inflate<'_>) -> Result<Vec<RecordBatch>, String> {
     let all = bytes.as_slice();
     let mut decoder = Decoder::new();
     let mut batches = Vec::new();
@@ -161,7 +169,7 @@ pub fn read_stream(bytes: &ArrowBuffer) -> Result<Vec<RecordBatch>, String> {
         let start = at + framing.skip + len;
         let body_len = body_len(&parsed, (all.len() - start) as u64)?;
         let body = bytes.slice_with_length(start, body_len);
-        if let Some(batch) = decoder.message(&parsed, &body)? {
+        if let Some(batch) = decoder.message(&parsed, &body, inflate)? {
             batches.push(batch);
         }
         at = start + body_len;
@@ -172,7 +180,9 @@ pub fn read_stream(bytes: &ArrowBuffer) -> Result<Vec<RecordBatch>, String> {
 /// A stream read from `reader` one message at a time, for a stream too large to hold whole.
 /// Each message and its body are read into memory of their declared sizes, which must fit in
 /// the `limit` bytes the stream was said to hold, so no length read from the stream is
-/// allocated before it is known to be there.
+/// allocated before it is known to be there. It reads the streams Moruna writes itself (a spill
+/// file, the trace), which are never compressed: a compressed batch is refused by the check,
+/// whose ceiling here is zero.
 pub struct ReadStream<R> {
     reader: R,
     left: u64,
@@ -234,9 +244,9 @@ impl<R: Read> ReadStream<R> {
             if body.len() < body_len {
                 return Err(format!("the stream ends inside a body of {body_len} bytes"));
             }
-            if let Some(batch) = self
-                .decoder
-                .message(&parsed, &ArrowBuffer::from_vec(body))?
+            if let Some(batch) =
+                self.decoder
+                    .message(&parsed, &ArrowBuffer::from_vec(body), &Inflate::none())?
             {
                 return Ok(Some(batch));
             }

@@ -1,5 +1,6 @@
-//! The Arrow IPC source's SO tests, SO-T35 to SO-T37 and SO-T39 (07 k, e.9, e.10); SO-T34 is the
-//! round trip in `moruna-runtime`'s `tests/end_to_end.rs`, SO-T38 the file pyarrow wrote in
+//! The Arrow IPC source's SO tests, SO-T35 to SO-T37, SO-T39 to SO-T41 (07 k, e.9, e.10); SO-T34
+//! is the round trip in `moruna-runtime`'s `tests/end_to_end.rs` (with the sink's compression,
+//! SO-T42), SO-T38 the file pyarrow wrote and SO-T43 the compressed one, both in
 //! `python/tests/test_ipc.py`.
 //!
 //! The files are written here with arrow's own `FileWriter`, a writer that is none of this
@@ -19,7 +20,8 @@ use moruna_kernel::arrow::array::{
     StringDictionaryBuilder,
 };
 use moruna_kernel::arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema};
-use moruna_kernel::arrow::ipc::writer::{FileWriter, StreamWriter};
+use moruna_kernel::arrow::ipc::writer::{FileWriter, IpcWriteOptions, StreamWriter};
+use moruna_kernel::arrow::ipc::{CompressionType, MetadataVersion};
 use moruna_kernel::buffer::arena_tier_of;
 use moruna_kernel::{MorunaError, Payload, Reactor, RowRange, Source, SourceSchema, Split, Tier};
 use moruna_sources::{ArrowIpcSource, ArrowIpcSourceConfig};
@@ -759,4 +761,253 @@ fn so_t37_ipc_stream_refused() {
     std::fs::write(&text, b"just some text that is not arrow at all").expect("a text file");
     let e = err(source_over(&[&text], FakeReactor::new(), None, None));
     assert!(e.to_string().contains("ARROW1"), "{e}");
+}
+
+// SO-T40 ipc_compressed_files. e.9, e.10, contracts e.8, KA10.
+
+/// As `write_ipc`, with every body buffer compressed by `codec`: arrow's writer, none of this
+/// project's.
+fn write_ipc_compressed(
+    dir: &Path,
+    name: &str,
+    first: u64,
+    blocks: &[u64],
+    codec: CompressionType,
+) -> IpcLedger {
+    let ledger = IpcLedger {
+        path: dir.join(name),
+        blocks: blocks.to_vec(),
+    };
+    let file = std::fs::File::create(&ledger.path).expect("the fixture file");
+    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)
+        .and_then(|o| o.try_with_compression(Some(codec)))
+        .expect("write options");
+    let mut writer = FileWriter::try_new_with_options(file, &schema(), options).expect("a writer");
+    let mut start = first;
+    for rows in blocks {
+        writer
+            .write(&batch_of(&ledger, start, *rows))
+            .expect("a block");
+        start += rows;
+    }
+    writer.finish().expect("the footer");
+    ledger
+}
+
+const CODECS: [(&str, CompressionType); 2] = [
+    ("zstd", CompressionType::ZSTD),
+    ("lz4", CompressionType::LZ4_FRAME),
+];
+
+#[test]
+fn so_t40_ipc_compressed_files_are_read_in_the_arena() {
+    for (name, codec) in CODECS {
+        let dir = scratch();
+        let ledger = write_ipc_compressed(&dir, "t40.arrow", 0, &BLOCKS, codec);
+        let source = source_over(
+            &[&ledger.path],
+            seed(FakeReactor::new(), &ledger.path),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let splits = source.plan().expect("the plan");
+        assert_eq!(splits.len(), BLOCKS.len(), "{name}");
+        let alloc = CountingAllocator::new(FakeAllocator::new());
+        let baseline = alloc.fake().in_use(Tier::Host);
+        let mut start = 0;
+        for (split, rows) in splits.iter().zip(BLOCKS) {
+            assert_eq!(split.rows, rows, "{name}");
+            let payload = block_on(source.read(split, None, &alloc, Tier::Host))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_rows(&ledger, &payload, start, rows);
+            // The inflated body is an arena buffer the batch is decoded over: nothing is copied
+            // into the arena once more.
+            for column in batch_of_payload(&payload).columns() {
+                for buffer in column.to_data().buffers() {
+                    if rows == 0 {
+                        // A block of no rows is the decoder's own empty arrays.
+                        continue;
+                    }
+                    assert_eq!(
+                        arena_tier_of(buffer),
+                        Some(Tier::Host),
+                        "{name}: a buffer of {} bytes in {:?} was not read in the arena ({rows} rows)",
+                        buffer.len(),
+                        column.data_type()
+                    );
+                }
+            }
+            start += rows;
+        }
+        assert_eq!(source.stats().decode_bytes, 0, "{name}: decoded in place");
+        assert_eq!(alloc.payload_copies(), 0, "{name}");
+        assert_eq!(alloc.fake().in_use(Tier::Host), baseline, "{name}");
+
+        // Several blocks to a split, a projection, and a row range inside one block.
+        let source = source_over(
+            &[&ledger.path],
+            seed(FakeReactor::new(), &ledger.path),
+            Some(&["x", "id"]),
+            Some(400),
+        )
+        .expect("the plan");
+        let splits = source.plan().expect("the plan");
+        let payload = block_on(source.read(&splits[0], None, &alloc, Tier::Host)).expect("a split");
+        assert_eq!(batch_of_payload(&payload).num_columns(), 2, "{name}");
+        assert_eq!(
+            ids(&payload),
+            (0..splits[0].rows as i64).collect::<Vec<_>>()
+        );
+        let range = RowRange { start: 7, end: 30 };
+        let payload =
+            block_on(source.read(&splits[0], Some(range), &alloc, Tier::Host)).expect("a range");
+        assert_eq!(ids(&payload), (7..30).collect::<Vec<i64>>(), "{name}");
+    }
+}
+
+#[test]
+fn so_t40_ipc_compressed_files_of_every_type() {
+    let every = moruna_testkit::ipc::batches()
+        .into_iter()
+        .find(|(label, _, _)| *label == "every_type")
+        .expect("the every_type batch")
+        .1
+        .remove(0);
+    for (name, codec) in CODECS {
+        let dir = scratch();
+        let path = dir.join("every.arrow");
+        let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)
+            .and_then(|o| o.try_with_compression(Some(codec)))
+            .expect("write options");
+        let mut writer = FileWriter::try_new_with_options(
+            std::fs::File::create(&path).expect("the file"),
+            &every.schema(),
+            options,
+        )
+        .expect("a writer");
+        writer.write(&every).expect("a block");
+        writer.write(&every.slice(1, 2)).expect("a block");
+        writer.finish().expect("the footer");
+
+        let source = source_over(&[&path], seed(FakeReactor::new(), &path), None, None)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let alloc = FakeAllocator::new();
+        let splits = source.plan().expect("the plan");
+        assert_eq!(splits.len(), 2, "{name}");
+        let first = block_on(source.read(&splits[0], None, &alloc, Tier::Host))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(batch_of_payload(&first), &every, "{name}");
+        let second = block_on(source.read(&splits[1], None, &alloc, Tier::Host))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(batch_of_payload(&second), &every.slice(1, 2), "{name}");
+    }
+}
+
+#[test]
+fn so_t40_ipc_compressed_block_over_the_budget_is_refused_by_name() {
+    for (name, codec) in CODECS {
+        let dir = scratch();
+        let ledger = write_ipc_compressed(&dir, "t40c.arrow", 0, &[5_000], codec);
+        let source = source_over(
+            &[&ledger.path],
+            seed(FakeReactor::new(), &ledger.path),
+            None,
+            None,
+        )
+        .expect("the plan");
+        let splits = source.plan().expect("the plan");
+        // The arena has room for the landed block and a little more; half of what is left is
+        // the ceiling, and the block inflates to more.
+        let alloc = FakeAllocator::new().with_limit(Tier::Host, 256 << 10);
+        let refused = err(block_on(source.read(&splits[0], None, &alloc, Tier::Host)));
+        let text = refused.to_string();
+        assert!(
+            matches!(refused, MorunaError::Source { .. }),
+            "{name}: {text}"
+        );
+        assert!(
+            text.contains("block 0") && text.contains("bytes this reader may inflate"),
+            "{name}: {text}"
+        );
+        assert_eq!(alloc.in_use(Tier::Host), 0, "{name}");
+    }
+}
+
+// SO-T41 ipc_compressed_malformed_never_panics. SO-I10, contracts CT-I13, e.8.
+#[test]
+fn so_t41_ipc_compressed_malformed_never_panics() {
+    for (name, codec) in CODECS {
+        let dir = scratch();
+        let ledger = write_ipc_compressed(&dir, "t41.arrow", 0, &[40, 7, 25], codec);
+        let full = std::fs::read(&ledger.path).expect("the file");
+        let len = full.len();
+        let (footer_start, blocks) = landmarks(&full);
+        let path = dir.join("case.arrow");
+        let mut rng = Rng::new(0x5041_0000_0000_0041 ^ len as u64);
+        let mut failures = Vec::new();
+
+        // Every truncation, before the plan and after it.
+        for cut in (0..len).step_by(3) {
+            let short = &full[..cut];
+            failures.extend(
+                exercise(
+                    &path,
+                    short,
+                    short,
+                    &format!("{name}: cut to {cut} before the plan"),
+                )
+                .err(),
+            );
+            failures.extend(
+                exercise(
+                    &path,
+                    short,
+                    &full,
+                    &format!("{name}: cut to {cut} after the plan"),
+                )
+                .err(),
+            );
+        }
+        // The footer, and the bodies' first bytes, where each buffer's length is.
+        let mut spots: Vec<usize> = (footer_start..len).collect();
+        for block in &blocks {
+            spots.extend(*block..block + 140.min(len - block));
+        }
+        for at in spots {
+            for value in [0x00u8, 0xFF, 0x7F, 0x01] {
+                let mut bytes = full.clone();
+                bytes[at] = value;
+                failures.extend(
+                    exercise(
+                        &path,
+                        &bytes,
+                        &bytes,
+                        &format!("{name}: byte {at}={value:#04x}"),
+                    )
+                    .err(),
+                );
+            }
+        }
+        // Random edits anywhere, which are mostly inside compressed frames.
+        for case in 0..600 {
+            let mut bytes = full.clone();
+            let mut label = format!("{name}: random {case}:");
+            for _ in 0..1 + rng.below(4) {
+                let at = rng.below(len);
+                let value = rng.next_u64() as u8;
+                bytes[at] = value;
+                label.push_str(&format!(" {at}={value:#04x}"));
+            }
+            failures.extend(exercise(&path, &bytes, &bytes, &label).err());
+            failures
+                .extend(exercise(&path, &bytes, &full, &format!("{label} after the plan")).err());
+        }
+        assert!(
+            failures.is_empty(),
+            "{} malformed compressed files panicked; the first: {:?}",
+            failures.len(),
+            &failures[..failures.len().min(10)]
+        );
+    }
 }

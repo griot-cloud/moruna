@@ -596,3 +596,240 @@ pub fn tally(failed: &[String]) -> String {
     }
     out
 }
+
+/// `batches` as one IPC stream with every body buffer compressed by `codec` (`ZSTD` at `level`,
+/// or `LZ4_FRAME`), written by arrow-ipc's own writer: the stream a pyarrow user would send.
+pub fn compressed_stream(
+    batches: &[RecordBatch],
+    codec: arrow::ipc::CompressionType,
+    level: Option<i32>,
+) -> Vec<u8> {
+    let schema = batches[0].schema();
+    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)
+        .and_then(|o| o.try_with_compression(Some(codec)))
+        .and_then(|o| o.try_with_compression_level(level))
+        .expect("write options");
+    let mut out = Vec::new();
+    let mut writer =
+        StreamWriter::try_new_with_options(&mut out, &schema, options).expect("a stream writer");
+    for batch in batches {
+        writer.write(batch).expect("a batch written");
+    }
+    writer.finish().expect("the stream finished");
+    drop(writer);
+    out
+}
+
+/// Streams built by hand, so that a test can make a buffer say what it likes about its own
+/// length (the decompression bombs of contracts CT-T24).
+pub mod crafted {
+    use std::io::Write;
+
+    use super::*;
+
+    /// A zstd frame of `raw`, with its content size in the header, as arrow-ipc and Arrow C++
+    /// write it.
+    pub fn zstd_frame(raw: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(raw, 3).expect("zstd compresses")
+    }
+
+    /// A zstd frame of `raw` written as a stream, which leaves the content size out.
+    pub fn zstd_frame_without_size(raw: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(raw, 3).expect("zstd compresses")
+    }
+
+    /// An LZ4 frame of `raw` with the block size of `block`.
+    pub fn lz4_frame(raw: &[u8], block: lz4_flex::frame::BlockSize) -> Vec<u8> {
+        let info = lz4_flex::frame::FrameInfo::new().block_size(block);
+        let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(info, Vec::new());
+        encoder.write_all(raw).expect("lz4 compresses");
+        encoder.finish().expect("the frame finished")
+    }
+
+    /// A body buffer that says it holds `declared` uncompressed bytes, then `frame`.
+    pub fn says(declared: i64, frame: &[u8]) -> Vec<u8> {
+        let mut out = declared.to_le_bytes().to_vec();
+        out.extend_from_slice(frame);
+        out
+    }
+
+    /// A body buffer stored as it is: -1, then `raw`.
+    pub fn stored(raw: &[u8]) -> Vec<u8> {
+        says(-1, raw)
+    }
+
+    /// A body buffer that is honest: the length of `raw`, then its frame by `codec`.
+    pub fn packed(codec: arrow::ipc::CompressionType, raw: &[u8]) -> Vec<u8> {
+        let frame = if codec == arrow::ipc::CompressionType::ZSTD {
+            zstd_frame(raw)
+        } else {
+            lz4_frame(raw, lz4_flex::frame::BlockSize::Max64KB)
+        };
+        says(raw.len() as i64, &frame)
+    }
+
+    /// A stream of the schema of `schema` and one record batch message, compressed by `codec`
+    /// (method `BUFFER`, metadata V5), of `length` rows, with these field nodes `(length, null
+    /// count)` and these body buffers exactly as given (an empty one is an empty buffer). The
+    /// body buffers are laid out at multiples of 8, as the format has them.
+    pub fn stream(
+        schema: &Arc<Schema>,
+        codec: arrow::ipc::CompressionType,
+        length: i64,
+        nodes: &[(i64, i64)],
+        buffers: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let how = How {
+            codec,
+            method: arrow::ipc::BodyCompressionMethod::BUFFER,
+            version: MetadataVersion::V5,
+        };
+        stream_as(schema, how, length, nodes, buffers)
+    }
+
+    /// How a crafted message says it is compressed, for the messages that lie about that.
+    #[derive(Clone, Copy)]
+    pub struct How {
+        /// The codec the message names.
+        pub codec: arrow::ipc::CompressionType,
+        /// The method the message names.
+        pub method: arrow::ipc::BodyCompressionMethod,
+        /// The metadata version the message is written with.
+        pub version: MetadataVersion,
+    }
+
+    /// As [`stream`], with the codec, the method and the metadata version the message names.
+    pub fn stream_as(
+        schema: &Arc<Schema>,
+        how: How,
+        length: i64,
+        nodes: &[(i64, i64)],
+        buffers: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let codec = how.codec;
+        let valid = super::stream(
+            &[RecordBatch::new_empty(Arc::clone(schema))],
+            MetadataVersion::V5,
+        );
+        let ((start, len), _) = messages(&valid)[0];
+        let mut out = valid[start - 8..start + len].to_vec();
+
+        let mut body = Vec::new();
+        let mut entries = Vec::new();
+        for buffer in buffers {
+            entries.push(arrow::ipc::Buffer::new(
+                body.len() as i64,
+                buffer.len() as i64,
+            ));
+            body.extend_from_slice(buffer);
+            body.resize(body.len().next_multiple_of(8), 0);
+        }
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let nodes: Vec<arrow::ipc::FieldNode> = nodes
+            .iter()
+            .map(|(len, nulls)| arrow::ipc::FieldNode::new(*len, *nulls))
+            .collect();
+        let nodes = fbb.create_vector(&nodes);
+        let buffers = fbb.create_vector(&entries);
+        let compression = {
+            let mut b = arrow::ipc::BodyCompressionBuilder::new(&mut fbb);
+            b.add_codec(codec);
+            b.add_method(how.method);
+            b.finish()
+        };
+        let batch = {
+            let mut b = arrow::ipc::RecordBatchBuilder::new(&mut fbb);
+            b.add_length(length);
+            b.add_nodes(nodes);
+            b.add_buffers(buffers);
+            b.add_compression(compression);
+            b.finish()
+        };
+        let message = {
+            let mut b = arrow::ipc::MessageBuilder::new(&mut fbb);
+            b.add_version(how.version);
+            b.add_header_type(arrow::ipc::MessageHeader::RecordBatch);
+            b.add_header(batch.as_union_value());
+            b.add_bodyLength(body.len() as i64);
+            b.finish()
+        };
+        fbb.finish(message, None);
+        let mut flat = fbb.finished_data().to_vec();
+        flat.resize(flat.len().next_multiple_of(8), 0);
+        out.extend_from_slice(&[0xff; 4]);
+        out.extend_from_slice(&(flat.len() as u32).to_le_bytes());
+        out.extend_from_slice(&flat);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&[0xff; 4]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+}
+
+/// The streams `compressed_stream` makes of every stream of `batches`, by the label and the
+/// codec: ZSTD and LZ4_FRAME of everything written with metadata V5 (V4 has no compression).
+pub fn compressed_streams() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for (label, batches, version) in batches() {
+        if version != MetadataVersion::V5 {
+            continue;
+        }
+        for (name, codec) in [
+            ("zstd", arrow::ipc::CompressionType::ZSTD),
+            ("lz4", arrow::ipc::CompressionType::LZ4_FRAME),
+        ] {
+            out.push((
+                format!("{label}_{name}"),
+                compressed_stream(&batches, codec, None),
+            ));
+        }
+    }
+    out
+}
+
+/// `corruptions`' cousin for compressed streams, whose bytes are mostly bodies: every message
+/// flatbuffer byte as `corruptions` does, and then `random` edits of one to four bytes inside
+/// the bodies, where the lengths and the frames are, and the 8 length bytes that start each
+/// body's buffers set to each of `VALUES`.
+pub fn body_corruptions(
+    stream: &[u8],
+    seed: u64,
+    random: usize,
+) -> impl Iterator<Item = (String, Vec<u8>)> + '_ {
+    let mut rng = Rng::new(seed);
+    let bodies: Vec<(usize, usize)> = messages(stream)
+        .into_iter()
+        .map(|(_, body)| body)
+        .filter(|(_, len)| *len > 0)
+        .collect();
+    let mut edits: Vec<Vec<(usize, u8)>> = Vec::new();
+    for (start, len) in &bodies {
+        for at in (*start..start + len).take(64) {
+            for value in VALUES {
+                edits.push(vec![(at, value)]);
+            }
+        }
+    }
+    for _ in 0..random {
+        if bodies.is_empty() {
+            break;
+        }
+        let (start, len) = bodies[rng.below(bodies.len())];
+        let count = 1 + rng.below(4);
+        edits.push(
+            (0..count)
+                .map(|_| (start + rng.below(len), rng.next_u64() as u8))
+                .collect(),
+        );
+    }
+    edits.into_iter().enumerate().map(move |(case, edit)| {
+        let mut bad = stream.to_vec();
+        for (at, value) in &edit {
+            bad[*at] = *value;
+        }
+        (
+            format!("body edit {case} ({} bytes, seed {seed:#x})", edit.len()),
+            bad,
+        )
+    })
+}

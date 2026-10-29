@@ -434,7 +434,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 
 | Crate | Used by | Purpose | Notes |
 |---|---|---|---|
-| `arrow` (arrow-rs) | 1, 4, 5, 7, 8, 9 | in-memory format, C Data Interface, IPC | features: `ffi`, `ipc`; component 4 builds the trace batches with it |
+| `arrow` (arrow-rs) | 1, 4, 5, 7, 8, 9 | in-memory format, C Data Interface, IPC | features: `ffi`, `ipc`, `ipc_compression` (the sink writes compressed IPC through arrow-ipc's writer, 08 e.3; reading is `moruna-kernel`'s own, contracts e.8); component 4 builds the trace batches with it |
 | `parquet` | 7, 8 | reader with footer metadata, projection, row selection; writer | features: `arrow`, `async`, `object_store` |
 | `object_store` | 6, 7, 8 | S3-compatible, GCS, Azure, local | features per backend behind runtime features |
 | `dlpark` | 1, 5, 7 | DLPack safe wrapper (`versioned::Dlpack`, the 1.x versioned struct) | component 7 enables its `pyo3` feature under `python` so `PyIteratorSource` imports a capsule without `unsafe`; `moruna-kernel` never does, which is what keeps pyo3 out of the contracts crate (CT-T12) |
@@ -447,7 +447,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `pyo3-arrow` | 5, 7, 12 | Arrow ↔ pyarrow zero-copy | |
 | `maturin` (build) | 12 | wheels | CPython 3.14, free-threaded and standard (6.6) |
 | `thiserror` | all | error types | |
-| `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a) |
+| `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a), and, since KA10, on `lz4_flex`, `zstd` and `flatbuffers` to inflate compressed Arrow IPC (01 e.8) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
 | `serde` | 4, 8, 9, 11, 24 | derive for the manifest, sink checkpoint, profile records, run meta, the cost model's observations and fitted state | features: `derive` |
 | `serde_json` | 4, 7, 8, 9, 11, 12, 24 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config`, the cost model's observation records and fitted state (24 e.2, e.4) | the only text format in the runtime; component 24 writes a float of fitted state as its bits rather than enable `float_roundtrip`, a feature every crate in the build would share |
@@ -473,6 +473,9 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |
 | `vm-fdt`, `acpi_tables` | `moruna-vmm` | the aarch64 device tree and the x86_64 ACPI tables that describe the guest's devices and hot-pluggable CPUs | |
 | `schemars` | 18 (runtime), 12 | the settings schema each kind declares: JSON Schema 2020-12 derived from the type its adapter reads its settings with (18 e.2, decision KD1) | already in the graph through `parcel-core` at this version; default features (`derive`, `std`); added 2026-10-28, named in 18 d.5 |
+| `lz4_flex` | 1 (and the testkit) | Arrow IPC `LZ4_FRAME` buffers: the frame decoder behind the checked inflation of contracts e.8 | `default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"]`; already in the graph through arrow-ipc's compression, so one version; added with KA10 |
+| `zstd` | 1 (and the testkit) | Arrow IPC `ZSTD` buffers: the frame's content size and the bounded one-shot decompressor of contracts e.8 | `default-features = false`; the version arrow-ipc uses; added with KA10 |
+| `flatbuffers` | 1 (and the testkit) | the record batch message that describes an inflated batch (contracts e.8): the builders arrow-ipc generated, which need the crate they were generated for | `default-features = false`; the version arrow-ipc uses; added with KA10 |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
 
@@ -506,6 +509,8 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `wasmtime` | 47.0.4 (2026-10-15: the version `parcel-runtime` brings, so the graph has one; 49.0.3 was the newest) | `wat` (dev) | 1.252.0 (the `wasmparser` wasmtime 47 uses) |
 | `zip` | 9.0.3 | `landlock` | 0.4.7 |
 | `seccompiler` | 0.5.0 | `schemars` | 1.2.2 (2026-10-28: the version `parcel-core` brings, so the graph has one) |
+| `lz4_flex` | 0.14.0 (the version arrow-ipc uses) | `zstd` | 0.13.3 (the version arrow-ipc uses) |
+| `flatbuffers` | 25.12.19 (the version arrow-ipc uses) | | |
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
 

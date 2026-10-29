@@ -897,8 +897,20 @@ fn run_to_completion(
 /// component is real (07 e.9, e.10; 08 e.3).
 #[test]
 fn so_t34_ipc_round_trip() {
+    ipc_round_trip("so_t34", moruna_kernel::ipc::Compression::None);
+}
+
+/// SO-T42. The same round trip with the sink compressing every body buffer, zstd and lz4: the
+/// source inflates what the sink compressed (07 e.9, 08 e.3, contracts e.8, KA10).
+#[test]
+fn so_t42_ipc_compressed_round_trip() {
+    ipc_round_trip("so_t42_zstd", moruna_kernel::ipc::Compression::Zstd(3));
+    ipc_round_trip("so_t42_lz4", moruna_kernel::ipc::Compression::Lz4);
+}
+
+fn ipc_round_trip(tag: &str, compression: moruna_kernel::ipc::Compression) {
     let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("so_t34");
+    let scratch = Scratch::new(tag);
     let input = scratch.path().join("in.parquet");
     let ipc = scratch.path().join("ipc");
     let rows: u64 = 90_000;
@@ -925,6 +937,7 @@ fn so_t34_ipc_round_trip() {
                 moruna_sinks::ArrowIpcSinkConfig {
                     path: ipc_dir.clone(),
                     file_bytes: 256 << 10,
+                    compression,
                 },
                 ctx.reactor.clone(),
                 ctx.alloc.clone(),
