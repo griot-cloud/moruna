@@ -73,9 +73,9 @@ dependencies = [
 
 [[package]]
 name = "cfg-if"
-version = "1.0.5"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "console-protocol"
@@ -295,6 +295,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "imagefs"
+version = "0.1.0"
+dependencies = [
+ "block-protocol",
+ "devices-protocol",
+ "imagefs-protocol",
+ "moruna-imagefs",
+ "moruna-svc",
+]
+
+[[package]]
+name = "imagefs-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "imagefs-test"
+version = "0.1.0"
+dependencies = [
+ "imagefs-protocol",
+ "moruna-imagefs",
+ "moruna-svc",
+]
+
+[[package]]
 name = "inherit-methods-macro"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -337,9 +364,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.191"
+version = "0.2.185"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
 name = "linux-boot-params"
@@ -398,6 +425,10 @@ dependencies = [
  "moruna-driver-table",
  "moruna-loader",
 ]
+
+[[package]]
+name = "moruna-imagefs"
+version = "0.1.0"
 
 [[package]]
 name = "moruna-kb1-programs"

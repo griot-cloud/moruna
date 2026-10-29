@@ -315,4 +315,4 @@ Resolved by KB2 (SDD 23): more than one CPU (f.11, booted on 2 and 4 CPUs); narr
 
 ## o. Deferred (post-KB1)
 
-The Linux personality (KC1), the image filesystem (KC2), the data plane on kernel channels (KD1), the kernel as a node (KE), aarch64.
+The Linux personality (KC1), the data plane on kernel channels (KD1), the kernel as a node (KE), aarch64. The image filesystem (KC2) is SDD 27; it added no call: the long-lived pin its page cache needs is a pin its driver keeps (SDD 27 m.1, SDD 25 d.3). What it needs of the kernel later is a pager, a memory object whose pages a server fills when a task first touches them (SDD 27 m.2), which is a kernel change of its own.

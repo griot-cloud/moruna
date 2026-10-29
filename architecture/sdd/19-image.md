@@ -1,10 +1,10 @@
 # Moruna SDD 19: An OCI image as a kind (`moruna-image`, `moruna-sandbox::image`, `moruna-runtime::kinds::image`)
 
 **Document type:** software design document, component 19
-**Status:** DRAFT · 2026-10-28 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended by KC2 on 2026-10-29 (f.9, the layer-file conversion; SDD 27) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `BOARD.md` EK, item KA1; `architecture/optimized-runtime.md` section 7 (images)
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.7 (`Kernel`, amended here with `finish`); **Cited:** 10 f.6 (the sink drive), 17 (the sandbox: the cgroup, the stage ceiling, the `.pex` child), 18 (the kinds registry)
-**Component location:** `crates/moruna-image/` (the image port, the layout adapter, the unpacking, the cache), `crates/moruna-sandbox/src/image/` and `src/seccomp.rs` (the confined process, the filter, the stream), `crates/moruna-runtime/src/kinds/image.rs` (the kind), `crates/moruna-image/tests/` (the Linux tests and the program they run)
+**Component location:** `crates/moruna-image/` (the image port, the layout adapter, the unpacking, the cache, and since KC2 `src/layerfile.rs` and `src/bin/moruna-layer.rs`, the conversion to layer files, f.9), `crates/moruna-sandbox/src/image/` and `src/seccomp.rs` (the confined process, the filter, the stream), `crates/moruna-runtime/src/kinds/image.rs` (the kind), `crates/moruna-image/tests/` (the Linux tests and the program they run)
 **Consumes:** the kinds registry (18), the sandbox's cgroup and output plumbing (17), the hardened Arrow IPC reader (contracts e.8). **Consumed by:** the job document (`"kind": "image"`), the facade's binding of packaged stages (12), the PM's board items KA2 and KA3.
 
 **Decisions worth your eye:** (1) there is no container runtime: an image is a filesystem and a command, unpacked by Moruna's own code and run by the sandbox that already confines a `.pex` child; (2) the contract with the process is Arrow IPC over standard input and output, one stream each way, one batch back per batch in, so a program in any language needs only an Arrow library; (3) the process is in a user namespace (so Moruna needs no privilege Moruna does not already have), a mount, pid, network, ipc, uts and cgroup namespace, with no capabilities, Landlock and a seccomp allow-list that kills it on any call off the list; (4) the unpacked root is a cache entry made whole and renamed into place, so many stages and many runs share one unpacking and never see half of it; (5) `Kernel` gains `finish`, because an image's exit status is only knowable after its input ends and nothing in the contract said when that was.
@@ -180,6 +180,8 @@ When a call fails because the pipe closed, the process is waited for (up to two 
 
 **f.8 The stage's memory.** At start and before every call the stage ceiling is `ceiling_in_force - (sample.anon_bytes - own)` from a fresh sample (17 f.7), written to `memory.max` when it moved, with the run's CPU quota. The cgroup's `memory.current` is the process's memory for the sampler (IM-I7). A resumed run starts a new process (`ResumePolicy::Reinit`): an image that keeps state between batches is not resumable.
 
+**f.9 Layer files (KC2, SDD 27 f.1).** For the microkernel, an image is not unpacked into a root: each layer becomes a layer file, one read-only block device, and the image filesystem merges them (SDD 27). `layerfile::convert` applies the layers in order with this section's own unpacking (`unpack::apply_layer`, f.2, every rule above unchanged) to a working root, and after each takes a snapshot of the root (each path's kind, mode, inode and device) and writes what that layer changed as a layer file: an entry for each path made, replaced or given a new mode (at the path the unpacking resolved it to, through the links of the layers below), a whiteout for each name it removed, and a directory marked opaque where it replaced something below or emptied the directory of everything below. The checks of f.1 to f.3 refuse what they refuse here too. Merging the files top down gives the root this section's unpacking gives, path for path (SDD 27 IF-I3, IF-T2). `moruna-layer convert LAYOUT REFERENCE OUT` writes them, each named by its SHA-256.
+
 ## g. Concurrency within the component
 
 `unpack` may run on any number of threads and processes at once (f.4). A stage's process is used by one worker at a time (a stateful stage with one instance, 10 f.4); `apply`'s writer thread is joined before `apply` returns. The stderr reader is a thread per process, ended when the pipe is.
@@ -251,4 +253,4 @@ None.
 
 ## o. Deferred (post-v1)
 
-**IM-O1. A registry adapter** of `ImageSource`. **IM-O2. Layers as shared read-only devices** and an overlay, so a root is not unpacked per image (the microkernel's KC2). **IM-O3. A per-call timeout** and a cancel that reaches a call in progress. **IM-O4. The `user` as a name,** looked up in the image's own passwd. **IM-O5. Image indexes,** with a platform chosen.
+**IM-O1. A registry adapter** of `ImageSource`. **IM-O2. Layers as shared read-only devices** and an overlay, so a root is not unpacked per image: built by KC2 (f.9, SDD 27). **IM-O3. A per-call timeout** and a cancel that reaches a call in progress. **IM-O4. The `user` as a name,** looked up in the image's own passwd. **IM-O5. Image indexes,** with a platform chosen.

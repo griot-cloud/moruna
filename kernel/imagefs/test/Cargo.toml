@@ -1,0 +1,12 @@
+[package]
+name = "imagefs-test"
+description = "IF-T12 to IF-T17: the image filesystem against two layer disks of a known tree, its cache, its scratch directory, and its conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-imagefs = { path = "../fs", version = "=0.1.0" }
+imagefs-protocol = { path = "../protocol", version = "=0.1.0" }

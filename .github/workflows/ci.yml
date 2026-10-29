@@ -176,8 +176,9 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          if git diff --quiet "$BASE...HEAD" -- kernel/ .github/workflows/ci.yml; then
-            echo "kernel/ is unchanged, so its build and boot stand"
+          # crates/moruna-image writes the image filesystem's layer disks the boot reads.
+          if git diff --quiet "$BASE...HEAD" -- kernel/ crates/moruna-image/ .github/workflows/ci.yml; then
+            echo "kernel/ and the layer writer are unchanged, so the build and boot stand"
             echo "kernel=false" >> "$GITHUB_OUTPUT"
           else
             echo "kernel=true" >> "$GITHUB_OUTPUT"
@@ -232,14 +233,14 @@ jobs:
           else
             echo "no /dev/vhost-vsock: the boot runs without a vsock"
           fi
-      - name: Format, and the host tests of the ABI, the loaders, the handle table, the SDK and the image tool
+      - name: Format, and the host tests of the ABI, the loaders, the handle table, the SDK, the image tool and the image filesystem's reader
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
         run: |
           cargo fmt --all -- --check
           host="$(rustc -vV | sed -n 's/^host: //p')"
           packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-svc -p moruna-image
-            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table)
+            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
       - name: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)

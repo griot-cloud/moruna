@@ -7,10 +7,12 @@
 # OUT defaults to kernel/target/boot and DESCRIPTION to kernel/initramfs/boot.image.
 # Writes OUT/moruna-microkernel.elf (the kernel), OUT/moruna-microkernel.qemu.elf (the
 # same image with e_machine set to EM_386, which QEMU's multiboot loader requires of
-# `-kernel`, as `cargo osdk run` does), and, through moruna-image (SDD 23, f.8),
-# OUT/initramfs.cpio, OUT/manifest (the boot manifest it carries) and OUT/expect (the
-# lines a boot of it must print). Plain cargo: core and alloc are built from source
-# for x86_64-unknown-none.
+# `-kernel`, as `cargo osdk run` does), OUT/layers (the image filesystem's two layer
+# disks, its layer list and the check list of their merged tree, SDD 27 k, written by
+# the root workspace's `moruna-layer fixture`), and, through moruna-image (SDD 23,
+# f.8), OUT/initramfs.cpio, OUT/manifest (the boot manifest it carries) and OUT/expect
+# (the lines a boot of it must print). Plain cargo: core and alloc are built from
+# source for x86_64-unknown-none.
 set -euo pipefail
 
 kernel="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,9 +39,13 @@ RUSTFLAGS="$flags -C link-arg=-T$kernel/sys/user.ld -C link-arg=-static" \
   cargo build --release --locked --target "$target" "${build_std[@]}" --workspace \
   --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image
 
-bin="$kernel/target/$target/release"
+bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
 rm -rf "$out"
 mkdir -p "$out"
+# The layer disks are the host writer's (moruna-image, the root workspace, on its own
+# toolchain); the boot description gives their lists as `data:` handles.
+(cd "$kernel/.." && cargo run --quiet --release --locked -p moruna-image --features testing \
+  --bin moruna-layer -- fixture "$out/layers")
 cargo run --quiet --release --locked --target "$host" -p moruna-image -- "$description" "$bin" "$out"
 
 cp "$bin/moruna-microkernel" "$out/moruna-microkernel.elf"

@@ -4300,6 +4300,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "moruna-image",
+ "moruna-imagefs",
  "moruna-job",
  "moruna-runtime",
  "parquet",
@@ -4311,6 +4312,10 @@ dependencies = [
  "tracing",
  "zstd 0.13.3",
 ]
+
+[[package]]
+name = "moruna-imagefs"
+version = "0.1.0"
 
 [[package]]
 name = "moruna-job"

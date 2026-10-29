@@ -18,6 +18,9 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }
 tracing = { workspace = true }
+# The layer files' format and reader, shared with the microkernel's image filesystem
+# (SDD 27): the writer here lays files out with it and reads them back with it.
+moruna-imagefs = { workspace = true }
 # The test fixture's: the image kind's tests run `arrow_echo` as an image's command.
 arrow = { workspace = true }
 
@@ -39,3 +42,9 @@ parquet = { workspace = true }
 name = "arrow_echo"
 path = "tests/fixtures/arrow_echo.rs"
 test = false
+
+# An image as the microkernel's layer files (SDD 27 f.1); with `testing`, also the CI
+# boot's fixture.
+[[bin]]
+name = "moruna-layer"
+path = "src/bin/moruna-layer.rs"

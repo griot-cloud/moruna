@@ -5,6 +5,9 @@
 //! as it reads, and lays the layers over one another into a directory the sandbox mounts read
 //! only (`moruna-sandbox`, SDD 19 e.3). The crate is pure Rust: it reads and writes files and runs
 //! nothing, so it builds and tests wherever Moruna does; running the command is Linux's.
+//!
+//! [`layerfile`] converts an image into the layer files the microkernel's image
+//! filesystem serves (SDD 27): one read-only, page-aligned file per layer.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -12,6 +15,7 @@
 mod digest;
 mod error;
 mod layer;
+pub mod layerfile;
 mod source;
 mod unpack;
 

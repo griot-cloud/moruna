@@ -133,6 +133,9 @@ seccompiler = { version = "=0.5.0" }
 # stays off.
 tar = { version = "=0.4.46", default-features = false }
 flate2 = { version = "=1.1.10" }
+# The microkernel's image filesystem reader (SDD 27), a `no_std` crate of the kernel
+# workspace: `moruna-image` writes layer files with its format and reads them back with it.
+moruna-imagefs = { path = "kernel/imagefs/fs", version = "=0.1.0" }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six
