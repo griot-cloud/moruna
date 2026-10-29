@@ -7,6 +7,13 @@
 //! memory with no copy. The request is answered when the device returns the chain;
 //! its pin then goes to the quarantine, which the driver releases since the device is
 //! done with it. Requests that find the queue full wait, in order, for room.
+//!
+//! A registered buffer (protocol 1.1) is pinned once, when the client registers it,
+//! and its pages' device addresses kept with the connection; `read_at` and `write_at`
+//! hand the device some of those pages and pin nothing. Each transfer holds the
+//! registration while it is in flight, so a registration ended (or a connection
+//! closed) under a transfer keeps its pin until the device returns the chain, and
+//! only then does the pin go to the quarantine.
 
 #![no_std]
 #![no_main]
@@ -62,12 +69,27 @@ enum Op {
     Flush,
 }
 
+/// A client's buffer, pinned once for every transfer into or out of it.
+struct Registration {
+    _pin: Pin,
+    pages: Vec<u64>,
+}
+
+/// What a transfer keeps alive until the device returns it.
+enum Hold {
+    None,
+    /// A buffer pinned for this transfer, handed back in the reply.
+    Buffer(Memory, Pin),
+    /// A registration, which keeps its pin.
+    Registered(Rc<Registration>),
+}
+
 struct Request {
     op: Op,
     sector: u64,
     pages: Vec<u64>,
     bytes: u64,
-    buffer: Option<(Memory, Pin)>,
+    hold: Hold,
     pending: Pending,
 }
 
@@ -172,13 +194,19 @@ impl Block {
             let outcome = if status != S_OK {
                 Outcome::Failure(block::Error::Io.code())
             } else {
-                match request.buffer {
+                match request.hold {
                     // The pin goes to the quarantine; the memory goes back.
-                    Some((memory, pin)) => {
+                    Hold::Buffer(memory, pin) => {
                         drop(pin);
                         Outcome::reply(memory)
                     }
-                    None => Outcome::reply(()),
+                    // The registration's pin goes to the quarantine only if it was
+                    // ended while this transfer was in flight.
+                    Hold::Registered(registration) => {
+                        drop(registration);
+                        Outcome::reply(())
+                    }
+                    Hold::None => Outcome::reply(()),
                 }
             };
             done.complete(request.pending, outcome);
@@ -192,6 +220,24 @@ impl Block {
         self.submit_waiting()
     }
 
+    /// Refuses a transfer the device cannot make: a count of zero or above the
+    /// largest, sectors past the end, a write to a read-only device.
+    fn check(&self, op: &Op, sector: u64, count: u32) -> Result<(), block::Error> {
+        if count == 0 || count > self.info.max_sectors {
+            return Err(block::Error::BadCount);
+        }
+        if sector
+            .checked_add(count as u64)
+            .is_none_or(|end| end > self.info.sectors)
+        {
+            return Err(block::Error::OutOfRange);
+        }
+        if matches!(op, Op::Write) && self.info.read_only {
+            return Err(block::Error::ReadOnly);
+        }
+        Ok(())
+    }
+
     fn transfer(
         &mut self,
         cx: &mut Context<'_>,
@@ -201,19 +247,10 @@ impl Block {
         buffer: Memory,
     ) -> Outcome {
         let fail = |e: block::Error| Outcome::Failure(e.code());
-        if count == 0 || count > self.info.max_sectors {
-            return fail(block::Error::BadCount);
-        }
-        if sector
-            .checked_add(count as u64)
-            .is_none_or(|end| end > self.info.sectors)
-        {
-            return fail(block::Error::OutOfRange);
+        if let Err(e) = self.check(&op, sector, count) {
+            return fail(e);
         }
         let read = matches!(op, Op::Read);
-        if !read && self.info.read_only {
-            return fail(block::Error::ReadOnly);
-        }
         let bytes = block_protocol::bytes(&self.info, count);
         let Ok(n) = Pin::pages(&self.device.dma, &buffer.0, read) else {
             return fail(block::Error::BadBuffer);
@@ -231,9 +268,60 @@ impl Block {
             sector,
             pages,
             bytes,
-            buffer: Some((buffer, pin)),
+            hold: Hold::Buffer(buffer, pin),
             pending: cx.defer(),
         })
+    }
+
+    /// Pins `buffer` for the connection's registrations (protocol 1.1).
+    fn register(&mut self, buffer: &Memory) -> Result<Registration, block::Error> {
+        let n =
+            Pin::pages(&self.device.dma, &buffer.0, true).map_err(|_| block::Error::BadBuffer)?;
+        let mut pages = vec![0u64; n];
+        let (pin, _) = Pin::create(&self.device.dma, &buffer.0, true, &mut pages)
+            .map_err(|_| block::Error::BadBuffer)?;
+        Ok(Registration { _pin: pin, pages })
+    }
+
+    /// A transfer between the disk and pages of a registration.
+    fn transfer_at(
+        &mut self,
+        cx: &mut Context<'_>,
+        op: Op,
+        registration: Rc<Registration>,
+        page: u32,
+        sector: u64,
+        count: u32,
+    ) -> Outcome {
+        if let Err(e) = self.check(&op, sector, count) {
+            return Outcome::Failure(e.code());
+        }
+        let bytes = block_protocol::bytes(&self.info, count);
+        let first = page as usize;
+        let n = bytes.div_ceil(4096) as usize;
+        let Some(pages) = registration.pages.get(first..first + n) else {
+            return Outcome::Failure(block::Error::BadBuffer.code());
+        };
+        let pages = pages.to_vec();
+        self.queue_request(Request {
+            op,
+            sector,
+            pages,
+            bytes,
+            hold: Hold::Registered(registration),
+            pending: cx.defer(),
+        })
+    }
+
+    /// Releases the quarantine when no transfer is in flight: every pin in it then is
+    /// one the device has finished with, such as a registration just ended.
+    fn release_idle(&mut self) {
+        if self.in_flight.is_empty()
+            && let Err(e) = dma_release(&self.device.dma)
+        {
+            self.failed
+                .get_or_insert(format!("dma_release: {}", e.name()));
+        }
     }
 
     /// Queues a request for the device. If the device cannot take it, the driver
@@ -247,7 +335,11 @@ impl Block {
     }
 }
 
-struct Connection(Rc<RefCell<Block>>);
+struct Connection {
+    block: Rc<RefCell<Block>>,
+    registrations: BTreeMap<u32, Rc<Registration>>,
+    next: u32,
+}
 
 fn decode<T: Wire>(d: &mut Decoder<'_>) -> Option<T> {
     T::decode(d).ok()
@@ -259,7 +351,8 @@ impl Handler for Connection {
     }
 
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
-        let mut b = self.0.borrow_mut();
+        let block = self.block.clone();
+        let mut b = block.borrow_mut();
         match ordinal {
             1 => match d.finish() {
                 Ok(()) => Outcome::reply(b.info),
@@ -291,11 +384,73 @@ impl Handler for Connection {
                     sector: 0,
                     pages: Vec::new(),
                     bytes: 0,
-                    buffer: None,
+                    hold: Hold::None,
                     pending,
                 })
             }
+            5 => {
+                let Some(buffer) = decode::<Memory>(d) else {
+                    return Outcome::Status(Status::BadMessage);
+                };
+                if d.finish().is_err() {
+                    return Outcome::Status(Status::BadMessage);
+                }
+                if self.registrations.len() >= block_protocol::REGISTRATIONS_MAX {
+                    return Outcome::Failure(block::Error::TooManyRegistrations.code());
+                }
+                match b.register(&buffer) {
+                    Ok(registration) => {
+                        let id = self.next;
+                        self.next = self.next.wrapping_add(1);
+                        let pages = registration.pages.len() as u32;
+                        self.registrations.insert(id, Rc::new(registration));
+                        Outcome::reply((id, pages))
+                    }
+                    Err(e) => Outcome::Failure(e.code()),
+                }
+            }
+            6 | 7 => {
+                let (Some(id), Some(page), Some(sector), Some(count)) = (
+                    decode::<u32>(d),
+                    decode::<u32>(d),
+                    decode::<u64>(d),
+                    decode::<u32>(d),
+                ) else {
+                    return Outcome::Status(Status::BadMessage);
+                };
+                if d.finish().is_err() {
+                    return Outcome::Status(Status::BadMessage);
+                }
+                let Some(registration) = self.registrations.get(&id).cloned() else {
+                    return Outcome::Failure(block::Error::NoRegistration.code());
+                };
+                let op = if ordinal == 6 { Op::Read } else { Op::Write };
+                b.transfer_at(cx, op, registration, page, sector, count)
+            }
+            8 => {
+                let Some(id) = decode::<u32>(d) else {
+                    return Outcome::Status(Status::BadMessage);
+                };
+                if d.finish().is_err() {
+                    return Outcome::Status(Status::BadMessage);
+                }
+                match self.registrations.remove(&id) {
+                    Some(registration) => {
+                        drop(registration);
+                        b.release_idle();
+                        Outcome::reply(())
+                    }
+                    None => Outcome::Failure(block::Error::NoRegistration.code()),
+                }
+            }
             _ => Outcome::Status(Status::UnknownMethod),
+        }
+    }
+
+    fn closed(&mut self) {
+        self.registrations.clear();
+        if let Ok(mut b) = self.block.try_borrow_mut() {
+            b.release_idle();
         }
     }
 }
@@ -390,8 +545,13 @@ fn run() -> i64 {
     let block = Rc::new(RefCell::new(block));
     let mut dispatcher = Dispatcher::new();
     let shared = block.clone();
-    let factory: moruna_svc::Factory =
-        Box::new(move || Box::new(Connection(shared.clone())) as Box<dyn Handler>);
+    let factory: moruna_svc::Factory = Box::new(move || {
+        Box::new(Connection {
+            block: shared.clone(),
+            registrations: BTreeMap::new(),
+            next: 1,
+        }) as Box<dyn Handler>
+    });
     let setup = dispatcher.listen(listener, factory).and_then(|()| {
         dispatcher.watch(Box::new(Irq {
             line,
