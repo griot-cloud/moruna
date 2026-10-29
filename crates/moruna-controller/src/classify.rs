@@ -69,7 +69,6 @@ pub(crate) fn classify(
         f64::from(computing) / f64::from(available)
     };
     let low_water = state.high_water / 2;
-    let last_stage = u16::try_from(state.stage_count()).unwrap_or(u16::MAX);
 
     let state_grew = {
         let before = state.last_state_total;
@@ -85,7 +84,7 @@ pub(crate) fn classify(
         return Bottleneck::StateGrowth;
     }
     if anon >= trip {
-        memory_pressure(state, last_stage, actions);
+        memory_pressure(state, actions);
         return Bottleneck::Memory;
     }
     // MH 4.10: a stage waiting on its host with the rest of the chain unsaturated is waiting,
@@ -128,12 +127,7 @@ pub(crate) fn classify(
         && rising(state)
         && inputs.stats.writes_in_flight == inputs.stats.sink_concurrency
     {
-        if state.staging_on.insert(last_stage) {
-            actions.knobs.push(Knob::StagingTrigger {
-                stage: last_stage,
-                on: true,
-            });
-        }
+        stage_sink_queues(state, actions);
         if state.read_ahead > 1 {
             state.read_ahead -= 1;
             actions.knobs.push(Knob::ReadAhead(state.read_ahead));
@@ -265,7 +259,7 @@ fn worst_state(state: &ControllerState) -> Option<(u16, u64, u64)> {
 /// The Memory row: halve the largest stage, raise its safety and turn staging on. A run with no
 /// kernel stage has no target to halve: its reads are what it holds, so the read-ahead drops to
 /// one instead. A stage waiting on a port is not the one halved (MH 4.10).
-pub(crate) fn memory_pressure(state: &mut ControllerState, last_stage: u16, actions: &mut Actions) {
+pub(crate) fn memory_pressure(state: &mut ControllerState, actions: &mut Actions) {
     if state.stages.is_empty() && state.read_ahead > 1 {
         state.read_ahead = 1;
         actions.knobs.push(Knob::ReadAhead(1));
@@ -291,11 +285,22 @@ pub(crate) fn memory_pressure(state: &mut ControllerState, last_stage: u16, acti
         ctl.safety = (ctl.safety + 0.2).min(SAFETY_CAP);
         model::refresh_envelopes(state);
     }
-    if state.staging_on.insert(last_stage) {
-        actions.knobs.push(Knob::StagingTrigger {
-            stage: last_stage,
-            on: true,
-        });
+    stage_sink_queues(state, actions);
+}
+
+/// Turn staging on for the queues the sinks take, the run's last queues (Qn in a chain), once
+/// each (f.6, contracts d.16).
+fn stage_sink_queues(state: &mut ControllerState, actions: &mut Actions) {
+    for sink in 0..state.topology.sinks() {
+        let Some(queue) = state.topology.sink_input(sink) else {
+            continue;
+        };
+        if state.staging_on.insert(queue) {
+            actions.knobs.push(Knob::StagingTrigger {
+                stage: queue,
+                on: true,
+            });
+        }
     }
 }
 

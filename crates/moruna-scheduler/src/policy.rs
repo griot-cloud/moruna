@@ -2,19 +2,21 @@
 
 use std::sync::atomic::Ordering;
 
-use moruna_kernel::{ErrorPolicy, MorunaError, Outcome, Seq, Sink};
+use moruna_kernel::{ErrorPolicy, MorunaError, Outcome, Seq, Sink, StageId};
 
 use crate::shared::{Exit, RunState, Shared};
 
 /// `apply_policy` of f.8. Returns the outcome the trace record carries.
 ///
-/// `Terminate` ends the run with the diagnostic. `Skip` drops the morsel and tells the sink so,
-/// which is what keeps a skipped sequence number from holding the commit watermark back (f.11).
+/// `Terminate` ends the run with the diagnostic. `Skip` drops the morsel and tells every sink it
+/// would have reached so, by the number it would have had there (contracts d.16), which is what
+/// keeps a skipped sequence number from holding a commit watermark back (f.11).
 /// `Budget(n)` skips errors 1 to n-1 and terminates on the n-th, so `Budget(1)` equals
 /// `Terminate`.
 pub(crate) fn apply_policy(
     shared: &Shared,
     stage_ix: usize,
+    input: StageId,
     seq: Seq,
     diagnostic: MorunaError,
 ) -> Outcome {
@@ -33,11 +35,16 @@ pub(crate) fn apply_policy(
     if let Some(entry) = shared.stages.get(stage_ix) {
         entry.skipped.fetch_add(1, Ordering::SeqCst);
     }
-    {
-        let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
-        sink.skip(seq);
+    for (sink, at) in shared.topology.to_sinks(input, seq) {
+        let Some(end) = shared.sinks.get(usize::from(sink)) else {
+            continue;
+        };
+        {
+            let handle = end.sink.read().unwrap_or_else(|e| e.into_inner());
+            handle.skip(at);
+        }
+        crate::sink_drive::update_watermark(shared, end);
     }
-    crate::sink_drive::update_watermark(shared);
     Outcome::Skipped
 }
 

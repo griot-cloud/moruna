@@ -559,7 +559,11 @@ mod tests {
     }
 
     fn refusal(job: &JobSpec) -> String {
-        match build(job, &Registry::standard(), opts()) {
+        match build(
+            &moruna_job::Job::from_v1(job),
+            &Registry::standard(),
+            opts(),
+        ) {
             Err(MorunaError::Config { msg, .. }) => msg,
             Err(other) => panic!("not a document refusal: {other}"),
             Ok(_) => panic!("built"),
@@ -699,9 +703,14 @@ mod tests {
         job.sink
             .settings
             .insert("root".into(), json!(format!("file://{root}")));
-        let built = build(&job, &Registry::standard(), opts()).expect("builds");
+        let built = build(
+            &moruna_job::Job::from_v1(&job),
+            &Registry::standard(),
+            opts(),
+        )
+        .expect("builds");
         assert!(built.spec.spec_digest.is_some());
-        assert!(built.spec.engine_memory.is_some() && built.spec.sink_memory.is_some());
+        assert!(built.spec.engine_memory.len() == 1 && built.spec.sink_memory.len() == 1);
         let mut not_a_caller = job.clone();
         not_a_caller
             .sink
@@ -749,7 +758,12 @@ mod tests {
             "excluded_url".into(),
             json!(disk.join("scratch").join("excluded").display().to_string()),
         );
-        build(&excluding, &Registry::standard(), opts()).expect("kept apart, it builds");
+        build(
+            &moruna_job::Job::from_v1(&excluding),
+            &Registry::standard(),
+            opts(),
+        )
+        .expect("kept apart, it builds");
         let _ = std::fs::remove_dir_all(&disk);
     }
 

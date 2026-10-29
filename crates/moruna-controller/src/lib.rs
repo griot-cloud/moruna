@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use moruna_kernel::{
     Fingerprint, KernelHints, KernelKind, KnobSnapshot, Knobs, Limits, MorunaError, Placement,
-    Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, TraceRecord, TraceTail,
+    Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, Topology, TraceRecord,
+    TraceTail,
 };
 
 mod apply;
@@ -602,6 +603,8 @@ impl RecordSummary {
 /// Everything the controller mutates, behind one mutex (g).
 pub(crate) struct ControllerState {
     pub cfg: ControllerConfig,
+    /// The run's shape: its queues and which stages take and give which (contracts d.16).
+    pub topology: Topology,
     pub kernels: Vec<KernelInfo>,
     pub phase: Phase,
     pub budgets: Budgets,
@@ -664,9 +667,9 @@ impl ControllerState {
         self.stages.len()
     }
 
-    /// The queues, Q0 to Qn: one more than the kernel stages.
+    /// The queues: one per edge of the run's DAG (Q0 to Qn in a chain).
     pub(crate) fn queue_count(&self) -> usize {
-        self.stage_count() + 1
+        usize::from(self.topology.queue_count())
     }
 
     pub(crate) fn stage_mut(&mut self, stage: StageId) -> Option<&mut StageCtl> {
@@ -931,7 +934,7 @@ impl Controller {
     /// Build a controller over the four components it reads and writes, all as trait objects.
     ///
     /// Fails with `Config` when the stages the kernels name are not the contiguous range
-    /// `1..=S` the linear chain requires.
+    /// `1..=S` the topology has.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: ControllerConfig,
@@ -941,8 +944,19 @@ impl Controller {
         sampler: Arc<dyn Sampler>,
         trace: Arc<dyn TraceTail>,
         placement: Arc<dyn Placement>,
+        topology: Topology,
         kernels: Vec<KernelInfo>,
     ) -> Result<Controller> {
+        if usize::from(topology.stages()) != kernels.len() {
+            return Err(MorunaError::Config {
+                name: "pipeline",
+                msg: format!(
+                    "the topology has {} kernel stages and {} kernels were given",
+                    topology.stages(),
+                    kernels.len()
+                ),
+            });
+        }
         let mut kernels = kernels;
         kernels.sort_by_key(|k| k.stage);
         for (at, kernel) in kernels.iter().enumerate() {
@@ -971,6 +985,7 @@ impl Controller {
         let now = Instant::now();
         let state = ControllerState {
             cfg,
+            topology,
             kernels,
             phase: Phase::Created,
             budgets: Budgets::default(),

@@ -343,6 +343,7 @@ impl Rig {
             Arc::new(sampler.clone()),
             Arc::new(trace.clone()),
             Arc::new(placement.clone()),
+            moruna_kernel::Topology::chain(kernels.len() as u16),
             kernels,
         )
         .expect("controller");
@@ -560,7 +561,7 @@ impl Placement for WatchedPlacement {
         self.other();
     }
 
-    fn set_committed(&self, _seq: Seq) {
+    fn set_committed(&self, _sink: u16, _seq: Seq) {
         self.other();
     }
 
@@ -574,7 +575,7 @@ impl Placement for WatchedPlacement {
     fn restore(
         &self,
         _manifest: &std::path::Path,
-        _plan: &[moruna_kernel::Split],
+        _plans: &[Vec<moruna_kernel::Split>],
         _fingerprints: &[Fingerprint],
     ) -> Result<moruna_kernel::ResumePoint> {
         self.other();

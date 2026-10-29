@@ -58,7 +58,7 @@ pub struct Queue {
     pub water: [(u64, u64); TIER_COUNT],
     /// Which marks the controller has set; the rest fall back to f.8's defaults.
     pub water_set: [bool; TIER_COUNT],
-    /// `set_staging`; false for stage 0, true otherwise (b).
+    /// `set_staging`; false for a queue a source gives, true otherwise (b).
     pub staging_enabled: bool,
     /// The promotion window `k`.
     pub promotion_window: u16,
@@ -73,9 +73,10 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// A queue with the defaults of b: staging off for stage 0 and on for every other
-    /// stage, a promotion window of 2 (preamble section 5), and a host consumer.
-    pub fn new(stage: StageId, host_tier: Tier) -> Queue {
+    /// A queue with the defaults of b: staging off for a queue a source gives (its entries are
+    /// `recomputable`) and on for every other, a promotion window of 2 (preamble section 5),
+    /// and a host consumer.
+    pub fn new(stage: StageId, host_tier: Tier, recomputable: bool) -> Queue {
         Queue {
             stage,
             order: VecDeque::new(),
@@ -86,7 +87,7 @@ impl Queue {
             target: host_tier,
             water: [(0, u64::MAX); TIER_COUNT],
             water_set: [false; TIER_COUNT],
-            staging_enabled: stage != 0,
+            staging_enabled: !recomputable,
             promotion_window: 2,
             head_error: None,
             blocked: false,
@@ -138,6 +139,16 @@ impl PlacementEngine {
     /// Add `bytes` to a queue's counter for `tier`.
     pub(crate) fn add_bytes(&self, index: usize, tier: Tier, bytes: u64) {
         self.counters[index].bytes[tier.index()].fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// An entry's bytes leave `tier`: the queue's counter falls, and when the entry was one of a
+    /// fan-out's (d.16) it leaves its group, so a batch other queues still hold stays counted
+    /// once (f.9).
+    pub(crate) fn drop_resident(&self, index: usize, tier: Tier, entry: &mut Entry) {
+        self.sub_bytes(index, tier, entry.bytes);
+        if let Some(group) = entry.group.take() {
+            group.leave(&self.shared_bytes);
+        }
     }
 
     /// Subtract `bytes` from a queue's counter for `tier`.
@@ -198,25 +209,99 @@ impl PlacementEngine {
                 if !matches!(entry.state, State::Evicted) {
                     return Err(MorunaError::Staging("replace: no evicted entry".into()));
                 }
-                let mut fresh = Entry::new(morsel, entry.recomputable);
+                let mut fresh = Entry::new(morsel, entry.recomputable, None);
                 fresh.disk = entry.disk;
                 *entry = fresh;
                 self.counters[index]
                     .evictions_replaced
                     .fetch_add(1, Ordering::Relaxed);
             } else {
-                let entry = Entry::new(morsel, stage == 0);
+                let recomputable = self.cfg.topology.source_of(stage).is_some();
+                let entry = Entry::new(morsel, recomputable, None);
                 queue.order.push_back(entry);
                 self.counters[index].count.fetch_add(1, Ordering::Relaxed);
             }
             self.add_bytes(index, tier, bytes);
             queue.waiters.clone()
         };
-        self.lineage_push(seq, stage, kind, bytes, origin);
+        self.lineage_push(&[stage], seq, kind, bytes, origin);
         for (_, waiter) in waiters {
             waiter.unpark();
         }
         self.plan_and_issue(index);
+        Ok(())
+    }
+
+    /// `push_to` for a fan-out (f.1, d.16): one morsel into each of `stages`, its payload shared
+    /// by every entry and counted once, and its lineage recorded at every queue in one step.
+    /// Every queue is checked before any is pushed into, so a refusal pushes nothing.
+    pub(crate) fn push_shared(
+        &self,
+        stages: &[StageId],
+        morsel: Morsel,
+    ) -> moruna_kernel::Result<()> {
+        if self.is_shutting_down() {
+            return Err(MorunaError::Cancelled);
+        }
+        let tier = morsel.payload.tier();
+        if !matches!(tier, Tier::PinnedHost | Tier::Host | Tier::Device(_))
+            || (tier.is_host() && tier != self.host_tier)
+        {
+            return Err(MorunaError::Staging(format!(
+                "push: morsel {} is in {tier:?}, which no queue of this run holds",
+                morsel.seq
+            )));
+        }
+        for &stage in stages {
+            if self.lock_queue(usize::from(stage)).closed {
+                return Err(MorunaError::Staging(format!(
+                    "push: stage {stage} is closed"
+                )));
+            }
+        }
+        let (seq, bytes, kind, origin) = (
+            morsel.seq,
+            morsel.bytes,
+            morsel.payload.kind(),
+            morsel.origin.clone(),
+        );
+        let group = crate::state::Group::new(bytes, tier.index());
+        let mut waiters = Vec::new();
+        let mut morsel = Some(morsel);
+        for (at, &stage) in stages.iter().enumerate() {
+            let index = usize::from(stage);
+            let this = if at + 1 == stages.len() {
+                morsel.take()
+            } else {
+                morsel.as_ref().map(|m| Morsel {
+                    seq: m.seq,
+                    stage: m.stage,
+                    payload: m.payload.share(),
+                    bytes: m.bytes,
+                    origin: m.origin.clone(),
+                    features: m.features.clone(),
+                })
+            };
+            let Some(this) = this else {
+                break;
+            };
+            let recomputable = self.cfg.topology.source_of(stage).is_some();
+            let mut queue = self.lock_queue(index);
+            // Counted into the queue first and into the group after, so the tier's total never
+            // dips below what is resident between the two.
+            self.add_bytes(index, tier, bytes);
+            let entry = Entry::new(this, recomputable, Some(group.join(&self.shared_bytes)));
+            queue.order.push_back(entry);
+            self.counters[index].count.fetch_add(1, Ordering::Relaxed);
+            waiters.extend(queue.waiters.iter().map(|(_, w)| w.clone()));
+        }
+        self.lineage_push(stages, seq, kind, bytes, origin);
+        for waiter in waiters {
+            waiter.unpark();
+        }
+        for &stage in stages {
+            self.plan_and_issue(usize::from(stage));
+        }
         Ok(())
     }
 
@@ -263,7 +348,7 @@ impl PlacementEngine {
             };
             entry.state = State::Consumed;
             if let Some(tier) = tier {
-                self.sub_bytes(index, tier, entry.bytes);
+                self.drop_resident(index, tier, &mut entry);
             }
             self.counters[index]
                 .count
@@ -274,7 +359,7 @@ impl PlacementEngine {
             (morsel, entry.disk, entry.seq)
         };
         let (morsel, disk, seq) = taken;
-        self.lineage_consumed(seq);
+        self.lineage_consumed(index as StageId, seq);
         if let Some(seg) = disk {
             self.release_record(seg.segment);
         }

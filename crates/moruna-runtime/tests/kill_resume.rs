@@ -342,12 +342,14 @@ fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
 fn expected_reads(manifest: &Path, plan: &[(u32, u64)]) -> (BTreeSet<(u32, u64, u64)>, bool) {
     let text = std::fs::read_to_string(manifest).expect("the manifest");
     let doc: serde_json::Value = serde_json::from_str(&text).expect("the manifest is JSON");
-    let committed = doc["committed_seq"].as_u64();
+    // A chain has one source and one sink: the manifest's lists hold one each (placement e.5).
+    let committed = doc["committed"][0].as_u64();
     let above = |seq: u64| committed.is_none_or(|c| seq > c);
     let mut want = BTreeSet::new();
     let mut known = BTreeSet::new();
     for row in doc["lineage"].as_array().into_iter().flatten() {
-        let seq = row["seq"].as_u64().unwrap_or_default();
+        // A chain's source morsel has one position, so its row is the morsel's.
+        let seq = row["root"].as_u64().unwrap_or_default();
         known.insert(seq);
         if above(seq) && row["disk"].is_null() {
             want.insert((
@@ -367,7 +369,7 @@ fn expected_reads(manifest: &Path, plan: &[(u32, u64)]) -> (BTreeSet<(u32, u64, 
             ));
         }
     }
-    let cursor = doc["source_cursor"]["split_index"]
+    let cursor = doc["source_cursors"][0]["split_index"]
         .as_u64()
         .unwrap_or_default() as usize;
     for (id, rows) in plan.iter().skip(cursor) {

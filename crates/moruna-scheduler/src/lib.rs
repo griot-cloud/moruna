@@ -1,7 +1,8 @@
 //! Moruna component 10, the scheduler: workers, drives, the admission rule and the trace.
 //!
-//! Design: `architecture/sdd/10-scheduler.md`. The scheduler turns a linear chain of stages
-//! into work for a pool of role-free threads. It owns the workers, the stage table, the
+//! Design: `architecture/sdd/10-scheduler.md`. The scheduler turns a run's DAG of sources,
+//! kernel stages and sinks (contracts d.16), a linear chain being the simplest, into work for a
+//! pool of role-free threads. It owns the workers, the stage table, the
 //! admission rule (f.3), the stateful instance pools (f.4), the source and sink drives (f.5,
 //! f.6), completion detection (f.7), the error policy (f.8), the probe protocol (f.9), the
 //! checkpoint thread (f.12), the resume path (f.13), the worker heartbeat (f.14) and the
@@ -12,9 +13,9 @@
 //! probe protocol without knowing its internals.
 //!
 //! Two properties hold by construction rather than by care. A worker only ever runs
-//! `Kernel::apply`: it never issues an IO operation and never waits on a `Completion`, because
-//! the only code that does either lives in the two drive threads (SC-I1, `source_drive` and
-//! `sink_drive`). And every morsel leaves exactly one trace record per stage, because the only
+//! `Kernel::apply_port`: it never issues an IO operation and never waits on a `Completion`,
+//! because the only code that does either lives in the drive threads, one per source and one per
+//! sink (SC-I1, `source_drive` and `sink_drive`). And every morsel leaves exactly one trace record per stage, because the only
 //! two places that build one are `worker::build_record`, called once at the end of a task, and
 //! the probe (SC-I4, G-I4).
 
@@ -49,17 +50,17 @@ mod source_drive;
 mod stats;
 mod worker;
 
-pub use pipeline::{Pipeline, SchedulerConfig};
+pub use pipeline::{Pipeline, SchedulerConfig, validate_graph};
 
 use shared::Shared;
 
 /// How a run ended (d.1).
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// The source was exhausted, every queue drained and the sink finished.
+    /// Every source was exhausted, every queue drained and every sink finished.
     Completed {
-        /// What the sink wrote.
-        sink: moruna_kernel::SinkSummary,
+        /// What each sink wrote, sink 0 first.
+        sinks: Vec<moruna_kernel::SinkSummary>,
     },
     /// The runtime ended the run itself with a diagnostic (G-I8).
     ///
@@ -192,7 +193,7 @@ impl Scheduler {
         (self.shared.knobs.cpu_bound(), self.shared.cfg.workers_max)
     }
 
-    /// The kernels of the chain, in stage order, for the facade's fingerprint list.
+    /// The kernels of the run, in stage order, for the facade's fingerprint list.
     pub fn kernels(&self) -> Vec<Arc<dyn Kernel>> {
         self.shared
             .stages

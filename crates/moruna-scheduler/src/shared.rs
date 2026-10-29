@@ -10,14 +10,14 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use crossbeam::sync::{Parker, Unparker};
 use moruna_kernel::{
     Allocator, CancelToken, Kernel, KernelKind, KernelState, MorunaError, PayloadSpec, Placement,
-    PlacementStats, RecordHook, Result, Sampler, Seq, Sink, SinkSummary, Source, SourceSchema,
-    Split, StageCounters, StageEvent, StageHook, StageId, TraceSink,
+    PlacementStats, Producer, RecordHook, Result, Sampler, Seq, Sink, SinkSummary, Source,
+    SourceSchema, Split, StageCounters, StageEvent, StageHook, StageId, Topology, TraceSink,
 };
 use moruna_sinks::SinkHandle;
 
 use crate::heartbeat::HeartbeatTable;
 use crate::knobs::KnobState;
-use crate::pipeline::{Pipeline, SchedulerConfig, validate_chain};
+use crate::pipeline::{Pipeline, SchedulerConfig, validate_graph};
 
 /// A test's hook into the worker loop between the pick and the claim (see `Shared::pick_hook`).
 #[cfg(test)]
@@ -74,7 +74,8 @@ impl RunState {
 
 /// How a run ended, as the thread that noticed it reports the fact to `run` (e.2).
 pub(crate) enum Exit {
-    Completed(SinkSummary),
+    /// What each sink wrote, sink 0 first.
+    Completed(Vec<SinkSummary>),
     Terminated(MorunaError),
     Cancelled,
 }
@@ -96,6 +97,10 @@ pub(crate) struct InstancePool {
 /// One kernel stage: the kernel, its instance pool and its counters (e.3).
 pub(crate) struct StageEntry {
     pub(crate) stage: StageId,
+    /// The queues it takes, by port (contracts d.16).
+    pub(crate) inputs: Vec<StageId>,
+    /// The queues it gives to: its output's consumers.
+    pub(crate) outputs: Vec<StageId>,
     pub(crate) kernel: Arc<dyn Kernel>,
     pub(crate) spec: PayloadSpec,
     pub(crate) pool: Option<InstancePool>,
@@ -131,7 +136,7 @@ impl StageEntry {
     }
 }
 
-/// What the source produced and the sink wrote, for the task lifecycle (MH 4.3).
+/// What a source produced or a sink wrote, for the task lifecycle (MH 4.3).
 #[derive(Default)]
 pub(crate) struct EndCounters {
     pub(crate) started: AtomicBool,
@@ -151,8 +156,8 @@ pub(crate) enum WorkerJob {
         instance: usize,
         bytes: Vec<u8>,
     },
-    /// One probe of one stage (f.9).
-    Probe { stage: StageId },
+    /// One probe of one stage, on the input port that holds its morsel (f.9).
+    Probe { stage: StageId, port: u16 },
     /// The SC-T19 seam: leave the loop without reporting (f.14).
     #[cfg(test)]
     Die,
@@ -169,7 +174,7 @@ pub(crate) struct JobRequest {
     pub(crate) reply: Sender<Result<JobOutput>>,
 }
 
-/// A request the source drive services on behalf of another thread (b, f.9), so the requesting
+/// A request a source drive services on behalf of another thread (b, f.9), so the requesting
 /// thread never waits on a reactor completion itself.
 pub(crate) struct HelperRequest {
     /// About this many payload bytes at the cursor.
@@ -177,7 +182,7 @@ pub(crate) struct HelperRequest {
     pub(crate) reply: Sender<Result<()>>,
 }
 
-/// Where the source drive is and what it has issued (f.5).
+/// Where a source's drive is and what it has issued (f.5).
 pub(crate) struct Cursor {
     pub(crate) split_index: u32,
     pub(crate) row_offset: u64,
@@ -251,31 +256,80 @@ impl Watermark {
     }
 }
 
+/// One source and its drive (f.5): what it reads, the queues it gives to, where its cursor is.
+pub(crate) struct SourceEnd {
+    /// Its number in the topology.
+    pub(crate) index: u16,
+    pub(crate) source: Arc<dyn Source>,
+    pub(crate) plan: Vec<Split>,
+    /// The queues each of its reads is pushed into, shared (contracts d.16).
+    pub(crate) outputs: Vec<StageId>,
+    /// The stage whose morsel target sizes its reads: the first consumer of its first queue,
+    /// or 0 (the sink's) when that is a sink (f.5, h).
+    pub(crate) target_stage: StageId,
+    pub(crate) cursor: Mutex<Cursor>,
+    pub(crate) to_recompute: Mutex<Vec<(Seq, moruna_kernel::Origin)>>,
+    /// The plan is read to the end and no read is in flight; its queues are closed.
+    pub(crate) exhausted: AtomicBool,
+    pub(crate) out: EndCounters,
+    pub(crate) helper_tx: Sender<HelperRequest>,
+    pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
+    pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) unparker: Mutex<Option<Unparker>>,
+}
+
+/// One sink and its drive (f.6): the queue it drains, its watermark, its counters.
+pub(crate) struct SinkEnd {
+    /// Its number in the topology.
+    pub(crate) index: u16,
+    pub(crate) sink: RwLock<SinkHandle>,
+    pub(crate) spec: PayloadSpec,
+    /// The queue it takes.
+    pub(crate) queue: StageId,
+    /// The schema of what it receives.
+    pub(crate) schema: SourceSchema,
+    pub(crate) committed: Mutex<Watermark>,
+    pub(crate) input: EndCounters,
+    /// A resumed run replays a source morsel to every sink, and each drops what its own
+    /// watermark already covers (placement f.13, d.16).
+    pub(crate) floor: Mutex<Option<Seq>>,
+    /// The lowest number not yet known to arrive or not: from it, numbers no morsel will have
+    /// are skipped once the sources they come from are read to the end (f.11, d.16).
+    pub(crate) gaps_from: Mutex<Seq>,
+    /// The highest number its queue has delivered.
+    pub(crate) highest: Mutex<Option<Seq>>,
+    /// Its queue is closed and drained and every write completed: it waits to be finished.
+    pub(crate) drained: AtomicBool,
+    pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) unparker: Mutex<Option<Unparker>>,
+}
+
 /// Everything the workers, the drives, the checkpoint thread and the controller's calls share.
 pub(crate) struct Shared {
     pub(crate) cfg: SchedulerConfig,
-    pub(crate) source: Arc<dyn Source>,
-    pub(crate) sink: RwLock<SinkHandle>,
-    pub(crate) sink_spec: PayloadSpec,
+    /// The run's shape (contracts d.16).
+    pub(crate) topology: Topology,
+    pub(crate) sources: Vec<SourceEnd>,
+    pub(crate) sinks: Vec<SinkEnd>,
     pub(crate) placement: Arc<dyn Placement>,
     pub(crate) alloc: Arc<dyn Allocator>,
     pub(crate) trace: Arc<dyn TraceSink>,
     pub(crate) sampler: Arc<dyn Sampler>,
     pub(crate) stages: Vec<StageEntry>,
-    pub(crate) plan: Vec<Split>,
-    pub(crate) schemas: Vec<SourceSchema>,
     pub(crate) knobs: KnobState,
 
     /// The stage table lock of preamble 4.2 position 1. Held only while the close cascade of
     /// f.7 runs; never across a call into another component, and never by the checkpoint
     /// thread, which is the deadlock preamble 4.2 exists to prevent.
     pub(crate) stage_table: Mutex<()>,
-    /// Queue `k` has been closed *in the engine*; index 0..=n. Published only after
-    /// `Placement::close` has returned, so `is_closed(k)` means no push into queue `k` can
-    /// succeed any more, which is what the close cascade's arithmetic rests on (f.7).
+    /// Queue `k` has been closed *in the engine*. Published only after `Placement::close` has
+    /// returned, so `is_closed(k)` means no push into queue `k` can succeed any more, which is
+    /// what the close cascade's arithmetic rests on (f.7).
     pub(crate) closed: Vec<AtomicBool>,
-    /// One thread has taken on closing queue `k`; the close itself then happens once.
-    closing: Vec<AtomicBool>,
+    /// One thread has taken on closing producer `p`'s queues: index 0 is unused, `s` is stage
+    /// `s`; a source's queues are claimed per queue in `queue_claims`.
+    stage_claims: Vec<AtomicBool>,
+    queue_claims: Vec<AtomicBool>,
 
     pub(crate) state: AtomicU8Cell,
     pub(crate) exit: Mutex<Option<Exit>>,
@@ -285,9 +339,6 @@ pub(crate) struct Shared {
     pub(crate) stopping: AtomicBool,
     pub(crate) probing: AtomicBool,
 
-    pub(crate) cursor: Mutex<Cursor>,
-    pub(crate) to_recompute: Mutex<Vec<(Seq, moruna_kernel::Origin)>>,
-    pub(crate) committed: Mutex<Watermark>,
     pub(crate) last_manifest: Mutex<Option<std::path::PathBuf>>,
 
     pub(crate) jobs: Vec<Sender<JobRequest>>,
@@ -297,21 +348,15 @@ pub(crate) struct Shared {
     pub(crate) heartbeat: HeartbeatTable,
     pub(crate) worker_handles: Mutex<Vec<Option<JoinHandle<()>>>>,
 
-    pub(crate) helper_tx: Sender<HelperRequest>,
-    pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
-    pub(crate) source_handle: Mutex<Option<JoinHandle<()>>>,
-    pub(crate) sink_handle: Mutex<Option<JoinHandle<()>>>,
     pub(crate) source_mode: AtomicU8Cell,
     pub(crate) sink_mode: AtomicU8Cell,
-    pub(crate) source_unparker: Mutex<Option<Unparker>>,
-    pub(crate) sink_unparker: Mutex<Option<Unparker>>,
 
     pub(crate) checkpoint_on: AtomicBool,
     pub(crate) checkpoint_stop: AtomicBool,
     pub(crate) checkpoint_handle: Mutex<Option<JoinHandle<()>>>,
 
     pub(crate) record_hook: RwLock<Option<RecordHook>>,
-    /// Who hears the chain's facts as they become true (MH 4.3 task events).
+    /// Who hears the run's facts as they become true (MH 4.3 task events).
     pub(crate) stage_hook: RwLock<Option<StageHook>>,
     /// Where what the kernels print goes, attributed to their stage (MH 4.3 `log`).
     pub(crate) output: RwLock<Option<Arc<dyn moruna_kernel::OutputSink>>>,
@@ -319,12 +364,8 @@ pub(crate) struct Shared {
     pub(crate) waits: RwLock<Option<Arc<moruna_kernel::StageWaits>>>,
     /// Called with each manifest once it is on disk (MH 4.7: the copy on an object store).
     pub(crate) manifest_hook: RwLock<Option<crate::ManifestHook>>,
-    /// Queue `k` has received a morsel; index 0..=n.
+    /// Queue `k` has received a morsel.
     fed: Vec<AtomicBool>,
-    /// The source's reads pushed to Q0, and their rows and bytes.
-    pub(crate) source_out: EndCounters,
-    /// The sink's writes completed, and their rows and bytes as the sink's summary says.
-    pub(crate) sink_in: EndCounters,
     /// The seam the CPU limit tests use: called by a worker after `pick` has named a stage and
     /// before it claims a busy slot, which is the window a lowered limit must not slip through.
     #[cfg(test)]
@@ -333,6 +374,7 @@ pub(crate) struct Shared {
 
     pub(crate) reads_in_flight: AtomicU16,
     pub(crate) writes_in_flight: AtomicU16,
+    /// Every source is read to the end.
     pub(crate) source_exhausted: AtomicBool,
     pub(crate) errors_total: AtomicU32,
     pub(crate) checkpoints: AtomicU64,
@@ -382,28 +424,33 @@ impl Shared {
         sampler: Arc<dyn Sampler>,
     ) -> Result<Arc<Shared>> {
         cfg.validate()?;
+        // f.1: validate the run before anything is opened or read.
+        let schemas = validate_graph(&pipeline)?;
         let Pipeline {
-            source,
+            sources,
             kernels,
-            mut sink,
+            sinks,
+            topology,
         } = pipeline;
-
-        // f.1: validate the chain before anything is opened or read.
-        let schemas = validate_chain(source.as_ref(), &kernels, &sink)?;
-        let plan = source.plan()?;
+        let mut plans = Vec::with_capacity(sources.len());
+        for source in &sources {
+            plans.push(source.plan()?);
+        }
 
         // f.1: a sink that cannot say what it committed cannot be resumed, and neither can a
         // source that cannot be re-read; either forces checkpointing off, named in the log.
         let mut checkpoint_enabled = cfg.checkpoint_enabled;
-        if checkpoint_enabled && sink.checkpoint()?.is_none() {
-            tracing::warn!(
-                target: "sched.not_resumable",
-                reason = "the sink does not track commits",
-                "checkpointing is off for this run"
-            );
-            checkpoint_enabled = false;
+        for sink in &sinks {
+            if checkpoint_enabled && sink.checkpoint()?.is_none() {
+                tracing::warn!(
+                    target: "sched.not_resumable",
+                    reason = "the sink does not track commits",
+                    "checkpointing is off for this run"
+                );
+                checkpoint_enabled = false;
+            }
         }
-        if checkpoint_enabled && !source.repeatable() {
+        if checkpoint_enabled && sources.iter().any(|s| !s.repeatable()) {
             tracing::warn!(
                 target: "sched.not_resumable",
                 reason = "the source is not repeatable",
@@ -411,16 +458,12 @@ impl Shared {
             );
             checkpoint_enabled = false;
         }
-        if !cfg.resuming {
-            let schema = schemas[0].clone();
-            sink.open(&schema)?;
-        }
 
-        let sink_spec = sink.accepts();
         let stages: Vec<StageEntry> = kernels
             .iter()
             .enumerate()
             .map(|(index, kernel)| {
+                let stage = index as StageId + 1;
                 let pool = match kernel.kind() {
                     KernelKind::Stateless => None,
                     KernelKind::Stateful { max_instances } => {
@@ -440,7 +483,9 @@ impl Shared {
                     }
                 };
                 StageEntry {
-                    stage: index as StageId + 1,
+                    stage,
+                    inputs: topology.inputs(stage).to_vec(),
+                    outputs: topology.outputs(stage).to_vec(),
                     spec: kernel.accepts(),
                     kernel: kernel.clone(),
                     pool,
@@ -460,11 +505,76 @@ impl Shared {
             })
             .collect();
 
+        let mut sink_ends = Vec::with_capacity(sinks.len());
+        for (index, mut sink) in sinks.into_iter().enumerate() {
+            let index = index as u16;
+            let queue = topology
+                .sink_input(index)
+                .ok_or_else(|| MorunaError::Plan(format!("sink {index} takes no queue")))?;
+            let schema = schemas[usize::from(queue)].clone();
+            if !cfg.resuming {
+                sink.open(&schema)?;
+            }
+            sink_ends.push(SinkEnd {
+                index,
+                spec: sink.accepts(),
+                sink: RwLock::new(sink),
+                queue,
+                schema,
+                committed: Mutex::new(Watermark::default()),
+                input: EndCounters::default(),
+                floor: Mutex::new(None),
+                gaps_from: Mutex::new(0),
+                highest: Mutex::new(None),
+                drained: AtomicBool::new(false),
+                handle: Mutex::new(None),
+                unparker: Mutex::new(None),
+            });
+        }
+
         // f.1: every queue's consumer, so the engine promotes toward the right tier.
         for entry in &stages {
-            placement.set_consumer(entry.stage - 1, entry.spec);
+            for &q in &entry.inputs {
+                placement.set_consumer(q, entry.spec);
+            }
         }
-        placement.set_consumer(stages.len() as StageId, sink_spec);
+        for end in &sink_ends {
+            placement.set_consumer(end.queue, end.spec);
+        }
+
+        let mut source_ends = Vec::with_capacity(sources.len());
+        for (index, (source, plan)) in sources.into_iter().zip(plans).enumerate() {
+            let index = index as u16;
+            let outputs = topology.source_outputs(index).to_vec();
+            let target_stage = outputs
+                .first()
+                .and_then(|&q| topology.link(q))
+                .map_or(0, |link| match link.to {
+                    moruna_kernel::Consumer::Kernel { stage, .. } => stage,
+                    moruna_kernel::Consumer::Sink(_) => 0,
+                });
+            let (helper_tx, helper_rx) = unbounded();
+            source_ends.push(SourceEnd {
+                index,
+                source,
+                plan,
+                outputs,
+                target_stage,
+                cursor: Mutex::new(Cursor {
+                    split_index: 0,
+                    row_offset: 0,
+                    next_seq: 0,
+                    issued: std::collections::BTreeMap::new(),
+                }),
+                to_recompute: Mutex::new(Vec::new()),
+                exhausted: AtomicBool::new(false),
+                out: EndCounters::default(),
+                helper_tx,
+                helper_rx: Mutex::new(Some(helper_rx)),
+                handle: Mutex::new(None),
+                unparker: Mutex::new(None),
+            });
+        }
 
         let workers = cfg.workers_max as usize;
         let mut jobs = Vec::with_capacity(workers);
@@ -479,25 +589,23 @@ impl Shared {
             unparkers.push(parker.unparker().clone());
             parkers.push(Some(parker));
         }
-        let (helper_tx, helper_rx) = unbounded();
-        let queues = stages.len() + 1;
+        let queues = usize::from(topology.queue_count());
 
         let shared = Arc::new(Shared {
-            knobs: KnobState::new(&cfg, queues),
+            knobs: KnobState::new(&cfg, stages.len() + 1),
             cfg,
-            source,
-            sink: RwLock::new(sink),
-            sink_spec,
+            topology,
+            sources: source_ends,
+            sinks: sink_ends,
             placement,
             alloc,
             trace,
             sampler,
+            stage_claims: (0..=stages.len()).map(|_| AtomicBool::new(false)).collect(),
             stages,
-            plan,
-            schemas,
             stage_table: Mutex::new(()),
             closed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
-            closing: (0..queues).map(|_| AtomicBool::new(false)).collect(),
+            queue_claims: (0..queues).map(|_| AtomicBool::new(false)).collect(),
             state: AtomicU8Cell::new(RunState::Init.code()),
             exit: Mutex::new(None),
             exit_signal: Condvar::new(),
@@ -505,14 +613,6 @@ impl Shared {
             token: Mutex::new(None),
             stopping: AtomicBool::new(false),
             probing: AtomicBool::new(false),
-            cursor: Mutex::new(Cursor {
-                split_index: 0,
-                row_offset: 0,
-                next_seq: 0,
-                issued: std::collections::BTreeMap::new(),
-            }),
-            to_recompute: Mutex::new(Vec::new()),
-            committed: Mutex::new(Watermark::default()),
             last_manifest: Mutex::new(None),
             jobs,
             job_inbox: Mutex::new(inbox),
@@ -520,14 +620,8 @@ impl Shared {
             parkers: Mutex::new(parkers),
             heartbeat: HeartbeatTable::new(workers),
             worker_handles: Mutex::new(Vec::new()),
-            helper_tx,
-            helper_rx: Mutex::new(Some(helper_rx)),
-            source_handle: Mutex::new(None),
-            sink_handle: Mutex::new(None),
             source_mode: AtomicU8Cell::new(DRIVE_IDLE),
             sink_mode: AtomicU8Cell::new(DRIVE_IDLE),
-            source_unparker: Mutex::new(None),
-            sink_unparker: Mutex::new(None),
             checkpoint_on: AtomicBool::new(checkpoint_enabled),
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_handle: Mutex::new(None),
@@ -537,8 +631,6 @@ impl Shared {
             waits: RwLock::new(None),
             manifest_hook: RwLock::new(None),
             fed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
-            source_out: EndCounters::default(),
-            sink_in: EndCounters::default(),
             #[cfg(test)]
             pick_hook: RwLock::new(None),
             stats_cache: Mutex::new(StatsCache {
@@ -563,14 +655,11 @@ impl Shared {
             target: "sched.start",
             workers = shared.cfg.workers_max,
             stages = shared.stages.len(),
+            sources = shared.sources.len(),
+            sinks = shared.sinks.len(),
             "scheduler built"
         );
         Ok(shared)
-    }
-
-    /// The queue the sink drains: Qn, or Q0 when there is no kernel (h).
-    pub(crate) fn last_queue(&self) -> StageId {
-        self.stages.len() as StageId
     }
 
     pub(crate) fn run_state(&self) -> RunState {
@@ -662,41 +751,49 @@ impl Shared {
         }
     }
 
-    /// The source pushed one read of `rows` rows and `bytes` bytes into Q0.
-    pub(crate) fn source_pushed(&self, rows: u64, bytes: u64) {
-        self.source_out.morsels.fetch_add(1, Ordering::SeqCst);
-        self.source_out.rows.fetch_add(rows, Ordering::SeqCst);
-        self.source_out.bytes.fetch_add(bytes, Ordering::SeqCst);
-        self.fed(0);
-    }
-
-    /// The source drive is issuing a read: the first one is told (MH 4.3 `task_started`).
-    pub(crate) fn source_reading(&self) {
-        if !self.source_out.started.swap(true, Ordering::SeqCst) {
-            self.tell(StageEvent::SourceReading);
+    /// Source `source` pushed one read of `rows` rows and `bytes` bytes into its queues.
+    pub(crate) fn source_pushed(&self, source: &SourceEnd, rows: u64, bytes: u64) {
+        source.out.morsels.fetch_add(1, Ordering::SeqCst);
+        source.out.rows.fetch_add(rows, Ordering::SeqCst);
+        source.out.bytes.fetch_add(bytes, Ordering::SeqCst);
+        for &q in &source.outputs {
+            self.fed(q);
         }
     }
 
-    /// The counters of queue `queue`'s producer: the source for Q0, kernel stage `k` for Qk.
+    /// A source's drive is issuing a read: the first one is told (MH 4.3 `task_started`).
+    pub(crate) fn source_reading(&self, source: &SourceEnd) {
+        if !source.out.started.swap(true, Ordering::SeqCst) {
+            self.tell(StageEvent::SourceReading {
+                source: source.index,
+            });
+        }
+    }
+
+    /// The counters of queue `queue`'s producer: its source's, or its kernel stage's.
     pub(crate) fn producer_counters(&self, queue: StageId) -> StageCounters {
-        match queue {
-            0 => StageCounters {
-                morsels: self.source_out.morsels.load(Ordering::SeqCst),
-                rows_out: self.source_out.rows.load(Ordering::SeqCst),
-                bytes_out: self.source_out.bytes.load(Ordering::SeqCst),
-                ..StageCounters::default()
+        match self.topology.link(queue).map(|l| l.from) {
+            Some(Producer::Source(s)) => match self.sources.get(usize::from(s)) {
+                Some(end) => StageCounters {
+                    morsels: end.out.morsels.load(Ordering::SeqCst),
+                    rows_out: end.out.rows.load(Ordering::SeqCst),
+                    bytes_out: end.out.bytes.load(Ordering::SeqCst),
+                    ..StageCounters::default()
+                },
+                None => StageCounters::default(),
             },
-            k => self
+            Some(Producer::Kernel(k)) => self
                 .stages
                 .get(k as usize - 1)
                 .map(StageEntry::counters)
                 .unwrap_or_default(),
+            None => StageCounters::default(),
         }
     }
 
     /// Claim the right to end the run. The first caller wins and is the only one that may act:
-    /// the sink drive finishes the sink only if it wins, and a terminate or a cancel that loses
-    /// is a no-op because the run had already finished (f.10, e.2).
+    /// the last sink drive to drain finishes the sinks only if it wins, and a terminate or a
+    /// cancel that loses is a no-op because the run had already finished (f.10, e.2).
     ///
     /// The claim is taken before any side effect, which is what keeps `finish` off a run that
     /// was cancelled or terminated: deciding by who publishes first is too late, because by then
@@ -761,6 +858,11 @@ impl Shared {
             .map_or(0, |q| q.count)
     }
 
+    /// True when every queue of the run is empty.
+    pub(crate) fn queues_empty(&self) -> bool {
+        self.placement.stats().queues.iter().all(|q| q.count == 0)
+    }
+
     pub(crate) fn send_job(&self, worker: u16, job: WorkerJob) -> Receiver<Result<JobOutput>> {
         let (reply, rx) = unbounded();
         let index = worker as usize % self.jobs.len();
@@ -810,45 +912,31 @@ impl Shared {
         for unparker in &self.unparkers {
             unparker.unpark();
         }
-        if let Some(unparker) = self
-            .source_unparker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            unparker.unpark();
+        for end in &self.sources {
+            if let Some(unparker) = end
+                .unparker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                unparker.unpark();
+            }
         }
-        if let Some(unparker) = self
-            .sink_unparker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            unparker.unpark();
+        for end in &self.sinks {
+            if let Some(unparker) = end
+                .unparker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                unparker.unpark();
+            }
         }
     }
 
-    /// True when the queue for `stage` has been closed by f.7 or by the source drive.
+    /// True when queue `stage` has been closed by f.7 or by its source's drive.
     pub(crate) fn is_closed(&self, stage: StageId) -> bool {
         self.closed
-            .get(stage as usize)
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
-    }
-
-    /// Take on closing a queue; true for the call that won it (f.7). The claim is separate from
-    /// `closed` because `closed` is published only once the engine has really closed the queue:
-    /// a flag flipped before the call would tell another thread the queue was sealed while a
-    /// push into it could still succeed, and the cascade would close the queue below a morsel.
-    fn claim_close(&self, stage: StageId) -> bool {
-        self.closing.get(stage as usize).is_some_and(|flag| {
-            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        })
-    }
-
-    /// True once a thread has taken the close on, whether or not the engine knows yet.
-    fn close_claimed(&self, stage: StageId) -> bool {
-        self.closing
             .get(stage as usize)
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
@@ -860,10 +948,11 @@ impl Shared {
             flag.store(true, Ordering::SeqCst);
         }
         tracing::debug!(target: "sched.close_stage", stage, "queue closed");
-        // Closed in the engine, so its producer has produced everything: its counters are
-        // final (f.7, MH 4.3 `task_completed`). Not once the run is ending: a kernel whose error
-        // ends the run claims the exit before it lets go of its stage (f.8), so the cascade
-        // that closes its queue after that is the run winding down, not the stage succeeding.
+        // Closed in the engine, so its producer has produced everything into it: its counters
+        // are final (f.7, MH 4.3 `task_completed`). Not once the run is ending: a kernel whose
+        // error ends the run claims the exit before it lets go of its stage (f.8), so the
+        // cascade that closes its queue after that is the run winding down, not the stage
+        // succeeding.
         if !self.exit_claimed.load(Ordering::SeqCst) {
             self.tell(StageEvent::QueueClosed {
                 queue: stage,
@@ -872,91 +961,87 @@ impl Shared {
         }
     }
 
-    /// Close a queue once, in order, and say whether this call did it (f.7).
+    /// Close a source's queue once, and say whether this call did it (f.5, f.7).
     pub(crate) fn close_queue(&self, stage: StageId) -> bool {
-        if !self.claim_close(stage) {
-            return false;
+        let claimed = self.queue_claims.get(stage as usize).is_some_and(|flag| {
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        });
+        if claimed {
+            self.close_in_engine(stage);
         }
-        self.close_in_engine(stage);
-        true
+        claimed
     }
 
-    /// The close cascade of f.7, evaluated by whichever worker or drive observes the condition.
-    /// Monotonic, so it is safe to run concurrently.
+    /// The close cascade of f.7 over the run's DAG, evaluated by whichever worker or drive
+    /// observes the condition. Monotonic, so it is safe to run concurrently: each stage's queues
+    /// close once, and a stage is looked at again only while some stage closed on this pass.
     ///
-    /// One queue per pass, and the three reads in one order: the queue below is sealed in the
-    /// engine, *then* its count, *then* `running`. That order is the whole argument. Because the
-    /// queue below is sealed, nothing can be pushed into it, so its count is final; because
-    /// `running` is read after the count, a morsel in flight is caught by one read or the other
-    /// (a worker takes its claim before it pops, worker.rs f.7). This used to read one
-    /// `placement.stats()` snapshot before the loop and close every stage the cascade allowed
-    /// against it: for the second stage onwards the count predated the close of the queue below
-    /// it, so a morsel pushed in between was not counted, the cascade closed that queue and the
-    /// ones after it, and the sink then found its own queue closed and empty and completed the
-    /// run without the morsel (SC-I9, SC-T8's row count; ~1 run in 100 of a 3-stage chain).
+    /// For each stage, the three reads in one order: its input queues are sealed in the
+    /// engine, *then* their counts, *then* `running`. That order is the whole argument. Because
+    /// the inputs are sealed, nothing can be pushed into them, so their counts are final;
+    /// because `running` is read after the counts, a morsel in flight is caught by one read or
+    /// the other (a worker takes its claim before it pops, worker.rs f.7). A count taken before
+    /// an input was sealed would miss a morsel pushed in between, the stage's outputs would
+    /// close under it and a sink would complete without it (SC-I9, SC-T8's row count).
     ///
     /// `placement.stats()` and `placement.close` stay outside the stage table lock: no lock of
     /// this component is ever held across a call into another one, which is what preamble 4.2
     /// requires and the deadlock it exists to prevent.
     pub(crate) fn advance_closes(&self) {
-        if !self.source_exhausted.load(Ordering::SeqCst) {
-            return;
+        loop {
+            let mut closed_one = false;
+            for index in 0..self.stages.len() {
+                closed_one |= self.close_stage(index);
+            }
+            if !closed_one {
+                return;
+            }
         }
-        while self.close_one() {}
     }
 
-    /// One step of the cascade: close the lowest queue that may be closed, and say whether it
-    /// closed one, so the caller can look for the next.
-    fn close_one(&self) -> bool {
-        let Some(stage) = self.next_closable() else {
-            return false;
-        };
-        // The queue below is sealed, so this count can no longer rise.
-        if self.queue_count(stage - 1) != 0 {
+    /// One step of the cascade: close stage `index`'s output queues when its inputs are sealed
+    /// and drained and it has no task running, and say whether this call did.
+    fn close_stage(&self, index: usize) -> bool {
+        let entry = &self.stages[index];
+        let claim = &self.stage_claims[usize::from(entry.stage)];
+        if claim.load(Ordering::SeqCst) {
             return false;
         }
         {
             let _guard = self.stage_table.lock().unwrap_or_else(|e| e.into_inner());
-            // After the count, never before it.
-            if self.stages[stage as usize - 1]
-                .running
-                .load(Ordering::SeqCst)
-                != 0
+            if !entry.inputs.iter().all(|&q| self.is_closed(q)) {
+                return false;
+            }
+            if entry.running.load(Ordering::SeqCst) != 0 {
+                return false;
+            }
+        }
+        // The inputs are sealed, so these counts can no longer rise.
+        if entry.inputs.iter().any(|&q| self.queue_count(q) != 0) {
+            return false;
+        }
+        {
+            let _guard = self.stage_table.lock().unwrap_or_else(|e| e.into_inner());
+            // After the counts, never before them.
+            if entry.running.load(Ordering::SeqCst) != 0 {
+                return false;
+            }
+            if claim
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
             {
                 return false;
             }
-            if !self.claim_close(stage) {
-                return false;
-            }
         }
-        self.close_in_engine(stage);
+        for &q in &entry.outputs {
+            self.close_in_engine(q);
+        }
         true
-    }
-
-    /// The lowest queue whose producer stage may be able to close it: the queue below it is
-    /// sealed in the engine and the stage has no task running. `None` when the cascade cannot
-    /// move, including while another thread is closing a queue (that thread carries the cascade
-    /// on from there).
-    fn next_closable(&self) -> Option<StageId> {
-        let _guard = self.stage_table.lock().unwrap_or_else(|e| e.into_inner());
-        for index in 0..self.stages.len() {
-            let stage = index as StageId + 1;
-            if self.is_closed(stage) {
-                continue;
-            }
-            if self.close_claimed(stage) || !self.is_closed(stage - 1) {
-                return None;
-            }
-            if self.stages[index].running.load(Ordering::SeqCst) != 0 {
-                return None;
-            }
-            return Some(stage);
-        }
-        None
     }
 }
 
-/// Spawn the worker pool parked and the two drive threads idle (f.1).
+/// Spawn the worker pool parked and a drive thread per source and per sink, idle (f.1).
 pub(crate) fn spawn_all(shared: &Arc<Shared>) -> Result<()> {
     let mut handles = Vec::new();
     {
@@ -981,55 +1066,60 @@ pub(crate) fn spawn_all(shared: &Arc<Shared>) -> Result<()> {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = handles;
 
-    let Some(helper_rx) = shared
-        .helper_rx
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-    else {
-        return Err(MorunaError::Plan("the drives were already spawned".into()));
-    };
-    let source_parker = Parker::new();
-    *shared
-        .source_unparker
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(source_parker.unparker().clone());
-    let source_shared = Arc::clone(shared);
-    let source = std::thread::Builder::new()
-        .name("moruna-source-drive".into())
-        .spawn(move || {
-            let drive = Arc::clone(&source_shared);
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                crate::source_drive::drive(drive, helper_rx, source_parker)
-            }));
-            if let Err(panic) = ran {
-                crate::source_drive::panicked(&source_shared, panic.as_ref());
-            }
-        })
-        .map_err(|e| MorunaError::Plan(format!("the source drive could not start: {e}")))?;
-    *shared
-        .source_handle
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(source);
+    for (index, end) in shared.sources.iter().enumerate() {
+        let Some(helper_rx) = end
+            .helper_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return Err(MorunaError::Plan("the drives were already spawned".into()));
+        };
+        let parker = Parker::new();
+        *end.unparker.lock().unwrap_or_else(|e| e.into_inner()) = Some(parker.unparker().clone());
+        let source_shared = Arc::clone(shared);
+        let name = if shared.sources.len() == 1 {
+            "moruna-source-drive".to_string()
+        } else {
+            format!("moruna-source-drive-{index}")
+        };
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                let drive = Arc::clone(&source_shared);
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    crate::source_drive::drive(drive, index, helper_rx, parker)
+                }));
+                if let Err(panic) = ran {
+                    crate::source_drive::panicked(&source_shared, index, panic.as_ref());
+                }
+            })
+            .map_err(|e| MorunaError::Plan(format!("the source drive could not start: {e}")))?;
+        *end.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
 
-    let sink_parker = Parker::new();
-    *shared
-        .sink_unparker
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(sink_parker.unparker().clone());
-    let sink_shared = Arc::clone(shared);
-    let sink = std::thread::Builder::new()
-        .name("moruna-sink-drive".into())
-        .spawn(move || {
-            let drive = Arc::clone(&sink_shared);
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                crate::sink_drive::drive(drive, sink_parker)
-            }));
-            if let Err(panic) = ran {
-                crate::sink_drive::panicked(&sink_shared, panic.as_ref());
-            }
-        })
-        .map_err(|e| MorunaError::Plan(format!("the sink drive could not start: {e}")))?;
-    *shared.sink_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    for (index, end) in shared.sinks.iter().enumerate() {
+        let parker = Parker::new();
+        *end.unparker.lock().unwrap_or_else(|e| e.into_inner()) = Some(parker.unparker().clone());
+        let sink_shared = Arc::clone(shared);
+        let name = if shared.sinks.len() == 1 {
+            "moruna-sink-drive".to_string()
+        } else {
+            format!("moruna-sink-drive-{index}")
+        };
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                let drive = Arc::clone(&sink_shared);
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    crate::sink_drive::drive(drive, index, parker)
+                }));
+                if let Err(panic) = ran {
+                    crate::sink_drive::panicked(&sink_shared, panic.as_ref());
+                }
+            })
+            .map_err(|e| MorunaError::Plan(format!("the sink drive could not start: {e}")))?;
+        *end.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
     Ok(())
 }

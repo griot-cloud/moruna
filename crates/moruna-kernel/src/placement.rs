@@ -44,10 +44,14 @@ pub struct QueueStats {
 /// Every queue's state plus the bytes in flight.
 #[derive(Clone, Debug, Default)]
 pub struct PlacementStats {
-    /// One entry per queue, by stage.
+    /// One entry per queue, by queue id.
     pub queues: Vec<QueueStats>,
     /// Bytes in moves the engine has issued and not yet seen complete.
     pub in_flight_bytes: u64,
+    /// Per tier, the bytes counted in more than one queue's `bytes_by_tier`: a batch fanned out
+    /// to `m` queues is resident once and each queue counts it, so the sum over queues is `m - 1`
+    /// copies too high by this (d.16). Zero for a run with no fan-out.
+    pub shared_by_tier: [u64; TIER_COUNT],
 }
 
 /// Which node's memory a pop may be satisfied from. Reserved for the multi-node
@@ -62,24 +66,25 @@ pub enum Locality {
 }
 
 /// Pieces of a checkpoint the placement engine does not own but records in the
-/// manifest on behalf of the scheduler (placement e.5).
+/// manifest on behalf of the scheduler (placement e.5). Sources and sinks are indexed by their
+/// numbers in the run's topology (d.16).
 #[derive(Clone, Debug, Default)]
 pub struct CheckpointExtras {
     /// `(stage, instance, bytes)` from `KernelState::checkpoint` for `Checkpoint` kernels.
     pub kernel_states: Vec<(StageId, usize, Vec<u8>)>,
-    /// From `Sink::checkpoint`.
-    pub sink_state: Option<Vec<u8>>,
-    /// From `Sink::committed_seq` at the moment of the checkpoint.
-    pub committed_seq: Option<Seq>,
-    /// Where the source drive is: the index into the plan and the next row within
-    /// that split, plus the next sequence number to assign.
-    pub source_cursor: SourceCursor,
-    /// Reads the source drive has issued and not yet pushed to Q0, ascending `seq`: behind the
-    /// cursor, so the cursor does not name them, and in no queue, so the lineage does not
-    /// either. `restore` hands each back in `ResumePoint::to_recompute` unless the lineage
-    /// already holds it (placement e.5, MH 4.7). Re-reading one is safe because `read` is
-    /// deterministic for a repeatable source (CT-I12).
-    pub issued: Vec<(Seq, Origin)>,
+    /// From each sink's `Sink::checkpoint`.
+    pub sink_states: Vec<Option<Vec<u8>>>,
+    /// From each sink's `Sink::committed_seq` at the moment of the checkpoint.
+    pub committed: Vec<Option<Seq>>,
+    /// Where each source's drive is: the index into its plan and the next row within that
+    /// split, plus the next sequence number to assign.
+    pub source_cursors: Vec<SourceCursor>,
+    /// Per source, the reads its drive has issued and not yet pushed to its queues, ascending
+    /// `seq`: behind the cursor, so the cursor does not name them, and in no queue, so the
+    /// lineage does not either. `restore` hands each back in `ResumePoint::to_recompute` unless
+    /// the lineage already holds it (placement e.5, MH 4.7). Re-reading one is safe because
+    /// `read` is deterministic for a repeatable source (CT-I12).
+    pub issued: Vec<Vec<(Seq, Origin)>>,
 }
 
 /// Where the source drive is in the plan.
@@ -98,11 +103,13 @@ pub struct SourceCursor {
 pub struct ResumePoint {
     /// The pieces the scheduler put in the manifest.
     pub extras: CheckpointExtras,
-    /// Morsels the manifest knew about that have no disk copy and are not
-    /// committed, and the reads `CheckpointExtras::issued` named that the lineage does
-    /// not hold: the scheduler re-reads each from its origin and pushes it to Q0 with its
-    /// original `seq` before restarting the source drive. Ascending `seq`, no duplicates.
-    pub to_recompute: Vec<(Seq, Origin)>,
+    /// Per source, the morsels it read that the manifest could not restore from disk and that
+    /// some sink had not committed, and the reads `CheckpointExtras::issued` named that the
+    /// lineage does not hold: the scheduler re-reads each from its origin and pushes it to the
+    /// source's queues with its original `seq` before restarting the source's drive, and each
+    /// sink drops what its own watermark already covers (placement f.13). Ascending `seq`, no
+    /// duplicates.
+    pub to_recompute: Vec<Vec<(Seq, Origin)>>,
 }
 
 /// The queues between stages, and the movement of bytes between tiers (component 9).
@@ -110,6 +117,30 @@ pub trait Placement: Send + Sync {
     /// Never blocks. Ok(()) even if the queue is above high water; the caller
     /// consults `is_full` for admission.
     fn push(&self, stage: StageId, morsel: Morsel) -> crate::Result<()>;
+    /// Push one morsel into every queue of `stages`, its producer's fan-out (d.16): the
+    /// payload is shared by each, never copied, and its bytes are resident once until the last
+    /// queue's consumer has taken it. The default pushes a share of the payload into each in
+    /// order; the engine overrides it to count the bytes once and to record the morsel's lineage
+    /// at every queue in one step (placement f.1).
+    fn push_to(&self, stages: &[StageId], morsel: Morsel) -> crate::Result<()> {
+        let Some((last, first)) = stages.split_last() else {
+            return Err(crate::MorunaError::Plan(
+                "a morsel is pushed into at least one queue".into(),
+            ));
+        };
+        for stage in first {
+            let share = Morsel {
+                seq: morsel.seq,
+                stage: morsel.stage,
+                payload: morsel.payload.share(),
+                bytes: morsel.bytes,
+                origin: morsel.origin.clone(),
+                features: morsel.features.clone(),
+            };
+            self.push(*stage, share)?;
+        }
+        self.push(*last, morsel)
+    }
     /// Returns the head if it is resident in a tier satisfying `want` and `locality`;
     /// `Ok(None)` if the queue is empty or the head is not yet resident. Never blocks.
     fn pop(
@@ -138,21 +169,22 @@ pub trait Placement: Send + Sync {
     fn replace(&self, stage: StageId, morsel: Morsel) -> crate::Result<()>;
     /// Cancel every in-flight move, stop planning, release reservations (preamble 4.3). Idempotent.
     fn shutdown(&self);
-    /// The sink has committed every morsel with a sequence number at or below `seq`.
-    /// Lets the engine forget the lineage of committed morsels (placement f.11).
-    fn set_committed(&self, seq: Seq);
+    /// Sink `sink` has committed every morsel with a sequence number at or below `seq`. The
+    /// engine forgets the lineage of a source's morsel once every sink it reaches has committed
+    /// what it became there (placement f.11).
+    fn set_committed(&self, sink: u16, seq: Seq);
     /// Write the run manifest atomically to the staging directory (placement e.5).
     /// Returns the manifest path. An engine without a staging directory returns
     /// `Err(Resume("no staging directory"))`.
     fn checkpoint(&self, extras: &CheckpointExtras) -> crate::Result<PathBuf>;
     /// Rebuild queues from a manifest written by `checkpoint`: entries with a disk
     /// copy come back `OnDisk`; the rest are listed in `ResumePoint::to_recompute`.
-    /// Must be called before any `push`. Validates the manifest against the plan
-    /// and kernel fingerprints it is given.
+    /// Must be called before any `push`. Validates the manifest against each source's plan
+    /// (`plans[i]`) and the kernel fingerprints it is given.
     fn restore(
         &self,
         manifest: &Path,
-        plan: &[Split],
+        plans: &[Vec<Split>],
         fingerprints: &[Fingerprint],
     ) -> crate::Result<ResumePoint>;
     /// True when the stage may not take more work.

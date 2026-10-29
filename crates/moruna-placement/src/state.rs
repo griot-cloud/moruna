@@ -230,6 +230,67 @@ impl PayloadRef {
     }
 }
 
+/// The entries of one fan-out (d.16): a batch pushed into several queues is resident once and
+/// each entry holds a share of it. Each queue counts the bytes, for its own water marks, and the
+/// engine's `shared_bytes` holds what that counts beyond the one residency, so the tier's total
+/// is exact (PL-I3). An entry leaves the group when its share leaves the tier (popped, demoted,
+/// evicted, moved), and the last one to leave takes the bytes with it.
+#[derive(Debug)]
+pub struct Group {
+    /// The batch's bytes.
+    pub bytes: u64,
+    /// The tier slot it is resident in.
+    pub slot: usize,
+    /// Entries still holding their share in that tier.
+    members: std::sync::atomic::AtomicUsize,
+}
+
+impl Group {
+    /// An empty group over `bytes` in tier slot `slot`; each entry joins as it is pushed.
+    pub fn new(bytes: u64, slot: usize) -> Arc<Group> {
+        Arc::new(Group {
+            bytes,
+            slot,
+            members: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// One more entry holds a share, counted into its queue: what `shared` counts beyond the
+    /// one residency rises by the share when another entry already holds one.
+    pub fn join(
+        self: &Arc<Self>,
+        shared: &[std::sync::atomic::AtomicU64; moruna_kernel::TIER_COUNT],
+    ) -> Arc<Group> {
+        let before = self
+            .members
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if before >= 1
+            && let Some(cell) = shared.get(self.slot)
+        {
+            cell.fetch_add(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        Arc::clone(self)
+    }
+
+    /// One entry's share left the tier. While another entry still holds a share the bytes stay
+    /// resident, so what `shared` counts beyond the one residency falls by the share.
+    pub fn leave(&self, shared: &[std::sync::atomic::AtomicU64; moruna_kernel::TIER_COUNT]) {
+        let before = self
+            .members
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if before > 1
+            && let Some(cell) = shared.get(self.slot)
+        {
+            cell.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |held| Some(held.saturating_sub(self.bytes)),
+            )
+            .ok();
+        }
+    }
+}
+
 /// One queued morsel with its placement state; identified by `(stage, seq)` (b).
 pub struct Entry {
     /// The sequence number the source assigned.
@@ -248,8 +309,10 @@ pub struct Entry {
     pub payload: Option<EntryPayload>,
     /// Where the bytes are and what is in flight (e.1).
     pub state: State,
-    /// `stage == 0` in v1 (b, D5).
+    /// The queue is one a source gives, so the bytes can be read again (b, D5).
     pub recomputable: bool,
+    /// The fan-out this entry's bytes are shared with, while they are (d.16, f.9).
+    pub group: Option<Arc<Group>>,
     /// The segment record holding a copy of these bytes, when there is one.
     pub disk: Option<SegmentRef>,
     /// The move in flight for this entry, when there is one (PL-I2).
@@ -257,8 +320,8 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// An entry over a freshly pushed morsel.
-    pub fn new(morsel: Morsel, recomputable: bool) -> Entry {
+    /// An entry over a freshly pushed morsel, one of a fan-out's when `group` is given.
+    pub fn new(morsel: Morsel, recomputable: bool, group: Option<Arc<Group>>) -> Entry {
         let Morsel {
             seq,
             stage,
@@ -280,6 +343,7 @@ impl Entry {
             payload: Some(payload),
             state: State::Resident(tier),
             recomputable,
+            group,
             disk: None,
             move_id: None,
         }
@@ -293,6 +357,7 @@ impl Entry {
         bytes: u64,
         kind: PayloadKind,
         seg: SegmentRef,
+        recomputable: bool,
     ) -> Entry {
         Entry {
             seq,
@@ -303,7 +368,8 @@ impl Entry {
             kind,
             payload: None,
             state: State::OnDisk(seg),
-            recomputable: stage == 0,
+            recomputable,
+            group: None,
             disk: Some(seg),
             move_id: None,
         }

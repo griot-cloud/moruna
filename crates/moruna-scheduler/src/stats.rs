@@ -39,17 +39,30 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
         writes_in_flight: shared.writes_in_flight.load(Ordering::SeqCst),
         sink_concurrency: shared.cfg.sink_concurrency,
         source_exhausted: shared.source_exhausted.load(Ordering::SeqCst),
+        // Over every source: the morsels read, less one (a chain's last number).
         seq_issued: shared
-            .cursor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .next_seq
+            .sources
+            .iter()
+            .map(|end| {
+                end.cursor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .next_seq
+            })
+            .sum::<u64>()
             .saturating_sub(1),
+        // The least of the sinks' watermarks: what every sink has committed.
         committed_seq: shared
-            .committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .reached,
+            .sinks
+            .iter()
+            .map(|end| {
+                end.committed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reached
+            })
+            .min()
+            .flatten(),
         checkpoints: shared.checkpoints.load(Ordering::SeqCst),
         last_checkpoint_us: shared.last_checkpoint_us.load(Ordering::SeqCst),
         resumed: shared.resumed.load(Ordering::SeqCst),

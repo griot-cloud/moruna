@@ -41,10 +41,11 @@ fn declaration(role: Role, name: &str) -> Declaration {
     }
 }
 
-/// JB-T1 dependencies_are_the_four: the crate an embedder depends on names `serde`,
-/// `serde_json`, `schemars` and `thiserror`, and nothing else, in its dependencies (SDD 22 JB-I1).
+/// JB-T1 dependencies_are_the_six: the crate an embedder depends on names `flatbuffers`,
+/// `flexbuffers`, `serde`, `serde_json`, `schemars` and `thiserror`, and nothing else, in its
+/// dependencies (SDD 22 JB-I1).
 #[test]
-fn jb_t1_dependencies_are_the_four() {
+fn jb_t1_dependencies_are_the_six() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("the manifest");
     let mut section = "";
@@ -64,10 +65,17 @@ fn jb_t1_dependencies_are_the_four() {
         }
     }
     found.sort();
-    let wanted: Vec<(String, String)> = ["schemars", "serde", "serde_json", "thiserror"]
-        .iter()
-        .map(|n| ("dependencies".to_string(), n.to_string()))
-        .collect();
+    let wanted: Vec<(String, String)> = [
+        "flatbuffers",
+        "flexbuffers",
+        "schemars",
+        "serde",
+        "serde_json",
+        "thiserror",
+    ]
+    .iter()
+    .map(|n| ("dependencies".to_string(), n.to_string()))
+    .collect();
     assert_eq!(found, wanted);
 }
 

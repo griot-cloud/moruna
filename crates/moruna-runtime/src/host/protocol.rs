@@ -6,9 +6,10 @@
 //! An `event` is one fact of the run's execution, versioned on its own (`v`, [`EVENTS_VERSION`])
 //! and named by its `kind`: version 1 had the task lifecycle; version 2 added `logs`, what the
 //! run's output store holds for each producer so far; version 3 added a running task's wait on a
-//! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10); version 4 adds the
-//! failure code `internal`, a crash: a panic of Moruna's own that unwound the run. A peer refuses
-//! a version it does not read rather than guess at it.
+//! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10); version 4 added the
+//! failure code `internal`, a crash: a panic of Moruna's own that unwound the run; version 5
+//! makes `task_registered`'s `upstream` the list of tasks a task takes its input from, the job's
+//! edges (SDD 22 e.4). A peer refuses a version it does not read rather than guess at it.
 //!
 //! What a task prints is never on the socket. Each record of it is an `event` of kind `log`
 //! ([`LogLine`]) in the run's output store (`report.logs`), numbered by its own producer; the
@@ -88,7 +89,7 @@ impl Heartbeat {
 }
 
 /// The version of the `event` message this build writes (MH 4.3).
-pub const EVENTS_VERSION: u32 = 4;
+pub const EVENTS_VERSION: u32 = 5;
 
 /// The version of the port messages this build writes and reads (MH 4.10).
 pub const PORTS_VERSION: u32 = 1;
@@ -117,9 +118,10 @@ pub struct EventMsg {
     pub body: Event,
 }
 
-/// The facts of version 4: the task lifecycle, the output store's reach (MH 4.3), a running
-/// task's waits on its ports (MH 4.10) and a crash's failures (`internal`). A task is one element of the chain, named by the id the
-/// document's `report.tasks` gives it.
+/// The facts of version 5: the task lifecycle, the output store's reach (MH 4.3), a running
+/// task's waits on its ports (MH 4.10) and a crash's failures (`internal`). A task is one task of
+/// the job's DAG, named by the id the document gives it, and `task_registered` names the tasks
+/// it takes its input from, which are the job's edges (SDD 22 e.4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -134,10 +136,12 @@ pub enum Event {
         task: String,
         /// `source`, `kernel` or `sink`.
         element: Element,
-        /// Its place in the chain: 0 the source, 1..=n the kernels, n+1 the sink.
+        /// Its place in the run: 0 a source, 1..=n the kernel stages in an order in which every
+        /// edge goes forward, n+1 a sink (SDD 22 e.4).
         stage: u16,
-        /// The task whose output it takes; `null` for the source.
-        upstream: Option<String>,
+        /// The tasks whose output it takes, by its input ports in order: its edges (version 5).
+        /// Empty for a source.
+        upstream: Vec<String>,
         /// The host's tasks it carries as one group (`report.tasks`); empty for one task.
         members: Vec<String>,
     },
@@ -718,7 +722,7 @@ mod tests {
                 phase: Phase::Reading,
             }),
             format!(
-                "{{\"type\":\"event\",\"v\":4,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                "{{\"type\":\"event\",\"v\":5,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
                  \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
                 "0f".repeat(16)
             )
@@ -840,7 +844,7 @@ mod tests {
         assert_eq!(
             record.line(),
             format!(
-                "{{\"type\":\"event\",\"v\":4,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
+                "{{\"type\":\"event\",\"v\":5,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
                  \"t_us\":77,\"kind\":\"log\",\"id\":\"{s}/k1/4\",\"task\":\"k1\",\
                  \"stream\":\"stderr\",\"level\":null,\"bytes\":2,\"text\":\"hi\",\
                  \"partial\":false,\"continued\":true,\"truncated\":0}}\n",

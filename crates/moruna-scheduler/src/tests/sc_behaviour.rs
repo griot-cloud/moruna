@@ -22,13 +22,13 @@ fn sc_h_zero_splits() {
         .source(FakeSource::new().splits(0, 0, 0))
         .stages(2)
         .go();
-    let RunOutcome::Completed { sink } = (match rig.scheduler.run(CancelToken::new()) {
+    let RunOutcome::Completed { sinks } = (match rig.scheduler.run(CancelToken::new()) {
         Ok(outcome) => outcome,
         Err(e) => panic!("run: {e}"),
     }) else {
         panic!("a run with no splits still completes");
     };
-    assert_eq!(sink.rows, 0);
+    assert_eq!(sinks[0].rows, 0);
     assert_eq!(rig.sink.finish_calls(), 1);
     assert!(rig.trace.records().is_empty(), "no morsel, no record");
 }
@@ -42,7 +42,7 @@ fn sc_h_zero_kernels() {
         .source(FakeSource::new().splits(2, 6, 48))
         .go();
     match rig.scheduler.run(CancelToken::new()) {
-        Ok(RunOutcome::Completed { sink }) => assert_eq!(sink.rows, 12),
+        Ok(RunOutcome::Completed { sinks }) => assert_eq!(sinks[0].rows, 12),
         other => panic!("expected Completed, got {other:?}"),
     }
     assert!(
@@ -68,7 +68,7 @@ fn sc_h_read_ahead_zero_keeps_a_floor_of_one() {
         .stages(1)
         .go();
     match rig.scheduler.run(CancelToken::new()) {
-        Ok(RunOutcome::Completed { sink }) => assert_eq!(sink.rows, 12),
+        Ok(RunOutcome::Completed { sinks }) => assert_eq!(sinks[0].rows, 12),
         other => panic!("expected Completed, got {other:?}"),
     }
     assert_eq!(
@@ -396,11 +396,11 @@ fn sc_d1_ordered_sink_handle() {
             morsel_max: 1 << 20,
             ..cfg()
         },
-        Pipeline {
-            source: Arc::new(FakeSource::new().splits(1, 8, 64)),
-            kernels: vec![Arc::new(FakeKernel::new())],
-            sink: handle,
-        },
+        Pipeline::chain(
+            Arc::new(FakeSource::new().splits(1, 8, 64)),
+            vec![Arc::new(FakeKernel::new())],
+            handle,
+        ),
         Arc::new(FakePlacement::new()),
         Arc::new(moruna_testkit::FakeAllocator::new()),
         Arc::new(moruna_testkit::FakeTrace::new()),
@@ -509,11 +509,11 @@ fn sc_f5_ordered_sink_completes_in_order() {
             morsel_max: 1 << 20,
             ..cfg()
         },
-        Pipeline {
-            source: Arc::new(FakeSource::new().splits(2, 20, 160)),
-            kernels: vec![Arc::new(FakeKernel::new()), Arc::new(FakeKernel::new())],
-            sink: handle,
-        },
+        Pipeline::chain(
+            Arc::new(FakeSource::new().splits(2, 20, 160)),
+            vec![Arc::new(FakeKernel::new()), Arc::new(FakeKernel::new())],
+            handle,
+        ),
         Arc::new(FakePlacement::new()),
         Arc::new(moruna_testkit::FakeAllocator::new()),
         Arc::new(moruna_testkit::FakeTrace::new().capacity(1 << 14)),

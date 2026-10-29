@@ -108,10 +108,18 @@ pub(crate) fn finish_instances(shared: &Shared) -> Result<()> {
                 }
             }
             let stage = shared.stages[stage_ix].stage;
-            let last = crate::source_drive::cursor(shared)
-                .0
-                .next_seq
-                .saturating_sub(1);
+            // The last morsel any source issued: a job may read from several (d.16).
+            let last = shared
+                .sources
+                .iter()
+                .map(|source| {
+                    crate::source_drive::cursor(source)
+                        .0
+                        .next_seq
+                        .saturating_sub(1)
+                })
+                .max()
+                .unwrap_or(0);
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(MorunaError::Kernel { msg, features, .. })) => {

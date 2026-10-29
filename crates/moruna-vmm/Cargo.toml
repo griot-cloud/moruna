@@ -17,6 +17,8 @@ moruna-kernel = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# A job document version 2 is FlatBuffers, relayed to the guest as base64 (SDD 22 e.4).
+base64 = { workspace = true }
 libc = { workspace = true }
 vm-memory = { workspace = true }
 virtio-queue = { workspace = true }

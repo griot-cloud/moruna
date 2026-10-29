@@ -197,11 +197,11 @@ impl RigBuilder {
             Some(sink) => sink,
             None => Box::new(self.sink.clone()),
         };
-        let pipeline = Pipeline {
+        let pipeline = Pipeline::chain(
             source,
-            kernels: self.kernels,
-            sink: SinkHandle::wrap(inner, self.ordered, 256 * 1024 * 1024),
-        };
+            self.kernels,
+            SinkHandle::wrap(inner, self.ordered, 256 * 1024 * 1024),
+        );
         let scheduler = Scheduler::new(
             self.cfg,
             pipeline,
@@ -300,13 +300,13 @@ impl Placement for RecordingPlacement {
         self.inner.shutdown();
     }
 
-    fn set_committed(&self, seq: Seq) {
+    fn set_committed(&self, sink: u16, seq: Seq) {
         self.recorder
             .committed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(seq);
-        self.inner.set_committed(seq);
+        self.inner.set_committed(sink, seq);
     }
 
     fn checkpoint(&self, extras: &CheckpointExtras) -> Result<PathBuf> {
@@ -316,10 +316,10 @@ impl Placement for RecordingPlacement {
     fn restore(
         &self,
         manifest: &Path,
-        plan: &[Split],
+        plans: &[Vec<Split>],
         fingerprints: &[Fingerprint],
     ) -> Result<ResumePoint> {
-        self.inner.restore(manifest, plan, fingerprints)
+        self.inner.restore(manifest, plans, fingerprints)
     }
 
     fn is_full(&self, stage: StageId) -> bool {

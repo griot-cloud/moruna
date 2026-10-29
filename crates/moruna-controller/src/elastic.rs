@@ -178,7 +178,6 @@ fn replan(state: &mut ControllerState, lowered: bool, actions: &mut Actions) {
             .push(Knob::ActiveWorkers(state.active_workers));
     }
     if lowered {
-        let last_stage = u16::try_from(state.stage_count()).unwrap_or(u16::MAX);
-        classify::memory_pressure(state, last_stage, actions);
+        classify::memory_pressure(state, actions);
     }
 }

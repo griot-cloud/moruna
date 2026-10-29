@@ -74,6 +74,7 @@ fn rc_t17_tick_lock_bound() {
             watched_sampler,
             watched_trace,
             watched_placement.clone(),
+            moruna_kernel::Topology::chain(1),
             vec![kernel(1, KernelHints::default())],
         )
         .expect("controller"),

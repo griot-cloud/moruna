@@ -1,9 +1,11 @@
-//! The source drive (f.5), the drive-side helper (f.9) and the recompute pass of a resumed run
+//! The source drives (f.5), the drive-side helper (f.9) and the recompute pass of a resumed run
 //! (f.13).
 //!
-//! One of the two threads in the process that may wait on a `Completion` (CT-I7, SC-I1): it
-//! issues `Source::read` up to `read_ahead` in flight, polls the futures with a waker over its
-//! own parker, and pushes each result to Q0. It holds no scheduler lock while it waits.
+//! One drive per source, and the drives are with the sink drives the only threads in the process
+//! that may wait on a `Completion` (CT-I7, SC-I1): each issues its source's `Source::read` up to
+//! `read_ahead` in flight, polls the futures with a waker over its own parker, and pushes each
+//! result into every queue its source gives to, the batch shared (contracts d.16). It holds no
+//! scheduler lock while it waits.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,10 +16,10 @@ use std::time::Duration;
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::{Parker, Unparker};
 use moruna_kernel::{
-    BoxFuture, Morsel, MorunaError, Origin, Payload, Result, RowRange, Seq, Split, Tier,
+    BoxFuture, Morsel, MorunaError, Origin, Payload, Result, RowRange, Seq, Split, StageId, Tier,
 };
 
-use crate::shared::{Cursor, DRIVE_DRIVING, DRIVE_STOP, HelperRequest, Shared};
+use crate::shared::{Cursor, DRIVE_DRIVING, DRIVE_STOP, HelperRequest, Shared, SourceEnd};
 
 /// Wakes the drive thread when a completion resolves; the drive owns no runtime of its own (l).
 struct DriveWake(Unparker);
@@ -35,11 +37,13 @@ impl std::task::Wake for DriveWake {
 /// Why a read was issued, which decides what happens to its payload.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum ReadKind {
-    /// A new range: pushed to Q0.
+    /// A new range: pushed into the source's queues.
     Fresh,
-    /// An entry the engine evicted: put back in its original position with `replace`.
-    Replacement,
-    /// A morsel the manifest could not point to on disk: pushed to Q0 with its original seq.
+    /// An entry the engine evicted from this queue: put back in its original position with
+    /// `replace`.
+    Replacement(StageId),
+    /// A morsel the manifest could not point to on disk: pushed into the source's queues with
+    /// its original seq.
     Recompute,
 }
 
@@ -63,20 +67,21 @@ fn tier0(shared: &Shared) -> Tier {
     }
 }
 
-/// The stage whose morsel target sizes a source read: the first kernel's, or the sink's queue
-/// when there is no kernel (f.5, h).
-fn target_stage(shared: &Shared) -> moruna_kernel::StageId {
-    if shared.stages.is_empty() { 0 } else { 1 }
-}
-
 /// Where a range that starts at `start` in `split` ends, for a read of about `bytes` (the
-/// morsel target when `None`), clamped to the morsel range (f.5).
-fn range_end(shared: &Shared, split: &Split, start: u64, bytes: Option<u64>) -> u64 {
+/// morsel target of the source's first consumer when `None`, f.5, h), clamped to the morsel
+/// range (f.5).
+fn range_end(
+    shared: &Shared,
+    end: &SourceEnd,
+    split: &Split,
+    start: u64,
+    bytes: Option<u64>,
+) -> u64 {
     if !split.sub_splittable {
         return split.rows;
     }
     let target = bytes
-        .unwrap_or_else(|| shared.knobs.morsel_target(target_stage(shared)))
+        .unwrap_or_else(|| shared.knobs.morsel_target(end.target_stage))
         .clamp(shared.cfg.morsel_min, shared.cfg.morsel_max);
     (start + rows_for(split, target)).min(split.rows)
 }
@@ -97,18 +102,22 @@ fn settle(cursor: &mut Cursor, plan: &[Split]) {
 /// The next range to issue, and the cursor advanced past it (f.5). `None` when the plan is
 /// exhausted. The range is recorded as issued under the same lock that advances the cursor, so
 /// a checkpoint never sees the cursor past a read it cannot find (MH 4.7).
-fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRange, Seq, bool)> {
-    let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
-    settle(&mut cursor, &shared.plan);
+fn take_next_range(
+    shared: &Shared,
+    source: &SourceEnd,
+    bytes: Option<u64>,
+) -> Option<(usize, RowRange, Seq, bool)> {
+    let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    settle(&mut cursor, &source.plan);
     let index = cursor.split_index as usize;
-    let split = shared.plan.get(index)?;
+    let split = source.plan.get(index)?;
     let start = cursor.row_offset;
     let whole = !split.sub_splittable;
-    let end = range_end(shared, split, start, bytes);
+    let end = range_end(shared, source, split, start, bytes);
     let seq = cursor.next_seq;
     cursor.next_seq += 1;
     cursor.row_offset = end;
-    settle(&mut cursor, &shared.plan);
+    settle(&mut cursor, &source.plan);
     let origin = Origin {
         split: split.id,
         row_start: start,
@@ -121,12 +130,12 @@ fn take_next_range(shared: &Shared, bytes: Option<u64>) -> Option<(usize, RowRan
 
 /// The range `take_next_range(shared, None)` would issue next, without taking it: its split's
 /// index and its rows. `None` when the plan is exhausted.
-fn peek_next_range(shared: &Shared) -> Option<(usize, RowRange)> {
-    let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
-    settle(&mut cursor, &shared.plan);
+fn peek_next_range(shared: &Shared, source: &SourceEnd) -> Option<(usize, RowRange)> {
+    let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    settle(&mut cursor, &source.plan);
     let index = cursor.split_index as usize;
-    let split = shared.plan.get(index)?;
-    let end = range_end(shared, split, cursor.row_offset, None);
+    let split = source.plan.get(index)?;
+    let end = range_end(shared, source, split, cursor.row_offset, None);
     Some((
         index,
         RowRange {
@@ -175,17 +184,18 @@ fn arena_admits(shared: &Shared, inflight: &[InFlight<'_>], charge: u64) -> bool
         return true;
     }
     inflight.is_empty()
+        && shared.reads_in_flight.load(Ordering::SeqCst) == 0
         && shared.writes_in_flight.load(Ordering::SeqCst) == 0
         && shared.knobs.slots.busy() == 0
-        && (0..=shared.last_queue()).all(|stage| shared.queue_count(stage) == 0)
+        && shared.queues_empty()
 }
 
-/// A read recorded by `take_next_range` (or by a resume's recompute list) has reached Q0, so
-/// the lineage holds it from here on and the manifest no longer needs to name it as issued.
-/// Called after the push, never before: between the two the morsel may be named twice, which
-/// `restore` resolves, and never zero times.
-fn pushed(shared: &Shared, seq: Seq) {
-    shared
+/// A read recorded by `take_next_range` (or by a resume's recompute list) has reached the
+/// source's queues, so the lineage holds it from here on and the manifest no longer needs to
+/// name it as issued. Called after the push, never before: between the two the morsel may be
+/// named twice, which `restore` resolves, and never zero times.
+fn pushed(source: &SourceEnd, seq: Seq) {
+    source
         .cursor
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -203,12 +213,20 @@ fn rows_for(split: &Split, target: u64) -> u64 {
     (target / bytes_per_row).max(1)
 }
 
-/// The drive thread (f.1): idle until `run`, answering helper requests throughout.
-pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, parker: Parker) {
+/// Source `index`'s drive thread (f.1): idle until `run`, answering helper requests throughout.
+pub(crate) fn drive(
+    shared: Arc<Shared>,
+    index: usize,
+    helper_rx: Receiver<HelperRequest>,
+    parker: Parker,
+) {
+    let Some(source) = shared.sources.get(index) else {
+        return;
+    };
     let waker = Waker::from(Arc::new(DriveWake(parker.unparker().clone())));
     let mut cx = Context::from_waker(&waker);
     let mut inflight: Vec<InFlight<'_>> = Vec::new();
-    let mut replacing: HashSet<Seq> = HashSet::new();
+    let mut replacing: HashSet<(StageId, Seq)> = HashSet::new();
     let mut recomputed = false;
     // The most a read has come to over its split's estimate, which scales the next read's
     // admission (f.5).
@@ -218,13 +236,14 @@ pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, par
         let mode = shared.source_mode.get();
         let mut worked = poll_inflight(
             &shared,
+            source,
             &mut inflight,
             &mut replacing,
             &mut learned,
             &mut cx,
         );
         while let Ok(request) = helper_rx.try_recv() {
-            service_helper(&shared, request, &parker, &mut cx);
+            service_helper(&shared, source, request, &parker, &mut cx);
             worked = true;
         }
         if mode == DRIVE_STOP {
@@ -238,11 +257,11 @@ pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, par
         {
             if !recomputed {
                 recomputed = true;
-                recompute(&shared, &parker, &mut cx);
+                recompute(&shared, source, &parker, &mut cx);
             }
-            worked |= issue_replacements(&shared, &mut inflight, &mut replacing, learned);
-            worked |= issue_reads(&shared, &mut inflight, learned);
-            close_when_exhausted(&shared, &inflight);
+            worked |= issue_replacements(&shared, source, &mut inflight, &mut replacing, learned);
+            worked |= issue_reads(&shared, source, &mut inflight, learned);
+            close_when_exhausted(&shared, source, &inflight);
         }
         if !worked {
             parker.park_timeout(Duration::from_millis(1));
@@ -262,7 +281,12 @@ pub(crate) fn drive(shared: Arc<Shared>, helper_rx: Receiver<HelperRequest>, par
 /// is now issued only while no evicted entry waits for its re-read and the arena has room for
 /// it beside what the reads already in flight may still take (`arena_admits`), so the queue
 /// waits on the sink instead.
-fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>, learned: f64) -> bool {
+fn issue_reads<'a>(
+    shared: &'a Shared,
+    source: &'a SourceEnd,
+    inflight: &mut Vec<InFlight<'a>>,
+    learned: f64,
+) -> bool {
     let depth = shared.knobs.read_ahead();
     let mut issued = false;
     loop {
@@ -271,23 +295,23 @@ fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>, learned
             .filter(|entry| entry.kind == ReadKind::Fresh)
             .count();
         if depth == 0 {
-            if fresh >= 1 || shared.queue_count(0) != 0 {
+            if fresh >= 1 || source.outputs.iter().any(|&q| shared.queue_count(q) != 0) {
                 break;
             }
         } else if fresh >= depth as usize {
             break;
         }
-        if shared.placement.is_full(0) {
+        if source.outputs.iter().any(|&q| shared.placement.is_full(q)) {
             break;
         }
         // f.5: an ordered sink that is holding bytes out of order stops admission until the
         // sequence it is waiting for arrives (08 f.4).
-        if shared
-            .sink
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_stalled()
-        {
+        if shared.sinks.iter().any(|end| {
+            end.sink
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_stalled()
+        }) {
             break;
         }
         // f.5: an evicted Q0 entry is one the planner took out because Q0 was over its high
@@ -295,25 +319,30 @@ fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>, learned
         // the tail, which is where the planner evicts from next, and when the evicted entry is
         // the head nothing leaves Q0 until it is back (09 f.2 step 1). Fresh reads wait for the
         // replacements.
-        if !shared.placement.evicted(0).is_empty() {
+        if source
+            .outputs
+            .iter()
+            .any(|&q| !shared.placement.evicted(q).is_empty())
+        {
             break;
         }
-        let Some((index, rows)) = peek_next_range(shared) else {
+        let Some((index, rows)) = peek_next_range(shared, source) else {
             break;
         };
         if !arena_admits(
             shared,
             inflight,
-            read_charge(&shared.plan[index], rows, learned),
+            read_charge(&source.plan[index], rows, learned),
         ) {
             break;
         }
-        let Some((index, rows, seq, whole)) = take_next_range(shared, None) else {
+        let Some((index, rows, seq, whole)) = take_next_range(shared, source, None) else {
             break;
         };
-        let charge = read_charge(&shared.plan[index], rows, learned);
+        let charge = read_charge(&source.plan[index], rows, learned);
         submit(
             shared,
+            source,
             inflight,
             index,
             rows,
@@ -327,8 +356,9 @@ fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>, learned
     issued
 }
 
-/// f.5: service `placement.evicted(0)` by re-reading each entry and calling `replace`, the
-/// entries nearest the head first and no more of them at once than the read-ahead. An entry was
+/// f.5: service `placement.evicted(q)` of each queue the source gives by re-reading each entry
+/// and calling `replace`, the entries nearest the head first and no more of them at once than
+/// the read-ahead. An entry was
 /// evicted because Q0 was over its high water, so re-reading every evicted entry as soon as it was
 /// evicted put them all back over it: the placement evicted others, which were re-read in turn,
 /// and the replacements, which no admission check stops, filled the arena (a peQL copy at
@@ -336,17 +366,30 @@ fn issue_reads<'a>(shared: &'a Shared, inflight: &mut Vec<InFlight<'a>>, learned
 /// until the consumer reaches them.
 fn issue_replacements<'a>(
     shared: &'a Shared,
+    source: &'a SourceEnd,
     inflight: &mut Vec<InFlight<'a>>,
-    replacing: &mut HashSet<Seq>,
+    replacing: &mut HashSet<(StageId, Seq)>,
     learned: f64,
 ) -> bool {
     let mut issued = false;
     let window = usize::from(shared.knobs.read_ahead().max(1));
-    for (seq, origin) in shared.placement.evicted(0).into_iter().take(window) {
-        if !replacing.insert(seq) {
+    let evicted: Vec<(StageId, Seq, Origin)> = source
+        .outputs
+        .iter()
+        .flat_map(|&q| {
+            shared
+                .placement
+                .evicted(q)
+                .into_iter()
+                .take(window)
+                .map(move |(seq, origin)| (q, seq, origin))
+        })
+        .collect();
+    for (queue, seq, origin) in evicted {
+        if !replacing.insert((queue, seq)) {
             continue;
         }
-        let Some(index) = shared
+        let Some(index) = source
             .plan
             .iter()
             .position(|split| split.id == origin.split)
@@ -357,18 +400,19 @@ fn issue_replacements<'a>(
             start: origin.row_start,
             end: origin.row_end,
         };
-        let whole = !shared.plan[index].sub_splittable;
+        let whole = !source.plan[index].sub_splittable;
         // Counted beside the fresh reads' charges, so a fresh read is not admitted into bytes
         // a replacement is about to take.
-        let charge = read_charge(&shared.plan[index], rows, learned);
+        let charge = read_charge(&source.plan[index], rows, learned);
         submit(
             shared,
+            source,
             inflight,
             index,
             rows,
             seq,
             whole,
-            ReadKind::Replacement,
+            ReadKind::Replacement(queue),
             charge,
         );
         issued = true;
@@ -379,6 +423,7 @@ fn issue_replacements<'a>(
 #[allow(clippy::too_many_arguments)]
 fn submit<'a>(
     shared: &'a Shared,
+    source: &'a SourceEnd,
     inflight: &mut Vec<InFlight<'a>>,
     index: usize,
     rows: RowRange,
@@ -387,7 +432,7 @@ fn submit<'a>(
     kind: ReadKind,
     charge: u64,
 ) {
-    let split = &shared.plan[index];
+    let split = &source.plan[index];
     let origin = Origin {
         split: split.id,
         row_start: rows.start,
@@ -395,8 +440,8 @@ fn submit<'a>(
         node: shared.cfg.node,
     };
     let range = if whole { None } else { Some(rows) };
-    shared.source_reading();
-    let future = shared
+    shared.source_reading(source);
+    let future = source
         .source
         .read(split, range, shared.alloc.as_ref(), tier0(shared));
     shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
@@ -414,8 +459,9 @@ fn submit<'a>(
 /// Poll every read once; a resolved one is pushed, replaced or fails the run (f.5, h).
 fn poll_inflight(
     shared: &Shared,
+    source: &SourceEnd,
     inflight: &mut Vec<InFlight<'_>>,
-    replacing: &mut HashSet<Seq>,
+    replacing: &mut HashSet<(StageId, Seq)>,
     learned: &mut f64,
     cx: &mut Context<'_>,
 ) -> bool {
@@ -429,26 +475,28 @@ fn poll_inflight(
                 let entry = inflight.remove(index);
                 shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
                 progressed = true;
-                replacing.remove(&entry.seq);
+                if let ReadKind::Replacement(queue) = entry.kind {
+                    replacing.remove(&(queue, entry.seq));
+                }
                 match result {
                     Ok(payload) => {
-                        learn(shared, &entry, &payload, learned);
+                        learn(source, &entry, &payload, learned);
                         let (rows, bytes) = (payload.rows(), payload.bytes());
                         let morsel = Morsel::new(entry.seq, 0, payload, entry.origin.clone());
                         let outcome = match entry.kind {
-                            ReadKind::Replacement => shared.placement.replace(0, morsel),
+                            ReadKind::Replacement(queue) => shared.placement.replace(queue, morsel),
                             ReadKind::Fresh | ReadKind::Recompute => {
                                 if entry.kind == ReadKind::Recompute {
                                     shared.recomputed.fetch_add(1, Ordering::SeqCst);
                                 }
-                                shared.placement.push(0, morsel)
+                                shared.placement.push_to(&source.outputs, morsel)
                             }
                         };
                         match outcome {
                             Ok(()) => {
-                                if entry.kind != ReadKind::Replacement {
-                                    pushed(shared, entry.seq);
-                                    shared.source_pushed(rows, bytes);
+                                if !matches!(entry.kind, ReadKind::Replacement(_)) {
+                                    pushed(source, entry.seq);
+                                    shared.source_pushed(source, rows, bytes);
                                 }
                             }
                             Err(MorunaError::Cancelled) => {}
@@ -475,8 +523,8 @@ fn poll_inflight(
 /// read has come to over its estimate and scales the next read's admission by it. It never
 /// falls, so one read that came to more than its estimate keeps the bound honest for the rest
 /// of the run.
-fn learn(shared: &Shared, entry: &InFlight<'_>, payload: &Payload, learned: &mut f64) {
-    let Some(split) = shared.plan.iter().find(|split| split.id == entry.split) else {
+fn learn(source: &SourceEnd, entry: &InFlight<'_>, payload: &Payload, learned: &mut f64) {
+    let Some(split) = source.plan.iter().find(|split| split.id == entry.split) else {
         return;
     };
     let estimate = estimated_bytes(split, entry.rows);
@@ -509,21 +557,49 @@ fn source_diagnostic(e: MorunaError, split: u32, rows: RowRange) -> MorunaError 
 }
 
 /// f.5: when the plan is exhausted (no split at or after the cursor has a row left) and no read
-/// is in flight, close Q0 and say so.
-fn close_when_exhausted(shared: &Shared, inflight: &[InFlight<'_>]) {
-    if !inflight.is_empty() {
+/// is in flight, close the source's queues and say so; the run's sources are exhausted when the
+/// last of them is.
+fn close_when_exhausted(shared: &Shared, source: &SourceEnd, inflight: &[InFlight<'_>]) {
+    if !inflight.is_empty() || source.exhausted.load(Ordering::SeqCst) {
         return;
     }
     {
-        let mut cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
-        settle(&mut cursor, &shared.plan);
-        if (cursor.split_index as usize) < shared.plan.len() {
+        let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        settle(&mut cursor, &source.plan);
+        if (cursor.split_index as usize) < source.plan.len() {
             return;
         }
     }
-    shared.source_exhausted.store(true, Ordering::SeqCst);
-    shared.close_queue(0);
+    source.exhausted.store(true, Ordering::SeqCst);
+    if shared
+        .sources
+        .iter()
+        .all(|end| end.exhausted.load(Ordering::SeqCst))
+    {
+        shared.source_exhausted.store(true, Ordering::SeqCst);
+    }
+    for &q in &source.outputs {
+        shared.close_queue(q);
+    }
     shared.advance_closes();
+    shared.unpark_all();
+}
+
+/// How many morsels each source has read, for the sources read to the end; `None` for one still
+/// reading.
+pub(crate) fn counts(shared: &Shared) -> Vec<Option<Seq>> {
+    shared
+        .sources
+        .iter()
+        .map(|end| {
+            end.exhausted.load(Ordering::SeqCst).then(|| {
+                end.cursor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .next_seq
+            })
+        })
+        .collect()
 }
 
 /// f.5, h: the source drive panicked, in the source's code or in its own. The run ends with a
@@ -531,12 +607,15 @@ fn close_when_exhausted(shared: &Shared, inflight: &[InFlight<'_>]) {
 /// (the read it was most likely serving), or the split at the cursor when none was in flight,
 /// and saying what the panic said. Nothing is left waiting for a drive that is gone: without
 /// this the run waited for ever, its tasks never ended (MA2).
-pub(crate) fn panicked(shared: &Shared, panic: &(dyn std::any::Any + Send)) {
+pub(crate) fn panicked(shared: &Shared, index: usize, panic: &(dyn std::any::Any + Send)) {
+    let Some(source) = shared.sources.get(index) else {
+        return;
+    };
     let split = {
-        let cursor = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
         match cursor.issued.values().next() {
             Some(origin) => origin.split,
-            None => shared
+            None => source
                 .plan
                 .get(cursor.split_index as usize)
                 .map_or(cursor.split_index, |split| split.id),
@@ -552,15 +631,22 @@ pub(crate) fn panicked(shared: &Shared, panic: &(dyn std::any::Any + Send)) {
 
 /// The drive-side helper of f.9: one read of about `bytes` at the cursor, issued and waited on
 /// here so the probing thread never waits on a completion itself.
-fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: &mut Context<'_>) {
+fn service_helper(
+    shared: &Shared,
+    source: &SourceEnd,
+    request: HelperRequest,
+    parker: &Parker,
+    cx: &mut Context<'_>,
+) {
     let reply: Sender<Result<()>> = request.reply;
-    let Some((index, rows, seq, whole)) = take_next_range(shared, Some(request.bytes)) else {
+    let Some((index, rows, seq, whole)) = take_next_range(shared, source, Some(request.bytes))
+    else {
         let _ = reply.send(Err(MorunaError::Plan(
             "the source plan is exhausted; there is nothing to probe with".into(),
         )));
         return;
     };
-    let split = &shared.plan[index];
+    let split = &source.plan[index];
     let origin = Origin {
         split: split.id,
         row_start: rows.start,
@@ -568,8 +654,8 @@ fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: 
         node: shared.cfg.node,
     };
     let range = if whole { None } else { Some(rows) };
-    shared.source_reading();
-    let mut future = shared
+    shared.source_reading(source);
+    let mut future = source
         .source
         .read(split, range, shared.alloc.as_ref(), tier0(shared));
     shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
@@ -580,10 +666,10 @@ fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: 
             let (rows, bytes) = (payload.rows(), payload.bytes());
             let pushed_ok = shared
                 .placement
-                .push(0, Morsel::new(seq, 0, payload, origin));
+                .push_to(&source.outputs, Morsel::new(seq, 0, payload, origin));
             if pushed_ok.is_ok() {
-                pushed(shared, seq);
-                shared.source_pushed(rows, bytes);
+                pushed(source, seq);
+                shared.source_pushed(source, rows, bytes);
             }
             pushed_ok
         }
@@ -592,13 +678,13 @@ fn service_helper(shared: &Shared, request: HelperRequest, parker: &Parker, cx: 
     let _ = reply.send(answer);
 }
 
-/// f.13: before the source drive issues a new read, every `(seq, origin)` the manifest could
-/// not point to on disk is re-read in order through the normal source path and pushed to Q0
-/// with its original sequence number. The re-reads obey `read_ahead` and `is_full(0)` like any
-/// other read, so a large recompute list does not blow the budget.
-fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
+/// f.13: before a source's drive issues a new read, every `(seq, origin)` of it the manifest
+/// could not point to on disk is re-read in order through the normal source path and pushed into
+/// its queues with its original sequence number. The re-reads obey `is_full` like any other
+/// read, so a large recompute list does not blow the budget.
+fn recompute(shared: &Shared, source: &SourceEnd, parker: &Parker, cx: &mut Context<'_>) {
     let pending: Vec<(Seq, Origin)> = std::mem::take(
-        &mut *shared
+        &mut *source
             .to_recompute
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
@@ -612,13 +698,16 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
         "re-reading the morsels the manifest could not point to"
     );
     for (seq, origin) in pending {
-        while shared.placement.is_full(0) && !shared.is_cancelled() && !shared.has_exit() {
+        while source.outputs.iter().any(|&q| shared.placement.is_full(q))
+            && !shared.is_cancelled()
+            && !shared.has_exit()
+        {
             parker.park_timeout(Duration::from_millis(1));
         }
         if shared.is_cancelled() || shared.has_exit() {
             return;
         }
-        let Some(index) = shared
+        let Some(index) = source
             .plan
             .iter()
             .position(|split| split.id == origin.split)
@@ -632,7 +721,7 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
             );
             return;
         };
-        let split = &shared.plan[index];
+        let split = &source.plan[index];
         let rows = RowRange {
             start: origin.row_start,
             end: origin.row_end,
@@ -642,8 +731,8 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
         } else {
             None
         };
-        shared.source_reading();
-        let mut future = shared
+        shared.source_reading(source);
+        let mut future = source
             .source
             .read(split, range, shared.alloc.as_ref(), tier0(shared));
         shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
@@ -653,12 +742,12 @@ fn recompute(shared: &Shared, parker: &Parker, cx: &mut Context<'_>) {
             Ok(payload) => {
                 let (rows, bytes) = (payload.rows(), payload.bytes());
                 let morsel = Morsel::new(seq, 0, payload, origin);
-                if let Err(e) = shared.placement.push(0, morsel) {
+                if let Err(e) = shared.placement.push_to(&source.outputs, morsel) {
                     crate::policy::terminate(shared, e);
                     return;
                 }
-                pushed(shared, seq);
-                shared.source_pushed(rows, bytes);
+                pushed(source, seq);
+                shared.source_pushed(source, rows, bytes);
                 shared.recomputed.fetch_add(1, Ordering::SeqCst);
             }
             Err(e) => {
@@ -679,25 +768,26 @@ fn block_on<T>(future: &mut BoxFuture<'_, T>, parker: &Parker, cx: &mut Context<
     }
 }
 
-/// f.13: the cursor a resumed run starts from, and the sequence counter that goes with it. The
-/// morsels the resume will re-read first are recorded as issued, so a manifest written while
-/// the recompute pass is still reading them names them rather than losing them.
+/// f.13: the cursor a resumed source starts from, and the sequence counter that goes with it.
+/// The morsels the resume will re-read first are recorded as issued, so a manifest written
+/// while the recompute pass is still reading them names them rather than losing them.
 pub(crate) fn set_cursor(
-    shared: &Shared,
+    source: &SourceEnd,
     cursor: moruna_kernel::SourceCursor,
     recompute: &[(Seq, Origin)],
 ) {
-    let mut slot = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
     slot.split_index = cursor.split_index;
     slot.row_offset = cursor.row_offset;
     slot.next_seq = cursor.next_seq;
     slot.issued = recompute.iter().cloned().collect();
 }
 
-/// The cursor as f.12 records it, the next range to issue, never the last completed one; and,
-/// in the same snapshot, every read issued behind it that has not reached Q0 (MH 4.7).
-pub(crate) fn cursor(shared: &Shared) -> (moruna_kernel::SourceCursor, Vec<(Seq, Origin)>) {
-    let slot = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+/// A source's cursor as f.12 records it, the next range to issue, never the last completed
+/// one; and, in the same snapshot, every read issued behind it that has not reached its queues
+/// (MH 4.7).
+pub(crate) fn cursor(source: &SourceEnd) -> (moruna_kernel::SourceCursor, Vec<(Seq, Origin)>) {
+    let slot = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
     (
         moruna_kernel::SourceCursor {
             split_index: slot.split_index,

@@ -1,10 +1,13 @@
 //! The probe protocol (f.9, `Prober::probe`).
 //!
 //! Every worker but one is held off for the whole call, so the peak the sampler reports is the
-//! probe's own. The input for stage 1 is one read the source drive issues on the probing
-//! thread's behalf (the drive-side helper of b), so no thread but a drive ever waits on a
-//! completion (SC-I1). For a later stage it is the head of the previous queue, which is that
-//! stage's probe output. The output is pushed downstream as a normal morsel: nothing is wasted.
+//! probe's own. A stage's input is the head of one of its input queues: one that already holds a
+//! morsel (an upstream stage's probe output, or a source read pushed to every queue its source
+//! gives), or else one read the source feeding one of its ports issues on the probing thread's
+//! behalf (the drive-side helper of b), so no thread but a drive ever waits on a completion
+//! (SC-I1). The controller probes the stages in order, which is an order in which every queue
+//! goes forward, so in a chain stage 1 reads and every later stage takes the previous stage's
+//! output. The output is pushed downstream as a normal morsel: nothing is wasted.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -41,17 +44,48 @@ pub(crate) fn probe(shared: &Shared, stage: StageId, bytes: u64) -> Result<Probe
 }
 
 fn probe_inner(shared: &Shared, stage: StageId, bytes: u64) -> Result<ProbeResult> {
-    if stage == 1 {
-        // f.9: the drive answers helper requests in `Init` too, which is when the controller
-        // probes; it issues the read, waits on it and pushes the morsel to Q0 with the next
-        // sequence number.
-        let (reply, rx) = unbounded();
+    let inputs = &shared.stages[usize::from(stage) - 1].inputs;
+    let held = inputs
+        .iter()
+        .position(|&q| shared.queue_count(q) != 0)
+        .map(|port| port as u16);
+    let fed_by_source = inputs.iter().enumerate().find_map(|(port, &q)| {
         shared
-            .helper_tx
+            .topology
+            .source_of(q)
+            .map(|source| (port as u16, source))
+    });
+    let port = match (held, fed_by_source) {
+        (Some(port), _) => port,
+        (None, Some((port, source))) => {
+            read_for(shared, source, bytes)?;
+            port
+        }
+        (None, None) => 0,
+    };
+    tracing::info!(target: "sched.probe", stage, port, bytes, "probing");
+    match shared.run_on_worker(PROBING_WORKER, WorkerJob::Probe { stage, port })? {
+        JobOutput::Probe(result) => Ok(result),
+        JobOutput::Done => Err(MorunaError::Plan(format!(
+            "stage {stage} had no morsel to probe with"
+        ))),
+    }
+}
+
+/// f.9: source `source`'s drive answers helper requests in `Init` too, which is when the
+/// controller probes; it issues the read, waits on it and pushes the morsel into every queue the
+/// source gives to, with the next sequence number.
+fn read_for(shared: &Shared, source: u16, bytes: u64) -> Result<()> {
+    let Some(end) = shared.sources.get(usize::from(source)) else {
+        return Err(MorunaError::Plan(format!("the run has no source {source}")));
+    };
+    {
+        let (reply, rx) = unbounded();
+        end.helper_tx
             .send(HelperRequest { bytes, reply })
             .map_err(|_| MorunaError::Plan("the source drive is not running".into()))?;
-        if let Some(unparker) = shared
-            .source_unparker
+        if let Some(unparker) = end
+            .unparker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -67,13 +101,7 @@ fn probe_inner(shared: &Shared, stage: StageId, bytes: u64) -> Result<ProbeResul
             }
         }
     }
-    tracing::info!(target: "sched.probe", stage, bytes, "probing");
-    match shared.run_on_worker(PROBING_WORKER, WorkerJob::Probe { stage })? {
-        JobOutput::Probe(result) => Ok(result),
-        JobOutput::Done => Err(MorunaError::Plan(format!(
-            "stage {stage} had no morsel to probe with"
-        ))),
-    }
+    Ok(())
 }
 
 /// Wait until no worker is inside `apply`, bounded so a long kernel cannot wedge the call.

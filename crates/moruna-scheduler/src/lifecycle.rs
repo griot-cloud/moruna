@@ -97,9 +97,9 @@ fn finalize(shared: &Arc<Shared>, exit: Exit) -> crate::RunOutcome {
     let _ = shared.trace.flush();
 
     match exit {
-        Exit::Completed(sink) => {
+        Exit::Completed(sinks) => {
             shared.set_run_state(RunState::Completed);
-            crate::RunOutcome::Completed { sink }
+            crate::RunOutcome::Completed { sinks }
         }
         Exit::Terminated(diagnostic) => {
             shared.set_run_state(RunState::Terminated);
@@ -115,10 +115,15 @@ fn finalize(shared: &Arc<Shared>, exit: Exit) -> crate::RunOutcome {
     }
 }
 
-/// f.10: the source drive lets its in-flight reads resolve and the sink drive lets its
-/// in-flight writes complete, then both threads end.
+/// f.10: the source drives let their in-flight reads resolve and the sink drives let their
+/// in-flight writes complete, then every drive thread ends.
 fn join_drives(shared: &Shared) {
-    for slot in [&shared.source_handle, &shared.sink_handle] {
+    let slots = shared
+        .sources
+        .iter()
+        .map(|end| &end.handle)
+        .chain(shared.sinks.iter().map(|end| &end.handle));
+    for slot in slots {
         let handle = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(handle) = handle {
             shared.unpark_all();
@@ -142,9 +147,9 @@ fn join_workers(shared: &Shared) {
 }
 
 /// Resume, step one (f.13). In `Init`, in this order: refuse when checkpointing is off, resume
-/// the sink instead of opening it, set the cursor and the sequence counter, set the watermark,
-/// rebuild the instance pools, and keep `to_recompute` for `run_resumed`. Nothing is read and
-/// nothing is written.
+/// each sink instead of opening it, set each source's cursor and sequence counter, set each
+/// sink's watermark, rebuild the instance pools, and keep each source's `to_recompute` for
+/// `run_resumed`. Nothing is read and nothing is written.
 pub(crate) fn apply_resume_point(shared: &Arc<Shared>, point: ResumePoint) -> Result<()> {
     if shared.run_state() != RunState::Init {
         return Err(MorunaError::Resume(
@@ -154,13 +159,13 @@ pub(crate) fn apply_resume_point(shared: &Arc<Shared>, point: ResumePoint) -> Re
     if !shared.checkpoint_enabled() {
         // f.13: refuse before touching the sink. The message names the sink when a
         // non-resumable sink is the reason, and the staging directory otherwise.
-        let sink_is_the_reason = {
-            let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
+        let sink_is_the_reason = shared.sinks.iter().any(|end| {
+            let sink = end.sink.read().unwrap_or_else(|e| e.into_inner());
             sink.checkpoint().ok().flatten().is_none()
-        };
+        });
         let reason = if sink_is_the_reason {
             "the sink does not track commits, so this run could not write its own manifests"
-        } else if !shared.source.repeatable() {
+        } else if shared.sources.iter().any(|end| !end.source.repeatable()) {
             "the source is not repeatable, so this run could not write its own manifests"
         } else {
             "the staging directory is not available, so this run could not write its own manifests"
@@ -168,35 +173,52 @@ pub(crate) fn apply_resume_point(shared: &Arc<Shared>, point: ResumePoint) -> Re
         return Err(MorunaError::Resume(reason.into()));
     }
 
-    let committed = point.extras.committed_seq;
-    let state = point.extras.sink_state.clone().unwrap_or_default();
-    {
-        let schema = shared.schemas[0].clone();
-        let mut sink = shared.sink.write().unwrap_or_else(|e| e.into_inner());
-        sink.resume(&schema, &state, committed)?;
+    for end in &shared.sinks {
+        let at = usize::from(end.index);
+        let committed = point.extras.committed.get(at).copied().flatten();
+        let state = point
+            .extras
+            .sink_states
+            .get(at)
+            .cloned()
+            .flatten()
+            .unwrap_or_default();
+        {
+            let mut sink = end.sink.write().unwrap_or_else(|e| e.into_inner());
+            sink.resume(&end.schema, &state, committed)?;
+        }
+        end.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resumed_at(committed);
+        *end.floor.lock().unwrap_or_else(|e| e.into_inner()) = committed;
+        *end.gaps_from.lock().unwrap_or_else(|e| e.into_inner()) =
+            committed.map_or(0, |c| c.saturating_add(1));
     }
-    source_drive::set_cursor(shared, point.extras.source_cursor, &point.to_recompute);
-    shared
-        .committed
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .resumed_at(committed);
+    for end in &shared.sources {
+        let at = usize::from(end.index);
+        let cursor = point
+            .extras
+            .source_cursors
+            .get(at)
+            .copied()
+            .unwrap_or_default();
+        let recompute = point.to_recompute.get(at).cloned().unwrap_or_default();
+        source_drive::set_cursor(end, cursor, &recompute);
+        tracing::info!(
+            target: "sched.resume",
+            source = end.index,
+            to_recompute = recompute.len(),
+            split_index = cursor.split_index,
+            row_offset = cursor.row_offset,
+            "resuming"
+        );
+        *end.to_recompute.lock().unwrap_or_else(|e| e.into_inner()) = recompute;
+    }
 
     restore_instances(shared, &point)?;
 
-    *shared
-        .to_recompute
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = point.to_recompute.clone();
     shared.resumed.store(true, Ordering::SeqCst);
-    tracing::info!(
-        target: "sched.resume",
-        committed_seq = committed.unwrap_or_default(),
-        to_recompute = point.to_recompute.len(),
-        split_index = point.extras.source_cursor.split_index,
-        row_offset = point.extras.source_cursor.row_offset,
-        "resuming"
-    );
     Ok(())
 }
 

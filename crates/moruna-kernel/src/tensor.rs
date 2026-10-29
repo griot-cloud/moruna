@@ -72,6 +72,15 @@ pub struct ManagedTensor {
 }
 
 impl ManagedTensor {
+    /// The same tensor, a second time: both describe the same bytes, which stay alive until
+    /// the last of them drops (zero-copy views that must keep it alive, and `Payload::share`,
+    /// d.16).
+    pub fn share(&self) -> ManagedTensor {
+        ManagedTensor {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Element type.
     pub fn dtype(&self) -> DType {
         self.inner.dtype
@@ -320,13 +329,6 @@ impl ManagedTensor {
                 hook: Mutex::new(None),
             }),
         })
-    }
-
-    /// A second handle to the same tensor, for zero-copy views that must keep it alive.
-    pub(crate) fn share(&self) -> ManagedTensor {
-        ManagedTensor {
-            inner: Arc::clone(&self.inner),
-        }
     }
 }
 
