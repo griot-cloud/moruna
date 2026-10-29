@@ -292,11 +292,14 @@ One measure, the job's finish (section 0), and its consequence, utilisation. The
 
 | crate | holds | depends on |
 |---|---|---|
+| `moruna-job` | the job document, the catalogue and `check` (SDD 22) | none of the three below |
 | `moruna-cost` | `Inputs`, `CostKey`, `Estimate`, `UnitCost`, `Outcome`; the `CostModel` trait and registry; the default model; `ObservationStore` and its local adapter; the simulator | `moruna-job` only |
-| `moruna-job` | `explain(job, catalogue, stats, model, store) -> Plan`; the plan document (KA7) | `moruna-cost` |
-| `moruna-runtime` | warm-up (`moruna check` with profiling); the buffer catalog over placement; the `SchedulingPolicy` trait and its four adapters; online observation | both |
+| `moruna-plan` | the plan document (KA7); the `Planner` port and its `Planners` registry; the `levels` planner; `explain(job, catalogue, inputs, planners, planner) -> Plan`; `check_plan`, the plan's internal check (SDD 26) | `moruna-job`, and `moruna-cost` once it is on `main` |
+| `moruna-runtime` | runs from a plan; warm-up (`moruna check` with profiling); the buffer catalog over placement; the `SchedulingPolicy` trait and its four adapters; online observation | all three |
 
-An embedder depends on `moruna-job` and `moruna-cost` to plan in its own process, and supplies an `ObservationStore` adapter.
+The plan cannot live in `moruna-job`: `moruna-cost` depends on `moruna-job`, so `moruna-job` cannot depend on `moruna-cost`, and the plan's estimates are the cost model's. `moruna-plan` sits above both (KA7, 2026-10-29). Until `moruna-cost` is on `main`, a planner asks a cost model through `moruna-plan`'s `Estimator` port, whose answer is section 4's `UnitCost` field for field; KD6c adapts `CostModel` to it, and the simulator-based planner is another adapter of `Planner`.
+
+An embedder depends on `moruna-job`, `moruna-cost` and `moruna-plan` to plan in its own process, and supplies an `ObservationStore` adapter.
 
 ## 12. How it is proved
 
@@ -312,7 +315,8 @@ An embedder depends on `moruna-job` and `moruna-cost` to plan in its own process
 |---|---|---|
 | KD6a | `moruna-cost`: the types, the model port and registry, the default model, the observation store port and local adapter | `moruna-job` (KA4) |
 | KD6b | warm-up profiling in `moruna check` | KD6a |
-| KD6c | the simulator, and `explain` returning the plan | KD6a, KA5 (DAG), KA7 (plan document) |
+| KA7 | `moruna-plan`: the plan document, the planner port and the `levels` planner, `explain`, the plan's check; runs start from a plan and report against it | KA5 (DAG) |
+| KD6c | the simulator, and a simulator-based planner in `moruna-plan` that `explain` can choose | KD6a, KA5 (DAG), KA7 (plan document) |
 | KD7a | the buffer catalog with known-future eviction, over placement | KA5 |
 | KD7b | the policy port, the `admission` and `fifo` adapters, the benchmark matrix | KD7a |
 | KD7c | `residency_greedy` and `lookahead`; online learning and drift | KD6c, KD7b |

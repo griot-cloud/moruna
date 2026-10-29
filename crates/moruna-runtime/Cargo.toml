@@ -13,6 +13,9 @@ moruna-kernel = { workspace = true }
 # The kinds' declarations and the job document, which an embedder reads without running anything
 # (SDD 22).
 moruna-job = { workspace = true }
+# A run starts from its plan (SDD 26): the levels planner when the caller gives none, and the
+# plan's check before anything runs.
+moruna-plan = { workspace = true }
 moruna-arena = { workspace = true }
 moruna-discovery = { workspace = true }
 moruna-trace = { workspace = true }

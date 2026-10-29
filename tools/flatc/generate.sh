@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Generate the Rust of the job document's FlatBuffers schema (SDD 22 e.4), or, with --check,
-# fail when what is committed differs from what the schema generates.
+# Generate the Rust of every FlatBuffers schema in the workspace, the job document's (SDD 22 e.4)
+# and the plan document's (SDD 26 e.1), or, with --check, fail when what is committed differs from
+# what a schema generates.
 #
-#   tools/flatc/generate.sh          writes crates/moruna-job/src/generated/job_generated.rs
+#   tools/flatc/generate.sh          writes each crate's src/generated/<name>_generated.rs
 #   tools/flatc/generate.sh --check  regenerates into a scratch directory and diffs (CI)
 #
 # flatc runs inside a container, so nothing is installed on the machine: it is built from the
@@ -31,8 +32,9 @@ SOURCES="src/file_manager.cpp src/file_name_manager.cpp src/idl_parser.cpp src/i
   grpc/src/compiler/cpp_generator.cc grpc/src/compiler/go_generator.cc
   grpc/src/compiler/java_generator.cc grpc/src/compiler/python_generator.cc
   grpc/src/compiler/swift_generator.cc grpc/src/compiler/ts_generator.cc"
-SCHEMA="crates/moruna-job/schema/job.fbs"
-OUT="crates/moruna-job/src/generated"
+# Each schema and the directory its generated Rust is committed in.
+SCHEMAS="crates/moruna-job/schema/job.fbs:crates/moruna-job/src/generated
+  crates/moruna-plan/schema/plan.fbs:crates/moruna-plan/src/generated"
 
 check=0
 [ "${1:-}" = "--check" ] && check=1
@@ -77,19 +79,26 @@ if [ ! -x "$cache/flatc" ]; then
 fi
 
 scratch="target/flatc/out"
-rm -rf "$scratch"
-mkdir -p "$scratch"
-"$engine" run --rm -v "$PWD:/w" -w /w "$IMAGE" \
-  "/w/$cache/flatc" --rust -o "/w/$scratch" "/w/$SCHEMA"
-
-if [ "$check" = "1" ]; then
-  if ! diff -u "$OUT/job_generated.rs" "$scratch/job_generated.rs"; then
-    echo "flatc: $OUT/job_generated.rs is not what $SCHEMA generates; run tools/flatc/generate.sh and commit the result" >&2
-    exit 1
+status=0
+for pair in $SCHEMAS; do
+  schema="${pair%%:*}"
+  out="${pair#*:}"
+  name="$(basename "$schema" .fbs)_generated.rs"
+  rm -rf "$scratch"
+  mkdir -p "$scratch"
+  "$engine" run --rm -v "$PWD:/w" -w /w "$IMAGE" \
+    "/w/$cache/flatc" --rust -o "/w/$scratch" "/w/$schema"
+  if [ "$check" = "1" ]; then
+    if ! diff -u "$out/$name" "$scratch/$name"; then
+      echo "flatc: $out/$name is not what $schema generates; run tools/flatc/generate.sh and commit the result" >&2
+      status=1
+    else
+      echo "flatc: $out/$name is what $schema generates"
+    fi
+  else
+    mkdir -p "$out"
+    cp "$scratch/$name" "$out/$name"
+    echo "flatc: wrote $out/$name"
   fi
-  echo "flatc: $OUT/job_generated.rs is what $SCHEMA generates"
-else
-  mkdir -p "$OUT"
-  cp "$scratch/job_generated.rs" "$OUT/job_generated.rs"
-  echo "flatc: wrote $OUT/job_generated.rs"
-fi
+done
+exit "$status"

@@ -5,14 +5,23 @@ The `moruna` command is installed with the Python package. Run `moruna --help` f
 ## moruna run
 
 ```text
-moruna run JOB.json [--strict]
+moruna run JOB.json [--plan PLAN.mplan] [--strict]
 moruna run --vm JOB.json --image IMAGE [--disk PATH[:ro|:rw]]...
 ```
 
 Runs the job described in `JOB.json` and exits when it ends, printing one line with the exit code and the report's location.
 
+- `--plan` runs the job by a plan `moruna explain --out` wrote, instead of the plan Moruna makes for it. A plan of another job, or one that is not a plan of this job, is refused before anything runs.
 - `--strict` refuses a document that would take any setting from an environment variable, naming the setting.
 - `--vm` runs the job in a virtual machine with no network; Linux with KVM only. `--image` is the guest image directory or OCI layout, and each `--disk` attaches a disk image, read-only with `:ro`. See [An isolated virtual machine](hosting.md#an-isolated-virtual-machine).
+
+## moruna explain
+
+```text
+moruna explain JOB.json [--planner NAME] [--out PLAN.mplan]
+```
+
+Prints the plan Moruna would run the job by, as JSON, without running it: its steps in the order they start, each with the tasks it runs, the steps it waits for, its group (the steps that may run beside it), the resources it is given and its estimated cost, then the job's totals. The same job planned twice has the same step ids, and the events of its run name them, so a screen can show the plan and mark each step as it starts and ends. `--planner` chooses the planner (`levels` by default); `--out` also writes the plan for `moruna run --plan`. Exits 2 when the document is refused or the planner is unknown.
 
 ## moruna serve
 

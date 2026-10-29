@@ -24,6 +24,9 @@ written here is argument translation and nothing else (a, the anti-patterns of l
 from __future__ import annotations
 
 import importlib.util as _importlib_util
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 if _importlib_util.find_spec("pyarrow") is None:  # h, failures
@@ -89,6 +92,7 @@ __all__ = [
     "VortexSink",
     "VortexSource",
     "__version__",
+    "explain",
     "inspect_host",
     "kernel",
     "polars",
@@ -161,6 +165,29 @@ def run(
         keep_checkpoint=keep_checkpoint,
         resume=resume,
     )
+
+
+def explain(
+    job: str | os.PathLike[str] | bytes,
+    *,
+    planner: str | None = None,
+) -> dict[str, Any]:
+    """The plan Moruna would run the job document ``job`` by, as a dict, without running it.
+
+    ``job`` is a path to a job document or its bytes: version 2's FlatBuffers or version 1's
+    JSON. The plan lists its steps in the order they start, each with the tasks it runs, the steps
+    it waits for, its group (the steps that may run beside it), the resources it is given and its
+    estimated cost; ``groups`` lists the groups in order, and ``totals`` gives the job's finish,
+    critical path, peak memory and the resources it holds. The same document planned twice has
+    the same step ids, which the events of its run name (``step``).
+
+    ``planner`` names the planner; the default is ``"levels"``. Raises ``moruna.ConfigError``
+    naming the field when the document or its kinds are refused, and ``moruna.PlanError`` for an
+    unknown planner.
+    """
+    document = bytes(job) if isinstance(job, (bytes, bytearray)) else Path(job).read_bytes()
+    plan: dict[str, Any] = json.loads(_core.explain(document, planner=planner))
+    return plan
 
 
 def kernel(

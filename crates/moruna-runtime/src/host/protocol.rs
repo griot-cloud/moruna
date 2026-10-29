@@ -9,7 +9,10 @@
 //! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10); version 4 added the
 //! failure code `internal`, a crash: a panic of Moruna's own that unwound the run; version 5
 //! makes `task_registered`'s `upstream` the list of tasks a task takes its input from, the job's
-//! edges (SDD 22 e.4). A peer refuses a version it does not read rather than guess at it.
+//! edges (SDD 22 e.4); version 6 runs a job from its plan (SDD 26): every task event names the
+//! plan step that runs the task (`step`), `attempt_started` names the plan (`plan`), and
+//! `step_started` and `step_ended` tell each step's start and end. A peer refuses a version it
+//! does not read rather than guess at it.
 //!
 //! What a task prints is never on the socket. Each record of it is an `event` of kind `log`
 //! ([`LogLine`]) in the run's output store (`report.logs`), numbered by its own producer; the
@@ -89,7 +92,7 @@ impl Heartbeat {
 }
 
 /// The version of the `event` message this build writes (MH 4.3).
-pub const EVENTS_VERSION: u32 = 5;
+pub const EVENTS_VERSION: u32 = 6;
 
 /// The version of the port messages this build writes and reads (MH 4.10).
 pub const PORTS_VERSION: u32 = 1;
@@ -118,10 +121,12 @@ pub struct EventMsg {
     pub body: Event,
 }
 
-/// The facts of version 5: the task lifecycle, the output store's reach (MH 4.3), a running
-/// task's waits on its ports (MH 4.10) and a crash's failures (`internal`). A task is one task of
-/// the job's DAG, named by the id the document gives it, and `task_registered` names the tasks
-/// it takes its input from, which are the job's edges (SDD 22 e.4).
+/// The facts of version 6: the task lifecycle, the output store's reach (MH 4.3), a running
+/// task's waits on its ports (MH 4.10), a crash's failures (`internal`) and the plan's steps
+/// (SDD 26). A task is one task of the job's DAG, named by the id the document gives it, and
+/// `task_registered` names the tasks it takes its input from, which are the job's edges (SDD 22
+/// e.4). Every task event names the step of the run's plan that runs the task, `step`: `null`
+/// only when the document was refused before it was planned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -129,11 +134,38 @@ pub enum Event {
     AttemptStarted {
         /// A resume of an earlier process's run.
         resumed: bool,
+        /// The id of the plan the attempt runs; `null` when the document was refused before it
+        /// was planned (version 6).
+        plan: Option<String>,
+    },
+    /// A step of the plan started: the first of its tasks started (version 6).
+    StepStarted {
+        /// The step's id.
+        step: String,
+        /// The plan's id.
+        plan: String,
+        /// Its group in the plan.
+        group: u32,
+    },
+    /// A step of the plan ended: every one of its tasks ended (version 6). A step that never
+    /// started ends too, `skipped`, with no `step_started` before it.
+    StepEnded {
+        /// The step's id.
+        step: String,
+        /// The plan's id.
+        plan: String,
+        /// How: the first of `failed`, `cancelled`, `stopped`, `skipped`, `succeeded` any of its
+        /// tasks ended with.
+        outcome: StepOutcome,
+        /// From its start to its end; `null` when it never started.
+        duration_us: Option<u64>,
     },
     /// Once per task, before anything else is said of it.
     TaskRegistered {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// `source`, `kernel` or `sink`.
         element: Element,
         /// Its place in the run: 0 a source, 1..=n the kernel stages in an order in which every
@@ -150,6 +182,8 @@ pub enum Event {
     TaskWaiting {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// Why.
         reason: WaitReason,
         /// The tasks it waits on.
@@ -161,12 +195,16 @@ pub enum Event {
     TaskReady {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
     },
     /// It took its first input (a source: issued its first read; a sink: was handed its first
     /// morsel, or began its commit with none).
     TaskStarted {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// What it is doing.
         phase: Phase,
     },
@@ -174,6 +212,8 @@ pub enum Event {
     TaskPhase {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// What it is doing now.
         phase: Phase,
     },
@@ -182,6 +222,8 @@ pub enum Event {
     TaskCompleted {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// How.
         outcome: TaskOutcome,
         /// From its start to its end on this process's clock; `null` when it never started (a
@@ -199,6 +241,8 @@ pub enum Event {
     TaskFailed {
         /// The task; `null` when the scope is the attempt.
         task: Option<String>,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// A stable code.
         code: FailureCode,
         /// A sentence that names stages, morsels and sizes, never a value.
@@ -212,6 +256,8 @@ pub enum Event {
     TaskSkipped {
         /// The task.
         task: String,
+        /// The plan step that runs it (version 6).
+        step: Option<String>,
         /// Why.
         reason: SkipReason,
         /// The task whose failure skipped it.
@@ -315,6 +361,22 @@ impl LogLine {
         text.push('\n');
         text
     }
+}
+
+/// How a plan step ended (version 6): the first of these any of its tasks ended with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutcome {
+    /// A task of it failed.
+    Failed,
+    /// A task of it was cancelled.
+    Cancelled,
+    /// A task of it was stopped by another's failure.
+    Stopped,
+    /// A task of it never started.
+    Skipped,
+    /// Every task of it succeeded.
+    Succeeded,
 }
 
 /// What a task is (MH 4.3).
@@ -532,6 +594,9 @@ pub enum Outbound {
     Report {
         /// `RunReport` as JSON (04 d.1).
         report: serde_json::Value,
+        /// How the run went against its plan (SDD 26 e.3): the plan it ran, the order its steps
+        /// started in, each step's start, end and use, and every deviation from the plan.
+        plan: Option<serde_json::Value>,
     },
     /// Last.
     Exit {
@@ -560,6 +625,10 @@ pub enum Inbound {
     Spec {
         /// The document.
         spec: serde_json::Value,
+        /// The plan to run it by, its FlatBuffers as standard base64 (SDD 26); absent: the
+        /// document is planned by the default planner.
+        #[serde(default)]
+        plan: Option<String>,
     },
     /// Cancel the run: the manifest is written and the process exits 130.
     Cancel,
@@ -686,10 +755,11 @@ mod tests {
         assert!(changed.line().ends_with(",\"reason\":\"memory\"}\n"));
         let report = Outbound::Report {
             report: serde_json::json!({"run_id": "ab"}),
+            plan: Some(serde_json::json!({"plan": "cd"})),
         };
         assert_eq!(
             report.line(),
-            "{\"type\":\"report\",\"report\":{\"run_id\":\"ab\"}}\n"
+            "{\"type\":\"report\",\"report\":{\"run_id\":\"ab\"},\"plan\":{\"plan\":\"cd\"}}\n"
         );
         let exit = Outbound::Exit {
             code: 130,
@@ -719,16 +789,19 @@ mod tests {
         assert_eq!(
             event(Event::TaskStarted {
                 task: "orders".into(),
+                step: Some("s0123456789abcdef".into()),
                 phase: Phase::Reading,
             }),
             format!(
-                "{{\"type\":\"event\",\"v\":5,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
-                 \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
+                "{{\"type\":\"event\",\"v\":6,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                 \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\
+                 \"step\":\"s0123456789abcdef\",\"phase\":\"reading\"}}\n",
                 "0f".repeat(16)
             )
         );
         let failed = event(Event::TaskFailed {
             task: None,
+            step: None,
             code: FailureCode::IoError,
             message: "the read_file operation failed".into(),
             scope: FailureScope::Attempt,
@@ -736,7 +809,7 @@ mod tests {
         });
         assert!(
             failed.ends_with(
-                "\"kind\":\"task_failed\",\"task\":null,\"code\":\"io_error\",\
+                "\"kind\":\"task_failed\",\"task\":null,\"step\":null,\"code\":\"io_error\",\
                  \"message\":\"the read_file operation failed\",\"scope\":\"attempt\",\
                  \"retryable\":true}\n"
             ),
@@ -744,6 +817,7 @@ mod tests {
         );
         let crashed = event(Event::TaskFailed {
             task: Some("orders".into()),
+            step: Some("s1".into()),
             code: FailureCode::Internal,
             message: "index out of bounds".into(),
             scope: FailureScope::Task,
@@ -751,7 +825,7 @@ mod tests {
         });
         assert!(
             crashed.ends_with(
-                "\"kind\":\"task_failed\",\"task\":\"orders\",\"code\":\"internal\",\
+                "\"kind\":\"task_failed\",\"task\":\"orders\",\"step\":\"s1\",\"code\":\"internal\",\
                  \"message\":\"index out of bounds\",\"scope\":\"task\",\"retryable\":false}\n"
             ),
             "{crashed}"
@@ -759,19 +833,21 @@ mod tests {
         assert!(event(Event::CancelAcknowledged).ends_with("\"kind\":\"cancel_acknowledged\"}\n"));
         let waiting = event(Event::TaskWaiting {
             task: "triage".into(),
+            step: Some("s2".into()),
             reason: WaitReason::PortCall,
             blocking: Vec::new(),
             port: Some("model".into()),
         });
         assert!(
             waiting.ends_with(
-                "\"kind\":\"task_waiting\",\"task\":\"triage\",\"reason\":\"port_call\",\
+                "\"kind\":\"task_waiting\",\"task\":\"triage\",\"step\":\"s2\",\"reason\":\"port_call\",\
                  \"blocking\":[],\"port\":\"model\"}\n"
             ),
             "{waiting}"
         );
         let done = event(Event::TaskCompleted {
             task: "t1".into(),
+            step: Some("s3".into()),
             outcome: TaskOutcome::Succeeded,
             duration_us: None,
             counters: Some(Counters::default()),
@@ -784,6 +860,34 @@ mod tests {
                  \"errors\":0},\"cause\":null}\n"
             ),
             "{done}"
+        );
+        // Version 6: the plan's steps.
+        assert!(
+            event(Event::AttemptStarted {
+                resumed: false,
+                plan: Some("ab".into()),
+            })
+            .ends_with("\"kind\":\"attempt_started\",\"resumed\":false,\"plan\":\"ab\"}\n")
+        );
+        assert!(
+            event(Event::StepStarted {
+                step: "s3".into(),
+                plan: "ab".into(),
+                group: 2,
+            })
+            .ends_with("\"kind\":\"step_started\",\"step\":\"s3\",\"plan\":\"ab\",\"group\":2}\n")
+        );
+        assert!(
+            event(Event::StepEnded {
+                step: "s3".into(),
+                plan: "ab".into(),
+                outcome: StepOutcome::Skipped,
+                duration_us: None,
+            })
+            .ends_with(
+                "\"kind\":\"step_ended\",\"step\":\"s3\",\"plan\":\"ab\",\
+                 \"outcome\":\"skipped\",\"duration_us\":null}\n"
+            )
         );
     }
 
@@ -844,7 +948,7 @@ mod tests {
         assert_eq!(
             record.line(),
             format!(
-                "{{\"type\":\"event\",\"v\":5,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
+                "{{\"type\":\"event\",\"v\":6,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
                  \"t_us\":77,\"kind\":\"log\",\"id\":\"{s}/k1/4\",\"task\":\"k1\",\
                  \"stream\":\"stderr\",\"level\":null,\"bytes\":2,\"text\":\"hi\",\
                  \"partial\":false,\"continued\":true,\"truncated\":0}}\n",
@@ -867,7 +971,15 @@ mod tests {
         assert_eq!(
             Inbound::parse("{\"type\":\"spec\",\"spec\":{\"a\":1}}"),
             Ok(Inbound::Spec {
-                spec: serde_json::json!({"a": 1})
+                spec: serde_json::json!({"a": 1}),
+                plan: None,
+            })
+        );
+        assert_eq!(
+            Inbound::parse("{\"type\":\"spec\",\"spec\":{},\"plan\":\"TVBMMQ==\"}"),
+            Ok(Inbound::Spec {
+                spec: serde_json::json!({}),
+                plan: Some("TVBMMQ==".into()),
             })
         );
         assert!(Inbound::parse("{\"type\":\"resize\",\"memory\":1}").is_err());

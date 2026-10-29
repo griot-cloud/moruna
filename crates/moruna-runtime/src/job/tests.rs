@@ -25,7 +25,16 @@ mod v1 {
         kinds: &Registry,
         opts: BuildOptions<'_>,
     ) -> moruna_kernel::Result<Built> {
-        build::build(&Job::from_v1(job), kinds, opts)
+        let job = Job::from_v1(job);
+        let plan = crate::job::plan::levels(
+            &job,
+            moruna_plan::Resources {
+                workers: 4,
+                memory_start_bytes: 1 << 30,
+                memory_ceiling_bytes: 1 << 30,
+            },
+        )?;
+        build::build(&job, &plan, kinds, opts)
     }
 
     pub fn env_reliance(
@@ -36,7 +45,7 @@ mod v1 {
     }
 
     pub fn digest(job: &JobSpec) -> String {
-        crate::job::digest(&Job::from_v1(job))
+        moruna_plan::job_digest(&Job::from_v1(job))
     }
 
     pub fn resume_shape(job: &JobSpec) -> Option<crate::job::translate::ResumeArg> {

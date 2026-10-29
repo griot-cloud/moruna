@@ -232,10 +232,14 @@ pub fn run(
             user_sink,
         ),
     )?;
+    // A run starts from its plan (SDD 26 f.5): the default planner's, as `moruna run` does.
+    let job = moruna_job::Job::from_v1(&job);
+    let plan = map(py, moruna_runtime::job::plan::default_plan(&job))?;
     let built = map(
         py,
         moruna_runtime::job::build(
-            &moruna_job::Job::from_v1(&job),
+            &job,
+            &plan,
             &kinds,
             BuildOptions {
                 strict: false,

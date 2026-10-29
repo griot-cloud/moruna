@@ -407,6 +407,18 @@ fn entry(value: serde_json::Value) -> KindDoc {
     KindDoc::from_value(value).expect("an entry")
 }
 
+fn planned(job: &Job) -> moruna_plan::Plan {
+    moruna_runtime::job::plan::levels(
+        job,
+        moruna_plan::Resources {
+            workers: 4,
+            memory_start_bytes: 1 << 30,
+            memory_ceiling_bytes: 1 << 30,
+        },
+    )
+    .expect("planned")
+}
+
 fn opts() -> BuildOptions<'static> {
     BuildOptions {
         strict: false,
@@ -478,7 +490,7 @@ fn sc_t30_a_version_2_document_runs() {
     let bytes = job.to_flatbuffer().expect("encodes");
     let read = Job::from_flatbuffer(&bytes).expect("reads back");
     assert_eq!(read, job);
-    let built = build(&read, &Registry::standard(), opts()).expect("builds");
+    let built = build(&read, &planned(&read), &Registry::standard(), opts()).expect("builds");
     assert_eq!(built.parts.sources, vec![0]);
     assert_eq!(built.parts.sinks, vec![4, 5]);
     assert_eq!(built.parts.stages, vec![vec![1], vec![2], vec![3]]);
@@ -487,9 +499,10 @@ fn sc_t30_a_version_2_document_runs() {
     assert_eq!(rows_in(&low), expected(0, 1_000));
 }
 
-/// JB-T38 a_barrier_is_not_gone_around: the build refuses a document whose edge goes around a
-/// barrier, naming the edge, before any kind is built; the same document through the barrier
-/// builds.
+/// JB-T38 a_barrier_is_not_gone_around: a run refuses a document whose edge goes around a
+/// barrier, naming the edge, before any kind is built: its plan is refused with the build's
+/// refusal at the same field (SDD 26 f.5), so there is no plan to build it from; the same
+/// document through the barrier plans and builds.
 #[test]
 fn jb_t38_the_build_refuses_to_go_around_a_barrier() {
     let scratch = Scratch::new("jb_t38");
@@ -511,10 +524,16 @@ fn jb_t38_the_build_refuses_to_go_around_a_barrier() {
             Edge::between("join", "out"),
         ],
     );
-    let refused = build(&job, &Registry::standard(), opts())
-        .err()
-        .expect("refused")
-        .to_string();
+    let refused = moruna_runtime::job::plan::levels(
+        &job,
+        moruna_plan::Resources {
+            workers: 4,
+            memory_start_bytes: 1 << 30,
+            memory_ceiling_bytes: 1 << 30,
+        },
+    )
+    .expect_err("refused")
+    .to_string();
     assert!(
         refused.contains("edges[2]") && refused.contains("around the barrier `mask`"),
         "{refused}"
@@ -525,7 +544,7 @@ fn jb_t38_the_build_refuses_to_go_around_a_barrier() {
         &["a"],
     );
     job.edges.remove(2);
-    assert!(build(&job, &Registry::standard(), opts()).is_ok());
+    assert!(build(&job, &planned(&job), &Registry::standard(), opts()).is_ok());
 }
 
 // ------------------------------------------------------------------------------------------

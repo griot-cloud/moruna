@@ -30,6 +30,9 @@ pub mod errors;
 // f.10, 2026-09-29).
 #[cfg(feature = "python")]
 pub mod extend;
+// `moruna.explain(...)`, a job document's plan (SDD 26).
+#[cfg(feature = "python")]
+pub mod explain;
 #[cfg(feature = "python")]
 pub mod inspect;
 #[cfg(feature = "python")]

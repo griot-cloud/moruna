@@ -17,7 +17,7 @@ SDD 18 made "a kind Moruna can run" a declaration an embedder reads (`moruna kin
 
 It owns: the declaration types (`Role`, `Flow`, `Fact`, `Isolation`, `Needs`, `Declaration`, `Listing`), the settings schema format (`settings_schema`, `SCHEMA_DIALECT`, `Urls`), the job document (`JobSpec` and every type it contains, its parse and its two serialisations), the `Catalogue` and the two files that fill it, `check` and its refusals, and the validator for the settings schemas.
 
-It refuses to know: how a kind is built or run (the runtime's), the registry (the runtime's: a kind is code there and a declaration here), a hash (the document's digest is `sha256` of `JobSpec::identity_json`, which the runtime computes), and any embedder.
+It refuses to know: how a kind is built or run (the runtime's), the registry (the runtime's: a kind is code there and a declaration here), a hash (the document's digest is `sha256` of `Job::identity_json`, which `moruna-plan` computes, `moruna_plan::job_digest`, SDD 26), and any embedder.
 
 ## b. Vocabulary
 
@@ -97,7 +97,7 @@ pub struct SpecError { pub field: String, pub reason: String }   // "spec refuse
 // TaskIdsDoc, TaskRefDoc, is_task_id, SPEC_VERSION, CHECKPOINT_INTERVAL_MS, SCHEMA_DIALECT, LISTING_VERSION
 ```
 
-What changed in moving: `Role::verb` and `Flow::as_str` are public, `Role` has `Display`, and `SpecError` is a `thiserror` error. `JobSpec::digest` is the runtime's `moruna_runtime::job::digest(&job)`, because a hash is not a dependency of this crate; it is `sha256` of `identity_json`. The conversion of a `SpecError` into the runtime's error is `moruna_runtime::job::refusal`, because the runtime's error type is not this crate's.
+What changed in moving: `Role::verb` and `Flow::as_str` are public, `Role` has `Display`, and `SpecError` is a `thiserror` error. `JobSpec::digest` is `moruna_plan::job_digest(&job)` (SDD 26; the runtime's `moruna_runtime::job::digest` until KA7), because a hash is not a dependency of this crate; it is `sha256` of `identity_json`. The conversion of a `SpecError` into the runtime's error is `moruna_runtime::job::refusal`, because the runtime's error type is not this crate's.
 
 ### d.2 The catalogue
 

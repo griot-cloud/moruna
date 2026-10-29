@@ -1,0 +1,113 @@
+// Moruna's plan document, version 1 (SDD 26 e.1): what runs when and how, parallel or in
+// sequence, for one job.
+//
+// A plan is the planner's answer for one job (named by the job's digest): its steps in the order
+// they start, each a task of the job or a fused group of them, with the steps it waits for, its
+// group (the steps that may run beside it), the resources it is given and what it is estimated to
+// cost; and the job's totals. Every estimate is a distribution: a median, a 95th percentile, what
+// it counts, where its numbers came from and how many observations it rests on
+// (`architecture/adaptive-runtime.md` section 4).
+//
+// The Rust in `src/generated/plan_generated.rs` is generated from this file by
+// `tools/flatc/generate.sh` (flatc 25.12.19, the version of the `flatbuffers` crate) and is
+// committed; CI regenerates it and fails when it differs. Change this file, then run the script.
+
+namespace moruna.plan.fb;
+
+file_identifier "MPL1";
+file_extension "mplan";
+
+// What an estimate counts.
+enum Unit : ubyte { Seconds = 0, Bytes = 1, Rows = 2 }
+
+// Where an estimate's numbers came from, from most to least known.
+enum Basis : ubyte { Measured = 0, WarmUp = 1, Prior = 2, Default = 3 }
+
+// A distribution, not a number.
+table Estimate {
+  p50: double;
+  p95: double;
+  unit: Unit;
+  basis: Basis;
+  observations: uint;
+}
+
+// What a step takes and gives, over the batches the plan expects it to see.
+table UnitCost {
+  duration: Estimate (required);
+  worker_time: Estimate (required);
+  peak_memory: Estimate (required);
+  retained_memory: Estimate (required);
+  rows_out: Estimate (required);
+  bytes_out: Estimate (required);
+  state_growth: Estimate (required);
+  read_bytes: Estimate (required);
+  spill_bytes: Estimate (required);
+}
+
+// Workers, and memory at the start and at most.
+table Resources {
+  workers: uint;
+  memory_start_bytes: ulong;
+  memory_ceiling_bytes: ulong;
+}
+
+table Step {
+  // Stable: the same job planned by the same planner gives the same id.
+  id: string (required);
+  // The job's tasks it runs: one, or a fused group, by id.
+  tasks: [string] (required);
+  // The steps it waits for, by id.
+  depends_on: [string];
+  // The steps of one group may run beside each other; groups start in their order.
+  group: uint;
+  resources: Resources (required);
+  cost: UnitCost (required);
+}
+
+table Planner {
+  name: string (required);
+  version: uint;
+}
+
+// A median and a 95th percentile.
+struct Range {
+  p50: double;
+  p95: double;
+}
+
+table Totals {
+  // The weakest basis of any step's estimate, and the fewest observations.
+  basis: Basis;
+  observations: uint;
+  // Seconds from the first step's start to the last step's end.
+  finish: Range (required);
+  // The steps on the longest path, in order.
+  critical_path: [string];
+  peak_memory_bytes: Range (required);
+  // The resources held over the run: memory times time, worker time, disk bytes moved.
+  memory_byte_seconds: Range (required);
+  worker_seconds: Range (required);
+  disk_bytes: Range (required);
+}
+
+table Plan {
+  // The document's version: 1.
+  version: uint;
+  // The plan's content address: 32 lowercase hex characters.
+  id: string (required);
+  // The digest of the job it plans (`sha256:` and 64 hex characters).
+  job_digest: string (required);
+  planner: Planner (required);
+  // The cost model the planner asked, by its id; absent: none.
+  model: string;
+  // Milliseconds since the Unix epoch.
+  created_unix_ms: ulong;
+  // What the run is given, which the steps' resources are split from.
+  resources: Resources (required);
+  // In the order they start.
+  steps: [Step] (required);
+  totals: Totals (required);
+}
+
+root_type Plan;

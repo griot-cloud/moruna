@@ -4409,6 +4409,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-plan"
+version = "0.5.9"
+dependencies = [
+ "flatbuffers",
+ "moruna-job",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "moruna-polars"
 version = "0.5.9"
 dependencies = [
@@ -4430,6 +4442,7 @@ dependencies = [
  "moruna-kernels",
  "moruna-package",
  "moruna-placement",
+ "moruna-plan",
  "moruna-reactor",
  "moruna-runtime",
  "moruna-sandbox",
@@ -4497,6 +4510,7 @@ dependencies = [
  "moruna-kernels",
  "moruna-package",
  "moruna-placement",
+ "moruna-plan",
  "moruna-reactor",
  "moruna-sandbox",
  "moruna-scheduler",

@@ -505,6 +505,7 @@ fn po_t6_the_document_refuses_ports_it_cannot_serve() {
         };
         match build(
             &moruna_job::Job::from_v1(&job),
+            &support::planned(&moruna_job::Job::from_v1(&job)),
             &embedding(),
             BuildOptions {
                 strict: true,

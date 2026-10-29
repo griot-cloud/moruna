@@ -47,6 +47,7 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 22 | The job document and the catalogue, for embedders | `22-job.md` | 18 | an embedder reads Moruna's kinds and checks a job document against them, collecting every refusal, with a crate that depends on `serde`, `serde_json`, `schemars` and `thiserror` only; the declaration and document types have one home there; the embedded catalogue equals the registry's listing (added 2026-10-28, board item KA4) |
 | 23 | The SDK for servers and drivers | `23-svc.md` | 20 (`moruna-abi`, `moruna-sys`, `moruna-loader`; its own workspace, `kernel/`) | a protocol is declared once and the declaration is both ends; a connection opens with a handshake refused on a mismatch of name or major; a body decodes to exactly one value or nothing; a server never blocks on one client; an example server is added to a boot by its description alone, touching no kernel file (added 2026-10-28, BOARD EK KB2) |
 | 24 | The cost model's foundation | `24-cost.md` | 22 | what a unit takes from a run is predicted as a distribution with its basis, by a model chosen by a setting from a registry, learned from raw observations a store keeps so a new model learns the same history; the default model is recursive least squares on logarithms with forgetting; a crate that depends on `moruna-job`, `serde`, `serde_json` and `thiserror` only (added 2026-10-29, board item KD6a; `architecture/adaptive-runtime.md` sections 3 to 7) |
+| 26 | The plan of a job | `26-plan.md` | 22 | a job's plan says what runs when and how before it runs: steps with stable ids, groups, resources and estimates; a planner is an adapter of one port chosen by a setting; every plan passes the plan's check before it is shown or run, and a run starts from one and reports against it (added 2026-10-29, board item KA7) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -423,6 +424,7 @@ moruna/
     moruna-image/             component 19: an OCI layout read, verified and unpacked into a root (pure Rust; added 2026-10-28)
     moruna-record/            component 21: the record layout and the multi-producer ring that carries it (no dependency; added 2026-10-28)
     moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars and thiserror only (added 2026-10-28)
+    moruna-plan/              component 26: the plan document, the planner port and the `levels` planner, `explain`, `check_plan`; depends on moruna-job, flatbuffers, serde, serde_json, sha2 and thiserror (added 2026-10-29)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent

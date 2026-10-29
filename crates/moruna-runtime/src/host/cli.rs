@@ -1,5 +1,5 @@
-//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3, SDD 22 d.3): `run`, `run --vm`, `serve`,
-//! `kinds`, `check-job`, `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
+//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3, SDD 22 d.3, SDD 26 d.5): `run`,
+//! `run --vm`, `serve`, `kinds`, `check-job`, `explain`, `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
 //! run: the Python adapter's binary adds the Python kinds to [`Registry::standard`].
 
 use std::io::Write;
@@ -18,20 +18,23 @@ use crate::kinds::Registry;
 use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
-pub const USAGE: &str = "usage: moruna run <spec.json> [--strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
+pub const USAGE: &str = "usage: moruna run <spec.json> [--plan <plan.mplan>] [--strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
        moruna run --vm <spec.json> --image <dir-or-oci> [--disk <path>[:ro|:rw]]...
        moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
        moruna kinds
        moruna check-job <spec.json>
+       moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>]
        moruna --version";
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `moruna run <spec.json> [--strict]`.
+    /// `moruna run <spec.json> [--plan <plan.mplan>] [--strict]`.
     Run {
         /// The document.
         spec: String,
+        /// The plan to run it by (SDD 26); absent: the default planner's.
+        plan: Option<PathBuf>,
         /// Refuse any field the environment would fill.
         strict: bool,
         /// What a `.pex` package's sandbox needs (17 e.6).
@@ -66,6 +69,16 @@ pub enum Command {
         /// The document.
         spec: String,
     },
+    /// `moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>]` (SDD 26 d.5): the
+    /// document's plan, as JSON on standard output, and as the plan document at `out`.
+    Explain {
+        /// The document.
+        spec: String,
+        /// The planner, by name; absent: the default.
+        planner: Option<String>,
+        /// Where the plan document goes.
+        out: Option<PathBuf>,
+    },
     /// `moruna --version`.
     Version,
     /// `moruna --help`.
@@ -79,6 +92,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     match rest.next() {
         Some("run") => {
             let mut spec = None;
+            let mut plan = None;
             let mut strict = false;
             let mut vm = false;
             let mut image = None;
@@ -91,6 +105,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 match arg {
                     "--strict" => strict = true,
                     "--vm" => vm = true,
+                    "--plan" => {
+                        let path = rest
+                            .next()
+                            .ok_or_else(|| "moruna run: --plan needs a path".to_string())?;
+                        plan = Some(PathBuf::from(path));
+                    }
                     "--image" => {
                         let path = rest
                             .next()
@@ -127,9 +147,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 }
                 return Ok(Command::Run {
                     spec,
+                    plan,
                     strict,
                     packages,
                 });
+            }
+            if plan.is_some() {
+                return Err(
+                    "moruna run --vm: the guest plans the document itself; drop --plan".to_string(),
+                );
             }
             if strict {
                 return Err(
@@ -193,6 +219,38 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     "moruna check-job: one document, and `{extra}` is a second"
                 )),
             }
+        }
+        Some("explain") => {
+            let mut spec = None;
+            let mut planner = None;
+            let mut out = None;
+            while let Some(arg) = rest.next() {
+                match arg {
+                    "--planner" => {
+                        let name = rest
+                            .next()
+                            .ok_or_else(|| "moruna explain: --planner needs a name".to_string())?;
+                        planner = Some(name.to_string());
+                    }
+                    "--out" => {
+                        let path = rest
+                            .next()
+                            .ok_or_else(|| "moruna explain: --out needs a path".to_string())?;
+                        out = Some(PathBuf::from(path));
+                    }
+                    flag if flag.starts_with("--") => {
+                        return Err(format!("moruna explain: unknown option `{flag}`"));
+                    }
+                    path if spec.is_none() => spec = Some(path.to_string()),
+                    extra => {
+                        return Err(format!(
+                            "moruna explain: one document, and `{extra}` is a second"
+                        ));
+                    }
+                }
+            }
+            let spec = spec.ok_or_else(|| "moruna explain: which document?".to_string())?;
+            Ok(Command::Explain { spec, planner, out })
         }
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
@@ -269,15 +327,27 @@ fn main_as(
         Command::CheckJob { spec } => {
             return check_job(Path::new(&spec), kinds, &mut std::io::stderr().lock());
         }
+        Command::Explain { spec, planner, out } => {
+            return explain(
+                Path::new(&spec),
+                planner.as_deref(),
+                out.as_deref(),
+                kinds,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+        }
         Command::RunVm { spec, image, disks } => {
             return run_vm(Path::new(&spec), &image, &disks);
         }
         Command::Run {
             spec,
+            plan,
             strict,
             packages,
         } => session::run_file(
             Path::new(&spec),
+            plan.as_deref(),
             kinds,
             &HostOptions {
                 strict,
@@ -343,6 +413,66 @@ pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
             exit::SPEC_REFUSED
         }
     }
+}
+
+/// `moruna explain` (SDD 26 d.5): the plan of the document at `spec` by the planner `planner`
+/// names (the default when it names none), for the run's resources (the document's budget, what
+/// discovery finds where it leaves one to discovery), the document checked against the kinds of
+/// `kinds` first. The plan's JSON goes to `out`, and with `plan_file`, the plan document is
+/// written there for `moruna run --plan`. Exits 0 with a plan; 2 when the document, its kinds or
+/// the planner's name is refused, each refusal written to `err`; 1 when the kinds cannot be
+/// checked against, a planner fails, or the plan cannot be written.
+pub fn explain(
+    spec: &Path,
+    planner: Option<&str>,
+    plan_file: Option<&Path>,
+    kinds: &Registry,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let read = std::fs::read(spec)
+        .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
+        .and_then(|bytes| super::session::read_document(&bytes).map_err(|(_, refused)| refused));
+    let job = match read {
+        Ok(job) => job,
+        Err(refused) => {
+            let _ = writeln!(err, "{refused}");
+            return exit::SPEC_REFUSED;
+        }
+    };
+    let plan = match crate::job::plan::explain(&job, planner, kinds) {
+        Ok(plan) => plan,
+        Err(crate::job::plan::ExplainError::Plan(moruna_plan::PlanError::Job(refusals))) => {
+            for refusal in &refusals {
+                let _ = writeln!(err, "{refusal}");
+            }
+            return exit::SPEC_REFUSED;
+        }
+        Err(
+            e @ crate::job::plan::ExplainError::Plan(moruna_plan::PlanError::UnknownPlanner {
+                ..
+            }),
+        ) => {
+            let _ = writeln!(err, "moruna explain: {e}");
+            return exit::SPEC_REFUSED;
+        }
+        Err(e) => {
+            let _ = writeln!(err, "moruna explain: {e}");
+            return exit::FAILED;
+        }
+    };
+    if let Some(path) = plan_file
+        && let Err(e) = std::fs::write(path, plan.to_flatbuffer())
+    {
+        let _ = writeln!(
+            err,
+            "moruna explain: the plan could not be written to {}: {e}",
+            path.display()
+        );
+        return exit::FAILED;
+    }
+    let _ = writeln!(out, "{}", plan.to_json());
+    exit::COMPLETED
 }
 
 /// `moruna run --vm` (MH 4.8.4) on the monitor this build has: KVM, which is Linux-only.
@@ -464,6 +594,7 @@ mod tests {
             parse(&args(&["run", "job.json"])),
             Ok(Command::Run {
                 spec: "job.json".into(),
+                plan: None,
                 strict: false,
                 packages: PackageHost::default(),
             })
@@ -472,6 +603,7 @@ mod tests {
             parse(&args(&["run", "--strict", "job.json"])),
             Ok(Command::Run {
                 spec: "job.json".into(),
+                plan: None,
                 strict: true,
                 packages: PackageHost::default(),
             })
@@ -508,6 +640,7 @@ mod tests {
             ])),
             Ok(Command::Run {
                 spec: "job.json".into(),
+                plan: None,
                 strict: false,
                 packages: host.clone(),
             })
@@ -779,6 +912,7 @@ mod tests {
             report: None,
             report_file: Some("/tmp/r.json".into()),
             notes: Vec::new(),
+            plan: None,
         };
         assert_eq!(summary(&outcome), "moruna: exit 0; report: /tmp/r.json");
         outcome.code = 2;

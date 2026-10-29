@@ -22,6 +22,7 @@ use moruna_job::{
     Declaration, ErrorPolicyDoc, Fact, Flow, GuaranteeDoc, HostProfileDoc, Isolation, Job, KindDoc,
     ObjectStoreDoc, Role, SizerDoc, SpecError,
 };
+use moruna_plan::Plan;
 
 /// The fields whose `null` an environment variable may fill, and the variable (MH 4.1).
 pub const ENV_FIELDS: [(&str, &str); 5] = [
@@ -135,12 +136,13 @@ struct Assembling {
     output_task: usize,
 }
 
-/// Build the facade's `RunSpec` from a document (MH 4.1, SDD 22 e.4), each task by the kind
-/// `kinds` resolves its `kind` to for its role (SDD 18 f.2). The order is the order a refusal
-/// is found in: the environment, the run id, the graph (`moruna_job::check_graph`), the kinds,
-/// strict mode and the contracts by the kinds' declarations, the sources, the sinks, the kernels
-/// in an order in which every edge goes forward, the ranges, then resume, which reads the disk.
-pub fn build(job: &Job, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Built> {
+/// Build the facade's `RunSpec` from a document and its plan (MH 4.1, SDD 22 e.4, SDD 26 f.5),
+/// each task by the kind `kinds` resolves its `kind` to for its role (SDD 18 f.2). The order is
+/// the order a refusal is found in: the environment, the run id, the graph
+/// (`moruna_job::check_graph`), the plan (`moruna_plan::check_plan`), the kinds, strict mode and
+/// the contracts by the kinds' declarations, the sources, the sinks, the kernels in the order
+/// the plan starts them, the ranges, then resume, which reads the disk.
+pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Built> {
     // f.2: the precedence rule. A field set wins; a null field goes to discovery, which reads
     // its variable when one is set, and then to the default. Strict mode refuses the second.
     let env_resolved = env_reliance(job, opts.env);
@@ -170,6 +172,13 @@ pub fn build(job: &Job, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Buil
             first.field.clone(),
             first.message.clone(),
         )));
+    }
+    // SDD 26 PN-I4: a plan that is not a plan of this job is refused, naming its first step at
+    // fault, before anything is built from it.
+    if let Err(refusals) = moruna_plan::check_plan(plan, job) {
+        return Err(MorunaError::Plan(
+            moruna_plan::PlanError::Refused(refusals).to_string(),
+        ));
     }
     for (i, edge) in job.edges.iter().enumerate() {
         if edge.flow != Flow::Batches {
@@ -249,13 +258,12 @@ pub fn build(job: &Job, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Buil
         cx.set_sink_target(first.target.clone());
     }
 
-    // The kernels, in an order in which every edge goes forward (ties in document order), each
-    // built on its own. A kernel that takes its one input from a kernel whose one output goes to
-    // it alone joins that kernel's stage when the two kinds say their combination is one (MH
-    // 4.9); stages are numbered after that, in the same order.
-    let order = job
-        .topological_order()
-        .map_err(|_| MorunaError::Plan("the job's edges go round in a cycle".into()))?;
+    // The kernels, in the order the plan starts them (SDD 26 f.5), which is an order in which
+    // every edge goes forward, each built on its own. A kernel that takes its one input from a
+    // kernel whose one output goes to it alone joins that kernel's stage when the two kinds say
+    // their combination is one (MH 4.9) and no barrier stands between them; stages are numbered
+    // after that, in the same order, so the scheduler's starting order is the plan's.
+    let order = super::plan::task_order(job, plan);
     let kernel_tasks: Vec<usize> = (0..job.tasks.len())
         .filter(|&i| job.tasks[i].role == Role::Kernel)
         .collect();
@@ -461,7 +469,7 @@ pub fn build(job: &Job, kinds: &Registry, opts: BuildOptions<'_>) -> Result<Buil
     spec.checkpoint_keep = job.checkpoint.keep;
     spec.resume = resume;
     spec.resume_auto = resume_auto;
-    let digest = super::digest(job);
+    let digest = moruna_plan::job_digest(job);
     spec.spec_digest = Some(digest.clone());
     spec.notes = notes;
 
@@ -489,6 +497,11 @@ fn fusable_predecessor(job: &Job, i: usize, stage_of: &[Option<usize>]) -> Optio
     let p = job.task_index(&from.task)?;
     let producer = &job.tasks[p];
     if producer.role != Role::Kernel || producer.outputs.len() != 1 {
+        return None;
+    }
+    // Nothing is moved across a contract barrier (SDD 22 e.5, SDD 26 PN-I5): a barrier task
+    // stays a stage of its own, and the two ends of a barrier edge stay apart.
+    if task.barrier || producer.barrier || job.edges[edge].barrier {
         return None;
     }
     if job.edges_from(&producer.id, &from.port).len() != 1 {
