@@ -25,6 +25,7 @@ process supervisor
   expect kk: process driver exited with code 0 (
   expect KB3 kernel calls: ok:
   expect kk: process killee was killed through a handle to it
+  expect KC1 remote memory: ok:
   exits 0
 
 # KK-T10: a fault ends its process and nothing else.
@@ -118,6 +119,10 @@ process devices
   expect KB3 block2: virtio-blk up:
   expect kk: process block1 exited with code 0 (
   expect kk: process block2 exited with code 0 (
+  expect KB3 block3: virtio-blk up:
+  expect KB3 block7: virtio-blk up:
+  expect kk: process block3 exited with code 0 (
+  expect kk: process block7 exited with code 0 (
   expect KB3 devices: ok:
   exits 0
 link supervisor.devices devices.supervisor
@@ -191,3 +196,41 @@ process imagefs-test
   expect KC2 conformance moruna.imagefs: ok:
   exits 0
 link imagefs-test.fs imagefs.listen-test
+
+# KK-T13: the calls ABI 2.0 added for a process's own memory and threads.
+process vm
+  handle console console
+  expect KC1 kernel calls: ok:
+  exits 0
+
+# SDD 28: the Linux personality. A second image filesystem serves the Linux image:
+# the official python:3.14-slim image's four layers and one of the C test programs
+# above them, on block3 to block7 (build.sh). The personality server gets its process
+# resource from the supervisor, and a connection to that image filesystem for each
+# program it runs; LX-T10 to LX-T16 run unmodified Linux programs through it: static
+# musl, its threads, dynamic glibc, a refused call, isolation, the forward's round
+# trip, and CPython 3.14.
+process imagefs-linux imagefs
+  handle console console
+  handle data:linux/stack.layers layers
+  expect KC2 imagefs: up: 5 layers, lowest first: block3
+  exits 0
+link imagefs-linux.directory devices.directory-linux
+process linux
+  handle console console
+  expect linux: up:
+  expect linux: served: 7 programs run
+  exits 0
+link supervisor.linux linux.supervisor
+link linux.fs imagefs-linux.listen-linux
+process linux-test
+  handle console console
+  expect KC1 musl hello: ok:
+  expect KC1 musl threads: ok:
+  expect KC1 glibc dynamic: ok:
+  expect KC1 refused call: ok:
+  expect KC1 isolation: ok:
+  expect KC1 forward: ok:
+  expect KC1 cpython: ok: python3 -c printed 2432902008176640000
+  exits 0
+link linux-test.server linux.listen-test

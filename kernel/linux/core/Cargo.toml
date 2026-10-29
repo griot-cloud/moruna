@@ -1,0 +1,10 @@
+[package]
+name = "moruna-linux"
+description = "The Linux personality's logic (SDD 28): the system call table, the ELF loader's plan, the first stack, Linux's structures, file descriptors and the refusals counted; no_std and host tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true

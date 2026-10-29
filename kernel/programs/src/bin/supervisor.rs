@@ -11,6 +11,12 @@
 //! `memory_create`'s flags) and is refused what each must refuse; then it hands the
 //! device manager the roots of the devices: the process, device memory, ECAM, MSI and
 //! DMA resources.
+//!
+//! KK-T14 (ABI 2.0): it builds a process's memory from outside, as the Linux
+//! personality does (`process_map` at a chosen address, of zero pages and of an object,
+//! `process_write` and `process_read`, `process_protect`, a partial `process_unmap`),
+//! and is refused each thing it must be; then it hands the Linux personality server a
+//! process resource of its own.
 
 #![no_std]
 #![no_main]
@@ -44,6 +50,7 @@ fn run() -> i64 {
     let root_msi = slot("root.msi");
     let root_dma = slot("root.dma");
     let devices = Channel(slot("devices"));
+    let linux = Channel(slot("linux"));
     if abi_version() != moruna_sys::ABI_VERSION {
         println!(
             out,
@@ -186,6 +193,22 @@ fn run() -> i64 {
     ) {
         return code;
     }
+    if let Err(code) = remote_memory(&out, &root_process) {
+        return code;
+    }
+    // SDD 28: the Linux personality makes its processes with a process resource of its
+    // own.
+    let for_linux = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = linux.write(b"process", [for_linux]) {
+        return fail(
+            &out,
+            "handing the Linux personality its process resource",
+            e,
+        );
+    }
     // SDD 25: the device manager does the device work with the device roots.
     if let Err((e, _)) = devices.write(
         b"roots",
@@ -194,6 +217,161 @@ fn run() -> i64 {
         return fail(&out, "handing the device manager its roots", e);
     }
     0
+}
+
+fn kc1(out: &moruna_sys::Console, what: &str, e: Error) -> i64 {
+    println!(out, "KC1 remote memory: FAIL: {}: {}", what, e.name());
+    1
+}
+
+/// `result` must be `want`, for KK-T14.
+fn kc1_refused<T>(
+    out: &moruna_sys::Console,
+    what: &str,
+    want: Error,
+    result: Result<T, Error>,
+) -> Result<(), i64> {
+    match result {
+        Err(e) if e == want => Ok(()),
+        Err(e) => Err(kc1(out, what, e)),
+        Ok(_) => Err(kc1(out, what, Error::BadState)),
+    }
+}
+
+/// KK-T14: another process's memory, built and read from outside.
+fn remote_memory(out: &moruna_sys::Console, root_process: &Handle) -> Result<(), i64> {
+    const AT: u64 = 0x5000_0000;
+    let p = Process::create(root_process, "remote").map_err(|e| kc1(out, "process_create", e))?;
+    // Zero pages at a chosen address, written and read back through the process.
+    let va = p
+        .map(None, 0, 4 * 4096, AT, map::READ | map::WRITE)
+        .map_err(|e| kc1(out, "process_map of zero pages", e))?;
+    if va != AT {
+        return Err(kc1(out, "process_map at a chosen address", Error::BadState));
+    }
+    p.write(AT + 4090, b"across a page")
+        .map_err(|e| kc1(out, "process_write", e))?;
+    let mut back = [0u8; 13];
+    p.read(AT + 4090, &mut back)
+        .map_err(|e| kc1(out, "process_read", e))?;
+    let mut zero = [0xffu8; 16];
+    p.read(AT + 3 * 4096, &mut zero)
+        .map_err(|e| kc1(out, "process_read of an untouched page", e))?;
+    if &back != b"across a page" || zero != [0; 16] {
+        return Err(kc1(out, "the bytes read back", Error::BadState));
+    }
+    // The range is taken: without FIXED a second mapping is refused, with it replaces.
+    kc1_refused(
+        out,
+        "a second process_map without FIXED",
+        Error::BadState,
+        p.map(None, 0, 4096, AT, map::READ),
+    )?;
+    // An object's pages, mapped read only through a handle without WRITE.
+    let object = Memory::create(2 * 4096).map_err(|e| kc1(out, "memory_create", e))?;
+    {
+        let m = object
+            .map(0, 2 * 4096, map::WRITE)
+            .map_err(|e| kc1(out, "memory_map", e))?;
+        m.write(4096, b"object")
+            .map_err(|e| kc1(out, "writing the object", e))?;
+    }
+    let read_only = object
+        .0
+        .duplicate(Rights::READ | Rights::MAP)
+        .map_err(|e| kc1(out, "handle_duplicate", e))?;
+    p.map(Some(&read_only), 0, 2 * 4096, AT, map::READ | map::FIXED)
+        .map_err(|e| kc1(out, "process_map FIXED of an object", e))?;
+    let mut word = [0u8; 6];
+    p.read(AT + 4096, &mut word)
+        .map_err(|e| kc1(out, "process_read of the object", e))?;
+    if &word != b"object" {
+        return Err(kc1(
+            out,
+            "the object's bytes through the process",
+            Error::BadState,
+        ));
+    }
+    kc1_refused(
+        out,
+        "process_write to a read-only page",
+        Error::Fault,
+        p.write(AT + 4096, b"x"),
+    )?;
+    kc1_refused(
+        out,
+        "process_protect writable over a handle without WRITE",
+        Error::AccessDenied,
+        p.protect(AT, 2 * 4096, map::READ | map::WRITE),
+    )?;
+    kc1_refused(
+        out,
+        "process_map writable and executable",
+        Error::InvalidArgs,
+        p.map(
+            None,
+            0,
+            4096,
+            AT + 64 * 4096,
+            map::READ | map::WRITE | map::EXECUTE,
+        ),
+    )?;
+    // The zero pages left above the object keep their bytes; protecting them to none
+    // and back keeps them too.
+    p.protect(AT + 2 * 4096, 2 * 4096, 0)
+        .map_err(|e| kc1(out, "process_protect to no access", e))?;
+    kc1_refused(
+        out,
+        "process_read of an inaccessible page",
+        Error::Fault,
+        p.read(AT + 2 * 4096, &mut word),
+    )?;
+    p.write(AT + 2 * 4096, b"")
+        .map_err(|e| kc1(out, "an empty process_write", e))?;
+    p.protect(AT + 2 * 4096, 2 * 4096, map::READ | map::WRITE)
+        .map_err(|e| kc1(out, "process_protect back to writable", e))?;
+    // A partial unmap: the first object page goes, the second stays.
+    p.unmap(AT, 4096)
+        .map_err(|e| kc1(out, "a partial process_unmap", e))?;
+    kc1_refused(
+        out,
+        "process_read of an unmapped page",
+        Error::Fault,
+        p.read(AT, &mut word),
+    )?;
+    p.read(AT + 4096, &mut word)
+        .map_err(|e| kc1(out, "process_read of the page kept", e))?;
+    kc1_refused(
+        out,
+        "process_protect over a hole",
+        Error::OutOfRange,
+        p.protect(AT, 2 * 4096, map::READ),
+    )?;
+    // A handle without WRITE reaches nothing.
+    let looking = Process(
+        p.0.duplicate(Rights::READ)
+            .map_err(|e| kc1(out, "handle_duplicate of the process", e))?,
+    );
+    kc1_refused(
+        out,
+        "process_write through a read-only handle",
+        Error::AccessDenied,
+        looking.write(AT + 4096, b"y"),
+    )?;
+    kc1_refused(
+        out,
+        "process_map through a read-only handle",
+        Error::AccessDenied,
+        looking.map(None, 0, 4096, 0, map::READ),
+    )?;
+    looking
+        .read(AT + 4096, &mut word)
+        .map_err(|e| kc1(out, "process_read through a read-only handle", e))?;
+    println!(
+        out,
+        "KC1 remote memory: ok: process_map at a chosen address and FIXED, process_write and process_read across pages, process_protect and a partial process_unmap, and every refusal"
+    );
+    Ok(())
 }
 
 fn kb3(out: &moruna_sys::Console, what: &str, e: Error) -> i64 {

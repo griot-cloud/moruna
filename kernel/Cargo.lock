@@ -369,10 +369,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
+name = "linux"
+version = "0.1.0"
+dependencies = [
+ "imagefs-protocol",
+ "linux-protocol",
+ "moruna-abi",
+ "moruna-linux",
+ "moruna-svc",
+ "moruna-sys",
+]
+
+[[package]]
 name = "linux-boot-params"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec98c9607699076badfdd1780eb0398e26c6c6809fb670545565c416835c7f88"
+
+[[package]]
+name = "linux-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
+name = "linux-test"
+version = "0.1.0"
+dependencies = [
+ "linux-protocol",
+ "moruna-linux",
+ "moruna-svc",
+]
 
 [[package]]
 name = "lock_api"
@@ -435,6 +463,13 @@ name = "moruna-kb1-programs"
 version = "0.1.0"
 dependencies = [
  "moruna-sys",
+]
+
+[[package]]
+name = "moruna-linux"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
 ]
 
 [[package]]
