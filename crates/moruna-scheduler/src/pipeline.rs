@@ -174,6 +174,13 @@ pub fn validate_graph(pipeline: &Pipeline) -> Result<Vec<SourceSchema>> {
             pipeline.sinks.len()
         )));
     }
+    for source in &pipeline.sources {
+        if source.streaming() && source.repeatable() {
+            return Err(MorunaError::Plan(
+                "a streaming source must be non-repeatable".into(),
+            ));
+        }
+    }
     let mut schemas: Vec<Option<SourceSchema>> = vec![None; topology.links().len()];
     for (q, link) in topology.links().iter().enumerate() {
         if let Producer::Source(s) = link.from {

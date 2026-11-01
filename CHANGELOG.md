@@ -6,6 +6,8 @@ Phase A integration is under validation; this entry does not announce a tested o
 
 - Integrates the native node artifact, explicit account and storage grants, and the owned host launch/session interface.
 - Adds the native KD3 conformance fixtures and focused regressions for shared build contexts, memory admission, event records, and durable storage.
+- Terminates a failed ordered pipeline without waiting forever for queued sink writes whose earlier sequence failed, while retaining submitted I/O until completion.
+- Reads iterator sources through actual end of iteration instead of reporting completion after their first batch; an empty batch remains data and later iterator errors remain failures.
 - Release acceptance still requires the complete test and lint gates, all 21 KD3 cases (92 required result cells), and the 15 native SDK boot cases. Kernel TLS, io_uring expansion, and UEFI work are outside this Phase A release.
 
 ## 0.5.9

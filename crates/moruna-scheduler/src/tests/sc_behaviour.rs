@@ -789,3 +789,90 @@ fn sc_h_termination_retires_ordered_write_waiting_for_failed_lower_sequence() {
         "termination did not finish the sink"
     );
 }
+
+/// An opt-in stream has no finite plan covering its later batches. Empty batches are not EOF.
+#[test]
+fn sc_h_streaming_source_uses_actual_eof_and_preserves_late_error() {
+    use moruna_kernel::{Allocator, BoxFuture, Payload, Result, RowRange, Source, Split, Tier};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct Stream {
+        batches: Mutex<VecDeque<u64>>,
+        fail: bool,
+    }
+    impl Source for Stream {
+        fn schema(&self) -> SourceSchema {
+            Source::schema(&FakeSource::new())
+        }
+        fn plan(&self) -> Result<Vec<Split>> {
+            FakeSource::new().splits(1, 17, 136).plan()
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a Split,
+            _: Option<RowRange>,
+            _: &'a dyn Allocator,
+            _: Tier,
+        ) -> BoxFuture<'a, Result<Payload>> {
+            panic!("a streaming source must not be read through its finite estimate")
+        }
+        fn repeatable(&self) -> bool {
+            false
+        }
+        fn streaming(&self) -> bool {
+            true
+        }
+        fn read_next<'a>(
+            &'a self,
+            alloc: &'a dyn Allocator,
+            tier: Tier,
+        ) -> BoxFuture<'a, Result<Option<Payload>>> {
+            Box::pin(async move {
+                let rows = self.batches.lock().unwrap().pop_front();
+                match rows {
+                    Some(rows) => {
+                        let source = FakeSource::new().splits(1, rows, rows * 8);
+                        let plan = source.plan()?;
+                        source.read(&plan[0], None, alloc, tier).await.map(Some)
+                    }
+                    None if self.fail => Err(MorunaError::Source {
+                        split: 0,
+                        msg: "late iterator error".into(),
+                    }),
+                    None => Ok(None),
+                }
+            })
+        }
+    }
+    for (batches, fail) in [(vec![], false), (vec![0, 17, 240], false), (vec![17], true)] {
+        let rows: u64 = batches.iter().sum();
+        let source = Arc::new(Stream {
+            batches: Mutex::new(batches.into()),
+            fail,
+        });
+        let rig = RigBuilder::new()
+            .source_over(source.clone())
+            .ordered(true)
+            .go();
+        assert_eq!(
+            source.batches.lock().unwrap().iter().sum::<u64>(),
+            rows,
+            "planning must not eagerly pull a stream"
+        );
+        match rig.scheduler.run(CancelToken::new()) {
+            Ok(RunOutcome::Completed { sinks }) if !fail => {
+                assert_eq!(sinks[0].rows, rows);
+                assert_eq!(rig.sink.finish_calls(), 1);
+            }
+            Ok(RunOutcome::Terminated { diagnostic, .. }) if fail => {
+                assert!(
+                    diagnostic.to_string().contains("late iterator error"),
+                    "{diagnostic}"
+                );
+                assert_eq!(rig.sink.finish_calls(), 0);
+            }
+            other => panic!("stream outcome: {other:?}"),
+        }
+    }
+}

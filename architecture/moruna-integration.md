@@ -19,61 +19,63 @@ Account-based memory sampling and controller admission, and the strict node proo
 entry points. The pinned ring sources under `kernel/vendor/` are build inputs,
 including their upstream test fixtures; they are not compiler output.
 
-The latest private verifier correction reads full failure details from the
-canonical terminated report and requires equality with the Exit diagnostic. It
-retains Exit 4, the actual kernel-1 task failure, a corresponding error counter,
-and the original expected exception text. The event's deliberately generic
-message remains unchanged. This correction has source review, but its rebuilt
-driver and execution are still pending.
-
-The human explicitly requested consolidation, commit and push on 2026-11-01.
-Earlier BOARD restrictions on publication describe previous authorization. This
-request authorizes this branch push; it does not authorize release or deployment.
-Griot source and its Moruna dependency pin are outside this change.
+The human has authorized Phase A implementation, local testing, coordination with
+Griot for the shared test slot, and release 0.6.0 after acceptance. Earlier BOARD
+restrictions describe previous authorization. Griot source, data and its Moruna
+dependency pin remain outside this change.
 
 ## Verified results and remaining work
 
-The source-bound [validation ledger](../tools/proof-lab/validation.json) records
-the actual runs. The latest strict CPU1 run passed the 100,000-row success case,
-then stopped at the second case when the private verifier searched the wrong
-diagnostic field. Its failure receipt is preserved. Cases 3 through 5 did not run.
-The engine produced the intended Python failure and Exit 4 in case 2; this is
-evidence for the diagnostic correction, not a passing acceptance result.
+The source-bound [validation ledger](../tools/proof-lab/validation.json) preserves
+historical failures separately from later passing runs. The ordered-sink
+termination fix cancels queued writes that have not entered the underlying sink;
+it retains submitted I/O until its original completion. Three focused regressions
+passed. All 15 canonical SDK cases passed on 1, 2 and 4 CPUs using the normal
+engine, including propagation of the original Python exception and Exit 4.
+The ten image-sandbox tests also passed with actual namespace isolation.
 
-The current work is Phase A only, with a four-hour target ending at 14:54 Nairobi
-on 2026-11-01. Progress tables contain only its five active areas.
+The broader KD3 comparison found a separate iterator defect: a finite plan for
+only the first batch let the scheduler report completion without requesting later
+batches. That defect, all 21 cross-adapter cases and 92 required result cells,
+and the full local quality gate remain release blockers. Previously passing
+artifacts retain their original source identities; they do not certify later
+changes to their compiled inputs.
+
+The work is Phase A only. The original four-hour target ending at 14:54 Nairobi
+on 2026-11-01 was missed. Version 0.6.0 remains unreleased.
 
 | Area | Current status | Still needed before deployment |
 | ---- | -------------- | ------------------------------ |
 | Compiler dependencies | ✅ | None |
-| Runtime, SDK, checkpoints/history | 245 ARM tests passed; lint corrections prepared | Recheck lint and finish conformance |
-| Node launcher and admission | Launcher and frame tests passed | Pass the 1/2/4-CPU job matrix |
-| Combined application | Actual fixtures and verified Python/PyArrow inputs prepared | Execute Linux/native rows, refusals and readback |
-| Deployment artifacts | 0.6.0 engine and host tools built | Verify final artifacts and complete release gates |
+| Runtime, SDK, checkpoints/history | Termination regressions and SDK cases passed | Fix iterator delivery; pass full local quality, coverage and Python checks |
+| Node launcher and admission | ✅ | None |
+| Combined application | Image sandbox tests passed; KD3 found missing iterator rows | Pass Linux/native rows, refusals and readback on final source |
+| Deployment artifacts | Normal engine and tools built; 0.6.0 unreleased | Verify final affected artifacts and complete release gates |
 
 ## Resume sequence
 
-1. Build the corrected SDK driver and run the six existing
-   `moruna-event --test records kd3_sink_ack_tests` tests. Preserve the raw log,
-   exact source identity and both unstripped and shipped artifact hashes.
-2. Start a fresh acceptance output with that actual successful producer. Run the
-   five canonical cases in order on 1, 2 and 4 CPUs. Retain strict row counts,
-   identity, sink acknowledgement, budget, deadline and cleanup checks. Stop on
-   the first failure; do not merge old successes across different source inputs.
+1. Fix iterator streaming and add regressions that exercise multiple batches,
+   empty batches and an exception after the first batch. Preserve backpressure
+   and finite-plan behavior for other sources.
+2. Rebuild every artifact whose compiled inputs change. Rerun affected SDK and
+   sandbox checks on those artifacts; retain all original producer identities.
 3. Complete all 21 cross-adapter cases and 92 required result cells. Native sink
-   readback stays in the original admitted scope and reads the actual acknowledged
-   objects through canonical source adapters.
-4. Run local ARM Linux and x86 QEMU execution checks. No remote KVM server is
-   available; do not label emulated results as KVM execution. Complete the canonical
-   CI and release gates before publishing 0.6.0.
+   readback reads actual acknowledged objects through canonical source adapters.
+   Stop on failures; do not combine stale successes to claim final acceptance.
+4. Pass the full unmodified local `tools/quality/check.sh`, including its coverage
+   floor and the fresh free-threaded Python wheel suite. Only then push the final
+   integration and complete canonical CI and publication of 0.6.0.
+
+Local acceptance uses ARM Linux and x86 QEMU TCG. No remote KVM server is
+available; emulated results do not establish native KVM execution. The original
+Griot VM remains stopped with the human's authorization. Return the shared heavy
+test slot to the Griot chat explicitly when local heavy checks finish.
 
 Canonical repository entry points are `kernel/tools/build.sh`,
 `kernel/node/tools/proof.py`, `kernel/node/tools/io-proof.py`, and their existing
 configure/package tools. The [proof lab](../tools/proof-lab/README.md) preserves
-the exact private orchestration code and its historical input constraints.
-Use `tools/quality/check.sh --fast` for the normal pre-commit gate and
-`tools/quality/check.sh` for the normal pre-push gate. Publishing this integration
-snapshot does not itself mark those execution or deployment gates complete.
+historical orchestration and input constraints. Use the normal full pre-push gate
+for release; the earlier WIP hook bypass was not a release quality waiver.
 
 ## Consolidation checks
 

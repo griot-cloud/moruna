@@ -227,6 +227,11 @@ pub(crate) fn drive(
     let mut cx = Context::from_waker(&waker);
     let mut inflight: Vec<InFlight<'_>> = Vec::new();
     let mut replacing: HashSet<(StageId, Seq)> = HashSet::new();
+    let mut stream_read: Option<BoxFuture<'_, Result<Option<Payload>>>> = None;
+    let mut stream_charge = source
+        .plan
+        .first()
+        .map_or(0, |split| split.uncompressed_bytes.saturating_mul(2));
     let mut recomputed = false;
     // The most a read has come to over its split's estimate, which scales the next read's
     // admission (f.5).
@@ -242,22 +247,39 @@ pub(crate) fn drive(
             &mut learned,
             &mut cx,
         );
+        if let Some(future) = stream_read.as_mut()
+            && let Poll::Ready(result) = future.as_mut().poll(&mut cx)
+        {
+            stream_read = None;
+            shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
+            if let Ok(Some(payload)) = &result {
+                stream_charge = payload.bytes().saturating_mul(2);
+            }
+            match publish_stream(&shared, source, result) {
+                Ok(()) | Err(MorunaError::Cancelled) => {}
+                Err(error) => crate::policy::terminate(&shared, error),
+            }
+            worked = true;
+        }
         // The owner of the futures keeps polling their original completions. Only after
         // the final result has reached placement can it acknowledge a stable source cursor.
         if shared.checkpoint_pause.load(Ordering::SeqCst) && mode != DRIVE_STOP {
-            source
-                .checkpoint_paused
-                .store(inflight.is_empty(), Ordering::SeqCst);
+            source.checkpoint_paused.store(
+                inflight.is_empty() && stream_read.is_none(),
+                Ordering::SeqCst,
+            );
             parker.park_timeout(Duration::from_millis(1));
             continue;
         }
         source.checkpoint_paused.store(false, Ordering::SeqCst);
-        while let Ok(request) = helper_rx.try_recv() {
+        while stream_read.is_none()
+            && let Ok(request) = helper_rx.try_recv()
+        {
             service_helper(&shared, source, request, &parker, &mut cx);
             worked = true;
         }
         if mode == DRIVE_STOP {
-            if inflight.is_empty() {
+            if inflight.is_empty() && stream_read.is_none() {
                 break;
             }
         } else if mode == DRIVE_DRIVING
@@ -265,13 +287,42 @@ pub(crate) fn drive(
             && !shared.is_cancelled()
             && !shared.has_exit()
         {
-            if !recomputed {
-                recomputed = true;
-                recompute(&shared, source, &parker, &mut cx);
+            if source.source.streaming() {
+                // One original pull at a time, only after its previous output has left Q0.
+                // Unknown batch sizes remain subject to the real arena allocator's limit.
+                if stream_read.is_none()
+                    && !source.exhausted.load(Ordering::SeqCst)
+                    && source
+                        .outputs
+                        .iter()
+                        .all(|&q| shared.queue_count(q) == 0 && !shared.placement.is_full(q))
+                    && !shared.sinks.iter().any(|end| {
+                        end.sink
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_stalled()
+                    })
+                    && arena_admits(&shared, &[], stream_charge)
+                {
+                    shared.source_reading(source);
+                    shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
+                    stream_read = Some(
+                        source
+                            .source
+                            .read_next(shared.alloc.as_ref(), tier0(&shared)),
+                    );
+                    worked = true;
+                }
+            } else {
+                if !recomputed {
+                    recomputed = true;
+                    recompute(&shared, source, &parker, &mut cx);
+                }
+                worked |=
+                    issue_replacements(&shared, source, &mut inflight, &mut replacing, learned);
+                worked |= issue_reads(&shared, source, &mut inflight, learned);
+                close_when_exhausted(&shared, source, &inflight);
             }
-            worked |= issue_replacements(&shared, source, &mut inflight, &mut replacing, learned);
-            worked |= issue_reads(&shared, source, &mut inflight, learned);
-            close_when_exhausted(&shared, source, &inflight);
         }
         if !worked {
             parker.park_timeout(Duration::from_millis(1));
@@ -582,7 +633,55 @@ fn close_when_exhausted(shared: &Shared, source: &SourceEnd, inflight: &[InFligh
             return;
         }
     }
-    source.exhausted.store(true, Ordering::SeqCst);
+    close_source(shared, source);
+}
+
+/// A streaming cursor counts actual delivered batches and rows, never invented plan rows.
+fn publish_stream(
+    shared: &Shared,
+    source: &SourceEnd,
+    result: Result<Option<Payload>>,
+) -> Result<()> {
+    match result {
+        Ok(None) => {
+            close_source(shared, source);
+            Ok(())
+        }
+        Ok(Some(payload)) => {
+            let (rows, bytes) = (payload.rows(), payload.bytes());
+            let (seq, origin) = {
+                let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                let seq = cursor.next_seq;
+                cursor.next_seq += 1;
+                let start = cursor.row_offset;
+                cursor.row_offset = start.saturating_add(rows);
+                (
+                    seq,
+                    Origin {
+                        split: 0,
+                        row_start: start,
+                        row_end: cursor.row_offset,
+                        node: shared.cfg.node,
+                    },
+                )
+            };
+            crate::decide::admit_push(
+                shared,
+                &source.outputs,
+                Morsel::new(seq, 0, payload, origin),
+                None,
+            )?;
+            shared.source_pushed(source, rows, bytes);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn close_source(shared: &Shared, source: &SourceEnd) {
+    if source.exhausted.swap(true, Ordering::SeqCst) {
+        return;
+    }
     if shared
         .sources
         .iter()
@@ -651,6 +750,44 @@ fn service_helper(
     cx: &mut Context<'_>,
 ) {
     let reply: Sender<Result<()>> = request.reply;
+    if source.source.streaming() {
+        if source.exhausted.load(Ordering::SeqCst)
+            || source
+                .outputs
+                .iter()
+                .any(|&q| shared.queue_count(q) != 0 || shared.placement.is_full(q))
+            || shared.sinks.iter().any(|end| {
+                end.sink
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_stalled()
+            })
+            || !arena_admits(
+                shared,
+                &[],
+                source
+                    .plan
+                    .first()
+                    .map_or(0, |split| split.uncompressed_bytes.saturating_mul(2)),
+            )
+        {
+            let _ = reply.send(Err(MorunaError::Plan(
+                "the streaming source cannot admit a probe read now".into(),
+            )));
+            return;
+        }
+        let mut future = source
+            .source
+            .read_next(shared.alloc.as_ref(), tier0(shared));
+        shared.source_reading(source);
+        shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
+        let result = block_on(&mut future, parker, cx);
+        shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
+        let answer = publish_stream(shared, source, result);
+        let _ = reply.send(answer);
+        return;
+    }
+
     let Some((index, rows, seq, whole)) = take_next_range(shared, source, Some(request.bytes))
     else {
         let _ = reply.send(Err(MorunaError::Plan(

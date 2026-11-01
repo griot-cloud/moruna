@@ -38,7 +38,9 @@ pub struct RowRange {
 pub trait Source: Send + Sync {
     /// The schema of this source's output.
     fn schema(&self) -> SourceSchema;
-    /// All splits, in delivery order, before any read. Called once per run; on a
+    /// All finite splits, in delivery order, before any read. Streaming sources instead
+    /// return an initial size estimate and end only when `read_next` returns `None`.
+    /// Called once per run; on a
     /// resumed run the result must equal the plan recorded in the manifest
     /// (checked by a digest over split ids and row counts, placement e.5; a
     /// mismatch is `Resume`).
@@ -60,6 +62,25 @@ pub trait Source: Send + Sync {
         alloc: &'a dyn Allocator,
         tier: Tier,
     ) -> BoxFuture<'a, crate::Result<Payload>>;
+    /// Opt in to one-at-a-time streaming reads instead of exhausting the finite plan.
+    /// Such sources must be non-repeatable; their plan is only an initial size estimate.
+    fn streaming(&self) -> bool {
+        false
+    }
+    /// Pull one batch. Only `None` means EOF: an empty batch is still a batch.
+    /// The scheduler retains and drains this original future before stopping the drive.
+    fn read_next<'a>(
+        &'a self,
+        _alloc: &'a dyn Allocator,
+        _tier: Tier,
+    ) -> BoxFuture<'a, crate::Result<Option<Payload>>> {
+        Box::pin(async {
+            Err(crate::MorunaError::Config {
+                name: "source",
+                msg: "this finite source does not support streaming reads".into(),
+            })
+        })
+    }
     /// True when `plan` and `read` satisfy CT-I12. A source that pulls from a
     /// one-shot iterator returns false; the runtime then disables Q0 eviction
     /// (stages Q0 instead) and refuses `resume` for the run. Default true, which

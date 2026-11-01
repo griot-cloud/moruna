@@ -1,8 +1,8 @@
 """The tensor path, end to end: a safetensors file through a tensor kernel to a safetensors file.
 
 Every part of this path was built and tested on its own with fakes, and until 2026-09-29 nothing
-had run them together: the one round-trip test (SI-T10) had been ignored since wave 3 with an
-`unimplemented!()` body. The first real run completed first time; this test keeps it that way.
+had run them together: the one round-trip test (SI-T10) had been ignored since wave 3 with a
+placeholder body. The first real run completed first time; this test keeps it that way.
 
 The input file is written by hand rather than with the `safetensors` package, so the suite gains no
 dependency: the format is an 8-byte little-endian header length, a JSON header naming each tensor's

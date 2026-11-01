@@ -1,6 +1,6 @@
 //! `PyIteratorSource`: a Python iterator of `pyarrow.RecordBatch` objects (f.5).
 //!
-//! The one source that cannot promise SO-I6 or SO-I8: it plans one split per pulled batch and
+//! The one source that cannot promise SO-I6 or SO-I8: it streams one batch per pull and
 //! cannot re-pull, so it reports `sub_splittable = false` and `repeatable() == false`, the run
 //! over it is not resumable, and the facade disables Q0 eviction for it (PL-I6).
 //!
@@ -146,6 +146,9 @@ impl Source for PyIteratorSource {
                 return Ok(plan.clone());
             }
         }
+        if Self::lock(&self.state).exhausted {
+            return Ok(Vec::new());
+        }
         let pulled = self.pull()?;
         let mut state = PyIteratorSource::lock(&self.state);
         let splits = match pulled {
@@ -174,6 +177,38 @@ impl Source for PyIteratorSource {
     ) -> BoxFuture<'_, Result<Payload>> {
         let outcome = self.read_now(split, alloc, tier);
         Box::pin(async move { outcome })
+    }
+
+    fn streaming(&self) -> bool {
+        true
+    }
+
+    fn read_next<'a>(
+        &'a self,
+        alloc: &'a dyn Allocator,
+        tier: Tier,
+    ) -> BoxFuture<'a, Result<Option<Payload>>> {
+        Box::pin(async move {
+            if Self::lock(&self.state).exhausted {
+                return Ok(None);
+            }
+            let ahead = Self::lock(&self.state).ahead.take();
+            let batch = match ahead {
+                Some(batch) => batch,
+                None => match self.pull()? {
+                    Some(batch) => batch,
+                    None => {
+                        Self::lock(&self.state).exhausted = true;
+                        return Ok(None);
+                    }
+                },
+            };
+            Counters::add(&self.counters.reads, 1);
+            let (batch, copied) = crate::parquet::decode_copy::copy_batch(&batch, alloc, tier)?;
+            Counters::add(&self.counters.decode_bytes, copied);
+            alloc.note_payload_copy(copied);
+            Payload::table(batch).map(Some)
+        })
     }
 
     fn repeatable(&self) -> bool {

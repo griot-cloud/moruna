@@ -317,3 +317,42 @@ def test_a_killed_run_resumes_into_a_sink_that_checkpoints(scratch: pathlib.Path
             ids.extend(reader.read_all().column("id").to_pylist())
     assert sorted(ids) == list(range(40 * 500)), "every row exactly once"
     assert os.path.isdir(staging)
+
+
+@pytest.mark.parametrize("sizes", [[], [0, 17, 240], [17, 240]])
+def test_iterator_stream_reaches_real_eof(sizes: list[int], staging: dict[str, object]) -> None:
+    """The finite estimate of batch one must not terminate the streaming source."""
+    table = _table().slice(0, sum(sizes))
+    batch = table.combine_chunks().to_batches()[0] if sum(sizes) else None
+    schema = _table().schema
+    pulled = []
+
+    def batches():
+        offset = 0
+        for size in sizes:
+            pulled.append(size)
+            if size:
+                yield batch.slice(offset, size)
+            else:
+                yield pa.RecordBatch.from_arrays([pa.array([], type=f.type) for f in schema], schema=schema)
+            offset += size
+
+    sink = CollectSink()
+    report = moruna.run(moruna.IteratorSource(batches(), schema=schema), [], sink, ordered=True, **staging)
+    assert report.exit == "Completed", report
+    assert sink.ids == list(range(sum(sizes)))
+    assert sink.finished == 1
+    assert pulled == sizes
+
+
+def test_iterator_failure_after_first_batch_is_not_eof(staging: dict[str, object]) -> None:
+    batch = _table().slice(0, 17).combine_chunks().to_batches()[0]
+
+    def batches():
+        yield batch
+        raise ConnectionError("iterator failed after first batch")
+
+    sink = CollectSink()
+    with pytest.raises(moruna.IoError, match="ConnectionError: iterator failed after first batch"):
+        moruna.run(moruna.IteratorSource(batches(), schema=batch.schema), [], sink, **staging)
+    assert sink.finished == 0
