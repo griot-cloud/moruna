@@ -97,8 +97,8 @@ fn main() -> Result<()> {
     }
     let mut selected = None;
     let mut actual_job = None;
-    let mut options = args[4..].chunks_exact(2);
-    for option in &mut options {
+    let (options, remainder) = args[4..].as_chunks::<2>();
+    for option in options {
         match option[0].as_str() {
             "--case" if selected.is_none() => {
                 let case = option[1].parse::<usize>()?;
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
             _ => return Err("unknown/duplicate peer option".into()),
         }
     }
-    if !options.remainder().is_empty() || actual_job.is_some() && selected.is_none() {
+    if !remainder.is_empty() || actual_job.is_some() && selected.is_none() {
         return Err("--job requires one exact --case; every option requires a value".into());
     }
     let mut log = fs::File::create(&args[0])?;

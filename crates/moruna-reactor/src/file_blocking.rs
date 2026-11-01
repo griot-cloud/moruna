@@ -162,6 +162,18 @@ pub(crate) fn set_nocache(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Verify the actual owned descriptor's direct flag when binding a strict raw capability.
+#[cfg(target_os = "linux")]
+pub(crate) fn direct_flag(fd: &OwnedFd) -> io::Result<bool> {
+    // SAFETY: F_GETFL reads flags of the live borrowed descriptor and uses no pointer.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags & libc::O_DIRECT != 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,17 +256,5 @@ mod tests {
         assert_ne!(thread, caller, "the work does not run on the caller");
         assert!(buf.iter().all(|b| *b == 9));
         fs::remove_dir_all(&dir).ok();
-    }
-}
-
-/// Verify the actual owned descriptor's direct flag when binding a strict raw capability.
-#[cfg(target_os = "linux")]
-pub(crate) fn direct_flag(fd: &OwnedFd) -> io::Result<bool> {
-    // SAFETY: F_GETFL reads flags of the live borrowed descriptor and uses no pointer.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(flags & libc::O_DIRECT != 0)
     }
 }

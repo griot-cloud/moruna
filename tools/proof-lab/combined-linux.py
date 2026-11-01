@@ -33,6 +33,12 @@ printf '%s  /tmp/moruna-source.tar\n' "$archive_sha" | sha256sum -c -
 mkdir -p /proof/source /proof/cargo
 tar -xf /tmp/moruna-source.tar -C /proof/source
 cd /proof/source
+if [ "$phase" = kd3-prepare-linux ]; then
+  # Execution-only: never invalidate or build the retained Cargo artifact cache.
+  python3 /tmp/kd3-prepare-linux.py "$token" __KD3_PREPARE_SECONDS__
+  printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
+  exit 0
+fi
 test -f Cargo.lock
 test -f .cargo/config.toml
 test -d vendor
@@ -352,8 +358,25 @@ class CombinedRun(module.Ke2Run):
             if gnu:
                 self.guest_script=self.guest_script.replace('--target aarch64-unknown-linux-gnu','--target x86_64-unknown-linux-gnu').replace("['--target','aarch64-unknown-linux-gnu']","['--target','x86_64-unknown-linux-gnu']")
 
+        if options.phase == 'kd3-prepare-linux':
+            self.memory = 6
+            self.measurement_scope = 'Actual canonical KD3 assets and Linux41 executions/46 receipts only; native matrix unexecuted'
+            loaded = importlib.util.spec_from_file_location('kd3_prepare_inputs', ROOT/'kd3-prepare-linux.py')
+            prepare = importlib.util.module_from_spec(loaded);loaded.loader.exec_module(prepare)
+            config, mounts, self.kd3_fingerprints, self.kd3_prepare_refs = prepare.host_inputs(options.kd3_prepare_inputs, inputs, ROOT)
+            self.attachments.extend(mounts)
+            payload = {'kd3-prepare-linux.py':(ROOT/'kd3-prepare-linux.py').read_text(),
+                       'kd3-fixture-producer.py':(ROOT/'kd3-fixture-producer.py').read_text(),
+                       'kd3-prepare-inputs.json':json.dumps(config)}
+            self.runner_files += ('kd3-prepare-linux.py','kd3-fixture-producer.py')
+            encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+            prefix = "set -euo pipefail\npython3 - <<'PY_KD3_PREPARE'\nimport base64,json,pathlib\nfor name,text in json.loads(base64.b64decode("+repr(encoded)+")).items():\n pathlib.Path('/tmp',name).write_text(text)\nPY_KD3_PREPARE\n"
+            self.guest_script = prefix + self.guest_script.replace('__KD3_PREPARE_SECONDS__', str(max(1,options.seconds-120)))
+
 
     def call(self, arguments, *args, **kwargs):
+        if self.options.phase == 'kd3-prepare-linux' and arguments and arguments[0] == 'create':
+            arguments = [arguments[0], '--cap-add', 'CAP_SYS_ADMIN', *arguments[1:]]
         result = super().call(arguments, *args, **kwargs)
         if self.options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools') and len(arguments) > 4 and arguments[:4] == ['exec', self.name, '/bin/bash', '-c'] and arguments[4] == self.guest_script:
             require(self.owned() is not None, 'owned witness VM missing before artifact collection')
@@ -383,11 +406,64 @@ class CombinedRun(module.Ke2Run):
             for path,expected in self.kd3_fingerprints:
                 z=module.private_file(path).stat();require((z.st_dev,z.st_ino,z.st_uid,z.st_size,z.st_mtime_ns)==expected,'KD3 immutable input changed')
             tool_module.load_bundle(self.options.tools_bundle)
+        if self.options.phase == 'kd3-prepare-linux':
+            # The sole added capability is required by the real child sandbox's
+            # mount-namespace setup. Other phases retain the no-capability rule.
+            record = module.Run.owned(self, cleanup=cleanup)
+            if record is not None:
+                config = record['configuration']
+                require(config.get('capAdd') == ['CAP_SYS_ADMIN'] and not config.get('capDrop'),
+                        'preparation VM must add EXACT CAP_SYS_ADMIN and preserve default capabilities')
+                approved = dict(config);approved['capAdd'] = []
+                module.validate_inspect(approved, self.attachments)
+                validate_cache(self.cache,self.cache['owner_nonce'])
+                require(config['image']['descriptor']['digest'] == self.pins['index']
+                        and config['platform'] == {'os':'linux','architecture':'arm64'}
+                        and config['resources']['memoryInBytes'] == 6*1024**3,
+                        'preparation VM image/platform/resource differs')
+            return record
         return super().owned(cleanup=cleanup)
 
 
     def execute(self):
         result=super().execute()
+        if self.options.phase == 'kd3-prepare-linux':
+            receipt = {'collected':False,'phase_passed':False}
+            try:
+                require(json.loads((self.evidence/'summary.json').read_text()).get('cleanup') is True,
+                        'actual VM cleanup required before preparation collection')
+                validate_cache(self.cache,self.cache['owner_nonce'])
+                source = Path(self.cache['path'])/'kd3-prepare'/self.token
+                require(source.is_dir() and not source.is_symlink(),'actual preparation output missing')
+                destination = self.evidence/'kd3-prepared';destination.mkdir(mode=0o700)
+                total=0;count=0
+                for path in sorted(source.rglob('*')):
+                    relative=path.relative_to(source);target=destination/relative
+                    if path.is_dir():
+                        require(not path.is_symlink(),'preparation output directory link');target.mkdir(mode=0o700);continue
+                    image_layer=relative.as_posix().startswith('bundle/layers/stack-') and relative.suffix=='.img'
+                    limit=2*1024**3 if image_layer else 512*1024**2
+                    info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1 and info.st_size<=limit,'preparation output type/size/owner differs')
+                    total+=info.st_size;count+=1;require(total<=8*1024**3 and count<=60000,'preparation collection bounds')
+                    shutil.copy2(path,target);require(module.sha(path)==module.sha(target),'preparation collection SHA differs')
+                report=json.loads((destination/'report.json').read_text());receipt['actual']=report;receipt['collected']=True
+                if result==0:
+                    require(report.get('passed') is True and report.get('linux_processes')==41 and report.get('linux_phase_receipts')==46 and report.get('native_executed')==0,'actual Linux41/46 required')
+                    loaded=importlib.util.spec_from_file_location('kd3_prepare_collector',ROOT/'kd3-prepare-linux.py')
+                    prepare=importlib.util.module_from_spec(loaded);loaded.loader.exec_module(prepare)
+                    expected=json.loads((destination/'bundle-manifest.json').read_text())
+                    require(prepare.census(destination/'bundle')==expected,'complete prepared bundle custody differs')
+                    plan={'version':1,'root':str(destination/'bundle'),'manifest':str(destination/'bundle-manifest.json'),
+                          'producers':{role:self.kd3_prepare_refs[role] for role in ('arm','gnu')},
+                          'cells':'cells.json','matrix':'matrix.json','launcher':'host/kd3-fixture-boot',
+                          'image_record':'layers/image.record','image_digest':'layers/image.digest',
+                          'layer_list':'layers/stack.layers','layer_dir':'layers','linux_results':'linux-results',
+                          'matrix_validator':'kd3-matrix.py','matrix_validator_source_manifest':self.kd3_prepare_refs['source_manifest']}
+                    (destination/'PLAN.json').write_text(json.dumps(plan,indent=2)+'\n')
+                    receipt['phase_passed']=True;receipt['plan']=str(destination/'PLAN.json')
+            except BaseException as error:receipt['error']=type(error).__name__+': '+str(error);result=1
+            (self.evidence/'kd3-prepared-artifacts.json').write_text(json.dumps(receipt,indent=2)+'\n')
+            return result
         if self.options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
             record={'collected':False,'files':[]}
             try:
@@ -736,13 +812,14 @@ printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu'), default='check')
+    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
     parser.add_argument('--inputs', required=True)
     parser.add_argument('--archive', required=True)
     parser.add_argument('--cache-journal')
     parser.add_argument('--reuse-summary')
     parser.add_argument('--reuse-transition')
     parser.add_argument('--tools-bundle', required=True)
+    parser.add_argument('--kd3-prepare-inputs')
     parser.add_argument('--kd3-python-bundle')
     parser.add_argument('--kd3-gnu-bundle')
     parser.add_argument('--cross-bundle', default=str(ROOT/'cross-tools-archive-1u_y3fit/bundle.json'))
@@ -750,7 +827,7 @@ def main():
     parser.add_argument('--seconds', type=int, default=120)
     options = parser.parse_args()
     options.mode = 'combined-linux'
-    maximum=1050 if options.phase=='personality-artifacts' else 1100 if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu') else 600
+    maximum=1050 if options.phase=='personality-artifacts' else 1100 if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux') else 600
     require(30 <= options.seconds <= maximum, 'Combined stage exceeds its explicit phase bound')
     inputs = json.loads(module.private_file(options.inputs).read_text())
     archive = module.private_file(options.archive)
@@ -758,6 +835,7 @@ def main():
                            max_files=50000, max_bytes=800 * 1024 * 1024)
     if options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
         require(options.kd3_python_bundle and (not options.phase.endswith('-gnu') or options.kd3_gnu_bundle),'explicit official Python/GNU target bundle required')
+    if options.phase=='kd3-prepare-linux':require(options.kd3_prepare_inputs,'explicit actual preparation inputs required')
     if not options.run:
         print(json.dumps({'prepared_only': True, 'phase': options.phase, 'source_archive_sha256': inputs['archive_sha256']}))
         return 0

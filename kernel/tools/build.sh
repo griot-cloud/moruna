@@ -58,9 +58,16 @@ RUSTFLAGS="$flags" cargo build --release --locked --target "$target" "${build_st
 # unified into them; each program is linked static with the user linker script, whose
 # segments are what the kernel's loader takes (SDD 20, f.2). A new program needs no
 # change here.
+# Match the separately exercised native-link invocation and retain exact toolchain
+# and argv evidence if Cargo rejects the custom target before compiling a crate.
+rustup run nightly-2026-07-21 cargo --version
+rustup run nightly-2026-07-21 rustc --version
+set -x
 RUSTFLAGS="$flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-arg=-static" \
-  cargo -Zunstable-options -Zjson-target-spec build --release --locked --target "$user_target" "${build_std[@]}" --workspace \
+  rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
+  -Zunstable-options -Zjson-target-spec "${build_std[@]}" --workspace \
   --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image
+set +x
 
 bin="${CARGO_TARGET_DIR:-$kernel/target}/$user_target_name/release"
 kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"

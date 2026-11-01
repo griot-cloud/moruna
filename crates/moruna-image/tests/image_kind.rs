@@ -159,8 +159,11 @@ fn run_settings(
 ) -> Result<moruna_runtime::RunReport, String> {
     let _serial = RUNS.lock().unwrap_or_else(|e| e.into_inner());
     let job = document(scratch.path(), layout, settings);
+    let job = moruna_job::Job::from_v1(&job);
+    let plan = moruna_runtime::job::plan::default_plan(&job).map_err(|e| e.to_string())?;
     let built = build(
-        &moruna_job::Job::from_v1(&job),
+        &job,
+        &plan,
         &Registry::standard(),
         BuildOptions {
             strict: true,

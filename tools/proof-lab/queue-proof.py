@@ -14,17 +14,18 @@ def main():
     p.add_argument('--runner',choices=['std','personality','kernel','native','native-fpu','native-inventory','native-link'],required=True)
     p.add_argument('--phase',default='check');p.add_argument('--inputs',required=True);p.add_argument('--archive',required=True)
     p.add_argument('--origin-proof',metavar='ACTUAL_IMAGE_TOOLS_SUMMARY');p.add_argument('--layers-tests-kernel-inputs')
-    p.add_argument('--kd3-python-bundle');p.add_argument('--kd3-gnu-bundle')
+    p.add_argument('--kd3-prepare-inputs');p.add_argument('--kd3-python-bundle');p.add_argument('--kd3-gnu-bundle')
     p.add_argument('--tools-bundle');p.add_argument('--cache-journal');p.add_argument('--reuse-summary');p.add_argument('--reuse-transition')
     p.add_argument('--cross-bundle',default=str(ROOT/'cross-tools-archive-1u_y3fit/bundle.json'));p.add_argument('--rust-bundle',default=str(ROOT/'rust-musl-component/musl-target-vgegt4ot/bundle.json'))
     p.add_argument('--seconds',type=int,default=600);p.add_argument('--wait-seconds',type=int,default=1800)
-    options=p.parse_args();maximum=1050 if options.runner=='personality' else 1100 if options.runner=='std' and options.phase in ('witness-tests','sdk-proof-build','boot-host-tools','phase-a-tests','kd3-fixture-tools-arm','kd3-fixture-tools-gnu') else 600
+    options=p.parse_args();maximum=1050 if options.runner=='personality' else 1100 if options.runner=='std' and options.phase in ('witness-tests','sdk-proof-build','boot-host-tools','phase-a-tests','kd3-fixture-tools-arm','kd3-fixture-tools-gnu','kd3-prepare-linux') else 600
     require(60<=options.seconds<=maximum and 60<=options.wait_seconds<=3600,'bounded stage/queue duration required')
     require(not(options.runner=='std' and options.phase=='personality-artifacts'),'use explicit personality runner/cache for musl artifacts')
     require(not options.layers_tests_kernel_inputs or options.runner=='personality','focused layers tests belong only to personality producer')
     require(not options.origin_proof or options.runner=='native-link','optional origin proof belongs only to native-link')
     if options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
         require(options.runner=='std' and options.kd3_python_bundle and (not options.phase.endswith('-gnu') or options.kd3_gnu_bundle),'KD3 fixture builds require explicit std producer/Python/GNU inputs')
+    if options.phase=='kd3-prepare-linux':require(options.runner=='std' and options.kd3_prepare_inputs,'explicit std preparation inputs required')
     os.umask(0o077)
     if options.runner=='personality':
         module=load('combined-linux');helper=module.module;cls=module.PersonalityRun
