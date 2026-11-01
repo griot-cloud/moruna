@@ -123,7 +123,10 @@ fn threads(c: &mut linux::Client, cpus: usize) -> Result<String, String> {
 fn dynamic(c: &mut linux::Client) -> Result<String, String> {
     let r = run_program(c, &["/kc1/bin/dynamic"])?;
     exited_zero(&r, "dynamic")?;
-    if !r.text.contains("dynamic glibc ")
+    if !r
+        .text
+        .contains("dynamic: readlink non-link, missing, real target and canonical path ok")
+        || !r.text.contains("dynamic glibc ")
         || !r.text.contains("hello through ld-linux")
         || !r
             .text

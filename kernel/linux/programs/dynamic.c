@@ -1,6 +1,7 @@
 /* LX-T12: a dynamically linked glibc program, started through its interpreter
    (ld-linux-x86-64.so.2) from the image's Debian layer. */
 #include <gnu/libc-version.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <stdio.h>
@@ -40,7 +41,38 @@ static int readonly_mapping_regression(void) {
     return 0;
 }
 
+static int readlink_regression(void) {
+    char target[4096];
+    const char *paths[] = {"/kc1/bin/dynamic", "/kc1/bin", "/kc1/no-such-readlink-fixture"};
+    const int errors[] = {EINVAL, EINVAL, ENOENT};
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; ++i) {
+        errno = 0;
+        if (readlink(paths[i], target, sizeof target) != -1 || errno != errors[i]) return 1;
+        errno = 0;
+        if (readlinkat(AT_FDCWD, paths[i], target, sizeof target) != -1 || errno != errors[i]) return 2;
+    }
+    int dir = open("/kc1/bin", O_RDONLY | O_DIRECTORY);
+    if (dir < 0) return 3;
+    errno = 0;
+    if (readlinkat(dir, "dynamic", target, sizeof target) != -1 || errno != EINVAL) return 4;
+    errno = 0;
+    if (readlinkat(dir, "no-such-readlink-fixture", target, sizeof target) != -1 || errno != ENOENT) return 5;
+    if (close(dir)) return 6;
+    const char *exe = "/kc1/bin/dynamic";
+    ssize_t n = readlink("/proc/self/exe", target, sizeof target);
+    if (n != (ssize_t)strlen(exe) || memcmp(target, exe, (size_t)n)) return 7;
+    n = readlinkat(AT_FDCWD, "/proc/self/exe", target, sizeof target);
+    if (n != (ssize_t)strlen(exe) || memcmp(target, exe, (size_t)n)) return 8;
+    char *canonical = realpath("/kc1/bin/dynamic", NULL);
+    if (!canonical || strcmp(canonical, exe)) return 9;
+    free(canonical);
+    puts("dynamic: readlink non-link, missing, real target and canonical path ok");
+    return 0;
+}
+
 int main(void) {
+    int link = readlink_regression();
+    if (link) { fprintf(stderr, "dynamic: readlink regression failed %d\n", link); return 1; }
     int mapping = readonly_mapping_regression();
     if (mapping) { fprintf(stderr, "dynamic: mapping regression failed %d\n", mapping); return 1; }
     char *copy = strdup("through ld-linux");

@@ -1187,14 +1187,29 @@ impl Task {
         let target = if full == b"/proc/self/exe" {
             self.exe.clone()
         } else {
-            self.fs
-                .readlink(FsBytes(full))
-                .map_err(|e| match files::errno_of(e) {
-                    // A path that is not a link: Linux says so with EINVAL.
-                    errno::EOPNOTSUPP => errno::EINVAL,
-                    other => other,
-                })?
-                .0
+            match self.fs.readlink(FsBytes(full.clone())) {
+                Ok(target) => target.0,
+                Err(moruna_svc::CallError::Remote(imagefs::Error::BadPath)) => {
+                    // imagefs uses BadPath for an existing non-link as well as a
+                    // malformed path. Linux realpath relies on EINVAL only for
+                    // the former; stat without following preserves missing/error cases.
+                    let stat = self
+                        .fs
+                        .stat(FsBytes(full), false)
+                        .map_err(files::errno_of)?;
+                    return Err(if stat.kind != kind::SYMLINK {
+                        errno::EINVAL
+                    } else {
+                        errno::ENOENT
+                    });
+                }
+                Err(error) => {
+                    return Err(match files::errno_of(error) {
+                        errno::EOPNOTSUPP => errno::EINVAL,
+                        other => other,
+                    });
+                }
+            }
         };
         let n = target.len().min(size as usize);
         memory::write(&self.process, buf, &target[..n])?;
