@@ -97,13 +97,13 @@ pub struct Task {
     pub plane_slots: Vec<(Handle, bool)>,
 }
 
-/// Writes the reply to call `token` on the forward; `false` when the channel is gone. A
-/// call answered later sends nothing now.
-fn send_reply(channel: &Channel, token: u64, answer: Answer) -> bool {
+/// Writes the reply to call `token`, preserving the actual transport refusal.
+/// A call answered later sends nothing now.
+fn send_reply(channel: &Channel, token: u64, answer: Answer) -> Result<(), moruna_svc::Error> {
     let mut out = [0u8; reply::SIZE];
     write_u64(&mut out, reply::TOKEN, token);
     match answer {
-        Answer::Later => return true,
+        Answer::Later => return Ok(()),
         Answer::Value(v) => {
             write_u64(&mut out, reply::VALUE, v);
             write_u64(&mut out, reply::ACTION, reply::RETURN);
@@ -121,19 +121,15 @@ fn send_reply(channel: &Channel, token: u64, answer: Answer) -> bool {
     }
     loop {
         match channel.write_with(&out, &mut []) {
-            Ok(()) => return true,
+            Ok(()) => return Ok(()),
             Err(moruna_svc::Error::ShouldWait) => {
-                if moruna_svc::wait_one(
+                moruna_svc::wait_one(
                     &channel.0,
                     Signals::WRITABLE | Signals::PEER_CLOSED,
                     moruna_svc::DEADLINE_INFINITE,
-                )
-                .is_err()
-                {
-                    return false;
-                }
+                )?;
             }
-            Err(_) => return false,
+            Err(cause) => return Err(cause),
         }
     }
 }
@@ -443,7 +439,7 @@ impl Task {
             }
             self.served += 1;
             let answer = self.call(token, threads, number, args);
-            if !send_reply(channel, token, answer) {
+            if send_reply(channel, token, answer).is_err() {
                 return;
             }
         }
@@ -451,11 +447,28 @@ impl Task {
 
     /// Answers a call that blocked, on the task's forward.
     pub fn answer_later(&mut self, token: u64, answer: Answer) {
-        if !send_reply(&self.forward, token, answer) {
-            println!(
-                self.out().out,
-                "linux: {}: FAIL: a blocked call's answer could not be sent", self.name
-            );
+        match send_reply(&self.forward, token, answer) {
+            Ok(()) => {}
+            Err(moruna_svc::Error::PeerClosed) => {
+                // This is the dedicated kernel-owned forward, never a caller's
+                // arbitrary channel. Process::thread_ended marks Life::Ended
+                // BEFORE terminate drops its sole forward endpoint. Thus this
+                // exact refusal proves the recipient ended, even while its
+                // memory/plane drain precedes the final TERMINATED signal.
+                // Do not claim resource retirement or complete another call.
+                println!(
+                    self.out().out,
+                    "linux: {}: blocked reply discarded: recipient forward closed", self.name
+                );
+            }
+            Err(cause) => {
+                println!(
+                    self.out().out,
+                    "linux: {}: FAIL: a blocked call's answer could not be sent: {:?}",
+                    self.name,
+                    cause
+                );
+            }
         }
     }
 

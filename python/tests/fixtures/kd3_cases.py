@@ -285,7 +285,8 @@ def projects(args):
     (args.root / "pex/function.py").write_text("def identity(batch):\n    return batch\n")
     (args.root / "pex/function.yaml").write_text(
         "name: identity\nentry: function:identity\ninput_schema: {x: int64}\noutput_schema: {adds: {}}\n")
-    shutil.copyfile(HERE / "kd3_pex_assets.py", args.root / "pex-assets/function.py")
+    shutil.copyfile(HERE.parents[2] / "crates/moruna-py/tests/fixtures/kd3_pex_assets.py",
+                    args.root / "pex-assets/function.py")
     (args.root / "pex-assets/function.yaml").write_text(
         "name: assets-identity\nentry: function:readonly_identity\ninput_schema: {x: int64}\n"
         "output_schema: {adds: {}}\nhints: {args: true}\n")

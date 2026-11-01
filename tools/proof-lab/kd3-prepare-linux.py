@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Guest-only canonical KD3 preparation and actual Linux execution, never a VM proof."""
+import errno
 import hashlib
 import importlib.util
 import json
@@ -106,10 +107,52 @@ def main():
         require(Path('/sys/fs/cgroup/cgroup.controllers').is_file(), 'real cgroup2 hierarchy required')
         controllers = Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()
         require({'cpu', 'memory'} <= set(controllers), 'real CPU/memory controllers required')
-        # These are the NEW owned VM's actual cgroups, never a host hierarchy.
-        Path('/sys/fs/cgroup/cgroup.subtree_control').write_text('+cpu +memory')
+        # This namespace exposes a delegated parent, not the exempt true root.
+        # Move only its observed setup/init PIDs into our owned host leaf before
+        # enabling domain controllers. The job hierarchy must remain empty.
+        parent = Path('/sys/fs/cgroup')
+        host_leaf = parent / ('moruna-kd3-host-' + token)
+        host_leaf.mkdir(mode=0o700)
+        delegation = {'parent': str(parent), 'self_cgroup_before': Path('/proc/self/cgroup').read_text(),
+                      'controllers_before': (parent / 'cgroup.controllers').read_text(),
+                      'subtree_before': (parent / 'cgroup.subtree_control').read_text(),
+                      'host_leaf': str(host_leaf), 'snapshots': [], 'moves': [],
+                      'host_leaf_lifetime': 'retained until actual owned VM teardown'}
+        report['delegation'] = delegation
+        save()
+        for _ in range(8):
+            pids = [int(value) for value in (parent / 'cgroup.procs').read_text().split()]
+            require(len(pids) <= 256 and all(pid > 0 for pid in pids), 'bounded visible delegated-parent PIDs required')
+            delegation['snapshots'].append(pids)
+            save()
+            if not pids:
+                break
+            for pid in pids:
+                try:
+                    (host_leaf / 'cgroup.procs').write_text(str(pid))
+                    delegation['moves'].append({'pid': pid, 'outcome': 'moved'})
+                except OSError as error:
+                    delegation['moves'].append({'pid': pid, 'errno': error.errno, 'outcome': 'refused'})
+                    save()
+                    if error.errno != errno.ESRCH:
+                        raise
+                    # Only the real exited-process race is tolerated; other
+                    # accounting/permission/write failures stay explicit.
+                    delegation['moves'][-1]['outcome'] = 'exited-before-move'
+                save()
+        require(not (parent / 'cgroup.procs').read_text().strip(), 'delegated parent still has internal processes')
+        (parent / 'cgroup.subtree_control').write_text('+cpu +memory')
         cgroup.mkdir(mode=0o700)
         (cgroup / 'cgroup.subtree_control').write_text('+cpu +memory')
+        delegation.update(parent_procs_after=(parent / 'cgroup.procs').read_text(),
+                          host_procs_after=(host_leaf / 'cgroup.procs').read_text(),
+                          subtree_after=(parent / 'cgroup.subtree_control').read_text(),
+                          job_procs_after=(cgroup / 'cgroup.procs').read_text(),
+                          job_subtree_after=(cgroup / 'cgroup.subtree_control').read_text(),
+                          self_cgroup_after=Path('/proc/self/cgroup').read_text())
+        require(not delegation['parent_procs_after'].strip() and not delegation['job_procs_after'].strip(),
+                'real domain-controller parents must remain empty')
+        save()
         spec = importlib.util.spec_from_file_location('kd3_producer', '/tmp/kd3-fixture-producer.py')
         producer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(producer)
@@ -218,8 +261,26 @@ def main():
         save()
         raise
     finally:
-        if cgroup.exists():
-            cgroup.rmdir()
+        # Setup/init remain in their leaf until the runner tears down THIS VM.
+        # Moving them back would violate the enabled parent's domain rules.
+        delegation = report.get('delegation')
+        try:
+            if cgroup.exists():
+                if delegation is not None:
+                    delegation['job_procs_at_cleanup'] = (cgroup / 'cgroup.procs').read_text()
+                cgroup.rmdir()
+                if delegation is not None:
+                    delegation['job_parent_removed'] = True
+            if delegation is not None:
+                leaf = Path(delegation['host_leaf'])
+                delegation['host_procs_before_vm_teardown'] = (leaf / 'cgroup.procs').read_text()
+                delegation['parent_procs_before_vm_teardown'] = Path('/sys/fs/cgroup/cgroup.procs').read_text()
+                delegation['host_leaf_removed_by_helper'] = False
+                save()
+        except BaseException as error:
+            report['cgroup_cleanup_error'] = type(error).__name__ + ': ' + str(error)
+            save()
+            raise
 
 
 
