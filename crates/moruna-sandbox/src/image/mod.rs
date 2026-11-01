@@ -403,8 +403,8 @@ impl Child {
         self.reap(STOP_GRACE);
     }
 
-    /// The failure of a call or of the end of input, in words: how the process ended when it
-    /// ended, `cause` when it did not. `ended` says the cause is the process being gone (a
+    /// The failure of a call or of the end of input, in words: preserve its actual cause
+    /// alongside any observed process exit. `ended` says the cause is the process being gone (a
     /// closed pipe), so it is waited for; a protocol failure waits only a moment, since a
     /// process that writes what is not Arrow is usually alive.
     fn failed(&mut self, ended: bool, cause: String) -> MorunaError {
@@ -418,10 +418,7 @@ impl Child {
             self.kill();
         }
         let lines = self.tail.lines(STDERR_WAIT);
-        let head = match by_itself {
-            Some(exit) => describe(exit, self.cgroup.oom_kills() > 0, &self.name),
-            None => format!("image `{}`: {cause}", self.name),
-        };
+        let head = failure_head(&self.name, &cause, self.exit, self.cgroup.oom_kills() > 0);
         kernel_error(with_stderr(head, &lines))
     }
 }
@@ -432,6 +429,15 @@ impl Drop for Child {
         if self.exit.is_none() {
             self.kill();
         }
+    }
+}
+
+/// A protocol refusal remains the cause even when the process has already exited
+/// successfully or was killed during cleanup. Exit evidence must never erase it.
+fn failure_head(name: &str, cause: &str, exit: Option<Exit>, oom: bool) -> String {
+    match exit {
+        Some(exit) => format!("{}; {cause}", describe(exit, oom, name)),
+        None => format!("image `{name}`: {cause}"),
     }
 }
 

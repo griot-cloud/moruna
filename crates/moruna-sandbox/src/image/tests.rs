@@ -155,3 +155,22 @@ fn im_t27_the_words_of_a_failure() {
     assert!(quoted.ends_with("  line 29"));
     assert_eq!(quoted.lines().count(), 21);
 }
+
+/// The real parser/refusal cause survives an observed exit, including successful
+/// exits and the SIGKILL used to stop a malformed-output process.
+#[test]
+fn protocol_refusal_is_retained_alongside_actual_process_exit() {
+    let invalid = "its output is not an Arrow IPC stream: invalid continuation marker";
+    let head = failure_head("echo", invalid, Some(Exit::Code(0)), false);
+    assert!(head.contains("exited with status 0"), "{head}");
+    assert!(head.contains(invalid), "{head}");
+
+    let refused = "its output was refused by the engine's check: invalid continuation marker";
+    let head = failure_head("echo", refused, Some(Exit::Signal(libc::SIGKILL)), false);
+    assert!(head.contains("SIGKILL (9)"), "{head}");
+    assert!(head.contains(refused), "{head}");
+    assert_eq!(
+        failure_head("echo", refused, None, false),
+        format!("image `echo`: {refused}")
+    );
+}
