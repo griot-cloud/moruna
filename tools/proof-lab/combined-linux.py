@@ -373,6 +373,7 @@ PY_IMAGE_CLEANUP
     ;;
   sink-termination-tests)
     run_cargo test -p moruna-sinks --test si_reorder termination_ -- --nocapture --test-threads=1
+    run_cargo test -p moruna-scheduler --lib sc_h_termination_retires_ordered_write_waiting_for_failed_lower_sequence -- --nocapture --test-threads=1
     ;;
   ports-tests)
     run_cargo test -p moruna-sinks --test si_parquet portable_checkpoint_flush_ -- --nocapture --test-threads=1

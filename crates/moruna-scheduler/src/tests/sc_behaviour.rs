@@ -673,3 +673,119 @@ fn sc_f8_device_out_of_memory_reaches_the_hook_first() {
     }
     assert_eq!(rig.sink.skipped().len(), 3);
 }
+
+#[test]
+fn sc_h_termination_retires_ordered_write_waiting_for_failed_lower_sequence() {
+    use moruna_kernel::{Allocator, BoxFuture, Payload, RowRange, Sink, Source, Split, Tier};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    // The source owns the sequence assignment. Hold split/sequence zero, while
+    // split one completes normally; no scheduler or placement behavior is faked.
+    struct HoldFirst {
+        inner: FakeSource,
+        release: Arc<AtomicBool>,
+    }
+    impl Source for HoldFirst {
+        fn schema(&self) -> SourceSchema {
+            Source::schema(&self.inner)
+        }
+        fn plan(&self) -> moruna_kernel::Result<Vec<Split>> {
+            self.inner.plan()
+        }
+        fn read<'a>(
+            &'a self,
+            split: &'a Split,
+            rows: Option<RowRange>,
+            alloc: &'a dyn Allocator,
+            tier: Tier,
+        ) -> BoxFuture<'a, moruna_kernel::Result<Payload>> {
+            let held = split.id == 0;
+            let mut inner = self.inner.read(split, rows, alloc, tier);
+            Box::pin(std::future::poll_fn(move |cx| {
+                if held && !self.release.load(Ordering::Acquire) {
+                    // Same cooperative held-read pattern as common::HeldSource.
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                inner.as_mut().poll(cx)
+            }))
+        }
+    }
+    let release = Arc::new(AtomicBool::new(false));
+    let source = Arc::new(HoldFirst {
+        inner: FakeSource::new().splits(2, 1, 8),
+        release: Arc::clone(&release),
+    });
+    let sink = FakeSink::new();
+    let scheduler = Arc::new(
+        Scheduler::new(
+            SchedulerConfig {
+                workers_max: 1,
+                workers_active: 1,
+                read_ahead: 2,
+                initial_morsel_target: 8,
+                morsel_min: 8,
+                ..cfg()
+            },
+            Pipeline::chain(
+                source,
+                // Apply zero sees sequence one and succeeds. Only after its actual
+                // sink future is held do we release sequence zero into apply one.
+                vec![Arc::new(FakeKernel::new().fail_on(&[1]))],
+                SinkHandle::wrap(Box::new(sink.clone()), true, 0),
+            ),
+            Arc::new(FakePlacement::new()),
+            Arc::new(moruna_testkit::FakeAllocator::new()),
+            Arc::new(moruna_testkit::FakeTrace::new().capacity(1 << 14)),
+            Arc::new(moruna_testkit::FakeSampler::new()),
+        )
+        .expect("scheduler"),
+    );
+    let (send, receive) = mpsc::sync_channel(1);
+    let running = Arc::clone(&scheduler);
+    // Deliberately not a scoped thread: on the old regression a failed bounded
+    // receive must fail the test, rather than auto-joining the wedged run.
+    let run = std::thread::spawn(move || {
+        let result = running.run(CancelToken::new());
+        let _ = send.send(result);
+    });
+    let queued = wait_for(Duration::from_secs(5), || {
+        let handle = scheduler.shared().sinks[0]
+            .sink
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        handle.is_stalled() && handle.next_expected() == Some(0)
+    });
+    // Also release on a fixture failure, so the test never leaves a held source
+    // behind. This is a condition handoff, never a timing sleep.
+    release.store(true, Ordering::Release);
+    assert!(queued, "sequence one never reached the real reorder buffer");
+    let outcome = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scheduler termination hung while joining an ordered sink drive")
+        .expect("run");
+    run.join().expect("run thread");
+    let RunOutcome::Terminated { diagnostic, .. } = outcome else {
+        panic!("expected the original kernel failure, got {outcome:?}");
+    };
+    assert!(
+        matches!(diagnostic, MorunaError::Kernel { ref msg, .. }
+        if msg == "FakeKernel::fail_on(1)"),
+        "{diagnostic}"
+    );
+    assert!(
+        sink.written().is_empty(),
+        "queued sequence one entered the inner sink"
+    );
+    assert!(
+        sink.skipped().is_empty(),
+        "failed sequence zero was falsely skipped"
+    );
+    assert_eq!(sink.committed_seq(), None, "no commit ACK was produced");
+    assert_eq!(
+        sink.finish_calls(),
+        0,
+        "termination did not finish the sink"
+    );
+}
