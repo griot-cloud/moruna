@@ -44,7 +44,7 @@ test -f .cargo/config.toml
 test -d vendor
 export CARGO_HOME=/proof/cargo CARGO_TARGET_DIR=/proof/target
 export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
-if [ "$phase" = kd3-fixture-tools-arm ] || [ "$phase" = kd3-fixture-tools-gnu ] || [ "$phase" = witness-tests ] || [ "$phase" = sdk-proof-build ] || [ "$phase" = boot-host-tools ] || [ "$phase" = phase-a-tests ]; then export CARGO_BUILD_JOBS=1; fi
+if [ "$phase" = kd3-fixture-tools-arm ] || [ "$phase" = kd3-fixture-tools-gnu ] || [ "$phase" = witness-tests ] || [ "$phase" = sdk-proof-build ] || [ "$phase" = boot-host-tools ] || [ "$phase" = phase-a-tests ] || [ "$phase" = image-tests ]; then export CARGO_BUILD_JOBS=1; fi
 export LIBCLANG_PATH=/opt/moruna-proof-tools/usr/lib/aarch64-linux-gnu
 export LD_LIBRARY_PATH=/opt/moruna-proof-tools/usr/lib/aarch64-linux-gnu:/opt/moruna-proof-tools/usr/lib/llvm-14/lib
 python3 - <<'PY'
@@ -274,6 +274,103 @@ for rel in ['Cargo.lock','crates/moruna-runtime/src/host/launch_witness.rs','cra
 PY
     test "$witness_status" -eq 0
     ;;
+  image-tests)
+    export MORUNA_SANDBOX_CGROUP="/sys/fs/cgroup/moruna-image-$token"
+    export IMAGE_TEST_OUT="/proof/target/image-tests/$token"
+    mkdir -p /proof/target/image-tests
+    mkdir -m 700 "$IMAGE_TEST_OUT"
+    python3 - "$token" <<'PY_IMAGE_SANDBOX'
+import errno,json,os,subprocess,sys
+from pathlib import Path
+token=sys.argv[1]
+cgroup=Path(os.environ['MORUNA_SANDBOX_CGROUP'])
+receipt=Path(os.environ['IMAGE_TEST_OUT'])/'delegation.json'
+report={'version':1,'phase':'image-tests'}
+def require(ok,why):
+    if not ok:raise RuntimeError(why)
+def save():
+    data=json.dumps(report,sort_keys=True)+'\n'
+    require(len(data)<=512*1024,'bounded actual delegation receipt required')
+    temporary=receipt.with_suffix('.new');temporary.write_text(data);temporary.replace(receipt)
+try:
+    require(os.geteuid()==0,'Actual root required for image sandbox tests')
+    status=Path('/proc/self/status').read_text()
+    effective=int(next(line.split()[1] for line in status.splitlines() if line.startswith('CapEff:')),16)
+    require(effective&(1<<21),'Actual CAP_SYS_ADMIN required for mount namespaces')
+    report['preflight']={'effective_capabilities_hex':hex(effective),'required_added_capability':'CAP_SYS_ADMIN'}
+    subprocess.run(['/usr/bin/unshare','--mount','/bin/true'],check=True)
+    require(Path('/sys/fs/cgroup/cgroup.controllers').is_file(),'real cgroup2 hierarchy required')
+    controllers=Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()
+    require({'cpu','memory'}<=set(controllers),'real CPU/memory controllers required')
+    parent = Path('/sys/fs/cgroup')
+    host_leaf = parent / ('moruna-image-host-' + token)
+    host_leaf.mkdir(mode=0o700)
+    delegation = {'parent': str(parent), 'self_cgroup_before': Path('/proc/self/cgroup').read_text(),
+                  'controllers_before': (parent / 'cgroup.controllers').read_text(),
+                  'subtree_before': (parent / 'cgroup.subtree_control').read_text(),
+                  'host_leaf': str(host_leaf), 'snapshots': [], 'moves': [],
+                  'host_leaf_lifetime': 'retained until actual owned VM teardown'}
+    report['delegation'] = delegation
+    save()
+    for _ in range(8):
+        pids = [int(value) for value in (parent / 'cgroup.procs').read_text().split()]
+        require(len(pids) <= 256 and all(pid > 0 for pid in pids), 'bounded visible delegated-parent PIDs required')
+        delegation['snapshots'].append(pids)
+        save()
+        if not pids:
+            break
+        for pid in pids:
+            try:
+                (host_leaf / 'cgroup.procs').write_text(str(pid))
+                delegation['moves'].append({'pid': pid, 'outcome': 'moved'})
+            except OSError as error:
+                delegation['moves'].append({'pid': pid, 'errno': error.errno, 'outcome': 'refused'})
+                save()
+                if error.errno != errno.ESRCH:
+                    raise
+                # Only the real exited-process race is tolerated; other
+                # accounting/permission/write failures stay explicit.
+                delegation['moves'][-1]['outcome'] = 'exited-before-move'
+            save()
+    require(not (parent / 'cgroup.procs').read_text().strip(), 'delegated parent still has internal processes')
+    (parent / 'cgroup.subtree_control').write_text('+cpu +memory')
+    cgroup.mkdir(mode=0o700)
+    (cgroup / 'cgroup.subtree_control').write_text('+cpu +memory')
+    delegation.update(parent_procs_after=(parent / 'cgroup.procs').read_text(),
+                      host_procs_after=(host_leaf / 'cgroup.procs').read_text(),
+                      subtree_after=(parent / 'cgroup.subtree_control').read_text(),
+                      job_procs_after=(cgroup / 'cgroup.procs').read_text(),
+                      job_subtree_after=(cgroup / 'cgroup.subtree_control').read_text(),
+                      self_cgroup_after=Path('/proc/self/cgroup').read_text())
+    require(not delegation['parent_procs_after'].strip() and not delegation['job_procs_after'].strip(),
+            'real domain-controller parents must remain empty')
+    save()
+finally:
+    save()
+    print('MORUNA_IMAGE_DELEGATION',json.dumps(report,sort_keys=True),flush=True)
+PY_IMAGE_SANDBOX
+    image_status=0
+    run_cargo test -p moruna-image --test image_kind -- --ignored --nocapture --test-threads=1 || image_status=$?
+    python3 - "$image_status" <<'PY_IMAGE_CLEANUP'
+import json,os,sys
+from pathlib import Path
+receipt=Path(os.environ['IMAGE_TEST_OUT'])/'delegation.json'
+report=json.loads(receipt.read_text());delegation=report['delegation']
+report['test_exit']=int(sys.argv[1])
+try:
+    cgroup=Path(os.environ['MORUNA_SANDBOX_CGROUP'])
+    delegation['job_procs_at_cleanup']=(cgroup/'cgroup.procs').read_text()
+    cgroup.rmdir()
+    delegation['job_parent_removed']=True
+    delegation['host_procs_before_vm_teardown']=(Path(delegation['host_leaf'])/'cgroup.procs').read_text()
+    delegation['parent_procs_before_vm_teardown']=Path('/sys/fs/cgroup/cgroup.procs').read_text()
+    delegation['host_leaf_removed_by_helper']=False
+finally:
+    temporary=receipt.with_suffix('.new');temporary.write_text(json.dumps(report,sort_keys=True)+'\n');temporary.replace(receipt)
+    print('MORUNA_IMAGE_DELEGATION_CLEANUP',json.dumps(report,sort_keys=True),flush=True)
+PY_IMAGE_CLEANUP
+    if [ "$image_status" -ne 0 ]; then exit "$image_status"; fi
+    ;;
   ports-tests)
     run_cargo test -p moruna-sinks --test si_parquet portable_checkpoint_flush_ -- --nocapture --test-threads=1
     run_cargo test -p moruna-runtime --test ports po_t8_a_resumed_run_restores_a_stages_state_bytes -- --exact --nocapture --test-threads=1
@@ -324,10 +421,12 @@ class CombinedRun(module.Ke2Run):
 
     def __init__(self, options, inputs, archive, cache):
         super().__init__(options, inputs, archive, cache)
-        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'ports-tests'):
+        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'ports-tests', 'image-tests'):
             self.memory = 6
         if options.phase in ('boot-host-tools','sdk-proof-build'):
             self.measurement_scope='ARM64 Linux host helper dev/debug0 build and custody only; no optimization/performance/boot/execution claim'
+        if options.phase=='image-tests':
+            self.measurement_scope='Actual ARM Linux image sandbox regressions only; no native node, full suite or release acceptance claim'
         if options.phase=='ports-tests':
             self.measurement_scope='Targeted ARM portable-checkpoint regressions; no full suite or native claim'
         if options.phase=='phase-a-tests':
@@ -381,7 +480,7 @@ class CombinedRun(module.Ke2Run):
 
 
     def call(self, arguments, *args, **kwargs):
-        if self.options.phase == 'kd3-prepare-linux' and arguments and arguments[0] == 'create':
+        if self.options.phase in ('kd3-prepare-linux','image-tests') and arguments and arguments[0] == 'create':
             arguments = [arguments[0], '--cap-add', 'CAP_SYS_ADMIN', *arguments[1:]]
         result = super().call(arguments, *args, **kwargs)
         if self.options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools') and len(arguments) > 4 and arguments[:4] == ['exec', self.name, '/bin/bash', '-c'] and arguments[4] == self.guest_script:
@@ -412,21 +511,21 @@ class CombinedRun(module.Ke2Run):
             for path,expected in self.kd3_fingerprints:
                 z=module.private_file(path).stat();require((z.st_dev,z.st_ino,z.st_uid,z.st_size,z.st_mtime_ns)==expected,'KD3 immutable input changed')
             tool_module.load_bundle(self.options.tools_bundle)
-        if self.options.phase == 'kd3-prepare-linux':
+        if self.options.phase in ('kd3-prepare-linux','image-tests'):
             # The sole added capability is required by the real child sandbox's
             # mount-namespace setup. Other phases retain the no-capability rule.
             record = module.Run.owned(self, cleanup=cleanup)
             if record is not None:
                 config = record['configuration']
                 require(config.get('capAdd') == ['CAP_SYS_ADMIN'] and not config.get('capDrop'),
-                        'preparation VM must add EXACT CAP_SYS_ADMIN and preserve default capabilities')
+                        'sandbox proof VM must add EXACT CAP_SYS_ADMIN and preserve default capabilities')
                 approved = dict(config);approved['capAdd'] = []
                 module.validate_inspect(approved, self.attachments)
                 validate_cache(self.cache,self.cache['owner_nonce'])
                 require(config['image']['descriptor']['digest'] == self.pins['index']
                         and config['platform'] == {'os':'linux','architecture':'arm64'}
                         and config['resources']['memoryInBytes'] == 6*1024**3,
-                        'preparation VM image/platform/resource differs')
+                        'sandbox proof VM image/platform/resource differs')
             return record
         return super().owned(cleanup=cleanup)
 
@@ -818,7 +917,7 @@ printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'ports-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
+    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'ports-tests', 'image-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
     parser.add_argument('--inputs', required=True)
     parser.add_argument('--archive', required=True)
     parser.add_argument('--cache-journal')

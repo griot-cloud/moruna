@@ -22,6 +22,7 @@ def main():
     require(60<=options.seconds<=maximum and 60<=options.wait_seconds<=3600,'bounded stage/queue duration required')
     require(not(options.runner=='std' and options.phase=='personality-artifacts'),'use explicit personality runner/cache for musl artifacts')
     require(options.phase!='ports-tests' or options.runner=='std','focused ports replay belongs only to the std runner (600s maximum)')
+    require(options.phase!='image-tests' or options.runner=='std','image sandbox regressions belong only to the std runner (600s maximum)')
     require(not options.layers_tests_kernel_inputs or options.runner=='personality','focused layers tests belong only to personality producer')
     require(not options.origin_proof or options.runner=='native-link','optional origin proof belongs only to native-link')
     if options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
