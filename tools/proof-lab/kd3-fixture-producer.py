@@ -286,7 +286,11 @@ def main():
                 '--config', 'profile.dev.debug=0', '--config', 'profile.dev.incremental=false', '-j1',
                 '-p', 'moruna-py', '--features', 'python,peql', '--lib', '--bin', 'moruna-kd3-fixture']
         call(base, 'cargo-build')
-        for relative, name, executable in [('debug/moruna-kd3-fixture', 'moruna-kd3-fixture', True), ('debug/lib_core.so', '_core.so', False)]:
+        artifacts = [('debug/moruna-kd3-fixture', 'moruna-kd3-fixture', True), ('debug/lib_core.so', '_core.so', False)]
+        if arch == 'aarch64':
+            call(base[:base.index('-p')] + ['-p', 'moruna-vmm', '--example', 'kd3-fixture-boot', '--features', 'kd3-conformance-proof'], 'cargo-fixture-boot')
+            artifacts.append(('debug/examples/kd3-fixture-boot', 'kd3-fixture-boot', True))
+        for relative, name, executable in artifacts:
             source = Path('/proof/target') / target / relative
             require(source.is_file() and not source.is_symlink() and 0 < source.stat().st_size <= 1024**3, 'fixture raw artifact missing/over1GiB')
             raw_bytes, raw_hash = source.stat().st_size, sha(source)
@@ -297,7 +301,7 @@ def main():
             with dest.open('rb') as f:
                 header = f.read(20)
             machine = b'\xb7\x00' if arch == 'aarch64' else b'\x3e\x00'
-            require(header[:6] == b'\x7fELF\x02\x01' and header[18:20] == machine and 0 < dest.stat().st_size <= 256 * 1024**2, 'actual target ELF/256MiB bound differs')
+            require(header[:6] == b'\x7fELF\x02\x01' and header[18:20] == machine and 0 < dest.stat().st_size <= 512 * 1024**2, 'actual target ELF/512MiB test-artifact bound differs')
             report['files'].append({'name': name, 'bytes': dest.stat().st_size, 'sha256': sha(dest), 'original_path': str(source),
                                     'original_bytes': raw_bytes, 'original_sha256': raw_hash, 'strip_tool_sha256': sha(strip),
                                     'strip_version': subprocess.check_output([str(strip), '--version'], text=True).splitlines()[0]})

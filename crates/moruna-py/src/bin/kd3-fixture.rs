@@ -252,8 +252,7 @@ fn seed(path: &Path) -> Result<()> {
     writer.finish()?;
     Ok(())
 }
-fn run(path: &Path, adapter: &str) -> Result<Value> {
-    let fixture: Value = serde_json::from_slice(&fs::read(path)?)?;
+fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
     let matrix: Value = serde_json::from_str(MATRIX)?;
     let id = fixture["case"].as_str().ok_or("missing case")?;
     let case = matrix["cases"]
@@ -661,6 +660,69 @@ fn emit(value: &Value, case: &str, adapter: &str) -> Result<()> {
     out.flush()?;
     Ok(())
 }
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_case_grant(slot: &str) -> Result<Value> {
+    use moruna_sys::{Memory, ObjectType, PAGE_SIZE, Rights, map};
+    if slot != "kd3.case" || !moruna_micro::on_kernel() {
+        return Err("run-grant requires actual native kd3.case startup Memory".into());
+    }
+    let handle = moruna_micro::start::take(slot).ok_or("missing actual kd3.case grant")?;
+    let (kind, rights) = handle
+        .info()
+        .map_err(|e| invalid(format!("case grant info: {e:?}")))?;
+    if kind != ObjectType::Memory
+        || !rights.contains(Rights::READ | Rights::MAP)
+        || rights.contains(Rights::WRITE)
+    {
+        return Err("case grant must be actual readonly Memory".into());
+    }
+    let memory = Memory(handle);
+    let first = memory
+        .map(0, PAGE_SIZE, map::READ)
+        .map_err(|e| invalid(format!("case prefix mapping: {e:?}")))?;
+    let mut prefix = [0u8; 8];
+    first
+        .read(0, &mut prefix)
+        .map_err(|e| invalid(format!("case prefix read: {e:?}")))?;
+    let length = u64::from_le_bytes(prefix);
+    if length == 0 || length > 1024 * 1024 {
+        return Err("case grant JSON exceeds bounded 1MiB".into());
+    }
+    let total = length + 8;
+    let mapped = total.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let mapping = memory
+        .map(0, mapped, map::READ)
+        .map_err(|e| invalid(format!("case mapping: {e:?}")))?;
+    let mut bytes = vec![0; mapped as usize];
+    mapping
+        .read(0, &mut bytes)
+        .map_err(|e| invalid(format!("case read: {e:?}")))?;
+    if bytes[total as usize..].iter().any(|byte| *byte != 0) {
+        return Err("case grant padding is not zero".into());
+    }
+    let wrapper: Value = serde_json::from_slice(&bytes[8..total as usize])?;
+    let object = wrapper
+        .as_object()
+        .ok_or("case grant wrapper is not an object")?;
+    if object.len() != 3
+        || !object.contains_key("nonce")
+        || !object.contains_key("run_id")
+        || !object.contains_key("fixture")
+    {
+        return Err("case grant wrapper fields differ".into());
+    }
+    let nonce = std::env::var("MORUNA_KD3_PROOF_NONCE")?;
+    if wrapper["nonce"].as_str() != Some(nonce.as_str())
+        || wrapper["run_id"] != wrapper["fixture"]["job"]["run_id"]
+    {
+        return Err("case grant nonce/run identity differs".into());
+    }
+    Ok(wrapper["fixture"].clone())
+}
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn read_case_grant(_slot: &str) -> Result<Value> {
+    Err("run-grant requires actual native x86_64 startup Memory".into())
+}
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     #[cfg(feature = "peql")]
@@ -670,24 +732,28 @@ fn main() -> Result<()> {
     if args.len() == 2 && args[0] == "seed" {
         return seed(Path::new(&args[1]));
     }
-    if args.len() != 3 || args[0] != "run" {
+    if args.len() != 3 || !matches!(args[0].as_str(), "run" | "run-grant") {
         return Err(
             "usage: moruna-kd3-fixture seed INPUT.arrow | run CASE.json linux|native".into(),
         );
     }
+    let fixture: Value = if args[0] == "run" {
+        serde_json::from_slice(&fs::read(&args[1])?)?
+    } else {
+        if args[2] != "native" {
+            return Err("run-grant cannot label a host run native".into());
+        }
+        read_case_grant(&args[1])?
+    };
+    let case = fixture["case"].as_str().ok_or("case absent")?.to_owned();
     Python::initialize();
     let result = Python::attach(|py| -> Result<Value> {
         let module = pyo3::wrap_pymodule!(_core::module::_core)(py);
         py.import("sys")?
             .getattr("modules")?
             .set_item("moruna._core", module)?;
-        py.detach(|| run(Path::new(&args[1]), &args[2]))
+        py.detach(|| run_fixture(fixture, &args[2]))
     });
     let value = result?;
-    let fixture: Value = serde_json::from_slice(&fs::read(&args[1])?)?;
-    emit(
-        &value,
-        fixture["case"].as_str().ok_or("case absent")?,
-        &args[2],
-    )
+    emit(&value, &case, &args[2])
 }

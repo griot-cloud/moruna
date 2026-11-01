@@ -180,6 +180,59 @@ def validate_index(raw):
         qemu_bundle={'root':str(root),'manifest':str(mp),'manifest_sha256':sha(mp),'summary':str(sp),'summary_sha256':sha(sp),'build':summary,'bytes':total,'files':len(rows),'non_directory_paths':sorted(n for n,e in expected.items() if e['type']!='directory')}
     return {'driver_override':driver_override,'index':str(index),'index_sha256':sha(index),'producers':producers,'selected':selected,'mounts':mounts,'scripts':scripts,'script_sources':script_sources,'tls':tls,'tls_provenance':tls_provenance,'qemu':v['qemu'],'oci':bundle,'fingerprints':fingerprints,'directory_fingerprints':directory_fingerprints,'link_fingerprints':link_fingerprints,'qemu_bundle':qemu_bundle}
 
+def validate_kd3(raw,inputs):
+    plan=private_file(raw);v=json.loads(plan.read_text());require(v.get('version')==1,'KD3 plan version differs')
+    root=private_directory(Path(v['root']));manifest=private_file(v['manifest']);expected=json.loads(manifest.read_text())
+    actual=file_census(root,8*1024**3)
+    require(actual==expected,'prepared KD3 bundle actual complete census differs')
+    require(len(actual)<=50000,'KD3 bundle file count exceeds bound')
+    bypath={e['path']:e for e in actual}
+    def relative(name):
+        p=Path(name);require(not p.is_absolute() and '..' not in p.parts and p.as_posix()==name and name in bypath,'KD3 bundle reference escapes actual census');return root/p
+    require(set(v['producers'])=={'arm','gnu'},'both actual fixture producers required')
+    records={}
+    for role,ref in v['producers'].items():
+        summary=private_file(ref['summary']);mp=private_file(ref['manifest']);s=json.loads(summary.read_text());m=json.loads(mp.read_text())
+        require(s.get('stage_passed') is True and s.get('cleanup') is True and s.get('guest_exit')==0 and s.get('phase')=='kd3-fixture-tools-'+role,'actual fixture producer lacks pass/cleanup')
+        require(m.get('passed') is True and m.get('target')==('aarch64-unknown-linux-gnu' if role=='arm' else 'x86_64-unknown-linux-gnu'),'actual fixture target differs')
+        names={e['name'] for e in m['files']};require(names==({'moruna-kd3-fixture','_core.so','kd3-fixture-boot'} if role=='arm' else {'moruna-kd3-fixture','_core.so'}),'actual fixture artifact census differs')
+        records[role]=m
+        for path in (summary,mp):
+            z=path.stat();inputs['fingerprints'].append({'path':str(path),'bytes':z.st_size,'sha256':sha(path),'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
+    launcher=relative(v['launcher']);row=next(e for e in records['arm']['files'] if e['name']=='kd3-fixture-boot')
+    require(launcher.stat().st_size==row['bytes'] and sha(launcher)==row['sha256'] and launcher.stat().st_mode&0o111,'KD3 launcher differs from actual ARM producer')
+    cells=relative(v['cells']);matrix=relative(v['matrix']);cellrows=json.loads(cells.read_text());mat=json.loads(matrix.read_text());caseids={c['id'] for c in mat['cases']}
+    native=[c for c in cellrows if c['adapter']=='native' and c['phase']=='execute']
+    require(len(caseids)==21 and native and len(native)<=64,'actual complete KD3 author matrix required')
+    keys=set();runs=set()
+    for cell in native:
+        key=(cell['case'],cell['mode']);require(cell['case'] in caseids and key not in keys,'duplicate/unknown KD3 execution cell');keys.add(key)
+        run=cell['run_id'];require(len(run)==32 and all(c in '0123456789abcdef' for c in run) and run not in runs,'KD3 run must be fresh unique canonical assigned identity');runs.add(run)
+        job=json.loads(relative(cell['job']).read_text());command=json.loads(relative(cell['command']).read_text())
+        require(job.get('run_id')==run and set(command)=={'program','args','nonce'} and len(command['nonce'])==32 and all(c in '0123456789abcdef' for c in command['nonce']),'KD3 actual job/command identity differs')
+        if cell.get('fixture'):
+            fixture=json.loads(relative(cell['fixture']).read_text());require(fixture['case']==cell['case'] and fixture['mode']==cell['mode'] and fixture['job']==job,'actual grant fixture disagrees with admitted job')
+    required=set()
+    for case in mat['cases']:
+        modes=('rows','adapter-refusal') if case['runner']=='python-library' else ('rows','unknown-setting') if case['expect']=='rows' else ('rows',)
+        required.update((case['id'],mode) for mode in modes)
+    require(keys==required,'prepared KD3 execution cells omit required cases/modes')
+    for name in ('image_record','image_digest','layer_list'):relative(v[name])
+    layerdir=Path(v['layer_dir']);require(not layerdir.is_absolute() and '..' not in layerdir.parts and (root/layerdir).is_dir(),'KD3 derived layer directory differs')
+    require(all((root/layerdir/('stack-'+str(i)+'.img')).relative_to(root).as_posix() in bypath for i in range(1,1+len(list((root/layerdir).glob('stack-*.img'))))),'KD3 canonical stack has gaps')
+    for row in actual:
+        path=root/row['path'];z=path.stat();inputs['fingerprints'].append({'path':str(path),'bytes':z.st_size,'sha256':row['sha256'],'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
+    for path in (plan,manifest):
+        z=path.stat();inputs['fingerprints'].append({'path':str(path),'bytes':z.st_size,'sha256':sha(path),'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
+    if 'linux_results' in v:
+        directory=Path(v['linux_results']);require(not directory.is_absolute() and '..' not in directory.parts and (root/directory).is_dir(),'actual Linux result directory differs')
+        validator=relative(v['matrix_validator']);source_manifest=private_file(v['matrix_validator_source_manifest']);source_rows=json.loads(source_manifest.read_text());source_row=next((row for row in source_rows if row['path']=='tools/kd3-matrix.py'),None)
+        require(source_row is not None and source_row['sha256']==sha(validator) and source_row['bytes']==validator.stat().st_size,'matrix validator differs from exact shipping source census')
+        z=source_manifest.stat();inputs['fingerprints'].append({'path':str(source_manifest),'bytes':z.st_size,'sha256':sha(source_manifest),'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
+    inputs['mounts'].append({'path':str(root),'destination':'/inputs/kd3','readonly':True})
+    inputs['kd3']={**v,'plan_sha256':sha(plan),'manifest_sha256':sha(manifest),'native_cells':native}
+    inputs['kd3_census']={'root':str(root),'paths':[row['path'] for row in actual]}
+
 GUEST=r'''import hashlib,json,os,pathlib,shutil,subprocess,sys,time
 if not __debug__:raise RuntimeError('strict adapter requires assertions')
 phase,cpus,token,seconds,archive_sha=sys.argv[1:];cpus=int(cpus);seconds=int(seconds)
@@ -290,6 +343,62 @@ try:
   if all((evidence/('cpu'+str(cpu))/('case'+str(case))/'result.json').is_file() for cpu in (1,2,4) for case in range(1,6)):
    command(['python3',base/'tools/check-node-fixtures.py',evidence],'matrix15')
    result['matrix15_passed']=True
+ elif phase=='kd3':
+  k=config['kd3'];bundle=pathlib.Path('/inputs/kd3');root=evidence/'kd3';root.mkdir(mode=0o700,exist_ok=True)
+  cellroot=root/'cells';cellroot.mkdir(mode=0o700,exist_ok=True);results=root/'results';results.mkdir(mode=0o700,exist_ok=True)
+  matrix=json.loads((bundle/k['matrix']).read_text());cases={c['id']:c for c in matrix['cases']};expected=sorted(matrix['rows'])
+  kd3args=list(profile_args)
+  for option,name in [('--image-record','image_record'),('--linux-layers','layer_list'),('--linux-digest','image_digest'),('--engine-layer-dir','layer_dir')]:
+   kd3args[kd3args.index(option)+1]=bundle/k[name]
+  executed=0
+  for index,cell in enumerate(k['native_cells']):
+   out=cellroot/str(index);case=cases[cell['case']]
+   if out.exists():
+    prior=json.loads((out/'result.json').read_text()) if (out/'result.json').is_file() else {}
+    assert prior.get('passed') is True and prior.get('cleanup') is True and (out/'collected.json').is_file(),'failed/partial native KD3 cell retained; never overwrite/relabel'
+    continue
+   nonce=json.loads((bundle/cell['command']).read_text())['nonce']
+   args=['python3',proof,*kd3args,'--cpus',1,'--case',1,'--out',out,'--seconds',180,
+         '--kd3-conformance-proof',bundle/cell['command'],'--kd3-job',bundle/cell['job'],
+         '--fixture-boot',bundle/k['launcher'],'--fixture-cell',cell['case']]
+   if cell.get('fixture'):args+=['--kd3-case',bundle/cell['fixture']]
+   command(args,'kd3-'+str(index))
+   actual=json.loads((out/'result.json').read_text());receipt=json.loads((out/'fixture-result.json').read_text())
+   assert actual.get('passed') is True and actual.get('cleanup') is True and receipt.get('cleanup') is True,'actual native fixture/cleanup failed'
+   assert receipt['case']==cell['case'] and receipt['run']==cell['run_id'] and receipt['nonce']==nonce,'actual native fixture identity differs'
+   payload=receipt['result'];assert payload['run_id']==cell['run_id'],'actual assigned Guest run differs'
+   rows=payload['receipts'];want={('execute',cell['mode'])}
+   if case['runner']=='document' and case['role']=='sink' and case['expect']=='rows' and cell['mode']=='rows':want.add(('readback','rows'))
+   assert len(rows)==len(want) and {(r['phase'],r['mode']) for r in rows}==want,'actual native phase receipts incomplete/duplicate'
+   execute=next(r for r in rows if r['phase']=='execute')
+   for r in rows:
+    assert r['case']==cell['case'] and r['adapter']=='native' and r['run_id']==cell['run_id'],'actual receipt case/adapter/run mismatch'
+    refused=r['mode'] in ('unknown-setting','adapter-refusal') or case['expect']=='strict-import-refusal'
+    if refused:assert r['outcome']=='refused' and r.get('diagnostic'),'missing real expected refusal'
+    else:
+     assert r['outcome']=='rows' and sorted(r['rows'])==expected and r['finish']==1 and r['committed']==len(expected),'actual native rows/commit/finish differ'
+     if case['runner']=='document':assert isinstance(r.get('outside_after'),list) and not any(r['outside_after']),'actual native task reservation remains'
+    if r['phase']=='readback':assert execute.get('files') and r['producer']==execute,'readback not bound to exact actual sink ACK'
+    name='.'.join([r['case'],r['adapter'],r['phase'],r['mode']])+'.json'
+    with (results/name).open('x') as target:json.dump(r,target,indent=2);target.write('\n')
+   with (out/'collected.json').open('x') as collected:json.dump({'run_id':cell['run_id'],'case':cell['case'],'mode':cell['mode'],'receipt_sha256':sha(out/'fixture-result.json')},collected)
+   executed+=1
+   if executed>=config['kd3_count']:break
+  result['kd3_executed_this_turn']=executed
+  complete=all((cellroot/str(i)/'result.json').is_file() and json.loads((cellroot/str(i)/'result.json').read_text()).get('passed') is True and (cellroot/str(i)/'collected.json').is_file() for i in range(len(k['native_cells'])))
+  result['kd3_native_complete']=complete
+  result['kd3_native_receipts']=len(list(results.glob('*.json')))
+  if complete and k.get('linux_results'):
+   combined=root/'matrix-inputs';assert not combined.exists(),'final matrix evidence already exists, never overwrite'
+   combined.mkdir(mode=0o700)
+   for directory in (results,bundle/k['linux_results']):
+    for source in sorted(directory.glob('*.json')):
+     assert source.is_file() and not source.is_symlink(),'matrix input must be real regular receipt'
+     record=json.loads(source.read_text());name='.'.join(str(record[field]) for field in ('case','adapter','phase','mode'))+'.json'
+     assert '/' not in name and '..' not in name and not (combined/name).exists(),'matrix actual receipt duplicate/unsafe identity'
+     shutil.copy2(source,combined/name)
+   command(['python3',bundle/k['matrix_validator'],bundle/k['matrix'],combined],'kd3-matrix92')
+   result['kd3_matrix_passed']=True
  elif phase=='io':
   command(['python3',base/'node/tools/io-proof.py','--out',evidence/'io','--net-proof',base/'tools/net-proof.py','--cpus',1,'--seconds',180,'--',*profile_args],'io-two-boots')
  else:raise RuntimeError('unknown canonical phase')
@@ -306,6 +415,13 @@ def input_fingerprints_unchanged(inputs):
         p=private_directory(Path(e['path']));z=p.stat();require((z.st_dev,z.st_ino,z.st_uid)==(e['device'],e['inode'],e['uid']),'private QEMU root identity changed')
     for e in inputs.get('link_fingerprints',[]):
         p=Path(e['path']);z=p.lstat();require(stat.S_ISLNK(z.st_mode) and (z.st_dev,z.st_ino,z.st_uid)==(e['device'],e['inode'],e['uid']) and os.readlink(p)==e['target'],'private QEMU link identity changed')
+    if inputs.get('kd3_census'):
+        census=inputs['kd3_census'];root=Path(census['root']);actual=set()
+        for base,dirs,files in os.walk(root,followlinks=False):
+            for name in dirs:require(not (Path(base)/name).is_symlink(),'KD3 input directory gained symlink')
+            for name in files:
+                path=Path(base)/name;require(stat.S_ISREG(path.lstat().st_mode),'KD3 input gained nonregular file');actual.add(path.relative_to(root).as_posix())
+        require(actual==set(census['paths']),'KD3 input full file census changed')
     bundle=inputs.get('qemu_bundle')
     if bundle:
         root=Path(bundle['root']);actual=set()
@@ -489,6 +605,7 @@ class NodeAcceptanceRun(Run):
         input_fingerprints_unchanged(self.inputs)
     def archive(self):
         p=self.evidence/'helper-inputs.tar';config={'selected':self.inputs['selected'],'qemu':self.inputs['qemu'],'oci_manifest':self.inputs['oci']['selected_manifest'],'verified_cases':[],'engine_refresh':self.journal.get('engine_refresh'),'refresh_expected':self.journal.get('build_census')}
+        if self.options.phase=='kd3':config.update(kd3=self.inputs['kd3'],kd3_count=self.options.kd3_count)
         if self.options.phase=='profile':config['verified_cases']=[int(c) for c in self.journal.get('cases',{}).get(str(self.options.cpus),{})]
         items={n:p.read_bytes() for n,p in self.inputs['scripts'].items()};items.update({'inputs.json':json.dumps(config).encode(),'tls.roots':self.inputs['tls'].read_bytes(),'node-acceptance.py':Path(__file__).read_bytes()})
         with tarfile.open(p,'w') as tar:
@@ -545,6 +662,9 @@ class NodeAcceptanceRun(Run):
                                     r=json.loads(result.read_text())
                                     if r.get('passed') is True and r.get('cleanup') is True:self.journal.setdefault('cases',{}).setdefault(str(cpu),{})[str(case)]=rows
                     if self.options.phase not in ('assemble','refresh-engine'):require(file_census(self.output/'build',4*1024**3)==self.journal['build_census'],'assembled inputs changed during turn')
+                    kd3=self.output/'evidence/kd3'
+                    if kd3.exists():
+                        newrows=file_census(kd3,allow_sockets=True);newmap={e['path']:e for e in newrows};require(all(newmap.get(e['path'])==e for e in self.journal.get('retained_kd3',[])),'prior KD3 evidence changed during current turn');self.journal['retained_kd3']=newrows;self.journal['kd3_plan_sha256']=self.inputs['kd3']['plan_sha256'] if self.options.phase=='kd3' else self.journal.get('kd3_plan_sha256')
                     io=self.output/'evidence/io'
                     if io.exists():
                         rows=file_census(io,allow_sockets=True);prior=self.journal.get('retained_io');require(prior is None or prior==rows,'retained IO changed');self.journal['retained_io']=rows
@@ -556,6 +676,8 @@ class NodeAcceptanceRun(Run):
                             observed=json.loads(result.read_text())
                             require(observed.get('passed') is True,'actual guest phase completion absent')
                             if observed.get('matrix15_passed') is True:self.journal['matrix15_passed']=True
+                            if observed.get('kd3_native_complete') is True:self.journal['kd3_native_complete']=True
+                            if observed.get('kd3_matrix_passed') is True:self.journal['kd3_matrix_passed']=True
                     self.journal.setdefault('turns',[]).append({'summary':str(self.evidence/'summary.json'),'nonce':self.token,'phase':self.options.phase,'phase_passed':summary.get('phase_passed',False)})
                     atomic_json(self.output/'journal.json',self.journal)
                 except BaseException as e:summary['retention_error']=str(e);failure=e
@@ -568,13 +690,15 @@ class NodeAcceptanceRun(Run):
         return 1 if failure else 0
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--run',action='store_true');p.add_argument('--reuse-assembly');p.add_argument('--supervisor-tls-transition',action='store_true');p.add_argument('--engine-client-transition',action='store_true');p.add_argument('--driver-only-reuse',action='store_true');p.add_argument('--inputs',required=True);p.add_argument('--output',required=True);p.add_argument('--phase',choices=('assemble','profile','io'),required=True);p.add_argument('--cpus',type=int,choices=(1,2,4));p.add_argument('--seconds',type=int,default=1100);o=p.parse_args();o.mode='node-acceptance'
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--run',action='store_true');p.add_argument('--reuse-assembly');p.add_argument('--supervisor-tls-transition',action='store_true');p.add_argument('--engine-client-transition',action='store_true');p.add_argument('--driver-only-reuse',action='store_true');p.add_argument('--kd3-inputs');p.add_argument('--kd3-count',type=int,default=1);p.add_argument('--inputs',required=True);p.add_argument('--output',required=True);p.add_argument('--phase',choices=('assemble','profile','io','kd3'),required=True);p.add_argument('--cpus',type=int,choices=(1,2,4));p.add_argument('--seconds',type=int,default=1100);o=p.parse_args();o.mode='node-acceptance'
     require(180<=o.seconds<=1100,'total turn bound180..1100');require((o.phase=='profile')==(o.cpus is not None),'only profile requires explicit CPU count')
     inputs=validate_index(o.inputs);out=Path(o.output).absolute();require(out.is_relative_to(ROOT) and out.parent.exists(),'output must be in exact owned proof root');private_directory(out.parent)
     require(not o.supervisor_tls_transition or o.reuse_assembly,'supervisor/TLS correction requires explicit original assembly reuse')
     require(not o.engine_client_transition or (o.reuse_assembly and o.supervisor_tls_transition),'engine client correction requires explicit original assembly/supervisor/TLS reuse')
     require(not o.driver_only_reuse or (o.reuse_assembly and not o.supervisor_tls_transition and not o.engine_client_transition),'driver-only reuse requires separate current assembly fork')
     require(not inputs.get('driver_override') or o.driver_only_reuse or out.exists(),'driver override may only enter via explicit fork')
+    require((o.phase=='kd3')==bool(o.kd3_inputs),'KD3 mode requires separate exact prepared bundle plan');require(1<=o.kd3_count<=3,'bounded KD3 turn contains1..3 actual boots')
+    if o.kd3_inputs:validate_kd3(o.kd3_inputs,inputs)
     reuse=None
     if o.reuse_assembly:
         require(o.phase=='assemble' and not out.exists() and not out.is_symlink(),'reuse only prepares a new assembled output')
@@ -595,6 +719,9 @@ def main():
                 casepath=out/'evidence'/('cpu'+str(o.cpus))/('case'+str(case))
                 require(not casepath.exists() or str(case) in journal.get('cases',{}).get(str(o.cpus),{}),'failed/partial case retained; explicit reconciliation needed, never overwrite')
         if o.phase=='io':require(not (out/'evidence/io').exists(),'never overwrite prior same-home IO proof')
+        if o.phase=='kd3':
+            require(journal.get('kd3_plan_sha256',inputs['kd3']['plan_sha256'])==inputs['kd3']['plan_sha256'],'KD3 bundle plan changed after actual execution')
+            if 'retained_kd3' in journal:require(file_census(out/'evidence/kd3',allow_sockets=True)==journal['retained_kd3'],'prior KD3 actual evidence changed')
     else:require(o.phase=='assemble','first turn must explicitly assemble')
     if not o.run:print(json.dumps({'prepared_only':True,'no_container_commands':True,'index_sha256':inputs['index_sha256'],'assembly_reuse_prepared':reuse is not None}));return 0
     os.umask(0o077)

@@ -81,3 +81,8 @@ cuda = ["moruna-runtime/cuda"]
 name = "moruna-kd3-fixture"
 path = "src/bin/kd3-fixture.rs"
 required-features = ["python"]
+
+# The private KD3 native fixture consumes the same actual read-only start grant.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+moruna-micro = { workspace = true }
+moruna-sys = { workspace = true }

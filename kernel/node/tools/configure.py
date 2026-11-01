@@ -18,12 +18,15 @@ def main():
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--kd3-conformance-proof", type=Path,
                         help="explicit TEST-ONLY JSON {program,args,nonce}; Rust feature-gated validator remains mandatory")
+    parser.add_argument("--kd3-case", type=Path, help="bounded explicit readonly case grant; proof mode only")
     parser.add_argument("--storage-credential", type=Path)
     for name in ("local-config","checkpoint-admission","cache-admission","cache-key"):
         parser.add_argument(f"--{name}", type=Path)
     parser.add_argument("--maintenance-target", choices=("storage", "local"))
     parser.add_argument("--maintenance-config", type=Path)
     args = parser.parse_args()
+    if args.kd3_case and not args.kd3_conformance_proof:
+        parser.error("case grant requires explicit proof command mode")
     if (args.maintenance_target is None) != (args.maintenance_config is None):
         parser.error("maintenance target and finite canonical config must be supplied together")
     try:
@@ -148,6 +151,17 @@ def main():
         config = args.out / "engine.conf"
         lines = config.read_text().splitlines()
         lines = [line for line in lines if not line.startswith(("program ", "arg "))]
+        if command["program"] == "/moruna/bin/moruna-kd3-fixture":
+            if not args.kd3_case or args.kd3_case.is_symlink() or not 8 < args.kd3_case.stat().st_size <= (1 << 20) + 8:
+                parser.error("native Rust fixture requires bounded readonly case grant")
+            shutil.copyfile(args.kd3_case, args.out / "kd3.case")
+            with (args.out / "node.conf").open("a") as node:
+                node.write("grant admission initial.kd3-case kd3.case\n")
+            with (args.out / "initial.job").open("a") as initial:
+                initial.write("grant kd3.case initial.kd3-case\n")
+            lines.append("grant kd3.case data kd3.case")
+        elif args.kd3_case:
+            parser.error("case grant belongs only to exact native Rust fixture")
         config.write_text("\n".join(["program " + command["program"],
             *("arg " + value for value in command["args"]),
             "env MORUNA_KD3_PROOF_NONCE=" + command["nonce"],

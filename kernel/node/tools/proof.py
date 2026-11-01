@@ -39,6 +39,7 @@ def main():
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--sdk-proof", type=Path, help="Explicit nondefault Rust native SDK TCG proof executable; sole VM owner")
     parser.add_argument("--kd3-conformance-proof", type=Path, help="explicit private fixed command JSON")
+    parser.add_argument("--kd3-case", type=Path, help="actual fixture JSON passed as readonly case Memory, outside OCI image")
     parser.add_argument("--kd3-job", type=Path, help="actual canonical job supplying fresh single-use authority")
     parser.add_argument("--fixture-boot", type=Path, help="explicit kd3-conformance-proof VMM example")
     parser.add_argument("--fixture-cell", help="actual matrix case id")
@@ -118,6 +119,7 @@ def main():
         input_files["assembly_source"] = description
         if fixture_mode:
             input_files.update(fixture_job=args.kd3_job, fixture_command=args.kd3_conformance_proof, fixture_boot=args.fixture_boot)
+            if args.kd3_case: input_files["fixture_case"] = args.kd3_case
         common_inputs = {name: digest(path) for name, path in input_files.items()}
         record["inputs_sha256"] = hashlib.sha256(json.dumps(common_inputs, sort_keys=True).encode()).hexdigest()
         record["inputs"] = common_inputs
@@ -146,12 +148,31 @@ def main():
         (out / "profile.json").write_text(json.dumps(profile) + "\n")
         (out / "storage.conf").write_text("moruna-storage 1\ntimeout-ns 5000000000\nbody-limit 1048576\nsession-limit 4\nprovider single-node-home\nblock-service nvme0\nalignment 4096\n")
         (out / "network.conf").write_text(f"moruna-netstack 1\nsetting tls-unix-seconds {int(time.time())}\nsetting tls-time-valid-ms 3600000\ngrant listen-engine rights=connect remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8\n")
+        case_grant = None
+        if fixture_mode:
+            authored_command = json.loads(args.kd3_conformance_proof.read_text())
+            if authored_command["program"] == "/moruna/bin/moruna-kd3-fixture":
+                if not args.kd3_case:
+                    raise ValueError("Rust fixture requires explicit case outside immutable OCI image")
+                fixture = json.loads(args.kd3_case.read_text())
+                if fixture["job"] != actual_job or fixture["case"] != args.fixture_cell:
+                    raise ValueError("actual fixture and admitted canonical job/case differ")
+                wrapper = json.dumps({"nonce": authored_command["nonce"], "run_id": run, "fixture": fixture}, separators=(",", ":")).encode()
+                if not 0 < len(wrapper) <= 1 << 20:
+                    raise ValueError("case grant exceeds canonical fixture bound")
+                case_grant = out / "case-grant.bin"
+                case_grant.write_bytes(len(wrapper).to_bytes(8, "little") + wrapper)
+                description = out / "kd3.image"
+                description.write_text((tools.parent / "standalone.image").read_text().replace("  handle console console", "  handle console console\n  handle data:kd3.case kd3.case", 1))
+            elif args.kd3_case:
+                raise ValueError("Python library command must not receive Rust case grant")
         command(["python3", tools / "configure.py", "--profile", out / "profile.json", "--out", out / "assets",
                  "--image-record", args.image_record, "--layers", args.linux_layers, "--network", out / "network.conf",
                  "--tls-roots", args.io_net / "roots" if args.io_phase else args.tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
                  "--storage-config", out / "storage.conf", "--storage-grants", out / "canonical/storage.grants",
                  "--storage-admission", out / "canonical/storage.admission",
-                 *(["--kd3-conformance-proof", args.kd3_conformance_proof] if fixture_mode else [])])
+                 *(["--kd3-conformance-proof", args.kd3_conformance_proof] if fixture_mode else []),
+                 *(["--kd3-case", case_grant] if case_grant else [])])
         if args.io_phase:
             # Explicit fixture assembly uses the unmodified production node parser,
             # supervisor, authority and storage owner, not a substitute service.

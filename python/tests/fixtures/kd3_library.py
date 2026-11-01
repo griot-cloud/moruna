@@ -117,14 +117,14 @@ def main():
         report = moruna.run(
             source, kernels, output, budget=384 << 20, cpu=1.0,
             staging_dir=staging, staging_limit=128 << 20, ordered=True,
-            checkpoint=False, engine_ports=ports,
+            checkpoint=False, engine_ports=ports, allow_gil=True,
         )
     except moruna.MorunaError as error:
         if mode != "adapter-refusal" or "KD3 real" not in str(error):
             raise
         emit({"case": case_id, "adapter": adapter, "phase": "execute", "mode": mode,
                           "outcome": "refused", "diagnostic": str(error),
-                          "partial_rows": output.values, "finish": output.finished, "run_id": error.run_id})
+                          "partial_rows": output.values, "finish": output.finished, "run_id": error.run_id, "python_runtime": "standard CPython GIL; explicit allow_gil"})
         return
     if mode == "adapter-refusal":
         raise AssertionError("actual source/kernel/sink failure was not propagated")
@@ -132,7 +132,7 @@ def main():
         raise AssertionError(f"actual execution differs: {report.exit}, finish={output.finished}, rows={output.values}")
     emit({"case": case_id, "adapter": adapter, "phase": "execute", "mode": "rows",
                       "outcome": "rows", "rows": sorted(output.values), "finish": output.finished,
-                      "committed": len(output.values), "run_id": report.run_id})
+                      "committed": len(output.values), "run_id": report.run_id, "python_runtime": "standard CPython GIL; explicit allow_gil"})
 
 
 if __name__ == "__main__":

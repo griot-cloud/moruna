@@ -288,9 +288,8 @@ impl SamplerTrait for Sampler {
             }
         };
 
-        let (memory, kernel_peak, throttled_us) = reading.map_err(|cause| {
+        let (memory, kernel_peak, throttled_us) = reading.inspect_err(|_| {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
-            cause
         })?;
 
         *running_peak = (*running_peak).max(memory.anon);

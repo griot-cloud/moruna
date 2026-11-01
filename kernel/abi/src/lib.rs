@@ -1129,7 +1129,7 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0003);
+        assert_eq!(ABI_VERSION, 0x2_0005);
         assert_eq!(nr::ACCOUNT_MATCHES + 1, nr::BASE + nr::COUNT);
         assert_eq!(nr::ACCOUNT_MATCHES, nr::ACCOUNT_INFO + 1);
         assert_eq!(nr::ACCOUNT_CREATE, nr::PROCESS_GRANT + 1);
@@ -1164,7 +1164,10 @@ mod tests {
         let rdx = msi::pack(0xfee0_0000, 0x41);
         assert_eq!(msi::address(rdx), 0xfee0_0000);
         assert_eq!(msi::data(rdx), 0x41);
-        assert_eq!(memory_flags::ALL, 1);
+        assert_eq!(memory_flags::DMA, 1);
+        assert_eq!(memory_flags::CONTIGUOUS, 2);
+        assert_eq!(memory_flags::ALL, 3);
+        assert_eq!(memory_flags::CONTIGUOUS_MAX_BYTES, 4 << 20);
         assert_eq!(pin_flags::ALL, 1);
         assert_eq!(resource_info::SIZE, 24);
         assert_eq!(limits::PIN_MAX_PAGES, 65536);

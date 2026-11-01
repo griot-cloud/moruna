@@ -91,7 +91,7 @@ jobs:
           python -m pip install --quiet -r docs/requirements.txt
           sphinx-build -W --keep-going -q -b html docs docs/_build/html
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
       - name: The image kind, for real (SDD 19 k)

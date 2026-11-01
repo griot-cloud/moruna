@@ -275,7 +275,11 @@ fn validate_kd3_command(config: &engine::Config) -> Result<(), String> {
             && !value.chars().any(char::is_whitespace)
     }
     let fixture = config.program == "/moruna/bin/moruna-kd3-fixture"
-        && matches!(config.args.as_slice(), [run, file, adapter] if run == "run" && path(file) && file.ends_with(".json") && adapter == "native");
+        && matches!(config.args.as_slice(), [run, slot, adapter] if run == "run-grant" && slot == "kd3.case" && adapter == "native")
+        && config.grants.iter().any(|grant| {
+            grant.slot == "kd3.case"
+                && matches!(&grant.source, engine::Source::Data(from) if from == "kd3.case")
+        });
     let library = config.program == "/opt/python-std/bin/python3"
         && matches!(config.args.as_slice(), [script, matrix, case, adapter, staging, mode]
             if script == "/kd3/kd3_library.py" && path(matrix) && matrix.ends_with(".json")
@@ -303,7 +307,7 @@ fn validate_kd3_command(config: &engine::Config) -> Result<(), String> {
 mod kd3_command_tests {
     #[test]
     fn fixed_native_command_and_nonce_are_required() {
-        let base = "program /moruna/bin/moruna-kd3-fixture\narg run\narg /kd3/cases/source.json\narg native\nenv MORUNA_KD3_PROOF_NONCE=11111111111111111111111111111111\nmemory 805306368\nscratch 268435456\nruns 1\n";
+        let base = "program /moruna/bin/moruna-kd3-fixture\narg run-grant\narg kd3.case\narg native\nenv MORUNA_KD3_PROOF_NONCE=11111111111111111111111111111111\nmemory 805306368\nscratch 268435456\ngrant kd3.case data kd3.case\nruns 1\n";
         let config = engine::Config::parse(base).unwrap();
         super::validate_kd3_command(&config).unwrap();
         let mut wrong = config.clone();
