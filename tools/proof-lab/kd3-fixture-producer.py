@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -25,6 +26,56 @@ def require(ok, why):
 def sha(path):
     with path.open('rb') as source:
         return hashlib.file_digest(source, 'sha256').hexdigest()
+
+
+def elf_load_metadata(path):
+    """Descriptive ELF64 headers only; never a substitute for loader admission."""
+    size = path.stat().st_size
+    with path.open('rb') as stream:
+        header = stream.read(64)
+        require(len(header) == 64 and header[:6] == b'\x7fELF\x02\x01', 'ELF metadata requires actual ELF64LE')
+        phoff = struct.unpack_from('<Q', header, 32)[0]
+        entsize, count = struct.unpack_from('<HH', header, 54)
+        require(entsize == 56 and 0 < count <= 128 and phoff + count * entsize <= size, 'ELF metadata header bounds')
+        stream.seek(phoff)
+        headers = [struct.unpack('<IIQQQQQQ', stream.read(56)) for _ in range(count)]
+        loads = []
+        interpreter = None
+        dynamic = None
+        for kind, flags, offset, address, _, filesz, memsz, align in headers:
+            if kind == 1:
+                require(filesz <= memsz and offset + filesz <= size, 'ELF load metadata range')
+                loads.append({'offset': offset, 'virtual_address': address, 'file_bytes': filesz,
+                              'memory_bytes': memsz, 'flags': flags, 'alignment': align,
+                              'rounded_memory_bytes': ((address % 4096 + memsz + 4095) // 4096) * 4096})
+            elif kind == 3:
+                require(0 < filesz <= 4096 and offset + filesz <= size, 'ELF interpreter metadata range')
+                stream.seek(offset)
+                interpreter = stream.read(filesz).rstrip(b'\x00').decode('utf-8')
+            elif kind == 2:
+                dynamic = (offset, filesz)
+        needed = []
+        if dynamic:
+            offset, length = dynamic
+            require(length <= 1024**2 and offset + length <= size and length % 16 == 0, 'ELF dynamic metadata range')
+            stream.seek(offset)
+            tags = [struct.unpack('<qQ', stream.read(16)) for _ in range(length // 16)]
+            strings = next((value for tag, value in tags if tag == 5), None)
+            for tag, value in tags:
+                if tag != 1:
+                    continue
+                require(strings is not None, 'ELF needed name has no string table')
+                address = strings + value
+                segment = next((row for row in loads if row['virtual_address'] <= address < row['virtual_address'] + row['file_bytes']), None)
+                require(segment is not None, 'ELF needed name outside file-backed load')
+                relative = address - segment['virtual_address']
+                stream.seek(segment['offset'] + relative)
+                raw = stream.read(min(4096, segment['file_bytes'] - relative))
+                require(b'\x00' in raw, 'ELF needed name metadata bound')
+                needed.append(raw.split(b'\x00', 1)[0].decode('utf-8'))
+    return {'page_bytes': 4096, 'loads': loads, 'interpreter': interpreter, 'needed': needed,
+            'readonly_load_bytes': sum(row['rounded_memory_bytes'] for row in loads if not row['flags'] & 2),
+            'max_rounded_load_bytes': max((row['rounded_memory_bytes'] for row in loads), default=0)}
 
 
 def extract_fresh(archive, destination, members, prefix):
@@ -128,6 +179,7 @@ def main():
     work.mkdir(mode=0o700)
     report = {'version': 1, 'passed': False, 'target': target, 'toolchain': '1.98.1',
               'profile': 'dev-debug0', 'jobs': 1, 'scope': 'actual fixture/library artifact build only; no job/VM execution or performance claim',
+              'package_optimization': {'vortex-fastlanes': 1, 'vortex-array': 1, 'moruna-py': 1},
               'commands': [], 'files': []}
 
     def save():
@@ -283,7 +335,10 @@ def main():
                        BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu=shlex.join(target_args))
             strip = tools / 'usr/bin/x86_64-linux-gnu-strip'
         base = ['rustup', 'run', '1.98.1', 'cargo', 'build', '--locked', '--offline', '--target', target,
-                '--config', 'profile.dev.debug=0', '--config', 'profile.dev.incremental=false', '-j1',
+                '--config', 'profile.dev.debug=0', '--config', 'profile.dev.incremental=false',
+                '--config', 'profile.dev.package.vortex-fastlanes.opt-level=1',
+                '--config', 'profile.dev.package.vortex-array.opt-level=1',
+                '--config', 'profile.dev.package.moruna-py.opt-level=1', '-j1',
                 '-p', 'moruna-py', '--features', 'python,peql', '--lib', '--bin', 'moruna-kd3-fixture']
         call(base, 'cargo-build')
         artifacts = [('debug/moruna-kd3-fixture', 'moruna-kd3-fixture', True), ('debug/lib_core.so', '_core.so', False)]
@@ -306,7 +361,8 @@ def main():
             require(header[:6] == b'\x7fELF\x02\x01' and header[18:20] == machine and 0 < dest.stat().st_size <= 512 * 1024**2, 'actual target ELF/512MiB test-artifact bound differs')
             report['files'].append({'name': name, 'bytes': dest.stat().st_size, 'sha256': sha(dest), 'original_path': str(source),
                                     'original_bytes': raw_bytes, 'original_sha256': raw_hash, 'strip_tool_sha256': sha(strip),
-                                    'strip_version': subprocess.check_output([str(strip), '--version'], text=True, env=env).splitlines()[0]})
+                                    'strip_version': subprocess.check_output([str(strip), '--version'], text=True, env=env).splitlines()[0],
+                                    'elf_load_metadata': elf_load_metadata(dest)})
             save()
         if arch == 'aarch64':
             shutil.copytree('/proof/source/python/moruna', site / 'moruna')
