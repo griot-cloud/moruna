@@ -413,10 +413,11 @@ impl Task {
     }
 
     /// Serves a bounded turn so a continuously readable process cannot starve
-    /// other forwards. Unread requests retain the channel's level READABLE signal
-    /// and are picked up by the dispatcher's next turn.
+    /// other forwards. One forwarded call may itself perform many synchronous
+    /// filesystem RPCs, so it consumes the entire turn. Unread requests retain
+    /// the level READABLE signal for the dispatcher's next turn.
     pub fn serve(&mut self, channel: &Channel) {
-        const REQUESTS_PER_TURN: usize = 16;
+        const REQUESTS_PER_TURN: usize = 1;
         let mut buf = [0u8; request::SIZE];
         for _ in 0..REQUESTS_PER_TURN {
             match channel.read(&mut buf, &mut []) {
