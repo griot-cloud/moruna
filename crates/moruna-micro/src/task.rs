@@ -659,14 +659,14 @@ impl TaskState {
         let footprint = self.footprint();
         let head = match self.answer(END_SECONDS * SECONDS) {
             Some(Ok(e)) => match e.how {
-                how::EXITED => format!("image `{name}` exited with status {}", e.code),
-                how::SIGNALED => format!("image `{name}` was ended by signal {}", e.code),
+                how::EXITED => format!("image `{name}`: {cause}; exited with status {}", e.code),
+                how::SIGNALED => format!("image `{name}`: {cause}; was ended by signal {}", e.code),
                 _ => format!(
                     "image `{name}` was ended by the kernel ({cause}; {footprint}; the kernel's \
                      console line says why)"
                 ),
             },
-            Some(Err(why)) => format!("image `{name}`: {why}"),
+            Some(Err(why)) => format!("image `{name}`: {cause}; {why}"),
             None => format!("image `{name}`: {cause}"),
         };
         self.drain_log();
