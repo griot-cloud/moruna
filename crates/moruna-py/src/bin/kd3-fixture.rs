@@ -347,11 +347,13 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
         if bytes > 16 * 1024 * 1024 {
             return Err("actual governed fixture input exceeds 16MiB".into());
         }
-        fs::create_dir_all(&root)?;
+        // peQL's Parquet binding is a dataset directory, not one file.
+        let input_dir = root.join("input");
+        fs::create_dir_all(&input_dir)?;
         let mut target = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(root.join("input.parquet"))?;
+            .open(input_dir.join("part-00000.parquet"))?;
         if std::io::copy(&mut source, &mut target)? != bytes {
             return Err("actual governed input copy length differs".into());
         }
@@ -591,7 +593,7 @@ fn seed_contract(path: &Path) -> Result<()> {
     let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
     let engine = Engine::in_memory(path.parent().ok_or("contract path has no parent")?);
     let mut entries = Vec::new();
-    for (name, binding) in [("input", "input.parquet"), ("output", "output/")] {
+    for (name, binding) in [("input", "input/"), ("output", "output/")] {
         let source = format!(
             "contract: kd3/{name}\nversion: 1\nowner: kd3\nbinding: {{parquet: {binding}}}\nexpose:\n  - {{name: x, type: int64}}\nrules:\n  - {{id: fixture, op: decide, expr: \"ctx.purpose == 'conformance'\"}}\n"
         );

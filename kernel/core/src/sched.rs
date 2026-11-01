@@ -3,10 +3,10 @@
 //!
 //! OSTD's default scheduler queues every task on the boot processor, so a kernel that
 //! wants its other CPUs must bring its own. This one places a new task on the CPU with
-//! the fewest runnable tasks, preferring the current one on a tie; places a woken task
-//! on the waker's CPU when nothing else is runnable there (the waker of a request or a
-//! reply usually blocks next, so the two take turns on one CPU instead of waking a
-//! halted one for every message), and on the least loaded CPU otherwise; runs each
+//! the fewest runnable tasks, preferring the current one on a tie; retains that CPU
+//! across waits and wakes. OSTD dequeues a parking task before its old context has
+//! finished switching out, so migrating it at that point could select a task still
+//! in the foreground on another CPU. New tasks still spread across all CPUs. It runs each
 //! CPU's queue first in, first out; preempts a task that has run for a
 //! slice while another waits on its CPU; and gives each CPU an idle task that halts
 //! until an interrupt, so a CPU with nothing to run sleeps instead of spinning. A wake
@@ -108,9 +108,11 @@ impl LocalRunQueue for RunQueue {
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
         let current = self.current.take();
-        if let Some(task) = &current {
-            task.cpu().set_to_none();
-        }
+        // Preserve the task's assigned CPU even while it is absent from the
+        // runnable queue. OSTD has not switched away from this context yet;
+        // publishing cpu=None here would permit a concurrent wake to migrate
+        // the still-foreground task. Queue membership is checked under its
+        // home queue's lock in enqueue, independently of this affinity.
         self.publish();
         current
     }
@@ -148,15 +150,21 @@ impl Cpus {
 
 impl Scheduler for Cpus {
     fn enqueue(&self, runnable: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
-        // As OSTD's own scheduler does: a task that still names a CPU is still in that
-        // CPU's queue (it is parking, or was never dequeued), and goes back there.
+        // Only the first enqueue chooses a CPU. An assigned CPU is affinity,
+        // not evidence that this task is still runnable: a waiter can already
+        // be dequeued while its old context is completing the switch-out.
         let selected = self.select(flags);
-        let (still_queued, target) = match runnable.cpu().set_if_is_none(selected) {
-            Ok(()) => (false, selected),
-            Err(cpu) => (true, cpu),
+        let target = match runnable.cpu().set_if_is_none(selected) {
+            Ok(()) => selected,
+            Err(cpu) => cpu,
         };
         let mut rq = self.queues[target.as_usize()].disable_irq().lock();
-        if still_queued && runnable.cpu().set_if_is_none(target).is_err() {
+        if rq
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &runnable))
+            || rq.queue.iter().any(|queued| Arc::ptr_eq(queued, &runnable))
+        {
             return None;
         }
         // Only a CPU running its idle task is asked to reschedule; one still in its

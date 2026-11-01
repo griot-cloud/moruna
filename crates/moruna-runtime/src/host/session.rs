@@ -79,6 +79,9 @@ pub struct Outcome {
 /// The outbound half of the connection, shared by the run and the heartbeat.
 pub struct Wire {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
+    // Unlike report notes, this cause survives take_notes() and remains available
+    // to a later required port call after the peer has actually been dropped.
+    first_write_error: Mutex<Option<String>>,
     notes: Mutex<Vec<String>>,
     started: Instant,
     /// Unix nanoseconds at `started`, for the `ts` of a record.
@@ -92,6 +95,7 @@ impl Wire {
     pub fn new(writer: Option<Box<dyn Write + Send>>, started: Instant) -> Arc<Wire> {
         Arc::new(Wire {
             writer: Mutex::new(writer),
+            first_write_error: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
             started,
             epoch_ns: unix_ns_now().saturating_sub(started.elapsed().as_nanos() as i64),
@@ -107,6 +111,7 @@ impl Wire {
         };
         let mut frame = self.frame.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(error) = moruna_event::frame::write_frame(w.as_mut(), &mut frame, record) {
+            self.remember_write_error(&error);
             drop(frame);
             *writer = None;
             drop(writer);
@@ -132,6 +137,7 @@ impl Wire {
         };
         let line = message.line();
         if let Err(error) = w.write_all(line.as_bytes()).and_then(|()| w.flush()) {
+            self.remember_write_error(&error);
             *writer = None;
             drop(writer);
             self.note(format!(
@@ -147,12 +153,23 @@ impl Wire {
     pub fn try_send(&self, message: &Outbound) -> Result<(), String> {
         let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let Some(w) = writer.as_mut() else {
-            return Err("there is no peer: it never connected or it stopped receiving".to_string());
+            let first = self
+                .first_write_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut diagnostic =
+                "there is no peer: it never connected or it stopped receiving".to_string();
+            if let Some(cause) = first.as_ref() {
+                diagnostic.push_str("; first write error: ");
+                diagnostic.push_str(cause);
+            }
+            return Err(diagnostic);
         };
         let line = message.line();
         match w.write_all(line.as_bytes()).and_then(|()| w.flush()) {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.remember_write_error(&error);
                 *writer = None;
                 drop(writer);
                 self.note(format!(
@@ -171,6 +188,20 @@ impl Wire {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    fn remember_write_error(&self, error: &std::io::Error) {
+        let mut first = self
+            .first_write_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if first.is_none() {
+            *first = Some(format!(
+                "{:?}: {error}; raw_os_error={:?}",
+                error.kind(),
+                error.raw_os_error()
+            ));
+        }
     }
 
     /// Record something about the peer for the report.
@@ -1183,4 +1214,41 @@ pub fn read_report_file(path: &Path) -> std::io::Result<serde_json::Value> {
     let mut text = String::new();
     std::fs::File::open(path)?.read_to_string(&mut text)?;
     serde_json::from_str(&text).map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod wire_failure_tests {
+    use super::*;
+
+    struct BrokenWriter;
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "controlled first write",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn first_actual_write_error_survives_report_notes_drain() {
+        let wire = Wire::new(Some(Box::new(BrokenWriter)), Instant::now());
+        let message = Outbound::PortCancel {
+            v: protocol::PORTS_VERSION,
+            call: 1,
+            reason: "cancelled".into(),
+        };
+        let first = wire.try_send(&message).expect_err("actual writer refused");
+        assert!(first.contains("controlled first write"));
+        assert_eq!(wire.take_notes().len(), 1);
+        let later = wire
+            .try_send(&message)
+            .expect_err("failed peer cannot be reused");
+        assert!(later.contains("first write error: BrokenPipe"), "{later}");
+        assert!(later.contains("controlled first write"), "{later}");
+        assert!(wire.take_notes().is_empty());
+    }
 }
