@@ -94,6 +94,19 @@ mod proof {
             .filter_map(|line| line.strip_suffix('\n'))
     }
 
+    fn successful_termination(line: &str) -> bool {
+        let Some(status) = line
+            .trim_end()
+            .strip_prefix("KD2 engine: run 1 of 1: the engine exited with code ")
+        else {
+            return false;
+        };
+        status == "0"
+            || status
+                .strip_prefix("0; ")
+                .is_some_and(|stats| !stats.is_empty())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -162,6 +175,32 @@ mod proof {
                     .line(complete_lines(&malformed).next().unwrap(), &c)
                     .is_err()
             );
+        }
+
+        #[test]
+        fn termination_requires_exact_zero_token_and_allows_service_diagnostics() {
+            let prefix = "KD2 engine: run 1 of 1: the engine ";
+            for tail in [
+                "exited with code 0",
+                "exited with code 0\r\n",
+                "exited with code 0; 638 calls served; refused: socket (41): 2\r\n",
+            ] {
+                assert!(successful_termination(&format!("{prefix}{tail}")), "{tail}");
+            }
+            for tail in [
+                "exited with code 1",
+                "exited with code 10",
+                "exited with code 00",
+                "exited with code 0garbage",
+                "exited with code 0;",
+                "ended by signal 0",
+            ] {
+                assert!(
+                    !successful_termination(&format!("{prefix}{tail}")),
+                    "{tail}"
+                );
+            }
+            assert!(!successful_termination("exited with code 0"));
         }
 
         #[test]
@@ -270,7 +309,7 @@ mod proof {
                                 .into(),
                         );
                     }
-                    if !line.trim_end().ends_with("exited with code 0") {
+                    if !successful_termination(line) {
                         return Err(format!("actual fixture failed: {line}").into());
                     }
                     if !parts.ended {
