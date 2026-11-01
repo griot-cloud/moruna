@@ -18,8 +18,8 @@ use crate::size::parse_size;
 // The range checks every description of a run passes through once live in the facade's job
 // module (MH 4.1), so a document from a file and these arguments are clamped by one function.
 pub use moruna_runtime::job::translate::{
-    CHECKPOINT_INTERVAL_MS, FILE_BYTES, ROW_GROUP_BYTES, ResumeArg, STAGING_LIMIT_MIN, clamp,
-    clamp_file_bytes, clamp_row_group_bytes, normalise_target, resume_arg, trace_path,
+    FILE_BYTES, ROW_GROUP_BYTES, ResumeArg, STAGING_LIMIT_MIN, clamp, clamp_file_bytes,
+    clamp_row_group_bytes, normalise_target, resume_arg, trace_path,
 };
 
 /// A size argument as Python passed it: bytes, or a string for the parser of 03 f.3.
@@ -182,12 +182,10 @@ pub fn translate(raw: RawArgs, sink_notes: Vec<String>) -> Result<Translated> {
             format!("`{}` is not a number of seconds", raw.checkpoint_interval),
         ));
     }
-    let checkpoint_interval_ms = clamp(
-        "checkpoint.interval_ms",
-        interval_ms_given.round() as u64,
-        CHECKPOINT_INTERVAL_MS,
-        &mut notes,
-    );
+    // The one clamp of `checkpoint.interval_ms`, the document's and the planner's too.
+    let (checkpoint_interval_ms, clamped) =
+        moruna_job::checkpoint_interval_ms(interval_ms_given.round() as u64);
+    notes.extend(clamped);
 
     Ok(Translated {
         budget,

@@ -10,7 +10,7 @@ mod features;
 mod ratio;
 mod rls;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use moruna_job::Role;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,11 @@ pub const VERSION: u32 = 1;
 /// after 230. A run's units arrive by the hundred, so a change is followed within a run, and
 /// 50 units of noise of 10% pin a slope to about 1%.
 pub const FORGETTING: f64 = 0.98;
+/// The forgetting factor of a function's own fit while the online learner marks it drifting
+/// (design 9.6, SDD 24 f.11): about 1 / (1 - λ) = 10 recent units carry the fit, so the units
+/// measured after a change outweigh the 50 before it within a dozen units, at the price of a
+/// noisier fit until the key settles and λ is [`FORGETTING`] again.
+pub const DRIFT_FORGETTING: f64 = 0.9;
 /// The kind's prior does not forget: it is the median behaviour across every function of the
 /// kind, and a fit that forgot would be the behaviour of whichever function ran last.
 pub const KIND_FORGETTING: f64 = 1.0;
@@ -111,15 +116,17 @@ impl Fit {
         }
     }
 
-    fn observe(&mut self, f: &Features, inputs: &Inputs, outcome: &Outcome) {
+    /// Learn one unit, forgetting at `lambda`: the fit's own, or [`DRIFT_FORGETTING`] while its
+    /// key drifts.
+    fn observe(&mut self, f: &Features, inputs: &Inputs, outcome: &Outcome, lambda: f64) {
         let phi = self.features.phi(f);
-        self.features.push(f, self.lambda);
+        self.features.push(f, lambda);
         for (i, target) in REGRESSED.into_iter().enumerate() {
             if let Some(y) = outcome.get(target)
                 && y.is_finite()
                 && y >= 0.0
             {
-                self.targets[i].observe(phi, y, target.unit().floor(), self.lambda);
+                self.targets[i].observe(phi, y, target.unit().floor(), lambda);
             }
         }
         if let (Some(rows), Some(out)) = (inputs.data.rows, outcome.rows_out)
@@ -184,6 +191,10 @@ pub struct LogLinear {
     defaults: Defaults,
     keys: HashMap<CostKey, Fit>,
     kinds: HashMap<Role, HashMap<String, Fit>>,
+    /// The keys the online learner marks drifting: their fits forget at [`DRIFT_FORGETTING`].
+    /// A run's state, not the fit's: it is not saved, and a model loaded or fitted again starts
+    /// with none.
+    drifting: HashSet<CostKey>,
 }
 
 /// The fitted state as saved.
@@ -208,6 +219,7 @@ impl LogLinear {
             defaults,
             keys: HashMap::new(),
             kinds: HashMap::new(),
+            drifting: HashSet::new(),
         }
     }
 
@@ -222,19 +234,35 @@ impl LogLinear {
         self.keys.get(key).map(|fit| fit.targets[i].overhead())
     }
 
+    /// Whether `key` forgets at [`DRIFT_FORGETTING`] now.
+    pub fn is_drifting(&self, key: &CostKey) -> bool {
+        self.drifting.contains(key)
+    }
+
     fn learn(&mut self, key: &CostKey, inputs: &Inputs, outcome: &Outcome) {
         let f = Features::of(inputs);
         let defaults = &self.defaults;
-        self.keys
+        let drifting = self.drifting.contains(key);
+        let own = self
+            .keys
             .entry(key.clone())
-            .or_insert_with(|| Fit::new(FORGETTING, defaults, key.role))
-            .observe(&f, inputs, outcome);
-        self.kinds
+            .or_insert_with(|| Fit::new(FORGETTING, defaults, key.role));
+        let lambda = if drifting {
+            DRIFT_FORGETTING.min(own.lambda)
+        } else {
+            own.lambda
+        };
+        own.observe(&f, inputs, outcome, lambda);
+        // The kind's prior is every function of the kind pooled: one function drifting is not
+        // the kind changing, so the prior keeps its own forgetting.
+        let prior = self
+            .kinds
             .entry(key.role)
             .or_default()
             .entry(key.kind.clone())
-            .or_insert_with(|| Fit::new(KIND_FORGETTING, defaults, key.role))
-            .observe(&f, inputs, outcome);
+            .or_insert_with(|| Fit::new(KIND_FORGETTING, defaults, key.role));
+        let lambda = prior.lambda;
+        prior.observe(&f, inputs, outcome, lambda);
     }
 
     /// A ratio's answer by the fallbacks.
@@ -287,6 +315,7 @@ impl CostModel for LogLinear {
                     basis,
                     observations: count(t.n()),
                     extrapolated,
+                    drifting: false,
                 }
             };
             *cost.get_mut(target) = match (own, &own_ctx, kind, &kind_ctx) {
@@ -339,6 +368,7 @@ impl CostModel for LogLinear {
             basis: sel_basis.max(rows_basis),
             observations: sel_n,
             extrapolated: false,
+            drifting: false,
         };
         let width = inputs
             .bytes_per_row()
@@ -357,6 +387,7 @@ impl CostModel for LogLinear {
             basis: rows_out.basis.max(w_basis),
             observations: w_n,
             extrapolated: false,
+            drifting: false,
         };
         cost
     }
@@ -365,9 +396,26 @@ impl CostModel for LogLinear {
         self.learn(key, inputs, outcome);
     }
 
+    /// A drifting key forgets its level at once and forgets at [`DRIFT_FORGETTING`] until it
+    /// settles; its kind's prior is left alone.
+    fn set_drifting(&mut self, key: &CostKey, drifting: bool) {
+        if drifting {
+            if self.drifting.insert(key.clone())
+                && let Some(fit) = self.keys.get_mut(key)
+            {
+                for target in &mut fit.targets {
+                    target.forget_level();
+                }
+            }
+        } else {
+            self.drifting.remove(key);
+        }
+    }
+
     fn fit(&mut self, history: &dyn ObservationSource) -> Result<FitReport> {
         self.keys.clear();
         self.kinds.clear();
+        self.drifting.clear();
         let mut report = FitReport::default();
         history.scan_all(&mut |h| {
             if !h.observations.is_empty() {
@@ -449,6 +497,7 @@ impl CostModel for LogLinear {
         }
         self.keys = saved.keys.into_iter().collect();
         self.kinds.clear();
+        self.drifting.clear();
         for (role, name, fit) in saved.kinds {
             self.kinds.entry(role).or_default().insert(name, fit);
         }

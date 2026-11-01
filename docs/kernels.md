@@ -46,7 +46,11 @@ Save it as `kernels.py` and run `moruna check`:
 moruna check kernels.py
 score (python): agreed
   fingerprint sha256:cadf1a2ed66f5962ab6043268a9f5ddfad6430d3170ed053d8bfa4685dd6b9a4
-  profile: amplification p50 0.000 p95 0.000, state 0 bytes, 282.3 ns per row, gil free_threaded
+  gil free_threaded
+  warm-up (`loglinear@1`): per 10000 rows 3.12 ms (p95 3.90 ms), worker 3.10 ms, peak 1.1 MiB, retained 160.0 KiB [warm_up, 36 observations]
+  warm-up: start-up cold 1.20 ms, warm 41.0 us, speed-up 1.02x at 2 workers, 1.01x at 4, skewed keys 1.00x the time (value-dependent)
+  warm-up: measured 1000 x6, 10000 x6, 100000 x6; stopped after 100000 rows, residual 3.1%
+  warm-up used 9.84 s wall, 9.61 s worker, 412.3 MiB peak, 61.2 KiB to the store
 ```
 
 `moruna check` builds batches from the input schema, including an empty batch, a single row, all-null columns and edge values such as empty strings and the largest integers, and runs the kernel on each. It then compares what the kernel returned with the declared output. A kernel that disagrees is refused, with the column and the types named:
@@ -56,7 +60,7 @@ score (python): refused
   batch one_row: column `score`: declared int64, produced double
 ```
 
-The command exits with 0 when every kernel agrees and 2 when any is refused, so you can run it in continuous integration. It also records a first measurement of the kernel's memory use and speed, which the kernel's first real job uses as its starting point. The **fingerprint** identifies this exact kernel; a job document can require it, so that a changed kernel is not run by mistake. Pass `--json` for a machine-readable report and `--kernel NAME` to check one kernel in a module.
+The command exits with 0 when every kernel agrees and 2 when any is refused, so you can run it in continuous integration. A kernel that agrees is then warmed up: it runs on generated data of growing size, at more than one worker, and with skewed as well as even keys, and the cost model learns from every measurement. The report gives what the kernel costs per 10,000 rows, how much faster it is with more workers, how much skew slows it, and what the warm-up itself took. The measurements are kept (by default in `~/.moruna/observations`), so what is learned here is what a plan of a job uses. The **fingerprint** identifies this exact kernel; a job document can require it, so that a changed kernel is not run by mistake. Pass `--json` for a machine-readable report and `--kernel NAME` to check one kernel in a module.
 
 ## Polars kernels
 

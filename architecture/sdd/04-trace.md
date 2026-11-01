@@ -1,7 +1,7 @@
 # Moruna SDD 04: Trace writer and run report (`moruna-trace`)
 
 **Document type:** software design document, component 4 of 12
-**Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KD7c (the policy report's counters and learning: TR-T16) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/moruna-runtime-design.md` section 5.9; criteria S9; global invariant G-I4
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.1 (`RunId`), d.13 (`TraceRecord`, `TraceSink`, `TraceTail`, `Outcome`), e.5 (schema)
 **Component location:** `crates/moruna-trace`, Rust
@@ -105,6 +105,36 @@ pub struct RunMeta {
     pub sizer: &'static str, pub sizer_fallback_at: Option<Seq>,
     pub bottleneck_timeline: Vec<(f64, String)>,   // from ControllerSummary (11 d.1)
     pub controller_notes: Vec<String>,          // ControllerSummary.notes, appended to `notes` in the report
+    pub buffers: Option<BufferReport>,          // KD7a: the placement engine's buffer catalog at the end (09 f.18); None for a run given its own placement
+    pub policy: Option<PolicyReport>,           // KD7b: what the scheduling policy decided and left unused (10 f.3, SC-I13); None when no scheduler started
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PolicyReport {
+    pub name: String, pub decisions: u64, pub decision_ns: u64, pub over_budget: u64, pub fallbacks: u64,
+    pub admitted: u64, pub not_claimed: u64,
+    pub idle_ready_s: f64,                      // worker seconds idle while a unit was ready
+    pub unused_ready_byte_s: f64,               // budget bytes neither resident nor claimed while a unit was ready, times seconds
+    pub overflow_spills: u64, pub push_waits: u64,
+    // KD7c (10 f.22 to f.24): what the policy counted of its own decisions, where its predictions came from, and the learning
+    pub shallower: u64, pub simulations: u64, pub simulation_errors: u64, pub simulation_error: Option<String>,
+    pub predicted_by_model: u64, pub predicted_by_ratio: u64,
+    pub learning: Option<LearningReport>,       // None when no cost model was set
+}
+pub struct LearningReport { pub model: String, pub shadow: Option<String>, pub observed: u64, pub written: u64, pub unwritten: u64,
+                            pub store_error: Option<String>, pub refused: u64, pub refusal: Option<String>, pub drifts: Vec<DriftReport> }
+pub struct DriftReport { pub stage: StageId, pub target: String, pub at_unit: u64, pub units: u64, pub settled: bool }
+
+/// What the buffer catalog did over a run (09 f.18, adaptive-runtime 9.7), for the benchmark
+/// matrix to compare eviction orders and policies by; copied into `RunReport::buffers`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BufferReport {
+    pub eviction: String,                       // the order's name: "known_future"
+    pub peak_by_tier: Vec<u64>, pub budget_by_tier: Vec<u64>,   // by TierKind::index
+    pub spilled_bytes: u64, pub spills: u64, pub reloaded_bytes: u64, pub reloads: u64,
+    pub evictions: u64, pub misses: u64, pub miss_reload_bytes: u64,
+    pub released: u64, pub freed: u64, pub overrun_bytes: u64,
+    pub overflows: u64, pub overflow_bytes: u64,   // KD7b: written straight to disk
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -174,6 +204,8 @@ pub struct RunReport {
     /// 2026-09-22 (PM), which named neither while h and e.1 required them.
     pub overflow_failed: bool,
     pub late_records: u64,
+    pub buffers: Option<BufferReport>,        // meta.buffers; absent from the JSON when None (KD7a)
+    pub policy: Option<PolicyReport>,         // meta.policy; absent from the JSON when None (KD7b)
     pub io_paths: IoPaths,                    // paths taken (meta.io_paths)
     pub peak_anon_bytes: u64,
     pub peak_fraction_of_ceiling: f64,        // S1
@@ -292,6 +324,8 @@ The trace is the observability. `tracing` events: `trace.overflow` (debug, chunk
 **TR-T11 flush_then_finish.** From four threads, `record` 100,000 records, then each thread calls `flush` concurrently; after every `flush` returns, `snapshot().len() == 400,000`; `finish` once afterwards writes the footer; a second `finish` is a no-op; `record` after `finish` counts in `late_records`. TR-I5, e.1.
 
 **TR-T15 malformed_files_never_panic.** (2026-10-28; `tests/tr_t15_malformed_files.rs`) A final file whose schema, in its stream and in its footer, names type id 229 gives a finished view no batches, and an overflow file whose schema does gives a snapshot only its in-memory chunks (before TR-I7, the view's `FileReader` and `StreamReader` panicked in arrow-ipc's `fb_to_schema`); every case of `moruna_testkit::ipc::corruptions` over an Arrow IPC file of each of `batches()` (its stream, and the whole file) put where the final file is, and over each of `streams()` put where the overflow file is, reads as far as it is valid, never a panic. TR-I7.
+
+**TR-T16 policy_and_learning_in_the_report.** (KD7c; `tests/tr_t16_policy_and_learning_in_the_report.rs`) `PolicyReport::of` carries the policy's counters (shallower, simulations, failures and the first reason), the units predicted by the model and by ratios, and the learning (models, observed, written, unwritten with the reason, every spell of drift with its stage, target, unit, length and whether it settled) into JSON; a run with no model reports none. Adaptive-runtime 9.7.
 
 ## l. Implementation notes for the agent
 

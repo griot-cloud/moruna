@@ -1,25 +1,30 @@
-//! The device model (MH 4.8.2): one [`Device`] trait, one implementation per device, and a
-//! [`Bus`] that routes a guest access to the device that owns the address.
-//!
-//! The guest's devices are exactly: `virtio-blk` (one per disk), `virtio-vsock`, `virtio-mem`,
-//! the 8250 serial console, and on x86_64 the CPU hot-plug controller and the two legacy ports
-//! a Linux guest uses to power off and reset. All virtio devices sit on `virtio-mmio`. There is
-//! no network device: [`DeviceKind`] has no variant for one and the virtio device ids the
-//! monitor can construct exclude `VIRTIO_ID_NET` (MH H10, `vm_t2_no_network_device_kind`).
+//! Shared portable virtio-vsock model used by the real Linux vhost-user server.
+//! The legacy device bus and other emulated devices remain x86_64 test-only;
+//! exposing this transport does not enable a KVM frontend on another architecture.
 
+#[cfg(all(test, target_arch = "x86_64"))]
 pub mod block;
+#[cfg(all(test, target_arch = "x86_64"))]
 pub mod cpu_hotplug;
+#[cfg(all(test, target_arch = "x86_64"))]
 pub mod legacy;
+#[cfg(all(test, target_arch = "x86_64"))]
 pub mod mem;
+#[cfg(all(test, target_arch = "x86_64"))]
 pub mod mmio;
+#[cfg(all(test, target_arch = "x86_64"))]
 pub mod serial;
 pub mod virtio;
 pub mod vsock;
 
+#[cfg(all(test, target_arch = "x86_64"))]
 use std::collections::BTreeMap;
+#[cfg(all(test, target_arch = "x86_64"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(test, target_arch = "x86_64"))]
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(test, target_arch = "x86_64"))]
 use crate::error::{Result, VmmError};
 
 /// The guest's memory, as every device sees it.
@@ -30,6 +35,7 @@ pub type Mem = vm_memory::GuestMemoryMmap<()>;
 /// This is the one trait every device implements (MH 4.8.2: "a trait per device from day
 /// one"); a later device, a shared-memory window or a PCI function, implements it too and
 /// touches no other device (MH 4.8.6).
+#[cfg(all(test, target_arch = "x86_64"))]
 pub trait Device: Send {
     /// A short name for diagnostics.
     fn name(&self) -> &'static str;
@@ -41,6 +47,7 @@ pub trait Device: Send {
 
 /// Every kind of device the monitor can attach. There is no network kind (MH H10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub enum DeviceKind {
     /// `virtio-blk`, one per disk.
     Block,
@@ -56,6 +63,7 @@ pub enum DeviceKind {
     Legacy,
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
 impl DeviceKind {
     /// Every kind, for the exhaustive H10 test.
     pub const ALL: [DeviceKind; 6] = [
@@ -87,6 +95,7 @@ pub trait Irq: Send + Sync {
 
 /// Why the guest stopped, as the monitor learnt it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub enum StopReason {
     /// The guest powered off (ACPI S5, PSCI `SYSTEM_OFF`).
     PowerOff,
@@ -104,11 +113,13 @@ pub enum StopReason {
 /// A one-shot latch: the first reason recorded wins, later ones are ignored, and every thread
 /// can ask whether the guest has stopped.
 #[derive(Default)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub struct StopSignal {
     stopped: AtomicBool,
     reason: Mutex<Option<StopReason>>,
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
 impl StopSignal {
     /// Record `reason` if nothing was recorded before; true if this call recorded it.
     pub fn request(&self, reason: StopReason) -> bool {
@@ -136,15 +147,18 @@ impl StopSignal {
 }
 
 /// A shared, lockable device.
+#[cfg(all(test, target_arch = "x86_64"))]
 pub type SharedDevice = Arc<Mutex<dyn Device>>;
 
 /// An address space (MMIO or port IO) mapping ranges to devices. Ranges never overlap:
 /// [`Bus::insert`] refuses an overlapping range.
 #[derive(Default, Clone)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub struct Bus {
     ranges: BTreeMap<u64, (u64, SharedDevice)>,
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
 impl Bus {
     /// Attach `dev` at `[base, base + len)`.
     pub fn insert(&mut self, base: u64, len: u64, dev: SharedDevice) -> Result<()> {
@@ -216,7 +230,7 @@ impl Bus {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
 

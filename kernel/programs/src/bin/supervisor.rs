@@ -25,7 +25,7 @@
 use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
     Channel, DeviceMemory, Error, Handle, Interrupt, Memory, Pin, Process, ResourceKind, Rights,
-    Signals, abi_version, dma_release, map, now, println, raw, wait_one,
+    Signals, abi_version, dma_release, map, memory_flags, now, println, raw, wait_one,
 };
 
 moruna_sys::main!(run);
@@ -51,6 +51,8 @@ fn run() -> i64 {
     let root_dma = slot("root.dma");
     let devices = Channel(slot("devices"));
     let linux = Channel(slot("linux"));
+    let plane = Channel(slot("plane"));
+    let quota = Channel(slot("quota"));
     if abi_version() != moruna_sys::ABI_VERSION {
         println!(
             out,
@@ -196,27 +198,205 @@ fn run() -> i64 {
     if let Err(code) = remote_memory(&out, &root_process) {
         return code;
     }
+    if let Err(code) = grant(&out, &root_process, &image) {
+        return code;
+    }
     // SDD 28: the Linux personality makes its processes with a process resource of its
     // own.
     let for_linux = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
         Ok(h) => h,
         Err(e) => return fail(&out, "duplicating the process resource", e),
     };
-    if let Err((e, _)) = linux.write(b"process", [for_linux]) {
+    if let Err((e, _)) = linux.write(moruna_node::Bootstrap::Linux.header(), [for_linux]) {
         return fail(
             &out,
             "handing the Linux personality its process resource",
             e,
         );
     }
+    // SDD 29: the data plane's test engine starts its tasks with a process resource of
+    // its own.
+    let for_plane = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = plane.write(b"process", [for_plane]) {
+        return fail(
+            &out,
+            "handing the data plane's engine its process resource",
+            e,
+        );
+    }
+    // SDD 20 f.18 (KB5): the accounts test starts its children with a process resource
+    // of its own.
+    let for_quota = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = quota.write(b"process", [for_quota]) {
+        return fail(&out, "handing the accounts test its process resource", e);
+    }
     // SDD 25: the device manager does the device work with the device roots.
     if let Err((e, _)) = devices.write(
-        b"roots",
+        moruna_node::Bootstrap::Devices.header(),
         [root_process, root_device, root_ecam, root_msi, root_dma],
     ) {
         return fail(&out, "handing the device manager its roots", e);
     }
-    0
+    supervise_descendants(&out, &[devices, linux])
+}
+
+/// The test boot is a real supervisor too: it drains the same escrow codec while
+/// device and Linux services run, rather than dropping their supervisory peers.
+fn supervise_descendants(out: &moruna_sys::Console, guardians: &[Channel]) -> i64 {
+    extern crate alloc;
+    use alloc::vec::Vec;
+    let mut children: Vec<(usize, u64, Handle)> = Vec::new();
+    let mut open = alloc::vec![true; guardians.len()];
+    let deadline = now().saturating_add(300_000_000_000);
+    loop {
+        for (index, guardian) in guardians.iter().enumerate() {
+            if !open[index] {
+                continue;
+            }
+            loop {
+                let mut bytes = [0; 16];
+                let mut handles = [None];
+                let (n, count) = match guardian.read(&mut bytes, &mut handles) {
+                    Ok(message) => message,
+                    Err(Error::ShouldWait) => break,
+                    Err(Error::PeerClosed) => {
+                        open[index] = false;
+                        break;
+                    }
+                    Err(e) => return fail(out, "reading child escrow", e),
+                };
+                let Some(record) = moruna_node::ChildRecord::decode(&bytes[..n], count) else {
+                    return fail(out, "child escrow codec", Error::InvalidArgs);
+                };
+                if record.retain {
+                    if children
+                        .iter()
+                        .any(|(g, id, _)| *g == index && *id == record.id)
+                        || children.iter().filter(|(g, _, _)| *g == index).count() >= 64
+                    {
+                        return fail(out, "child escrow limit", Error::Limit);
+                    }
+                    let Some(handle) = handles[0].take() else {
+                        return fail(out, "missing child escrow", Error::InvalidArgs);
+                    };
+                    if !matches!(handle.info(), Ok((moruna_sys::ObjectType::Process, rights)) if rights.contains(Rights::WRITE | Rights::WAIT))
+                    {
+                        return fail(out, "child escrow rights", Error::AccessDenied);
+                    }
+                    children.push((index, record.id, handle));
+                } else {
+                    children.retain(|(g, id, _)| *g != index || *id != record.id);
+                }
+            }
+        }
+        children.retain(|(_, _, child)| !matches!(wait_one(child, Signals::TERMINATED, now()), Ok(seen) if seen.contains(Signals::TERMINATED)));
+        if open.iter().all(|open| !open) {
+            for (_, _, child) in children {
+                let _ = Process(child).kill();
+            }
+            return 0;
+        }
+        let mut items: Vec<_> = guardians
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| open[*i])
+            .map(|(_, g)| moruna_sys::WaitItem::new(&g.0, Signals::READABLE | Signals::PEER_CLOSED))
+            .collect();
+        items.extend(
+            children
+                .iter()
+                .map(|(_, _, child)| moruna_sys::WaitItem::new(child, Signals::TERMINATED)),
+        );
+        if let Err(e) = moruna_sys::wait(&mut items, deadline) {
+            for (_, _, child) in children {
+                let _ = Process(child).kill();
+            }
+            return fail(out, "supervising descendants", e);
+        }
+    }
+}
+
+fn kd2(out: &moruna_sys::Console, what: &str, e: Error) -> i64 {
+    println!(out, "KD2 grant: FAIL: {}: {}", what, e.name());
+    1
+}
+
+/// KD2-T8 (SDD 30 k): `process_grant` (ABI 2.2) moves handles into a created process and maps
+/// a start page naming them, once; a handle without `TRANSFER` is refused and stays here;
+/// `process_start` refuses a granted process, though its image is mapped.
+fn grant(out: &moruna_sys::Console, root_process: &Handle, image: &Handle) -> Result<(), i64> {
+    let p = Process::create(root_process, "granted").map_err(|e| kd2(out, "process_create", e))?;
+    let entry = p
+        .map_image(image)
+        .map_err(|e| kd2(out, "process_map_image", e))?;
+    let (mine, theirs) = Channel::create().map_err(|e| kd2(out, "channel_create", e))?;
+    // A handle without TRANSFER: refused, and nothing moves.
+    let fixed = mine
+        .0
+        .duplicate(Rights::READ | Rights::WRITE)
+        .map_err(|e| kd2(out, "handle_duplicate", e))?;
+    let mut refused = [(Some(fixed), "fixed")];
+    match p.grant(&mut refused) {
+        Err(Error::AccessDenied) if refused[0].0.is_some() => {}
+        Err(e) => return Err(kd2(out, "a grant without TRANSFER", e)),
+        Ok(_) => {
+            return Err(kd2(
+                out,
+                "a grant without TRANSFER was taken",
+                Error::BadState,
+            ));
+        }
+    }
+    let mut named = [(Some(theirs.0), "peer")];
+    let page = p
+        .grant(&mut named)
+        .map_err(|e| kd2(out, "process_grant", e))?;
+    if named[0].0.is_some() || page == 0 || page % 4096 != 0 {
+        return Err(kd2(out, "the grant's page or its handle", Error::BadState));
+    }
+    let (_, again) = Channel::create().map_err(|e| kd2(out, "channel_create", e))?;
+    let mut twice = [(Some(again.0), "again")];
+    match p.grant(&mut twice) {
+        Err(Error::BadState) if twice[0].0.is_some() => {}
+        Err(e) => return Err(kd2(out, "a second grant", e)),
+        Ok(_) => return Err(kd2(out, "a second grant was taken", Error::BadState)),
+    }
+    // The page is mapped read only in the process and names the one handle.
+    use moruna_abi::start_page as sp;
+    let mut head = [0u8; sp::HEADER_SIZE + sp::ENTRY_SIZE];
+    p.read(page, &mut head)
+        .map_err(|e| kd2(out, "process_read of the start page", e))?;
+    let name_at = sp::HEADER_SIZE + sp::ENTRY_NAME;
+    if moruna_abi::read_u32(&head, sp::MAGIC_OFFSET) != Some(sp::MAGIC)
+        || moruna_abi::read_u32(&head, sp::COUNT_OFFSET) != Some(1)
+        || moruna_abi::fixed_name(&head[name_at..name_at + 32]) != b"peer"
+    {
+        return Err(kd2(out, "the start page's contents", Error::BadState));
+    }
+    match p.start_with(entry, &mut []) {
+        Err(Error::BadState) => {}
+        Err(e) => return Err(kd2(out, "process_start of a granted process", e)),
+        Ok(()) => return Err(kd2(out, "a granted process was started", Error::BadState)),
+    }
+    drop(p);
+    // The other end of the granted channel closes with the process that held it.
+    match wait_one(&mine.0, Signals::PEER_CLOSED, now() + ms(5_000)) {
+        Ok(s) if s.contains(Signals::PEER_CLOSED) => {}
+        Ok(_) => return Err(kd2(out, "the granted channel's peer", Error::BadState)),
+        Err(e) => return Err(kd2(out, "the granted channel's peer closing", e)),
+    }
+    println!(
+        out,
+        "KD2 grant: ok: a channel granted to a created process under `peer`, its start page at {:#x} naming it; a handle without TRANSFER refused and kept, a second grant and process_start refused, the handle closed with the process",
+        page
+    );
+    Ok(())
 }
 
 fn kc1(out: &moruna_sys::Console, what: &str, e: Error) -> i64 {
@@ -474,7 +654,23 @@ fn driver_calls(
         out,
         "memory_create with an unknown flag",
         Error::InvalidArgs,
-        moruna_sys::Error::from_raw(raw::memory_create(4096, 2)),
+        moruna_sys::Error::from_raw(raw::memory_create(4096, 4, 0)),
+    )?;
+    refused_with(
+        out,
+        "a contiguous object not made for DMA",
+        Error::InvalidArgs,
+        moruna_sys::Error::from_raw(raw::memory_create(4096, memory_flags::CONTIGUOUS, 0)),
+    )?;
+    refused_with(
+        out,
+        "a contiguous object over the bound",
+        Error::Limit,
+        moruna_sys::Error::from_raw(raw::memory_create(
+            memory_flags::CONTIGUOUS_MAX_BYTES + 4096,
+            memory_flags::DMA | memory_flags::CONTIGUOUS,
+            0,
+        )),
     )?;
     let domain = root_dma
         .narrow(0xffff, 1)
@@ -540,6 +736,26 @@ fn driver_calls(
         Ok(0) => {}
         Ok(_) => return Err(kb3(out, "a released quarantine", Error::BadState)),
         Err(e) => return Err(kb3(out, "dma_release again", e)),
+    }
+    // ABI 2.1: a contiguous object's pin gives a run of consecutive device addresses.
+    let run = Memory::create_dma_contiguous(3 * 4096)
+        .map_err(|e| kb3(out, "a contiguous DMA memory object", e))?;
+    let mut addresses = [0u64; 3];
+    let (run_pin, n) = Pin::create(&domain, &run.0, true, &mut addresses)
+        .map_err(|e| kb3(out, "pinning a contiguous object", e))?;
+    if n != 3
+        || addresses[0] == 0
+        || !addresses[0].is_multiple_of(4096)
+        || addresses[1] != addresses[0] + 4096
+        || addresses[2] != addresses[0] + 2 * 4096
+    {
+        return Err(kb3(out, "a contiguous pin's addresses", Error::BadState));
+    }
+    drop(run_pin);
+    match dma_release(&domain) {
+        Ok(1) => {}
+        Ok(_) => return Err(kb3(out, "a contiguous pin's quarantine", Error::BadState)),
+        Err(e) => return Err(kb3(out, "dma_release of a contiguous pin", e)),
     }
 
     // process_kill: refused before a start; ends a running process; refused after.

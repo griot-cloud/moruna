@@ -9,5 +9,6 @@ publish.workspace = true
 [dependencies]
 moruna-svc.workspace = true
 moruna-mmio = { path = "../mmio", version = "=0.1.0" }
+moruna-pci = { path = "../pci", version = "=0.1.0" }
 moruna-virtio = { path = "../virtio", version = "=0.1.0" }
 console-protocol = { path = "../console-protocol", version = "=0.1.0" }

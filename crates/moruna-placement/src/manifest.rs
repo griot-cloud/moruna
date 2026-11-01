@@ -13,19 +13,26 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use moruna_kernel::{
-    CheckpointExtras, Fingerprint, MorunaError, NodeId, Origin, PayloadKind, ResumePoint,
-    ResumePolicy, RunId, SegmentRef, Seq, SourceCursor, Split, StageId,
+    CheckpointExtras, Fingerprint, MorselFeatures, MorunaError, NodeId, Origin, PayloadKind,
+    ResumePoint, ResumePolicy, RunId, SegmentRef, Seq, SourceCursor, Split, StageId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::PlacementEngine;
+use crate::catalog::NewBuffer;
 use crate::staging::Segment;
-use crate::state::Entry;
+use crate::state::{Entry, State};
 
 /// The manifest version this build writes and the only one it reads (e.5): 2 records each
 /// source's cursor and plan, each sink's state and watermark, and a lineage row per position
 /// (d.16).
 pub const MANIFEST_VERSION: u32 = 2;
+
+/// Canonical placement segment filename under an explicitly selected run directory.
+/// Portable checkpoint materialization uses the same naming authority as live staging.
+pub fn segment_file(run_directory: &Path, segment: u32) -> PathBuf {
+    run_directory.join(format!("seg-{segment:06}.seg"))
+}
 
 /// Only the identity fields of a manifest, so the facade can build a `PlacementConfig` with
 /// the manifest's run id before `restore` (d.1).
@@ -224,6 +231,15 @@ fn resume(path: &Path, what: impl std::fmt::Display) -> MorunaError {
     MorunaError::Resume(format!("{}: {what}", path.display()))
 }
 
+/// One batch a `restore` brings back: one disk record and every position that names it (f.18).
+struct RestoredBatch {
+    seg: SegmentRef,
+    kind: PayloadKind,
+    bytes: u64,
+    consumers: Vec<(StageId, Seq)>,
+    origin: Origin,
+}
+
 /// Read a manifest from disk and parse it (f.13).
 pub fn read_manifest(path: &Path) -> moruna_kernel::Result<Manifest> {
     let text = std::fs::read_to_string(path).map_err(|e| resume(path, e))?;
@@ -392,6 +408,68 @@ pub fn find_resumable_manifest(
 }
 
 impl PlacementEngine {
+    /// Pin the actual payload of an unresolved manifest position while its producers and
+    /// consumers are quiesced by the scheduler. Tier moves may retain/release their own
+    /// references concurrently; no queue lock survives this call and no IO is issued.
+    /// Missing/evicted/device-only bytes remain an explicit refusal, never a source query.
+    pub fn checkpoint_payload(
+        &self,
+        row: &LineageRow,
+    ) -> moruna_kernel::Result<crate::state::PayloadRef> {
+        let index = self.check_stage(row.stage)?;
+        let queue = self.lock_queue(index);
+        let entry = queue
+            .order
+            .iter()
+            .find(|entry| entry.seq == row.seq)
+            .ok_or_else(|| {
+                MorunaError::Resume("checkpoint position has no retained payload".into())
+            })?;
+        if entry.stage != row.stage
+            || entry.origin.node.0 != row.node
+            || entry.origin.split != row.split
+            || entry.origin.row_start != row.row_start
+            || entry.origin.row_end != row.row_end
+        {
+            return Err(MorunaError::Resume(
+                "checkpoint retained position identity changed".into(),
+            ));
+        }
+        // Queue (position 2) precedes catalog (position 3). A queue entry only names
+        // its batch: residency, size and payload have exactly one authority, the catalog.
+        // Validate both mappings before pinning so a stale/rebound position cannot export
+        // another batch. This is not a consumer take and does not alter holders or totals.
+        let catalog = self.lock_catalog();
+        if catalog.of_entry(row.stage, row.seq) != Some(entry.buffer) {
+            return Err(MorunaError::Resume(
+                "checkpoint position no longer names its catalog batch".into(),
+            ));
+        }
+        let buffer = catalog
+            .get(entry.buffer)
+            .ok_or_else(|| MorunaError::Resume("checkpoint catalog batch is unavailable".into()))?;
+        if !buffer.consumers.contains(&(row.stage, row.seq))
+            || kind_name(buffer.kind) != row.kind
+            || buffer.bytes != row.bytes
+        {
+            return Err(MorunaError::Resume(
+                "checkpoint retained batch identity changed".into(),
+            ));
+        }
+        let payload = buffer.payload.as_ref().ok_or_else(|| {
+            MorunaError::Resume("checkpoint position requires unavailable bytes".into())
+        })?;
+        if payload.kind() != buffer.kind {
+            return Err(MorunaError::Resume(
+                "checkpoint catalog payload kind changed".into(),
+            ));
+        }
+        // Clone the actual Arrow/tensor ownership while the catalog is locked. DMA
+        // completion or eviction can later release its copy without invalidating this pin.
+        // Encoding and IO happen only after both guards leave this call.
+        Ok(payload.reference())
+    }
+
     /// `checkpoint` (f.12). Runs on the caller's thread, never under a queue lock, and the
     /// lineage lock is held only for the snapshot.
     pub(crate) fn write_manifest(
@@ -420,6 +498,19 @@ impl PlacementEngine {
         let snapshot = self.lineage_snapshot(&above);
         let mut referenced: HashSet<u32> = HashSet::new();
         let mut lineage = Vec::with_capacity(snapshot.len());
+        // Where a waiting morsel's bytes have a disk copy is its batch's, in the catalog (f.18):
+        // read after the lineage lock is released (preamble 4.2).
+        let catalog = self.lock_catalog();
+        let disk_of = |stage: StageId, seq: Seq, consumed: bool| -> Option<SegmentRef> {
+            if consumed {
+                return None;
+            }
+            let buffer = catalog.get(catalog.of_entry(stage, seq)?)?;
+            if !buffer.consumers.contains(&(stage, seq)) {
+                return None;
+            }
+            buffer.disk
+        };
         for ((source, root), record) in snapshot {
             let row =
                 |stage: StageId, seq: Seq, kind, bytes, disk: Option<SegmentRef>| LineageRow {
@@ -451,7 +542,8 @@ impl PlacementEngine {
                 lineage.push(row(stage, root, PayloadKind::Table, 0, None));
             }
             for position in &record.positions {
-                if let Some(disk) = position.disk {
+                let disk = disk_of(position.stage, position.seq, position.consumed);
+                if let Some(disk) = disk {
                     referenced.insert(disk.segment);
                 }
                 lineage.push(row(
@@ -459,10 +551,11 @@ impl PlacementEngine {
                     position.seq,
                     position.kind,
                     position.bytes,
-                    position.disk,
+                    disk,
                 ));
             }
         }
+        drop(catalog);
         let segments: Vec<SegmentRow> = {
             let staging = self.lock_staging();
             let mut rows: Vec<SegmentRow> = staging
@@ -798,8 +891,12 @@ impl PlacementEngine {
             roots.entry((row.source, row.root)).or_default().push(row);
         }
         let mut to_recompute: Vec<Vec<(Seq, Origin)>> = vec![Vec::new(); plans.len()];
-        let mut restored: Vec<(StageId, Entry)> = Vec::new();
+        // One batch per disk record (f.18): a batch fanned out before it was spilled was written
+        // once, and each of its positions names the same record, so it comes back as one batch
+        // with one consumer per position.
+        let mut batches: Vec<RestoredBatch> = Vec::new();
         let mut per_segment: HashMap<u32, u64> = HashMap::new();
+        let mut by_record: HashMap<(u32, u64), usize> = HashMap::new();
         {
             let mut lineage = self.lock_lineage();
             lineage.clear();
@@ -834,28 +931,27 @@ impl PlacementEngine {
                         offset: disk.offset,
                         len: disk.len,
                     };
-                    *per_segment.entry(seg.segment).or_insert(0) += 1;
                     positions.push(crate::lineage::Position {
                         stage: row.stage,
                         seq: row.seq,
                         kind,
                         bytes: row.bytes,
-                        disk: Some(seg),
                         consumed: false,
                     });
-                    let recomputable = self.cfg.topology.source_of(row.stage).is_some();
-                    restored.push((
-                        row.stage,
-                        Entry::on_disk(
-                            row.seq,
-                            row.stage,
-                            origin.clone(),
-                            row.bytes,
-                            kind,
-                            seg,
-                            recomputable,
-                        ),
-                    ));
+                    match by_record.get(&(seg.segment, seg.offset)) {
+                        Some(&at) => batches[at].consumers.push((row.stage, row.seq)),
+                        None => {
+                            *per_segment.entry(seg.segment).or_insert(0) += 1;
+                            by_record.insert((seg.segment, seg.offset), batches.len());
+                            batches.push(RestoredBatch {
+                                seg,
+                                kind,
+                                bytes: row.bytes,
+                                consumers: vec![(row.stage, row.seq)],
+                                origin: origin.clone(),
+                            });
+                        }
+                    }
                 }
                 lineage.insert(
                     (source, root),
@@ -865,6 +961,53 @@ impl PlacementEngine {
                         committed: false,
                     },
                 );
+            }
+        }
+        let mut restored: Vec<(StageId, Entry)> = Vec::new();
+        {
+            let mut catalog = self.lock_catalog();
+            for RestoredBatch {
+                seg,
+                kind,
+                bytes,
+                consumers,
+                origin,
+            } in batches
+            {
+                let Some(&(first, _)) = consumers.first() else {
+                    continue;
+                };
+                let owner = match self.cfg.topology.link(first) {
+                    Some(link) => link.from,
+                    None => {
+                        return Err(resume(path, format!("stage {first} is outside the run")));
+                    }
+                };
+                let id = catalog
+                    .insert(NewBuffer {
+                        bytes,
+                        kind,
+                        owner,
+                        payload: None,
+                        state: State::OnDisk(seg),
+                        disk: Some(seg),
+                        recomputable: self.cfg.topology.source_of(first).is_some(),
+                        consumers: consumers.clone(),
+                        outside: false,
+                    })
+                    .map_err(|e| resume(path, e))?;
+                for (stage, seq) in consumers {
+                    restored.push((
+                        stage,
+                        Entry {
+                            seq,
+                            stage,
+                            origin: origin.clone(),
+                            features: MorselFeatures::default(),
+                            buffer: id,
+                        },
+                    ));
+                }
             }
         }
         restored.sort_by_key(|(stage, entry)| (entry.seq, *stage));
@@ -943,8 +1086,7 @@ impl PlacementEngine {
                 return Err(resume(path, format!("stage {stage} is outside the run")));
             }
             let mut queue = self.lock_queue(index);
-            queue.order.push_back(entry);
-            self.counters[index].count.fetch_add(1, Ordering::Relaxed);
+            self.enqueue(&mut queue, entry);
         }
         self.restored.store(true, Ordering::Release);
         // The restored heads are on disk; nothing else will trigger the first promotion.

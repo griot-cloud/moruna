@@ -1,17 +1,29 @@
-//! The planner port (SDD 26 d.2): [`Planner`], what it is given ([`PlanInputs`]), the cost
-//! model a planner may ask ([`Estimator`]), and [`Planners`], the registry a setting chooses
-//! from.
+//! The planner port (SDD 26 d.2): [`Planner`], what it is given ([`PlanInputs`], with the
+//! `moruna-cost` model it may ask), and [`Planners`], the registry a setting chooses from.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use moruna_job::{BudgetDoc, Catalogue, Declaration, Job, Refusal, Task};
+use moruna_cost::{CostKey, CostModel, Kernel};
+use moruna_job::{BudgetDoc, Catalogue, Job, Refusal};
 
 use crate::check::PlanRefusal;
-use crate::plan::{Plan, PlannerId, Resources, UnitCost};
+use crate::plan::{Plan, PlannerId, Resources};
 
-/// The planner a run uses when nothing chooses another.
+/// The planner a run uses when nothing chooses another and no cost model is configured.
 pub const DEFAULT_PLANNER: &str = crate::levels::Levels::NAME;
+
+/// The disk bandwidth a planner assumes when the embedder gives none, bytes per second.
+pub const DISK_BYTES_PER_SECOND: u64 = 500_000_000;
+
+/// The planner `explain` uses when the caller names none (SDD 26 PN-I15): `simulated` when the
+/// inputs carry a cost model, `levels` otherwise.
+pub fn default_planner(inputs: &PlanInputs<'_>) -> &'static str {
+    match inputs.model {
+        Some(_) => crate::simulated::Simulated::NAME,
+        None => DEFAULT_PLANNER,
+    }
+}
 
 /// Why a job was not planned.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -51,7 +63,17 @@ pub enum PlanError {
         /// Why.
         reason: String,
     },
-    /// The cost model failed, or answered with an estimate a plan cannot carry, for a step.
+    /// A step can never run in the run's memory: a unit of it needs more than the budget.
+    #[error("step {step} (task `{task}`) is infeasible: {reason}")]
+    Infeasible {
+        /// The step.
+        step: String,
+        /// Its task.
+        task: String,
+        /// What it needs and what the run has.
+        reason: String,
+    },
+    /// The cost model answered with an estimate a plan cannot carry, for a step.
     #[error("cost model {model} for step {step}: {reason}")]
     Model {
         /// The model's id.
@@ -110,8 +132,16 @@ pub struct PlanInputs<'a> {
     pub tables: BTreeMap<String, TableStats>,
     /// What the run is given.
     pub resources: Resources,
-    /// A cost model to ask about each step; `None`: the planner's declared defaults.
-    pub model: Option<&'a dyn Estimator>,
+    /// The cost model to ask about each task's units; `None`: the planner's declared defaults.
+    pub model: Option<&'a dyn CostModel>,
+    /// What warm-up or a profile measured or declared of a task's kernel (start-up, checkpoint,
+    /// speed-ups, stateful), by the task's id.
+    pub kernels: BTreeMap<String, Kernel>,
+    /// The key a task's units are costed under, by the task's id, where the embedder knows its
+    /// function's fingerprint and input schema; others are [`crate::cost_key`]'s.
+    pub keys: BTreeMap<String, CostKey>,
+    /// The disk's bandwidth, bytes per second; `None`: [`DISK_BYTES_PER_SECOND`].
+    pub disk_bytes_per_second: Option<u64>,
 }
 
 impl<'a> PlanInputs<'a> {
@@ -121,6 +151,9 @@ impl<'a> PlanInputs<'a> {
             tables: BTreeMap::new(),
             resources,
             model: None,
+            kernels: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            disk_bytes_per_second: None,
         }
     }
 
@@ -132,10 +165,36 @@ impl<'a> PlanInputs<'a> {
         PlanInputs::new(budget_resources(&job.budget, discovered))
     }
 
-    /// The same inputs, asking `model` about each step.
-    pub fn with_model(mut self, model: &'a dyn Estimator) -> PlanInputs<'a> {
+    /// The same inputs, asking `model` about each task's units.
+    pub fn with_model(mut self, model: &'a dyn CostModel) -> PlanInputs<'a> {
         self.model = Some(model);
         self
+    }
+
+    /// The same inputs, with what is known of task `task`'s kernel.
+    pub fn with_kernel(mut self, task: impl Into<String>, kernel: Kernel) -> PlanInputs<'a> {
+        self.kernels.insert(task.into(), kernel);
+        self
+    }
+
+    /// The same inputs, costing task `task`'s units under `key`.
+    pub fn with_key(mut self, task: impl Into<String>, key: CostKey) -> PlanInputs<'a> {
+        self.keys.insert(task.into(), key);
+        self
+    }
+
+    /// The same inputs, with a disk of `bytes_per_second`.
+    pub fn with_disk(mut self, bytes_per_second: u64) -> PlanInputs<'a> {
+        self.disk_bytes_per_second = Some(bytes_per_second);
+        self
+    }
+
+    /// The model's id as a plan names it: `name@version`.
+    pub fn model_id(&self) -> Option<String> {
+        self.model.map(|m| {
+            let id = m.id();
+            format!("{}@{}", id.name, id.version)
+        })
     }
 
     /// The same inputs, with `stats` for the table source task `task` reads.
@@ -150,7 +209,10 @@ impl core::fmt::Debug for PlanInputs<'_> {
         f.debug_struct("PlanInputs")
             .field("tables", &self.tables)
             .field("resources", &self.resources)
-            .field("model", &self.model.map(|m| m.id()))
+            .field("model", &self.model_id())
+            .field("kernels", &self.kernels)
+            .field("keys", &self.keys)
+            .field("disk_bytes_per_second", &self.disk_bytes_per_second)
             .finish()
     }
 }
@@ -173,34 +235,6 @@ pub fn budget_resources(budget: &BudgetDoc, discovered: Resources) -> Resources 
         memory_start_bytes: memory_start,
         memory_ceiling_bytes: memory_ceiling,
     }
-}
-
-/// What a planner asks a cost model about one step (SDD 26 d.2).
-pub struct StepQuery<'a> {
-    /// The job.
-    pub job: &'a Job,
-    /// The step's tasks, in the job's order.
-    pub tasks: Vec<&'a Task>,
-    /// Each task's declaration, when the catalogue has its kind.
-    pub declarations: Vec<Option<&'a Declaration>>,
-    /// For a source step, the statistics of the table it reads, when the embedder gave them.
-    pub table: Option<&'a TableStats>,
-    /// The rows the step takes in, as the planner expects them; `None` when not known.
-    pub rows_in: Option<u64>,
-    /// The bytes it takes in.
-    pub bytes_in: Option<u64>,
-    /// What the step is given.
-    pub resources: Resources,
-}
-
-/// The cost model a planner asks about a step: the seam `moruna-cost`'s model is adapted to
-/// (SDD 26 d.2, `architecture/adaptive-runtime.md` section 5). Defined here while that crate is
-/// not on `main`; its answer has the shape of section 4's `UnitCost` field for field.
-pub trait Estimator: Send + Sync {
-    /// The model's name and version, stored in every plan it was asked for.
-    fn id(&self) -> String;
-    /// What the step costs over every batch it sees.
-    fn estimate(&self, query: &StepQuery<'_>) -> Result<UnitCost, String>;
 }
 
 /// A planner: one job in, Moruna's plan of it out (SDD 26 d.2). A planner is an adapter of this
@@ -230,12 +264,17 @@ impl Planners {
         Planners::default()
     }
 
-    /// Moruna's planners: `levels` ([`crate::Levels`]).
+    /// Moruna's planners: `levels` ([`crate::Levels`]) and `simulated`
+    /// ([`crate::Simulated`]).
     pub fn standard() -> Planners {
         let mut planners = Planners::empty();
         planners.by_name.insert(
             crate::levels::Levels::NAME.to_string(),
             Arc::new(crate::levels::Levels),
+        );
+        planners.by_name.insert(
+            crate::simulated::Simulated::NAME.to_string(),
+            Arc::new(crate::simulated::Simulated::default()),
         );
         planners
     }

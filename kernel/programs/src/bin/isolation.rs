@@ -1,7 +1,11 @@
-//! KK-T8, prober: every handle-taking call (29, ABI 2.0) on every value from 0 to 4096, and on the
-//! holder's live values, must return bad handle. First with only the console, then,
-//! after closing it, with no handle at all; the exit code counts the second pass's
-//! failures and the kernel prints it.
+//! KK-T8, prober: every handle-taking call (40, ABI 2.3: the 29 of ABI 2.0, the engine's five
+//! slot calls, `process_plane`, the server's `plane_get` and `plane_put`, SDD 29,
+//! `process_grant`, SDD 30, and the account calls and `memory_create`'s account, SDD 20
+//! f.18, for which zero names the caller's own account and is not probed) on every
+//! value from 0 to 4096, and on the holder's live values, must return bad handle; and so must
+//! the task's own three data-plane calls in a process with no plane, on every slot and port
+//! number. First with only the console, then, after closing it, with no handle at all; the
+//! exit code counts the second pass's failures and the kernel prints it.
 
 #![no_std]
 #![no_main]
@@ -15,7 +19,7 @@ use moruna_sys::{
 
 moruna_sys::main!(run);
 
-const CALLS: usize = 29;
+const CALLS: usize = 43;
 const SWEEP: RawHandle = 4096;
 
 /// The number of the first call that did not answer bad handle for `v`, if any.
@@ -28,7 +32,7 @@ fn probe(v: RawHandle) -> Option<usize> {
         raw::channel_write(v, &[], &[]),
         raw::channel_read(v, &mut [], &mut []).0,
         raw::memory_map(v, 0, 4096, map::READ),
-        raw::process_create(v, b"x"),
+        raw::process_create(v, b"x", 0),
         raw::process_map_image(v, v),
         raw::process_start(v, 0x40_0000, &[]),
         raw::timer_set(v, 0),
@@ -51,6 +55,35 @@ fn probe(v: RawHandle) -> Option<usize> {
         raw::process_read(v, 0x40_0000, &mut [0; 8]),
         raw::process_write(v, 0x40_0000, &[0; 8]),
         raw::forward_clone(v, 1, 0x40_0000, 0, 0, 0),
+        raw::slot_push(v, v, 0, 4096, 0),
+        raw::slot_take(v, &mut [0; 32]),
+        raw::slot_close(v),
+        raw::slot_refuse(v, b"no"),
+        raw::process_plane(v, &[v], 0),
+        raw::plane_get(v, 0).0,
+        raw::plane_put(v, 0, 0x40_0000, 4096),
+        raw::process_grant(v, &[]),
+        // Zero names the caller's own account for these (ABI 2.3): not a handle, so not
+        // probed, and never made, which for `memory_create` would make an object.
+        if v == 0 {
+            Error::BadHandle.to_raw()
+        } else {
+            raw::account_create(v, 0, b"x")
+        },
+        if v == 0 {
+            Error::BadHandle.to_raw()
+        } else {
+            raw::account_info(v, &mut [0; 64])
+        },
+        if v == 0 {
+            Error::BadHandle.to_raw()
+        } else {
+            raw::memory_create(4096, 0, v)
+        },
+        // A process with no plane names no slot and no port.
+        raw::batch_get(v as u64).0,
+        raw::batch_put(v as u64, 0x40_0000, 4096),
+        raw::port_call(v as u64, b"").0,
     ];
     results
         .iter()

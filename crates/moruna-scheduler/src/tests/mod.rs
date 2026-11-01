@@ -4,7 +4,7 @@
 //! under `cfg(test)` (`Scheduler::test_kill_worker`) and SC-T2 asserts on the pick rule, which
 //! is private to the crate.
 
-mod common;
+pub(crate) mod common;
 
 mod sc_behaviour;
 
@@ -29,6 +29,11 @@ mod sc_t25_any_plan_finishes;
 mod sc_t26_a_drive_that_panics_ends_the_run;
 mod sc_t27_a_kernels_finish;
 mod sc_t2_admission_rule;
+mod sc_t34_policy_port;
+mod sc_t35_liveness;
+mod sc_t36_residency_greedy;
+mod sc_t37_lookahead;
+mod sc_t38_learning;
 mod sc_t3_source_admission;
 mod sc_t4_one_record_per_morsel_stage;
 mod sc_t5_knobs_immediate;

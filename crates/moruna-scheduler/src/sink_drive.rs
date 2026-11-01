@@ -20,7 +20,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crossbeam::sync::{Parker, Unparker};
-use moruna_kernel::{BoxFuture, Locality, MorunaError, Result, Seq, Sink, SinkSummary};
+use moruna_kernel::{BoxFuture, Locality, MorunaError, Result, Seq, Sink, SinkSummary, StageId};
 use moruna_sinks::SinkHandle;
 
 use crate::shared::{DRIVE_DRIVING, DRIVE_STOP, Exit, RunState, Shared, SinkEnd};
@@ -58,6 +58,13 @@ pub(crate) fn drive(shared: Arc<Shared>, index: usize, parker: Parker) {
         if mode == DRIVE_STOP {
             break;
         }
+        if s.checkpoint_pause.load(Ordering::SeqCst) {
+            // Outside write_loop this drive owns no write futures.
+            end.checkpoint_paused.store(true, Ordering::SeqCst);
+            parker.park_timeout(Duration::from_millis(1));
+            continue;
+        }
+        end.checkpoint_paused.store(false, Ordering::SeqCst);
         if mode != DRIVE_DRIVING {
             parker.park_timeout(Duration::from_millis(1));
             continue;
@@ -97,7 +104,20 @@ fn write_loop(shared: &Shared, end: &SinkEnd, parker: &Parker, cx: &mut Context<
     let interval = Duration::from_millis(shared.cfg.heartbeat_interval_ms);
 
     loop {
-        let mut worked = poll_writes(shared, end, sink, &mut inflight, cx);
+        let mut worked = poll_writes(shared, end, queue, sink, &mut inflight, cx);
+        if shared.checkpoint_pause.load(Ordering::SeqCst)
+            && !shared.has_exit()
+            && !shared.is_cancelled()
+            && !shared.stopping.load(Ordering::SeqCst)
+        {
+            // Ordered sinks may need a missing input before an admitted future resolves.
+            // In that case the bounded barrier refuses; it never steals or drops the future.
+            end.checkpoint_paused
+                .store(inflight.is_empty(), Ordering::SeqCst);
+            parker.park_timeout(Duration::from_millis(1));
+            continue;
+        }
+        end.checkpoint_paused.store(false, Ordering::SeqCst);
         if gappy {
             worked |= skip_gaps(shared, end, sink);
         }
@@ -133,7 +153,12 @@ fn write_loop(shared: &Shared, end: &SinkEnd, parker: &Parker, cx: &mut Context<
                 Ok(Some(morsel)) if floor.is_some_and(|f| morsel.seq <= f) => {
                     // A resumed run replays a source morsel to every sink, and this sink had
                     // committed what it became here before the run stopped (placement f.13).
+                    let seq = morsel.seq;
                     drop(morsel);
+                    if let Err(e) = shared.placement.release(queue, seq) {
+                        crate::policy::terminate(shared, e);
+                        return Drained::Stopped;
+                    }
                     worked = true;
                 }
                 Ok(Some(morsel)) => {
@@ -241,6 +266,7 @@ fn skip_gaps(shared: &Shared, end: &SinkEnd, sink: &SinkHandle) -> bool {
 fn poll_writes(
     shared: &Shared,
     end: &SinkEnd,
+    queue: StageId,
     sink: &SinkHandle,
     inflight: &mut Vec<(Seq, BoxFuture<'_, Result<()>>)>,
     cx: &mut Context<'_>,
@@ -252,9 +278,13 @@ fn poll_writes(
         match poll {
             Poll::Pending => index += 1,
             Poll::Ready(result) => {
-                drop(inflight.remove(index));
+                let (seq, future) = inflight.remove(index);
+                drop(future);
                 shared.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
                 progressed = true;
+                // The write has resolved and the sink no longer holds the batch: its share is
+                // released (placement f.18).
+                let result = result.and(shared.placement.release(queue, seq));
                 match result {
                     Ok(()) => {
                         end.input.morsels.fetch_add(1, Ordering::SeqCst);
@@ -312,7 +342,30 @@ pub(crate) fn update_watermark(shared: &Shared, end: &SinkEnd) {
 
 /// f.6, f.11: once every sink's queue is closed and drained, `finish` each sink in order and
 /// move each watermark to the last number a morsel can have there; then the run is complete.
+struct FinishControl<'a>(&'a std::sync::atomic::AtomicBool);
+impl Drop for FinishControl<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 fn finish(shared: &Shared) {
+    // Sink/kernel finishing mutates checkpoint state too. Serialize it with probes and
+    // portable snapshots; a drained drive owns no outstanding CQE while it waits here.
+    loop {
+        if shared.is_cancelled() || shared.has_exit() {
+            return;
+        }
+        if shared
+            .control_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _control = FinishControl(&shared.control_active);
     // f.10: `finish` runs on completion only. The claim is what makes that true: a cancel or a
     // terminate racing this point wins or loses once, here, rather than after a sink has been
     // finished (SC-T11 asserts `finish_calls == 0` on a cancelled run).

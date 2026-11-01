@@ -1,12 +1,12 @@
 //! A virtio device opened by its driver process (SDD 25, f.7), from the handles its
 //! supervisor gave it: the function's windows, one MSI-X interrupt for every queue,
-//! and DMA memory for the rings and the driver's own buffers.
+//! and DMA memory (`moruna_pci::dma::DmaBuffer`) for the rings.
 
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{format, string::String};
 
 use moruna_mmio::Sub;
-use moruna_pci::{command, function::Function};
-use moruna_svc::{Handle, Interrupt, Mapping, Memory, Pin, dma_release, map};
+use moruna_pci::{command, dma::DmaBuffer, function::Function};
+use moruna_svc::{Handle, Interrupt, Mapping, dma_release, map};
 
 use crate::{
     MODERN_BASE, NO_VECTOR, VENDOR,
@@ -16,49 +16,6 @@ use crate::{
 
 /// The MSI-X entry every queue of a Moruna driver interrupts through.
 pub const VECTOR: u16 = 0;
-
-/// Memory a device reads or writes: a DMA memory object, mapped in the driver, pinned
-/// for the device, with each page's device address.
-pub struct DmaBuffer {
-    pub memory: Memory,
-    _pin: Pin,
-    pub map: Mapping<'static>,
-    pages: Vec<u64>,
-}
-
-impl DmaBuffer {
-    /// `bytes` (whole pages) of zeroed DMA memory pinned through `dma`.
-    pub fn new(dma: &Handle, bytes: u64) -> Result<DmaBuffer, String> {
-        let memory = Memory::create_dma(bytes).map_err(|e| format!("DMA memory: {}", e.name()))?;
-        let mut pages = vec![0u64; bytes.div_ceil(4096) as usize];
-        let (pin, n) = Pin::create(dma, &memory.0, true, &mut pages)
-            .map_err(|e| format!("pinning DMA memory: {}", e.name()))?;
-        pages.truncate(n);
-        let map = memory
-            .map_detached(0, n as u64 * 4096, map::WRITE)
-            .map_err(|e| format!("mapping DMA memory: {}", e.name()))?;
-        Ok(DmaBuffer {
-            memory,
-            _pin: pin,
-            map,
-            pages,
-        })
-    }
-
-    /// The device address of byte `offset`; a part handed to the device starting there
-    /// must not cross the page's end.
-    pub fn addr(&self, offset: usize) -> u64 {
-        self.pages[offset / 4096] + (offset % 4096) as u64
-    }
-
-    pub fn len(&self) -> usize {
-        self.pages.len() * 4096
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
-    }
-}
 
 /// A queue of the device, in its own pinned memory.
 pub struct VirtQueue {

@@ -80,7 +80,7 @@ impl Drop for RunningGuard {
                     staging_dir = None, staging_limit = None, on_error = None, ordered = false,
                     sizer = "rule", profiles_dir = None, storage = None, host_profile = None,
                     allow_gil = false, checkpoint = true, checkpoint_interval = 5.0,
-                    keep_checkpoint = false, resume = None))]
+                    keep_checkpoint = false, resume = None, cost = None, engine_ports = None))]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     py: Python<'_>,
@@ -103,6 +103,8 @@ pub fn run(
     checkpoint_interval: f64,
     keep_checkpoint: bool,
     resume: Option<String>,
+    cost: Option<PyRef<'_, crate::engine::PyCostSession>>,
+    engine_ports: Option<PyRef<'_, crate::engine::PyEnginePorts>>,
 ) -> PyResult<PyRunReport> {
     let _guard = map(py, RunningGuard::acquire())?;
 
@@ -217,20 +219,21 @@ pub fn run(
         SinkSpec::Python => Some(sink.clone().unbind()),
         _ => None,
     };
+    let mut served = Vec::new();
+    let mut given = Vec::with_capacity(stages.len());
+    for stage in stages {
+        match stage {
+            Stage::Py(k) => given.push(Some(k)),
+            Stage::Served(declaration, serve) => {
+                served.push((*declaration, serve));
+                given.push(None);
+            }
+            Stage::Std(_) | Stage::Package(_) => given.push(None),
+        }
+    }
     let kinds = map(
         py,
-        crate::kinds::library(
-            stages
-                .into_iter()
-                .map(|s| match s {
-                    Stage::Py(k) => Some(k),
-                    Stage::Std(_) | Stage::Package(_) => None,
-                })
-                .collect(),
-            iterable,
-            user_source,
-            user_sink,
-        ),
+        crate::kinds::library(given, iterable, user_source, user_sink, served),
     )?;
     // A run starts from its plan (SDD 26 f.5): the default planner's, as `moruna run` does.
     let job = moruna_job::Job::from_v1(&job);
@@ -251,7 +254,41 @@ pub fn run(
         ),
     )?;
 
-    drive(py, built.spec, trace_path)
+    let mut components = match engine_ports {
+        Some(ports) => ports
+            .components(&job, &built.parts)
+            .map_err(|e| map_err(py, &e))?,
+        None => match py
+            .detach(moruna_runtime::bootstrap::Guest::for_current_process)
+            .map_err(|e| map_err(py, &e))?
+        {
+            Some(guest) => guest
+                .components(&job, &built.parts)
+                .map_err(|e| map_err(py, &e))?,
+            None => moruna_runtime::Components::default(),
+        },
+    };
+    if let Some(cost) = cost {
+        let cost = &*cost;
+        let learning = py
+            .detach(|| cost.learning(&job, &built.parts))
+            .map_err(|e| map_err(py, &e))?;
+        if components
+            .learning
+            .as_ref()
+            .is_some_and(|bound| !Arc::ptr_eq(&bound.online, &learning.online))
+        {
+            return Err(map_err(
+                py,
+                &MorunaError::Config {
+                    name: "cost",
+                    msg: "guest bootstrap and cost parameter name two model authorities".into(),
+                },
+            ));
+        }
+        components.learning = Some(learning);
+    }
+    drive(py, built.spec, trace_path, components)
 }
 
 /// The document `moruna.run`'s arguments describe (MH 4.1). Every value was translated and
@@ -440,6 +477,12 @@ fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KindDoc
                     fingerprint: None,
                 },
             )
+        } else if let Ok(task) = item.cast::<crate::kinds::PyDeclaredTask>() {
+            let task = task.get();
+            Ok(KindDoc::new(
+                task.declaration.name.clone(),
+                task.settings.clone(),
+            ))
         } else if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
             let package = package.get();
             KindDoc::of(
@@ -485,12 +528,17 @@ fn clone_schema(schema: &IteratorSchema) -> IteratorSchema {
 }
 
 /// f.5: spawn the runtime thread, then poll for signals on the main thread until it finishes.
-fn drive(py: Python<'_>, spec: RunSpec, trace_path: Option<PathBuf>) -> PyResult<PyRunReport> {
+fn drive(
+    py: Python<'_>,
+    spec: RunSpec,
+    trace_path: Option<PathBuf>,
+    components: moruna_runtime::Components,
+) -> PyResult<PyRunReport> {
     let cancel = CancelToken::new();
     let thread_cancel = cancel.clone();
     let handle = std::thread::Builder::new()
         .name("moruna-runtime".to_string())
-        .spawn(move || Runtime::run(spec, thread_cancel))
+        .spawn(move || Runtime::run_with(spec, thread_cancel, components))
         .map_err(|e| {
             map_err(
                 py,

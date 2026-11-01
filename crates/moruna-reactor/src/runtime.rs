@@ -71,6 +71,7 @@ impl Inner {
 
 /// One file operation waiting for a reactor thread.
 pub(crate) struct ReadFileOp {
+    pub(crate) strict_fd: Option<Arc<std::os::fd::OwnedFd>>,
     pub(crate) path: PathBuf,
     pub(crate) offset: u64,
     pub(crate) dst: Buffer,
@@ -88,6 +89,7 @@ pub(crate) struct ReadFileOptOp {
 
 /// `write_file`.
 pub(crate) struct WriteFileOp {
+    pub(crate) strict_fd: Option<Arc<std::os::fd::OwnedFd>>,
     pub(crate) path: PathBuf,
     pub(crate) offset: u64,
     pub(crate) src: BufferView,
@@ -266,7 +268,7 @@ fn descriptor(
 /// waiting for the answer (RE-I1). It comes back with the result so a read can return its
 /// buffer; `None` means the engine dropped the callback without calling it, and then the bytes
 /// are already gone.
-async fn once<O: Send + 'static>(
+pub(crate) async fn once<O: Send + 'static>(
     engine: &Arc<dyn FileEngine>,
     req: FileReq,
     owner: O,
@@ -281,7 +283,14 @@ async fn once<O: Send + 'static>(
     match rx.await {
         Ok((Ok(n), owner)) => (Ok(n), Some(owner)),
         Ok((Err(msg), owner)) => (Err(std::io::Error::other(msg)), Some(owner)),
-        Err(_) => (Err(std::io::Error::other("the io engine stopped")), None),
+        Err(_) => (
+            Err(std::io::Error::other(
+                engine.terminal_failure().unwrap_or_else(|| {
+                    "the io engine stopped before delivering its completion".into()
+                }),
+            )),
+            None,
+        ),
     }
 }
 
@@ -430,8 +439,79 @@ fn host_ptr_of_view(view: &BufferView) -> Result<usize> {
     })
 }
 
+/// Strict IO has a stronger completion contract: sender, charged owner and admission
+/// permit move into Done, never into a Tokio future that shutdown can cancel early.
+fn submit_strict<O: Send + 'static>(
+    inner: Arc<Inner>,
+    fd: Arc<std::os::fd::OwnedFd>,
+    work: FileWork,
+    owner: O,
+    permit: OwnedSemaphorePermit,
+    finish: impl FnOnce(Arc<Inner>, Result<usize>, O) + Send + 'static,
+) {
+    let FileWork {
+        kind,
+        path,
+        offset,
+        ptr,
+        len,
+        verb,
+    } = work;
+    let available = inner.paths.uring.on
+        && inner.paths.uring.guaranteed
+        && inner.paths.direct.on
+        && inner.paths.direct.guaranteed
+        && inner.engine.name() == "uring"
+        && eligible(&inner, ptr, offset, len);
+    #[cfg(target_os = "linux")]
+    let direct = crate::file_blocking::direct_flag(&fd)
+        .map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e));
+    #[cfg(not(target_os = "linux"))]
+    let direct: Result<bool> = Ok(false);
+    match direct {
+        Ok(true) if available => {}
+        Ok(_) => {
+            finish(
+                inner,
+                Err(MorunaError::Config {
+                    name: "raw_storage",
+                    msg: "strict direct io_uring operation unavailable or misaligned".into(),
+                }),
+                owner,
+            );
+            return;
+        }
+        Err(e) => {
+            finish(inner, Err(e), owner);
+            return;
+        }
+    }
+    inner.counters.note_direct(true);
+    inner.counters.note_uring();
+    let engine = Arc::clone(&inner.engine);
+    let request = FileReq {
+        fd,
+        verb,
+        ptr,
+        len,
+        offset,
+    };
+    engine.submit(
+        request,
+        Box::new(move |result| {
+            let _through_original_completion = permit;
+            finish(
+                inner,
+                result.map_err(|e| crate::fdcache::io_error(kind.as_str(), &path, &e)),
+                owner,
+            );
+        }),
+    );
+}
+
 async fn run_read_file(inner: Arc<Inner>, op: ReadFileOp, _permit: OwnedSemaphorePermit) {
     let ReadFileOp {
+        strict_fd,
         path,
         offset,
         dst,
@@ -449,6 +529,28 @@ async fn run_read_file(inner: Arc<Inner>, op: ReadFileOp, _permit: OwnedSemaphor
             return;
         }
     };
+    if let Some(fd) = strict_fd {
+        submit_strict(
+            Arc::clone(&inner),
+            fd,
+            FileWork {
+                kind: OpKind::ReadFile,
+                path: path.clone(),
+                offset,
+                ptr,
+                len,
+                verb: Verb::Read,
+            },
+            dst,
+            _permit,
+            move |inner, result, dst| match result {
+                Ok(n) if n == len => inner.resolve(tx, Ok(dst)),
+                Ok(n) => inner.resolve(tx, Err(short_read(OpKind::ReadFile, &path, n, len))),
+                Err(e) => inner.resolve(tx, Err(e)),
+            },
+        );
+        return;
+    }
     // The buffer travels with the request: it is the engine's callback that holds it until the
     // syscall is over, not this task, which `shutdown` may drop (RE-I1, `once`).
     let (result, dst) = file_op(
@@ -513,6 +615,7 @@ async fn run_read_file_opt(inner: Arc<Inner>, op: ReadFileOptOp, _permit: OwnedS
 
 async fn run_write_file(inner: Arc<Inner>, op: WriteFileOp, _permit: OwnedSemaphorePermit) {
     let WriteFileOp {
+        strict_fd,
         path,
         offset,
         src,
@@ -530,6 +633,35 @@ async fn run_write_file(inner: Arc<Inner>, op: WriteFileOp, _permit: OwnedSemaph
             return;
         }
     };
+    if let Some(fd) = strict_fd {
+        submit_strict(
+            Arc::clone(&inner),
+            fd,
+            FileWork {
+                kind: OpKind::WriteFile,
+                path: path.clone(),
+                offset,
+                ptr,
+                len,
+                verb: Verb::Write,
+            },
+            src,
+            _permit,
+            move |inner, result, _src| match result {
+                Ok(n) if n == len => inner.resolve(tx, Ok(())),
+                Ok(n) => inner.resolve(
+                    tx,
+                    Err(MorunaError::Io {
+                        op: "write_file",
+                        target: path.display().to_string(),
+                        msg: format!("short strict write: {n} of {len}"),
+                    }),
+                ),
+                Err(e) => inner.resolve(tx, Err(e)),
+            },
+        );
+        return;
+    }
     // The view travels with the request and is dropped by the engine's callback, after the
     // syscall; the bytes it was over are still the caller's either way (RE-I1).
     let (result, src) = file_op(

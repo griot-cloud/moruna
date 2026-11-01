@@ -8,6 +8,7 @@
 //! ```text
 //! moruna-image 1
 //! process NAME [PROGRAM]            # PROGRAM defaults to NAME
+//!   memory SIZE                     # its own account: bytes, or KiB, MiB, GiB
 //!   handle SOURCE SLOT [rights=R,...]
 //!   driver VVVV:DDDD PROGRAM SERVICE  # a line of the process's driver table
 //!   expect TEXT                     # a line the boot's console must carry
@@ -15,6 +16,8 @@
 //!   faults TEXT                     # the process faults, as the kernel words it
 //! link PROCESS.SLOT[:R,...] PROCESS.SLOT[:R,...]
 //! expect TEXT                       # before any process: a line of the boot itself
+//! machine ARG...                    # QEMU arguments the boot's machine is given
+//! disk NAME SECTORS PATTERN         # a disk image the boot writes and checks
 //! ```
 //!
 //! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`, `root.ecam`,
@@ -30,6 +33,15 @@
 //! 0 under its slot, the second endpoint 1. `expect`, `exits` and `faults` are what a
 //! boot of the image must print; the tool writes them, with the kernel's own boot and
 //! power-off lines, to the expectations file the boot check reads.
+//!
+//! `machine` and `disk` describe the machine the image boots on, so a test's device is
+//! added beside the test, not in the boot script: `kernel/tools/boot.sh` gives QEMU
+//! every `machine` line's arguments (split at spaces, with `{out}`, `{cpus}` and `{memory}`
+//! replaced by the boot's directory and CPU count), and before the boot writes each
+//! `disk` afresh as `{out}/NAME-{cpus}.img`, SECTORS sectors of 512 bytes of pattern A
+//! (`kernel/tools/disk-image.py`); `kernel/tools/check-boot.sh` then checks the image
+//! holds PATTERN (`a`, untouched, or `b`, which the test wrote). The tool writes them to
+//! the files `machine` and `disks`.
 
 use std::{collections::BTreeSet, fmt, fs, path::Path};
 
@@ -96,6 +108,9 @@ pub struct DescHandle {
 pub struct DescProcess {
     pub name: String,
     pub program: String,
+    /// The limit of its own account, carved out of the machine's (SDD 20 f.18); `None`:
+    /// it is charged to the machine's account.
+    pub memory: Option<u64>,
     pub handles: Vec<DescHandle>,
     /// The process's driver table, if it manages devices.
     pub drivers: Table,
@@ -124,6 +139,26 @@ pub struct Link {
     pub line: usize,
 }
 
+/// What a disk the boot writes holds once the boot has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pattern {
+    /// Pattern A, as written: nothing wrote the disk.
+    A,
+    /// Pattern B, which a test wrote over A.
+    B,
+}
+
+/// A disk image the boot writes before it starts and checks after it ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disk {
+    pub name: String,
+    pub sectors: u64,
+    pub after: Pattern,
+}
+
+/// The most sectors a described disk holds: 1 GiB.
+pub const DISK_SECTORS_MAX: u64 = 1 << 21;
+
 /// A parsed description.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Description {
@@ -131,6 +166,46 @@ pub struct Description {
     pub links: Vec<Link>,
     /// Lines the boot itself must print, besides each process's.
     pub expect: Vec<String>,
+    /// The machine's QEMU arguments, a line of them per `machine` directive.
+    pub machine: Vec<String>,
+    /// The disks the boot writes and checks.
+    pub disks: Vec<Disk>,
+}
+
+/// A `machine` line's arguments: words of printable ASCII without quotes, backslashes
+/// or shell expansion, whose only braces are the `{out}`, `{cpus}` and `{memory}` placeholders.
+fn machine_args(rest: &str, line: usize) -> Result<String, DescError> {
+    if rest.is_empty() {
+        return err(line, "`machine` needs its QEMU arguments");
+    }
+    for word in rest.split_whitespace() {
+        if let Some(b) = word.bytes().find(|b| {
+            !b.is_ascii_graphic()
+                || matches!(
+                    b,
+                    b'"' | b'\'' | b'\\' | b'$' | b'`' | b';' | b'&' | b'|' | b'*' | b'?'
+                )
+        }) {
+            return err(
+                line,
+                format!(
+                    "`{word}` holds `{}`, which a machine argument may not",
+                    b as char
+                ),
+            );
+        }
+        let bare = word
+            .replace("{out}", "")
+            .replace("{cpus}", "")
+            .replace("{memory}", "");
+        if bare.contains('{') || bare.contains('}') {
+            return err(
+                line,
+                format!("`{word}` has a placeholder other than {{out}}, {{cpus}} and {{memory}}"),
+            );
+        }
+    }
+    Ok(rest.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn rights_list(list: &str, line: usize) -> Result<Rights, DescError> {
@@ -176,6 +251,38 @@ fn data_path(path: &str, line: usize) -> Result<String, DescError> {
             line,
             format!("data path `{path}` is not relative parts of [a-z0-9._-] without `..`"),
         )
+    }
+}
+
+/// A size: a number of bytes, or of `KiB`, `MiB` or `GiB`, whole pages above zero.
+fn size(text: &str, line: usize) -> Result<u64, DescError> {
+    let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, ""),
+    };
+    let scale = match unit {
+        "" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        _ => {
+            return err(
+                line,
+                format!("`{text}` is not a size: bytes, or KiB, MiB or GiB"),
+            );
+        }
+    };
+    let bytes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .filter(|b| *b > 0 && b.is_multiple_of(moruna_abi::PAGE_SIZE));
+    match bytes {
+        Some(b) => Ok(b),
+        None => err(
+            line,
+            format!("`{text}` is not a whole number of pages above zero"),
+        ),
     }
 }
 
@@ -234,11 +341,28 @@ impl Description {
                     d.processes.push(DescProcess {
                         name: process,
                         program: name(program, line, "program")?,
+                        memory: None,
                         handles: Vec::new(),
                         drivers: Table::default(),
                         expect: Vec::new(),
                         line,
                     });
+                }
+                "memory" => {
+                    let [text] = fields.as_slice() else {
+                        return err(line, "`memory SIZE`");
+                    };
+                    let bytes = size(text, line)?;
+                    let Some(process) = d.processes.last_mut() else {
+                        return err(line, "a `memory` line must follow a `process` line");
+                    };
+                    if process.memory.is_some() {
+                        return err(
+                            line,
+                            format!("process `{}` has two `memory` lines", process.name),
+                        );
+                    }
+                    process.memory = Some(bytes);
                 }
                 "handle" => {
                     let (source, slot, rights) = match fields.as_slice() {
@@ -305,7 +429,7 @@ impl Description {
                         program: String::from(*program),
                         service: String::from(*service),
                     });
-                    // The table's own rules (one driver a device, one line a service),
+                    // The table's own rules (one driver a device, at most 32 lines),
                     // checked here so the refusal names this line.
                     let rendered = process.drivers.to_string();
                     if let Err(e) = Table::parse(&rendered) {
@@ -319,6 +443,40 @@ impl Description {
                     d.links.push(Link {
                         ends: [end(a, line)?, end(b, line)?],
                         line,
+                    });
+                }
+                "machine" => {
+                    let args = machine_args(rest, line)?;
+                    d.machine.push(args);
+                }
+                "disk" => {
+                    let [disk, sectors, after] = fields.as_slice() else {
+                        return err(line, "`disk NAME SECTORS a|b`");
+                    };
+                    let disk = name(disk, line, "disk")?;
+                    if d.disks.iter().any(|x| x.name == disk) {
+                        return err(line, format!("disk `{disk}` is described twice"));
+                    }
+                    let sectors = match sectors.parse::<u64>() {
+                        Ok(n) if (1..=DISK_SECTORS_MAX).contains(&n) => n,
+                        _ => {
+                            return err(
+                                line,
+                                format!("`{sectors}` is not 1 to {DISK_SECTORS_MAX} sectors"),
+                            );
+                        }
+                    };
+                    let after = match *after {
+                        "a" => Pattern::A,
+                        "b" => Pattern::B,
+                        other => {
+                            return err(line, format!("`{other}` is not the pattern `a` or `b`"));
+                        }
+                    };
+                    d.disks.push(Disk {
+                        name: disk,
+                        sectors,
+                        after,
                     });
                 }
                 "expect" | "exits" | "faults" => {
@@ -451,6 +609,7 @@ impl Description {
             manifest.processes.push(ProcessSpec {
                 name: p.name.clone(),
                 path: format!("{BIN}/{}", p.program),
+                memory: p.memory,
                 handles,
             });
         }
@@ -590,6 +749,10 @@ pub struct Image {
     pub manifest: String,
     pub initramfs: Vec<u8>,
     pub expect: Vec<String>,
+    /// The machine's QEMU arguments, a line per `machine` directive.
+    pub machine: Vec<String>,
+    /// The disks, a line each: `NAME SECTORS a|b`.
+    pub disks: Vec<String>,
 }
 
 /// Builds the image a description names, its programs read from `programs` and its
@@ -630,5 +793,17 @@ pub fn build(description: &str, programs: &Path, data: &Path) -> Result<Image, D
         initramfs: archive(&files)?,
         manifest,
         expect: d.expectations(),
+        machine: d.machine.clone(),
+        disks: d
+            .disks
+            .iter()
+            .map(|disk| {
+                let after = match disk.after {
+                    Pattern::A => "a",
+                    Pattern::B => "b",
+                };
+                format!("{} {} {after}", disk.name, disk.sectors)
+            })
+            .collect(),
     })
 }

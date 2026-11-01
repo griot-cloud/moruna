@@ -30,6 +30,9 @@ table Estimate {
   unit: Unit;
   basis: Basis;
   observations: uint;
+  // Whether the inputs lie outside what the observations measured; appended, so a plan written
+  // before it reads as not extrapolated.
+  extrapolated: bool;
 }
 
 // What a step takes and gives, over the batches the plan expects it to see.

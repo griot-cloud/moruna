@@ -1,0 +1,11 @@
+[package]
+name = "moruna-gve"
+description = "Google's gVNIC for Moruna drivers: its registers, admin queue, device description, and GQI transmit and receive rings in queue page lists or raw addressing, in safe Rust, every value the device returns checked; not yet proven on hardware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-mmio = { path = "../mmio", version = "=0.1.0" }

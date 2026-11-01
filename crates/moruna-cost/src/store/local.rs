@@ -101,9 +101,7 @@ impl LocalStore {
     }
 
     fn key_dir(&self, key: &CostKey) -> PathBuf {
-        self.root
-            .join(OBSERVATIONS)
-            .join(format!("{:016x}", fnv1a(key.canonical().as_bytes())))
+        self.root.join(OBSERVATIONS).join(key_partition(key))
     }
 
     fn segment_cap(&self) -> usize {
@@ -111,15 +109,7 @@ impl LocalStore {
     }
 
     fn state_path(&self, model: &ModelId) -> Result<PathBuf> {
-        if !moruna_job::is_kind_name(&model.name) {
-            return Err(CostError::BadName {
-                name: model.name.clone(),
-            });
-        }
-        Ok(self
-            .root
-            .join(MODELS)
-            .join(format!("{}@{}.state", model.name, model.version)))
+        Ok(self.root.join(MODELS).join(model_state_name(model)?))
     }
 
     /// Retire a directory's oldest whole segments into its summary while it holds more than a
@@ -213,13 +203,7 @@ impl LocalStore {
 
     /// Keep the last `per_key` records and fold the older ones into the summary.
     fn trim(&self, key: &CostKey, summary: &mut Option<Summary>, kept: &mut Vec<Observation>) {
-        if kept.len() > self.retention.per_key {
-            let excess = kept.len() - self.retention.per_key;
-            let folded = summary.get_or_insert_with(|| Summary::new(key.clone()));
-            for observation in kept.drain(..excess) {
-                folded.fold(&observation);
-            }
-        }
+        trim_history(key, summary, kept, self.retention);
     }
 }
 
@@ -281,11 +265,7 @@ impl ObservationSource for LocalStore {
 
 impl ObservationStore for LocalStore {
     fn append(&self, observation: &Observation) -> Result<()> {
-        observation.check().map_err(CostError::Invalid)?;
-        let body = serde_json::to_vec(observation)
-            .map_err(|e| CostError::Invalid(format!("not serialisable: {e}")))?;
-        let record = frame::encode(&body)
-            .ok_or_else(|| CostError::Invalid("a record longer than 4 GiB".into()))?;
+        let record = encode_observation(observation)?;
         let dir = self.key_dir(&observation.key);
         std::fs::create_dir_all(&dir).map_err(|e| CostError::io(&dir, e))?;
         let mut held = self.live.lock().unwrap_or_else(PoisonError::into_inner);
@@ -366,6 +346,45 @@ impl Drop for Lock {
     }
 }
 
+/// The existing validated observation record codec, shared by local and governed adapters.
+/// This is the same frame and observation version; transport does not define another format.
+pub fn encode_observation(observation: &Observation) -> Result<Vec<u8>> {
+    observation.check().map_err(CostError::Invalid)?;
+    let body = serde_json::to_vec(observation)
+        .map_err(|e| CostError::Invalid(format!("not serialisable: {e}")))?;
+    frame::encode(&body).ok_or_else(|| CostError::Invalid("a record longer than 4 GiB".into()))
+}
+/// Existing key partition name. Collisions remain safe because every record carries its key.
+pub fn key_partition(key: &CostKey) -> String {
+    format!("{:016x}", fnv1a(key.canonical().as_bytes()))
+}
+/// Existing model cache name and validation, independent of its backing storage adapter.
+pub fn model_state_name(model: &ModelId) -> Result<String> {
+    if !moruna_job::is_kind_name(&model.name) {
+        return Err(CostError::BadName {
+            name: model.name.clone(),
+        });
+    }
+    Ok(format!("{}@{}.state", model.name, model.version))
+}
+/// Apply the existing raw-record retention/summary rule without discarding measurements.
+/// Adapters provide chronological records and an already accumulated summary, if any.
+pub fn trim_history(
+    key: &CostKey,
+    summary: &mut Option<Summary>,
+    kept: &mut Vec<Observation>,
+    retention: Retention,
+) {
+    let count = retention.per_key.max(1);
+    if kept.len() > count {
+        let excess = kept.len() - count;
+        let folded = summary.get_or_insert_with(|| Summary::new(key.clone()));
+        for observation in kept.drain(..excess) {
+            folded.fold(&observation);
+        }
+    }
+}
+
 /// FNV-1a, 64 bits: names a key's directory. Two keys that collide share a directory, and every
 /// record carries its key, so a scan still returns only its own.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -442,7 +461,9 @@ fn read_observations(path: &Path) -> Result<(Vec<Observation>, u64)> {
 
 /// Every whole record of a segment as an observation. A record whose frame checks but whose
 /// body is not an observation of this build is not a torn write: it is refused, loudly.
-fn decode_observations(path: &Path, bytes: &[u8]) -> Result<(Vec<Observation>, u64)> {
+/// Decode the same validated framed observation stream as the local store. `path` is a
+/// nonsecret source label for precise diagnostics, not an IO operation or filesystem grant.
+pub fn decode_observations(path: &Path, bytes: &[u8]) -> Result<(Vec<Observation>, u64)> {
     let decoded = frame::decode(bytes);
     let mut out = Vec::with_capacity(decoded.records.len());
     for (offset, body) in decoded.records {

@@ -45,6 +45,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -59,6 +60,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -282,6 +284,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "arrow"
@@ -874,6 +879,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -892,6 +898,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "block-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
 ]
 
 [[package]]
@@ -2558,6 +2571,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "devices-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3121,6 +3141,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -3618,6 +3639,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagefs-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4009,6 +4037,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4226,6 +4261,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-abi"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-adapters"
 version = "0.5.9"
 dependencies = [
@@ -4273,6 +4312,8 @@ dependencies = [
 name = "moruna-controller"
 version = "0.5.9"
 dependencies = [
+ "moruna-cost",
+ "moruna-job",
  "moruna-kernel",
  "moruna-testkit",
  "serde",
@@ -4316,6 +4357,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-event"
+version = "0.5.9"
+dependencies = [
+ "flatbuffers",
+ "moruna-record",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "moruna-image"
 version = "0.5.9"
 dependencies = [
@@ -4325,6 +4377,7 @@ dependencies = [
  "moruna-image",
  "moruna-imagefs",
  "moruna-job",
+ "moruna-plane-linux",
  "moruna-runtime",
  "parquet",
  "serde",
@@ -4341,11 +4394,16 @@ name = "moruna-imagefs"
 version = "0.1.0"
 
 [[package]]
+name = "moruna-ipc-check"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-job"
 version = "0.5.9"
 dependencies = [
  "flatbuffers",
  "flexbuffers",
+ "moruna-types",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -4361,7 +4419,9 @@ dependencies = [
  "dlpark",
  "flatbuffers",
  "lz4_flex",
+ "moruna-ipc-check",
  "moruna-testkit",
+ "moruna-types",
  "serde_json",
  "thiserror 2.0.20",
  "zstd 0.13.3",
@@ -4379,9 +4439,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-micro"
+version = "0.5.9"
+dependencies = [
+ "imagefs-protocol",
+ "libc",
+ "linux-protocol",
+ "moruna-adapters",
+ "moruna-kernel",
+ "moruna-plane",
+ "moruna-record",
+ "moruna-svc",
+ "moruna-sys",
+ "tracing",
+ "vsock-protocol",
+]
+
+[[package]]
 name = "moruna-package"
 version = "0.5.9"
 dependencies = [
+ "moruna-job",
  "moruna-kernel",
  "serde",
  "serde_json",
@@ -4413,11 +4491,33 @@ name = "moruna-plan"
 version = "0.5.9"
 dependencies = [
  "flatbuffers",
+ "moruna-cost",
  "moruna-job",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "moruna-plane"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-ipc-check",
+ "moruna-sys",
+]
+
+[[package]]
+name = "moruna-plane-linux"
+version = "0.5.9"
+dependencies = [
+ "libc",
+ "moruna-abi",
+ "moruna-ipc-check",
+ "moruna-plane",
+ "moruna-testkit",
+ "seccompiler",
 ]
 
 [[package]]
@@ -4436,7 +4536,9 @@ dependencies = [
  "arrow",
  "moruna-adapters",
  "moruna-arena",
+ "moruna-cost",
  "moruna-discovery",
+ "moruna-event",
  "moruna-job",
  "moruna-kernel",
  "moruna-kernels",
@@ -4448,6 +4550,7 @@ dependencies = [
  "moruna-sandbox",
  "moruna-sinks",
  "moruna-sources",
+ "moruna-storage",
  "moruna-trace",
  "moruna-wasm",
  "parquet",
@@ -4457,6 +4560,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4474,6 +4578,7 @@ dependencies = [
  "io-uring",
  "libc",
  "moruna-kernel",
+ "moruna-storage",
  "moruna-testkit",
  "object_store",
  "socket2",
@@ -4502,22 +4607,30 @@ dependencies = [
  "moruna-adapters",
  "moruna-arena",
  "moruna-controller",
+ "moruna-cost",
  "moruna-datafusion",
  "moruna-discovery",
+ "moruna-event",
  "moruna-image",
  "moruna-job",
  "moruna-kernel",
  "moruna-kernels",
+ "moruna-micro",
  "moruna-package",
  "moruna-placement",
  "moruna-plan",
  "moruna-reactor",
+ "moruna-record",
  "moruna-sandbox",
  "moruna-scheduler",
  "moruna-sinks",
  "moruna-sources",
+ "moruna-storage",
+ "moruna-storage-format",
+ "moruna-sys",
  "moruna-testkit",
  "moruna-trace",
+ "moruna-types",
  "moruna-vmm",
  "moruna-wasm",
  "parcel-core",
@@ -4540,11 +4653,15 @@ version = "0.5.9"
 dependencies = [
  "landlock",
  "libc",
+ "moruna-abi",
  "moruna-adapters",
  "moruna-arena",
  "moruna-image",
+ "moruna-ipc-check",
  "moruna-kernel",
  "moruna-package",
+ "moruna-plane",
+ "moruna-plane-linux",
  "moruna-testkit",
  "pyo3",
  "seccompiler",
@@ -4560,7 +4677,10 @@ version = "0.5.9"
 dependencies = [
  "crossbeam",
  "libc",
+ "moruna-cost",
+ "moruna-job",
  "moruna-kernel",
+ "moruna-placement",
  "moruna-sinks",
  "moruna-testkit",
  "thiserror 2.0.20",
@@ -4604,11 +4724,85 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-storage"
+version = "0.5.9"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "blake3",
+ "bytes",
+ "futures",
+ "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "moruna-kernel",
+ "moruna-micro",
+ "moruna-storage-format",
+ "moruna-storage-service",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-testkit",
+ "object_store",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.20",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "moruna-storage-format"
+version = "0.5.9"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "blake3",
+ "ghash",
+ "polyval",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "moruna-storage-service"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "block-protocol",
+ "devices-protocol",
+ "moruna-storage-format",
+ "moruna-svc",
+ "moruna-sys",
+ "netstack-protocol",
+]
+
+[[package]]
+name = "moruna-svc"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-sys",
+]
+
+[[package]]
+name = "moruna-sys"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+]
+
+[[package]]
 name = "moruna-testkit"
 version = "0.5.9"
 dependencies = [
+ "arrow",
  "flatbuffers",
  "lz4_flex",
+ "moruna-ipc-check",
  "moruna-kernel",
  "zstd 0.13.3",
 ]
@@ -4626,6 +4820,10 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
 ]
+
+[[package]]
+name = "moruna-types"
+version = "0.5.9"
 
 [[package]]
 name = "moruna-vmm"
@@ -4699,6 +4897,13 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+]
+
+[[package]]
+name = "netstack-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
 ]
 
 [[package]]
@@ -5968,6 +6173,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -8546,6 +8752,13 @@ dependencies = [
  "vortex-mask",
  "vortex-session",
  "zigzag",
+]
+
+[[package]]
+name = "vsock-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
 ]
 
 [[package]]

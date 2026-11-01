@@ -14,6 +14,48 @@ extern crate alloc;
 
 use moruna_abi::Error;
 
+/// The clock a driver polls its device with while it waits for it to do something:
+/// the kernel's clock and a short sleep on the kernel, a model's in a host test, whose
+/// pause is where the model does what it was asked.
+pub trait Clock {
+    /// Nanoseconds on a monotonic clock.
+    fn now(&self) -> u64;
+    /// Waits a little before the next poll: about a millisecond on the kernel.
+    fn pause(&self);
+}
+
+/// The kernel's clock, pausing on a timer of the driver's own.
+#[cfg(target_os = "none")]
+pub struct TimerClock(moruna_svc::Timer);
+
+#[cfg(target_os = "none")]
+impl TimerClock {
+    pub fn new() -> Result<TimerClock, Error> {
+        moruna_svc::Timer::create().map(TimerClock)
+    }
+}
+
+#[cfg(target_os = "none")]
+impl Clock for TimerClock {
+    fn now(&self) -> u64 {
+        moruna_svc::now()
+    }
+    fn pause(&self) {
+        // A pause that cannot be slept is a spin: the poll loop's deadline bounds it.
+        if self
+            .0
+            .set(moruna_svc::now().saturating_add(1_000_000))
+            .is_ok()
+        {
+            let _ = moruna_svc::wait_one(
+                &self.0.0,
+                moruna_svc::Signals::SIGNALED,
+                moruna_svc::DEADLINE_INFINITE,
+            );
+        }
+    }
+}
+
 /// A mapped window, read and written at natural alignment and exact width.
 pub trait Region {
     /// The window's length in bytes.

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use moruna_kernel::{CancelToken, MorunaError};
 use moruna_testkit::{FakePlacement, FakeSink, FakeSource};
 
-use super::common::{Latch, RigBuilder, StatefulKernel, manifest_lock};
+use super::common::{HeldSource, Latch, Release, RigBuilder, StatefulKernel, manifest_lock};
 
 #[test]
 fn sc_t21_checkpoint_on_demand() {
@@ -29,21 +29,32 @@ fn sc_t21_checkpoint_on_demand() {
         .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
         .go();
 
-    // Before `run` there is no checkpoint thread to serve a request.
-    match rig.scheduler.checkpoint_now(Duration::from_millis(30)) {
-        Err(MorunaError::Resume(msg)) => assert!(msg.contains("no manifest"), "{msg}"),
-        other => panic!("expected a timeout naming the state, got {other:?}"),
+    // Before `run` there is no checkpoint thread to serve a request: refused at once, naming
+    // the state, and not left counted for the thread to serve once the run starts.
+    match rig.scheduler.checkpoint_now(Duration::from_secs(30)) {
+        Err(MorunaError::Resume(msg)) => {
+            assert!(msg.contains("no manifest") && msg.contains("Init"), "{msg}")
+        }
+        other => panic!("expected a refusal naming the state, got {other:?}"),
     }
 
     let cancel = CancelToken::new();
     let token = cancel.clone();
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| rig.scheduler.run(token));
+        let _release = Release(|| {
+            cancel.cancel();
+            gate.open();
+        });
         assert!(
             gate.wait_holding(Duration::from_secs(30)),
             "the run never reached the latch"
         );
         let before = rig.fake_placement.manifests_written().len();
+        assert_eq!(
+            before, 0,
+            "the request refused before the run left nothing for the checkpoint thread to serve"
+        );
         let asked = Instant::now();
         let path = match rig.scheduler.checkpoint_now(Duration::from_secs(10)) {
             Ok(path) => path,
@@ -82,62 +93,15 @@ fn sc_t21_checkpoint_on_demand_refused_without_manifests() {
     }
 }
 
-/// A source whose reads of one split stay pending until the test lets them go, so a manifest
-/// is written with reads demonstrably in flight.
-struct HeldSource {
-    inner: FakeSource,
-    held_split: u32,
-    release: Arc<std::sync::atomic::AtomicBool>,
-    pending: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl moruna_kernel::Source for HeldSource {
-    fn schema(&self) -> moruna_kernel::SourceSchema {
-        moruna_kernel::Source::schema(&self.inner)
-    }
-
-    fn plan(&self) -> moruna_kernel::Result<Vec<moruna_kernel::Split>> {
-        moruna_kernel::Source::plan(&self.inner)
-    }
-
-    fn read<'a>(
-        &'a self,
-        split: &'a moruna_kernel::Split,
-        rows: Option<moruna_kernel::RowRange>,
-        alloc: &'a dyn moruna_kernel::Allocator,
-        tier: moruna_kernel::Tier,
-    ) -> moruna_kernel::BoxFuture<'a, moruna_kernel::Result<moruna_kernel::Payload>> {
-        use std::sync::atomic::Ordering;
-        let held = split.id == self.held_split;
-        if held {
-            self.pending.fetch_add(1, Ordering::SeqCst);
-        }
-        let release = Arc::clone(&self.release);
-        let mut inner = moruna_kernel::Source::read(&self.inner, split, rows, alloc, tier);
-        Box::pin(std::future::poll_fn(move |cx| {
-            if held && !release.load(Ordering::SeqCst) {
-                cx.waker().wake_by_ref();
-                return std::task::Poll::Pending;
-            }
-            inner.as_mut().poll(cx)
-        }))
-    }
-}
-
 /// MH 4.7, the in-flight read gap (10 l): a manifest written while reads are outstanding names
 /// them as issued, and a restore hands each back to be read again.
 #[test]
 fn sc_t21_a_read_in_flight_is_named_in_the_manifest() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     let _guard = manifest_lock();
-    let release = Arc::new(AtomicBool::new(false));
-    let pending = Arc::new(AtomicUsize::new(0));
-    let source = HeldSource {
-        inner: FakeSource::new().splits(3, 20, 160),
-        held_split: 1,
-        release: release.clone(),
-        pending: pending.clone(),
-    };
+    let source = HeldSource::new(FakeSource::new().splits(3, 20, 160), 1);
+    let release = source.release.clone();
+    let pending = source.pending.clone();
     let rig = RigBuilder::new()
         .cfg(|cfg| {
             cfg.workers_max = 2;
@@ -155,6 +119,10 @@ fn sc_t21_a_read_in_flight_is_named_in_the_manifest() {
     let token = cancel.clone();
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| rig.scheduler.run(token));
+        let _release = Release(|| {
+            release.store(true, Ordering::SeqCst);
+            cancel.cancel();
+        });
         assert!(
             super::common::wait_for(Duration::from_secs(10), || pending.load(Ordering::SeqCst)
                 > 0),
@@ -182,7 +150,7 @@ fn sc_t21_a_read_in_flight_is_named_in_the_manifest() {
                 *seq < point.extras.source_cursors[0].next_seq,
                 "behind the cursor"
             );
-            if origin.split == 1 {
+            if origin.split >= 1 {
                 assert!(
                     point.to_recompute[0].iter().any(|(s, _)| s == seq),
                     "held read {seq} comes back to be read again"

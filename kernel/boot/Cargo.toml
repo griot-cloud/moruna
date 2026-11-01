@@ -14,3 +14,6 @@ ostd.workspace = true
 osdk-frame-allocator.workspace = true
 osdk-heap-allocator.workspace = true
 moruna-microkernel.workspace = true
+
+[features]
+probe = ["moruna-microkernel/probe"]

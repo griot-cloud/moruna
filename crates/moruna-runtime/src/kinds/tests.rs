@@ -87,6 +87,7 @@ impl RunnableKind for Probe {
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: self.isolation,
+            served: None,
         }
     }
 

@@ -234,9 +234,11 @@ Admit a ready unit (reserving its memory), prefetch a disk-resident input, spill
 ```rust
 pub trait SchedulingPolicy: Send {
     fn id(&self) -> PolicyId;
-    fn decide(&mut self, state: &SchedulerState, model: &dyn CostModel, sim: &Simulator) -> Vec<Action>;
+    fn decide(&mut self, state: &SchedulerState<'_>) -> Vec<Action>;
 }
 ```
+
+The trait is a contract (`moruna-kernel`, contracts d.18), so a policy depends on contracts alone; `SchedulerState` carries the ready units, the DAG and the catalog's `Residency` port, and (KD7c) each unit's prediction with its spread, its critical-path weight and how long it has waited, the machine, and every stage's snapshot (its backlog in memory and on disk, its units under way, a unit's prediction). The scheduler asks the run's cost model through its port (`moruna-cost`'s `CostModel`, through `Online`) and hands the answers over as the contract's `Prediction`; with no model a unit's prediction is its stage's measured ratios, marked as such. `lookahead` builds its simulation from the snapshot and plays `moruna-cost`'s simulator (SDD 10 f.22 to f.24).
 
 Adapters:
 - `admission`: today's `pick.rs` rule, the baseline;
@@ -275,7 +277,7 @@ Each time a worker frees, a read completes or a unit finishes:
 
 ### 9.7 What it reports
 
-- Step-tagged events for each unit's lifecycle (KA8).
+- Step-tagged events for each unit's lifecycle, each a record (SDD 12 PY-I13, KA8) whose headers carry the run, the plan, the step and the task.
 - An event for every decision that departs from the plan, with the runner-up and both scores.
 - The report gains:
   - the order actually run;
@@ -294,10 +296,14 @@ One measure, the job's finish (section 0), and its consequence, utilisation. The
 |---|---|---|
 | `moruna-job` | the job document, the catalogue and `check` (SDD 22) | none of the three below |
 | `moruna-cost` | `Inputs`, `CostKey`, `Estimate`, `UnitCost`, `Outcome`; the `CostModel` trait and registry; the default model; `ObservationStore` and its local adapter; the simulator | `moruna-job` only |
-| `moruna-plan` | the plan document (KA7); the `Planner` port and its `Planners` registry; the `levels` planner; `explain(job, catalogue, inputs, planners, planner) -> Plan`; `check_plan`, the plan's internal check (SDD 26) | `moruna-job`, and `moruna-cost` once it is on `main` |
-| `moruna-runtime` | runs from a plan; warm-up (`moruna check` with profiling); the buffer catalog over placement; the `SchedulingPolicy` trait and its four adapters; online observation | all three |
+| `moruna-plan` | the plan document (KA7); the `Planner` port and its `Planners` registry; the `levels` and `simulated` planners; `explain(job, catalogue, inputs, planners, planner) -> Plan`; `check_plan`, the plan's internal check (SDD 26) | `moruna-job` and `moruna-cost` |
+| `moruna-placement` | the buffer catalog (KD7a, SDD 09 f.18): every batch's size, location, owner, remaining consumers and reload cost; known-future eviction; the `Residency` port. It lives in the engine that holds the bytes, because a catalog anywhere else would be a second record of residency beside placement's | contracts only (SDD 09) |
+| `moruna-kernel` (contracts) | the `Residency` port and the `SchedulingPolicy` port with its registry (contracts d.17, d.18): the scheduler calls both and depends on contracts alone | none of these |
+| `moruna-scheduler` | the decision each free worker makes through the policy, the decision budget, the claims on every push; the `admission`, `fifo`, `residency_greedy` and `lookahead` adapters and their registry (KD7b, KD7c; SDD 10 f.3, f.20 to f.24); the predictions it asks the cost model for, online learning and drift during the run, the observations written at its end (KD7c, f.22) | contracts and `moruna-cost` |
+| `moruna-controller` | the morsel, the `model` sizer among its sizers when a run has a cost model (KD7c, SDD 11 f.16) | contracts and `moruna-cost` |
+| `moruna-runtime` | runs from a plan; warm-up (`moruna check` with profiling); the `scheduler.policy` setting; opens the cost model and the store and hands them to the scheduler and the controller (KD6b) | all of these |
 
-The plan cannot live in `moruna-job`: `moruna-cost` depends on `moruna-job`, so `moruna-job` cannot depend on `moruna-cost`, and the plan's estimates are the cost model's. `moruna-plan` sits above both (KA7, 2026-10-29). Until `moruna-cost` is on `main`, a planner asks a cost model through `moruna-plan`'s `Estimator` port, whose answer is section 4's `UnitCost` field for field; KD6c adapts `CostModel` to it, and the simulator-based planner is another adapter of `Planner`.
+The plan cannot live in `moruna-job`: `moruna-cost` depends on `moruna-job`, so `moruna-job` cannot depend on `moruna-cost`, and the plan's estimates are the cost model's. `moruna-plan` sits above both (KA7, 2026-10-29). Its planners ask `moruna-cost`'s `CostModel` directly and carry its `Estimate` and `UnitCost`; the simulator is in `moruna-cost`, playing a workload of its own that `moruna-plan` builds from the job, so the scheduler's lookahead plays it without the plan; the simulator-based planner, `simulated`, is another adapter of `Planner`, which `explain` takes when a cost model is configured (KD6c).
 
 An embedder depends on `moruna-job`, `moruna-cost` and `moruna-plan` to plan in its own process, and supplies an `ObservationStore` adapter.
 
@@ -317,7 +323,7 @@ An embedder depends on `moruna-job`, `moruna-cost` and `moruna-plan` to plan in 
 | KD6b | warm-up profiling in `moruna check` | KD6a |
 | KA7 | `moruna-plan`: the plan document, the planner port and the `levels` planner, `explain`, the plan's check; runs start from a plan and report against it | KA5 (DAG) |
 | KD6c | the simulator, and a simulator-based planner in `moruna-plan` that `explain` can choose | KD6a, KA5 (DAG), KA7 (plan document) |
-| KD7a | the buffer catalog with known-future eviction, over placement | KA5 |
+| KD7a | the buffer catalog with known-future eviction, in `moruna-placement` (section 11) | KA5 |
 | KD7b | the policy port, the `admission` and `fifo` adapters, the benchmark matrix | KD7a |
 | KD7c | `residency_greedy` and `lookahead`; online learning and drift | KD6c, KD7b |
 | KD7d | the default policy chosen from the matrix; decisions reported | KD7c |

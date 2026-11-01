@@ -9,11 +9,19 @@
 //! then accessible again keeps its bytes; the page table holds an entry only for pages
 //! that are accessible, because OSTD tracks a frame only while its entry is present.
 //!
-//! Lock order: the space's lock is a leaf; it is never held while a handle is dropped.
+//! A space is charged to its process's account (SDD 20, f.18): its root table and the
+//! three over the top of user space when it is made, each area's record, each zero page
+//! when it is first touched, and a table page for each region of `charge::TABLE_REGIONS`
+//! an area touches. When no area touches a region any more the space unmaps the whole
+//! region, so that OSTD drops its table, and the charge goes back.
+//!
+//! Lock order: the space's lock is taken before an account's ledger, which is a leaf;
+//! it is never held while a handle is dropped.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{Error, PAGE_SIZE, map};
+use moruna_abi::{Error, PAGE_SIZE, charge, map};
 use ostd::{
     mm::{
         CachePolicy, FrameAllocOptions, MAX_USERSPACE_VADDR, PageFlags, PageProperty, UFrame, VmIo,
@@ -23,7 +31,10 @@ use ostd::{
     task::disable_preempt,
 };
 
-use crate::memory::{DeviceMemory, MemoryObject};
+use crate::{
+    account::{Account, Charge},
+    memory::{DeviceMemory, MemoryObject},
+};
 
 pub use moruna_abi::IMAGE_RANGE;
 /// Where `memory_map`, stacks and the start page are placed when the kernel chooses.
@@ -58,6 +69,10 @@ pub enum Kind {
     /// `memory_map`, or anything another process mapped with `process_map`, or a
     /// forwarded process's own fast `mmap` and `brk`.
     Mapping,
+    /// A batch, a window or a port reply the data plane mapped (SDD 29). Only the data
+    /// plane unmaps it: no call of the process, nor a server's on it, unmaps, protects
+    /// or maps over one, so the plane always unmaps what it mapped.
+    Plane,
 }
 
 /// What fills an area's pages.
@@ -163,11 +178,40 @@ struct Inner {
     /// Every zero page allocated, by its address.
     zero: BTreeMap<u64, UFrame>,
     brk: Option<Brk>,
+    /// The table pages charged for the regions the areas touch, besides the fixed four.
+    tables: u64,
+    /// What is charged to the account for the areas, the zero pages and the tables:
+    /// `AREA` an area, `ZERO_PAGE` a zero page, a page a table, once a change settles.
+    charged: u64,
+}
+
+impl Inner {
+    /// What the areas, the zero pages and the tables cost now.
+    fn cost(&self) -> u64 {
+        self.areas.len() as u64 * charge::AREA
+            + self.zero.len() as u64 * charge::ZERO_PAGE
+            + self.tables * charge::PAGE
+    }
+
+    /// The end of the area nearest below `start` and the start of the one nearest at or
+    /// above `end`: the neighbours of a range no area overlaps.
+    fn neighbours(&self, start: u64, end: u64) -> (Option<u64>, Option<u64>) {
+        let before = self.areas.range(..start).next_back().map(|(_, a)| a.end);
+        let after = self.areas.range(end..).next().map(|(s, _)| *s);
+        (before, after)
+    }
 }
 
 pub struct Space {
     pub vm: Arc<VmSpace>,
     inner: SpinLock<Inner>,
+    /// The bytes the kernel has copied into or out of this space (`plane_probe`, SDD 29
+    /// DP-T1): every user copy and every copy through a page's frame counts.
+    copied: AtomicU64,
+    /// The account the space is charged to, its process's.
+    account: Arc<Account>,
+    /// The root table and the three over the top of user space (`charge::SPACE`).
+    _fixed: Charge,
 }
 
 fn zeroed_frame() -> Result<UFrame, Error> {
@@ -179,22 +223,149 @@ fn zeroed_frame() -> Result<UFrame, Error> {
         .map_err(|_| Error::NoMemory)
 }
 
-impl Default for Space {
-    fn default() -> Space {
-        Space::new()
-    }
-}
-
 impl Space {
-    pub fn new() -> Space {
-        Space {
+    /// An empty address space charged to `account`.
+    pub fn new(account: &Arc<Account>) -> Result<Space, Error> {
+        let fixed = Charge::new(account, charge::SPACE)?;
+        Ok(Space {
             vm: Arc::new(VmSpace::new()),
             inner: SpinLock::new(Inner {
                 areas: BTreeMap::new(),
                 zero: BTreeMap::new(),
                 brk: None,
+                tables: 0,
+                charged: 0,
             }),
+            copied: AtomicU64::new(0),
+            account: account.clone(),
+            _fixed: fixed,
+        })
+    }
+
+    /// The account the space is charged to.
+    pub fn account(&self) -> &Arc<Account> {
+        &self.account
+    }
+
+    /// Charges `bytes` more for the space's areas, pages and tables.
+    fn charge(&self, inner: &mut Inner, bytes: u64) -> Result<(), Error> {
+        self.account.charge(bytes)?;
+        inner.charged += bytes;
+        Ok(())
+    }
+
+    /// Gives back what was charged beyond what the space costs now: after a change that
+    /// was charged for the most it could need, or that freed something.
+    fn settle(&self, inner: &mut Inner) {
+        let cost = inner.cost();
+        if cost > inner.charged {
+            // Every change charges what it can grow by before it changes anything.
+            ostd::early_println!(
+                "kk: accounting broken: a space costs {} bytes and has {} charged",
+                cost,
+                inner.charged
+            );
+            return;
         }
+        self.account.uncharge(inner.charged - cost);
+        inner.charged = cost;
+    }
+
+    /// Unmaps whole regions `reclaim` names, in which nothing is mapped, so that OSTD
+    /// drops the tables under them (moruna_quota::tables). A range inside one already
+    /// unmapped is skipped.
+    fn reclaim(&self, reclaim: &[Option<(u64, u64)>; 3]) {
+        let mut done: Option<(u64, u64)> = None;
+        for range in reclaim.iter().rev().flatten() {
+            if done.is_some_and(|(lo, hi)| lo <= range.0 && range.1 <= hi) {
+                continue;
+            }
+            self.unmap_ptes(range.0, range.1 - range.0);
+            done = Some(*range);
+        }
+    }
+
+    /// Counts `n` bytes the kernel copied into or out of this space.
+    pub fn count_copy(&self, n: usize) {
+        self.copied.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// The bytes the kernel has copied into or out of this space.
+    pub fn copied(&self) -> u64 {
+        self.copied.load(Ordering::Relaxed)
+    }
+
+    /// Whether any area of `va .. end` is the data plane's.
+    fn touches_plane(inner: &Inner, va: u64, end: u64) -> bool {
+        inner
+            .areas
+            .range(..end)
+            .rev()
+            .take_while(|(_, a)| a.end > va)
+            .any(|(_, a)| a.kind == Kind::Plane)
+    }
+
+    /// Maps `len` bytes (whole pages) of a memory object for the data plane, where the
+    /// kernel chooses; returns where.
+    pub fn map_plane(
+        &self,
+        memory: Arc<MemoryObject>,
+        first: usize,
+        len: u64,
+        write: bool,
+    ) -> Result<u64, Error> {
+        let prot = if write {
+            map::READ | map::WRITE
+        } else {
+            map::READ
+        };
+        let backing = Backing::Object {
+            memory,
+            first,
+            writable: write,
+        };
+        self.map(None, len, Kind::Plane, prot, backing, false)
+    }
+
+    /// Unmaps the data plane's area that begins at `va` and is `len` bytes long, backed
+    /// by `memory`; `BadState` when no such area is there.
+    pub fn unmap_plane(&self, va: u64, len: u64, memory: &Arc<MemoryObject>) -> Result<(), Error> {
+        let end = Space::check_range(va, len)?;
+        let removed = {
+            let mut inner = self.inner.lock();
+            let same = inner.areas.get(&va).is_some_and(|a| {
+                a.kind == Kind::Plane
+                    && a.end == end
+                    && matches!(&a.backing, Backing::Object { memory: m, .. } if Arc::ptr_eq(m, memory))
+            });
+            if !same {
+                return Err(Error::BadState);
+            }
+            let removed = inner.areas.remove(&va);
+            let (before, after) = inner.neighbours(va, end);
+            let freed = moruna_quota::tables(&[(va, end)], before, after, map_end());
+            inner.tables -= freed.pages;
+            self.settle(&mut inner);
+            // Under the lock, so no map can fill an entry the unmap then takes.
+            self.unmap_ptes(va, end - va);
+            self.reclaim(&freed.reclaim);
+            removed
+        };
+        drop(removed);
+        Ok(())
+    }
+
+    /// The physical address of the page holding `addr`, if a page is there.
+    pub fn frame_at(&self, addr: u64) -> Result<u64, Error> {
+        use ostd::mm::HasPaddr;
+        let page = addr & !(PAGE_SIZE - 1);
+        let mut inner = self.inner.lock();
+        let (start, area) = Space::area_at(&inner, page).ok_or(Error::BadState)?;
+        let area = area.clone();
+        let frame = self
+            .frame(&mut inner, start, &area, page)
+            .map_err(|_| Error::BadState)?;
+        Ok(frame.paddr() as u64)
     }
 
     fn unmap_ptes(&self, va: u64, len: u64) {
@@ -286,6 +457,20 @@ impl Space {
             }
             inner.areas.insert(at, tail);
         }
+    }
+
+    /// New area records needed by splitting these boundaries. A boundary in a hole
+    /// or already at an area edge allocates nothing; freeing whole areas works even
+    /// when the account is full and never raises its allocation peak.
+    fn split_bytes(inner: &Inner, va: u64, end: u64) -> u64 {
+        [va, end]
+            .into_iter()
+            .filter(|at| {
+                Space::area_at(inner, *at)
+                    .is_some_and(|(start, area)| moruna_quota::split_needed(start, area.end, *at))
+            })
+            .count() as u64
+            * charge::AREA
     }
 
     fn overlaps(inner: &Inner, va: u64, end: u64) -> bool {
@@ -383,7 +568,17 @@ impl Space {
             prot,
             backing,
         };
-        self.fill_ptes(&inner, va, &area, va, va + len)?;
+        // The area's record and the tables of the regions only it touches, charged
+        // before anything is mapped.
+        let (before, after) = inner.neighbours(va, va + len);
+        let added = moruna_quota::tables(&[(va, va + len)], before, after, map_end());
+        self.charge(&mut inner, charge::AREA + added.bytes())?;
+        inner.tables += added.pages;
+        if let Err(e) = self.fill_ptes(&inner, va, &area, va, va + len) {
+            inner.tables -= added.pages;
+            self.settle(&mut inner);
+            return Err(e);
+        }
         inner.areas.insert(va, area);
         Ok(va)
     }
@@ -406,12 +601,20 @@ impl Space {
                     return Err(Error::InvalidArgs);
                 }
             }
+            if Space::touches_plane(&inner, va, end) {
+                return Err(Error::InvalidArgs);
+            }
+            // Splitting at both ends makes at most two areas more before the range's go.
+            let split_bytes = Space::split_bytes(&inner, va, end);
+            self.charge(&mut inner, split_bytes)?;
             Space::split(&mut inner, va);
             Space::split(&mut inner, end);
             let starts: Vec<u64> = inner.areas.range(va..end).map(|(s, _)| *s).collect();
             let mut removed = Vec::new();
+            let mut pieces = Vec::new();
             for s in starts {
                 if let Some(a) = inner.areas.remove(&s) {
+                    pieces.push((s, a.end));
                     removed.push(a);
                 }
             }
@@ -428,9 +631,16 @@ impl Space {
             {
                 brk.current = brk.current.min(va).max(brk.start);
             }
+            let (before, after) = inner.neighbours(va, end);
+            let freed = moruna_quota::tables(&pieces, before, after, map_end());
+            inner.tables -= freed.pages;
+            self.settle(&mut inner);
+            // Under the lock, so no map can fill an entry the unmap then takes; what
+            // the areas and pages held is dropped after it.
+            self.unmap_ptes(va, end - va);
+            self.reclaim(&freed.reclaim);
             (removed, frames)
         };
-        self.unmap_ptes(va, end - va);
         drop(removed);
         drop(frames);
         Ok(())
@@ -450,7 +660,7 @@ impl Space {
             if start > cursor {
                 return Err(Error::OutOfRange);
             }
-            if only.is_some_and(|k| k != area.kind) {
+            if only.is_some_and(|k| k != area.kind) || area.kind == Kind::Plane {
                 return Err(Error::InvalidArgs);
             }
             Space::check_prot(prot, &area.backing)?;
@@ -459,8 +669,12 @@ impl Space {
         if cursor < end {
             return Err(Error::OutOfRange);
         }
+        // Splitting at both ends makes at most two areas more.
+        let split_bytes = Space::split_bytes(&inner, va, end);
+        self.charge(&mut inner, split_bytes)?;
         Space::split(&mut inner, va);
         Space::split(&mut inner, end);
+        self.settle(&mut inner);
         let starts: Vec<u64> = inner.areas.range(va..end).map(|(s, _)| *s).collect();
         for s in &starts {
             if let Some(a) = inner.areas.get_mut(s) {
@@ -486,8 +700,15 @@ impl Space {
             .map(|(s, a)| (*s, a))
     }
 
-    /// The frame of page `page` of `area`, allocating a zero page the first time.
-    fn frame(inner: &mut Inner, start: u64, area: &Area, page: u64) -> Result<UFrame, Error> {
+    /// The frame of page `page` of `area`, allocating a zero page the first time, which
+    /// is charged to the space's account then (`QuotaExceeded` when it has no room).
+    fn frame(
+        &self,
+        inner: &mut Inner,
+        start: u64,
+        area: &Area,
+        page: u64,
+    ) -> Result<UFrame, Error> {
         match &area.backing {
             Backing::Object { memory, first, .. } => {
                 let index = first + ((page - start) / PAGE_SIZE) as usize;
@@ -497,7 +718,14 @@ impl Space {
                 if let Some(f) = inner.zero.get(&page) {
                     return Ok(f.clone());
                 }
-                let frame = zeroed_frame()?;
+                self.charge(inner, charge::ZERO_PAGE)?;
+                let frame = match zeroed_frame() {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        self.settle(inner);
+                        return Err(e);
+                    }
+                };
                 inner.zero.insert(page, frame.clone());
                 Ok(frame)
             }
@@ -506,18 +734,20 @@ impl Space {
     }
 
     /// Maps the frame of the page holding `addr` if `access` is allowed there and the
-    /// page has no entry: a first touch of a zero page. Returns whether it did.
-    pub fn fault(&self, addr: u64, access: Access) -> bool {
+    /// page has no entry: a first touch of a zero page. `Ok(true)` when it did,
+    /// `Ok(false)` when the fault is not a first touch, and the error when the page
+    /// could not be had: `QuotaExceeded` when the account has no room for it.
+    pub fn fault(&self, addr: u64, access: Access) -> Result<bool, Error> {
         let page = addr & !(PAGE_SIZE - 1);
         let mut inner = self.inner.lock();
         let Some((start, area)) = Space::area_at(&inner, page) else {
-            return false;
+            return Ok(false);
         };
         if !allows(area.prot, access) {
-            return false;
+            return Ok(false);
         }
         let area = area.clone();
-        self.touch(&mut inner, start, &area, page).is_ok()
+        self.touch(&mut inner, start, &area, page).map(|()| true)
     }
 
     /// Gives page `page` of `area` its entry if it has none.
@@ -531,7 +761,7 @@ impl Space {
         if matches!(cursor.query(), Ok((_, Some(_)))) {
             return Ok(());
         }
-        let frame = Space::frame(inner, start, area, page)?;
+        let frame = self.frame(inner, start, area, page)?;
         cursor.jump(page as usize).map_err(|_| Error::InvalidArgs)?;
         cursor.map(
             frame,
@@ -605,7 +835,7 @@ impl Space {
                     return Err(Error::Fault);
                 }
                 let area = area.clone();
-                let frame = Space::frame(&mut inner, start, &area, page)?;
+                let frame = self.frame(&mut inner, start, &area, page)?;
                 if matches!(area.backing, Backing::Zero) {
                     // A page first touched by a copy is touched for the process too.
                     self.touch(&mut inner, start, &area, page)?;
@@ -613,6 +843,7 @@ impl Space {
                 frame
             };
             f(&frame, within, done, n)?;
+            self.count_copy(n);
             done += n;
         }
         Ok(())
@@ -709,33 +940,50 @@ impl Space {
                 if start > cursor {
                     return Err(Error::OutOfRange);
                 }
+                if area.kind == Kind::Plane {
+                    return Err(Error::InvalidArgs);
+                }
                 cursor = area.end;
             }
             if cursor < end {
                 return Err(Error::OutOfRange);
             }
             let pages: Vec<u64> = inner.zero.range(va..end).map(|(p, _)| *p).collect();
-            pages.iter().filter_map(|p| inner.zero.remove(p)).collect()
+            let frames = pages.iter().filter_map(|p| inner.zero.remove(p)).collect();
+            self.settle(&mut inner);
+            frames
         };
         self.unmap_ptes(va, end - va);
         drop(frames);
         Ok(())
     }
 
-    /// Ends the space: every area and every page goes.
+    /// Ends the space: every area, every page and every table but the fixed four goes,
+    /// and their charge with them.
     pub fn clear(&self) {
         let (areas, zero) = {
             let mut inner = self.inner.lock();
             inner.brk = None;
-            (
+            inner.tables = 0;
+            let taken = (
                 core::mem::take(&mut inner.areas),
                 core::mem::take(&mut inner.zero),
-            )
+            );
+            self.settle(&mut inner);
+            taken
         };
-        for (start, area) in &areas {
-            self.unmap_ptes(*start, area.end - start);
-        }
+        // One unmap of all of user space takes every entry and every table OSTD can
+        // drop: all but the root and the three over the top of user space.
+        self.unmap_ptes(0, map_end());
         drop(areas);
         drop(zero);
+    }
+}
+
+impl Drop for Space {
+    fn drop(&mut self) {
+        // A process may lose its last handle before launch or after a failed setup.
+        // Those address spaces never pass through process termination.
+        self.clear();
     }
 }

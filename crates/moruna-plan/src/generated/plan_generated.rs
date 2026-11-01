@@ -341,6 +341,7 @@ impl<'a> Estimate<'a> {
   pub const VT_UNIT: ::flatbuffers::VOffsetT = 8;
   pub const VT_BASIS: ::flatbuffers::VOffsetT = 10;
   pub const VT_OBSERVATIONS: ::flatbuffers::VOffsetT = 12;
+  pub const VT_EXTRAPOLATED: ::flatbuffers::VOffsetT = 14;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -355,6 +356,7 @@ impl<'a> Estimate<'a> {
     builder.add_p95(args.p95);
     builder.add_p50(args.p50);
     builder.add_observations(args.observations);
+    builder.add_extrapolated(args.extrapolated);
     builder.add_basis(args.basis);
     builder.add_unit(args.unit);
     builder.finish()
@@ -396,6 +398,13 @@ impl<'a> Estimate<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u32>(Estimate::VT_OBSERVATIONS, Some(0)).unwrap()}
   }
+  #[inline]
+  pub fn extrapolated(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(Estimate::VT_EXTRAPOLATED, Some(false)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Estimate<'_> {
@@ -409,6 +418,7 @@ impl ::flatbuffers::Verifiable for Estimate<'_> {
      .visit_field::<Unit>("unit", Self::VT_UNIT, false)?
      .visit_field::<Basis>("basis", Self::VT_BASIS, false)?
      .visit_field::<u32>("observations", Self::VT_OBSERVATIONS, false)?
+     .visit_field::<bool>("extrapolated", Self::VT_EXTRAPOLATED, false)?
      .finish();
     Ok(())
   }
@@ -419,6 +429,7 @@ pub struct EstimateArgs {
     pub unit: Unit,
     pub basis: Basis,
     pub observations: u32,
+    pub extrapolated: bool,
 }
 impl<'a> Default for EstimateArgs {
   #[inline]
@@ -429,6 +440,7 @@ impl<'a> Default for EstimateArgs {
       unit: Unit::Seconds,
       basis: Basis::Measured,
       observations: 0,
+      extrapolated: false,
     }
   }
 }
@@ -459,6 +471,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> EstimateBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<u32>(Estimate::VT_OBSERVATIONS, observations, 0);
   }
   #[inline]
+  pub fn add_extrapolated(&mut self, extrapolated: bool) {
+    self.fbb_.push_slot::<bool>(Estimate::VT_EXTRAPOLATED, extrapolated, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> EstimateBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     EstimateBuilder {
@@ -481,6 +497,7 @@ impl ::core::fmt::Debug for Estimate<'_> {
       ds.field("unit", &self.unit());
       ds.field("basis", &self.basis());
       ds.field("observations", &self.observations());
+      ds.field("extrapolated", &self.extrapolated());
       ds.finish()
   }
 }

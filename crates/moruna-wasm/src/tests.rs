@@ -78,7 +78,7 @@ fn gate(anon: u64, ceiling: u64) -> Arc<MemoryGate> {
         ceiling_bytes: ceiling,
         ..Sample::default()
     }]);
-    MemoryGate::new(Arc::new(sampler) as Arc<dyn Sampler>, ceiling)
+    MemoryGate::new(Arc::new(sampler) as Arc<dyn Sampler>, ceiling).unwrap()
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn sb_t1_identity_component() {
     );
     assert!(counts.linear.peak >= counts.linear.bytes);
     assert!(counts.linear.largest > 0);
-    assert_eq!(state.footprint(), Some(counts.linear.peak));
+    assert_eq!(state.footprint().unwrap(), Some(counts.linear.peak));
     assert_eq!(
         state.checkpoint().unwrap(),
         None,
@@ -629,7 +629,7 @@ fn sb_t3_a_failed_growth_gives_its_admission_back() {
     assert_eq!(counts.linear.refused, 0);
     assert!(counts.linear.peak <= 20 * 65536, "{counts:?}");
     // What was admitted and failed is not held against the next request.
-    assert_eq!(g.admit((1 << 30) - (20 * 65536)), Ok(()));
+    assert!(g.admit((1 << 30) - (20 * 65536)).is_ok());
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -1,4 +1,4 @@
-//! `moruna.imagefs` 1.0 (SDD 27, d.1): a task's root filesystem. The image is read
+//! `moruna.imagefs` 3.0 (SDD 27, d.1): a task's root filesystem. The image is read
 //! only and merged from its layers; `/tmp` is the task's scratch directory, the only
 //! path a write, a creation or a removal reaches. A connection is one task: its open
 //! files and its scratch directory are its own and end with it. File reads are small
@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::{format, string::ToString, vec, vec::Vec};
 
 use moruna_svc::{
-    Decoder, Encoder, Memory, ProtocolError, Rights, Wire, WireError,
+    Account, Decoder, Encoder, Handle, Memory, ProtocolError, Rights, Wire, WireError,
     conformance::{Case, Fail, Probe, Suite},
 };
 
@@ -173,7 +173,7 @@ moruna_svc::protocol! {
     /// A task's root filesystem: the image, read only, and its scratch directory.
     pub protocol imagefs {
         name = "moruna.imagefs";
-        major = 1;
+        major = 3;
         minor = 0;
         requests {
             /// Opens `path` (absolute) with `open` flags; `mode` is a new file's. The
@@ -204,10 +204,25 @@ moruna_svc::protocol! {
             11 => fn mkdir(path: Bytes, mode: u32) -> ();
             /// Removes a file or an empty directory of the scratch directory.
             12 => fn remove(path: Bytes) -> ();
-            /// Sets the scratch directory's quota in bytes, before anything is in it.
-            13 => fn quota(bytes: u64) -> ();
             /// The server's counts.
             14 => fn stats() -> Stats;
+            /// (2.0, SDD 30) Moves `from` to `to`, both in the scratch directory, with
+            /// Linux's `rename` meaning: a file replaces a file, a directory an empty
+            /// directory.
+            15 => fn rename(from: Bytes, to: Bytes) -> ();
+            /// (2.0, SDD 20 f.18) The account the scratch directory's pages are charged
+            /// to, with `READ` and `WRITE`, given before anything is in it: the kernel
+            /// holds the directory to its limit. A connection given none has an account
+            /// of `scratch::DEFAULT_QUOTA` bytes the server carves out of its own when the
+            /// directory first needs a page.
+            16 => fn scratch_account(account: Handle) -> ();
+            /// Actual mounted immutable layer seals, lowest first (SDD30 image identity).
+            17 => fn layers() -> Vec<Bytes>;
+            /// Actual read-only subtree capability. This source connection resolves
+            /// the directory and retains its Scratch/Account until all views close.
+            /// Returned channel is unconnected; its protocol is imagefs3 and writes
+            /// are refused independently by the serving readonly session.
+            18 => fn export_directory(path: Bytes) -> moruna_svc::Channel;
         }
         events {}
         errors {
@@ -216,7 +231,8 @@ moruna_svc::protocol! {
             3 => IsDirectory;
             /// A write, a creation or a removal outside the scratch directory.
             4 => ReadOnly;
-            /// The scratch directory's quota.
+            /// The scratch directory's account has no room for a page more, or the
+            /// directory holds as many entries as it can.
             5 => NoSpace;
             6 => Exists;
             7 => NotEmpty;
@@ -236,7 +252,7 @@ moruna_svc::protocol! {
             14 => Io;
             15 => TooManyFiles;
             /// A request the file does not support (a mapping of a scratch file), an
-            /// unknown flag, or a quota set after the scratch directory was used.
+            /// unknown flag, or an account given after the scratch directory was used.
             16 => Unsupported;
         }
     }
@@ -458,19 +474,52 @@ fn scratch(p: &mut Probe) -> Result<(), Fail> {
     decode_reply::<()>(p, 10, file_req(file)?)
 }
 
-/// The quota is set once, and held.
-fn quota(p: &mut Probe) -> Result<(), Fail> {
+/// The scratch directory's account (2.0) is given once, before anything is in it, and
+/// holds the directory to its limit: a write past it is `NoSpace`, and the account's use
+/// is what the directory holds.
+fn scratch_account(p: &mut Probe) -> Result<(), Fail> {
+    let limit = 64 * 1024;
+    let account = Account::carve(limit, "conformance").map_err(|e| {
+        format!(
+            "carving an account of {limit} bytes for the probe: {}",
+            e.name()
+        )
+    })?;
+    let given = account
+        .0
+        .duplicate(Rights::READ | Rights::WRITE)
+        .map_err(|e| format!("duplicating the account: {}", e.name()))?;
     let mut e = Encoder::new();
-    8192u64.encode(&mut e).map_err(wire)?;
-    decode_reply::<()>(p, 13, e)?;
-    let (file, _) = open_file(p, b"/tmp/quota", open::CREATE | open::WRITE)?;
+    given.encode(&mut e).map_err(wire)?;
+    decode_reply::<()>(p, 16, e)?;
+    let (file, _) = open_file(p, b"/tmp/account", open::CREATE | open::WRITE)?;
     let mut e = file_req(file)?;
     0u64.encode(&mut e).map_err(wire)?;
-    Bytes(vec![1; 9000]).encode(&mut e).map_err(wire)?;
+    Bytes(vec![1; 8192]).encode(&mut e).map_err(wire)?;
+    decode_reply::<u32>(p, 8, e)?;
+    let used = account
+        .usage()
+        .map_err(|e| format!("reading the account: {}", e.name()))?
+        .used;
+    if used < 8192 {
+        return Err(format!(
+            "8192 bytes written charged its account {used} bytes"
+        ));
+    }
+    let mut e = file_req(file)?;
+    0u64.encode(&mut e).map_err(wire)?;
+    Bytes(vec![1; limit as usize])
+        .encode(&mut e)
+        .map_err(wire)?;
     p.request(8, e)?.failure(code(imagefs::Error::NoSpace))?;
     let mut e = Encoder::new();
-    (1u64 << 20).encode(&mut e).map_err(wire)?;
-    p.request(13, e)?.failure(code(imagefs::Error::Unsupported))
+    account
+        .0
+        .duplicate(Rights::READ | Rights::WRITE)
+        .map_err(|e| format!("duplicating the account: {}", e.name()))?
+        .encode(&mut e)
+        .map_err(wire)?;
+    p.request(16, e)?.failure(code(imagefs::Error::Unsupported))
 }
 
 /// The first regular file of the image, found walking from the root.
@@ -559,6 +608,44 @@ fn map(p: &mut Probe) -> Result<(), Fail> {
     Ok(())
 }
 
+/// (2.0) A scratch file renamed is found under its new name with its bytes and gone from
+/// its old one; it replaces a file; a rename out of or into the image is `ReadOnly`.
+fn rename(p: &mut Probe) -> Result<(), Fail> {
+    let rename_req = |from: &[u8], to: &[u8]| -> Result<Encoder, Fail> {
+        let mut e = Encoder::new();
+        path(&mut e, from)?;
+        path(&mut e, to)?;
+        Ok(e)
+    };
+    let (a, _) = open_file(p, b"/tmp/rename-a.tmp", open::CREATE | open::WRITE)?;
+    let mut e = file_req(a)?;
+    0u64.encode(&mut e).map_err(wire)?;
+    Bytes(b"committed".to_vec()).encode(&mut e).map_err(wire)?;
+    decode_reply::<u32>(p, 8, e)?;
+    decode_reply::<()>(p, 10, file_req(a)?)?;
+    let (b, _) = open_file(p, b"/tmp/rename-b", open::CREATE | open::WRITE)?;
+    decode_reply::<()>(p, 10, file_req(b)?)?;
+    decode_reply::<()>(p, 15, rename_req(b"/tmp/rename-a.tmp", b"/tmp/rename-b")?)?;
+    let (b, stat) = open_file(p, b"/tmp/rename-b", 0)?;
+    let Bytes(back) = decode_reply(p, 6, read_req(b, 0, 100)?)?;
+    if back != b"committed" || stat.size != 9 {
+        return Err(format!("a renamed file reads {back:?}"));
+    }
+    decode_reply::<()>(p, 10, file_req(b)?)?;
+    let mut e = Encoder::new();
+    path(&mut e, b"/tmp/rename-a.tmp")?;
+    true.encode(&mut e).map_err(wire)?;
+    p.request(2, e)?.failure(code(imagefs::Error::NotFound))?;
+    let (image_file, _) = some_file(p)?;
+    p.request(15, rename_req(&image_file, b"/tmp/stolen")?)?
+        .failure(code(imagefs::Error::ReadOnly))?;
+    p.request(15, rename_req(b"/tmp/rename-b", b"/rename-b")?)?
+        .failure(code(imagefs::Error::ReadOnly))?;
+    let mut e = Encoder::new();
+    path(&mut e, b"/tmp/rename-b")?;
+    decode_reply::<()>(p, 12, e)
+}
+
 /// Unknown open flags are refused; stats answer.
 fn flags_and_stats(p: &mut Probe) -> Result<(), Fail> {
     p.request(1, open_req(b"/", open::ALL + 1, 0)?)?
@@ -570,7 +657,47 @@ fn flags_and_stats(p: &mut Probe) -> Result<(), Fail> {
     Ok(())
 }
 
+fn readonly_directory(p: &mut Probe) -> Result<(), Fail> {
+    let (file, _) = open_file(p, b"/tmp/view-proof", open::CREATE | open::WRITE)?;
+    let mut write = file_req(file)?;
+    0u64.encode(&mut write).map_err(wire)?;
+    Bytes(b"source".to_vec()).encode(&mut write).map_err(wire)?;
+    let n: u32 = decode_reply(p, 8, write)?;
+    if n != 6 {
+        return Err("source write was short".into());
+    }
+    let mut request = Encoder::new();
+    path(&mut request, b"/tmp")?;
+    let endpoint: moruna_svc::Channel = decode_reply(p, 18, request)?;
+    let mut view = imagefs::Client::connect(endpoint, moruna_svc::deadline_in(10_000_000_000))
+        .map_err(wire)?;
+    view.core().set_timeout(10_000_000_000);
+    let (read, _) = view
+        .open(Bytes(b"/view-proof".to_vec()), 0, 0)
+        .map_err(wire)?;
+    if view.read(read, 0, 32).map_err(wire)?.0 != b"source" {
+        return Err("view did not read its source".into());
+    }
+    if view.open(Bytes(b"/view-proof".to_vec()), open::WRITE, 0)
+        != Err(moruna_svc::CallError::Remote(imagefs::Error::ReadOnly))
+    {
+        return Err("readonly view allowed write-open".into());
+    }
+    if view.stat(Bytes(b"/../view-proof".to_vec()), true)
+        != Err(moruna_svc::CallError::Remote(imagefs::Error::BadPath))
+    {
+        return Err("readonly view escaped its root".into());
+    }
+    view.close(read).map_err(wire)?;
+    let _: () = decode_reply(p, 10, file_req(file)?)?;
+    Ok(())
+}
+
 const CASES: &[Case] = &[
+    Case {
+        name: "export_directory (3.0): real source, readonly and root confinement",
+        check: readonly_directory,
+    },
     Case {
         name: "open, readdir, close: the root lists dev, proc and tmp, in order",
         check: root,
@@ -592,8 +719,8 @@ const CASES: &[Case] = &[
         check: scratch,
     },
     Case {
-        name: "quota: set once, and held",
-        check: quota,
+        name: "scratch_account (2.0): given once, and held",
+        check: scratch_account,
     },
     Case {
         name: "map: an image file's bytes, read only; bad ranges refused",
@@ -602,6 +729,10 @@ const CASES: &[Case] = &[
     Case {
         name: "open's unknown flags, and stats",
         check: flags_and_stats,
+    },
+    Case {
+        name: "rename (2.0): a scratch file moved and replacing another; the image refused",
+        check: rename,
     },
 ];
 
@@ -613,5 +744,28 @@ pub fn suite() -> Suite {
         requests: imagefs::REQUESTS,
         cases: CASES,
         timeout: 60_000_000_000,
+    }
+}
+
+#[cfg(test)]
+mod account_protocol_version_tests {
+    #[test]
+    fn kb5_previous_unaccounted_major_is_refused_before_requests() {
+        use moruna_svc::protocol::{ProtocolId, Refusal};
+        let current = super::imagefs::ID;
+        assert_eq!((current.major, current.minor), (3, 0));
+        let old = ProtocolId::new(current.name, 2, 0);
+        assert_eq!(current.accepts(&old.hello()), Err(Refusal::MajorMismatch));
+        assert_eq!(old.accepts(&current.hello()), Err(Refusal::MajorMismatch));
+        let unaccounted = ProtocolId::new(current.name, 1, 3);
+        assert_eq!(
+            current.accepts(&unaccounted.hello()),
+            Err(Refusal::MajorMismatch)
+        );
+        assert_eq!(
+            unaccounted.accepts(&current.hello()),
+            Err(Refusal::MajorMismatch)
+        );
+        assert_eq!(current.accepts(&current.hello()), Ok(()));
     }
 }

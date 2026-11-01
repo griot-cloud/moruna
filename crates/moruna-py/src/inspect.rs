@@ -24,7 +24,13 @@ pub fn inspect_host(py: Python<'_>) -> PyResult<Py<PyDict>> {
     // different on each (2026-09-23).
     let sampler = moruna_discovery::Sampler::new(&discovered)
         .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
-    out.set_item("anon_bytes", sampler.sample().anon_bytes)?;
+    out.set_item(
+        "anon_bytes",
+        sampler
+            .sample()
+            .map_err(|e| to_py_err(py, &e, Attachments::default()))?
+            .anon_bytes,
+    )?;
 
     let p = &discovered.profile;
     let profile = PyDict::new(py);

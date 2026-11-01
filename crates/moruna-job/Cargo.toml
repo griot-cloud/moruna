@@ -19,3 +19,12 @@ serde_json = { workspace = true }
 # The settings schema each kind declares (SDD 18 e.2).
 schemars = { workspace = true }
 thiserror = { workspace = true }
+# The type grammar of a served kind's schema rules (MH 4.9), the one reader the runtime's Arrow
+# types are converted from; a workspace crate with no dependency of its own (JB-I16).
+moruna-types = { workspace = true }
+
+# A job document version 2 for an image `moruna build` made (SDD 30), kept at the repository root
+# beside the other example.
+[[example]]
+name = "image_job"
+path = "../../examples/image_job.rs"

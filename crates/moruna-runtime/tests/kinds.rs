@@ -47,6 +47,7 @@ impl RunnableKind for Scale {
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
+            served: None,
         }
     }
 

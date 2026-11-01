@@ -8,7 +8,9 @@
 //! - [`mmap`]: how a mapping of a file is made;
 //! - [`fd`]: file descriptors;
 //! - [`path`]: paths from the working directory or an open directory;
-//! - [`refused`]: the calls refused, counted.
+//! - [`refused`]: the calls refused, counted;
+//! - [`events`]: `eventfd` and `epoll`, an event loop's own descriptors (SDD 30 f.4);
+//! - [`machine`]: what a program granted a memory budget is told its machine has (SDD 30 f.3).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -16,7 +18,9 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod events;
 pub mod fd;
+pub mod machine;
 pub mod mmap;
 pub mod path;
 pub mod refused;

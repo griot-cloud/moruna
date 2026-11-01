@@ -174,13 +174,14 @@ jobs:
         with:
           fetch-depth: 0
       - id: changed
-        name: Did this pull request touch kernel/?
+        name: Did this pull request change a native boot or engine proof input?
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          # crates/moruna-image writes the image filesystem's layer disks the boot reads.
-          if git diff --quiet "$BASE...HEAD" -- kernel/ crates/moruna-image/ .github/workflows/ci.yml; then
-            echo "kernel/ and the layer writer are unchanged, so the build and boot stand"
+          # Native job boots execute the root runtime and its transitive crates too.
+          # A runtime/codec/pin-only change must not silently skip the mandatory peer.
+          if git diff --quiet "$BASE...HEAD" -- kernel/ crates/ Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows/ci.yml; then
+            echo "native boot, engine, codec and pinned build inputs are unchanged"
             echo "kernel=false" >> "$GITHUB_OUTPUT"
           else
             echo "kernel=true" >> "$GITHUB_OUTPUT"
@@ -198,7 +199,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /opt/qemu
-          key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-vhost-kernel-ubuntu-24.04-v2
+          key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-vhost-user-ubuntu-24.04-v3
       - name: Build QEMU ${{ env.QEMU_VERSION }}
         if: steps.changed.outputs.kernel == 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -208,9 +209,10 @@ jobs:
           echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
           mkdir qemu-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-src
           cd qemu-src
-          # vhost-kernel builds vhost-vsock-pci, the vsock SDD 25's DR-T13 boots with.
+          # vhost-user builds vhost-user-vsock-pci, the vsock every boot has (SDD 30 f.11),
+          # whose back end is build.sh's moruna-vhost-vsock: no host kernel module.
           ./configure --prefix=/opt/qemu --target-list=x86_64-softmmu \
-            --without-default-features --enable-kvm --enable-tcg --enable-vhost-kernel \
+            --without-default-features --enable-kvm --enable-tcg --enable-vhost-user \
             --disable-docs --disable-werror
           make -j"$(nproc)"
           sudo make install
@@ -226,24 +228,15 @@ jobs:
             sudo udevadm trigger --name-match=kvm
           fi
           ls -l /dev/kvm || echo "no /dev/kvm: the boot runs under TCG"
-          # DR-T13 (SDD 25): a vsock needs the host's vhost_vsock module. Without it the
-          # boot has no vsock, and check-boot.sh requires the test's line saying so.
-          sudo modprobe vhost_vsock || echo "no vhost_vsock module on this runner"
-          if [ -e /dev/vhost-vsock ]; then
-            sudo chmod 0666 /dev/vhost-vsock
-            ls -l /dev/vhost-vsock
-          else
-            echo "no /dev/vhost-vsock: the boot runs without a vsock"
-          fi
-      - name: Format, and the host tests of the ABI, the loaders, the handle table, the SDK, the image tool and the image filesystem's reader
+      - name: Format and host tests of ABI, loaders, handles, quotas, SDK, image and device libraries
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
         run: |
           cargo fmt --all -- --check
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-svc -p moruna-image
+          packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-quota -p moruna-svc -p moruna-image
             -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
-            -p moruna-linux -p linux-protocol)
+            -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
       - name: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)
@@ -254,6 +247,10 @@ jobs:
       - name: The Linux personality's image (SDD 28 k), musl for its static programs, and python:3.14-slim's layers
         if: steps.changed.outputs.kernel == 'true'
         run: |
+          # This step runs at the root: rust-toolchain.toml selects the engine's
+          # pinned stable toolchain, not kernel/'s nightly. musl-tools supplies C,
+          # but does not install Rust's std for this target.
+          rustup target add x86_64-unknown-linux-musl
           sudo apt-get install -y -q --no-install-recommends musl-tools
           kernel/tools/python-layout.sh "$RUNNER_TEMP/python"
       - name: Build the kernel, the programs and the boot image
@@ -274,17 +271,27 @@ jobs:
             kernel/tools/check-boot.sh "$RUNNER_TEMP/serial-$cpus.log" "$status" "$RUNNER_TEMP/boot/expect" "$cpus" || fail=1
           done
           exit "$fail"
-      - name: Clippy for x86_64-unknown-none (the kernel, and every userland crate)
+      - name: Required five production-node job cases on one, two and four CPUs
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          kernel/tools/node-fixtures.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/native-node-ci" \
+            "$(command -v qemu-system-x86_64)" /etc/ssl/certs/ca-certificates.crt 180
+      - name: Clippy for the builtin kernel target and canonical native-user target
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel
         env:
-          RUSTFLAGS: -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y
+          RUSTFLAGS: --cfg polyval_force_soft -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y
         run: |
+          unset CARGO_ENCODED_RUSTFLAGS
           build_std=(-Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
+          # Preserve the builtin soft-float kernel target; only native userland
+          # uses the canonical SSE2/SysV JSON target, exactly as build.sh does.
           cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" \
             -p moruna-microkernel-boot -- -D warnings
-          cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" --workspace \
-            --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image -- -D warnings
+          RUSTFLAGS="$RUSTFLAGS -Zunstable-options -C link-arg=-T$PWD/sys/user.ld -C link-arg=-static" \
+            cargo -Zunstable-options -Zjson-target-spec clippy --release --locked \
+            --target "$PWD/targets/x86_64-moruna-user.json" "${build_std[@]}" --workspace \
+            --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image -- -D warnings
       - name: Licences of the kernel workspace (MPL-2.0 for OSTD, DECISIONS.md MK1)
         if: steps.changed.outputs.kernel == 'true'
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17

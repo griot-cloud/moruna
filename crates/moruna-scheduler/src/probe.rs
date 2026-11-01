@@ -29,6 +29,15 @@ pub(crate) fn probe(shared: &Shared, stage: StageId, bytes: u64) -> Result<Probe
             shared.stages.len()
         )));
     }
+    if shared
+        .control_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(MorunaError::Plan(
+            "another scheduler control operation is active".into(),
+        ));
+    }
     shared.probing.store(true, Ordering::SeqCst);
     shared.close_gate();
     // Every worker that was inside `apply` finishes first; after this nobody but the probing
@@ -39,6 +48,7 @@ pub(crate) fn probe(shared: &Shared, stage: StageId, bytes: u64) -> Result<Probe
     let outcome = probe_inner(shared, stage, bytes);
     shared.open_gate();
     shared.probing.store(false, Ordering::SeqCst);
+    shared.control_active.store(false, Ordering::SeqCst);
     shared.unpark_all();
     outcome
 }

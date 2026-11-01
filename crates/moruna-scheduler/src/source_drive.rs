@@ -242,6 +242,16 @@ pub(crate) fn drive(
             &mut learned,
             &mut cx,
         );
+        // The owner of the futures keeps polling their original completions. Only after
+        // the final result has reached placement can it acknowledge a stable source cursor.
+        if shared.checkpoint_pause.load(Ordering::SeqCst) && mode != DRIVE_STOP {
+            source
+                .checkpoint_paused
+                .store(inflight.is_empty(), Ordering::SeqCst);
+            parker.park_timeout(Duration::from_millis(1));
+            continue;
+        }
+        source.checkpoint_paused.store(false, Ordering::SeqCst);
         while let Ok(request) = helper_rx.try_recv() {
             service_helper(&shared, source, request, &parker, &mut cx);
             worked = true;
@@ -484,12 +494,14 @@ fn poll_inflight(
                         let (rows, bytes) = (payload.rows(), payload.bytes());
                         let morsel = Morsel::new(entry.seq, 0, payload, entry.origin.clone());
                         let outcome = match entry.kind {
-                            ReadKind::Replacement(queue) => shared.placement.replace(queue, morsel),
+                            ReadKind::Replacement(queue) => {
+                                crate::decide::admit_replace(shared, queue, morsel)
+                            }
                             ReadKind::Fresh | ReadKind::Recompute => {
                                 if entry.kind == ReadKind::Recompute {
                                     shared.recomputed.fetch_add(1, Ordering::SeqCst);
                                 }
-                                shared.placement.push_to(&source.outputs, morsel)
+                                crate::decide::admit_push(shared, &source.outputs, morsel, None)
                             }
                         };
                         match outcome {
@@ -742,7 +754,7 @@ fn recompute(shared: &Shared, source: &SourceEnd, parker: &Parker, cx: &mut Cont
             Ok(payload) => {
                 let (rows, bytes) = (payload.rows(), payload.bytes());
                 let morsel = Morsel::new(seq, 0, payload, origin);
-                if let Err(e) = shared.placement.push_to(&source.outputs, morsel) {
+                if let Err(e) = crate::decide::admit_push(shared, &source.outputs, morsel, None) {
                     crate::policy::terminate(shared, e);
                     return;
                 }

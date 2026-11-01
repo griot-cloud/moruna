@@ -89,6 +89,18 @@ impl Encoder {
         Ok(())
     }
 
+    /// Export a bounded control body that carries no handles, for an explicit
+    /// Memory control record. It is the same codec, not another serialization.
+    pub fn into_control_bytes(self) -> Result<Vec<u8>, WireError> {
+        if self.body_len() > limits::CHANNEL_MAX_BYTES {
+            return Err(WireError::TooLarge);
+        }
+        if !self.handles.is_empty() {
+            return Err(WireError::Handle);
+        }
+        Ok(self.bytes[HEADER..].to_vec())
+    }
+
     /// The whole message (header room included) and its handles, for the frame layer.
     pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<Option<Handle>>) {
         (self.bytes, self.handles)
@@ -284,6 +296,9 @@ tuple!(A);
 tuple!(A, B);
 tuple!(A, B, C);
 tuple!(A, B, C, D);
+// Composite native admission arguments use the same sequential Wire fields.
+tuple!(A, B, C, D, E);
+tuple!(A, B, C, D, E, F);
 
 impl Wire for Handle {
     fn encode(self, e: &mut Encoder) -> Result<(), WireError> {
@@ -312,12 +327,11 @@ impl Wire for Channel {
     }
 }
 
-#[cfg(target_os = "none")]
-impl Wire for moruna_sys::Memory {
+impl Wire for crate::Memory {
     fn encode(self, e: &mut Encoder) -> Result<(), WireError> {
         e.put_handle(self.0)
     }
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
-        typed_handle(d, ObjectType::Memory).map(moruna_sys::Memory)
+        typed_handle(d, ObjectType::Memory).map(crate::Memory)
     }
 }

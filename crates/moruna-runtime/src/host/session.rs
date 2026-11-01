@@ -20,12 +20,11 @@ use moruna_kernel::{CancelToken, MorunaError, RunId};
 use moruna_placement::PlacementEngine;
 use moruna_trace::RunReport;
 
-use super::lifecycle::{Ending, EventOut, Layout, Lifecycle, PlanRun, Steps};
+use super::events::{EventOptions, Events, Meta, unix_ns_now};
+use super::lifecycle::{Ending, Layout, Lifecycle, PlanRun, Steps};
 use super::logs::{Capture, FINISH_WAIT, Tell, attempt_dir};
 use super::ports::HostPorts;
-use super::protocol::{
-    self, EVENTS_VERSION, Event, EventMsg, Heartbeat, Inbound, LimitsMsg, Outbound,
-};
+use super::protocol::{self, Heartbeat, Inbound, LimitsMsg, Outbound};
 use super::transport::{self, Address, Conn};
 use super::{VERSION, diagnostic, exit, exit_code};
 use crate::job::{BuildOptions, build};
@@ -41,6 +40,8 @@ pub const HEARTBEAT: Duration = Duration::from_millis(1000);
 
 /// How a job is run.
 pub struct HostOptions<'a> {
+    /// Explicit shared registration/live cost configuration; None disables learning.
+    pub cost: Option<crate::cost::CostSettings>,
     /// Refuse any field the environment would fill (H8).
     pub strict: bool,
     /// The environment, as a lookup.
@@ -54,6 +55,8 @@ pub struct HostOptions<'a> {
     /// Capture the process's own standard output and error into the run's output store while
     /// the run lasts, as the engine's (MH 4.3 `log`): the process is the run's alone.
     pub capture_process: bool,
+    /// Where the run's events go beside the connection and the output store (MH 4.3 version 7).
+    pub events: EventOptions,
 }
 
 /// How a job ended.
@@ -78,6 +81,10 @@ pub struct Wire {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     notes: Mutex<Vec<String>>,
     started: Instant,
+    /// Unix nanoseconds at `started`, for the `ts` of a record.
+    epoch_ns: i64,
+    /// The frame being written, kept for its capacity.
+    frame: Mutex<Vec<u8>>,
 }
 
 impl Wire {
@@ -87,7 +94,33 @@ impl Wire {
             writer: Mutex::new(writer),
             notes: Mutex::new(Vec::new()),
             started,
+            epoch_ns: unix_ns_now().saturating_sub(started.elapsed().as_nanos() as i64),
+            frame: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Send one event as a frame (MH 4.3): the same failure rule as [`Wire::send`].
+    pub fn send_event(&self, record: &[u8]) {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = writer.as_mut() else {
+            return;
+        };
+        let mut frame = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(error) = moruna_event::frame::write_frame(w.as_mut(), &mut frame, record) {
+            drop(frame);
+            *writer = None;
+            drop(writer);
+            self.note(format!(
+                "the peer stopped receiving at {} ms ({error}); the run continued and the report \
+                 is on disk",
+                self.elapsed_ms()
+            ));
+        }
+    }
+
+    /// Unix nanoseconds at the instant [`Wire::started`] is, which every `t_us` counts from.
+    pub fn epoch_ns(&self) -> i64 {
+        self.epoch_ns
     }
 
     /// Send one message. The first failed write drops the peer, with a note; later sends do
@@ -159,65 +192,6 @@ impl Wire {
     /// When the process began the run: the clock every `t_ms` and `t_us` counts from.
     pub fn started(&self) -> Instant {
         self.started
-    }
-}
-
-/// The thread that writes a run's events (MH 4.3 `event`): each gets the next `seq` as it is
-/// written, so the peer reads them numbered from 1 with no gap, in the order they became true.
-struct Events {
-    tx: std::sync::mpsc::Sender<Option<(u64, Event)>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Events {
-    fn start(wire: &Arc<Wire>, attempt: u32, start: String) -> Events {
-        let (tx, rx) = std::sync::mpsc::channel::<Option<(u64, Event)>>();
-        let writer = wire.clone();
-        let thread = std::thread::Builder::new()
-            .name("moruna-events".to_string())
-            .spawn(move || {
-                let mut seq = 0u64;
-                while let Ok(Some((t_us, body))) = rx.recv() {
-                    seq += 1;
-                    writer.send(&Outbound::Event(EventMsg {
-                        v: EVENTS_VERSION,
-                        attempt,
-                        start: start.clone(),
-                        seq,
-                        t_us,
-                        body,
-                    }));
-                }
-            });
-        let thread = match thread {
-            Ok(thread) => Some(thread),
-            Err(error) => {
-                wire.note(format!(
-                    "the run's events cannot be written: no thread for them ({error})"
-                ));
-                None
-            }
-        };
-        Events { tx, thread }
-    }
-
-    fn out(&self) -> EventOut {
-        let tx = self.tx.clone();
-        Box::new(move |t_us, event| {
-            let _ = tx.send(Some((t_us, event)));
-        })
-    }
-}
-
-/// Dropping the events writes every event told so far and ends the thread; later ones go
-/// nowhere. Dropping is the one way they close, so a run that unwinds past its events still
-/// writes every event told before, the ends its lifecycle told as it dropped included (PY-I11).
-impl Drop for Events {
-    fn drop(&mut self) {
-        let _ = self.tx.send(None);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
     }
 }
 
@@ -508,6 +482,14 @@ pub fn run_plan(
     run_planned(Ok(plan), job, kinds, opts, wire, reader, mode)
 }
 
+fn native_guest() -> moruna_kernel::Result<Option<Arc<crate::bootstrap::Guest>>> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if moruna_micro::on_kernel() {
+        return crate::bootstrap::Guest::from_start().map(Some);
+    }
+    Ok(None)
+}
+
 fn run_planned(
     plan: moruna_kernel::Result<Plan>,
     job: Job,
@@ -517,12 +499,29 @@ fn run_planned(
     reader: Option<Box<dyn BufRead + Send>>,
     mode: Mode,
 ) -> Outcome {
-    let fallback_id = job
-        .id
-        .as_deref()
-        .and_then(RunId::from_hex)
-        .or_else(|| crate::run::mint_run_id().ok())
-        .unwrap_or(RunId([0; 16]));
+    // Actual native startup authority is mandatory. A missing grant cannot fall
+    // back to empty host components or invent another run identity.
+    let guest = match native_guest() {
+        Ok(guest) => guest,
+        Err(error) => {
+            return finish(
+                wire,
+                None,
+                None,
+                exit_code(&error),
+                Some(diagnostic(&error)),
+                None,
+                None,
+            );
+        }
+    };
+    let fallback_id = guest.as_ref().map(|g| g.run_id()).unwrap_or_else(|| {
+        job.id
+            .as_deref()
+            .and_then(RunId::from_hex)
+            .or_else(|| crate::run::mint_run_id().ok())
+            .unwrap_or(RunId([0; 16]))
+    });
     let digest = moruna_plan::job_digest(&job);
     // This process's own id in its events: two processes of one attempt are two producers.
     let start = match crate::run::mint_run_id() {
@@ -544,7 +543,6 @@ fn run_planned(
             );
         }
     };
-    let events = Events::start(wire, job.report.attempt(), start.clone());
     // MH 4.10: host ports ride this connection, when there is one to read replies from.
     let host_ports = (wire.has_peer() && reader.is_some()).then(|| HostPorts::new(wire.clone()));
     let built = match plan {
@@ -572,6 +570,22 @@ fn run_planned(
             // each naming its step when the document was planned.
             let layout = Layout::of(&job, None);
             let steps = plan.as_ref().map(|p| Steps::of(p, &job, &layout));
+            let events = Events::start(
+                wire,
+                Meta {
+                    run: fallback_id.to_hex(),
+                    plan: steps.as_ref().map(|s| s.plan_id().to_string()),
+                    attempt: job.report.attempt(),
+                    start: start.clone(),
+                    epoch_ns: wire.epoch_ns(),
+                },
+                attempt_dir(
+                    &logs_path(&job, &fallback_id.to_hex()),
+                    job.report.attempt(),
+                    &start,
+                ),
+                &opts.events,
+            );
             let lifecycle = Lifecycle::new(layout, steps, wire.started(), events.out());
             lifecycle.begin(job.resume.is_some());
             lifecycle.end(Ending::Failed(&error));
@@ -592,7 +606,64 @@ fn run_planned(
     let layout = Layout::of(&job, Some(&built.parts));
     let tasks: Vec<String> = layout.ids();
     let steps = Steps::of(&plan, &job, &layout);
+    let plan_id = steps.plan_id().to_string();
+    // The facade takes the run id from the manifest on a resume (12 f.7); the report file and the
+    // events are named for the same id.
+    let run_id = guest
+        .as_ref()
+        .map(|g| g.run_id())
+        .unwrap_or_else(|| match &built.spec.resume {
+            Some(path) => PlacementEngine::read_manifest_header(path)
+                .map(|h| h.run_id)
+                .unwrap_or(fallback_id),
+            None => built.run_id.unwrap_or(fallback_id),
+        });
+    let store = attempt_dir(
+        &logs_path(&job, &run_id.to_hex()),
+        job.report.attempt(),
+        &start,
+    );
+    let events = Events::start(
+        wire,
+        Meta {
+            run: run_id.to_hex(),
+            plan: Some(plan_id.clone()),
+            attempt: job.report.attempt(),
+            start: start.clone(),
+            epoch_ns: wire.epoch_ns(),
+        },
+        store.clone(),
+        &opts.events,
+    );
     let lifecycle = Lifecycle::new(layout, Some(steps), wire.started(), events.out());
+    let guest_components = match &guest {
+        Some(guest) => guest.components(&job, &built.parts),
+        None => Ok(Components::default()),
+    };
+    let guest_components = match guest_components {
+        Ok(components) => components,
+        Err(error) => {
+            let lifecycle = Lifecycle::new(
+                Layout::of(&job, Some(&built.parts)),
+                None,
+                wire.started(),
+                events.out(),
+            );
+            lifecycle.begin(job.resume.is_some());
+            lifecycle.end(Ending::Failed(&error));
+            drop(events);
+            let file = report_path(&job, &fallback_id.to_hex());
+            return finish(
+                wire,
+                Some(&file),
+                Some((&fallback_id.to_hex(), &digest)),
+                exit_code(&error),
+                Some(diagnostic(&error)),
+                None,
+                None,
+            );
+        }
+    };
     // What the run starts beside itself, held out here so a run that crashes still stops it.
     let stop = Arc::new(AtomicBool::new(false));
     let mut capture: Option<Capture> = None;
@@ -605,25 +676,18 @@ fn run_planned(
     // leaves the session as it came (PY-I11).
     let driven = std::panic::catch_unwind(AssertUnwindSafe(|| {
         lifecycle.begin(job.resume.is_some());
-        // The facade takes the run id from the manifest on a resume (12 f.7); the report file
-        // is named for the same id.
-        let run_id = match &built.spec.resume {
-            Some(path) => PlacementEngine::read_manifest_header(path)
-                .map(|h| h.run_id)
-                .unwrap_or(fallback_id),
-            None => built.run_id.unwrap_or(fallback_id),
-        };
         let file = report_path(&job, &run_id.to_hex());
 
         // What the tasks print goes to the output store, by stage; the peer hears its reach.
         let output = capture.insert(Capture::start(
-            attempt_dir(
-                &logs_path(&job, &run_id.to_hex()),
-                job.report.attempt(),
-                &start,
-            ),
-            job.report.attempt(),
-            start,
+            store,
+            Meta {
+                run: run_id.to_hex(),
+                plan: Some(plan_id),
+                attempt: job.report.attempt(),
+                start,
+                epoch_ns: wire.epoch_ns(),
+            },
             tasks,
             wire.started(),
             Tell {
@@ -689,18 +753,46 @@ fn run_planned(
             }
         }
 
-        let result = Runtime::run_with(
-            built.spec,
-            opts.cancel.clone(),
-            Components {
-                run_id: Some(run_id),
-                observer: Some(observer),
-                limits_subscribers: vec![limits_changed(wire.clone())],
-                stage_hook: Some(lifecycle.hook()),
-                output: Some(output.sink()),
-                ..Components::default()
-            },
-        );
+        let services = if guest.is_some() {
+            Ok(guest_components)
+        } else {
+            (|| -> moruna_kernel::Result<_> {
+                let learning = opts
+                    .cost
+                    .clone()
+                    .map(|settings| {
+                        crate::cost::RunLearning::for_job(
+                            settings.open_online()?,
+                            &job,
+                            &built.parts,
+                        )
+                    })
+                    .transpose()?;
+                let history = kinds
+                    .embedding()
+                    .historical_rows(&job, &built.parts, run_id)?;
+                let checkpoints = kinds.embedding().checkpoints(&job, run_id)?;
+                Ok(Components {
+                    learning,
+                    history,
+                    checkpoints,
+                    ..guest_components
+                })
+            })()
+        };
+        let result = match services {
+            Ok(mut components) => {
+                components.run_id = Some(run_id);
+                components.observer = Some(observer);
+                components
+                    .limits_subscribers
+                    .push(limits_changed(wire.clone()));
+                components.stage_hook = Some(lifecycle.hook());
+                components.output = Some(output.sink());
+                Runtime::run_with(built.spec, opts.cancel.clone(), components)
+            }
+            Err(error) => Err(crate::error::RunError::bare(error)),
+        };
         (run_id, file, result)
     }));
     stop.store(true, Ordering::SeqCst);

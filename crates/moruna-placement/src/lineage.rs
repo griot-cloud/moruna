@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
-use moruna_kernel::{Origin, PayloadKind, SegmentRef, Seq, StageId};
+use moruna_kernel::{Origin, PayloadKind, Seq, StageId};
 
 use crate::{NO_COMMIT, PlacementEngine};
 
@@ -30,9 +30,9 @@ pub struct Position {
     pub kind: PayloadKind,
     /// Payload bytes.
     pub bytes: u64,
-    /// The segment record holding a copy, when there is one.
-    pub disk: Option<SegmentRef>,
-    /// True once the morsel has been popped (it is inside a kernel or a sink).
+    /// True once the morsel has been popped (it is inside a kernel or a sink). Whether its bytes
+    /// have a disk copy is the catalog's to say, once for every position of a fanned-out batch
+    /// (f.18); the manifest reads it there.
     pub consumed: bool,
 }
 
@@ -104,7 +104,6 @@ impl PlacementEngine {
                 Some(position) => {
                     position.kind = kind;
                     position.bytes = bytes;
-                    position.disk = None;
                     position.consumed = false;
                 }
                 None => record.positions.push(Position {
@@ -112,7 +111,6 @@ impl PlacementEngine {
                     seq,
                     kind,
                     bytes,
-                    disk: None,
                     consumed: false,
                 }),
             }
@@ -133,19 +131,10 @@ impl PlacementEngine {
         }
     }
 
-    /// A demotion wrote a record, or a promotion kept one (f.7): the disk copy stays valid
-    /// until the entry is consumed.
-    pub(crate) fn lineage_set_disk(&self, stage: StageId, seq: Seq, disk: Option<SegmentRef>) {
-        self.with_position(stage, seq, |position| position.disk = disk);
-    }
-
     /// A consumer popped the morsel; its position stays until what the consumer makes of it is
     /// pushed, or every sink has committed it (PL-I11).
     pub(crate) fn lineage_consumed(&self, stage: StageId, seq: Seq) {
-        self.with_position(stage, seq, |position| {
-            position.consumed = true;
-            position.disk = None;
-        });
+        self.with_position(stage, seq, |position| position.consumed = true);
     }
 
     /// The watermark of sink `sink`, or `None` when it has committed nothing (e.2).
@@ -191,8 +180,8 @@ impl PlacementEngine {
     }
 
     /// `set_committed` (f.11): sink `sink` has committed every morsel at or below `seq`. Each
-    /// source's records every sink has committed are released. The lineage lock is held only to
-    /// collect; the segments lock is taken after it has been dropped (preamble 4.2).
+    /// source's records every sink has committed are released. A disk record is released by its
+    /// batch, when the last consumer takes it (f.7, f.18), not here.
     pub(crate) fn commit_to(&self, sink: u16, seq: Seq) {
         let Some(cell) = self.sink_watermarks.get(usize::from(sink)) else {
             return;
@@ -207,7 +196,6 @@ impl PlacementEngine {
         }
         cell.store(seq, Ordering::Release);
         let sinks = self.sink_watermarks();
-        let mut released: Vec<SegmentRef> = Vec::new();
         for source in 0..self.cfg.topology.sources() {
             let Some(upto) = self.source_watermark(source, &sinks) else {
                 continue;
@@ -226,20 +214,14 @@ impl PlacementEngine {
                     record.committed = true;
                     for position in &mut record.positions {
                         position.consumed = true;
-                        released.extend(position.disk.take());
                     }
                 }
             } else {
                 let keys: Vec<Root> = lineage.range(range).map(|(k, _)| *k).collect();
                 for key in keys {
-                    if let Some(record) = lineage.remove(&key) {
-                        released.extend(record.positions.into_iter().filter_map(|p| p.disk));
-                    }
+                    lineage.remove(&key);
                 }
             }
-        }
-        for segment in released {
-            self.release_record(segment.segment);
         }
     }
 

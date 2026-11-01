@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Generate the Rust of every FlatBuffers schema in the workspace, the job document's (SDD 22 e.4)
-# and the plan document's (SDD 26 e.1), or, with --check, fail when what is committed differs from
+# Generate the Rust of every FlatBuffers schema in the workspace, the job document's (SDD 22 e.4),
+# the plan document's (SDD 26 e.1) and the run events' (SDD 12, MH 4.3), or, with --check, fail when what is committed differs from
 # what a schema generates.
 #
 #   tools/flatc/generate.sh          writes each crate's src/generated/<name>_generated.rs
@@ -34,7 +34,8 @@ SOURCES="src/file_manager.cpp src/file_name_manager.cpp src/idl_parser.cpp src/i
   grpc/src/compiler/swift_generator.cc grpc/src/compiler/ts_generator.cc"
 # Each schema and the directory its generated Rust is committed in.
 SCHEMAS="crates/moruna-job/schema/job.fbs:crates/moruna-job/src/generated
-  crates/moruna-plan/schema/plan.fbs:crates/moruna-plan/src/generated"
+  crates/moruna-plan/schema/plan.fbs:crates/moruna-plan/src/generated
+  crates/moruna-event/schema/event.fbs:crates/moruna-event/src/generated"
 
 check=0
 [ "${1:-}" = "--check" ] && check=1

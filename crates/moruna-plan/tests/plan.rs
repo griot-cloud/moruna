@@ -3,11 +3,14 @@
 
 use std::sync::Arc;
 
+use moruna_cost::{
+    CostKey, CostModel, Digest, FitReport, Inputs, ModelId, ObservationSource, Outcome,
+};
 use moruna_job::{BudgetDoc, Catalogue, Edge, ElasticDoc, Job, KindDoc, Task};
 use moruna_plan::{
-    Basis, Estimate, Estimator, Levels, PLAN_IDENTIFIER, Plan, PlanBytesError, PlanError,
-    PlanInputs, PlanRefusalCode, Planner, PlannerId, Planners, Resources, Step, StepQuery,
-    TableStats, Totals, Unit, UnitCost, budget_resources, check_plan, explain, is_plan_flatbuffer,
+    Basis, Estimate, Levels, PLAN_IDENTIFIER, Plan, PlanBytesError, PlanError, PlanInputs,
+    PlanRefusalCode, Planner, PlannerId, Planners, Resources, Step, TableStats, Target, Totals,
+    Unit, UnitCost, budget_resources, check_plan, cost_key, explain, is_plan_flatbuffer,
     is_step_id, job_ceiling, job_digest, plan_with, step_id,
 };
 use serde_json::{Value, json};
@@ -402,10 +405,11 @@ fn pn_t7_declared_defaults_follow_the_counts() {
         run().memory_ceiling_bytes as f64
     );
     for step in &plan.steps {
-        for (name, unit, estimate) in step.cost.fields() {
-            assert_eq!(estimate.basis, Basis::Default, "{name}");
-            assert_eq!(estimate.observations, 0, "{name}");
-            assert_eq!(estimate.unit, unit, "{name}");
+        for target in Target::ALL {
+            let estimate = step.cost.get(target);
+            assert_eq!(estimate.basis, Basis::Default, "{target}");
+            assert_eq!(estimate.observations, 0, "{target}");
+            assert_eq!(estimate.unit, target.unit(), "{target}");
         }
     }
     assert_eq!(plan.totals.basis, Basis::Default);
@@ -417,20 +421,44 @@ fn pn_t7_declared_defaults_follow_the_counts() {
     assert_eq!(plan.step_of("join").expect("join").cost.rows_out.p50, 0.0);
 }
 
-/// A model that says each step takes a second per task place, and a tenth of a second more for
-/// the join, so the critical path is decided by durations.
+/// A model whose units of function 1 take a second, of function 5 five seconds, and of any
+/// other half a second; it reads 7 bytes when the kind's declaration was handed over and 3 when
+/// not, so the critical path is decided by durations.
 struct Clockwork;
 
-impl Estimator for Clockwork {
-    fn id(&self) -> String {
-        "clockwork@3".into()
+/// A key of the `std` kernel running function `n`.
+fn function(n: u8) -> CostKey {
+    CostKey {
+        fingerprint: Digest([n; 32]),
+        ..cost_key(&Task::kernel("k", cast()))
+    }
+}
+
+/// The parts of a model a test does not exercise.
+macro_rules! inert {
+    () => {
+        fn observe(&mut self, _: &CostKey, _: &Inputs, _: &Outcome) {}
+        fn fit(&mut self, _: &dyn ObservationSource) -> moruna_cost::Result<FitReport> {
+            Ok(FitReport::default())
+        }
+        fn save(&self) -> moruna_cost::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn load(&mut self, _: &[u8]) -> moruna_cost::Result<()> {
+            Ok(())
+        }
+    };
+}
+
+impl CostModel for Clockwork {
+    fn id(&self) -> ModelId {
+        ModelId::new("clockwork", 3)
     }
 
-    fn estimate(&self, query: &StepQuery<'_>) -> Result<UnitCost, String> {
-        let task = query.tasks[0];
-        let seconds = match task.id.as_str() {
-            "a" => 1.0,
-            "b" => 5.0,
+    fn predict(&self, key: &CostKey, inputs: &Inputs) -> UnitCost {
+        let seconds = match key.fingerprint.0[0] {
+            1 => 1.0,
+            5 => 5.0,
             _ => 0.5,
         };
         let measured = |p50: f64, p95: f64, unit: Unit| Estimate {
@@ -439,31 +467,35 @@ impl Estimator for Clockwork {
             unit,
             basis: Basis::Measured,
             observations: 12,
+            extrapolated: false,
+            drifting: false,
         };
-        let declared = query.declarations[0].is_some();
-        Ok(UnitCost {
+        let declared = inputs.kernel.deterministic.is_some();
+        let rows = inputs.data.rows.unwrap_or(10) as f64;
+        UnitCost {
             duration: measured(seconds, seconds * 2.0, Unit::Seconds),
             worker_time: measured(seconds, seconds * 2.0, Unit::Seconds),
             peak_memory: measured(1000.0, 2000.0, Unit::Bytes),
-            rows_out: measured(
-                query.rows_in.unwrap_or(10) as f64,
-                query.rows_in.unwrap_or(10) as f64,
-                Unit::Rows,
-            ),
+            rows_out: measured(rows, rows, Unit::Rows),
             read_bytes: measured(if declared { 7.0 } else { 3.0 }, 9.0, Unit::Bytes),
             ..UnitCost::zero()
-        })
+        }
     }
+
+    inert!();
 }
 
-/// PN-T8 (PN-I3): with a model, the planner asks it about every step and carries its answers;
-/// the totals follow its durations; a model's failure or an estimate no plan carries is refused
-/// naming the step.
+/// PN-T8 (PN-I3): with a model, the planner asks it about every task's units and carries its
+/// answers; the totals follow its durations; an estimate no plan carries is refused naming the
+/// step.
 #[test]
 fn pn_t8_the_levels_planner_asks_the_model() {
     let catalogue = Catalogue::standard().expect("standard");
     let model = Clockwork;
-    let inputs = PlanInputs::new(run()).with_model(&model);
+    let inputs = PlanInputs::new(run())
+        .with_model(&model)
+        .with_key("a", function(1))
+        .with_key("b", function(5));
     let plan = plan_with(&Levels, &diamond(), &catalogue, &inputs).expect("planned");
     assert_eq!(plan.model.as_deref(), Some("clockwork@3"));
     let b = plan.step_of("b").expect("b");
@@ -475,8 +507,8 @@ fn pn_t8_the_levels_planner_asks_the_model() {
     );
     assert_eq!(
         plan.step_of("join").expect("join").cost.rows_out.p50,
-        20.0,
-        "the join takes both arms' rows"
+        10.0,
+        "with no counts, rows are the model's own answer"
     );
     // The longest path goes through b: 0.5 + 5 + 0.5 + 0.5.
     let path: Vec<String> = plan
@@ -500,35 +532,34 @@ fn pn_t8_the_levels_planner_asks_the_model() {
     assert_eq!(plan.totals.worker_seconds.p50, 7.5);
     assert_eq!(plan.totals.disk_bytes.p50, 35.0);
 
-    struct Broken(bool);
-    impl Estimator for Broken {
-        fn id(&self) -> String {
-            "broken".into()
+    struct Broken;
+    impl CostModel for Broken {
+        fn id(&self) -> ModelId {
+            ModelId::new("broken", 1)
         }
-        fn estimate(&self, query: &StepQuery<'_>) -> Result<UnitCost, String> {
-            if self.0 {
-                return Err(format!("no history for {}", query.tasks[0].kind));
-            }
-            Ok(UnitCost {
-                duration: Estimate::declared(2.0, 1.0, Unit::Seconds),
+        fn predict(&self, _: &CostKey, _: &Inputs) -> UnitCost {
+            UnitCost {
+                duration: Estimate {
+                    p95: 1.0,
+                    ..Estimate::exact(2.0, Unit::Seconds)
+                },
                 ..UnitCost::zero()
-            })
-        }
-    }
-    for (broken, says) in [(true, "no history for parquet"), (false, "duration: p95")] {
-        let model = Broken(broken);
-        let inputs = PlanInputs::new(run()).with_model(&model);
-        match plan_with(&Levels, &chain(), &catalogue, &inputs) {
-            Err(e @ PlanError::Model { .. }) => {
-                let PlanError::Model { step, reason, .. } = &e else {
-                    unreachable!()
-                };
-                assert!(is_step_id(step));
-                assert!(reason.contains(says), "{reason}");
-                assert!(e.to_string().contains("cost model broken"));
             }
-            other => panic!("{other:?}"),
         }
+        inert!();
+    }
+    let model = Broken;
+    let inputs = PlanInputs::new(run()).with_model(&model);
+    match plan_with(&Levels, &chain(), &catalogue, &inputs) {
+        Err(e @ PlanError::Model { .. }) => {
+            let PlanError::Model { step, reason, .. } = &e else {
+                unreachable!()
+            };
+            assert!(is_step_id(step));
+            assert!(reason.contains("duration: p95"), "{reason}");
+            assert!(e.to_string().contains("cost model broken@1"), "{e}");
+        }
+        other => panic!("{other:?}"),
     }
 }
 
@@ -946,7 +977,7 @@ impl Planner for Flat {
     }
 }
 
-/// PN-T18 (PN-I9): a planner of a test's own registers beside `levels` and is chosen by its
+/// PN-T18 (PN-I9): a planner of a test's own registers beside Moruna's and is chosen by its
 /// name; what it returns is checked like any planner's, so a plan that does not wait for its
 /// inputs is refused before anyone sees it; a planner whose plan names another maker, or whose
 /// id is not its content, is refused; names are a kind's, and one name is one planner.
@@ -955,7 +986,7 @@ fn pn_t18_a_test_planner_is_chosen_by_setting() {
     let catalogue = Catalogue::standard().expect("standard");
     let mut planners = Planners::standard();
     planners.add(Arc::new(Flat)).expect("registers");
-    assert_eq!(planners.names(), ["levels", "test.flat"]);
+    assert_eq!(planners.names(), ["levels", "simulated", "test.flat"]);
     let inputs = PlanInputs::new(run());
     let single = Job::new(vec![Task::source("only", source())], Vec::new());
     let mut single_out = single.clone();
@@ -993,9 +1024,12 @@ fn pn_t18_a_test_planner_is_chosen_by_setting() {
     let flat = Flat.plan(&one, &catalogue, &inputs).expect("planned");
     assert_eq!(flat.planner, PlannerId::new("test.flat", 7));
 
-    match explain(&chain(), &catalogue, &inputs, &planners, "simulated") {
+    match explain(&chain(), &catalogue, &inputs, &planners, "lookahead") {
         Err(e @ PlanError::UnknownPlanner { .. }) => {
-            assert!(e.to_string().contains("levels, test.flat"), "{e}");
+            assert!(
+                e.to_string().contains("levels, simulated, test.flat"),
+                "{e}"
+            );
         }
         other => panic!("{other:?}"),
     }

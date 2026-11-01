@@ -103,7 +103,7 @@ fn ct_t15_resume_defaults() {
             .expect("the default checkpoint succeeds")
             .is_none()
     );
-    assert_eq!(state.footprint(), None);
+    assert_eq!(state.footprint().unwrap(), None);
     assert!(state.as_any_mut().downcast_mut::<NoState>().is_some());
 
     // The default sink is not resumable and says so through `resume`, and reports no commit

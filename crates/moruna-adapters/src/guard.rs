@@ -6,8 +6,8 @@
 //! sampler. Every function a hook calls is safe to run without the GIL, allocates nothing, and
 //! takes no lock unless the gate has to measure the process.
 
-use core::cell::Cell;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use moruna_kernel::{AllocCounts, KernelAlloc, Sampler};
@@ -32,6 +32,14 @@ pub struct Refusal {
     pub ceiling: u64,
 }
 
+/// Admission failed either on a genuine budget measurement or on unavailable accounting.
+#[derive(Debug)]
+pub enum GateError {
+    /// Actual measured budget refusal.
+    Budget(Refusal),
+    /// Original sampler diagnostic; never fabricated as budget bytes.
+    Accounting(moruna_kernel::MorunaError),
+}
 /// What the guard holds for one kernel now (05 d.1).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiveCounts {
@@ -57,6 +65,7 @@ pub struct LiveCounts {
 /// request of that size was admitted).
 pub struct MemoryGate {
     sampler: Arc<dyn Sampler>,
+    failed: AtomicBool,
     ceiling: AtomicU64,
     /// The process's memory at the last measurement.
     base: AtomicU64,
@@ -88,15 +97,16 @@ fn signed(bytes: u64) -> i64 {
 impl MemoryGate {
     /// A gate over the run's sampler, starting from `ceiling` and one measurement taken now. A
     /// sample that names a ceiling replaces `ceiling` (the ceiling in force, 03 f.2).
-    pub fn new(sampler: Arc<dyn Sampler>, ceiling: u64) -> Arc<MemoryGate> {
-        let sample = sampler.sample();
+    pub fn new(sampler: Arc<dyn Sampler>, ceiling: u64) -> moruna_kernel::Result<Arc<MemoryGate>> {
+        let sample = sampler.sample()?;
         let ceiling = if sample.ceiling_bytes > 0 {
             sample.ceiling_bytes
         } else {
             ceiling
         };
-        Arc::new(MemoryGate {
+        Ok(Arc::new(MemoryGate {
             sampler,
+            failed: AtomicBool::new(false),
             ceiling: AtomicU64::new(ceiling),
             base: AtomicU64::new(sample.anon_bytes),
             pending: AtomicU64::new(0),
@@ -104,7 +114,7 @@ impl MemoryGate {
             measuring: Mutex::new(()),
             measurements: AtomicU64::new(1),
             refusals: AtomicU64::new(0),
-        })
+        }))
     }
 
     /// f.9: admit `bytes` or refuse them. Every admission is answered once, by [`settle`] when
@@ -112,7 +122,13 @@ impl MemoryGate {
     ///
     /// [`settle`]: MemoryGate::settle
     /// [`credit`]: MemoryGate::credit
-    pub fn admit(&self, bytes: u64) -> Result<(), Refusal> {
+    pub fn admit(&self, bytes: u64) -> Result<(), GateError> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(GateError::Accounting(moruna_kernel::MorunaError::Config {
+                name: "memory accounting",
+                msg: "gate closed after an accounting read failure".into(),
+            }));
+        }
         let mut pending = self.pending.load(Ordering::Acquire);
         loop {
             let ceiling = self.ceiling.load(Ordering::Acquire);
@@ -138,7 +154,7 @@ impl MemoryGate {
     }
 
     /// The slow path: judge `bytes` on a fresh measurement.
-    fn measure_and_admit(&self, bytes: u64) -> Result<(), Refusal> {
+    fn measure_and_admit(&self, bytes: u64) -> Result<(), GateError> {
         let _measuring = self
             .measuring
             .lock()
@@ -146,7 +162,10 @@ impl MemoryGate {
         // What was allocated before the sample is in it, or never will be (f.9); what is
         // allocated while it is taken stays counted on top of it, which can only over-estimate.
         let counted = self.settled.load(Ordering::Acquire);
-        let sample = self.sampler.sample();
+        let sample = self.sampler.sample().map_err(|cause| {
+            self.failed.store(true, Ordering::Release);
+            GateError::Accounting(cause)
+        })?;
         // The measurement goes in before the bytes it replaces come out, so a fast path that
         // reads between the two over-estimates instead of under-estimating.
         self.base.store(sample.anon_bytes, Ordering::Release);
@@ -164,11 +183,11 @@ impl MemoryGate {
                 .saturating_add(pending);
             if ceiling > 0 && in_use.saturating_add(bytes) > ceiling {
                 self.refusals.fetch_add(1, Ordering::Relaxed);
-                return Err(Refusal {
+                return Err(GateError::Budget(Refusal {
                     requested: bytes,
                     in_use,
                     ceiling,
-                });
+                }));
             }
             match self.pending.compare_exchange_weak(
                 pending,
@@ -284,6 +303,7 @@ impl KernelMemory {
             counts: Cell::new(KernelAlloc::NONE),
             held: Cell::new(0),
             refusal: Cell::new(None),
+            accounting_failure: RefCell::new(None),
             inside: Cell::new(false),
         };
         let restore = Restore(FRAME.with(|slot| slot.replace(&frame as *const Frame)));
@@ -297,18 +317,21 @@ impl KernelMemory {
             FrameEnd {
                 counts,
                 refusal: frame.refusal.get(),
+                accounting_failure: frame.accounting_failure.into_inner(),
             },
         )
     }
 }
 
 /// What a frame leaves: the call's counts (Python objects and NumPy data) and its first refusal.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FrameEnd {
     /// The call's counts, `measured`, with `refusal_on` set.
     pub counts: KernelAlloc,
     /// The first refusal of the call, the diagnostic's.
     pub refusal: Option<Refusal>,
+    /// Original accounting failure, terminal even when Python catches MemoryError.
+    pub accounting_failure: Option<moruna_kernel::MorunaError>,
 }
 
 /// The thread-local record of one call (05 b, f.12).
@@ -320,6 +343,7 @@ struct Frame {
     /// What the call holds in NumPy blocks, for its peak.
     held: Cell<i64>,
     refusal: Cell<Option<Refusal>>,
+    accounting_failure: RefCell<Option<moruna_kernel::MorunaError>>,
     /// Set while the guard calls the allocator underneath.
     inside: Cell<bool>,
 }
@@ -399,7 +423,13 @@ impl Frame {
         }
         match gate.admit(bytes) {
             Ok(()) => Ok(true),
-            Err(refusal) => {
+            Err(GateError::Accounting(cause)) => {
+                if self.accounting_failure.borrow().is_none() {
+                    *self.accounting_failure.borrow_mut() = Some(cause);
+                }
+                Err(())
+            }
+            Err(GateError::Budget(refusal)) => {
                 let mut counts = self.counts.get();
                 counts.source_mut(source).refused += 1;
                 self.counts.set(counts);

@@ -72,7 +72,7 @@ fn sc_t2_admission_rule() {
     std::thread::sleep(Duration::from_millis(2));
     for _ in 0..1_000 {
         assert_eq!(
-            crate::pick::pick(shared, 0),
+            crate::decide::chosen(shared, 0),
             Some((3, 0)),
             "the emptiest output queue is stage 3's"
         );
@@ -93,7 +93,7 @@ fn sc_t2_admission_rule() {
     );
     for _ in 0..1_000 {
         assert_eq!(
-            crate::pick::pick(shared, 0),
+            crate::decide::chosen(shared, 0),
             Some((2, 0)),
             "ties break to the later stage"
         );
@@ -104,7 +104,7 @@ fn sc_t2_admission_rule() {
     std::thread::sleep(Duration::from_millis(2));
     for _ in 0..1_000 {
         assert_eq!(
-            crate::pick::pick(shared, 0),
+            crate::decide::chosen(shared, 0),
             Some((1, 0)),
             "the fewest output bytes wins"
         );

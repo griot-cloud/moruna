@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use moruna_adapters::guard::{MemoryGate, Refusal};
+use moruna_adapters::guard::{GateError, MemoryGate, Refusal};
 use moruna_kernel::AllocCounts;
 use wasmtime::ResourceLimiter;
 
@@ -20,6 +20,7 @@ pub struct Limits {
     pending: u64,
     counts: AllocCounts,
     refusal: Option<Refusal>,
+    accounting_failure: Option<moruna_kernel::MorunaError>,
     /// The assets directory the host named (16 b), read by `read-asset`.
     assets: Option<std::path::PathBuf>,
     /// The stage's ports, reached by `call` (MH 4.10).
@@ -36,11 +37,15 @@ impl Limits {
             pending: 0,
             counts: AllocCounts::default(),
             refusal: None,
+            accounting_failure: None,
             assets: None,
             calls: None,
         }
     }
 
+    pub(crate) fn take_accounting_failure(&mut self) -> Option<moruna_kernel::MorunaError> {
+        self.accounting_failure.take()
+    }
     /// The same limits, with the assets directory `read-asset` reads.
     pub fn with_assets(mut self, assets: Option<std::path::PathBuf>) -> Limits {
         self.assets = assets;
@@ -174,7 +179,11 @@ impl ResourceLimiter for Limits {
         {
             match gate.admit(growth) {
                 Ok(()) => self.pending = growth,
-                Err(refusal) => return Ok(self.refuse(refusal)),
+                Err(GateError::Budget(refusal)) => return Ok(self.refuse(refusal)),
+                Err(GateError::Accounting(cause)) => {
+                    self.accounting_failure = Some(cause);
+                    return Err(wasmtime::Error::msg("memory accounting failed"));
+                }
             }
         }
         self.size = self.size.saturating_add(growth);

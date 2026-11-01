@@ -10,6 +10,7 @@ description = "Moruna IO reactor"
 
 [dependencies]
 moruna-kernel = { workspace = true }
+moruna-storage = { workspace = true }
 # The backends a URL may name (06 d.1 ObjectStoreConfig, d.2).
 object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 # `time` for the uring submission batching and the copy-event poll (06 f.1, f.5).

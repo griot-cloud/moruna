@@ -242,13 +242,12 @@ struct Peer {
 
 impl Write for Peer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let lines = bytes.iter().filter(|b| **b == b'\n').count();
-        let is_event = bytes.windows(15).any(|w| w == b"\"type\":\"event\"");
+        let is_event = bytes.first() == Some(&moruna_event::frame::FRAME);
         self.text
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend_from_slice(bytes);
-        if is_event && lines > 0 {
+        if is_event {
             let seen = self.events.fetch_add(1, Ordering::SeqCst) + 1;
             if seen == self.cancel_at {
                 match self.inbound.as_mut() {
@@ -288,12 +287,14 @@ fn run_cancelled(job: JobSpec, cancel_at: usize, how: Cancel) -> (Outcome, Vec<V
     };
     let wire = Wire::new(Some(Box::new(peer)), Instant::now());
     let opts = HostOptions {
+        cost: None,
         strict: false,
         env: &no_env,
         cancel,
         heartbeat: HEARTBEAT,
         packages: Default::default(),
         capture_process: false,
+        events: Default::default(),
     };
     let outcome = session::run_job(
         moruna_job::Job::from_v1(&job),
@@ -313,11 +314,10 @@ fn run(job: JobSpec, cancel_at: usize) -> (Outcome, Vec<Value>) {
 
 /// The events among the lines the peer read.
 fn events_in(text: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
-    let text = text.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    String::from_utf8(text)
-        .expect("the peer reads UTF-8")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("a JSON line"))
+    let bytes = text.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    moruna_runtime::host::protocol::json_messages(&bytes)
+        .expect("the peer reads the protocol")
+        .into_iter()
         .filter(|m| m["type"] == "event")
         .collect()
 }
@@ -490,12 +490,14 @@ fn run_crashing(job: JobSpec, kinds: &Registry) -> (Option<String>, Vec<Value>) 
     let wire = Wire::new(Some(Box::new(peer)), Instant::now());
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let opts = HostOptions {
+            cost: None,
             strict: false,
             env: &no_env,
             cancel: CancelToken::new(),
             heartbeat: HEARTBEAT,
             packages: Default::default(),
             capture_process: false,
+            events: Default::default(),
         };
         session::run_job(
             moruna_job::Job::from_v1(&job),

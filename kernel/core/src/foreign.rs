@@ -156,12 +156,25 @@ fn send(
     }
     write_u64(&mut bytes, request::IP, ctx.instruction_pointer() as u64);
     *thread.parked.lock() = Some(ctx.clone());
-    forward.waiting.lock().insert(thread.tid);
-    let answer = exchange(thread, forward, bytes);
-    forward.waiting.lock().remove(&thread.tid);
+    // A thread has one forwarded call in flight at a time: its request is paid for in
+    // the thread's own charge (`charge::THREAD`).
+    let request = Message {
+        bytes,
+        handles: Vec::new(),
+        endpoints: 0,
+        charge: None,
+    };
+    let answer = exchange(
+        thread,
+        &forward.endpoint,
+        &forward.waiting,
+        request,
+        reply::SIZE,
+        "its personality server",
+    );
     *thread.parked.lock() = None;
     let message = match answer {
-        Ok(Some(m)) => m,
+        Ok(Some(m)) => m.bytes,
         Ok(None) => return Flow::ThreadExit,
         Err(why) => return broken(thread, why),
     };
@@ -206,48 +219,74 @@ fn send(
     }
 }
 
-/// Queues `bytes` to the server and waits for the reply with this thread's token.
-/// `Ok(None)` when the thread was killed while it waited.
-fn exchange(thread: &Thread, forward: &Forward, bytes: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
-    let endpoint = &forward.endpoint;
+/// Queues `request` towards the peer of `endpoint`, the kernel's end of a channel to a
+/// server (a forward's personality, SDD 28 f.1, or a task's engine, SDD 29 f.4), and
+/// waits for the reply with this thread's token: a message of exactly `reply_size`
+/// bytes whose first eight are the token. Replies for the other threads in `waiting`
+/// stay queued for them; anything else is dropped. `Ok(None)` when the thread was
+/// killed while it waited; `Err` when the server (`who`) has gone.
+pub(crate) fn exchange(
+    thread: &Thread,
+    endpoint: &Arc<Endpoint>,
+    waiting: &SpinLock<BTreeSet<u64>>,
+    request: Message,
+    reply_size: usize,
+    who: &str,
+) -> Result<Option<Message>, String> {
+    waiting.lock().insert(thread.tid);
+    let answer = rendezvous(thread, endpoint, waiting, request, reply_size, who);
+    waiting.lock().remove(&thread.tid);
+    answer
+}
+
+fn rendezvous(
+    thread: &Thread,
+    endpoint: &Arc<Endpoint>,
+    waiting: &SpinLock<BTreeSet<u64>>,
+    request: Message,
+    reply_size: usize,
+    who: &str,
+) -> Result<Option<Message>, String> {
     let channel = &endpoint.channel;
     let (side, peer) = (endpoint.side, endpoint.peer());
     let (waiter, waker) = Waiter::new_pair();
     endpoint.signaller().observe(&waker);
     thread.set_waker(Some(waker.clone()));
-    let mut pending = Some(bytes);
+    let mut pending = Some(request);
+    // What is dropped from the queue is dropped after the lock, and there is never more
+    // of it than the queue holds.
+    let mut dropped: Vec<Message> = Vec::new();
+    if dropped.try_reserve(limits::CHANNEL_DEPTH).is_err() {
+        return Err(alloc::format!("no memory to wait for {who}"));
+    }
     let result = loop {
         if thread.killed() {
             break Ok(None);
         }
         {
             let mut inner = channel.inner.lock();
-            if let Some(bytes) = pending.take() {
+            if let Some(message) = pending.take() {
                 if !inner.open[peer] {
-                    break Err(String::from("its personality server has gone"));
+                    break Err(alloc::format!("{who} has gone"));
                 }
                 if inner.queues[peer].len() < limits::CHANNEL_DEPTH {
-                    inner.queues[peer].push_back(Message {
-                        bytes,
-                        handles: Vec::new(),
-                        endpoints: 0,
-                    });
+                    inner.queues[peer].push_back(message);
                     channel.refresh(&inner);
                 } else {
-                    pending = Some(bytes);
+                    pending = Some(message);
                 }
             }
             if pending.is_none() {
-                let waiting = forward.waiting.lock();
+                let waiting = waiting.lock();
                 let mut found = None;
                 let mut removed = false;
                 let mut i = 0;
                 while i < inner.queues[side].len() {
                     let token = inner.queues[side][i]
                         .bytes
-                        .get(..reply::SIZE)
-                        .filter(|_| inner.queues[side][i].bytes.len() == reply::SIZE)
-                        .and_then(|b| read_u64(b, reply::TOKEN));
+                        .get(..reply_size)
+                        .filter(|_| inner.queues[side][i].bytes.len() == reply_size)
+                        .and_then(|b| read_u64(b, 0));
                     match token {
                         Some(t) if t == thread.tid => {
                             found = inner.queues[side].remove(i);
@@ -255,14 +294,23 @@ fn exchange(thread: &Thread, forward: &Forward, bytes: Vec<u8>) -> Result<Option
                             break;
                         }
                         Some(t) if waiting.contains(&t) => i += 1,
-                        // Not a reply, or for no waiting thread: dropped.
+                        // Not a reply, or for no waiting thread: dropped (outside the
+                        // lock below, with the handles it carries).
                         _ => {
-                            let _ = inner.queues[side].remove(i);
+                            if let Some(stale) = inner.queues[side].remove(i) {
+                                channel.uncarry(side, stale.endpoints);
+                                // Within what was reserved: one pass drops at most
+                                // what the queue holds, and each pass is emptied.
+                                dropped.push(stale);
+                            }
                             removed = true;
                         }
                     }
                 }
                 drop(waiting);
+                if let Some(message) = &found {
+                    channel.uncarry(side, message.endpoints);
+                }
                 channel.refresh(&inner);
                 // A reply queued while another was waiting raised no signal: the
                 // threads it is for are woken once a reply has been taken and more
@@ -271,17 +319,19 @@ fn exchange(thread: &Thread, forward: &Forward, bytes: Vec<u8>) -> Result<Option
                     endpoint.signaller().poke();
                 }
                 if let Some(message) = found {
-                    break Ok(Some(message.bytes));
+                    break Ok(Some(message));
                 }
                 if !inner.open[peer] {
-                    break Err(String::from("its personality server has gone"));
+                    break Err(alloc::format!("{who} has gone"));
                 }
             }
         }
+        dropped.clear();
         waiter.wait();
     };
     endpoint.signaller().unobserve(&waker);
     thread.set_waker(None);
+    drop(dropped);
     result
 }
 
@@ -346,7 +396,7 @@ fn sleep_until(thread: &Thread, deadline: u64) -> Result<(), ()> {
 
 fn map_error(e: Error) -> u64 {
     fail(match e {
-        Error::NoMemory | Error::Limit | Error::OutOfRange => errno::ENOMEM,
+        Error::NoMemory | Error::Limit | Error::OutOfRange | Error::QuotaExceeded => errno::ENOMEM,
         Error::AccessDenied => errno::EACCES,
         Error::Fault => errno::EFAULT,
         Error::BadState => errno::EEXIST,
@@ -360,7 +410,7 @@ fn futex_errno(e: Error) -> u64 {
         Error::TimedOut => errno::ETIMEDOUT,
         Error::BadState => errno::EINTR,
         Error::Fault => errno::EFAULT,
-        Error::NoMemory => errno::ENOMEM,
+        Error::NoMemory | Error::QuotaExceeded => errno::ENOMEM,
         _ => errno::EINVAL,
     })
 }

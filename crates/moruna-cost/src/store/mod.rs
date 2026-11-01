@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use local::LocalStore;
+pub use local::{
+    LocalStore, decode_observations, encode_observation, key_partition, model_state_name,
+    trim_history,
+};
 
 use crate::error::Result;
 use crate::estimate::{Outcome, Target, UnitCost};
@@ -213,6 +216,13 @@ pub trait ObservationSource {
 /// The port an embedder implements (section 7): append-only records and fitted state beside
 /// them. Appends from many threads and many runs at once are allowed.
 pub trait ObservationStore: ObservationSource + Send + Sync {
+    /// A private fitting/version context over the same observation authority. Conditional
+    /// stores return a fresh context so concurrent fitters cannot adopt each other's loaded
+    /// model versions. None retains this adapter; it never selects another authority.
+    fn fitting_store(&self) -> Result<Option<std::sync::Arc<dyn ObservationStore>>> {
+        Ok(None)
+    }
+
     /// Keep one observation.
     fn append(&self, observation: &Observation) -> Result<()>;
     /// Keep a model's fitted state, replacing what that model saved before.

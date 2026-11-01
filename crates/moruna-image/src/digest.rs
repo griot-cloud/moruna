@@ -25,6 +25,19 @@ impl Digest {
         }
     }
 
+    /// The 32 bytes.
+    pub fn bytes(&self) -> [u8; 32] {
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            _ => c - b'a' + 10,
+        };
+        let mut out = [0u8; 32];
+        for (i, pair) in self.hex.as_bytes().chunks(2).enumerate() {
+            out[i] = (digit(pair[0]) << 4) | digit(pair[1]);
+        }
+        out
+    }
+
     /// The 64 hex digits, which name the blob's file and the cache entry.
     pub fn hex(&self) -> &str {
         &self.hex
@@ -60,6 +73,12 @@ impl FromStr for Digest {
         Ok(Digest {
             hex: hex.to_string(),
         })
+    }
+}
+
+impl serde::Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
     }
 }
 

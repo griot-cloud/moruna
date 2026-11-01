@@ -341,7 +341,8 @@ fn fake_reactor() {
 }
 
 /// `FakePlacement`: knobs `with_pressure`, `with_delay`, `with_manifest_store`; observables
-/// `pushed`, `popped`, `committed`, `manifests_written`, `budgets_set`, `shutdown_calls`.
+/// `pushed`, `popped`, `released`, `held`, `committed`, `manifests_written`, `budgets_set`,
+/// `shutdown_calls`.
 fn fake_placement() {
     let alloc = FakeAllocator::new();
     let placement = FakePlacement::new();
@@ -369,6 +370,22 @@ fn fake_placement() {
     assert_eq!(stats.queues[0].stage, 0);
     assert_eq!(stats.queues[0].count, 0);
     assert_eq!(stats.in_flight_bytes, 0);
+    // Taken and not released, the two count as held in the catalog's figures.
+    assert_eq!(placement.held(), vec![(0, 0), (0, 1)]);
+    assert_eq!(stats.catalog.held_bytes, popped.bytes + blocking.bytes);
+    assert_eq!(stats.catalog.buffers, 2);
+    placement.release(0, 1).expect("released");
+    assert!(placement.release(0, 1).is_err(), "a take is released once");
+    assert!(
+        placement.release(3, 0).is_err(),
+        "nothing was taken from queue 3"
+    );
+    placement.release(0, 0).expect("released");
+    assert_eq!(placement.released(0), vec![1, 0]);
+    assert!(placement.released(5).is_empty());
+    assert!(placement.held().is_empty());
+    let catalog = placement.stats().catalog;
+    assert_eq!((catalog.held_bytes, catalog.released), (0, 2));
 
     // The knobs the controller writes through the scheduler.
     placement.set_budgets(TierBudgets {
@@ -660,11 +677,15 @@ fn fake_kernel() {
 
     let mut state = kernel.init(&ctx).expect("an instance");
     assert_eq!(kernel.init_calls(), 1);
-    assert_eq!(state.footprint(), Some(1024));
+    assert_eq!(state.footprint().unwrap(), Some(1024));
     let payload = morsel(&alloc, 0, 0).payload;
     let out = kernel.apply(state.as_mut(), payload).expect("applied");
     assert_eq!(out.rows(), 8);
-    assert_eq!(state.footprint(), Some(1024 + 16), "grow_state_by(16)");
+    assert_eq!(
+        state.footprint().unwrap(),
+        Some(1024 + 16),
+        "grow_state_by(16)"
+    );
     let applies = kernel.applies();
     assert_eq!(applies.len(), 1);
     assert_eq!(applies[0].0, 0, "the apply index");
@@ -679,7 +700,7 @@ fn fake_kernel() {
     assert_eq!(kernel.checkpoint_calls(), 1);
     let restored = kernel.restore(&ctx, &bytes).expect("restored");
     assert_eq!(kernel.restore_calls(), 1);
-    assert_eq!(restored.footprint(), Some(1024 + 16));
+    assert_eq!(restored.footprint().unwrap(), Some(1024 + 16));
 
     // A kernel that does not declare Checkpoint refuses to be restored.
     let reinit = FakeKernel::new().resume(ResumePolicy::Reinit);
@@ -719,24 +740,28 @@ fn fake_sampler() {
         ..Sample::default()
     };
     let sampler = FakeSampler::new().scripted(vec![first, second]);
-    assert_eq!(sampler.sample().anon_bytes, 1);
-    assert_eq!(sampler.sample().anon_bytes, 2);
-    assert_eq!(sampler.sample().anon_bytes, 2, "the last sample repeats");
-    assert_eq!(sampler.sample().peak_anon_bytes, 9);
+    assert_eq!(sampler.sample().unwrap().anon_bytes, 1);
+    assert_eq!(sampler.sample().unwrap().anon_bytes, 2);
+    assert_eq!(
+        sampler.sample().unwrap().anon_bytes,
+        2,
+        "the last sample repeats"
+    );
+    assert_eq!(sampler.sample().unwrap().peak_anon_bytes, 9);
     assert_eq!(sampler.samples_taken(), 4);
     sampler.reset_peak();
     assert_eq!(sampler.peak_resets(), 1);
 
     let live = FakeSampler::new().live();
     assert!(
-        live.sample().at_ns > 0,
+        live.sample().unwrap().at_ns > 0,
         "a live sample is stamped with the wall clock"
     );
     assert_eq!(live.samples_taken(), 1);
     live.reset_peak();
     assert_eq!(live.peak_resets(), 1);
     assert_eq!(
-        FakeSampler::new().sample().anon_bytes,
+        FakeSampler::new().sample().unwrap().anon_bytes,
         0,
         "no script is all zeroes"
     );

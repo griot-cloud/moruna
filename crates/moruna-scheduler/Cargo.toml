@@ -11,15 +11,29 @@ description = "Moruna scheduler"
 [dependencies]
 moruna-kernel = { workspace = true }
 moruna-sinks = { workspace = true }
+# The run's cost model, its online learning and the simulator the lookahead plays (f.22, f.23;
+# adaptive-runtime 9.4, 9.6). It depends on moruna-job, serde, serde_json and thiserror only.
+moruna-cost = { workspace = true }
 crossbeam = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# The kind's role a test's cost keys name (SC-T33, SC-T38, SC-B1).
+moruna-job = { workspace = true }
 # The fakes of contracts d.15. Every SC test drives the scheduler through them and names only
 # their knobs (10 k); a test dependency only, in no shipping crate's graph.
 moruna-testkit = { workspace = true }
+# The real placement engine, for the tests and the policy matrix that prove the hard rule
+# against the buffer catalog itself (SC-T28, SC-B1); a test dependency only.
+moruna-placement = { workspace = true }
 
 [features]
 default = []
+
+# SC-B1, the policy matrix (adaptive-runtime 10, RA 9): every policy on RA 7's workloads.
+# `cargo bench -p moruna-scheduler --bench policy_matrix`; MORUNA_SC_B1=full for the proof.
+[[bench]]
+name = "policy_matrix"
+harness = false

@@ -1,7 +1,7 @@
 # Moruna SDD 23: The SDK for servers and drivers (`kernel/svc`), the boot image tool, and the kernel's second set of calls
 
 **Document type:** software design document, component 23
-**Status:** DRAFT · 2026-10-28 (becomes HANDOFF-READY when section m is empty; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended by KE1 on 2026-10-29 (pair suites, f.5; SV-T16; the boot description's `machine` and `disk` lines, f.8) (becomes HANDOFF-READY when section m is empty; the human flips it)
 **Parent:** `BOARD.md` section EK, item KB2 (Brackly, 2026-10-28): "a third party adds a driver, a filesystem or a whole new server by writing a process against this SDK and listing it in the boot manifest, without rebuilding the kernel or forking anything"; SDD 20 section m, items 1 to 4
 **Decisions:** none new; MK1 (OSTD) stands
 **Component location:** `kernel/svc/` (`moruna-svc`), `kernel/tools/image/` (`moruna-image`), `kernel/initramfs/boot.image` (the CI boot's description), `kernel/examples/` (the echo example), `kernel/tools/{build,boot,check-boot,check-examples}.sh`; the kernel additions in `kernel/core/src/{sched,channel,syscall,object,process,boot}.rs`, `kernel/abi`, `kernel/sys` (`heap.rs`, `Handle::narrow`, `Channel::write_with`)
@@ -106,7 +106,7 @@ A driver is the case that needs the last four: it waits on its interrupt alongsi
 
 ### d.5 The conformance harness
 
-`conformance::Suite { id, requests, cases, timeout }`, `Case { name, check: fn(&mut Probe) -> Result<(), Fail> }`, `Probe` (`request`, `send_raw`, `next_event`), `Answer` (`reply`, `failure`, `status`), `Connector` (`Listener` is one), `run(suite, connector, report) -> Summary`.
+`conformance::Suite { id, requests, cases, timeout }`, `Case { name, check: fn(&mut Probe) -> Result<(), Fail> }`, `Probe` (`request`, `send_raw`, `next_event`), `Answer` (`reply`, `failure`, `status`), `Connector` (`Listener` is one), `run(suite, connector, report) -> Summary`; since KE1, `PairCase { name, check: fn(&mut Probe, &mut Probe) -> Result<(), Fail> }`, `PairSuite { id, cases, timeout }` and `run_pair(suite, a, b, report) -> Summary`.
 
 ### d.6 What a program gets
 
@@ -204,6 +204,8 @@ A suite's own cases cover every request with valid and invalid arguments. `run` 
 
 Each check runs on its own connection, so one failure does not spoil the next. A suite is passed when every check passes.
 
+A pair suite (KE1) checks two joined servers of one protocol together, for a property neither has alone: two network cards on one link, each frame out of one arriving at the other (SDD 29). Each case runs on a fresh connection to each server, its handshake made and checked as a suite's are, and is counted and reported the same way; a pair suite adds no shared checks, since `run` makes them against each server alone.
+
 ### f.6 The heap
 
 `moruna-sys` feature `heap` installs the global allocator: eight size classes (16 to 2048 bytes, each a free list through its free blocks) carved from 64 KiB chunks made by `memory_create` and `memory_map` (the memory object's handle is closed; the mapping keeps the pages); a larger block is its own mapping, unmapped by `dealloc`. Alignment up to a page; a larger one is refused (null). One spin lock.
@@ -214,7 +216,7 @@ Each check runs on its own connection, so one failure does not spoil the next. A
 
 ### f.8 The boot image tool
 
-`moruna-image DESCRIPTION PROGRAMS OUT` parses the description (refusals by line), builds the `Manifest`, renders it and parses it back with `Manifest::parse` and compares, reads each program and parses it with `moruna_loader::elf::parse` against `IMAGE_RANGE`, writes a newc archive (directories, `bin/*`, `manifest`) and reads it back with `moruna_loader::cpio::files`, and writes `OUT/initramfs.cpio`, `OUT/manifest` and `OUT/expect`. `build.sh` builds the kernel, then every userland crate of the workspace in one invocation (the user linker script `kernel/sys/user.ld` passed as link arguments), then runs the tool. `check-boot.sh LOG STATUS EXPECT CPUS` requires every expected line, `kk: CPUS CPUs online`, `kk: process threads ran on CPUS of CPUS CPUs`, no `FAIL:`, no refused boot, no panic, and QEMU status 33.
+`moruna-image DESCRIPTION PROGRAMS OUT` parses the description (refusals by line), builds the `Manifest`, renders it and parses it back with `Manifest::parse` and compares, reads each program and parses it with `moruna_loader::elf::parse` against `IMAGE_RANGE`, writes a newc archive (directories, `bin/*`, `manifest`) and reads it back with `moruna_loader::cpio::files`, and writes `OUT/initramfs.cpio`, `OUT/manifest` and `OUT/expect`, and since KE1 `OUT/machine` (each `machine ARG...` line: QEMU arguments with `{out}` and `{cpus}` placeholders, no quotes, shell metacharacters or other braces) and `OUT/disks` (each `disk NAME SECTORS a|b` line). `boot.sh` gives QEMU every machine line and writes every disk (`OUT/NAME-CPUS.img`, pattern A) before the boot; `check-boot.sh` checks each disk holds its pattern after it (SDD 25 e.4, DR-T19). `build.sh` builds the kernel, then every userland crate of the workspace in one invocation (the user linker script `kernel/sys/user.ld` passed as link arguments), then runs the tool. `check-boot.sh LOG STATUS EXPECT CPUS` requires every expected line, `kk: CPUS CPUs online`, `kk: process threads ran on CPUS of CPUS CPUs`, no `FAIL:`, no refused boot, no panic, and QEMU status 33.
 
 ### f.9 Level-triggered interrupts (SDD 20 m.1)
 
@@ -282,6 +284,7 @@ Host tests run with `cargo test` in `kernel/` for `moruna-svc` and `moruna-image
 | SV-T13 | narrowing | boot: `supervisor`, `driver` | `KB2 narrowing: ok:`: the driver claims its page and line and is refused the pages either side, the next line, wider resources and each resource for the other kind; the supervisor is refused narrowing the process resource and an unaligned window (SV-I12) |
 | SV-T14 | the cycle rule | boot: `cycles` | `KB2 cycles: ok:`: own-channel refusal, refusal while the queue carries an endpoint, passage once drained, and closing the holder closes the held endpoint (SV-I13) |
 | SV-T15 | the examples touch no kernel file | CI: `tools/check-examples.sh` | SV-I11 over every commit of the pull request |
+| SV-T16 | a pair suite | `svc/tests/service.rs` | `run_pair` runs each case on a fresh connection to each of two servers and tallies and reports it; a case that fails is counted; a server of another protocol fails every case at its handshake |
 
 Coverage on the host (`cargo llvm-cov`): `moruna-svc` 93.3% of lines, `moruna-image` 97.4%. The kernel additions are covered by the boot tests above.
 

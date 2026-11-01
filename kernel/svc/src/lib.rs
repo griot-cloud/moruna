@@ -28,18 +28,23 @@ pub mod os;
 pub mod protocol;
 mod schema;
 pub mod server;
-#[cfg(not(target_os = "none"))]
+#[cfg(not(any(target_os = "none", feature = "native")))]
 pub mod sim;
 pub mod wire;
 
 pub use client::{CallError, ClientCore, connect, deadline_in};
 pub use frame::{Kind, Transport};
-pub use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Rights, Signals, limits};
+#[cfg(not(any(target_os = "none", feature = "native")))]
+pub use moruna_abi::map;
+pub use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Rights, Signals, charge, limits};
 pub use os::{Channel, Handle, WaitItem, now, wait, wait_one};
 pub use protocol::{Hello, NoError, ProtocolError, ProtocolId, Refusal, Refused, Status};
 pub use server::{
-    Completions, ConnectionId, Context, Dispatcher, Factory, Handler, Outcome, Pending, Turn, Watch,
+    Completions, ConnectionId, Context, Dispatcher, Factory, Handler, Outcome, Pending, Turn,
+    Watch, WatchCapacity, WatchPermit,
 };
+#[cfg(not(any(target_os = "none", feature = "native")))]
+pub use sim::{Account, Mapping, Memory};
 pub use wire::{Decoder, Encoder, Wire, WireError};
 
 /// What a program on the kernel needs besides the SDK: its entry, its console, its
@@ -47,8 +52,16 @@ pub use wire::{Decoder, Encoder, Wire, WireError};
 /// supervisor make (SDD 25).
 #[cfg(target_os = "none")]
 pub use moruna_sys::{
-    Console, DeviceMemory, Interrupt, Mapping, Memory, Msi, Pin, Process, ResourceInfo,
-    ResourceKind, Timer, dma_release, exit, main, map, println, start,
+    Account, Console, DeviceMemory, Interrupt, Mapping, Memory, Msi, Pin, PrivateMemory, Process,
+    ResourceInfo, ResourceKind, Timer, Usage, dma_release, exit, main, map, println, random, start,
+};
+
+/// What a Linux program granted handles on the kernel (SDD 30) needs besides the SDK: the
+/// objects and calls above, without the entry and the exit its own runtime has.
+#[cfg(all(feature = "native", not(target_os = "none")))]
+pub use moruna_sys::{
+    Account, Console, DeviceMemory, Interrupt, Mapping, Memory, Msi, Pin, PrivateMemory, Process,
+    ResourceInfo, ResourceKind, Timer, Usage, dma_release, map, println, random, start,
 };
 
 #[doc(hidden)]

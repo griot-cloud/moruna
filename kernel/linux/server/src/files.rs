@@ -6,7 +6,10 @@
 use alloc::vec::Vec;
 
 use imagefs_protocol::{Dirent, Stat as FsStat, imagefs, kind};
-use moruna_linux::types::{Stat, dtype, errno, mode};
+use moruna_linux::{
+    events::{Epoll, EventFd},
+    types::{Stat, dtype, errno, mode},
+};
 use moruna_svc::CallError;
 
 /// A device node of the table.
@@ -22,10 +25,28 @@ pub enum Open {
     /// Standard input (0), output (1) or error (2): output goes to the task's capture
     /// and the console, input is at its end.
     Console(u8),
+    /// A data-plane task's 0 (its input slot as a stream) or 1 (its output slot), SDD 29
+    /// f.8.
+    Plane(u8),
+    /// A data-plane task's 1 or 2 when it is text: lines go to the log ring.
+    Log(u8),
     Device(Device),
     /// A file or directory of the image filesystem: its number on the task's
     /// connection, its path, what it is, and the description's offset and flags.
     Fs(FsFile),
+    /// An eventfd (SDD 30 f.4): its counter, and `O_NONBLOCK` as set.
+    EventFd {
+        counter: EventFd,
+        flags: u64,
+    },
+    /// An epoll instance (SDD 30 f.4).
+    Epoll(Epoll),
+    /// A file the server writes itself, read only: what the program's machine has
+    /// (`/proc/meminfo`, `/sys/devices/system/cpu/online`, SDD 30 f.3).
+    Text {
+        bytes: Vec<u8>,
+        offset: u64,
+    },
 }
 
 pub struct FsFile {
@@ -43,6 +64,28 @@ pub struct FsFile {
 impl FsFile {
     pub fn is_dir(&self) -> bool {
         self.stat.kind == kind::DIRECTORY
+    }
+}
+
+/// `stat` of a file the server writes itself: a regular file, read only, its size.
+pub fn text_stat(size: u64) -> Stat {
+    Stat {
+        ino: 0x7e57,
+        mode: mode::S_IFREG | 0o444,
+        nlink: 1,
+        rdev: 0,
+        size,
+    }
+}
+
+/// `stat` of an eventfd or an epoll instance: an anonymous file, as Linux's are.
+pub fn anon_stat() -> Stat {
+    Stat {
+        ino: 0xa110,
+        mode: 0o600,
+        nlink: 1,
+        rdev: 0,
+        size: 0,
     }
 }
 

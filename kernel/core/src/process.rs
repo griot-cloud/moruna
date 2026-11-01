@@ -19,7 +19,9 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-use moruna_abi::{ABI_VERSION, Error, PAGE_SIZE, Signals, limits, map, start_page, valid_name};
+use moruna_abi::{
+    ABI_VERSION, Error, PAGE_SIZE, RawHandle, Signals, charge, limits, map, start_page, valid_name,
+};
 use moruna_handles::HandleTable;
 use moruna_loader::elf;
 use ostd::{
@@ -36,11 +38,13 @@ use ostd::{
 };
 
 use crate::{
+    account::{Account, Charge},
     clock,
     foreign::{self, Forward},
     futex,
     memory::{DeviceMemory, MemoryObject},
     object::Handle,
+    plane::Plane,
     signal::Signaller,
     syscall::{self, Flow},
     usercopy,
@@ -92,12 +96,28 @@ pub struct Process {
     cpus: AtomicU64,
     /// Its forward, given before it started (SDD 28).
     forward: SpinLock<Option<Arc<Forward>>>,
+    /// Its data plane, given before it started (SDD 29).
+    plane: SpinLock<Option<Arc<Plane>>>,
+    /// Whether `process_grant` gave it its handles and start page (ABI 2.2, SDD 30).
+    granted: AtomicBool,
     /// CPU time its threads have used, in nanoseconds, kernel time included.
     pub cpu_ns: AtomicU64,
     /// The code the last thread to end by a fast `exit` gave: a process whose last
     /// thread ends that way ends with it.
     last_code: AtomicI64,
+    /// What its handle table's slots cost, charged as the table grows (SDD 20 f.18).
+    table_charge: SpinLock<Charge>,
+    /// Its record, charged to its own account.
+    _record: Charge,
 }
+
+// The fixed charges cover the records they stand for (SDD 20 f.18).
+const _: () = assert!(core::mem::size_of::<Process>() as u64 <= charge::PROCESS);
+const _: () = assert!(
+    core::mem::size_of::<Thread>() as u64 + core::mem::size_of::<Task>() as u64
+        <= charge::THREAD - 128 * charge::PAGE
+);
+const _: () = assert!(2 * moruna_handles::slot_bytes::<Handle>() as u64 <= charge::HANDLE_SLOT);
 
 /// Counts the boot as one live process while it starts the manifest's processes, so a
 /// process that ends on another CPU before the last one has started cannot power the
@@ -162,16 +182,24 @@ fn prot(write: bool, execute: bool) -> u64 {
 }
 
 impl Process {
-    pub fn new(name: &[u8], supervisor: bool) -> Result<Arc<Process>, Error> {
+    /// A created process named `name`, charged to `account`, as is everything it
+    /// causes to exist.
+    pub fn new(
+        name: &[u8],
+        supervisor: bool,
+        account: &Arc<Account>,
+    ) -> Result<Arc<Process>, Error> {
         if !valid_name(name) {
             return Err(Error::InvalidArgs);
         }
         let name = core::str::from_utf8(name).map_err(|_| Error::InvalidArgs)?;
+        let record = Charge::new(account, charge::PROCESS)?;
+        let space = Space::new(account)?;
         let koid = NEXT_KOID.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Process {
             name: String::from(name),
             koid,
-            space: Space::new(),
+            space,
             handles: SpinLock::new(HandleTable::new(salt(koid))),
             state: SpinLock::new(State {
                 life: Life::Created { entry: None },
@@ -182,9 +210,53 @@ impl Process {
             supervisor,
             cpus: AtomicU64::new(0),
             forward: SpinLock::new(None),
+            plane: SpinLock::new(None),
+            granted: AtomicBool::new(false),
             cpu_ns: AtomicU64::new(0),
             last_code: AtomicI64::new(0),
+            table_charge: SpinLock::new(Charge::new(account, 0)?),
+            _record: record,
         }))
+    }
+
+    /// The account everything it causes to exist is charged to.
+    pub fn account(&self) -> &Arc<Account> {
+        self.space.account()
+    }
+
+    /// Inserts `handle` into `table`, this process's own, locked: the table's growth is
+    /// charged first, `charge::HANDLE_SLOTS` slots at a time (`QuotaExceeded` with the
+    /// handle not inserted, and given back to be dropped outside the lock).
+    pub fn insert_into(
+        &self,
+        table: &mut HandleTable<Handle>,
+        handle: Handle,
+    ) -> Result<RawHandle, (Error, Handle)> {
+        if table.grows() {
+            let step = charge::HANDLE_SLOTS * charge::HANDLE_SLOT;
+            let need = moruna_quota::table_steps(table.slots() + 1) * step;
+            let mut charged = self.table_charge.lock();
+            let have = charged.bytes();
+            if need > have
+                && let Err(e) = charged.grow(need - have)
+            {
+                return Err((e, handle));
+            }
+        }
+        table.insert_or_return(handle)
+    }
+
+    /// Inserts `handle` into this process's table, as [`Process::insert_into`] does,
+    /// dropping a handle refused outside the table's lock.
+    pub fn insert(&self, handle: Handle) -> Result<RawHandle, Error> {
+        let result = {
+            let mut table = self.handles.lock();
+            self.insert_into(&mut table, handle)
+        };
+        result.map_err(|(e, refused)| {
+            drop(refused);
+            e
+        })
     }
 
     /// Its forward, if it has one.
@@ -252,7 +324,7 @@ impl Process {
         for segment in &parsed.segments {
             let start = segment.page_start();
             let len = segment.page_end() - start;
-            let object = Arc::new(MemoryObject::new(len)?);
+            let object = Arc::new(MemoryObject::new(len, self.account())?);
             let from = segment.offset as usize;
             let bytes = image
                 .get(from..from + segment.filesz as usize)
@@ -307,6 +379,24 @@ impl Process {
         Ok(())
     }
 
+    /// Its plane, if it has one.
+    pub fn plane(&self) -> Option<Arc<Plane>> {
+        self.plane.lock().clone()
+    }
+
+    /// Gives a created process its plane (`process_plane`), once.
+    pub fn set_plane(&self, plane: Plane) -> Result<(), Error> {
+        if !self.is_created() {
+            return Err(Error::BadState);
+        }
+        let mut slot = self.plane.lock();
+        if slot.is_some() {
+            return Err(Error::BadState);
+        }
+        *slot = Some(Arc::new(plane));
+        Ok(())
+    }
+
     fn begin_running(&self) -> Result<(), Error> {
         let mut state = self.state.lock();
         match state.life {
@@ -332,10 +422,13 @@ impl Process {
                 _ => return Err(Error::BadState),
             }
         }
+        if self.granted.load(Ordering::Acquire) {
+            return Err(Error::BadState);
+        }
         if !is_user(entry) || handles.len() > limits::START_HANDLES_MAX {
             return Err(Error::InvalidArgs);
         }
-        let stack = Arc::new(MemoryObject::new(limits::MAIN_STACK_BYTES)?);
+        let stack = Arc::new(MemoryObject::new(limits::MAIN_STACK_BYTES, self.account())?);
         let stack_va = self.space.map(
             None,
             limits::MAIN_STACK_BYTES,
@@ -348,45 +441,7 @@ impl Process {
             },
             false,
         )?;
-
-        let mut page = [0u8; PAGE_SIZE as usize];
-        moruna_abi::write_u32(&mut page, start_page::MAGIC_OFFSET, start_page::MAGIC);
-        moruna_abi::write_u32(&mut page, start_page::VERSION_OFFSET, ABI_VERSION as u32);
-        moruna_abi::write_u32(&mut page, start_page::COUNT_OFFSET, handles.len() as u32);
-        moruna_abi::write_u32(
-            &mut page,
-            start_page::CPUS_OFFSET,
-            ostd::cpu::num_cpus() as u32,
-        );
-        let name = self.name.as_bytes();
-        page[start_page::NAME_OFFSET..start_page::NAME_OFFSET + name.len()].copy_from_slice(name);
-        {
-            let mut table = self.handles.lock();
-            for (i, (handle, slot)) in handles.into_iter().enumerate() {
-                let at = start_page::HEADER_SIZE + i * start_page::ENTRY_SIZE;
-                let rights = handle.rights.bits();
-                let value = table.insert(handle)?;
-                moruna_abi::write_u32(&mut page, at + start_page::ENTRY_HANDLE, value);
-                moruna_abi::write_u32(&mut page, at + start_page::ENTRY_RIGHTS, rights);
-                let n = slot.len().min(limits::NAME_MAX);
-                let name_at = at + start_page::ENTRY_NAME;
-                page[name_at..name_at + n].copy_from_slice(&slot[..n]);
-            }
-        }
-        let start = Arc::new(MemoryObject::new(PAGE_SIZE)?);
-        start.write(0, &page)?;
-        let start_va = self.space.map(
-            None,
-            PAGE_SIZE,
-            Kind::StartPage,
-            map::READ,
-            Backing::Object {
-                memory: start,
-                first: 0,
-                writable: false,
-            },
-            false,
-        )?;
+        let start_va = self.map_start_page(handles)?;
 
         self.begin_running()?;
         LIVE.fetch_add(1, Ordering::AcqRel);
@@ -404,6 +459,81 @@ impl Process {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Gives a created process its creator will launch (`process_grant`, ABI 2.2) the
+    /// handles of `handles` under their slot names, and maps a start page naming them
+    /// into it read only, where the kernel chooses; returns the page's address. Once a
+    /// process; `process_start` refuses a process that has been granted.
+    pub fn grant(&self, handles: Vec<(Handle, Vec<u8>)>) -> Result<u64, Error> {
+        if !self.is_created() {
+            return Err(Error::BadState);
+        }
+        if handles.len() > limits::START_HANDLES_MAX {
+            return Err(Error::InvalidArgs);
+        }
+        if self.granted.swap(true, Ordering::AcqRel) {
+            return Err(Error::BadState);
+        }
+        self.map_start_page(handles)
+    }
+
+    /// Moves `handles` into the table and maps the start page that names them (SDD 20
+    /// d.4) read only; returns where.
+    fn map_start_page(&self, handles: Vec<(Handle, Vec<u8>)>) -> Result<u64, Error> {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        moruna_abi::write_u32(&mut page, start_page::MAGIC_OFFSET, start_page::MAGIC);
+        moruna_abi::write_u32(&mut page, start_page::VERSION_OFFSET, ABI_VERSION as u32);
+        moruna_abi::write_u32(&mut page, start_page::COUNT_OFFSET, handles.len() as u32);
+        moruna_abi::write_u32(
+            &mut page,
+            start_page::CPUS_OFFSET,
+            ostd::cpu::num_cpus() as u32,
+        );
+        let name = self.name.as_bytes();
+        page[start_page::NAME_OFFSET..start_page::NAME_OFFSET + name.len()].copy_from_slice(name);
+        let mut refused = None;
+        // What a refusal leaves unmoved is dropped after the table's lock.
+        let mut handles = handles.into_iter().enumerate();
+        {
+            let mut table = self.handles.lock();
+            for (i, (handle, slot)) in handles.by_ref() {
+                let at = start_page::HEADER_SIZE + i * start_page::ENTRY_SIZE;
+                let rights = handle.rights.bits();
+                let value = match self.insert_into(&mut table, handle) {
+                    Ok(value) => value,
+                    Err((e, handle)) => {
+                        refused = Some((e, handle));
+                        break;
+                    }
+                };
+                moruna_abi::write_u32(&mut page, at + start_page::ENTRY_HANDLE, value);
+                moruna_abi::write_u32(&mut page, at + start_page::ENTRY_RIGHTS, rights);
+                let n = slot.len().min(limits::NAME_MAX);
+                let name_at = at + start_page::ENTRY_NAME;
+                page[name_at..name_at + n].copy_from_slice(&slot[..n]);
+            }
+        }
+        if let Some((e, handle)) = refused {
+            // Dropped outside the table's lock; what was moved in before stays in it.
+            drop(handle);
+            drop(handles);
+            return Err(e);
+        }
+        let start = Arc::new(MemoryObject::new(PAGE_SIZE, self.account())?);
+        start.write(0, &page)?;
+        self.space.map(
+            None,
+            PAGE_SIZE,
+            Kind::StartPage,
+            map::READ,
+            Backing::Object {
+                memory: start,
+                first: 0,
+                writable: false,
+            },
+            false,
+        )
     }
 
     /// Starts a created process whose address space its creator built
@@ -635,6 +765,13 @@ impl Process {
         // The forward goes with the process: its server sees the channel close.
         let forward = self.forward.lock().take();
         drop(forward);
+        // Its plane gives back what it held: the engine sees each batch released and
+        // each window returned, and then the slot's end (SDD 29 f.6).
+        let plane = self.plane.lock().take();
+        if let Some(plane) = &plane {
+            plane.detach();
+        }
+        drop(plane);
         self.space.clear();
         self.signaller.update(Signals::NONE, Signals::TERMINATED);
         if self.supervisor && failed {
@@ -646,6 +783,8 @@ impl Process {
 
 pub struct Thread {
     pub process: Arc<Process>,
+    /// Its kernel stack, registers and FPU state, charged to its process's account.
+    _charge: Charge,
     pub signaller: Signaller,
     /// The thread's id: a forwarded process's `gettid`, and its forward token.
     pub tid: u64,
@@ -659,6 +798,9 @@ pub struct Thread {
     pub clear_tid: AtomicU64,
     /// The registers of a thread waiting on its forward, for `forward_clone`.
     pub parked: SpinLock<Option<UserContext>>,
+    /// Its last port call's reply, mapped until its next port call or its end: the
+    /// address, the bytes mapped and the memory object (SDD 29 f.4).
+    pub port_reply: SpinLock<Option<(u64, u64, Arc<MemoryObject>)>>,
     /// CPU time the thread has used, in nanoseconds, and when it last took a CPU.
     pub cpu_ns: AtomicU64,
     on_cpu_since: AtomicU64,
@@ -690,8 +832,10 @@ impl Thread {
         clear_tid: u64,
         set_tid: u64,
     ) -> Result<Arc<Thread>, Error> {
+        let charge = Charge::new(process.account(), charge::THREAD)?;
         let thread = Arc::new(Thread {
             process: process.clone(),
+            _charge: charge,
             signaller: Signaller::new(Signals::NONE),
             tid: NEXT_KOID.fetch_add(1, Ordering::Relaxed),
             killed: AtomicBool::new(false),
@@ -700,6 +844,7 @@ impl Thread {
             fpu: SpinLock::new(FpuContext::new()),
             clear_tid: AtomicU64::new(clear_tid),
             parked: SpinLock::new(None),
+            port_reply: SpinLock::new(None),
             cpu_ns: AtomicU64::new(0),
             on_cpu_since: AtomicU64::new(0),
         });
@@ -774,25 +919,49 @@ fn describe(exception: Option<CpuException>, ip: usize) -> String {
     }
 }
 
-/// A page fault on a page with no entry that the area allows: a zero page's first
-/// touch (SDD 20, f.12). Anything else is the process's fault.
-fn first_touch(space: &Space, exception: &Option<CpuException>) -> bool {
+/// What a fault was.
+enum Touch {
+    /// A zero page's first touch, now mapped (SDD 20, f.12).
+    Served,
+    /// The process's own fault.
+    Fault,
+    /// A first touch whose page could not be had: why, for the process's end.
+    Refused(String),
+}
+
+/// A page fault on a page with no entry that the area allows is a zero page's first
+/// touch, served when its page can be charged and allocated. Anything else is the
+/// process's fault.
+fn first_touch(space: &Space, exception: &Option<CpuException>) -> Touch {
     let Some(CpuException::PageFault(info)) = exception else {
-        return false;
+        return Touch::Fault;
     };
     let code = info.error_code.bits();
     // Bit 0: the page was present (a protection fault, never a first touch).
     if code & 0b1 != 0 {
-        return false;
+        return Touch::Fault;
     }
-    let access = if code & 0b1_0000 != 0 {
-        Access::Execute
+    let (access, word) = if code & 0b1_0000 != 0 {
+        (Access::Execute, "execute")
     } else if code & 0b10 != 0 {
-        Access::Write
+        (Access::Write, "write")
     } else {
-        Access::Read
+        (Access::Read, "read")
     };
-    space.fault(info.addr as u64, access)
+    match space.fault(info.addr as u64, access) {
+        Ok(true) => Touch::Served,
+        Ok(false) => Touch::Fault,
+        Err(Error::QuotaExceeded) => Touch::Refused(format!(
+            "a page fault at {:#x} on {word} could not be charged: {}",
+            info.addr,
+            space.account().refusal(charge::ZERO_PAGE)
+        )),
+        Err(e) => Touch::Refused(format!(
+            "a page fault at {:#x} on {word} could not be served: {}",
+            info.addr,
+            e.name()
+        )),
+    }
 }
 
 fn run(thread: Arc<Thread>, context: UserContext) {
@@ -830,16 +999,29 @@ fn run(thread: Arc<Thread>, context: UserContext) {
                 let context = user.context_mut();
                 let ip = context.instruction_pointer();
                 let exception = context.take_exception();
-                if first_touch(&thread.process.space, &exception) {
-                    continue;
-                }
-                thread.process.end(Exit::Fault(describe(exception, ip)));
+                let why = match first_touch(&thread.process.space, &exception) {
+                    Touch::Served => continue,
+                    Touch::Fault => describe(exception, ip),
+                    Touch::Refused(why) => why,
+                };
+                thread.process.end(Exit::Fault(why));
                 break;
             }
             ReturnReason::KernelEvent => {}
         }
     }
     clear_child_tid(&thread);
+    if let Some((addr, span, memory)) = thread.port_reply.lock().take() {
+        // The plane's own mapping: only it can have removed it, and it has not.
+        if let Err(e) = thread.process.space.unmap_plane(addr, span, &memory) {
+            early_println!(
+                "kk: process {} port reply at {:#x} not unmapped at thread end: {}",
+                thread.process.name,
+                addr,
+                e.name()
+            );
+        }
+    }
     thread.set_waker(None);
     thread.signaller.update(Signals::NONE, Signals::TERMINATED);
     thread.process.thread_ended();

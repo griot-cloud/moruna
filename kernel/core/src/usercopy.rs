@@ -18,7 +18,12 @@ fn read_into(space: &Space, ptr: u64, buf: &mut [u8]) -> Result<(), Error> {
     let mut reader = space.vm.reader(addr, buf.len()).map_err(|_| Error::Fault)?;
     let len = buf.len();
     let mut writer = VmWriter::from(&mut buf[..]);
-    match reader.read_fallible(&mut writer) {
+    let read = reader.read_fallible(&mut writer);
+    space.count_copy(match &read {
+        Ok(n) => *n,
+        Err((_, n)) => *n,
+    });
+    match read {
         Ok(n) if n == len => Ok(()),
         _ => Err(Error::Fault),
     }
@@ -31,7 +36,12 @@ fn write_from(space: &Space, ptr: u64, data: &[u8]) -> Result<(), Error> {
         .writer(addr, data.len())
         .map_err(|_| Error::Fault)?;
     let mut reader = VmReader::from(data);
-    match writer.write_fallible(&mut reader) {
+    let written = writer.write_fallible(&mut reader);
+    space.count_copy(match &written {
+        Ok(n) => *n,
+        Err((_, n)) => *n,
+    });
+    match written {
         Ok(n) if n == data.len() => Ok(()),
         _ => Err(Error::Fault),
     }

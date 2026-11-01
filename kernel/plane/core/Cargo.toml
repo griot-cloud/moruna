@@ -1,0 +1,26 @@
+[package]
+name = "moruna-plane"
+description = "The engine's side of the data plane (SDD 29): the arena, slots, ownership moved between tasks, fan-out, residency, the record check before the engine sees a batch, port calls, and the data-plane port the engine is written against"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-ipc-check.workspace = true
+
+# The engine as a Linux program on the kernel (SDD 30), with its own allocator.
+moruna-sys = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "none")'.dependencies]
+moruna-sys = { workspace = true, features = ["heap"] }
+
+[features]
+# The conformance suite every adapter of the port runs (KA2), and the host model of the
+# kernel's calls that runs it against KernelPlane.
+conformance = []
+model = ["conformance"]
+# `kernel`, the plane on the kernel's own calls, in a program built for another target:
+# the engine, a Linux program the personality started with granted handles (SDD 30).
+native = ["dep:moruna-sys"]

@@ -61,6 +61,13 @@ fn plain(n: u64, a: [u64; 6]) -> (u64, u64) {
             | nr::FUTEX_WAIT
             | nr::FUTEX_WAKE
             | nr::RANDOM_READ
+            | nr::SLOT_TAKE
+            | nr::SLOT_REFUSE
+            | nr::PROCESS_PLANE
+            | nr::PROCESS_GRANT
+            | nr::PORT_CALL
+            | nr::ACCOUNT_CREATE
+            | nr::ACCOUNT_INFO
     ));
     // SAFETY: only calls that read no memory through their arguments reach here: the
     // crate's own wrappers call `plain` with those numbers and no other.
@@ -137,12 +144,14 @@ pub fn memory_map(v: RawHandle, offset: u64, len: u64, flags: u64) -> u64 {
     call4(nr::MEMORY_MAP, v as u64, offset, len, flags).0
 }
 
-pub fn process_create(resource: RawHandle, name: &[u8]) -> u64 {
+/// `process_create` (ABI 2.3): the process charged to `account`, zero for the caller's
+/// own account.
+pub fn process_create(resource: RawHandle, name: &[u8], account: RawHandle) -> u64 {
     let a = [
         resource as u64,
         name.as_ptr() as u64,
         name.len() as u64,
-        0,
+        account as u64,
         0,
         0,
     ];
@@ -160,6 +169,14 @@ pub fn process_start(process: RawHandle, entry: u64, entries: &[u8]) -> u64 {
     let a = [process as u64, entry, entries.as_ptr() as u64, count, 0, 0];
     // SAFETY: the kernel reads `count * 40` bytes, no more than `entries.len()`.
     unsafe { syscall(nr::PROCESS_START, a) }.0
+}
+
+/// `entries` is a whole number of 40-byte start entries, as `process_start`'s (ABI 2.2).
+pub fn process_grant(process: RawHandle, entries: &[u8]) -> u64 {
+    let count = (entries.len() / moruna_abi::start_entry::SIZE) as u64;
+    let a = [process as u64, entries.as_ptr() as u64, count, 0, 0, 0];
+    // SAFETY: the kernel reads `count * 40` bytes, no more than `entries.len()`.
+    unsafe { syscall(nr::PROCESS_GRANT, a) }.0
 }
 
 pub fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
@@ -210,9 +227,37 @@ pub fn resource_narrow(resource: RawHandle, base: u64, len: u64) -> u64 {
     call3(nr::RESOURCE_NARROW, resource as u64, base, len).0
 }
 
-/// `memory_create` with its ABI 1.2 flags (`moruna_abi::memory_flags`).
-pub fn memory_create(size: u64, flags: u64) -> u64 {
-    call2(nr::MEMORY_CREATE, size, flags).0
+/// `memory_create` with its ABI 1.2 flags (`moruna_abi::memory_flags`), charged to
+/// `account` (ABI 2.3), zero for the caller's own account.
+pub fn memory_create(size: u64, flags: u64, account: RawHandle) -> u64 {
+    call3(nr::MEMORY_CREATE, size, flags, account as u64).0
+}
+
+/// `account_create` (ABI 2.3): an account named `name` of `limit` bytes carved out of
+/// `parent`, zero for the caller's own account.
+pub fn account_create(parent: RawHandle, limit: u64, name: &[u8]) -> u64 {
+    let a = [
+        parent as u64,
+        limit,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `name.len()` bytes from `name`.
+    unsafe { syscall(nr::ACCOUNT_CREATE, a) }.0
+}
+
+/// ABI 2.5: exact Account/Memory charged-owner comparison, no user pointers.
+pub fn account_matches(account: RawHandle, object: RawHandle) -> u64 {
+    call2(nr::ACCOUNT_MATCHES, account as u64, object as u64).0
+}
+
+/// `account_info` (ABI 2.3) of `account`, zero for the caller's own.
+pub fn account_info(account: RawHandle, out: &mut [u8; moruna_abi::account_info::SIZE]) -> u64 {
+    let a = [account as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0];
+    // SAFETY: the kernel writes `account_info::SIZE` bytes to `out`, which holds them.
+    unsafe { syscall(nr::ACCOUNT_INFO, a) }.0
 }
 
 /// `interrupt_create_msi`: the interrupt in `rax`, the message in `rdx`
@@ -362,6 +407,91 @@ pub fn random_read(buf: &mut [u8]) -> u64 {
     unsafe { syscall(nr::RANDOM_READ, a) }.0
 }
 
+/// `batch_get` (ABI 2.1): an address and a length, or an error in `rax`. Safe: it adds a
+/// mapping where the kernel chooses, and unmaps only the slot's previous batch, which
+/// the plane's `Batch` borrows keep out of reach.
+pub fn batch_get(slot: u64) -> (u64, u64) {
+    call1(nr::BATCH_GET, slot)
+}
+
+/// `batch_put` (ABI 2.1): unmaps only the slot's window.
+pub fn batch_put(slot: u64, addr: u64, len: u64) -> u64 {
+    call3(nr::BATCH_PUT, slot, addr, len).0
+}
+
+/// `plane_get` (ABI 2.1).
+pub fn plane_get(process: RawHandle, slot: u64) -> (u64, u64) {
+    call2(nr::PLANE_GET, process as u64, slot)
+}
+
+/// `plane_put` (ABI 2.1).
+pub fn plane_put(process: RawHandle, slot: u64, addr: u64, len: u64) -> u64 {
+    call4(nr::PLANE_PUT, process as u64, slot, addr, len).0
+}
+
+/// `slot_create` (ABI 2.1).
+pub fn slot_create(flags: u64) -> u64 {
+    call1(nr::SLOT_CREATE, flags).0
+}
+
+/// `slot_push` (ABI 2.1).
+pub fn slot_push(slot: RawHandle, memory: RawHandle, offset: u64, len: u64, cookie: u64) -> u64 {
+    call6(
+        nr::SLOT_PUSH,
+        [slot as u64, memory as u64, offset, len, cookie, 0],
+    )
+    .0
+}
+
+/// `slot_close` (ABI 2.1).
+pub fn slot_close(slot: RawHandle) -> u64 {
+    call1(nr::SLOT_CLOSE, slot as u64).0
+}
+
+/// `slot_take` (ABI 2.1): the event's 32 bytes land in `out`; the handle it gives
+/// back, or zero, in `rax`.
+pub fn slot_take(slot: RawHandle, out: &mut [u8; moruna_abi::plane::slot_event::SIZE]) -> u64 {
+    let a = [slot as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0];
+    // SAFETY: the kernel writes exactly `slot_event::SIZE` bytes into `out`.
+    unsafe { syscall(nr::SLOT_TAKE, a) }.0
+}
+
+/// `slot_refuse` (ABI 2.1): the reason is read from `reason`.
+pub fn slot_refuse(slot: RawHandle, reason: &[u8]) -> u64 {
+    let a = [
+        slot as u64,
+        reason.as_ptr() as u64,
+        reason.len() as u64,
+        0,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `reason.len()` bytes from `reason`.
+    unsafe { syscall(nr::SLOT_REFUSE, a) }.0
+}
+
+/// `process_plane` (ABI 2.1): the slots' handle values are read from `slots`.
+pub fn process_plane(process: RawHandle, slots: &[RawHandle], port: RawHandle) -> u64 {
+    let a = [
+        process as u64,
+        slots.as_ptr() as u64,
+        slots.len() as u64,
+        port as u64,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `slots.len()` four-byte values from `slots`.
+    unsafe { syscall(nr::PROCESS_PLANE, a) }.0
+}
+
+/// `port_call` (ABI 2.1): the request is read from `bytes`; the reply's address and
+/// length come back in `rax` and `rdx`.
+pub fn port_call(port: u64, bytes: &[u8]) -> (u64, u64) {
+    let a = [port, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0];
+    // SAFETY: the kernel reads `bytes.len()` bytes from `bytes`.
+    unsafe { syscall(nr::PORT_CALL, a) }
+}
+
 /// `thread_set_fs` (ABI 2.0). Safe for this crate's programs, which keep nothing at
 /// the FS base.
 pub fn thread_set_fs(base: u64) -> u64 {
@@ -374,6 +504,7 @@ pub(crate) fn memory_protect(addr: u64, len: u64, flags: u64) -> u64 {
 }
 
 /// `memory_unmap`, for the heap, which unmaps only mappings it made itself.
+#[cfg(feature = "heap")]
 pub(crate) fn memory_unmap(addr: u64, len: u64) -> u64 {
     call2(nr::MEMORY_UNMAP, addr, len).0
 }

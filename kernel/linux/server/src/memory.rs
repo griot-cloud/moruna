@@ -1,6 +1,7 @@
 //! A task's memory, as the server reads and writes it: through `process_read` and
 //! `process_write` on the task's process handle, never by mapping it (SDD 28, f.1). A
-//! bad address is `EFAULT`, as Linux answers it.
+//! bad address is `EFAULT`, as Linux answers it; a page the task's account has no room
+//! for is `ENOMEM`.
 
 use alloc::vec::Vec;
 
@@ -10,6 +11,15 @@ use moruna_svc::Process;
 
 const PAGE: u64 = 4096;
 
+/// A copy the kernel refused: `ENOMEM` when a page it needed could not be charged to the
+/// task's account (SDD 20 f.18), `EFAULT` otherwise.
+fn errno_of(e: moruna_svc::Error) -> u64 {
+    match e {
+        moruna_svc::Error::QuotaExceeded => errno::ENOMEM,
+        _ => errno::EFAULT,
+    }
+}
+
 /// `len` bytes at `addr`.
 pub fn read(p: &Process, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
     let mut out = alloc::vec![0u8; len];
@@ -17,7 +27,7 @@ pub fn read(p: &Process, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
     while done < len {
         let n = (len - done).min(PROCESS_COPY_MAX);
         p.read(addr + done as u64, &mut out[done..done + n])
-            .map_err(|_| errno::EFAULT)?;
+            .map_err(errno_of)?;
         done += n;
     }
     Ok(out)
@@ -27,7 +37,7 @@ pub fn read(p: &Process, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
 pub fn write(p: &Process, addr: u64, data: &[u8]) -> Result<(), u64> {
     for (i, chunk) in data.chunks(PROCESS_COPY_MAX).enumerate() {
         p.write(addr + (i * PROCESS_COPY_MAX) as u64, chunk)
-            .map_err(|_| errno::EFAULT)?;
+            .map_err(errno_of)?;
     }
     Ok(())
 }

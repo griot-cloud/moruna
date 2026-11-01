@@ -5,22 +5,25 @@
 //!   in) registers [`Imported`], the `python` kernel kind that imports the module a document names;
 //! - the library (`moruna.run`) registers [`Given`], the `python` kernel kind that hands back the
 //!   kernels it was given, and [`Iterable`], [`UserSource`] and [`UserSink`] for the iterable and
-//!   the user's `moruna.Source` and `moruna.Sink` it holds.
+//!   the user's `moruna.Source` and `moruna.Sink` it holds, and declares the kinds the program
+//!   serves itself (`@moruna.kind`, SDD 18 KD-I11): each [`PyDeclaredTask`]'s declaration, its
+//!   guest port answered by the Python callable that serves it ([`PyServe`]).
 //!
 //! Every other kind is the runtime's ([`Registry::standard`]).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use moruna_adapters::PyKernel;
 use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, SpecError, settings_schema};
-use moruna_kernel::{Kernel, MorunaError, Result, SourceSchema};
+use moruna_kernel::{Answer, GuestCall, GuestPort, Kernel, MorunaError, Result, SourceSchema};
 use moruna_runtime::job::refusal;
 use moruna_runtime::kinds::{
-    BuiltSink, BuiltSource, Context, Entry, Registry, RunnableKind, SinkKind, SourceKind, Stage,
-    check_pin,
+    BuiltSink, BuiltSource, Context, Embedding, Entry, Registry, RunnableKind, SinkKind,
+    SourceKind, Stage, check_pin,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyBytes, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -133,6 +136,7 @@ fn kernel_declaration(isolation: Isolation) -> Declaration {
         deterministic: Fact::No,
         preserves_columns: Fact::No,
         isolation,
+        served: None,
     }
 }
 
@@ -302,6 +306,7 @@ fn held_declaration(name: &str, role: Role, summary: &str) -> Declaration {
         deterministic: Fact::No,
         preserves_columns: Fact::No,
         isolation: Isolation::Caller,
+        served: None,
     }
 }
 
@@ -400,15 +405,185 @@ impl SinkKind for UserSink {
     }
 }
 
-/// What `moruna.run` runs with: the runtime's kinds, [`Given`] over its kernels, and the
-/// objects it holds as their kinds.
+/// A task of a kind the program serves itself (`@moruna.kind`, SDD 18 KD-I11): what calling a
+/// `moruna.DeclaredKind` with settings returns and `moruna.run` takes as a kernel. The kind's
+/// declaration, the task's settings, and the Python callable that answers its port.
+#[pyclass(frozen, module = "moruna._core", name = "DeclaredTask")]
+pub struct PyDeclaredTask {
+    pub(crate) declaration: Declaration,
+    pub(crate) settings: serde_json::Map<String, serde_json::Value>,
+    pub(crate) serve: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyDeclaredTask {
+    /// The kind's name.
+    #[getter]
+    fn kind(&self) -> String {
+        self.declaration.name.clone()
+    }
+
+    /// The task's settings, as JSON.
+    #[getter]
+    fn settings(&self) -> String {
+        moruna_job::canonical_json(&serde_json::Value::Object(self.settings.clone()))
+    }
+}
+
+/// A Python callable that serves a kind's port: each request handed to
+/// `moruna._kinds._answer(serve, request)` on the call's own thread, which reads the batch with
+/// pyarrow, calls `serve(batch, settings)` and writes what it returns as an Arrow IPC stream. An
+/// exception is the port's refusal, in the exception's words, and fails the task with it.
+pub struct PyServe {
+    serve: Py<PyAny>,
+}
+
+impl GuestPort for PyServe {
+    fn call(&self, request: Vec<u8>, _call: &GuestCall) -> Answer {
+        Python::attach(|py| {
+            let answered = py
+                .import("moruna._kinds")
+                .and_then(|module| module.getattr("_answer"))
+                .and_then(|answer| answer.call1((self.serve.bind(py), PyBytes::new(py, &request))))
+                .and_then(|reply| reply.extract::<Vec<u8>>());
+            match answered {
+                Ok(bytes) => Answer::Ok(bytes),
+                Err(e) => Answer::Error(e.to_string()),
+            }
+        })
+    }
+}
+
+/// The program `moruna.run` is, to the kinds it runs: the guest ports of the kinds it serves.
+struct Serving(BTreeMap<String, Arc<dyn GuestPort>>);
+
+impl Embedding for Serving {
+    fn guest_port(&self, name: &str) -> Option<Arc<dyn GuestPort>> {
+        self.0.get(name).cloned()
+    }
+}
+
+/// A declaration from its JSON, checked as `Registry::declare` checks it: a kind the program
+/// serves, under a name no kind of the library's has, with a settings schema the validator reads.
+fn declared_kind(text: &str) -> Result<Declaration> {
+    let declaration: Declaration = serde_json::from_str(text).map_err(|e| MorunaError::Config {
+        name: "kinds",
+        msg: format!("not a declaration: {e}"),
+    })?;
+    library(Vec::new(), None, None, None, Vec::new())?.declare(declaration.clone())?;
+    Ok(declaration)
+}
+
+/// `moruna._core.declare_kind(declaration)`: the declaration `@moruna.kind` built, checked, as
+/// canonical JSON; refused with `ConfigError` naming why.
+#[pyfunction]
+fn declare_kind(py: Python<'_>, declaration: &str) -> PyResult<String> {
+    let declared = declared_kind(declaration)
+        .map_err(|e| crate::errors::to_py_err(py, &e, crate::errors::Attachments::default()))?;
+    let value = serde_json::to_value(&declared).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("the declaration does not serialise: {e}"))
+    })?;
+    Ok(moruna_job::canonical_json(&value))
+}
+
+/// `moruna._core.declared_task(declaration, settings, serve)`: a task of the declared kind with
+/// these settings, served by `serve`. The settings are checked when the run is built.
+#[pyfunction]
+fn declared_task(
+    py: Python<'_>,
+    declaration: &str,
+    settings: &str,
+    serve: Bound<'_, PyAny>,
+) -> PyResult<PyDeclaredTask> {
+    let to_err =
+        |e: MorunaError| crate::errors::to_py_err(py, &e, crate::errors::Attachments::default());
+    let declaration = declared_kind(declaration).map_err(to_err)?;
+    let settings = match serde_json::from_str::<serde_json::Value>(settings) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => {
+            return Err(to_err(MorunaError::Config {
+                name: "kinds",
+                msg: format!("`{}`'s settings are a JSON object", declaration.name),
+            }));
+        }
+    };
+    if !serve.is_callable() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "`{}` is served by a callable over pyarrow batches",
+            declaration.name
+        )));
+    }
+    Ok(PyDeclaredTask {
+        declaration,
+        settings,
+        serve: serve.unbind(),
+    })
+}
+
+/// `moruna._core.kinds(declarations)`: what `moruna.kinds()` returns, as JSON: the listing of
+/// the kinds `moruna.run` can run, with the declared kinds among them.
+#[pyfunction]
+fn kinds(py: Python<'_>, declarations: Vec<String>) -> PyResult<String> {
+    let to_err =
+        |e: MorunaError| crate::errors::to_py_err(py, &e, crate::errors::Attachments::default());
+    let mut registry = library(Vec::new(), None, None, None, Vec::new()).map_err(to_err)?;
+    for text in &declarations {
+        let declaration = declared_kind(text).map_err(to_err)?;
+        registry.declare(declaration).map_err(to_err)?;
+    }
+    Ok(registry.listing().to_json())
+}
+
+/// The kinds' functions and classes on `moruna._core`.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyDeclaredTask>()?;
+    m.add_function(wrap_pyfunction!(declare_kind, m)?)?;
+    m.add_function(wrap_pyfunction!(declared_task, m)?)?;
+    m.add_function(wrap_pyfunction!(kinds, m)?)?;
+    Ok(())
+}
+
+/// What `moruna.run` runs with: the runtime's kinds, [`Given`] over its kernels, the objects it
+/// holds as their kinds, and the kinds the program serves (`served`, each declaration with the
+/// callable that answers its guest port), declared in the order given; the same kind given twice
+/// is declared once, and two declarations of one name are refused.
 pub fn library(
     kernels: Vec<Option<Arc<PyKernel>>>,
     iterable: Option<(Py<PyAny>, SourceSchema)>,
     source: Option<Py<PyAny>>,
     sink: Option<Py<PyAny>>,
+    served: Vec<(Declaration, Py<PyAny>)>,
 ) -> Result<Registry> {
-    let mut kinds = Registry::standard();
+    let mut ports: BTreeMap<String, Arc<dyn GuestPort>> = BTreeMap::new();
+    let mut declared: Vec<Declaration> = Vec::new();
+    for (declaration, serve) in served {
+        if let Some(same) = declared.iter().find(|d| d.name == declaration.name) {
+            if *same != declaration {
+                return Err(MorunaError::Config {
+                    name: "kinds",
+                    msg: format!(
+                        "two kinds called `{}` are given, declared differently",
+                        declaration.name
+                    ),
+                });
+            }
+            continue;
+        }
+        let port = declaration
+            .served
+            .as_ref()
+            .and_then(|s| s.port.guest.clone())
+            .ok_or_else(|| MorunaError::Config {
+                name: "kinds",
+                msg: format!(
+                    "`{}` is served in this process, by a guest port",
+                    declaration.name
+                ),
+            })?;
+        ports.insert(port, Arc::new(PyServe { serve }));
+        declared.push(declaration);
+    }
+    let mut kinds = Registry::standard().with_embedding(Arc::new(Serving(ports)));
     kinds.register_kernel(Arc::new(Given { kernels }))?;
     kinds.register_source(Arc::new(Iterable {
         object: Mutex::new(iterable),
@@ -419,6 +594,9 @@ pub fn library(
     kinds.register_sink(Arc::new(UserSink {
         object: Mutex::new(sink),
     }))?;
+    for declaration in declared {
+        kinds.declare(declaration)?;
+    }
     Ok(kinds)
 }
 

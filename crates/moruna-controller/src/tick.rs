@@ -42,7 +42,20 @@ pub(crate) fn tick(ctl: &Inner) {
     // Measure with no lock held (RC-I10). The sample is the one call that can be slow, so it
     // is also the one that is timed.
     let at = Instant::now();
-    let sample = ctl.peers().sampler.sample();
+    let sample = match ctl.peers().sampler.sample() {
+        Ok(sample) => sample,
+        Err(cause) => {
+            {
+                let mut state = ctl.held();
+                state.terminated = true;
+            }
+            ctl.perform(Actions {
+                terminate: Some(cause),
+                ..Actions::default()
+            });
+            return;
+        }
+    };
     let sample_took = at.elapsed();
     if sample_took > TICK_LOCK_BOUND {
         let mut state = ctl.held();

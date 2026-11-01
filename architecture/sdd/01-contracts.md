@@ -1,11 +1,13 @@
 # Moruna SDD 01: Contracts crate (`moruna-kernel`)
 
 **Document type:** software design document, component 1 of 12
-**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I15, CT-T28) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I15, CT-T28) and by KD7a and KD7b (the buffer catalog's port and the scheduling policy's: d.10, d.17, d.18, CT-T29, CT-T30), and by KD7c (predictions with a spread, the machine and the stages' snapshot, the policy's counters, the learning stats: d.18, CT-T31) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
+
+KA6 also adds the single type grammar in `moruna-types`, converted by contracts (CT-I16, CT-T12).
 **Parent:** `architecture/moruna-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
 **Preamble:** `00-preamble.md` (read first)
 **Component location:** `crates/moruna-kernel`, Rust 2024 edition
-**Consumes:** nothing internal; `arrow`, `dlpark`, `thiserror`, `blake3` **Consumed by:** every other component
+**Consumes:** `moruna-types` (the type grammar, which depends on nothing; KA6); `arrow`, `dlpark`, `thiserror`, `blake3` **Consumed by:** every other component
 
 ---
 
@@ -63,6 +65,8 @@ Beyond the preamble's global vocabulary:
 **CT-I14. A compressed Arrow IPC batch costs what its message says and no more (KA10, 2026-10-28).** arrow-ipc reserves the uncompressed length a compressed buffer declares before it decompresses, so a few bytes could ask for any amount of memory. A record batch compressed with `LZ4_FRAME` or `ZSTD` (method `BUFFER`) is therefore inflated by `ipc::check` (e.8) and by nothing else: every buffer's size is worked out from the message alone and the declared size held to it, the sizes together are held to a ceiling the caller passes (its stage's share of the memory budget), and not a byte is allocated for the batch until all of that has passed. What is allocated is allocated through the `Allocator`, as one arena buffer of the checked size; decompression stops at each buffer's size and refuses output past it or short of it; and arrow-ipc is handed an uncompressed message and body, exactly as for an uncompressed batch. A refusal leaves nothing held. Rationale: an embedder measured uncompressed IPC at 3.7 times the size of Parquet for the same rows, so Moruna must accept compression; a tenant's function or a damaged file must not be able to use it to exhaust the host.
 
 **CT-I15. A batch handed to a consumer may be shared (KA5, 2026-10-29).** A batch a source or a stage fans out to several queues is one set of bytes every consumer reads (`Payload::share`, d.16): a kernel and a sink read their input and never write into it, and the bytes are released when the last holder drops its share. Rationale: a fan-out that copied would double the memory of every branch, and the budget (G-I1) counts the batch once (placement PL-I16).
+
+**CT-I16. The type grammar is read once, and converted here (KA6, 2026-10-29).** A declared column's type (MH 4.9) is read by `moruna_types::parse`, the grammar's only reader, into an Arrow-free description; `declare::data_type` converts a description into the `DataType` it names, `declare::named` names a `DataType` by its description (a list of non-nullable items as the list of nullable ones, the grammar having no other), `TypeDecl::from(&ColumnType)` and `parse_type` are the read and the conversion together, and `type_name` writes a type as its description's spelling (`moruna_types::TypeName`'s `Display`, the grammar's only writer), or as Arrow prints it outside the grammar. No crate parses a type spelling another way; `moruna-job` compares the descriptions where no Arrow is linked (SDD 22 JB-I15). Rationale: two readers of one grammar agree only over the spellings a test knows.
 
 **CT-I12. A morsel is recomputable from its origin.** `Source::read` is deterministic for a given `(split, rows)` while the input is unchanged, and a morsel at stage `s` equals `kernels[1..=s]` applied in order to that read (in a DAG, the kernels on the path `Topology::parent` traces from its queue back to its source, d.16). `Origin` therefore names the morsel completely. Q0 eviction (D5) and run resume (placement e.5) both rely on this and on nothing else; neither replicates bytes. Rationale: recovery by lineage costs nothing on the normal path, recovery by replication costs a copy of everything.
 
@@ -567,7 +571,7 @@ pub trait KernelState: Send {
     /// state that grows with morsels seen and budget for it (RC f.3); a kernel
     /// whose state accumulates should implement it, because the linear model
     /// `a_k × bytes_in` does not describe it and the alternative is a breach.
-    fn footprint(&self) -> Option<u64> { None }
+    fn footprint(&self) -> Result<Option<u64>> { Ok(None) }
 }
 /// Unit state for stateless kernels.
 pub struct NoState;
@@ -619,6 +623,8 @@ pub trait Kernel: Send + Sync + 'static {
 ```
 
 The scheduler calls `apply_port` and `output_schema_of` and nothing else of the two; a kernel of one input implements neither and sees `apply` and `output_schema` as before. A kernel's input may be shared with another consumer (d.16, CT-I15): it reads its input and never writes into it.
+
+**Run-local logical rows.** `LogicalTaskRows { task, ports }` describes checked logical outputs inside one executable stage; its ordered members survive fusion. `LogicalRows::append(task, port, &RecordBatch)` receives exact intermediate rows and returns a real refusal on required capture failure. `Kernel::with_logical_rows` validates the actual fused representation and returns a run-local bound executable; it never mutates a shared kernel used by another run. Opaque kinds refuse this capability before execution. The kernel contract imports no storage implementation: the runtime bridges this row port to the sole governed artifact publisher. Requested materialization is explicit additional work and does not rewrite the plan to disable fusion. Final executable output is never substituted for an earlier logical task's output.
 
 ### d.8 Sink
 
@@ -801,11 +807,28 @@ pub struct QueueStats {
 }
 #[derive(Clone, Debug, Default)]
 pub struct PlacementStats {
-    pub queues: Vec<QueueStats>,          // by queue id
+    pub queues: Vec<QueueStats>,          // by queue id; a fanned-out batch is in each of its queues' figures
     pub in_flight_bytes: u64,
-    /// Per tier, the bytes counted in more than one queue's figure: a batch fanned out to `m`
-    /// queues is resident once and each counts it (d.16; KA5). Zero with no fan-out.
-    pub shared_by_tier: [u64; TIER_COUNT],
+    pub catalog: CatalogStats,            // KD7a: the buffer catalog (placement f.18), every batch once
+}
+/// The buffer catalog's figures (placement f.18, adaptive-runtime 9.1). Per-tier arrays are
+/// indexed by `TierKind::index`; the `Disk` slot holds the batches whose only copy is on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatalogStats {
+    pub resident_by_tier: [u64; TIER_COUNT],   // now, every batch once, held ones included
+    pub peak_by_tier: [u64; TIER_COUNT],       // the highest resident_by_tier reached
+    pub reserved_by_tier: [u64; TIER_COUNT],   // moves in flight and admissions
+    pub budget_by_tier: [u64; TIER_COUNT],
+    pub held_bytes: u64,                       // taken by a running unit and not yet released
+    pub buffers: u64,
+    pub spilled_bytes: u64, pub spills: u64,
+    pub reloaded_bytes: u64, pub reloads: u64,
+    pub evictions: u64,                        // batches sent out of memory, by the order or a policy's spill
+    pub misses: u64, pub miss_reload_bytes: u64,   // a consumer reached a batch out of memory; weighted by reload cost
+    pub released: u64, pub freed: u64,
+    pub overrun_bytes: u64,                    // bytes pushed beyond their reservation
+    pub overflows: u64, pub overflow_bytes: u64,   // KD7b: pushes memory could not admit, written straight to disk
+    pub outside_bytes: u64,                    // their bytes whose records have not landed: in no tier
 }
 
 /// Which node's memory a pop may be satisfied from. Reserved for the multi-node
@@ -849,7 +872,7 @@ pub struct ResumePoint {
     pub to_recompute: Vec<Vec<(Seq, Origin)>>,
 }
 
-pub trait Placement: Send + Sync {
+pub trait Placement: Residency + Send + Sync {   // KD7b: every placement offers its catalog's port (d.17)
     /// Never blocks. Ok(()) even if the queue is above high water; the caller
     /// consults `is_full` for admission.
     fn push(&self, stage: StageId, morsel: Morsel) -> Result<()>;
@@ -869,8 +892,14 @@ pub trait Placement: Send + Sync {
     /// True if the head of `stage` is resident in a tier satisfying `want` (non-consuming;
     /// the scheduler's pick uses it so a worker never pops what it cannot run).
     fn peek_resident(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> bool;
+    /// The consumer of `stage` is done with the batch it took as `seq` (KD7a): until then the
+    /// batch counts as resident and nothing evicts it; once every consumer has taken and
+    /// released it, its bytes leave the catalog (placement f.18). `Staging` when no such take is
+    /// held. Every pop is followed by exactly one release.
+    fn release(&self, stage: StageId, seq: Seq) -> Result<()>;
     /// Entries in state `Evicted` for `stage`, oldest first; the scheduler re-reads each
-    /// from its origin and pushes the replacement with `replace`.
+    /// from its origin and pushes the replacement with `replace`. A fanned-out batch is listed
+    /// once, under the lowest of its queues, and one `replace` brings it back for all (KD7a).
     fn evicted(&self, stage: StageId) -> Vec<(Seq, Origin)>;
     /// Replace an `Evicted` entry's bytes (same `seq`) in its original position.
     fn replace(&self, stage: StageId, morsel: Morsel) -> Result<()>;
@@ -1039,7 +1068,7 @@ pub struct HostProfile {
 /// the controller (its tick) and the scheduler (before and after every `apply`).
 /// Cheap: a few file reads or syscalls; interior mutability for its caches.
 pub trait Sampler: Send + Sync {
-    fn sample(&self) -> Sample;
+    fn sample(&self) -> Result<Sample>;
     /// Reset the kernel's peak counter (cgroup v2 `memory.peak` is writable on
     /// kernels ≥ 6.x; otherwise the sampler tracks its own running peak and resets
     /// that), so a probe measures its own peak (RC f.2).
@@ -1053,7 +1082,12 @@ pub trait Sampler: Send + Sync {
 /// 2026-10-15). The run's sampler adds every registered one's `in_use` to each sample's
 /// `anon_bytes`, so the ceiling governs the process and its children together.
 pub trait OutsideMemory: Send + Sync {
-    fn in_use(&self) -> u64;
+    fn in_use(&self) -> Result<u64>;
+    /// Amended 2026-10-29 (SDD 24 p.4): a high-water mark of what is held, reset and read
+    /// over one call, where the memory keeps one (a cgroup's `memory.peak`). The defaults keep
+    /// none: `reset_peak` returns `Ok(false)` and `peak` `Ok(None)`.
+    fn reset_peak(&self) -> Result<bool> { Ok(false) }
+    fn peak(&self) -> Result<Option<u64>> { Ok(None) }
 }
 
 /// The whole process's high-water mark over a run. Amended 2026-09-30: `since_ns`.
@@ -1217,6 +1251,73 @@ pub const MAX_PATHS: usize = 4096;
 **Sharing.** `Payload::share` is the same bytes a second time (a `RecordBatch` clone, `ManagedTensor::share`): what a fan-out pushes into its second and later queues (CT-I15).
 
 **`StageEvent`** names sources and sinks by number: `SourceReading { source }`, `SinkWriting { sink }`, `SinkCommitting { sink }`, `SinkFinished { sink, counters }`; `Fed` and `QueueClosed` name the queue, and a producer of several queues closes each.
+
+### d.17 The buffer catalog's port (KD7b, 2026-10-29; placement f.18)
+
+`catalog.rs`. Every placement keeps a buffer catalog and offers `Residency`, which `Placement` requires, so the scheduler claims what it pushes and its policy reads and drives memory through the same object.
+
+```rust
+pub struct BufferId(pub u64);
+pub enum Location { Memory(Tier), MemoryAndDisk(Tier), Disk, Moving { from: TierKind, to: TierKind }, Dropped, Remote }
+pub struct Future { pub next_use: u64, pub hot: bool, pub all_staging: bool, pub any_staging: bool }
+pub struct BatchView { pub id: BufferId, pub bytes: u64, pub location: Location, pub owner: Producer, pub consumers: Vec<(StageId, Seq)>, pub holders: Vec<(StageId, Seq)>, pub reload_cost: u64, pub future: Option<Future> }
+pub struct CatalogSnapshot { pub batches: Vec<BatchView>, pub stats: CatalogStats }
+pub struct Head { pub id: BufferId, pub seq: Seq, pub bytes: u64, pub last: bool, pub arrived: u64 }
+pub enum CatalogEvent { Released { batch, stage, seq }, Freed { batch, bytes }, Spilled { batch, bytes }, Reloaded { batch, bytes }, Dropped { batch, bytes } }
+pub trait CatalogObserver: Send + Sync { fn event(&self, event: &CatalogEvent); }
+pub trait ClaimHolder: Send + Sync { fn give_back(&self, slot: usize, bytes: u64); }
+pub struct Reservation { /* slot, bytes, Weak<dyn ClaimHolder> */ }   // new, bytes, slot, into_claim, join; Drop gives the bytes back
+pub enum Reserve { Granted(Reservation), Pending { need: u64 }, Refused { need: u64, budget: u64 } }
+pub trait Residency: Send + Sync {
+    fn snapshot(&self) -> CatalogSnapshot;
+    fn head(&self, stage: StageId) -> Option<Head>;
+    fn reserve(&self, tier: Tier, bytes: u64) -> Result<Reserve>;             // a claim of nothing is always granted
+    fn push_reserved(&self, stages: &[StageId], morsel: Morsel, claim: Reservation) -> Result<()>;
+    fn replace_reserved(&self, stage: StageId, morsel: Morsel, claim: Reservation) -> Result<()>;
+    fn push_spilled(&self, stages: &[StageId], morsel: Morsel) -> Result<()>;  // straight to disk; Staging without a disk tier
+    fn shed(&self, tier: TierKind, bytes: u64) -> bool;
+    fn spill(&self, batch: BufferId) -> Result<()>;
+    fn reload(&self, batch: BufferId) -> Result<()>;
+    fn observe(&self, observer: Arc<dyn CatalogObserver>);
+    fn floor(&self, tier: Tier, batch: u64) -> CatalogFloor;              // the run's floor against the tier's budget now
+}
+pub const DEFAULT_PROMOTION_WINDOW: u16 = 2;
+pub struct CatalogFloor { pub queues: u64, pub windows: u64, pub batch: u64, pub bytes: u64, pub budget: u64 }   // of, holds, terms; bytes = (windows + 2) x batch
+```
+
+### d.18 The scheduling policy's port (KD7b, 2026-10-29; adaptive-runtime 9.3)
+
+`policy.rs`. A policy decides, once per free worker, from the units ready for it, the DAG and the catalog's port; the scheduler keeps the hard rule whatever it says (10 SC-I12).
+
+```rust
+pub struct PolicyId { pub name: &'static str, pub version: u32 }
+pub struct Spread { pub p50: u64, pub p95: u64 }                     // exact(v), new(p50, p95): p95 held at p50 or above
+pub enum PredictedBy { Model, MeasuredRatio }                          // the run's cost model, or the stage's measured ratios (default)
+pub struct Prediction { pub out_bytes: Spread, pub duration_ns: Spread, pub by: PredictedBy, pub drifting: bool, pub observations: u32 }   // claim() = out_bytes.p95
+pub struct Ready { pub stage: StageId, pub port: u16, pub queue: StageId, pub head: Head, pub queue_bytes: u64, pub out_bytes: u64,
+                   pub predicted: Prediction, pub critical_ns: u64, pub waited_ns: u64 }
+pub struct Machine { pub workers: u16, pub budget_bytes: u64, pub held_bytes: u64, pub disk_bytes_per_second: u64, pub claim_cap_bytes: u64 }
+pub struct PortView { pub queue: StageId, pub batches: u64, pub memory_bytes: u64, pub disk_bytes: u64 }
+pub struct StageView { pub stage: StageId, pub ports: Vec<PortView>, pub running_ns: Vec<u64>, pub cap: u16, pub unit: Prediction }
+pub struct SchedulerState<'a> { pub worker: u16, pub ready: &'a [Ready], pub topology: &'a Topology, pub residency: &'a dyn Residency, pub budget_ns: u64,
+                                pub machine: Machine, pub stages: &'a [StageView] }
+pub enum Action { Run { stage: StageId, port: u16 }, Spill(BufferId), Reload(BufferId), Wait }   // in the order to try them
+pub trait SchedulingPolicy: Send { fn id(&self) -> PolicyId; fn decide(&mut self, state: &SchedulerState<'_>) -> Vec<Action>;
+                                   fn counters(&self) -> PolicyCounters { PolicyCounters::default() } }
+pub struct PolicyCounters { pub shallower: u64, pub simulations: u64, pub simulation_errors: u64, pub simulation_error: Option<String>, pub resizes: u64 }
+pub trait PolicyAdapter: Send + Sync { fn name(&self) -> &str; fn make(&self) -> Box<dyn SchedulingPolicy>; }
+pub struct SchedulingPolicies { /* by name */ }   // empty, register (a lowercase word, once), names, make (unknown: Config naming the registered ones)
+pub struct PolicyStats { pub name: String, pub decisions: u64, pub decision_ns: u64, pub over_budget: u64, pub fallbacks: u64, pub admitted: u64, pub not_claimed: u64, pub idle_ready_ns: u64, pub unused_ready_byte_ns: u128, pub overflow_spills: u64, pub push_waits: u64,
+                        pub counters: PolicyCounters, pub predicted_by_model: u64, pub predicted_by_ratio: u64, pub learning: Option<LearningStats> }   // in SchedulerStats::policy
+pub struct LearningStats { pub model: String, pub shadow: Option<String>, pub observed: u64, pub written: u64, pub unwritten: u64, pub store_error: Option<String>,
+                           pub refused: u64, pub refusal: Option<String>, pub drifts: Vec<DriftStat> }
+pub struct DriftStat { pub stage: StageId, pub target: String, pub at_unit: u64, pub units: u64, pub settled: bool }
+```
+
+The cost model is not a contract: the scheduler reads it through `moruna-cost`'s port (10 f.22) and hands a policy the answers as `Prediction`, so a policy depends on contracts alone and every policy reads one kind of prediction whether a model is configured or not, marked with which (KD7c).
+
+```rust
+```
 
 ### d.15 Test fakes (`moruna-testkit`)
 
@@ -1411,7 +1512,7 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T11 features_cost.** (reference host, E1, for the timing; the structural half runs anywhere) `MorselFeatures::from_payload` on a 10 M-row string batch runs in under 1 ms on the reference host, provisional with the host name elsewhere; on every host the test also proves the O(columns) property structurally: the batch is built over a values buffer whose bytes are never read (a `FakeAllocator` buffer left uninitialised is fine) and the string total equals the offsets buffer's last value. Proves f.2.
 
-**CT-T12 no_runtime_deps.** `cargo tree -p moruna-kernel` contains none of tokio, cudarc, pyo3, parquet, object_store. Proves the boundary in section a and S7.
+**CT-T12 no_runtime_deps.** `cargo tree -p moruna-kernel` contains none of tokio, cudarc, pyo3, parquet, object_store, and does contain arrow, dlpark, thiserror, blake3 and `moruna-types` (KA6). Proves the boundary in section a and S7.
 
 **CT-T13 fakes_compile.** `moruna-testkit` implements every trait in d.3 to d.13 with the knobs in d.15, and its tests exercise every method and every knob once. Proves the contract is implementable.
 
@@ -1439,6 +1540,12 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 **CT-T26 ipc_inflate_refusals.** (`tests/ct_t23_ipc_inflate.rs`) A codec Moruna does not read, a method it does not read and metadata V4 are refused naming what the message says, with nothing allocated; `ReadStream` and `read_stream(.., &Inflate::none())` refuse a compressed batch with a ceiling of zero as the reason, and `decode` refuses a compressed staging record (e.7) the same way; `encode_compressed` refuses `Compression::None`, a zstd level outside the library's and a base offset that is not a multiple of 8; `Compression::parse` reads `none`, `zstd`, `zstd` with a level and `lz4`, and refuses the rest. Proves CT-I14.
 
 **CT-T27 ipc_bombs_cost_the_heap_little.** (`tests/ct_t27_ipc_inflate_heap.rs`, one test in its binary, behind a counting global allocator) Every stream of CT-T24 is refused while the process's heap rises by less than 1 MiB over what the stream itself holds (a decoder's working memory is not the arena's); the worst figure is printed. Proves CT-I14.
+
+**CT-T29 a_claim_goes_back_once** (`catalog.rs`, KD7b). A claim dropped unused gives its bytes back to its holder; taken over with `into_claim` or joined to another it gives nothing back; joining claims of two slots is refused and the refused one goes back; a claim outliving its holder is dropped quietly. d.17.
+
+**CT-T30 policies_by_name** (`policy.rs`, KD7b). A policy name is a lowercase word, taken once; the registry makes a registered one and refuses an unknown name naming the registered ones. d.18.
+
+**CT-T31 a_prediction_claims_its_p95** (`policy.rs`, KD7c). A spread holds its p95 at its median or above and an exact one is a point; a prediction claims its output's p95; a measured ratio is the default source; a policy that counts nothing reports no counters. d.18.
 
 **CT-T28 topology** (`graph.rs`, KA5). The chain keeps every number and equals `Topology::new` over its own links; a diamond numbers its join `2s` and `2s + 1`, `parent` and `root` invert it, `paths` and `to_sinks` follow it, `reaches` and `last_at_sink` read it against the sources' counts; a fan-out and a fan-in; every shape a run cannot have is refused naming what is wrong; `Affine` composes, inverts and refuses an overflow. d.16.
 
@@ -1479,7 +1586,15 @@ None. (Four E10 items the wave 0 agent raised, issues #5 to #8, were resolved by
 | untrusted IPC (2026-10-28) | CT-I13, e.7, e.8 | CT-T22 |
 | compressed IPC (KA10, 2026-10-28) | CT-I14, e.7, e.8 | CT-T23, CT-T24, CT-T25, CT-T26, CT-T27 |
 | the run as a DAG (KA5, 2026-10-29) | CT-I15, d.7, d.10, d.16 | CT-T28 |
+| the buffer catalog's port and the policy's (KD7b, adaptive-runtime 9.1 to 9.4) | d.10, d.17, d.18 | CT-T29, CT-T30, PL-T38, SC-T33, SC-T34 |
+| predictions with a spread, the snapshot, the policy's counters, learning (KD7c, adaptive-runtime 9.3, 9.4, 9.6) | d.18 | CT-T31, SC-T36, SC-T37, SC-T38 |
 
 ## o. Deferred (post-v1)
 
 None.
+
+A one-task executable's returned Table payload is that task's exact logical output, so the engine may bind a run-local forwarding wrapper while preserving its fingerprint, schemas, instance lifecycle, restore/finish, multi-input routing and waiting-state contract. It may not use this rule for multiple fused tasks or multiple distinct output ports. Tensor output schemas refuse required row capture before execution; a mismatching runtime payload also refuses. Fused intermediates still require the executable's native logical-row capability, with no final-output substitution.
+
+### Fallible accounting correction (2026-10-30)
+
+The v1 accounting path is fallible: OutsideMemory::in_use returns Result<u64>, Sampler::sample returns Result<Sample>, and KernelState::footprint returns Result<Option<u64>>. Genuine absent child/stateless/unsupported footprint remains Ok(0)/Ok(None); failed reads are Err, never stale/zero measurements. Controller/worker/check/warmup consumers propagate the actual diagnostic and retire claimed work before terminal cancellation. No source-only change is a runtime-proof claim.

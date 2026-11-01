@@ -101,7 +101,7 @@ impl Sampler {
 }
 impl moruna_kernel::Sampler for Sampler {
     /// DS-I3. Never fails after `new`; a transient read error repeats the last sample and increments `read_errors`.
-    fn sample(&self) -> Sample;
+    fn sample(&self) -> Result<Sample>;
     /// DS-I3. Writes `memory.peak` when the kernel allows, else resets the running peak to the current `anon_bytes`.
     fn reset_peak(&self);
 }
@@ -291,3 +291,7 @@ None.
 ## o. Deferred (post-v1)
 
 None.
+
+### Fallible accounting correction (2026-10-30)
+
+Sampler read failures now return the actual current-reading error, increment read_errors and never replay last with a new timestamp. Construction requires a successful fresh sample. Mandatory cgroup counters and process-memory reads fail on unreadable/malformed input; a supported fresh platform memory interface remains valid. Optional peak capability is distinct from inventing a current reading. No source-only change is a runtime-proof claim.

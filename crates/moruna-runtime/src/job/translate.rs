@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use moruna_kernel::{MorunaError, Result, RunId};
 use moruna_placement::PlacementEngine;
 
-/// `checkpoint.interval_ms` (preamble section 5).
-pub const CHECKPOINT_INTERVAL_MS: (u64, u64) = (500, 60_000);
 /// `sink.row_group_bytes` (preamble section 5).
 pub const ROW_GROUP_BYTES: (u64, u64) = (16 << 20, 1 << 30);
 /// `sink.file_bytes` (preamble section 5).

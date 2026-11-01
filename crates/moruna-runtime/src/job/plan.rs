@@ -116,7 +116,8 @@ impl ExplainError {
 }
 
 /// `explain` as `moruna explain` and `moruna.explain(...)` run it (SDD 26 d.5): the plan of `job`
-/// by the planner `planner` names (the default when it names none), for the run's resources
+/// by the planner `planner` names (when it names none, `moruna_plan::default_planner`'s, which is
+/// `levels` while the runtime configures no cost model), for the run's resources
 /// (the job's budget, what discovery finds where it leaves one to discovery), the job checked
 /// first against the kinds `kinds` declares.
 pub fn explain(
@@ -127,12 +128,13 @@ pub fn explain(
     let catalogue =
         Catalogue::from_listing(kinds.listing()).map_err(|e| ExplainError::Kinds(e.to_string()))?;
     let found = discovered(job).map_err(ExplainError::Discovery)?;
+    let inputs = PlanInputs::for_job(job, found);
     moruna_plan::explain(
         job,
         &catalogue,
-        &PlanInputs::for_job(job, found),
+        &inputs,
         &moruna_plan::Planners::standard(),
-        planner.unwrap_or(moruna_plan::DEFAULT_PLANNER),
+        planner.unwrap_or(moruna_plan::default_planner(&inputs)),
     )
     .map_err(ExplainError::Plan)
 }

@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+pub mod net;
 pub mod queue;
 pub mod transport;
 

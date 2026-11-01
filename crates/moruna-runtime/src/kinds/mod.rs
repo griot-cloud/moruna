@@ -17,7 +17,7 @@ use crate::job::refusal;
 use crate::packaged::{PackageHost, Packaged};
 use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
 use moruna_job::{ContractEntry, Declaration, KindDoc, LISTING_VERSION, Listing, Role, SpecError};
-use moruna_kernel::{Kernel, MorunaError, Result, StageId};
+use moruna_kernel::{Kernel, MorunaError, Result};
 use serde::de::DeserializeOwned;
 
 pub mod arrow_ipc;
@@ -28,6 +28,7 @@ pub mod image;
 pub mod package;
 pub mod parquet;
 pub mod ports;
+pub mod served;
 pub mod standard;
 pub mod tensor;
 pub mod vortex;
@@ -90,6 +91,34 @@ impl<'d> Entry<'d> {
 /// What the program running a document supplies besides its kinds (d.1): the hooks a kind may
 /// ask of it. Every method has the answer of a program that supplies nothing.
 pub trait Embedding: Send + Sync {
+    /// Authorize required historical logical outputs for this checked job and actual run.
+    /// Hosted CLI/SDK/MCP adapters use this native seam; no default authority is invented.
+    fn historical_rows(
+        &self,
+        job: &moruna_job::Job,
+        parts: &crate::job::Parts,
+        run_id: moruna_kernel::RunId,
+    ) -> Result<Option<Arc<crate::history::Historical>>> {
+        let _ = (job, parts, run_id);
+        Ok(None)
+    }
+
+    /// Live scoped checkpoint writer. Missing authority refuses portable publication;
+    /// no credentials or storage grants are inferred from a job URL.
+    fn checkpoints(
+        &self,
+        job: &moruna_job::Job,
+        run_id: moruna_kernel::RunId,
+    ) -> Result<Option<Arc<crate::portable::Publisher>>> {
+        let _ = (job, run_id);
+        Ok(None)
+    }
+
+    /// Live scoped reader for retained task output; absent is an explicit unavailable port.
+    fn historical_reader(&self) -> Result<Option<Arc<crate::history::ReadPort>>> {
+        Ok(None)
+    }
+
     /// Where the contracts of the governed engine opened at `root` keep their files, when the
     /// program knows more than the engine does: an authorized read-only root another party's
     /// contract is bound to, say. `None` is the engine's own resolution.
@@ -269,9 +298,9 @@ pub struct Stage {
     pub fuse: Option<Arc<dyn Fuse>>,
     /// The packaged kernel the facade binds to the run's gate, sampler and limits (16, 17).
     pub packaged: Option<Packaged>,
-    /// Called once with the stage's id when the chain is settled: a stage that calls ports
-    /// learns its id this way (MH 4.10).
-    pub placed: Option<Box<dyn FnOnce(StageId) + Send>>,
+    /// The ports the stage calls (MH 4.10): the build makes them once the stage's id is known,
+    /// hands them to the kernel, and the run binds them to its cancel and its waits.
+    pub ports: Option<ports::StageCalls>,
     /// The kernel as the Python adapter's type, for `bind_allocator` and `gil_state` (05 d.1).
     #[cfg(feature = "python")]
     pub python: Option<Arc<moruna_adapters::PyKernel>>,
@@ -284,7 +313,7 @@ impl Stage {
             kernel,
             fuse: None,
             packaged: None,
-            placed: None,
+            ports: None,
             #[cfg(feature = "python")]
             python: None,
         }
@@ -350,8 +379,19 @@ struct Registered<K: ?Sized> {
     kind: Arc<K>,
 }
 
+impl<K: ?Sized> Clone for Registered<K> {
+    fn clone(&self) -> Registered<K> {
+        Registered {
+            declaration: self.declaration.clone(),
+            kind: Arc::clone(&self.kind),
+        }
+    }
+}
+
 /// The kinds a program can run (d.1, KD-I1): its sources, runnable kinds and sinks by name, and
-/// its hooks.
+/// its hooks. A clone shares the adapters: what a command line adds to it for one invocation
+/// (`--kinds`) leaves the program's own registry as it was.
+#[derive(Clone)]
 pub struct Registry {
     sources: BTreeMap<String, Registered<dyn SourceKind>>,
     kernels: BTreeMap<String, Registered<dyn RunnableKind>>,
@@ -437,7 +477,8 @@ impl Registry {
         Ok(())
     }
 
-    /// Register a runnable kind (KD-I2), as [`Registry::register_source`].
+    /// Register a runnable kind (KD-I2), as [`Registry::register_source`]. A kind its embedder
+    /// serves is declared ([`Registry::declare`]), not registered with an adapter of its own.
     pub fn register_kernel(&mut self, kind: Arc<dyn RunnableKind>) -> Result<()> {
         let declaration = kind.declaration();
         admissible(
@@ -445,7 +486,40 @@ impl Registry {
             Role::Kernel,
             self.kernels.contains_key(&declaration.name),
         )?;
+        if declaration.served.is_some() {
+            return Err(MorunaError::Config {
+                name: "kinds",
+                msg: format!(
+                    "`{}` is served by a port, and a served kind is declared (Registry::declare), \
+                     not registered with an adapter: Moruna runs every served kind the same way",
+                    declaration.name
+                ),
+            });
+        }
         self.put_kernel(kind);
+        Ok(())
+    }
+
+    /// Declare a kind the program running Moruna serves through a port (KD-I11): a declaration
+    /// with `isolation: embedder` and `served`, which one adapter ([`served::Served`]) runs by
+    /// handing each batch to the port. Refused, `Config { name: "kinds" }`, as any registration
+    /// is (KD-I2), when a kernel kind of its name is registered already (a built-in one
+    /// included), when it is not a served kind, and when its settings schema uses what the
+    /// validator its settings are checked with does not read (SDD 22 JB-I7).
+    pub fn declare(&mut self, declaration: Declaration) -> Result<()> {
+        admissible(
+            &declaration,
+            Role::Kernel,
+            self.kernels.contains_key(&declaration.name),
+        )?;
+        moruna_job::schema::admit(&declaration.settings).map_err(|fault| MorunaError::Config {
+            name: "kinds",
+            msg: format!(
+                "`{}`'s settings schema cannot be checked against: {fault}",
+                declaration.name
+            ),
+        })?;
+        self.put_kernel(Arc::new(served::Served::new(declaration)?));
         Ok(())
     }
 

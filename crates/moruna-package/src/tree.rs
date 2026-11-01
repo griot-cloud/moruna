@@ -122,6 +122,34 @@ pub fn tree(package: &Package) -> Result<Tree, PackageError> {
     }
 }
 
+/// Extract this already verified snapshot into a NEW process-private tree using
+/// the same authoritative extractor. Never trust a neighboring mutable marker,
+/// reuse another process's tree, or remove a pre-existing temporary directory.
+pub fn private_tree(package: &Package) -> Result<Tree, PackageError> {
+    not_pex(package)?;
+    let root = loop {
+        let root = std::env::temp_dir().join(format!(
+            "moruna-native-tree-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&root) {
+            Ok(()) => break root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(PackageError::io(&root, error)),
+        }
+    };
+    let tree = Tree {
+        root,
+        private: true,
+        notes: vec![
+            "verified snapshot extracted into this native process's private charged scratch".into(),
+        ],
+    };
+    extract(package, &tree.root)?;
+    Ok(tree)
+}
+
 /// Write the tree beside the package (`moruna aot`, 16 f.10), refusing when that place cannot
 /// be written. Returns the tree's path.
 pub fn write_beside(package: &Package) -> Result<PathBuf, PackageError> {

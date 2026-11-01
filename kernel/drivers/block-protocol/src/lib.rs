@@ -1,7 +1,8 @@
-//! `moruna.driver.block` 1.1 (SDD 25, d.3): a block device. Data never travels in a
+//! `moruna.driver.block` 2.0 (SDD 25, d.3): a block device. Data never travels in a
 //! message: a client sends a handle to its buffer, a DMA memory object, the driver
 //! pins it and its device reads or writes it directly, and the reply hands the buffer
-//! back. Since 1.1 a client may register a buffer once (`register`), which the driver
+//! back. Mutating commands require an actual connection-bound exclusive writer lease.
+//! A client may register a buffer once (`register`), which the driver
 //! pins once and keeps pinned until `unregister` or the connection ends, and then
 //! move sectors to and from any of its pages (`read_at`, `write_at`) with no pin per
 //! request: the image filesystem's page cache works so (SDD 27, f.5).
@@ -10,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+pub mod lease;
 
 use alloc::{format, string::ToString, vec, vec::Vec};
 
@@ -53,8 +55,8 @@ moruna_svc::protocol! {
     /// objects its device moves data to and from directly.
     pub protocol block {
         name = "moruna.driver.block";
-        major = 1;
-        minor = 1;
+        major = 2;
+        minor = 0;
         requests {
             /// The device's sector size, capacity and largest transfer.
             1 => fn info() -> Info;
@@ -63,20 +65,24 @@ moruna_svc::protocol! {
             2 => fn read(sector: u64, count: u32, buffer: Memory) -> Memory;
             /// Writes `count` sectors at `sector` from the first bytes of `data` (a DMA
             /// memory object with `READ`), and hands it back.
-            3 => fn write(sector: u64, count: u32, data: Memory) -> Memory;
+            3 => fn write(lease:u64, sector: u64, count: u32, data: Memory) -> Memory;
             /// Answered once every write answered before it is on stable storage.
-            4 => fn flush() -> ();
+            4 => fn flush(lease:u64) -> ();
             /// Pins `buffer` (a DMA memory object with `READ` and `WRITE`) for as long
             /// as the connection keeps it: its registration number and its pages.
-            5 since 1 => fn register(buffer: Memory) -> (u32, u32);
+            5 => fn register(buffer: Memory) -> (u32, u32);
             /// Reads `count` sectors from `sector` into registered buffer `id`, from its
             /// page `page`.
-            6 since 1 => fn read_at(id: u32, page: u32, sector: u64, count: u32) -> ();
+            6 => fn read_at(id: u32, page: u32, sector: u64, count: u32) -> ();
             /// Writes `count` sectors at `sector` from registered buffer `id`, from its
             /// page `page`.
-            7 since 1 => fn write_at(id: u32, page: u32, sector: u64, count: u32) -> ();
+            7 => fn write_at(lease:u64, id: u32, page: u32, sector: u64, count: u32) -> ();
             /// Ends registration `id`; its pages are unpinned once no transfer uses them.
-            8 since 1 => fn unregister(id: u32) -> ();
+            8 => fn unregister(id: u32) -> ();
+            /// Exclusive namespace writer bound to this actual SDK connection.
+            9 => fn acquire_write() -> u64;
+            /// Close admission and release only after original writes and final flush.
+            10 => fn release_write(lease:u64) -> ();
         }
         events {}
         errors {
@@ -95,6 +101,14 @@ moruna_svc::protocol! {
             6 => NoRegistration;
             /// The connection holds as many registrations as it may.
             7 => TooManyRegistrations;
+            /// Another connection owns or is draining the namespace writer.
+            8 => LeaseInUse;
+            /// This actual connection/generation does not own the writer.
+            9 => NotWriter;
+            /// Release/disconnect closed writer admission; original IO still owns it.
+            10 => LeaseClosing;
+            /// Required final durability barrier or ownership accounting failed.
+            11 => LeaseFailed;
         }
     }
 }
@@ -119,6 +133,36 @@ fn info_of(p: &mut Probe) -> Result<Info, Fail> {
     Ok(info)
 }
 
+fn claim(p: &mut Probe) -> Result<u64, Fail> {
+    let mut answer = p.request(9, Encoder::new())?.reply()?;
+    let mut decoder = answer.decoder();
+    let token = u64::decode(&mut decoder).map_err(wire)?;
+    decoder.finish().map_err(wire)?;
+    Ok(token)
+}
+fn token_body(token: u64) -> Result<Encoder, Fail> {
+    let mut body = Encoder::new();
+    token.encode(&mut body).map_err(wire)?;
+    Ok(body)
+}
+fn release(p: &mut Probe, token: u64) -> Result<(), Fail> {
+    empty_reply(p, 10, token_body(token)?)
+}
+fn write_transfer(token: u64, sector: u64, count: u32, buffer: Memory) -> Result<Encoder, Fail> {
+    let mut body = token_body(token)?;
+    sector.encode(&mut body).map_err(wire)?;
+    count.encode(&mut body).map_err(wire)?;
+    buffer.encode(&mut body).map_err(wire)?;
+    Ok(body)
+}
+fn write_at_body(token: u64, id: u32, page: u32, sector: u64, count: u32) -> Result<Encoder, Fail> {
+    let mut body = token_body(token)?;
+    id.encode(&mut body).map_err(wire)?;
+    page.encode(&mut body).map_err(wire)?;
+    sector.encode(&mut body).map_err(wire)?;
+    count.encode(&mut body).map_err(wire)?;
+    Ok(body)
+}
 fn transfer(sector: u64, count: u32, buffer: Memory) -> Result<Encoder, Fail> {
     let mut e = Encoder::new();
     sector.encode(&mut e).map_err(wire)?;
@@ -195,8 +239,15 @@ fn bad_counts(p: &mut Probe) -> Result<(), Fail> {
     let over = i.max_sectors.saturating_add(1);
     p.request(2, transfer(0, over, dma(bytes(&i, over))?)?)?
         .failure(block::Error::BadCount.code())?;
-    p.request(3, transfer(0, 0, dma(4096)?)?)?
-        .failure(block::Error::BadCount.code())
+    if i.read_only {
+        return p
+            .request(9, Encoder::new())?
+            .failure(block::Error::ReadOnly.code());
+    }
+    let token = claim(p)?;
+    p.request(3, write_transfer(token, 0, 0, dma(4096)?)?)?
+        .failure(block::Error::BadCount.code())?;
+    release(p, token)
 }
 
 fn bad_buffers(p: &mut Probe) -> Result<(), Fail> {
@@ -223,16 +274,23 @@ fn bad_buffers(p: &mut Probe) -> Result<(), Fail> {
         wo.0.duplicate(Rights::WRITE | Rights::TRANSFER)
             .map_err(|e| e.name().to_string())?,
     );
-    p.request(3, transfer(0, 1, wo)?)?.failure(bad)
+    if i.read_only {
+        return Ok(());
+    }
+    let token = claim(p)?;
+    p.request(3, write_transfer(token, 0, 1, wo)?)?
+        .failure(bad)?;
+    release(p, token)
 }
 
 fn write_round_trip(p: &mut Probe) -> Result<(), Fail> {
     let i = info_of(p)?;
     if i.read_only {
         return p
-            .request(3, transfer(0, 1, dma(bytes(&i, 1))?)?)?
+            .request(9, Encoder::new())?
             .failure(block::Error::ReadOnly.code());
     }
+    let token = claim(p)?;
     let n = i.sector_size as usize;
     let last = i.sectors - 1;
     let original = buffer_back(p, 2, transfer(last, 1, dma(bytes(&i, 1))?)?)?;
@@ -241,12 +299,17 @@ fn write_round_trip(p: &mut Probe) -> Result<(), Fail> {
     data.map(0, 4096, map::WRITE)
         .and_then(|m| m.write(0, &pattern))
         .map_err(|e| e.name().to_string())?;
-    drop(buffer_back(p, 3, transfer(last, 1, data)?)?);
+    drop(buffer_back(p, 3, write_transfer(token, last, 1, data)?)?);
     let back = buffer_back(p, 2, transfer(last, 1, dma(bytes(&i, 1))?)?)?;
     let read = read_bytes(&back, n)?;
     // Restore the sector before judging, so the disk ends as it began.
-    drop(buffer_back(p, 3, transfer(last, 1, original)?)?);
-    p.request(4, Encoder::new())?.reply()?;
+    drop(buffer_back(
+        p,
+        3,
+        write_transfer(token, last, 1, original)?,
+    )?);
+    p.request(4, token_body(token)?)?.reply()?;
+    release(p, token)?;
     if read != pattern {
         return Err("the sector read back is not the one written".to_string());
     }
@@ -254,9 +317,15 @@ fn write_round_trip(p: &mut Probe) -> Result<(), Fail> {
 }
 
 fn flush(p: &mut Probe) -> Result<(), Fail> {
-    let mut reply = p.request(4, Encoder::new())?.reply()?;
-    let d = reply.decoder();
-    d.finish().map_err(wire)
+    let info = info_of(p)?;
+    if info.read_only {
+        return p
+            .request(4, token_body(0)?)?
+            .failure(block::Error::NotWriter.code());
+    }
+    let token = claim(p)?;
+    empty_reply(p, 4, token_body(token)?)?;
+    release(p, token)
 }
 
 fn register(p: &mut Probe, buffer: Memory) -> Result<(u32, u32), Fail> {
@@ -346,8 +415,8 @@ fn registered_refusals(p: &mut Probe) -> Result<(), Fail> {
     p.request(6, at(id, 0, i.sectors, one)?)?
         .failure(block::Error::OutOfRange.code())?;
     if i.read_only {
-        p.request(7, at(id, 0, 0, one)?)?
-            .failure(block::Error::ReadOnly.code())?;
+        p.request(7, write_at_body(0, id, 0, 0, one)?)?
+            .failure(block::Error::NotWriter.code())?;
     }
     empty_reply(p, 8, at_id(id)?)?;
     p.request(6, at(id, 0, 0, one)?)?
@@ -363,6 +432,7 @@ fn registered_write(p: &mut Probe) -> Result<(), Fail> {
     if i.read_only {
         return Ok(());
     }
+    let token = claim(p)?;
     let n = i.sector_size as usize;
     let last = i.sectors - 1;
     let original = buffer_back(p, 2, transfer(last, 1, dma(bytes(&i, 1))?)?)?;
@@ -379,17 +449,46 @@ fn registered_write(p: &mut Probe) -> Result<(), Fail> {
     );
     let (wid, _) = register(p, out)?;
     let (rid, _) = register(p, back)?;
-    empty_reply(p, 7, at(wid, 0, last, 1)?)?;
+    empty_reply(p, 7, write_at_body(token, wid, 0, last, 1)?)?;
     empty_reply(p, 6, at(rid, 0, last, 1)?)?;
     let read = read_bytes(&view, n)?;
-    drop(buffer_back(p, 3, transfer(last, 1, original)?)?);
-    p.request(4, Encoder::new())?.reply()?;
+    drop(buffer_back(
+        p,
+        3,
+        write_transfer(token, last, 1, original)?,
+    )?);
+    p.request(4, token_body(token)?)?.reply()?;
+    release(p, token)?;
     if read != pattern {
         return Err(
             "the sector read back through a registration is not the one written".to_string(),
         );
     }
     Ok(())
+}
+
+fn writer_permissions(p: &mut Probe) -> Result<(), Fail> {
+    let info = info_of(p)?;
+    p.request(4, token_body(0)?)?
+        .failure(block::Error::NotWriter.code())?;
+    p.request(3, write_transfer(0, 0, 1, dma(bytes(&info, 1))?)?)?
+        .failure(block::Error::NotWriter.code())?;
+    if info.read_only {
+        return p
+            .request(9, Encoder::new())?
+            .failure(block::Error::ReadOnly.code());
+    }
+    let token = claim(p)?;
+    p.request(9, Encoder::new())?
+        .failure(block::Error::LeaseInUse.code())?;
+    p.request(
+        4,
+        token_body(token.checked_add(1).ok_or("lease token overflow")?)?,
+    )?
+    .failure(block::Error::NotWriter.code())?;
+    release(p, token)?;
+    p.request(4, token_body(token)?)?
+        .failure(block::Error::NotWriter.code())
 }
 
 /// A connection holds at most `REGISTRATIONS_MAX` registrations.
@@ -413,6 +512,10 @@ fn not_a_memory_object(p: &mut Probe) -> Result<(), Fail> {
 }
 
 const CASES: &[Case] = &[
+    Case {
+        name: "writer lease: actual connection token, wrong/stale tokens and readonly refusal",
+        check: writer_permissions,
+    },
     Case {
         name: "info: a power-of-two sector size, a capacity and a largest transfer",
         check: info,

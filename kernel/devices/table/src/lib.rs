@@ -9,8 +9,11 @@
 //!
 //! A line names a PCI vendor and device id (four hex digits each), the driver program
 //! (its image is in the device manager's slot `driver.PROGRAM`), and the service name:
-//! the device manager publishes the n-th device a line matches, in PCI order, as
-//! `SERVICEn` (`block0`, `block1`). `#` begins a comment line. The boot image tool
+//! the device manager publishes the n-th device of a service, in PCI order, as
+//! `SERVICEn` (`block0`, `block1`). Several lines may name one service, so devices of
+//! one kind with different drivers share its names: a node image that names both
+//! network cards a cloud offers as `net` publishes whichever the machine has as `net0`.
+//! `#` begins a comment line. The boot image tool
 //! renders the table from its description's `driver` lines; the device manager parses
 //! it with this code.
 
@@ -133,9 +136,6 @@ impl Table {
                 .any(|d| d.vendor == vendor && d.device == device)
             {
                 return err(line, "a device has two drivers");
-            }
-            if table.drivers.iter().any(|d| d.service == *service) {
-                return err(line, "a service name is used by two lines");
             }
             if table.drivers.len() == MAX_DRIVERS {
                 return err(line, "more than 32 drivers");
@@ -260,13 +260,13 @@ driver 1af4:1044 virtio-blk entropy
             .reason,
             "a device has two drivers"
         );
-        assert_eq!(
-            refused(&format!(
-                "{head}driver 1af4:1042 a b\ndriver 1af4:1043 c b\n"
-            ))
-            .reason,
-            "a service name is used by two lines"
-        );
+        // Two drivers may publish one service: its devices are numbered across both.
+        let shared = Table::parse(&format!(
+            "{head}driver 1af4:1041 virtio-net net\ndriver 1ae0:0042 gve net\n"
+        ))
+        .expect("two lines of one service");
+        assert_eq!(shared.drivers.len(), 2);
+        assert_eq!(shared.programs(), ["virtio-net", "gve"]);
         let mut many = String::from(head);
         for i in 0..=MAX_DRIVERS {
             many.push_str(&format!("driver 1af4:{i:04x} p s{i}\n"));

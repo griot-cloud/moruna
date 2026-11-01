@@ -195,7 +195,7 @@ fn dedupe_remembers_across_batches_and_across_a_checkpoint() {
         .apply(state.as_mut(), Payload::table(batch()).expect("p"))
         .expect("apply");
     assert_eq!(first.rows(), 3);
-    assert!(state.footprint().expect("footprint") > 0);
+    assert!(state.footprint().unwrap().expect("footprint") > 0);
     let saved = state.checkpoint().expect("checkpoint").expect("bytes");
     let mut restored = kernel.restore(&ctx, &saved).expect("restore");
     let again = kernel

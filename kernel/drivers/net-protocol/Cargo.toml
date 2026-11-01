@@ -1,0 +1,10 @@
+[package]
+name = "net-protocol"
+description = "moruna.driver.net: a network card's protocol (Ethernet frames out and in, its address, MTU, link and declared offloads), the receive fan-out every network driver serves it with, and its conformance suites for one card and for two cards on one link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

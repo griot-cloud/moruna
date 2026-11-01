@@ -9,7 +9,7 @@
 //! - `map` gives the bytes `read` gives, and a second mapping of the same pages is
 //!   the same memory, read from no device (IF-T14);
 //! - a second client reads a file the first read with no block read (IF-T15);
-//! - the scratch directory refuses a write past its quota, and is the task's own;
+//! - the scratch directory refuses a write past its account's limit, and is the task's own;
 //!   nothing is written to the image (IF-T16);
 //! - the protocol's conformance suite (IF-T17).
 
@@ -29,7 +29,9 @@ use alloc::{
 
 use imagefs_protocol::{Bytes, READ_MAX, Stat, Stats, imagefs, kind, open};
 use moruna_imagefs::sha256;
-use moruna_svc::{CallError, Channel, Console, Memory, conformance, deadline_in, println, start};
+use moruna_svc::{
+    Account, CallError, Channel, Console, Memory, Rights, conformance, deadline_in, println, start,
+};
 
 moruna_svc::main!(run);
 
@@ -387,8 +389,16 @@ fn cache(a: &mut Client, b: &mut Client, checks: &Checks) -> Result<String, Stri
 }
 
 fn scratch(a: &mut Client, b: &mut Client, checks: &Checks) -> Result<String, String> {
-    let quota = 64 * 1024;
-    call("quota", b.quota(quota))?;
+    // The scratch directory's account (imagefs 1.2, SDD 20 f.18): carved here, given to
+    // the second connection, and the kernel holds the directory to it.
+    let quota = 256 * 1024;
+    let account = Account::carve(quota, "imagefs-test.scratch")
+        .map_err(|e| format!("carving an account of {quota} bytes: {}", e.name()))?;
+    let given = account
+        .0
+        .duplicate(Rights::READ | Rights::WRITE)
+        .map_err(|e| format!("duplicating the account: {}", e.name()))?;
+    call("scratch_account", b.scratch_account(given))?;
     let (file, _) = call(
         "/tmp/q",
         b.open(
@@ -409,8 +419,16 @@ fn scratch(a: &mut Client, b: &mut Client, checks: &Checks) -> Result<String, St
             break false;
         }
     };
-    if !refused || written + 16 * 1024 <= quota - 1024 {
-        return Err(format!("the quota of {quota} took {written} bytes"));
+    // Each 16 KiB of a file is a memory object charged its pages and its record, so the
+    // account fills a little before the bytes reach its limit, never after.
+    let used = account
+        .usage()
+        .map_err(|e| format!("reading the account: {}", e.name()))?;
+    if !refused || written + 2 * 16 * 1024 <= quota || used.used > used.limit {
+        return Err(format!(
+            "an account of {quota} took {written} bytes ({} charged to it) before a write was refused",
+            used.used
+        ));
     }
     let left = call("/tmp/q", b.fstat(file))?;
     if left.size != written {
@@ -471,8 +489,121 @@ fn scratch(a: &mut Client, b: &mut Client, checks: &Checks) -> Result<String, St
     }
     call("/tmp/q", b.close(file))?;
     Ok(format!(
-        "/tmp took {written} bytes of a {quota}-byte quota and refused the next write with NoSpace; another task does not see it; writing, making, removing and truncating in the image were each refused with ReadOnly, and {some_file} reads as before"
+        "/tmp took {written} bytes of a {quota}-byte account, which the kernel charged {} bytes, and refused the next write with NoSpace; another task does not see it; writing, making, removing and truncating in the image were each refused with ReadOnly, and {some_file} reads as before",
+        used.used
     ))
+}
+
+/// Actual server/SDK capability proof, not a host filesystem model.
+fn readonly_view(listener: &Channel) -> Result<String, String> {
+    let mut source = connect(listener)?;
+    call(
+        "asset dir",
+        source.mkdir(Bytes(b"/tmp/assets".to_vec()), 0o700),
+    )?;
+    let (file, _) = call(
+        "asset file",
+        source.open(
+            Bytes(b"/tmp/assets/value".to_vec()),
+            open::CREATE | open::WRITE,
+            0o600,
+        ),
+    )?;
+    call(
+        "asset write",
+        source.write(file, 0, Bytes(b"original".to_vec())),
+    )?;
+    let channel = call(
+        "export_directory",
+        source.export_directory(Bytes(b"/tmp/assets".to_vec())),
+    )?;
+    let mut view = Client::connect(channel, deadline_in(30 * SECONDS))
+        .map_err(|e| format!("view hello: {e:?}"))?;
+    view.core().set_timeout(30 * SECONDS);
+    let (read, _) = call("view value", view.open(Bytes(b"/value".to_vec()), 0, 0))?;
+    if call("view read", view.read(read, 0, 32))?.0 != b"original" {
+        return Err("wrong source bytes".into());
+    }
+    for path in [
+        b"/../value".as_slice(),
+        b"/../../tmp/assets/value".as_slice(),
+    ] {
+        if !matches!(
+            view.stat(Bytes(path.to_vec()), true),
+            Err(CallError::Remote(imagefs::Error::BadPath))
+        ) {
+            return Err("view parent escape accepted".into());
+        }
+    }
+    if !matches!(
+        view.open(Bytes(b"/value".to_vec()), open::WRITE, 0),
+        Err(CallError::Remote(imagefs::Error::ReadOnly))
+    ) {
+        return Err("view write-open accepted".into());
+    }
+    if !matches!(
+        view.write(read, 0, Bytes(b"bad".to_vec())),
+        Err(CallError::Remote(imagefs::Error::ReadOnly))
+    ) {
+        return Err("view write accepted".into());
+    }
+    if !matches!(
+        view.mkdir(Bytes(b"/new".to_vec()), 0o700),
+        Err(CallError::Remote(imagefs::Error::ReadOnly))
+    ) {
+        return Err("view mkdir accepted".into());
+    }
+    if !matches!(
+        view.remove(Bytes(b"/value".to_vec())),
+        Err(CallError::Remote(imagefs::Error::ReadOnly))
+    ) {
+        return Err("view remove accepted".into());
+    }
+    if !matches!(
+        view.truncate(read, 0),
+        Err(CallError::Remote(imagefs::Error::ReadOnly))
+    ) {
+        return Err("view truncate accepted".into());
+    }
+    if !matches!(
+        view.rename(Bytes(b"/value".to_vec()), Bytes(b"/moved".to_vec())),
+        Err(CallError::Remote(imagefs::Error::ReadOnly))
+    ) {
+        return Err("view rename accepted".into());
+    }
+    // The same live source object, not a copied directory or pathname alias.
+    call(
+        "source update",
+        source.write(file, 0, Bytes(b"updated!".to_vec())),
+    )?;
+    if call("view updated", view.read(read, 0, 32))?.0 != b"updated!" {
+        return Err("view is not the actual source object".into());
+    }
+    call("source close", source.close(file))?;
+    drop(source);
+    if call("view after source close", view.read(read, 0, 32))?.0 != b"updated!" {
+        return Err("view lost source lifetime".into());
+    }
+    call("view close", view.close(read))?;
+    Ok("actual readonly source directory retained after source disconnect; mutations and parent escapes refused".into())
+}
+
+/// KB5-T9: the account protocol cannot decode old unchecked-budget requests.
+fn old_major_refused(listener: &Channel) -> Result<(), String> {
+    let channel = moruna_svc::connect(listener).map_err(|e| format!("connecting: {e:?}"))?;
+    let old = moruna_svc::protocol::ProtocolId::new(imagefs::ID.name, 1, 1);
+    match moruna_svc::ClientCore::connect(channel, old, deadline_in(5 * SECONDS)) {
+        Err(moruna_svc::CallError::Refused(refusal))
+            if refusal.reason == moruna_svc::protocol::Refusal::MajorMismatch
+                && refusal.server == imagefs::ID.hello() =>
+        {
+            Ok(())
+        }
+        other => Err(format!(
+            "the old major was not refused before requests: {:?}",
+            other.map(|_| ())
+        )),
+    }
 }
 
 fn run() -> i64 {
@@ -483,6 +614,14 @@ fn run() -> i64 {
         println!(out, "KC2 imagefs-test: FAIL: no fs slot");
         return 1;
     };
+    if let Err(why) = old_major_refused(&listener) {
+        println!(out, "KB5 imagefs protocol: FAIL: {}", why);
+        return 1;
+    }
+    println!(
+        out,
+        "KB5 imagefs protocol: ok: major 1 rejected at hello; account/readonly capability protocol 3.0 required"
+    );
     let checks = match checks() {
         Ok(c) => c,
         Err(e) => {
@@ -515,6 +654,7 @@ fn run() -> i64 {
         }
         Err(e) => report("cache", Err(e)),
     }
+    report("readonly capability", readonly_view(&listener));
     drop(a);
     let suite = imagefs_protocol::suite();
     let mut bad = 0;

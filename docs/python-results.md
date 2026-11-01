@@ -39,6 +39,16 @@ moruna.explain(job, *, planner=None) -> dict
 
 Returns the plan Moruna would run the job document `job` by (a path, or the document's bytes), without running it. The dictionary contains `id`, `job_digest`, `planner`, `resources`, `steps` (each with `id`, `tasks`, `depends_on`, `group`, `resources` and `cost`, every cost field a `p50`, `p95`, `unit`, `basis` and `observations`), `groups` (the steps that may run side by side, in the order they start) and `totals` (`finish`, `critical_path`, `peak_memory_bytes` and the resources held). The same document gives the same step ids every time, and the events of its run name them. A refused document raises `moruna.ConfigError` naming the field; an unknown planner raises `moruna.PlanError`.
 
+## `moruna.check`
+
+```python
+moruna.check(target, *, kernel=None, seed=0, warm_up=True, store=None, budget=60.0,
+             statistics=None, model=None, sandbox_python=None, sandbox_cgroup=None,
+             args=None, assets=None) -> dict
+```
+
+Checks every kernel in `target` (a module name, a `.py` file or a package) against its declared schemas and warms up each one that agrees, as `moruna check --json` does, and returns the same report: `exit`, `error` and `kernels`, one report per kernel. A kernel's `warm_up` holds `cost_per_10000_rows` (each field a `p50`, `p95`, `unit`, `basis` and `observations`), `kernel` (start-up, speed-up at 2 and 4 workers, state and checkpoint), `skew` and `selectivity` (marked `value_dependent`, since generated data has no real distribution), `progress` (how far the warm-up got and why it stopped), and `consumed` (wall and worker seconds, memory and the bytes written to the store, for charging). When a warm-up cannot run, `warm_up` holds `error` instead and `exit` is 2. `store` is the observation store's directory, `budget` the warm-up's seconds, `statistics` the input table's statistics (a dictionary, or a path to a JSON file) and `model` the cost model by name.
+
 ## Exceptions
 
 Runtime exceptions inherit from `moruna.MorunaError`, which inherits from `Exception`. Runtime-created instances expose `kind: str`, `message: str`, `diagnostic: dict`, `run_id: str | None`, `manifest: str | None`, and `report: RunReport | None`. Constructor validation can instead raise ordinary `TypeError` or `ValueError`.

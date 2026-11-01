@@ -193,6 +193,60 @@ pub(crate) fn project(steps: &[Step], batch: &RecordBatch) -> Result<RecordBatch
     batch_of("select", schema, columns, batch.num_rows())
 }
 
+/// One fused projection with explicit logical-prefix materialization only where requested.
+/// Cast results are shared between prefix plans, and final output is still planned as one
+/// fused projection (including dropped-column elimination when that column is not retained).
+pub(crate) fn project_tapped(
+    steps: &[Step],
+    batch: &RecordBatch,
+    wanted: impl Fn(usize) -> bool,
+    mut emit: impl FnMut(usize, &RecordBatch) -> Result<()>,
+) -> Result<RecordBatch> {
+    let mut cached: Vec<(usize, Vec<(DataType, bool)>, ArrayRef)> = Vec::new();
+    let mut final_batch = None;
+    for end in 1..=steps.len() {
+        if end != steps.len() && !wanted(end - 1) {
+            continue;
+        }
+        let planned = plan_projection(&steps[..end], &batch.schema())?;
+        let mut columns = Vec::with_capacity(planned.len());
+        for column in &planned {
+            let mut array = batch.column(column.source).clone();
+            for (at, (to, strict)) in column.casts.iter().enumerate() {
+                let chain = &column.casts[..=at];
+                if let Some((_, _, known)) = cached
+                    .iter()
+                    .find(|(source, casts, _)| *source == column.source && casts == chain)
+                {
+                    array = known.clone();
+                } else {
+                    let options = cast::CastOptions {
+                        safe: !strict,
+                        ..Default::default()
+                    };
+                    array = cast::cast_with_options(&array, to, &options).map_err(arrow("cast"))?;
+                    cached.push((column.source, chain.to_vec(), array.clone()));
+                }
+            }
+            columns.push(array);
+        }
+        let schema = Arc::new(Schema::new(
+            planned
+                .iter()
+                .map(|column| Field::new(column.name.clone(), column.ty.clone(), column.nullable))
+                .collect::<Vec<_>>(),
+        ));
+        let output = batch_of("select", schema, columns, batch.num_rows())?;
+        if wanted(end - 1) {
+            emit(end - 1, &output)?;
+        }
+        if end == steps.len() {
+            final_batch = Some(output);
+        }
+    }
+    final_batch.ok_or_else(|| plan("select", "a fused projection has no logical steps"))
+}
+
 /// `fill_null`: each named column's nulls replaced with a literal cast to the column's type.
 pub(crate) fn fill_check(values: &[(String, Literal)], input: &Schema) -> Result<()> {
     for (name, literal) in values {

@@ -51,9 +51,28 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         }
-        let Some((stage, port)) = crate::pick::pick(&shared, worker) else {
-            idle(&shared, worker, &parker);
-            continue;
+        // f.3: the run's policy decides, and the unit runs only under a claim on what it is
+        // predicted to make (contracts d.18, adaptive-runtime 9.4).
+        let (stage, port, claim, learn) = match crate::decide::decide(&shared, worker) {
+            Ok(crate::decide::Decision::Run {
+                stage,
+                port,
+                claim,
+                learn,
+            }) => (stage, port, claim, learn),
+            Ok(crate::decide::Decision::Idle { ready }) => {
+                let started = std::time::Instant::now();
+                idle(&shared, worker, &parker);
+                if ready {
+                    crate::decide::idled_while_ready(&shared, started.elapsed().as_nanos() as u64);
+                }
+                continue;
+            }
+            Err(e) => {
+                crate::policy::terminate(&shared, e);
+                idle(&shared, worker, &parker);
+                continue;
+            }
         };
         #[cfg(test)]
         {
@@ -73,7 +92,16 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         };
-        match run_task(&shared, worker, stage, port, slot, false) {
+        match run_task(
+            &shared,
+            worker,
+            stage,
+            port,
+            slot,
+            false,
+            Some(claim),
+            learn.as_ref(),
+        ) {
             Ok(_) | Err(MorunaError::Cancelled) => {}
             Err(e) => crate::policy::terminate(&shared, e),
         }
@@ -112,7 +140,8 @@ fn run_job(shared: &Shared, worker: u16, job: WorkerJob) -> Result<JobOutput> {
         } => instances::run_restore(shared, worker, stage_ix, instance, &bytes),
         WorkerJob::Probe { stage, port } => {
             let slot = shared.knobs.slots.claim();
-            run_task(shared, worker, stage, port, slot, true).map(|result| match result {
+            run_task(shared, worker, stage, port, slot, true, None, None).map(|result| match result
+            {
                 Some(probe) => JobOutput::Probe(probe),
                 None => JobOutput::Done,
             })
@@ -162,7 +191,10 @@ enum Applied {
 /// One task: f.2's body, on the batch at the head of input port `port`'s queue. With `probing`
 /// it is also f.9's body, which is the same work with a peak reset in front, a sample taken
 /// before the pop and a `Probe` outcome on the record. `slot` is the busy slot the caller
-/// claimed for it, held until the task's counters are down.
+/// claimed for it, held until the task's counters are down. `learn` is the cost model's
+/// prediction the unit was chosen on: a unit that produced is settled against it (f.22), in
+/// memory, before its record is emitted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_task(
     shared: &Shared,
     worker: u16,
@@ -170,6 +202,8 @@ pub(crate) fn run_task(
     port: u16,
     slot: BusySlot<'_>,
     probing: bool,
+    claim: Option<moruna_kernel::Reservation>,
+    learn: Option<&std::sync::Arc<moruna_cost::Prediction>>,
 ) -> Result<Option<ProbeResult>> {
     let stage_ix = match (stage as usize).checked_sub(1) {
         Some(index) if index < shared.stages.len() => index,
@@ -191,11 +225,12 @@ pub(crate) fn run_task(
 
     // f.9: the probe resets the peak and samples before it pops, so the peak it reports is its
     // own; a normal task samples immediately before `apply` (f.2).
-    let mut s0 = Sample::default();
-    if probing {
+    let probe_sample = if probing {
         shared.sampler.reset_peak();
-        s0 = shared.sampler.sample();
-    }
+        Some(shared.sampler.sample()?)
+    } else {
+        None
+    };
 
     // f.7: the claim on the stage is taken before the pop, not after it. The close cascade closes
     // a queue when its producer's input is closed and empty and the producer has no task running,
@@ -207,29 +242,33 @@ pub(crate) fn run_task(
     // and a `None` here is the same race f.4 describes, answered by re-picking. Reported to the
     // PM as a finding on f.2, which names `pop_blocking`.
     entry.running.fetch_add(1, Ordering::SeqCst);
-    let popped = claim_and_pop(shared, input, entry.spec, probing);
-    let Some((morsel, wait_us)) = popped.inspect_err(|_| {
-        entry.running.fetch_sub(1, Ordering::SeqCst);
-    })?
-    else {
-        entry.running.fetch_sub(1, Ordering::SeqCst);
-        return Ok(None);
-    };
-
+    // f.4: the instance is acquired before the pop. A batch the worker has taken is held in the
+    // placement engine's catalog until it is released (placement f.18), so a taken batch cannot
+    // be put back at the tail of its queue the way a lost race once did: the race is settled
+    // before anything is taken.
     let held = match instances::acquire(shared, stage_ix, worker) {
         Ok(Some(held)) => Some(held),
         Ok(None) if entry.pool.is_some() => {
-            // f.4: the stage was admissible only if a slot was free, so this is a race, not a
-            // policy. The morsel goes back and the worker re-picks.
-            let _ = shared.placement.push(input, morsel);
+            // The stage was admissible only if a slot was free, so this is a race, not a
+            // policy: the worker re-picks.
             entry.running.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
         Ok(None) => None,
         Err(e) => {
-            let _ = shared.placement.push(input, morsel);
             entry.running.fetch_sub(1, Ordering::SeqCst);
             return Err(e);
+        }
+    };
+    let popped = claim_and_pop(shared, input, entry.spec, probing);
+    let (morsel, wait_us) = match popped {
+        Ok(Some(found)) => found,
+        other => {
+            if let Some(held) = held {
+                instances::release(shared, stage_ix, held, false);
+            }
+            entry.running.fetch_sub(1, Ordering::SeqCst);
+            return other.map(|_| None);
         }
     };
 
@@ -264,9 +303,32 @@ pub(crate) fn run_task(
     };
     let mut no_state = NoState;
 
-    if !probing {
-        s0 = shared.sampler.sample();
-    }
+    // A failed read cannot produce a trace sample. Release the claimed instance and
+    // task counters before the existing worker error path terminates/cancels the run.
+    let accounting_failed =
+        |state_box: &mut Option<Box<dyn moruna_kernel::KernelState>>, cause, retire| {
+            shared.heartbeat.end_task(worker);
+            if let Some(state) = state_box.take() {
+                instances::release(
+                    shared,
+                    stage_ix,
+                    instances::Held {
+                        index: instance_index,
+                        state,
+                    },
+                    retire,
+                );
+            }
+            entry.running.fetch_sub(1, Ordering::SeqCst);
+            cause
+        };
+    let s0 = match probe_sample {
+        Some(sample) => sample,
+        None => match shared.sampler.sample() {
+            Ok(sample) => sample,
+            Err(cause) => return Err(accounting_failed(&mut state_box, cause, false)),
+        },
+    };
     let t0 = now_ns();
     let c0 = thread_cpu_ns();
     let raw = {
@@ -281,16 +343,40 @@ pub(crate) fn run_task(
     };
     let c1 = thread_cpu_ns();
     let t1 = now_ns();
+    // The unit is done with its input: the share it took is released, before its output is
+    // pushed, so the batch's bytes leave memory first when this was its last consumer
+    // (placement f.18).
+    let released = shared.placement.release(input, seq_in);
+    crate::decide::unit_finished(shared, t1.saturating_sub(t0));
     // What the call asked for, which a counting kernel left on this thread (contracts d.7, E13).
     let alloc = moruna_kernel::take_kernel_alloc();
-    let s1 = shared.sampler.sample();
+    let s1 = match shared.sampler.sample() {
+        Ok(sample) => sample,
+        Err(cause) => {
+            return Err(accounting_failed(
+                &mut state_box,
+                cause,
+                !matches!(&raw, Ok(Ok(_))),
+            ));
+        }
+    };
     shared.heartbeat.end_task(worker);
 
     // f.2: read the footprint while the instance is still held.
-    let state_bytes = state_box
+    let footprint = state_box
         .as_ref()
-        .and_then(|state| state.footprint())
-        .unwrap_or(0);
+        .map(|state| state.footprint())
+        .transpose();
+    let state_bytes = match footprint {
+        Ok(bytes) => bytes.flatten().unwrap_or(0),
+        Err(cause) => {
+            return Err(accounting_failed(
+                &mut state_box,
+                cause,
+                !matches!(&raw, Ok(Ok(_))),
+            ));
+        }
+    };
 
     let applied = match raw {
         Ok(Ok(out)) => Applied::Produced(out),
@@ -322,7 +408,7 @@ pub(crate) fn run_task(
     let mut tier_out = tier_in;
     let mut error = None;
     let mut failure = None;
-    let mut push_error = None;
+    let mut push_error = released.err();
     match applied {
         Applied::Produced(out) => {
             rows_out = out.rows();
@@ -331,7 +417,11 @@ pub(crate) fn run_task(
             let out_morsel = Morsel::new(seq, stage, out, origin);
             // One push into every queue the stage gives to: the batch is shared, never copied
             // (contracts d.16).
-            if let Err(e) = shared.placement.push_to(&entry.outputs, out_morsel) {
+            if push_error.is_some() {
+                // The release failed: the run ends on that error, and nothing is pushed.
+            } else if let Err(e) =
+                crate::decide::admit_push(shared, &entry.outputs, out_morsel, claim)
+            {
                 push_error = Some(e);
             } else {
                 entry.rows_out.fetch_add(rows_out, Ordering::SeqCst);
@@ -343,6 +433,19 @@ pub(crate) fn run_task(
                 entry
                     .busy_ns
                     .fetch_add(t1.saturating_sub(t0), Ordering::SeqCst);
+                crate::learning::settle(
+                    shared,
+                    stage_ix,
+                    learn,
+                    crate::learning::Measured {
+                        rows_in,
+                        bytes_in,
+                        wall_ns: t1.saturating_sub(t0),
+                        cpu_ns: c1.saturating_sub(c0),
+                        rows_out,
+                        bytes_out,
+                    },
+                );
             }
         }
         Applied::Failed(e) => {
@@ -485,21 +588,14 @@ pub(crate) fn emit(shared: &Shared, record: TraceRecord) {
     }
 }
 
-/// Bytes per tier over every queue, for `q_bytes_before` and `q_bytes_after` (d.13). The trace
-/// field names queue bytes and the run report reads the pair as a delta, so the totals over
-/// every queue are what makes `staging_bytes_delta` the change one task caused. A batch fanned
-/// out to several queues is resident once and counted once (contracts d.16).
+/// Bytes per tier the placement engine holds, for `q_bytes_before` and `q_bytes_after` (d.13):
+/// the buffer catalog's totals, every batch once whether it waits in one queue, in several (a
+/// fan-out, contracts d.16) or in a unit's hands, and the `Disk` slot what is only on disk. The
+/// run report reads the pair as a delta, so `staging_bytes_delta` is the change one task caused.
 pub(crate) fn tier_totals(stats: &PlacementStats) -> Vec<u64> {
     let mut totals = vec![0u64; TIER_COUNT];
-    for queue in &stats.queues {
-        for (index, bytes) in queue.bytes_by_tier.iter().enumerate() {
-            if let Some(slot) = totals.get_mut(index) {
-                *slot += bytes;
-            }
-        }
-    }
-    for (slot, shared) in totals.iter_mut().zip(stats.shared_by_tier.iter()) {
-        *slot = slot.saturating_sub(*shared);
+    for (slot, bytes) in totals.iter_mut().zip(stats.catalog.resident_by_tier.iter()) {
+        *slot = *bytes;
     }
     totals
 }

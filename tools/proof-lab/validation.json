@@ -1,0 +1,139 @@
+{
+  "recorded_client_date": "2026-11-01",
+  "branch": "codex/moruna-consolidated-20261101",
+  "base_head": "38447a99447151aec77eb28272a8a32e682052f3",
+  "source_candidate_patch_sha256": "371fcf02b04d5b4659dea879bdf55422f1e522a5984fdadb229fb3911113a6fe",
+  "candidate_path_changes": 1105,
+  "latest_frozen_source": {
+    "archive_sha256": "7276fa78291a44d5fbb6f631359d87a89e8ca9a20da54a8e946750dce0c09cdf",
+    "archive_bytes": 137489647,
+    "inputs_census_sha256": "f0ef4f206d0cc7913538a660f914201262f89e0d130c1d13d1cfa858c6eb91cb",
+    "source_census_sha256": "1d00986233d148a401994f741e8be63fe4571567017613c75e7ae49398b56e64",
+    "cargo_lock_sha256": "1caedfbc967afa51d87907f057928d3f5b5fd7808640084c33a7153cb771f1a0"
+  },
+  "latest_private_common_sha256": "d4f5ac087c1a8517143629b06bd44b7f77f036f0f1d2a94c22927002ccb55720",
+  "latest_private_adapter_sha256_before_documentation_normalization": "f7157d92b2142bb034f660068f4201bf4f1573e83951ee5b2f7c616124f19705",
+  "latest_correction_execution": "NOT RUN; previously passed case1 does not certify corrected source",
+  "runs": [
+    {
+      "run": "moruna-proof-501-45b8167b8230",
+      "summary_sha256": "6f13578a06b95cc1c2e46959aca23b8b8c0bce79dfa20115fd5c4eaac5d729a2",
+      "phase": "witness-tests",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "a6e12073007e9d5b6183a039fb28716eb3cb631c61955f4747f18fbf7cf4d6bf",
+      "inputs_census_sha256": "04f3498f4c4e2e62f6b574a2b453c50c4ab7eb8bcf761f31a914d610eca91e0a",
+      "scope": "14 host witness tests passed; not kernel execution"
+    },
+    {
+      "run": "moruna-proof-501-568870ac5dd3",
+      "summary_sha256": "059ebe72759365541bdf443a8694ea2b2cf6c8c73e95c76192fbd1c2a492e470",
+      "phase": "link",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "16c10d15d973f3dd157164228ded1ab929bc90a127715c7d2281f66f642e2787",
+      "inputs_census_sha256": "daf9e7d8cd2ad7a9bb0a16d425c2b5d922860d291bfbe12b07a31720fdb4b66d",
+      "scope": "52 native artifacts and permission-origin fixture; not KVM deployment"
+    },
+    {
+      "run": "moruna-proof-501-3e682418af86",
+      "summary_sha256": "4ec504692b0fd9d9e814e174bbc6fba2e3d0e7d848ef73b4811cea956bc70235",
+      "phase": "personality-artifacts",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "7581ec2121187bde7c220619ccf6540be47420600080faa22df2ff63f72c2beb",
+      "inputs_census_sha256": "cb19b3ea1e5cc28eabe50034dc64cc7e81016b08afb6af08da8f8ce05c084525",
+      "scope": "Engine build with 21 focused tests passed"
+    },
+    {
+      "run": "moruna-proof-501-86ac3876204d",
+      "summary_sha256": "537e16cf810e5cb0d505acaf4ec9c2d3e4c74e9fba0309a208b7ff8f350f3e76",
+      "phase": "sdk-proof-build",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "d41132f402882cd2c5123fd750d52921607a078009e13b942836f7adb6be785e",
+      "inputs_census_sha256": "e8d9a533730defb8bf05f40f04ce8a87cd4c0679fd0718efc5dd8914259e98ab",
+      "scope": "Six sink-ack tests and one ARM driver passed; source predates diagnostic correction"
+    },
+    {
+      "run": "moruna-proof-501-c04dd942e5fb",
+      "summary_sha256": "1f329fb8b7ab9089cf7b0c45744bfb7c638c4698c32b2ddf36d135c8af966855",
+      "phase": "profile",
+      "guest_exit": 1,
+      "cleanup": true,
+      "source_archive_sha256": null,
+      "inputs_census_sha256": null,
+      "scope": "CPU1 case1 passed; case2 failed; cases3-5 unrun"
+    }
+  ],
+  "CPU1_cases": [
+    {
+      "case": 1,
+      "result_sha256": "bf66e57bd8f3811edb23f2c0768987626ed3373a210311b1f6a016838ef34ac1",
+      "passed": true,
+      "cleanup": true,
+      "inputs_sha256": "38d5e4a9d7100fbc391aa6fb2b925a7b75a9b36d40ae8f2e33e880f6da309991",
+      "run_id": "c1000101000000000000000000000000",
+      "owned_children": [],
+      "inputs_unchanged": true,
+      "error": null
+    },
+    {
+      "case": 2,
+      "result_sha256": "c102f406519b377ad5cd680dbbdfc81f32d54c0647e4a32252b96d2073bd7222",
+      "passed": false,
+      "cleanup": false,
+      "inputs_sha256": "38d5e4a9d7100fbc391aa6fb2b925a7b75a9b36d40ae8f2e33e880f6da309991",
+      "run_id": "c1000102000000000000000000000000",
+      "owned_children": [],
+      "inputs_unchanged": true,
+      "error": "Command '['/proof/build/kd3-native-proof', '/proof/evidence/cpu1/case2/sdk-config.json']' returned non-zero exit status 1."
+    }
+  ],
+  "remaining": [
+    "Rebuild driver from corrected source and run six focused tests",
+    "Run all five canonical SDK cases in order on CPU1, CPU2 and CPU4 with same inputs",
+    "Run native connection/refusal and durable storage/recovery proof",
+    "Run actual Linux x86 KVM staging",
+    "Verify full Griot application on Moruna"
+  ],
+  "large_local_artifact_store": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux",
+  "artifact_note": "Source and proof tooling are tracked here. Large raw logs, compiler caches, vendor archives and executable/VM images remain local artifacts and are not part of this commit.",
+  "consolidation_checks": {
+    "rust_format": "PASS cargo fmt --all -- --check",
+    "docs": "PASS 26 pages",
+    "python_syntax": "PASS 76 changed Python files",
+    "shell_syntax": "PASS 5 changed shell files",
+    "merge_markers": "None in authored source",
+    "no_stubs": "PASS after equivalent invalid-header fixture replacement",
+    "DCO_self_test": "PASS",
+    "authored_whitespace": "PASS excluding byte-preserved vendored/generated sources and patch fixture",
+    "clippy": "DEFERRED before compiler start: Griot VM holds shared heavy-work reservation",
+    "full_tests_coverage_python": "NOT RUN for consolidated branch",
+    "normal_commit_hook": "Stopped at clippy resource guard; no commit created by that attempt",
+    "Griot_changes": "None during consolidation, baseline diff and status hashes verified"
+  },
+  "consolidation_source_adjustments": [
+    "Preserved pre-existing BOARD, SDD10 and governed regression edits through clean three-way reconciliation",
+    "Normalized two documentation heading punctuation marks for repository conventions",
+    "Changed invalid ServedCall test magic from XXXX to NOPE to avoid false stub-marker detection; same Magic rejection assertion",
+    "Included independently reviewed exact one-file failure-diagnostic adapter validation patch"
+  ],
+  "publication_authorization": {
+    "client_date": "2026-11-01",
+    "human_instruction": "Push WIP snapshot; defer heavy checks",
+    "scope": "This Moruna integration branch only; no Griot source/service changes; no deployment",
+    "hook_handling": "Existing MORUNA_SKIP_QUALITY=1 for this authorized WIP commit/push only; no persistent hook/config change"
+  },
+  "source_assembly_base_head": "38447a99447151aec77eb28272a8a32e682052f3",
+  "publication_base_head": "67c0787046c8b2d1fce7e17cb194a1a6dd49a6e2",
+  "excluded_compiler_output_history": {
+    "commit": "4864632fa7f66e935b271eefbd98d2b22a7ec418",
+    "files": 4458,
+    "bytes": 2184376510,
+    "source_fixes": "Retained in consolidated tree",
+    "local_artifacts": "Retained on disk",
+    "original_integration_branch": "Unchanged",
+    "initial_upload": "Stopped; no remote branch created"
+  }
+}

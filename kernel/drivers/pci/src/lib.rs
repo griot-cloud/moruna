@@ -391,6 +391,8 @@ impl Msix {
 }
 
 #[cfg(target_os = "none")]
+pub mod dma;
+#[cfg(target_os = "none")]
 pub mod function;
 
 #[cfg(test)]

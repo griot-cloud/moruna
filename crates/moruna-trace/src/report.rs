@@ -58,10 +58,11 @@ pub struct RunMeta {
     pub controller_notes: Vec<String>,
     /// Every shrink the facade's watcher started, and how long its drain took.
     pub drains: Vec<DrainSummary>,
-    /// The whole process's high-water mark over the run, as the operating system counts it
-    /// (`Sampler::process_peak`): what the report's peak is, for every shape of run, a chain
-    /// with no kernel included.
+    /// The sampler's high-water mark in `memory_basis`, including a chain with no
+    /// kernel. Native Account marks are observed pressure, never exact RSS.
     pub process_peak: ProcessPeak,
+    /// Sampler pressure basis; serialized as an additive plain metadata label.
+    pub memory_basis: moruna_kernel::MemoryBasis,
     /// What the whole process consumed over the run, measured (`Sampler::process_usage`).
     pub process_usage: ProcessUsage,
     /// What the engine behind the sink said about the write it committed
@@ -71,6 +72,255 @@ pub struct RunMeta {
     /// What the engine behind the source said about the read it planned
     /// (`Source::read_report`); `None` for a source with no such engine.
     pub read: Option<SourceRead>,
+    /// The placement engine's buffer catalog at the end of the run (placement f.18); `None` for
+    /// a run given a placement of its own.
+    pub buffers: Option<BufferReport>,
+    /// What the scheduling policy decided and left unused (10 f.3, adaptive-runtime 9.7);
+    /// `None` when the run never started its scheduler.
+    pub policy: Option<PolicyReport>,
+}
+
+/// What the scheduling policy did over a run (adaptive-runtime 9.7, 10), for the benchmark
+/// matrix to compare policies by.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PolicyReport {
+    /// The policy in use.
+    pub name: String,
+    /// Decisions made, and the nanoseconds they took.
+    pub decisions: u64,
+    /// Nanoseconds spent deciding.
+    pub decision_ns: u64,
+    /// Decisions over their budget, and those the baseline made in their place.
+    pub over_budget: u64,
+    /// Decisions the baseline made because the last was over budget.
+    pub fallbacks: u64,
+    /// Units run, and units chosen whose claim was not granted.
+    pub admitted: u64,
+    /// Units chosen whose claim was not granted.
+    pub not_claimed: u64,
+    /// Seconds workers idled while a unit was ready.
+    pub idle_ready_s: f64,
+    /// Budget bytes neither resident nor claimed while a unit was ready, times seconds.
+    pub unused_ready_byte_s: f64,
+    /// Pushes memory could not admit, written straight to disk.
+    pub overflow_spills: u64,
+    /// Pushes that waited for room.
+    pub push_waits: u64,
+    /// Decisions the policy made with a shallower procedure to keep to its budget (lookahead
+    /// falling to greedy).
+    pub shallower: u64,
+    /// Simulations the policy ran, and those that could not be run, with the first reason.
+    pub simulations: u64,
+    /// Simulations that could not be run.
+    pub simulation_errors: u64,
+    /// Why the first could not be.
+    pub simulation_error: Option<String>,
+    /// Units run whose prediction came from the cost model, and from measured ratios.
+    pub predicted_by_model: u64,
+    /// Units run predicted from measured ratios.
+    pub predicted_by_ratio: u64,
+    /// What the run's learning did (adaptive-runtime 9.6); `None` when no cost model was set.
+    pub learning: Option<LearningReport>,
+    /// What deciding and learning cost, part by part (adaptive-runtime 0, G9).
+    pub overhead: OverheadReport,
+}
+
+/// What the adaptive machinery cost a run (adaptive-runtime 0, G9), seconds and counts.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OverheadReport {
+    /// Units run and their wall time summed.
+    pub units: u64,
+    /// The units' wall time summed.
+    pub unit_s: f64,
+    /// Gathering what decisions read, part of their budget.
+    pub gather_s: f64,
+    /// Of it, asking the cost model, how often, and how often a stage's cache answered.
+    pub predict_s: f64,
+    /// Times the model was asked.
+    pub predictions: u64,
+    /// Times a stage's cache answered.
+    pub cached: u64,
+    /// Of the gathering, the stages' snapshot.
+    pub snapshot_s: f64,
+    /// The policy's decisions.
+    pub decide_s: f64,
+    /// Settling units into the models, on the workers, and how many.
+    pub learn_s: f64,
+    /// Units settled.
+    pub learned: u64,
+    /// The share of the units' time the three above took: what the run paid for adapting.
+    pub share: f64,
+    /// Appending to the store and writing the fitted state, on the learning thread.
+    pub store_s: f64,
+    /// Writing the fitted state.
+    pub save_s: f64,
+    /// The run's end waiting for the learning thread, after its output was complete.
+    pub drain_s: f64,
+}
+
+/// What the run's cost model learned (adaptive-runtime 9.6, 9.7).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LearningReport {
+    /// The deciding model, `name@version`.
+    pub model: String,
+    /// The model in shadow.
+    pub shadow: Option<String>,
+    /// Units observed, written to the store, and not written.
+    pub observed: u64,
+    /// Observations written to the store.
+    pub written: u64,
+    /// Observations not written.
+    pub unwritten: u64,
+    /// Why the first was not written.
+    pub store_error: Option<String>,
+    /// Outcomes refused as no measurement.
+    pub refused: u64,
+    /// Why the first was refused.
+    pub refusal: Option<String>,
+    /// Every spell of drift: the stage, the target, the unit it began at, how many units it
+    /// lasted and whether it settled.
+    pub drifts: Vec<DriftReport>,
+}
+
+/// One spell of a stage's drift.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DriftReport {
+    /// The stage.
+    pub stage: StageId,
+    /// The target whose outcomes left the spread.
+    pub target: String,
+    /// The stage's units observed when it began.
+    pub at_unit: u64,
+    /// Units observed while it drifted.
+    pub units: u64,
+    /// Whether it settled before the run ended.
+    pub settled: bool,
+}
+
+impl PolicyReport {
+    /// The report of the scheduler's figures.
+    pub fn of(stats: &moruna_kernel::PolicyStats) -> PolicyReport {
+        PolicyReport {
+            name: stats.name.clone(),
+            decisions: stats.decisions,
+            decision_ns: stats.decision_ns,
+            over_budget: stats.over_budget,
+            fallbacks: stats.fallbacks,
+            admitted: stats.admitted,
+            not_claimed: stats.not_claimed,
+            idle_ready_s: stats.idle_ready_ns as f64 / 1e9,
+            unused_ready_byte_s: stats.unused_ready_byte_ns as f64 / 1e9,
+            overflow_spills: stats.overflow_spills,
+            push_waits: stats.push_waits,
+            shallower: stats.counters.shallower,
+            simulations: stats.counters.simulations,
+            simulation_errors: stats.counters.simulation_errors,
+            simulation_error: stats.counters.simulation_error.clone(),
+            predicted_by_model: stats.predicted_by_model,
+            predicted_by_ratio: stats.predicted_by_ratio,
+            overhead: {
+                let o = &stats.overhead;
+                let s = |ns: u64| ns as f64 / 1e9;
+                OverheadReport {
+                    units: o.units,
+                    unit_s: s(o.unit_ns),
+                    gather_s: s(o.gather_ns),
+                    predict_s: s(o.predict_ns),
+                    predictions: o.predictions,
+                    cached: o.cached,
+                    snapshot_s: s(o.snapshot_ns),
+                    decide_s: s(o.decide_ns),
+                    learn_s: s(o.learn_ns),
+                    learned: o.learned,
+                    share: o.share(),
+                    store_s: s(o.store_ns),
+                    save_s: s(o.save_ns),
+                    drain_s: s(o.drain_ns),
+                }
+            },
+            learning: stats.learning.as_ref().map(|l| LearningReport {
+                model: l.model.clone(),
+                shadow: l.shadow.clone(),
+                observed: l.observed,
+                written: l.written,
+                unwritten: l.unwritten,
+                store_error: l.store_error.clone(),
+                refused: l.refused,
+                refusal: l.refusal.clone(),
+                drifts: l
+                    .drifts
+                    .iter()
+                    .map(|d| DriftReport {
+                        stage: d.stage,
+                        target: d.target.clone(),
+                        at_unit: d.at_unit,
+                        units: d.units,
+                        settled: d.settled,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+}
+
+/// What the buffer catalog did over a run (placement f.18, adaptive-runtime 9.7): the figures the
+/// benchmark matrix compares eviction orders and policies by. Per-tier arrays are indexed by
+/// `TierKind::index` (Device, PinnedHost, Host, Disk, Remote).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BufferReport {
+    /// The eviction order the catalog ran with.
+    pub eviction: String,
+    /// The highest bytes resident per tier, every batch once.
+    pub peak_by_tier: Vec<u64>,
+    /// The budget per tier at the end of the run, beside which the peaks are read.
+    pub budget_by_tier: Vec<u64>,
+    /// Bytes written to disk to free memory, and how many batches.
+    pub spilled_bytes: u64,
+    /// Batches spilled.
+    pub spills: u64,
+    /// Bytes read back from disk, and how many batches.
+    pub reloaded_bytes: u64,
+    /// Batches reloaded.
+    pub reloads: u64,
+    /// Batches sent out of memory, by the eviction order or by a policy's spill.
+    pub evictions: u64,
+    /// Times a consumer reached a batch eviction had taken out of memory.
+    pub misses: u64,
+    /// The misses weighted by reload cost: the disk bytes bringing them back moved.
+    pub miss_reload_bytes: u64,
+    /// Shares consumers took and released.
+    pub released: u64,
+    /// Batches freed.
+    pub freed: u64,
+    /// Bytes batches were pushed beyond their reservations.
+    pub overrun_bytes: u64,
+    /// Batches memory could not admit, written straight to disk, and their bytes.
+    pub overflows: u64,
+    /// Their bytes.
+    pub overflow_bytes: u64,
+}
+
+impl BufferReport {
+    /// The report of a catalog that ran with the order named `eviction`.
+    pub fn of(eviction: &str, stats: &moruna_kernel::CatalogStats) -> BufferReport {
+        BufferReport {
+            eviction: eviction.to_string(),
+            peak_by_tier: stats.peak_by_tier.to_vec(),
+            budget_by_tier: stats.budget_by_tier.to_vec(),
+            spilled_bytes: stats.spilled_bytes,
+            spills: stats.spills,
+            reloaded_bytes: stats.reloaded_bytes,
+            reloads: stats.reloads,
+            evictions: stats.evictions,
+            misses: stats.misses,
+            miss_reload_bytes: stats.miss_reload_bytes,
+            released: stats.released,
+            freed: stats.freed,
+            overrun_bytes: stats.overrun_bytes,
+            overflows: stats.overflows,
+            overflow_bytes: stats.overflow_bytes,
+        }
+    }
 }
 
 /// One shrink of the arena and its drain: when the watcher marked regions draining, how
@@ -205,10 +455,14 @@ pub struct RunReport {
     /// The direct paths taken (G-I7).
     #[serde(serialize_with = "io_paths_json")]
     pub io_paths: IoPaths,
-    /// The most anonymous memory the whole process held during the run, as the operating
-    /// system counts it: the sampler's process peak, or a record's `mem_anon_peak` when one is
-    /// higher.
+    /// Legacy pressure-peak field in `memory_basis`: process anonymous residency
+    /// by default, native Account charges with registered outside reservations
+    /// when explicitly labeled. Native peaks are observed, never exact RSS marks.
     pub peak_anon_bytes: u64,
+    /// Meaning of legacy memory-pressure/peak fields; absent means legacy
+    /// ProcessAnon. An explicit native string labels charges, never RSS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_basis: Option<String>,
     /// The process's CPU time over the run, user plus system, nanoseconds, as the operating
     /// system accounted it. Zero when `usage_measured` is false.
     pub cpu_ns: u64,
@@ -266,6 +520,15 @@ pub struct RunReport {
     /// `{"engine", "report"}`. Absent from the JSON for every other run.
     #[serde(serialize_with = "read_json", skip_serializing_if = "Option::is_none")]
     pub read: Option<SourceRead>,
+    /// What the buffer catalog did (placement f.18): bytes spilled and reloaded, evictions, misses
+    /// weighted by reload cost, peaks beside budgets. Absent from the JSON for a run given a
+    /// placement of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffers: Option<BufferReport>,
+    /// What the scheduling policy decided and left unused (10 f.3). Absent from the JSON when
+    /// the run never started its scheduler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyReport>,
 }
 
 /// `SinkWrite` is the contracts' type (d.8); serialised here as `{"engine", "report"}`, the
@@ -646,7 +909,9 @@ impl RunReport {
             notes.insert(0, note);
         }
         if meta.process_peak.bytes > 0 {
-            notes.push(if meta.process_peak.exact {
+            notes.push(if meta.memory_basis == moruna_kernel::MemoryBasis::NativeAccountCharge {
+                "the peak is observed native Account charge pressure, not process RSS or a kernel interval mark".into()
+            } else if meta.process_peak.exact {
                 "the peak is the operating system's own high-water mark of the process".into()
             } else {
                 "the peak is the highest of the samples the run took of the process".into()
@@ -665,6 +930,8 @@ impl RunReport {
             drains: meta.drains.clone(),
             io_paths: meta.io_paths.clone(),
             peak_anon_bytes: peak_anon,
+            memory_basis: (meta.memory_basis != moruna_kernel::MemoryBasis::ProcessAnon)
+                .then(|| meta.memory_basis.as_str().to_string()),
             cpu_ns: meta.process_usage.cpu_ns,
             mem_byte_seconds: meta.process_usage.mem_byte_seconds,
             usage_measured: meta.process_usage.measured,
@@ -691,6 +958,8 @@ impl RunReport {
             late_records: trace.late_records(),
             write: meta.write.clone(),
             read: meta.read.clone(),
+            buffers: meta.buffers.clone(),
+            policy: meta.policy.clone(),
         }
     }
 

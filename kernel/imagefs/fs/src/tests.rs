@@ -958,3 +958,79 @@ fn if_t8_a_failing_device_is_named() {
     );
     let _ = PAGE_U64;
 }
+
+#[test]
+fn kd2_t12_a_mounted_layers_seal_is_its_first_pages_hash() {
+    let (lower, upper) = (lower(), upper());
+    let (cache, _) = mount(vec![lower.clone(), upper.clone()], 64);
+    let seals: Vec<[u8; 32]> = cache
+        .layers()
+        .iter()
+        .map(|l| l.header.seal().unwrap())
+        .collect();
+    assert_eq!(
+        seals,
+        [
+            sha256::digest(&lower[..PAGE]),
+            sha256::digest(&upper[..PAGE])
+        ],
+        "the seal the server reports is the hash the launcher computes of the file's first page"
+    );
+    assert_ne!(seals[0], seals[1], "two layers, two seals");
+}
+
+#[test]
+fn directory_capability_confines_links_and_parent_traversal() {
+    let layer = build_with(
+        &dir(vec![
+            ("outside", file(b"private")),
+            (
+                "assets",
+                dir(vec![
+                    ("inside", file(b"public")),
+                    ("absolute", T::Link("/inside")),
+                    ("escape", T::Link("../outside")),
+                ]),
+            ),
+        ]),
+        |_| {},
+    );
+    let (mut cache, overlay) = mount(vec![layer], 64);
+    let scratch = Scratch::new();
+    let tree = Tree {
+        overlay: &overlay,
+        scratch: &scratch,
+    };
+    let anchor = tree.resolve(&mut cache, b"/assets", true).unwrap();
+    let inside = tree
+        .resolve_at(&mut cache, Some(&anchor), b"/inside", true)
+        .unwrap();
+    assert_eq!(
+        tree.resolve_at(&mut cache, Some(&anchor), b"/absolute", true)
+            .unwrap(),
+        inside
+    );
+    assert_eq!(
+        tree.resolve_at(&mut cache, Some(&anchor), b"/escape", true),
+        Err(Error::BadPath)
+    );
+    assert_eq!(
+        tree.resolve_at(&mut cache, Some(&anchor), b"/../outside", true),
+        Err(Error::BadPath)
+    );
+    assert_eq!(
+        tree.resolve_at(&mut cache, Some(&anchor), b"/outside", true),
+        Err(Error::NotFound)
+    );
+}
+
+#[test]
+fn pinned_scratch_directory_lives_until_its_last_view_closes() {
+    let mut scratch = Scratch::new();
+    let id = scratch.mkdir(0, b"assets", 0o700).unwrap();
+    scratch.open(id).unwrap();
+    scratch.remove(0, b"assets").unwrap();
+    assert!(scratch.info(id).unwrap().directory);
+    scratch.close(id);
+    assert!(scratch.info(id).is_err());
+}

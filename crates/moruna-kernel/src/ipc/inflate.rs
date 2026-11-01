@@ -30,10 +30,9 @@
 use std::io::Read;
 
 use arrow::buffer::Buffer as ArrowBuffer;
-use arrow::datatypes::{DataType, Field};
 use arrow::ipc;
+use moruna_ipc_check::walk::{Plan, Rule, Span};
 
-use super::check::Span;
 use super::host_tier;
 use crate::ALIGNMENT;
 use crate::buffer::{AllocStats, Allocator, Buffer};
@@ -113,44 +112,6 @@ impl Allocator for NoArena {
 
     fn is_pinned(&self) -> bool {
         false
-    }
-}
-
-/// The size a buffer must have, from the message and what is already inflated.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Rule {
-    /// No size is stated: the ceiling bounds it.
-    Free,
-    /// Exactly this many bytes.
-    Exact(u64),
-    /// A validity bitmap of `len` bits, or none.
-    Validity(usize),
-    /// The offsets of a list: `len + 1` of `width` bytes, or none for no values.
-    Offsets { len: usize, width: usize },
-    /// The offsets of a string or binary column: as `Offsets`, inflated and checked, and their
-    /// last states the size of the data after them.
-    Text { len: usize, width: usize },
-    /// The data of the string or binary column whose offsets are in `slot`.
-    Data { offsets: usize },
-}
-
-impl Rule {
-    /// `len` values of `width` bytes.
-    pub(super) fn values(len: usize, width: usize) -> Rule {
-        Rule::Exact((len as u64).saturating_mul(width as u64))
-    }
-
-    /// The values buffer of a column of `data_type` and `len` values.
-    pub(super) fn of_values(data_type: &DataType, len: usize) -> Rule {
-        match data_type {
-            DataType::Boolean => Rule::Exact((len as u64).div_ceil(8)),
-            DataType::FixedSizeBinary(width) => {
-                Rule::values(len, usize::try_from(*width).unwrap_or(usize::MAX))
-            }
-            other => other
-                .primitive_width()
-                .map_or(Rule::Free, |width| Rule::values(len, width)),
-        }
     }
 }
 
@@ -248,122 +209,6 @@ impl<'a, 'i> Packed<'a, 'i> {
             used: 0,
             set_aside: 0,
             zstd: None,
-        })
-    }
-
-    /// Take the buffer at `entry` for the column `field`: its declared size held to the one
-    /// `rule` gives and to what is left of the ceiling, then planned. A string column's offsets
-    /// are inflated now, because the size of its data is their last. Nothing is allocated for a
-    /// buffer that is refused.
-    pub(super) fn take(
-        &mut self,
-        field: &Field,
-        what: &'static str,
-        entry: Span,
-        rule: Rule,
-    ) -> Result<Span, String> {
-        let name = field.name().to_string();
-        let name = name.as_str();
-        let bytes = self
-            .body
-            .get(entry.offset..entry.offset + entry.len)
-            .ok_or_else(|| format!("column {name:?} has a {what} buffer outside the body"))?;
-        let (form, size) = declared(name, what, bytes)?;
-
-        // The sizes the message allows: the one it implies, and up to the next multiple of 8
-        // (Arrow C++ writes a sliced array's buffers padded that far) or, for the data of a
-        // string or binary column, of 64 (it pads those to its IPC alignment); and whether
-        // none at all is also right. A writer that is exact (arrow-rs) and one that pads are
-        // both read, and a size anywhere else is a lie.
-        let (allowed, or_none) = match rule {
-            Rule::Free => (None, false),
-            Rule::Exact(n) => (Some((n, round_up(n, 8))), false),
-            Rule::Validity(len) => {
-                let n = (len as u64).div_ceil(8);
-                (Some((n, round_up(n, 8))), true)
-            }
-            Rule::Offsets { len, width } | Rule::Text { len, width } => {
-                let n = (len as u64).saturating_add(1).saturating_mul(width as u64);
-                (Some((n, round_up(n, 8))), len == 0)
-            }
-            Rule::Data { offsets } => {
-                let slot = self.slots.get(offsets).ok_or_else(|| {
-                    format!("column {name:?} has a {what} buffer with no offsets before it")
-                })?;
-                (Some((slot.data, round_up(slot.data, 64))), false)
-            }
-        };
-        if let Some((low, high)) = allowed
-            && !(low..=high).contains(&size)
-            && !(or_none && size == 0)
-        {
-            let implied = if low == high {
-                format!("{low}")
-            } else {
-                format!("{low} to {high}")
-            };
-            return Err(format!(
-                "column {name:?} has a {what} buffer that declares {size} uncompressed bytes \
-                 where the message implies {implied}"
-            ));
-        }
-
-        let placed = round_up(size, ALIGNMENT as u64);
-        let aside = if matches!(rule, Rule::Text { .. }) {
-            size
-        } else {
-            0
-        };
-        let held = self.used.saturating_add(self.set_aside);
-        let left = self.inflate.ceiling.saturating_sub(held);
-        if placed.saturating_add(aside) > left {
-            return Err(format!(
-                "column {name:?} has a {what} buffer of {size} uncompressed bytes, and {left} of \
-                 the {} bytes this reader may inflate for one batch are left (the batch has \
-                 {held} planned)",
-                self.inflate.ceiling
-            ));
-        }
-
-        let mut slot = Slot {
-            column: name.to_string(),
-            what,
-            at: entry.offset,
-            stored: entry.len,
-            form,
-            size,
-            data: 0,
-            offsets: None,
-        };
-        if let Rule::Text { width, .. } = rule {
-            self.check_working_set(name, what, form, bytes, left.saturating_sub(aside))?;
-            if size > 0 {
-                let tier = host_tier(self.inflate.alloc);
-                let len = usize::try_from(size).map_err(|_| {
-                    format!("column {name:?} has {what} of {size} bytes, more than fits in memory")
-                })?;
-                let mut buffer = self
-                    .inflate
-                    .alloc
-                    .alloc(len, tier)
-                    .map_err(|e| format!("column {name:?} {what}: {e}"))?;
-                self.fill(name, what, form, bytes, &mut buffer[..len])?;
-                // Only the offsets themselves, not the padding after them.
-                let count = usize::try_from(allowed.map_or(size, |(low, _)| low)).unwrap_or(len);
-                slot.data = last_offset(&buffer[..count.min(len)], width)
-                    .map_err(|e| format!("column {name:?} has {what} that {e}"))?;
-                slot.offsets = Some(buffer);
-            }
-        } else {
-            self.check_working_set(name, what, form, bytes, left)?;
-        }
-        self.used = self.used.saturating_add(placed);
-        self.set_aside = self.set_aside.saturating_add(aside);
-        self.slots.push(slot);
-        Ok(Span {
-            offset: entry.offset,
-            len: usize::try_from(size).unwrap_or(usize::MAX),
-            slot: self.slots.len() - 1,
         })
     }
 
@@ -529,6 +374,122 @@ impl<'a, 'i> Packed<'a, 'i> {
         Ok(Inflated {
             message: fbb.finished_data().to_vec(),
             body,
+        })
+    }
+}
+
+impl Plan for Packed<'_, '_> {
+    /// Take the buffer at `entry` for the column `name`: its declared size held to the one
+    /// `rule` gives and to what is left of the ceiling, then planned. A string column's offsets
+    /// are inflated now, because the size of its data is their last. Nothing is allocated for a
+    /// buffer that is refused.
+    fn take(
+        &mut self,
+        name: &str,
+        what: &'static str,
+        entry: Span,
+        rule: Rule,
+    ) -> Result<Span, String> {
+        let bytes = self
+            .body
+            .get(entry.offset..entry.offset + entry.len)
+            .ok_or_else(|| format!("column {name:?} has a {what} buffer outside the body"))?;
+        let (form, size) = declared(name, what, bytes)?;
+
+        // The sizes the message allows: the one it implies, and up to the next multiple of 8
+        // (Arrow C++ writes a sliced array's buffers padded that far) or, for the data of a
+        // string or binary column, of 64 (it pads those to its IPC alignment); and whether
+        // none at all is also right. A writer that is exact (arrow-rs) and one that pads are
+        // both read, and a size anywhere else is a lie.
+        let (allowed, or_none) = match rule {
+            Rule::Free => (None, false),
+            Rule::Exact(n) => (Some((n, round_up(n, 8))), false),
+            Rule::Validity(len) => {
+                let n = (len as u64).div_ceil(8);
+                (Some((n, round_up(n, 8))), true)
+            }
+            Rule::Offsets { len, width } | Rule::Text { len, width } => {
+                let n = (len as u64).saturating_add(1).saturating_mul(width as u64);
+                (Some((n, round_up(n, 8))), len == 0)
+            }
+            Rule::Data { offsets } => {
+                let slot = self.slots.get(offsets).ok_or_else(|| {
+                    format!("column {name:?} has a {what} buffer with no offsets before it")
+                })?;
+                (Some((slot.data, round_up(slot.data, 64))), false)
+            }
+        };
+        if let Some((low, high)) = allowed
+            && !(low..=high).contains(&size)
+            && !(or_none && size == 0)
+        {
+            let implied = if low == high {
+                format!("{low}")
+            } else {
+                format!("{low} to {high}")
+            };
+            return Err(format!(
+                "column {name:?} has a {what} buffer that declares {size} uncompressed bytes \
+                 where the message implies {implied}"
+            ));
+        }
+
+        let placed = round_up(size, ALIGNMENT as u64);
+        let aside = if matches!(rule, Rule::Text { .. }) {
+            size
+        } else {
+            0
+        };
+        let held = self.used.saturating_add(self.set_aside);
+        let left = self.inflate.ceiling.saturating_sub(held);
+        if placed.saturating_add(aside) > left {
+            return Err(format!(
+                "column {name:?} has a {what} buffer of {size} uncompressed bytes, and {left} of \
+                 the {} bytes this reader may inflate for one batch are left (the batch has \
+                 {held} planned)",
+                self.inflate.ceiling
+            ));
+        }
+
+        let mut slot = Slot {
+            column: name.to_string(),
+            what,
+            at: entry.offset,
+            stored: entry.len,
+            form,
+            size,
+            data: 0,
+            offsets: None,
+        };
+        if let Rule::Text { width, .. } = rule {
+            self.check_working_set(name, what, form, bytes, left.saturating_sub(aside))?;
+            if size > 0 {
+                let tier = host_tier(self.inflate.alloc);
+                let len = usize::try_from(size).map_err(|_| {
+                    format!("column {name:?} has {what} of {size} bytes, more than fits in memory")
+                })?;
+                let mut buffer = self
+                    .inflate
+                    .alloc
+                    .alloc(len, tier)
+                    .map_err(|e| format!("column {name:?} {what}: {e}"))?;
+                self.fill(name, what, form, bytes, &mut buffer[..len])?;
+                // Only the offsets themselves, not the padding after them.
+                let count = usize::try_from(allowed.map_or(size, |(low, _)| low)).unwrap_or(len);
+                slot.data = last_offset(&buffer[..count.min(len)], width)
+                    .map_err(|e| format!("column {name:?} has {what} that {e}"))?;
+                slot.offsets = Some(buffer);
+            }
+        } else {
+            self.check_working_set(name, what, form, bytes, left)?;
+        }
+        self.used = self.used.saturating_add(placed);
+        self.set_aside = self.set_aside.saturating_add(aside);
+        self.slots.push(slot);
+        Ok(Span {
+            offset: entry.offset,
+            len: usize::try_from(size).unwrap_or(usize::MAX),
+            slot: self.slots.len() - 1,
         })
     }
 }

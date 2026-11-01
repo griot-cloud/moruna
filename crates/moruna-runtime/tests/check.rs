@@ -1,6 +1,6 @@
 //! H13 through the Rust harness (15 k): a kernel that disagrees with its declaration is refused
-//! naming the column (CK-T1); the profile row a check writes is read by a later run's sizer
-//! (CK-T2); a check never overwrites a profile (CK-T4); every standard kernel passes (CK-T5).
+//! naming the column (CK-T1); every standard kernel passes (CK-T5). What a check costs is
+//! warm-up's, in `tests/warmup.rs`.
 
 #![allow(clippy::result_large_err)]
 
@@ -11,30 +11,23 @@ use std::sync::{Arc, Mutex};
 use moruna_kernel::arrow::datatypes::DataType;
 use moruna_kernel::declare::{ColumnDecl, Declared, SchemaDecl};
 use moruna_kernel::{
-    CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, Payload,
-    PayloadSpec, Sampler as _, SourceSchema,
+    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, Payload, PayloadSpec,
+    SourceSchema,
 };
 use moruna_kernels::{StdKernel, fuse_chain};
 use moruna_runtime::check::{CheckOptions, Verdict, check};
-use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
-use serde_json::{Value, json};
-use support::{Appender, Doubler, Scratch, one_run_at_a_time, write_parquet};
+use serde_json::json;
+use support::{Appender, Doubler, one_run_at_a_time};
 
-/// A kernel with a declaration, over one of the support kernels. It remembers the input schema
-/// the run's chain walk hands it, so a test can say which schema the run keyed its profile by.
+/// A kernel with a declaration, over one of the support kernels.
 struct Declaring {
     inner: Arc<dyn Kernel>,
     declared: Declared,
-    seen: Mutex<Option<SourceSchema>>,
 }
 
 impl Declaring {
     fn new(inner: Arc<dyn Kernel>, declared: Declared) -> Arc<Declaring> {
-        Arc::new(Declaring {
-            inner,
-            declared,
-            seen: Mutex::new(None),
-        })
+        Arc::new(Declaring { inner, declared })
     }
 }
 
@@ -55,7 +48,6 @@ impl Kernel for Declaring {
         self.inner.accepts()
     }
     fn output_schema(&self, input: &SourceSchema) -> moruna_kernel::Result<SourceSchema> {
-        *self.seen.lock().expect("lock") = Some(input.clone());
         self.inner.output_schema(input)
     }
     fn init(&self, ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
@@ -64,16 +56,6 @@ impl Kernel for Declaring {
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
         self.inner.apply(state, input)
     }
-}
-
-/// The process's resident anonymous memory now, as discovery measures it.
-fn resident_now() -> u64 {
-    let discovered = moruna_discovery::discover(&moruna_discovery::DiscoveryInput::default())
-        .expect("discovery");
-    moruna_discovery::Sampler::new(&discovered)
-        .expect("sampler")
-        .sample()
-        .anon_bytes
 }
 
 fn unchanged() -> SchemaDecl {
@@ -86,8 +68,7 @@ fn unchanged() -> SchemaDecl {
 
 #[test]
 fn ck_t1_h13_a_kernel_that_disagrees_is_refused_naming_the_column() {
-    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
-    // its own: no check runs beside it.
+    // A check builds a real arena, which raises every other's baseline: one at a time.
     let _serial = one_run_at_a_time();
     // The appender adds a boolean column; its author declared an integer one.
     let liar = Declaring::new(
@@ -121,7 +102,10 @@ fn ck_t1_h13_a_kernel_that_disagrees_is_refused_naming_the_column() {
             .summary()
             .contains("column `loud`: declared int64, produced bool")
     );
-    assert!(report.profile.is_none(), "a refused kernel seeds nothing");
+    assert!(
+        report.warm_up.is_none(),
+        "a refused kernel is not warmed up"
+    );
 
     // The same kernel, declared truthfully, agrees.
     let honest = Declaring::new(
@@ -145,152 +129,8 @@ fn ck_t1_h13_a_kernel_that_disagrees_is_refused_naming_the_column() {
 }
 
 #[test]
-fn ck_t2_h13_the_profile_row_a_check_writes_is_read_by_a_later_run() {
-    let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("ck_t2");
-    let profiles = scratch.path().join("profiles");
-    let declared = Declared {
-        input: Some(SchemaDecl::from_schema(&support::schema())),
-        output: Some(unchanged()),
-    };
-    let kernel = Declaring::new(Arc::new(Doubler::new()), declared.clone());
-
-    let mut opts = CheckOptions::new("doubler");
-    opts.profiles_dir = Some(profiles.clone());
-    let report = check(kernel.clone(), opts).expect("the harness runs");
-    assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
-    let row = report.profile.clone().expect("a profile");
-    assert!(row.written);
-    let path = row.path.clone().expect("a path");
-    let written: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("the row")).expect("json");
-    assert_eq!(written["runs"], 1);
-    assert_eq!(written["source"], "moruna check");
-    assert_eq!(written["fingerprint"], kernel.fingerprint().to_hex());
-    let check_samples = written["a_k_samples"].as_u64().expect("samples");
-    assert!(check_samples >= 1, "the preferred batch gives a sample");
-
-    // A real run over a Parquet file of that schema, with the same store.
-    let input = scratch.path().join("in.parquet");
-    let out_dir = scratch.path().join("out");
-    std::fs::create_dir_all(&out_dir).expect("out");
-    std::fs::create_dir_all(scratch.path().join("staging")).expect("staging");
-    // Large enough that the controller measures it and writes its profile (11 f.3: a dataset
-    // that fits four times over in the budget is not measured).
-    write_parquet(&input, 4_000_000, 16);
-    let source_path = input.clone();
-    let sink_url = format!("file://{}", out_dir.display());
-    let mut spec = RunSpec::new(
-        SourceSpec::Build(Box::new(move |ctx| {
-            moruna_sources::ParquetSource::new(
-                moruna_sources::ParquetSourceConfig {
-                    urls: vec![format!("file://{}", source_path.display())],
-                    ..Default::default()
-                },
-                ctx.reactor.clone(),
-                ctx.object_metadata()?,
-            )
-            .map(|source| Arc::new(source) as Arc<dyn moruna_kernel::Source>)
-        })),
-        vec![kernel.clone() as Arc<dyn Kernel>],
-        SinkSpec::Build(Box::new(move |ctx| {
-            moruna_sinks::ParquetSink::new(
-                moruna_sinks::ParquetSinkConfig {
-                    url: sink_url.clone(),
-                    row_group_bytes: 2 << 20,
-                    file_bytes: 8 << 20,
-                    ..Default::default()
-                },
-                ctx.reactor.clone(),
-                ctx.alloc.clone(),
-            )
-            .map(|sink| Box::new(sink.with_run_id(ctx.run_id)) as Box<dyn moruna_kernel::Sink>)
-        })),
-    );
-    // What this test is about is the profile, not the budget, so the budget is room above what
-    // the process already holds rather than a fixed number: the budget counts the whole
-    // process, and a test binary rests at a different size on every platform. A fixed 256 MiB
-    // was below the run's own floor on a Linux runner whose test process held 305 MB, and the
-    // run was refused before it could read the profile (2026-09-29). The elastic tests size
-    // their machine the same way.
-    spec.budget = Some(resident_now() + (256 << 20));
-    spec.cpu = Some(2.0);
-    spec.staging_dir = Some(scratch.path().join("staging"));
-    spec.staging_limit = Some(1 << 30);
-    spec.profiles_dir = Some(profiles.clone());
-    let report = match Runtime::run(spec, CancelToken::new()) {
-        Ok(report) => report,
-        Err(error) => panic!("the run did not complete: {error}"),
-    };
-    assert!(
-        !report.notes.iter().any(|n| n.contains("small dataset")),
-        "the dataset must be large enough for the controller to measure: {:?}",
-        report.notes
-    );
-
-    // The run's stage input schema is the declared one, so it looked up this very row...
-    let seen = kernel
-        .seen
-        .lock()
-        .expect("lock")
-        .clone()
-        .expect("the chain walk");
-    let SourceSchema::Table(seen) = seen else {
-        panic!("a table")
-    };
-    assert_eq!(
-        SourceSchema::Table(seen.clone()).hash(),
-        SourceSchema::Table(support::schema()).hash(),
-        "the run keyed its profile by {seen:?}"
-    );
-    // ...loaded it, and merged its own figures into it (11 e.3: runs adds one, samples add up).
-    let merged: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("the row")).expect("json");
-    assert_eq!(
-        merged["runs"], 2,
-        "the run read the row the check wrote: {merged}"
-    );
-    assert!(merged["a_k_samples"].as_u64().expect("samples") > check_samples);
-}
-
-#[test]
-fn ck_t4_a_check_never_overwrites_a_profile() {
-    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
-    // its own: no check runs beside it.
-    let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("ck_t4");
-    let kernel = Declaring::new(
-        Arc::new(Doubler::new()),
-        Declared {
-            input: Some(SchemaDecl::from_schema(&support::schema())),
-            output: Some(unchanged()),
-        },
-    );
-    let run = |notes_expected: bool| {
-        let mut opts = CheckOptions::new("doubler");
-        opts.profiles_dir = Some(scratch.path().to_path_buf());
-        opts.seed = 7;
-        let report = check(kernel.clone(), opts).expect("the harness runs");
-        assert_eq!(report.verdict, Verdict::Agreed);
-        let row = report.profile.expect("row");
-        assert_eq!(row.written, !notes_expected);
-        assert_eq!(!report.notes.is_empty(), notes_expected);
-        row.path.expect("path")
-    };
-    let path = run(false);
-    std::fs::write(&path, "{\"evidence\": true}").expect("overwrite by hand");
-    let again = run(true);
-    assert_eq!(path, again);
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("row"),
-        "{\"evidence\": true}"
-    );
-}
-
-#[test]
 fn ck_t5_every_standard_kernel_passes_check() {
-    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
-    // its own: no check runs beside it.
+    // A check builds a real arena, which raises every other's baseline: one at a time.
     let _serial = one_run_at_a_time();
     let chain = [
         ("cast", json!({"columns": {"a": "double"}})),
@@ -315,7 +155,6 @@ fn ck_t5_every_standard_kernel_passes_check() {
         ),
         ("date_trunc", json!({"column": "t", "unit": "month"})),
     ];
-    let scratch = Scratch::new("ck_t5");
     for (name, args) in chain {
         let kernel = StdKernel::new(name, &args).expect(name);
         let fingerprint = kernel.fingerprint();
@@ -323,7 +162,6 @@ fn ck_t5_every_standard_kernel_passes_check() {
         let mut opts = CheckOptions::new(name);
         opts.kind = "std";
         opts.fingerprint_scheme = "sha256";
-        opts.profiles_dir = Some(scratch.path().to_path_buf());
         let report = check(kernel, opts).expect("the harness runs");
         assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
         assert_eq!(report.exit_code(), 0);
@@ -331,7 +169,6 @@ fn ck_t5_every_standard_kernel_passes_check() {
             report.fingerprint,
             format!("sha256:{}", fingerprint.to_hex())
         );
-        assert!(report.profile.expect("row").written, "{name}");
     }
     // Fused chains are checkable too.
     let fused = fuse_chain(vec![
@@ -350,8 +187,7 @@ fn ck_t5_every_standard_kernel_passes_check() {
 
 #[test]
 fn ck_not_checkable_and_plan_refusals() {
-    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
-    // its own: no check runs beside it.
+    // A check builds a real arena, which raises every other's baseline: one at a time.
     let _serial = one_run_at_a_time();
     // No declarations at all: not checkable, exit 2, and the reason says what is missing.
     let bare: Arc<dyn Kernel> = Arc::new(Doubler::new());
@@ -451,9 +287,8 @@ fn ck_not_checkable_and_plan_refusals() {
 }
 
 #[test]
-fn ck_json_and_summary_carry_the_profile_and_the_gil() {
-    // The check's synthetic batches are this process's memory, which CK-T2's run samples as
-    // its own: no check runs beside it.
+fn ck_json_and_summary_carry_the_gil() {
+    // A check builds a real arena, which raises every other's baseline: one at a time.
     let _serial = one_run_at_a_time();
     let kernel = Declaring::new(
         Arc::new(Doubler::new()),
@@ -476,9 +311,9 @@ fn ck_json_and_summary_carry_the_profile_and_the_gil() {
         "bind is called with the arena"
     );
     let json = report.to_json();
-    assert_eq!(json["moruna_check"], 1);
-    assert_eq!(json["profile"]["gil"], "free_threaded");
-    assert!(json["profile"]["path"].is_null());
+    assert_eq!(json["moruna_check"], 2);
+    assert_eq!(json["gil"], "free_threaded");
+    assert!(json["warm_up"].is_null(), "no warm-up was asked for");
     assert!(report.summary().contains("gil free_threaded"));
     assert!(report.fingerprint.starts_with("blake3:"));
 

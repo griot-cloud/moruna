@@ -9,14 +9,17 @@
 
 use alloc::sync::Arc;
 
-use moruna_abi::{Error, Signals, resource_range};
+use moruna_abi::{Error, Signals, charge, resource_range};
 use ostd::{
     arch::irq::{IRQ_CHIP, MappedIrqLine},
     irq::IrqLine,
     sync::SpinLock,
 };
 
-use crate::signal::Signaller;
+use crate::{
+    account::{Account, Charge},
+    signal::Signaller,
+};
 
 /// The highest global system interrupt number the kernel routes.
 pub const GSI_MAX: u32 = 255;
@@ -66,7 +69,13 @@ enum Line {
 pub struct Interrupt {
     pub signaller: Arc<Signaller>,
     _line: Line,
+    _charge: Charge,
 }
+
+const _: () = assert!(
+    (core::mem::size_of::<Interrupt>() + core::mem::size_of::<Signaller>()) as u64
+        <= charge::OBJECT
+);
 
 fn line_raising(signaller: &Arc<Signaller>) -> Result<IrqLine, Error> {
     let mut line = IrqLine::alloc().map_err(|_| Error::Limit)?;
@@ -76,10 +85,11 @@ fn line_raising(signaller: &Arc<Signaller>) -> Result<IrqLine, Error> {
 }
 
 impl Interrupt {
-    pub fn new(gsi: u32) -> Result<Interrupt, Error> {
+    pub fn new(gsi: u32, account: &Arc<Account>) -> Result<Interrupt, Error> {
         if gsi > GSI_MAX {
             return Err(Error::InvalidArgs);
         }
+        let charge = Charge::new(account, charge::OBJECT)?;
         let chip = IRQ_CHIP.get().ok_or(Error::BadState)?;
         let signaller = Arc::new(Signaller::new(Signals::NONE));
         let line = line_raising(&signaller)?;
@@ -90,13 +100,15 @@ impl Interrupt {
         Ok(Interrupt {
             signaller,
             _line: Line::Gsi { _mapped: mapped },
+            _charge: charge,
         })
     }
 
     /// An interrupt raised by a message, in MSI slot `slot`; returns it with the
     /// message's address and data. A slot another live object holds is `AccessDenied`.
-    pub fn msi(slot: u64) -> Result<(Interrupt, u32, u32), Error> {
+    pub fn msi(slot: u64, account: &Arc<Account>) -> Result<(Interrupt, u32, u32), Error> {
         let slot = usize::try_from(slot).map_err(|_| Error::InvalidArgs)?;
+        let charge = Charge::new(account, charge::OBJECT)?;
         let held = MsiSlot::take(slot)?;
         let signaller = Arc::new(Signaller::new(Signals::NONE));
         let line = line_raising(&signaller)?;
@@ -128,6 +140,7 @@ impl Interrupt {
                     _line: line,
                     _slot: held,
                 },
+                _charge: charge,
             },
             address,
             data,

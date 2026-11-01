@@ -1,0 +1,24 @@
+[package]
+name = "moruna-netstack"
+description = "The network server's logic: smoltcp over one or more moruna.driver.net cards, the sockets of moruna.net and the rights that bound them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+smoltcp = { version = "=0.12.0", default-features = false, features = ["alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-dhcpv4", "proto-dns", "socket-tcp-reno", "socket-tcp-cubic", "iface-max-addr-count-8", "iface-neighbor-cache-count-64", "dns-max-server-count-4", "dns-max-result-count-8"] }
+moruna-svc.workspace = true
+netstack-protocol = { path = "../protocol", version = "=0.1.0" }
+
+rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+ring = { version = "=0.17.14", default-features = false, features = ["alloc", "less-safe-getrandom-custom-or-rdrand"] }
+getrandom = { version = "=0.2.17", features = ["custom"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "crypto"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+heapless = { version = "=0.8.0", default-features = false }

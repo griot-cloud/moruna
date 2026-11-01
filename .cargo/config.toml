@@ -1,0 +1,5 @@
+# SDD32: pinned polyval 0.6.2 autodetect retains keyed state in ManuallyDrop without Drop.
+# The upstream soft backend implements zeroizing Drop. This GLOBAL cfg reaches dependencies;
+# moruna-storage-format/build.rs refuses crypto if an overriding RUSTFLAGS removes it.
+[build]
+rustflags = ["--cfg", "polyval_force_soft"]

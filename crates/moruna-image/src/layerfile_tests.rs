@@ -1,7 +1,7 @@
-//! IF-T1 to IF-T4 (SDD 27, k): layer files written here and read back with
+//! IF-T1 to IF-T4, IF-T13 and IF-T20 to IF-T23 (SDD 27, k): layer files written here and read back with
 //! the microkernel's reader compiled for the host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use moruna_imagefs::format::{Header, Kind, Node, OPAQUE, PAGE};
 
-use super::{Data, Entry, Item, convert, read, tree, write};
+use super::{Data, Entry, Item, convert, difference, read, tree, write};
+use crate::layer::Applied;
 use crate::testing::{Entry as Tar, LayoutBuilder, Scratch, media};
-use crate::{Digest, OciLayout, unpack};
+use crate::{Digest, ImageSource, OciLayout, unpack};
 
 fn file(bytes: &[u8]) -> Entry {
     Entry::File {
@@ -98,7 +99,7 @@ fn if_t1_a_layer_round_trips() {
     ]);
     let out = scratch.path().join("x.layer");
     let written = write(&tree, &out).unwrap();
-    assert_eq!(written.id, Digest::of(&fs::read(&out).unwrap()));
+    assert_eq!(written.id, Digest::of(&fs::read(&out).unwrap()[..PAGE]));
     assert_eq!(
         fs::metadata(&out).unwrap().len(),
         written.pages * PAGE as u64
@@ -551,7 +552,7 @@ fn if_t13_the_fixture_lists_what_its_layers_hold() {
         )
     );
     for (p, id) in &f.layers {
-        assert_eq!(Digest::of(&fs::read(p).unwrap()), *id);
+        assert_eq!(Digest::of(&fs::read(p).unwrap()[..PAGE]), *id);
     }
 }
 
@@ -574,7 +575,7 @@ fn lx_t17_a_directory_as_a_layer() {
     std::os::unix::fs::symlink("bin/hello", root.join("kc1/run")).unwrap();
     let out = scratch.path().join("top.layer");
     let written = write(&tree(&root).unwrap(), &out).unwrap();
-    assert_eq!(written.id, Digest::of(&fs::read(&out).unwrap()));
+    assert_eq!(written.id, Digest::of(&fs::read(&out).unwrap()[..PAGE]));
     let merged = read(&[out]).unwrap();
     assert_eq!(
         merged.get("/kc1/bin/hello"),
@@ -598,4 +599,268 @@ fn lx_t17_a_directory_as_a_layer() {
     if made.is_ok_and(|s| s.success()) {
         assert!(tree(&odd).is_err());
     }
+}
+
+/// What each layer of `layers` did to the root, as the unpacker recorded it, the layers applied
+/// one over another with the unpacker `convert` uses.
+fn applied_of(name: &str, layers: Vec<Vec<Tar>>) -> Vec<Applied> {
+    let scratch = Scratch::new(name);
+    let mut b = LayoutBuilder::new(&scratch.path().join("layout"));
+    for entries in &layers {
+        b = b.layer(media::TAR, entries);
+    }
+    b.finish(Some("img:1"));
+    let layout = OciLayout::open(scratch.path().join("layout")).unwrap();
+    let manifest = layout.manifest("img:1").unwrap();
+    let root = scratch.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let mut skipped = 0;
+    manifest
+        .layers
+        .iter()
+        .map(|d| unpack::apply_layer(&layout, d, &root, &mut skipped).unwrap())
+        .collect()
+}
+
+fn paths(list: &[&str]) -> BTreeSet<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
+}
+
+/// IF-T20: a layer that replaces a file with another of the same size is recorded as having
+/// written it, and the merged tree shows the upper layer's bytes. The difference is the
+/// record's, so it does not depend on whether the filesystem gave the new file the old file's
+/// inode, as ext4 does.
+#[test]
+fn if_t20_a_replaced_file_of_the_same_size_is_written() {
+    let layers = || {
+        vec![
+            vec![
+                Tar::dir("etc"),
+                Tar::file("etc/passwd", b"root:x:0:0:lower"),
+                Tar::file("etc/hosts", b"127.0.0.1 local"),
+            ],
+            vec![Tar::file("etc/passwd", b"root:x:0:0:upper")],
+        ]
+    };
+    let record = applied_of("if_t20_record", layers());
+    assert_eq!(record[1].written, paths(&["etc/passwd"]));
+    assert!(record[1].removed.is_empty() && record[1].opaque.is_empty());
+    let (merged, unpacked) = both("if_t20_merge", layers());
+    assert_eq!(
+        merged.get("/etc/passwd"),
+        Some(&Item::File(0o644, b"root:x:0:0:upper".to_vec()))
+    );
+    assert_eq!(merged, unpacked);
+    assert_eq!(
+        merged.get("/etc/hosts"),
+        Some(&Item::File(0o644, b"127.0.0.1 local".to_vec()))
+    );
+}
+
+/// IF-T21: a symbolic link replaced by a file (not written through), a directory replaced by a
+/// file, and a file replaced by a link, each recorded as written and merged as unpacked.
+#[test]
+fn if_t21_a_replaced_link_or_directory_is_written() {
+    let layers = || {
+        vec![
+            vec![
+                Tar::file("target", b"the target"),
+                Tar::Symlink("link", "target"),
+                Tar::dir("d"),
+                Tar::file("d/inner", b"inner"),
+                Tar::file("f", b"a file"),
+            ],
+            vec![
+                Tar::file("link", b"now a file"),
+                Tar::file("d", b"was a directory"),
+                Tar::Symlink("f", "target"),
+            ],
+        ]
+    };
+    let record = applied_of("if_t21_record", layers());
+    assert_eq!(record[1].written, paths(&["link", "d", "f"]));
+    assert!(record[1].removed.is_empty() && record[1].opaque.is_empty());
+    let (merged, unpacked) = both("if_t21_merge", layers());
+    assert_eq!(merged, unpacked);
+    assert_eq!(
+        merged.get("/link"),
+        Some(&Item::File(0o644, b"now a file".to_vec()))
+    );
+    assert_eq!(
+        merged.get("/target"),
+        Some(&Item::File(0o644, b"the target".to_vec()))
+    );
+    assert_eq!(
+        merged.get("/d"),
+        Some(&Item::File(0o644, b"was a directory".to_vec()))
+    );
+    assert_eq!(merged.get("/f"), Some(&Item::Symlink(b"target".to_vec())));
+    assert!(!merged.contains_key("/d/inner"));
+}
+
+/// IF-T22: the record's shape. What a layer wrote, what it removed of the layers below, and
+/// the directories that hide what is below them, over whiteouts, opaque markers, a directory
+/// made where a file was or where the layer removed a name, parents made on the way, and
+/// paths made and removed in the same layer; and the files merge as the unpacking.
+#[test]
+fn if_t22_the_record_names_what_the_layer_did() {
+    let layers = || {
+        vec![
+            vec![
+                Tar::dir("a"),
+                Tar::file("a/x", b"1"),
+                Tar::dir("a/sub"),
+                Tar::file("a/sub/z", b"3"),
+                Tar::file("f", b"old!"),
+                Tar::Symlink("s", "f"),
+                Tar::dir("d"),
+                Tar::file("d/inner", b"i"),
+                Tar::file("gone", b"g"),
+                Tar::file("k", b"a file"),
+                Tar::dir("r"),
+                Tar::file("r/old", b"o"),
+                Tar::dir("o"),
+                Tar::file("o/lower", b"l"),
+                Tar::dir("o/sub"),
+                Tar::file("o/sub/keep", b"k"),
+                Tar::dir("p"),
+                Tar::file("p/f", b"p"),
+                Tar::dir("q"),
+                Tar::file("q/f", b"q"),
+                Tar::dir("t"),
+                Tar::file("t/x", b"t"),
+            ],
+            vec![
+                Tar::file("f", b"new!"),
+                Tar::file("s", b"now a file"),
+                Tar::file("d", b"was a directory"),
+                Tar::file(".wh.gone", b""),
+                Tar::file(".wh.a", b""),
+                Tar::file("a/n", b"n"),
+                Tar::dir("k"),
+                Tar::file("k/in", b"in"),
+                Tar::file("r/.wh..wh..opq", b""),
+                Tar::file("r/new", b"new"),
+                Tar::file("deep/er/file", b"deep"),
+                Tar::dir("o/sub"),
+                Tar::file("o/.wh..wh..opq", b""),
+            ],
+            vec![
+                Tar::file("p/f", b"made, then its directory goes"),
+                Tar::file("tmp/x", b"made, then removed"),
+                Tar::file(".wh.tmp", b""),
+                Tar::file(".wh.p", b""),
+                Tar::file(".wh.q", b""),
+                Tar::dir("q"),
+            ],
+            vec![
+                Tar::file("o/.wh..wh..opq", b""),
+                Tar::file("o", b"an opaque directory, then a file"),
+                Tar::file(".wh.t", b""),
+                Tar::file("t", b"now a file"),
+            ],
+        ]
+    };
+    let record = applied_of("if_t22_record", layers());
+    assert_eq!(record.len(), 4);
+    assert_eq!(
+        record[1],
+        Applied {
+            written: paths(&[
+                "f",
+                "s",
+                "d",
+                "a",
+                "a/n",
+                "k",
+                "k/in",
+                "r/new",
+                "deep",
+                "deep/er",
+                "deep/er/file",
+                "o/sub",
+            ]),
+            removed: paths(&["gone", "a", "a/x", "a/sub", "a/sub/z", "r/old", "o/lower"]),
+            opaque: paths(&["a", "k", "r", "o"]),
+        }
+    );
+    assert_eq!(
+        record[2],
+        Applied {
+            written: paths(&["q"]),
+            removed: paths(&["p", "q", "q/f"]),
+            opaque: paths(&["q"]),
+        }
+    );
+    assert_eq!(
+        record[3],
+        Applied {
+            written: paths(&["o", "t"]),
+            removed: paths(&["o/sub", "o/sub/keep", "t", "t/x"]),
+            opaque: BTreeSet::new(),
+        }
+    );
+    same("if_t22_merge", layers());
+}
+
+/// IF-T22: what an opaque directory keeps of the layers below is stated by the layer: a
+/// directory the layer names that was there keeps its entries through the marker, as the
+/// unpacking leaves them.
+#[test]
+fn if_t22_an_opaque_directory_states_what_it_keeps() {
+    let layers = || {
+        vec![
+            vec![
+                Tar::dir("o"),
+                Tar::file("o/lower", b"l"),
+                Tar::dir("o/kept"),
+                Tar::file("o/kept/deep", b"deep"),
+            ],
+            vec![Tar::dir("o/kept"), Tar::file("o/.wh..wh..opq", b"")],
+        ]
+    };
+    let record = applied_of("if_t22_keeps_record", layers());
+    assert_eq!(record[1].written, paths(&["o/kept"]));
+    assert_eq!(record[1].opaque, paths(&["o"]));
+    let (merged, unpacked) = both("if_t22_keeps", layers());
+    assert_eq!(merged, unpacked);
+    assert!(merged.contains_key("/o/kept/deep"));
+    assert!(!merged.contains_key("/o/lower"));
+}
+
+/// IF-T22: the root can be opaque: a layer that hides every entry of the layers below it and
+/// adds its own.
+#[test]
+fn if_t22_the_root_can_be_opaque() {
+    let layers = || {
+        vec![
+            vec![Tar::file("a", b"1"), Tar::dir("b"), Tar::file("b/c", b"2")],
+            vec![Tar::file(".wh..wh..opq", b""), Tar::file("new", b"3")],
+        ]
+    };
+    let record = applied_of("if_t22_root_record", layers());
+    assert_eq!(record[1].written, paths(&["new"]));
+    assert_eq!(record[1].removed, paths(&["a", "b", "b/c"]));
+    assert_eq!(record[1].opaque, paths(&[""]));
+    let (merged, unpacked) = both("if_t22_root", layers());
+    assert_eq!(merged, unpacked);
+    assert_eq!(merged.len(), 1);
+    assert!(merged.contains_key("/new"));
+}
+
+/// IF-T23: a record that names a path the working root does not hold is an error that says
+/// so, not a layer written without it.
+#[test]
+fn if_t23_a_record_naming_a_missing_path_is_refused() {
+    let scratch = Scratch::new("if_t23");
+    let root = scratch.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let record = Applied {
+        written: paths(&["nowhere"]),
+        ..Applied::default()
+    };
+    let err = difference(&record, &root).unwrap_err();
+    assert!(err.to_string().contains("nowhere"), "{err}");
+    let nothing = difference(&Applied::default(), &root).unwrap();
+    assert!(matches!(nothing, Entry::Directory { ref children, .. } if children.is_empty()));
 }

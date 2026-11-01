@@ -30,6 +30,10 @@ pub(crate) fn run(
             "run_resumed was called without apply_resume_point".into(),
         ));
     }
+    // f.22, before anything runs: what the run's cost model learns is written by a thread of its own.
+    if let Some(learning) = shared.learning.get() {
+        learning.start()?;
+    }
     *shared.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     shared.set_run_state(RunState::Running);
     shared.tell(moruna_kernel::StageEvent::Running);
@@ -60,7 +64,7 @@ pub(crate) fn run(
 }
 
 /// The exit sequence every ending shares (preamble 4.3, e.2, f.10).
-fn finalize(shared: &Arc<Shared>, exit: Exit) -> crate::RunOutcome {
+fn finalize(shared: &Arc<Shared>, mut exit: Exit) -> crate::RunOutcome {
     match &exit {
         Exit::Completed(_) => shared.set_run_state(RunState::Finishing),
         Exit::Terminated(_) => shared.set_run_state(RunState::Terminating),
@@ -74,9 +78,15 @@ fn finalize(shared: &Arc<Shared>, exit: Exit) -> crate::RunOutcome {
     // every worker waiting in `pop_blocking` (preamble 4.3).
     shared.placement.shutdown();
     join_workers(shared);
+    // f.22: every unit has settled; the learning thread writes what is left and the fitted
+    // state, waited for at most `DRAIN`.
+    if let Some(learning) = shared.learning.get() {
+        learning.finish(shared.cfg.clock.as_ref());
+    }
     shared.sink_mode.set(DRIVE_STOP);
     shared.unpark_all();
     join_drives(shared);
+    shared.checkpoint_quiet.store(true, Ordering::SeqCst);
 
     // f.12: on termination and cancellation the scheduler writes the final manifest itself,
     // from the thread that drives the exit, before the checkpoint thread is stopped, and on
@@ -86,8 +96,20 @@ fn finalize(shared: &Arc<Shared>, exit: Exit) -> crate::RunOutcome {
     checkpoint::stop(shared);
     let final_manifest = shared.checkpoint_enabled()
         && (!matches!(exit, Exit::Completed(_)) || shared.cfg.checkpoint_keep);
-    if final_manifest {
-        let _ = checkpoint::checkpoint_now(shared);
+    if final_manifest && let Err(error) = checkpoint::checkpoint_now(shared) {
+        let portable = shared
+            .manifest_preparation
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if portable {
+            tracing::warn!(target:"sched.checkpoint", error = %error, "final portable checkpoint refused; no new bucket acknowledgement");
+            // A required final publication cannot turn an otherwise complete run into a
+            // successful portable result. Cancellation/termination retain their real cause.
+            if matches!(exit, Exit::Completed(_)) {
+                exit = Exit::Terminated(error);
+            }
+        }
     }
     let manifest = shared
         .last_manifest

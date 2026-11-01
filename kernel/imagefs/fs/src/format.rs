@@ -249,6 +249,14 @@ impl Header {
 
     /// Parses and checks a header page: its checksum, its constants, and that the
     /// layout its counts give is the one it states.
+    /// The layer's seal (SDD 30 f.12): the SHA-256 of its header page. The page is the one
+    /// [`encode`](Header::encode) makes, which is the only page [`parse`](Header::parse)
+    /// accepts for these fields, so the seal of a mounted header is the seal of the file's
+    /// first page; and the page carries the root every other page is checked against.
+    pub fn seal(&self) -> Result<[u8; 32], FormatError> {
+        Ok(sha256::digest(&self.encode()?))
+    }
+
     pub fn parse(p: &[u8]) -> Result<(Header, Geometry), FormatError> {
         if p.len() != PAGE {
             return bad(format!("a header is one page, not {} bytes", p.len()));

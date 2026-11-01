@@ -35,12 +35,14 @@ use moruna_kernel::{
 
 mod checkpoint;
 mod cputime;
+mod decide;
 mod heartbeat;
 mod instances;
 mod knobs;
+mod learning;
 mod lifecycle;
-mod pick;
 mod pipeline;
+pub mod policies;
 mod policy;
 mod probe;
 mod shared;
@@ -50,6 +52,7 @@ mod source_drive;
 mod stats;
 mod worker;
 
+pub use decide::{Clock, DISK_BYTES_PER_SECOND, SystemClock};
 pub use pipeline::{Pipeline, SchedulerConfig, validate_graph};
 
 use shared::Shared;
@@ -84,6 +87,10 @@ pub enum RunOutcome {
 /// the write counts as done (MH 4.7): a failure is a failed manifest write (f.12).
 pub type ManifestHook = Arc<dyn Fn(&std::path::Path) -> Result<()> + Send + Sync>;
 
+/// Acquire actual checkpoint resources before workers/drives are quiesced. The returned
+/// hook owns that admission until publication finishes; refusal leaves the run ungated.
+pub type ManifestPreparation = Arc<dyn Fn() -> Result<ManifestHook> + Send + Sync>;
+
 /// The workers, the drives, the stage table and the admission rule (a).
 pub struct Scheduler {
     shared: Arc<Shared>,
@@ -113,6 +120,33 @@ impl Scheduler {
         instances::init_instances(&self.shared)
     }
 
+    /// The run's cost model (f.22): `online`, the models the embedder opened with the store they
+    /// learn into, and each kernel stage's key, stage 1 first. From here on every unit a policy
+    /// weighs is predicted by the deciding model, every unit that finishes is settled into it,
+    /// and what was learned is written to the store as the run goes and at its end. Refused
+    /// once the run has started, when a model is set already, or when the keys are not one per
+    /// kernel stage.
+    pub fn set_cost(
+        &self,
+        online: Arc<moruna_cost::Online>,
+        keys: Vec<moruna_cost::CostKey>,
+    ) -> Result<()> {
+        if self.shared.run_state() != shared::RunState::Init {
+            return Err(MorunaError::Config {
+                name: "cost.model",
+                msg: "the cost model is set before the run starts".into(),
+            });
+        }
+        let learning = learning::Learning::new(online, keys, self.shared.stages.len())?;
+        self.shared
+            .learning
+            .set(learning)
+            .map_err(|_| MorunaError::Config {
+                name: "cost.model",
+                msg: "the run's cost model is set already".into(),
+            })
+    }
+
     /// What every manifest is handed once it is on disk (MH 4.7).
     pub fn set_manifest_hook(&self, hook: ManifestHook) {
         *self
@@ -120,6 +154,16 @@ impl Scheduler {
             .manifest_hook
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// Install a pre-barrier admission and publication operation. Replaces the ordinary
+    /// manifest hook for this run; no allocation waiting is allowed after the pause begins.
+    pub fn set_manifest_preparation(&self, prepare: ManifestPreparation) {
+        *self
+            .shared
+            .manifest_preparation
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(prepare);
     }
 
     /// The run's record of which stages wait on a port (MH 4.10): read into the counters the

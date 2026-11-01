@@ -252,6 +252,13 @@ macro_rules! protocol {
                     &mut self.core
                 }
 
+                /// The connection underneath, given up whole: for a client that keeps
+                /// requests outstanding while it does other work, as a server does with
+                /// a driver it is the client of.
+                pub fn into_core(self) -> $crate::ClientCore {
+                    self.core
+                }
+
                 /// The next event, waiting until `deadline`.
                 pub fn next_event(&mut self, deadline: u64) -> ::core::result::Result<Event, $crate::CallError<Error>> {
                     let mut frame = self.core.next_event(deadline).map_err($crate::CallError::typed)?;

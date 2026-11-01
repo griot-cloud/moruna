@@ -1,6 +1,8 @@
-//! Issuing moves and observing them (e.4, f.2, f.5, f.6, f.10).
+//! Issuing moves and observing them (e.4, f.2, f.5, f.6, f.10, f.18).
 //!
-//! The planner decides under the queue lock; issuing happens with no lock held, because
+//! A move is a batch's, not an entry's: it is keyed by the batch's id in the catalog, and when it
+//! lands every queue the batch waits in is woken and planned (PL-I18). The planner decides under
+//! the queue lock and the catalog lock; issuing happens with no lock held, because
 //! every reactor call may resolve on the calling thread and its `then` callback takes the
 //! queue lock (preamble 4.2, g). A completion runs the callback on the reactor thread that
 //! resolved it, which is how the engine observes moves without a thread of its own (PL-I14).
@@ -15,7 +17,8 @@ use moruna_kernel::{
 };
 
 use crate::PlacementEngine;
-use crate::plan::{EntryView, Intent, PlanInput, plan};
+use crate::catalog::{BufferId, Catalog};
+use crate::plan::{EntryView, PlanInput, plan};
 use crate::queue::Queue;
 use crate::staging::read::decode_record;
 use crate::staging::segment::{RecordHeader, round_up};
@@ -78,10 +81,10 @@ pub enum InFlight {
 
 /// One move the engine has issued and not yet seen complete (e.2).
 pub struct MoveInFlight {
-    /// The queue.
+    /// The queue the move is counted in: the batch's first consumer's (f.18).
     pub stage: usize,
-    /// The entry.
-    pub seq: Seq,
+    /// The batch.
+    pub buffer: BufferId,
     /// What it is doing.
     pub op: InFlight,
     /// Completions still outstanding.
@@ -92,22 +95,33 @@ pub struct MoveInFlight {
     pub attempt: u8,
     /// The reservation to release when the move settles, if any.
     pub reservation: Option<(usize, u64)>,
-    /// The entry's payload bytes.
+    /// The batch's payload bytes.
     pub bytes: u64,
     /// True for a promotion, false for a demotion.
     pub promote: bool,
 }
 
-/// What `plan_locked` hands the issuer: everything a move needs, and no lock.
+/// What one planning pass of a queue decided (f.2, f.18).
+struct Pass {
+    /// The promotions to issue.
+    tasks: Vec<Task>,
+    /// Per tier, the bytes the catalog is asked to shed from the queue's batches.
+    pressure: Vec<(TierKind, u64)>,
+    /// The first reservation that found no room: the tier slot and the bytes.
+    short: Option<(usize, u64, Option<BufferId>)>,
+}
+
+/// What a planning or shedding pass hands the issuer: everything a move needs, and no lock.
 pub struct Task {
-    stage: usize,
-    stage_id: StageId,
-    seq: Seq,
-    move_id: u64,
-    bytes: u64,
-    promote: bool,
-    reservation: Option<(usize, u64)>,
-    kind: TaskKind,
+    pub(crate) stage: usize,
+    pub(crate) stage_id: StageId,
+    pub(crate) seq: Seq,
+    pub(crate) buffer: BufferId,
+    pub(crate) move_id: u64,
+    pub(crate) bytes: u64,
+    pub(crate) promote: bool,
+    pub(crate) reservation: Option<(usize, u64)>,
+    pub(crate) kind: TaskKind,
 }
 
 /// Why a move could not be issued at all. Only the disk bound of f.2 step 4 turns a
@@ -138,7 +152,7 @@ enum Redo {
     Read(PathBuf, u64, u64),
 }
 
-enum TaskKind {
+pub(crate) enum TaskKind {
     Write {
         from: Tier,
         payload: PayloadRef,
@@ -166,18 +180,45 @@ impl PlacementEngine {
         )
     }
 
-    /// Plan one queue and issue what it decided (f.2). The lock is released before the
-    /// first reactor or allocator call, without exception (preamble 4.2).
+    /// Plan one queue and issue what it decided (f.2), then ask the catalog to shed what the
+    /// queue holds above its water marks and to make room for a promotion that found none
+    /// (f.18). No lock is held across a reactor or allocator call, without exception
+    /// (preamble 4.2).
     pub(crate) fn plan_and_issue(&self, index: usize) {
         if self.is_shutting_down() {
             return;
         }
-        let tasks = {
+        let (
+            Pass {
+                tasks,
+                pressure,
+                short,
+            },
+            target,
+            epoch,
+        ) = {
             let mut queue = self.lock_queue(index);
-            self.plan_locked(index, &mut queue)
+            queue.epoch += 1;
+            let pass = self.plan_locked(index, &mut queue);
+            (pass, queue.target, queue.epoch)
         };
         for task in tasks {
             self.issue(task);
+        }
+        let stage = index as StageId;
+        for (kind, need) in pressure {
+            let found = self.shed(kind.index(), need, Some(stage), None);
+            if !found && kind == target.kind() {
+                // Recorded only when no later pass has looked at the queue since this one did:
+                // a pop or a landing in between planned it again, and its finding stands (f.14).
+                let mut queue = self.lock_queue(index);
+                if queue.epoch == epoch {
+                    queue.blocked = true;
+                }
+            }
+        }
+        if let Some((slot, bytes, demand)) = short {
+            self.make_room(slot, bytes, demand);
         }
     }
 
@@ -188,12 +229,8 @@ impl PlacementEngine {
         }
     }
 
-    /// Build the planner's input from a queue (f.2).
-    fn plan_input(&self, index: usize, queue: &Queue) -> PlanInput {
-        let mut bytes = [0u64; moruna_kernel::TIER_COUNT];
-        for (slot, cell) in self.counters[index].bytes.iter().enumerate() {
-            bytes[slot] = cell.load(Ordering::Acquire);
-        }
+    /// Build the planner's input from a queue and the catalog (f.2).
+    fn plan_input(&self, index: usize, queue: &Queue, catalog: &Catalog) -> PlanInput {
         // Where the controller has not set a mark, f.8's default: high is the tier's budget
         // divided by the number of queues, low is half of that.
         let queues = self.queues.len() as u64;
@@ -204,218 +241,164 @@ impl PlacementEngine {
                 *mark = (high / 2, high);
             }
         }
+        // The planner reads the head and the promotion window and nothing behind them: which
+        // batches leave memory is the catalog's choice (f.18), so a plan costs the window, not
+        // the queue.
+        let window = usize::from(queue.promotion_window).max(1);
         PlanInput {
             entries: queue
                 .order
                 .iter()
-                .map(|entry| EntryView {
-                    bytes: entry.bytes,
-                    tier: entry.state.resident_tier(),
-                    has_disk: entry.disk.is_some(),
-                    on_disk: matches!(entry.state, State::OnDisk(_)),
-                    in_flight: entry.state.in_flight(),
-                    evicted: matches!(entry.state, State::Evicted),
-                    recomputable: entry.recomputable,
-                    on_remote: matches!(entry.state, State::OnRemote(_, _)),
+                .take(window)
+                .map(|entry| match catalog.get(entry.buffer) {
+                    Some(buffer) => EntryView {
+                        tier: buffer.state.resident_tier(),
+                        on_disk: matches!(buffer.state, State::OnDisk(_)),
+                        in_flight: buffer.state.in_flight(),
+                        evicted: matches!(buffer.state, State::Evicted),
+                        on_remote: matches!(buffer.state, State::OnRemote(_, _)),
+                    },
+                    None => {
+                        // A queued entry always names a batch the catalog holds (PL-I18); an
+                        // entry that does not is inert here and refused by `pop`.
+                        tracing::error!(target: "placement.catalog", stage = index, seq = entry.seq, "an entry names no batch");
+                        EntryView {
+                            tier: None,
+                            on_disk: false,
+                            in_flight: true,
+                            evicted: false,
+                            on_remote: false,
+                        }
+                    }
                 })
                 .collect(),
             target: queue.target,
             want: queue.consumer,
             host_tier: self.host_tier,
             water,
-            bytes,
-            // A disk budget of zero means the run has no disk tier at all (preamble section 5:
-            // "0 disables the disk tier"), so no queue may plan a demotion to it. Without this
-            // the planner demoted, the segment roll refused the charge, and a run on a host
-            // with no writable staging directory died mid pass with `Staging` instead of
-            // running without spill (PM, 2026-09-22; PL-I7, f.2 step 4).
-            staging_enabled: queue.staging_enabled
-                && self.disk_budget.load(std::sync::atomic::Ordering::Acquire) > 0,
+            bytes: {
+                // What is already on its way out does not count toward the pressure again.
+                let held = catalog.queue_bytes(index as StageId);
+                let leaving = catalog.queue_leaving(index as StageId);
+                std::array::from_fn(|slot| held[slot].saturating_sub(leaving[slot]))
+            },
             window: queue.promotion_window,
         }
     }
 
-    /// Run the planner and apply everything that needs no external call; return the moves
-    /// to issue once the lock is released.
-    fn plan_locked(&self, index: usize, queue: &mut Queue) -> Vec<Task> {
-        let input = self.plan_input(index, queue);
+    /// Run the planner and claim what each promotion needs; return the promotions to issue
+    /// once the locks are released, the pressure the catalog must relieve, and the first
+    /// reservation that found no room (f.2, f.18).
+    fn plan_locked(&self, index: usize, queue: &mut Queue) -> Pass {
+        let mut catalog = self.lock_catalog();
+        let input = self.plan_input(index, queue, &catalog);
         let decided = plan(&input);
-        queue.blocked = decided.blocked;
+        queue.blocked = false;
+        if decided.head_evicted
+            && let Some(head) = queue.order.front()
+        {
+            // The consumer has reached a batch eviction dropped: a miss (f.18).
+            catalog.miss(head.buffer);
+        }
         let stage_id = queue.stage;
-        let counters = &self.counters[index];
         let mut tasks = Vec::new();
+        let mut short = None;
         let mut window_stopped = false;
         for intent in decided.intents {
-            match intent {
-                Intent::Promote {
-                    index: position,
-                    from: _,
-                    to,
-                    head,
-                } => {
-                    if !head && window_stopped {
-                        continue;
-                    }
-                    let Some(entry) = queue.order.get(position) else {
-                        continue;
-                    };
-                    let bytes = entry.bytes;
-                    let seq = entry.seq;
-                    let slot = to.index();
-                    if !self.reserve(slot, bytes) {
-                        if head && bytes > self.budget_of(slot) {
-                            queue.head_error = Some(MorunaError::Staging(format!(
-                                "head cannot fit in {to:?}: need {bytes}, budget {}",
-                                self.budget_of(slot)
-                            )));
-                        }
-                        if !head {
-                            window_stopped = true;
-                        }
-                        continue;
-                    }
-                    let (kind, from) = match &entry.state {
-                        State::OnDisk(seg) => (TaskKind::Read { seg: *seg, to }, Tier::Disk(*seg)),
-                        State::Resident(at) | State::ResidentOnDisk(at) => {
-                            let at = *at;
-                            match entry.payload.as_ref().map(EntryPayload::reference) {
-                                Some(payload) if at != to => (
-                                    TaskKind::Copy {
-                                        from: at,
-                                        to,
-                                        payload,
-                                    },
-                                    at,
-                                ),
-                                Some(_) | None => {
-                                    self.release(slot, bytes);
-                                    continue;
-                                }
-                            }
-                        }
-                        State::Promoting(_, _)
-                        | State::Demoting(_, _)
-                        | State::Evicted
-                        | State::Consumed
-                        | State::OnRemote(_, _) => {
-                            self.release(slot, bytes);
+            if !intent.head && window_stopped {
+                continue;
+            }
+            let Some(entry) = queue.order.get(intent.index) else {
+                continue;
+            };
+            let (id, seq) = (entry.buffer, entry.seq);
+            let Some(bytes) = catalog.get(id).map(|buffer| buffer.bytes) else {
+                continue;
+            };
+            let to = intent.to;
+            let slot = to.index();
+            let budget = self.budget_of(slot);
+            if !catalog.reserve(slot, bytes, budget) {
+                if intent.head && bytes > budget {
+                    queue.head_error = Some(MorunaError::Staging(format!(
+                        "head cannot fit in {to:?}: need {bytes}, budget {budget}"
+                    )));
+                } else {
+                    catalog.wait_for_room(index);
+                    // A head's room may come from batches about to be taken (f.18 rule 13).
+                    short.get_or_insert((slot, bytes, intent.head.then_some(id)));
+                }
+                if !intent.head {
+                    window_stopped = true;
+                }
+                continue;
+            }
+            let Some(buffer) = catalog.get(id) else {
+                catalog.unreserve(slot, bytes);
+                continue;
+            };
+            let state = buffer.state.clone();
+            let reference = buffer.payload.as_ref().map(EntryPayload::reference);
+            let (kind, from) = match &state {
+                State::OnDisk(seg) => (TaskKind::Read { seg: *seg, to }, Tier::Disk(*seg)),
+                State::Resident(at) | State::ResidentOnDisk(at) => {
+                    let at = *at;
+                    match reference {
+                        Some(payload) if at != to => (
+                            TaskKind::Copy {
+                                from: at,
+                                to,
+                                payload,
+                            },
+                            at,
+                        ),
+                        Some(_) | None => {
+                            catalog.unreserve(slot, bytes);
                             continue;
                         }
-                    };
-                    let move_id = self.next_move_id();
-                    if let Some(entry) = queue.order.get_mut(position) {
-                        entry.state = State::Promoting(from, to);
-                        entry.move_id = Some(move_id);
                     }
-                    tracing::debug!(target: "placement.promote", stage = stage_id, seq, from = ?from, to = ?to, bytes);
-                    tasks.push(Task {
-                        stage: index,
-                        stage_id,
-                        seq,
-                        move_id,
-                        bytes,
-                        promote: true,
-                        reservation: Some((slot, bytes)),
-                        kind,
-                    });
                 }
-                Intent::Demote {
-                    index: position,
-                    from,
-                    to,
-                } => {
-                    let Some(entry) = queue.order.get(position) else {
-                        continue;
-                    };
-                    let bytes = entry.bytes;
-                    let seq = entry.seq;
-                    let payload_kind = entry.kind;
-                    let Some(payload) = entry.payload.as_ref().map(EntryPayload::reference) else {
-                        continue;
-                    };
-                    let (kind, target, reservation) = match to {
-                        TierKind::Disk => (
-                            TaskKind::Write {
-                                from,
-                                payload,
-                                kind: payload_kind,
-                            },
-                            Tier::Disk(PENDING_DISK),
-                            None,
-                        ),
-                        TierKind::Device
-                        | TierKind::PinnedHost
-                        | TierKind::Host
-                        | TierKind::Remote => {
-                            let down = self.host_tier;
-                            let slot = down.index();
-                            if !self.reserve(slot, bytes) {
-                                continue;
-                            }
-                            (
-                                TaskKind::Copy {
-                                    from,
-                                    to: down,
-                                    payload,
-                                },
-                                down,
-                                Some((slot, bytes)),
-                            )
-                        }
-                    };
-                    let move_id = self.next_move_id();
-                    if let Some(entry) = queue.order.get_mut(position) {
-                        entry.state = State::Demoting(from, target);
-                        entry.move_id = Some(move_id);
-                    }
-                    tracing::debug!(target: "placement.demote", stage = stage_id, seq, from = ?from, to = ?target, bytes);
-                    tasks.push(Task {
-                        stage: index,
-                        stage_id,
-                        seq,
-                        move_id,
-                        bytes,
-                        promote: false,
-                        reservation,
-                        kind,
-                    });
+                State::Promoting(_, _)
+                | State::Demoting(_, _)
+                | State::Evicted
+                | State::Consumed
+                | State::OnRemote(_, _) => {
+                    catalog.unreserve(slot, bytes);
+                    continue;
                 }
-                Intent::DropResident { index: position } => {
-                    let Some(entry) = queue.order.get_mut(position) else {
-                        continue;
-                    };
-                    let (Some(seg), Some(tier)) = (entry.disk, entry.state.resident_tier()) else {
-                        continue;
-                    };
-                    entry.payload = None;
-                    entry.state = State::OnDisk(seg);
-                    let (seq, bytes) = (entry.seq, entry.bytes);
-                    self.drop_resident(index, tier, entry);
-                    counters.demotions.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(target: "placement.demote", stage = stage_id, seq, from = ?tier, to = "Disk", bytes, no_io = true);
-                }
-                Intent::Evict { index: position } => {
-                    let Some(entry) = queue.order.get_mut(position) else {
-                        continue;
-                    };
-                    let Some(tier) = entry.state.resident_tier() else {
-                        continue;
-                    };
-                    entry.payload = None;
-                    entry.state = State::Evicted;
-                    entry.disk = None;
-                    let (seq, bytes) = (entry.seq, entry.bytes);
-                    self.drop_resident(index, tier, entry);
-                    counters.evictions.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(target: "placement.evict", stage = stage_id, seq, from = ?tier, bytes);
-                }
+            };
+            if intent.head && matches!(from, Tier::Disk(_)) {
+                // The consumer has reached a batch eviction put on disk: a reload on demand,
+                // and a miss weighted by its cost (f.18).
+                catalog.miss(id);
             }
+            let move_id = self.next_move_id();
+            catalog.update(id, |buffer| {
+                buffer.state = State::Promoting(from, to);
+                buffer.move_id = Some(move_id);
+            });
+            tracing::debug!(target: "placement.promote", stage = stage_id, seq, from = ?from, to = ?to, bytes);
+            tasks.push(Task {
+                stage: index,
+                stage_id,
+                seq,
+                buffer: id,
+                move_id,
+                bytes,
+                promote: true,
+                reservation: Some((slot, bytes)),
+                kind,
+            });
         }
-        tasks
+        Pass {
+            tasks,
+            pressure: decided.pressure,
+            short,
+        }
     }
 
     /// Issue one move. No engine lock is held here (g).
-    fn issue(&self, task: Task) {
+    pub(crate) fn issue(&self, task: Task) {
         let outcome = match &task.kind {
             TaskKind::Write {
                 from,
@@ -551,7 +534,7 @@ impl PlacementEngine {
             task.move_id,
             MoveInFlight {
                 stage: task.stage,
-                seq: task.seq,
+                buffer: task.buffer,
                 op,
                 pieces_left,
                 failed: false,
@@ -640,14 +623,11 @@ impl PlacementEngine {
         }
     }
 
-    /// A move that could not even be issued: put the entry back where its bytes are, and
+    /// A move that could not even be issued: put the batch back where its bytes are, and
     /// handle the disk bound of f.2 step 4.
     fn abandon(&self, task: &Task, refusal: Refusal) {
         let error = refusal.error();
         let disk_bound = matches!(refusal, Refusal::DiskBound(_));
-        if let Some((slot, bytes)) = task.reservation {
-            self.release(slot, bytes);
-        }
         {
             let mut moves = self.lock_moves();
             if moves.remove(&task.move_id).is_some() {
@@ -660,36 +640,57 @@ impl PlacementEngine {
             }
         }
         let is_write = matches!(task.kind, TaskKind::Write { .. });
-        let mut evicted = false;
-        {
-            let mut queue = self.lock_queue(task.stage);
-            let Some(position) = queue.position(task.seq) else {
-                return;
-            };
-            let head = position == 0;
-            let entry = &mut queue.order[position];
-            if entry.move_id != Some(task.move_id) {
+        let (consumers, evicted, outside, events) = {
+            let mut catalog = self.lock_catalog();
+            if let Some((slot, bytes)) = task.reservation {
+                catalog.unreserve(slot, bytes);
+            }
+            let current = catalog
+                .get(task.buffer)
+                .is_some_and(|buffer| buffer.move_id == Some(task.move_id));
+            if !current {
                 return;
             }
-            entry.move_id = None;
-            if is_write && disk_bound && entry.recomputable {
-                // No room for the record and the bytes can be read again (f.2 step 4).
-                if let Some(tier) = entry.state.resident_tier() {
-                    self.drop_resident(task.stage, tier, entry);
+            let recomputable = catalog
+                .get(task.buffer)
+                .is_some_and(|buffer| buffer.recomputable);
+            let evicted = is_write && disk_bound && recomputable;
+            let outside = catalog
+                .get(task.buffer)
+                .is_some_and(|buffer| buffer.outside);
+            catalog.update(task.buffer, |buffer| {
+                buffer.move_id = None;
+                if evicted {
+                    // No room for the record and the bytes can be read again (f.2 step 4).
+                    buffer.payload = None;
+                    buffer.state = State::Evicted;
+                    buffer.disk = None;
+                    buffer.missed = false;
+                } else {
+                    buffer.state = buffer.state.source_state(buffer.disk);
                 }
-                entry.payload = None;
-                entry.state = State::Evicted;
-                entry.disk = None;
-                evicted = true;
-                self.counters[task.stage]
-                    .evictions
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                entry.state = entry.state.source_state(entry.disk);
-                if is_write && disk_bound {
-                    // Not recomputable and no room: the run cannot continue on this queue,
-                    // whichever entry could not be written. `is_full` holds and the next
-                    // `pop` carries the totals (PL-I7, f.2 step 4, f.14).
+            });
+            if evicted {
+                catalog.dropped(task.buffer, task.bytes);
+            }
+            let consumers = consumer_stages(&catalog, task.buffer);
+            (consumers, evicted, outside, catalog.drain_events())
+        };
+        if evicted {
+            self.counters[task.stage]
+                .evictions
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            for &stage in &consumers {
+                let mut queue = self.lock_queue(usize::from(stage));
+                let head = queue
+                    .order
+                    .front()
+                    .is_some_and(|entry| entry.buffer == task.buffer);
+                if (is_write && disk_bound) || outside {
+                    // Not recomputable and no room: the run cannot continue on the queues this
+                    // batch waits in, wherever it is in them. `is_full` holds and the next `pop`
+                    // carries the totals (PL-I7, f.2 step 4, f.14).
                     queue.blocked = true;
                     if queue.head_error.is_none() {
                         queue.head_error = Some(head_error_of(error));
@@ -700,10 +701,10 @@ impl PlacementEngine {
             }
         }
         tracing::warn!(target: "placement.move_failed", stage = task.stage, seq = task.seq, error = %error, issued = false);
-        if evicted {
-            self.lineage_set_disk(task.stage as StageId, task.seq, None);
+        self.deliver(events);
+        for stage in consumers {
+            self.unpark_all(usize::from(stage));
         }
-        self.unpark_all(task.stage);
     }
 
     /// Take a move out of the map once its last completion has arrived (g). Returns the
@@ -749,52 +750,62 @@ impl PlacementEngine {
         else {
             return;
         };
-        let (segment, body_offset, payload_len, from) =
-            (*segment, *body_offset, *payload_len, *from);
         let seg = SegmentRef {
-            segment,
-            offset: body_offset,
-            len: payload_len,
+            segment: *segment,
+            offset: *body_offset,
+            len: *payload_len,
         };
-        let stage = done.stage;
-        let seq = done.seq;
-        // The record's pieces hold a shared handle on the entry's own payload. It must be
-        // released before the entry can be popped again, or `pop` would find the payload
-        // still shared and could not hand the morsel back (d.3, d.4).
+        let from = *from;
+        let (stage, id, bytes) = (done.stage, done.buffer, done.bytes);
+        // The record's pieces hold a shared handle on the batch's own payload. It is released
+        // before the batch is touched, so nothing outlives the write (d.3, d.4).
         drop(done);
-        {
-            let mut queue = self.lock_queue(stage);
-            let Some(position) = queue.position(seq) else {
-                return;
-            };
-            let window = usize::from(queue.promotion_window).max(1);
-            let entry = &mut queue.order[position];
-            if entry.move_id != Some(move_id) {
+        // Pops may have moved the batch into a consumer's promotion window while its record was
+        // in flight. Its bytes are still resident (the reactor was given a view, RE-I1), so the
+        // record is kept and so is the resident copy: the batch becomes `Resident + OnDisk` and
+        // the consumer never waits on a read of bytes that are already here (PL-I1, G-I3). The
+        // next shedding pass drops the resident copy for free if it leaves the window (f.7).
+        let hot = self.is_hot(id);
+        let (consumers, waiting, events) = {
+            let mut catalog = self.lock_catalog();
+            let current = catalog
+                .get(id)
+                .is_some_and(|buffer| buffer.move_id == Some(move_id));
+            if !current {
                 return;
             }
-            entry.move_id = None;
-            entry.disk = Some(seg);
-            if position < window {
-                // Pops moved this entry into the promotion window while its record was in
-                // flight. Its bytes are still resident (the reactor was given a view, RE-I1),
-                // so the record is kept and the resident copy is kept too: the entry becomes
-                // `Resident + OnDisk` and the consumer never waits on a read of bytes that
-                // are already here (PL-I1, G-I3). The next pressure pass drops the resident
-                // copy for free if the entry leaves the window again (f.7).
-                entry.state = State::ResidentOnDisk(from);
+            self.record_written(seg.segment);
+            catalog.update(id, |buffer| {
+                buffer.move_id = None;
+                buffer.disk = Some(seg);
+                // A batch memory never admitted lands on disk whatever its position: its
+                // consumer reads it back under a claim (KD7b).
+                let outside = std::mem::replace(&mut buffer.outside, false);
+                if hot && !outside {
+                    buffer.state = State::ResidentOnDisk(from);
+                } else {
+                    buffer.payload = None;
+                    buffer.state = State::OnDisk(seg);
+                    buffer.missed = false;
+                }
+            });
+            catalog.spilled(id, bytes);
+            let waiting = if hot {
+                Vec::new()
             } else {
-                entry.payload = None;
-                entry.state = State::OnDisk(seg);
-                self.drop_resident(stage, from, entry);
-            }
-        }
+                catalog.take_waiting()
+            };
+            (
+                consumer_stages(&catalog, id),
+                waiting,
+                catalog.drain_events(),
+            )
+        };
         self.counters[stage]
             .demotions
             .fetch_add(1, Ordering::Relaxed);
-        self.record_written(segment);
-        self.lineage_set_disk(stage as StageId, seq, Some(seg));
-        self.unpark_all(stage);
-        self.plan_and_issue(stage);
+        self.deliver(events);
+        self.wake_and_plan(&consumers, &waiting);
     }
 
     /// A promotion's read resolved (f.6).
@@ -885,7 +896,7 @@ impl PlacementEngine {
         let reference = holder.reference();
         drop(holder);
         let bytes = done.bytes;
-        let (stage, seq) = (done.stage, done.seq);
+        let (stage, buffer) = (done.stage, done.buffer);
         let reservation = done.reservation;
         {
             let mut moves = self.lock_moves();
@@ -893,7 +904,7 @@ impl PlacementEngine {
                 move_id,
                 MoveInFlight {
                     stage,
-                    seq,
+                    buffer,
                     op: InFlight::Copy {
                         from: self.host_tier,
                         to,
@@ -917,45 +928,60 @@ impl PlacementEngine {
         }
     }
 
-    /// A promotion landed: the entry is resident again, and its disk copy (if any) stays
-    /// valid until the entry is consumed (f.6, f.7).
+    /// A promotion or a copy down landed: the batch is resident in its new tier, and its disk
+    /// copy (if any) stays valid until its last consumer takes it (f.6, f.7).
     fn land_promotion(&self, move_id: u64, done: &MoveInFlight, payload: Payload) {
-        let stage = done.stage;
-        let seq = done.seq;
+        let (stage, id) = (done.stage, done.buffer);
         let tier = payload.tier();
         let promote = done.promote;
-        {
-            let mut queue = self.lock_queue(stage);
-            let Some(position) = queue.position(seq) else {
-                if let Some((slot, bytes)) = done.reservation {
-                    self.release(slot, bytes);
-                }
+        let from_disk = matches!(done.op, InFlight::Read { .. });
+        // A batch a `restore` brought back has entries with no features yet; they are read off
+        // the first payload that lands (f.13).
+        let features = from_disk.then(|| MorselFeatures::from_payload(&payload));
+        let (consumers, waiting, events) = {
+            let mut catalog = self.lock_catalog();
+            if let Some((slot, bytes)) = done.reservation {
+                catalog.unreserve(slot, bytes);
+            }
+            let current = catalog
+                .get(id)
+                .is_some_and(|buffer| buffer.move_id == Some(move_id));
+            if !current {
                 return;
+            }
+            catalog.update(id, |buffer| {
+                buffer.move_id = None;
+                buffer.payload = Some(EntryPayload::from(payload));
+                buffer.state = match buffer.disk {
+                    Some(_) => State::ResidentOnDisk(tier),
+                    None => State::Resident(tier),
+                };
+            });
+            catalog.touch(id);
+            if from_disk {
+                catalog.reloaded(id, done.bytes);
+            }
+            // A copy down frees the tier it left.
+            let waiting = if promote {
+                Vec::new()
+            } else {
+                catalog.take_waiting()
             };
-            let entry = &mut queue.order[position];
-            if entry.move_id != Some(move_id) {
-                if let Some((slot, bytes)) = done.reservation {
-                    self.release(slot, bytes);
+            (
+                consumer_entries(&catalog, id),
+                waiting,
+                catalog.drain_events(),
+            )
+        };
+        if let Some(features) = features {
+            for &(stage, seq) in &consumers {
+                let mut queue = self.lock_queue(usize::from(stage));
+                if let Some(position) = queue.position(seq)
+                    && queue.order[position].features.bytes == 0
+                {
+                    queue.order[position].features = features.clone();
                 }
-                return;
             }
-            let previous = entry.state.resident_tier();
-            entry.move_id = None;
-            if entry.features.bytes == 0 {
-                entry.features = MorselFeatures::from_payload(&payload);
-            }
-            entry.payload = Some(EntryPayload::from(payload));
-            entry.state = match entry.disk {
-                Some(_) => State::ResidentOnDisk(tier),
-                None => State::Resident(tier),
-            };
-            if let Some(previous) = previous {
-                self.drop_resident(stage, previous, entry);
-            }
-            self.add_bytes(stage, tier, entry.bytes);
-        }
-        if let Some((slot, bytes)) = done.reservation {
-            self.release(slot, bytes);
         }
         if promote {
             self.counters[stage]
@@ -966,8 +992,9 @@ impl PlacementEngine {
                 .demotions
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.unpark_all(stage);
-        self.plan_and_issue(stage);
+        self.deliver(events);
+        let stages: Vec<StageId> = consumers.iter().map(|(stage, _)| *stage).collect();
+        self.wake_and_plan(&stages, &waiting);
     }
 
     /// A move failed. The reactor has already applied its own fallback (06 f.9); the engine
@@ -976,15 +1003,15 @@ impl PlacementEngine {
     fn after_failure(&self, move_id: u64, done: MoveInFlight) {
         if done.attempt > 0 {
             let error = MorunaError::Staging(format!(
-                "move of morsel {} on stage {} failed twice",
-                done.seq, done.stage
+                "move of batch {} counted in queue {} failed twice",
+                done.buffer.0, done.stage
             ));
             self.fail_settled(&done, move_id, error);
             return;
         }
         let MoveInFlight {
             stage,
-            seq,
+            buffer,
             op,
             reservation,
             bytes,
@@ -993,18 +1020,22 @@ impl PlacementEngine {
         } = done;
         let retry_id = self.next_move_id();
         {
-            let mut queue = self.lock_queue(stage);
-            match queue.position(seq) {
-                Some(position) if queue.order[position].move_id == Some(move_id) => {
-                    queue.order[position].move_id = Some(retry_id);
+            let mut catalog = self.lock_catalog();
+            let current = catalog
+                .get(buffer)
+                .is_some_and(|b| b.move_id == Some(move_id));
+            if !current {
+                if let Some((slot, held)) = reservation {
+                    catalog.unreserve(slot, held);
                 }
-                Some(_) | None => return,
+                return;
             }
+            catalog.update(buffer, |b| b.move_id = Some(retry_id));
         }
         self.counters[stage]
             .move_retries
             .fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(target: "placement.move_failed", stage, seq, attempt = 1, retrying = true);
+        tracing::warn!(target: "placement.move_failed", stage, buffer = buffer.0, attempt = 1, retrying = true);
         // The identical operation: the same pieces at the same offsets, the same source view
         // over the same bytes, the same record range (f.10).
         let again = match &op {
@@ -1029,7 +1060,7 @@ impl PlacementEngine {
                 retry_id,
                 MoveInFlight {
                     stage,
-                    seq,
+                    buffer,
                     op,
                     pieces_left,
                     failed: false,
@@ -1053,36 +1084,108 @@ impl PlacementEngine {
         }
     }
 
-    /// Settle a move that will not be retried: the entry stays where its bytes were, the
-    /// reservation is released, and a failed head is reported through the next `pop`
-    /// (f.10).
+    /// Settle a move that will not be retried: the batch stays where its bytes were, the
+    /// reservation is released, and a failed promotion of a head is reported through the next
+    /// `pop` of each queue it heads (f.10).
     fn fail_settled(&self, done: &MoveInFlight, move_id: u64, error: MorunaError) {
-        if let Some((slot, bytes)) = done.reservation {
-            self.release(slot, bytes);
-        }
-        let stage = done.stage;
-        let seq = done.seq;
-        {
-            let mut queue = self.lock_queue(stage);
-            let Some(position) = queue.position(seq) else {
+        let id = done.buffer;
+        let (consumers, waiting, events, outside) = {
+            let mut catalog = self.lock_catalog();
+            let outside = catalog.get(id).is_some_and(|buffer| buffer.outside);
+            if let Some((slot, bytes)) = done.reservation {
+                catalog.unreserve(slot, bytes);
+            }
+            let current = catalog
+                .get(id)
+                .is_some_and(|buffer| buffer.move_id == Some(move_id));
+            if !current {
                 return;
+            }
+            catalog.update(id, |buffer| {
+                buffer.move_id = None;
+                buffer.state = buffer.state.source_state(buffer.disk);
+            });
+            let waiting = if done.reservation.is_some() {
+                catalog.take_waiting()
+            } else {
+                Vec::new()
             };
-            if queue.order[position].move_id != Some(move_id) {
-                return;
-            }
-            let disk = queue.order[position].disk;
-            let entry = &mut queue.order[position];
-            entry.move_id = None;
-            entry.state = entry.state.source_state(disk);
-            if position == 0 && done.promote && queue.head_error.is_none() {
-                queue.head_error = Some(MorunaError::Staging(format!(
-                    "morsel {seq} on stage {stage} could not be promoted: {error}"
-                )));
+            (
+                consumer_stages(&catalog, id),
+                waiting,
+                catalog.drain_events(),
+                outside,
+            )
+        };
+        if outside {
+            // Memory never admitted it and disk would not take it: fail loud on every queue it
+            // waits in (KD7b).
+            for &stage in &consumers {
+                let mut queue = self.lock_queue(usize::from(stage));
+                queue.blocked = true;
+                if queue.head_error.is_none() {
+                    queue.head_error = Some(MorunaError::Staging(format!(
+                        "a batch memory could not admit could not be written to disk: {error}"
+                    )));
+                }
             }
         }
-        tracing::warn!(target: "placement.move_failed", stage, seq, error = %error, attempts = 2);
-        self.unpark_all(stage);
+        if done.promote {
+            for &stage in &consumers {
+                let mut queue = self.lock_queue(usize::from(stage));
+                let head = queue.order.front().is_some_and(|entry| entry.buffer == id);
+                if head && queue.head_error.is_none() {
+                    let seq = queue.order.front().map(|entry| entry.seq).unwrap_or(0);
+                    queue.head_error = Some(MorunaError::Staging(format!(
+                        "morsel {seq} on stage {stage} could not be promoted: {error}"
+                    )));
+                }
+            }
+        }
+        tracing::warn!(target: "placement.move_failed", stage = done.stage, buffer = id.0, error = %error, attempts = 2);
+        self.deliver(events);
+        for &stage in &consumers {
+            self.unpark_all(usize::from(stage));
+        }
+        for queue in waiting {
+            self.plan_and_issue(queue);
+        }
     }
+
+    /// Wake every queue a batch waits in and plan it, then plan the queues that were waiting for
+    /// the room a landing freed.
+    fn wake_and_plan(&self, stages: &[StageId], waiting: &[usize]) {
+        for &stage in stages {
+            self.unpark_all(usize::from(stage));
+        }
+        for &stage in stages {
+            self.plan_and_issue(usize::from(stage));
+        }
+        for &queue in waiting {
+            if !stages.iter().any(|&stage| usize::from(stage) == queue) {
+                self.plan_and_issue(queue);
+            }
+        }
+    }
+}
+
+/// The queues a batch waits in, lowest first and each once.
+pub(crate) fn consumer_stages(catalog: &Catalog, id: BufferId) -> Vec<StageId> {
+    let mut stages: Vec<StageId> = consumer_entries(catalog, id)
+        .into_iter()
+        .map(|(stage, _)| stage)
+        .collect();
+    stages.sort_unstable();
+    stages.dedup();
+    stages
+}
+
+/// The `(queue, seq)` of every entry naming a batch.
+pub(crate) fn consumer_entries(catalog: &Catalog, id: BufferId) -> Vec<(StageId, Seq)> {
+    catalog
+        .get(id)
+        .map(|buffer| buffer.consumers.clone())
+        .unwrap_or_default()
 }
 
 /// A copy of an error for the queue's `head_error`, which `pop` returns once (f.10);

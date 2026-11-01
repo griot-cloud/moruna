@@ -286,24 +286,7 @@ impl Runner<'_> {
 
     /// A connection with a completed handshake.
     fn probe(&mut self) -> Result<Probe, Fail> {
-        let channel = self.raw()?;
-        let mut answer = self.hello(&channel, self.suite.id.hello())?;
-        if answer.kind != Kind::Welcome {
-            return Err(format!("the handshake was answered {:?}", answer.kind));
-        }
-        let mut d = answer.decoder();
-        let (major, minor) = (u16::decode(&mut d), u16::decode(&mut d));
-        match (major, minor, d.finish()) {
-            (Ok(major), Ok(minor), Ok(()))
-                if major == self.suite.id.major && minor >= self.suite.id.minor => {}
-            _ => return Err("the welcome does not carry the protocol's version".to_string()),
-        }
-        Ok(Probe {
-            channel,
-            next_txid: 1,
-            events: VecDeque::new(),
-            timeout: self.suite.timeout,
-        })
+        handshake(self.connector, self.suite.id, self.suite.timeout)
     }
 
     fn closed(&self, channel: &Channel) -> Result<(), Fail> {
@@ -605,6 +588,74 @@ pub fn run(
         });
     }
     r.summary
+}
+
+/// A connection to a server of `id` from `connector`, its handshake made and checked.
+fn handshake(connector: &mut dyn Connector, id: ProtocolId, timeout: u64) -> Result<Probe, Fail> {
+    let channel = connector.connect()?;
+    let mut body = Encoder::new();
+    id.hello()
+        .encode(&mut body)
+        .map_err(|e| format!("encoding hello: {e:?}"))?;
+    frame::send(&channel, Kind::Hello, 0, 0, body).map_err(|e| format!("sending hello: {e:?}"))?;
+    let mut answer = next_frame(&channel, deadline_in(timeout))?;
+    if answer.kind != Kind::Welcome {
+        return Err(format!("the handshake was answered {:?}", answer.kind));
+    }
+    let mut d = answer.decoder();
+    let (major, minor) = (u16::decode(&mut d), u16::decode(&mut d));
+    match (major, minor, d.finish()) {
+        (Ok(major), Ok(minor), Ok(())) if major == id.major && minor >= id.minor => {}
+        _ => return Err("the welcome does not carry the protocol's version".to_string()),
+    }
+    Ok(Probe {
+        channel,
+        next_txid: 1,
+        events: VecDeque::new(),
+        timeout,
+    })
+}
+
+/// One check of two joined servers of a protocol, run on a fresh [`Probe`] of each:
+/// what reaches one through the other (two network cards on one link, SDD 29).
+pub struct PairCase {
+    pub name: &'static str,
+    pub check: fn(&mut Probe, &mut Probe) -> Result<(), Fail>,
+}
+
+/// A protocol's suite for two joined servers.
+pub struct PairSuite {
+    pub id: ProtocolId,
+    pub cases: &'static [PairCase],
+    /// How long a check waits for either server, in nanoseconds.
+    pub timeout: u64,
+}
+
+/// Runs `suite` against the two servers `a` and `b` reach, reporting each check as it
+/// finishes. A suite for one server ([`run`]) checks each of them alone first.
+pub fn run_pair(
+    suite: &PairSuite,
+    a: &mut dyn Connector,
+    b: &mut dyn Connector,
+    report: &mut dyn FnMut(&Check<'_>),
+) -> Summary {
+    let mut summary = Summary::default();
+    for case in suite.cases {
+        let result = handshake(a, suite.id, suite.timeout).and_then(|mut pa| {
+            let mut pb = handshake(b, suite.id, suite.timeout)?;
+            (case.check)(&mut pa, &mut pb)
+        });
+        if result.is_ok() {
+            summary.passed += 1;
+        } else {
+            summary.failed += 1;
+        }
+        report(&Check {
+            name: case.name,
+            result: &result,
+        });
+    }
+    summary
 }
 
 /// A typed client's error, for a case that calls through a `Client`.

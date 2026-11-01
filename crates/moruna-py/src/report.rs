@@ -533,6 +533,7 @@ mod tests {
                 pinned: false,
                 rdma: false,
             },
+            memory_basis: None,
             peak_anon_bytes: 4 << 30,
             peak_fraction_of_ceiling: 0.5,
             peak_ceiling_bytes: 8 << 30,
@@ -557,6 +558,8 @@ mod tests {
             late_records: 0,
             write: None,
             read: None,
+            buffers: None,
+            policy: None,
         }
     }
 

@@ -60,20 +60,24 @@ fn leak(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
-/// A layout holding `arrow_echo` at `/bin/arrow_echo` with what it needs, one gzip layer, named
-/// `echo`; its directory.
+/// A layout holding `arrow_echo` and `plane_echo` in `/bin` with what they need, one gzip layer,
+/// named `echo`; its directory.
 fn layout(scratch: &Scratch) -> PathBuf {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_arrow_echo"));
-    let mut entries = vec![
-        Entry::dir("bin"),
-        Entry::dir("etc"),
-        Entry::File(
-            "bin/arrow_echo",
+    let mut entries = vec![Entry::dir("bin"), Entry::dir("etc")];
+    let mut libs = std::collections::BTreeSet::new();
+    for (name, binary) in [
+        ("bin/arrow_echo", env!("CARGO_BIN_EXE_arrow_echo")),
+        ("bin/plane_echo", env!("CARGO_BIN_EXE_plane_echo")),
+    ] {
+        let binary = PathBuf::from(binary);
+        entries.push(Entry::File(
+            name,
             std::fs::read(&binary).expect("the fixture is built"),
             0o755,
-        ),
-    ];
-    for lib in libraries(&binary) {
+        ));
+        libs.extend(libraries(&binary));
+    }
+    for lib in libs {
         let path = leak(lib.to_string_lossy().trim_start_matches('/').to_string());
         entries.push(Entry::File(
             path,
@@ -156,7 +160,7 @@ fn run_settings(
     let _serial = RUNS.lock().unwrap_or_else(|e| e.into_inner());
     let job = document(scratch.path(), layout, settings);
     let built = build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -375,4 +379,79 @@ fn im_t24_a_missing_command_is_named() {
         .finish(Some("echo"));
     let e = run_settings(&scratch, &by_name, json!({})).expect_err("the build is refused");
     assert!(e.contains("user `app` is not numeric"), "{e}");
+}
+
+/// The `id` column of the Parquet files under `out`, in file order.
+fn ids(out: &Path) -> Vec<i64> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet"))
+        .collect();
+    files.sort();
+    let mut id = Vec::new();
+    for file in files {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&file).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let array = batch.column_by_name("id").expect("id");
+            let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            id.extend((0..array.len()).map(|i| array.value(i)));
+        }
+    }
+    id
+}
+
+/// IM-T28 a_plane_program_is_a_stage (KA2): a command that makes the plane's calls itself on its
+/// descriptor 3, under the image's filter, moves every row, in order, with no stream.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t28_a_plane_program_is_a_stage() {
+    let scratch = Scratch::new("im_t28");
+    let layout = layout(&scratch);
+    let report = run_settings(
+        &scratch,
+        &layout,
+        json!({"command": ["/bin/plane_echo"], "plane": true}),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        ids(&scratch.path().join("out")),
+        (0..ROWS).collect::<Vec<_>>()
+    );
+    let json: Value = serde_json::from_str(&report.to_json()).unwrap();
+    let stage = json["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stage"] == 1)
+        .expect("the image's stage");
+    assert_eq!(stage["rows_out"], ROWS);
+}
+
+/// IM-T29 a_refused_record_ends_the_stage (KA2): a record the engine's check refuses ends the
+/// run with the check's reason; a record more than was read is named.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t29_a_refused_record_ends_the_stage() {
+    let scratch = Scratch::new("im_t29");
+    let layout = layout(&scratch);
+    let e = run_settings(
+        &scratch,
+        &layout,
+        json!({"command": ["/bin/plane_echo", "--garbage"], "plane": true}),
+    )
+    .expect_err("the run fails");
+    assert!(e.contains("refused by the engine's check"), "{e}");
+    assert!(e.contains("continuation marker"), "the check's reason: {e}");
+    let e = run_settings(
+        &scratch,
+        &layout,
+        json!({"command": ["/bin/plane_echo", "--twice"], "plane": true}),
+    )
+    .expect_err("the run fails");
+    assert!(e.contains("more record batches than"), "{e}");
 }

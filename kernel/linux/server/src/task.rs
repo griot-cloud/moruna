@@ -19,12 +19,14 @@ use moruna_linux::{
     table::{self, nr},
     types::{self, SIG_DFL, SIG_IGN, SIGACTION_SIZE, Stat, errno, errno::fail, open},
 };
-use moruna_svc::{Channel, Handle, Process, Rights, Signals, deadline_in, println};
+use moruna_svc::{Account, Channel, Handle, Process, Rights, Signals, deadline_in, println};
 
 use crate::{
     Shared,
+    events::Blocked,
     files::{self, Device, FsFile, Open},
     load, memory,
+    plane::PlaneIo,
 };
 
 const SECONDS: u64 = 1_000_000_000;
@@ -39,7 +41,13 @@ const SIGNALS: usize = 65;
 pub enum Answer {
     Value(u64),
     ExitProcess(i64),
-    Restart { entry: u64, stack: u64, brk: u64 },
+    Restart {
+        entry: u64,
+        stack: u64,
+        brk: u64,
+    },
+    /// Nothing yet: the call blocks, and is answered later (SDD 30 f.4).
+    Later,
 }
 
 impl From<Result<u64, u64>> for Answer {
@@ -55,12 +63,12 @@ pub struct Task {
     pub shared: Rc<RefCell<Shared>>,
     pub name: String,
     pub process: Process,
-    pub fs: imagefs::Client,
+    pub fs: crate::namespace::Namespace,
     pub fds: Fds<Open>,
     pub cwd: Vec<u8>,
     pub exe: Vec<u8>,
     pub pid: u64,
-    refused: Refused,
+    pub refused: Refused,
     served: u64,
     output: Vec<u8>,
     dropped: u64,
@@ -71,6 +79,63 @@ pub struct Task {
     umask: u64,
     comm: [u8; 16],
     ended: Option<(u8, i64)>,
+    /// A data-plane task's streams (SDD 29 f.8).
+    pub plane: Option<PlaneIo>,
+    /// The account its process is charged to when its starter gave one (`run_granted`,
+    /// `run_plane`): what it is told its machine has (SDD 30 f.3, SDD 20 f.18). `None`
+    /// for a program `run` starts, which is charged to the server's own account and told
+    /// nothing of memory.
+    pub account: Option<Account>,
+    /// Its granted start page, which its auxiliary vector names (SDD 30 d.2).
+    pub start_page: Option<u64>,
+    /// Its forward's server end, for answering a blocked call later.
+    forward: Channel,
+    /// Its threads whose calls are answered later.
+    pub blocked: Vec<Blocked>,
+    /// The handles to its plane's slots the server watches, until the main loop takes
+    /// them for its watches: `(handle, output)`.
+    pub plane_slots: Vec<(Handle, bool)>,
+}
+
+/// Writes the reply to call `token` on the forward; `false` when the channel is gone. A
+/// call answered later sends nothing now.
+fn send_reply(channel: &Channel, token: u64, answer: Answer) -> bool {
+    let mut out = [0u8; reply::SIZE];
+    write_u64(&mut out, reply::TOKEN, token);
+    match answer {
+        Answer::Later => return true,
+        Answer::Value(v) => {
+            write_u64(&mut out, reply::VALUE, v);
+            write_u64(&mut out, reply::ACTION, reply::RETURN);
+        }
+        Answer::ExitProcess(code) => {
+            write_u64(&mut out, reply::VALUE, code as u64);
+            write_u64(&mut out, reply::ACTION, reply::EXIT_PROCESS);
+        }
+        Answer::Restart { entry, stack, brk } => {
+            write_u64(&mut out, reply::VALUE, entry);
+            write_u64(&mut out, reply::ACTION, reply::RESTART);
+            write_u64(&mut out, reply::STACK, stack);
+            write_u64(&mut out, reply::BRK, brk);
+        }
+    }
+    loop {
+        match channel.write_with(&out, &mut []) {
+            Ok(()) => return true,
+            Err(moruna_svc::Error::ShouldWait) => {
+                if moruna_svc::wait_one(
+                    &channel.0,
+                    Signals::WRITABLE | Signals::PEER_CLOSED,
+                    moruna_svc::DEADLINE_INFINITE,
+                )
+                .is_err()
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 fn process_name(path: &[u8]) -> String {
@@ -98,9 +163,40 @@ impl Task {
         exe: &[u8],
         argv: &[Vec<u8>],
         env: &[Vec<u8>],
+        mut plane: Option<linux_protocol::Plane>,
+        grant: Option<linux_protocol::Grant>,
     ) -> Result<(Task, Channel, Handle), linux::Error> {
         let name = process_name(exe);
-        let (fs, process) = {
+        let assets = plane.as_mut().and_then(|p| p.assets.take());
+        // The account its starter carved for it: the kernel charges its process and
+        // everything the process causes to exist to it (SDD 20 f.18).
+        let (grant, plane, account) = match (grant, plane) {
+            (Some(g), plane) => {
+                let linux_protocol::Grant {
+                    handles,
+                    account,
+                    scratch,
+                } = g;
+                (
+                    Some((handles, scratch)),
+                    plane.map(Streams::of),
+                    Some(Account(account)),
+                )
+            }
+            (None, Some(p)) => {
+                let account = Account(p.account);
+                let streams = Streams {
+                    input: p.input,
+                    output: p.output,
+                    port: p.port,
+                    log: p.log,
+                    log_bytes: p.log_bytes,
+                };
+                (None, Some(streams), Some(account))
+            }
+            (None, None) => (None, None, None),
+        };
+        let (mut fs, process) = {
             let s = shared.borrow();
             let channel = moruna_svc::connect(&s.fs).map_err(|e| {
                 println!(
@@ -115,11 +211,23 @@ impl Task {
                     linux::Error::NoProcess
                 })?;
             fs.core().set_timeout(300 * SECONDS);
-            let process = Process::create(&s.resource, &name).map_err(|e| {
+            let made = match &account {
+                Some(account) => Process::create_in(&s.resource, &name, &account.0),
+                None => Process::create(&s.resource, &name),
+            };
+            let process = made.map_err(|e| {
                 println!(s.out, "linux: {}: process_create: {}", name, e.name());
                 linux::Error::NoProcess
             })?;
-            (fs, process)
+            let assets = assets
+                .map(|channel| {
+                    let mut client = imagefs::Client::connect(channel, deadline_in(300 * SECONDS))
+                        .map_err(|_| linux::Error::BadGrant)?;
+                    client.core().set_timeout(300 * SECONDS);
+                    Ok::<_, linux::Error>(client)
+                })
+                .transpose()?;
+            (crate::namespace::Namespace::new(fs, assets), process)
         };
         let (kernel, server) = Channel::create().map_err(|_| linux::Error::NoProcess)?;
         if let Err((e, _)) = process.forward(kernel, &table::forward_table()) {
@@ -135,9 +243,98 @@ impl Task {
             .0
             .duplicate(Rights::WAIT)
             .map_err(|_| linux::Error::NoProcess)?;
+        let forward = server
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::WAIT)
+            .map(Channel)
+            .map_err(|_| linux::Error::NoProcess)?;
+        let (start_page, scratch) = match grant {
+            Some((mut granted, scratch)) => {
+                if granted.iter().any(|(name, _)| name.0 == b"filesystem") {
+                    return Err(linux::Error::BadGrant);
+                }
+                let source = fs
+                    .export_directory(FsBytes(b"/".to_vec()))
+                    .map_err(|_| linux::Error::BadGrant)?;
+                granted.push((Bytes(b"filesystem".to_vec()), source.0));
+                let names: Vec<String> = granted
+                    .iter()
+                    .map(|(n, _)| String::from_utf8_lossy(&n.0).into_owned())
+                    .collect();
+                let mut handles: Vec<(Option<Handle>, &str)> = granted
+                    .into_iter()
+                    .zip(names.iter())
+                    .map(|((_, h), n)| (Some(h), n.as_str()))
+                    .collect();
+                let page = process.grant(&mut handles).map_err(|e| {
+                    println!(
+                        shared.borrow().out,
+                        "linux: {}: process_grant of {} handles ({:?}): {}",
+                        name,
+                        names.len(),
+                        names,
+                        e.name()
+                    );
+                    linux::Error::BadGrant
+                })?;
+                (Some(page), scratch)
+            }
+            None if plane.is_some() => {
+                // The exact Account already supplied to Process::create_in.
+                // READ is metadata authority; TRANSFER is required for this one
+                // startup move. No WRITE, DUPLICATE, caller limit or new issuer.
+                let observer = account
+                    .as_ref()
+                    .ok_or(linux::Error::BadGrant)?
+                    .0
+                    .duplicate(Rights::READ | Rights::TRANSFER)
+                    .map_err(|_| linux::Error::BadGrant)?;
+                let source = fs
+                    .export_directory(FsBytes(b"/".to_vec()))
+                    .map_err(|_| linux::Error::BadGrant)?;
+                let mut handles = [(Some(observer), "account"), (Some(source.0), "filesystem")];
+                let page = process
+                    .grant(&mut handles)
+                    .map_err(|_| linux::Error::BadGrant)?;
+                (Some(page), None)
+            }
+            None => (None, None),
+        };
+        let (plane, plane_slots) = match plane {
+            Some(plane) => {
+                let (io, slots) = attach(shared, &name, &process, plane)?;
+                (Some(io), slots)
+            }
+            None => (None, Vec::new()),
+        };
         let mut fds = Fds::new(FILES_MAX);
-        for stream in 0..3 {
-            fds.open(Open::Console(stream), false, 0);
+        match &plane {
+            None => {
+                for stream in 0..3 {
+                    fds.open(Open::Console(stream), false, 0);
+                }
+            }
+            Some(p) => {
+                fds.open(
+                    if p.has_input() {
+                        Open::Plane(0)
+                    } else {
+                        Open::Console(0)
+                    },
+                    false,
+                    0,
+                );
+                fds.open(
+                    if p.has_output() {
+                        Open::Plane(1)
+                    } else {
+                        Open::Log(1)
+                    },
+                    false,
+                    0,
+                );
+                fds.open(Open::Log(2), false, 0);
+            }
         }
         let mut task = Task {
             shared: shared.clone(),
@@ -159,7 +356,24 @@ impl Task {
             umask: 0o022,
             comm: [0u8; 16],
             ended: None,
+            plane,
+            account,
+            start_page,
+            forward,
+            blocked: Vec::new(),
+            plane_slots,
         };
+        if let Some(scratch) = scratch {
+            // The scratch directory's pages are charged to the account its starter
+            // carved for them, which the kernel holds the directory to (SDD 27 f.7).
+            task.fs.scratch_account(scratch).map_err(|e| {
+                println!(
+                    task.shared.borrow().out,
+                    "linux: {}: its scratch directory's account: {e:?}", task.name
+                );
+                linux::Error::BadGrant
+            })?;
+        }
         let base = path::base_name(exe);
         let n = base.len().min(15);
         task.comm[..n].copy_from_slice(&base[..n]);
@@ -175,10 +389,17 @@ impl Task {
                 _ => linux::Error::NotExecutable,
             }
         })?;
+        let escrow = task
+            .shared
+            .borrow_mut()
+            .guardian
+            .publish(&task.process)
+            .map_err(|_| linux::Error::NoProcess)?;
         let pid = task
             .process
             .launch(image.entry, image.stack, image.brk)
             .map_err(|e| {
+                let _ = task.shared.borrow().guardian.retract(escrow);
                 println!(
                     task.shared.borrow().out,
                     "linux: {}: process_launch: {}",
@@ -222,41 +443,19 @@ impl Task {
             }
             self.served += 1;
             let answer = self.call(token, threads, number, args);
-            let mut out = [0u8; reply::SIZE];
-            write_u64(&mut out, reply::TOKEN, token);
-            match answer {
-                Answer::Value(v) => {
-                    write_u64(&mut out, reply::VALUE, v);
-                    write_u64(&mut out, reply::ACTION, reply::RETURN);
-                }
-                Answer::ExitProcess(code) => {
-                    write_u64(&mut out, reply::VALUE, code as u64);
-                    write_u64(&mut out, reply::ACTION, reply::EXIT_PROCESS);
-                }
-                Answer::Restart { entry, stack, brk } => {
-                    write_u64(&mut out, reply::VALUE, entry);
-                    write_u64(&mut out, reply::ACTION, reply::RESTART);
-                    write_u64(&mut out, reply::STACK, stack);
-                    write_u64(&mut out, reply::BRK, brk);
-                }
+            if !send_reply(channel, token, answer) {
+                return;
             }
-            loop {
-                match channel.write_with(&out, &mut []) {
-                    Ok(()) => break,
-                    Err(moruna_svc::Error::ShouldWait) => {
-                        if moruna_svc::wait_one(
-                            &channel.0,
-                            Signals::WRITABLE | Signals::PEER_CLOSED,
-                            moruna_svc::DEADLINE_INFINITE,
-                        )
-                        .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            }
+        }
+    }
+
+    /// Answers a call that blocked, on the task's forward.
+    pub fn answer_later(&mut self, token: u64, answer: Answer) {
+        if !send_reply(&self.forward, token, answer) {
+            println!(
+                self.out().out,
+                "linux: {}: FAIL: a blocked call's answer could not be sent", self.name
+            );
         }
     }
 
@@ -264,6 +463,10 @@ impl Task {
     /// console.
     pub fn ended(&mut self) -> Ended {
         self.flush_line();
+        if let Some(plane) = &mut self.plane {
+            plane.finish(&self.name);
+            self.dropped += plane.dropped;
+        }
         let (how_, code) = self.ended.unwrap_or((how::FAULTED, -1));
         let counts = self.refused.counts();
         let rendered = Refused::render(&counts);
@@ -299,10 +502,28 @@ impl Task {
     /// Answers call `number` of the thread `token`.
     fn call(&mut self, token: u64, threads: u32, number: u64, a: [u64; 6]) -> Answer {
         let p = &self.process;
+        if let Some(stream) = self.plane_fd(a[0]) {
+            match number {
+                nr::READ if stream == 0 => return self.read_plane(token, a[1], a[2]),
+                nr::WRITE if stream == 1 => return self.write_plane(token, a[1], a[2]),
+                nr::READV if stream == 0 => return self.readv_plane(token, a[1], a[2]),
+                nr::WRITEV if stream == 1 => return self.writev_plane(token, a[1], a[2]),
+                nr::READ | nr::WRITE | nr::READV | nr::WRITEV => {
+                    return Answer::Value(fail(errno::EBADF));
+                }
+                _ => {}
+            }
+        }
         match number {
-            nr::READ => self.read(a[0], a[1], a[2], None).into(),
+            nr::READ => match self.eventfd_of(a[0]) {
+                Some(blocks) => self.read_eventfd(token, a[0], a[1], a[2], blocks),
+                None => self.read(a[0], a[1], a[2], None).into(),
+            },
             nr::PREAD64 => self.read(a[0], a[1], a[2], Some(a[3])).into(),
-            nr::WRITE => self.write(a[0], a[1], a[2], None).into(),
+            nr::WRITE => match self.eventfd_of(a[0]) {
+                Some(blocks) => self.write_eventfd(token, a[0], a[1], a[2], blocks),
+                None => self.write(a[0], a[1], a[2], None).into(),
+            },
             nr::PWRITE64 => self.write(a[0], a[1], a[2], Some(a[3])).into(),
             nr::READV => self.vector(a[0], a[1], a[2], false).into(),
             nr::WRITEV => self.vector(a[0], a[1], a[2], true).into(),
@@ -322,6 +543,7 @@ impl Task {
                 .into(),
             nr::NEWFSTATAT => self.stat_at(a[0], a[1], a[2], a[3]).into(),
             nr::FSTAT => self.fstat(a[0], a[1]).into(),
+            nr::POLL => self.poll(a[0], a[1]).into(),
             nr::LSEEK => self.lseek(a[0], a[1], a[2]).into(),
             nr::GETDENTS64 => self.getdents(a[0], a[1], a[2]).into(),
             nr::READLINK => self.readlink(at_fdcwd(), a[0], a[1], a[2]).into(),
@@ -354,6 +576,28 @@ impl Task {
                 self.dup_to(a[0], a[1], a[2] & open::O_CLOEXEC != 0).into()
             }
             nr::FCNTL => self.fcntl(a[0], a[1], a[2]),
+            nr::RENAME => self.rename(at_fdcwd(), a[0], at_fdcwd(), a[1], 0).into(),
+            nr::RENAMEAT => self.rename(a[0], a[1], a[2], a[3], 0).into(),
+            nr::RENAMEAT2 => self.rename(a[0], a[1], a[2], a[3], a[4]).into(),
+            nr::SYSINFO => self.sysinfo(a[0]).into(),
+            nr::EVENTFD => self.eventfd(a[0], 0).into(),
+            nr::EVENTFD2 => self.eventfd(a[0], a[1]).into(),
+            nr::EPOLL_CREATE => {
+                if a[0] as i32 <= 0 {
+                    return Answer::Value(fail(errno::EINVAL));
+                }
+                self.epoll_create(0).into()
+            }
+            nr::EPOLL_CREATE1 => self.epoll_create(a[0]).into(),
+            nr::EPOLL_CTL => self.epoll_ctl(a[0], a[1], a[2], a[3]).into(),
+            nr::EPOLL_WAIT | nr::EPOLL_PWAIT => {
+                let deadline = moruna_linux::events::deadline_ms(a[3] as i32, moruna_svc::now());
+                self.epoll_wait(token, a[0], a[1], a[2], deadline)
+            }
+            nr::EPOLL_PWAIT2 => match self.timespec_deadline(a[3]) {
+                Ok(deadline) => self.epoll_wait(token, a[0], a[1], a[2], deadline),
+                Err(e) => Answer::Value(fail(e)),
+            },
             nr::IOCTL => self.ioctl(a[0], a[1], a[2]).into(),
             nr::MMAP => self.mmap(a).into(),
             nr::UNAME => {
@@ -473,7 +717,11 @@ impl Task {
         let count = count.min(IO_MAX);
         match &mut *file {
             Open::Console(0) => Ok(0),
-            Open::Console(_) => Err(errno::EBADF),
+            Open::Console(_) | Open::Log(_) => Err(errno::EBADF),
+            // A plane descriptor's `read`, `readv`, `write` and `writev` are `call`'s, which
+            // may answer them later (SDD 30 f.10); what reaches here is `pread`, and a
+            // stream has no offsets.
+            Open::Plane(_) => Err(errno::ESPIPE),
             Open::Device(Device::Null) => Ok(0),
             Open::Device(Device::Zero) => {
                 memory::write(&self.process, buf, &vec![0u8; count as usize])?;
@@ -485,6 +733,36 @@ impl Task {
                 memory::write(&self.process, buf, &bytes)?;
                 Ok(count)
             }
+            Open::Text { bytes, offset } => {
+                let start = at.unwrap_or(*offset).min(bytes.len() as u64) as usize;
+                let end = (start + count as usize).min(bytes.len());
+                memory::write(&self.process, buf, &bytes[start..end])?;
+                if at.is_none() {
+                    *offset = end as u64;
+                }
+                Ok((end - start) as u64)
+            }
+            // An eventfd reached here by `pread` (Linux's `ESPIPE`) or `readv`, which
+            // takes it without blocking: a `readv` of an empty one is `EAGAIN` though
+            // opened blocking, counted as taken in part.
+            Open::EventFd { counter, .. } => {
+                if at.is_some() {
+                    return Err(errno::ESPIPE);
+                }
+                match counter.read(count)? {
+                    moruna_linux::events::Step::Done(v) => {
+                        drop(file);
+                        memory::write(&self.process, buf, &v.to_le_bytes())?;
+                        Ok(8)
+                    }
+                    moruna_linux::events::Step::WouldBlock => {
+                        drop(file);
+                        self.refused.count(nr::READV);
+                        Err(errno::EAGAIN)
+                    }
+                }
+            }
+            Open::Epoll(_) => Err(errno::EINVAL),
             Open::Fs(f) => {
                 if f.is_dir() {
                     return Err(errno::EISDIR);
@@ -529,7 +807,39 @@ impl Task {
                 self.console_write(&data);
                 Ok(count)
             }
+            // `pwrite` of a plane descriptor (the rest is `call`'s).
+            Open::Plane(_) => Err(errno::ESPIPE),
+            Open::Log(fd) => {
+                let fd = *fd as usize;
+                let data = memory::read(&self.process, buf, count as usize)?;
+                drop(file);
+                let plane = self.plane.as_mut().ok_or(errno::EBADF)?;
+                plane.log(&self.name, fd, &data);
+                Ok(count)
+            }
             Open::Device(_) => Ok(count),
+            Open::Text { .. } => Err(errno::EBADF),
+            // `pwrite` (Linux's `ESPIPE`) or `writev` of an eventfd: without blocking.
+            Open::EventFd { counter, .. } => {
+                if at.is_some() {
+                    return Err(errno::ESPIPE);
+                }
+                let data = memory::read(&self.process, buf, 8.min(count as usize))?;
+                if data.len() < 8 {
+                    return Err(errno::EINVAL);
+                }
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&data);
+                match counter.write(count, u64::from_le_bytes(w))? {
+                    moruna_linux::events::Step::Done(()) => Ok(8),
+                    moruna_linux::events::Step::WouldBlock => {
+                        drop(file);
+                        self.refused.count(nr::WRITEV);
+                        Err(errno::EAGAIN)
+                    }
+                }
+            }
+            Open::Epoll(_) => Err(errno::EINVAL),
             Open::Fs(f) => {
                 if f.is_dir() {
                     return Err(errno::EISDIR);
@@ -559,6 +869,41 @@ impl Task {
                 Ok(done as u64)
             }
         }
+    }
+
+    /// `poll`: every descriptor this personality has is ready for what it is opened for
+    /// (a read or a write of one blocks inside the call, never before it), so each entry
+    /// asking for input or output is answered at once; a closed one is `POLLNVAL`. A
+    /// call asking for nothing answers 0 at once, whatever its timeout: no descriptor
+    /// here becomes ready later. Rust's runtime asks this of 0, 1 and 2 when it starts.
+    fn poll(&mut self, fds: u64, count: u64) -> Result<u64, u64> {
+        const POLLIN: u16 = 0x1;
+        const POLLOUT: u16 = 0x4;
+        const POLLNVAL: u16 = 0x20;
+        const POLLRDNORM: u16 = 0x40;
+        const POLLWRNORM: u16 = 0x100;
+        if count > FILES_MAX as u64 {
+            return Err(errno::EINVAL);
+        }
+        let mut table = memory::read(&self.process, fds, count as usize * 8)?;
+        let mut ready = 0u64;
+        for entry in table.chunks_mut(8) {
+            let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let events = u16::from_le_bytes([entry[4], entry[5]]);
+            let revents = if fd < 0 {
+                0
+            } else if self.fds.get(fd as u64).is_none() {
+                POLLNVAL
+            } else {
+                events & (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
+            };
+            entry[6..8].copy_from_slice(&revents.to_le_bytes());
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        memory::write(&self.process, fds, &table)?;
+        Ok(ready)
     }
 
     fn vector(&mut self, fd: u64, iov: u64, count: u64, write: bool) -> Result<u64, u64> {
@@ -592,7 +937,7 @@ impl Task {
     }
 
     /// The absolute path `path` (in the task's memory) names from directory `dirfd`.
-    fn resolve(&self, dirfd: u64, path: u64) -> Result<Vec<u8>, u64> {
+    pub(crate) fn resolve(&self, dirfd: u64, path: u64) -> Result<Vec<u8>, u64> {
         let p = memory::string(&self.process, path, path::PATH_MAX)?;
         self.resolve_bytes(dirfd, &p)
     }
@@ -628,6 +973,16 @@ impl Task {
             return self
                 .fds
                 .open(Open::Device(d), cloexec, 0)
+                .map(|n| n as u64)
+                .ok_or(errno::EMFILE);
+        }
+        if let Some(text) = self.text_file(full)? {
+            if flags & open::O_ACCMODE != open::O_RDONLY {
+                return Err(errno::EACCES);
+            }
+            return self
+                .fds
+                .open(text, cloexec, 0)
                 .map(|n| n as u64)
                 .ok_or(errno::EMFILE);
         }
@@ -692,8 +1047,10 @@ impl Task {
         let entry = self.fds.get(fd).ok_or(errno::EBADF)?.clone();
         let file = entry.file.borrow();
         Ok(match &*file {
-            Open::Console(s) => files::console_stat(*s),
+            Open::Console(s) | Open::Plane(s) | Open::Log(s) => files::console_stat(*s),
             Open::Device(d) => files::device_stat(*d),
+            Open::Text { bytes, .. } => files::text_stat(bytes.len() as u64),
+            Open::EventFd { .. } | Open::Epoll(_) => files::anon_stat(),
             Open::Fs(f) => {
                 // A scratch file's size changes as it is written.
                 let s = self.fs.fstat(f.number).map_err(files::errno_of)?;
@@ -723,6 +1080,9 @@ impl Task {
     fn stat_path(&mut self, full: &[u8], follow: bool, buf: u64) -> Result<u64, u64> {
         if let Some(d) = files::device(full) {
             return self.put_stat(buf, files::device_stat(d));
+        }
+        if let Some(Open::Text { bytes, .. }) = self.text_file(full)? {
+            return self.put_stat(buf, files::text_stat(bytes.len() as u64));
         }
         let s = self
             .fs
@@ -946,15 +1306,23 @@ impl Task {
                 Ok(0)
             }
             F_GETFL => Ok(match &*entry.file.borrow() {
-                Open::Console(0) => open::O_RDONLY,
-                Open::Console(_) => open::O_WRONLY,
-                Open::Device(_) => open::O_RDWR,
+                Open::Console(0) | Open::Plane(0) => open::O_RDONLY,
+                Open::Console(_) | Open::Plane(_) | Open::Log(_) => open::O_WRONLY,
+                Open::Device(_) | Open::Epoll(_) => open::O_RDWR,
+                Open::Text { .. } => open::O_RDONLY,
+                Open::EventFd { flags, .. } => *flags,
                 Open::Fs(f) => f.flags,
             }),
             F_SETFL => {
-                if let Open::Fs(f) = &mut *entry.file.borrow_mut() {
-                    let settable = open::O_APPEND | open::O_NONBLOCK;
-                    f.flags = (f.flags & !settable) | (arg & settable);
+                match &mut *entry.file.borrow_mut() {
+                    Open::Fs(f) => {
+                        let settable = open::O_APPEND | open::O_NONBLOCK;
+                        f.flags = (f.flags & !settable) | (arg & settable);
+                    }
+                    Open::EventFd { flags, .. } => {
+                        *flags = (*flags & !open::O_NONBLOCK) | (arg & open::O_NONBLOCK);
+                    }
+                    _ => {}
                 }
                 Ok(0)
             }
@@ -1271,4 +1639,76 @@ fn load_error(e: u64) -> &'static str {
         errno::EIO => "the image filesystem failed reading it",
         _ => "it could not be loaded",
     }
+}
+
+/// What a `run_plane`'s plane gives the task besides its account: its slots, its port and
+/// its log ring.
+pub struct Streams {
+    input: Option<Handle>,
+    output: Option<Handle>,
+    port: Option<Channel>,
+    log: Handle,
+    log_bytes: u64,
+}
+
+impl Streams {
+    /// A plane's streams, its account closed: for a request that carries its account
+    /// elsewhere.
+    fn of(p: linux_protocol::Plane) -> Streams {
+        Streams {
+            input: p.input,
+            output: p.output,
+            port: p.port,
+            log: p.log,
+            log_bytes: p.log_bytes,
+        }
+    }
+}
+
+/// Gives the created `process` the plane of a `run_plane` (SDD 29 f.8): its input slot,
+/// then its output slot, numbered in that order, and its port; and maps the log ring.
+fn attach(
+    shared: &Rc<RefCell<Shared>>,
+    name: &str,
+    process: &Process,
+    plane: Streams,
+) -> Result<(PlaneIo, Vec<(Handle, bool)>), linux::Error> {
+    use moruna_sys::plane::Slot;
+    let failed = |what: &str, e: moruna_svc::Error| {
+        println!(
+            shared.borrow().out,
+            "linux: {}: {}: {}",
+            name,
+            what,
+            e.name()
+        );
+        linux::Error::NoProcess
+    };
+    let input = plane.input.map(Slot);
+    let output = plane.output.map(Slot);
+    let mut slots: Vec<&Slot> = Vec::new();
+    slots.extend(input.as_ref());
+    slots.extend(output.as_ref());
+    // The server keeps its handles to the slots, and waits on them while a call waits
+    // for a batch or a window (SDD 30 f.10).
+    let numbers = (
+        input.as_ref().map(|s| (0u32, s.0.raw())),
+        output
+            .as_ref()
+            .map(|s| (u32::from(input.is_some()), s.0.raw())),
+    );
+    if let Err((e, _)) = moruna_sys::plane::attach(process, &slots, plane.port) {
+        return Err(failed("process_plane", e));
+    }
+    let log = moruna_sys::Memory(plane.log)
+        .map_detached(
+            0,
+            plane.log_bytes,
+            moruna_abi::map::READ | moruna_abi::map::WRITE,
+        )
+        .map_err(|e| failed("mapping the log ring", e))?;
+    let mut watched = Vec::new();
+    watched.extend(input.map(|s| (s.0, false)));
+    watched.extend(output.map(|s| (s.0, true)));
+    Ok((PlaneIo::new(numbers.0, numbers.1, log), watched))
 }

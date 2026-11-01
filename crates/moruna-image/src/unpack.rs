@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::MOUNT_POINTS;
 use crate::digest::{Digest, Hashing};
 use crate::error::{Error, Result};
-use crate::layer::{Layer, remove_any};
+use crate::layer::{Applied, Layer, remove_any};
 use crate::source::{Config, Descriptor, ImageSource, Manifest};
 
 /// The file a cache entry holds when, and only when, it was made whole.
@@ -186,16 +186,17 @@ fn check(descriptor: &Descriptor, reader: Hashing<impl Read>) -> Result<()> {
     Ok(())
 }
 
+/// One layer laid over `rootfs`, its blob checked as it is read, and what it did to the root.
 pub(crate) fn apply_layer(
     source: &dyn ImageSource,
     descriptor: &Descriptor,
     rootfs: &Path,
     skipped: &mut u64,
-) -> Result<()> {
+) -> Result<Applied> {
     let compression = compression(descriptor)?;
     let name = descriptor.digest.to_string();
     let mut hashing = Hashing::new(source.blob(&descriptor.digest)?);
-    let applied = (|| -> Result<()> {
+    let applied = (|| -> Result<Applied> {
         let mut layer = Layer::new(&name, rootfs, skipped);
         let stream: Box<dyn Read + '_> = match compression {
             Compression::None => Box::new(&mut hashing),
@@ -208,7 +209,7 @@ pub(crate) fn apply_layer(
         layer.apply(BufReader::new(stream))
     })();
     match applied {
-        Ok(()) => check(descriptor, hashing),
+        Ok(done) => check(descriptor, hashing).map(|()| done),
         Err(e) => {
             // A blob that is not the bytes it is named by fails in whatever way those bytes
             // fail; the digest is the cause worth naming.

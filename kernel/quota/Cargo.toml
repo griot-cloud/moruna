@@ -1,0 +1,10 @@
+[package]
+name = "moruna-quota"
+description = "The Moruna microkernel's memory accounting: an account's ledger and the page tables an address space's areas need"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true

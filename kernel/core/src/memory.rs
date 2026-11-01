@@ -9,7 +9,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
 
-use moruna_abi::{Error, PAGE_SIZE, limits};
+use moruna_abi::{Error, PAGE_SIZE, charge, limits};
 use ostd::{
     io::IoMem,
     mm::{
@@ -19,26 +19,43 @@ use ostd::{
     sync::SpinLock,
 };
 
-use crate::object::{QUARANTINE_MAX, Resource};
+use crate::{
+    account::{Account, Charge},
+    object::{QUARANTINE_MAX, Resource},
+};
 
 const PAGE: usize = PAGE_SIZE as usize;
+
+// The fixed charges cover the records they stand for (SDD 20 f.18).
+const _: () = assert!(core::mem::size_of::<MemoryObject>() as u64 <= charge::OBJECT);
+const _: () = assert!(core::mem::size_of::<UFrame>() as u64 <= charge::PAGE_RECORD);
+const _: () = assert!(core::mem::size_of::<DeviceMemory>() as u64 <= charge::OBJECT);
+const _: () = assert!(core::mem::size_of::<Pin>() as u64 <= charge::OBJECT);
+const _: () =
+    assert!(core::mem::size_of::<DmaStream<FromAndToDevice>>() as u64 + 8 <= charge::PIN_PAGE);
 
 pub struct MemoryObject {
     frames: Vec<UFrame>,
     size: u64,
     /// Made with `memory_flags::DMA`: only such an object may be pinned for a device.
     dma: bool,
+    /// KE1: one physical run for a contiguous DMA object.
+    run: Option<USegment>,
+    /// Its pages and its record, charged to the account it was made in until it is
+    /// freed, whoever holds it by then (SDD 20 f.18).
+    _charge: Charge,
 }
 
 impl MemoryObject {
-    /// Allocates `size` bytes, rounded up to whole pages, all zero.
-    pub fn new(size: u64) -> Result<MemoryObject, Error> {
-        MemoryObject::with_dma(size, false)
+    /// Allocates `size` bytes, rounded up to whole pages, all zero, charged to
+    /// `account`.
+    pub fn new(size: u64, account: &Arc<Account>) -> Result<MemoryObject, Error> {
+        MemoryObject::with_dma(size, false, account)
     }
 
     /// Allocates `size` bytes as [`MemoryObject::new`] does; `dma` marks it as memory a
     /// holder of a DMA resource may hand to a device.
-    pub fn with_dma(size: u64, dma: bool) -> Result<MemoryObject, Error> {
+    pub fn with_dma(size: u64, dma: bool, account: &Arc<Account>) -> Result<MemoryObject, Error> {
         if size == 0 {
             return Err(Error::InvalidArgs);
         }
@@ -46,6 +63,8 @@ impl MemoryObject {
             return Err(Error::Limit);
         }
         let pages = size.div_ceil(PAGE_SIZE) as usize;
+        // Charged before anything is allocated, so a refusal allocates nothing.
+        let charge = Charge::new(account, charge::memory(pages as u64))?;
         let mut frames = Vec::new();
         frames
             .try_reserve_exact(pages)
@@ -60,7 +79,46 @@ impl MemoryObject {
             frames,
             size: pages as u64 * PAGE_SIZE,
             dma,
+            run: None,
+            _charge: charge,
         })
+    }
+
+    /// Allocates `size` bytes for DMA, rounded up to whole pages, all zero, as one
+    /// physically contiguous run (`memory_flags::CONTIGUOUS`, ABI 2.4).
+    pub fn contiguous(size: u64, account: &Arc<Account>) -> Result<MemoryObject, Error> {
+        if size == 0 {
+            return Err(Error::InvalidArgs);
+        }
+        if size > moruna_abi::memory_flags::CONTIGUOUS_MAX_BYTES {
+            return Err(Error::Limit);
+        }
+        let pages = size.div_ceil(PAGE_SIZE) as usize;
+        // Charge all pages, metadata and object BEFORE allocating the physical run.
+        let charge = Charge::new(account, charge::memory(pages as u64))?;
+        let mut options = FrameAllocOptions::new();
+        options.zeroed(true);
+        let run: USegment = options
+            .alloc_segment(pages)
+            .map_err(|_| Error::NoMemory)?
+            .into();
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(pages)
+            .map_err(|_| Error::NoMemory)?;
+        frames.extend(run.clone());
+        Ok(MemoryObject {
+            frames,
+            size: pages as u64 * PAGE_SIZE,
+            dma: true,
+            run: Some(run),
+            _charge: charge,
+        })
+    }
+
+    /// Whether this memory is still charged to exactly this original Account.
+    pub fn charged_to(&self, account: &Arc<Account>) -> bool {
+        self._charge.matches(account)
     }
 
     /// Whether the object was made for DMA.
@@ -68,9 +126,9 @@ impl MemoryObject {
         self.dma
     }
 
-    /// A memory object holding a copy of `bytes`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<MemoryObject, Error> {
-        let object = MemoryObject::new(bytes.len().max(1) as u64)?;
+    /// A memory object holding a copy of `bytes`, charged to `account`.
+    pub fn from_bytes(bytes: &[u8], account: &Arc<Account>) -> Result<MemoryObject, Error> {
+        let object = MemoryObject::new(bytes.len().max(1) as u64, account)?;
         object.write(0, bytes)?;
         Ok(object)
     }
@@ -134,6 +192,8 @@ pub struct DeviceMemory {
     pub io: IoMem,
     pub size: u64,
     range: Range<u64>,
+    /// Its record: the pages are the device's, not RAM.
+    _charge: Charge,
 }
 
 fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
@@ -156,10 +216,10 @@ static CLAIMS: SpinLock<Claims> = SpinLock::new(Claims {
 });
 
 impl DeviceMemory {
-    /// Claims the physical range `paddr .. paddr + size`, both page aligned. A range a
-    /// live region holds, or one that only partly overlaps a range acquired before, is
-    /// refused (`AccessDenied`).
-    pub fn new(paddr: u64, size: u64) -> Result<DeviceMemory, Error> {
+    /// Claims the physical range `paddr .. paddr + size`, both page aligned, its record
+    /// charged to `account`. A range a live region holds, or one that only partly
+    /// overlaps a range acquired before, is refused (`AccessDenied`).
+    pub fn new(paddr: u64, size: u64, account: &Arc<Account>) -> Result<DeviceMemory, Error> {
         if size == 0 || !paddr.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) {
             return Err(Error::InvalidArgs);
         }
@@ -170,6 +230,7 @@ impl DeviceMemory {
         let range = paddr..end;
         let start = usize::try_from(paddr).map_err(|_| Error::InvalidArgs)?;
         let end = usize::try_from(end).map_err(|_| Error::InvalidArgs)?;
+        let charge = Charge::new(account, charge::OBJECT)?;
         let mut claims = CLAIMS.lock();
         if claims.live.iter().any(|l| overlaps(l, &range)) {
             return Err(Error::AccessDenied);
@@ -194,7 +255,12 @@ impl DeviceMemory {
             }
         };
         claims.live.push(range.clone());
-        Ok(DeviceMemory { io, size, range })
+        Ok(DeviceMemory {
+            io,
+            size,
+            range,
+            _charge: charge,
+        })
     }
 }
 
@@ -207,14 +273,6 @@ impl Drop for DeviceMemory {
     }
 }
 
-/// The pages of a memory object as a device sees them: one DMA mapping per page
-/// (through the IOMMU when OSTD has one; the physical address otherwise). Dropping it
-/// ends the mappings and lets the pages go.
-pub struct Pinned {
-    _memory: Arc<MemoryObject>,
-    _streams: Vec<DmaStream<FromAndToDevice>>,
-}
-
 /// A pin: the pages of a memory object handed to the devices a DMA resource covers.
 /// When its last handle closes, the pages go into that resource's quarantine rather
 /// than back to the allocator, because the device may still be writing them; they
@@ -225,10 +283,24 @@ pub struct Pin {
     pinned: Option<Pinned>,
 }
 
+/// The pages of a memory object as a device sees them: one DMA mapping per page
+/// (through the IOMMU when OSTD has one; the physical address otherwise), and their
+/// record's charge, which stays with them in a quarantine until `dma_release`.
+/// Dropping it ends the mappings and lets the pages go.
+pub struct Pinned {
+    _memory: Arc<MemoryObject>,
+    _streams: Vec<DmaStream<FromAndToDevice>>,
+    _charge: Charge,
+}
+
 impl Pin {
-    /// Pins `memory` for `domain`'s devices; returns the pin and the device address of
-    /// each page, in order.
-    pub fn new(domain: Arc<Resource>, memory: Arc<MemoryObject>) -> Result<(Pin, Vec<u64>), Error> {
+    /// Pins `memory` for `domain`'s devices, its record charged to `account`; returns
+    /// the pin and the device address of each page, in order.
+    pub fn new(
+        domain: Arc<Resource>,
+        memory: Arc<MemoryObject>,
+        account: &Arc<Account>,
+    ) -> Result<(Pin, Vec<u64>), Error> {
         if !memory.is_dma() {
             return Err(Error::InvalidArgs);
         }
@@ -236,6 +308,7 @@ impl Pin {
             return Err(Error::Limit);
         }
         let pages = memory.frames().len();
+        let charge = Charge::new(account, charge::OBJECT + pages as u64 * charge::PIN_PAGE)?;
         let mut streams = Vec::new();
         streams
             .try_reserve_exact(pages)
@@ -244,18 +317,27 @@ impl Pin {
         addresses
             .try_reserve_exact(pages)
             .map_err(|_| Error::NoMemory)?;
-        for frame in memory.frames() {
-            // x86_64 keeps DMA coherent with the caches.
-            let stream =
-                DmaStream::map(USegment::from(frame.clone()), true).map_err(|_| Error::NoMemory)?;
-            addresses.push(stream.daddr() as u64);
+        // x86_64 keeps DMA coherent with the caches.
+        if let Some(run) = &memory.run {
+            // One mapping, so the device sees the run as one run of addresses.
+            let stream = DmaStream::map(run.clone(), true).map_err(|_| Error::NoMemory)?;
+            let base = stream.daddr() as u64;
+            addresses.extend((0..pages as u64).map(|i| base + i * PAGE_SIZE));
             streams.push(stream);
+        } else {
+            for frame in memory.frames() {
+                let stream = DmaStream::map(USegment::from(frame.clone()), true)
+                    .map_err(|_| Error::NoMemory)?;
+                addresses.push(stream.daddr() as u64);
+                streams.push(stream);
+            }
         }
         let pin = Pin {
             domain,
             pinned: Some(Pinned {
                 _memory: memory,
                 _streams: streams,
+                _charge: charge,
             }),
         };
         Ok((pin, addresses))

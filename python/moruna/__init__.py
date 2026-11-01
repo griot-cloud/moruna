@@ -26,6 +26,7 @@ from __future__ import annotations
 import importlib.util as _importlib_util
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,8 @@ from moruna._core import (
     BudgetError,
     Cancelled,
     ConfigError,
+    CostSession,
+    EnginePorts,
     IoError,
     IteratorSource,
     KernelError,
@@ -67,6 +70,7 @@ from moruna._core import (
     inspect_host,
     load,
 )
+from moruna._kinds import DeclaredKind, KindCall, kind, kinds
 
 __version__: str = _core.__version__
 
@@ -77,6 +81,8 @@ __all__ = [
     "BudgetError",
     "Cancelled",
     "ConfigError",
+    "CostSession",
+    "EnginePorts",
     "IoError",
     "IteratorSource",
     "KernelError",
@@ -92,10 +98,12 @@ __all__ = [
     "VortexSink",
     "VortexSource",
     "__version__",
+    "build",
     "explain",
     "inspect_host",
     "kernel",
     "polars",
+    "read_events",
     "run",
     "std",
 ]
@@ -105,6 +113,11 @@ __all__ += ["Sink", "Source", "Split"]
 
 # A function package (SDD 16 d.3).
 __all__ += ["PackageKernel", "load"]
+
+# Checking a function and warming it up: what it costs (MH 4.9, AR section 6).
+__all__ += ["check"]
+# A kind the program serves itself, and the listing of every kind (SDD 18 e.3, e.4).
+__all__ += ["DeclaredKind", "KindCall", "kind", "kinds"]
 
 
 def run(
@@ -128,17 +141,27 @@ def run(
     checkpoint_interval: float = 5.0,
     keep_checkpoint: bool = False,
     resume: str | None = None,
+    cost: CostSession | None = None,
+    engine_ports: EnginePorts | None = None,
 ) -> RunReport:
     """Run one pipeline from ``source`` through ``kernels`` to ``sink`` and return its report.
 
     ``kernels`` may be one kernel or a list of them, in stage order; a plain callable is wrapped
-    as if it had been decorated with ``@moruna.kernel`` and its defaults. Every keyword argument is
+    as if it had been decorated with ``@moruna.kernel`` and its defaults, and a task of a
+    ``@moruna.kind`` (the kind called with its settings) is run by handing each batch to the
+    callable that serves it. Every keyword argument is
     optional, and each is range checked once, here, against the configuration table of the design
     (PY-I10): a value outside its range is clamped to the nearest bound and the clamp is named in
     ``report.notes``.
 
     ``resume`` takes ``"auto"``, a run id (32 hexadecimal characters) or a path to a
     ``manifest.json``, and is the only parameter a user meets after a failure (f.7).
+
+    ``cost`` shares the same configured observation store/model as registration warm-up.
+    On the Moruna kernel, omitted ``engine_ports`` consumes the canonical startup
+    grants and assigned run identity; missing native authority refuses the run.
+    ``engine_ports`` is supplied by a native host with actual scoped retention/checkpoint
+    authority. Python cannot create storage grants; missing capabilities refuse explicitly.
 
     Raises ``moruna.ConfigError`` when a Python kernel would run under a GIL interpreter without
     ``allow_gil=True`` (PY-I4), ``moruna.PlanError`` when the sink would write where the source
@@ -164,7 +187,59 @@ def run(
         checkpoint_interval=checkpoint_interval,
         keep_checkpoint=keep_checkpoint,
         resume=resume,
+        cost=cost,
+        engine_ports=engine_ports,
     )
+
+
+def build(
+    fn: Any,
+    *,
+    out: str | os.PathLike[str] = "moruna-image",
+    tag: str | None = None,
+    platform: str | None = None,
+    lock: str | os.PathLike[str] | None = None,
+    files: Sequence[str | os.PathLike[str]] = (),
+    runtime_layout: str | os.PathLike[str] | None = None,
+    runtime_reference: str | None = None,
+    cache: str | os.PathLike[str] | None = None,
+    index_url: str | None = None,
+    find_links: Sequence[str] = (),
+    no_index: bool = False,
+) -> Any:
+    """Build the kernel ``fn`` as an OCI image of four layers and return what was built (SDD 30).
+
+    The same as ``moruna build <module>:<function>``. ``fn`` is a ``@moruna.kernel`` (or a plain
+    function) bound to a name at the top level of its module. The image is written to the OCI
+    layout directory ``out`` under the name ``tag`` (default ``<function>:latest``): the
+    runtime (``python:3.14-slim``'s own layers), the dependencies the project's ``uv.lock`` or
+    ``requirements.lock`` pins (``lock``, or the nearest above the module), the shim, and the
+    module with the ``files`` it names. ``platform`` is ``linux/aarch64`` or ``linux/x86_64``
+    (default: this machine's on Linux, aarch64 on a Mac). The result has ``digest`` (the image's),
+    ``reference``, ``layout``, and ``layers``, each with its ``role``, ``blob.digest`` and
+    ``blob.size``. Raises ``moruna.ConfigError`` naming the cause when the build is refused: no
+    lock, an unpinned or unhashed requirement, a wheel the platform has none of.
+    """
+    from moruna import _build  # noqa: PLC0415, the builder is needed by `build` alone
+
+    try:
+        return _build.build(
+            fn,
+            out=out,
+            tag=tag,
+            platform=platform,
+            lock=lock,
+            files=files,
+            runtime_layout=runtime_layout,
+            runtime_reference=runtime_reference,
+            cache=cache,
+            index_url=index_url,
+            find_links=find_links,
+            no_index=no_index,
+            version=__version__,
+        )
+    except _build.Refused as exc:
+        raise ConfigError(f"build refused: {exc}") from exc
 
 
 def explain(
@@ -188,6 +263,23 @@ def explain(
     document = bytes(job) if isinstance(job, (bytes, bytearray)) else Path(job).read_bytes()
     plan: dict[str, Any] = json.loads(_core.explain(document, planner=planner))
     return plan
+
+
+def read_events(source: str | os.PathLike[str] | bytes) -> list[dict[str, Any]]:
+    """The events a run wrote as records, as dicts.
+
+    ``source`` is a path to a file of records or its bytes: a run's events file in its output
+    store (``_events.mrec`` in the attempt's directory, written when the run had no peer), or a
+    segment of one producer's output (``<task>/<first seq>.mrec``). Every event is a dict with
+    the fields version 6 of the host protocol's ``event`` had (``type``, ``v``, ``attempt``,
+    ``start``, ``seq``, ``t_us``, ``kind`` and the fact's own), in the order they were written;
+    a record of output (``kind`` ``log``) also carries its ``id``.
+
+    Raises ``ValueError`` when the bytes are not whole events, naming where they stop being one.
+    """
+    data = bytes(source) if isinstance(source, (bytes, bytearray)) else Path(source).read_bytes()
+    events: list[dict[str, Any]] = json.loads(_core.read_events(data))
+    return events
 
 
 def kernel(
@@ -287,3 +379,17 @@ def polars(fn: Any, *, accepts: str = "table", **declarations: Any) -> KernelSpe
 
 
 from moruna import std  # noqa: E402, the standard kernels need the names above
+from moruna._check import check  # noqa: E402, it finds kernels with the decorator above
+
+from moruna._engine import (  # noqa: E402, native handles are defined above
+    ArtifactChunk, ArtifactManifest, LogicalOutputIdentity, ObjectIdentity, ObjectVersion,
+    PinnedObject, RetainedOutput, Registration, RegistrationRefused, artifact_chunk, artifact_manifest,
+    checkpoint_receipt, checkpoint_pending, prepare_registration, retained_outputs,
+    restore_checkpoint,
+)
+__all__ += ["Registration", "RegistrationRefused", "prepare_registration", "retained_outputs",
+            "artifact_manifest", "artifact_chunk", "checkpoint_receipt", "checkpoint_pending",
+            "restore_checkpoint"]
+
+__all__ += ["ArtifactChunk", "ArtifactManifest", "LogicalOutputIdentity", "ObjectIdentity",
+            "ObjectVersion", "PinnedObject", "RetainedOutput"]

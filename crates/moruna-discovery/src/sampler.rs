@@ -170,9 +170,9 @@ impl Sampler {
             let mut inner = sampler.held();
             inner.lifetime_at_create = inner.lifetime_peak();
         }
-        // Prime the running peak and the last sample, so a read error on the very first call
-        // still returns a coherent value.
-        let _ = sampler.sample();
+        // Require a fresh reading before exposing the sampler; an initial error is not
+        // a coherent zero/stale baseline.
+        sampler.sample()?;
         Ok(sampler)
     }
 
@@ -219,7 +219,7 @@ impl core::fmt::Debug for Sampler {
 }
 
 impl SamplerTrait for Sampler {
-    fn sample(&self) -> Sample {
+    fn sample(&self) -> Result<Sample> {
         let at_ns = self.next_at_ns();
         let device_used = devices::device_used(&self.devices);
         let (ceiling_bytes, cpu_limit) = {
@@ -246,8 +246,8 @@ impl SamplerTrait for Sampler {
         let reading = match source {
             Source::V2 {
                 stat, peak, cpu, ..
-            } => read_at_zero(stat, buffer)
-                .map(cgroup::parse_memory_stat_v2)
+            } => read_current(stat, buffer)
+                .and_then(|text| cgroup::parse_memory_stat(text, true))
                 .map(|memory| {
                     let kernel_peak = peak
                         .as_ref()
@@ -260,8 +260,8 @@ impl SamplerTrait for Sampler {
                         .unwrap_or(0);
                     (memory, kernel_peak, throttled)
                 }),
-            Source::V1 { stat, cpu } => read_at_zero(stat, buffer)
-                .map(cgroup::parse_memory_stat_v1)
+            Source::V1 { stat, cpu } => read_current(stat, buffer)
+                .and_then(|text| cgroup::parse_memory_stat(text, false))
                 .map(|memory| {
                     let throttled = cpu
                         .as_ref()
@@ -288,18 +288,10 @@ impl SamplerTrait for Sampler {
             }
         };
 
-        let Some((memory, kernel_peak, throttled_us)) = reading else {
+        let (memory, kernel_peak, throttled_us) = reading.map_err(|cause| {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
-            let repeated = Sample {
-                at_ns,
-                device_used,
-                ceiling_bytes,
-                cpu_limit,
-                ..*last
-            };
-            *last = repeated;
-            return repeated;
-        };
+            cause
+        })?;
 
         *running_peak = (*running_peak).max(memory.anon);
         if let Some((then, bytes)) = *integral_edge
@@ -369,7 +361,7 @@ impl SamplerTrait for Sampler {
             cpu_limit,
         };
         *last = sample;
-        sample
+        Ok(sample)
     }
 
     fn process_usage(&self) -> ProcessUsage {
@@ -439,6 +431,15 @@ fn open(path: &Path) -> Result<File> {
     })
 }
 
+fn read_current<'a>(file: &File, buffer: &'a mut [u8; BUFFER_BYTES]) -> Result<&'a str> {
+    let error = |msg: String| moruna_kernel::MorunaError::Io {
+        op: "read",
+        target: "memory.stat".into(),
+        msg,
+    };
+    let length = file.read_at(buffer, 0).map_err(|e| error(e.to_string()))?;
+    std::str::from_utf8(&buffer[..length]).map_err(|e| error(e.to_string()))
+}
 /// Read a cgroup file from offset 0 into the fixed buffer, with no allocation and no path lookup
 /// (f.2). `None` on a read error or non-UTF-8 content, which the caller counts.
 fn read_at_zero<'a>(file: &File, buffer: &'a mut [u8; BUFFER_BYTES]) -> Option<&'a str> {
@@ -515,27 +516,27 @@ mod tests {
             .expect("sampler over the fixture");
 
         // Monotonic time and the first reading.
-        let first = sampler.sample();
+        let first = sampler.sample().unwrap();
         assert_eq!(first.anon_bytes, 1000);
         assert_eq!(first.file_bytes, 2000);
         assert_eq!(first.throttled_us, 7);
         assert_eq!(first.peak_anon_bytes, 1000);
-        let second = sampler.sample();
+        let second = sampler.sample().unwrap();
         assert!(second.at_ns > first.at_ns, "at_ns strictly increases");
 
         // The peak follows the synthetic state up and stays there when it falls back.
         write(&dir, "memory.stat", "anon 9000\nfile 1\nunevictable 1000\n");
-        let high = sampler.sample();
+        let high = sampler.sample().unwrap();
         assert_eq!(high.anon_bytes, 10_000, "anon + unevictable, DS-I4");
         assert_eq!(high.peak_anon_bytes, 10_000);
         write(&dir, "memory.stat", "anon 500\nfile 1\nunevictable 0\n");
-        let low = sampler.sample();
+        let low = sampler.sample().unwrap();
         assert_eq!(low.anon_bytes, 500);
         assert_eq!(low.peak_anon_bytes, 10_000, "the peak is remembered");
 
         // reset_peak then sample reports the peak at the current anonymous bytes.
         sampler.reset_peak();
-        let after = sampler.sample();
+        let after = sampler.sample().unwrap();
         assert_eq!(after.peak_anon_bytes, after.anon_bytes);
 
         // Eight threads sampling and resetting at once: every sample is one of the states the
@@ -549,7 +550,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut previous = 0u64;
                 for _ in 0..200 {
-                    let sample = sampler.sample();
+                    let sample = sampler.sample().unwrap();
                     assert!(sample.at_ns > previous);
                     previous = sample.at_ns;
                     assert_eq!(sample.anon_bytes, 500, "one of the synthetic states");
@@ -568,7 +569,7 @@ mod tests {
         // 2 s bound belongs to the reference host (E1) and is reported as provisional elsewhere.
         let started = std::time::Instant::now();
         for _ in 0..100_000 {
-            let _ = sampler.sample();
+            let _ = sampler.sample().unwrap();
         }
         let elapsed = started.elapsed();
         assert_eq!(sampler.read_errors(), 0);
@@ -588,7 +589,7 @@ mod tests {
         );
         write(&dir, "memory.current", "1077936128");
         let sampler = Sampler::with_roots(&discovered_at(Some(dir)), tmp.path()).expect("sampler");
-        let sample = sampler.sample();
+        let sample = sampler.sample().unwrap();
         assert_eq!(sample.anon_bytes, 1_048_576 + 2_097_152);
         assert_eq!(sample.file_bytes, 1_073_741_824);
         assert_ne!(sample.anon_bytes, 1_077_936_128, "never memory.current");
@@ -627,8 +628,8 @@ mod tests {
         file.sync_all().expect("sync");
 
         let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
-        let before = sampler.sample().anon_bytes;
-        let during = crate::probes::with_mapped_file(&file, MAPPED, || sampler.sample())
+        let before = sampler.sample().unwrap().anon_bytes;
+        let during = crate::probes::with_mapped_file(&file, MAPPED, || sampler.sample().unwrap())
             .expect("the mapping")
             .anon_bytes;
 
@@ -649,7 +650,7 @@ mod tests {
         write(&dir, "memory.peak", "999999\n");
         let sampler =
             Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
-        assert_eq!(sampler.sample().peak_anon_bytes, 999_999);
+        assert_eq!(sampler.sample().unwrap().peak_anon_bytes, 999_999);
         sampler.reset_peak();
         let written = std::fs::read_to_string(dir.join("memory.peak")).expect("memory.peak");
         assert_eq!(written, "reset");
@@ -684,10 +685,10 @@ mod tests {
         let sampler =
             Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
         // Until a reset is refused the kernel's figure stands, as before.
-        assert_eq!(sampler.sample().peak_anon_bytes, 999_999);
+        assert_eq!(sampler.sample().unwrap().peak_anon_bytes, 999_999);
 
         sampler.reset_peak();
-        let after = sampler.sample();
+        let after = sampler.sample().unwrap();
         assert_eq!(
             after.peak_anon_bytes, 100,
             "after a refused reset the peak is the sampler's own, not the cgroup's lifetime mark"
@@ -700,9 +701,9 @@ mod tests {
 
         // And the running peak keeps following the samples from there.
         write(&dir, "memory.stat", "anon 250\nfile 0\nunevictable 0\n");
-        assert_eq!(sampler.sample().peak_anon_bytes, 250);
+        assert_eq!(sampler.sample().unwrap().peak_anon_bytes, 250);
         write(&dir, "memory.stat", "anon 120\nfile 0\nunevictable 0\n");
-        assert_eq!(sampler.sample().peak_anon_bytes, 250);
+        assert_eq!(sampler.sample().unwrap().peak_anon_bytes, 250);
     }
 
     /// f.2, v1 fallback: the v1 field names are read and `throttled_time` is nanoseconds.
@@ -714,12 +715,12 @@ mod tests {
         write(&dir, "memory.stat", "cache 2048\nrss 4096\n");
         write(&dir, "cpu.stat", "throttled_time 5000\n");
         let sampler = Sampler::with_roots(&discovered_at(Some(dir)), tmp.path()).expect("sampler");
-        let sample = sampler.sample();
+        let sample = sampler.sample().unwrap();
         assert_eq!(sample.anon_bytes, 4096);
         assert_eq!(sample.file_bytes, 2048);
         assert_eq!(sample.throttled_us, 5);
         sampler.reset_peak();
-        assert_eq!(sampler.sample().peak_anon_bytes, 4096);
+        assert_eq!(sampler.sample().unwrap().peak_anon_bytes, 4096);
     }
 
     /// f.2, outside a cgroup: `/proc/self/status` where there is one, the platform otherwise, and
@@ -730,7 +731,7 @@ mod tests {
         let proc_dir = tmp.path().join("proc");
         write(&proc_dir, "self/status", crate::os::STATUS);
         let sampler = Sampler::with_roots(&discovered_at(None), &proc_dir).expect("sampler");
-        let sample = sampler.sample();
+        let sample = sampler.sample().unwrap();
         assert_eq!(sample.anon_bytes, 1600 * 1024);
         assert_eq!(sample.file_bytes, 400 * 1024);
         assert_eq!(sample.throttled_us, 0);
@@ -738,11 +739,11 @@ mod tests {
 
         // And over the real host, which on macOS goes through the platform interface.
         let real = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
-        let sample = real.sample();
+        let sample = real.sample().unwrap();
         assert!(sample.anon_bytes > 0, "the process has resident memory");
         assert!(sample.peak_anon_bytes >= sample.anon_bytes);
         real.reset_peak();
-        assert!(real.sample().peak_anon_bytes > 0);
+        assert!(real.sample().unwrap().peak_anon_bytes > 0);
     }
 
     /// DS-T15 ceiling_scope: the sampler counts what the ceiling counts. In a cgroup whose limit
@@ -775,7 +776,7 @@ mod tests {
                 let sampler =
                     Sampler::with_roots(&discovered_with(Some(dir.clone()), source), &proc_dir)
                         .expect("sampler");
-                let sample = sampler.sample();
+                let sample = sampler.sample().unwrap();
                 assert_eq!(
                     sample.anon_bytes,
                     1600 * 1024,
@@ -803,7 +804,7 @@ mod tests {
             )
             .expect("sampler");
             assert_eq!(
-                pod.sample().anon_bytes,
+                pod.sample().unwrap().anon_bytes,
                 1 << 30,
                 "the cgroup's limit is enforced on every process in it"
             );
@@ -821,7 +822,7 @@ mod tests {
             &proc_dir,
         )
         .expect("sampler");
-        let sample = sampler.sample();
+        let sample = sampler.sample().unwrap();
         assert_eq!((sample.anon_bytes, sample.throttled_us), (1600 * 1024, 0));
     }
 
@@ -857,13 +858,13 @@ mod tests {
         ] {
             write(&proc_dir, "self/status", &status(3 * 1024 * 1024));
             let sampler = Sampler::with_roots(&discovered, &proc_dir).expect("sampler");
-            let sample = sampler.sample();
+            let sample = sampler.sample().unwrap();
             assert_eq!(sample.anon_bytes, 40 * MIB, "RssAnon alone, never VmRSS");
             assert_eq!(sample.file_bytes, 3 * 1024 * MIB + 64 * MIB);
 
             // More mapped file, the same anonymous memory: nothing the budget counts moved.
             write(&proc_dir, "self/status", &status(6 * 1024 * 1024));
-            let sample = sampler.sample();
+            let sample = sampler.sample().unwrap();
             assert_eq!(sample.anon_bytes, 40 * MIB);
             assert_eq!(sample.peak_anon_bytes, 40 * MIB);
             if !cfg!(target_vendor = "apple") {
@@ -885,18 +886,18 @@ mod tests {
     fn the_process_peak_is_the_whole_process_and_survives_a_reset() {
         const BURST: usize = 64 << 20;
         let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
-        let before = sampler.sample().anon_bytes;
+        let before = sampler.sample().unwrap().anon_bytes;
         let burst = vec![7u8; BURST];
         // Where the platform keeps no mark of its own, only a sample can see the burst; on
         // macOS no sample is taken, so the kernel's mark alone must hold it.
         let during = if cfg!(target_vendor = "apple") {
             0
         } else {
-            sampler.sample().anon_bytes
+            sampler.sample().unwrap().anon_bytes
         };
         drop(std::hint::black_box(burst));
         sampler.reset_peak();
-        let after = sampler.sample();
+        let after = sampler.sample().unwrap();
         let peak = sampler.process_peak();
         let seen = before.max(during).max(after.anon_bytes);
         assert!(
@@ -920,7 +921,7 @@ mod tests {
             Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
         write(&dir, "memory.stat", "anon 900\nfile 0\nunevictable 0\n");
         fixture.reset_peak();
-        let _ = fixture.sample();
+        let _ = fixture.sample().unwrap();
         let peak = fixture.process_peak();
         assert_eq!((peak.bytes, peak.exact), (5000, false));
     }
@@ -933,10 +934,10 @@ mod tests {
     fn a_peak_carries_the_window_it_rose_in() {
         const BURST: usize = 128 << 20;
         let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
-        let first = sampler.sample();
+        let first = sampler.sample().unwrap();
         let burst = vec![7u8; BURST];
         drop(std::hint::black_box(burst));
-        let second = sampler.sample();
+        let second = sampler.sample().unwrap();
         let peak = sampler.process_peak();
         assert!(peak.since_ns <= peak.at_ns, "{peak:?}");
         if cfg!(target_vendor = "apple") {
@@ -956,35 +957,32 @@ mod tests {
         let fixture =
             Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
         write(&dir, "memory.stat", "anon 9000\nfile 0\nunevictable 0\n");
-        let risen = fixture.sample();
+        let risen = fixture.sample().unwrap();
         let peak = fixture.process_peak();
         assert_eq!((peak.bytes, peak.exact), (9000, false));
         assert_eq!((peak.at_ns, peak.since_ns), (risen.at_ns, risen.at_ns));
     }
 
-    /// DS-I3: a read error repeats the last sample with a fresh timestamp and is counted.
+    /// DS-I3: a current read error is counted and propagated, never repeated as fresh.
     #[test]
-    fn a_read_error_repeats_the_last_sample() {
+    fn a_read_error_refuses_instead_of_repeating_the_last_sample() {
         let tmp = TempDir::new("read-error");
-        let proc_dir = tmp.path().join("proc-absent");
-        let sampler = Sampler::with_roots(&discovered_at(None), &proc_dir).expect("sampler");
-        // On a host with a real /proc or a platform interface there is no error to provoke here;
-        // the fixture path is the one that can fail, so drive it through a removed file.
         let dir = tmp.path().join("cgroup");
         write(&dir, "memory.stat", "anon 42\nfile 0\nunevictable 0\n");
         let over_cgroup =
             Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
-        let good = over_cgroup.sample();
+        let good = over_cgroup.sample().unwrap();
         assert_eq!(good.anon_bytes, 42);
         // Truncating the file to nothing parses as zeros rather than failing, so make the read
         // itself fail by replacing the handle's content with invalid UTF-8.
         std::fs::write(dir.join("memory.stat"), [0xff, 0xfe, 0xfd]).expect("invalid utf-8");
-        let repeated = over_cgroup.sample();
+        let failed = over_cgroup.sample();
+        assert!(
+            matches!(failed,Err(moruna_kernel::MorunaError::Io{target,..})if target=="memory.stat")
+        );
         assert_eq!(over_cgroup.read_errors(), 1);
-        assert_eq!(repeated.anon_bytes, good.anon_bytes);
-        assert!(repeated.at_ns > good.at_ns);
-        // The operating system sampler answers or counts an error, never panics.
-        let _ = sampler.sample();
+        // The last good reading is not returned as if it were current.
+        assert_eq!(good.anon_bytes, 42);
     }
 
     /// The sampler refuses to start when a cgroup file it needs cannot be opened.
@@ -1006,7 +1004,7 @@ mod tests {
         let tmp = TempDir::new("shape");
         let sampler: Arc<dyn SamplerTrait> =
             Arc::new(Sampler::with_roots(&discovered_at(None), tmp.path()).expect("sampler"));
-        let _ = sampler.sample();
+        let _ = sampler.sample().unwrap();
         sampler.reset_peak();
         let input = DiscoveryInput::default();
         assert!(input.explicit_budget.is_none());
@@ -1022,20 +1020,23 @@ mod tests {
         write(&dir, "memory.stat", "anon 1000\nfile 2000\nunevictable 0\n");
         let own =
             Sampler::with_roots(&discovered_at(Some(dir.clone())), tmp.path()).expect("sampler");
-        let sample = own.sample();
+        let sample = own.sample().unwrap();
         assert_eq!(sample.ceiling_bytes, 1024 * 1024 * 1024);
         assert!((sample.cpu_limit - 1.0).abs() < f64::EPSILON);
 
         let discovered = discovered_at(Some(dir.clone()));
         let cell = Arc::new(ArcSwap::from_pointee(discovered.limits.clone()));
         let following = Sampler::following(&discovered, Arc::clone(&cell)).expect("sampler");
-        assert_eq!(following.sample().ceiling_bytes, 1024 * 1024 * 1024);
+        assert_eq!(
+            following.sample().unwrap().ceiling_bytes,
+            1024 * 1024 * 1024
+        );
         cell.store(Arc::new(Limits {
             memory_ceiling: 3 * 1024 * 1024 * 1024,
             cpu_quota: 6.0,
             ..discovered.limits.clone()
         }));
-        let sample = following.sample();
+        let sample = following.sample().unwrap();
         assert_eq!(sample.ceiling_bytes, 3 * 1024 * 1024 * 1024);
         assert!((sample.cpu_limit - 6.0).abs() < f64::EPSILON);
     }
@@ -1044,7 +1045,7 @@ mod tests {
     #[test]
     fn process_usage_is_measured_not_estimated() {
         let sampler = Sampler::new(&discovered_at(None)).expect("sampler over the real host");
-        let _ = sampler.sample();
+        let _ = sampler.sample().unwrap();
         let mut x = 0u64;
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_millis(60) {
@@ -1054,7 +1055,7 @@ mod tests {
         }
         std::hint::black_box(x);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let _ = sampler.sample();
+        let _ = sampler.sample().unwrap();
         let usage = sampler.process_usage();
         assert!(usage.measured, "{usage:?}");
         assert!(

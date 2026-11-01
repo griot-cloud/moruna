@@ -94,6 +94,7 @@ pub mod nr {
     pub const FUTEX: u64 = 202;
     pub const SCHED_SETAFFINITY: u64 = 203;
     pub const SCHED_GETAFFINITY: u64 = 204;
+    pub const EPOLL_CREATE: u64 = 213;
     pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const FADVISE64: u64 = 221;
@@ -101,25 +102,34 @@ pub mod nr {
     pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const EXIT_GROUP: u64 = 231;
+    pub const EPOLL_WAIT: u64 = 232;
+    pub const EPOLL_CTL: u64 = 233;
     pub const TGKILL: u64 = 234;
     pub const WAITID: u64 = 247;
     pub const OPENAT: u64 = 257;
     pub const MKDIRAT: u64 = 258;
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
+    pub const RENAMEAT: u64 = 264;
     pub const READLINKAT: u64 = 267;
     pub const FACCESSAT: u64 = 269;
     pub const SET_ROBUST_LIST: u64 = 273;
+    pub const EPOLL_PWAIT: u64 = 281;
+    pub const EVENTFD: u64 = 284;
+    pub const EVENTFD2: u64 = 290;
+    pub const EPOLL_CREATE1: u64 = 291;
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
     pub const PRLIMIT64: u64 = 302;
     pub const GETCPU: u64 = 309;
+    pub const RENAMEAT2: u64 = 316;
     pub const GETRANDOM: u64 = 318;
     pub const STATX: u64 = 332;
     pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
     pub const CLOSE_RANGE: u64 = 436;
     pub const FACCESSAT2: u64 = 439;
+    pub const EPOLL_PWAIT2: u64 = 441;
 }
 
 /// The table: number, name, who answers. In number order.
@@ -131,6 +141,7 @@ pub const TABLE: &[(u64, &str, Status)] = &[
     (nr::STAT, "stat", Status::Server),
     (nr::FSTAT, "fstat", Status::Server),
     (nr::LSTAT, "lstat", Status::Server),
+    (nr::POLL, "poll", Status::Server),
     (nr::LSEEK, "lseek", Status::Server),
     (nr::MMAP, "mmap", Status::Fast(fast::MMAP)),
     (nr::MPROTECT, "mprotect", Status::Fast(fast::MPROTECT)),
@@ -166,6 +177,7 @@ pub const TABLE: &[(u64, &str, Status)] = &[
     (nr::FTRUNCATE, "ftruncate", Status::Server),
     (nr::GETCWD, "getcwd", Status::Server),
     (nr::CHDIR, "chdir", Status::Server),
+    (nr::RENAME, "rename", Status::Server),
     (nr::MKDIR, "mkdir", Status::Server),
     (nr::RMDIR, "rmdir", Status::Server),
     (nr::UNLINK, "unlink", Status::Server),
@@ -177,6 +189,7 @@ pub const TABLE: &[(u64, &str, Status)] = &[
         Status::Fast(fast::GETTIMEOFDAY),
     ),
     (nr::GETRLIMIT, "getrlimit", Status::Server),
+    (nr::SYSINFO, "sysinfo", Status::Server),
     (nr::GETUID, "getuid", Status::Server),
     (nr::GETGID, "getgid", Status::Server),
     (nr::GETEUID, "geteuid", Status::Server),
@@ -196,6 +209,7 @@ pub const TABLE: &[(u64, &str, Status)] = &[
     (nr::FUTEX, "futex", Status::Fast(fast::FUTEX)),
     (nr::SCHED_SETAFFINITY, "sched_setaffinity", Status::Server),
     (nr::SCHED_GETAFFINITY, "sched_getaffinity", Status::Server),
+    (nr::EPOLL_CREATE, "epoll_create", Status::Server),
     (nr::GETDENTS64, "getdents64", Status::Server),
     (
         nr::SET_TID_ADDRESS,
@@ -219,24 +233,32 @@ pub const TABLE: &[(u64, &str, Status)] = &[
         Status::Fast(fast::CLOCK_NANOSLEEP),
     ),
     (nr::EXIT_GROUP, "exit_group", Status::Server),
+    (nr::EPOLL_WAIT, "epoll_wait", Status::Server),
+    (nr::EPOLL_CTL, "epoll_ctl", Status::Server),
     (nr::TGKILL, "tgkill", Status::Server),
     (nr::WAITID, "waitid", Status::Server),
     (nr::OPENAT, "openat", Status::Server),
     (nr::MKDIRAT, "mkdirat", Status::Server),
     (nr::NEWFSTATAT, "newfstatat", Status::Server),
     (nr::UNLINKAT, "unlinkat", Status::Server),
+    (nr::RENAMEAT, "renameat", Status::Server),
     (nr::READLINKAT, "readlinkat", Status::Server),
     (nr::FACCESSAT, "faccessat", Status::Server),
+    (nr::EPOLL_PWAIT, "epoll_pwait", Status::Server),
+    (nr::EVENTFD, "eventfd", Status::Server),
+    (nr::EVENTFD2, "eventfd2", Status::Server),
+    (nr::EPOLL_CREATE1, "epoll_create1", Status::Server),
     (nr::DUP3, "dup3", Status::Server),
     (nr::PRLIMIT64, "prlimit64", Status::Server),
+    (nr::RENAMEAT2, "renameat2", Status::Server),
     (nr::GETRANDOM, "getrandom", Status::Fast(fast::GETRANDOM)),
     (nr::CLOSE_RANGE, "close_range", Status::Server),
     (nr::FACCESSAT2, "faccessat2", Status::Server),
+    (nr::EPOLL_PWAIT2, "epoll_pwait2", Status::Server),
 ];
 
 /// Names of refused calls the report names, besides the table's.
 const REFUSED_NAMES: &[(u64, &str)] = &[
-    (nr::POLL, "poll"),
     (nr::RT_SIGRETURN, "rt_sigreturn"),
     (nr::PIPE, "pipe"),
     (nr::MREMAP, "mremap"),
@@ -245,8 +267,6 @@ const REFUSED_NAMES: &[(u64, &str)] = &[
     (nr::FORK, "fork"),
     (nr::VFORK, "vfork"),
     (nr::GETDENTS, "getdents"),
-    (nr::RENAME, "rename"),
-    (nr::SYSINFO, "sysinfo"),
     (nr::SET_ROBUST_LIST, "set_robust_list"),
     (nr::PIPE2, "pipe2"),
     (nr::GETCPU, "getcpu"),

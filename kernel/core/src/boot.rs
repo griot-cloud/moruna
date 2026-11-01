@@ -5,6 +5,12 @@
 //! handles it lists. Only the first process, the supervisor, may receive the root
 //! resources. Any refusal powers the machine off with the reason on the console:
 //! a kernel that cannot start what it was told to start does not run half of it.
+//!
+//! Before anything is made the kernel sizes the machine's account (SDD 20 f.18): the
+//! free memory its frame allocator holds, less the kernel's own reserve. A manifest
+//! process with a `memory` line gets an account of its own carved out of it; every other
+//! is charged to the machine's account, as is what the boot makes for no one process
+//! (the channels, the root resources).
 
 use alloc::{
     format,
@@ -24,6 +30,7 @@ use ostd::{
 };
 
 use crate::{
+    account::Account,
     channel::{self, Endpoint},
     memory::MemoryObject,
     object::{Console, Handle, Object, Resource},
@@ -65,8 +72,27 @@ fn start() -> Result<usize, String> {
     ostd::task::inject_pre_schedule_handler(process::deactivate_current);
     ostd::task::inject_post_schedule_handler(process::activate_current);
     early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
+    let machine = machine_account()?;
     process::boot_begins();
-    start_manifest()
+    start_manifest(&machine)
+}
+
+/// The machine's account: the free memory, less the reserve, in whole pages.
+fn machine_account() -> Result<Arc<Account>, String> {
+    let free = osdk_frame_allocator::load_total_free_size() as u64;
+    let limit = moruna_quota::machine_limit(free);
+    let kept = free - limit;
+    if limit == 0 {
+        return Err(format!(
+            "{free} bytes of free memory leave nothing for processes beside the kernel's reserve of {kept}"
+        ));
+    }
+    early_println!(
+        "kk: memory: {} bytes for processes, {} kept by the kernel",
+        limit,
+        free - limit
+    );
+    Ok(Account::machine(limit))
 }
 
 /// The PCI configuration space the firmware describes (ACPI MCFG, its first segment),
@@ -84,7 +110,7 @@ fn ecam() -> Result<core::ops::Range<u64>, String> {
     Ok(start..end)
 }
 
-fn start_manifest() -> Result<usize, String> {
+fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {
     let initramfs = ostd::boot::boot_info()
         .initramfs
         .ok_or("the bootloader passed no initramfs")?;
@@ -93,16 +119,18 @@ fn start_manifest() -> Result<usize, String> {
         .ok_or("the initramfs holds no `manifest`")?;
     let manifest = Manifest::parse(text).map_err(|e| e.to_string())?;
 
-    let mut ends: Vec<[Option<Arc<Endpoint>>; 2]> = manifest
-        .channels
-        .iter()
-        .map(|_| {
-            let (a, b) = channel::create();
-            [Some(a), Some(b)]
-        })
-        .collect();
+    let mut ends: Vec<[Option<Arc<Endpoint>>; 2]> = Vec::new();
+    for name in &manifest.channels {
+        let (a, b) =
+            channel::create(machine).map_err(|e| format!("channel {name}: {}", e.name()))?;
+        ends.push([Some(a), Some(b)]);
+    }
     let console = Arc::new(Console);
-    let root = |kind| Object::Resource(Arc::new(Resource::root(kind)));
+    let root = |kind| -> Result<Object, String> {
+        Resource::root(kind, machine)
+            .map(|r| Object::Resource(Arc::new(r)))
+            .map_err(|e| format!("a root resource: {}", e.name()))
+    };
 
     for (index, spec) in manifest.processes.iter().enumerate() {
         let elf = cpio::find(&files, &spec.path).ok_or_else(|| {
@@ -111,7 +139,19 @@ fn start_manifest() -> Result<usize, String> {
                 spec.name, spec.path
             )
         })?;
-        let process = Process::new(spec.name.as_bytes(), index == 0)
+        let account = match spec.memory {
+            Some(limit) => machine
+                .carve(spec.name.as_bytes(), limit, machine)
+                .map_err(|e| {
+                    format!(
+                        "process {}: an account of {limit} bytes from the machine's: {}",
+                        spec.name,
+                        e.name()
+                    )
+                })?,
+            None => machine.clone(),
+        };
+        let process = Process::new(spec.name.as_bytes(), index == 0, &account)
             .map_err(|e| format!("process {}: {}", spec.name, e.name()))?;
         let entry = process.load_image(elf).map_err(|e| {
             format!(
@@ -125,15 +165,19 @@ fn start_manifest() -> Result<usize, String> {
         for h in &spec.handles {
             let object = match &h.source {
                 Source::Console => Object::Console(console.clone()),
-                Source::RootProcess => root(ResourceKind::Process),
-                Source::RootDevice => root(ResourceKind::DeviceMemory),
-                Source::RootInterrupt => root(ResourceKind::Interrupt),
-                Source::RootMsi => root(ResourceKind::Msi),
-                Source::RootDma => root(ResourceKind::Dma),
-                Source::RootEcam => Object::Resource(Arc::new(Resource::new(
-                    ResourceKind::DeviceMemory,
-                    ecam().map_err(|e| format!("process {}: {e}", spec.name))?,
-                ))),
+                Source::RootProcess => root(ResourceKind::Process)?,
+                Source::RootDevice => root(ResourceKind::DeviceMemory)?,
+                Source::RootInterrupt => root(ResourceKind::Interrupt)?,
+                Source::RootMsi => root(ResourceKind::Msi)?,
+                Source::RootDma => root(ResourceKind::Dma)?,
+                Source::RootEcam => Object::Resource(Arc::new(
+                    Resource::new(
+                        ResourceKind::DeviceMemory,
+                        ecam().map_err(|e| format!("process {}: {e}", spec.name))?,
+                        machine,
+                    )
+                    .map_err(|e| format!("process {}: root.ecam: {}", spec.name, e.name()))?,
+                )),
                 Source::ChannelEnd { channel, end } => {
                     let endpoint = ends
                         .get_mut(*channel)
@@ -147,7 +191,8 @@ fn start_manifest() -> Result<usize, String> {
                     let bytes = cpio::find(&files, path).ok_or_else(|| {
                         format!("process {}: the initramfs holds no {}", spec.name, path)
                     })?;
-                    let object = MemoryObject::from_bytes(bytes).map_err(|e| {
+                    // The process's: it is charged to the process's account.
+                    let object = MemoryObject::from_bytes(bytes, &account).map_err(|e| {
                         format!("process {}: file {}: {}", spec.name, path, e.name())
                     })?;
                     Object::Memory(Arc::new(object))

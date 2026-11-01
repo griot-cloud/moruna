@@ -898,6 +898,19 @@ mod tests {
     use super::*;
 
     /// SB-T10: the lists in code are the lists in 17 e.5, name for name.
+    /// KA2: the data plane's task library makes no system call an image's filter does not
+    /// allow, so a command that makes the plane's calls needed nothing added to it (SDD 19 e.4).
+    #[test]
+    fn the_plane_needs_nothing_an_image_is_not_allowed() {
+        for name in moruna_plane_linux::task::SYSCALLS {
+            assert!(
+                IMAGE_ALLOWED.contains(name) || IMAGE_ALLOWED_ARCH.contains(name),
+                "the plane's `{name}` is not on an image's list"
+            );
+            assert!(image_number(name).is_some(), "`{name}` has a number here");
+        }
+    }
+
     #[test]
     fn sb_t10_seccomp_list_is_the_documents() {
         let sdd = std::fs::read_to_string(

@@ -1,0 +1,11 @@
+[package]
+name = "netstack-test"
+description = "Runs the socket conformance suite and controlled user-network proof on the microkernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+netstack-protocol = { path = "../protocol", version = "=0.1.0" }

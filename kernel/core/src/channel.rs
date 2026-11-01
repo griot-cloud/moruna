@@ -14,10 +14,14 @@
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use moruna_abi::{Signals, limits};
+use moruna_abi::{Error, Signals, charge, limits};
 use ostd::sync::SpinLock;
 
-use crate::{object::Handle, signal::Signaller};
+use crate::{
+    account::{Account, Charge},
+    object::Handle,
+    signal::Signaller,
+};
 
 /// Taken by every write that carries an endpoint, between its check of the cycle rule
 /// and its count of what it queued, so two such writes are never interleaved. It is
@@ -29,7 +33,29 @@ pub struct Message {
     pub handles: Vec<Handle>,
     /// How many of `handles` are channel endpoints.
     pub endpoints: usize,
+    /// What the message costs the sender's account while it is queued (SDD 20 f.18):
+    /// `None` only for a forwarded call's request, which is its thread's, one at a
+    /// time, and paid for in the thread's charge.
+    #[expect(dead_code, reason = "held for its drop, which gives the charge back")]
+    pub charge: Option<Charge>,
 }
+
+impl Message {
+    /// What a message of `bytes` bytes and `handles` handles is charged.
+    pub fn cost(bytes: usize, handles: usize) -> u64 {
+        charge::MESSAGE + bytes as u64 + handles as u64 * charge::MESSAGE_HANDLE
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Message>() as u64 <= charge::MESSAGE);
+const _: () = assert!(core::mem::size_of::<Handle>() as u64 <= charge::MESSAGE_HANDLE);
+// Both endpoints, the channel, and both queues grown to their depth.
+const _: () = assert!(
+    (2 * core::mem::size_of::<Endpoint>()
+        + core::mem::size_of::<Channel>()
+        + 2 * limits::CHANNEL_DEPTH * core::mem::size_of::<Message>()) as u64
+        <= charge::CHANNEL
+);
 
 pub struct Inner {
     /// `queues[i]` holds the messages endpoint `i` will read.
@@ -43,6 +69,7 @@ pub struct Channel {
     /// `carried[i]` counts the endpoints in the messages queued towards endpoint `i`.
     /// It grows only under [`TRANSFER`] and shrinks when a message is read or dropped.
     carried: [AtomicUsize; 2],
+    _charge: Charge,
 }
 
 impl Channel {
@@ -115,8 +142,9 @@ impl Drop for Endpoint {
     }
 }
 
-/// Creates a channel and returns its two endpoints.
-pub fn create() -> (Arc<Endpoint>, Arc<Endpoint>) {
+/// Creates a channel, charged to `account`, and returns its two endpoints.
+pub fn create(account: &Arc<Account>) -> Result<(Arc<Endpoint>, Arc<Endpoint>), Error> {
+    let charge = Charge::new(account, charge::CHANNEL)?;
     let channel = Arc::new(Channel {
         inner: SpinLock::new(Inner {
             queues: [VecDeque::new(), VecDeque::new()],
@@ -127,12 +155,13 @@ pub fn create() -> (Arc<Endpoint>, Arc<Endpoint>) {
             Signaller::new(Signals::WRITABLE),
         ],
         carried: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        _charge: charge,
     });
-    (
+    Ok((
         Arc::new(Endpoint {
             channel: channel.clone(),
             side: 0,
         }),
         Arc::new(Endpoint { channel, side: 1 }),
-    )
+    ))
 }

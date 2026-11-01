@@ -23,7 +23,7 @@ const DEVICE_QUEUE_SHARE: f64 = 0.6;
 /// (12 f.1, 02 f.1). A sample is still taken, for the tick clock and the throttling counter.
 pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
     // Sampling is a call into another component, so it happens with no lock held (RC-I10).
-    let sample = ctl.peers().sampler.sample();
+    let sample = ctl.peers().sampler.sample()?;
 
     let (budgets, tier_budgets) = {
         let mut state = ctl.held();

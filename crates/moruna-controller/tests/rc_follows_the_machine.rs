@@ -368,8 +368,8 @@ struct Racing {
 }
 
 impl Sampler for Racing {
-    fn sample(&self) -> Sample {
-        let sample = self.inner.sample();
+    fn sample(&self) -> moruna_kernel::Result<Sample> {
+        let sample = self.inner.sample()?;
         let watcher = self
             .watcher
             .lock()
@@ -378,7 +378,7 @@ impl Sampler for Racing {
         if let Some(watcher) = watcher {
             watcher();
         }
-        sample
+        Ok(sample)
     }
 
     fn reset_peak(&self) {
@@ -467,4 +467,18 @@ fn rc_t19_a_sample_older_than_the_watcher() {
     controller.tick_once();
     assert_eq!(controller.limits_in_force().0, high);
     controller.stop();
+}
+
+#[test]
+fn accounting_read_failure_terminates_instead_of_reusing_prior_sample() {
+    let rig = rig(GIB, 2, run(100 * MIB, GIB, 2.0, 1, 4));
+    rig.controller.prepare().unwrap();
+    rig.sampler.set_read_failure(true);
+    rig.controller.tick_once();
+    let cause = rig
+        .knobs
+        .terminated()
+        .expect("failed sampler must terminate");
+    assert!(cause.contains("accounting source unavailable"), "{cause}");
+    assert!(cause.contains("TEST-ONLY sampler"), "{cause}");
 }

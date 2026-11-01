@@ -206,20 +206,14 @@ pub(crate) fn anon_for_kernels(state: &ControllerState) -> u64 {
 /// The headroom the kernels may be planned into at all, fixed term included: `KERNEL_ANON_SHARE`
 /// of what the arena left above itself, less the bytes the instances hold.
 pub(crate) fn for_kernels(state: &ControllerState) -> u64 {
-    scale(
-        anon_headroom(state).saturating_sub(state.state_total),
-        KERNEL_ANON_SHARE,
-    )
+    kernel_envelope(anon_headroom(state), state.state_total)
 }
 
 /// What one in-flight morsel of a stage costs the process outside the arena (f.3): the anon
 /// analogue of `allowance`.
 pub(crate) fn anon_allowance(state: &ControllerState, at: usize, target: u64) -> u64 {
     let ctl = &state.stages[at];
-    scale(
-        target,
-        ctl.a_anon.max(MIN_AMPLIFICATION) * f64::from(ctl.safety),
-    )
+    anon_work(target, ctl.a_anon, ctl.safety)
 }
 
 /// The anonymous footprint a proposed set of targets would reach, above the resting figure: the
@@ -828,4 +822,17 @@ pub(crate) fn resize(state: &mut ControllerState, actions: &mut Actions) {
     actions.budgets = Some(tier_budgets);
     refresh_envelopes(state);
     apply::assert_consistent(state);
+}
+
+/// Canonical anonymous kernel planning envelope, shared with pre-dispatch admission.
+pub(crate) fn kernel_envelope(headroom: u64, state: u64) -> u64 {
+    scale(headroom.saturating_sub(state), KERNEL_ANON_SHARE)
+}
+
+/// Canonical anonymous allowance of one in-flight morsel.
+pub(crate) fn anon_work(target: u64, amplification: f64, safety: f32) -> u64 {
+    scale(
+        target,
+        amplification.max(MIN_AMPLIFICATION) * f64::from(safety),
+    )
 }

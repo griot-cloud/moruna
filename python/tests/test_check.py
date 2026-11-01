@@ -88,21 +88,26 @@ def run_check(*args: str) -> tuple[int, str, str]:
     return done.returncode, done.stdout, done.stderr
 
 
-def test_ck_t9_an_agreeing_module_exits_0_and_writes_a_profile(tmp_path: Path) -> None:
+def test_ck_t9_an_agreeing_module_exits_0_and_is_warmed_up(tmp_path: Path) -> None:
     module = write(tmp_path, "agreeing", AGREEING)
-    profiles = tmp_path / "profiles"
-    code, out, _ = run_check(str(module), "--json", "--profiles-dir", str(profiles))
+    store = tmp_path / "observations"
+    code, out, _ = run_check(str(module), "--json", "--store", str(store), "--budget", "10")
     assert code == 0, out
     report = json.loads(out)
     assert report["exit"] == 0
+    assert report["moruna_check"] == 2
     [kernel] = report["kernels"]
     assert kernel["kernel"] == "shout"
     assert kernel["verdict"] == "agreed"
     assert kernel["fingerprint"].startswith("sha256:")
-    assert kernel["profile"]["written"]
-    row = json.loads(Path(kernel["profile"]["path"]).read_text())
-    assert row["source"] == "moruna check"
-    assert row["gil"] in ("free_threaded", "serialised")
+    assert kernel["gil"] in ("free_threaded", "serialised")
+    warm = kernel["warm_up"]
+    assert warm["model"] == {"name": "loglinear", "version": 1}
+    assert warm["observations"] > 0
+    assert warm["key"]["kind"] == "python"
+    assert (store / "models" / "loglinear@1.state").is_file()
+    assert any((store / "observations").iterdir()), "the units are in the store"
+    assert "warm-up (`loglinear@1`): per 10000 rows" in kernel["summary"]
     assert [b["name"] for b in kernel["batches"]] == [
         "empty",
         "one_row",
@@ -114,7 +119,7 @@ def test_ck_t9_an_agreeing_module_exits_0_and_writes_a_profile(tmp_path: Path) -
 
 def test_ck_t9_h13_a_refused_kernel_names_the_column_and_exits_2(tmp_path: Path) -> None:
     module = write(tmp_path, "refused", REFUSED)
-    code, out, _ = run_check(str(module), "--no-profile")
+    code, out, _ = run_check(str(module), "--no-warm-up")
     assert code == 2
     assert "halve (python): refused" in out
     assert "column `half`: declared int64, produced double" in out
@@ -122,12 +127,12 @@ def test_ck_t9_h13_a_refused_kernel_names_the_column_and_exits_2(tmp_path: Path)
 
 def test_ck_t9_kernel_selection_and_no_kernels(tmp_path: Path) -> None:
     module = write(tmp_path, "mixed", MIXED)
-    code, out, _ = run_check(str(module), "--json", "--no-profile")
+    code, out, _ = run_check(str(module), "--json", "--no-warm-up")
     report = json.loads(out)
     verdicts = {k["kernel"]: k["verdict"] for k in report["kernels"]}
     assert verdicts == {"shout": "agreed", "cleaned": "agreed", "undeclared": "not_checkable"}
     assert code == 2
-    code, out, _ = run_check(str(module), "--kernel", "cleaned", "--no-profile")
+    code, out, _ = run_check(str(module), "--kernel", "cleaned", "--no-warm-up")
     assert code == 0, out
     assert "cleaned (std): agreed" in out
     code, _, err = run_check(str(module), "--kernel", "missing")
@@ -259,7 +264,7 @@ def test_std_kernels_run_and_fuse_in_moruna_run(tmp_path: Path) -> None:
 @needs_polars
 def test_ck_t8_a_polars_signature_checks_and_runs(tmp_path: Path) -> None:
     module = write(tmp_path, "frames", POLARS)
-    code, out, _ = run_check(str(module), "--json", "--no-profile")
+    code, out, _ = run_check(str(module), "--json", "--no-warm-up")
     report = json.loads(out)
     assert code == 0, out
     assert {k["kernel"] for k in report["kernels"]} == {"doubled", "lazily"}
@@ -298,7 +303,7 @@ def test_an_undecorated_polars_function_is_found_and_wrapped(tmp_path: Path) -> 
     loaded = _check._load(str(module))
     [(name, kernel)] = _check.kernels_of(loaded)
     assert name == "plain"
-    report = _check.check_one(name, kernel, 0, None)
+    report = _check.check_one(name, kernel, 0, _check._warm_up(False, None, 60.0, None, None))
     assert report["verdict"] == "not_checkable"
 
     def not_frames(frame: pl.DataFrame) -> int:
@@ -308,3 +313,41 @@ def test_an_undecorated_polars_function_is_found_and_wrapped(tmp_path: Path) -> 
     wrapped = moruna.polars(lambda f: f.with_columns(pl.lit(1).alias("one")))
     batch = pa.RecordBatch.from_pydict({"s": ["a"]})
     assert wrapped(batch).num_columns == 2
+
+
+def test_cm_t58_python_check_returns_the_fitted_cost(tmp_path: Path) -> None:
+    """KD6b (AR section 6.6): ``moruna.check`` returns each kernel's cost per 10,000 rows, every
+    estimate naming its basis, and what warm-up consumed; the statistics are honoured."""
+    module = write(tmp_path, "agreeing", AGREEING)
+    store = tmp_path / "observations"
+    result = moruna.check(
+        str(module),
+        store=str(store),
+        budget=10.0,
+        statistics={"columns": [{"name": "text", "bytes_mean": 24.0, "null_fraction": 0.5}]},
+    )
+    assert result["exit"] == 0, result
+    [kernel] = result["kernels"]
+    cost = kernel["warm_up"]["cost_per_10000_rows"]
+    assert cost["duration"]["p50"] > 0
+    assert cost["duration"]["p95"] >= cost["duration"]["p50"]
+    assert cost["duration"]["basis"] == "warm_up"
+    assert cost["peak_memory"]["unit"] == "bytes"
+    consumed = kernel["warm_up"]["consumed"]
+    assert consumed["wall_seconds"] > 0
+    assert consumed["store_bytes"] > 0
+    assert kernel["warm_up"]["selectivity"]["value_dependent"] is True
+    assert kernel["warm_up"]["progress"]["sizes"][0]["uniform"] > 0
+    # The statistics were read: they mark no key, and warm-up says what it did instead.
+    assert any("no key column is marked" in n for n in kernel["warm_up"]["notes"])
+    # Statistics naming a column the input does not have refuse warm-up, saying so.
+    ghost = moruna.check(str(module), store=str(store), statistics={"columns": [{"name": "ghost"}]})
+    assert ghost["exit"] == 2
+    assert "`ghost`" in ghost["kernels"][0]["warm_up"]["error"]
+    # A model that is not registered is refused, naming the ones that are.
+    refused = moruna.check(str(module), store=str(store), model="nope")
+    assert refused["exit"] == 2
+    assert "loglinear" in refused["error"]
+    # Without warm-up there is no cost, and nothing is written.
+    plain = moruna.check(str(module), warm_up=False)
+    assert plain["kernels"][0]["warm_up"] is None

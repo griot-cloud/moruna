@@ -1,8 +1,9 @@
 //! `moruna-image DESCRIPTION PROGRAMS OUT`: builds the boot image DESCRIPTION names
 //! from the programs in the directory PROGRAMS and the data files OUT already holds
 //! (a `data:PATH` handle is OUT/PATH), and writes into OUT the initramfs
-//! (`initramfs.cpio`), the boot manifest it carries (`manifest`), and the lines a boot
-//! of it must print (`expect`), one per line.
+//! (`initramfs.cpio`), the boot manifest it carries (`manifest`), the lines a boot of
+//! it must print (`expect`), one per line, the machine's QEMU arguments (`machine`, a
+//! line per `machine` directive) and the disks the boot writes and checks (`disks`).
 
 use std::{fs, path::Path, process::ExitCode};
 
@@ -37,6 +38,9 @@ fn run(description: &Path, programs: &Path, out: &Path) -> Result<String, String
     let mut expect = image.expect.join("\n");
     expect.push('\n');
     write("expect", expect.as_bytes())?;
+    let lines = |lines: &[String]| -> String { lines.iter().map(|l| format!("{l}\n")).collect() };
+    write("machine", lines(&image.machine).as_bytes())?;
+    write("disks", lines(&image.disks).as_bytes())?;
     Ok(format!(
         "moruna-image: {} bytes of initramfs, {} expected lines, in {}",
         image.initramfs.len(),

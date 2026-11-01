@@ -7,12 +7,19 @@
 //! only DMA through the reactor to move them, within the per-tier budgets the controller
 //! sets.
 //!
+//! The buffer catalog (f.18) is the one record of every batch the engine holds: its size, where
+//! its bytes are, who produced it, which consumers still have to take it, which running units
+//! hold it, and what bringing it back would cost. A queue entry names its batch and nothing more,
+//! so a batch fanned out to several queues is resident, spilled and reloaded once (PL-I18). When
+//! memory must be freed, the batches leave in the order of their next use as the queues show it
+//! (Belady over the known future), weighed by reload cost against size (PL-I20).
+//!
 //! It has no thread of its own (PL-I14): every reactor operation is issued from the thread
 //! that called `push`, `pop`, a setter or `restore` and returns at once, and its outcome is
 //! observed in a `Completion::then` callback on the reactor thread that resolved it. The
-//! lock order is the preamble's (4.2): a queue lock, then the lineage index, then the moves
-//! map and the segments map, and no lock is ever held across a call into the reactor or the
-//! allocator.
+//! lock order is the preamble's (4.2): a queue lock, then the lineage index, then the catalog,
+//! then the moves map and the segments map, and no lock is ever held across a call into the
+//! reactor or the allocator.
 
 #![deny(missing_docs)]
 // Section l: `unsafe` is not permitted in this crate. Every DMA source is a `BufferView`
@@ -31,20 +38,24 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use moruna_kernel::{
     Allocator, CheckpointExtras, DeviceId, Fingerprint, Locality, Morsel, MorunaError, NodeId,
     PayloadKind, PayloadSpec, Placement, PlacementStats, Reactor, ResumePoint, ResumePolicy, RunId,
-    Seq, Split, StageId, StagingCodec, TIER_COUNT, Tier, TierBudgets, TierKind, TierPref, Topology,
+    Seq, Split, StageId, StagingCodec, Tier, TierBudgets, TierKind, TierPref, Topology,
 };
 
+pub mod catalog;
 pub mod lineage;
 pub mod locks;
 pub mod manifest;
 pub mod moves;
 pub mod plan;
+pub mod portable_record;
 pub mod queue;
+pub mod residency;
 pub mod shutdown;
 pub mod staging;
 pub mod state;
 pub mod stats;
 
+use catalog::{Catalog, CatalogObserver, EvictionOrder, KnownFuture};
 use lineage::Lineage;
 use manifest::ManifestHeader;
 use moves::MoveInFlight;
@@ -54,32 +65,6 @@ use stats::PlacementDetail;
 
 /// "Nothing committed yet" in the committed watermark (e.2).
 pub(crate) const NO_COMMIT: u64 = u64::MAX;
-
-/// How a queue demotes an entry it cannot keep resident.
-///
-/// Reserved (b): no configuration field carries it in v1. What decides at run time is the
-/// queue's `staging_enabled` flag alone; the enum exists so that the entry state machine and
-/// `evicted()` are written once for any stage, not for stage zero.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum DemotionPolicy {
-    /// Demote by writing a segment record.
-    Write,
-    /// Demote by dropping the bytes and listing the entry for recomputation.
-    Evict,
-}
-
-impl DemotionPolicy {
-    /// The policy a queue's `staging_enabled` flag and an entry's recomputability imply
-    /// (b): staging on writes, staging off evicts a recomputable entry, and staging off on
-    /// a non-recomputable entry has no policy at all (PL-I6).
-    pub fn of(staging_enabled: bool, recomputable: bool) -> Option<DemotionPolicy> {
-        match (staging_enabled, recomputable) {
-            (true, _) => Some(DemotionPolicy::Write),
-            (false, true) => Some(DemotionPolicy::Evict),
-            (false, false) => None,
-        }
-    }
-}
 
 /// Everything the engine is told once, at `new` (d.1).
 #[derive(Clone, Debug)]
@@ -120,6 +105,9 @@ pub struct PlacementConfig {
     pub config: serde_json::Value,
     /// `checkpoint.enabled`; false unlinks reclaimable segments at once (f.7).
     pub checkpoint_enabled: bool,
+    /// The order in which batches leave memory (f.18): [`KnownFuture`] unless a policy names
+    /// another.
+    pub eviction: Arc<dyn EvictionOrder>,
 }
 
 impl Default for PlacementConfig {
@@ -142,6 +130,7 @@ impl Default for PlacementConfig {
             resume_policy: Vec::new(),
             config: serde_json::Value::Null,
             checkpoint_enabled: true,
+            eviction: Arc::new(KnownFuture),
         }
     }
 }
@@ -157,7 +146,12 @@ pub struct PlacementEngine {
     pub(crate) run_dir: Option<PathBuf>,
     pub(crate) queues: Vec<Mutex<Queue>>,
     pub(crate) counters: Vec<QueueCounters>,
-    pub(crate) reserved: [AtomicU64; TIER_COUNT],
+    /// The buffer catalog (f.18), preamble 4.2 position 3.
+    pub(crate) catalog: Mutex<Catalog>,
+    /// The order batches leave memory in (f.18).
+    pub(crate) order: Arc<dyn EvictionOrder>,
+    /// Who hears the catalog's events.
+    pub(crate) observer: RwLock<Option<Arc<dyn CatalogObserver>>>,
     pub(crate) budgets: RwLock<TierBudgets>,
     pub(crate) disk_bytes: AtomicU64,
     pub(crate) disk_budget: AtomicU64,
@@ -172,9 +166,6 @@ pub struct PlacementEngine {
     pub(crate) sink_watermarks: Vec<AtomicU64>,
     /// Each source's watermark as the last commit computed it from the sinks' (f.11, d.16).
     pub(crate) source_watermarks: Vec<AtomicU64>,
-    /// Per tier, the bytes counted in more than one queue: what a fanned-out batch is counted
-    /// over its one residency (d.16, f.9).
-    pub(crate) shared_bytes: [AtomicU64; TIER_COUNT],
     pub(crate) manifest_refs: Mutex<HashSet<u32>>,
     pub(crate) shutting_down: AtomicBool,
     pub(crate) restored: AtomicBool,
@@ -235,6 +226,7 @@ impl PlacementEngine {
         let sources = usize::from(cfg.topology.sources());
         let counters: Vec<QueueCounters> = (0..stages).map(|_| QueueCounters::default()).collect();
         let budgets = RwLock::new(cfg.budgets.clone());
+        let order = Arc::clone(&cfg.eviction);
         Ok(Arc::new_cyclic(|this| PlacementEngine {
             cfg,
             alloc,
@@ -242,9 +234,11 @@ impl PlacementEngine {
             host_tier,
             page_bytes,
             run_dir,
+            catalog: Mutex::new(Catalog::new(stages)),
             queues,
             counters,
-            reserved: std::array::from_fn(|_| AtomicU64::new(0)),
+            order,
+            observer: RwLock::new(None),
             budgets,
             disk_bytes: AtomicU64::new(0),
             disk_budget: AtomicU64::new(disk_budget),
@@ -256,7 +250,6 @@ impl PlacementEngine {
             lineage: Mutex::new(BTreeMap::new()),
             sink_watermarks: (0..sinks).map(|_| AtomicU64::new(NO_COMMIT)).collect(),
             source_watermarks: (0..sources).map(|_| AtomicU64::new(NO_COMMIT)).collect(),
-            shared_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
             manifest_refs: Mutex::new(HashSet::new()),
             shutting_down: AtomicBool::new(false),
             restored: AtomicBool::new(false),
@@ -301,6 +294,11 @@ impl PlacementEngine {
         manifest::read_manifest_header(path)
     }
 
+    /// The name of the order batches leave memory in (f.18), for the run report.
+    pub fn eviction_order(&self) -> &'static str {
+        self.order.name()
+    }
+
     /// The run's one host tier (contracts e.1).
     pub fn host_tier(&self) -> Tier {
         self.host_tier
@@ -339,49 +337,6 @@ impl PlacementEngine {
         }
     }
 
-    /// Resident bytes in one tier slot, summed over queues, a fanned-out batch once (f.9, d.16).
-    pub(crate) fn resident_of(&self, slot: usize) -> u64 {
-        let counted: u64 = self
-            .counters
-            .iter()
-            .map(|c| c.bytes[slot].load(Ordering::Relaxed))
-            .sum();
-        counted.saturating_sub(self.shared_bytes[slot].load(Ordering::Relaxed))
-    }
-
-    /// Claim `bytes` against a destination tier's budget for a move in flight (PL-I3, f.9).
-    /// A failed reservation returns false without side effect.
-    pub(crate) fn reserve(&self, slot: usize, bytes: u64) -> bool {
-        let budget = self.budget_of(slot);
-        loop {
-            let reserved = self.reserved[slot].load(Ordering::Acquire);
-            let resident = self.resident_of(slot);
-            if resident.saturating_add(reserved).saturating_add(bytes) > budget {
-                return false;
-            }
-            if self.reserved[slot]
-                .compare_exchange_weak(
-                    reserved,
-                    reserved + bytes,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    /// Release a reservation when its move completes or fails (f.9).
-    pub(crate) fn release(&self, slot: usize, bytes: u64) {
-        self.reserved[slot]
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                Some(held.saturating_sub(bytes))
-            })
-            .ok();
-    }
-
     /// The next move id; also the key of the moves map (g).
     pub(crate) fn next_move_id(&self) -> u64 {
         self.next_move.fetch_add(1, Ordering::Relaxed)
@@ -406,21 +361,15 @@ impl PlacementEngine {
 
 impl Placement for PlacementEngine {
     fn push(&self, stage: StageId, morsel: Morsel) -> moruna_kernel::Result<()> {
-        let index = self.check_stage(stage)?;
-        self.push_entry(index, morsel, false)
+        self.check_stage(stage)?;
+        self.push_into(&[stage], morsel, queue::Admit::Unclaimed)
     }
 
     fn push_to(&self, stages: &[StageId], morsel: Morsel) -> moruna_kernel::Result<()> {
         for stage in stages {
             self.check_stage(*stage)?;
         }
-        match stages {
-            [] => Err(MorunaError::Plan(
-                "a morsel is pushed into at least one queue".into(),
-            )),
-            [one] => self.push_entry(usize::from(*one), morsel, false),
-            many => self.push_shared(many, morsel),
-        }
+        self.push_into(stages, morsel, queue::Admit::Unclaimed)
     }
 
     fn pop(
@@ -443,6 +392,11 @@ impl Placement for PlacementEngine {
         self.pop_blocking_entry(index, &want, locality)
     }
 
+    fn release(&self, stage: StageId, seq: Seq) -> moruna_kernel::Result<()> {
+        let index = self.check_stage(stage)?;
+        self.release_take(index, seq)
+    }
+
     fn peek_resident(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> bool {
         match self.check_stage(stage) {
             Ok(index) => self.peek(index, &want, locality),
@@ -459,7 +413,7 @@ impl Placement for PlacementEngine {
 
     fn replace(&self, stage: StageId, morsel: Morsel) -> moruna_kernel::Result<()> {
         let index = self.check_stage(stage)?;
-        self.push_entry(index, morsel, true)
+        self.replace_entry(index, morsel, None)
     }
 
     fn shutdown(&self) {
@@ -509,6 +463,9 @@ impl Placement for PlacementEngine {
             *held = budgets;
         }
         self.plan_every_queue();
+        for kind in [TierKind::Device, self.host_tier.kind()] {
+            self.relieve(kind.index());
+        }
     }
 
     fn set_water(&self, stage: StageId, tier: TierKind, low: u64, high: u64) {

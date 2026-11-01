@@ -6,6 +6,8 @@
 
 use alloc::{format, string::String};
 
+use moruna_abi::Error;
+use moruna_mmio::Region;
 use moruna_svc::{
     DeviceMemory, Handle, Interrupt, Mapping, Msi, ResourceInfo, ResourceKind, map, start,
 };
@@ -19,10 +21,51 @@ pub struct Claim {
     pub info: ResourceInfo,
 }
 
-/// One memory BAR: its mapping, and where the BAR's first byte is in it.
+/// One memory BAR: its mapping, and where the BAR's first byte is in it. As a
+/// [`Region`] it is the BAR itself: offset 0 is the BAR's first byte.
 pub struct BarWindow {
     pub map: Mapping<'static>,
     pub delta: u64,
+}
+
+impl BarWindow {
+    fn at(&self, offset: usize, n: usize) -> Result<usize, Error> {
+        let base = self.delta as usize;
+        match offset.checked_add(n) {
+            Some(end) if end <= self.len() => Ok(base + offset),
+            _ => Err(Error::OutOfRange),
+        }
+    }
+}
+
+impl Region for BarWindow {
+    fn len(&self) -> usize {
+        (self.map.len() as usize).saturating_sub(self.delta as usize)
+    }
+    fn read8(&self, offset: usize) -> Result<u8, Error> {
+        self.map.read8(self.at(offset, 1)?)
+    }
+    fn read16(&self, offset: usize) -> Result<u16, Error> {
+        self.map.read16(self.at(offset, 2)?)
+    }
+    fn read32(&self, offset: usize) -> Result<u32, Error> {
+        self.map.read32(self.at(offset, 4)?)
+    }
+    fn read64(&self, offset: usize) -> Result<u64, Error> {
+        self.map.read64(self.at(offset, 8)?)
+    }
+    fn write8(&self, offset: usize, value: u8) -> Result<(), Error> {
+        self.map.write8(self.at(offset, 1)?, value)
+    }
+    fn write16(&self, offset: usize, value: u16) -> Result<(), Error> {
+        self.map.write16(self.at(offset, 2)?, value)
+    }
+    fn write32(&self, offset: usize, value: u32) -> Result<(), Error> {
+        self.map.write32(self.at(offset, 4)?, value)
+    }
+    fn write64(&self, offset: usize, value: u64) -> Result<(), Error> {
+        self.map.write64(self.at(offset, 8)?, value)
+    }
 }
 
 pub struct Function {
@@ -116,6 +159,11 @@ impl Function {
 
     pub fn bar(&self, index: usize) -> Option<&BarWindow> {
         self.bars.get(index).and_then(Option::as_ref)
+    }
+
+    /// Takes BAR `index`'s window out.
+    pub fn take_bar(&mut self, index: usize) -> Option<BarWindow> {
+        self.bars.get_mut(index).and_then(Option::take)
     }
 
     /// Takes the BAR windows out, each with the offset of its BAR's first byte.

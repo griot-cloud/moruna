@@ -29,8 +29,9 @@ use std::sync::Arc;
 use moruna_kernel::arrow::datatypes::{DataType, Schema, SchemaRef};
 use moruna_kernel::declare::{ColumnDecl, Declared, SchemaDecl};
 use moruna_kernel::{
-    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError, NoState,
-    Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
+    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, LogicalRows,
+    LogicalTaskRows, MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy,
+    SourceSchema, TierPref,
 };
 use serde_json::Value;
 use sha2::Digest;
@@ -111,6 +112,36 @@ pub struct StdKernel {
     declared: Declared,
     fingerprint: Fingerprint,
     amplification: f64,
+    capture: Option<Arc<LogicalBinding>>,
+}
+
+struct LogicalBinding {
+    tasks: Vec<LogicalTaskRows>,
+    rows: Arc<dyn LogicalRows>,
+}
+
+impl core::fmt::Debug for LogicalBinding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LogicalBinding")
+            .field("tasks", &self.tasks)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogicalBinding {
+    fn emit(
+        &self,
+        index: usize,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+    ) -> Result<()> {
+        let task = self.tasks.get(index).ok_or_else(|| {
+            MorunaError::Plan("logical tap index differs from fused executable".into())
+        })?;
+        for port in &task.ports {
+            self.rows.append(&task.task, port, batch)?;
+        }
+        Ok(())
+    }
 }
 
 /// The fingerprint of MH 4.9: SHA-256 over `"moruna-std\0" || name || "\0" || canonical args ||
@@ -435,6 +466,7 @@ impl StdKernel {
             op,
             declared,
             amplification,
+            capture: None,
         })
     }
 
@@ -528,6 +560,7 @@ pub fn fuse(first: &StdKernel, second: &StdKernel) -> Option<StdKernel> {
         declared: Declared::default(),
         fingerprint: Fingerprint(hasher.finalize().into()),
         amplification: first.amplification.max(second.amplification),
+        capture: None,
     };
     fused.declared = fused_declaration(first, second, &fused);
     Some(fused)
@@ -615,12 +648,40 @@ impl KernelState for Seen {
         Ok(Some(out))
     }
 
-    fn footprint(&self) -> Option<u64> {
-        Some(self.bytes + self.keys.len() as u64 * 32)
+    fn footprint(&self) -> moruna_kernel::Result<Option<u64>> {
+        Ok(Some(self.bytes + self.keys.len() as u64 * 32))
     }
 }
 
 impl Kernel for StdKernel {
+    fn with_logical_rows(
+        &self,
+        tasks: &[LogicalTaskRows],
+        rows: Arc<dyn LogicalRows>,
+    ) -> Result<Arc<dyn Kernel>> {
+        let boundaries = match &self.op {
+            Op::Project(steps) => steps.len(),
+            Op::FillFilter(..) => 2,
+            _ => 1,
+        };
+        if self.capture.is_some()
+            || tasks.len() != boundaries
+            || tasks
+                .iter()
+                .any(|task| task.task.is_empty() || task.ports.iter().any(String::is_empty))
+        {
+            return Err(MorunaError::Plan(
+                "logical task bindings do not match standard fused boundaries".into(),
+            ));
+        }
+        let mut bound = self.clone();
+        bound.capture = Some(Arc::new(LogicalBinding {
+            tasks: tasks.to_vec(),
+            rows,
+        }));
+        Ok(Arc::new(bound))
+    }
+
     fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
     }
@@ -768,10 +829,28 @@ impl Kernel for StdKernel {
             )));
         };
         let out = match &self.op {
-            Op::Project(steps) => ops::project(steps, batch)?,
+            Op::Project(steps) => match &self.capture {
+                Some(capture) => ops::project_tapped(
+                    steps,
+                    batch,
+                    |index| !capture.tasks[index].ports.is_empty(),
+                    |index, rows| capture.emit(index, rows),
+                )?,
+                None => ops::project(steps, batch)?,
+            },
             Op::Filter(expr) => ops::filter(expr, batch)?,
             Op::Fill(values) => ops::fill(values, batch)?,
-            Op::FillFilter(values, expr) => ops::fill_then_filter(values, expr, batch)?,
+            Op::FillFilter(values, expr) => {
+                if let Some(capture) = &self.capture
+                    && !capture.tasks[0].ports.is_empty()
+                {
+                    // This requested intermediate was intentionally elided by the fused fast path.
+                    // Materialize it once for retention, while the final operation stays fused.
+                    let filled = ops::fill(values, batch)?;
+                    capture.emit(0, &filled)?;
+                }
+                ops::fill_then_filter(values, expr, batch)?
+            }
             Op::Dedupe(keys) => {
                 let seen = state.as_any_mut().downcast_mut::<Seen>().ok_or_else(|| {
                     MorunaError::Plan("moruna.std.dedupe was given a state it did not make".into())
@@ -800,8 +879,18 @@ impl Kernel for StdKernel {
                 unit,
                 output,
             } => ops::date_trunc(column, *unit, output.as_deref(), batch)?,
-            Op::Union => return Ok(input),
+            Op::Union => {
+                if let Some(capture) = &self.capture {
+                    capture.emit(0, batch)?;
+                }
+                return Ok(input);
+            }
         };
+        if let Some(capture) = &self.capture {
+            if !matches!(self.op, Op::Project(_)) {
+                capture.emit(capture.tasks.len() - 1, &out)?;
+            }
+        }
         drop(input);
         Payload::table(out)
     }

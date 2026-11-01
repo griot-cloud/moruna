@@ -7,8 +7,13 @@
 //! moruna-manifest 1
 //! channel NAME
 //! process NAME PATH
+//! memory BYTES
 //! handle SOURCE SLOT [rights=R,R,...]
 //! ```
+//!
+//! `memory` (ABI 2.3) gives the process above it an account of its own whose limit, a
+//! whole number of pages, is carved out of the machine's; a process without one is
+//! charged to the machine's account itself (SDD 20 f.18).
 //!
 //! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`,
 //! `root.ecam`, `root.msi`, `root.dma`, `channel:NAME.0`, `channel:NAME.1` or
@@ -94,6 +99,9 @@ pub struct ProcessSpec {
     pub name: String,
     /// The ELF inside the initramfs.
     pub path: String,
+    /// The limit of the process's own account (`memory`), carved out of the machine's;
+    /// `None`: it is charged to the machine's account.
+    pub memory: Option<u64>,
     pub handles: Vec<HandleSpec>,
 }
 
@@ -131,6 +139,9 @@ pub enum Reason {
     TooManyChannels,
     TooManyHandles,
     NoProcesses,
+    BadMemory,
+    MemoryBeforeProcess,
+    DuplicateMemory,
 }
 
 impl Reason {
@@ -161,6 +172,9 @@ impl Reason {
             Reason::TooManyChannels => "more than 64 channels",
             Reason::TooManyHandles => "more than 64 handles for one process",
             Reason::NoProcesses => "the manifest starts no process",
+            Reason::BadMemory => "a `memory` line is not a whole number of pages above zero",
+            Reason::MemoryBeforeProcess => "a `memory` line comes before any `process` line",
+            Reason::DuplicateMemory => "a process is given `memory` twice",
         }
     }
 }
@@ -303,8 +317,28 @@ impl Manifest {
                     manifest.processes.push(ProcessSpec {
                         name: String::from(name),
                         path: String::from(path),
+                        memory: None,
                         handles: Vec::new(),
                     });
+                }
+                "memory" => {
+                    if fields.len() != 2 {
+                        return Err(err(line, Reason::WrongArity));
+                    }
+                    let bytes: u64 = fields[1]
+                        .parse()
+                        .map_err(|_| err(line, Reason::BadMemory))?;
+                    if bytes == 0 || !bytes.is_multiple_of(crate::PAGE_SIZE) {
+                        return Err(err(line, Reason::BadMemory));
+                    }
+                    let process = manifest
+                        .processes
+                        .last_mut()
+                        .ok_or(err(line, Reason::MemoryBeforeProcess))?;
+                    if process.memory.is_some() {
+                        return Err(err(line, Reason::DuplicateMemory));
+                    }
+                    process.memory = Some(bytes);
                 }
                 "handle" => {
                     if fields.len() != 3 && fields.len() != 4 {
@@ -410,6 +444,9 @@ impl fmt::Display for Manifest {
         }
         for p in &self.processes {
             writeln!(f, "process {} {}", p.name, p.path)?;
+            if let Some(bytes) = p.memory {
+                writeln!(f, "memory {bytes}")?;
+            }
             for h in &p.handles {
                 f.write_str("handle ")?;
                 match &h.source {
@@ -465,6 +502,7 @@ process ping bin/ping
 handle console console
 handle channel:pp.0 peer rights=read,write,wait
 process pong bin/pong   # trailing comment
+memory 1048576
 handle channel:pp.1 peer
 ";
 
@@ -495,6 +533,45 @@ handle channel:pp.1 peer
         assert_eq!(
             m.processes[2].handles[0].source,
             Source::ChannelEnd { channel: 0, end: 1 }
+        );
+        assert_eq!(
+            (m.processes[0].memory, m.processes[2].memory),
+            (None, Some(1 << 20))
+        );
+    }
+
+    #[test]
+    fn kb5_t2_manifest_memory() {
+        let head = "moruna-manifest 1\n";
+        assert_eq!(
+            reason(&format!("{head}memory 4096\n")),
+            Reason::MemoryBeforeProcess
+        );
+        for bad in ["0", "4095", "4097", "lots", "-4096"] {
+            assert_eq!(
+                reason(&format!("{head}process a bin/a\nmemory {bad}\n")),
+                Reason::BadMemory,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            reason(&format!(
+                "{head}process a bin/a\nmemory 4096\nmemory 8192\n"
+            )),
+            Reason::DuplicateMemory
+        );
+        assert_eq!(
+            reason(&format!("{head}process a bin/a\nmemory\n")),
+            Reason::WrongArity
+        );
+        let m = Manifest::parse(
+            format!("{head}process a bin/a\nmemory 8192\nhandle console c\n").as_bytes(),
+        )
+        .expect("parses");
+        assert_eq!(m.processes[0].memory, Some(8192));
+        assert!(
+            m.to_string()
+                .contains("process a bin/a\nmemory 8192\nhandle console c\n")
         );
     }
 
@@ -669,6 +746,9 @@ handle channel:pp.1 peer
             Reason::TooManyChannels,
             Reason::TooManyHandles,
             Reason::NoProcesses,
+            Reason::BadMemory,
+            Reason::MemoryBeforeProcess,
+            Reason::DuplicateMemory,
         ] {
             assert!(!r.describe().is_empty());
         }

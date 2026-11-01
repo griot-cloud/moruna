@@ -70,6 +70,19 @@ pub struct SchedulerConfig {
     pub resuming: bool,
     /// `LOCAL_NODE` in v1; passed to `Origin`.
     pub node: NodeId,
+    /// `scheduler.policy`: the name of the scheduling policy, made from `policies` (contracts
+    /// d.18, adaptive-runtime 9.3).
+    pub policy: String,
+    /// The registry the policy is made from; `crate::policies::standard()` unless the embedder
+    /// registers its own.
+    pub policies: moruna_kernel::SchedulingPolicies,
+    /// The clock a push waiting for room measures its wait by (f.20); the system's, unless a
+    /// test drives it.
+    pub clock: std::sync::Arc<dyn crate::decide::Clock>,
+    /// The disk's bandwidth, bytes per second, as the embedder declares it (adaptive-runtime
+    /// 3.3): what a lookahead plays a spill and a read-back at. `DISK_BYTES_PER_SECOND` unless
+    /// the embedder knows its machine's.
+    pub disk_bytes_per_second: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -89,6 +102,10 @@ impl Default for SchedulerConfig {
             heartbeat_interval_ms: 1000,
             resuming: false,
             node: moruna_kernel::LOCAL_NODE,
+            policy: crate::policies::ADMISSION.to_string(),
+            policies: crate::policies::standard(),
+            clock: std::sync::Arc::new(crate::decide::SystemClock::default()),
+            disk_bytes_per_second: crate::decide::DISK_BYTES_PER_SECOND,
         }
     }
 }
@@ -124,6 +141,12 @@ impl SchedulerConfig {
             return Err(MorunaError::Config {
                 name: "checkpoint.interval_ms",
                 msg: "the checkpoint interval must be positive".into(),
+            });
+        }
+        if self.disk_bytes_per_second == 0 {
+            return Err(MorunaError::Config {
+                name: "disk.bytes_per_second",
+                msg: "the disk's bandwidth must be positive".into(),
             });
         }
         Ok(())

@@ -124,7 +124,19 @@ impl Tree<'_> {
     /// What `path` names; a symbolic link at its end is followed when `follow`.
     pub fn resolve(&self, p: &mut impl Pages, path: &[u8], follow: bool) -> Result<Place> {
         let queue = components(path)?;
-        self.walk(p, queue, follow)
+        self.walk(p, queue, follow, None)
+    }
+    /// Resolve within an actual pinned directory, never a path-prefix alias.
+    /// Parent traversal cannot escape this capability root; absolute symlinks
+    /// restart at it rather than at the source task's ambient namespace.
+    pub fn resolve_at(
+        &self,
+        p: &mut impl Pages,
+        root: Option<&Place>,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<Place> {
+        self.walk(p, components(path)?, follow, root)
     }
 
     /// The directory `path`'s last component would be in, and that component, which
@@ -137,7 +149,7 @@ impl Tree<'_> {
         if !valid_name(&name) {
             return Err(Error::BadPath);
         }
-        let dir = self.walk(p, queue, true)?;
+        let dir = self.walk(p, queue, true, None)?;
         if !dir.is_directory(self.scratch) {
             return Err(Error::NotDirectory);
         }
@@ -149,9 +161,19 @@ impl Tree<'_> {
         p: &mut impl Pages,
         mut queue: VecDeque<Vec<u8>>,
         follow: bool,
+        anchor: Option<&Place>,
     ) -> Result<Place> {
         let root = self.overlay.root(p)?;
-        let mut stack = alloc::vec![Frame::Image(root.clone())];
+        let global_root = Place::Image(Found::Directory(root.clone()));
+        let ambient = anchor.is_none_or(|a| *a == global_root);
+        let first = match anchor {
+            None => Frame::Image(root.clone()),
+            Some(Place::Image(Found::Directory(dir))) => Frame::Image(dir.clone()),
+            Some(Place::Scratch(id)) if self.scratch.info(*id)?.directory => Frame::Scratch(*id),
+            Some(Place::MountPoint(i)) => Frame::MountPoint(*i),
+            _ => return Err(Error::NotDirectory),
+        };
+        let mut stack = alloc::vec![first];
         let mut links = 0;
         while let Some(name) = queue.pop_front() {
             if name == b"." {
@@ -160,6 +182,8 @@ impl Tree<'_> {
             if name == b".." {
                 if stack.len() > 1 {
                     stack.pop();
+                } else if !ambient {
+                    return Err(Error::BadPath);
                 }
                 continue;
             }
@@ -167,7 +191,7 @@ impl Tree<'_> {
                 return Err(Error::BadPath);
             }
             let last = queue.is_empty();
-            let at_root = stack.len() == 1;
+            let at_root = ambient && stack.len() == 1;
             let top = stack.last().ok_or(Error::NotFound)?;
             let next = match top {
                 Frame::Image(_) if at_root && name == SCRATCH => Frame::Scratch(0),
@@ -261,7 +285,16 @@ impl Tree<'_> {
 
     /// A symbolic link's target.
     pub fn readlink(&self, p: &mut impl Pages, path: &[u8]) -> Result<Vec<u8>> {
-        match self.resolve(p, path, false)? {
+        self.readlink_at(p, None, path)
+    }
+    /// Read a link inside an actual capability root without resolving its target.
+    pub fn readlink_at(
+        &self,
+        p: &mut impl Pages,
+        root: Option<&Place>,
+        path: &[u8],
+    ) -> Result<Vec<u8>> {
+        match self.resolve_at(p, root, path, false)? {
             Place::Image(Found::Symlink { layer, node, .. }) => {
                 self.overlay.target(p, layer, &node)
             }

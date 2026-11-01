@@ -16,5 +16,22 @@ lz4_flex = { workspace = true }
 zstd = { workspace = true }
 flatbuffers = { workspace = true }
 
+# The data plane's boot fixtures (`plane-fixture`, SDD 29 k) build their batches with
+# arrow, the same arrow `moruna-kernel` re-exports.
+arrow = { workspace = true }
+moruna-ipc-check = { workspace = true }
+
 [features]
 default = []
+
+# The data plane's boot fixtures (SDD 29 k), written by kernel/tools/build.sh.
+[[bin]]
+name = "plane-fixture"
+path = "src/bin/plane-fixture.rs"
+test = false
+
+# KD2's boot fixture (SDD 30 k): the rows the engine on the kernel reads.
+[[bin]]
+name = "kd2-fixture"
+path = "src/bin/kd2-fixture.rs"
+test = false

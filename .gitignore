@@ -1,5 +1,7 @@
 # Rust
 /target/
+/target-linux/
+/target-*/
 **/target/
 Cargo.lock.orig
 

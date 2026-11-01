@@ -1,0 +1,37 @@
+[package]
+name = "moruna-storage-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Native governed object storage over actual caller Memory, block and network grants"
+
+[dependencies]
+moruna-svc.workspace = true
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+moruna-storage-format = { path = "../../crates/moruna-storage-format", version = "=0.5.9", features = ["pure", "crypto"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+moruna-sys.workspace = true
+block-protocol = { path = "../drivers/block-protocol", version = "=0.1.0" }
+netstack-protocol = { path = "../net/protocol", version = "=0.1.0" }
+
+devices-protocol = { path = "../devices/protocol", version = "=0.1.0" }
+
+[features]
+default = []
+service = []
+
+[[bin]]
+name = "storage"
+path = "src/main.rs"
+required-features = ["service"]
+test = false
+bench = false
+
+[[bin]]
+name = "storage-maintenance"
+path = "src/maintenance_main.rs"
+required-features = ["service"]
+test = false
+bench = false

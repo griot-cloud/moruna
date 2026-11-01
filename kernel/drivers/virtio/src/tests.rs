@@ -646,3 +646,89 @@ impl Region for Sub<'_> {
         self.0.write64(offset, value)
     }
 }
+
+/// NT-T6 (SDD 29, k): a network device's configuration, the header of a frame sent,
+/// what a received buffer holds, and the command that sets the queue pairs, each
+/// value the device gives checked.
+#[test]
+fn nt_t6_virtio_net_configuration_frames_and_commands() {
+    use crate::net::{
+        self, NetConfig, NetError, ctrl_queue, feature, read_config, received, rx_queue, tx_queue,
+        write_header, write_pairs_command,
+    };
+    let c = Fake::new(16);
+    c.poke(0, &[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    c.poke(6, &1u16.to_le_bytes());
+    c.poke(8, &4u16.to_le_bytes());
+    c.poke(10, &9000u16.to_le_bytes());
+    let all = feature::MAC | feature::STATUS | feature::MQ | feature::MTU;
+    assert_eq!(
+        read_config(&c, all),
+        Ok(NetConfig {
+            mac: 0x5254_0012_3456,
+            link_up: true,
+            max_pairs: 4,
+            mtu: 9000
+        })
+    );
+    // Without the features, the device is up, has one pair and the default MTU.
+    assert_eq!(
+        read_config(&c, feature::MAC),
+        Ok(NetConfig {
+            mac: 0x5254_0012_3456,
+            link_up: true,
+            max_pairs: 1,
+            mtu: net::DEFAULT_MTU
+        })
+    );
+    c.poke(6, &0u16.to_le_bytes());
+    assert!(!read_config(&c, all).expect("down").link_up);
+    assert_eq!(net::link_up(&c), Ok(false));
+    c.poke(8, &0u16.to_le_bytes());
+    assert_eq!(read_config(&c, all), Err(NetError::BadPairs(0)));
+    c.poke(8, &0x8001u16.to_le_bytes());
+    assert_eq!(read_config(&c, all), Err(NetError::BadPairs(0x8001)));
+    c.poke(8, &2u16.to_le_bytes());
+    c.poke(10, &67u16.to_le_bytes());
+    assert_eq!(read_config(&c, all), Err(NetError::BadMtu(67)));
+    c.poke(0, &[0x01, 0, 0x5e, 0, 0, 1]);
+    assert!(matches!(
+        read_config(&c, feature::MAC),
+        Err(NetError::BadAddress(_))
+    ));
+    c.poke(0, &[0; 6]);
+    assert_eq!(read_config(&c, feature::MAC), Err(NetError::BadAddress(0)));
+
+    let page = Fake::new(4096);
+    page.poke(0, &[0xff; 12]);
+    write_header(&page, 0).expect("header");
+    assert_eq!(page.peek(0, 12), [0; 12]);
+    // A received buffer: header, then the frame.
+    assert_eq!(received(&page, 0, 4096, 12 + 60, 1514), Ok(12..72));
+    assert_eq!(received(&page, 0, 4096, 12 + 1514, 1514), Ok(12..1526));
+    for bad in [0, 11, 12 + 13, 12 + 1515, 4097] {
+        assert_eq!(
+            received(&page, 0, 4096, bad, 1514),
+            Err(NetError::BadLength(bad)),
+            "{bad}"
+        );
+    }
+    page.poke(0, &[1]);
+    assert_eq!(
+        received(&page, 0, 4096, 100, 1514),
+        Err(NetError::Offload { flags: 1, gso: 0 })
+    );
+    page.poke(0, &[0, 3]);
+    assert_eq!(
+        received(&page, 0, 4096, 100, 1514),
+        Err(NetError::Offload { flags: 0, gso: 3 })
+    );
+    write_pairs_command(&page, 64, 3).expect("command");
+    assert_eq!(page.peek(64, 4), [4, 0, 3, 0]);
+    assert_eq!(
+        (rx_queue(0), tx_queue(0), rx_queue(3), tx_queue(3)),
+        (0, 1, 6, 7)
+    );
+    assert_eq!(ctrl_queue(4, true), 8);
+    assert_eq!(ctrl_queue(1, false), 2);
+}

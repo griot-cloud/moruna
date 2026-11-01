@@ -66,6 +66,9 @@ impl Rig {
     fn components(&self, ceiling: u64, staging: Option<std::path::PathBuf>) -> Components {
         let trace = Arc::new(self.trace.clone());
         Components {
+            checkpoints: None,
+            history: None,
+            learning: None,
             discovered: Some(discovered(ceiling, staging)),
             alloc: Some(Arc::new(self.alloc.clone()) as Arc<dyn Allocator>),
             reactor: Some(Arc::new(self.reactor.clone()) as Arc<dyn Reactor>),

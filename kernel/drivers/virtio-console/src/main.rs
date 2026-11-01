@@ -19,6 +19,7 @@ use core::cell::RefCell;
 
 use console_protocol::{LINE_MAX, console};
 use moruna_mmio::Region;
+use moruna_pci::dma::DmaBuffer;
 use moruna_svc::{
     Channel, Completions, Console, Context, DEADLINE_INFINITE, Decoder, Dispatcher, Handle,
     Handler, Interrupt, Outcome, Pending, ProtocolError, ProtocolId, Signals, Status, Watch, Wire,
@@ -26,7 +27,7 @@ use moruna_svc::{
 };
 use moruna_virtio::{
     Buffer,
-    device::{Device, DmaBuffer, VirtQueue},
+    device::{Device, VirtQueue},
     kind,
 };
 

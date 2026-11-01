@@ -9,7 +9,17 @@ publish.workspace = true
 [dependencies]
 moruna-abi.workspace = true
 
+# A Linux program on the Moruna kernel that was granted handles (SDD 30), with its own
+# runtime and allocator.
+moruna-sys = { workspace = true, optional = true }
+
 # On the kernel, the SDK runs on its syscalls and its heap. On a host, for tests, it
 # runs on `sim`, a model of the same channel ABI (SDD 23, f.7).
 [target.'cfg(target_os = "none")'.dependencies]
 moruna-sys = { workspace = true, features = ["heap"] }
+
+[features]
+# The SDK on the kernel's own calls in a program built for another target: a Linux
+# program the Linux personality started with granted handles, the engine (SDD 30). It
+# runs only on the Moruna kernel, and only on x86_64.
+native = ["dep:moruna-sys"]

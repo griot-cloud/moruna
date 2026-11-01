@@ -140,6 +140,8 @@ pub struct SchedulerStats {
     pub recomputed: u64,
     /// Knob values clamped to their range.
     pub knob_clamps: u64,
+    /// The scheduling policy's decisions and what they left unused (d.18).
+    pub policy: crate::policy::PolicyStats,
 }
 
 /// The probe protocol (RC f.2) as the controller sees it. Implemented by the scheduler.

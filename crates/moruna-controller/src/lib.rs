@@ -31,6 +31,7 @@ use moruna_kernel::{
     TraceTail,
 };
 
+mod admission;
 mod apply;
 mod breach;
 mod budget;
@@ -44,7 +45,10 @@ pub mod sizer;
 mod summary;
 mod tick;
 
-pub use sizer::{Envelope, LearnedSizer, Observation, Proposal, RuleSizer, Sizer, SizerOutcome};
+pub use admission::{FixedCommitmentInput, fixed_commitment_budget};
+pub use sizer::{
+    Envelope, LearnedSizer, ModelSizer, Observation, Proposal, RuleSizer, Sizer, SizerOutcome,
+};
 pub use summary::{Bottleneck, ControllerSummary};
 
 /// The contracts' result type; every error here is an `MorunaError` value (contracts d.14).
@@ -470,6 +474,8 @@ pub(crate) struct StageCtl {
     pub waiting: bool,
 }
 
+const INITIAL_ANON_AMPLIFICATION: f64 = 4.0;
+
 impl StageCtl {
     /// Fold one record's reading into the window and refit both terms of f.3 from it.
     ///
@@ -496,8 +502,8 @@ impl StageCtl {
         StageCtl {
             stage,
             a_k: 4.0,
-            a_anon: 4.0,
-            a_anon_seed: 4.0,
+            a_anon: INITIAL_ANON_AMPLIFICATION,
+            a_anon_seed: INITIAL_ANON_AMPLIFICATION,
             c_anon: 0,
             anon_points: VecDeque::new(),
             a_k_dev: 0.0,

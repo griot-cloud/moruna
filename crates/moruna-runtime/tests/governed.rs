@@ -937,4 +937,29 @@ fn sc_t24_a_query_with_no_rows_finishes() {
     };
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     assert_eq!(support::read_back_rows(&out), 0, "the output holds no rows");
+    assert!(
+        out.join("_SUCCESS").is_file(),
+        "the sink committed the result"
+    );
+    let files: Vec<_> = std::fs::read_dir(&out)
+        .expect("output directory")
+        .map(|entry| entry.expect("output entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "an empty result is a real schema-bearing file"
+    );
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(&files[0]).expect("empty output file"),
+    )
+    .expect("the empty output is valid Parquet");
+    assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+    let expected = Schema::new(vec![Field::new("answer", DataType::Int64, false)]);
+    assert_eq!(
+        reader.schema().fields(),
+        expected.fields(),
+        "the SQL schema survives"
+    );
 }

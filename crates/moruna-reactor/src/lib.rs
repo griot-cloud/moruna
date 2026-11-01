@@ -21,6 +21,8 @@
 mod copy;
 mod fdcache;
 mod file_blocking;
+#[cfg(any(all(target_os = "linux", feature = "uring"), test))]
+mod file_lifecycle;
 mod file_uring;
 pub mod files;
 mod gds;
@@ -28,8 +30,10 @@ mod object;
 mod paths;
 mod runtime;
 mod segments;
-mod socket;
+use moruna_storage::proxy as socket;
 mod stats;
+#[cfg(target_os = "linux")]
+mod strict;
 #[cfg(test)]
 mod tests;
 
@@ -488,6 +492,7 @@ impl moruna_kernel::Reactor for Reactor {
         self.send(
             |q| &q.read_file,
             ReadFileOp {
+                strict_fd: None,
                 path: path.to_path_buf(),
                 offset,
                 dst,
@@ -529,6 +534,7 @@ impl moruna_kernel::Reactor for Reactor {
         self.send(
             |q| &q.write_file,
             WriteFileOp {
+                strict_fd: None,
                 path: path.to_path_buf(),
                 offset,
                 src,

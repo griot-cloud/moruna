@@ -10,6 +10,9 @@ description = "Moruna resource controller"
 
 [dependencies]
 moruna-kernel = { workspace = true }
+# The run's cost model, whose morsel the `model` sizer proposes (f.16; adaptive-runtime G4). It
+# depends on moruna-job, serde, serde_json and thiserror only.
+moruna-cost = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,6 +21,8 @@ serde_json = { workspace = true }
 # The fakes of contracts d.15. Every RC test drives the controller through them and names no
 # other crate (11 k); a test dependency only, in no shipping crate's graph.
 moruna-testkit = { workspace = true }
+# The kind's role a cost key names (RC-T22).
+moruna-job = { workspace = true }
 
 [features]
 default = []

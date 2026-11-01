@@ -1,0 +1,16 @@
+[package]
+name = "engine"
+description = "The engine's supervisor (SDD 30 d.3): starts Moruna's engine, a Linux program, through the Linux personality with the handles, budget and scratch quota its configuration names, once a run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+linux-protocol = { path = "../linux/protocol", version = "=0.1.0" }
+devices-protocol = { path = "../devices/protocol", version = "=0.1.0" }
+moruna-linux = { path = "../linux/core", version = "=0.1.0" }
+
+moruna-storage-service = { path = "../storage", version = "=0.1.0" }
+moruna-storage-format = { path = "../../crates/moruna-storage-format", version = "=0.5.9", default-features = false, features = ["pure"] }

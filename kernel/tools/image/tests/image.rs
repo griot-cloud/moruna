@@ -47,6 +47,7 @@ process ping
   handle console console rights=write,transfer
   exits 0
 process pong pong-program
+  memory 16MiB
   faults page fault at 0x0 on read
 
 link ping.peer pong.peer:read,write,wait
@@ -90,12 +91,21 @@ fn sv_t9_a_description_renders_the_manifest_the_kernel_parses() {
     let (manifest, text) = d.manifest().expect("manifest");
     assert_eq!(Manifest::parse(text.as_bytes()), Ok(manifest.clone()));
     assert_eq!(manifest.channels, ["ping.peer", "link1"]);
+    assert_eq!(
+        manifest
+            .processes
+            .iter()
+            .map(|p| p.memory)
+            .collect::<Vec<_>>(),
+        [None, None, Some(16 << 20)]
+    );
+    assert!(text.contains("process pong bin/pong-program\nmemory 16777216\n"));
     assert!(text.contains("handle file:bin/child child-image"));
     assert!(text.contains("handle channel:ping.peer.1 peer rights=read,write,wait"));
     let expect = d.expectations();
     assert_eq!(expect[0], "kk: 1 CPUs online");
     assert!(expect.contains(
-        &"kk: moruna microkernel, abi 2.0: started 3 processes from the manifest".to_string()
+        &"kk: moruna microkernel, abi 2.5: started 3 processes from the manifest".to_string()
     ));
     assert!(expect.contains(&"kk: process supervisor exited with code 0 (".to_string()));
     assert!(expect.contains(&"kk: process pong faulted: page fault at 0x0 on read".to_string()));
@@ -141,6 +151,24 @@ fn sv_t9_a_bad_description_is_refused_by_line() {
         ("moruna-image 1\nexits 0\n", 2, "must follow"),
         ("moruna-image 1\nexpect\n", 2, "needs its text"),
         ("moruna-image 1\nfrobnicate\n", 2, "not a directive"),
+        ("moruna-image 1\nmemory 4096\n", 2, "must follow"),
+        ("moruna-image 1\nprocess a\nmemory\n", 3, "memory SIZE"),
+        ("moruna-image 1\nprocess a\nmemory 12TB\n", 3, "not a size"),
+        (
+            "moruna-image 1\nprocess a\nmemory 4095\n",
+            3,
+            "whole number of pages",
+        ),
+        (
+            "moruna-image 1\nprocess a\nmemory 0MiB\n",
+            3,
+            "whole number of pages",
+        ),
+        (
+            "moruna-image 1\nprocess a\nmemory 4KiB\nmemory 8KiB\n",
+            4,
+            "two `memory` lines",
+        ),
         (
             "moruna-image 1\ndriver 1af4:1042 virtio-blk block\n",
             2,
@@ -377,4 +405,105 @@ link imagefs-test.fs imagefs.listen-test
     .expect("refused");
     assert!(e.reason.starts_with("data `missing`:"), "{e}");
     fs::remove_dir_all(dir).expect("clean");
+}
+
+/// DR-T19 (SDD 25, k): `machine` lines carry the QEMU arguments of a test's devices
+/// and `disk` lines the images the boot writes and checks; the tool writes both files
+/// and refuses, by line, what boot.sh could not pass on safely.
+#[test]
+fn dr_t19_machine_and_disk_lines_describe_the_boots_machine() {
+    let text = "\
+moruna-image 1
+machine -drive file={out}/nvme0-{cpus}.img,format=raw,if=none,id=nvme0
+machine   -device nvme,drive=nvme0,serial=ke1-nvme0,addr=0x10
+disk nvme0 32768 b
+process supervisor
+  handle console console
+  exits 0
+disk nvme1 8192 a
+";
+    let d = Description::parse(text).expect("parses");
+    assert_eq!(
+        d.machine,
+        [
+            "-drive file={out}/nvme0-{cpus}.img,format=raw,if=none,id=nvme0",
+            "-device nvme,drive=nvme0,serial=ke1-nvme0,addr=0x10",
+        ]
+    );
+    assert_eq!(d.disks.len(), 2);
+    assert_eq!(d.disks[0].sectors, 32768);
+    assert_eq!(d.disks[0].after, moruna_image::Pattern::B);
+    assert_eq!(d.disks[1].after, moruna_image::Pattern::A);
+    let dir = programs(&["supervisor"]);
+    let image = build(text, &dir, &dir).expect("builds");
+    assert_eq!(image.disks, ["nvme0 32768 b", "nvme1 8192 a"]);
+    assert_eq!(image.machine.len(), 2);
+    let description = dir.join("machine.image");
+    fs::write(&description, text).expect("description");
+    let out = dir.join("out");
+    let run = Command::new(env!("CARGO_BIN_EXE_moruna-image"))
+        .args([&description, &dir, &out])
+        .output()
+        .expect("runs");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("disks")).expect("disks"),
+        "nvme0 32768 b\nnvme1 8192 a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("machine"))
+            .expect("machine")
+            .lines()
+            .count(),
+        2
+    );
+    fs::remove_dir_all(dir).expect("clean");
+    let refused: &[(&str, &str)] = &[
+        ("machine\n", "needs its QEMU arguments"),
+        ("machine -device \"nvme\"\n", "may not"),
+        ("machine -drive file=$HOME/x\n", "may not"),
+        ("machine -drive file=a;b\n", "may not"),
+        ("machine -drive file={home}/x\n", "placeholder"),
+        ("machine -drive file={out\n", "placeholder"),
+        ("disk nvme0 8192\n", "disk NAME"),
+        ("disk Nvme 8192 a\n", "not 1 to 32 bytes"),
+        ("disk nvme0 0 a\n", "sectors"),
+        ("disk nvme0 lots a\n", "sectors"),
+        ("disk nvme0 4194304 a\n", "sectors"),
+        ("disk nvme0 8 c\n", "pattern"),
+        ("disk nvme0 8 a\ndisk nvme0 8 b\n", "twice"),
+    ];
+    for (body, words) in refused {
+        let text = format!("moruna-image 1\n{body}");
+        let e = Description::parse(&text).expect_err(&text);
+        let line = if body.matches('\n').count() == 2 {
+            3
+        } else {
+            2
+        };
+        assert_eq!(e.line, line, "{text:?}: {e}");
+        assert!(e.reason.contains(words), "{text:?}: {e}");
+    }
+}
+
+/// Shared memfd RAM must use the boot script's one fixed RAM decision. Admit
+/// that exact placeholder without broadening machine directives into shell input.
+#[test]
+fn machine_memory_placeholder_is_explicit_and_unknown_expansions_stay_refused() {
+    let text = "moruna-image 1\nmachine -object memory-backend-memfd,id=ram0,size={memory},share=on\nprocess supervisor\n  handle console console\n  exits 0\n";
+    let parsed = Description::parse(text).expect("canonical RAM placeholder");
+    assert_eq!(
+        parsed.machine,
+        ["-object memory-backend-memfd,id=ram0,size={memory},share=on"]
+    );
+    for bad in ["{ram}", "${memory}", "{memory_extra}", "$(memory)"] {
+        assert!(
+            Description::parse(&text.replace("{memory}", bad)).is_err(),
+            "{bad}"
+        );
+    }
 }

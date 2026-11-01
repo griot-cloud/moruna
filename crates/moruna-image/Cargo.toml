@@ -24,6 +24,10 @@ moruna-imagefs = { workspace = true }
 # The test fixture's: the image kind's tests run `arrow_echo` as an image's command.
 arrow = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The test fixture's: `plane_echo` makes the data plane's calls through the task library.
+moruna-plane-linux = { workspace = true }
+
 [features]
 default = []
 # `testing`: the layouts and layers the image kind's tests build (SDD 19 k).
@@ -41,6 +45,13 @@ parquet = { workspace = true }
 [[bin]]
 name = "arrow_echo"
 path = "tests/fixtures/arrow_echo.rs"
+test = false
+
+# A program that makes the data plane's calls itself, an image's command in the image kind's
+# `plane` tests (SDD 19, SDD 29 d.1 on Linux).
+[[bin]]
+name = "plane_echo"
+path = "tests/fixtures/plane_echo.rs"
 test = false
 
 # An image as the microkernel's layer files (SDD 27 f.1); with `testing`, also the CI

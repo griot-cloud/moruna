@@ -23,6 +23,11 @@ moruna-arena = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 # An image's root and what it runs (SDD 19).
 moruna-image = { workspace = true }
+# An image's batches cross the data plane (SDD 29, KA2): the port, its Linux adapter, and the
+# task's side that carries a program's standard streams onto it.
+moruna-plane = { workspace = true }
+moruna-plane-linux = { workspace = true }
+moruna-abi = { workspace = true }
 libc = { workspace = true }
 landlock = { workspace = true }
 seccompiler = { workspace = true }
@@ -30,6 +35,10 @@ seccompiler = { workspace = true }
 [dev-dependencies]
 moruna-testkit = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# IM-T26 checks the records the stream reader lays as the engine checks a put record.
+moruna-ipc-check = { workspace = true }
 
 [features]
 default = []

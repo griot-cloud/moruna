@@ -3,9 +3,8 @@
 //! `kernel/tools/vsock-peer.py` listens) and checks the answer, then listens on port
 //! 5001, accepts the host's connection and answers it.
 //!
-//! A machine with no virtio-vsock (a runner with no `/dev/vhost-vsock` cannot give
-//! QEMU one) has no `vsock0`; the test then says so in a line of its own, which the
-//! boot check accepts only when the boot attached no vsock.
+//! Every boot's machine has its vsock (a vhost-user device whose back end is a host
+//! program, SDD 30 f.11), so a machine without `vsock0` fails the test.
 
 #![no_std]
 #![no_main]
@@ -16,7 +15,7 @@ extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 
 use devices_protocol::directory;
-use moruna_svc::{CallError, Channel, Console, conformance, deadline_in, println, start};
+use moruna_svc::{Channel, Console, conformance, deadline_in, println, start};
 use vsock_protocol::{HOST_CID, vsock};
 
 moruna_svc::main!(run);
@@ -99,13 +98,6 @@ fn run() -> i64 {
     dir.core().set_timeout(300 * SECONDS);
     let channel = match dir.lookup(String::from("vsock0")) {
         Ok(c) => c,
-        Err(CallError::Remote(directory::Error::NotFound)) => {
-            println!(
-                out,
-                "KB3 vsock: no device: this machine has no virtio-vsock, so there is no vsock0"
-            );
-            return 0;
-        }
         Err(e) => {
             println!(out, "KB3 vsock: FAIL: looking up vsock0: {:?}", e);
             return 1;

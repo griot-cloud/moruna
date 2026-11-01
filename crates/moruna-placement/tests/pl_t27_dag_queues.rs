@@ -1,8 +1,9 @@
 //! PL-T27 and PL-T28 (f.17, contracts d.16): the queues of a run's DAG.
 //!
 //! PL-T27 fan_out_is_counted_once: a batch pushed into several queues with `push_to` is one
-//! residency, counted once in the tier's total and in each queue's own figure, and released when
-//! the last of its consumers takes it. PL-T28 lineage_by_root: a source morsel's lineage follows
+//! batch in the catalog, counted once in the tier's total and in each queue's own figure while it
+//! waits there, held while a consumer that took it has not released it, and freed when the last
+//! of its consumers releases it (PL-I16, PL-I18, PL-I19). PL-T28 lineage_by_root: a source morsel's lineage follows
 //! it into every queue it fans out to, a sink's commit releases only what every sink it reaches
 //! has committed, and a manifest restores a morsel whose every position is on disk at each of
 //! them and lists any other for its source to read again.
@@ -67,24 +68,24 @@ fn pl_t27_fan_out_is_counted_once() {
     let bytes = morsel.bytes;
     engine.push_to(&[0, 1], morsel).expect("fans out");
     let stats = engine.stats();
+    let host = TierKind::Host.index();
     assert_eq!(host_bytes(&engine, 0), bytes, "queue 0 counts the batch");
     assert_eq!(host_bytes(&engine, 1), bytes, "queue 1 counts the batch");
     assert_eq!(
-        stats.shared_by_tier[TierKind::Host.index()],
-        bytes,
-        "and the second count is the share"
+        stats.catalog.resident_by_tier[host], bytes,
+        "and the catalog counts it once"
     );
+    assert_eq!(stats.catalog.buffers, 1, "one batch, not two");
     // The two consumers are handed the same bytes.
     let a = engine
         .pop(0, common::want_host(), Locality::Any)
         .expect("pop")
         .expect("the head");
-    assert_eq!(
-        engine.stats().shared_by_tier[TierKind::Host.index()],
-        0,
-        "one consumer took its share: the batch is resident once, in queue 1"
-    );
+    let after = engine.stats().catalog;
+    assert_eq!(host_bytes(&engine, 0), 0, "queue 0 no longer holds it");
     assert_eq!(host_bytes(&engine, 1), bytes);
+    assert_eq!(after.resident_by_tier[host], bytes, "still resident once");
+    assert_eq!(after.held_bytes, bytes, "and held by queue 0's consumer");
     let b = engine
         .pop(1, common::want_host(), Locality::Any)
         .expect("pop")
@@ -97,6 +98,28 @@ fn pl_t27_fan_out_is_counted_once() {
     };
     assert_eq!(address(&a), address(&b), "shared, never copied");
     assert_eq!(host_bytes(&engine, 1), 0);
+    assert_eq!(engine.stats().catalog.resident_by_tier[host], bytes);
+    engine
+        .release(0, a.seq)
+        .expect("queue 0's consumer releases");
+    assert_eq!(
+        engine.stats().catalog.resident_by_tier[host],
+        bytes,
+        "queue 1's consumer still holds it"
+    );
+    assert!(
+        engine.release(0, a.seq).is_err(),
+        "a share is released once"
+    );
+    engine
+        .release(1, b.seq)
+        .expect("queue 1's consumer releases");
+    let done = engine.stats().catalog;
+    assert_eq!(
+        done.resident_by_tier[host], 0,
+        "freed once every consumer released"
+    );
+    assert_eq!((done.released, done.freed, done.buffers), (2, 1, 0));
     // A fan-out into a closed queue pushes nothing anywhere.
     engine.close(1);
     let refused = engine.push_to(&[0, 1], common::table_morsel(&alloc, 1, 0, 10));

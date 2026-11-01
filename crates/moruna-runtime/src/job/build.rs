@@ -10,7 +10,7 @@ use std::sync::Arc;
 use moruna_discovery::DiscoveryInput;
 use moruna_kernel::{
     Consumer, ErrorPolicy, Guarantee, HostProfile, Kernel, Link, MorunaError, Producer, Result,
-    RunId, SizerKind, StageId, Topology,
+    RunId, SizerKind, StageId, StagePorts, Topology,
 };
 use moruna_reactor::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 
@@ -308,13 +308,18 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     };
     let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(assembled.len());
     let mut packaged = Vec::new();
+    let mut stage_ports = Vec::new();
     #[cfg(feature = "python")]
     let mut py_kernels = Vec::new();
     for (at, assembling) in assembled.into_iter().enumerate() {
         let stage = assembling.stage;
         let id = (at + 1) as StageId;
-        if let Some(placed) = stage.placed {
-            placed(id);
+        // MH 4.10: a stage that calls ports is given them now its id is known; the run binds
+        // them to its cancel and its waits when it starts.
+        if let Some(calls) = stage.ports {
+            let ports = StagePorts::new(id, calls.routes);
+            (calls.bind)(Arc::clone(&ports));
+            stage_ports.push(ports);
         }
         if let Some(p) = stage.packaged {
             packaged.push(p);
@@ -326,12 +331,9 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         kernels.push(stage.kernel);
     }
 
-    let checkpoint_interval_ms = translate::clamp(
-        "checkpoint.interval_ms",
-        job.checkpoint.interval_ms,
-        translate::CHECKPOINT_INTERVAL_MS,
-        &mut notes,
-    );
+    let (checkpoint_interval_ms, clamped) =
+        moruna_job::checkpoint_interval_ms(job.checkpoint.interval_ms);
+    notes.extend(clamped);
     let staging_limit = job.staging.limit_bytes.map(|limit| {
         translate::clamp(
             "budget.disk",
@@ -368,34 +370,11 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     // needs a staging directory to look in.
     let resume_arg = job.resume.as_deref().map(translate::resume_arg);
     let resume_auto = matches!(resume_arg, Some(translate::ResumeArg::Auto));
-    // MH 4.7: with `staging.url`, the run works in `staging.dir` and copies each manifest to the
-    // prefix; a resume by "auto" or by run id reads the copies into the directory first.
-    if let Some(url) = &job.staging.url {
-        let Some(dir) = &staging_dir else {
-            return Err(refusal(SpecError::new(
-                "staging.url",
-                "needs staging.dir: the run works in a directory and copies its manifests to the \
-                 prefix",
-            )));
-        };
-        if !job.checkpoint.enabled {
-            return Err(refusal(SpecError::new(
-                "staging.url",
-                "copies manifests, and checkpoint.enabled is false: there are none",
-            )));
-        }
-        if matches!(
-            resume_arg,
-            Some(translate::ResumeArg::Auto | translate::ResumeArg::RunId(_))
-        ) {
-            let files = moruna_reactor::ObjectFiles::new(object_store_of(&job.object_store))?;
-            std::fs::create_dir_all(dir).map_err(|e| MorunaError::Io {
-                op: "create_dir",
-                target: dir.display().to_string(),
-                msg: e.to_string(),
-            })?;
-            notes.extend(crate::durable::fetch(&files, url, dir)?);
-        }
+    if job.staging.url.is_some() {
+        return Err(refusal(SpecError::new(
+            "staging.url",
+            "raw manifest copying is not portable; restore through a scoped native checkpoint port, then supply its actual materialized manifest",
+        )));
     }
     let resume = if resume_auto {
         if staging_dir.is_none() {
@@ -431,6 +410,7 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     let mut spec = RunSpec::graph(source_specs, kernels, sink_specs, topology);
     spec.engine_memory = engine_memory;
     spec.packaged = packaged;
+    spec.ports = stage_ports;
     spec.sink_memory = sink_memory;
     #[cfg(feature = "python")]
     {

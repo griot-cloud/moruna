@@ -21,8 +21,9 @@
 //!   [`RATE_BYTES`] bytes a second, with bursts, and to [`PRODUCER_BYTES_MAX`] bytes in all; what
 //!   is past that is dropped and counted, and where the drops end a `platform` record says how
 //!   many there were;
-//! - records are written in segments of the producer's file tree (`<logs>/a<attempt>-<start>/
-//!   <task>/<first seq>.jsonl`, the engine's under `_engine`), each written whole and renamed
+//! - each record is a `moruna-record` record of the `log` event (SDD 21, MH 4.3 version 7) and is
+//!   written in segments of the producer's file tree (`<logs>/a<attempt>-<start>/
+//!   <task>/<first seq>.mrec`, the engine's under `_engine`), each written whole and renamed
 //!   into place, so a reader never sees half a segment;
 //! - at most every [`LOGS_EVERY`] the thread tells the peer how far each producer's records
 //!   reach now (`logs`), and once more when the run is over, with `drained`.
@@ -40,7 +41,10 @@ use std::time::{Duration, Instant};
 use moruna_kernel::StageId;
 use moruna_kernel::output::{Level, OutputSink, Stream};
 
-use super::protocol::{EVENTS_VERSION, Event, LogLine, LogReach, LogStream};
+use moruna_event::{ENGINE, Encoder};
+
+use super::events::{Meta, RECORD_FILE};
+use super::protocol::{Event, LogReach, LogStream};
 
 /// The most text one record holds; a longer line is several.
 pub const RECORD_MAX: usize = 16 << 10;
@@ -75,9 +79,6 @@ pub const READ_CHUNK: usize = 64 << 10;
 /// How often the writer looks at its clocks when nothing arrives.
 const TICK: Duration = Duration::from_millis(100);
 
-/// The directory name of the engine's own output: no task id starts with `_`.
-pub const ENGINE: &str = "_engine";
-
 /// The directory of one attempt's output under `logs`.
 pub fn attempt_dir(logs: &Path, attempt: u32, start: &str) -> PathBuf {
     logs.join(format!("a{attempt}-{start}"))
@@ -85,7 +86,7 @@ pub fn attempt_dir(logs: &Path, attempt: u32, start: &str) -> PathBuf {
 
 /// A segment's file name: the first record it holds, zero-padded so names sort as numbers do.
 pub fn segment_name(first_seq: u64) -> String {
-    format!("{first_seq:020}.jsonl")
+    format!("{first_seq:020}.{RECORD_FILE}")
 }
 
 enum Msg {
@@ -236,8 +237,7 @@ impl Capture {
     /// and counted.
     pub fn start(
         dir: PathBuf,
-        attempt: u32,
-        start: String,
+        meta: Meta,
         tasks: Vec<String>,
         clock: Instant,
         tell: Tell,
@@ -251,7 +251,7 @@ impl Capture {
             clock,
         });
         let (done_tx, done_rx) = mpsc::channel();
-        let mut writer = Writer::new(dir, attempt, start, tasks, Arc::clone(&shared), tell);
+        let mut writer = Writer::new(dir, meta, tasks, Arc::clone(&shared), tell);
         let spawned = std::thread::Builder::new()
             .name("moruna-logs".to_string())
             .spawn(move || {
@@ -389,6 +389,11 @@ struct Group {
     t_us: u64,
     at: Instant,
     closed: bool,
+    /// Since its exception line, the sentence Python writes between a traceback and the one it
+    /// chains to has come: only then is the next `Traceback` line this group's. Two stages'
+    /// writes interleave whole, so one traceback can follow another with nothing between them,
+    /// and those are two records.
+    chained: bool,
 }
 
 impl Group {
@@ -505,13 +510,19 @@ impl Assembler {
             if group.closed {
                 // After its exception line a traceback may chain another: an empty line, the
                 // chain's sentence, and the next traceback are still the group's.
-                if line.is_empty() || chains(&line) {
+                if line.is_empty() {
                     group.add(&line, now);
                     return;
                 }
-                if line == TRACEBACK {
+                if chains(&line) {
+                    group.add(&line, now);
+                    group.chained = true;
+                    return;
+                }
+                if line == TRACEBACK && group.chained {
                     group.add(&line, now);
                     group.closed = false;
+                    group.chained = false;
                     return;
                 }
             } else if indented || line.is_empty() || chains(&line) || line == TRACEBACK {
@@ -532,6 +543,7 @@ impl Assembler {
                 t_us,
                 at: now,
                 closed: false,
+                chained: false,
             });
             return;
         }
@@ -703,8 +715,8 @@ fn dropped_sentence(records: u64, bytes: u64, cause: Cause) -> String {
 
 struct Writer {
     dir: PathBuf,
-    attempt: u32,
-    start: String,
+    meta: Meta,
+    encoder: Encoder,
     producers: Vec<Producer>,
     shared: Arc<Shared>,
     tell: Tell,
@@ -717,8 +729,7 @@ struct Writer {
 impl Writer {
     fn new(
         dir: PathBuf,
-        attempt: u32,
-        start: String,
+        meta: Meta,
         tasks: Vec<String>,
         shared: Arc<Shared>,
         tell: Tell,
@@ -729,8 +740,8 @@ impl Writer {
         let made = vec![false; producers.len()];
         Writer {
             dir,
-            attempt,
-            start,
+            meta,
+            encoder: Encoder::new(),
             producers,
             shared,
             tell,
@@ -925,39 +936,46 @@ impl Writer {
     }
 
     fn append(&mut self, p: usize, stream: LogStream, level: Option<Level>, piece: Piece) {
-        let (attempt, start) = (self.attempt, self.start.clone());
         let producer = &mut self.producers[p];
-        producer.seq += 1;
-        let seq = producer.seq;
+        let seq = producer.seq + 1;
         let text_bytes = piece.text.len() as u64;
-        let line = LogLine {
-            kind_of: "event",
-            v: EVENTS_VERSION,
-            attempt,
-            start: start.clone(),
-            seq,
-            t_us: piece.t_us,
-            kind: "log",
-            id: format!("{start}/{}/{seq}", producer.dir),
+        let truncated = piece.truncated;
+        let event = Event::Log {
             task: producer.task.clone(),
             stream,
-            level: level.map(Level::name),
-            bytes: piece.text.len() as u64,
+            level: level.map(|l| Level::name(l).to_string()),
+            bytes: text_bytes,
             text: piece.text,
             partial: piece.partial,
             continued: piece.continued,
-            truncated: piece.truncated,
-        }
-        .line();
+            truncated,
+        };
+        let record = match self.encoder.encode(
+            &self.meta.stamp(),
+            seq,
+            self.meta.ts_ns(piece.t_us),
+            piece.t_us,
+            &event,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                producer.drop_one(text_bytes, Cause::Store);
+                (self.tell.note)(format!(
+                    "a record of output could not be written as a record and is dropped: {error}"
+                ));
+                return;
+            }
+        };
+        producer.seq = seq;
         if producer.pending.is_empty() {
             producer.pending_first = seq;
             producer.pending_since = Some(Instant::now());
         }
-        producer.pending.extend_from_slice(line.as_bytes());
+        producer.pending.extend_from_slice(record);
         producer.pending_records += 1;
         producer.pending_bytes += text_bytes;
-        producer.pending_truncated += u64::from(piece.truncated > 0);
-        producer.kept_bytes += line.len() as u64;
+        producer.pending_truncated += u64::from(truncated > 0);
+        producer.kept_bytes += record.len() as u64;
         if producer.pending.len() >= SEGMENT_BYTES {
             self.flush(p);
         }
@@ -1036,14 +1054,15 @@ fn write_whole(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, dir.join(name))
 }
 
-/// Read a producer's records back from the store, in order: what a host's reader and a test
-/// do with the files this module writes.
+/// Read a producer's records back from the store, in order: what a host's reader and a test do
+/// with the files this module writes. Each record is the JSON rendering of its event
+/// (`moruna_event::EventMsg::to_value`); one that is not a record of output is an error.
 pub fn read_producer(dir: &Path) -> std::io::Result<Vec<serde_json::Value>> {
     let mut names: Vec<String> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".jsonl") && !n.starts_with('.'))
+            .filter(|n| n.ends_with(&format!(".{RECORD_FILE}")) && !n.starts_with('.'))
             .collect(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -1051,9 +1070,14 @@ pub fn read_producer(dir: &Path) -> std::io::Result<Vec<serde_json::Value>> {
     names.sort();
     let mut records = VecDeque::new();
     for name in names {
-        let text = std::fs::read_to_string(dir.join(&name))?;
-        for line in text.lines() {
-            records.push_back(serde_json::from_str(line).map_err(std::io::Error::other)?);
+        let bytes = std::fs::read(dir.join(&name))?;
+        for event in moruna_event::read_records(&bytes).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {e}", dir.join(&name).display()),
+            )
+        })? {
+            records.push_back(event.to_value());
         }
     }
     Ok(records.into())

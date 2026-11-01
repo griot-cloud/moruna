@@ -87,3 +87,12 @@ mod tests {
         assert!(super::unavailable().to_string().contains("needs Linux"));
     }
 }
+
+/// Bounded native child output transport.
+pub mod native_output;
+/// Canonical native PEX record envelope over the existing sandbox logical protocol.
+pub mod native_wire;
+
+/// The actual package state machine used inside a native charged PEX process.
+#[cfg(all(target_os = "linux", feature = "python"))]
+pub mod native_child;

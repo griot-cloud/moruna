@@ -38,14 +38,15 @@ fn declaration(role: Role, name: &str) -> Declaration {
         deterministic: Fact::Yes,
         preserves_columns: Fact::Yes,
         isolation: Isolation::Builtin,
+        served: None,
     }
 }
 
-/// JB-T1 dependencies_are_the_six: the crate an embedder depends on names `flatbuffers`,
-/// `flexbuffers`, `serde`, `serde_json`, `schemars` and `thiserror`, and nothing else, in its
-/// dependencies (SDD 22 JB-I1).
+/// JB-T1 dependencies_are_the_seven: the crate an embedder depends on names `flatbuffers`,
+/// `flexbuffers`, `moruna-types`, `serde`, `serde_json`, `schemars` and `thiserror`, and nothing
+/// else, in its dependencies (SDD 22 JB-I1).
 #[test]
-fn jb_t1_dependencies_are_the_six() {
+fn jb_t1_dependencies_are_the_seven() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("the manifest");
     let mut section = "";
@@ -68,6 +69,7 @@ fn jb_t1_dependencies_are_the_six() {
     let wanted: Vec<(String, String)> = [
         "flatbuffers",
         "flexbuffers",
+        "moruna-types",
         "schemars",
         "serde",
         "serde_json",

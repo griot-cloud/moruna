@@ -1,6 +1,8 @@
 //! `moruna.json` (16 e.1) and the declaration as the decorator spells it (16 e.2).
 
-use moruna_kernel::declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, parse_type};
+use moruna_job::SchemaRules;
+use moruna_job::rules::Column;
+use moruna_kernel::declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, TypeDecl};
 use serde_json::{Map, Value};
 
 use crate::{Format, PackageError, WASM_PLATFORM, WORLD};
@@ -215,103 +217,34 @@ impl Hints {
 }
 
 /// One declared schema from its spelling (16 e.2): an object is a subset, an array exact, an
-/// output object of `adds`, `drops` and `changes` relative.
+/// output object of `adds`, `drops` and `changes` relative. The spelling is read by
+/// `moruna_job::SchemaRules`, which a served kind's declaration is read by too (SDD 18 e.4), its
+/// types by the grammar's one reader (`moruna_types`), and each type converted to the Arrow type
+/// it names.
 pub fn schema_decl(value: &Value, field: &str, output: bool) -> Result<SchemaDecl, PackageError> {
-    match value {
-        Value::Array(items) => {
-            let mut columns = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                let at = format!("{field}[{i}]");
-                let parts = item.as_array().ok_or_else(|| {
-                    refuse(
-                        &at,
-                        "an exact column is [name, type] or [name, type, nullable]",
-                    )
-                })?;
-                let (name, ty, nullable) = match parts.as_slice() {
-                    [n, t] => (n, t, true),
-                    [n, t, Value::Bool(b)] => (n, t, *b),
-                    _ => {
-                        return Err(refuse(
-                            &at,
-                            "an exact column is [name, type] or [name, type, nullable]",
-                        ));
-                    }
-                };
-                let name = name
-                    .as_str()
-                    .ok_or_else(|| refuse(&at, "the column name must be a string"))?;
-                columns.push(column(name, ty, &at, nullable)?);
-            }
-            Ok(SchemaDecl::Exact(columns))
-        }
-        Value::Object(map) => {
-            let relative = !map.is_empty()
-                && map
-                    .keys()
-                    .all(|k| matches!(k.as_str(), "adds" | "drops" | "changes"));
-            if relative {
-                if !output {
-                    return Err(refuse(
-                        field,
-                        "an input schema cannot be relative: adds, drops and changes describe an \
-                         output",
-                    ));
-                }
-                let adds = columns_of(map.get("adds"), &format!("{field}.adds"))?;
-                let changes = columns_of(map.get("changes"), &format!("{field}.changes"))?;
-                let drops = match map.get("drops") {
-                    None | Some(Value::Null) => Vec::new(),
-                    Some(Value::Array(names)) => names
-                        .iter()
-                        .map(|n| {
-                            n.as_str().map(str::to_string).ok_or_else(|| {
-                                refuse(format!("{field}.drops"), "names must be strings")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    Some(_) => {
-                        return Err(refuse(
-                            format!("{field}.drops"),
-                            "must be a list of column names",
-                        ));
-                    }
-                };
-                return Ok(SchemaDecl::Relative {
-                    adds,
-                    drops,
-                    changes,
-                });
-            }
-            Ok(SchemaDecl::Subset(columns_of(Some(value), field)?))
-        }
-        _ => Err(refuse(
-            field,
-            "a schema is an object of column to type, or a list of [name, type] columns",
-        )),
-    }
-}
-
-fn columns_of(value: Option<&Value>, field: &str) -> Result<Vec<ColumnDecl>, PackageError> {
-    match value {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Object(map)) => map
-            .iter()
-            .map(|(name, ty)| column(name, ty, &format!("{field}.{name}"), true))
-            .collect(),
-        Some(_) => Err(refuse(field, "must be an object of column to type")),
-    }
-}
-
-fn column(name: &str, ty: &Value, field: &str, nullable: bool) -> Result<ColumnDecl, PackageError> {
-    let spelling = ty
-        .as_str()
-        .ok_or_else(|| refuse(field, "a type is a string of the type grammar (MH 4.9)"))?;
-    let ty = parse_type(spelling).map_err(|e| refuse(field, e.to_string()))?;
-    Ok(ColumnDecl {
-        name: name.to_string(),
-        ty,
-        nullable,
+    let rules = SchemaRules::parse(value, field, output).map_err(|f| refuse(f.field, f.reason))?;
+    let columns = |columns: Vec<Column>| -> Vec<ColumnDecl> {
+        columns
+            .into_iter()
+            .map(|c| ColumnDecl {
+                ty: TypeDecl::from(&c.ty),
+                name: c.name,
+                nullable: c.nullable,
+            })
+            .collect()
+    };
+    Ok(match rules {
+        SchemaRules::Exact(c) => SchemaDecl::Exact(columns(c)),
+        SchemaRules::Subset(c) => SchemaDecl::Subset(columns(c)),
+        SchemaRules::Relative {
+            adds,
+            drops,
+            changes,
+        } => SchemaDecl::Relative {
+            adds: columns(adds),
+            drops,
+            changes: columns(changes),
+        },
     })
 }
 

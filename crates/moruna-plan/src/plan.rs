@@ -13,162 +13,9 @@ use sha2::{Digest, Sha256};
 /// The version of the plan document this build writes and reads.
 pub const PLAN_VERSION: u32 = 1;
 
-/// What an estimate counts (`architecture/adaptive-runtime.md` section 4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Unit {
-    /// Seconds of wall or worker time.
-    Seconds,
-    /// Bytes.
-    Bytes,
-    /// Rows.
-    Rows,
-}
-
-/// Where an estimate's numbers came from (section 5.4), ordered from most to least known.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Basis {
-    /// This function's history, at least one unit of which ran in a real run.
-    Measured,
-    /// This function's history, all of it from warm-up.
-    WarmUp,
-    /// The kind's prior: every function of the kind, pooled.
-    Prior,
-    /// A declared default.
-    Default,
-}
-
-/// A distribution, not a number: its median, its 95th percentile, and what it rests on
-/// (section 4).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub struct Estimate {
-    /// The median.
-    pub p50: f64,
-    /// The 95th percentile; never below the median.
-    pub p95: f64,
-    /// What it counts.
-    pub unit: Unit,
-    /// Which fallback answered.
-    pub basis: Basis,
-    /// The observations it rests on.
-    pub observations: u32,
-}
-
-impl Estimate {
-    /// A declared default: `p50` and `p95` of `unit`, resting on no observation.
-    pub fn declared(p50: f64, p95: f64, unit: Unit) -> Estimate {
-        Estimate {
-            p50,
-            p95,
-            unit,
-            basis: Basis::Default,
-            observations: 0,
-        }
-    }
-
-    /// Whether it is an estimate of `unit` a reader can use: finite, not negative, its 95th
-    /// percentile not below its median. The reason when it is not.
-    pub fn check(&self, unit: Unit) -> Result<(), String> {
-        if self.unit != unit {
-            return Err(format!(
-                "counts {}, and this estimate counts {}",
-                unit_name(self.unit),
-                unit_name(unit)
-            ));
-        }
-        if !(self.p50.is_finite() && self.p95.is_finite()) {
-            return Err(format!(
-                "p50 {} and p95 {} are not both finite",
-                self.p50, self.p95
-            ));
-        }
-        if self.p50 < 0.0 {
-            return Err(format!("p50 {} is negative", self.p50));
-        }
-        if self.p95 < self.p50 {
-            return Err(format!("p95 {} is below p50 {}", self.p95, self.p50));
-        }
-        Ok(())
-    }
-}
-
-fn unit_name(unit: Unit) -> &'static str {
-    match unit {
-        Unit::Seconds => "seconds",
-        Unit::Bytes => "bytes",
-        Unit::Rows => "rows",
-    }
-}
-
-/// What a step takes from the run and gives, over the batches the plan expects it to see: the
-/// fields of `UnitCost` (section 4), each its own estimate.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub struct UnitCost {
-    /// Wall time.
-    pub duration: Estimate,
-    /// Worker time.
-    pub worker_time: Estimate,
-    /// Peak memory.
-    pub peak_memory: Estimate,
-    /// Memory still held after it.
-    pub retained_memory: Estimate,
-    /// Rows out.
-    pub rows_out: Estimate,
-    /// Bytes out.
-    pub bytes_out: Estimate,
-    /// State added.
-    pub state_growth: Estimate,
-    /// Bytes read from disk.
-    pub read_bytes: Estimate,
-    /// Bytes spilled to disk.
-    pub spill_bytes: Estimate,
-}
-
-impl UnitCost {
-    /// Every field a declared zero of its unit.
-    pub fn zero() -> UnitCost {
-        let s = Estimate::declared(0.0, 0.0, Unit::Seconds);
-        let b = Estimate::declared(0.0, 0.0, Unit::Bytes);
-        let r = Estimate::declared(0.0, 0.0, Unit::Rows);
-        UnitCost {
-            duration: s,
-            worker_time: s,
-            peak_memory: b,
-            retained_memory: b,
-            rows_out: r,
-            bytes_out: b,
-            state_growth: b,
-            read_bytes: b,
-            spill_bytes: b,
-        }
-    }
-
-    /// Each field by its name, with the unit it counts, in the order of section 4.
-    pub fn fields(&self) -> [(&'static str, Unit, &Estimate); 9] {
-        [
-            ("duration", Unit::Seconds, &self.duration),
-            ("worker_time", Unit::Seconds, &self.worker_time),
-            ("peak_memory", Unit::Bytes, &self.peak_memory),
-            ("retained_memory", Unit::Bytes, &self.retained_memory),
-            ("rows_out", Unit::Rows, &self.rows_out),
-            ("bytes_out", Unit::Bytes, &self.bytes_out),
-            ("state_growth", Unit::Bytes, &self.state_growth),
-            ("read_bytes", Unit::Bytes, &self.read_bytes),
-            ("spill_bytes", Unit::Bytes, &self.spill_bytes),
-        ]
-    }
-
-    /// Whether every field is a usable estimate of its unit; the first that is not, by name.
-    pub fn check(&self) -> Result<(), String> {
-        for (name, unit, estimate) in self.fields() {
-            estimate
-                .check(unit)
-                .map_err(|why| format!("{name}: {why}"))?;
-        }
-        Ok(())
-    }
-}
+/// A step's estimated cost is `moruna-cost`'s (`architecture/adaptive-runtime.md` section 4),
+/// field for field: what it takes from the run and gives, over every batch it sees.
+pub use moruna_cost::{Basis, Estimate, Target, Unit, UnitCost};
 
 /// Workers, and memory at the start and at most: what a run is given, and what a step is given
 /// of it.
@@ -239,7 +86,11 @@ pub struct Range {
 impl Range {
     /// Whether it is finite, not negative and ordered; the reason when not.
     pub fn check(&self) -> Result<(), String> {
-        Estimate::declared(self.p50, self.p95, Unit::Bytes).check(Unit::Bytes)
+        Estimate {
+            p95: self.p95,
+            ..Estimate::exact(self.p50, Unit::Bytes)
+        }
+        .check(Unit::Bytes)
     }
 }
 
@@ -338,8 +189,7 @@ impl Totals {
         let mut held = (0.0f64, 0.0f64);
         let mut workers = (0.0f64, 0.0f64);
         let mut disk = (0.0f64, 0.0f64);
-        let mut basis = Basis::Measured;
-        let mut observations = u32::MAX;
+        let (basis, observations) = weakest(steps);
         for step in steps {
             let c = &step.cost;
             let group = groups.entry(step.group).or_default();
@@ -351,14 +201,6 @@ impl Totals {
             workers.1 += c.worker_time.p95;
             disk.0 += c.read_bytes.p50 + c.spill_bytes.p50;
             disk.1 += c.read_bytes.p95 + c.spill_bytes.p95;
-            for (_, _, estimate) in c.fields() {
-                basis = basis.max(estimate.basis);
-                observations = observations.min(estimate.observations);
-            }
-        }
-        if steps.is_empty() {
-            basis = Basis::Default;
-            observations = 0;
         }
         let peak = groups
             .values()
@@ -378,6 +220,20 @@ impl Totals {
             disk_bytes: range(disk),
         }
     }
+}
+
+/// The weakest basis of any estimate of `steps` and the fewest observations any rests on; with
+/// no step, `Default` resting on none.
+pub fn weakest(steps: &[Step]) -> (Basis, u32) {
+    if steps.is_empty() {
+        return (Basis::Default, 0);
+    }
+    steps
+        .iter()
+        .map(|s| s.cost.weakest())
+        .fold((Basis::Measured, u32::MAX), |(b, n), (sb, sn)| {
+            (b.max(sb), n.min(sn))
+        })
 }
 
 /// Moruna's plan of one job: its steps in the order they start, and the job's totals.
@@ -483,6 +339,18 @@ impl Plan {
         }
         value
     }
+}
+
+/// Milliseconds since the Unix epoch, for a plan's creation time; refused, naming `planner`,
+/// when the clock is before the epoch.
+pub(crate) fn now_ms(planner: &PlannerId) -> Result<u64, crate::planner::PlanError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| crate::planner::PlanError::Planner {
+            planner: planner.to_string(),
+            reason: format!("the clock is before the Unix epoch: {e}"),
+        })?
+        .as_millis() as u64)
 }
 
 /// The content address of `job` (MH 4.1): `sha256:` and the 64 lowercase hex characters of the

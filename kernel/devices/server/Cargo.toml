@@ -16,3 +16,5 @@ moruna-mmio = { path = "../../drivers/mmio", version = "=0.1.0" }
 moruna-pci = { path = "../../drivers/pci", version = "=0.1.0" }
 moruna-driver-table = { path = "../table", version = "=0.1.0" }
 devices-protocol = { path = "../protocol", version = "=0.1.0" }
+
+moruna-node = { path = "../../node/core", version = "=0.1.0" }

@@ -3,21 +3,26 @@
 //!
 //! A layer file is not the OCI tar: it is what the layer did to the layers below it,
 //! as SDD 19's unpacking did it. [`convert`] applies each layer with that unpacking
-//! (`unpack.rs`, `layer.rs`) and writes the difference it made: every entry it made
-//! or replaced (at the path the unpacking resolved, symbolic links of lower layers
-//! followed), a whiteout for every name it removed, and a directory it replaced or
-//! emptied of everything below marked opaque. Merging the files top down (SDD 27 f.3)
-//! is therefore the unpacking itself, whatever quirk of the rules a layer exercises
-//! (IF-I3, IF-T2).
+//! (`unpack.rs`, `layer.rs`), which records the paths it wrote, the paths of the layers
+//! below it removed and the directories it made opaque, and writes the difference from
+//! that record: every entry it made or replaced (at the path the unpacking resolved,
+//! symbolic links of lower layers followed), a whiteout for every name it removed, and
+//! a directory it replaced or emptied of everything below marked opaque. Merging the
+//! files top down (SDD 27 f.3) is therefore the unpacking itself, whatever quirk of the
+//! rules a layer exercises (IF-I3, IF-T2); no two trees are compared, so what a
+//! filesystem does with inode numbers cannot hide a change.
 //!
 //! [`write`] lays a tree out as `moruna_imagefs::format` describes: the header, the
 //! node table in breadth-first order (each directory's children consecutive and in
 //! name order), the names, the extents, every file's data from a page boundary (runs
 //! of zero pages are holes and take no space), and the SHA-256 tree over all of it.
-//! The layer's id is the SHA-256 of the file. [`read`] reads files back with the
+//! The layer's id is its seal: the SHA-256 of its header page, which carries the root
+//! of that tree, so the id names every byte of the file and the image filesystem checks
+//! it when it mounts the layer without reading the rest (SDD 30 f.12). [`read`] reads
+//! files back with the
 //! kernel's own reader, compiled for the host.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
@@ -34,9 +39,9 @@ use moruna_imagefs::scratch::Scratch;
 use moruna_imagefs::volume::Pages;
 use sha2::{Digest as _, Sha256};
 
-use crate::digest::{Digest, Hashing};
+use crate::digest::Digest;
 use crate::error::{Error, Result};
-use crate::layer::remove_any;
+use crate::layer::{Applied, remove_any};
 use crate::source::{Config, ImageSource};
 use crate::unpack;
 
@@ -102,7 +107,7 @@ impl Entry {
 /// A layer file written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerFile {
-    /// The SHA-256 of the file: the layer's id.
+    /// The layer's id: its seal, the SHA-256 of its header page.
     pub id: Digest,
     /// Where it is.
     pub path: PathBuf,
@@ -487,64 +492,11 @@ fn assemble(flat: &Flat<'_>, extents: &[Extent], spill: &Path, out: &Path) -> Re
         .and_then(|_| file.write_all(&header))
         .and_then(|()| file.sync_all())
         .map_err(io_at(out, "writing the header of"))?;
-    let reader = BufReader::new(File::open(out).map_err(io_at(out, "opening"))?);
-    let (id, _) = Hashing::new(reader)
-        .finish()
-        .map_err(io_at(out, "hashing"))?;
     Ok(LayerFile {
-        id,
+        id: Digest::of(&header),
         path: out.to_path_buf(),
         pages: g.pages,
     })
-}
-
-/// What a path was after a layer was applied: enough to tell what changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Seen {
-    kind: Kind,
-    mode: u32,
-    ino: u64,
-    dev: u64,
-    size: u64,
-}
-
-/// Every path under `root`, relative, with what it is.
-fn snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Seen>> {
-    let mut out = BTreeMap::new();
-    let mut todo = vec![PathBuf::new()];
-    while let Some(rel) = todo.pop() {
-        let at = root.join(&rel);
-        let meta = fs::symlink_metadata(&at).map_err(io_at(&at, "reading"))?;
-        let kind = if meta.file_type().is_symlink() {
-            Kind::Symlink
-        } else if meta.is_dir() {
-            Kind::Directory
-        } else if meta.is_file() {
-            Kind::Regular
-        } else {
-            return Err(bad(format!(
-                "{} is not a file, directory or link",
-                at.display()
-            )));
-        };
-        if kind == Kind::Directory {
-            for child in fs::read_dir(&at).map_err(io_at(&at, "listing"))? {
-                let child = child.map_err(io_at(&at, "listing"))?;
-                todo.push(rel.join(child.file_name()));
-            }
-        }
-        out.insert(
-            rel,
-            Seen {
-                kind,
-                mode: meta.mode() & 0o777,
-                ino: meta.ino(),
-                dev: meta.dev(),
-                size: meta.len(),
-            },
-        );
-    }
-    Ok(out)
 }
 
 fn name_of(path: &Path) -> Vec<u8> {
@@ -554,130 +506,135 @@ fn name_of(path: &Path) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// The directory entry at `rel` in `root`, made (as a directory of `mode`) with its
-/// parents when missing.
-fn dir_at<'a>(
-    root: &'a mut Entry,
-    rel: &Path,
-    after: &BTreeMap<PathBuf, Seen>,
-) -> Result<&'a mut Entry> {
+/// What `at` is in the root, `None` when it is not there (nor is a directory on the way to it).
+fn lookup(at: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(at) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(io_at(at, "reading")(e)),
+    }
+}
+
+/// The directory entry at `rel` in `root`, made (as a directory of its mode in the working root)
+/// with its parents when missing.
+fn dir_at<'a>(root: &'a mut Entry, rel: &Path, rootfs: &Path) -> Result<&'a mut Entry> {
     let mut at = root;
     let mut walked = PathBuf::new();
     for part in rel.iter() {
         walked.push(part);
-        let mode = after.get(&walked).map_or(0o755, |s| s.mode);
+        let here = rootfs.join(&walked);
+        let meta = fs::symlink_metadata(&here).map_err(io_at(&here, "reading"))?;
         let Entry::Directory { children, .. } = at else {
             return Err(bad(format!("{} is under a file", walked.display())));
         };
         at = children
             .entry(name_of(&walked))
-            .or_insert_with(|| Entry::directory(mode));
+            .or_insert_with(|| Entry::directory(meta.mode() & 0o777));
     }
     Ok(at)
 }
 
-/// What one layer did, from the tree before it and after it (SDD 27, f.1).
-fn difference(
-    before: &BTreeMap<PathBuf, Seen>,
-    after: &BTreeMap<PathBuf, Seen>,
-    rootfs: &Path,
-) -> Result<Entry> {
-    let changed = |p: &Path, s: &Seen| {
-        before
-            .get(p)
-            .is_none_or(|b| b.ino != s.ino || b.dev != s.dev || b.kind != s.kind)
-    };
-    // A directory that hides everything below: one this layer made where the layers
-    // below had something, or one whose every entry below is gone or replaced.
-    let mut opaque: Vec<&Path> = Vec::new();
-    for (p, s) in after {
-        if s.kind != Kind::Directory || !before.contains_key(p.as_path()) {
-            continue;
-        }
-        if changed(p, s) {
-            opaque.push(p);
-            continue;
-        }
-        let mut lower = before
-            .keys()
-            .filter(|c| c.parent() == Some(p.as_path()) && !c.as_os_str().is_empty())
-            .peekable();
-        if lower.peek().is_some()
-            && lower.all(|c| after.get(c.as_path()).is_none_or(|s| changed(c, s)))
-        {
-            opaque.push(p);
+/// Every path under the directory `dir` of the working root, added to `paths`: what a
+/// directory that hides the layers below keeps of them is what the layer has to state.
+fn below(rootfs: &Path, dir: &Path, paths: &mut BTreeSet<PathBuf>) -> Result<()> {
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(rel) = todo.pop() {
+        let at = rootfs.join(&rel);
+        for child in fs::read_dir(&at).map_err(io_at(&at, "listing"))? {
+            let child = child.map_err(io_at(&at, "listing"))?;
+            let path = rel.join(child.file_name());
+            let kind = child.file_type().map_err(io_at(&at, "reading"))?;
+            if kind.is_dir() {
+                todo.push(path.clone());
+            }
+            paths.insert(path);
         }
     }
-    let under_opaque = |p: &Path| opaque.iter().any(|o| p != *o && p.starts_with(o));
-    let mut root = Entry::directory(after.get(Path::new("")).map_or(0o755, |s| s.mode));
-    for (p, s) in after {
-        let mode_changed = before.get(p.as_path()).is_some_and(|b| b.mode != s.mode);
-        let is_opaque = opaque.contains(&p.as_path());
+    Ok(())
+}
+
+/// What one layer did, from the unpacker's record of it (SDD 27, f.1): an entry for every path
+/// it wrote, read from the working root as the layer left it, the directories it made opaque,
+/// and a whiteout for every name of the layers below it removed.
+fn difference(applied: &Applied, rootfs: &Path) -> Result<Entry> {
+    let mut paths = applied.written.clone();
+    for dir in &applied.opaque {
+        paths.insert(dir.clone());
+        below(rootfs, dir, &mut paths)?;
+    }
+    let mut root = Entry::directory(0o755);
+    for p in &paths {
+        let at = rootfs.join(p);
+        let meta = lookup(&at)?.ok_or_else(|| {
+            bad(format!(
+                "the unpacking says it wrote {}, and the working root has nothing there",
+                p.display()
+            ))
+        })?;
+        let is_opaque = applied.opaque.contains(p);
         if p.as_os_str().is_empty() {
             if let Entry::Directory {
                 mode, opaque: o, ..
             } = &mut root
             {
-                *mode = s.mode;
+                *mode = meta.mode() & 0o777;
                 *o = is_opaque;
             }
             continue;
         }
-        if !(changed(p, s) || mode_changed || is_opaque || under_opaque(p)) {
-            continue;
-        }
-        let parent = dir_at(&mut root, p.parent().unwrap_or(Path::new("")), after)?;
+        let parent = dir_at(&mut root, p.parent().unwrap_or(Path::new("")), rootfs)?;
         let Entry::Directory { children, .. } = parent else {
             return Err(bad(format!("{} is under a file", p.display())));
         };
         let name = name_of(p);
-        let entry = match s.kind {
-            Kind::Directory => {
-                let existing = children.remove(&name);
-                let kids = match existing {
-                    Some(Entry::Directory { children, .. }) => children,
-                    _ => BTreeMap::new(),
-                };
-                Entry::Directory {
-                    mode: s.mode,
-                    opaque: is_opaque,
-                    children: kids,
-                }
+        let entry = if meta.file_type().is_symlink() {
+            use std::os::unix::ffi::OsStrExt;
+            let target = fs::read_link(&at).map_err(io_at(&at, "reading the link"))?;
+            Entry::Symlink {
+                target: target.as_os_str().as_bytes().to_vec(),
             }
-            Kind::Regular => Entry::File {
-                mode: s.mode,
-                data: Data::Path(rootfs.join(p), s.size),
-                link: Some(s.ino ^ (s.dev << 48)),
-            },
-            Kind::Symlink | Kind::Whiteout => {
-                use std::os::unix::ffi::OsStrExt;
-                let at = rootfs.join(p);
-                let target = fs::read_link(&at).map_err(io_at(&at, "reading the link"))?;
-                Entry::Symlink {
-                    target: target.as_os_str().as_bytes().to_vec(),
-                }
+        } else if meta.is_dir() {
+            // Parents sort before what they hold, so nothing is in it yet.
+            Entry::Directory {
+                mode: meta.mode() & 0o777,
+                opaque: is_opaque,
+                children: BTreeMap::new(),
             }
+        } else if meta.is_file() {
+            Entry::File {
+                mode: meta.mode() & 0o777,
+                data: Data::Path(at.clone(), meta.len()),
+                link: Some(meta.ino() ^ (meta.dev() << 48)),
+            }
+        } else {
+            return Err(bad(format!(
+                "{} is not a file, directory or link",
+                at.display()
+            )));
         };
         children.insert(name, entry);
     }
-    // Whiteouts: a name the layers below had and this layer removed, in a directory
-    // that is still there and does not hide everything below anyway.
-    for p in before.keys() {
-        if p.as_os_str().is_empty() || after.contains_key(p.as_path()) {
-            continue;
-        }
-        let parent = p.parent().unwrap_or(Path::new(""));
-        let Some(ps) = after.get(parent) else {
+    // Whiteouts: a name the layers below had and this layer removed and did not make again, in
+    // a directory that is still there and does not hide everything below anyway.
+    for p in &applied.removed {
+        let Some(parent) = p.parent() else {
             continue;
         };
-        if ps.kind != Kind::Directory
-            || opaque.contains(&parent)
-            || under_opaque(parent)
-            || changed(parent, ps)
-        {
+        if lookup(&rootfs.join(p))?.is_some() {
             continue;
         }
-        let dir = dir_at(&mut root, parent, after)?;
+        let kept = lookup(&rootfs.join(parent))?.is_some_and(|m| m.is_dir());
+        if !kept || parent.ancestors().any(|a| applied.opaque.contains(a)) {
+            continue;
+        }
+        let dir = dir_at(&mut root, parent, rootfs)?;
         if let Entry::Directory { children, .. } = dir {
             children.insert(name_of(p), Entry::Whiteout);
         }
@@ -717,13 +674,11 @@ fn convert_in(
 ) -> Result<Converted> {
     let manifest = source.manifest(reference)?;
     let config = Config::parse(&unpack::blob_bytes(source, &manifest.config)?)?;
-    let mut before = snapshot(rootfs)?;
     let mut skipped = 0;
     let mut layers = Vec::new();
     for (i, descriptor) in manifest.layers.iter().enumerate() {
-        unpack::apply_layer(source, descriptor, rootfs, &mut skipped)?;
-        let after = snapshot(rootfs)?;
-        let tree = difference(&before, &after, rootfs)?;
+        let applied = unpack::apply_layer(source, descriptor, rootfs, &mut skipped)?;
+        let tree = difference(&applied, rootfs)?;
         let part = work.join(format!("layer-{i}"));
         let written = write(&tree, &part)?;
         let named = out.join(format!("{}.layer", written.id.hex()));
@@ -732,7 +687,6 @@ fn convert_in(
             path: named,
             ..written
         });
-        before = after;
     }
     // The image's own refusals of SDD 19 f.3, which the unpacking makes after its last
     // layer: a mount point that is not a directory.

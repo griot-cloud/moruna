@@ -26,6 +26,7 @@ use alloc::{
 use core::cell::RefCell;
 
 use moruna_mmio::Region;
+use moruna_pci::dma::DmaBuffer;
 use moruna_svc::{
     Channel, Completions, ConnectionId, Console, Context, DEADLINE_INFINITE, Decoder, Dispatcher,
     Handle, Handler, Interrupt, Outcome, Pending, ProtocolError, ProtocolId, Signals, Status,
@@ -33,7 +34,7 @@ use moruna_svc::{
 };
 use moruna_virtio::{
     Buffer,
-    device::{Device, DmaBuffer, VirtQueue},
+    device::{Device, VirtQueue},
     kind,
 };
 use vsock_protocol::{CHUNK_MAX, vsock};

@@ -20,10 +20,17 @@ pub mod manifest;
 /// The ABI version: the major number changes when a call's meaning changes, the minor
 /// number when a call is added. `abi_version` returns `MAJOR << 16 | MINOR`. ABI 2.0
 /// (KC1) moved every call to `nr::BASE + n`, so that a process whose foreign system
-/// calls are forwarded (SDD 28) keeps the whole low range for them.
+/// calls are forwarded (SDD 28) keeps the whole low range for them. ABI 2.1 (KD1) added
+/// the data plane: slots, the engine's calls on them, and the task's calls in
+/// `nr::DATA_PLANE` (SDD 29). ABI 2.2 (KD2) added `process_grant`: handles and a start
+/// page for a process its creator launches, so a Linux program can be the engine (SDD 30).
+/// ABI 2.3 (KB5) added memory accounts: the object `Account`, `account_create` and
+/// `account_info`, the account `process_create` and `memory_create` charge (an argument
+/// whose zero is the call ABI 2.2 made), and the error `QuotaExceeded` (SDD 20 f.18).
+/// ABI 2.4 adds KE1 contiguous DMA flags; ABI 2.5 adds exact Account/Memory charged-origin comparison.
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 0;
+pub const ABI_MINOR: u16 = 5;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -41,10 +48,14 @@ pub mod nr {
     pub const CHANNEL_CREATE: u64 = BASE + 4;
     pub const CHANNEL_WRITE: u64 = BASE + 5;
     pub const CHANNEL_READ: u64 = BASE + 6;
+    /// `memory_create(size, flags, account)`: ABI 1.2 added `flags`, ABI 2.3 the account
+    /// the object is charged to (zero: the caller's own).
     pub const MEMORY_CREATE: u64 = BASE + 7;
     pub const MEMORY_MAP: u64 = BASE + 8;
     /// Since 2.0 any whole pages of a mapping `memory_map` made, not only all of it.
     pub const MEMORY_UNMAP: u64 = BASE + 9;
+    /// `process_create(resource, name, length, account)`: ABI 2.3 added the account the
+    /// process is charged to (zero: the caller's own).
     pub const PROCESS_CREATE: u64 = BASE + 10;
     pub const PROCESS_MAP_IMAGE: u64 = BASE + 11;
     pub const PROCESS_START: u64 = BASE + 12;
@@ -106,11 +117,70 @@ pub mod nr {
     /// Added in ABI 2.0: bytes from the CPU's random source (at most
     /// `limits::RANDOM_MAX` a call).
     pub const RANDOM_READ: u64 = BASE + 42;
+    /// Added in ABI 2.1: a slot, the place one batch at a time moves through between
+    /// the engine and a task (SDD 29): `(flags)`, `slot_flags::INPUT` or `OUTPUT`. Its
+    /// handles raise `READABLE` while an event waits, `WRITABLE` while a push would be
+    /// taken, `PEER_CLOSED` once its task has ended, and (ABI 2.2) `SIGNALED` while its
+    /// task's `batch_get` would not wait, which a server serving the task's descriptors
+    /// waits on (SDD 30 f.10).
+    pub const SLOT_CREATE: u64 = BASE + 43;
+    /// Added in ABI 2.1: the engine hands a slot a memory object (moved out of its
+    /// table): a batch for an input slot, a window for an output slot:
+    /// `(slot, memory, offset, len, cookie)`.
+    pub const SLOT_PUSH: u64 = BASE + 44;
+    /// Added in ABI 2.1: the next event of a slot (`slot_event`), with the memory object
+    /// it gives back, if any: `(slot, event)`.
+    pub const SLOT_TAKE: u64 = BASE + 45;
+    /// Added in ABI 2.1: no more pushes: the task's `batch_get` answers the end once
+    /// what is queued is taken.
+    pub const SLOT_CLOSE: u64 = BASE + 46;
+    /// Added in ABI 2.1: the record taken from a slot failed the engine's check: the
+    /// task attached to it ends with the reason: `(slot, reason, len)`.
+    pub const SLOT_REFUSE: u64 = BASE + 47;
+    /// Added in ABI 2.1: gives a created process its plane: its slots, numbered in the
+    /// order given, and the kernel's end of its port channel (none when zero):
+    /// `(process, slots, count, port)`.
+    pub const PROCESS_PLANE: u64 = BASE + 48;
+    /// Added in ABI 2.2: moves handles into a created process its creator will launch,
+    /// under slot names, and maps a start page naming them read only into it; returns
+    /// the page's address, which the creator hands the program (SDD 30 d.1):
+    /// `(process, entries, count)`, `entries` as `process_start`'s.
+    pub const PROCESS_GRANT: u64 = BASE + 49;
+    /// Added in ABI 2.3: a new account whose ceiling is carved out of a parent's: the
+    /// caller's own (zero), an account, or a process's: `(parent, limit, name, length)`;
+    /// the limit, whole pages, is held from the parent until the new account is gone.
+    pub const ACCOUNT_CREATE: u64 = BASE + 50;
+    /// Added in ABI 2.3: an account's limit, use, peak, what it holds for the accounts
+    /// carved from it, and its name ([`crate::account_info`]): `(account, out)`, the
+    /// account the caller's own (zero), an account or a process's.
+    pub const ACCOUNT_INFO: u64 = BASE + 51;
+    /// ABI 2.5: exact capability/charged-origin identity, with READ on both:
+    /// `(account, object)`, object only Account or Memory. Returns 0 or 1; no
+    /// numeric account identity, authority minting, names or ancestor matching.
+    pub const ACCOUNT_MATCHES: u64 = BASE + 52;
     /// One past the highest call of the table.
-    pub const COUNT: u64 = 43;
-    /// Reserved for the data plane's calls (`batch_get`, `batch_put`, `port_call`,
-    /// KD1): native numbers, answered by the kernel, `BadSyscall` until they exist.
+    pub const COUNT: u64 = 53;
+    /// The data plane's calls (SDD 29): native numbers a task makes on its own plane,
+    /// or a personality server on a task's. The rest of the range is reserved.
     pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
+    /// `batch_get(slot) -> (address, length)` (ABI 2.1): an input slot's next batch
+    /// mapped read only, or an output slot's window mapped writable; `(0, 0)` at the end.
+    pub const BATCH_GET: u64 = BASE + 0x100;
+    /// `batch_put(slot, address, length)` (ABI 2.1): a record written in the output
+    /// slot's window, handed to the engine; the window leaves the task.
+    pub const BATCH_PUT: u64 = BASE + 0x101;
+    /// `port_call(port, address, length) -> (address, length)` (ABI 2.1): a request to
+    /// the engine on the task's port channel; the reply is mapped in read only.
+    pub const PORT_CALL: u64 = BASE + 0x102;
+    /// `plane_get(process, slot) -> (address, length)` (ABI 2.1): `batch_get` on a slot
+    /// of a process the caller holds with `WRITE`, mapped into the caller.
+    pub const PLANE_GET: u64 = BASE + 0x103;
+    /// `plane_put(process, slot, address, length)` (ABI 2.1): `batch_put` of a window
+    /// `plane_get` mapped into the caller.
+    pub const PLANE_PUT: u64 = BASE + 0x104;
+    /// `plane_probe(op, argument)` (ABI 2.1): what the data plane's tests measure
+    /// (`probe`); `BadSyscall` in a kernel built without its `probe` feature.
+    pub const PLANE_PROBE: u64 = BASE + 0x10f;
 
     /// Whether `number` is a native call: one of the table's, or the data plane's.
     pub const fn is_native(number: u64) -> bool {
@@ -151,11 +221,14 @@ pub enum Error {
     BadState = 13,
     /// A pointer the caller passed does not name readable (or writable) memory.
     Fault = 14,
+    /// (2.3) The account the call charges has no room for it: its use, what it holds for
+    /// the accounts carved from it, and the call's charge would pass its limit.
+    QuotaExceeded = 15,
 }
 
 impl Error {
     /// All errors, in code order.
-    pub const ALL: [Error; 14] = [
+    pub const ALL: [Error; 15] = [
         Error::BadHandle,
         Error::WrongType,
         Error::AccessDenied,
@@ -170,6 +243,7 @@ impl Error {
         Error::Limit,
         Error::BadState,
         Error::Fault,
+        Error::QuotaExceeded,
     ];
 
     /// The positive code; `rax` carries its negation.
@@ -214,6 +288,7 @@ impl Error {
             Error::Limit => "limit reached",
             Error::BadState => "bad state",
             Error::Fault => "fault",
+            Error::QuotaExceeded => "quota exceeded",
         }
     }
 }
@@ -375,10 +450,14 @@ pub enum ObjectType {
     Resource = 9,
     /// A memory object pinned for a device (ABI 1.2, `memory_pin`).
     Pin = 10,
+    /// The engine's end of a slot of the data plane (ABI 2.1, SDD 29).
+    Slot = 11,
+    /// A memory account: a ceiling, and what is charged to it (ABI 2.3, SDD 20 f.18).
+    Account = 12,
 }
 
 impl ObjectType {
-    pub const ALL: [ObjectType; 10] = [
+    pub const ALL: [ObjectType; 12] = [
         ObjectType::Process,
         ObjectType::Thread,
         ObjectType::Channel,
@@ -389,6 +468,8 @@ impl ObjectType {
         ObjectType::Console,
         ObjectType::Resource,
         ObjectType::Pin,
+        ObjectType::Slot,
+        ObjectType::Account,
     ];
 
     pub fn from_raw(raw: u32) -> Option<ObjectType> {
@@ -446,7 +527,13 @@ pub mod resource_range {
 pub mod memory_flags {
     /// The object may be pinned for a device with `memory_pin`.
     pub const DMA: u64 = 1 << 0;
-    pub const ALL: u64 = DMA;
+    /// The object's pages are one physically contiguous run, and a pin maps them as
+    /// one run of device addresses (ABI 2.4): for a ring a device reads as one block
+    /// longer than a page. Only with `DMA`, and at most `CONTIGUOUS_MAX_BYTES`.
+    pub const CONTIGUOUS: u64 = 1 << 1;
+    pub const ALL: u64 = DMA | CONTIGUOUS;
+    /// The largest contiguous object: 4 MiB.
+    pub const CONTIGUOUS_MAX_BYTES: u64 = 4 << 20;
 }
 
 /// The flags of `memory_pin`.
@@ -488,6 +575,75 @@ pub mod resource_info {
     pub const KIND: usize = 0;
     pub const BASE: usize = 8;
     pub const LEN: usize = 16;
+}
+
+/// The 64 bytes `account_info` writes (ABI 2.3), little endian.
+///
+/// ```text
+/// offset 0   u64 the limit, bytes
+/// offset 8   u64 what is charged to it now, bytes
+/// offset 16  u64 the most that was ever charged to it at once, bytes
+/// offset 24  u64 what it holds for the accounts carved from it: their limits, bytes
+/// offset 32  [u8; 32] its name, zero padded
+/// ```
+///
+/// Room left in it is `limit - used - reserved`.
+pub mod account_info {
+    pub const SIZE: usize = 64;
+    pub const LIMIT: usize = 0;
+    pub const USED: usize = 8;
+    pub const PEAK: usize = 16;
+    pub const RESERVED: usize = 24;
+    pub const NAME: usize = 32;
+}
+
+/// What the kernel charges an account (ABI 2.3, SDD 20 f.18), in bytes. Every page a
+/// process causes to exist is charged to an account: a memory object's pages and the
+/// kernel's record of each, a zero page when it is first touched, an address space's
+/// page tables, a thread's kernel stack, and each kernel object at a fixed charge. The
+/// kernel checks at its build that every fixed charge covers the record it stands for.
+pub mod charge {
+    /// A page.
+    pub const PAGE: u64 = crate::PAGE_SIZE;
+    /// A kernel object's record: a timer, an interrupt, a device memory region, a
+    /// resource, a pin, an account; and a memory object's, besides its pages.
+    pub const OBJECT: u64 = 256;
+    /// What the kernel keeps of each page of a memory object besides the page.
+    pub const PAGE_RECORD: u64 = 16;
+    /// A zero page, once first touched: the page and the kernel's record of it.
+    pub const ZERO_PAGE: u64 = PAGE + 32;
+    /// An area of an address space: a mapping, or each part of one an unmap or a change
+    /// of protection split it into.
+    pub const AREA: u64 = 96;
+    /// What the kernel keeps of each page a pin hands a device.
+    pub const PIN_PAGE: u64 = 128;
+    /// A channel: both endpoints and the room of both queues.
+    pub const CHANNEL: u64 = 4 * PAGE;
+    /// A slot of the data plane, whose queues are reserved whole when it is made.
+    pub const SLOT: u64 = 3 * PAGE;
+    /// A thread: its kernel stack (OSTD's 128 pages), its registers and its FPU state.
+    pub const THREAD: u64 = 130 * PAGE;
+    /// A process's record, besides its address space's tables and its threads.
+    pub const PROCESS: u64 = PAGE;
+    /// An address space's root table and the three tables over the top of user space,
+    /// which the hardware layer keeps until the space ends.
+    pub const SPACE: u64 = 4 * PAGE;
+    /// The page tables of an address space: one page for each 2 MiB, 1 GiB and 512 GiB
+    /// region of it an area touches, besides [`SPACE`].
+    pub const TABLE_REGIONS: [u64; 3] = [1 << 21, 1 << 30, 1 << 39];
+    /// A message queued on a channel: its record and each handle it carries, besides
+    /// its bytes; charged to the sender until it is read or dropped.
+    pub const MESSAGE: u64 = 128;
+    pub const MESSAGE_HANDLE: u64 = 32;
+    /// A process's handle table grows by [`HANDLE_SLOTS`] slots at a time, each
+    /// [`HANDLE_SLOT`] bytes, and keeps its size until the process ends.
+    pub const HANDLE_SLOTS: u64 = 64;
+    pub const HANDLE_SLOT: u64 = 96;
+
+    /// A memory object of `pages` pages.
+    pub const fn memory(pages: u64) -> u64 {
+        OBJECT + pages * (PAGE + PAGE_RECORD)
+    }
 }
 
 /// The flags of `memory_map`, `memory_protect` and the `process_*` calls on another
@@ -547,6 +703,13 @@ pub mod limits {
     pub const RANDOM_MAX: usize = 4096;
     /// The most foreign numbers a forward's table names: numbers `0 .. FORWARD_FAST`.
     pub const FORWARD_FAST: usize = 512;
+    /// The most slots one process's plane has (ABI 2.1).
+    pub const PLANE_SLOTS: usize = 64;
+    /// The most memory objects one slot holds at once: queued, mapped by its task, and
+    /// given back and not yet taken (ABI 2.1).
+    pub const SLOT_DEPTH: usize = 64;
+    /// The longest reason `slot_refuse` takes, in bytes of UTF-8 (ABI 2.1).
+    pub const REFUSAL_MAX: usize = 512;
 }
 
 /// A process's forward (SDD 28, d.1): how its foreign system calls reach the server
@@ -667,6 +830,92 @@ pub mod forward {
         /// register zero, its FS base zero and its heap at `BRK`: the server rebuilt
         /// the address space of a process with this one thread (an `execve`).
         pub const RESTART: u64 = 3;
+    }
+}
+
+/// The data plane (SDD 29): slots, their events, and a task's port calls.
+///
+/// A slot is made by the engine (`slot_create`) and attached to one task process
+/// before it starts (`process_plane`). The engine pushes memory objects into it: an
+/// input slot's are batches, each one page-aligned Arrow IPC record the task maps read
+/// only with `batch_get`; an output slot's are windows the task maps writable with
+/// `batch_get`, writes a record into and hands back with `batch_put`. What comes back
+/// to the engine comes as events (`slot_take`).
+pub mod plane {
+    /// The flags of `slot_create`: exactly one.
+    pub mod slot_flags {
+        /// The engine pushes batches; the task reads them.
+        pub const INPUT: u64 = 1 << 0;
+        /// The engine pushes windows; the task writes records into them.
+        pub const OUTPUT: u64 = 1 << 1;
+    }
+
+    /// The 32 bytes `slot_take` writes, little endian.
+    ///
+    /// ```text
+    /// offset 0   u32 kind
+    /// offset 4   u32 reserved, zero
+    /// offset 8   u64 the cookie the memory object was pushed with
+    /// offset 16  u64 PUT: where the record starts in the memory object
+    /// offset 24  u64 PUT: the record's length
+    /// ```
+    pub mod slot_event {
+        pub const SIZE: usize = 32;
+        pub const KIND: usize = 0;
+        pub const COOKIE: usize = 8;
+        pub const OFFSET: usize = 16;
+        pub const LEN: usize = 24;
+        /// An input batch the task is done with: it took the next one, or it ended.
+        /// No handle.
+        pub const RELEASED: u32 = 1;
+        /// A record the task put in its window: the window's memory object comes back.
+        pub const PUT: u32 = 2;
+        /// A window the task never put a record in, given back when the task ended.
+        pub const RETURNED: u32 = 3;
+    }
+
+    /// A port call's request, the kernel to the engine on the task's port channel: a
+    /// header of [`request::SIZE`] bytes and then the bytes the task passed.
+    pub mod request {
+        /// `u32` the message's kind, [`CALL`].
+        pub const KIND: usize = 0;
+        /// `u64` the calling thread's token; the reply carries it back.
+        pub const TOKEN: usize = 8;
+        /// `u64` the port the task named.
+        pub const PORT: usize = 16;
+        /// `u64` the length of the bytes after the header.
+        pub const LEN: usize = 24;
+        pub const SIZE: usize = 32;
+        /// A port call.
+        pub const CALL: u32 = 1;
+        /// The most bytes a request carries: a channel message less the header.
+        pub const MAX: usize = crate::limits::CHANNEL_MAX_BYTES - SIZE;
+    }
+
+    /// A port call's reply, the engine to the kernel: [`reply::SIZE`] bytes and, when
+    /// `STATUS` is zero and `LEN` is not, one memory object holding the reply, which
+    /// the kernel maps into the caller read only.
+    pub mod reply {
+        /// `u64` the token of the request answered.
+        pub const TOKEN: usize = 0;
+        /// `u64` zero, or the error code the call returns (`Error::code`).
+        pub const STATUS: usize = 8;
+        /// `u64` the reply's length in the memory object.
+        pub const LEN: usize = 16;
+        pub const SIZE: usize = 24;
+    }
+
+    /// The operations of `plane_probe`.
+    pub mod probe {
+        /// The physical address of the page holding the argument, an address of the
+        /// caller's (`BadState` where no page is).
+        pub const FRAME: u64 = 0;
+        /// The bytes the kernel has copied into or out of the caller's memory since it
+        /// started.
+        pub const COPIED: u64 = 1;
+        /// The physical address of page 0 of a memory object the caller holds a handle
+        /// to, the argument being `handle | page << 32`.
+        pub const OBJECT_FRAME: u64 = 2;
     }
 }
 
@@ -854,7 +1103,9 @@ mod tests {
             assert_eq!(ObjectType::from_raw(t as u32), Some(t));
         }
         assert_eq!(ObjectType::from_raw(0), None);
-        assert_eq!(ObjectType::from_raw(11), None);
+        assert_eq!(ObjectType::from_raw(11), Some(ObjectType::Slot));
+        assert_eq!(ObjectType::from_raw(12), Some(ObjectType::Account));
+        assert_eq!(ObjectType::from_raw(13), None);
         for k in ResourceKind::ALL {
             assert_eq!(ResourceKind::from_raw(k as u32), Some(k));
         }
@@ -878,8 +1129,17 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0000);
-        assert_eq!(nr::RANDOM_READ + 1, nr::BASE + nr::COUNT);
+        assert_eq!(ABI_VERSION, 0x2_0003);
+        assert_eq!(nr::ACCOUNT_MATCHES + 1, nr::BASE + nr::COUNT);
+        assert_eq!(nr::ACCOUNT_MATCHES, nr::ACCOUNT_INFO + 1);
+        assert_eq!(nr::ACCOUNT_CREATE, nr::PROCESS_GRANT + 1);
+        assert!(nr::is_native(nr::BATCH_GET) && nr::is_native(nr::PLANE_PROBE));
+        assert_eq!(
+            plane::request::SIZE + plane::request::MAX,
+            limits::CHANNEL_MAX_BYTES
+        );
+        assert_eq!(plane::slot_event::SIZE, plane::slot_event::LEN + 8);
+        assert_eq!(plane::reply::SIZE, plane::reply::LEN + 8);
         assert!(nr::is_native(nr::BASE) && nr::is_native(nr::FORWARD_CLONE));
         assert!(!nr::is_native(nr::BASE - 1) && !nr::is_native(nr::BASE + nr::COUNT));
         assert!(nr::is_native(nr::DATA_PLANE.start) && !nr::is_native(nr::DATA_PLANE.end));
@@ -910,5 +1170,25 @@ mod tests {
         assert_eq!(limits::PIN_MAX_PAGES, 65536);
         assert_eq!(resource_range::MSI_END, 224);
         assert_eq!(resource_range::DMA_END, 65536);
+    }
+
+    #[test]
+    fn kb5_t1_account_layout_and_charges() {
+        assert_eq!(account_info::SIZE, account_info::NAME + limits::NAME_MAX);
+        assert_eq!(account_info::RESERVED, account_info::PEAK + 8);
+        assert_eq!(Error::QuotaExceeded.code(), 15);
+        assert_eq!(Error::from_code(15), Some(Error::QuotaExceeded));
+        assert_eq!(Error::QuotaExceeded.name(), "quota exceeded");
+        assert_eq!(charge::memory(0), charge::OBJECT);
+        assert_eq!(
+            charge::memory(3),
+            charge::OBJECT + 3 * (PAGE_SIZE + charge::PAGE_RECORD)
+        );
+        // Each table region is 512 of the one below it, the lowest 512 pages.
+        assert_eq!(charge::TABLE_REGIONS[0], 512 * PAGE_SIZE);
+        assert_eq!(charge::TABLE_REGIONS[1], 512 * charge::TABLE_REGIONS[0]);
+        assert_eq!(charge::TABLE_REGIONS[2], 512 * charge::TABLE_REGIONS[1]);
+        const { assert!(charge::THREAD >= 128 * PAGE_SIZE) };
+        const { assert!(charge::SPACE.is_multiple_of(PAGE_SIZE)) };
     }
 }

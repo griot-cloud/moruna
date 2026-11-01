@@ -40,19 +40,27 @@ struct ChildSampler {
 }
 
 impl ChildSampler {
-    fn read_current(&self) -> u64 {
+    fn read_current(&self) -> moruna_kernel::Result<u64> {
         let mut buf = [0u8; 32];
-        let n = self.current.read_at(&mut buf, 0).unwrap_or(0);
-        std::str::from_utf8(&buf[..n])
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        let failure = |msg: String| MorunaError::Io {
+            op: "read",
+            target: "memory.current".into(),
+            msg,
+        };
+        let n = self
+            .current
+            .read_at(&mut buf, 0)
+            .map_err(|error| failure(error.to_string()))?;
+        let text = std::str::from_utf8(&buf[..n]).map_err(|error| failure(error.to_string()))?;
+        text.trim()
+            .parse()
+            .map_err(|error: std::num::ParseIntError| failure(error.to_string()))
     }
 }
 
 impl Sampler for ChildSampler {
-    fn sample(&self) -> Sample {
-        let anon = self.read_current();
+    fn sample(&self) -> moruna_kernel::Result<Sample> {
+        let anon = self.read_current()?;
         let peak = self.peak.fetch_max(anon, Ordering::AcqRel).max(anon);
         self.mapping
             .counter(field::IN_USE)
@@ -60,12 +68,12 @@ impl Sampler for ChildSampler {
         self.mapping
             .counter(field::PEAK)
             .fetch_max(peak, Ordering::AcqRel);
-        Sample {
+        Ok(Sample {
             anon_bytes: anon,
             peak_anon_bytes: peak,
             ceiling_bytes: self.mapping.counter(field::CEILING).load(Ordering::Acquire),
             ..Sample::default()
-        }
+        })
     }
 
     fn reset_peak(&self) {}
@@ -180,8 +188,9 @@ pub fn conflicts(deps: &Path, libraries: &BTreeMap<String, String>) -> Result<()
 
 /// Import `entry` from the tree and make the adapter's kernel of it with the manifest's
 /// declaration and hints.
-fn load(
+pub(crate) fn load_at(
     py: Python<'_>,
+    tree: &Path,
     deps: &Path,
     entry: &str,
     manifest: &Manifest,
@@ -189,7 +198,7 @@ fn load(
 ) -> Result<PyKernel, String> {
     let sys = py.import("sys").map_err(|e| failed("load", e))?;
     let path = sys.getattr("path").map_err(|e| failed("load", e))?;
-    for dir in [deps.to_path_buf(), Path::new(TREE).join("src")] {
+    for dir in [deps.to_path_buf(), tree.join("src")] {
         path.call_method1("insert", (0, dir.display().to_string()))
             .map_err(|e| failed("load", e))?;
     }
@@ -299,17 +308,17 @@ fn run(py: Python<'_>, start: &str, control: &UnixStream, memfd: OwnedFd) -> Res
     let manifest = Manifest::from_value(&manifest).map_err(|e| failed("manifest", e))?;
     let deps = Path::new(TREE).join("deps").join(&target);
     conflicts(&deps, &libraries)?;
-    let kernel = load(py, &deps, &entry, &manifest, args.as_ref())?;
+    let kernel = load_at(py, Path::new(TREE), &deps, &entry, &manifest, args.as_ref())?;
     let sampler = Arc::new(ChildSampler {
         current,
         mapping: Arc::clone(&mapping),
         peak: AtomicU64::new(0),
     });
     let ceiling = mapping.counter(field::CEILING).load(Ordering::Acquire);
-    kernel.bind_gate(MemoryGate::new(
-        Arc::clone(&sampler) as Arc<dyn Sampler>,
-        ceiling,
-    ));
+    kernel.bind_gate(
+        MemoryGate::new(Arc::clone(&sampler) as Arc<dyn Sampler>, ceiling)
+            .map_err(|error| failed("memory accounting", error))?,
+    );
     let arena = moruna_arena::Arena::new(moruna_arena::ArenaConfig {
         host_bytes: CHILD_ARENA_BYTES,
         ..moruna_arena::ArenaConfig::default()
@@ -450,12 +459,12 @@ fn message_of(e: &MorunaError) -> String {
 }
 
 impl Served {
-    fn counted(&self, counts: KernelAlloc) -> AllocDoc {
-        let _ = self.sampler.sample();
+    fn counted(&self, counts: &KernelAlloc) -> moruna_kernel::Result<AllocDoc> {
         self.mapping
             .counter(field::CALLS)
             .fetch_add(1, Ordering::AcqRel);
-        AllocDoc::from(&counts)
+        self.sampler.sample()?;
+        Ok(AllocDoc::from(counts))
     }
 
     /// `reply` with the leases released since the last reply.
@@ -522,7 +531,10 @@ impl Served {
             Err(e) => return error(format!("the input: {e}"), AllocDoc::default()),
         };
         let (result, counts) = self.kernel.call_arrow(py, state, batch);
-        let alloc = self.counted(counts);
+        let alloc = match self.counted(&counts) {
+            Ok(alloc) => alloc,
+            Err(cause) => return error(cause.to_string(), AllocDoc::from(&counts)),
+        };
         match result {
             Ok(out) => match self.write(py, out, out_at, out_len) {
                 Ok(written) => FromChild::Done {

@@ -1,39 +1,50 @@
 //! An OCI image's command as a kernel (SDD 19): one confined process per stage, started from an
-//! unpacked image, exchanging Arrow IPC with Moruna over standard input and output.
+//! unpacked image, its batches crossing the data plane (SDD 29, KA2).
 //!
-//! The contract with the process (SDD 19 f.6): Moruna writes one Arrow IPC stream to its standard
-//! input, the schema, then one record batch for each `apply`, then the end-of-stream marker at
-//! `finish`. The process writes one Arrow IPC stream to its standard output, the schema, then
-//! exactly one record batch for each it read, in order; when its input ends it ends its stream
-//! and exits with status 0. A run that applied no batch ends the input without a byte, and the
-//! process writes nothing and exits with status 0.
+//! The stage is a task of a plane of its own (`moruna_plane_linux::LinuxPlane`), one input slot
+//! and one output slot. Each `apply` writes the batch once, as a record, into a memfd that the
+//! engine seals and checks, offers it on the input, grants a window of the stage's ceiling on
+//! the output, and takes the record the task puts back, checked after the task lost write access
+//! to it, decoded in place and landed in the run's arena.
+//!
+//! The command reads and writes its batches one of two ways. Unmodified (the default), it
+//! reads one Arrow IPC stream on its standard input and writes one on its standard output (SDD
+//! 19 f.6), and the engine's bridge ([`stdio`]) carries both onto the plane: the schema, then
+//! one record batch for each `apply`, then the end-of-stream marker at `finish`; it writes the
+//! schema, then exactly one record batch for each it read, in order, and when its input ends
+//! it ends its stream and exits with status 0. A run that applied no batch ends the input
+//! without a byte. With `plane`, the command makes the plane's three calls itself on its
+//! descriptor 3 (`moruna_plane_linux::task`), the same contract with no stream and no copy: a
+//! record per batch read, its input's end, its exit. Either way a record that fails the check
+//! ends the stage with the check's reason.
 
-mod output;
 mod spawn;
+mod stdio;
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use moruna_adapters::{UNKNOWN_SEQ, UNKNOWN_STAGE};
-use moruna_image::Image;
-use moruna_kernel::arrow::ipc::writer::StreamWriter;
+use moruna_image::{Image, Launch};
+use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::declare::Declared;
 use moruna_kernel::{
     Allocator, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError,
     OutsideMemory, Payload, PayloadKind, PayloadSpec, Result, Sampler, SourceSchema, TierPref,
 };
+use moruna_plane::{DataPlane, Event, PlaneError, Shape, TaskId};
+use moruna_plane_linux::LinuxPlane;
 use seccompiler::BpfProgram;
 
 use crate::STOP_GRACE;
 use crate::cgroup::StageCgroup;
 use crate::output::{TAIL_LINES, Tail, follow_stderr};
-use output::{Next, Output};
-use spawn::{Plan, spawn};
+use spawn::{Plan, Streams, spawn};
+use stdio::Bridge;
 
 /// The size of an image's `/tmp` (SDD 19 f.5 step 4): the stage has no scratch setting yet.
 pub const TMP_BYTES: u64 = 64 << 20;
@@ -41,8 +52,11 @@ pub const TMP_BYTES: u64 = 64 << 20;
 pub const EXIT_WAIT: Duration = Duration::from_secs(60);
 /// How long the end of a child's standard error is waited for once the child is gone.
 const STDERR_WAIT: Duration = Duration::from_millis(500);
-/// The `PATH` a command is looked for in when the image's environment names none.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// The page a record's buffers start on.
+const PAGE: usize = 4096;
+/// The input slot and the output slot of a stage's plane.
+const INPUT: u32 = 0;
+const OUTPUT: u32 = 0;
 /// Names this process's stage cgroups apart, across kernels.
 static STAGES: AtomicU64 = AtomicU64::new(0);
 
@@ -77,10 +91,15 @@ struct ImageMemory {
 }
 
 impl OutsideMemory for ImageMemory {
-    fn in_use(&self) -> u64 {
-        lock(&self.cgroup)
-            .as_ref()
-            .map_or(0, |c| c.memory_current().unwrap_or(0))
+    fn in_use(&self) -> Result<u64> {
+        match lock(&self.cgroup).as_ref() {
+            None => Ok(0),
+            Some(cgroup) => cgroup.memory_current().map_err(|e| MorunaError::Io {
+                op: "read",
+                target: "memory.current".into(),
+                msg: e.to_string(),
+            }),
+        }
     }
 }
 
@@ -95,69 +114,8 @@ pub enum Exit {
     Lost,
 }
 
-/// The user an image runs as, from its config (SDD 19 IM-I4): root, or a numeric uid and gid.
-fn identity(user: &str) -> Result<(u32, u32)> {
-    let numeric = |s: &str| -> Result<u32> {
-        s.parse::<u32>().map_err(|_| {
-            config(format!(
-                "the image's user `{user}` is not numeric: name its user by uid (and gid), for \
-                 the sandbox has no passwd to look a name up in"
-            ))
-        })
-    };
-    match user {
-        "" | "root" => Ok((0, 0)),
-        _ => match user.split_once(':') {
-            Some((u, g)) => Ok((numeric(u)?, numeric(g)?)),
-            None => {
-                let uid = numeric(user)?;
-                Ok((uid, uid))
-            }
-        },
-    }
-}
-
-/// The image's environment and the settings', each `NAME=value`, a later name replacing an
-/// earlier one; the process gets this and nothing of Moruna's.
-fn environment(
-    image: &[String],
-    settings: &BTreeMap<String, String>,
-) -> Result<Vec<(String, String)>> {
-    let mut env: Vec<(String, String)> = Vec::new();
-    let mut put = |name: &str, value: &str| match env.iter_mut().find(|(n, _)| n == name) {
-        Some(entry) => entry.1 = value.to_string(),
-        None => env.push((name.to_string(), value.to_string())),
-    };
-    for entry in image {
-        let Some((name, value)) = entry.split_once('=') else {
-            return Err(config(format!(
-                "the image's Env entry `{entry}` is not NAME=value"
-            )));
-        };
-        put(name, value);
-    }
-    for (name, value) in settings {
-        put(name, value);
-    }
-    Ok(env)
-}
-
 fn cstring(text: &str, what: &str) -> Result<CString> {
     CString::new(text).map_err(|_| config(format!("{what} holds a NUL byte")))
-}
-
-/// The paths `command` is tried at: itself when it names a directory, else one per `PATH`
-/// entry.
-fn candidates(command: &str, path: &str) -> Result<Vec<CString>> {
-    if command.contains('/') {
-        return Ok(vec![cstring(command, "the command")?]);
-    }
-    path.split(':')
-        .map(|dir| {
-            let dir = if dir.is_empty() { "." } else { dir };
-            cstring(&format!("{dir}/{command}"), "the command")
-        })
-        .collect()
 }
 
 /// An image's command as a kernel.
@@ -166,12 +124,12 @@ pub struct ImageKernel {
     fingerprint: Fingerprint,
     rootfs: PathBuf,
     cgroup: PathBuf,
-    uid: u32,
-    gid: u32,
-    working_dir: String,
-    command: Vec<String>,
-    env: Vec<(String, String)>,
+    /// The single image-config reader shared with the native engine.
+    launch: Launch,
     filters: Vec<BpfProgram>,
+    /// The command makes the plane's calls on descriptor 3 rather than reading and writing
+    /// streams.
+    plane: bool,
     binding: Mutex<Option<Binding>>,
     memory: Arc<ImageMemory>,
 }
@@ -180,53 +138,36 @@ impl std::fmt::Debug for ImageKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageKernel")
             .field("name", &self.name)
-            .field("command", &self.command)
+            .field("command", &self.launch.command)
             .finish()
     }
 }
 
 impl ImageKernel {
     /// The kernel of `image`'s command, or `command` where the settings replace it, with the
-    /// settings' `env` added to the image's, in stages whose cgroups are made under `cgroup`.
+    /// settings' `env` added to the image's, in stages whose cgroups are made under `cgroup`;
+    /// with `plane`, the command makes the plane's calls itself.
     pub fn new(
         name: &str,
         image: &Image,
         command: Option<Vec<String>>,
         env: &BTreeMap<String, String>,
         cgroup: PathBuf,
+        plane: bool,
     ) -> Result<ImageKernel> {
-        let command = command.unwrap_or_else(|| image.config.command());
-        let Some(first) = command.first() else {
-            return Err(config(format!(
-                "{name}: the image names no command (no Entrypoint and no Cmd) and the settings \
-                 give none"
-            )));
-        };
-        let (uid, gid) = identity(&image.config.user)?;
-        let env = environment(&image.config.env, env)?;
-        let working_dir = if image.config.working_dir.is_empty() {
-            "/".to_string()
-        } else {
-            image.config.working_dir.clone()
-        };
-        if !working_dir.starts_with('/') {
-            return Err(config(format!(
-                "{name}: the image's working directory `{working_dir}` is not absolute"
-            )));
+        let launch = moruna_image::Launch::new(name, &image.config, command, env)
+            .map_err(|e| config(e.to_string()))?;
+        for at in launch.candidates() {
+            cstring(&at, "the command")?;
         }
-        let path = env
-            .iter()
-            .find(|(n, _)| n == "PATH")
-            .map_or(DEFAULT_PATH, |(_, v)| v.as_str());
-        candidates(first, path)?;
         let rootfs = image
             .rootfs
             .canonicalize()
             .map_err(|e| config(format!("{}: {e}", image.rootfs.display())))?;
         let filters = crate::seccomp::image_filters().map_err(config)?;
         let identity = serde_json::json!({
-            "image": image.digest.to_string(), "command": command, "env": env,
-            "working_dir": working_dir, "user": image.config.user,
+            "image": image.digest.to_string(), "command": &launch.command, "env": &launch.env,
+            "working_dir": &launch.working_dir, "user": image.config.user, "plane": plane,
         });
         Ok(ImageKernel {
             name: name.to_string(),
@@ -236,12 +177,9 @@ impl ImageKernel {
             ),
             rootfs,
             cgroup,
-            uid,
-            gid,
-            working_dir,
-            command,
-            env,
+            launch,
             filters,
+            plane,
             binding: Mutex::new(None),
             memory: Arc::new(ImageMemory::default()),
         })
@@ -276,7 +214,7 @@ impl ImageKernel {
                 self.name
             ))
         })?;
-        let sample = binding.sampler.sample();
+        let sample = binding.sampler.sample()?;
         let ceiling = if sample.ceiling_bytes > 0 {
             sample.ceiling_bytes
         } else {
@@ -319,30 +257,46 @@ impl ImageKernel {
         let plan = Plan {
             cgroup: cgroup.dir().to_path_buf(),
             rootfs: self.rootfs.clone(),
-            uid: self.uid,
-            gid: self.gid,
-            working_dir: cstring(&self.working_dir, "the working directory")?,
-            candidates: candidates(
-                &self.command[0],
-                self.env
-                    .iter()
-                    .find(|(n, _)| n == "PATH")
-                    .map_or(DEFAULT_PATH, |(_, v)| v.as_str()),
-            )?,
+            uid: self.launch.uid,
+            gid: self.launch.gid,
+            working_dir: cstring(&self.launch.working_dir, "the working directory")?,
+            candidates: self
+                .launch
+                .candidates()
+                .iter()
+                .map(|c| cstring(c, "the command"))
+                .collect::<Result<_>>()?,
             argv: self
+                .launch
                 .command
                 .iter()
                 .map(|a| cstring(a, "the command"))
                 .collect::<Result<_>>()?,
             envp: self
-                .env
+                .launch
+                .env_entries()
                 .iter()
-                .map(|(k, v)| cstring(&format!("{k}={v}"), "the environment"))
+                .map(|e| cstring(e, "the environment"))
                 .collect::<Result<_>>()?,
             tmp_bytes: TMP_BYTES,
             filters: self.filters.clone(),
         };
-        let started = spawn(&plan).map_err(|e| {
+        // The stage's plane: one input, one output, no port. Its budget is a record of the
+        // input and a window of the output, each at most the stage's ceiling.
+        let mut plane = LinuxPlane::new(ceiling.saturating_mul(2));
+        let (task, end) = plane
+            .open(Shape {
+                inputs: 1,
+                outputs: 1,
+                port: false,
+            })
+            .map_err(|e| config(format!("{}: the stage's plane: {e:?}", self.name)))?;
+        let (streams, bridged) = if self.plane {
+            (Streams::Plane(end), None)
+        } else {
+            (Streams::Stdio, Some(end))
+        };
+        let started = spawn(&plan, streams).map_err(|e| {
             config(format!(
                 "{}: the process could not be started: {e}",
                 self.name
@@ -359,18 +313,42 @@ impl ImageKernel {
         );
         *lock(&self.memory.cgroup) = Some(Arc::clone(&cgroup));
         tracing::info!(target: "sandbox", pid = started.pid, image = %self.name, "image process started");
+        let child = Child {
+            pid: started.pid,
+            tail,
+            cgroup,
+            exit: None,
+            name: self.name.clone(),
+        };
+        let bridge = match (bridged, started.stdin, started.stdout) {
+            (Some(end), Some(stdin), Some(stdout)) => Some(
+                Bridge::start(end, stdin, stdout)
+                    .map_err(|e| config(format!("{}: {e}", self.name)))?,
+            ),
+            (None, None, None) => {
+                // The command is the task: a refused record ends it through its pidfd.
+                let pidfd = moruna_plane_linux::sys::pidfd(started.pid as u32)
+                    .map_err(|e| config(format!("{}: pidfd_open: {e}", self.name)))?;
+                plane
+                    .attach(task, pidfd)
+                    .map_err(|e| config(format!("{}: the stage's plane: {e:?}", self.name)))?;
+                None
+            }
+            _ => {
+                return Err(config(format!(
+                    "{}: the process was started with streams its interface does not have",
+                    self.name
+                )));
+            }
+        };
         Ok(ImageState {
-            child: Child {
-                pid: started.pid,
-                input: Input::Pending(started.stdin),
-                output: Output::new(started.stdout),
-                tail,
-                cgroup,
-                sent: 0,
-                received: 0,
-                exit: None,
-                name: self.name.clone(),
-            },
+            child,
+            bridge,
+            plane,
+            task,
+            granted: false,
+            sent: 0,
+            received: 0,
             alloc: Arc::clone(&ctx.alloc),
             ceiling,
             memory: Arc::clone(&self.memory),
@@ -378,25 +356,11 @@ impl ImageKernel {
     }
 }
 
-/// Moruna's end of the process's standard input.
-enum Input {
-    /// Nothing written yet: the schema goes with the first batch.
-    Pending(File),
-    /// The stream is open.
-    Open(Box<StreamWriter<File>>),
-    /// The stream has ended.
-    Closed,
-}
-
 /// One stage's process, Moruna's side.
 struct Child {
     pid: libc::pid_t,
-    input: Input,
-    output: Output<File>,
     tail: Arc<Tail>,
     cgroup: Arc<StageCgroup>,
-    sent: u64,
-    received: u64,
     exit: Option<Exit>,
     name: String,
 }
@@ -524,9 +488,17 @@ fn with_stderr(head: String, lines: &[String]) -> String {
     )
 }
 
-/// A stage's state: its process, and the arena outputs land in.
+/// A stage's state: its process, its plane and the bridge of its streams, and the arena
+/// outputs land in. The process goes first when it is dropped, then the bridge, then the plane.
 pub struct ImageState {
     child: Child,
+    bridge: Option<Bridge>,
+    plane: LinuxPlane,
+    task: TaskId,
+    /// A window is granted on the output and not yet put.
+    granted: bool,
+    sent: u64,
+    received: u64,
     alloc: Arc<dyn Allocator>,
     ceiling: u64,
     memory: Arc<ImageMemory>,
@@ -541,6 +513,133 @@ impl ImageState {
     /// The stage cgroup's directory.
     pub fn cgroup(&self) -> PathBuf {
         self.child.cgroup.dir().to_path_buf()
+    }
+
+    /// What the plane holds now (SDD 29 d.4).
+    pub fn residency(&self) -> moruna_plane::Residency {
+        self.plane.residency()
+    }
+
+    /// The stage's error for what the plane said: the process ended or refused, its words
+    /// quoted.
+    fn failed(&mut self, ended: bool, cause: String) -> MorunaError {
+        let cause = match self.bridge.as_ref().and_then(Bridge::fault) {
+            Some(fault) => fault,
+            None => cause,
+        };
+        self.child.failed(ended, cause)
+    }
+
+    /// `batch` as a record, written once into a memfd of the plane and checked there: the
+    /// framing, then each buffer at its page.
+    fn load(&mut self, batch: &RecordBatch) -> Result<moruna_plane::BatchId> {
+        let (framing, buffers) = moruna_kernel::ipc::encode_framing(batch, PAGE, 0, &*self.alloc)?;
+        let end = buffers
+            .iter()
+            .map(|(at, b)| at + b.len())
+            .chain(std::iter::once(framing.len()))
+            .max()
+            .unwrap_or(PAGE);
+        // The record ends where its body does, padded to 8 as the body length is.
+        let len = end.div_ceil(8) * 8;
+        let loaded = self.plane.load_with(len as u64, |window| {
+            window[..framing.len()].copy_from_slice(&framing);
+            for (at, b) in &buffers {
+                window[*at..*at + b.len()].copy_from_slice(b.as_slice());
+            }
+            Ok(())
+        });
+        match loaded {
+            Ok((id, _)) => Ok(id),
+            Err(PlaneError::Budget { asked, free }) => Err(kernel_error(format!(
+                "image `{}`: its input batch is {asked} bytes as a record, more than the {free} \
+                 its stage's plane has left (twice the stage's ceiling of {})",
+                self.child.name, self.ceiling
+            ))),
+            Err(e) => Err(kernel_error(format!(
+                "image `{}`: its input batch could not be put on its plane: {}",
+                self.child.name,
+                plane_words(&e, &self.plane)
+            ))),
+        }
+    }
+
+    /// A window of the ceiling on the output, unless one is there.
+    fn grant(&mut self) -> Result<()> {
+        if self.granted {
+            return Ok(());
+        }
+        match self.plane.grant(self.task, OUTPUT, self.ceiling) {
+            Ok(()) => {
+                self.granted = true;
+                Ok(())
+            }
+            Err(e) => Err(kernel_error(format!(
+                "image `{}`: its output's window of {} bytes: {}",
+                self.child.name,
+                self.ceiling,
+                plane_words(&e, &self.plane)
+            ))),
+        }
+    }
+
+    /// The next event of the stage's plane that is a put, a refusal or the task's end.
+    fn next(&mut self) -> Result<Event> {
+        loop {
+            match self.plane.next(u64::MAX) {
+                Ok(Some(Event::Released { .. } | Event::Freed { .. })) => {}
+                // The stage's plane has no port, so a call never reaches here; one that did is
+                // refused as a plane without a port refuses it.
+                Ok(Some(Event::Call { call, .. })) => {
+                    let _ = self.plane.answer(call, Err(moruna_abi::Error::BadHandle));
+                }
+                Ok(Some(e)) => return Ok(e),
+                Ok(None) => {
+                    return Err(self.failed(true, "its plane has nothing left to wait on".into()));
+                }
+                Err(e) => {
+                    let words = plane_words(&e, &self.plane);
+                    return Err(self.failed(false, format!("its plane failed: {words}")));
+                }
+            }
+        }
+    }
+
+    /// The record the task put, decoded in place over the sealed memfd and landed in the
+    /// run's arena; the plane's batch dropped.
+    fn take(&mut self, batch: moruna_plane::BatchId) -> Result<Payload> {
+        let read = read_batch(&mut self.plane, batch);
+        let landed = read.and_then(|b| moruna_adapters::land::land_table(b, &self.alloc));
+        self.plane
+            .drop_batch(batch)
+            .map_err(|e| kernel_error(format!("image `{}`: {e:?}", self.child.name)))?;
+        Ok(landed?.0)
+    }
+}
+
+/// `batch` decoded over a read-only mapping of its memfd: the arrays point into the record's
+/// pages, which the mapping keeps while they live.
+fn read_batch(plane: &mut LinuxPlane, batch: moruna_plane::BatchId) -> Result<RecordBatch> {
+    let map = plane
+        .map(batch)
+        .map_err(|e| kernel_error(format!("the output's record: {}", plane_words(&e, plane))))?;
+    let len = map.len();
+    let at = core::ptr::NonNull::new(map.addr() as *mut u8)
+        .ok_or_else(|| kernel_error("the output's record is mapped at 0".into()))?;
+    // SAFETY: `at` is valid for `len` bytes for as long as the mapping lives, and the buffer
+    // holds the mapping; the memfd is sealed, so no one writes the bytes.
+    let buffer = unsafe {
+        moruna_kernel::arrow::buffer::Buffer::from_custom_allocation(at, len, Arc::new(map))
+    };
+    moruna_kernel::ipc::decode(buffer, PAGE)
+}
+
+/// What the plane said, in words.
+fn plane_words(e: &PlaneError, plane: &LinuxPlane) -> String {
+    match (e, plane.last_error()) {
+        (PlaneError::Kernel(k), Some(said)) => format!("{} ({said})", k.name()),
+        (PlaneError::Kernel(k), None) => k.name().to_string(),
+        (other, _) => format!("{other:?}"),
     }
 }
 
@@ -562,8 +661,16 @@ impl KernelState for ImageState {
     }
 
     /// The process's memory, which is the stage's footprint.
-    fn footprint(&self) -> Option<u64> {
-        self.child.cgroup.memory_current().ok()
+    fn footprint(&self) -> Result<Option<u64>> {
+        self.child
+            .cgroup
+            .memory_current()
+            .map(Some)
+            .map_err(|e| MorunaError::Io {
+                op: "read",
+                target: "memory.current".into(),
+                msg: e.to_string(),
+            })
     }
 }
 
@@ -605,7 +712,7 @@ impl Kernel for ImageKernel {
         Ok(Box::new(self.start(ctx)?))
     }
 
-    /// SDD 19 f.6: one batch to the process and one back, in lockstep.
+    /// SDD 19 f.6: one batch to the process and one back, in lockstep, across the plane.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         let st = state
             .as_any_mut()
@@ -613,7 +720,7 @@ impl Kernel for ImageKernel {
             .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
         let Payload::Table(batch, _) = input else {
             return Err(MorunaError::Plan(
-                "an image takes a table; its batches cross as Arrow IPC".into(),
+                "an image takes a table; its batches cross the data plane as records".into(),
             ));
         };
         let own = st.child.cgroup.memory_current().unwrap_or(0);
@@ -621,45 +728,36 @@ impl Kernel for ImageKernel {
         if ceiling != st.ceiling {
             st.ceiling = self.write_limits(&st.child.cgroup, own)?;
         }
-        let limit = st.ceiling;
-        st.child.sent += 1;
-        let child = &mut st.child;
-        // The write and the read go together: a process that starts answering before it has read
-        // all of a large batch is not left to wait for a reader that is waiting on the writer.
-        let (written, read) = std::thread::scope(|scope| {
-            let input = &mut child.input;
-            let writer = scope.spawn(|| write_batch(input, &batch));
-            let read = child.output.next(limit);
-            let written = writer
-                .join()
-                .unwrap_or_else(|_| Err("the writer of the input panicked".into()));
-            (written, read)
-        });
+        let record = st.load(&batch)?;
         drop(batch);
-        let out = match (written, read) {
-            (_, Ok(Next::Batch(out))) => out,
-            (Err(e), Ok(Next::End)) => {
-                return Err(child.failed(true, format!("its input could not be written: {e}")));
+        let offered = st.plane.offer(st.task, INPUT, record);
+        // The engine's hold ends now: the record is freed once the task has released it.
+        let _ = st.plane.drop_batch(record);
+        if let Err(e) = offered {
+            let words = plane_words(&e, &st.plane);
+            return Err(st.failed(true, format!("its input could not be offered: {words}")));
+        }
+        st.sent += 1;
+        st.grant()?;
+        match st.next()? {
+            Event::Put { batch, .. } => {
+                st.granted = false;
+                st.received += 1;
+                st.take(batch)
             }
-            (_, Ok(Next::End)) => {
-                return Err(child.failed(
-                    true,
-                    format!(
-                        "its output ended after {} batches, for {} sent",
-                        child.received, child.sent
-                    ),
-                ));
+            Event::Refused { reason, .. } => Err(st.failed(
+                false,
+                format!("its output batch was refused by the engine's check: {reason}"),
+            )),
+            Event::Ended { .. } => {
+                let cause = format!(
+                    "its output ended after {} batches, for {} sent",
+                    st.received, st.sent
+                );
+                Err(st.failed(true, cause))
             }
-            (_, Err(why)) => {
-                return Err(child.failed(
-                    false,
-                    format!("its output is not an Arrow IPC stream: {why}"),
-                ));
-            }
-        };
-        child.received += 1;
-        let landed = moruna_adapters::land::land_table(out, &st.alloc)?;
-        Ok(landed.0)
+            other => Err(st.failed(false, format!("its plane said {other:?}"))),
+        }
     }
 
     /// SDD 19 f.6, f.7: the input ends; the output must end where the input did and the process
@@ -669,35 +767,34 @@ impl Kernel for ImageKernel {
             .as_any_mut()
             .downcast_mut::<ImageState>()
             .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
+        if let Err(e) = st.plane.finish(st.task, INPUT) {
+            let words = plane_words(&e, &st.plane);
+            return Err(st.failed(true, format!("its input could not be ended: {words}")));
+        }
+        // A window is there for a batch it should not write, so that one is named.
+        st.grant()?;
+        match st.next()? {
+            Event::Ended { .. } => {}
+            Event::Put { batch, .. } => {
+                let _ = st.plane.drop_batch(batch);
+                let cause = format!(
+                    "its output holds more record batches than the {} sent",
+                    st.sent
+                );
+                return Err(st.failed(false, cause));
+            }
+            Event::Refused { reason, .. } => {
+                return Err(st.failed(
+                    false,
+                    format!("its output was refused by the engine's check: {reason}"),
+                ));
+            }
+            other => return Err(st.failed(false, format!("its plane said {other:?}"))),
+        }
+        if let Some(fault) = st.bridge.as_ref().and_then(Bridge::fault) {
+            return Err(st.child.failed(false, fault));
+        }
         let child = &mut st.child;
-        match std::mem::replace(&mut child.input, Input::Closed) {
-            Input::Open(mut writer) => {
-                if let Err(e) = writer.finish() {
-                    return Err(child.failed(true, format!("its input could not be ended: {e}")));
-                }
-            }
-            Input::Pending(_) | Input::Closed => {}
-        }
-        // Whatever the process writes after its last answer is the end of its stream and
-        // nothing else.
-        match child.output.next(st.ceiling) {
-            Ok(Next::End) => {}
-            Ok(Next::Batch(_)) => {
-                return Err(child.failed(
-                    false,
-                    format!(
-                        "its output holds more record batches than the {} sent",
-                        child.sent
-                    ),
-                ));
-            }
-            Err(why) => {
-                return Err(child.failed(
-                    false,
-                    format!("its output is not an Arrow IPC stream: {why}"),
-                ));
-            }
-        }
         match child.reap(EXIT_WAIT) {
             Some(Exit::Code(0)) => Ok(()),
             Some(exit) => {
@@ -721,23 +818,6 @@ impl Kernel for ImageKernel {
                 )))
             }
         }
-    }
-}
-
-/// One batch on the process's input: the schema first when it is the first.
-fn write_batch(
-    input: &mut Input,
-    batch: &moruna_kernel::arrow::record_batch::RecordBatch,
-) -> std::result::Result<(), String> {
-    if let Input::Pending(_) = input
-        && let Input::Pending(file) = std::mem::replace(input, Input::Closed)
-    {
-        let writer = StreamWriter::try_new(file, &batch.schema()).map_err(|e| e.to_string())?;
-        *input = Input::Open(Box::new(writer));
-    }
-    match input {
-        Input::Open(writer) => writer.write(batch).map_err(|e| e.to_string()),
-        _ => Err("the input has ended".into()),
     }
 }
 

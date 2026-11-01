@@ -141,6 +141,7 @@ impl RunnableKind for Imports {
             deterministic: Fact::No,
             preserves_columns: Fact::No,
             isolation: Isolation::Imported,
+            served: None,
         }
     }
 
@@ -239,6 +240,7 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
             deterministic: Fact::No,
             preserves_columns: Fact::No,
             isolation: Isolation::Caller,
+            served: None,
         }
     }
     struct Caller;
@@ -487,6 +489,39 @@ fn config_prefix() -> String {
     }
     .to_string();
     shown.trim_end_matches('X').to_string()
+}
+
+/// PN-T34's runtime half (SDD 26 PN-I18): for an interval below, inside and above the range,
+/// the run's build and the simulated planner use one cadence, `moruna_job`'s one clamp.
+#[test]
+fn pn_t34_the_run_and_the_planner_see_one_checkpoint_interval() {
+    let model = moruna_cost::LogLinear::new(moruna_cost::Defaults::standard());
+    let inputs = moruna_plan::PlanInputs::new(moruna_plan::Resources {
+        workers: 2,
+        memory_start_bytes: 1 << 30,
+        memory_ceiling_bytes: 1 << 30,
+    })
+    .with_model(&model);
+    for given in [1, 100, 500, 5_000, 60_000, 120_000, u64::MAX] {
+        let mut job = minimal("file:///data/out");
+        job.checkpoint.interval_ms = given;
+        let built = v1::build(&job, &Registry::standard(), opts(false, &no_env)).expect("builds");
+        let planned = moruna_plan::Simulated::default()
+            .simulation(&Job::from_v1(&job), &Catalogue::empty(), &inputs)
+            .expect("a simulation")
+            .workload
+            .checkpoint_interval_seconds
+            .expect("the job checkpoints");
+        assert_eq!(
+            planned,
+            built.spec.checkpoint_interval_ms as f64 / 1_000.0,
+            "interval_ms {given}"
+        );
+        assert_eq!(
+            built.spec.checkpoint_interval_ms,
+            moruna_job::checkpoint_interval_ms(given).0
+        );
+    }
 }
 
 /// HO-T9 build_translates_every_field (H1): each field of the document arrives in the

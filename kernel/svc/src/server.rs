@@ -22,8 +22,11 @@
 use alloc::{
     boxed::Box,
     collections::{BTreeSet, VecDeque},
+    rc::Rc,
     vec::Vec,
 };
+
+use core::cell::Cell;
 
 use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Signals, limits};
 
@@ -224,6 +227,56 @@ pub enum Turn {
     Empty,
 }
 
+struct CapacityState {
+    used: Cell<usize>,
+    reserved: Cell<usize>,
+    alive: Cell<bool>,
+}
+impl Default for CapacityState {
+    fn default() -> Self {
+        Self {
+            used: Cell::new(0),
+            reserved: Cell::new(0),
+            alive: Cell::new(true),
+        }
+    }
+}
+/// Single-dispatcher wait capacity, including unpublished reserved watches.
+#[derive(Clone, Default)]
+pub struct WatchCapacity(Rc<CapacityState>);
+impl WatchCapacity {
+    /// Reserve before starting a resource that requires an eventual termination/IO watch.
+    /// Concurrent listener arrivals cannot take this slot. Drop rolls back all failures.
+    pub fn reserve(&self) -> Result<WatchPermit, Error> {
+        if !self.0.alive.get() {
+            return Err(Error::BadState);
+        }
+        if self.0.used.get() + self.0.reserved.get() >= limits::WAIT_MAX_ITEMS {
+            return Err(Error::Limit);
+        }
+        self.0.reserved.set(self.0.reserved.get() + 1);
+        Ok(WatchPermit {
+            capacity: self.clone(),
+            reserved: true,
+        })
+    }
+}
+/// Non-cloneable reservation, accepted only by its original dispatcher.
+pub struct WatchPermit {
+    capacity: WatchCapacity,
+    reserved: bool,
+}
+impl Drop for WatchPermit {
+    fn drop(&mut self) {
+        if self.reserved {
+            self.capacity
+                .0
+                .reserved
+                .set(self.capacity.0.reserved.get() - 1);
+        }
+    }
+}
+
 /// The dispatch loop: at most `limits::WAIT_MAX_ITEMS` handles (connections,
 /// listeners and watched handles together), waited on at once.
 #[derive(Default)]
@@ -231,11 +284,78 @@ pub struct Dispatcher {
     slots: Vec<Slot>,
     next_id: ConnectionId,
     completions: Completions,
+    capacity: WatchCapacity,
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        self.capacity.0.alive.set(false);
+        self.capacity.0.used.set(0);
+    }
 }
 
 impl Dispatcher {
     pub fn new() -> Dispatcher {
         Dispatcher::default()
+    }
+
+    /// A reservation capability tied to this exact dispatcher, never a second limit.
+    pub fn watch_capacity(&self) -> WatchCapacity {
+        self.capacity.clone()
+    }
+    /// Publish a watch using its pre-admission reservation, preserving the real wait bound.
+    pub fn watch_reserved(
+        &mut self,
+        watch: Box<dyn Watch>,
+        mut permit: WatchPermit,
+    ) -> Result<(), Error> {
+        if !Rc::ptr_eq(&self.capacity.0, &permit.capacity.0)
+            || !permit.reserved
+            || !self.capacity.0.alive.get()
+        {
+            return Err(Error::InvalidArgs);
+        }
+        permit.reserved = false;
+        self.capacity
+            .0
+            .reserved
+            .set(self.capacity.0.reserved.get() - 1);
+        self.slots.push(Slot::Watch(watch));
+        self.capacity.0.used.set(self.slots.len());
+        Ok(())
+    }
+
+    /// Admit a connection against an existing reservation from this dispatcher.
+    /// A capability producer reserves before exposing its returned endpoint.
+    pub fn serve_reserved(
+        &mut self,
+        channel: Channel,
+        handler: Box<dyn Handler>,
+        mut permit: WatchPermit,
+    ) -> Result<ConnectionId, Error> {
+        if !Rc::ptr_eq(&self.capacity.0, &permit.capacity.0)
+            || !permit.reserved
+            || !self.capacity.0.alive.get()
+        {
+            return Err(Error::InvalidArgs);
+        }
+        let id = self.next_id;
+        let next = id.checked_add(1).ok_or(Error::Limit)?;
+        permit.reserved = false;
+        self.capacity
+            .0
+            .reserved
+            .set(self.capacity.0.reserved.get() - 1);
+        self.next_id = next;
+        self.slots.push(Slot::Connection {
+            channel,
+            handler,
+            id,
+            welcomed: None,
+            deferred: BTreeSet::new(),
+        });
+        self.capacity.0.used.set(self.slots.len());
+        Ok(id)
     }
 
     /// The handles held: connections, listeners and watched handles.
@@ -258,7 +378,7 @@ impl Dispatcher {
     }
 
     fn room(&self) -> Result<(), Error> {
-        if self.slots.len() >= limits::WAIT_MAX_ITEMS {
+        if self.capacity.0.used.get() + self.capacity.0.reserved.get() >= limits::WAIT_MAX_ITEMS {
             return Err(Error::Limit);
         }
         Ok(())
@@ -281,6 +401,7 @@ impl Dispatcher {
             welcomed: None,
             deferred: BTreeSet::new(),
         });
+        self.capacity.0.used.set(self.slots.len());
         Ok(id)
     }
 
@@ -289,6 +410,7 @@ impl Dispatcher {
     pub fn watch(&mut self, watch: Box<dyn Watch>) -> Result<(), Error> {
         self.room()?;
         self.slots.push(Slot::Watch(watch));
+        self.capacity.0.used.set(self.slots.len());
         Ok(())
     }
 
@@ -324,6 +446,7 @@ impl Dispatcher {
         }
         if let Some(index) = closed {
             self.slots.remove(index);
+            self.capacity.0.used.set(self.slots.len());
         }
         result
     }
@@ -333,6 +456,7 @@ impl Dispatcher {
     pub fn listen(&mut self, channel: Channel, factory: Factory) -> Result<(), Error> {
         self.room()?;
         self.slots.push(Slot::Listener { channel, factory });
+        self.capacity.0.used.set(self.slots.len());
         Ok(())
     }
 
@@ -374,6 +498,7 @@ impl Dispatcher {
             keep.extend(kept);
         }
         self.slots = keep;
+        self.capacity.0.used.set(self.slots.len());
         for (channel, handler) in arrived {
             // A connection that arrives with no room left is closed: its client sees
             // the peer close instead of a welcome.
@@ -561,4 +686,115 @@ fn failure(channel: &Channel, txid: u32, code: u32) -> Result<(), Transport> {
     let mut body = Encoder::new();
     body.put_raw(&code.to_le_bytes());
     frame::send(channel, Kind::Failure, 0, txid, body)
+}
+
+#[cfg(all(test, not(target_os = "none"), not(feature = "native")))]
+mod capacity_tests {
+    // These exercise the host SDK/channel model, not native Process/DMA proof.
+    use super::*;
+    struct Connection;
+    impl Handler for Connection {
+        fn protocol(&self) -> ProtocolId {
+            ProtocolId {
+                name: "moruna.capacity-test",
+                major: 1,
+                minor: 0,
+            }
+        }
+        fn handle(&mut self, _: &mut Context<'_>, _: u16, _: &mut Decoder<'_>) -> Outcome {
+            Outcome::Status(Status::UnknownMethod)
+        }
+    }
+    struct ClosingWatch(Channel);
+    impl Watch for ClosingWatch {
+        fn handle(&self) -> &Handle {
+            &self.0.0
+        }
+        fn signals(&self) -> Signals {
+            Signals::PEER_CLOSED
+        }
+        fn signaled(&mut self, _: Signals, _: &mut Completions) -> bool {
+            false
+        }
+    }
+    #[test]
+    fn reserved_watch_survives_connection_capacity_flood_and_releases_on_close() {
+        let mut dispatcher = Dispatcher::new();
+        let capacity = dispatcher.watch_capacity();
+        let permit = capacity.reserve().unwrap();
+        let mut peers = Vec::new();
+        for _ in 0..limits::WAIT_MAX_ITEMS - 1 {
+            let (server, peer) = Channel::create().unwrap();
+            peers.push(peer);
+            dispatcher.serve(server, Box::new(Connection)).unwrap();
+        }
+        assert!(matches!(capacity.reserve(), Err(Error::Limit)));
+        let (extra, _extra_peer) = Channel::create().unwrap();
+        assert!(matches!(
+            dispatcher.serve(extra, Box::new(Connection)),
+            Err(Error::Limit)
+        ));
+        let (watch, watch_peer) = Channel::create().unwrap();
+        dispatcher
+            .watch_reserved(Box::new(ClosingWatch(watch)), permit)
+            .unwrap();
+        assert_eq!(dispatcher.len(), limits::WAIT_MAX_ITEMS);
+        drop(watch_peer);
+        dispatcher.turn(crate::deadline_in(1_000_000_000)).unwrap();
+        assert_eq!(dispatcher.len(), limits::WAIT_MAX_ITEMS - 1);
+        assert!(capacity.reserve().is_ok());
+        drop(peers);
+    }
+    #[test]
+    fn reservation_rolls_back_failed_admission_and_rejects_foreign_dispatcher() {
+        let source = Dispatcher::new();
+        let capacity = source.watch_capacity();
+        let permit = capacity.reserve().unwrap();
+        let mut other = Dispatcher::new();
+        let (watch, _peer) = Channel::create().unwrap();
+        assert!(matches!(
+            other.watch_reserved(Box::new(ClosingWatch(watch)), permit),
+            Err(Error::InvalidArgs)
+        ));
+        assert_eq!(other.len(), 0);
+        let permits = (0..limits::WAIT_MAX_ITEMS)
+            .map(|_| capacity.reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(capacity.reserve(), Err(Error::Limit)));
+        drop(permits);
+        let rolled_back = capacity.reserve().unwrap();
+        drop(rolled_back);
+        drop(source);
+        assert!(matches!(capacity.reserve(), Err(Error::BadState)));
+    }
+    #[test]
+    fn reserved_connection_survives_flood_and_foreign_permit_rolls_back() {
+        let mut dispatcher = Dispatcher::new();
+        let capacity = dispatcher.watch_capacity();
+        let permit = capacity.reserve().unwrap();
+        let mut peers = Vec::new();
+        for _ in 0..limits::WAIT_MAX_ITEMS - 1 {
+            let (server, peer) = Channel::create().unwrap();
+            peers.push(peer);
+            dispatcher.serve(server, Box::new(Connection)).unwrap();
+        }
+        let (server, peer) = Channel::create().unwrap();
+        dispatcher
+            .serve_reserved(server, Box::new(Connection), permit)
+            .unwrap();
+        assert_eq!(dispatcher.len(), limits::WAIT_MAX_ITEMS);
+        drop(peer);
+        dispatcher.turn(crate::deadline_in(1_000_000_000)).unwrap();
+        assert_eq!(dispatcher.len(), limits::WAIT_MAX_ITEMS - 1);
+        let permit = capacity.reserve().unwrap();
+        let mut other = Dispatcher::new();
+        let (server, _peer) = Channel::create().unwrap();
+        assert!(matches!(
+            other.serve_reserved(server, Box::new(Connection), permit),
+            Err(Error::InvalidArgs)
+        ));
+        assert!(capacity.reserve().is_ok());
+        assert_eq!(other.len(), 0);
+        drop(peers);
+    }
 }

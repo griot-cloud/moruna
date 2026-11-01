@@ -1,10 +1,10 @@
 # Moruna SDD 18: The kinds a run is made of (`moruna-runtime::kinds`)
 
 **Document type:** software design document, component 18
-**Status:** DRAFT · 2026-10-28 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended 2026-10-29 by KA6 (kinds their embedder serves: KD-I11, d.1, d.2, d.3, e.1, e.4, e.5, KD-T12 to KD-T18) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/agents/briefs/waves-a-b-c.md` section 1 law 2, section 4 MB3 and MB4, section 5 MC1 and MC2; decisions AP1, FB1, KD1 (`DECISIONS.md`); `architecture/moruna-hosted-engine.md` (MH) section 4.1
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.7 (`Kernel`, `Fingerprint`), `Source`, `Sink`; **Cited:** 12 f.3 (the sink equals source rule), 16 PK-I8 and f.8, 17 (the packaged runtimes), MH 4.5 (the governed ends), MH 4.9 (standard kernels and fusion), MH 4.10 (ports)
-**Component location:** `crates/moruna-runtime/src/kinds/` (the ports, the registry, the suites, and one module per technology: `parquet.rs`, `vortex.rs`, `tensor.rs`, `arrow_ipc.rs`, `governed.rs`, `standard.rs`, `package.rs`, `ports.rs`), `crates/moruna-job/src/kind.rs` (the declaration, its role, flows and facts, the settings schema format and the listing, which an embedder reads without the runtime: SDD 22), `crates/moruna-runtime/src/job/build.rs` (the build that resolves a document through the registry), `crates/moruna-py/src/kinds.rs` (the Python kinds), `crates/moruna-runtime/src/host/cli.rs` (`moruna kinds`)
+**Component location:** `crates/moruna-runtime/src/kinds/` (the ports, the registry, the suites, and one module per technology: `parquet.rs`, `vortex.rs`, `tensor.rs`, `arrow_ipc.rs`, `governed.rs`, `standard.rs`, `package.rs`, `ports.rs`, `served.rs`), `crates/moruna-job/src/kind.rs` (the declaration, its role, flows and facts, the settings schema format and the listing, which an embedder reads without the runtime: SDD 22), `crates/moruna-runtime/src/job/build.rs` (the build that resolves a document through the registry), `crates/moruna-py/src/kinds.rs` (the Python kinds), `crates/moruna-runtime/src/host/cli.rs` (`moruna kinds`)
 **Consumes:** `moruna-job` (22: the declaration, the listing and the document), contracts (1), sources (7), sinks (8), the standard kernels (`moruna-kernels`), the package and its runtimes (16, 17), the peQL bridge (`moruna-datafusion`, feature `peql`). **Consumed by:** the job document's build (12, MH 4.1), the command line (MH 4.2), the Python surface (12), every embedder that reads `moruna kinds`, MC2 (the job spec v2) and MC3 (the planner).
 
 **Decisions worth your eye:** (1) a document names every part of a run by a string, and a registry the running program assembles resolves it; the closed enums at the boundary are gone, and the document format names no kind; (2) three ports, one per role (source, runnable kind, sink), one declaration shape for all three, one registry; (3) a kind's settings schema is JSON Schema 2020-12 derived from the type its adapter reads its settings with, so the published schema and the check cannot drift (decision KD1); (4) `rust` is not a kind this build registers, so a v1 `rust` entry is refused as any unregistered kind is, and an embedder that compiles a kernel into its binary registers it as a kind of its own.
@@ -61,11 +61,14 @@ It refuses to know: what a kind does with its settings beyond reading them (each
 
 **KD-I10. One stage per fused run of stages, by the kinds' own word.** Adjacent stages are joined into one when the earlier stage's `Fuse` returns a stage for the later one's (MH 4.9); the build never inspects a kernel to decide it, and `Built::stage_kernels` says which entries each stage carries.
 
+**KD-I11. A kind its embedder serves is declared, and one adapter runs it by port call (KA6).** The program running Moruna declares a kind of its own in the format of e.1, with `isolation: embedder`, `needs.model_port: yes` and `served` (e.4): the port each batch goes to and the rules of what the kind takes and gives. It is a kernel; it is refused as a source or a sink (those are registered with their adapters), when its isolation and `served` disagree, when its port document or its rules are not ones (`Declaration::check`), when a kernel kind of its name is registered (a built-in one included), and when its settings schema uses what the validator does not read (SDD 22 JB-I7); `register_kernel` refuses a declaration that names `served`, so a served kind has one way in. Every task of it is a stage of `kinds::served`: its settings checked by the declared schema with the validator `moruna_job::check` uses (the kind has no settings type of Moruna's, KD-I4's counterpart); its port's route made by `kinds::ports::route_with` (a guest port with no handler, a host port with no peer: refused at `<field>.kind` naming the kind and the port); each batch on input `i` handed to the port as the call of e.5, by `StagePorts::call` (MH 4.10: the deadline, the run's cancel, the waits); the answer read by `moruna_kernel::ipc::read_stream` within `Inflate::share` of the instance's arena, one record batch or more of one schema, concatenated, compared with the declared output resolved against the batch's schema, and landed. A port's refusal, an answer that is not a stream, of no batch, or not what the kind declares, a deadline passed, a lost call: each fails the task as a kernel error naming the kind and the port; a cancel ends it as cancelled and no call starts after it. Its instances hold nothing a batch changes (`ResumePolicy::Reinit`), so a resumed run calls the port again for every batch the run's sinks did not commit, and only those: a batch whose answer a killed run never committed is asked for again, and one it committed is not. **A served kind's port must therefore be idempotent per batch**: asked for one batch with one settings and input port more than once, it answers each time with what it may answer once, and anything it does besides answering (a charge, a write of its own) it does as if asked once. Moruna makes the sink's output exactly once; what the port does outside the answer is the embedder's. No embedder's code, name or protocol is in Moruna: the kind is its declaration, and its port is a name.
+
 ## d. Interfaces
 
 ### d.1 The registry and the program's hooks
 
 ```rust
+#[derive(Clone)]   // a clone shares the adapters; `--kinds` declares into one for one invocation
 pub struct Registry { /* sources, kernels, sinks by name; the program's Embedding */ }
 impl Registry {
     pub fn empty() -> Registry;
@@ -75,6 +78,7 @@ impl Registry {
     pub fn register_source(&mut self, kind: Arc<dyn SourceKind>) -> Result<()>;   // KD-I2
     pub fn register_kernel(&mut self, kind: Arc<dyn RunnableKind>) -> Result<()>;
     pub fn register_sink(&mut self, kind: Arc<dyn SinkKind>) -> Result<()>;
+    pub fn declare(&mut self, declaration: Declaration) -> Result<()>;               // KD-I11
     pub fn source(&self, field: &str, name: &str) -> Result<(&Declaration, &dyn SourceKind)>;   // KD-I1
     pub fn kernel(&self, field: &str, name: &str) -> Result<(&Declaration, &dyn RunnableKind)>;
     pub fn sink(&self, field: &str, name: &str) -> Result<(&Declaration, &dyn SinkKind)>;
@@ -120,22 +124,30 @@ pub struct Stage {
     pub kernel: Arc<dyn Kernel>,
     pub fuse: Option<Arc<dyn Fuse>>,                       // KD-I10
     pub packaged: Option<Packaged>,                        // bound to the run's gate (16, 17)
-    pub placed: Option<Box<dyn FnOnce(StageId) + Send>>,   // the stage's id once the chain is settled
+    pub ports: Option<StageCalls>,                         // MH 4.10: the routes, and their hand-off to the kernel
     #[cfg(feature = "python")] pub python: Option<Arc<PyKernel>>,
 }
 pub trait Fuse: Send + Sync { fn fuse(&self, next: &dyn Fuse) -> Option<Stage>; fn as_any(&self) -> &dyn Any; }
+pub struct StageCalls {                                    // kinds::ports
+    pub routes: BTreeMap<String, Route>,
+    pub bind: Box<dyn FnOnce(Arc<StagePorts>) + Send>,
+}
 pub fn check_pin(entry: &Entry<'_>, pinned: Option<&str>, kernel: &dyn Kernel) -> Result<()>;
 ```
+
+A stage that calls ports names them in `Stage::ports`: the build makes its `StagePorts` once the stage's id is known, hands them to `bind`, and puts them in `RunSpec::ports`, which the facade binds to the run's cancel and its waits when the run starts. A `package` stage and a served stage (KD-I11) are given their ports this one way.
 
 `Context::shared::<T>` is the build's one value of type `T`: the `datafusion` source and the `peql` sink share one engine per root through it (MH 4.5). `Context::source_targets` is where the built source reads, for a sink that keeps something apart from it (the `peql` sink's `excluded_url`).
 
 ### d.3 The command
 
 ```
-moruna kinds
+moruna kinds [--kinds <kinds.json>]...
 ```
 
-prints the registry's listing (e.3) as indented JSON and exits 0; any argument is refused (exit 2). The `moruna` binary with the Python adapter lists the Python kinds beside the runtime's.
+prints the registry's listing (e.3) as indented JSON and exits 0; any other argument is refused (exit 2). The `moruna` binary with the Python adapter lists the Python kinds beside the runtime's.
+
+`--kinds <file>` (KA6), on `run`, `serve`, `kinds`, `check-job` and `explain`, names a file of the kinds the program running Moruna serves: a JSON array of declarations (e.4), each declared into a clone of the binary's registry for that invocation (KD-I11). A file not there, not such an array, or a declaration refused, is refused naming the file (exit 2); `run --vm` and every other command refuse the option, since a guest's `moruna serve` is given its own.
 
 ### d.4 The document (MH 4.1)
 
@@ -170,7 +182,7 @@ prints the registry's listing (e.3) as indented JSON and exits 0; any argument i
 }
 ```
 
-Isolation: `builtin`, code compiled into the program, in its process; `imported`, code imported by path into the process (what KD-I6 refuses); `caller`, an object the library caller handed over, never named by a document from a file or a socket; `confined`, code from a package run apart from the process (17, decision FP1).
+Isolation: `builtin`, code compiled into the program, in its process; `imported`, code imported by path into the process (what KD-I6 refuses); `caller`, an object the library caller handed over, never named by a document from a file or a socket; `confined`, code from a package run apart from the process (17, decision FP1); `embedder`, code of the program running Moruna, reached through a port it serves (KD-I11, e.4), with `served`, which no other isolation has.
 
 | Kind | Role | Inputs, outputs | Network | Contracts | Deterministic | Preserves columns | Isolation |
 |---|---|---|---|---|---|---|---|
@@ -189,6 +201,7 @@ Isolation: `builtin`, code compiled into the program, in its process; `imported`
 | `python` (library) | kernel | batches, batches | no (GPU by settings) | no | no | no | caller |
 | `iterator`, `python` (library) | source | nothing, batches | no | no | no | no | caller |
 | `python` (library) | sink | batches, nothing | no | no | no | no | caller |
+| any kind its embedder serves (KD-I11, e.4) | kernel | batches, batches | its declaration's (model port yes) | its declaration's | its declaration's | its declaration's | embedder |
 
 ### e.2 The settings schema (decision KD1)
 
@@ -204,6 +217,30 @@ In the job spec v2 (MC2, FlatBuffers, decision FB1), a node is a kind name and i
 ```
 
 `Listing` (`moruna_job`) serialises and deserialises as itself, so an embedder in Rust reads it back, and `moruna_job::Catalogue` is the declarations of one, which the embedder checks a document against (SDD 22). The standard kinds' listing is embedded in `moruna-job` and a runtime test proves it equal to this registry's (SDD 22 JB-I3).
+
+### e.4 A kind its embedder serves (KA6)
+
+```jsonc
+{
+  "name": "judge", "role": "kernel", "summary": "Labels each row with a model",
+  "settings": { /* e.2: the embedder's own closed schema, with examples */ },
+  "inputs": "batches", "outputs": "batches",
+  "needs": { "network": "no", "egress": [], "gpu": "no", "model_port": "yes", "contracts": "no" },
+  "deterministic": "no", "preserves_columns": "yes",
+  "isolation": "embedder",
+  "served": {
+    "port": { "host": "judge", "deadline_ms": 600000 },   // MH 4.10: exactly one of host and guest
+    "input_schema": { "text": "string" },                  // SDD 16 e.2's spelling; absent: any
+    "output_schema": { "adds": { "label": "string" } }    // likewise, relative when only adds, drops, changes
+  }
+}
+```
+
+`served.port` is the port document a `package` entry's `ports` holds (`moruna_job::PortDoc`): a `host` port is served by the host protocol's peer (MH 4.3 `port_call`), a `guest` port by the handler the program registered (`Embedding::guest_port`), and `deadline_ms` bounds one call. The rules are read once, without Arrow, by `moruna_job::SchemaRules` (SDD 22 e.6), each type by `moruna_types::parse`, the type grammar's only reader; `moruna_package::manifest::schema_decl` converts them into the kernel contract's types (contracts CT-I16). The standard listing (e.3) and the files `moruna-job` embeds hold no served kind; a served kind is in a listing only when a program declared it.
+
+### e.5 The call (KA6)
+
+Each batch of a served task is one port call. The request is `MSK1`, a little-endian `u32` header length, the header, then the batch as one Arrow IPC stream (the schema, one record batch, the end marker). The header is the canonical JSON (MH 4.1) of `moruna_job::ServedCall`: `{"input": <port, from 0>, "kind": <name>, "settings": <the task's settings>, "v": 1}`. The answer is an Arrow IPC stream of one record batch or more, of one schema, which may be compressed (`LZ4_FRAME`, `ZSTD`); the port's refusal is its error (`port_reply.error`, `Answer::Error`), never bytes. The request and the answer are each at most 64 MiB (MH 4.10). On the Moruna kernel (KD1's data plane) the same bytes are the request of a `port_call` and its reply (`DataPlane::answer`): nothing in the format is the transport's.
 
 ## f. Algorithms and policies
 
@@ -267,11 +304,25 @@ None. The registry is code the program assembles; the settings are the document'
 
 **KD-T11 fusion_through_the_port.** Two stages of a kind whose fuse joins its own become one, as two fusable standard kernels do, and no stage joins a neighbour of another kind; `stage_kernels` says which entries each stage carries. KD-I10.
 
+**KD-T12 declare_and_list.** (`tests/served.rs`) A served kind declared into the standard registry is listed with the standard kinds, as declared, and its listing is a catalogue; one named `std`, `package` or `image`, one named twice, one that is not served, one whose settings schema uses `pattern`, and a served kind registered through `register_kernel` are each refused naming why; a clone's declaration leaves the registry it was cloned from as it was; the kind passes the runnable-kind suite (KD-C1 to KD-C6) in a context whose embedder serves its port; `--kinds` reads a file of declarations into a clone, and is refused by `--version`, by `run --vm`, with no file, with a file that is not declarations and with a declaration named after a built-in. KD-I11, d.3.
+
+**KD-T13 a_served_kind_runs.** A served kind's task fanned out to two sinks, a task of two inputs fed by two sources, an answer of two batches, and two served kinds in a row, each run by the real runtime from a version 2 document (the first checked by `moruna_job::check` against the registry's listing first): every sink holds every row once, each the port's transform, every batch of a fan-in told its input port. KD-I11, e.5.
+
+**KD-T14 a_port_fails_the_task.** A port that refuses (its words in the error), answers bytes that are no stream, a stream of no batch, a batch without a declared column, nothing within a 300 ms deadline, or panics, fails the run with a kernel error naming the kind and the port; a guest port with no handler and a host port with no peer refuse the document at `<field>.kind`; settings the schema refuses are refused at `<field>.settings.<key>`; input that does not fit the declared input is refused when the run is planned, naming the column. And at the kernel, every fifth corruption and truncation of valid answers (testkit's sweep) is an error and never a panic; a compressed answer whose buffer says it inflates to a terabyte is refused; an honest one of 8 MiB past the ceiling of an arena of 4 MiB is refused with nothing allocated, and taken under a roomy arena. KD-I11, contracts CT-I13, e.8.
+
+**KD-T15 the_grammar_has_one_reader.** The converter (contracts CT-I16) over every type the grammar has (each leaf, every unit with and without a zone, decimals, lists and large lists of each with the default item name and another, a nested list): the Arrow type a description converts to is named by it again and spelled as it is; two descriptions convert to one Arrow type exactly when they are one; `parse_type` is the grammar read and converted; a list of non-nullable items is named as the nullable one, and a type outside the grammar by nothing; a package's schema is the served kind's rules converted. SDD 22 JB-I16.
+
+**KD-T16 a_cancel_stops_the_calls.** A run of one worker cancelled while its served task waits on the port ends `Cancelled` within 3 s, the call is given up, and no call is made after the cancel. MH 4.10, KD-I11.
+
+**KD-T17 a_held_run_killed_resumes.** A served kind fanned out to two sinks whose files close every 256 KiB, its port holding the batch that carries a chosen row (at a quarter, half and three quarters of the input): the process is killed with `SIGKILL` only once the port has said it holds that batch and a manifest written after that says both sinks committed, and a hold never reached, a held run that ends, and no such manifest each fail the test naming which. Resumed in a fresh process with `resume: "auto"`, holding nothing: it reports it resumed, its port is asked again for the held batch and for fewer rows than the input, and each sink holds what the uninterrupted run's does, every row once, each the port's transform. KD-I11 (the port asked again for what was not committed, exactly once in the sinks), MH 4.7, SC-T32.
+
+**KD-T18 served_over_the_host.** `moruna run job.json --kinds kinds.json` with a stub host on `report.socket`: every batch is a `port_call` to the host's `scale`, every answer the batch's output, and the run completes with every row transformed; a host that answers `error` fails the run (exit 4) with the report's diagnostic naming the kind, the port and the host's words. KD-I11, MH 4.3, d.3.
+
 The tests that were the builder's keep their ids and now run through the registry: HO-T1 to HO-T4, HO-T9 (`job/tests.rs`), PK-T11 (as KD-T7), PK-T12, PO-T6, PY-T23 to PY-T27, HO-T19.
 
 ## l. Implementation notes for the agent
 
-A new kind: write its adapter in a module of its own (or its own crate), derive its settings type with `serde` and `schemars` (`deny_unknown_fields`), build its declaration with `moruna_job::settings_schema::<T>(name, examples)`, register it, and run its port's suite in its tests. Change nothing else. A kind that calls ports reads `ports: Option<BTreeMap<String, PortDoc>>` and builds its routes with `kinds::ports::routes`, binding them in `Stage::placed`.
+A new kind: write its adapter in a module of its own (or its own crate), derive its settings type with `serde` and `schemars` (`deny_unknown_fields`), build its declaration with `moruna_job::settings_schema::<T>(name, examples)`, register it, and run its port's suite in its tests. Change nothing else. A kind that calls ports reads `ports: Option<BTreeMap<String, PortDoc>>` (`moruna_job::PortDoc`), builds its routes with `kinds::ports::routes`, and names them in `Stage::ports`. A kind the program serves needs no adapter at all: declare it (KD-I11).
 
 ## m. Open items
 
@@ -290,6 +341,7 @@ None.
 | 16 PK-I8 (no import path in a hosted run) | KD-I6 | KD-T7 |
 | MH 4.5 (contracts carried for the governed ends) | KD-I8 | KD-T8 |
 | MH 4.9 (fusion) | KD-I10 | KD-T11 |
+| KA6 (an embedder's kinds, declared, run by port call; the catalogue is data) | KD-I11, e.4, e.5, d.3 | KD-T12 to KD-T18, JB-T25, JB-T41 to JB-T45, PY-T39 to PY-T43 |
 
 ## o. Deferred (post-v1)
 

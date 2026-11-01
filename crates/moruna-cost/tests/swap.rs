@@ -8,8 +8,8 @@ use std::sync::Arc;
 use common::{Rng, batch, key, scratch};
 use moruna_cost::{
     Basis, CostError, CostKey, CostModel, CostModels, CostSetting, Estimate, FitReport, InUse,
-    Inputs, LocalStore, LogLinear, ModelAdapter, ModelId, ObservationSource, ObservationStore,
-    Origin, Outcome, Readiness, Target, Unit, UnitCost,
+    Inputs, LocalStore, LogLinear, ModelAdapter, ModelId, Observation, ObservationSource,
+    ObservationStore, Origin, Outcome, Readiness, Target, Unit, UnitCost,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,7 @@ impl CostModel for Constant {
                 basis: Basis::Measured,
                 observations: 1,
                 extrapolated: false,
+                drifting: false,
             };
         }
         cost
@@ -116,9 +117,16 @@ fn run(in_use: &mut InUse, store: &dyn ObservationStore, rng: &mut Rng, units: u
         let mut outcome = Outcome::new(Origin::Run);
         outcome.set(Target::Duration, 2e-7 * rows * (0.1 * rng.normal()).exp());
         outcome.set(Target::PeakMemory, 128.0 * rows);
-        in_use
-            .settle(store, &k, &inputs, Some(&prediction), &outcome, n)
-            .expect("settles");
+        in_use.observe(&k, &inputs, &outcome);
+        let observation = Observation::settled(
+            k.clone(),
+            inputs,
+            outcome,
+            n,
+            in_use.deciding().id(),
+            Some(&prediction),
+        );
+        store.append(&observation).expect("appends");
     }
 }
 
@@ -331,16 +339,16 @@ fn cm_t17_shadow_mode() {
 
     // A settle with no prediction (warm-up, say) keeps the outcome alone.
     let mut plain = InUse::new(Box::new(Constant::default()), None);
-    plain
-        .settle(
-            &store,
-            &k,
-            &batch(1e3),
-            None,
-            &Outcome::new(Origin::WarmUp),
-            1,
-        )
-        .expect("settles");
+    plain.observe(&k, &batch(1e3), &Outcome::new(Origin::WarmUp));
+    let observation = Observation::settled(
+        k.clone(),
+        batch(1e3),
+        Outcome::new(Origin::WarmUp),
+        1,
+        plain.deciding().id(),
+        None,
+    );
+    store.append(&observation).expect("appends");
     plain.save(&store).expect("saves");
     assert!(plain.shadow().is_none() && plain.readiness().is_empty());
     let last = store

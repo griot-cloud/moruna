@@ -16,12 +16,20 @@ repository = "https://github.com/griot-cloud/moruna"
 publish = false
 
 [workspace.dependencies]
+# Actual kernel/native prerequisites, integrated from the KD2/KB5/KE2 lanes.
+moruna-micro = { path = "crates/moruna-micro", version = "0.5.9" }
+moruna-sys = { path = "kernel/sys", version = "=0.1.0" }
+moruna-svc = { path = "kernel/svc", version = "=0.1.0" }
+moruna-storage-service = { path = "kernel/storage", version = "=0.1.0" }
 # Workspace crates (preamble 6.1; the crate graph is preamble 1.3).
 moruna-kernel = { path = "crates/moruna-kernel", version = "0.5.9" }
+moruna-types = { path = "crates/moruna-types", version = "0.5.9" }
 moruna-arena = { path = "crates/moruna-arena", version = "0.5.9" }
 moruna-discovery = { path = "crates/moruna-discovery", version = "0.5.9" }
 moruna-trace = { path = "crates/moruna-trace", version = "0.5.9" }
 moruna-adapters = { path = "crates/moruna-adapters", version = "0.5.9" }
+moruna-storage-format = { path = "crates/moruna-storage-format", version = "0.5.9" }
+moruna-storage = { path = "crates/moruna-storage", version = "0.5.9" }
 moruna-reactor = { path = "crates/moruna-reactor", version = "0.5.9" }
 moruna-sources = { path = "crates/moruna-sources", version = "0.5.9" }
 moruna-sinks = { path = "crates/moruna-sinks", version = "0.5.9" }
@@ -32,6 +40,7 @@ moruna-runtime = { path = "crates/moruna-runtime", version = "0.5.9" }
 moruna-job = { path = "crates/moruna-job", version = "0.5.9" }
 moruna-cost = { path = "crates/moruna-cost", version = "0.5.9" }
 moruna-plan = { path = "crates/moruna-plan", version = "0.5.9" }
+moruna-event = { path = "crates/moruna-event", version = "0.5.9" }
 moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.5.9" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.5.9" }
 moruna-vmm = { path = "crates/moruna-vmm", version = "0.5.9" }
@@ -40,6 +49,8 @@ moruna-package = { path = "crates/moruna-package", version = "0.5.9" }
 moruna-wasm = { path = "crates/moruna-wasm", version = "0.5.9" }
 moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.5.9" }
 moruna-image = { path = "crates/moruna-image", version = "0.5.9" }
+moruna-plane-linux = { path = "crates/moruna-plane-linux", version = "0.5.9" }
+moruna-record = { path = "crates/moruna-record", version = "0.5.9", default-features = false }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -142,6 +153,20 @@ flate2 = { version = "=1.1.10" }
 # The microkernel's image filesystem reader (SDD 27), a `no_std` crate of the kernel
 # workspace: `moruna-image` writes layer files with its format and reads them back with it.
 moruna-imagefs = { path = "kernel/imagefs/fs", version = "=0.1.0" }
+# The Arrow IPC check (contracts CT-I13, e.8; SDD 29), a `no_std` crate of the kernel workspace:
+# `moruna-kernel` checks every message with it, and the engine on the Moruna kernel checks every
+# data-plane record with it.
+moruna-ipc-check = { path = "kernel/plane/check", version = "=0.1.0" }
+# The data-plane port (SDD 29 d.4), a `no_std` crate of the kernel workspace, and the kernel's ABI
+# whose error codes and bounds it speaks in: `moruna-plane-linux` is the port's adapter on Linux.
+moruna-plane = { path = "kernel/plane/core", version = "=0.1.0" }
+moruna-abi = { path = "kernel/abi", version = "=0.1.0" }
+# The engine as a Linux program on the Moruna kernel (SDD 30): `moruna-micro` reaches the
+# kernel's own calls through these crates of the kernel workspace, each built for the
+# engine's Linux target with its `native` feature.
+vsock-protocol = { path = "kernel/drivers/vsock-protocol", version = "=0.1.0" }
+linux-protocol = { path = "kernel/linux/protocol", version = "=0.1.0" }
+imagefs-protocol = { path = "kernel/imagefs/protocol", version = "=0.1.0" }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six

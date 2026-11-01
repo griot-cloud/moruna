@@ -58,6 +58,11 @@ pub struct Estimate {
     /// Whether the inputs lie outside what the observations measured; the spread is wider when
     /// they do.
     pub extrapolated: bool,
+    /// Whether the key's outcomes have left its predictions' spread persistently (design 9.6,
+    /// SDD 24 f.11): the spread is widened while they do. Never written by a model; set by
+    /// [`Estimate::widened`], which the online learner applies.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drifting: bool,
 }
 
 impl Estimate {
@@ -72,6 +77,119 @@ impl Estimate {
             basis: Basis::Default,
             observations: 0,
             extrapolated: false,
+            drifting: false,
+        }
+    }
+
+    /// A declared figure known exactly: `p50` and `p95` both `value`.
+    pub fn exact(value: f64, unit: Unit) -> Estimate {
+        Estimate::declared(value, 1.0, unit)
+    }
+
+    /// Whether it is an estimate of `unit` a reader can use: finite, not negative, its 95th
+    /// percentile not below its median. The reason when it is not.
+    pub fn check(&self, unit: Unit) -> Result<(), String> {
+        if self.unit != unit {
+            return Err(format!(
+                "counts {}, and this estimate counts {}",
+                unit.as_str(),
+                self.unit.as_str()
+            ));
+        }
+        if !(self.p50.is_finite() && self.p95.is_finite()) {
+            return Err(format!(
+                "p50 {} and p95 {} are not both finite",
+                self.p50, self.p95
+            ));
+        }
+        if self.p50 < 0.0 {
+            return Err(format!("p50 {} is negative", self.p50));
+        }
+        if self.p95 < self.p50 {
+            return Err(format!("p95 {} is below p50 {}", self.p95, self.p50));
+        }
+        Ok(())
+    }
+
+    /// The spread as a log-normal's sigma (SDD 24 f.6): `ln((p95 + floor) / (p50 + floor)) /
+    /// Z95`, the floor of its unit added so a zero median has one. Zero when p95 is p50.
+    pub fn sigma(&self) -> f64 {
+        let floor = self.unit.floor();
+        let ratio = (self.p95.max(self.p50) + floor) / (self.p50.max(0.0) + floor);
+        if ratio.is_finite() && ratio > 1.0 {
+            ratio.ln() / crate::sample::Z95
+        } else {
+            0.0
+        }
+    }
+
+    /// The estimate's quantile at `q` in (0, 1), reading it as the log-normal through its median
+    /// and its 95th percentile (SDD 24 f.6): `(p50 + floor) · exp(sigma · z(q)) - floor`, never
+    /// below zero. An estimate whose p95 is its p50 answers p50 at every `q`.
+    pub fn quantile(&self, q: f64) -> f64 {
+        let sigma = self.sigma();
+        if sigma == 0.0 {
+            return self.p50;
+        }
+        let floor = self.unit.floor();
+        ((self.p50 + floor) * (sigma * crate::sample::normal_quantile(q)).exp() - floor).max(0.0)
+    }
+
+    /// One draw from the estimate's distribution ([`Estimate::quantile`] at a uniform draw).
+    pub fn sample(&self, rng: &mut crate::sample::Rng) -> f64 {
+        self.quantile(rng.open01())
+    }
+
+    /// The estimate of the sum of `n` independent units each of this estimate (SDD 24 f.6): the
+    /// median `n · p50`, the 95th percentile `n · p50 + sqrt(n) · (p95 - p50)`, since spreads of
+    /// independent units add in quadrature. `n` may be fractional (a last unit cut short counts
+    /// its share) and is not negative. Basis, observations and the extrapolation mark carry over.
+    pub fn sum(&self, n: f64) -> Estimate {
+        let k = n.max(0.0);
+        Estimate {
+            p50: self.p50 * k,
+            p95: self.p50 * k + k.sqrt() * (self.p95 - self.p50).max(0.0),
+            ..*self
+        }
+    }
+
+    /// The estimate with its spread widened for a drifting key (SDD 24 f.11): its log-normal's
+    /// sigma at least `floor_sigma`, then times `factor`, so a key that never had a spread gets
+    /// one; the median is kept and the estimate marked `drifting`. The widened p95 stays finite
+    /// (its logarithm above the median's is held to [`MAX_WIDENED_LOG_SPREAD`]).
+    pub fn widened(&self, factor: f64, floor_sigma: f64) -> Estimate {
+        let floor = self.unit.floor();
+        let sigma = self.sigma().max(floor_sigma.max(0.0)) * factor.max(1.0);
+        let lift = (sigma * crate::sample::Z95).min(MAX_WIDENED_LOG_SPREAD);
+        let p50 = self.p50.max(0.0);
+        Estimate {
+            p95: ((p50 + floor) * lift.exp() - floor).max(self.p95).max(p50),
+            drifting: true,
+            ..*self
+        }
+    }
+
+    /// The estimate times `factor`, which is finite and not negative.
+    pub fn scaled(&self, factor: f64) -> Estimate {
+        Estimate {
+            p50: self.p50 * factor,
+            p95: self.p95 * factor,
+            ..*self
+        }
+    }
+}
+
+/// The widest a drifting estimate's p95 lies above its median, as a logarithm (e^20): wide, and
+/// finite whatever the spread it was widened from.
+pub const MAX_WIDENED_LOG_SPREAD: f64 = 20.0;
+
+impl Unit {
+    /// Its name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unit::Seconds => "seconds",
+            Unit::Bytes => "bytes",
+            Unit::Rows => "rows",
         }
     }
 }
@@ -198,6 +316,27 @@ impl UnitCost {
             Target::ReadBytes => &self.read_bytes,
             Target::SpillBytes => &self.spill_bytes,
         }
+    }
+
+    /// Whether every field is a usable estimate of its target's unit; the first that is not, by
+    /// name.
+    pub fn check(&self) -> Result<(), String> {
+        for target in Target::ALL {
+            self.get(target)
+                .check(target.unit())
+                .map_err(|why| format!("{target}: {why}"))?;
+        }
+        Ok(())
+    }
+
+    /// The weakest basis of any field and the fewest observations any rests on.
+    pub fn weakest(&self) -> (Basis, u32) {
+        Target::ALL
+            .iter()
+            .map(|&t| self.get(t))
+            .fold((Basis::Measured, u32::MAX), |(b, n), e| {
+                (b.max(e.basis), n.min(e.observations))
+            })
     }
 
     /// The estimate of one target, to set.

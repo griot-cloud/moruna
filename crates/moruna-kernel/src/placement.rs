@@ -41,17 +41,65 @@ pub struct QueueStats {
     pub promotions: u64,
 }
 
-/// Every queue's state plus the bytes in flight.
+/// Every queue's state, the bytes in flight, and the buffer catalog's figures.
 #[derive(Clone, Debug, Default)]
 pub struct PlacementStats {
-    /// One entry per queue, by queue id.
+    /// One entry per queue, by queue id. A batch fanned out to `m` queues is in each of their
+    /// `bytes_by_tier`; [`CatalogStats::resident_by_tier`] counts it once.
     pub queues: Vec<QueueStats>,
     /// Bytes in moves the engine has issued and not yet seen complete.
     pub in_flight_bytes: u64,
-    /// Per tier, the bytes counted in more than one queue's `bytes_by_tier`: a batch fanned out
-    /// to `m` queues is resident once and each queue counts it, so the sum over queues is `m - 1`
-    /// copies too high by this (d.16). Zero for a run with no fan-out.
-    pub shared_by_tier: [u64; TIER_COUNT],
+    /// The buffer catalog (placement f.18): the one record of where every batch the engine
+    /// holds is, and what moving them has cost.
+    pub catalog: CatalogStats,
+}
+
+/// The buffer catalog's figures (placement f.18, adaptive-runtime 9.1). Every batch the engine
+/// holds is counted once, whether it waits in one queue, in several (a fan-out, d.16), or in the
+/// hands of a running unit that took it and has not released it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatalogStats {
+    /// Bytes per tier now, indexed by `TierKind::index`; the `Disk` slot holds the batches whose
+    /// only copy is a segment record.
+    pub resident_by_tier: [u64; TIER_COUNT],
+    /// The highest `resident_by_tier` reached in each tier over the run.
+    pub peak_by_tier: [u64; TIER_COUNT],
+    /// Bytes claimed against each tier and not yet resident: moves in flight and admissions.
+    pub reserved_by_tier: [u64; TIER_COUNT],
+    /// The budget in force per tier, beside which the two figures above are read.
+    pub budget_by_tier: [u64; TIER_COUNT],
+    /// Bytes of batches a running unit has taken and not yet released.
+    pub held_bytes: u64,
+    /// Batches the catalog records now.
+    pub buffers: u64,
+    /// Bytes written to disk to free memory.
+    pub spilled_bytes: u64,
+    /// Batches written to disk to free memory.
+    pub spills: u64,
+    /// Bytes read back from disk into memory.
+    pub reloaded_bytes: u64,
+    /// Batches read back from disk into memory.
+    pub reloads: u64,
+    /// Batches sent out of memory to free it, by the eviction order or by a policy's spill:
+    /// spilled, a resident copy dropped beside a disk copy, or dropped to be read again from the
+    /// source.
+    pub evictions: u64,
+    /// Times a consumer reached a batch that eviction had taken out of memory.
+    pub misses: u64,
+    /// The misses weighted by each one's reload cost: the disk bytes bringing it back moves.
+    pub miss_reload_bytes: u64,
+    /// Shares a consumer took and then released.
+    pub released: u64,
+    /// Batches freed: every consumer took and released them, and their bytes left memory.
+    pub freed: u64,
+    /// Bytes a batch pushed beyond the reservation made for it.
+    pub overrun_bytes: u64,
+    /// Batches memory could not admit, pushed straight to disk (`Residency::push_spilled`).
+    pub overflows: u64,
+    /// Their bytes.
+    pub overflow_bytes: u64,
+    /// Bytes of such batches whose records have not landed yet: admitted to no tier.
+    pub outside_bytes: u64,
 }
 
 /// Which node's memory a pop may be satisfied from. Reserved for the multi-node
@@ -113,7 +161,9 @@ pub struct ResumePoint {
 }
 
 /// The queues between stages, and the movement of bytes between tiers (component 9).
-pub trait Placement: Send + Sync {
+/// Every placement keeps a buffer catalog and offers its port (d.17), so the scheduler claims
+/// what it pushes and its policy reads and drives memory through the same object.
+pub trait Placement: crate::catalog::Residency + Send + Sync {
     /// Never blocks. Ok(()) even if the queue is above high water; the caller
     /// consults `is_full` for admission.
     fn push(&self, stage: StageId, morsel: Morsel) -> crate::Result<()>;
@@ -162,8 +212,15 @@ pub trait Placement: Send + Sync {
     /// True if the head of `stage` is resident in a tier satisfying `want` (non-consuming;
     /// the scheduler's pick uses it so a worker never pops what it cannot run).
     fn peek_resident(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> bool;
+    /// The consumer of `stage` is done with the batch it took as `seq`: the unit that ran on it
+    /// has finished, or the sink's write of it has resolved. Until then the batch counts as
+    /// resident and nothing evicts it; once every consumer has taken and released it, its bytes
+    /// leave the catalog (placement f.18). `Staging` when `stage` holds no such take.
+    fn release(&self, stage: StageId, seq: Seq) -> crate::Result<()>;
     /// Entries in state `Evicted` for `stage`, oldest first; the scheduler re-reads each
-    /// from its origin and pushes the replacement with `replace`.
+    /// from its origin and pushes the replacement with `replace`. A batch fanned out to several
+    /// queues is one batch, listed once, under the lowest of them, and one `replace` brings it
+    /// back for every queue (placement f.18).
     fn evicted(&self, stage: StageId) -> Vec<(Seq, Origin)>;
     /// Replace an `Evicted` entry's bytes (same `seq`) in its original position.
     fn replace(&self, stage: StageId, morsel: Morsel) -> crate::Result<()>;

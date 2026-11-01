@@ -8,7 +8,7 @@ use std::io::{BufReader, ErrorKind, Read};
 use moruna_kernel::arrow::buffer::Buffer;
 use moruna_kernel::arrow::ipc;
 use moruna_kernel::arrow::record_batch::RecordBatch;
-use moruna_kernel::ipc::Decoder;
+use moruna_kernel::ipc::{Decoder, Inflate};
 
 /// The continuation marker that may precede a message's length.
 const CONTINUATION: [u8; 4] = [0xff; 4];
@@ -103,7 +103,14 @@ impl<R: Read> Output<R> {
                 self.take(body_len as usize, "a message body")?
                     .ok_or_else(|| format!("the output ends inside a body of {body_len} bytes"))?
             };
-            if let Some(batch) = self.decoder.message(&parsed, &Buffer::from_vec(body))? {
+            // This reader holds no arena to inflate into, so a compressed batch is refused with
+            // the ceiling of zero as the reason (contracts e.8), as every compressed batch was
+            // before compression was read.
+            let inflate = Inflate::none();
+            if let Some(batch) = self
+                .decoder
+                .message(&parsed, &Buffer::from_vec(body), &inflate)?
+            {
                 return Ok(Next::Batch(batch));
             }
         }

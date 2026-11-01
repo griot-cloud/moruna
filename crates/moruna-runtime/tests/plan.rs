@@ -192,12 +192,8 @@ impl Write for Heard {
 
 impl Heard {
     fn lines(&self) -> Vec<Value> {
-        let text = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        String::from_utf8(text)
-            .expect("UTF-8")
-            .lines()
-            .map(|l| serde_json::from_str(l).expect("a JSON line"))
-            .collect()
+        let bytes = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        moruna_runtime::host::protocol::json_messages(&bytes).expect("the peer reads the protocol")
     }
 }
 
@@ -206,12 +202,14 @@ fn run(job: Job, plan: Option<Plan>, kinds: &Registry) -> (Outcome, Vec<Value>) 
     let heard = Heard::default();
     let wire = Wire::new(Some(Box::new(heard.clone())), Instant::now());
     let opts = HostOptions {
+        cost: None,
         strict: false,
         env: &no_env,
         cancel: CancelToken::new(),
         heartbeat: HEARTBEAT,
         packages: Default::default(),
         capture_process: false,
+        events: Default::default(),
     };
     let outcome = match plan {
         Some(plan) => session::run_plan(plan, job, kinds, &opts, &wire, None, Mode::Run),
@@ -240,7 +238,7 @@ fn pn_t21_a_run_from_its_plan() {
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
 
     let events: Vec<&Value> = lines.iter().filter(|l| l["type"] == "event").collect();
-    assert!(events.iter().all(|e| e["v"] == 6));
+    assert!(events.iter().all(|e| e["v"] == 7));
     let attempt = events
         .iter()
         .find(|e| e["kind"] == "attempt_started")
@@ -532,12 +530,14 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
     );
 
     let opts = HostOptions {
+        cost: None,
         strict: false,
         env: &no_env,
         cancel: CancelToken::new(),
         heartbeat: HEARTBEAT,
         packages: Default::default(),
         capture_process: false,
+        events: Default::default(),
     };
     let outcome = session::run_file(&spec, Some(&plan_file), &kinds, &opts);
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
@@ -566,6 +566,7 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
             plan: Some("job.mplan".into()),
             strict: false,
             packages: Default::default(),
+            events_json: false,
         })
     );
     let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

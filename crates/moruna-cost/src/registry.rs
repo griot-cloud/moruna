@@ -214,28 +214,20 @@ impl InUse {
         }
     }
 
-    /// A unit finished: both models learn it, and it is kept with what each predicted.
-    pub fn settle(
-        &mut self,
-        store: &dyn ObservationStore,
-        key: &CostKey,
-        inputs: &Inputs,
-        prediction: Option<&Prediction>,
-        outcome: &Outcome,
-        at_ms: u64,
-    ) -> Result<()> {
-        let mut observation = Observation::new(key.clone(), inputs.clone(), outcome.clone(), at_ms);
-        observation.model = Some(self.deciding.id());
-        if let Some(p) = prediction {
-            observation.predictions.push(p.deciding.clone());
-            observation.predictions.extend(p.shadow.clone());
-        }
-        store.append(&observation)?;
+    /// A unit finished: both models learn it online, each `observe` one constant-time update,
+    /// never a refit. Nothing is written: the caller keeps the record ([`Observation::settled`])
+    /// and appends it to the store off the hot path.
+    pub fn observe(&mut self, key: &CostKey, inputs: &Inputs, outcome: &Outcome) {
         self.deciding.observe(key, inputs, outcome);
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.observe(key, inputs, outcome);
         }
-        Ok(())
+    }
+
+    /// The deciding model, to tell it a key drifts (SDD 24 f.11); the shadow is not told, since
+    /// it does not steer and is judged on how it follows a change by itself.
+    pub fn deciding_mut(&mut self) -> &mut dyn CostModel {
+        self.deciding.as_mut()
     }
 
     /// Save each model's fitted state beside the records.
@@ -245,6 +237,27 @@ impl InUse {
             store.save_state(&shadow.id(), &shadow.save()?)?;
         }
         Ok(())
+    }
+}
+
+impl Observation {
+    /// The record of a settled unit: decided by `model`, with what each model in use predicted
+    /// for it, the deciding model's first (section 5.2).
+    pub fn settled(
+        key: CostKey,
+        inputs: Inputs,
+        outcome: Outcome,
+        at_ms: u64,
+        model: ModelId,
+        prediction: Option<&Prediction>,
+    ) -> Observation {
+        let mut observation = Observation::new(key, inputs, outcome, at_ms);
+        observation.model = Some(model);
+        if let Some(p) = prediction {
+            observation.predictions.push(p.deciding.clone());
+            observation.predictions.extend(p.shadow.clone());
+        }
+        observation
     }
 }
 

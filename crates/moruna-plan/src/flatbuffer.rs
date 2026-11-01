@@ -6,7 +6,8 @@ use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, Vector, WIPOffset};
 
 use crate::generated::moruna::plan::fb;
 use crate::plan::{
-    Basis, Estimate, PLAN_VERSION, Plan, PlannerId, Range, Resources, Step, Totals, Unit, UnitCost,
+    Basis, Estimate, PLAN_VERSION, Plan, PlannerId, Range, Resources, Step, Target, Totals, Unit,
+    UnitCost,
 };
 
 /// The FlatBuffers file identifier of a plan document, at bytes 4 to 8 of every buffer.
@@ -219,6 +220,10 @@ fn read_estimate(at: &str, e: fb::Estimate<'_>) -> Result<Estimate, PlanBytesErr
         unit: unit(at, e.unit())?,
         basis: basis(at, e.basis())?,
         observations: e.observations(),
+        extrapolated: e.extrapolated(),
+        // A drifting mark is a run's (SDD 24 f.11): a planner's estimates are made before any
+        // unit runs, so the plan document has no field for it.
+        drifting: false,
     })
 }
 
@@ -235,10 +240,10 @@ fn read_cost(at: &str, c: fb::UnitCost<'_>) -> Result<UnitCost, PlanBytesError> 
         read_bytes: e("read_bytes", c.read_bytes())?,
         spill_bytes: e("spill_bytes", c.spill_bytes())?,
     };
-    for (name, u, estimate) in cost.fields() {
-        estimate
-            .check(u)
-            .map_err(|why| field(format!("{at}.{name}"), why))?;
+    for target in Target::ALL {
+        cost.get(target)
+            .check(target.unit())
+            .map_err(|why| field(format!("{at}.{target}"), why))?;
     }
     Ok(cost)
 }
@@ -256,6 +261,7 @@ fn write_estimate<'b>(b: &mut FlatBufferBuilder<'b>, e: &Estimate) -> WIPOffset<
             },
             basis: write_basis(e.basis),
             observations: e.observations,
+            extrapolated: e.extrapolated,
         },
     )
 }

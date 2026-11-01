@@ -23,9 +23,14 @@ required-features = ["python"]
 moruna-kernel = { workspace = true }
 arrow = { workspace = true }
 moruna-runtime = { workspace = true }
+moruna-cost = { workspace = true }
+moruna-storage = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
 moruna-job = { workspace = true }
 # `moruna.explain(...)` and the plan every run starts from (SDD 26).
 moruna-plan = { workspace = true }
+# `moruna.read_events(...)`: the events a run wrote as records (MH 4.3 version 7).
+moruna-event = { workspace = true }
 moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }
@@ -69,3 +74,9 @@ uring = ["moruna-runtime/uring"]
 # binary is built with.
 peql = ["moruna-runtime/peql"]
 cuda = ["moruna-runtime/cuda"]
+
+# KD3's real cross-adapter fixture; no new runtime/library authority.
+[[bin]]
+name = "moruna-kd3-fixture"
+path = "src/bin/kd3-fixture.rs"
+required-features = ["python"]

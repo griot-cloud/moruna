@@ -29,3 +29,26 @@ fn sc_t18_stateful_init_fails() {
     // `run` is never called; shutdown joins the parked workers and the two idle drives.
     rig.scheduler.shutdown();
 }
+
+#[test]
+fn accounting_failure_releases_claimed_work_and_terminates_without_a_fake_record() {
+    use std::{sync::atomic::Ordering, time::Duration};
+    let rig = RigBuilder::new().stages(1).go();
+    rig.sampler.set_read_failure(true);
+    let outcome = super::common::run_within(&rig, Duration::from_secs(5), "failed accounting");
+    assert!(
+        matches!(outcome,crate::RunOutcome::Terminated{diagnostic:MorunaError::Io{target,msg,..},..}if target=="TEST-ONLY sampler"&&msg.contains("accounting source unavailable"))
+    );
+    assert!(rig.sink.written().is_empty());
+    assert!(
+        rig.trace.records().is_empty(),
+        "no stale/zero sample record is emitted"
+    );
+    assert_eq!(
+        rig.scheduler.shared().stages[0]
+            .running
+            .load(Ordering::SeqCst),
+        0
+    );
+    rig.scheduler.shutdown();
+}

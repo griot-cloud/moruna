@@ -32,8 +32,9 @@ use alloc::{
 };
 use core::cell::RefCell;
 
-use block_protocol::{Info, block};
+use block_protocol::{Info, block, lease};
 use moruna_mmio::Region;
+use moruna_pci::dma::DmaBuffer;
 use moruna_svc::{
     Channel, Completions, Console, Context, DEADLINE_INFINITE, Decoder, Dispatcher, Handle,
     Handler, Interrupt, Memory, Outcome, Pending, Pin, ProtocolError, ProtocolId, Signals, Status,
@@ -41,7 +42,7 @@ use moruna_svc::{
 };
 use moruna_virtio::{
     Buffer,
-    device::{Device, DmaBuffer, VirtQueue},
+    device::{Device, VirtQueue},
     kind,
 };
 
@@ -84,13 +85,18 @@ enum Hold {
     Registered(Rc<Registration>),
 }
 
+enum LeaseTag {
+    Original(lease::Io),
+    Release(lease::Release),
+}
 struct Request {
     op: Op,
     sector: u64,
     pages: Vec<u64>,
     bytes: u64,
     hold: Hold,
-    pending: Pending,
+    pending: Option<Pending>,
+    lease: Option<LeaseTag>,
 }
 
 struct Block {
@@ -102,6 +108,10 @@ struct Block {
     waiting: VecDeque<Request>,
     info: Info,
     flush: bool,
+    writer: lease::Lease,
+    release_pending: Option<Pending>,
+    closed: Rc<RefCell<Vec<u64>>>,
+    ready: Vec<(Pending, Outcome)>,
     served: u64,
     /// Why the device can no longer be used; the driver ends with it.
     failed: Option<String>,
@@ -181,7 +191,7 @@ impl Block {
             .pop_used()
             .map_err(|e| format!("used ring: {e:?}"))?
         {
-            let (slot, request) = self
+            let (slot, mut request) = self
                 .in_flight
                 .remove(&used.head)
                 .ok_or("the device returned a chain not in flight")?;
@@ -191,6 +201,7 @@ impl Block {
                 .read8(slot * SLOT + 16)
                 .map_err(|e| format!("status: {}", e.name()))?;
             self.free_slots.push(slot);
+            self.finish_lease(request.lease.take(), status == S_OK);
             let outcome = if status != S_OK {
                 Outcome::Failure(block::Error::Io.code())
             } else {
@@ -209,7 +220,9 @@ impl Block {
                     Hold::None => Outcome::reply(()),
                 }
             };
-            done.complete(request.pending, outcome);
+            if let Some(pending) = request.pending {
+                done.complete(pending, outcome);
+            }
             self.served += 1;
             finished += 1;
         }
@@ -217,6 +230,7 @@ impl Block {
             // The device has finished with every pin closed so far.
             dma_release(&self.device.dma).map_err(|e| format!("dma_release: {}", e.name()))?;
         }
+        self.advance_lease();
         self.submit_waiting()
     }
 
@@ -242,15 +256,26 @@ impl Block {
         &mut self,
         cx: &mut Context<'_>,
         op: Op,
+        token: Option<u64>,
         sector: u64,
         count: u32,
         buffer: Memory,
     ) -> Outcome {
         let fail = |e: block::Error| Outcome::Failure(e.code());
+        if matches!(op, Op::Write) {
+            if let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
+                return fail(error);
+            }
+        }
         if let Err(e) = self.check(&op, sector, count) {
             return fail(e);
         }
         let read = matches!(op, Op::Read);
+        if matches!(op, Op::Read) {
+            if let Err(error) = self.writer.can_read(cx.connection()) {
+                return Outcome::Failure(error.code());
+            }
+        }
         let bytes = block_protocol::bytes(&self.info, count);
         let Ok(n) = Pin::pages(&self.device.dma, &buffer.0, read) else {
             return fail(block::Error::BadBuffer);
@@ -263,13 +288,25 @@ impl Block {
             return fail(block::Error::BadBuffer);
         };
         pages.truncate(bytes.div_ceil(4096) as usize);
+        let lease = if matches!(op, Op::Write) {
+            match self.writer.write(cx.connection(), token.unwrap_or(0)) {
+                Ok(io) => Some(LeaseTag::Original(io)),
+                Err(error) => return fail(error),
+            }
+        } else {
+            match self.writer.read(cx.connection()) {
+                Ok(io) => io.map(LeaseTag::Original),
+                Err(error) => return Outcome::Failure(error.code()),
+            }
+        };
         self.queue_request(Request {
             op,
             sector,
             pages,
             bytes,
             hold: Hold::Buffer(buffer, pin),
-            pending: cx.defer(),
+            pending: Some(cx.defer()),
+            lease,
         })
     }
 
@@ -288,13 +325,24 @@ impl Block {
         &mut self,
         cx: &mut Context<'_>,
         op: Op,
+        token: Option<u64>,
         registration: Rc<Registration>,
         page: u32,
         sector: u64,
         count: u32,
     ) -> Outcome {
+        if matches!(op, Op::Write) {
+            if let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
+                return Outcome::Failure(error.code());
+            }
+        }
         if let Err(e) = self.check(&op, sector, count) {
             return Outcome::Failure(e.code());
+        }
+        if matches!(op, Op::Read) {
+            if let Err(error) = self.writer.can_read(cx.connection()) {
+                return Outcome::Failure(error.code());
+            }
         }
         let bytes = block_protocol::bytes(&self.info, count);
         let first = page as usize;
@@ -303,16 +351,81 @@ impl Block {
             return Outcome::Failure(block::Error::BadBuffer.code());
         };
         let pages = pages.to_vec();
+        let lease = if matches!(op, Op::Write) {
+            match self.writer.write(cx.connection(), token.unwrap_or(0)) {
+                Ok(io) => Some(LeaseTag::Original(io)),
+                Err(error) => return Outcome::Failure(error.code()),
+            }
+        } else {
+            match self.writer.read(cx.connection()) {
+                Ok(io) => io.map(LeaseTag::Original),
+                Err(error) => return Outcome::Failure(error.code()),
+            }
+        };
         self.queue_request(Request {
             op,
             sector,
             pages,
             bytes,
             hold: Hold::Registered(registration),
-            pending: cx.defer(),
+            pending: Some(cx.defer()),
+            lease,
         })
     }
 
+    fn finish_lease(&mut self, tag: Option<LeaseTag>, success: bool) {
+        let result = match tag {
+            Some(LeaseTag::Original(io)) => self.writer.finish(io),
+            Some(LeaseTag::Release(release)) => {
+                let result = self.writer.released(release, success);
+                if let Some(pending) = self.release_pending.take() {
+                    self.ready.push((
+                        pending,
+                        if result.is_ok() {
+                            Outcome::reply(())
+                        } else {
+                            Outcome::Failure(block::Error::LeaseFailed.code())
+                        },
+                    ));
+                }
+                result
+            }
+            None => Ok(()),
+        };
+        if result.is_err() {
+            self.failed.get_or_insert(String::from(
+                "namespace writer completion/final durability barrier failed",
+            ));
+        }
+    }
+    fn advance_lease(&mut self) {
+        if self.failed.is_some() {
+            return;
+        }
+        let closed = core::mem::take(&mut *self.closed.borrow_mut());
+        let had_closed = !closed.is_empty();
+        for connection in closed {
+            self.writer.disconnect(connection);
+        }
+        if had_closed {
+            self.release_idle();
+        }
+        if let Some(release) = self.writer.releasing() {
+            if !release.needs_flush() || !self.flush {
+                self.finish_lease(Some(LeaseTag::Release(release)), true);
+            } else {
+                self.queue_request(Request {
+                    op: Op::Flush,
+                    sector: 0,
+                    pages: Vec::new(),
+                    bytes: 0,
+                    hold: Hold::None,
+                    pending: None,
+                    lease: Some(LeaseTag::Release(release)),
+                });
+            }
+        }
+    }
     /// Releases the quarantine when no transfer is in flight: every pin in it then is
     /// one the device has finished with, such as a registration just ended.
     fn release_idle(&mut self) {
@@ -339,6 +452,8 @@ struct Connection {
     block: Rc<RefCell<Block>>,
     registrations: BTreeMap<u32, Rc<Registration>>,
     next: u32,
+    connection: Option<u64>,
+    closed: Rc<RefCell<Vec<u64>>>,
 }
 
 fn decode<T: Wire>(d: &mut Decoder<'_>) -> Option<T> {
@@ -351,6 +466,7 @@ impl Handler for Connection {
     }
 
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
+        self.connection = Some(cx.connection());
         let block = self.block.clone();
         let mut b = block.borrow_mut();
         match ordinal {
@@ -359,6 +475,14 @@ impl Handler for Connection {
                 Err(_) => Outcome::Status(Status::BadMessage),
             },
             2 | 3 => {
+                let token = if ordinal == 3 {
+                    let Some(token) = decode::<u64>(d) else {
+                        return Outcome::Status(Status::BadMessage);
+                    };
+                    Some(token)
+                } else {
+                    None
+                };
                 let (Some(sector), Some(count), Some(buffer)) =
                     (decode::<u64>(d), decode::<u32>(d), decode::<Memory>(d))
                 else {
@@ -368,17 +492,27 @@ impl Handler for Connection {
                     return Outcome::Status(Status::BadMessage);
                 }
                 let op = if ordinal == 2 { Op::Read } else { Op::Write };
-                b.transfer(cx, op, sector, count, buffer)
+                b.transfer(cx, op, token, sector, count, buffer)
             }
             4 => {
+                let Some(token) = decode::<u64>(d) else {
+                    return Outcome::Status(Status::BadMessage);
+                };
                 if d.finish().is_err() {
                     return Outcome::Status(Status::BadMessage);
+                }
+                if let Err(error) = b.writer.authorize(cx.connection(), token) {
+                    return Outcome::Failure(error.code());
                 }
                 if !b.flush {
                     // A device without a write cache has nothing to flush.
                     return Outcome::reply(());
                 }
-                let pending = cx.defer();
+                let lease = match b.writer.flush(cx.connection(), token) {
+                    Ok(io) => Some(LeaseTag::Original(io)),
+                    Err(error) => return Outcome::Failure(error.code()),
+                };
+                let pending = Some(cx.defer());
                 b.queue_request(Request {
                     op: Op::Flush,
                     sector: 0,
@@ -386,6 +520,7 @@ impl Handler for Connection {
                     bytes: 0,
                     hold: Hold::None,
                     pending,
+                    lease,
                 })
             }
             5 => {
@@ -410,6 +545,14 @@ impl Handler for Connection {
                 }
             }
             6 | 7 => {
+                let token = if ordinal == 7 {
+                    let Some(token) = decode::<u64>(d) else {
+                        return Outcome::Status(Status::BadMessage);
+                    };
+                    Some(token)
+                } else {
+                    None
+                };
                 let (Some(id), Some(page), Some(sector), Some(count)) = (
                     decode::<u32>(d),
                     decode::<u32>(d),
@@ -425,7 +568,7 @@ impl Handler for Connection {
                     return Outcome::Failure(block::Error::NoRegistration.code());
                 };
                 let op = if ordinal == 6 { Op::Read } else { Op::Write };
-                b.transfer_at(cx, op, registration, page, sector, count)
+                b.transfer_at(cx, op, token, registration, page, sector, count)
             }
             8 => {
                 let Some(id) = decode::<u32>(d) else {
@@ -443,12 +586,41 @@ impl Handler for Connection {
                     None => Outcome::Failure(block::Error::NoRegistration.code()),
                 }
             }
+            9 => {
+                if d.finish().is_err() {
+                    return Outcome::Status(Status::BadMessage);
+                }
+                if b.info.read_only {
+                    return Outcome::Failure(block::Error::ReadOnly.code());
+                }
+                match b.writer.claim(cx.connection()) {
+                    Ok(token) => Outcome::reply(token),
+                    Err(error) => Outcome::Failure(error.code()),
+                }
+            }
+            10 => {
+                let Some(token) = decode::<u64>(d) else {
+                    return Outcome::Status(Status::BadMessage);
+                };
+                if d.finish().is_err() {
+                    return Outcome::Status(Status::BadMessage);
+                }
+                if let Err(error) = b.writer.close(cx.connection(), token) {
+                    return Outcome::Failure(error.code());
+                }
+                b.release_pending = Some(cx.defer());
+                b.advance_lease();
+                Outcome::Deferred
+            }
             _ => Outcome::Status(Status::UnknownMethod),
         }
     }
 
     fn closed(&mut self) {
         self.registrations.clear();
+        if let Some(connection) = self.connection.take() {
+            self.closed.borrow_mut().push(connection);
+        }
         if let Ok(mut b) = self.block.try_borrow_mut() {
             b.release_idle();
         }
@@ -518,6 +690,10 @@ fn open() -> Result<(Block, Interrupt), String> {
                 read_only: features & F_RO != 0,
             },
             flush: features & F_FLUSH != 0,
+            writer: lease::Lease::default(),
+            release_pending: None,
+            closed: Rc::new(RefCell::new(Vec::new())),
+            ready: Vec::new(),
             served: 0,
             failed: None,
         },
@@ -545,11 +721,14 @@ fn run() -> i64 {
     let block = Rc::new(RefCell::new(block));
     let mut dispatcher = Dispatcher::new();
     let shared = block.clone();
+    let closed = block.borrow().closed.clone();
     let factory: moruna_svc::Factory = Box::new(move || {
         Box::new(Connection {
             block: shared.clone(),
             registrations: BTreeMap::new(),
             next: 1,
+            connection: None,
+            closed: closed.clone(),
         }) as Box<dyn Handler>
     });
     let setup = dispatcher.listen(listener, factory).and_then(|()| {
@@ -571,10 +750,25 @@ fn run() -> i64 {
         info.max_sectors,
         if info.read_only { ", read only" } else { "" }
     );
-    while dispatcher.channels() > 0 {
-        if let Some(e) = block.borrow_mut().failed.take() {
+    loop {
+        let (busy, ready, failure) = {
+            let mut block = block.borrow_mut();
+            block.advance_lease();
+            (
+                !block.in_flight.is_empty() || !block.waiting.is_empty(),
+                core::mem::take(&mut block.ready),
+                block.failed.take(),
+            )
+        };
+        for (pending, outcome) in ready {
+            let _peer_already_closed = dispatcher.complete(pending, outcome);
+        }
+        if let Some(e) = failure {
             println!(out, "KB3 {}: FAIL: the device: {}", name, e);
             return 1;
+        }
+        if dispatcher.channels() == 0 && !busy {
+            break;
         }
         if let Err(e) = dispatcher.turn(DEADLINE_INFINITE) {
             println!(out, "KB3 {}: FAIL: wait: {}", name, e.name());

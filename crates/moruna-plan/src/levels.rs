@@ -2,15 +2,17 @@
 
 use moruna_job::{Catalogue, Job, Role};
 
+use crate::costing;
 use crate::plan::{Estimate, Plan, PlannerId, Resources, Step, Totals, Unit, UnitCost, step_id};
-use crate::planner::{PlanError, PlanInputs, Planner, StepQuery};
+use crate::planner::{PlanError, PlanInputs, Planner};
 
 /// The planner that steps through a job's DAG level by level: every task is a step; a task's
 /// level is one more than the deepest level of the tasks it takes input from (a source's is 0),
 /// so everything whose inputs are ready together forms one group, and the groups start in level
 /// order. A group's steps share the run's resources: each takes the run's memory divided by the
 /// group's size, and the run's workers divided by it (at least one). Without a cost model its
-/// estimates are declared defaults (f.2); with one, it asks the model about each step.
+/// estimates are declared defaults (f.2); with one, each step's cost is its units' over the
+/// batches its morsel gives, by arithmetic rather than simulation (f.6).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Levels;
 
@@ -33,50 +35,13 @@ impl Planner for Levels {
         inputs: &PlanInputs<'_>,
     ) -> Result<Plan, PlanError> {
         let me = self.id();
-        moruna_job::check_graph(job).map_err(PlanError::Job)?;
+        let graph = costing::graph(job, &me)?;
         let run = inputs.resources;
-        if run.workers == 0 {
-            return Err(PlanError::Inputs {
-                field: "resources.workers".into(),
-                reason: "a run is given at least one worker".into(),
-            });
-        }
-        if run.memory_ceiling_bytes < run.memory_start_bytes {
-            return Err(PlanError::Inputs {
-                field: "resources.memory_ceiling_bytes".into(),
-                reason: format!(
-                    "{} is below the start, {}",
-                    run.memory_ceiling_bytes, run.memory_start_bytes
-                ),
-            });
-        }
-        let order = job
-            .topological_order()
-            .map_err(|cycle| PlanError::Planner {
-                planner: me.to_string(),
-                reason: format!(
-                    "the job's edges go round a cycle through tasks {}",
-                    cycle
-                        .iter()
-                        .map(|&i| job.tasks[i].id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            })?;
+        costing::check_run(run)?;
         let n = job.tasks.len();
-        // Each task's producers, by place, in the job's edge order.
-        let mut producers: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for edge in &job.edges {
-            if let (Some(a), Some(b)) = (
-                job.task_index(&edge.from.task),
-                job.task_index(&edge.to.task),
-            ) && !producers[b].contains(&a)
-            {
-                producers[b].push(a);
-            }
-        }
+        let producers = &graph.producers;
         let mut level = vec![0u32; n];
-        for &i in &order {
+        for &i in &graph.order {
             level[i] = producers[i]
                 .iter()
                 .map(|&p| level[p] + 1)
@@ -92,62 +57,53 @@ impl Planner for Levels {
         for &l in &level {
             *size.entry(l).or_default() += 1;
         }
+        let share = |i: usize| {
+            let share = size.get(&level[i]).copied().unwrap_or(1).max(1);
+            Resources {
+                workers: (run.workers / share).max(1),
+                memory_start_bytes: run.memory_start_bytes / u64::from(share),
+                memory_ceiling_bytes: run.memory_ceiling_bytes / u64::from(share),
+            }
+        };
+        let costed = match inputs.model {
+            Some(model) => Some(costing::cost(
+                job, catalogue, inputs, model, &graph, &ids, &share,
+            )?),
+            None => None,
+        };
 
         // What each task gives, by place, as the plan expects it: rows and bytes out.
         let mut flow: Vec<Flow> = vec![(None, None); n];
         let mut steps = Vec::with_capacity(n);
         for &i in &places {
             let task = &job.tasks[i];
-            let share = size.get(&level[i]).copied().unwrap_or(1).max(1);
-            let resources = Resources {
-                workers: (run.workers / share).max(1),
-                memory_start_bytes: run.memory_start_bytes / u64::from(share),
-                memory_ceiling_bytes: run.memory_ceiling_bytes / u64::from(share),
-            };
-            let (rows_in, bytes_in) = if producers[i].is_empty() {
-                (None, None)
-            } else {
-                let sum = |pick: fn(&Flow) -> Option<u64>| {
-                    producers[i].iter().try_fold(0u64, |acc, &p| {
-                        pick(&flow[p]).map(|v| acc.saturating_add(v))
-                    })
-                };
-                (sum(|f| f.0), sum(|f| f.1))
-            };
-            let table = match task.role {
-                Role::Source => inputs.tables.get(&task.id),
-                _ => None,
-            };
-            let (cost, gives) = match inputs.model {
-                None => declared(task.role, table, rows_in, bytes_in, resources),
-                Some(model) => {
-                    let query = StepQuery {
-                        job,
-                        tasks: vec![task],
-                        declarations: vec![catalogue.get(task.role, &task.kind)],
-                        table,
-                        rows_in,
-                        bytes_in,
-                        resources,
+            let resources = share(i);
+            let cost = match &costed {
+                None => {
+                    let (rows_in, bytes_in) = if producers[i].is_empty() {
+                        (None, None)
+                    } else {
+                        let sum = |pick: fn(&Flow) -> Option<u64>| {
+                            producers[i].iter().try_fold(0u64, |acc, &p| {
+                                pick(&flow[p]).map(|v| acc.saturating_add(v))
+                            })
+                        };
+                        (sum(|f| f.0), sum(|f| f.1))
                     };
-                    let cost = model.estimate(&query).map_err(|reason| PlanError::Model {
-                        model: model.id(),
-                        step: ids[i].clone(),
-                        reason,
-                    })?;
-                    cost.check().map_err(|reason| PlanError::Model {
-                        model: model.id(),
-                        step: ids[i].clone(),
-                        reason,
-                    })?;
-                    let gives = (
-                        Some(cost.rows_out.p50.round() as u64),
-                        Some(cost.bytes_out.p50.round() as u64),
-                    );
-                    (cost, gives)
+                    let table = match task.role {
+                        Role::Source => inputs.tables.get(&task.id),
+                        _ => None,
+                    };
+                    let (cost, gives) = declared(task.role, table, rows_in, bytes_in, resources);
+                    flow[i] = gives;
+                    cost
+                }
+                Some(costed) => {
+                    let c = &costed[i];
+                    let start = costing::start_seconds(&c.kernel);
+                    costing::aggregate(c, resources.workers, start)
                 }
             };
-            flow[i] = gives;
             let mut depends_on: Vec<String> = Vec::new();
             for &p in &producers[i] {
                 if !depends_on.contains(&ids[p]) {
@@ -164,18 +120,11 @@ impl Planner for Levels {
             });
         }
         let totals = Totals::of(&steps);
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PlanError::Planner {
-                planner: me.to_string(),
-                reason: format!("the clock is before the Unix epoch: {e}"),
-            })?
-            .as_millis() as u64;
         Ok(Plan::new(
             job,
-            me,
-            inputs.model.map(|m| m.id()),
-            created,
+            me.clone(),
+            inputs.model_id(),
+            crate::plan::now_ms(&me)?,
             run,
             steps,
             totals,
@@ -207,16 +156,12 @@ fn declared(
         }
         Role::Kernel | Role::Sink => (rows_in, bytes_in, None),
     };
-    let at = |v: Option<u64>, unit: Unit| {
-        let v = v.unwrap_or(0) as f64;
-        Estimate::declared(v, v, unit)
-    };
+    let at = |v: Option<u64>, unit: Unit| Estimate::exact(v.unwrap_or(0) as f64, unit);
     let cost = UnitCost {
-        peak_memory: Estimate::declared(
-            resources.memory_start_bytes as f64,
-            resources.memory_ceiling_bytes as f64,
-            Unit::Bytes,
-        ),
+        peak_memory: Estimate {
+            p95: resources.memory_ceiling_bytes as f64,
+            ..Estimate::exact(resources.memory_start_bytes as f64, Unit::Bytes)
+        },
         rows_out: at(rows, Unit::Rows),
         bytes_out: at(bytes, Unit::Bytes),
         read_bytes: at(read, Unit::Bytes),

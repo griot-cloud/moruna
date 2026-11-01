@@ -407,7 +407,7 @@
     {
       "name": "image",
       "role": "kernel",
-      "summary": "An OCI image's command in a sandboxed process, Arrow IPC over its standard input and output",
+      "summary": "An OCI image's command in a sandboxed process, its batches on the data plane: Arrow IPC over its standard input and output, or the plane's calls",
       "settings": {
         "type": "object",
         "additionalProperties": false,
@@ -446,6 +446,11 @@
               "null"
             ],
             "description": "Where unpacked images are kept; `images` beside the run's output when it is a directory."
+          },
+          "plane": {
+            "type": "boolean",
+            "description": "The command makes the data plane's calls (`batch_get`, `batch_put`) on its descriptor 3\ninstead of reading Arrow IPC on its standard input and writing it on its standard output.",
+            "default": false
           }
         },
         "required": [
@@ -544,7 +549,7 @@
                   "string",
                   "null"
                 ],
-                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name ([`super::Embedding::guest_port`])."
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name (`Embedding::guest_port`)."
               },
               "deadline_ms": {
                 "type": [
@@ -553,7 +558,7 @@
                 ],
                 "format": "uint64",
                 "minimum": 0,
-                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_kernel::ports::PORT_DEADLINE_MS`), at most a day."
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_job::PORT_DEADLINE_MS`), at most a day."
               }
             },
             "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."

@@ -11,9 +11,11 @@
 //! an endpoint drops what is queued to it. Signals are `READABLE`, `WRITABLE` and
 //! `PEER_CLOSED`; `wait` sleeps until one is raised or the deadline passes.
 //!
-//! What it does not model: rights (every handle carries all of a channel's), handle
-//! values (a handle is an owned Rust value), and objects other than channels, except an
-//! inert object for tests that need a handle that is not a channel.
+//! Channel handles carry the channel's full rights. Memory objects additionally
+//! model shared backing, subset rights and mapping bounds. Numeric handle values,
+//! real kernel quota charging and DMA are not modeled. Explicit Account objects
+//! model only immutable charged-owner identity and rights, never native proof; inert
+//! handles exist only for wrong-object tests.
 
 extern crate std;
 
@@ -101,9 +103,16 @@ impl Drop for Endpoint {
     }
 }
 
+struct AccountIdentity;
+struct MemoryState {
+    bytes: Mutex<Vec<u8>>,
+    owner: Option<Arc<AccountIdentity>>,
+}
 enum Object {
     Endpoint(Arc<Endpoint>),
     Inert,
+    Memory(Arc<MemoryState>, Rights),
+    Account(Arc<AccountIdentity>, Rights),
 }
 
 /// An owned handle; dropping it closes it.
@@ -114,6 +123,8 @@ impl core::fmt::Debug for Handle {
         match &self.0 {
             Object::Endpoint(e) => write!(f, "Handle(endpoint {})", e.side),
             Object::Inert => f.write_str("Handle(inert)"),
+            Object::Memory(_, _) => f.write_str("Handle(memory)"),
+            Object::Account(_, _) => f.write_str("Handle(account-model)"),
         }
     }
 }
@@ -130,13 +141,34 @@ impl Handle {
         Ok(match &self.0 {
             Object::Endpoint(_) => (ObjectType::Channel, CHANNEL_RIGHTS),
             Object::Inert => (ObjectType::Memory, Rights::READ | Rights::TRANSFER),
+            Object::Memory(_, rights) => (ObjectType::Memory, *rights),
+            Object::Account(_, rights) => (ObjectType::Account, *rights),
         })
+    }
+
+    /// Duplicate only the requested subset of an actual memory handle's rights.
+    pub fn duplicate(&self, rights: Rights) -> Result<Handle> {
+        match &self.0 {
+            Object::Memory(bytes, have)
+                if have.contains(Rights::DUPLICATE) && have.contains(rights) =>
+            {
+                Ok(Handle(Object::Memory(bytes.clone(), rights)))
+            }
+            Object::Memory(_, _) => Err(Error::AccessDenied),
+            Object::Account(account, have)
+                if have.contains(Rights::DUPLICATE) && have.contains(rights) =>
+            {
+                Ok(Handle(Object::Account(account.clone(), rights)))
+            }
+            Object::Account(_, _) => Err(Error::AccessDenied),
+            _ => Err(Error::WrongType),
+        }
     }
 
     fn endpoint(&self) -> Result<&Arc<Endpoint>> {
         match &self.0 {
             Object::Endpoint(e) => Ok(e),
-            Object::Inert => Err(Error::WrongType),
+            Object::Inert | Object::Memory(_, _) | Object::Account(_, _) => Err(Error::WrongType),
         }
     }
 
@@ -192,6 +224,9 @@ impl Channel {
         let mut carried = Vec::new();
         for slot in handles.iter() {
             let handle = slot.as_ref().ok_or(Error::InvalidArgs)?;
+            if !handle.info()?.1.contains(Rights::TRANSFER) {
+                return Err(Error::AccessDenied);
+            }
             if let Object::Endpoint(e) = &handle.0 {
                 if Arc::ptr_eq(&e.pair, &me.pair) {
                     return Err(Error::InvalidArgs);
@@ -347,4 +382,177 @@ pub fn wait_one(handle: &Handle, signals: Signals, deadline: u64) -> Result<Sign
     let mut items = [WaitItem::new(handle, signals)];
     wait(&mut items, deadline)?;
     Ok(items[0].observed())
+}
+
+/// Explicit host identity/rights model only. No native quota, DMA, process or
+/// physical allocation proof is provided by this type.
+#[derive(Debug)]
+pub struct Account(pub Handle);
+impl Account {
+    pub fn carve(limit: u64, name: &str) -> Result<Self> {
+        if limit == 0
+            || limit % 4096 != 0
+            || name.is_empty()
+            || name.len() > 32
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+        {
+            return Err(Error::InvalidArgs);
+        }
+        Ok(Self(Handle(Object::Account(
+            Arc::new(AccountIdentity),
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+        ))))
+    }
+    pub fn matches(&self, other: &Handle) -> Result<bool> {
+        let Object::Account(account, rights) = &self.0.0 else {
+            return Err(Error::WrongType);
+        };
+        if !rights.contains(Rights::READ) || !other.info()?.1.contains(Rights::READ) {
+            return Err(Error::AccessDenied);
+        }
+        match &other.0 {
+            Object::Account(other, _) => Ok(Arc::ptr_eq(account, other)),
+            Object::Memory(memory, _) => Ok(memory
+                .owner
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(account, owner))),
+            _ => Err(Error::WrongType),
+        }
+    }
+}
+
+/// Host model of the native owned memory object. It models bounds and handle
+/// rights, not kernel quota charging or DMA; kernel acceptance proves those.
+#[derive(Debug)]
+pub struct Memory(pub Handle);
+pub struct Mapping<'a> {
+    memory: &'a Memory,
+    offset: usize,
+    len: usize,
+    writable: bool,
+}
+impl Memory {
+    pub fn create(size: u64) -> Result<Self> {
+        Self::allocate(size, None)
+    }
+    pub fn create_in(size: u64, handle: &Handle) -> Result<Self> {
+        let Object::Account(account, rights) = &handle.0 else {
+            return Err(Error::WrongType);
+        };
+        if !rights.contains(Rights::WRITE) {
+            return Err(Error::AccessDenied);
+        }
+        Self::allocate(size, Some(account.clone()))
+    }
+    fn allocate(size: u64, owner: Option<Arc<AccountIdentity>>) -> Result<Self> {
+        if size == 0 {
+            return Err(Error::InvalidArgs);
+        }
+        if size > limits::MEMORY_MAX_BYTES {
+            return Err(Error::Limit);
+        }
+        let size = usize::try_from(size.checked_add(4095).ok_or(Error::Limit)? / 4096 * 4096)
+            .map_err(|_| Error::Limit)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).map_err(|_| Error::NoMemory)?;
+        bytes.resize(size, 0);
+        Ok(Self(Handle(Object::Memory(
+            Arc::new(MemoryState {
+                bytes: Mutex::new(bytes),
+                owner,
+            }),
+            Rights::ALL,
+        ))))
+    }
+    pub fn map(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'_>> {
+        let Object::Memory(bytes, rights) = &self.0.0 else {
+            return Err(Error::WrongType);
+        };
+        let offset = usize::try_from(offset).map_err(|_| Error::InvalidArgs)?;
+        let len = usize::try_from(len).map_err(|_| Error::InvalidArgs)?;
+        if !rights.contains(Rights::MAP | Rights::READ)
+            || (flags & moruna_abi::map::WRITE != 0 && !rights.contains(Rights::WRITE))
+        {
+            return Err(Error::AccessDenied);
+        }
+        if flags & !moruna_abi::map::ALL != 0
+            || flags & (moruna_abi::map::WRITE | moruna_abi::map::EXECUTE)
+                == (moruna_abi::map::WRITE | moruna_abi::map::EXECUTE)
+            || len == 0
+            || offset % 4096 != 0
+            || len % 4096 != 0
+        {
+            return Err(Error::InvalidArgs);
+        }
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > lock(&bytes.bytes).len())
+        {
+            return Err(Error::OutOfRange);
+        }
+        Ok(Mapping {
+            memory: self,
+            offset,
+            len,
+            writable: flags & moruna_abi::map::WRITE != 0,
+        })
+    }
+}
+impl Mapping<'_> {
+    pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(out.len())
+            .filter(|end| *end <= self.len)
+            .ok_or(Error::InvalidArgs)?;
+        let Object::Memory(bytes, _) = &self.memory.0.0 else {
+            return Err(Error::WrongType);
+        };
+        out.copy_from_slice(&lock(&bytes.bytes)[self.offset + offset..self.offset + end]);
+        Ok(())
+    }
+    pub fn write(&self, offset: usize, data: &[u8]) -> Result<()> {
+        if !self.writable {
+            return Err(Error::AccessDenied);
+        }
+        let end = offset
+            .checked_add(data.len())
+            .filter(|end| *end <= self.len)
+            .ok_or(Error::InvalidArgs)?;
+        let Object::Memory(bytes, _) = &self.memory.0.0 else {
+            return Err(Error::WrongType);
+        };
+        lock(&bytes.bytes)[self.offset + offset..self.offset + end].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod account_memory_model_tests {
+    use super::*;
+    #[test]
+    fn explicit_model_account_identity_survives_loans_and_refuses_foreign_or_unowned_memory() {
+        let one = Account::carve(8 << 20, "same").unwrap();
+        let two = Account::carve(8 << 20, "same").unwrap();
+        assert!(!one.matches(&two.0).unwrap());
+        let memory = Memory::create_in(4096, &one.0).unwrap();
+        let loan = memory
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+            .unwrap();
+        assert!(one.matches(&loan).unwrap());
+        assert!(!two.matches(&loan).unwrap());
+        assert!(!one.matches(&Memory::create(4096).unwrap().0).unwrap());
+        let no_read = memory
+            .0
+            .duplicate(Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+            .unwrap();
+        assert_eq!(one.matches(&no_read), Err(Error::AccessDenied));
+        let readonly = one.0.duplicate(Rights::READ | Rights::TRANSFER).unwrap();
+        assert!(matches!(
+            Memory::create_in(4096, &readonly),
+            Err(Error::AccessDenied)
+        ));
+    }
 }

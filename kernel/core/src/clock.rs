@@ -8,14 +8,17 @@
 use alloc::{collections::BTreeMap, sync::Arc, sync::Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{DEADLINE_INFINITE, Signals};
+use moruna_abi::{DEADLINE_INFINITE, Error, Signals, charge};
 use ostd::{
     arch::{read_tsc, tsc_freq},
     sync::{LocalIrqDisabled, SpinLock, Waker},
     timer,
 };
 
-use crate::signal::Signaller;
+use crate::{
+    account::{Account, Charge},
+    signal::Signaller,
+};
 
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// The realtime clock at boot, in nanoseconds since 1970, read from the CMOS clock.
@@ -232,21 +235,20 @@ pub struct Timer {
     /// The sequence number of the queued entry, zero when not armed.
     armed: AtomicU64,
     deadline: AtomicU64,
+    _charge: Charge,
 }
 
-impl Default for Timer {
-    fn default() -> Timer {
-        Timer::new()
-    }
-}
+const _: () = assert!(core::mem::size_of::<Timer>() as u64 <= charge::OBJECT);
 
 impl Timer {
-    pub fn new() -> Timer {
-        Timer {
+    /// A timer, its record charged to `account`.
+    pub fn new(account: &Arc<Account>) -> Result<Timer, Error> {
+        Ok(Timer {
             signaller: Signaller::new(Signals::NONE),
             armed: AtomicU64::new(0),
             deadline: AtomicU64::new(0),
-        }
+            _charge: Charge::new(account, charge::OBJECT)?,
+        })
     }
 
     /// Clears `SIGNALED` and arms the timer for `deadline`; zero disarms it. A deadline

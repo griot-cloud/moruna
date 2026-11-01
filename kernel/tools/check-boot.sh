@@ -2,9 +2,10 @@
 # Judges a boot's serial log (SDD 20 k, SDD 23 k, SDD 25 k): every line the image's
 # description expects (moruna-image's OUT/expect) present in the serial log or in
 # console0's file, every CPU online and every CPU having run a process thread,
-# nothing failed, no panic, the disk image holding what the block test wrote, the
-# vsock test's lines (or, when the boot had no vsock, the line saying so), and QEMU's
-# status the kernel's success. Prints each verdict.
+# nothing failed, no panic, every disk the description names holding the pattern it
+# says (what the block and NVMe tests wrote, or what the boot wrote, untouched), the
+# vsock test's and the engine's runs' lines, and QEMU's status the kernel's success.
+# Prints each verdict.
 #
 #   kernel/tools/check-boot.sh LOG QEMU_STATUS EXPECT CPUS
 #
@@ -42,7 +43,7 @@ expect "kk: process threads ran on $cpus of $cpus CPUs"
 
 # A test's failure line and a refused boot, exactly; a panic in any case (OSTD prints
 # "Non-resettable panic!", a program's handler "panicked").
-for bad in "FAIL:" "kk: boot refused"; do
+for bad in "FAIL:" "kk: boot refused" "kk: accounting broken"; do
   if grep -qF -- "$bad" "$seen"; then
     echo "FOUND \"$bad\":"
     grep -F -- "$bad" "$seen"
@@ -55,22 +56,30 @@ if grep -qi -- "panic" "$seen"; then
   fail=1
 fi
 
-# DR-T9: what the block test wrote and flushed is on the host's disk image.
-python3 "$tools/disk-image.py" check "$out/disk-$cpus.img" || fail=1
+# DR-T9, DR-T18: what the block and NVMe tests wrote and flushed is on the host's disk
+# images, and a disk no test wrote is as the boot wrote it.
+while read -r name sectors after; do
+  python3 "$tools/disk-image.py" check "$out/$name-$cpus.img" "$sectors" "$after" || fail=1
+done < "$out/disks"
 
-# DR-T13: with a vsock, both exchanges, on each side; without one, the line saying so.
-vsock="$(cat "$out/vsock-$cpus")"
-if [ "$vsock" = attached ]; then
-  expect "KB3 vsock: ok:"
-  expect "KB3 conformance moruna.driver.vsock: ok:"
-  expect "KB3 vsock0: virtio-vsock up as cid 3"
-  expect "kk: process vsock0 exited with code 0 ("
-  peer="$out/vsock-peer-$cpus.log"
-  expect "vsock-peer: ok: the guest (cid 3" "$peer"
-  expect "vsock-peer: ok: connected to the guest's port 5001 and it answered 'hello back from the guest'" "$peer"
-else
-  echo "note: the boot had no vsock ($vsock)"
-  expect "KB3 vsock: no device:"
+# DR-T13: both exchanges, on each side, through the vhost-user back end; SDD 30 k: the
+# engine's five runs, each judged by the embedder on the host's side.
+expect "KB3 vsock: ok:"
+expect "KB3 conformance moruna.driver.vsock: ok:"
+expect "KB3 vsock0: virtio-vsock up as cid 3"
+expect "kk: process vsock0 exited with code 0 ("
+peer="$out/vsock-peer-$cpus.log"
+expect "vsock-peer: ok: the guest connected to port 5000" "$peer"
+expect "vsock-peer: ok: connected to the guest's port 5001 and it answered 'hello back from the guest'" "$peer"
+# Source-derived generic baseline: linux/test's seven check() runs plus granted(),
+# and plane/test shimless()'s two actual run_plane requests. The removed bare
+# engine contributed5engine processes+6image tasks; all5strict assertions now
+# remain mandatory on each CPU profile in check-node-fixtures.py (15boots).
+expect "linux: served: 10 programs run"
+if grep -qF -- "FAIL:" "$peer"; then
+  echo "FOUND FAILURE in actual vsock peer log:"
+  grep -F -- "FAIL:" "$peer"
+  fail=1
 fi
 
 if [ "$status" != 33 ]; then

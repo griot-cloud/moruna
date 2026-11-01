@@ -109,17 +109,44 @@ pub struct HostProfile {
     pub durable_staging: Guarantee,
 }
 
+/// What the sampler's legacy `anon_bytes` pressure bucket measures. This is
+/// separate from CPU/billing evidence and does not change kernel accounting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryBasis {
+    /// Anonymous residency/pressure, as on the existing OS/cgroup samplers.
+    #[default]
+    ProcessAnon,
+    /// Actual native Account charges, not RSS. The base excludes child ceilings;
+    /// registered outside-memory providers add their retained reservations.
+    NativeAccountCharge,
+}
+impl MemoryBasis {
+    /// Stable report metadata label; no new binary protocol enum is introduced.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessAnon => "process_anon",
+            Self::NativeAccountCharge => "native_account_charge",
+        }
+    }
+}
+
 /// Live resource sampling. Implemented by discovery; one instance per run, shared by
 /// the controller (its tick) and the scheduler (before and after every `apply`).
 /// Cheap: a few file reads or syscalls; interior mutability for its caches.
 pub trait Sampler: Send + Sync {
-    /// One sample of live resource state.
-    fn sample(&self) -> Sample;
+    /// Meaning of the sample/peak memory pressure bucket. Existing samplers
+    /// remain process-anonymous by default; wrappers must preserve this label.
+    fn memory_basis(&self) -> MemoryBasis {
+        MemoryBasis::ProcessAnon
+    }
+    /// One fresh sample; accounting read failures are errors, never stale/zero readings.
+    fn sample(&self) -> crate::Result<Sample>;
     /// Reset the kernel's peak counter (cgroup v2 `memory.peak` is writable on
     /// kernels 6.x and later; otherwise the sampler tracks its own running peak and resets
     /// that), so a probe measures its own peak (RC f.2).
     fn reset_peak(&self);
-    /// The most anonymous memory the whole process has held since this sampler was created,
+    /// The largest memory pressure observed since creation, in `memory_basis`.
+    /// For ProcessAnon, the most anonymous memory the whole process has held,
     /// as the operating system counts it, whatever the run's shape: every sample's reading,
     /// and on a platform that keeps a lifetime high-water mark, every rise of that mark, so a
     /// burst between two samples is not missed. `reset_peak` does not touch it. This is the
@@ -136,10 +163,23 @@ pub trait Sampler: Send + Sync {
 
 /// Memory a run holds outside its own process: a packaged stage's child (17 SB-I9; contracts
 /// d.12, amended 2026-10-15). The run's sampler adds every registered one's `in_use` to each
-/// sample's `anon_bytes`, so the ceiling governs the process and its children together.
+/// sample's legacy `anon_bytes` pressure bucket, so the ceiling governs the run
+/// and its children together. A native child may retain its full carved ceiling
+/// until certified retirement; it is not counted again by the native base sampler.
 pub trait OutsideMemory: Send + Sync {
-    /// Bytes held now.
-    fn in_use(&self) -> u64;
+    /// Bytes held now; failure to read the actual account is an error, never zero.
+    fn in_use(&self) -> crate::Result<u64>;
+    /// Start a new high-water mark at what is held now (a cgroup's `memory.peak`, SDD 24 p.4).
+    /// `Ok(false)`: this keeps no mark, which is the default; an `Err` says why a mark it
+    /// keeps could not be reset.
+    fn reset_peak(&self) -> crate::Result<bool> {
+        Ok(false)
+    }
+    /// The most held at once since the last [`OutsideMemory::reset_peak`] that returned
+    /// `Ok(true)`; `Ok(None)` when this keeps no mark.
+    fn peak(&self) -> crate::Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// The whole process's consumption over a run ([`Sampler::process_usage`]): the facts a
@@ -155,12 +195,14 @@ pub struct ProcessUsage {
     pub measured: bool,
 }
 
-/// The whole process's high-water mark over a run ([`Sampler::process_peak`]).
+/// High-water mark in the sampler's declared [`MemoryBasis`]. An Account charge
+/// sample is not process RSS or an exact per-task/per-interval kernel mark.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessPeak {
-    /// Anonymous host bytes at the peak.
+    /// Bytes at the peak in the sampler's declared memory basis.
     pub bytes: u64,
-    /// When the sampler saw it, nanoseconds since the epoch.
+    /// When observed in the sampler's clock (epoch OS time or native monotonic
+    /// kernel time, according to MemoryBasis).
     pub at_ns: u64,
     /// True when the figure is the kernel's own high-water mark and not only the highest of
     /// the samples taken, so no burst between samples can have been missed.
@@ -176,17 +218,23 @@ pub struct ProcessPeak {
 /// One sample of live resource state; produced by discovery's sampler.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Sample {
-    /// Anonymous host bytes of the process.
+    /// Legacy memory-pressure bucket: process anonymous residency by default,
+    /// or native charged Account bytes when `Sampler::memory_basis` says so.
+    /// Native base charges exclude `Usage.reserved`; outside wrappers add their
+    /// own registered child reservations exactly once. Never relabel this as RSS.
     pub anon_bytes: u64,
-    /// Page-cache bytes attributed to the process.
+    /// Separately measured file/page-cache bytes. Native Account accounting has
+    /// no separate file classification; zero there is not a measured zero cache.
     pub file_bytes: u64,
-    /// The peak anonymous host bytes since the last `reset_peak`.
+    /// Observed pressure peak since reset, in the declared memory basis. Native
+    /// Account sampling never substitutes the Account's lifetime kernel peak.
     pub peak_anon_bytes: u64,
     /// Microseconds the process was CPU-throttled, cumulative.
     pub throttled_us: u64,
     /// Device bytes in use per device.
     pub device_used: [u64; 8],
-    /// When the sample was taken, nanoseconds since the epoch.
+    /// When sampled, in nanoseconds: epoch time for existing OS samplers, native
+    /// monotonic kernel time for NativeAccountCharge (no UTC claim).
     pub at_ns: u64,
     /// The host memory ceiling in force when the sample was taken, from the limits the
     /// discovery watcher last published. The controller reads its ceiling from here

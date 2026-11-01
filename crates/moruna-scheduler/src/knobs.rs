@@ -226,6 +226,13 @@ pub(crate) fn set(shared: &Shared, knob: Knob) {
                 state.clamped(3, "promotion_window", morsels as u64, clamped as u64);
             }
             shared.placement.set_promotion_window(stage, clamped);
+            // The floor moves with the windows; the claim cap is counted from it (f.22).
+            let floor = shared
+                .placement
+                .floor(crate::decide::host_tier(shared), shared.cfg.morsel_min);
+            shared
+                .floor_bytes
+                .store(floor.bytes, std::sync::atomic::Ordering::Relaxed);
             upsert(
                 &mut state
                     .promotion_window

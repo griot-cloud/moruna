@@ -74,14 +74,21 @@ pub struct MetaInput {
     pub controller: Option<ControllerSummary>,
     /// Every shrink the limits watcher started and how long its drain took.
     pub drains: Vec<moruna_trace::DrainSummary>,
-    /// The whole process's high-water mark over the run (`Sampler::process_peak`).
+    /// Sampler pressure peak in `memory_basis` (`Sampler::process_peak`).
     pub process_peak: moruna_kernel::ProcessPeak,
+    /// Actual sampler pressure basis; never infer RSS from a legacy field name.
+    pub memory_basis: moruna_kernel::MemoryBasis,
     /// What the whole process consumed over the run (`Sampler::process_usage`).
     pub process_usage: moruna_kernel::ProcessUsage,
     /// What the sink's engine said about the write it committed, when the run completed.
     pub write: Option<moruna_kernel::SinkWrite>,
     /// What the source's engine said about the read it planned, when the source was built.
     pub read: Option<moruna_kernel::SourceRead>,
+    /// The placement engine's buffer catalog at the end of the run, when the facade built the
+    /// engine (placement f.18).
+    pub buffers: Option<moruna_trace::BufferReport>,
+    /// What the scheduling policy decided, when the scheduler started (10 f.3).
+    pub policy: Option<moruna_trace::PolicyReport>,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -115,9 +122,12 @@ pub fn meta(input: MetaInput) -> RunMeta {
         controller_notes,
         drains: input.drains,
         process_peak: input.process_peak,
+        memory_basis: input.memory_basis,
         process_usage: input.process_usage,
         write: input.write,
         read: input.read,
+        buffers: input.buffers,
+        policy: input.policy,
     }
 }
 
@@ -188,6 +198,7 @@ mod tests {
             io_paths: moruna_kernel::IoPaths::default(),
             controller: Some(summary),
             drains: Vec::new(),
+            memory_basis: moruna_kernel::MemoryBasis::ProcessAnon,
             process_peak: moruna_kernel::ProcessPeak {
                 bytes: 9,
                 at_ns: 2,
@@ -197,8 +208,23 @@ mod tests {
             process_usage: moruna_kernel::ProcessUsage::default(),
             write: None,
             read: None,
+            policy: None,
+            buffers: Some(moruna_trace::BufferReport::of(
+                "known_future",
+                &moruna_kernel::CatalogStats {
+                    spilled_bytes: 5,
+                    ..Default::default()
+                },
+            )),
         });
         assert_eq!(meta.process_peak.bytes, 9);
+        assert_eq!(
+            meta.buffers
+                .as_ref()
+                .map(|b| (b.eviction.as_str(), b.spilled_bytes)),
+            Some(("known_future", 5)),
+            "the catalog's figures reach the report"
+        );
         assert_eq!(meta.bottleneck_timeline.len(), all.len());
         assert_eq!(meta.bottleneck_timeline[0].1, "IoRead");
         assert_eq!(meta.bottleneck_timeline[6].1, "StateGrowth");
@@ -221,10 +247,13 @@ mod tests {
             io_paths: moruna_kernel::IoPaths::default(),
             controller: None,
             drains: Vec::new(),
+            memory_basis: moruna_kernel::MemoryBasis::ProcessAnon,
             process_peak: moruna_kernel::ProcessPeak::default(),
             process_usage: moruna_kernel::ProcessUsage::default(),
             write: None,
             read: None,
+            buffers: None,
+            policy: None,
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());

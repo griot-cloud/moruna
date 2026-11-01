@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::catalogue::Catalogue;
 use crate::doc::is_task_id;
 use crate::job::{Job, Task};
 use crate::kind::{Declaration, Fact, Flow, Role};
+use crate::rules::Known;
 use crate::schema::{self, Step, Violation, Wrong};
 
 /// One thing wrong with a document: where, what kind of wrong, and a sentence a person can act
@@ -60,6 +61,12 @@ pub enum RefusalCode {
     Cycle,
     /// A barrier with nothing on one side, or an edge that goes around one.
     Barrier,
+    /// The columns an edge carries do not fit the schema rules of the served kind it feeds, or a
+    /// served kind's output rules name a column its input does not have (SDD 22 e.6).
+    Schema {
+        /// The column at fault.
+        column: String,
+    },
     /// The kind needs a contract (`needs.contracts` is `yes`) and the job carries none.
     Contract,
 }
@@ -67,8 +74,8 @@ pub enum RefusalCode {
 /// Check `job` against `catalogue`. Every refusal is collected, not only the first, in the order
 /// the document is read: each task (its id, its kind, its kind's flows, its settings, its ports),
 /// then each edge (its ends, its flow), then each task's ports (fed by exactly one edge, read by
-/// at least one), then the graph (a cycle, a barrier), then the contracts. Nothing is built or
-/// run.
+/// at least one), then the graph (a cycle, a barrier), then the columns along the edges into
+/// served kinds (SDD 22 e.6), then the contracts. Nothing is built or run.
 pub fn check(job: &Job, catalogue: &Catalogue) -> Result<(), Vec<Refusal>> {
     walk(job, Some(catalogue))
 }
@@ -192,6 +199,7 @@ fn walk(job: &Job, catalogue: Option<&Catalogue>) -> Result<(), Vec<Refusal>> {
     };
     if acyclic {
         barriers(job, &mut refusals);
+        columns(job, &declared, &mut refusals);
     }
     if job.contracts.is_empty() {
         for (field, kind) in needing {
@@ -276,10 +284,12 @@ fn task_entry<'c>(
             ),
         });
     }
-    let settings = Value::Object(task.settings.clone());
-    for violation in schema::validate(&declared.settings, &declared.settings, &settings) {
-        refusals.push(settings_refusal(field, &task.kind, &violation));
-    }
+    refusals.extend(settings_refusals(
+        field,
+        &task.kind,
+        &declared.settings,
+        &task.settings,
+    ));
     if declared.needs.contracts == Fact::Yes {
         needing.push((field.to_string(), task.kind.clone()));
     }
@@ -478,6 +488,101 @@ fn unknown(field: &str, role: Role, name: &str, catalogue: &Catalogue) -> Refusa
     }
 }
 
+/// What a kind's settings schema refuses of a task's settings (SDD 22 e.2, step 3): one
+/// [`RefusalCode::Settings`] refusal per violation, at `<field>.settings.<path>`, for the task at
+/// `field` of the kind `kind`. What [`check`] says of a task's settings, and what the runtime says
+/// of the settings of a kind it has no settings type for (a served kind, SDD 18 KD-I11).
+pub fn settings_refusals(
+    field: &str,
+    kind: &str,
+    schema: &Value,
+    settings: &Map<String, Value>,
+) -> Vec<Refusal> {
+    let settings = Value::Object(settings.clone());
+    schema::validate(schema, schema, &settings)
+        .iter()
+        .map(|violation| settings_refusal(field, kind, violation))
+        .collect()
+}
+
+/// The columns along the edges into served kinds (SDD 22 e.6), as far as the job knows them
+/// without running: what a served kind's output rules say it gives, from its input where they
+/// are relative, compared with what the served kind it feeds says it takes. A column a task may
+/// have that the job cannot know of is never refused.
+fn columns(job: &Job, declared: &[Option<&Declaration>], refusals: &mut Vec<Refusal>) {
+    let Ok(order) = job.topological_order() else {
+        return;
+    };
+    let mut known: Vec<Option<Known>> = vec![None; job.tasks.len()];
+    for &i in &order {
+        let task = &job.tasks[i];
+        let Some(served) = declared[i].and_then(|d| d.served.as_ref()) else {
+            continue;
+        };
+        // A catalogue admits only rules that parse (JB-I4); a declaration put in another way
+        // has its rules read as none.
+        let input_rules = served.input_rules().ok().flatten();
+        let mut first_input: Option<Known> = None;
+        for (p, port) in task.inputs.iter().enumerate() {
+            for e in job.edges_into(&task.id, port) {
+                let edge = &job.edges[e];
+                let Some(producer) = job.task_index(&edge.from.task) else {
+                    continue;
+                };
+                let Some(given) = &known[producer] else {
+                    continue;
+                };
+                if p == 0 {
+                    first_input = Some(given.clone());
+                }
+                let Some(rules) = &input_rules else {
+                    continue;
+                };
+                for misfit in rules.misfits(given) {
+                    refusals.push(Refusal {
+                        field: format!("edges[{e}]"),
+                        code: RefusalCode::Schema {
+                            column: misfit.column().to_string(),
+                        },
+                        message: format!(
+                            "`{}` (`{}`) does not take what `{}` gives it: {misfit}",
+                            task.id, task.kind, edge.from.task
+                        ),
+                    });
+                }
+            }
+        }
+        // What the task is given is what its own input rules admit, when nothing upstream says
+        // more.
+        let input = first_input.or_else(|| {
+            input_rules
+                .as_ref()
+                .and_then(|rules| rules.known(None).ok().flatten())
+        });
+        let Some(output_rules) = served.output_rules().ok().flatten() else {
+            continue;
+        };
+        match output_rules.known(input.as_ref()) {
+            Ok(gives) => known[i] = gives,
+            Err(misfits) => {
+                for misfit in misfits {
+                    refusals.push(Refusal {
+                        field: job.field(i),
+                        code: RefusalCode::Schema {
+                            column: misfit.column().to_string(),
+                        },
+                        message: format!(
+                            "`{}`'s output_schema drops or changes a column its input does not \
+                             have: {misfit}",
+                            task.kind
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// A violation of a kind's settings schema, as a refusal naming the value at fault.
 fn settings_refusal(field: &str, kind: &str, violation: &Violation) -> Refusal {
     let dotted = dotted(&violation.path);
@@ -600,6 +705,7 @@ mod tests {
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
+            served: None,
         };
         catalogue.declare_unchecked(odd(Role::Source, Flow::Batches, Flow::Batches));
         catalogue.declare_unchecked(odd(Role::Kernel, Flow::Files, Flow::Batches));

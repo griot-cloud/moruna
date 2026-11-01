@@ -1,0 +1,21 @@
+[package]
+name = "moruna-event"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna's run events: the FlatBuffers schema, the record each event is written as, and the JSON rendering for people"
+
+# What a peer of a run reads its events with (SDD 12, MH 4.3 version 7): nothing from Arrow, the
+# engines or the runtime, so a host, a monitor or a language binding decodes the events a run
+# tells without linking the run.
+[dependencies]
+# The record every event is (SDD 21): its layout, byte for byte.
+moruna-record = { workspace = true, features = ["std"] }
+# The event body is FlatBuffers, as the job and plan documents are.
+flatbuffers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,7 @@
+# Lab execution produces large local artifacts; track only the preserved tooling.
+*
+!.gitignore
+!README.md
+!*.py
+!script-origins.json
+!validation.json

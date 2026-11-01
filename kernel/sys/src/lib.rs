@@ -11,29 +11,39 @@
 //! fn run() -> i64 { 0 }
 //! ```
 
+//!
+//! A Linux program on the Moruna kernel that was granted handles (SDD 30) uses the same
+//! wrappers: it is built for its Linux target, where the crate leaves out the entry, the
+//! panic handler and the heap, which its own runtime gives it, and it finds its start
+//! page with [`start::init`] from the address its auxiliary vector carries.
+
 #![no_std]
-#![feature(allow_internal_unsafe)]
+#![cfg_attr(target_os = "none", feature(allow_internal_unsafe))]
 // `main!` exports `_start` from the program that invokes it, which is the one unsafe
 // attribute a program needs; the macro carries it so the program can forbid unsafe code.
-#![expect(internal_features)]
+#![cfg_attr(target_os = "none", expect(internal_features))]
 
 #[cfg(feature = "heap")]
 extern crate alloc;
 
 #[cfg(feature = "heap")]
 mod heap;
+pub mod plane;
+mod private_memory;
+pub use private_memory::PrivateMemory;
 pub mod raw;
 pub mod start;
 
+#[cfg(target_os = "none")]
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::{
     fmt::{self, Write as _},
     marker::PhantomData,
-    sync::atomic::{AtomicU8, Ordering},
 };
 
 pub use moruna_abi::{
     ABI_VERSION, DEADLINE_INFINITE, Error, ObjectType, PAGE_SIZE, RawHandle, ResourceKind, Rights,
-    Signals, forward, limits, map, memory_flags, pin_flags,
+    Signals, charge, forward, limits, map, memory_flags, pin_flags,
 };
 use moruna_abi::{msi, nr, start_entry, wait_item};
 
@@ -325,13 +335,46 @@ pub fn wait_one(handle: &Handle, signals: Signals, deadline: u64) -> Result<Sign
 pub struct Memory(pub Handle);
 
 impl Memory {
+    /// A memory object of `size` bytes, whole pages, charged to the caller's account.
     pub fn create(size: u64) -> Result<Memory> {
-        check(raw::memory_create(size, 0)).map(|v| Memory(Handle(v as RawHandle)))
+        check(raw::memory_create(size, 0, 0)).map(|v| Memory(Handle(v as RawHandle)))
+    }
+
+    /// A memory object charged to `account`: an [`Account`]'s handle, or a process's,
+    /// either with `WRITE` (ABI 2.3).
+    pub fn create_in(size: u64, account: &Handle) -> Result<Memory> {
+        check(raw::memory_create(size, 0, account.raw())).map(|v| Memory(Handle(v as RawHandle)))
     }
 
     /// A memory object a holder of a DMA resource may pin for a device (ABI 1.2).
     pub fn create_dma(size: u64) -> Result<Memory> {
-        check(raw::memory_create(size, memory_flags::DMA)).map(|v| Memory(Handle(v as RawHandle)))
+        check(raw::memory_create(size, memory_flags::DMA, 0))
+            .map(|v| Memory(Handle(v as RawHandle)))
+    }
+
+    /// DMA memory charged to the supplied actual account, never a service pool.
+    pub fn create_dma_in(size: u64, account: &Handle) -> Result<Memory> {
+        check(raw::memory_create(size, memory_flags::DMA, account.raw()))
+            .map(|v| Memory(Handle(v as RawHandle)))
+    }
+    /// KE1 ABI 2.4: one bounded contiguous DMA run charged to this process.
+    pub fn create_dma_contiguous(size: u64) -> Result<Memory> {
+        check(raw::memory_create(
+            size,
+            memory_flags::DMA | memory_flags::CONTIGUOUS,
+            0,
+        ))
+        .map(|v| Memory(Handle(v as RawHandle)))
+    }
+
+    /// One bounded contiguous DMA run charged to the explicit original account.
+    pub fn create_dma_contiguous_in(size: u64, account: &Handle) -> Result<Memory> {
+        check(raw::memory_create(
+            size,
+            memory_flags::DMA | memory_flags::CONTIGUOUS,
+            account.raw(),
+        ))
+        .map(|v| Memory(Handle(v as RawHandle)))
     }
 
     /// Maps `len` bytes from `offset` with `flags` (`map::WRITE`, `map::EXECUTE`).
@@ -343,6 +386,99 @@ impl Memory {
     /// a mapping keeps its pages whatever becomes of the handle it was made from.
     pub fn map_detached(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'static>> {
         mapping(&self.0, offset, len, flags)
+    }
+}
+
+/// A memory account (ABI 2.3, SDD 20 f.18): a limit, and what is charged to it. Its
+/// limit was carved out of its parent's, which holds it until the last handle to the
+/// account and the last thing charged to it are gone.
+#[derive(Debug)]
+pub struct Account(pub Handle);
+
+impl Account {
+    /// An account named `name` (1 to 32 bytes of `[a-z0-9._-]`) of `limit` bytes, whole
+    /// pages, carved out of the caller's own account: `QuotaExceeded` when it has no
+    /// room for the whole limit.
+    pub fn carve(limit: u64, name: &str) -> Result<Account> {
+        check(raw::account_create(0, limit, name.as_bytes()))
+            .map(|v| Account(Handle(v as RawHandle)))
+    }
+
+    /// An account carved out of this one.
+    pub fn carve_from(&self, limit: u64, name: &str) -> Result<Account> {
+        check(raw::account_create(self.0.raw(), limit, name.as_bytes()))
+            .map(|v| Account(Handle(v as RawHandle)))
+    }
+
+    /// Compare an actual Account capability, or a Memory object's immutable
+    /// charged owner, to this exact Account. READ is required on both handles.
+    /// Foreign accounts return false; names, usage and ancestry have no meaning.
+    pub fn matches(&self, object: &Handle) -> Result<bool> {
+        match check(raw::account_matches(self.0.raw(), object.raw()))? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::BadState),
+        }
+    }
+
+    /// Its figures now.
+    pub fn usage(&self) -> Result<Usage> {
+        Usage::of(&self.0)
+    }
+}
+
+/// An account's figures (`account_info`), in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub limit: u64,
+    /// Charged to it now.
+    pub used: u64,
+    /// The most ever charged to it at once.
+    pub peak: u64,
+    /// Held for the accounts carved out of it: the sum of their limits.
+    pub reserved: u64,
+    name: [u8; limits::NAME_MAX],
+}
+
+impl Usage {
+    fn read(account: RawHandle) -> Result<Usage> {
+        use moruna_abi::account_info as info;
+        let mut out = [0u8; info::SIZE];
+        check(raw::account_info(account, &mut out))?;
+        let word = |at: usize| moruna_abi::read_u64(&out, at).unwrap_or(0);
+        let mut name = [0u8; limits::NAME_MAX];
+        name.copy_from_slice(&out[info::NAME..info::NAME + limits::NAME_MAX]);
+        Ok(Usage {
+            limit: word(info::LIMIT),
+            used: word(info::USED),
+            peak: word(info::PEAK),
+            reserved: word(info::RESERVED),
+            name,
+        })
+    }
+
+    /// The caller's own account's figures.
+    pub fn own() -> Result<Usage> {
+        Usage::read(0)
+    }
+
+    /// The figures of the account `handle` names: an account, or a process's, with
+    /// `READ`.
+    pub fn of(handle: &Handle) -> Result<Usage> {
+        Usage::read(handle.raw())
+    }
+
+    /// What can still be charged to it, or carved out of it.
+    pub fn room(&self) -> u64 {
+        self.limit
+            .saturating_sub(self.used)
+            .saturating_sub(self.reserved)
+    }
+
+    /// Its name.
+    pub fn name(&self) -> &str {
+        let name = moruna_abi::fixed_name(&self.name);
+        core::str::from_utf8(name).unwrap_or("")
     }
 }
 
@@ -522,6 +658,32 @@ impl Mapping<'_> {
         Ok(())
     }
 
+    /// The mapping's bytes as one region shared with other processes, for a protocol
+    /// whose every access is an atomic or a hand-over of bytes from one side to the
+    /// other, as a `moruna-record` ring's is (SDD 29 f.7). Writable mappings only.
+    pub fn shared_region(&mut self) -> Result<&mut [u8]> {
+        if !self.writable {
+            return Err(Error::AccessDenied);
+        }
+        // SAFETY: the kernel keeps `len` bytes at `addr` mapped writable for as long as
+        // the mapping lives, which the borrow of `self` outlives. Other processes may
+        // map the same pages; the caller's protocol (atomics for the shared words, and
+        // each slot of bytes owned by one side at a time) is what keeps their accesses
+        // from racing, as this method's contract says.
+        Ok(unsafe { core::slice::from_raw_parts_mut(self.addr as *mut u8, self.len as usize) })
+    }
+
+    /// The mapping's bytes, read in place: for memory no process writes while the borrow
+    /// lives, which is what a data-plane batch is (SDD 29 DP-I4: no task maps a batch
+    /// writable, and the engine writes none it has pushed). The engine decodes a record a
+    /// task put this way, with no copy (SDD 30 f.6).
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: the kernel keeps `len` bytes at `addr` mapped readable for as long as
+        // the mapping lives, which the borrow of `self` outlives. The caller's contract,
+        // as this method's says, is that nothing writes them meanwhile.
+        unsafe { core::slice::from_raw_parts(self.addr as *const u8, self.len as usize) }
+    }
+
     pub fn read_u32(&self, offset: usize) -> Result<u32> {
         let mut b = [0u8; 4];
         self.read(offset, &mut b)?;
@@ -590,15 +752,55 @@ impl Drop for Mapping<'_> {
     }
 }
 
+/// The start entries (`moruna_abi::start_entry`) naming `handles`, and how many.
+fn start_entries(
+    handles: &[(Option<Handle>, &str)],
+) -> Result<([[u8; start_entry::SIZE]; limits::START_HANDLES_MAX], usize)> {
+    if handles.len() > limits::START_HANDLES_MAX {
+        return Err(Error::Limit);
+    }
+    let mut entries = [[0u8; start_entry::SIZE]; limits::START_HANDLES_MAX];
+    for (e, (h, name)) in entries.iter_mut().zip(handles.iter()) {
+        let h = h.as_ref().ok_or(Error::InvalidArgs)?;
+        e[start_entry::HANDLE..start_entry::HANDLE + 4].copy_from_slice(&h.raw().to_le_bytes());
+        let n = name.len().min(limits::NAME_MAX);
+        e[start_entry::NAME..start_entry::NAME + n].copy_from_slice(&name.as_bytes()[..n]);
+    }
+    Ok((entries, handles.len()))
+}
+
+/// The handles a call moved into another process are that process's now: their values
+/// here are not closed.
+fn forget_moved(handles: &mut [(Option<Handle>, &str)]) {
+    for (h, _) in handles.iter_mut() {
+        if let Some(h) = h.take() {
+            core::mem::forget(h);
+        }
+    }
+}
+
 /// A process handle.
 #[derive(Debug)]
 pub struct Process(pub Handle);
 
 impl Process {
-    /// Creates an empty process from the process root resource.
+    /// Creates an empty process from the process root resource, charged to the caller's
+    /// own account: it and everything it causes to exist.
     pub fn create(resource: &Handle, name: &str) -> Result<Process> {
-        let r = raw::process_create(resource.raw(), name.as_bytes());
+        let r = raw::process_create(resource.raw(), name.as_bytes(), 0);
         check(r).map(|v| Process(Handle(v as RawHandle)))
+    }
+
+    /// Creates an empty process charged to `account`: an [`Account`]'s handle, or a
+    /// process's, either with `WRITE` (ABI 2.3).
+    pub fn create_in(resource: &Handle, name: &str, account: &Handle) -> Result<Process> {
+        let r = raw::process_create(resource.raw(), name.as_bytes(), account.raw());
+        check(r).map(|v| Process(Handle(v as RawHandle)))
+    }
+
+    /// The figures of the account this process is charged to.
+    pub fn usage(&self) -> Result<Usage> {
+        Usage::of(&self.0)
     }
 
     /// Loads the static ELF image in `image`; returns its entry point.
@@ -617,24 +819,30 @@ impl Process {
     /// their slot names: on success every slot is left `None`, on failure every handle
     /// stays where it was. A `None` slot is `InvalidArgs`.
     pub fn start_with(&self, entry: u64, handles: &mut [(Option<Handle>, &str)]) -> Result<()> {
-        if handles.len() > limits::START_HANDLES_MAX {
-            return Err(Error::Limit);
-        }
-        let mut entries = [[0u8; start_entry::SIZE]; limits::START_HANDLES_MAX];
-        for (e, (h, name)) in entries.iter_mut().zip(handles.iter()) {
-            let h = h.as_ref().ok_or(Error::InvalidArgs)?;
-            e[start_entry::HANDLE..start_entry::HANDLE + 4].copy_from_slice(&h.raw().to_le_bytes());
-            let n = name.len().min(limits::NAME_MAX);
-            e[start_entry::NAME..start_entry::NAME + n].copy_from_slice(&name.as_bytes()[..n]);
-        }
-        let used = &entries[..handles.len()];
-        check(raw::process_start(self.0.raw(), entry, used.as_flattened()))?;
-        for (h, _) in handles.iter_mut() {
-            if let Some(h) = h.take() {
-                core::mem::forget(h);
-            }
-        }
+        let (entries, count) = start_entries(handles)?;
+        check(raw::process_start(
+            self.0.raw(),
+            entry,
+            entries[..count].as_flattened(),
+        ))?;
+        forget_moved(handles);
         Ok(())
+    }
+
+    /// Moves the handles of `handles` into this created process under their slot names
+    /// and maps a start page naming them into it (`process_grant`, ABI 2.2), for a
+    /// process its creator launches with [`Process::launch`]; returns the page's address
+    /// in the process, which the creator hands the program (a Linux program reads it
+    /// from its auxiliary vector, SDD 30 d.2). On success every slot is left `None`, on
+    /// failure every handle stays where it was.
+    pub fn grant(&self, handles: &mut [(Option<Handle>, &str)]) -> Result<u64> {
+        let (entries, count) = start_entries(handles)?;
+        let page = check(raw::process_grant(
+            self.0.raw(),
+            entries[..count].as_flattened(),
+        ))?;
+        forget_moved(handles);
+        Ok(page)
     }
 
     /// Ends the running process (`process_kill`, ABI 1.2).
@@ -878,10 +1086,12 @@ impl fmt::Write for Line {
     }
 }
 
+#[cfg(target_os = "none")]
 static PANICKING: AtomicU8 = AtomicU8::new(0);
 
 /// A panic prints its message on the console slot, if the process has one, and ends
 /// the process with code 101.
+#[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     if PANICKING.swap(1, Ordering::AcqRel) == 0
@@ -901,6 +1111,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 
 /// Declares a process's entry: `main!(run)` runs `fn run() -> i64` and exits with
 /// what it returns.
+#[cfg(target_os = "none")]
 #[macro_export]
 #[allow_internal_unsafe]
 macro_rules! main {

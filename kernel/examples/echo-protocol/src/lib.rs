@@ -174,6 +174,8 @@ pub fn suite() -> Suite {
         id: echo::ID,
         requests: echo::REQUESTS,
         cases: CASES,
-        timeout: 5_000_000_000,
+        // The CI boot runs every test at once under emulation, the data plane's 64 MiB
+        // batch among them (SDD 29 k), so a call waits as long as the block suite's do.
+        timeout: 30_000_000_000,
     }
 }

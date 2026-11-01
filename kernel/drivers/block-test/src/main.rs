@@ -107,6 +107,9 @@ fn data(directory: &mut directory::Client) -> Result<Info, String> {
             "block0 is {info:?}, not the 4 MiB disk the boot attaches"
         ));
     }
+    let lease = disk
+        .acquire_write()
+        .map_err(|e| format!("acquire writer: {e:?}"))?;
     let chunk = (info.max_sectors as u64).min(2048);
     let mut buffer =
         Memory::create_dma(chunk * 512).map_err(|e| format!("DMA memory: {}", e.name()))?;
@@ -121,7 +124,7 @@ fn data(directory: &mut directory::Client) -> Result<Info, String> {
             if write {
                 fill(&buffer, sector, n)?;
                 buffer = disk
-                    .write(sector, n as u32, buffer)
+                    .write(lease, sector, n as u32, buffer)
                     .map_err(|e| format!("write at {sector}: {e:?}"))?;
             } else {
                 buffer = disk
@@ -135,8 +138,10 @@ fn data(directory: &mut directory::Client) -> Result<Info, String> {
     };
     buffer = pass(&mut disk, buffer, false, pattern_a).map_err(|e| format!("pattern A: {e}"))?;
     buffer = pass(&mut disk, buffer, true, pattern_b)?;
-    disk.flush().map_err(|e| format!("flush: {e:?}"))?;
+    disk.flush(lease).map_err(|e| format!("flush: {e:?}"))?;
     drop(pass(&mut disk, buffer, false, pattern_b).map_err(|e| format!("pattern B: {e}"))?);
+    disk.release_write(lease)
+        .map_err(|e| format!("release writer: {e:?}"))?;
     Ok(info)
 }
 

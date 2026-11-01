@@ -7,4 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-moruna-sys.workspace = true
+moruna-sys = { workspace = true, features = ["heap"] }
+# The start page's layout, which KD2-T8 reads back through `process_read`.
+moruna-abi.workspace = true
+
+moruna-node = { path = "../node/core", version = "=0.1.0" }

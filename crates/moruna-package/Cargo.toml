@@ -10,6 +10,8 @@ description = "Moruna function packages: the manifest, the reader, the fingerpri
 
 [dependencies]
 moruna-kernel = { workspace = true }
+# The spelling of a declaration's schemas (16 e.2), which a served kind's declaration shares.
+moruna-job = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

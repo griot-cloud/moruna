@@ -7,14 +7,16 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
 
-use moruna_abi::{ObjectType, ResourceKind, Rights, resource_range};
+use moruna_abi::{Error, ObjectType, ResourceKind, Rights, charge, resource_range};
 use ostd::sync::SpinLock;
 
 use crate::{
+    account::{Account, Charge},
     channel::Endpoint,
     clock::Timer,
     interrupt::Interrupt,
     memory::{DeviceMemory, MemoryObject, Pin, Pinned},
+    plane::SlotEnd,
     process::{Process, Thread},
     signal::Signaller,
 };
@@ -35,22 +37,32 @@ pub struct Resource {
     /// the device is done with them (SDD 25, f.4): their pages stay allocated, and
     /// mapped for the device, until `dma_release`. Empty for every other kind.
     pub quarantine: SpinLock<Vec<Pinned>>,
+    _charge: Charge,
 }
 
 /// The most pins one DMA resource keeps in quarantine; `memory_pin` is `Limit` beyond.
 pub const QUARANTINE_MAX: usize = 4096;
 
+const _: () = assert!(core::mem::size_of::<Resource>() as u64 <= charge::OBJECT);
+const _: () = assert!(core::mem::size_of::<Console>() as u64 <= charge::OBJECT);
+
 impl Resource {
-    pub fn new(kind: ResourceKind, range: Range<u64>) -> Resource {
-        Resource {
+    /// A resource of `kind` over `range`, its record charged to `account`.
+    pub fn new(
+        kind: ResourceKind,
+        range: Range<u64>,
+        account: &Arc<Account>,
+    ) -> Result<Resource, Error> {
+        Ok(Resource {
             kind,
             range,
             quarantine: SpinLock::new(Vec::new()),
-        }
+            _charge: Charge::new(account, charge::OBJECT)?,
+        })
     }
 
     /// The root resource of `kind`, covering everything of that kind.
-    pub fn root(kind: ResourceKind) -> Resource {
+    pub fn root(kind: ResourceKind, account: &Arc<Account>) -> Result<Resource, Error> {
         let range = match kind {
             ResourceKind::Process => 0..0,
             ResourceKind::DeviceMemory => 0..resource_range::DEVICE_END,
@@ -58,7 +70,7 @@ impl Resource {
             ResourceKind::Msi => 0..resource_range::MSI_END,
             ResourceKind::Dma => 0..resource_range::DMA_END,
         };
-        Resource::new(kind, range)
+        Resource::new(kind, range, account)
     }
 
     /// Whether `start .. start + len` lies inside this resource's range.
@@ -82,6 +94,10 @@ pub enum Object {
     Resource(Arc<Resource>),
     /// Held for its drop, which hands the pages to the quarantine.
     Pin(#[expect(dead_code, reason = "held for its drop")] Arc<Pin>),
+    /// The engine's end of a data-plane slot (ABI 2.1).
+    Slot(Arc<SlotEnd>),
+    /// A memory account (ABI 2.3).
+    Account(Arc<Account>),
 }
 
 impl Object {
@@ -97,6 +113,8 @@ impl Object {
             Object::Console(_) => ObjectType::Console,
             Object::Resource(_) => ObjectType::Resource,
             Object::Pin(_) => ObjectType::Pin,
+            Object::Slot(_) => ObjectType::Slot,
+            Object::Account(_) => ObjectType::Account,
         }
     }
 
@@ -108,11 +126,13 @@ impl Object {
             Object::Channel(e) => Some(e.signaller()),
             Object::Timer(t) => Some(&t.signaller),
             Object::Interrupt(i) => Some(&*i.signaller),
+            Object::Slot(s) => Some(s.0.signaller()),
             Object::Memory(_)
             | Object::DeviceMemory(_)
             | Object::Console(_)
             | Object::Resource(_)
-            | Object::Pin(_) => None,
+            | Object::Pin(_)
+            | Object::Account(_) => None,
         }
     }
 
@@ -124,11 +144,14 @@ impl Object {
             | ObjectType::Thread
             | ObjectType::Channel
             | ObjectType::Timer
-            | ObjectType::Interrupt => base | Rights::READ | Rights::WRITE | Rights::WAIT,
+            | ObjectType::Interrupt
+            | ObjectType::Slot => base | Rights::READ | Rights::WRITE | Rights::WAIT,
             ObjectType::Memory | ObjectType::DeviceMemory => {
                 base | Rights::READ | Rights::WRITE | Rights::MAP
             }
             ObjectType::Console | ObjectType::Resource => base | Rights::WRITE,
+            // Read its figures; carve from it, or charge a process or memory to it.
+            ObjectType::Account => base | Rights::READ | Rights::WRITE,
             // A pin is only ever closed; closing needs no right.
             ObjectType::Pin => Rights::NONE,
         }

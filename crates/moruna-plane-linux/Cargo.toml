@@ -1,0 +1,25 @@
+[package]
+name = "moruna-plane-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The data-plane port on Linux (SDD 29 d.4, KA2): batches in sealed memfds moved between sandboxed tasks with no copy, the record checked after the producer has lost write access, and the task library a sandboxed program calls batch_get, batch_put and port_call through"
+
+[dependencies]
+moruna-plane = { workspace = true }
+moruna-abi = { workspace = true }
+# A record's framing, and a stream re-laid as records (`stream`).
+moruna-ipc-check = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+moruna-plane = { workspace = true, features = ["model"] }
+moruna-testkit = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+seccompiler = { workspace = true }

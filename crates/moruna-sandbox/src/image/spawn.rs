@@ -53,15 +53,24 @@ pub struct Plan {
     pub filters: Vec<BpfProgram>,
 }
 
-/// A started image: its process and the three pipes.
+/// How the command's batches cross (SDD 19 f.6, SDD 29 f.8).
+pub enum Streams {
+    /// As Arrow IPC streams on its standard input and output.
+    Stdio,
+    /// By the plane's three calls on descriptor 3, the plane socket given here; its standard
+    /// input is `/dev/null` and its standard output joins its standard error.
+    Plane(OwnedFd),
+}
+
+/// A started image: its process and its pipes.
 pub struct Spawned {
     /// The process Moruna reaps.
     pub pid: libc::pid_t,
-    /// What Moruna writes the command's input to.
-    pub stdin: File,
-    /// What Moruna reads the command's output from.
-    pub stdout: File,
-    /// The command's standard error.
+    /// What Moruna writes the command's input to, when it reads its batches there.
+    pub stdin: Option<File>,
+    /// What Moruna reads the command's output from, when it writes its batches there.
+    pub stdout: Option<File>,
+    /// The command's standard error (and its standard output, when it uses the plane).
     pub stderr: OwnedFd,
 }
 
@@ -76,28 +85,50 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Start the image's process (SDD 19 f.5): fork, and in the child confine and execute.
-pub fn spawn(plan: &Plan) -> io::Result<Spawned> {
+pub fn spawn(plan: &Plan, streams: Streams) -> io::Result<Spawned> {
     use std::os::fd::AsRawFd;
-    let (in_r, in_w) = pipe()?;
-    let (out_r, out_w) = pipe()?;
     let (err_r, err_w) = pipe()?;
+    // What the child is given (it holds them across the fork), its descriptors 0 to 2 (and 3,
+    // the plane) in order, and what Moruna keeps.
+    let (given, raw, stdin, stdout) = match streams {
+        Streams::Stdio => {
+            let (in_r, in_w) = pipe()?;
+            let (out_r, out_w) = pipe()?;
+            let raw = vec![in_r.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()];
+            (
+                vec![in_r, out_w],
+                raw,
+                Some(File::from(in_w)),
+                Some(File::from(out_r)),
+            )
+        }
+        Streams::Plane(socket) => {
+            let null = OwnedFd::from(File::open("/dev/null")?);
+            let raw = vec![
+                null.as_raw_fd(),
+                err_w.as_raw_fd(),
+                err_w.as_raw_fd(),
+                socket.as_raw_fd(),
+            ];
+            (vec![null, socket], raw, None, None)
+        }
+    };
     // What the child needs to ask the system about, asked here.
     // SAFETY: getuid and getgid take nothing and cannot fail.
     let (outer_uid, outer_gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let rootfs_flags = inherited_flags(&plan.rootfs)?;
-    let ends = [in_r.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()];
     // SAFETY: the child (below) touches only memory this thread owns and calls the system; it
     // never returns into the parent's code, and ends with `_exit`.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
-        0 => middle(plan, ends, (outer_uid, outer_gid), rootfs_flags),
+        0 => middle(plan, &raw, (outer_uid, outer_gid), rootfs_flags),
         pid => {
-            drop((in_r, out_w, err_w));
+            drop((given, err_w));
             Ok(Spawned {
                 pid,
-                stdin: File::from(in_w),
-                stdout: File::from(out_r),
+                stdin,
+                stdout,
                 stderr: err_r,
             })
         }
@@ -126,8 +157,8 @@ fn must<T>(step: &str, r: io::Result<T>) -> T {
 
 /// The first child: descriptors, signals, the cgroup, the namespaces, the identity, then the
 /// second child; and it waits for that one.
-fn middle(plan: &Plan, ends: [RawFd; 3], outer: (u32, u32), rootfs_flags: libc::c_ulong) -> ! {
-    must("descriptors", stdio(ends));
+fn middle(plan: &Plan, ends: &[RawFd], outer: (u32, u32), rootfs_flags: libc::c_ulong) -> ! {
+    must("descriptors", descriptors(ends));
     // SAFETY: setrlimit with a pointer to a struct on this stack, and signal calls with
     // integers; nothing but this process is touched.
     unsafe {
@@ -198,20 +229,29 @@ fn reflect(child: libc::pid_t) -> ! {
     }
 }
 
-/// Descriptors 0, 1 and 2 are the three pipes; every other descriptor is closed.
-fn stdio(ends: [RawFd; 3]) -> io::Result<()> {
-    for (target, fd) in ends.iter().enumerate() {
-        let target = target as RawFd;
-        // SAFETY: dup2 and fcntl on descriptors this process holds.
-        unsafe {
-            if *fd == target {
-                libc::fcntl(*fd, libc::F_SETFD, 0);
-            } else if libc::dup2(*fd, target) == -1 {
-                return Err(io::Error::last_os_error());
-            }
+/// `ends` become descriptors 0, 1, 2 (and 3), in order; every other descriptor is closed.
+/// Each is moved above them first, so that one already at a target is not overwritten before
+/// it is placed.
+fn descriptors(ends: &[RawFd]) -> io::Result<()> {
+    let mut high = [0 as RawFd; 4];
+    if ends.len() > high.len() {
+        return Err(io::Error::other("more than four descriptors"));
+    }
+    for (h, fd) in high.iter_mut().zip(ends) {
+        // SAFETY: fcntl F_DUPFD on a descriptor this process holds.
+        *h = unsafe { libc::fcntl(*fd, libc::F_DUPFD, 100) };
+        if *h < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
-    close_from(3)
+    for (target, fd) in high[..ends.len()].iter().enumerate() {
+        // SAFETY: dup2 of a descriptor this process holds onto a small number; the copy is not
+        // close-on-exec, so the command has it.
+        if unsafe { libc::dup2(*fd, target as RawFd) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    close_from(ends.len() as u32)
 }
 
 /// `close_range(first, ~0, 0)`.

@@ -203,8 +203,9 @@ import json, os, pathlib, sys, time
 import pyarrow as pa, pyarrow.ipc as ipc
 import moruna
 
-SPLITS, SPLIT_ROWS = 40, 500
+SPLITS, SPLIT_ROWS, HOLD = 40, 500, 12
 out, staging, mode = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+holding = out.parent / "holding"
 
 
 class Numbers(moruna.Source):
@@ -217,6 +218,20 @@ class Numbers(moruna.Source):
     def read(self, split_id, start, end):
         base = split_id * SPLIT_ROWS
         return pa.record_batch({"id": pa.array(range(base + start, base + end), pa.int64())})
+
+
+@moruna.kernel
+def hold(batch):
+    # The first run cannot end: the morsel holding the first row of split HOLD says so in a
+    # file and waits for the parent's SIGKILL. The morsels before it pass, reach the sink and
+    # its manifests, and the drives and the checkpoint thread are free, so the kill lands
+    # mid-run because the run cannot get past the hold, not because the host was slow.
+    ids = batch.column("id")
+    if mode == "fresh" and len(ids) and ids[0].as_py() <= HOLD * SPLIT_ROWS <= ids[-1].as_py():
+        holding.touch()
+        while True:
+            time.sleep(1)
+    return batch
 
 
 class Files(moruna.Sink):
@@ -234,7 +249,6 @@ class Files(moruna.Sink):
             writer.write_batch(batch)
         os.replace(tmp, self.dir / name)
         self.names.append(name)
-        time.sleep(0.05)
 
     def checkpoint(self):
         return json.dumps(self.names).encode()
@@ -247,7 +261,7 @@ class Files(moruna.Sink):
                 path.unlink()
 
 
-report = moruna.run(Numbers(), [], Files(out), staging_dir=staging, staging_limit="2GiB",
+report = moruna.run(Numbers(), [hold], Files(out), staging_dir=staging, staging_limit="2GiB",
                    checkpoint_interval=0.5, resume=None if mode == "fresh" else "auto")
 print(json.dumps({"exit": report.exit, "resumed": report.resumed, "run_id": report.run_id}))
 """
@@ -266,14 +280,19 @@ def test_a_killed_run_resumes_into_a_sink_that_checkpoints(scratch: pathlib.Path
     child = subprocess.Popen(  # noqa: S603
         [*run, "fresh"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
+    holding = scratch / "holding"
     try:
+        # The hold, every split before it written, and a manifest: the run is stopped at a known
+        # point, and nothing it does next can end it.
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline and child.poll() is None:
             written = len(list(out.glob("part-*.arrow")))
-            if written >= 12 and any(staging.rglob("manifest.json")):
+            if holding.exists() and written >= 12 and any(staging.rglob("manifest.json")):
                 break
             time.sleep(0.02)
-        assert child.poll() is None, f"the run ended before it could be killed: {child.stderr}"
+        assert child.poll() is None, f"the held run ended: {child.communicate()}"
+        assert holding.exists(), "the run never reached the hold"
+        assert any(staging.rglob("manifest.json")), "the held run wrote no manifest"
         child.send_signal(signal.SIGKILL)
         child.wait(timeout=30)
     finally:
@@ -281,7 +300,7 @@ def test_a_killed_run_resumes_into_a_sink_that_checkpoints(scratch: pathlib.Path
             child.kill()
     assert child.returncode == -signal.SIGKILL
     before = len(list(out.glob("part-*.arrow")))
-    assert 0 < before < 40, before
+    assert 12 <= before < 40, before
 
     resumed = subprocess.run(  # noqa: S603
         [*run, "resume"], capture_output=True, text=True, check=False, timeout=300

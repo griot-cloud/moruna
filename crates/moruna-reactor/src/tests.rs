@@ -336,6 +336,9 @@ impl FileEngine for FlakyEngine {
     fn name(&self) -> &'static str {
         "flaky"
     }
+    fn terminal_failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A file engine that holds every request for a while before delegating, so a test can be sure
@@ -362,6 +365,9 @@ impl FileEngine for SlowEngine {
 
     fn name(&self) -> &'static str {
         "slow"
+    }
+    fn terminal_failure(&self) -> Option<String> {
+        None
     }
 }
 
@@ -1619,6 +1625,9 @@ impl FileEngine for SilentEngine {
     fn name(&self) -> &'static str {
         "silent"
     }
+    fn terminal_failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// G-I8 at start: a host that will not give the reactor a thread is diagnosed, not signalled.
@@ -1669,6 +1678,9 @@ impl FileEngine for HoldingEngine {
 
     fn name(&self) -> &'static str {
         "holding"
+    }
+    fn terminal_failure(&self) -> Option<String> {
+        None
     }
 }
 
@@ -2144,4 +2156,76 @@ fn re_t14_a_callback_registered_late_runs_on_a_reactor_thread() {
     assert!(ok, "the write succeeded");
     assert!(elsewhere, "the late callback ran on the registering thread");
     reactor.shutdown();
+}
+
+/// The controlled engine reports its identity but performs no kernel IO. Only construction
+/// and actual FD-flag refusal are tested here, never physical uring/direct behavior.
+#[cfg(target_os = "linux")]
+#[test]
+fn re_t22_strict_storage_refuses_probed_paths_and_buffered_descriptors() {
+    use std::os::fd::OwnedFd;
+    struct Controlled(HoldingEngine);
+    impl FileEngine for Controlled {
+        fn submit(&self, req: FileReq, done: Done) {
+            self.0.submit(req, done);
+        }
+        fn name(&self) -> &'static str {
+            "uring"
+        }
+        fn terminal_failure(&self) -> Option<String> {
+            None
+        }
+    }
+    let alloc = FakeAllocator::new();
+    for guarantee in [Guarantee::Probed(true), Guarantee::Present] {
+        let mut host = profile(Guarantee::Probed(false));
+        host.io_uring = guarantee;
+        host.direct_io_staging = guarantee;
+        let engine = Arc::new(Controlled(HoldingEngine::default()));
+        let reactor = build(
+            config(host),
+            &alloc,
+            Hooks {
+                force_uring: true,
+                engine: Some(engine.clone()),
+                ..Hooks::default()
+            },
+        );
+        let strict = reactor.strict_storage();
+        if guarantee == Guarantee::Probed(true) {
+            assert!(matches!(
+                strict,
+                Err(MorunaError::Config {
+                    name: "raw_storage",
+                    ..
+                })
+            ));
+        } else {
+            let dir = scratch_dir("strict-buffered-refusal");
+            let path = dir.join("buffered");
+            write_file(&path, &[0; 4096]);
+            let fd = Arc::new(OwnedFd::from(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap(),
+            ));
+            assert!(matches!(
+                strict.unwrap().bind(fd),
+                Err(MorunaError::Config {
+                    name: "raw_storage",
+                    ..
+                })
+            ));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        assert_eq!(
+            engine.0.held(),
+            0,
+            "no rejected operation reached the engine"
+        );
+        assert_eq!(reactor.stats().fallbacks, 0);
+        reactor.shutdown();
+    }
 }

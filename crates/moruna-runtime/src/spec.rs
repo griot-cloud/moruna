@@ -170,6 +170,9 @@ pub struct RunSpec {
     /// The packaged kernels among them (16, 17), which the facade binds to the run's gate,
     /// sampler and limits.
     pub packaged: Vec<crate::packaged::Packaged>,
+    /// The ports of the stages that call any (MH 4.10), which the facade binds to the run's
+    /// cancel and its waits.
+    pub ports: Vec<Arc<moruna_kernel::StagePorts>>,
     /// The outputs, sink 0 first; each wrapped into a `SinkHandle` by the facade.
     pub sinks: Vec<SinkSpec>,
     /// The engine memory of each source that is an engine running operators of its own (a
@@ -207,6 +210,8 @@ pub struct RunSpec {
     pub ordered: bool,
     /// Which decision function sizes morsels.
     pub sizer: SizerKind,
+    /// `scheduler.policy`: the scheduling policy, by its registered name (contracts d.18).
+    pub policy: String,
     /// The profile store; `None` disables it.
     pub profiles_dir: Option<PathBuf>,
     /// Credentials and endpoints for object URLs.
@@ -265,6 +270,7 @@ impl RunSpec {
             #[cfg(feature = "python")]
             py_kernels: Vec::new(),
             packaged: Vec::new(),
+            ports: Vec::new(),
             sinks,
             engine_memory: Vec::new(),
             sink_memory: Vec::new(),
@@ -279,6 +285,7 @@ impl RunSpec {
             error_policy: ErrorPolicy::Terminate,
             ordered: false,
             sizer: SizerKind::Rule,
+            policy: moruna_scheduler::policies::ADMISSION.to_string(),
             // `None` is the preamble's default, which the facade resolves and creates
             // (12 f.1): one owner, and a caller that wants a different store says so.
             profiles_dir: None,
@@ -309,6 +316,12 @@ pub fn default_profiles_dir() -> Option<PathBuf> {
 /// step, so the startup order is observable with instrumented fakes.
 #[derive(Default)]
 pub struct Components {
+    /// Scoped native portable checkpoint authority; raw staging URLs cannot replace it.
+    pub checkpoints: Option<Arc<crate::portable::Publisher>>,
+    /// Explicit authorized required historical logical-row capture, independent of logs/spill.
+    pub history: Option<Arc<crate::history::Historical>>,
+    /// Shared registration/live cost authority with one identity per executable kernel stage.
+    pub learning: Option<crate::cost::RunLearning>,
     /// Skips the discovery step.
     pub discovered: Option<Discovered>,
     /// Skips the arena step.

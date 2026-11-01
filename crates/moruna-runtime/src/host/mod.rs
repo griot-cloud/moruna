@@ -7,8 +7,11 @@
 //! `moruna-py`'s, and it calls [`cli::main`] with a registry that adds the Python kinds.
 
 pub mod cli;
+pub mod events;
+pub mod launch_witness;
 pub mod lifecycle;
 pub mod logs;
+pub mod native;
 pub mod ports;
 pub mod protocol;
 pub mod session;

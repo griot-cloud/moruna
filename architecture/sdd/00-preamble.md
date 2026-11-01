@@ -65,6 +65,7 @@ graph LR
   sinks["moruna-sinks (8)"]
   placement["moruna-placement (9)"]
   scheduler["moruna-scheduler (10)"]
+  cost["moruna-cost (24)"]
   controller["moruna-controller (11)"]
   runtime["moruna-runtime (facade)"]
   py["moruna-py (12)"]
@@ -91,6 +92,8 @@ graph LR
   scheduler --> kernel
   scheduler -.->|dyn Placement| placement
   scheduler -->|SinkHandle, ReorderBuffer| sinks
+  scheduler -->|Online, the simulator: KD7c| cost
+  controller -->|Online, the model sizer: KD7c| cost
   runtime --> arena
   runtime --> discovery
   runtime --> trace
@@ -403,12 +406,15 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 moruna/
   Cargo.toml                 workspace; members below; shared [workspace.dependencies] with pinned versions
   crates/
-    moruna-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 only.
+    moruna-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 and moruna-types only.
+    moruna-types/             the type grammar of a schema declaration (MH 4.9), read and written without Arrow; depends on nothing (01 CT-I16, 22 JB-I15; added 2026-10-29, KA6)
     moruna-arena/             component 2
     moruna-discovery/         component 3
     moruna-trace/             component 4
     moruna-adapters/          component 5: the Python kernel adapter only (feature: python)
-    moruna-reactor/           component 6
+    moruna-reactor/           component 6; consumes the shared storage host-proxy connector
+    moruna-storage-format/    component 32: no_std + alloc identity and durable frame codec, shared by host/native-node adapters
+    moruna-storage/           component 32: governed bucket storage, encrypted cache, checkpoint/artifact publication and strict raw IO adapter
     moruna-sources/           component 7
     moruna-sinks/             component 8
     moruna-placement/         component 9
@@ -423,7 +429,7 @@ moruna/
     moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux); component 19's `ImageKernel`
     moruna-image/             component 19: an OCI layout read, verified and unpacked into a root (pure Rust; added 2026-10-28)
     moruna-record/            component 21: the record layout and the multi-producer ring that carries it (no dependency; added 2026-10-28)
-    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars and thiserror only (added 2026-10-28)
+    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars, thiserror, flatbuffers, flexbuffers and moruna-types only (added 2026-10-28)
     moruna-plan/              component 26: the plan document, the planner port and the `levels` planner, `explain`, `check_plan`; depends on moruna-job, flatbuffers, serde, serde_json, sha2 and thiserror (added 2026-10-29)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
@@ -486,6 +492,16 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `lz4_flex` | 1 (and the testkit) | Arrow IPC `LZ4_FRAME` buffers: the frame decoder behind the checked inflation of contracts e.8 | `default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"]`; already in the graph through arrow-ipc's compression, so one version; added with KA10 |
 | `zstd` | 1 (and the testkit) | Arrow IPC `ZSTD` buffers: the frame's content size and the bounded one-shot decompressor of contracts e.8 | `default-features = false`; the version arrow-ipc uses; added with KA10 |
 | `flatbuffers` | 1 (and the testkit) | the record batch message that describes an inflated batch (contracts e.8): the builders arrow-ipc generated, which need the crate they were generated for | `default-features = false`; the version arrow-ipc uses; added with KA10 |
+
+KS1 direct-use additions approved by the integrating PM on 2026-10-30 use packages already locked and cached; they change no existing version, source or checksum. The new graph adds `moruna-storage-format` and `moruna-storage`, moves the socket connector's existing HTTP dependencies to storage, and enables zeroize edges on AES, AES-GCM, BLAKE3 and arrayvec. The format crate has no SDK/filesystem/Tokio dependency and does not globally enable its optional pure-hash feature on host builds.
+
+| dependency | component | direct purpose | exact existing pin and features |
+|---|---|---|---|
+| `aes-gcm` | 32 portable cache | authenticated workspace/node-epoch cache encryption | 0.10.3; default features off, `aes`, `alloc`, `zeroize` |
+| `aes` | 32 portable cache | AES-256 key schedule with zeroizing Drop, not only zeroizing input bytes | 0.8.4; `zeroize` |
+| `ghash` | 32 portable cache | enable zeroization of the existing GCM authentication state, not a new algorithm | 0.5.1; default features off, `zeroize`; approved 2026-10-30 |
+| `polyval` | 32 portable cache | enable zeroizing Drop in the authoritative supported backend; nonzeroizing backend selection is refused | 0.6.2; default features off, `zeroize`; approved 2026-10-30 |
+| `zeroize` | 32 portable cache | scoped workspace/node/derived keys and keyed-hash state | 1.9.0; `alloc`; upstream AES enables target-specific support |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
 

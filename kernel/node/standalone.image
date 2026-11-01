@@ -1,0 +1,35 @@
+# Production assembly: only the node owner starts in the initial manifest.
+# package.py validates node.conf/initial.job/engine.conf with their actual parsers.
+# All data assets below must be supplied explicitly; no fixture cloud/layer/key is
+# generated. Driver table data and driver images are emitted by moruna-image.
+moruna-image 1
+process node-supervisor
+  handle console console
+  handle root.process root.process
+  handle root.device root.device
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma
+  handle program:devices image.devices
+  handle program:imagefs image.imagefs
+  handle program:linux image.linux
+  handle program:netstack image.netstack
+  handle program:node-admission image.admission
+  handle program:engine image.engine
+  handle program:storage image.storage
+  handle data:node.conf config
+  handle data:initial.job initial.job
+  handle data:engine.conf engine.config
+  handle data:engine.bindings engine.bindings
+  handle data:storage.conf storage.config
+  handle data:storage.grants storage.grants
+  handle data:storage.admission storage.admission
+  handle data:image.record initial.image
+  handle data:linux.layers linux.layers
+  handle data:network.conf network.config
+  handle data:tls.roots tls.roots
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1053 virtio-vsock vsock
+  driver 1af4:1041 virtio-net net
+  driver 1b36:0010 nvme nvme
+  driver 1ae0:0042 gve net

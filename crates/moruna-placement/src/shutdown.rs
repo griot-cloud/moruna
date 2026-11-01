@@ -22,25 +22,33 @@ impl PlacementEngine {
             moves.clear();
             held
         };
-        for (slot, bytes) in reservations {
-            self.release(slot, bytes);
-        }
         self.in_flight_bytes.store(0, Ordering::Release);
+        {
+            let mut catalog = self.lock_catalog();
+            for (slot, bytes) in reservations {
+                catalog.unreserve(slot, bytes);
+            }
+            // A promotion in flight stays where its bytes were; a demotion in flight stays
+            // resident (f.15). Neither loses bytes, because the reactor was given a view, not the
+            // buffer (RE-I1).
+            let moving: Vec<_> = catalog
+                .buffers()
+                .into_iter()
+                .filter(|buffer| buffer.state.in_flight())
+                .map(|buffer| buffer.id)
+                .collect();
+            for id in moving {
+                catalog.update(id, |buffer| {
+                    buffer.state = buffer.state.source_state(buffer.disk);
+                    buffer.move_id = None;
+                });
+            }
+        }
         for index in 0..self.queues.len() {
             let waiters = {
                 let mut queue = self.lock_queue(index);
-                for entry in queue.order.iter_mut() {
-                    // A promotion in flight stays where its bytes were; a demotion in flight
-                    // stays resident (f.15). Neither loses bytes, because the reactor was
-                    // given a view, not the buffer (RE-I1).
-                    if entry.state.in_flight() {
-                        let disk = entry.disk;
-                        entry.state = entry.state.source_state(disk);
-                        entry.move_id = None;
-                    }
-                }
                 queue.closed = true;
-                let _ = std::mem::replace(&mut queue.blocked, true);
+                queue.blocked = true;
                 queue.waiters.clone()
             };
             for (_, waiter) in waiters {

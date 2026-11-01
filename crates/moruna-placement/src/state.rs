@@ -1,12 +1,15 @@
-//! The entry state machine (09 e.1) and the payload an entry holds (e.2).
+//! The state machine of a batch's bytes (09 e.1), the payload the catalog holds for a batch, and
+//! the queue entry that names a batch (e.2, f.18).
 
 use std::sync::Arc;
 
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    ManagedTensor, Morsel, MorselFeatures, MorunaError, NodeId, Origin, Payload, PayloadKind,
-    PayloadSpec, RemoteRef, SegmentRef, Seq, StageId, Tier, TierPref,
+    ManagedTensor, Morsel, MorselFeatures, NodeId, Origin, Payload, PayloadKind, PayloadSpec,
+    RemoteRef, SegmentRef, Seq, StageId, Tier, TierPref,
 };
+
+use crate::catalog::BufferId;
 
 /// The number of states an entry can be in (e.1), which is the width of the
 /// `entries_by_state` histogram of section j.
@@ -158,45 +161,13 @@ impl EntryPayload {
         }
     }
 
-    /// Take the payload apart into the contract's `Payload`. On failure the payload comes
-    /// back untouched, so the entry that held it loses nothing.
-    pub fn into_payload(self) -> Result<Payload, (EntryPayload, MorunaError)> {
+    /// A consumer's share of the bytes as the contract's `Payload` (f.3, CT-I15): the batch's
+    /// buffers or the tensor's bytes, shared and never copied, so a take never waits for a DMA
+    /// view a completion still holds to go.
+    pub fn share(&self) -> Payload {
         match self {
-            EntryPayload::Table(batch, tier) => {
-                // The tier tag is the arena's (CT-I2): the batch's buffers came from the
-                // arena or from a reactor read into an arena buffer, so the safe constructor
-                // infers the same tier the entry recorded. Cloning a batch is a refcount
-                // bump, so the payload survives a refusal.
-                match Payload::table(batch.clone()) {
-                    Ok(payload) if payload.tier() == tier => Ok(payload),
-                    Ok(payload) => {
-                        let found = payload.tier();
-                        Err((
-                            EntryPayload::Table(batch, tier),
-                            MorunaError::Staging(format!(
-                                "entry recorded {tier:?} but its buffers are in {found:?}"
-                            )),
-                        ))
-                    }
-                    Err(error) => Err((EntryPayload::Table(batch, tier), error)),
-                }
-            }
-            // `try_unwrap` hands the handle back when a DMA view of the tensor is still
-            // alive, which is the one case in which the entry must keep its bytes and the
-            // caller must try again.
-            EntryPayload::Tensor(tensor, tier) => match Arc::try_unwrap(tensor) {
-                Ok(tensor) => {
-                    let tier = tensor.tier();
-                    Ok(Payload::Tensor(tensor, tier))
-                }
-                Err(tensor) => Err((
-                    EntryPayload::Tensor(tensor, tier),
-                    MorunaError::Staging(
-                        "a DMA view of this tensor is still alive; the move has not released it"
-                            .into(),
-                    ),
-                )),
-            },
+            EntryPayload::Table(batch, tier) => Payload::Table(batch.clone(), *tier),
+            EntryPayload::Tensor(tensor, tier) => Payload::Tensor(tensor.share(), *tier),
         }
     }
 }
@@ -230,177 +201,34 @@ impl PayloadRef {
     }
 }
 
-/// The entries of one fan-out (d.16): a batch pushed into several queues is resident once and
-/// each entry holds a share of it. Each queue counts the bytes, for its own water marks, and the
-/// engine's `shared_bytes` holds what that counts beyond the one residency, so the tier's total
-/// is exact (PL-I3). An entry leaves the group when its share leaves the tier (popped, demoted,
-/// evicted, moved), and the last one to leave takes the bytes with it.
-#[derive(Debug)]
-pub struct Group {
-    /// The batch's bytes.
-    pub bytes: u64,
-    /// The tier slot it is resident in.
-    pub slot: usize,
-    /// Entries still holding their share in that tier.
-    members: std::sync::atomic::AtomicUsize,
-}
-
-impl Group {
-    /// An empty group over `bytes` in tier slot `slot`; each entry joins as it is pushed.
-    pub fn new(bytes: u64, slot: usize) -> Arc<Group> {
-        Arc::new(Group {
-            bytes,
-            slot,
-            members: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-
-    /// One more entry holds a share, counted into its queue: what `shared` counts beyond the
-    /// one residency rises by the share when another entry already holds one.
-    pub fn join(
-        self: &Arc<Self>,
-        shared: &[std::sync::atomic::AtomicU64; moruna_kernel::TIER_COUNT],
-    ) -> Arc<Group> {
-        let before = self
-            .members
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if before >= 1
-            && let Some(cell) = shared.get(self.slot)
-        {
-            cell.fetch_add(self.bytes, std::sync::atomic::Ordering::AcqRel);
-        }
-        Arc::clone(self)
-    }
-
-    /// One entry's share left the tier. While another entry still holds a share the bytes stay
-    /// resident, so what `shared` counts beyond the one residency falls by the share.
-    pub fn leave(&self, shared: &[std::sync::atomic::AtomicU64; moruna_kernel::TIER_COUNT]) {
-        let before = self
-            .members
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        if before > 1
-            && let Some(cell) = shared.get(self.slot)
-        {
-            cell.fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |held| Some(held.saturating_sub(self.bytes)),
-            )
-            .ok();
-        }
-    }
-}
-
-/// One queued morsel with its placement state; identified by `(stage, seq)` (b).
+/// One queued morsel: its place in its queue and the batch it names (b, f.18). Where the batch's
+/// bytes are, its disk copy and its move in flight are the catalog's, kept once for every queue
+/// the batch waits in (PL-I18); the entry keeps only what is the morsel's own on this queue.
 pub struct Entry {
-    /// The sequence number the source assigned.
+    /// The sequence number on this queue.
     pub seq: Seq,
     /// The stage whose output this is.
     pub stage: StageId,
     /// The lineage of the morsel (CT-I12).
     pub origin: Origin,
-    /// `payload.bytes()` at push; the figure every tier counter moves by.
-    pub bytes: u64,
     /// The features the morsel carried, moved back into it at `pop`.
     pub features: MorselFeatures,
-    /// Table or tensor.
-    pub kind: PayloadKind,
-    /// The bytes, while the entry has any.
-    pub payload: Option<EntryPayload>,
-    /// Where the bytes are and what is in flight (e.1).
-    pub state: State,
-    /// The queue is one a source gives, so the bytes can be read again (b, D5).
-    pub recomputable: bool,
-    /// The fan-out this entry's bytes are shared with, while they are (d.16, f.9).
-    pub group: Option<Arc<Group>>,
-    /// The segment record holding a copy of these bytes, when there is one.
-    pub disk: Option<SegmentRef>,
-    /// The move in flight for this entry, when there is one (PL-I2).
-    pub move_id: Option<u64>,
+    /// The batch in the catalog.
+    pub buffer: BufferId,
 }
 
 impl Entry {
-    /// An entry over a freshly pushed morsel, one of a fan-out's when `group` is given.
-    pub fn new(morsel: Morsel, recomputable: bool, group: Option<Arc<Group>>) -> Entry {
-        let Morsel {
-            seq,
-            stage,
-            payload,
-            bytes,
-            origin,
-            features,
-        } = morsel;
-        let kind = payload.kind();
-        let payload = EntryPayload::from(payload);
-        let tier = payload.tier();
-        Entry {
-            seq,
-            stage,
-            origin,
-            bytes,
-            features,
-            kind,
-            payload: Some(payload),
-            state: State::Resident(tier),
-            recomputable,
-            group,
-            disk: None,
-            move_id: None,
-        }
-    }
-
-    /// An entry a `restore` rebuilt from a manifest record: bytes on disk, no arena buffer.
-    pub fn on_disk(
-        seq: Seq,
-        stage: StageId,
-        origin: Origin,
-        bytes: u64,
-        kind: PayloadKind,
-        seg: SegmentRef,
-        recomputable: bool,
-    ) -> Entry {
-        Entry {
-            seq,
-            stage,
-            origin,
-            bytes,
-            features: MorselFeatures::default(),
-            kind,
-            payload: None,
-            state: State::OnDisk(seg),
-            recomputable,
-            group: None,
-            disk: Some(seg),
-            move_id: None,
-        }
-    }
-
-    /// Rebuild the morsel this entry holds, for `pop`. Moves the payload and the features
-    /// out of the entry, so the pop path allocates nothing (l). On failure the entry keeps
-    /// its payload and its features, so nothing is lost and the caller may try again.
-    pub fn take_morsel(&mut self) -> Result<Morsel, MorunaError> {
-        let Some(payload) = self.payload.take() else {
-            return Err(MorunaError::Staging(format!(
-                "pop: entry {} of stage {} has no resident bytes",
-                self.seq, self.stage
-            )));
-        };
-        let payload = match payload.into_payload() {
-            Ok(payload) => payload,
-            Err((payload, error)) => {
-                self.payload = Some(payload);
-                return Err(error);
-            }
-        };
+    /// Rebuild the morsel this entry names from a consumer's share of its batch, for `pop`.
+    /// Moves the features out of the entry, so the pop path allocates nothing (l).
+    pub fn into_morsel(mut self, payload: Payload) -> Morsel {
         let bytes = payload.bytes();
-        let features = std::mem::take(&mut self.features);
-        Ok(Morsel {
+        Morsel {
             seq: self.seq,
             stage: self.stage,
             payload,
             bytes,
-            origin: self.origin.clone(),
-            features,
-        })
+            origin: self.origin,
+            features: std::mem::take(&mut self.features),
+        }
     }
 }

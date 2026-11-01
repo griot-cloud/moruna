@@ -19,6 +19,7 @@ use moruna_job::JobSpec;
 use moruna_kernel::{CancelToken, Kernel};
 use moruna_runtime::host::cli;
 use moruna_runtime::host::exit;
+use moruna_runtime::host::protocol;
 use moruna_runtime::host::session::{self, HEARTBEAT, read_report_file};
 use moruna_runtime::host::transport::{self, Address};
 use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
@@ -190,16 +191,14 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(read_back_rows(&out2), rows);
 }
 
-/// Read every message until `exit`, with the instant each arrived.
+/// Read every message until `exit`, with the instant each arrived; an event's frame is read as
+/// the JSON its record renders.
 fn drain(reader: &mut dyn BufRead) -> Vec<(Instant, Value)> {
     let mut messages = Vec::new();
-    let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return messages,
-            Ok(_) => {
-                let value: Value = serde_json::from_str(&line).expect("a JSON line");
+        match protocol::read_json_message(reader) {
+            Ok(None) | Err(_) => return messages,
+            Ok(Some(value)) => {
                 let last = value["type"] == "exit";
                 messages.push((Instant::now(), value));
                 if last {
@@ -211,9 +210,9 @@ fn drain(reader: &mut dyn BufRead) -> Vec<(Instant, Value)> {
 }
 
 fn read_one(reader: &mut dyn BufRead) -> Value {
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("a line");
-    serde_json::from_str(&line).expect("a JSON line")
+    protocol::read_json_message(reader)
+        .expect("a message")
+        .expect("a message before the end")
 }
 
 /// The next message that is not an `event`.
@@ -701,12 +700,14 @@ fn ho_t13_report_file_placement() {
         None,
         &kinds(),
         &session::HostOptions {
+            cost: None,
             strict: true,
             env: &no_env,
             cancel: CancelToken::new(),
             heartbeat: HEARTBEAT,
             packages: moruna_runtime::packaged::PackageHost::default(),
             capture_process: false,
+            events: Default::default(),
         },
     );
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
@@ -778,7 +779,7 @@ fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     assert_eq!(start.len(), 32);
     let mut last_t = 0;
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e["v"], 6, "{e}");
+        assert_eq!(e["v"], 7, "{e}");
         assert_eq!(e["attempt"], attempt, "{e}");
         assert_eq!(e["start"], start.as_str(), "{e}");
         assert_eq!(e["seq"], i as u64 + 1, "{e}");

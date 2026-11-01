@@ -1,6 +1,6 @@
-//! What a virtio device is to the transport: its id, features, config space and queues,
-//! independent of how the guest reaches it. `virtio-mmio` ([`super::mmio`]) is the only
-//! transport today; a PCI transport later would drive the same trait.
+//! The shared virtio device contract, independent of how the guest reaches it.
+//! The real vhost-user backend and the legacy x86 test MMIO transport drive the
+//! same features, configuration and queue implementation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -134,7 +134,7 @@ pub fn read_config_bytes(src: &[u8], offset: u64, data: &mut [u8]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
     use crate::testing::counting_irq;

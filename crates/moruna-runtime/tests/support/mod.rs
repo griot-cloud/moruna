@@ -467,6 +467,12 @@ pub struct Printer {
     fingerprint: Fingerprint,
     flood: usize,
     ms: u64,
+    /// A stage's workers share its output streams, which are byte streams: what one worker
+    /// writes in two calls another may write between. A kernel whose output must be whole (a
+    /// character split across two writes, a line in two halves) writes it holding this, as any
+    /// program that shares a stream between threads must; HO-T21 asserts what the store does with
+    /// whole output, not what threads do to a shared stream.
+    output: std::sync::Mutex<()>,
 }
 
 impl Printer {
@@ -476,6 +482,7 @@ impl Printer {
             fingerprint: Fingerprint::compute("moruna-runtime::tests::Printer", b"v1"),
             flood,
             ms,
+            output: std::sync::Mutex::new(()),
         }
     }
 }
@@ -525,6 +532,7 @@ impl Kernel for Printer {
                 .map(|c| c.value(0)),
             _ => None,
         };
+        let printing = self.output.lock().unwrap_or_else(|e| e.into_inner());
         write(
             Stream::Stdout,
             format!("row-value:{}\n", first.unwrap_or(-1)).as_bytes(),
@@ -546,6 +554,7 @@ impl Kernel for Printer {
         for _ in 0..self.flood {
             write(Stream::Stdout, line.as_bytes());
         }
+        drop(printing);
         if self.ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.ms));
         }
@@ -586,6 +595,7 @@ where
             deterministic: Fact::No,
             preserves_columns: Fact::No,
             isolation: Isolation::Imported,
+            served: None,
         }
     }
 
@@ -656,6 +666,7 @@ impl<T> Handed<T> {
             deterministic: Fact::No,
             preserves_columns: Fact::No,
             isolation: Isolation::Caller,
+            served: None,
         }
     }
 }

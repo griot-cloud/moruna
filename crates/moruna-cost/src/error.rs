@@ -66,6 +66,19 @@ pub enum CostError {
         #[source]
         source: std::io::Error,
     },
+    /// A unit that can never start: what it needs does not fit the run's memory (SDD 24 CM-I14).
+    #[error("task `{task}` is infeasible: a unit needs {needs} bytes and {reason}")]
+    Infeasible {
+        /// The task, by name.
+        task: String,
+        /// The bytes a unit of it needs at once.
+        needs: f64,
+        /// Why that cannot be had.
+        reason: String,
+    },
+    /// A workload the simulator cannot run, or a simulation that cannot go on.
+    #[error("simulation refused: {0}")]
+    Simulation(String),
     /// A whole record of the store that cannot be read as an observation of this build.
     #[error("observation store {} at byte {offset}: {reason}", path.display())]
     Unreadable {

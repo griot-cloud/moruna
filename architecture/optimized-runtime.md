@@ -83,13 +83,14 @@ Not from nothing. Two Rust kernels implement the Linux syscall interface already
 
 Batches never travel through a pipe or a socket inside the VM. They sit in pages.
 
-- The engine owns an arena: a region of the VM's memory, backed by huge pages, with a fixed budget.
+- The engine owns an arena: memory objects of the VM's memory, within a fixed budget, made once and used again as windows and batches. Large pages are the aim; the kernel gives 4 KiB pages until its hardware layer maps large ones for a process (SDD 29 m.1).
 - A batch is one Arrow IPC record in the page-aligned framing the engine already writes (`moruna-kernel/src/ipc.rs`): every buffer starts on a page boundary, so a buffer can be mapped, written by direct IO, or handed to a device with no copy.
-- `batch_get(slot) -> (ptr, len)`: the kernel maps the batch's pages into the calling task read-only and returns where. The task reads the Arrow arrays in place.
-- `batch_put(slot, ptr, len)`: the task hands back a region it was granted write access to. The kernel checks the record's framing (the schema, every node and buffer, no compression) before the engine sees it, unmaps it from the task, and marks it ready. A record that fails the check ends the task with the reason.
+- `batch_get(slot) -> (ptr, len)`: the kernel maps the batch's pages into the calling task read-only and returns where, releasing the slot's previous batch. The task reads the Arrow arrays in place. On an output slot it maps the task's window, writable.
+- `batch_put(slot, ptr, len)`: the task hands back the record it wrote in its window. The kernel unmaps the window from the task and gives it to the engine, which checks the record's framing (the schema, every node and buffer, no compression, no dictionaries) before anything else of it sees the record: the bytes checked are bytes no task can write any more. A record that fails the check ends the task with the reason. The kernel itself reads no record (SDD 29 f.3).
 - `port_call(port, ptr, len) -> (ptr, len)`: the one non-Arrow channel. The bytes go to the engine, which forwards them over vsock to the embedder's agent, which applies its policy. The task blocks until the answer is mapped in.
+- A batch offered to several tasks is the same pages mapped read only into each, freed once, after the last.
 
-The three syscalls are the only way bytes leave a task. `write` to fd 1 and 2 goes to the log, with the existing rules: whole lines, rate limits, drops counted. That is the "only Arrow flows" guarantee, enforced by the kernel rather than by inspection.
+The three syscalls are the only way bytes leave a task. `write` to fd 1 and 2 goes to the log as records in a ring the engine reads (SDD 29 f.7): whole lines, drops counted. That is the "only Arrow flows" guarantee, enforced by the kernel rather than by inspection.
 
 Spill goes the same way: a batch evicted from the arena is written to the data disk by the engine through virtio-blk with direct IO, and read back into the arena when needed. Later, a GPU or a DMA engine is another consumer of the same pages.
 
@@ -170,10 +171,10 @@ What a task can do is the table in section 3, and nothing else. What stands betw
 | the monitor, `moruna-vmm` | exists; gains virtio-shm and per-layer block devices |
 | the engine | exists; moves from pipes and seccomp to slots and the three syscalls |
 | the page-aligned Arrow record | exists (`ipc.rs`); becomes the data plane's unit |
-| the record check | exists (the IPC check); moves into the kernel's `batch_put` |
+| the record check | exists (the IPC check), now `no_std` and shared; runs in the engine on what `batch_put` handed back, before the engine sees it (SDD 29) |
 | wasm kind | exists; unchanged |
 | the kernel | built, from Asterinas or Hermit |
-| the three channel syscalls | built |
+| the three channel syscalls | built (KD1, SDD 29) |
 | the overlay filesystem over layer devices | built |
 | the image builder and `@moruna.kernel` | built; the current `.pex` packaging is its first, Python-only form |
 | the conformance suite across kinds | built |

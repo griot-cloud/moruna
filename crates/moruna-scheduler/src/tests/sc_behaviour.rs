@@ -12,7 +12,7 @@ use moruna_kernel::{
 use moruna_sinks::SinkHandle;
 use moruna_testkit::{FakeKernel, FakePlacement, FakeSink, FakeSource};
 
-use super::common::{RigBuilder, StatefulKernel, cfg, manifest_lock};
+use super::common::{RigBuilder, StatefulKernel, cfg, manifest_lock, wait_for};
 use crate::{Pipeline, RunOutcome, Scheduler, SchedulerConfig};
 
 /// h: zero splits. Q0 closes at once, the queues close in order and the sink finishes empty.
@@ -131,7 +131,9 @@ fn sc_h_sink_failure_terminates() {
 }
 
 /// f.8: `Knobs::terminate` takes the terminate path from the controller's thread, whatever the
-/// error policy says.
+/// error policy says. The terminate is sent once the run is running, not after a sleep: on a
+/// loaded host the run's thread had not reached `run` 20 ms after it was spawned, the terminate
+/// landed in `Init`, and `run` then refused to start, which is right and is not this test.
 #[test]
 fn sc_h_controller_terminate() {
     let rig = RigBuilder::new()
@@ -146,7 +148,14 @@ fn sc_h_controller_terminate() {
         .go();
     let outcome = std::thread::scope(|scope| {
         let handle = scope.spawn(|| rig.scheduler.run(CancelToken::new()));
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            wait_for(Duration::from_secs(30), || rig
+                .scheduler
+                .shared()
+                .run_state()
+                .is_live()),
+            "the run never started"
+        );
         rig.scheduler
             .terminate(MorunaError::Staging("the controller said so".into()));
         match handle.join() {

@@ -142,6 +142,16 @@ impl TargetFit {
         }
     }
 
+    /// Forget the level (SDD 24 f.11): the intercept's variance back to its prior, so the next
+    /// units move the level as the first units did, while the slopes keep what they learned. A
+    /// key found drifting has most often changed its level (the same work, slower or faster), and
+    /// forgetting the level follows that within a few units where forgetting alone takes tens.
+    /// Adding to a diagonal keeps the covariance positive semi-definite.
+    pub fn forget_level(&mut self) {
+        let d = self.p[0];
+        self.p[0] = d.max(p0(0));
+    }
+
     /// Units observed.
     pub fn n(&self) -> u64 {
         self.n

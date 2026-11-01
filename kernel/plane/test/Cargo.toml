@@ -1,0 +1,16 @@
+[package]
+name = "plane-test"
+description = "The boot's tests of the data plane (SDD 29 k): an engine on moruna-plane, and the tasks it runs: zero copy, fan-out, the check's refusals, isolation, port calls, throughput, and an unmodified Arrow program through the Linux personality"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-sys = { workspace = true, features = ["heap"] }
+moruna-svc.workspace = true
+moruna-plane.workspace = true
+moruna-ipc-check.workspace = true
+linux-protocol = { path = "../../linux/protocol", version = "=0.1.0" }
+moruna-record = { path = "../../../crates/moruna-record", version = "=0.5.9", default-features = false }

@@ -1,7 +1,8 @@
 //! The lock order of preamble 4.2, checked at run time.
 //!
 //! The engine's locks are, in order: a queue (position 2 of the preamble's list), the lineage
-//! index (2b), the roll guard and the moves map and the segments map (3). A lock is taken
+//! index (2b), the buffer catalog (2c), the roll guard and the moves map and the segments map
+//! (3). A lock is taken
 //! only when every lock this thread already holds sits earlier in that order; anything else
 //! is counted and, in a debug build, asserted. PL-T23 and PL-T15 read the counter.
 
@@ -12,12 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const QUEUE: u32 = 1;
 /// The lineage index (position 2b).
 pub const LINEAGE: u32 = 2;
+/// The buffer catalog (position 2c, f.18).
+pub const CATALOG: u32 = 3;
 /// The guard that serialises opening a segment (position 3).
-pub const ROLL: u32 = 3;
+pub const ROLL: u32 = 4;
 /// The moves map (position 3).
-pub const MOVES: u32 = 4;
+pub const MOVES: u32 = 5;
 /// The segments map (position 3).
-pub const SEGMENTS: u32 = 5;
+pub const SEGMENTS: u32 = 6;
 
 static VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 

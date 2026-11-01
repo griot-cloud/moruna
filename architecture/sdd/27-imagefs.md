@@ -1,7 +1,7 @@
 # Moruna SDD 27: The image filesystem (`kernel/imagefs`, `moruna-image::layerfile`)
 
 **Document type:** software design document, component 27
-**Status:** DRAFT · 2026-10-29 (becomes HANDOFF-READY when section m is empty; the human flips it)
+**Status:** DRAFT (amended by KD2, 2026-10-29: `moruna.imagefs` 1.1, `rename` in the scratch directory, SDD 30 f.9; 1.2, `layers`, and a layer's id its seal, checked at mount, SDD 30 f.12) · 2026-10-29 (becomes HANDOFF-READY when section m is empty; the human flips it)
 **Parent:** `BOARD.md` section EK, item KC2 (Brackly, 2026-10-28): "the image filesystem server: layers as block devices, one overlay, whiteouts, paging on demand"; `architecture/optimized-runtime.md` section 3 (the filesystem) and section 7 (images); SDD 25 section o (what KC2 needs of the block protocol); SDD 19 IM-O2 (layers as shared read-only devices)
 **Decisions:** none new; MK1 (OSTD) stands
 **Component location:** `kernel/imagefs/fs` (`moruna-imagefs`: the format, the reader, the merge, the paths, the page cache, the scratch directory; `no_std`, host tested), `kernel/imagefs/protocol` (`imagefs-protocol`: `moruna.imagefs` and its conformance suite), `kernel/imagefs/server` (`imagefs`, the server process), `kernel/imagefs/test` (`imagefs-test`, the boot's client); the block protocol's registered buffers in `kernel/drivers/block-protocol` and `kernel/drivers/virtio-blk` (SDD 25 d.3, f.9); `crates/moruna-image/src/layerfile.rs` (the writer, the conversion, the host reader) and `src/bin/moruna-layer.rs`; the boot's layer disks in `kernel/tools/{build,boot}.sh` and `kernel/initramfs/boot.image`; the image tool's `data:` handles (`kernel/tools/image`)
@@ -36,7 +36,7 @@ It refuses to know: the Linux system call interface (KC1 translates it into this
 
 ## d. Interfaces
 
-### d.1 `moruna.imagefs` 1.0 (`imagefs-protocol`)
+### d.1 `moruna.imagefs` 3.0 (`imagefs-protocol`)
 
 ```rust
 1  => fn open(path: Bytes, flags: u32, mode: u32) -> (u32, Stat);
@@ -51,14 +51,17 @@ It refuses to know: the Linux system call interface (KC1 translates it into this
 10 => fn close(file: u32) -> ();
 11 => fn mkdir(path: Bytes, mode: u32) -> ();
 12 => fn remove(path: Bytes) -> ();
-13 => fn quota(bytes: u64) -> ();
 14 => fn stats() -> Stats;
+15 => fn rename(from: Bytes, to: Bytes) -> ();
+16 => fn scratch_account(account: Handle) -> ();
+17 => fn layers() -> Vec<Bytes>;
+18 => fn export_directory(path: Bytes) -> Channel;
 errors { 1 NotFound; 2 NotDirectory; 3 IsDirectory; 4 ReadOnly; 5 NoSpace; 6 Exists;
          7 NotEmpty; 8 BadPath; 9 Loop; 10 BadFile; 11 BadRange; 12 TooLarge; 13 Corrupt;
          14 Io; 15 TooManyFiles; 16 Unsupported; }
 ```
 
-A connection is one task. Paths are absolute byte strings of at most 4096 bytes without NUL. `open` flags: `WRITE` 1, `CREATE` 2, `EXCLUSIVE` 4, `TRUNCATE` 8, `DIRECTORY` 16, `NOFOLLOW` 32; an unknown flag is `Unsupported`; `WRITE`, `TRUNCATE` and `CREATE` of a new file reach only the scratch directory; `NOFOLLOW` on a symbolic link is `Loop`, as `O_NOFOLLOW` is. A file number is the connection's (at most 1024 open). `Stat` is `kind` (1 directory, 2 regular, 3 symbolic link), `mode` (permission bits), `size` (a link's target length), `ino` (unique over the image: layer and node; the scratch directory's and the mount points' in ranges of their own). `readdir` lists a directory as it was at its first `readdir` after `open`, in name order, at most 48 KiB of entries an answer; the next cookie, and no entries at the end. `read` answers at most `READ_MAX` (32 KiB), fewer at the end, none past it. `map`'s offset is on a page and its length 1 byte to 256 MiB, inside the file's pages; the memory object is read only, holds the file's bytes and zeros after its end; a scratch file is `Unsupported`. `quota` is accepted only before the scratch directory is first used, and at most 1 GiB; until then it is 64 MiB (SDD 19's `TMP_BYTES`). `Stats` counts the cache's hits, misses, evictions and refused pages, the pages read from the devices and the requests that read them, the cache's resident and total slots, and the mappings served again, read into, and copied from the cache.
+A connection is one task. Paths are absolute byte strings of at most 4096 bytes without NUL. `open` flags: `WRITE` 1, `CREATE` 2, `EXCLUSIVE` 4, `TRUNCATE` 8, `DIRECTORY` 16, `NOFOLLOW` 32; an unknown flag is `Unsupported`; `WRITE`, `TRUNCATE` and `CREATE` of a new file reach only the scratch directory; `NOFOLLOW` on a symbolic link is `Loop`, as `O_NOFOLLOW` is. A file number is the connection's (at most 1024 open). `Stat` is `kind` (1 directory, 2 regular, 3 symbolic link), `mode` (permission bits), `size` (a link's target length), `ino` (unique over the image: layer and node; the scratch directory's and the mount points' in ranges of their own). `readdir` lists a directory as it was at its first `readdir` after `open`, in name order, at most 48 KiB of entries an answer; the next cookie, and no entries at the end. `read` answers at most `READ_MAX` (32 KiB), fewer at the end, none past it. `map`'s offset is on a page and its length 1 byte to 256 MiB, inside the file's pages; the memory object is read only, holds the file's bytes and zeros after its end; the imagefs `map` RPC maps immutable image files only and a scratch regular file returns `Unsupported`. Linux readonly mmap of a scratch-backed asset uses bounded `read` RPCs into a private child-account mapping and then removes write permission; writable asset mappings are refused. This does not add scratch support to the imagefs `map` RPC or claim zero-copy asset mapping. `scratch_account` accepts an actual charged Account capability before scratch use; there is no numeric quota RPC. `layers` returns the actual mounted seals. `export_directory` resolves and pins a real directory and returns an unconnected imagefs3 readonly view channel sharing the source Scratch store and Account lifetime. Mutations and write-open are refused; absolute links restart at that capability root and parent escape is refused. Both old majors are rejected at hello. See SDD33 for actor-local `/assets` assembly and bounded dispatcher reservation. `Stats` counts the cache's hits, misses, evictions and refused pages, the pages read from the devices and the requests that read them, the cache's resident and total slots, and the mappings served again, read into, and copied from the cache.
 
 `Bytes` is a `Vec<u8>` on the wire, moved as one run.
 
@@ -83,7 +86,7 @@ pub fn read(layers: &[PathBuf]) -> Result<BTreeMap<String, Item>>;    // the mer
 | slot | what |
 |---|---|
 | `console` | the debug console |
-| `layers` | a memory object: `moruna-layers 1`, then `layer SERVICE SHA256` a line, lowest layer first |
+| `layers` | a memory object: `moruna-layers 1`, then `layer SERVICE SEAL` a line, lowest layer first; a layer's seal is the SHA-256 of its header page (`Header::seal`), its id, which the server checks the device's layer against as it mounts it and refuses otherwise, naming both |
 | `directory` | the device manager's directory, for each `SERVICE` |
 | `listen*` | listeners; every connection on any is a task |
 
@@ -148,13 +151,19 @@ The server keeps at most 256 mappings and 64 MiB of them, keyed by (layer, node,
 
 ### f.1 Conversion
 
-`convert` reads the manifest and config, then for each layer in order: applies it to a working root with SDD 19's own unpacking (`unpack::apply_layer`, f.2 there: the digest checked, parents resolved through the root's links, whiteouts and opaque markers applied, special bits dropped, devices skipped); takes a snapshot of the root (every path's kind, mode, inode and device); and writes the difference from the snapshot before:
+`convert` reads the manifest and config, then for each layer in order: applies it to a working root with SDD 19's own unpacking (`unpack::apply_layer`, f.2 there: the digest checked, parents resolved through the root's links, whiteouts and opaque markers applied, special bits dropped, devices skipped), which returns a record of what it did; and writes the difference from that record. The record (`Applied`) holds the resolved paths, relative to the root, that the unpacking touched:
 
-- an entry for every path whose inode, device or kind changed, whose mode changed, or that lies under a directory marked opaque, with its parent directories (their current modes) as the entries that hold it;
-- a directory marked opaque when it replaced something below (a new inode where the layers below had a path), or when every entry the layers below had in it is gone or replaced;
-- a whiteout for every path the layers below had that is gone, whose parent is still there, unchanged and not opaque (a removed tree is one whiteout at its top).
+- `written`: every path it created or replaced, of any kind, including a directory it names that was already there (it sets the mode), a directory it made on the way to an entry, and a hard link; a path it made and later removed is not there;
+- `removed`: every path of the layers below that a whiteout or an opaque marker removed, and everything under a removed directory; a path the layer made itself is never there;
+- `opaque`: the directories that hide what the layers below held in them: one with an opaque marker, one made where a non-directory was, and one made where the same layer had removed that path.
 
-Unpacking never rewrites a file in place (it removes and makes it), so a changed path is a new inode, and an unchanged one is the same inode. A file's bytes are read from the working root; a file of mode 0 is made readable for the read and given its mode back. After the last layer, SDD 19 f.3's mount point check runs, so an image SDD 19 refuses is refused here. The result is IF-I3 by construction: merging the differences top down is applying the layers.
+The difference is:
+
+- an entry for every written path, with its kind, mode and contents read from the working root as the layer left it, with its parent directories (their current modes) as the entries that hold it, and, under a directory marked opaque, an entry for every path that is there, because what the marker leaves in a directory the layer named is what the layer must state;
+- a directory marked opaque for every opaque directory of the record;
+- a whiteout for every removed path that is gone, whose parent is still a directory there and is not opaque nor under one (a removed tree is one whiteout at its top).
+
+The difference does not come from comparing the root before and after the layer: a filesystem may give a file that a layer replaces the inode of the file it removed (ext4 does), and then no comparison of inodes sees the change. A record naming a path the working root does not hold is an error. A file's bytes are read from the working root; a file of mode 0 is made readable for the read and given its mode back. After the last layer, SDD 19 f.3's mount point check runs, so an image SDD 19 refuses is refused here. The result is IF-I3 by construction: merging the differences top down is applying the layers.
 
 ### f.2 Writing
 
@@ -178,7 +187,7 @@ A path is split on `/`; empty parts and `.` are dropped. Each part is looked for
 
 ### f.7 The scratch directory
 
-Each connection has its own. An entry costs 256 bytes and its name; a file its bytes; a write that grows a file charges the growth first and is refused whole when it would pass the quota. A file removed while open keeps its bytes (and its charge) until its last close. There are no links and no renames.
+Each connection has its own. An entry costs 256 bytes and its name; a file its bytes; a write that grows a file charges the growth first and is refused whole when it would pass the quota. A file removed while open keeps its bytes (and its charge) until its last close. There are no links. `rename` (1.1, SDD 30 f.9) moves an entry within the scratch directory with Linux's meaning: a file replaces a file, a directory an empty directory, a directory never into itself; the new name is charged and the old one given back, a replaced entry's charge goes with it, and an open entry replaced lives until its last close (IF-T20); a rename out of the scratch directory or into the image is `ReadOnly`.
 
 ### f.8 Registered buffers (block protocol 1.1)
 
@@ -206,7 +215,7 @@ Host tests run with `cargo test -p moruna-imagefs` in `kernel/` (and in CI's ker
 
 | id | test | where | asserts |
 |---|---|---|---|
-| IF-T1 | `if_t1_*` | `moruna-image` | a tree written reads back as it was through the host reader, whiteout and opaque flag in the file, hard links sharing extents, zero pages holes; the id is the file's SHA-256; the same tree writes the same bytes; trees a layer cannot hold are refused and leave nothing |
+| IF-T1 | `if_t1_*` | `moruna-image` | a tree written reads back as it was through the host reader, whiteout and opaque flag in the file, hard links sharing extents, zero pages holes; the id is the seal, the SHA-256 of the file's header page; the same tree writes the same bytes; trees a layer cannot hold are refused and leave nothing |
 | IF-T2 | `if_t2_*` | `moruna-image` | three layers of SDD 19's tests (IM-T2 to IM-T5's entries, links of a lower layer followed, hard links, modes of 0 and setuid, an empty layer, a whiteout of every root entry) converted and merged equal SDD 19's unpacking, path for path |
 | IF-T3 | `if_t3_*` | `moruna-image` | sixty seeded random trees: every file reads back, and its first page that is not a hole is a whole page of the layer file's data region |
 | IF-T4 | `if_t4_*` | `moruna-image`, `moruna-imagefs` | a byte of a layer file changed at a seeded place, 300 and 400 times, is refused (`Corrupt`), never a panic; a cut file, a missing one, and well hashed files that break the format (children out of order, a cycle, a mode with setuid, extents short of the file, a name with `/`, a target with NUL) are refused |
@@ -224,7 +233,12 @@ Host tests run with `cargo test -p moruna-imagefs` in `kernel/` (and in CI's ker
 | IF-T16 | scratch and read only | boot: `imagefs-test` | `KC2 scratch: ok:`: `/tmp` refuses the write past a 64 KiB quota with `NoSpace` and keeps its length; another connection does not see the file; opening an image file to write or truncate, making a file or a directory in the image, removing an image file and removing `/tmp` are each `ReadOnly`, and the file reads as before |
 | IF-T17 | the suite | boot: `imagefs-test` | `KC2 conformance moruna.imagefs: ok:`: SV-T7's shared checks and the protocol's own (the root's listing, bad paths and file numbers, the image read only, the scratch directory's life, the quota, `map` against `read` and its refusals, unknown flags, `stats`) |
 | IF-T18 | `if_t18_*` | `tools/image` | `data:` handles carry a file of the build's data directory once at `data/PATH`; paths that could leave it, and a file that is not there, are refused |
+| IF-T20 | `if_t20_*` | `moruna-imagefs` | `Scratch::rename` (1.1, SDD 30): across directories, over a file, to itself, every refusal, a directory over an empty one, an open file replaced, the quota held, nothing left charged; the suite's `rename` case (KD2-T10) |
 | IF-T19 | registered buffers | boot: `block-test` | DR-T10's suite (block 1.1) against `block0`: `read_at` into a registered buffer's third page holds what `read` gives; every refusal (not DMA, no `WRITE`, no registration, past the registration, bad count, past the disk, read only, after `unregister`); a sector written from one registration reads back through another; at most 64 registrations |
+| IF-T20 | `if_t20_*` | `moruna-image` | a layer that replaces a file with another of the same size is recorded as having written it, and the merged tree shows the upper layer's bytes, whichever inode the filesystem gave the new file |
+| IF-T21 | `if_t21_*` | `moruna-image` | a symbolic link replaced by a file (not written through), a directory replaced by a file, and a file replaced by a link are recorded as written and merge as unpacked |
+| IF-T22 | `if_t22_*` | `moruna-image` | the record's shape over whiteouts, opaque markers, directories made where a file or a removed name was, parents made on the way, and paths made and removed in one layer; an opaque directory, the root included, states what it keeps of the layers below |
+| IF-T23 | `if_t23_*` | `moruna-image` | a record naming a path the working root does not hold is an error that names it |
 
 Coverage on the host (`cargo llvm-cov`, lines): `moruna-imagefs` 98.3%, `moruna-image` 92.4% (m.4).
 
@@ -259,4 +273,4 @@ Coverage on the host (`cargo llvm-cov`, lines): `moruna-imagefs` 98.3%, `moruna-
 
 ## o. Deferred
 
-**IF-O1. A pager** (m.2): mappings that page in on touch. **IF-O2. Concurrent requests** (m.3). **IF-O3. Layers shared across images**: the server serves one image's layers; several images over shared layers is one server with a list per image, keyed as the cache already is. **IF-O4. Links and renames in the scratch directory**, which KC1 may need for some programs. **IF-O5. The layer id checked**: the server takes the id with the device and checks every page against the header's root, not the header against the id; making the id the hash of the header page would let the server check a layer end to end without reading it.
+**IF-O1. A pager** (m.2): mappings that page in on touch. **IF-O2. Concurrent requests** (m.3). **IF-O3. Layers shared across images**: the server serves one image's layers; several images over shared layers is one server with a list per image, keyed as the cache already is. **IF-O4. Links in the scratch directory**, which KC1 may need for some programs; renames are 1.1's (SDD 30). IF-O5 (the layer id checked) is done (KD2, SDD 30 f.12): a layer's id is its seal, the hash of its header page, which the server checks at mount, and every page is checked against the root the header carries, so a layer is checked end to end without being read; `layers` (1.2) reports the seals.

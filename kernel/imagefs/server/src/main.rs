@@ -1,7 +1,9 @@
 //! The image filesystem server (SDD 27): every task's root filesystem.
 //!
 //! It starts with an ordered list of block services and layer ids, lowest first (the
-//! slot `layers`), looks each service up in the device manager's directory, and
+//! slot `layers`; a layer's id is its seal, the hash of its header page, which it checks
+//! each device's layer against as it mounts it), looks each service up in the device
+//! manager's directory, and
 //! registers one DMA memory object, the page cache's slots, with every layer's
 //! driver, so the cache is pinned once and never per request. It mounts each layer
 //! by reading its header, and from then on reads a page only when something touches
@@ -11,7 +13,8 @@
 //! the object is kept so a second mapping of the same pages is the same memory.
 //!
 //! Each connection is one task, with its own open files and its own scratch
-//! directory at `/tmp`. The server ends when its last client and listener have gone.
+//! directory at `/tmp`, whose bytes are memory objects charged to the directory's
+//! account (`pages`). The server ends when its last client and listener have gone.
 
 #![no_std]
 #![no_main]
@@ -45,9 +48,11 @@ use moruna_imagefs::{
     volume::{FileMap, Pages},
 };
 use moruna_svc::{
-    CallError, Channel, Console, Context, DEADLINE_INFINITE, Dispatcher, Encoder, Mapping, Memory,
-    Rights, Wire, deadline_in, map as mapflags, println, start,
+    Account, CallError, Channel, Console, Context, DEADLINE_INFINITE, Dispatcher, Encoder, Handle,
+    Mapping, Memory, Rights, Wire, deadline_in, map as mapflags, println, start,
 };
+
+mod pages;
 
 moruna_svc::main!(run);
 
@@ -254,6 +259,8 @@ struct Shared {
     map_pages_read: u64,
     map_pages_copied: u64,
     served: u64,
+    capacity: Option<moruna_svc::WatchCapacity>,
+    views: Vec<(Channel, Task, moruna_svc::WatchPermit)>,
 }
 
 impl Shared {
@@ -428,7 +435,9 @@ enum Open {
 /// One task's connection.
 struct Task {
     shared: Rc<RefCell<Shared>>,
-    scratch: Scratch,
+    scratch: Rc<RefCell<Scratch>>,
+    root: Option<Place>,
+    readonly: bool,
     files: BTreeMap<u32, Open>,
     next: u32,
 }
@@ -457,10 +466,13 @@ impl Task {
 
     /// A directory's entries, listed once and kept with the open file.
     fn listing(&mut self, file: u32) -> Result<Vec<Dirent>, imagefs::Error> {
+        let scratch_owner = self.scratch.clone();
+        let scratch = scratch_owner.borrow();
+
         let shared = self.shared.clone();
         let mut sh = shared.borrow_mut();
         let sh = &mut *sh;
-        let scratch = &self.scratch;
+        let scratch = &scratch;
         let open = self.files.get_mut(&file).ok_or(imagefs::Error::BadFile)?;
         let (place, slot) = match open {
             Open::Image { place, listing, .. } => (place.clone(), listing),
@@ -494,6 +506,13 @@ impl imagefs::Server for Task {
         flags: u32,
         mode: u32,
     ) -> Result<(u32, Stat), imagefs::Error> {
+        if self.readonly && flags & (open::WRITE | open::CREATE | open::TRUNCATE) != 0 {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         if flags & !open::ALL != 0 {
             return Err(imagefs::Error::Unsupported);
         }
@@ -507,9 +526,14 @@ impl imagefs::Server for Task {
         let found = {
             let tree = Tree {
                 overlay: &sh.overlay,
-                scratch: &self.scratch,
+                scratch: &scratch,
             };
-            tree.resolve(&mut sh.cache, &path.0, flags & open::NOFOLLOW == 0)
+            tree.resolve_at(
+                &mut sh.cache,
+                self.root.as_ref(),
+                &path.0,
+                flags & open::NOFOLLOW == 0,
+            )
         };
         let place = match found {
             Ok(place) => {
@@ -522,22 +546,20 @@ impl imagefs::Server for Task {
                 let parent = {
                     let tree = Tree {
                         overlay: &sh.overlay,
-                        scratch: &self.scratch,
+                        scratch: &scratch,
                     };
                     tree.parent(&mut sh.cache, &path.0)
                 };
                 match parent.map_err(|e| sh.fail(e))? {
-                    (Place::Scratch(dir), name) => Place::Scratch(
-                        self.scratch
-                            .create(dir, &name, mode)
-                            .map_err(|e| sh.fail(e))?,
-                    ),
+                    (Place::Scratch(dir), name) => {
+                        Place::Scratch(scratch.create(dir, &name, mode).map_err(|e| sh.fail(e))?)
+                    }
                     _ => return Err(imagefs::Error::ReadOnly),
                 }
             }
             Err(e) => return Err(sh.fail(e)),
         };
-        let directory = place.is_directory(&self.scratch);
+        let directory = place.is_directory(&scratch);
         if matches!(place, Place::Image(Found::Symlink { .. })) {
             // O_NOFOLLOW on a symbolic link.
             return Err(imagefs::Error::Loop);
@@ -551,9 +573,9 @@ impl imagefs::Server for Task {
         let open = match place {
             Place::Scratch(id) => {
                 if flags & open::TRUNCATE != 0 {
-                    self.scratch.truncate(id, 0).map_err(|e| sh.fail(e))?;
+                    scratch.truncate(id, 0).map_err(|e| sh.fail(e))?;
                 }
-                self.scratch.open(id).map_err(|e| sh.fail(e))?;
+                scratch.open(id).map_err(|e| sh.fail(e))?;
                 Open::Scratch {
                     id,
                     write,
@@ -568,8 +590,8 @@ impl imagefs::Server for Task {
             },
         };
         let stat = match &open {
-            Open::Image { place, .. } => place.stat(&self.scratch),
-            Open::Scratch { id, .. } => Place::Scratch(*id).stat(&self.scratch),
+            Open::Image { place, .. } => place.stat(&scratch),
+            Open::Scratch { id, .. } => Place::Scratch(*id).stat(&scratch),
         }
         .map_err(|e| sh.fail(e))?;
         let number = self.next;
@@ -584,33 +606,33 @@ impl imagefs::Server for Task {
         path: Bytes,
         follow: bool,
     ) -> Result<Stat, imagefs::Error> {
+        let scratch_owner = self.scratch.clone();
+        let scratch = scratch_owner.borrow();
+
         let shared = self.shared.clone();
         let mut sh = shared.borrow_mut();
         let sh = &mut *sh;
         let tree = Tree {
             overlay: &sh.overlay,
-            scratch: &self.scratch,
+            scratch: &scratch,
         };
         let place = tree
-            .resolve(&mut sh.cache, &path.0, follow)
+            .resolve_at(&mut sh.cache, self.root.as_ref(), &path.0, follow)
             .map_err(|e| sh.fail(e))?;
-        place
-            .stat(&self.scratch)
-            .map(stat_of)
-            .map_err(|e| sh.fail(e))
+        place.stat(&scratch).map(stat_of).map_err(|e| sh.fail(e))
     }
 
     fn fstat(&mut self, _: &mut Context<'_>, file: u32) -> Result<Stat, imagefs::Error> {
+        let scratch_owner = self.scratch.clone();
+        let scratch = scratch_owner.borrow();
+
         let place = match self.file(file)? {
             Open::Image { place, .. } => place.clone(),
             Open::Scratch { id, .. } => Place::Scratch(*id),
         };
         let shared = self.shared.clone();
         let sh = shared.borrow();
-        place
-            .stat(&self.scratch)
-            .map(stat_of)
-            .map_err(|e| sh.fail(e))
+        place.stat(&scratch).map(stat_of).map_err(|e| sh.fail(e))
     }
 
     fn readdir(
@@ -636,14 +658,17 @@ impl imagefs::Server for Task {
     }
 
     fn readlink(&mut self, _: &mut Context<'_>, path: Bytes) -> Result<Bytes, imagefs::Error> {
+        let scratch_owner = self.scratch.clone();
+        let scratch = scratch_owner.borrow();
+
         let shared = self.shared.clone();
         let mut sh = shared.borrow_mut();
         let sh = &mut *sh;
         let tree = Tree {
             overlay: &sh.overlay,
-            scratch: &self.scratch,
+            scratch: &scratch,
         };
-        tree.readlink(&mut sh.cache, &path.0)
+        tree.readlink_at(&mut sh.cache, self.root.as_ref(), &path.0)
             .map(Bytes)
             .map_err(|e| sh.fail(e))
     }
@@ -666,6 +691,7 @@ impl imagefs::Server for Task {
             Open::Scratch { id, .. } => {
                 return self
                     .scratch
+                    .borrow()
                     .read(*id, offset, len as usize)
                     .map(Bytes)
                     .map_err(|e| sh.fail(e));
@@ -720,13 +746,16 @@ impl imagefs::Server for Task {
         offset: u64,
         len: u64,
     ) -> Result<Memory, imagefs::Error> {
+        let scratch_owner = self.scratch.clone();
+        let scratch = scratch_owner.borrow();
+
         let shared = self.shared.clone();
         let mut sh = shared.borrow_mut();
         let sh = &mut *sh;
         let open = self.files.get_mut(&file).ok_or(imagefs::Error::BadFile)?;
         let (place, map) = match open {
             Open::Scratch { id, .. } => {
-                return Err(if self.scratch.info(*id).is_ok_and(|i| i.directory) {
+                return Err(if scratch.info(*id).is_ok_and(|i| i.directory) {
                     imagefs::Error::IsDirectory
                 } else {
                     imagefs::Error::Unsupported
@@ -778,6 +807,13 @@ impl imagefs::Server for Task {
         offset: u64,
         data: Bytes,
     ) -> Result<u32, imagefs::Error> {
+        if self.readonly {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         let Open::Scratch {
             id, write: true, ..
         } = self.file(file)?
@@ -787,7 +823,7 @@ impl imagefs::Server for Task {
         let id = *id;
         let shared = self.shared.clone();
         let sh = shared.borrow();
-        self.scratch
+        scratch
             .write(id, offset, &data.0)
             .map(|n| n as u32)
             .map_err(|e| sh.fail(e))
@@ -799,6 +835,13 @@ impl imagefs::Server for Task {
         file: u32,
         size: u64,
     ) -> Result<(), imagefs::Error> {
+        if self.readonly {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         let Open::Scratch {
             id, write: true, ..
         } = self.file(file)?
@@ -808,13 +851,16 @@ impl imagefs::Server for Task {
         let id = *id;
         let shared = self.shared.clone();
         let sh = shared.borrow();
-        self.scratch.truncate(id, size).map_err(|e| sh.fail(e))
+        scratch.truncate(id, size).map_err(|e| sh.fail(e))
     }
 
     fn close(&mut self, _: &mut Context<'_>, file: u32) -> Result<(), imagefs::Error> {
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         match self.files.remove(&file) {
             Some(Open::Scratch { id, .. }) => {
-                self.scratch.close(id);
+                scratch.close(id);
                 Ok(())
             }
             Some(Open::Image { .. }) => Ok(()),
@@ -823,19 +869,25 @@ impl imagefs::Server for Task {
     }
 
     fn mkdir(&mut self, _: &mut Context<'_>, path: Bytes, mode: u32) -> Result<(), imagefs::Error> {
+        if self.readonly {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         let shared = self.shared.clone();
         let mut sh = shared.borrow_mut();
         let sh = &mut *sh;
         let parent = {
             let tree = Tree {
                 overlay: &sh.overlay,
-                scratch: &self.scratch,
+                scratch: &scratch,
             };
             tree.parent(&mut sh.cache, &path.0)
         };
         match parent.map_err(|e| sh.fail(e))? {
-            (Place::Scratch(dir), name) => self
-                .scratch
+            (Place::Scratch(dir), name) => scratch
                 .mkdir(dir, &name, mode)
                 .map(|_| ())
                 .map_err(|e| sh.fail(e)),
@@ -844,37 +896,165 @@ impl imagefs::Server for Task {
     }
 
     fn remove(&mut self, _: &mut Context<'_>, path: Bytes) -> Result<(), imagefs::Error> {
+        if self.readonly {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         let shared = self.shared.clone();
         let mut sh = shared.borrow_mut();
         let sh = &mut *sh;
         let parent = {
             let tree = Tree {
                 overlay: &sh.overlay,
-                scratch: &self.scratch,
+                scratch: &scratch,
             };
             tree.parent(&mut sh.cache, &path.0)
         };
         match parent.map_err(|e| sh.fail(e))? {
-            (Place::Scratch(dir), name) => self.scratch.remove(dir, &name).map_err(|e| sh.fail(e)),
+            (Place::Scratch(dir), name) => scratch.remove(dir, &name).map_err(|e| sh.fail(e)),
             _ => Err(imagefs::Error::ReadOnly),
         }
     }
 
-    fn quota(&mut self, _: &mut Context<'_>, bytes: u64) -> Result<(), imagefs::Error> {
+    fn rename(
+        &mut self,
+        _: &mut Context<'_>,
+        from: Bytes,
+        to: Bytes,
+    ) -> Result<(), imagefs::Error> {
+        if self.readonly {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
+        let shared = self.shared.clone();
+        let mut sh = shared.borrow_mut();
+        let sh = &mut *sh;
+        let (source, target) = {
+            let tree = Tree {
+                overlay: &sh.overlay,
+                scratch: &scratch,
+            };
+            (
+                tree.parent(&mut sh.cache, &from.0),
+                tree.parent(&mut sh.cache, &to.0),
+            )
+        };
+        let source = source.map_err(|e| sh.fail(e))?;
+        let target = target.map_err(|e| sh.fail(e))?;
+        match (source, target) {
+            ((Place::Scratch(from_dir), from_name), (Place::Scratch(to_dir), to_name)) => scratch
+                .rename(from_dir, &from_name, to_dir, &to_name)
+                .map_err(|e| sh.fail(e)),
+            _ => Err(imagefs::Error::ReadOnly),
+        }
+    }
+
+    fn scratch_account(
+        &mut self,
+        _: &mut Context<'_>,
+        account: Handle,
+    ) -> Result<(), imagefs::Error> {
+        if self.readonly {
+            return Err(imagefs::Error::ReadOnly);
+        }
+
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+
         let shared = self.shared.clone();
         let sh = shared.borrow();
-        self.scratch.set_quota(bytes).map_err(|e| sh.fail(e))
+        let store = pages::Pages::new(Some(Account(account)));
+        scratch
+            .set_store(alloc::boxed::Box::new(store))
+            .map_err(|e| sh.fail(e))
+    }
+
+    fn export_directory(
+        &mut self,
+        _: &mut Context<'_>,
+        path: Bytes,
+    ) -> Result<Channel, imagefs::Error> {
+        let shared = self.shared.clone();
+        let permit = shared
+            .borrow()
+            .capacity
+            .as_ref()
+            .ok_or(imagefs::Error::Io)?
+            .reserve()
+            .map_err(|_| imagefs::Error::TooManyFiles)?;
+        let (ours, theirs) = Channel::create().map_err(|_| imagefs::Error::Io)?;
+        let scratch_owner = self.scratch.clone();
+        let mut scratch = scratch_owner.borrow_mut();
+        let mut sh = shared.borrow_mut();
+        let sh = &mut *sh;
+        let tree = Tree {
+            overlay: &sh.overlay,
+            scratch: &scratch,
+        };
+        let root = tree
+            .resolve_at(&mut sh.cache, self.root.as_ref(), &path.0, true)
+            .map_err(|e| sh.fail(e))?;
+        if !root.is_directory(&scratch) {
+            return Err(imagefs::Error::NotDirectory);
+        }
+        if let Place::Scratch(id) = &root {
+            scratch.open(*id).map_err(|e| sh.fail(e))?;
+        }
+        let view = Task {
+            shared: shared.clone(),
+            scratch: scratch_owner.clone(),
+            root: Some(root),
+            readonly: true,
+            files: BTreeMap::new(),
+            next: 1,
+        };
+        sh.views.push((ours, view, permit));
+        Ok(theirs)
     }
 
     fn stats(&mut self, _: &mut Context<'_>) -> Result<Stats, imagefs::Error> {
         Ok(self.shared.borrow().stats())
     }
+
+    /// (1.2) Each mounted layer's seal, lowest first: the hash of the header page it was
+    /// mounted from, re-made from the header the cache checked (SDD 30 f.12).
+    fn layers(&mut self, _: &mut Context<'_>) -> Result<Vec<Bytes>, imagefs::Error> {
+        let sh = self.shared.borrow();
+        sh.cache
+            .layers()
+            .iter()
+            .map(|l| {
+                l.header.seal().map(|s| Bytes(s.to_vec())).map_err(|e| {
+                    println!(sh.out, "KC2 imagefs: layer {}'s seal: {}", l.index, e.0);
+                    imagefs::Error::Corrupt
+                })
+            })
+            .collect()
+    }
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
+        if let Ok(mut scratch) = self.scratch.try_borrow_mut() {
+            for open in self.files.values() {
+                if let Open::Scratch { id, .. } = open {
+                    scratch.close(*id);
+                }
+            }
+            if let Some(Place::Scratch(id)) = &self.root {
+                scratch.close(*id);
+            }
+        }
         if let Ok(mut sh) = self.shared.try_borrow_mut() {
-            sh.served += 1;
+            if !self.readonly {
+                sh.served += 1;
+            }
         }
     }
 }
@@ -987,7 +1167,20 @@ fn mount(out: &Console) -> Result<Shared, String> {
     for i in 0..cache.disk().devices.len() {
         cache.mount().map_err(|e| format!("layer {i}: {e:?}"))?;
         let pages = cache.layers()[i].geometry.pages;
+        let seal = cache.layers()[i]
+            .header
+            .seal()
+            .map_err(|e| format!("layer {i}'s seal: {}", e.0))?;
+        let seal: String = seal.iter().map(|b| format!("{b:02x}")).collect();
         let d = &cache.disk().devices[i];
+        // A layer's id is its seal (SDD 30 f.12): the device holds the layer the list names,
+        // whose every page is checked against the root its header carries.
+        if seal != d.id {
+            return Err(format!(
+                "{}: the layer list names the layer {}, and the device holds the layer {}",
+                d.service, d.id, seal
+            ));
+        }
         described.push(format!(
             "{} ({}..., {} pages)",
             d.service,
@@ -1018,6 +1211,8 @@ fn mount(out: &Console) -> Result<Shared, String> {
         map_pages_read: 0,
         map_pages_copied: 0,
         served: 0,
+        capacity: None,
+        views: Vec::new(),
     })
 }
 
@@ -1033,6 +1228,7 @@ fn run() -> i64 {
         }
     };
     let mut dispatcher = Dispatcher::new();
+    shared.borrow_mut().capacity = Some(dispatcher.watch_capacity());
     let mut listeners = 0;
     for i in 0..start::count() {
         let Some((_, _, slot)) = start::entry(i) else {
@@ -1047,7 +1243,13 @@ fn run() -> i64 {
         let s = shared.clone();
         let factory = imagefs::factory(move || Task {
             shared: s.clone(),
-            scratch: Scratch::new(),
+            // Its bytes in memory objects charged to an account (SDD 20 f.18): the one
+            // its task's starter gives, or one carved when it first needs a page.
+            scratch: Rc::new(RefCell::new(Scratch::with_store(alloc::boxed::Box::new(
+                pages::Pages::new(None),
+            )))),
+            root: None,
+            readonly: false,
             files: BTreeMap::new(),
             next: 1,
         });
@@ -1070,6 +1272,20 @@ fn run() -> i64 {
         if let Err(e) = dispatcher.turn(DEADLINE_INFINITE) {
             println!(out, "KC2 imagefs: FAIL: wait: {}", e.name());
             return 1;
+        }
+        let views = core::mem::take(&mut shared.borrow_mut().views);
+        for (channel, view, permit) in views {
+            if dispatcher
+                .serve_reserved(
+                    channel,
+                    alloc::boxed::Box::new(imagefs::Serve(view)),
+                    permit,
+                )
+                .is_err()
+            {
+                println!(out, "KC2 imagefs: FAIL: reserved readonly view endpoint");
+                return 1;
+            }
         }
     }
     let sh = shared.borrow();

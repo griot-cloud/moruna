@@ -1,0 +1,10 @@
+[package]
+name = "netstack-protocol"
+description = "moruna.net: the network server's socket protocol (TCP connect, listen and accept, send and receive with backpressure, half-close; UDP; ICMP echo; name resolution), the rights a grant carries, and its conformance suites for one server and for two cards on one link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

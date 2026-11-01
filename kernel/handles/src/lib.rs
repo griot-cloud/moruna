@@ -20,6 +20,11 @@ struct Slot<T> {
     entry: Option<T>,
 }
 
+/// What one slot of a table of `T` costs: the slot, and its place on the free list.
+pub const fn slot_bytes<T>() -> usize {
+    core::mem::size_of::<Slot<T>>() + core::mem::size_of::<usize>()
+}
+
 pub struct HandleTable<T> {
     slots: Vec<Slot<T>>,
     free: Vec<usize>,
@@ -63,14 +68,32 @@ impl<T> HandleTable<T> {
         limits::HANDLES_PER_PROCESS - self.count
     }
 
+    /// The slots the table has made, used or free: it never gives one back.
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the next insert makes a slot, rather than reusing a free one.
+    pub fn grows(&self) -> bool {
+        self.free.is_empty()
+    }
+
     pub fn insert(&mut self, handle: T) -> Result<RawHandle, Error> {
+        self.insert_or_return(handle).map_err(|(e, _)| e)
+    }
+
+    /// Inserts `handle`, or gives it back with why not, so the caller can drop it
+    /// outside its lock.
+    pub fn insert_or_return(&mut self, handle: T) -> Result<RawHandle, (Error, T)> {
         if self.count >= limits::HANDLES_PER_PROCESS {
-            return Err(Error::Limit);
+            return Err((Error::Limit, handle));
         }
         let slot = match self.free.pop() {
             Some(slot) => slot,
             None => {
-                self.slots.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                if self.slots.try_reserve(1).is_err() {
+                    return Err((Error::NoMemory, handle));
+                }
                 self.slots.push(Slot {
                     generation: 0,
                     entry: None,
@@ -175,6 +198,28 @@ mod tests {
         assert_ne!(v, 0);
         assert_eq!(t.get(v), Ok(&7));
         assert_eq!(t.get(0), Err(Error::BadHandle));
+    }
+
+    #[test]
+    fn kb5_t5_the_table_says_when_it_grows() {
+        let mut t: HandleTable<u8> = HandleTable::new(0x77);
+        assert!(t.grows());
+        let a = t.insert(1).expect("room");
+        let _b = t.insert(2).expect("room");
+        assert_eq!(t.slots(), 2);
+        t.remove(a).expect("present");
+        // A freed slot is reused: no growth, and the table keeps its size.
+        assert!(!t.grows());
+        t.insert(3).expect("room");
+        assert_eq!(t.slots(), 2);
+        assert!(t.grows());
+        // A refusal gives the handle back.
+        let mut full: HandleTable<u16> = HandleTable::new(9);
+        for i in 0..limits::HANDLES_PER_PROCESS {
+            full.insert(i as u16).expect("room");
+        }
+        assert_eq!(full.insert_or_return(7), Err((Error::Limit, 7)));
+        assert!(slot_bytes::<u64>() >= core::mem::size_of::<u64>());
     }
 
     #[test]

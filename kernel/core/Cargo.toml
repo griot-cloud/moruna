@@ -11,3 +11,13 @@ ostd.workspace = true
 moruna-abi = { workspace = true, features = ["manifest"] }
 moruna-loader.workspace = true
 moruna-handles.workspace = true
+moruna-quota.workspace = true
+# The free memory the frame allocator holds at boot: the machine's account is sized from
+# it (SDD 20 f.18).
+osdk-frame-allocator.workspace = true
+
+[features]
+# `plane_probe` (SDD 29): the physical frames and copied bytes the data plane's tests
+# measure. The CI boot's kernel is built with it; a kernel built without it answers
+# the call `BadSyscall`.
+probe = []

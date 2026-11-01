@@ -1,0 +1,50 @@
+[package]
+name = "moruna-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Versioned governed bucket storage, encrypted node cache and durable storage publication"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+moruna-storage-format = { workspace = true, features = ["serde", "crypto"] }
+object_store = { workspace = true, features = ["cloud"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true, features = ["zeroize"] }
+aes = { version = "=0.8.4", features = ["zeroize"] }
+getrandom = { workspace = true }
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+zeroize = { version = "=1.9.0", features = ["alloc"] }
+libc = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+
+socket2 = { workspace = true, features = ["all"] }
+
+[dev-dependencies]
+object_store = { workspace = true, features = ["aws"] }
+moruna-testkit = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[features]
+default = []
+s3 = ["object_store/aws"]
+gcs = ["object_store/gcp"]
+native = ["dep:moruna-micro", "dep:moruna-sys", "dep:moruna-svc", "dep:moruna-storage-service"]
+
+# The real Linux personality on the Moruna kernel, never the SDK host simulator.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+moruna-micro = { workspace = true, optional = true }
+moruna-sys = { workspace = true, optional = true }
+moruna-svc = { workspace = true, features = ["native"], optional = true }
+moruna-storage-service = { workspace = true, optional = true }

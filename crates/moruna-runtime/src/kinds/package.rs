@@ -10,9 +10,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::ports::{self, PortDoc};
+use super::ports::{self, StageCalls};
 use super::{Context, Entry, RunnableKind, Stage, check_pin};
-use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
+use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, PortDoc, Role, settings_schema};
 
 /// The `package` kind.
 pub struct Package;
@@ -62,6 +62,7 @@ impl RunnableKind for Package {
             deterministic: Fact::BySettings,
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Confined,
+            served: None,
         }
     }
 
@@ -109,9 +110,10 @@ impl RunnableKind for Package {
         // MH 4.10: every package stage knows its ports, none listed or some, so a call to a name
         // it does not list is refused by name.
         let bound = packaged.clone();
-        stage.placed = Some(Box::new(move |id| {
-            bound.bind_ports(moruna_kernel::StagePorts::new(id, routes));
-        }));
+        stage.ports = Some(StageCalls {
+            routes,
+            bind: Box::new(move |ports| bound.bind_ports(ports)),
+        });
         stage.packaged = Some(packaged);
         Ok(stage)
     }

@@ -9,7 +9,7 @@
 //! - [`cache`]: the bounded page cache that reads a page only when it is touched and
 //!   believes it only once it matches its hash;
 //! - [`map`]: how a mapping of a file's pages is filled;
-//! - [`scratch`]: the per-task writable directory and its quota.
+//! - [`scratch`]: the per-task writable directory, and the store that meters its bytes.
 
 #![no_std]
 #![forbid(unsafe_code)]

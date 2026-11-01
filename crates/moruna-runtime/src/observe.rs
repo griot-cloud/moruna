@@ -148,7 +148,16 @@ impl RunObserver {
                 .sum();
         }
         if let Some(sampler) = live.sampler.upgrade() {
-            progress.anon_bytes = Some(sampler.sample().anon_bytes);
+            match sampler.sample() {
+                Ok(sample) => progress.anon_bytes = Some(sample.anon_bytes),
+                Err(cause) => {
+                    // No stale heartbeat reading: the actual error terminates through the
+                    // same scheduler diagnostic path used by controller/worker failures.
+                    if let Some(scheduler) = live.scheduler.upgrade() {
+                        moruna_kernel::Knobs::terminate(scheduler.as_ref(), cause);
+                    }
+                }
+            }
         }
         progress
     }

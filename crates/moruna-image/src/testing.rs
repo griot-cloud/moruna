@@ -119,6 +119,12 @@ impl LayoutBuilder {
         }
     }
 
+    /// The whole image config document.
+    pub fn config_document(mut self, document: serde_json::Value) -> LayoutBuilder {
+        self.config = document;
+        self
+    }
+
     /// The image config's `config` object.
     pub fn config(mut self, config: serde_json::Value) -> LayoutBuilder {
         self.config = serde_json::json!({"config": config});

@@ -49,8 +49,10 @@ moruna_svc::main!(run);
 /// How long the device manager waits for the supervisor's resources, and for its
 /// drivers to end once it has closed their listeners.
 const WAIT_NS: u64 = 120_000_000_000;
-/// The most MSI slots one function gets.
-const MSI_PER_FUNCTION: u64 = 4;
+/// The most MSI slots one function gets: an NVMe controller's driver takes one for
+/// each I/O queue pair, one per CPU (SDD 25, f.15). A slot holds no vector until its
+/// driver makes an interrupt in it.
+const MSI_PER_FUNCTION: u64 = 16;
 
 /// A function found on the bus.
 struct Function {
@@ -95,6 +97,7 @@ struct State {
     devices: Vec<Device>,
     shutting: bool,
     restarted: u32,
+    guardian: moruna_node::Guardian,
 }
 
 fn dup(h: &Handle, what: &str) -> Result<Handle, String> {
@@ -135,9 +138,16 @@ impl State {
         handles.push((Some(dup(&d.msi, "msi")?), "msi"));
         handles.push((Some(dup(&d.dma, "dma")?), "dma"));
         handles.push((Some(theirs.0), "listen"));
-        process
-            .start_with(entry, &mut handles)
-            .map_err(|e| format!("process_start: {}", e.name()))?;
+        let escrow = self
+            .guardian
+            .publish(&process)
+            .map_err(|e| format!("driver escrow: {}", e.name()))?;
+        if let Err(e) = process.start_with(entry, &mut handles) {
+            self.guardian
+                .retract(escrow)
+                .map_err(|e| format!("driver retract: {}", e.name()))?;
+            return Err(format!("process_start: {}", e.name()));
+        }
         let watched = process
             .0
             .duplicate(Rights::READ | Rights::WAIT)
@@ -368,8 +378,8 @@ fn roots(supervisor: &Channel) -> Result<Roots, String> {
     let mut bytes = [0u8; 16];
     let mut handles: [Option<Handle>; 5] = Default::default();
     match supervisor.read(&mut bytes, &mut handles) {
-        Ok((_, 5)) => {}
-        Ok((_, n)) => return Err(format!("the supervisor sent {n} handles, not 5")),
+        Ok((n, count)) if moruna_node::Bootstrap::Devices.accepts(&bytes[..n], count) => {}
+        Ok(_) => return Err("invalid versioned device root bootstrap".to_string()),
         Err(e) => return Err(format!("reading the supervisor's resources: {}", e.name())),
     }
     let [
@@ -619,6 +629,7 @@ fn serve(out: &Console) -> Result<String, String> {
         devices,
         shutting: false,
         restarted: 0,
+        guardian: moruna_node::Guardian::new(supervisor),
     }));
     let mut dispatcher = Dispatcher::new();
     let count = state.borrow().devices.len();

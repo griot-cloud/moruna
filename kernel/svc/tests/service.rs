@@ -855,3 +855,105 @@ fn sv_t7_a_server_that_never_answers_times_out() {
     assert_eq!(summary.failed, failures);
     drop(theirs);
 }
+
+/// SV-T16 (SDD 23, k): a pair suite runs each case on a fresh connection to each of
+/// two servers, counts what passed and what failed, and reports every case; a server
+/// that cannot be reached fails each case with the reason.
+#[test]
+fn sv_t16_a_pair_suite_checks_two_servers_together() {
+    fn add_on(p: &mut conformance::Probe, a: u64, b: u64) -> Result<u64, conformance::Fail> {
+        let mut e = Encoder::new();
+        a.encode(&mut e).map_err(|e| format!("{e:?}"))?;
+        b.encode(&mut e).map_err(|e| format!("{e:?}"))?;
+        let mut reply = p.request(1, e)?.reply()?;
+        let mut d = reply.decoder();
+        u64::decode(&mut d).map_err(|e| format!("{e:?}"))
+    }
+    fn both(
+        a: &mut conformance::Probe,
+        b: &mut conformance::Probe,
+    ) -> Result<(), conformance::Fail> {
+        // What one server answers, the other is asked to build on.
+        let first = add_on(a, 2, 3)?;
+        match add_on(b, first, 4)? {
+            9 => Ok(()),
+            n => Err(format!("5 + 4 answered {n}")),
+        }
+    }
+    fn wrong(
+        _: &mut conformance::Probe,
+        _: &mut conformance::Probe,
+    ) -> Result<(), conformance::Fail> {
+        Err(String::from("this case fails"))
+    }
+    const CASES: &[conformance::PairCase] = &[
+        conformance::PairCase {
+            name: "add: one server's answer through the other",
+            check: both,
+        },
+        conformance::PairCase {
+            name: "a case that fails",
+            check: wrong,
+        },
+    ];
+    let suite = conformance::PairSuite {
+        id: calc::ID,
+        cases: CASES,
+        timeout: 5_000_000_000,
+    };
+    let (la, ja) = calc_server();
+    let (lb, jb) = calc_server();
+    let mut names = Vec::new();
+    let summary = conformance::run_pair(
+        &suite,
+        &mut conformance::Listener(la),
+        &mut conformance::Listener(lb),
+        &mut |c| names.push((c.name.to_string(), c.result.is_ok())),
+    );
+    assert_eq!(
+        summary,
+        conformance::Summary {
+            passed: 1,
+            failed: 1
+        }
+    );
+    assert_eq!(
+        names,
+        [
+            (
+                "add: one server's answer through the other".to_string(),
+                true
+            ),
+            ("a case that fails".to_string(), false),
+        ]
+    );
+    ja.join().expect("server a").expect("run");
+    jb.join().expect("server b").expect("run");
+    // A server of another protocol fails every case at its handshake.
+    let (listener, join) = serve(Dispatcher::new);
+    let other = conformance::PairSuite {
+        id: ProtocolId {
+            name: "moruna.example.other",
+            major: 1,
+            minor: 0,
+        },
+        cases: CASES,
+        timeout: 5_000_000_000,
+    };
+    let (lb, jb) = calc_server();
+    let mut reasons = Vec::new();
+    let summary = conformance::run_pair(
+        &other,
+        &mut conformance::Listener(listener),
+        &mut conformance::Listener(lb),
+        &mut |c| reasons.push(c.result.clone()),
+    );
+    assert_eq!(summary.failed, 2);
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r.as_ref().is_err_and(|e| e.contains("handshake")))
+    );
+    join.join().expect("server").expect("run");
+    jb.join().expect("server b").expect("run");
+}

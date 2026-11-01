@@ -166,8 +166,8 @@ def loud(batch):
 def _records(logs: pathlib.Path, task: str) -> list[dict]:
     [attempt] = [p for p in logs.iterdir() if p.name.startswith("a1-")]
     records = []
-    for segment in sorted((attempt / task).glob("*.jsonl")):
-        records.extend(json.loads(line) for line in segment.read_text().splitlines())
+    for segment in sorted((attempt / task).glob("*.mrec")):
+        records.extend(moruna.read_events(segment))
     return records
 
 

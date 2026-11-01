@@ -1,11 +1,12 @@
 //! PL-T1 head_hot (PL-I1, PL-I2): the head of every queue is resident, or has exactly one
 //! promotion in flight toward the target tier and no demotion. Driven twice: over the pure
-//! planner of f.2, and over the engine with delayed moves.
+//! planner of f.2, and over the engine with delayed moves. The planner decides promotions and
+//! reports pressure; which batches leave memory is the catalog's (f.18, PL-T29 to PL-T33).
 
 mod common;
 
 use moruna_kernel::{Locality, PayloadKind, PayloadSpec, Placement, Tier, TierKind, TierPref};
-use moruna_placement::plan::{EntryView, Intent, PlanInput, plan};
+use moruna_placement::plan::{EntryView, PlanInput, plan};
 use moruna_placement::state::State;
 use moruna_testkit::{FakeAllocator, FakeReactor};
 use std::time::Duration;
@@ -24,13 +25,10 @@ fn random_input(rng: &mut common::Rng, host: Tier, target: Tier) -> PlanInput {
                 _ => None,
             };
             EntryView {
-                bytes: 1 + rng.below(16),
                 tier,
-                has_disk: rng.below(2) == 1,
                 on_disk,
                 in_flight: pick == 5,
                 evicted,
-                recomputable: rng.below(2) == 1,
                 on_remote: false,
             }
         })
@@ -58,7 +56,6 @@ fn random_input(rng: &mut common::Rng, host: Tier, target: Tier) -> PlanInput {
         host_tier: host,
         water,
         bytes,
-        staging_enabled: rng.below(2) == 1,
         window: 1 + rng.below(4) as u16,
     }
 }
@@ -71,36 +68,47 @@ fn pl_t1_head_hot_planner() {
             for _ in 0..4000 {
                 let input = random_input(&mut rng, host, target);
                 let out = plan(&input);
-                // The head is never demoted, evicted or dropped (PL-I1).
+                // Only the head is promoted as the head, and only inside the window (PL-I1).
+                let window = usize::from(input.window).max(1);
                 for intent in &out.intents {
-                    let index = match intent {
-                        Intent::Promote { index, .. }
-                        | Intent::Demote { index, .. }
-                        | Intent::DropResident { index }
-                        | Intent::Evict { index } => *index,
-                    };
                     assert!(
-                        index < input.entries.len(),
-                        "an intent names an entry that is not there"
+                        intent.index < input.entries.len().min(window),
+                        "a promotion names an entry outside the window: {intent:?}"
                     );
-                    if index == 0 {
-                        assert!(
-                            matches!(intent, Intent::Promote { head: true, .. }),
-                            "the head may only be promoted, got {intent:?}"
-                        );
-                    }
+                    assert_eq!(intent.head, intent.index == 0, "{intent:?}");
+                    assert_eq!(intent.to, input.target, "{intent:?}");
+                    let entry = &input.entries[intent.index];
+                    assert!(
+                        !entry.in_flight && !entry.evicted,
+                        "{intent:?} on {entry:?}"
+                    );
                 }
                 // At most one move per entry (PL-I2).
                 let mut seen = vec![0usize; input.entries.len()];
                 for intent in &out.intents {
-                    let index = match intent {
-                        Intent::Promote { index, .. }
-                        | Intent::Demote { index, .. }
-                        | Intent::DropResident { index }
-                        | Intent::Evict { index } => *index,
-                    };
-                    seen[index] += 1;
-                    assert!(seen[index] <= 1, "entry {index} got two moves in one plan");
+                    seen[intent.index] += 1;
+                    assert!(
+                        seen[intent.index] <= 1,
+                        "entry {} got two moves in one plan",
+                        intent.index
+                    );
+                }
+                // Pressure is what the queue holds above a high mark, down to the low one.
+                for kind in [TierKind::Device, host.kind()] {
+                    let (low, high) = input.water[kind.index()];
+                    let held = input.bytes[kind.index()];
+                    let asked = out
+                        .pressure
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .map(|(_, need)| *need);
+                    if out.head_evicted {
+                        assert!(out.pressure.is_empty() && out.intents.is_empty());
+                    } else if held > high {
+                        assert_eq!(asked, Some(held - low), "{kind:?}");
+                    } else {
+                        assert_eq!(asked, None, "{kind:?}");
+                    }
                 }
                 // A head that is not where the consumer wants it gets a promotion, unless it
                 // has no bytes anywhere (f.2 step 1 stops the queue for `evicted()`).
@@ -113,9 +121,7 @@ fn pl_t1_head_hot_planner() {
                     let promotable = head.tier.is_some() || head.on_disk;
                     if !satisfied && !head.in_flight && !head.evicted && promotable {
                         assert!(
-                            out.intents
-                                .iter()
-                                .any(|i| matches!(i, Intent::Promote { index: 0, .. })),
+                            out.intents.iter().any(|i| i.index == 0 && i.head),
                             "an unsatisfied head must be promoted: {:?}",
                             head
                         );
@@ -154,11 +160,11 @@ fn pl_t1_head_hot_engine() {
                 next_seq += 1;
             }
             6..=7 => {
-                if engine
+                if let Some(morsel) = engine
                     .pop(0, common::want_host(), Locality::Any)
                     .expect("pop")
-                    .is_some()
                 {
+                    engine.release(0, morsel.seq).expect("release");
                     popped += 1;
                 }
             }
@@ -194,6 +200,7 @@ fn pl_t1_head_hot_engine() {
             assert!(morsel.seq > previous, "FIFO order");
         }
         last = Some(morsel.seq);
+        engine.release(0, morsel.seq).expect("release");
         popped += 1;
     }
     assert_eq!(popped, next_seq, "every pushed morsel came back");

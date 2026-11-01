@@ -104,7 +104,6 @@ pub(crate) struct StageEntry {
     pub(crate) kernel: Arc<dyn Kernel>,
     pub(crate) spec: PayloadSpec,
     pub(crate) pool: Option<InstancePool>,
-    pub(crate) out_bytes: AtomicU64,
     pub(crate) tasks: AtomicU64,
     pub(crate) busy_ns: AtomicU64,
     pub(crate) errors: AtomicU32,
@@ -271,6 +270,8 @@ pub(crate) struct SourceEnd {
     pub(crate) to_recompute: Mutex<Vec<(Seq, moruna_kernel::Origin)>>,
     /// The plan is read to the end and no read is in flight; its queues are closed.
     pub(crate) exhausted: AtomicBool,
+    /// Drive-owned acknowledgement: no read/helper can publish until the barrier opens.
+    pub(crate) checkpoint_paused: AtomicBool,
     pub(crate) out: EndCounters,
     pub(crate) helper_tx: Sender<HelperRequest>,
     pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
@@ -300,6 +301,8 @@ pub(crate) struct SinkEnd {
     pub(crate) highest: Mutex<Option<Seq>>,
     /// Its queue is closed and drained and every write completed: it waits to be finished.
     pub(crate) drained: AtomicBool,
+    /// Drive-owned acknowledgement after every admitted write future resolved.
+    pub(crate) checkpoint_paused: AtomicBool,
     pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
     pub(crate) unparker: Mutex<Option<Unparker>>,
 }
@@ -338,6 +341,11 @@ pub(crate) struct Shared {
     pub(crate) token: Mutex<Option<CancelToken>>,
     pub(crate) stopping: AtomicBool,
     pub(crate) probing: AtomicBool,
+    /// Serializes probe/checkpoint control without holding a mutex over kernel calls.
+    pub(crate) control_active: AtomicBool,
+    pub(crate) checkpoint_pause: AtomicBool,
+    /// Published only after every worker and original IO drive has actually joined.
+    pub(crate) checkpoint_quiet: AtomicBool,
 
     pub(crate) last_manifest: Mutex<Option<std::path::PathBuf>>,
 
@@ -364,6 +372,7 @@ pub(crate) struct Shared {
     pub(crate) waits: RwLock<Option<Arc<moruna_kernel::StageWaits>>>,
     /// Called with each manifest once it is on disk (MH 4.7: the copy on an object store).
     pub(crate) manifest_hook: RwLock<Option<crate::ManifestHook>>,
+    pub(crate) manifest_preparation: RwLock<Option<crate::ManifestPreparation>>,
     /// Queue `k` has received a morsel.
     fed: Vec<AtomicBool>,
     /// The seam the CPU limit tests use: called by a worker after `pick` has named a stage and
@@ -371,6 +380,24 @@ pub(crate) struct Shared {
     #[cfg(test)]
     pub(crate) pick_hook: RwLock<Option<PickHook>>,
     pub(crate) stats_cache: Mutex<StatsCache>,
+    /// The run's scheduling policy, its baseline and what deciding cost (f.3, contracts d.18).
+    pub(crate) decider: Mutex<crate::decide::Decider>,
+    /// The run's cost model and each stage's key, once the embedder sets them (f.22).
+    pub(crate) learning: std::sync::OnceLock<crate::learning::Learning>,
+    /// The next decision is the baseline's: the last was over its budget (9.4 step 4).
+    pub(crate) fallback_next: AtomicBool,
+    /// What the policy reads, and what the baseline reads (contracts d.18).
+    pub(crate) reads: (moruna_kernel::Reads, moruna_kernel::Reads),
+    /// The run's floor in its host tier at `morsel.min_bytes` (placement f.18 rule 13), counted
+    /// at `new` and again whenever the scheduler forwards a promotion window, the only thing
+    /// that moves it: what the claim cap is counted from (f.22).
+    pub(crate) floor_bytes: AtomicU64,
+    /// Each worker's decision buffers, by worker.
+    pub(crate) scratch: Vec<Mutex<crate::decide::Scratch>>,
+    /// Pushes waiting for room (f.20); the stall detector leaves the run alone while one waits.
+    pub(crate) pushes_waiting: AtomicU64,
+    /// What the stall detector saw at its last check, while the run was quiescent (f.21).
+    pub(crate) stall: Mutex<Option<Vec<u64>>>,
 
     pub(crate) reads_in_flight: AtomicU16,
     pub(crate) writes_in_flight: AtomicU16,
@@ -424,6 +451,24 @@ impl Shared {
         sampler: Arc<dyn Sampler>,
     ) -> Result<Arc<Shared>> {
         cfg.validate()?;
+        // f.3, contracts d.18: the policy is a setting; an unknown name is refused naming the
+        // registered ones, before anything is opened.
+        let decider = crate::decide::Decider::new(
+            cfg.policies.make(&cfg.policy)?,
+            cfg.policies.make(crate::policies::ADMISSION)?,
+            usize::from(pipeline.topology.queue_count()),
+        );
+        let reads = decider.reads();
+        // 12.5: a budget under the run's floor is refused before anything is opened or read.
+        let floor_bytes = crate::decide::check_floor(
+            placement.as_ref(),
+            if alloc.is_pinned() {
+                moruna_kernel::Tier::PinnedHost
+            } else {
+                moruna_kernel::Tier::Host
+            },
+            cfg.morsel_min,
+        )?;
         // f.1: validate the run before anything is opened or read.
         let schemas = validate_graph(&pipeline)?;
         let Pipeline {
@@ -489,7 +534,6 @@ impl Shared {
                     spec: kernel.accepts(),
                     kernel: kernel.clone(),
                     pool,
-                    out_bytes: AtomicU64::new(0),
                     tasks: AtomicU64::new(0),
                     busy_ns: AtomicU64::new(0),
                     errors: AtomicU32::new(0),
@@ -527,6 +571,7 @@ impl Shared {
                 gaps_from: Mutex::new(0),
                 highest: Mutex::new(None),
                 drained: AtomicBool::new(false),
+                checkpoint_paused: AtomicBool::new(false),
                 handle: Mutex::new(None),
                 unparker: Mutex::new(None),
             });
@@ -568,6 +613,7 @@ impl Shared {
                 }),
                 to_recompute: Mutex::new(Vec::new()),
                 exhausted: AtomicBool::new(false),
+                checkpoint_paused: AtomicBool::new(false),
                 out: EndCounters::default(),
                 helper_tx,
                 helper_rx: Mutex::new(Some(helper_rx)),
@@ -613,6 +659,9 @@ impl Shared {
             token: Mutex::new(None),
             stopping: AtomicBool::new(false),
             probing: AtomicBool::new(false),
+            control_active: AtomicBool::new(false),
+            checkpoint_pause: AtomicBool::new(false),
+            checkpoint_quiet: AtomicBool::new(false),
             last_manifest: Mutex::new(None),
             jobs,
             job_inbox: Mutex::new(inbox),
@@ -630,6 +679,7 @@ impl Shared {
             output: RwLock::new(None),
             waits: RwLock::new(None),
             manifest_hook: RwLock::new(None),
+            manifest_preparation: RwLock::new(None),
             fed: (0..queues).map(|_| AtomicBool::new(false)).collect(),
             #[cfg(test)]
             pick_hook: RwLock::new(None),
@@ -638,6 +688,16 @@ impl Shared {
                 stats: PlacementStats::default(),
                 valid: false,
             }),
+            decider: Mutex::new(decider),
+            fallback_next: AtomicBool::new(false),
+            reads,
+            floor_bytes: AtomicU64::new(floor_bytes),
+            scratch: (0..workers)
+                .map(|_| Mutex::new(crate::decide::Scratch::default()))
+                .collect(),
+            learning: std::sync::OnceLock::new(),
+            pushes_waiting: AtomicU64::new(0),
+            stall: Mutex::new(None),
             reads_in_flight: AtomicU16::new(0),
             writes_in_flight: AtomicU16::new(0),
             source_exhausted: AtomicBool::new(false),

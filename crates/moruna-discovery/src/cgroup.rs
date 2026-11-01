@@ -127,44 +127,50 @@ pub(crate) fn parse_cpu_max(text: &str) -> Option<f64> {
     Some(quota / period)
 }
 
-/// Parse a v2 `memory.stat` body: `anon + unevictable` and `file` (DS-I4).
-pub(crate) fn parse_memory_stat_v2(text: &str) -> MemoryStat {
-    let mut stat = MemoryStat::default();
+/// Parse live cgroup memory counters, refusing missing, malformed, duplicate or
+/// overflowing measurements. V2 counts `anon + unevictable` and `file`; V1
+/// counts `rss` and `cache`. Unrelated kernel counters are ignored.
+pub(crate) fn parse_memory_stat(text: &str, v2: bool) -> moruna_kernel::Result<MemoryStat> {
+    let error = |msg: &str| moruna_kernel::MorunaError::Io {
+        op: "parse",
+        target: "memory.stat".into(),
+        msg: msg.into(),
+    };
+    let (anon_name, file_name) = if v2 {
+        ("anon", "file")
+    } else {
+        ("rss", "cache")
+    };
+    let (mut anon, mut file, mut unevictable) = (None, None, None);
     for line in text.lines() {
         let mut parts = line.split_ascii_whitespace();
-        let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
+        let Some(name) = parts.next() else { continue };
+        let slot = if name == anon_name {
+            &mut anon
+        } else if name == file_name {
+            &mut file
+        } else if v2 && name == "unevictable" {
+            &mut unevictable
+        } else {
             continue;
         };
-        let Ok(value) = value.parse::<u64>() else {
-            continue;
-        };
-        match key {
-            "anon" | "unevictable" => stat.anon = stat.anon.saturating_add(value),
-            "file" => stat.file = value,
-            _ => {}
+        if slot.is_some() {
+            return Err(error("duplicate memory counter"));
         }
+        *slot = Some(
+            parts
+                .next()
+                .ok_or_else(|| error("missing memory counter value"))?
+                .parse::<u64>()
+                .map_err(|_| error("invalid memory counter value"))?,
+        );
     }
-    stat
-}
-
-/// Parse a v1 `memory.stat` body: `rss` is the anonymous set, `cache` the page cache.
-pub(crate) fn parse_memory_stat_v1(text: &str) -> MemoryStat {
-    let mut stat = MemoryStat::default();
-    for line in text.lines() {
-        let mut parts = line.split_ascii_whitespace();
-        let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let Ok(value) = value.parse::<u64>() else {
-            continue;
-        };
-        match key {
-            "rss" => stat.anon = value,
-            "cache" => stat.file = value,
-            _ => {}
-        }
-    }
-    stat
+    let anon = anon.ok_or_else(|| error("anonymous memory counter missing"))?;
+    let file = file.ok_or_else(|| error("file memory counter missing"))?;
+    let anon = anon
+        .checked_add(unevictable.unwrap_or(0))
+        .ok_or_else(|| error("anonymous memory counter overflow"))?;
+    Ok(MemoryStat { anon, file })
 }
 
 /// Parse a v2 `cpu.stat` body for `throttled_usec`.
@@ -395,8 +401,7 @@ mod tests {
         assert_eq!(parse_cpu_max("400000 0"), None);
         assert_eq!(parse_cpu_max(""), None);
 
-        let v2 =
-            parse_memory_stat_v2("anon 100\nfile 200\nunevictable 5\nslab 7\nbroken\nfile x\n");
+        let v2 = parse_memory_stat("anon 100\nfile 200\nunevictable 5\nslab 7\n", true).unwrap();
         assert_eq!(
             v2,
             MemoryStat {
@@ -404,7 +409,7 @@ mod tests {
                 file: 200
             }
         );
-        let v1 = parse_memory_stat_v1("cache 200\nrss 100\ntotal_rss 999\n");
+        let v1 = parse_memory_stat("cache 200\nrss 100\ntotal_rss 999\n", false).unwrap();
         assert_eq!(
             v1,
             MemoryStat {
@@ -419,5 +424,34 @@ mod tests {
         );
         assert_eq!(parse_throttled_usec_v2("nr_periods 3\n"), 0);
         assert_eq!(parse_throttled_usec_v1("throttled_time 42000\n"), 42);
+    }
+    #[test]
+    fn live_memory_grammar_never_turns_bad_counters_into_zero_or_old_values() {
+        for (text, v2) in [
+            ("anon 100\nfile x\n", true),
+            ("anon 100\nfile 200\nfile x\n", true),
+            ("anon 100\nfile 200\nanon 1\n", true),
+            ("anon 100\nfile\n", true),
+            ("anon 100\n", true),
+            ("file 200\n", true),
+            ("anon 18446744073709551615\nfile 1\nunevictable 1\n", true),
+            ("rss -1\ncache 200\n", false),
+            ("rss 100\ncache 200\ncache 201\n", false),
+            ("rss 100\n", false),
+            ("cache 200\n", false),
+        ] {
+            assert!(
+                matches!(parse_memory_stat(text, v2), Err(moruna_kernel::MorunaError::Io { op: "parse", target, .. }) if target == "memory.stat"),
+                "accepted invalid memory.stat: {text:?}"
+            );
+        }
+        assert_eq!(
+            parse_memory_stat("anon 0\nfile 0\n", true).unwrap(),
+            MemoryStat { anon: 0, file: 0 }
+        );
+        assert_eq!(
+            parse_memory_stat("rss 0\ncache 0\n", false).unwrap(),
+            MemoryStat { anon: 0, file: 0 }
+        );
     }
 }

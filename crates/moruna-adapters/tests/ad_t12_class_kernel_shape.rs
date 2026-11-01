@@ -140,7 +140,7 @@ fn ad_t12_instances_are_independent_and_apply_gets_the_matching_state() {
             "apply was given the wrong instance's state"
         );
         // The class reports its own footprint, which grew with the morsel it just saw.
-        assert_eq!(state.footprint(), Some(4096 + 1));
+        assert_eq!(state.footprint().unwrap(), Some(4096 + 1));
     }
 
     // f.7: the checkpoint is what the class produced, and restore rebuilds a state that behaves
@@ -172,7 +172,7 @@ fn ad_t12_footprint_is_none_when_the_class_has_no_such_method() {
         .expect("the class has setup and __call__");
     kernel.bind_allocator(Arc::clone(&alloc));
     let state = kernel.init(&init_ctx(0, &alloc)).expect("setup runs");
-    assert_eq!(state.footprint(), None);
+    assert_eq!(state.footprint().unwrap(), None);
     // A Reinit kernel has nothing to save.
     let mut state = state;
     assert_eq!(state.checkpoint().expect("no error"), None);

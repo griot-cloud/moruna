@@ -1,4 +1,4 @@
-//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 4).
+//! One run's task lifecycle, told as the facts become true (MH 4.3 `event`, version 7).
 //!
 //! A task is one task of the job's DAG, named by the id the document gives it: each source, each
 //! kernel stage (several fused standard kernels being one task, a group), each sink. The
@@ -36,7 +36,7 @@ use serde::Serialize;
 
 use super::protocol::{
     CancelDisposition, Counters, Element, Event, FailureCode, FailureScope, Phase, SkipReason,
-    StepOutcome, TaskOutcome, WaitReason,
+    StepOutcome, TaskOutcome, WaitReason, counters_of,
 };
 use crate::job::Parts;
 use moruna_job::{Job, Role, TaskRefDoc};
@@ -728,7 +728,7 @@ impl Lifecycle {
                     t,
                     producer,
                     TaskOutcome::Succeeded,
-                    Some(Counters::of(counters)),
+                    Some(counters_of(counters)),
                     None,
                 );
                 let task = &mut inner.tasks[consumer];
@@ -795,7 +795,7 @@ impl Lifecycle {
                         t,
                         pos,
                         TaskOutcome::Succeeded,
-                        Some(Counters::of(counters)),
+                        Some(counters_of(counters)),
                         None,
                     );
                 }
@@ -999,6 +999,11 @@ pub struct Steps {
 }
 
 impl Steps {
+    /// The id of the plan the steps are of.
+    pub fn plan_id(&self) -> &str {
+        &self.plan
+    }
+
     /// The steps of `plan`, a plan of `job`, over the run's tasks as `layout` lays them out. A
     /// fused kernel stage carries the steps of every task fused into it.
     pub fn of(plan: &moruna_plan::Plan, job: &Job, layout: &Layout) -> Steps {

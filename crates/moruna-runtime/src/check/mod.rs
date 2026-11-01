@@ -4,15 +4,17 @@
 //! `moruna` binary when it lands (F8.1), and a Rust author's own test. It takes any
 //! [`Kernel`], reads its declarations, generates the synthetic batches of MH 4.9 from the input
 //! declaration, runs each through the kernel in process with an arena and a trace exactly as a
-//! run would, compares every produced schema with the output declaration (MH 4.9), and writes
-//! the first profile-store row for the kernel's fingerprint (MH 4.9) so the first real run sizes
-//! from evidence rather than from the default amplification.
+//! run would, and compares every produced schema with the output declaration (MH 4.9). A kernel
+//! that agrees is then warmed up ([`warmup`], AR section 6): run at sizes, workers and distinct
+//! counts in the same harness, every unit written to the observation store and the cost model
+//! fitted, so the report carries what the function costs per 10,000 rows.
 //!
 //! It is not a test framework and not a guarantee about real data: it is the guarantee that the
-//! function *is a kernel*, and a first measurement of what it costs.
+//! function *is a kernel*, and a measurement of what it costs.
 
 pub mod package;
 pub mod synth;
+pub mod warmup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use moruna_arena::{Arena, ArenaConfig};
+use moruna_cost::{CostKey, Digest};
 use moruna_kernel::arrow::array::{Array, ArrayData, ArrayRef, make_array};
 use moruna_kernel::arrow::buffer::{BooleanBuffer, Buffer as ArrowBuffer, NullBuffer};
 use moruna_kernel::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -31,17 +34,11 @@ use moruna_kernel::{
 use moruna_trace::{TraceConfig, TraceWriter};
 use serde_json::{Value, json};
 
-/// The format version of the JSON report and of the fields this harness adds to a profile row.
-pub const CHECK_FORMAT: u32 = 1;
-/// The profile-store format this harness writes, which is the controller's (11 e.3).
-const PROFILE_VERSION: u32 = 1;
-/// The controller's initial safety multiplier (preamble section 5, `controller.safety_initial`),
-/// recorded in the row the way a run records the multiplier it ended at.
-const SAFETY_INITIAL: f32 = 1.5;
+pub use warmup::{WarmUp, WarmUpFailure, WarmUpReport};
 
-/// Batches smaller than this give no amplification sample: their fixed costs (buffer alignment,
-/// validity bitmaps) are the whole of their output (MH 4.9).
-pub const MIN_SAMPLE_BYTES: u64 = 4096;
+/// The format version of the JSON report: 2 since warm-up (AR section 6) replaced the profile
+/// row.
+pub const CHECK_FORMAT: u32 = 2;
 
 /// Distinguishes the scratch directories of concurrent checks in one process.
 static SCRATCH: AtomicU64 = AtomicU64::new(0);
@@ -59,10 +56,11 @@ pub struct CheckOptions {
     /// (`sha256` for Python and standard kernels, whose fingerprints MH 4.9 defines; `blake3`
     /// for a Rust kernel's `Fingerprint::compute`, contracts e.6).
     pub fingerprint_scheme: &'static str,
-    /// The seed of the synthetic batches (MH 4.9).
+    /// The seed of the synthetic batches (MH 4.9) and of warm-up's data.
     pub seed: u64,
-    /// Where the profile row goes; `None` writes none.
-    pub profiles_dir: Option<PathBuf>,
+    /// Warm-up (AR section 6): where its observations go and which model it fits; `None` checks
+    /// the kernel without costing it.
+    pub warm_up: Option<WarmUp>,
     /// A Python kernel's GIL state; `None` for a kernel that never enters the interpreter.
     pub gil: Option<GilState>,
     /// A Python kernel's `memory_guard` (05 AD-I10, E13): whether a run would refuse its
@@ -74,14 +72,14 @@ pub struct CheckOptions {
 }
 
 impl CheckOptions {
-    /// Options for a Rust kernel named `name`: seed 0, no profile row, no GIL.
+    /// Options for a Rust kernel named `name`: seed 0, no warm-up, no GIL.
     pub fn new(name: impl Into<String>) -> CheckOptions {
         CheckOptions {
             name: name.into(),
             kind: "rust",
             fingerprint_scheme: "blake3",
             seed: 0,
-            profiles_dir: None,
+            warm_up: None,
             gil: None,
             memory_guard: None,
             bind: None,
@@ -127,37 +125,10 @@ pub struct BatchOutcome {
     pub bytes_out: u64,
     /// Wall nanoseconds inside `apply`.
     pub wall_ns: u64,
-    /// `peak_delta / bytes_in` (MH 4.9); `None` for an empty batch or a failed one.
-    pub amplification: Option<f64>,
     /// The kernel's error, when it failed.
     pub error: Option<String>,
     /// How the produced schema disagreed with the declaration.
     pub disagreements: Vec<Disagreement>,
-}
-
-/// The profile row a check writes (MH 4.9).
-#[derive(Clone, Debug)]
-pub struct ProfileRow {
-    /// The file, when a directory was given.
-    pub path: Option<PathBuf>,
-    /// False when the file already existed: a check never overwrites evidence from a run.
-    pub written: bool,
-    /// The input schema hash that keys it, as hex.
-    pub schema_hash: String,
-    /// Median amplification.
-    pub a_k_p50: f64,
-    /// 95th percentile amplification.
-    pub a_k_p95: f64,
-    /// Sample variance of the amplification.
-    pub a_k_var: f64,
-    /// Amplification samples.
-    pub samples: u64,
-    /// Largest state footprint seen, or the declared `state_bytes`.
-    pub state_bytes_max: u64,
-    /// Wall nanoseconds per input row over the non-empty batches.
-    pub wall_ns_per_row: f64,
-    /// `"free_threaded"`, `"serialised"` or `"none"`.
-    pub gil: &'static str,
 }
 
 /// What `moruna check` says about one kernel (MH 4.9).
@@ -175,8 +146,11 @@ pub struct CheckReport {
     pub reason: Option<String>,
     /// The batches run, in order.
     pub batches: Vec<BatchOutcome>,
-    /// The profile row, when the kernel agreed.
-    pub profile: Option<ProfileRow>,
+    /// `"free_threaded"`, `"serialised"` or `"none"`: how a Python kernel's invocations hold
+    /// the interpreter.
+    pub gil: &'static str,
+    /// Warm-up, when it was asked for and the kernel agreed: its report, or why it failed.
+    pub warm_up: Option<std::result::Result<WarmUpReport, WarmUpFailure>>,
     /// The seed.
     pub seed: u64,
     /// Trace records written, one per batch run (MH 4.9).
@@ -193,11 +167,12 @@ pub struct CheckReport {
 }
 
 impl CheckReport {
-    /// 0 for an agreeing kernel, 2 otherwise (MH 4.9).
+    /// 0 for an agreeing kernel whose warm-up, when asked for, ran; 2 otherwise (MH 4.9; AR
+    /// section 6: a warm-up that cannot run is a check that cannot register the function).
     pub fn exit_code(&self) -> i32 {
-        match self.verdict {
-            Verdict::Agreed => 0,
-            Verdict::Refused | Verdict::NotCheckable => 2,
+        match (self.verdict, &self.warm_up) {
+            (Verdict::Agreed, None | Some(Ok(_))) => 0,
+            _ => 2,
         }
     }
 
@@ -223,7 +198,6 @@ impl CheckReport {
                     "bytes_in": b.bytes_in,
                     "bytes_out": b.bytes_out,
                     "wall_ns": b.wall_ns,
-                    "amplification": b.amplification,
                     "error": b.error,
                 })
             })
@@ -252,20 +226,21 @@ impl CheckReport {
                 })
             })
             .collect();
-        let profile = self.profile.as_ref().map(|p| {
-            json!({
-                "path": p.path.as_ref().map(|p| p.display().to_string()),
-                "written": p.written,
-                "schema_hash": p.schema_hash,
-                "a_k_p50": p.a_k_p50,
-                "a_k_p95": p.a_k_p95,
-                "a_k_var": p.a_k_var,
-                "samples": p.samples,
-                "state_bytes_max": p.state_bytes_max,
-                "wall_ns_per_row": p.wall_ns_per_row,
-                "gil": p.gil,
-            })
-        });
+        let serialised = |value: std::result::Result<Value, serde_json::Error>| {
+            value.unwrap_or_else(|e| json!({"error": format!("the warm-up report: {e}")}))
+        };
+        let warm_up = match &self.warm_up {
+            None => Value::Null,
+            Some(Ok(report)) => serialised(serde_json::to_value(report)),
+            Some(Err(failure)) => serialised(serde_json::to_value(failure).map(|mut v| {
+                if let Value::Object(map) = &mut v
+                    && let Some(reason) = map.remove("reason")
+                {
+                    map.insert("error".into(), reason);
+                }
+                v
+            })),
+        };
         json!({
             "moruna_check": CHECK_FORMAT,
             "kernel": self.name,
@@ -277,7 +252,8 @@ impl CheckReport {
             "seed": self.seed,
             "batches": batches,
             "refusals": refusals,
-            "profile": profile,
+            "gil": self.gil,
+            "warm_up": warm_up,
             "trace_records": self.trace_records,
             "memory_guard": self.memory_guard,
             "alloc": self.alloc.as_ref().and_then(|a| serde_json::to_value(a).ok()),
@@ -287,7 +263,7 @@ impl CheckReport {
     }
 
     /// The human summary of MH 4.9: one line naming the verdict and the fingerprint, then one
-    /// line per refusal or failure, then the profile.
+    /// line per refusal or failure, then warm-up's cost.
     pub fn summary(&self) -> String {
         let mut out = format!(
             "{} ({}): {}\n  fingerprint {}\n",
@@ -308,19 +284,15 @@ impl CheckReport {
         for (batch, d) in self.refusals() {
             out.push_str(&format!("  batch {batch}: {d}\n"));
         }
-        if let Some(p) = &self.profile {
-            out.push_str(&format!(
-                "  profile: amplification p50 {:.3} p95 {:.3}, state {} bytes, {:.1} ns per row, gil {}\n",
-                p.a_k_p50, p.a_k_p95, p.state_bytes_max, p.wall_ns_per_row, p.gil
-            ));
-            match (&p.path, p.written) {
-                (Some(path), true) => out.push_str(&format!("  wrote {}\n", path.display())),
-                (Some(path), false) => out.push_str(&format!(
-                    "  kept {} (a profile was already there)\n",
-                    path.display()
-                )),
-                (None, _) => {}
+        if self.gil != "none" {
+            out.push_str(&format!("  gil {}\n", self.gil));
+        }
+        match &self.warm_up {
+            Some(Ok(report)) => out.push_str(&warmup::summary(report)),
+            Some(Err(failure)) => {
+                out.push_str(&format!("  warm-up failed: {}\n", failure.reason));
             }
+            None => {}
         }
         if let Some(a) = &self.alloc {
             let outside = a
@@ -348,15 +320,16 @@ impl CheckReport {
     }
 }
 
-/// Check one kernel (MH 4.9 to f.5). `Err` only when the harness itself cannot start (no arena,
-/// no trace); everything the kernel does wrong is in the report.
+/// Check one kernel (MH 4.9 to f.5), and warm it up when `opts.warm_up` asks (AR section 6).
+/// `Err` only when the harness itself cannot start (no arena, no trace); everything the kernel
+/// does wrong, and anything that stops warm-up, is in the report.
 pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport> {
     let CheckOptions {
         name,
         kind,
         fingerprint_scheme,
         seed,
-        profiles_dir,
+        warm_up,
         gil,
         memory_guard,
         bind,
@@ -369,7 +342,12 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         verdict: Verdict::NotCheckable,
         reason: None,
         batches: Vec::new(),
-        profile: None,
+        gil: match gil {
+            None => "none",
+            Some(GilState::FreeThreaded) => "free_threaded",
+            Some(GilState::Serialised) => "serialised",
+        },
+        warm_up: None,
         seed,
         trace_records: 0,
         alloc: None,
@@ -438,11 +416,56 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         }
     }
 
+    // Warm-up's data and sizes are settled before the arena is made, so that one arena, the one
+    // a Python kernel is bound to, holds the check's batches and warm-up's alike.
+    let mut warm_up = warm_up;
+    let prepared = warm_up
+        .as_ref()
+        .map(|warm| warmup::prepare(warm, &schema, seed));
+    let extra = match &prepared {
+        Some(Ok(p)) => p.arena_bytes,
+        _ => 0,
+    };
+
     // 3. Run, with an arena and a trace, as a run would.
-    let harness = Harness::start(&batches)?;
+    let harness = Harness::start(&batches, extra)?;
     if let Some(bind) = bind {
         bind(harness.alloc.clone());
     }
+    // Warm-up's start-up comes before the check's batches, so its cold start is the kernel's
+    // first invocation in this process (AR section 6.3).
+    let warm_up = match (warm_up.as_mut(), prepared) {
+        (Some(warm), Some(Ok(prepared))) => {
+            let key = CostKey {
+                role: moruna_job::Role::Kernel,
+                kind: warmup::cost_kind(kind),
+                fingerprint: Digest(fingerprint.0),
+                settings: warm.settings,
+                schema: Digest(source_schema.hash()),
+            };
+            let made = warmup::Kind::of(kernel.as_ref(), warm.maker.is_none());
+            let bench = warmup::Harnessed::new(
+                &kernel,
+                &harness,
+                prepared.generator,
+                warm.maker.clone(),
+                warm.outside.clone(),
+                made.stateful,
+            );
+            let mut run = warmup::Run::new(
+                prepared.plan,
+                made,
+                warm,
+                Box::new(bench),
+                key,
+                prepared.arena_bytes,
+            );
+            run.start();
+            Some(Ok(run))
+        }
+        (_, Some(Err(reason))) => Some(Err(reason)),
+        _ => None,
+    };
     let mut state: Box<dyn KernelState> = match kernel.kind() {
         KernelKind::Stateless => Box::new(NoState),
         KernelKind::Stateful { .. } => {
@@ -455,27 +478,24 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
                 Err(e) => {
                     report.verdict = Verdict::Refused;
                     report.reason = Some(format!("refused: init failed: {e}"));
+                    drop(warm_up);
                     harness.finish();
                     return Ok(report);
                 }
             }
         }
     };
-    let mut state_bytes_max = hints.state_bytes.unwrap_or(0);
     for (index, batch) in batches.into_iter().enumerate() {
         let name = synth::BATCHES[index];
         let outcome = harness.run_one(kernel.as_ref(), state.as_mut(), index, name, batch);
         let mut outcome = outcome?;
-        if let Some(footprint) = state.footprint() {
-            state_bytes_max = state_bytes_max.max(footprint);
-        }
         // 4. Compare (MH 4.9).
         if let Some(produced) = outcome.produced.take() {
             outcome.batch.disagreements = expected.compare(&produced);
         }
         report.batches.push(outcome.batch);
     }
-    (report.trace_records, report.alloc) = harness.finish();
+    drop(state);
 
     let failed = report
         .batches
@@ -483,30 +503,21 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
         .any(|b| b.error.is_some() || !b.disagreements.is_empty());
     if failed {
         report.verdict = Verdict::Refused;
+        drop(warm_up);
+        (report.trace_records, report.alloc) = harness.finish();
         return Ok(report);
     }
     report.verdict = Verdict::Agreed;
 
-    // 5. Profile (MH 4.9).
-    let row = profile_row(&report.batches, state_bytes_max, gil, &source_schema.hash());
-    let row = match profiles_dir {
-        None => row,
-        Some(_) if row.samples == 0 => {
-            report.notes.push(format!(
-                "no batch reached {MIN_SAMPLE_BYTES} bytes, so there is no amplification to \
-                 record; no profile row written"
-            ));
-            row
-        }
-        Some(dir) => write_row(
-            row,
-            &dir,
-            &fingerprint,
-            &report.fingerprint,
-            &mut report.notes,
-        ),
-    };
-    report.profile = Some(row);
+    // 5. Warm-up (AR section 6), in the same harness.
+    report.warm_up = warm_up.map(|run| match run {
+        Ok(run) => run.complete(),
+        Err(reason) => Err(WarmUpFailure {
+            reason,
+            progress: warmup::Progress::default(),
+        }),
+    });
+    (report.trace_records, report.alloc) = harness.finish();
     Ok(report)
 }
 
@@ -519,13 +530,16 @@ struct RunOne {
 /// The arena, the sampler and the trace one check runs with.
 struct Harness {
     alloc: Arc<dyn Allocator>,
+    /// The same arena, for its high-water mark (warm-up's peak).
+    arena: Arc<Arena>,
     sampler: Option<moruna_discovery::Sampler>,
     trace: Arc<TraceWriter>,
     scratch: PathBuf,
 }
 
 impl Harness {
-    fn start(batches: &[RecordBatch]) -> Result<Harness> {
+    /// A harness whose arena holds `batches` and `extra` bytes besides (warm-up's).
+    fn start(batches: &[RecordBatch], extra: u64) -> Result<Harness> {
         let discovered = moruna_discovery::discover(&moruna_discovery::DiscoveryInput::default())?;
         let page = discovered.limits.page_bytes.max(4096) as u64;
         // Room for every input twice over (the landed copy and whatever the kernel slices),
@@ -535,8 +549,8 @@ impl Harness {
             .map(|b| b.get_array_memory_size() as u64)
             .sum();
         let granule = page.max(64 << 10);
-        let host_bytes = (inputs * 2 + (32 << 20)).div_ceil(granule) * granule;
-        let alloc: Arc<dyn Allocator> = Arena::new(ArenaConfig {
+        let host_bytes = (inputs * 2 + extra + (32 << 20)).div_ceil(granule) * granule;
+        let arena = Arena::new(ArenaConfig {
             host_bytes,
             host_tier: moruna_kernel::TierKind::Host,
             device_bytes: Vec::new(),
@@ -545,6 +559,7 @@ impl Harness {
             memlock: moruna_kernel::Guarantee::Absent,
             register_rdma: false,
         })?;
+        let alloc: Arc<dyn Allocator> = Arc::clone(&arena) as Arc<dyn Allocator>;
         let sampler = moruna_discovery::Sampler::new(&discovered).ok();
         let scratch = std::env::temp_dir().join(format!(
             "moruna-check-{}-{}",
@@ -565,17 +580,19 @@ impl Harness {
         })?;
         Ok(Harness {
             alloc,
+            arena,
             sampler,
             trace,
             scratch,
         })
     }
 
-    fn anon(&self) -> u64 {
+    fn anon(&self) -> Result<u64> {
         self.sampler
             .as_ref()
-            .map(|s| s.sample().anon_bytes)
-            .unwrap_or(0)
+            .map(|s| s.sample().map(|sample| sample.anon_bytes))
+            .transpose()
+            .map(|sample| sample.unwrap_or(0))
     }
 
     fn run_one(
@@ -595,7 +612,7 @@ impl Harness {
         if let Some(sampler) = &self.sampler {
             sampler.reset_peak();
         }
-        let anon_before = self.anon();
+        let anon_before = self.anon()?;
         let started = Instant::now();
         let t_start_ns = crate::report::now_ns();
         let result = kernel.apply(state, payload);
@@ -603,7 +620,7 @@ impl Harness {
         // What the call asked for, which a counting kernel left on this thread (E13).
         let alloc = moruna_kernel::take_kernel_alloc();
         let t_end_ns = crate::report::now_ns();
-        let anon_after = self.anon();
+        let anon_after = self.anon()?;
         let mut outcome = BatchOutcome {
             name,
             rows_in,
@@ -611,7 +628,6 @@ impl Harness {
             bytes_in,
             bytes_out: 0,
             wall_ns,
-            amplification: None,
             error: None,
             disagreements: Vec::new(),
         };
@@ -622,14 +638,6 @@ impl Harness {
                 outcome.rows_out = out.num_rows() as u64;
                 outcome.bytes_out = out.get_array_memory_size() as u64;
                 tier_out = tier;
-                if bytes_in >= MIN_SAMPLE_BYTES {
-                    // MH 4.9: the bytes the kernel allocated for its output outside the arena,
-                    // per input byte. The process's anonymous growth is in the trace record and
-                    // not in the figure: at a check's batch sizes it is allocator noise, and a
-                    // noisy seed is worse than a low one, which the first probe corrects.
-                    let fresh = outside_arena_bytes(&out, self.alloc.as_ref());
-                    outcome.amplification = Some(fresh as f64 / bytes_in as f64);
-                }
                 produced = Some(out.schema());
             }
             Ok(Payload::Tensor(_, _)) => {
@@ -666,7 +674,7 @@ impl Harness {
             q_bytes_after: Vec::new(),
             staging_bytes_delta: 0,
             placement_miss_wait_us: 0,
-            state_bytes: state.footprint().unwrap_or(0),
+            state_bytes: state.footprint()?.unwrap_or(0),
             sizer: 0,
             outcome: if outcome.error.is_some() {
                 Outcome::Error
@@ -773,151 +781,4 @@ fn copy_buffer(source: &ArrowBuffer, alloc: &dyn Allocator) -> Result<ArrowBuffe
     Ok(buffer
         .into_arrow_buffer()?
         .slice_with_length(0, bytes.len()))
-}
-
-/// The nearest-rank percentile of `sorted` (ascending); 0 for none.
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let rank = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-    sorted[rank.min(sorted.len() - 1)]
-}
-
-/// The row of MH 4.9 from the batches that produced a measurement.
-fn profile_row(
-    batches: &[BatchOutcome],
-    state_bytes_max: u64,
-    gil: Option<GilState>,
-    schema_hash: &[u8; 32],
-) -> ProfileRow {
-    let mut samples: Vec<f64> = batches.iter().filter_map(|b| b.amplification).collect();
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = samples.len();
-    let mean = if n > 0 {
-        samples.iter().sum::<f64>() / n as f64
-    } else {
-        0.0
-    };
-    let var = if n > 1 {
-        samples.iter().map(|s| (s - mean) * (s - mean)).sum::<f64>() / (n - 1) as f64
-    } else {
-        0.0
-    };
-    let rows: u64 = batches.iter().map(|b| b.rows_in).sum();
-    let wall: u64 = batches
-        .iter()
-        .filter(|b| b.rows_in > 0)
-        .map(|b| b.wall_ns)
-        .sum();
-    ProfileRow {
-        path: None,
-        written: false,
-        schema_hash: hex(schema_hash),
-        a_k_p50: percentile(&samples, 0.5),
-        a_k_p95: percentile(&samples, 0.95),
-        a_k_var: var,
-        samples: n as u64,
-        state_bytes_max,
-        wall_ns_per_row: if rows > 0 {
-            wall as f64 / rows as f64
-        } else {
-            0.0
-        },
-        gil: match gil {
-            None => "none",
-            Some(GilState::FreeThreaded) => "free_threaded",
-            Some(GilState::Serialised) => "serialised",
-        },
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Write the row where the controller will look for it (11 e.3): `<fingerprint>-<schema>.json`
-/// under `dir`, in the controller's format plus this harness's own fields, which the controller
-/// ignores. An existing file is left alone: it is evidence from a run, or an earlier check.
-fn write_row(
-    mut row: ProfileRow,
-    dir: &std::path::Path,
-    fingerprint: &moruna_kernel::Fingerprint,
-    printed: &str,
-    notes: &mut Vec<String>,
-) -> ProfileRow {
-    let path = dir.join(format!("{}-{}.json", fingerprint.to_hex(), row.schema_hash));
-    row.path = Some(path.clone());
-    if path.exists() {
-        notes.push(format!(
-            "a profile for this fingerprint and input schema exists; not overwritten: {}",
-            path.display()
-        ));
-        return row;
-    }
-    let value = json!({
-        "version": PROFILE_VERSION,
-        "fingerprint": fingerprint.to_hex(),
-        "schema_hash": row.schema_hash,
-        "updated": rfc3339_now(),
-        "a_k_p50": row.a_k_p50,
-        "a_k_p95": row.a_k_p95,
-        "a_k_dev_p95": 0.0,
-        "a_k_samples": row.samples,
-        "a_k_var": row.a_k_var,
-        "state_bytes_max": row.state_bytes_max,
-        "final_target": 0,
-        "final_workers": 1,
-        "final_safety": SAFETY_INITIAL,
-        "runs": 1,
-        "prediction_error_p95": 0.0,
-        "source": "moruna check",
-        "check_format": CHECK_FORMAT,
-        "check_fingerprint": printed,
-        "wall_ns_per_row": row.wall_ns_per_row,
-        "gil": row.gil,
-    });
-    let written = std::fs::create_dir_all(dir).and_then(|()| {
-        let temp = dir.join(format!(
-            ".{}.tmp.{}",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("profile.json"),
-            std::process::id()
-        ));
-        let text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
-        std::fs::write(&temp, text)?;
-        std::fs::rename(&temp, &path)
-    });
-    match written {
-        Ok(()) => row.written = true,
-        Err(e) => notes.push(format!("profile not written: {e}")),
-    }
-    row
-}
-
-/// Now as an RFC 3339 timestamp in UTC, the profile store's `updated` (11 e.3).
-fn rfc3339_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let time = secs % 86_400;
-    // Hinnant's days-to-civil.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3600,
-        (time % 3600) / 60,
-        time % 60
-    )
 }

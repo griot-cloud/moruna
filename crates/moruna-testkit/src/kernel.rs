@@ -42,8 +42,8 @@ impl KernelState for FakeState {
         Ok(Some(bytes))
     }
 
-    fn footprint(&self) -> Option<u64> {
-        Some(self.bytes)
+    fn footprint(&self) -> moruna_kernel::Result<Option<u64>> {
+        Ok(Some(self.bytes))
     }
 }
 

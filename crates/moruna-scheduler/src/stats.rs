@@ -7,6 +7,26 @@ use moruna_kernel::{SchedulerStats, StageStats};
 use crate::instances;
 use crate::shared::Shared;
 
+/// The policy's figures, with what learning did and cost.
+fn policy_stats(shared: &Shared) -> moruna_kernel::PolicyStats {
+    let mut stats = shared
+        .decider
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stats();
+    if let Some(learning) = shared.learning.get() {
+        stats.learning = Some(learning.stats());
+        let (learn_ns, learned, store_ns, save_ns, drain_ns) = learning.costs();
+        let o = &mut stats.overhead;
+        o.learn_ns = learn_ns;
+        o.learned = learned;
+        o.store_ns = store_ns;
+        o.save_ns = save_ns;
+        o.drain_ns = drain_ns;
+    }
+    stats
+}
+
 /// Every counter as of now. Cheap: atomics and one pool lock per stateful stage.
 pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
     let per_stage = shared
@@ -24,6 +44,7 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
         .collect();
     let (stages_waiting, calls_waiting) = shared.waiting();
     SchedulerStats {
+        policy: policy_stats(shared),
         per_stage,
         workers_waiting: u16::try_from(calls_waiting).unwrap_or(u16::MAX),
         stages_waiting,

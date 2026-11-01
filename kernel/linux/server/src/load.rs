@@ -61,7 +61,7 @@ fn prot_of(read: bool, write: bool, execute: bool) -> u64 {
 
 fn errno_of(e: Error) -> u64 {
     match e {
-        Error::NoMemory | Error::Limit | Error::OutOfRange => errno::ENOMEM,
+        Error::NoMemory | Error::Limit | Error::OutOfRange | Error::QuotaExceeded => errno::ENOMEM,
         Error::AccessDenied => errno::EACCES,
         Error::BadState => errno::EEXIST,
         Error::Fault => errno::EFAULT,
@@ -225,6 +225,11 @@ impl Task {
             (at::CLKTCK, 100),
             (at::SECURE, 0),
         ];
+        let mut auxv = auxv.to_vec();
+        // A granted program's start page (SDD 30 d.2).
+        if let Some(page) = self.start_page {
+            auxv.push((linux_protocol::AT_MORUNA_START, page));
+        }
         let argv: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
         let envp: Vec<&[u8]> = env.iter().map(|e| e.as_slice()).collect();
         let start = Start {
@@ -256,7 +261,11 @@ impl Task {
                 if stat.kind != kind::REGULAR {
                     return Err(errno::ENODEV);
                 }
-                (*number, stat.size, !path.starts_with(b"/tmp/"))
+                let assets = self.fs.is_assets(*number);
+                if assets && prot & map::WRITE != 0 {
+                    return Err(errno::EACCES);
+                }
+                (*number, stat.size, !assets && !path.starts_with(b"/tmp/"))
             }
             Open::Device(crate::files::Device::Zero) => {
                 drop(file);
@@ -335,7 +344,11 @@ impl Task {
         offset: u64,
         limit: Option<u64>,
     ) -> Result<u64, u64> {
-        let plan = mmap::plan(len, prot, flags, offset, size, mappable)?;
+        let assets = self.fs.is_assets(number);
+        if assets && prot & map::WRITE != 0 {
+            return Err(errno::EACCES);
+        }
+        let plan = mmap::plan(len, prot, flags, offset, size, mappable && !assets)?;
         let fixed = flags & MAP_FIXED != 0;
         let noreplace = flags & MAP_FIXED_NOREPLACE != 0;
         let first = if plan.copy {
