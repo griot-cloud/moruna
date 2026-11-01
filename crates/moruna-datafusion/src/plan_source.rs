@@ -406,11 +406,12 @@ impl Runtime {
     /// a plan or a write gets the threads its parallelism uses and no more (F8.9).
     pub(crate) fn with_threads(threads: usize) -> Result<Runtime> {
         let threads = threads.clamp(2, 8);
-        tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             .worker_threads(threads)
             .max_blocking_threads(threads)
-            .thread_name("moruna-plan")
-            .enable_all()
+            .thread_name("moruna-plan");
+        moruna_reactor::configure_runtime(&mut builder)
             .build()
             .map(|rt| Runtime(Some(rt)))
             .map_err(|e| plan_err(format!("a runtime for the plan: {e}")))

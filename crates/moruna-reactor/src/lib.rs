@@ -325,6 +325,37 @@ impl Reactor {
     }
 }
 
+/// Configure executors used by file workers and granted native SDK operations.
+/// Native programs use timers and blocking tasks; Tokio's OS network/signal driver is
+/// unavailable there. Ordinary hosts retain Tokio's complete existing driver setup.
+pub fn configure_runtime(builder: &mut tokio::runtime::Builder) -> &mut tokio::runtime::Builder {
+    configure_runtime_for(builder, native_runtime())
+}
+
+pub(crate) fn native_runtime() -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        moruna_micro::on_kernel()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+fn configure_runtime_for(
+    builder: &mut tokio::runtime::Builder,
+    native: bool,
+) -> &mut tokio::runtime::Builder {
+    if native {
+        // enable_io also constructs Tokio's signal driver when process/signal features
+        // are unified by a caller. Timers and the blocking file pool need no OS-I/O driver.
+        builder.enable_time()
+    } else {
+        builder.enable_all()
+    }
+}
+
 /// The reactor's tokio runtime, and the one place a thread is asked for at start.
 ///
 /// A host that will not give the process a thread (the `ulimit -u` of a loaded build machine,
@@ -342,8 +373,8 @@ fn start_runtime(threads: usize, stack_bytes: Option<usize>) -> Result<tokio::ru
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder
             .worker_threads(threads)
-            .thread_name("moruna-reactor")
-            .enable_all();
+            .thread_name("moruna-reactor");
+        configure_runtime(&mut builder);
         if let Some(bytes) = stack_bytes {
             builder.thread_stack_size(bytes);
         }

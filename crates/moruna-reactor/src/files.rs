@@ -26,8 +26,7 @@ impl ObjectFiles {
     /// A client over `cfg`. A backend the configuration does not have is refused at the first
     /// call that names it, as for every object operation.
     pub fn new(cfg: ObjectStoreConfig) -> Result<ObjectFiles> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let runtime = crate::configure_runtime(&mut tokio::runtime::Builder::new_current_thread())
             .build()
             .map_err(|e| MorunaError::Config {
                 name: "object_store",

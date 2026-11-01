@@ -964,10 +964,10 @@ pub fn task_output(
     let bytes = std::fs::read(manifest).map_err(|error| error.to_string())?;
     let pinned: moruna_storage::Metadata = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid pinned manifest reference: {error}"))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
+    let runtime =
+        moruna_reactor::configure_runtime(&mut tokio::runtime::Builder::new_current_thread())
+            .build()
+            .map_err(|error| error.to_string())?;
     runtime.block_on(async {
         let manifest = reader
             .manifest(&pinned)

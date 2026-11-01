@@ -105,9 +105,10 @@ impl Store {
         std::thread::Builder::new()
             .name("moruna-governed-cost".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
+                let runtime = moruna_reactor::configure_runtime(
+                    &mut tokio::runtime::Builder::new_current_thread(),
+                )
+                .build();
                 let runtime = match runtime {
                     Ok(runtime) => {
                         let _ = ready.send(Ok(()));

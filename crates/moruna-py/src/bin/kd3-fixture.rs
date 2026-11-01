@@ -227,10 +227,10 @@ impl Readback {
             readback: None,
         };
         sink.open(&source.schema())?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| invalid(format!("readback IO executor: {e}")))?;
+        let runtime =
+            moruna_reactor::configure_runtime(&mut tokio::runtime::Builder::new_current_thread())
+                .build()
+                .map_err(|e| invalid(format!("readback IO executor: {e}")))?;
         for (seq, split) in source.plan()?.iter().enumerate() {
             let payload = runtime.block_on(source.read(
                 split,

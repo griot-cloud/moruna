@@ -30,10 +30,16 @@ io-uring = { workspace = true, optional = true }
 # A `vsock://` endpoint's connection, made without `unsafe` (MH 4.6).
 socket2 = { workspace = true, features = ["all"] }
 
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+moruna-micro = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+seccompiler = { workspace = true }
+
 [dev-dependencies]
 moruna-testkit = { workspace = true }
 object_store = { workspace = true }
-tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "signal"] }
 
 [features]
 default = []

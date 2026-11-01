@@ -699,10 +699,10 @@ fn worker(
     startup: (&Shared, mpsc::Sender<Result<(), String>>),
 ) -> Result<(), String> {
     let (shared, ready) = startup;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let runtime =
+        moruna_reactor::configure_runtime(&mut tokio::runtime::Builder::new_current_thread())
+            .build()
+            .map_err(|e| e.to_string())?;
     let begun = captures
         .iter_mut()
         .zip(&plan.outputs)

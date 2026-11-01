@@ -226,9 +226,20 @@ impl ObjectLayer {
 
     /// The client for `url` and the path inside it, built once per `(scheme, container)`.
     pub(crate) fn resolve(&self, url: &str) -> Result<(Arc<dyn ObjectBackend>, OsPath)> {
+        self.resolve_for(url, crate::native_runtime())
+    }
+
+    fn resolve_for(&self, url: &str, native: bool) -> Result<(Arc<dyn ObjectBackend>, OsPath)> {
         let located = self.parse(url)?;
         if let Some(backend) = &self.override_backend {
             return Ok((Arc::clone(backend), located.path));
+        }
+        // An injected backend already owns its transport; never replace its capability.
+        // The personality has no OS socket/connect calls for the generic cloud clients.
+        if native && located.scheme != Scheme::File {
+            return Err(config(
+                "native object URL requires a granted SDK backend; Linux socket transport is unavailable",
+            ));
         }
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(client) = clients.get(&located.client_key) {
@@ -710,6 +721,75 @@ mod store_tests {
             Arc::clone(&memory) as Arc<dyn ObjectStore>,
             Some(memory as Arc<dyn object_store::multipart::MultipartStore>),
         )
+    }
+
+    #[test]
+    fn native_object_policy_refuses_os_sockets_but_preserves_file_and_injected_backends() {
+        let dir = crate::fdcache::tests::scratch_dir("native-object-policy");
+        let layer = ObjectLayer::new(
+            ObjectStoreConfig {
+                local_root: Some(dir.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        let error = layer
+            .resolve_for("s3://bucket/key", true)
+            .err()
+            .expect("native socket path refused before building a client");
+        assert!(matches!(
+            error,
+            MorunaError::Config {
+                name: "object_store",
+                ..
+            }
+        ));
+        assert!(
+            layer.clients.lock().unwrap().is_empty(),
+            "no remote client or I/O future was created"
+        );
+        let host_error = layer
+            .resolve_for("s3://bucket/key", false)
+            .err()
+            .expect("host still requires its normal credentials");
+        assert!(host_error.to_string().contains("no s3 configuration"));
+        let (file, path) = layer
+            .resolve_for("file://actual", true)
+            .expect("native local file backend");
+        let injected: Arc<dyn ObjectBackend> = Arc::new(store());
+        let hooked = ObjectLayer::new(ObjectStoreConfig::default(), Some(injected.clone()));
+        let (kept, key) = hooked
+            .resolve_for("s3://bucket/key", true)
+            .expect("explicit backend retains its own transport");
+        assert!(Arc::ptr_eq(&kept, &injected));
+        let runtime =
+            crate::configure_runtime_for(&mut tokio::runtime::Builder::new_current_thread(), true)
+                .build()
+                .unwrap();
+        runtime.block_on(async {
+            file.put(
+                &path,
+                PutPayload::from_bytes(Bytes::from_static(b"file bytes")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                &file.get_range(&path, 0..10).await.unwrap()[..],
+                b"file bytes"
+            );
+            kept.put(
+                &key,
+                PutPayload::from_bytes(Bytes::from_static(b"backend bytes")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                &kept.get_range(&key, 0..13).await.unwrap()[..],
+                b"backend bytes"
+            );
+        });
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The local filesystem has no multipart uploads, so the seam hands back no future for one

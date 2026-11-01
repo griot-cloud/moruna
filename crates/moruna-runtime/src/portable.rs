@@ -733,11 +733,11 @@ impl Publisher {
                 if let Some(history) = &history {
                     prepared.history = Some(history.snapshot(sequence)?);
                 }
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .enable_io()
-                    .build()
-                    .map_err(|_| MorunaError::Resume("checkpoint IO runtime unavailable".into()))?;
+                let runtime = moruna_reactor::configure_runtime(
+                    &mut tokio::runtime::Builder::new_current_thread(),
+                )
+                .build()
+                .map_err(|_| MorunaError::Resume("checkpoint IO runtime unavailable".into()))?;
                 let receipt = runtime.block_on(async {
                     tokio::time::timeout(publisher.timeout, bridge.publish(&publisher.access,
                         path, sequence, &publisher.local_target, &publisher.bucket_target,

@@ -187,8 +187,7 @@ fn pinned(value: &str) -> PyResult<Metadata> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("pinned metadata: {e}")))
 }
 fn runtime() -> PyResult<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    moruna_reactor::configure_runtime(&mut tokio::runtime::Builder::new_current_thread())
         .build()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }

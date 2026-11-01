@@ -10,6 +10,7 @@ description = "Moruna DataFusion bridge"
 
 [dependencies]
 moruna-kernel = { workspace = true }
+moruna-reactor = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
 # peql: the arena copy, the Tokio runtime a plan runs on, and the engine itself.
 moruna-sources = { workspace = true, optional = true }
@@ -32,7 +33,7 @@ default = []
 datafusion = ["dep:datafusion"]
 # `PlanSource` over a DataFusion plan and peQL's governed plans, `PeqlSink` over peQL's
 # contract writes (MH 4.5).
-peql = ["datafusion", "dep:moruna-sources", "dep:tokio", "dep:futures", "dep:peql", "dep:serde_json"]
+peql = ["datafusion", "dep:moruna-reactor", "dep:moruna-sources", "dep:tokio", "dep:futures", "dep:peql", "dep:serde_json"]
 # Contracts bound to Iceberg tables, through a catalog the host gives peQL's engine; Moruna
 # constructs no catalog, it only writes through the engine it is handed.
 peql-iceberg = ["peql", "peql/iceberg"]
