@@ -104,6 +104,11 @@ fn write_loop(shared: &Shared, end: &SinkEnd, parker: &Parker, cx: &mut Context<
     let interval = Duration::from_millis(shared.cfg.heartbeat_interval_ms);
 
     loop {
+        if shared.has_exit() || shared.is_cancelled() || shared.stopping.load(Ordering::SeqCst) {
+            // A failed lower sequence will never arrive. Resolve only queued
+            // ordering waits; poll_writes still drains every original inner I/O.
+            sink.cancel_queued_writes();
+        }
         let mut worked = poll_writes(shared, end, queue, sink, &mut inflight, cx);
         if shared.checkpoint_pause.load(Ordering::SeqCst)
             && !shared.has_exit()

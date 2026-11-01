@@ -34,6 +34,8 @@ struct State {
     stalled: bool,
     held_max: u64,
     stalls: u64,
+    cancelled: bool,
+    retiring: bool,
 }
 
 impl State {
@@ -89,6 +91,8 @@ impl<S: Sink + ?Sized> ReorderBuffer<S> {
                 stalled: false,
                 held_max: 0,
                 stalls: 0,
+                cancelled: false,
+                retiring: false,
             }),
         }
     }
@@ -119,6 +123,42 @@ impl<S: Sink + ?Sized> ReorderBuffer<S> {
         }
     }
 
+    /// Cancel only writes still waiting for sequence order. A payload already
+    /// taken by the inner sink is absent from `held`; its original future must
+    /// still be polled to completion by the drive.
+    pub fn cancel_queued_writes(&self) {
+        {
+            let mut state = self.lock();
+            if state.cancelled || state.retiring {
+                return;
+            }
+            state.retiring = true;
+        }
+        loop {
+            let payload = {
+                let mut state = self.lock();
+                state.held.values_mut().find_map(|slot| slot.payload.take())
+            };
+            let Some(payload) = payload else { break };
+            drop(payload);
+        }
+        let held = {
+            let mut state = self.lock();
+            // Every queued owner has now retired. Turns may report cancellation;
+            // their latest wakers stayed in the map throughout retirement.
+            state.cancelled = true;
+            state.retiring = false;
+            state.held_bytes = 0;
+            state.stalled = false;
+            core::mem::take(&mut state.held)
+        };
+        for slot in held.into_values() {
+            if let Some(waker) = slot.waker {
+                waker.wake();
+            }
+        }
+    }
+
     /// The sink this buffer wraps.
     pub fn inner(&self) -> &S {
         &self.inner
@@ -132,6 +172,9 @@ impl<S: Sink + ?Sized> ReorderBuffer<S> {
     fn admit(&self, seq: Seq, payload: Payload) -> Result<()> {
         let bytes = payload.bytes();
         let mut state = self.lock();
+        if state.cancelled || state.retiring {
+            return Err(MorunaError::Cancelled);
+        }
         if seq < state.next_expected
             || state.skipped_ahead.contains(&seq)
             || state.held.contains_key(&seq)
@@ -170,21 +213,6 @@ impl<S: Sink + ?Sized> ReorderBuffer<S> {
         state.advance();
         Ok(())
     }
-
-    /// Take the payload back out once its turn has come.
-    fn take(&self, seq: Seq) -> Result<Payload> {
-        let mut state = self.lock();
-        let Some(mut slot) = state.held.remove(&seq) else {
-            return Err(MorunaError::Sink("sequence out of range".into()));
-        };
-        if slot.counted {
-            state.held_bytes -= slot.bytes;
-        }
-        state.relax();
-        slot.payload
-            .take()
-            .ok_or_else(|| MorunaError::Sink("sequence out of range".into()))
-    }
 }
 
 /// Resolves when the buffer is waiting for `seq`.
@@ -194,12 +222,28 @@ struct Turn<'a, S: Sink + ?Sized> {
 }
 
 impl<S: Sink + ?Sized> core::future::Future for Turn<'_, S> {
-    type Output = ();
+    type Output = Result<Payload>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Payload>> {
         let mut state = self.buffer.lock();
-        if state.next_expected == self.seq {
-            return Poll::Ready(());
+        if state.cancelled {
+            return Poll::Ready(Err(MorunaError::Cancelled));
+        }
+        if !state.retiring && state.next_expected == self.seq {
+            let Some(mut slot) = state.held.remove(&self.seq) else {
+                return Poll::Ready(Err(MorunaError::Sink("sequence out of range".into())));
+            };
+            if slot.counted {
+                state.held_bytes -= slot.bytes;
+            }
+            state.relax();
+            // Ownership transfers to this write future under the same lock that
+            // distinguishes queued cancellation from an entered inner write.
+            return Poll::Ready(
+                slot.payload
+                    .take()
+                    .ok_or_else(|| MorunaError::Sink("sequence out of range".into())),
+            );
         }
         let seq = self.seq;
         if let Some(slot) = state.held.get_mut(&seq) {
@@ -225,8 +269,7 @@ impl<S: Sink + ?Sized> Sink for ReorderBuffer<S> {
     fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.admit(seq, payload)?;
-            Turn { buffer: self, seq }.await;
-            let payload = self.take(seq)?;
+            let payload = Turn { buffer: self, seq }.await?;
             let outcome = self.inner.write(seq, payload).await;
             // The turn passes whether the inner write succeeded or not: a failure that held the
             // buffer shut would strand every morsel behind it as well.
@@ -282,6 +325,8 @@ impl<S: Sink + ?Sized> Sink for ReorderBuffer<S> {
         own.skipped_ahead.clear();
         own.held_bytes = 0;
         own.stalled = false;
+        own.cancelled = false;
+        own.retiring = false;
         Ok(())
     }
 }

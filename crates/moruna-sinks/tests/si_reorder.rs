@@ -220,3 +220,118 @@ fn a_reorder_buffer_resumes_at_the_watermark() {
     buffer.resume(&schema, b"", None).expect("resume");
     assert_eq!(buffer.next_expected(), 0);
 }
+
+/// A failed lower sequence never arrives: termination must release queued owners
+/// and resolve their futures without writing, skipping, committing, or finishing.
+#[test]
+fn termination_cancels_a_queued_higher_sequence_without_committing() {
+    let alloc = FakeAllocator::new();
+    let fake = FakeSink::new();
+    let buffer = ReorderBuffer::new(Box::new(fake.clone()), 1 << 20);
+    let mut higher = buffer.write(7, arena_payload(&alloc, 16, 0));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(higher.as_mut().poll(&mut cx).is_pending());
+    assert!(buffer.held_bytes() > 0);
+    assert!(alloc.in_use(alloc.host_tier()) > 0);
+    assert!(fake.written().is_empty());
+
+    buffer.cancel_queued_writes();
+    assert!(matches!(
+        higher.as_mut().poll(&mut cx),
+        Poll::Ready(Err(MorunaError::Cancelled))
+    ));
+    drop(higher);
+    assert_eq!(buffer.held_bytes(), 0);
+    assert_eq!(alloc.in_use(alloc.host_tier()), 0);
+    assert_eq!(
+        buffer.next_expected(),
+        0,
+        "the failed sequence was not skipped"
+    );
+    assert!(fake.written().is_empty());
+    assert!(fake.skipped().is_empty());
+    assert_eq!(buffer.committed_seq(), None);
+    assert_eq!(fake.finish_calls(), 0);
+    assert!(matches!(
+        block_on(buffer.write(0, arena_payload(&alloc, 16, 0))),
+        Err(MorunaError::Cancelled)
+    ));
+}
+
+/// Once the inner sink owns a write, cancellation must retain its future and
+/// payload until that original future completes, rather than returning Cancelled.
+#[test]
+fn termination_keeps_an_entered_inner_write_until_its_completion() {
+    use moruna_kernel::{BoxFuture, Payload, PayloadSpec, SinkSummary};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Gated {
+        inner: FakeSink,
+        entered: Arc<AtomicBool>,
+        complete: Arc<AtomicBool>,
+    }
+    impl Sink for Gated {
+        fn open(&mut self, schema: &SourceSchema) -> moruna_kernel::Result<()> {
+            self.inner.open(schema)
+        }
+        fn accepts(&self) -> PayloadSpec {
+            self.inner.accepts()
+        }
+        fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, moruna_kernel::Result<()>> {
+            Box::pin(async move {
+                self.entered.store(true, Ordering::Release);
+                std::future::poll_fn(|_| {
+                    if self.complete.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                self.inner.write(seq, payload).await
+            })
+        }
+        fn finish(&mut self) -> moruna_kernel::Result<SinkSummary> {
+            self.inner.finish()
+        }
+        fn committed_seq(&self) -> Option<Seq> {
+            self.inner.committed_seq()
+        }
+    }
+    let alloc = FakeAllocator::new();
+    let fake = FakeSink::new();
+    let entered = Arc::new(AtomicBool::new(false));
+    let complete = Arc::new(AtomicBool::new(false));
+    let buffer = ReorderBuffer::new(
+        Box::new(Gated {
+            inner: fake.clone(),
+            entered: entered.clone(),
+            complete: complete.clone(),
+        }),
+        1 << 20,
+    );
+    let mut original = buffer.write(0, arena_payload(&alloc, 16, 0));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(original.as_mut().poll(&mut cx).is_pending());
+    assert!(entered.load(Ordering::Acquire));
+    buffer.cancel_queued_writes();
+    assert!(original.as_mut().poll(&mut cx).is_pending());
+    assert!(
+        alloc.in_use(alloc.host_tier()) > 0,
+        "original owner retained"
+    );
+    assert!(fake.written().is_empty());
+    assert_eq!(buffer.committed_seq(), None);
+    complete.store(true, Ordering::Release);
+    assert!(matches!(
+        original.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    drop(original);
+    assert_eq!(fake.written(), vec![0]);
+    assert_eq!(buffer.committed_seq(), Some(0));
+    assert_eq!(alloc.in_use(alloc.host_tier()), 0);
+    assert_eq!(fake.finish_calls(), 0);
+}

@@ -44,7 +44,7 @@ test -f .cargo/config.toml
 test -d vendor
 export CARGO_HOME=/proof/cargo CARGO_TARGET_DIR=/proof/target
 export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
-if [ "$phase" = kd3-fixture-tools-arm ] || [ "$phase" = kd3-fixture-tools-gnu ] || [ "$phase" = witness-tests ] || [ "$phase" = sdk-proof-build ] || [ "$phase" = boot-host-tools ] || [ "$phase" = phase-a-tests ] || [ "$phase" = image-tests ]; then export CARGO_BUILD_JOBS=1; fi
+if [ "$phase" = kd3-fixture-tools-arm ] || [ "$phase" = kd3-fixture-tools-gnu ] || [ "$phase" = witness-tests ] || [ "$phase" = sdk-proof-build ] || [ "$phase" = boot-host-tools ] || [ "$phase" = phase-a-tests ] || [ "$phase" = image-tests ] || [ "$phase" = sink-termination-tests ]; then export CARGO_BUILD_JOBS=1; fi
 export LIBCLANG_PATH=/opt/moruna-proof-tools/usr/lib/aarch64-linux-gnu
 export LD_LIBRARY_PATH=/opt/moruna-proof-tools/usr/lib/aarch64-linux-gnu:/opt/moruna-proof-tools/usr/lib/llvm-14/lib
 python3 - <<'PY'
@@ -371,6 +371,9 @@ finally:
 PY_IMAGE_CLEANUP
     if [ "$image_status" -ne 0 ]; then exit "$image_status"; fi
     ;;
+  sink-termination-tests)
+    run_cargo test -p moruna-sinks --test si_reorder termination_ -- --nocapture --test-threads=1
+    ;;
   ports-tests)
     run_cargo test -p moruna-sinks --test si_parquet portable_checkpoint_flush_ -- --nocapture --test-threads=1
     run_cargo test -p moruna-runtime --test ports po_t8_a_resumed_run_restores_a_stages_state_bytes -- --exact --nocapture --test-threads=1
@@ -421,7 +424,7 @@ class CombinedRun(module.Ke2Run):
 
     def __init__(self, options, inputs, archive, cache):
         super().__init__(options, inputs, archive, cache)
-        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'ports-tests', 'image-tests'):
+        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'ports-tests', 'image-tests', 'sink-termination-tests'):
             self.memory = 6
         if options.phase in ('boot-host-tools','sdk-proof-build'):
             self.measurement_scope='ARM64 Linux host helper dev/debug0 build and custody only; no optimization/performance/boot/execution claim'
@@ -917,7 +920,7 @@ printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'ports-tests', 'image-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
+    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'ports-tests', 'image-tests', 'sink-termination-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
     parser.add_argument('--inputs', required=True)
     parser.add_argument('--archive', required=True)
     parser.add_argument('--cache-journal')
