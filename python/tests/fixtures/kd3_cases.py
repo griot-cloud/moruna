@@ -222,6 +222,11 @@ def cases(args):
                     fixture["governed_input"] = str(root / "governed/input.parquet")
                 if adapter == "linux":
                     fixture.update(sandbox_python=args.sandbox_python, sandbox_cgroup=args.sandbox_cgroup)
+                elif case["id"].startswith("kernel.package.pex"):
+                    # NativePex requires an explicit real interpreter from the
+                    # attached image; the preparation overlay installs this
+                    # pinned standard CPython here. Never pass Linux cgroups.
+                    fixture["sandbox_python"] = "/opt/python-std/bin/python3"
                 path = out / "cases" / (name + ".json")
                 write(path, fixture)
                 job_file = "jobs/" + name + ".json"
