@@ -175,9 +175,10 @@ mod proof {
         }
         let artifacts = moruna_vmm::microkernel::inspect(&cfg.descriptor)?;
         let r = &artifacts.resources;
+        // Launch admits a job budget, then derives physical VM RAM from the descriptor.
         let budget = moruna_vmm::session::Budget {
-            memory_bytes: r.node_memory_bytes,
-            memory_max_bytes: r.node_memory_bytes,
+            memory_bytes: r.job_memory_bytes,
+            memory_max_bytes: r.job_memory_bytes,
             cpus: r.cpus,
             cpus_max: r.cpus,
         };

@@ -235,7 +235,7 @@ def validate_kd3(raw,inputs):
         validator=relative(v['matrix_validator']);source_manifest=private_file(v['matrix_validator_source_manifest']);source_rows=json.loads(source_manifest.read_text());source_row=next((row for row in source_rows if row['path']=='tools/kd3-matrix.py'),None)
         require(source_row is not None and source_row['sha256']==sha(validator) and source_row['bytes']==validator.stat().st_size,'matrix validator differs from exact shipping source census')
         z=source_manifest.stat();inputs['fingerprints'].append({'path':str(source_manifest),'bytes':z.st_size,'sha256':sha(source_manifest),'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
-    inputs['mounts'].append({'path':str(root),'destination':'/inputs/kd3','readonly':True})
+    inputs['mounts'].append({'path':str(root),'destination':'/proof/kd3-inputs','readonly':True})
     inputs['kd3']={**v,'plan_sha256':sha(plan),'manifest_sha256':sha(manifest),'native_cells':native}
     inputs['kd3_census']={'root':str(root),'paths':[row['path'] for row in actual]}
 
@@ -350,7 +350,7 @@ try:
    command(['python3',base/'tools/check-node-fixtures.py',evidence],'matrix15')
    result['matrix15_passed']=True
  elif phase=='kd3':
-  k=config['kd3'];bundle=pathlib.Path('/inputs/kd3');root=evidence/'kd3';root.mkdir(mode=0o700,exist_ok=True)
+  k=config['kd3'];bundle=pathlib.Path('/proof/kd3-inputs');root=evidence/'kd3';root.mkdir(mode=0o700,exist_ok=True)
   cellroot=root/'cells';cellroot.mkdir(mode=0o700,exist_ok=True);results=root/'results';results.mkdir(mode=0o700,exist_ok=True)
   matrix=json.loads((bundle/k['matrix']).read_text());cases={c['id']:c for c in matrix['cases']};expected=sorted(matrix['rows'])
   kd3args=list(profile_args)
