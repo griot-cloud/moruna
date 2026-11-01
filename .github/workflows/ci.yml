@@ -93,7 +93,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: The image kind, for real (SDD 19 k)
         # An image's command runs in its own namespaces, under Landlock and seccomp, in a cgroup
         # Moruna made: that needs root and a cgroup v2 directory with `memory` and `cpu` handed to
