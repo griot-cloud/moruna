@@ -20,4 +20,4 @@ osdk-frame-allocator.workspace = true
 # `plane_probe` (SDD 29): the physical frames and copied bytes the data plane's tests
 # measure. The CI boot's kernel is built with it; a kernel built without it answers
 # the call `BadSyscall`.
-probe = []
+probe = ["osdk-frame-allocator/shared-pool-probe"]

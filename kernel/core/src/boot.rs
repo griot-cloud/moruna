@@ -72,6 +72,8 @@ fn start() -> Result<usize, String> {
     ostd::task::inject_pre_schedule_handler(process::deactivate_current);
     ostd::task::inject_post_schedule_handler(process::activate_current);
     early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
+    #[cfg(feature = "probe")]
+    osdk_frame_allocator::probe_shared_pool();
     let machine = machine_account()?;
     process::boot_begins();
     start_manifest(&machine)

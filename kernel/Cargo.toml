@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["vendor/ring-0.17.14"]
+exclude = ["vendor/ring-0.17.14", "vendor/osdk-frame-allocator-0.19.0"]
 members = ["abi", "loader", "handles", "quota", "core", "boot", "sys", "svc", "programs", "tools/image", "examples/*", "drivers/*", "devices/*", "imagefs/*", "linux/core", "linux/protocol", "linux/server", "linux/test", "plane/check", "plane/core", "plane/test", "engine", "net/*", "storage", "node/core", "node/protocol", "node/supervisor", "node/admission", "node/image", "node/proof"]
 
 [workspace.package]
@@ -37,3 +37,5 @@ panic = "abort"
 # Audited build-only baremetal platform adaptation; exact sources/provenance in net/.
 [patch.crates-io]
 ring = { path = "vendor/ring-0.17.14" }
+
+osdk-frame-allocator = { path = "vendor/osdk-frame-allocator-0.19.0" }
