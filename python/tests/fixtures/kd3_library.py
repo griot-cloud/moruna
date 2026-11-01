@@ -90,7 +90,11 @@ def main():
             raise ConnectionError("KD3 real iterator refusal")
         yield batch.slice(17)
 
-    source = batches() if case_id == "library.iterator" else Input()
+    source = (
+        moruna.IteratorSource(batches(), schema=schema)
+        if case_id == "library.iterator"
+        else Input()
+    )
     kernels = [identity] if case_id == "library.python.kernel" else []
     output = Output()
     # Native startup authority is mandatory; off-kernel caller embedding remains explicit.
