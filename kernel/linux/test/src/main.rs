@@ -123,7 +123,12 @@ fn threads(c: &mut linux::Client, cpus: usize) -> Result<String, String> {
 fn dynamic(c: &mut linux::Client) -> Result<String, String> {
     let r = run_program(c, &["/kc1/bin/dynamic"])?;
     exited_zero(&r, "dynamic")?;
-    if !r.text.contains("dynamic glibc ") || !r.text.contains("hello through ld-linux") {
+    if !r.text.contains("dynamic glibc ")
+        || !r.text.contains("hello through ld-linux")
+        || !r
+            .text
+            .contains("dynamic: readonly subrange alias, private copy and descriptor reuse ok")
+    {
         return Err(format!("printed `{}`", r.text.trim_end()));
     }
     Ok(format!("{} (refused: {})", r.text.trim_end(), refused(&r)))

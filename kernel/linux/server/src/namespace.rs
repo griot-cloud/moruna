@@ -12,6 +12,24 @@ struct File {
     assets: bool,
     remote: u32,
     root: bool,
+    readonly_mapping: Option<ReadonlyMapping>,
+}
+
+/// Immutable image bytes retained for this exact open file, not a reusable fd.
+struct ReadonlyMapping {
+    memory: Memory,
+    offset: u64,
+    len: u64,
+}
+
+impl ReadonlyMapping {
+    fn contains(&self, offset: u64, len: u64) -> bool {
+        offset >= self.offset
+            && offset
+                .checked_add(len)
+                .zip(self.offset.checked_add(self.len))
+                .is_some_and(|(end, mapped_end)| end <= mapped_end)
+    }
 }
 pub struct Namespace {
     root: imagefs::Client,
@@ -146,6 +164,7 @@ impl Namespace {
                 assets,
                 remote,
                 root: path == b"/",
+                readonly_mapping: None,
             },
         );
         Ok((local, stat))
@@ -177,9 +196,39 @@ impl Namespace {
         let (a, n) = self.file(n)?;
         self.client(a)?.read(n, at, len)
     }
-    pub fn map(&mut self, n: u32, at: u64, len: u64) -> Result<Memory> {
-        let (a, n) = self.file(n)?;
-        self.client(a)?.map(n, at, len)
+    /// A readonly view of immutable file bytes. A contained range shares the
+    /// existing backing; the caller must pass the returned memory offset to map.
+    /// Writable MAP_PRIVATE mappings use the separate read-and-copy path.
+    pub fn map_readonly(&mut self, n: u32, at: u64, len: u64) -> Result<(&Memory, u64)> {
+        let (assets, remote) = self.file(n)?;
+        if len == 0 || !at.is_multiple_of(4096) || at.checked_add(len).is_none() {
+            return refusal(imagefs::Error::BadRange);
+        }
+        let contained = self
+            .files
+            .get(&n)
+            .and_then(|file| file.readonly_mapping.as_ref())
+            .is_some_and(|mapping| mapping.contains(at, len));
+        if !contained {
+            let memory = self.client(assets)?.map(remote, at, len)?;
+            let file = self
+                .files
+                .get_mut(&n)
+                .ok_or(CallError::Remote(imagefs::Error::BadFile))?;
+            // Active process mappings independently retain their old backing.
+            // Replacing this one file-local handle cannot retire those mappings.
+            file.readonly_mapping = Some(ReadonlyMapping {
+                memory,
+                offset: at,
+                len,
+            });
+        }
+        let mapping = self
+            .files
+            .get(&n)
+            .and_then(|file| file.readonly_mapping.as_ref())
+            .ok_or(CallError::Remote(imagefs::Error::BadFile))?;
+        Ok((&mapping.memory, at - mapping.offset))
     }
     pub fn write(&mut self, n: u32, at: u64, data: Bytes) -> Result<u32> {
         let (a, n) = self.file(n)?;

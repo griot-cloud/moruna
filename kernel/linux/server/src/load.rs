@@ -403,12 +403,18 @@ impl Task {
             }
             return Ok(());
         }
-        let memory = self
+        let (memory, memory_offset) = self
             .fs
-            .map(number, offset, plan.file_len)
+            .map_readonly(number, offset, plan.file_len)
             .map_err(crate::files::errno_of)?;
         self.process
-            .map(Some(&memory.0), 0, plan.file_len, va, prot | map::FIXED)
+            .map(
+                Some(&memory.0),
+                memory_offset,
+                plan.file_len,
+                va,
+                prot | map::FIXED,
+            )
             .map_err(errno_of)?;
         Ok(())
     }
