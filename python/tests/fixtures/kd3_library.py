@@ -5,11 +5,30 @@ Requires the real installed Moruna/PyArrow runtime; nothing is mocked or install
 Each invocation runs exactly one job (and one native assigned startup identity).
 """
 import json
+import os
 import pathlib
 import sys
 
 import moruna
 import pyarrow as pa
+
+
+def emit(value):
+    nonce = os.environ.get("MORUNA_KD3_PROOF_NONCE")
+    if nonce is None:
+        print(json.dumps(value))
+        return
+    run, case = value.get("run_id"), value["case"]
+    def hex32(text):
+        return isinstance(text, str) and len(text) == 32 and all(c in "0123456789abcdef" for c in text)
+    if value["adapter"] != "native" or not hex32(nonce) or not hex32(run) or not case or len(case) > 80 or any(not(c.isascii() and (c.isalnum() or c in "._-")) for c in case):
+        raise ValueError("invalid explicit native proof envelope")
+    raw = json.dumps({"run_id": run, "receipts": [value]}).encode()
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("native proof result exceeds 8MiB")
+    for index, offset in enumerate(range(0, len(raw), 96)):
+        print(f"KD3R {case} {run} {nonce} {len(raw)} {index} {raw[offset:offset+96].hex()}")
+    print(f"KD3E {case} {run} {nonce} {len(raw)} {(len(raw)+95)//96}", flush=True)
 
 
 def main():
@@ -103,17 +122,17 @@ def main():
     except moruna.MorunaError as error:
         if mode != "adapter-refusal" or "KD3 real" not in str(error):
             raise
-        print(json.dumps({"case": case_id, "adapter": adapter, "phase": "execute", "mode": mode,
+        emit({"case": case_id, "adapter": adapter, "phase": "execute", "mode": mode,
                           "outcome": "refused", "diagnostic": str(error),
-                          "partial_rows": output.values, "finish": output.finished, "run_id": error.run_id}))
+                          "partial_rows": output.values, "finish": output.finished, "run_id": error.run_id})
         return
     if mode == "adapter-refusal":
         raise AssertionError("actual source/kernel/sink failure was not propagated")
     if report.exit != "Completed" or output.finished != 1 or sorted(output.values) != sorted(expected):
         raise AssertionError(f"actual execution differs: {report.exit}, finish={output.finished}, rows={output.values}")
-    print(json.dumps({"case": case_id, "adapter": adapter, "phase": "execute", "mode": "rows",
+    emit({"case": case_id, "adapter": adapter, "phase": "execute", "mode": "rows",
                       "outcome": "rows", "rows": sorted(output.values), "finish": output.finished,
-                      "committed": len(output.values), "run_id": report.run_id}))
+                      "committed": len(output.values), "run_id": report.run_id})
 
 
 if __name__ == "__main__":

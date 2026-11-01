@@ -40,15 +40,16 @@ diagnostic field. Its failure receipt is preserved. Cases 3 through 5 did not ru
 The engine produced the intended Python failure and Exit 4 in case 2; this is
 evidence for the diagnostic correction, not a passing acceptance result.
 
+The current work is Phase A only, with a four-hour target ending at 14:54 Nairobi
+on 2026-11-01. Progress tables contain only its five active areas.
+
 | Area | Current status | Still needed before deployment |
 | ---- | -------------- | ------------------------------ |
 | Compiler dependencies | ✅ | None |
-| Runtime, SDK, checkpoints/history | Six verifier tests and first SDK case passed; diagnostic correction reviewed | Rebuild corrected verifier and complete SDK cases |
-| Node launcher and admission | Test workload and owned cleanup exercised | Complete admission cases and native KVM staging |
-| Secure networking | Certificate bundle accepted at startup | Execute connection and refusal checks |
-| Durable storage and file operations | Storage code compiled; NVMe device starts | Execute durable write and recovery checks |
-| Combined application | 100,000-row workload passes on CPU1 | Finish CPU1/2/4 cases and verify Griot on Moruna |
-| Deployment artifacts | Engine and image built; source consolidated | Finish checks and staging deployment |
+| Runtime, SDK, checkpoints/history | 245 ARM tests passed; lint corrections prepared | Recheck lint and finish conformance |
+| Node launcher and admission | Launcher and frame tests passed | Pass the 1/2/4-CPU job matrix |
+| Combined application | Actual fixtures and verified Python/PyArrow inputs prepared | Execute Linux/native rows, refusals and readback |
+| Deployment artifacts | 0.6.0 engine and host tools built | Verify final artifacts and complete release gates |
 
 ## Resume sequence
 
@@ -59,11 +60,12 @@ evidence for the diagnostic correction, not a passing acceptance result.
    five canonical cases in order on 1, 2 and 4 CPUs. Retain strict row counts,
    identity, sink acknowledgement, budget, deadline and cleanup checks. Stop on
    the first failure; do not merge old successes across different source inputs.
-3. Execute the separate native network/storage proof: real connection/refusal
-   behavior and durable write/recovery over two boots of the same home image.
-4. Exercise a real Linux x86 KVM staging host, then Griot's actual application,
-   persistent data and restart paths. An emulated workload pass does not certify
-   either of these steps.
+3. Complete all 21 cross-adapter cases and 92 required result cells. Native sink
+   readback stays in the original admitted scope and reads the actual acknowledged
+   objects through canonical source adapters.
+4. Run local ARM Linux and x86 QEMU execution checks. No remote KVM server is
+   available; do not label emulated results as KVM execution. Complete the canonical
+   CI and release gates before publishing 0.6.0.
 
 Canonical repository entry points are `kernel/tools/build.sh`,
 `kernel/node/tools/proof.py`, `kernel/node/tools/io-proof.py`, and their existing

@@ -52,3 +52,6 @@ virtio-queue = { workspace = true, features = ["test-utils"] }
 default = []
 # Explicit proof-only software-emulated boot, never a production KVM fallback.
 native-tcg-proof = []
+
+# Explicit fixture command/console proof only; production launcher stays strict KVM.
+kd3-conformance-proof = ["native-tcg-proof"]

@@ -12,6 +12,7 @@ import os
 import uuid
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import time
 
@@ -37,12 +38,19 @@ def main():
     for name in ("qemu", "backend", "peer", "fixture-emitter", "validator", "image-builder", "provision", "kernel-elf", "user-bins", "image-record", "linux-layers", "linux-digest", "tls-roots", "layer-fixture-1", "layer-fixture-2", "engine-layer-dir"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--sdk-proof", type=Path, help="Explicit nondefault Rust native SDK TCG proof executable; sole VM owner")
+    parser.add_argument("--kd3-conformance-proof", type=Path, help="explicit private fixed command JSON")
+    parser.add_argument("--kd3-job", type=Path, help="actual canonical job supplying fresh single-use authority")
+    parser.add_argument("--fixture-boot", type=Path, help="explicit kd3-conformance-proof VMM example")
+    parser.add_argument("--fixture-cell", help="actual matrix case id")
     parser.add_argument("--io-phase", choices=("created", "existing"))
     parser.add_argument("--io-home", type=Path)
     parser.add_argument("--io-net", type=Path)
     args = parser.parse_args()
     if any((args.io_phase is not None, args.io_home is not None, args.io_net is not None)) != all((args.io_phase is not None, args.io_home is not None, args.io_net is not None)):
         parser.error("IO fixture requires phase, same provisioned home, and existing net-proof inputs together")
+    fixture_mode = any((args.kd3_conformance_proof, args.kd3_job, args.fixture_boot, args.fixture_cell))
+    if fixture_mode and (not all((args.kd3_conformance_proof, args.kd3_job, args.fixture_boot, args.fixture_cell)) or args.sdk_proof or args.io_phase):
+        parser.error("fixture command/job/boot/cell required together, separate from SDK server and IO proofs")
     if args.sdk_proof and args.io_phase:
         parser.error("SDK engine-case proof cannot stand in for the separate native storage/network IO actor")
     if not 10 <= args.seconds <= 600:
@@ -68,7 +76,7 @@ def main():
     record = {"version": 1, "cpus": args.cpus, "case": args.case, "passed": False, "cleanup": False}
     children = []
     logs = []
-    sdk_cleanup = not bool(args.sdk_proof)
+    sdk_cleanup = not bool(args.sdk_proof or fixture_mode)
 
     def remaining():
         left = deadline - time.monotonic()
@@ -108,12 +116,21 @@ def main():
         input_files["proof_source"] = Path(__file__).resolve()
         input_files["configure_source"] = tools / "configure.py"
         input_files["assembly_source"] = description
+        if fixture_mode:
+            input_files.update(fixture_job=args.kd3_job, fixture_command=args.kd3_conformance_proof, fixture_boot=args.fixture_boot)
         common_inputs = {name: digest(path) for name, path in input_files.items()}
         record["inputs_sha256"] = hashlib.sha256(json.dumps(common_inputs, sort_keys=True).encode()).hexdigest()
         record["inputs"] = common_inputs
         run = (f"c200{args.cpus:02x}{1 if args.io_phase == 'created' else 2:02x}" if args.io_phase else f"c100{args.cpus:02x}{args.case:02x}") + "00" * 12
         # ONE canonical case definition remains in kd3-peer, including assigned id.
-        command([args.peer, "--emit-job", args.linux_digest, args.case, run, out / "job.json"])
+        if fixture_mode:
+            actual_job = json.loads(args.kd3_job.read_text())
+            run = actual_job.get("run_id")
+            if not isinstance(run, str) or len(run) != 32 or any(c not in "0123456789abcdef" for c in run):
+                raise ValueError("fixture job needs actual fresh canonical run_id")
+            shutil.copyfile(args.kd3_job, out / "job.json")
+        else:
+            command([args.peer, "--emit-job", args.linux_digest, args.case, run, out / "job.json"])
         command([args.fixture_emitter, out / "job.json", out / "canonical", *(["--storage-write-proof"] if args.io_phase else [])])
         identity = json.loads((out / "canonical/identity.json").read_text())
         if identity.get("version") != 1 or identity.get("run_id") != run:
@@ -133,7 +150,8 @@ def main():
                  "--image-record", args.image_record, "--layers", args.linux_layers, "--network", out / "network.conf",
                  "--tls-roots", args.io_net / "roots" if args.io_phase else args.tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
                  "--storage-config", out / "storage.conf", "--storage-grants", out / "canonical/storage.grants",
-                 "--storage-admission", out / "canonical/storage.admission"])
+                 "--storage-admission", out / "canonical/storage.admission",
+                 *(["--kd3-conformance-proof", args.kd3_conformance_proof] if fixture_mode else [])])
         if args.io_phase:
             # Explicit fixture assembly uses the unmodified production node parser,
             # supervisor, authority and storage owner, not a substitute service.
@@ -143,7 +161,8 @@ def main():
             text = text.replace("handle program:engine image.engine", "handle program:node-storage-proof image.engine")
             description = out / "io.image"
             description.write_text(text)
-        command([args.validator, description, out / "assets", RAM, args.cpus, PORT])
+        command([args.validator, description, out / "assets", RAM, args.cpus, PORT,
+                 *(["--kd3-conformance-proof"] if fixture_mode else [])])
         resources = json.loads((out / "assets/node-resources.json").read_text())
         expected_resources = {key: profile[key] for key in
                               ("cpus", "node_memory_bytes", "job_memory_bytes", "job_account_bytes", "scratch_bytes")}
@@ -170,7 +189,7 @@ def main():
             command([args.provision, "plan", "--output", out / "home.root", "--capacity", 64 * MIB,
                      "--alignment", 4096, "--log-bytes", MIB, "--role", "single-node-home", "--workspace", "moruna-ci", "--bucket", "jobs"])
             command([args.provision, "format", "--image", out / "home.img", "--root", out / "home.root"])
-        if args.sdk_proof:
+        if args.sdk_proof or fixture_mode:
             # Descriptor paths are relative to ONE existing common owned root;
             # retain exact inputs without copying large layers per matrix case.
             # SDK inspect/snapshot is the sole descriptor/artifact validator.
@@ -199,6 +218,24 @@ def main():
             seconds = int(remaining()) - 30
             if seconds < 10:
                 raise TimeoutError("insufficient remaining SDK execution/cleanup budget")
+            if fixture_mode:
+                authored = json.loads(args.kd3_conformance_proof.read_text())
+                config = {"descriptor": str(descriptor_path), "runtime_dir": str(runtime),
+                          "qemu": str(args.qemu), "backend": str(args.backend), "case": args.fixture_cell,
+                          "run": run, "nonce": authored["nonce"], "seconds": seconds,
+                          "result": str(out / "fixture-result.json")}
+                config_path = out / "fixture-config.json"
+                config_path.write_text(json.dumps(config, indent=2) + "\n")
+                record["case_inputs"] = {name: digest(out / name) for name in
+                    ("job.json", "canonical/engine.bindings", "canonical/storage.admission", "canonical/storage.grants",
+                     "assets/engine.conf", "assets/node.conf", "assets/initramfs.cpio", "fixture-config.json")}
+                command([args.fixture_boot, config_path])
+                result = json.loads((out / "fixture-result.json").read_text())
+                sdk_cleanup = result.get("cleanup") is True
+                if not sdk_cleanup or result.get("run") != run or result.get("case") != args.fixture_cell or result.get("nonce") != authored["nonce"]:
+                    raise ValueError("actual fixture result identity/cleanup differs")
+                record.update(fixture=result, run_id=run, cleanup_method="fixture-owned-exited", passed=True)
+                return
             config = {"descriptor": str(descriptor_path), "job": str(out / "job.json"), "image_digest": str(args.linux_digest),
                       "case": args.case, "node_boot": uuid.uuid4().hex, "attempt": 1,
                       "state_directory": str(state), "runtime_directory": str(runtime), "evidence_directory": str(evidence),
@@ -363,7 +400,7 @@ def main():
         record["cleanup"] = cleaned
         record["passed"] = bool(record["passed"] and cleaned)
         (out / "result.json").write_text(json.dumps(record, indent=2) + "\n")
-        if args.sdk_proof and not record["passed"]:
+        if (args.sdk_proof or fixture_mode) and not record["passed"]:
             raise SystemExit(f"SDK node CI case failed; actual evidence: {out / 'result.json'}")
     if not record["passed"]:
         raise SystemExit(f"node CI case failed; actual evidence: {out / 'result.json'}")

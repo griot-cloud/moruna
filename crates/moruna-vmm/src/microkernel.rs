@@ -146,12 +146,14 @@ pub fn inspect(descriptor: &Path) -> Result<MicrokernelArtifacts> {
         || artifacts.writable_disks.len() > 4
         || r.node_memory_bytes < crate::limits::MIN_MEMORY_BYTES
         || r.node_memory_bytes > crate::limits::MAX_MEMORY_BYTES
-        || r.node_memory_bytes % crate::limits::MEMORY_ALIGN_BYTES != 0
+        || !r
+            .node_memory_bytes
+            .is_multiple_of(crate::limits::MEMORY_ALIGN_BYTES)
         || r.job_memory_bytes == 0
-        || r.job_memory_bytes % 4096 != 0
-        || r.job_account_bytes % 4096 != 0
+        || !r.job_memory_bytes.is_multiple_of(4096)
+        || !r.job_account_bytes.is_multiple_of(4096)
         || r.scratch_bytes == 0
-        || r.scratch_bytes % 4096 != 0
+        || !r.scratch_bytes.is_multiple_of(4096)
         || r.job_memory_bytes
             .checked_add(r.scratch_bytes)
             .is_none_or(|n| n >= r.job_account_bytes)

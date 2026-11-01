@@ -6,7 +6,7 @@
 use arrow::{
     array::{Array, FixedSizeListArray, Int64Array, RecordBatch},
     datatypes::{DataType, Field, Schema},
-    ipc::writer::StreamWriter,
+    ipc::writer::FileWriter,
 };
 use moruna_kernel::{
     BoxFuture, CancelToken, MorunaError, Payload, PayloadSpec, Seq, Sink, SinkSummary, SourceSchema,
@@ -36,10 +36,12 @@ struct Facts {
     finished: u64,
     committed: u64,
     files: Vec<String>,
+    readback: Option<Box<Facts>>,
 }
 struct Observe {
     inner: Box<dyn Sink>,
     facts: Arc<Mutex<Facts>>,
+    readback: Option<Readback>,
 }
 impl Sink for Observe {
     fn open(&mut self, schema: &SourceSchema) -> moruna_kernel::Result<()> {
@@ -95,13 +97,25 @@ impl Sink for Observe {
     }
     fn finish(&mut self) -> moruna_kernel::Result<SinkSummary> {
         let summary = self.inner.finish()?;
-        let mut facts = self
-            .facts
-            .lock()
-            .map_err(|_| invalid("observer poisoned"))?;
-        facts.finished += 1;
-        facts.committed = summary.rows;
-        facts.files = summary.files.clone();
+        {
+            let mut facts = self
+                .facts
+                .lock()
+                .map_err(|_| invalid("observer poisoned"))?;
+            facts.finished += 1;
+            facts.committed = summary.rows;
+            facts.files = summary.files.clone();
+        }
+        if let Some(reader) = self.readback.take() {
+            let files = summary.files.clone();
+            let read = std::thread::spawn(move || reader.read(files))
+                .join()
+                .map_err(|_| invalid("actual readback thread panicked"))??;
+            self.facts
+                .lock()
+                .map_err(|_| invalid("observer poisoned"))?
+                .readback = Some(Box::new(read));
+        }
         Ok(summary)
     }
     fn committed_seq(&self) -> Option<Seq> {
@@ -120,6 +134,70 @@ impl Sink for Observe {
         seq: Option<Seq>,
     ) -> moruna_kernel::Result<()> {
         self.inner.resume(schema, state, seq)
+    }
+}
+// Retains the ORIGINAL run's arena/reactor owners and shared claims. No second
+// Runtime, Guest claim, account, or source-input query is introduced.
+struct Readback {
+    context: moruna_runtime::spec::BuildCtx,
+    kind: String,
+    target: String,
+}
+impl Readback {
+    fn read(self, files: Vec<String>) -> moruna_kernel::Result<Facts> {
+        use moruna_runtime::kinds::{Context, Entry, Registry, Standalone};
+        if files.is_empty() {
+            return Err(invalid("sink ACK named no files"));
+        }
+        let registry = Registry::standard();
+        let mut context = Context::new(Arc::new(Standalone));
+        let source_doc: moruna_job::KindDoc =
+            serde_json::from_value(json!({"kind":self.kind,"url":files}))
+                .map_err(|e| invalid(format!("actual receipt source: {e}")))?;
+        let (_, adapter) = registry.source("source", &self.kind)?;
+        let source = adapter
+            .source(&Entry::new("source", None, &source_doc), &mut context)?
+            .spec
+            .build(&self.context)?;
+        let sink_kind = if self.kind == "tensor" {
+            "tensor"
+        } else {
+            "arrow_ipc"
+        };
+        let sink_doc: moruna_job::KindDoc =
+            serde_json::from_value(json!({"kind":sink_kind,"url":self.target}))
+                .map_err(|e| invalid(format!("readback sink: {e}")))?;
+        let (_, adapter) = registry.sink("sink", sink_kind)?;
+        let inner = adapter
+            .sink(&Entry::new("sink", None, &sink_doc), &mut context)?
+            .spec
+            .build(&self.context)?;
+        let facts = Arc::new(Mutex::new(Facts::default()));
+        let mut sink = Observe {
+            inner,
+            facts: facts.clone(),
+            readback: None,
+        };
+        sink.open(&source.schema())?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| invalid(format!("readback IO executor: {e}")))?;
+        for (seq, split) in source.plan()?.iter().enumerate() {
+            let payload = runtime.block_on(source.read(
+                split,
+                None,
+                self.context.alloc.as_ref(),
+                moruna_kernel::Tier::Host,
+            ))?;
+            runtime.block_on(sink.write(seq as u64, payload))?;
+        }
+        sink.finish()?;
+        drop(sink);
+        Arc::try_unwrap(facts)
+            .map_err(|_| invalid("readback facts still owned"))?
+            .into_inner()
+            .map_err(|_| invalid("readback facts poisoned"))
     }
 }
 // A REAL executable handler supplied by this test embedder through the public
@@ -163,7 +241,7 @@ fn seed(path: &Path) -> Result<()> {
     let rows = expected()?;
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(rows))])?;
-    let mut writer = StreamWriter::try_new(
+    let mut writer = FileWriter::try_new(
         fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -195,6 +273,7 @@ fn run(path: &Path, adapter: &str) -> Result<Value> {
         ("native", true) | ("linux", false) => {}
         _ => return Err("adapter label contradicts actual startup environment".into()),
     }
+    let assigned = guest.as_ref().map(|guest| guest.run_id().to_hex());
     let phase = fixture["phase"].as_str().unwrap_or("execute");
     let mode = fixture["mode"].as_str().unwrap_or("rows");
     if !["execute", "readback"].contains(&phase) || !["rows", "unknown-setting"].contains(&mode) {
@@ -351,7 +430,7 @@ fn run(path: &Path, adapter: &str) -> Result<Value> {
                 return Err(error.into());
             }
             return Ok(
-                json!({"case":id,"adapter":adapter,"phase":phase,"mode":mode,"outcome":"refused","diagnostic":diagnostic}),
+                json!({"case":id,"adapter":adapter,"phase":phase,"mode":mode,"outcome":"refused","diagnostic":diagnostic,"run_id":assigned}),
             );
         }
     };
@@ -384,6 +463,21 @@ fn run(path: &Path, adapter: &str) -> Result<Value> {
     };
     let facts = Arc::new(Mutex::new(Facts::default()));
     let observe = facts.clone();
+    let reader = (case["role"] == "sink" && phase == "execute" && mode == "rows").then(|| {
+        (
+            if case["kind"] == "peql" {
+                "parquet".to_owned()
+            } else {
+                case["kind"].as_str().unwrap_or("").to_owned()
+            },
+            format!(
+                "{}/receipt-readback",
+                fixture["job"]["staging"]["dir"]
+                    .as_str()
+                    .unwrap_or("/tmp/kd3-staging")
+            ),
+        )
+    });
     if built.spec.sinks.len() != 1 {
         return Err("KD3 fixture requires one real sink".into());
     }
@@ -395,6 +489,11 @@ fn run(path: &Path, adapter: &str) -> Result<Value> {
             Ok(Box::new(Observe {
                 inner: original.build(context)?,
                 facts: observe,
+                readback: reader.map(|(kind, target)| Readback {
+                    context: context.clone(),
+                    kind,
+                    target,
+                }),
             }))
         })));
     let cancel = CancelToken::new();
@@ -432,12 +531,99 @@ fn run(path: &Path, adapter: &str) -> Result<Value> {
     if actual != expected || facts.finished != 1 || facts.committed != expected.len() as u64 {
         return Err("actual rows/finish/committed summary mismatch".into());
     }
-    Ok(
-        json!({"case":id,"adapter":adapter,"phase":phase,"mode":mode,"outcome":"rows","rows":actual,"finish":facts.finished,"committed":facts.committed,"outside_after":outside_after,"files":facts.files,"producer":producer,"report":report}),
-    )
+    let execute = json!({"case":id,"adapter":adapter,"phase":phase,"mode":mode,"outcome":"rows","rows":actual,"finish":facts.finished,"committed":facts.committed,"outside_after":outside_after,"files":facts.files,"producer":producer,"run_id":report.run_id.to_string(),"report":report});
+    if let Some(read) = &facts.readback {
+        let mut actual = read.batches.values().flatten().copied().collect::<Vec<_>>();
+        actual.sort_unstable();
+        if actual != expected || read.finished != 1 || read.committed != expected.len() as u64 {
+            return Err("actual receipt source readback differs".into());
+        }
+        let readback = json!({"case":id,"adapter":adapter,"phase":"readback","mode":"rows","outcome":"rows","rows":actual,"finish":read.finished,"committed":read.committed,"outside_after":outside_after,"files":read.files,"source_urls":facts.files,"producer":execute,"run_id":report.run_id.to_string()});
+        return Ok(json!({"run_id":report.run_id.to_string(),"receipts":[execute,readback]}));
+    }
+    Ok(execute)
+}
+#[cfg(feature = "peql")]
+fn seed_contract(path: &Path) -> Result<()> {
+    use moruna_datafusion::engine::Engine;
+    let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+    let engine = Engine::in_memory(path.parent().ok_or("contract path has no parent")?);
+    let mut entries = Vec::new();
+    for (name, binding) in [("input", "input.parquet"), ("output", "output/")] {
+        let source = format!(
+            "contract: kd3/{name}\nversion: 1\nowner: kd3\nbinding: {{parquet: {binding}}}\nexpose:\n  - {{name: x, type: int64}}\nrules:\n  - {{id: fixture, op: decide, expr: \"ctx.purpose == 'conformance'\"}}\n"
+        );
+        let registered = engine.register_contract(&source, &schema)?;
+        entries.push(moruna_runtime::kinds::governed::entry_of(&registered)?);
+    }
+    let mut out = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    serde_json::to_writer_pretty(&mut out, &entries)?;
+    out.write_all(b"\n")?;
+    out.sync_all()?;
+    Ok(())
+}
+fn emit(value: &Value, case: &str, adapter: &str) -> Result<()> {
+    let Some(nonce) = std::env::var_os("MORUNA_KD3_PROOF_NONCE") else {
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer(&mut out, value)?;
+        out.write_all(b"\n")?;
+        return Ok(());
+    };
+    let nonce = nonce.to_str().ok_or("proof nonce is not UTF-8")?;
+    let run = value["run_id"]
+        .as_str()
+        .ok_or("native result has no assigned run")?;
+    let hex32 = |s: &str| {
+        s.len() == 32
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if adapter != "native"
+        || !hex32(nonce)
+        || !hex32(run)
+        || case.len() > 80
+        || case.is_empty()
+        || !case
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err("invalid explicit native proof envelope".into());
+    }
+    let wrapped = if value.get("receipts").is_some() {
+        value.clone()
+    } else {
+        json!({"run_id":run,"receipts":[value]})
+    };
+    let bytes = serde_json::to_vec(&wrapped)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("native proof result exceeds 8MiB".into());
+    }
+    let mut out = std::io::stdout().lock();
+    for (index, chunk) in bytes.chunks(96).enumerate() {
+        write!(out, "KD3R {case} {run} {nonce} {} {index} ", bytes.len())?;
+        for byte in chunk {
+            write!(out, "{byte:02x}")?;
+        }
+        out.write_all(b"\n")?;
+    }
+    writeln!(
+        out,
+        "KD3E {case} {run} {nonce} {} {}",
+        bytes.len(),
+        bytes.len().div_ceil(96)
+    )?;
+    out.flush()?;
+    Ok(())
 }
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(feature = "peql")]
+    if args.len() == 2 && args[0] == "seed-contract" {
+        return seed_contract(Path::new(&args[1]));
+    }
     if args.len() == 2 && args[0] == "seed" {
         return seed(Path::new(&args[1]));
     }
@@ -455,8 +641,10 @@ fn main() -> Result<()> {
         py.detach(|| run(Path::new(&args[1]), &args[2]))
     });
     let value = result?;
-    let mut out = std::io::stdout().lock();
-    serde_json::to_writer(&mut out, &value)?;
-    out.write_all(b"\n")?;
-    Ok(())
+    let fixture: Value = serde_json::from_slice(&fs::read(&args[1])?)?;
+    emit(
+        &value,
+        fixture["case"].as_str().ok_or("case absent")?,
+        &args[2],
+    )
 }

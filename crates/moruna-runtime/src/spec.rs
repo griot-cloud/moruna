@@ -15,6 +15,7 @@ use moruna_reactor::ObjectStoreConfig;
 ///
 /// The arena and the reactor exist by then and do not exist before it, which is why a source
 /// that needs either cannot be constructed by the caller ahead of `run` (see `SourceSpec`).
+#[derive(Clone)]
 pub struct BuildCtx {
     /// What discovery found for this run.
     pub discovered: Discovered,
@@ -33,7 +34,7 @@ pub struct BuildCtx {
     /// How many sinks the run has: they share the arena's file buffer share (contracts d.16).
     pub sinks: u16,
     /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
-    pub(crate) sink_buffer: std::sync::atomic::AtomicU64,
+    pub(crate) sink_buffer: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BuildCtx {
@@ -366,6 +367,21 @@ mod tests {
     use super::*;
     use moruna_testkit::{FakeAllocator, FakeReactor, FakeSink, FakeSource};
 
+    #[test]
+    fn cloned_build_context_shares_actual_file_buffer_claims() {
+        let original = ctx(None);
+        let retained = original.clone();
+        assert!(Arc::ptr_eq(&original.alloc, &retained.alloc));
+        assert!(Arc::ptr_eq(&original.reactor, &retained.reactor));
+        assert!(Arc::ptr_eq(&original.sink_buffer, &retained.sink_buffer));
+        assert_eq!(original.run_id, retained.run_id);
+        let first = retained.claim_file_buffer();
+        assert!(first > 0);
+        assert_eq!(original.sink_buffer_bytes(), first);
+        let second = original.claim_file_buffer();
+        assert_eq!(retained.sink_buffer_bytes(), first + second);
+    }
+
     fn ctx(metadata: Option<Arc<dyn ObjectMetadata>>) -> BuildCtx {
         BuildCtx {
             discovered: Discovered {
@@ -390,7 +406,7 @@ mod tests {
             run_id: RunId([3; 16]),
             arena_bytes: 139_198_464,
             sinks: 1,
-            sink_buffer: std::sync::atomic::AtomicU64::new(0),
+            sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

@@ -267,8 +267,66 @@ fn maintenance_assets(root: &Path, node: &moruna_node::Config) -> Result<(), Str
     Ok(())
 }
 
+// This allowlist only enables explicitly authored one-job proof commands.
+fn validate_kd3_command(config: &engine::Config) -> Result<(), String> {
+    fn path(value: &str) -> bool {
+        value.starts_with("/kd3/")
+            && !value.contains("..")
+            && !value.chars().any(char::is_whitespace)
+    }
+    let fixture = config.program == "/moruna/bin/moruna-kd3-fixture"
+        && matches!(config.args.as_slice(), [run, file, adapter] if run == "run" && path(file) && file.ends_with(".json") && adapter == "native");
+    let library = config.program == "/opt/python-std/bin/python3"
+        && matches!(config.args.as_slice(), [script, matrix, case, adapter, staging, mode]
+            if script == "/kd3/kd3_library.py" && path(matrix) && matrix.ends_with(".json")
+            && ["library.iterator", "library.python.source", "library.python.sink", "library.python.kernel"].contains(&case.as_str()) && adapter == "native"
+            && path(staging) && ["rows", "adapter-refusal"].contains(&mode.as_str()));
+    let nonce = config
+        .env
+        .iter()
+        .filter_map(|env| env.strip_prefix("MORUNA_KD3_PROOF_NONCE="))
+        .collect::<Vec<_>>();
+    if config.runs != 1
+        || !(fixture || library)
+        || nonce.len() != 1
+        || nonce[0].len() != 32
+        || !nonce[0].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("KD3 proof requires one exact fixture command and explicit nonce".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod kd3_command_tests {
+    #[test]
+    fn fixed_native_command_and_nonce_are_required() {
+        let base = "program /moruna/bin/moruna-kd3-fixture\narg run\narg /kd3/cases/source.json\narg native\nenv MORUNA_KD3_PROOF_NONCE=11111111111111111111111111111111\nmemory 805306368\nscratch 268435456\nruns 1\n";
+        let config = engine::Config::parse(base).unwrap();
+        super::validate_kd3_command(&config).unwrap();
+        let mut wrong = config.clone();
+        wrong.args[1] = "/kd3/../secret.json".into();
+        assert!(super::validate_kd3_command(&wrong).is_err());
+        let mut wrong = config.clone();
+        wrong.env.clear();
+        assert!(super::validate_kd3_command(&wrong).is_err());
+        let mut wrong = config;
+        wrong.args[2] = "linux".into();
+        assert!(super::validate_kd3_command(&wrong).is_err());
+    }
+}
+
 fn run() -> Result<(), String> {
-    let args: Vec<_> = std::env::args().collect();
+    let mut args: Vec<_> = std::env::args().collect();
+    let proof_command = args
+        .last()
+        .is_some_and(|arg| arg == "--kd3-conformance-proof");
+    if proof_command {
+        if !cfg!(feature = "kd3-conformance-proof") {
+            return Err("KD3 command assembly requires explicit nondefault proof feature".into());
+        }
+        args.pop();
+    }
     let [_, description, assets, ram, cpus, port] = args.as_slice() else {
         return Err("usage: moruna-node-image DESCRIPTION ASSETS NODE_RAM CPUS AGENT_PORT".into());
     };
@@ -374,7 +432,11 @@ fn run() -> Result<(), String> {
     let engine = engine::Config::parse(
         std::str::from_utf8(&engine_bytes).map_err(|_| "engine config encoding")?,
     )?;
-    if engine.runs != 1 || engine.args != ["serve", "--listen", &format!("vsock://-1:{port}")] {
+    if proof_command {
+        validate_kd3_command(&engine)?;
+    } else if engine.runs != 1
+        || engine.args != ["serve", "--listen", &format!("vsock://-1:{port}")]
+    {
         return Err("initial engine must serve exactly one run at declared agent port".into());
     }
     let required = engine

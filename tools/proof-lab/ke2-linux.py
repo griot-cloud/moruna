@@ -68,18 +68,36 @@ with destination.open('rb') as f:header=f.read(20)
 if not 0<shipped.st_size<=128*1024**2 or not shipped.st_mode&0o111 or header[:6]!=b'\x7fELF\x02\x01' or header[18:20]!=b'\xb7\x00':raise SystemExit('Shipped image helper ELF/128MiB bound differs')
 if sum(item['bytes'] for item in record['files'])+shipped.st_size>256*1024**2:raise SystemExit('Shipped image helper aggregate exceeds256MiB')
 if source.stat().st_size!=info.st_size or sha(source)!=original_sha:raise SystemExit('Raw cache tool changed while stripping retained copy')
-record['files'].append({'name':name,'bytes':shipped.st_size,'sha256':sha(destination),'original_path':str(source),'original_bytes':info.st_size,'original_sha256':original_sha,'strip_tool_sha256':strip_sha,'strip_version':strip_version})
+record['files'].append({'name':name,'features':['kd3-conformance-proof'] if name=='moruna-node-image' else [],'proof_only':name=='moruna-node-image','bytes':shipped.st_size,'sha256':sha(destination),'original_path':str(source),'original_bytes':info.st_size,'original_sha256':original_sha,'strip_tool_sha256':strip_sha,'strip_version':strip_version})
 manifest.write_text(json.dumps(record,indent=2)+'\n')
 print('MORUNA_IMAGE_TOOL_RETAINED',name,info.st_size,original_sha,shipped.st_size,record['files'][-1]['sha256'])
 PY_IMAGE_TOOL
     }
     for tool in moruna-image moruna-node-image; do
+      features=()
+      if [ "$tool" = moruna-node-image ]; then features=(--features kd3-conformance-proof); fi
       rustup run 1.98.1 cargo build --locked --offline --manifest-path kernel/Cargo.toml \
         --target aarch64-unknown-linux-gnu --config profile.dev.debug=0 \
         --config profile.dev.incremental=false --config profile.test.debug=0 \
-        --config profile.test.incremental=false -j1 -p "$tool" --bin "$tool"
+        --config profile.test.incremental=false -j1 -p "$tool" --bin "$tool" "${features[@]}"
       retain_image_tool "/proof/target/aarch64-unknown-linux-gnu/debug/$tool" "$tool"
     done
+    timeout 600s rustup run 1.98.1 cargo test --locked --offline --manifest-path kernel/Cargo.toml \
+      --target aarch64-unknown-linux-gnu --config profile.dev.debug=0 \
+      --config profile.dev.incremental=false --config profile.test.debug=0 \
+      --config profile.test.incremental=false -j1 -p moruna-node-image --bin moruna-node-image \
+      --features kd3-conformance-proof kd3_command_tests -- --test-threads=1 \
+      2>&1 | tee /proof/image-tools/kd3-command-tests.log
+    python3 - <<'PY_IMAGE_TEST'
+import hashlib,json,pathlib,re
+root=pathlib.Path('/proof/image-tools');log=root/'kd3-command-tests.log'
+counts=re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$',log.read_text(),re.MULTILINE)
+if counts != [('1','0','0')]:raise SystemExit('Exact one KD3 host command validator test must pass, none ignored')
+manifest=root/'artifacts.json';record=json.loads(manifest.read_text())
+record['scope']='ARM64 host image writer plus EXPLICIT TEST-ONLY kd3-conformance-proof validator; not a production-default binary or boot/KVM claim'
+record['focused_tests']={'package':'moruna-node-image','bin':'moruna-node-image','features':['kd3-conformance-proof'],'filter':'kd3_command_tests','target':'aarch64-unknown-linux-gnu','toolchain':'1.98.1','jobs':1,'timeout_seconds':600,'locked':True,'offline':True,'passed':1,'failed':0,'ignored':0,'exit':0,'log':log.name,'sha256':hashlib.sha256(log.read_bytes()).hexdigest()}
+manifest.write_text(json.dumps(record,indent=2)+'\n')
+PY_IMAGE_TEST
     ;;
   integrated)
     run_cargo -p moruna-svc -p netstack-protocol -p moruna-netstack -p block-protocol \
@@ -174,7 +192,7 @@ class Ke2Run(Run):
         if options.phase=='image-tools':
             require(not cache.get('requires_local_clean'), 'image tools require fresh or exact same-source cache; no retargeting')
             require(cache['source_lock_sha256']==inputs['kernel_cargo_lock_sha256'] and cache['inputs_census_sha256']==inputs['inputs_census_sha256'] and cache['toolchain']=='1.98.1' and cache['target']=='aarch64-unknown-linux-gnu' and cache['profile']=='test-debug0', 'image tools cache must match exact ARM GNU source/profile')
-            self.measurement_scope='ARM64 Linux image parser/writer dev-debug0 build and custody only; no optimization/performance/boot claim'
+            self.measurement_scope='ARM64 image parser/writer plus explicit TEST-ONLY KD3 validator feature/unit test; no production-default/KVM/boot claim'
 
     def call(self, arguments, *args, **kwargs):
         result=super().call(arguments, *args, **kwargs)
@@ -185,6 +203,14 @@ class Ke2Run(Run):
                 folder=self.evidence/'image-tools';record=json.loads((folder/'artifacts.json').read_text())
                 require(record.get('profile')=='dev-debug0' and record.get('cache_profile')=='test-debug0' and record.get('target')=='aarch64-unknown-linux-gnu' and record.get('toolchain')=='1.98.1' and record.get('jobs')==1, 'image helper actual profile differs')
                 require({item['name'] for item in record['files']}=={'moruna-image','moruna-node-image'} and len(record['files'])==2, 'required actual image tools missing')
+                tests=record.get('focused_tests',{})
+                require((tests.get('package'),tests.get('bin'),tests.get('filter'))==('moruna-node-image','moruna-node-image','kd3_command_tests') and tests.get('features')==['kd3-conformance-proof'] and (tests.get('passed'),tests.get('failed'),tests.get('ignored'),tests.get('exit'))==(1,0,0,0), 'actual feature-specific image validator test missing')
+                testlog=folder/'kd3-command-tests.log'
+                require(testlog.is_file() and not testlog.is_symlink() and testlog.stat().st_size<=8*1024**2 and sha(testlog)==tests.get('sha256'), 'actual host validator test log differs')
+                import re
+                require(re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$',testlog.read_text(),re.MULTILINE)==[('1','0','0')], 'actual host validator test counts differ')
+                for item in record['files']:
+                    require(item.get('features')==(['kd3-conformance-proof'] if item['name']=='moruna-node-image' else []) and item.get('proof_only')==(item['name']=='moruna-node-image'), 'host image helper feature classification differs')
                 total=0;raw_total=0
                 for item in record['files']:
                     path=folder/item['name'];info=path.lstat();total+=info.st_size;raw_total+=item['original_bytes']

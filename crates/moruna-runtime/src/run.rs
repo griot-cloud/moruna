@@ -475,7 +475,7 @@ fn drive(
         run_id,
         arena_bytes,
         sinks: topology.sinks(),
-        sink_buffer: std::sync::atomic::AtomicU64::new(0),
+        sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
     for spec in source_specs {

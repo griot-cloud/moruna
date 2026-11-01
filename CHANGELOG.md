@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Phase A integration is under validation; this entry does not announce a tested or published release.
+
+- Integrates the native node artifact, explicit account and storage grants, and the owned host launch/session interface.
+- Adds the native KD3 conformance fixtures and focused regressions for shared build contexts, memory admission, event records, and durable storage.
+- Release acceptance still requires the complete test and lint gates, all 21 KD3 cases (92 required result cells), and the 15 native SDK boot cases. Kernel TLS, io_uring expansion, and UEFI work are outside this Phase A release.
+
 ## 0.5.9
 
 - **`moruna build`: a Python kernel as an OCI image (KA3).** `moruna build <module>:<function>` and `moruna.build(fn)` write an OCI layout the `image` kind runs: the official `python:3.14-slim` layers by digest, the project's locked dependencies installed for `linux/aarch64` or `linux/x86_64` (a `uv.lock` or a `requirements.lock` with hashes; a project with no lock is refused, and nothing is resolved), the Moruna shim, and the function. Layers 2 to 4 are reproducible tars that carry the bytecode of every source (hash based, written by a CPython that matches the runtime's, so nothing is compiled at a start), so the same function is one image bit for bit and two functions of one lock share every layer but the last. The shim reads and writes the Arrow IPC stream of SDD 19 f.6 and needs only `pyarrow`; a module's `import moruna` finds a stand-in of `kernel` and `polars` in the image. `examples/image_job.rs` writes the version 2 job that runs one (SDD 30, BD-T1 to BD-T32).

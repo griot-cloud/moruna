@@ -23,6 +23,30 @@ def census(folder, authored=False):
     return values
 
 current_lock=sha(source_input/'kernel/Cargo.lock')
+release_delta=None
+if len(sys.argv)>3:
+    anchor_path=Path(sys.argv[3]).resolve(strict=True)
+    anchor=json.loads(anchor_path.read_text())
+    old_lock=anchor_path.parent/'source/kernel/Cargo.lock'
+    assert sha(old_lock)==anchor['kernel_cargo_lock_sha256']
+    assert sha(Path(anchor['archive_path']))==anchor['archive_sha256']
+    old_packages=tomllib.loads(old_lock.read_text())['package']
+    new_packages=tomllib.loads((source_input/'kernel/Cargo.lock').read_text())['package']
+    assert [p for p in old_packages if p.get('source')]==[p for p in new_packages if p.get('source')], 'release external pin drift'
+    old_local={p['name']:p for p in old_packages if not p.get('source')}
+    new_local={p['name']:p for p in new_packages if not p.get('source')}
+    assert old_local.keys()==new_local.keys()
+    changed={n for n in old_local if old_local[n]!=new_local[n]}
+    assert changed=={'moruna-record','moruna-storage-format'}, 'unexpected kernel release delta'
+    for name in changed:
+        before=old_local[name];after=new_local[name]
+        assert before['version']=='0.5.9' and after['version']=='0.6.0'
+        assert {k:v for k,v in before.items() if k!='version'}=={k:v for k,v in after.items() if k!='version'}
+    release_delta={'anchor_provenance':str(anchor_path),'anchor_archive_sha256':anchor['archive_sha256'],
+                   'old_lock_sha256':sha(old_lock),'new_lock_sha256':current_lock,'local_versions':sorted(changed)}
+    # Replay the existing dependency reconciliation against its exact source
+    # anchor; the output below still records the actual new lock and sources.
+    current_lock=sha(old_lock)
 removed_registry=set()
 if current_lock != prior['kernel_lock_sha256']:
     reconciliation=json.loads((root/'kernel-lock-reconciliation-20261030/reconciliation.json').read_text())
@@ -51,7 +75,27 @@ for item in before:
     shutil.copy2(source_input/item['path'],path)
 (source/'vendor').mkdir(mode=0o700)
 removed_files=0
-for directory in (vendor_input/'vendor').iterdir():
+vendor_root=vendor_input/'vendor'
+if release_delta:
+    # The verified immutable archive remains complete even when an old mutable
+    # vendor cache has lost files. Recover only into this new proof input.
+    manifest=Path(anchor['inputs_census_path'])
+    assert sha(manifest)==anchor['inputs_census_sha256']
+    records={p['path']:p for p in json.loads(manifest.read_text()) if p['path'].startswith('vendor/')}
+    recovered=out/'verified-parent-vendor';recovered.mkdir(mode=0o700)
+    seen=set()
+    with tarfile.open(anchor['archive_path']) as tar:
+        for member in tar:
+            if member.name not in records:continue
+            item=records[member.name]
+            assert member.isfile() and not Path(member.name).is_absolute() and '..' not in Path(member.name).parts
+            assert member.name not in seen and member.size==item['bytes']
+            seen.add(member.name);dest=recovered/member.name;dest.parent.mkdir(parents=True,exist_ok=True)
+            with tar.extractfile(member) as src,dest.open('xb') as target:shutil.copyfileobj(src,target)
+            dest.chmod(item['mode']);assert sha(dest)==item['sha256']
+    assert seen==records.keys(), 'immutable parent vendor census incomplete'
+    vendor_root=recovered/'vendor'
+for directory in vendor_root.iterdir():
     package=tomllib.loads((directory/'Cargo.toml').read_text())['package']
     if (package['name'],package['version']) in removed_registry:
         removed_files+=len(json.loads((directory/'.cargo-checksum.json').read_text())['files'])
@@ -64,6 +108,7 @@ if len(sys.argv)>2:
     stdlib=json.loads((extra/'provenance.json').read_text());assert stdlib['complete']
     assert sha(Path(stdlib['actual_rust_src_lock']))==stdlib['actual_rust_src_lock_sha256']
     for directory in (extra/'vendor').iterdir():
+        if release_delta and (source/'vendor'/directory.name).exists():continue
         assert not (source/'vendor'/directory.name).exists()
         shutil.copytree(directory,source/'vendor'/directory.name,copy_function=os.link)
 locked=tomllib.loads((source/'kernel/Cargo.lock').read_text())['package']
@@ -81,7 +126,7 @@ for crate in sorted((source/'vendor').iterdir()):
     for name,digest in checksum['files'].items(): assert sha(crate/name)==digest
     checked+=len(checksum['files']);packages.append(key)
 assert len(packages)==len(external) and kernel_count==prior['registry_packages']-len(removed_registry)
-assert checked==prior['verified_vendor_files']-removed_files+(sum(p['files_checked'] for p in stdlib['packages']) if stdlib else 0)
+assert checked==(anchor['verified_vendor_files'] if release_delta else prior['verified_vendor_files']-removed_files+(sum(p['files_checked'] for p in stdlib['packages']) if stdlib else 0))
 if removed_registry:
     provenance=json.loads((source/'kernel/net/ring-provenance.json').read_text())
     upstream=source/'kernel/net'/provenance['upstream_files_manifest']
@@ -111,7 +156,8 @@ with tarfile.open(archive,'w:gz',compresslevel=1) as tar:
         member.uid=member.gid=0;member.uname=member.gname='';member.mtime=0
         with path.open('rb') as file:tar.addfile(member,file)
 assert census(source_input,authored=True)==before, 'source changed during freeze'
-record={'source_head':'38447a99447151aec77eb28272a8a32e682052f3',
+capture=json.loads((candidate/'capture.json').read_text()) if (candidate/'capture.json').is_file() else {}
+record={'source_head':capture.get('source_head','38447a99447151aec77eb28272a8a32e682052f3'),
         'source_dirty_diff_sha256':source_sha,'source_census_sha256':source_sha,
         'kernel_cargo_lock_sha256':sha(source/'kernel/Cargo.lock'),
         'source_census_entries':len(before),'registry_packages':len(packages),'verified_vendor_files':checked,
@@ -122,6 +168,8 @@ record={'source_head':'38447a99447151aec77eb28272a8a32e682052f3',
         'archive_path':str(archive),'archive_sha256':sha(archive),'archive_bytes':archive.stat().st_size,
         'candidate_path':str(candidate),'source_unchanged_after_archive':True,
         'scope':'Assembled kernel graph host/native source input. No compiler, boot, deployment or hardware proof implied.'}
+if release_delta:record['release_local_version_delta']=release_delta
+if capture:record['repository_capture']=capture
 save('provenance.json',record)
 print(json.dumps({'path':str(out),'inputs_files':len(inputs),'inputs_bytes':record['inputs_bytes'],
                   'archive_sha256':record['archive_sha256'],'kernel_lock_sha256':record['kernel_cargo_lock_sha256']}))

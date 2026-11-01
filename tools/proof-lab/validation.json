@@ -135,5 +135,41 @@
     "local_artifacts": "Retained on disk",
     "original_integration_branch": "Unchanged",
     "initial_upload": "Stopped; no remote branch created"
+  },
+  "phase_a_060": {
+    "deadline_utc": "2026-11-01T11:54:37Z",
+    "local_scope": "User requests ARM Linux tests and local x86 QEMU; no SSH/KVM host",
+    "host_producer": {
+      "run": "moruna-proof-501-99b59f573a99",
+      "version": "0.6.0",
+      "tools": 8,
+      "focused_tests_passed": 6,
+      "cleanup": true
+    },
+    "engine_producer": {
+      "run": "moruna-proof-501-2233d130525c",
+      "version": "0.6.0",
+      "passed": true,
+      "cleanup": true,
+      "note": "Predates the same-scope context clone; final source rebuild still required"
+    },
+    "regression": {
+      "run": "moruna-proof-501-a12ec7ad1466",
+      "passed_tests": 245,
+      "ignored_tests": 2,
+      "failed_tests": 0,
+      "overall_stage": "FAILED clippy: four manual-is-multiple-of findings; source corrected, recheck pending",
+      "cleanup": true
+    },
+    "matrix": "21 cases/92 cells NOT YET EXECUTED",
+    "SDK_boots": "15 required, NOT YET ACCEPTED for0.6.0",
+    "release": "NOT PUBLISHED",
+    "active_table_areas": [
+      "Compiler dependencies",
+      "Runtime, SDK, checkpoints/history",
+      "Node launcher and admission",
+      "Combined application",
+      "Deployment artifacts"
+    ]
   }
 }

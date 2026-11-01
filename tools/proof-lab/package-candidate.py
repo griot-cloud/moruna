@@ -60,7 +60,9 @@ if len(sys.argv)>2:
    with tar.extractfile(entry) as src,dest.open('xb') as target:shutil.copyfileobj(src,target)
    dest.chmod(item['mode']);assert sha(dest)==item['sha256'],'recovered vendor bytes differ'
  assert seen==set(vendor_records),'accepted archive vendor incomplete'
- assert accepted_records['Cargo.lock']['sha256']==sha(source/'Cargo.lock'),'accepted root lock changed'
+ # Local workspace release versions may change while the dependency closure stays
+ # identical. The complete external source/version/checksum pins must still match.
+ assert external(accepted_path.parent/'source/Cargo.lock')==external(source/'Cargo.lock'),'accepted external pins changed'
  vendor_source=recovery/'vendor'
  vendor_fallback={'provenance':str(accepted_path),'provenance_sha256':sha(accepted_path),'archive_sha256':accepted['archive_sha256'],'inputs_census_sha256':accepted['inputs_census_sha256'],'vendor_files_verified':len(seen),'reason':'canonical old vendor source is incomplete; verified immutable accepted archive used without package or config changes'}
 shutil.copytree(vendor_source,source/'vendor',copy_function=os.link)
@@ -88,7 +90,8 @@ with tarfile.open(archive,'w:gz',compresslevel=1) as tar:
   path=source/item['path'];entry=tar.gettarinfo(str(path),arcname=item['path']);entry.uid=entry.gid=0;entry.uname=entry.gname='';entry.mtime=0
   with path.open('rb') as f:tar.addfile(entry,f)
 assert census(source_input,filter_source=True)==before,'candidate changed during freeze'
-provenance={'source_head':'38447a99447151aec77eb28272a8a32e682052f3','source_dirty_diff_sha256':source_sha,
+capture=json.loads((candidate/'capture.json').read_text()) if (candidate/'capture.json').is_file() else {}
+provenance={'source_head':capture.get('source_head','38447a99447151aec77eb28272a8a32e682052f3'),'source_dirty_diff_sha256':source_sha,
  'source_census_entries':len(before),'source_census_file':'source-manifest.json','source_census_sha256':source_sha,
  'cargo_lock_sha256':sha(source/'Cargo.lock'),'registry_packages':sum(v['source'].startswith('registry+') for v in vendor),
  'git_packages':sum(v['source'].startswith('git+') for v in vendor),'vendor_manifest_sha256':vendor_sha,
@@ -96,7 +99,8 @@ provenance={'source_head':'38447a99447151aec77eb28272a8a32e682052f3','source_dir
  'inputs_census_sha256':input_sha,'inputs_files':len(inputs),'inputs_bytes':sum(i['bytes'] for i in inputs),
  'archive_path':str(archive),'archive_sha256':sha(archive),'archive_bytes':archive.stat().st_size,
  'source_unchanged_after_archive':True,'candidate_path':str(candidate),
- 'scope':'Private combined source candidate with recorded real feature snapshots and integration resolutions; not a Git merge or accepted kernel. Remaining kernel/SDD conflicts are explicitly outside std-only selected compile scope.'}
+ 'scope':'Frozen source input only; compilation, execution and release acceptance are separate recorded gates.'}
+if capture:provenance['repository_capture']=capture
 if vendor_fallback:provenance['verified_vendor_fallback']=vendor_fallback
 save('provenance.json',provenance)
 print(json.dumps({'path':str(out),'source_census_sha256':source_sha,'inputs_census_sha256':input_sha,'archive_sha256':provenance['archive_sha256'],'source_files':len(before),'inputs_files':len(inputs)}))

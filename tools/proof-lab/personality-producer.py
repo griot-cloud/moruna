@@ -168,8 +168,10 @@ def main():
         bindgen=shlex.join([arg for arg in target_args if arg!='-nostdinc++'])
         env['BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl']=bindgen
         env['BINDGEN_EXTRA_CLANG_ARGS_x86_64-unknown-linux-musl']=bindgen
-        if reuse and reuse.get('transition'):
-            transition=reuse['transition']
+        full_clean=json.loads(P('/tmp/personality-full-clean.json').read_text()) if P('/tmp/personality-full-clean.json').exists() else None
+        if (reuse and reuse.get('transition')) or full_clean:
+            cross.require(not(reuse and full_clean),'full rebuild cannot retain prior artifacts')
+            transition=reuse['transition'] if reuse else full_clean
             clean=AUTHORED_CLEAN.replace('__CENSUS__',transition['new_inputs_census_sha256']).replace('__TRANSITION__',transition['sha256'])
             clean_env=dict(env);clean_env['RUSTFLAGS']='--cfg polyval_force_soft'
             call([sys.executable,'-c',clean],'authored-clean',clean_env)

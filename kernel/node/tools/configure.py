@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     for name in ("image-record", "layers", "network", "tls-roots", "engine-bindings", "storage-config", "storage-grants", "storage-admission"):
         parser.add_argument(f"--{name}", type=Path, required=True)
+    parser.add_argument("--kd3-conformance-proof", type=Path,
+                        help="explicit TEST-ONLY JSON {program,args,nonce}; Rust feature-gated validator remains mandatory")
     parser.add_argument("--storage-credential", type=Path)
     for name in ("local-config","checkpoint-admission","cache-admission","cache-key"):
         parser.add_argument(f"--{name}", type=Path)
@@ -136,6 +138,19 @@ def main():
         f"program {program}\narg serve\narg --listen\narg vsock://-1:{profile['agent_port']}\n"
         f"env HOME=/tmp\nmemory {profile['job_memory_bytes']}\nscratch {profile['scratch_bytes']}\n"
         "grant vsock lookup vsock0\ngrant linux personality\ngrant image data image\ngrant engine.bindings data engine.bindings\ngrant network service network\ngrant storage admission storage.admission storage.binding\nruns 1\n")
+    if args.kd3_conformance_proof:
+        command = json.loads(args.kd3_conformance_proof.read_text())
+        if set(command) != {"program", "args", "nonce"} or not isinstance(command["args"], list):
+            parser.error("explicit proof command requires exact program,args,nonce")
+        values = [command["program"], command["nonce"], *command["args"]]
+        if any(not isinstance(v, str) or not v or any(c.isspace() or c in "#\x00" for c in v) for v in values):
+            parser.error("unsafe proof command token")
+        config = args.out / "engine.conf"
+        lines = config.read_text().splitlines()
+        lines = [line for line in lines if not line.startswith(("program ", "arg "))]
+        config.write_text("\n".join(["program " + command["program"],
+            *("arg " + value for value in command["args"]),
+            "env MORUNA_KD3_PROOF_NONCE=" + command["nonce"], *lines]) + "\n")
     with (args.out / "initial.job").open("a") as output: output.write("\n".join(extra_initial) + ("\n" if extra_initial else ""))
     with (args.out / "engine.conf").open("a") as output: output.write("\n".join(extra_engine) + ("\n" if extra_engine else ""))
     (args.out / "profile.json").write_text(json.dumps(profile, indent=2) + "\n")

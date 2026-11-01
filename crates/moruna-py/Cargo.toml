@@ -23,6 +23,7 @@ required-features = ["python"]
 moruna-kernel = { workspace = true }
 arrow = { workspace = true }
 moruna-runtime = { workspace = true }
+moruna-datafusion = { workspace = true, optional = true }
 moruna-cost = { workspace = true }
 moruna-storage = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "net"] }
@@ -72,7 +73,7 @@ python = [
 uring = ["moruna-runtime/uring"]
 # A governed plan as the source and a contract write as the sink (MH 4.5); what the guest
 # binary is built with.
-peql = ["moruna-runtime/peql"]
+peql = ["moruna-runtime/peql", "dep:moruna-datafusion", "moruna-datafusion/peql"]
 cuda = ["moruna-runtime/cuda"]
 
 # KD3's real cross-adapter fixture; no new runtime/library authority.

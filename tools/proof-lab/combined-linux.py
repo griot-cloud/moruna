@@ -38,7 +38,7 @@ test -f .cargo/config.toml
 test -d vendor
 export CARGO_HOME=/proof/cargo CARGO_TARGET_DIR=/proof/target
 export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
-if [ "$phase" = witness-tests ] || [ "$phase" = sdk-proof-build ] || [ "$phase" = boot-host-tools ]; then export CARGO_BUILD_JOBS=1; fi
+if [ "$phase" = kd3-fixture-tools-arm ] || [ "$phase" = kd3-fixture-tools-gnu ] || [ "$phase" = witness-tests ] || [ "$phase" = sdk-proof-build ] || [ "$phase" = boot-host-tools ] || [ "$phase" = phase-a-tests ]; then export CARGO_BUILD_JOBS=1; fi
 export LIBCLANG_PATH=/opt/moruna-proof-tools/usr/lib/aarch64-linux-gnu
 export LD_LIBRARY_PATH=/opt/moruna-proof-tools/usr/lib/aarch64-linux-gnu:/opt/moruna-proof-tools/usr/lib/llvm-14/lib
 python3 - <<'PY'
@@ -131,6 +131,63 @@ print('MORUNA_BOOT_HOST_TOOL_RETAINED',name,'raw',info.st_size,original_sha,'shi
 PY_HOST_TOOL
     }
 case "$phase" in
+  kd3-fixture-tools-arm|kd3-fixture-tools-gnu)
+    python3 /tmp/kd3-fixture-producer.py "$token" __KD3_TARGET__ __KD3_SECONDS__
+    ;;
+  phase-a-tests)
+    # Focused Phase A regressions only; full release CI and actual boot gates are separate.
+    export PHASE_A_OUT="/proof/target/phase-a-tests/$token"
+    mkdir -p /proof/target/phase-a-tests
+    mkdir -m 700 "$PHASE_A_OUT"
+    cat > /tmp/phase-a-record.py <<'PY_PHASE_A_RECORD'
+import datetime,hashlib,json,os,pathlib,re,sys
+root=pathlib.Path(os.environ['PHASE_A_OUT']);path=root/'results.json'
+name,state,*argv=sys.argv[1:]
+validation_error=None
+record=json.loads(path.read_text()) if path.exists() else {'version':1,'phase':'phase-a-tests','inputs_census_sha256':'__INPUTS_CENSUS__','target':'aarch64-unknown-linux-gnu','toolchain':'1.98.1','jobs':1,'complete':False,'commands':[]}
+if state=='start':
+    if any(item['name']==name for item in record['commands']):raise SystemExit('Duplicate phase A command')
+    record['commands'].append({'name':name,'argv':argv,'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'exit':None,'state':'running','test_results':[]})
+elif state=='complete':
+    if any(item['exit']!=0 for item in record['commands']):raise SystemExit('Phase A cannot complete with failed/incomplete command')
+    record['complete']=True
+else:
+    item=record['commands'][-1]
+    if item['name']!=name or item['state']!='running':raise SystemExit('Phase A result ordering differs')
+    log=root/(name+'.log')
+    if not log.is_file() or log.stat().st_size>32*1024**2:raise SystemExit('Phase A log missing/over bound')
+    raw=log.read_bytes();text=raw.decode('utf-8',errors='replace')
+    results=[{'outcome':outcome,'passed':int(passed),'failed':int(failed),'ignored':int(ignored)} for outcome,passed,failed,ignored in re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$',text,re.MULTILINE)]
+    item.update(exit=int(state),state='finished',finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),log=log.name,bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest(),test_results=results)
+    if int(state)==0 and 'test' in item['argv'] and sum(result['passed']+result['failed'] for result in results)==0:
+        validation_error='Selected test command executed no tests: '+name
+        item['validation_error']=validation_error
+tmp=path.with_suffix('.new')
+with tmp.open('w') as f:json.dump(record,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+os.replace(tmp,path)
+if validation_error:raise SystemExit(validation_error)
+PY_PHASE_A_RECORD
+    phase_a_check() {
+      local name="$1"; shift
+      python3 /tmp/phase-a-record.py "$name" start "$@"
+      set +e
+      (set -o noclobber; "$@" > "$PHASE_A_OUT/$name.log" 2>&1)
+      local code=$?
+      set -e
+      python3 /tmp/phase-a-record.py "$name" "$code"
+      return "$code"
+    }
+    phase_a_check account run_cargo test -p moruna-kernel --test ct_native_account
+    phase_a_check admission run_cargo test -p moruna-controller --lib admission::tests
+    phase_a_check report run_cargo test -p moruna-trace --test tr_t3_pure_report
+    phase_a_check events run_cargo test -p moruna-event --test records
+    phase_a_check vmm run_cargo test -p moruna-vmm --all-targets --features kd3-conformance-proof
+    phase_a_check host run_cargo test -p moruna-runtime --lib host:: --features native-tcg-proof
+    phase_a_check build-context run_cargo test -p moruna-runtime --lib spec::tests::cloned_build_context_shares_actual_file_buffer_claims --features native-tcg-proof
+    phase_a_check storage run_cargo test -p moruna-storage-format -p moruna-storage -p moruna-reactor -- --test-threads=2
+    phase_a_check clippy run_cargo clippy -p moruna-kernel -p moruna-controller -p moruna-trace -p moruna-event -p moruna-vmm -p moruna-runtime -p moruna-storage-format -p moruna-storage -p moruna-reactor --all-targets --features moruna-runtime/native-tcg-proof,moruna-vmm/kd3-conformance-proof -- -D warnings
+    python3 /tmp/phase-a-record.py finished complete
+    ;;
   storage-tests) run_cargo test -p moruna-storage-format -p moruna-storage -p moruna-reactor --features moruna-reactor/uring -- --test-threads=2 ;;
   check-sdk) run_cargo check --keep-going -p moruna-runtime -p moruna-cost -p moruna-placement -p moruna-scheduler -p moruna-storage -p moruna-reactor -p moruna-plane-linux -p moruna-py --all-targets --features moruna-reactor/uring,moruna-py/python,moruna-py/uring ;;
   boot-host-tools)
@@ -138,7 +195,7 @@ case "$phase" in
     export RUSTFLAGS="--cfg polyval_force_soft"
     unset CARGO_ENCODED_RUSTFLAGS
     mkdir -p /proof/witness-proof
-
+    run_cargo test -p moruna-event --test records kd3_sink_ack_tests > /proof/witness-proof/sink-ack-tests.log 2>&1
     run_cargo build -p moruna-vmm --bin moruna-vhost-vsock
     retain_tool /proof/target/aarch64-unknown-linux-gnu/debug/moruna-vhost-vsock moruna-vhost-vsock
     run_cargo build -p moruna-runtime --example kd3-peer
@@ -155,10 +212,14 @@ case "$phase" in
     retain_tool /proof/target/aarch64-unknown-linux-gnu/debug/plane-fixture plane-fixture
     retain_tool /proof/target/aarch64-unknown-linux-gnu/debug/kd2-fixture kd2-fixture
     python3 - <<'PY_HOST_REQUIRED'
-import json,pathlib
+import hashlib,json,pathlib,re
 record=json.loads(pathlib.Path('/proof/witness-proof/boot-host-tools.json').read_text())
 required={'moruna-vhost-vsock','kd3-peer','node-ci-assets','kd3-native-proof','moruna-storage-provision','moruna-layer','plane-fixture','kd2-fixture'}
 if {item['name'] for item in record['files']}!=required or len(record['files'])!=8:raise SystemExit('Required host tool set incomplete')
+log=pathlib.Path('/proof/witness-proof/sink-ack-tests.log')
+if re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$',log.read_text(),re.MULTILINE)!=[('6','0','0')]:raise SystemExit('Six sink tests must pass without failures or ignored tests')
+record['focused_tests']={'command':['cargo','test','-p','moruna-event','--test','records','kd3_sink_ack_tests'],'passed':6,'failed':0,'ignored':0,'exit':0,'log':log.name,'sha256':hashlib.sha256(log.read_bytes()).hexdigest()}
+pathlib.Path('/proof/witness-proof/boot-host-tools.json').write_text(json.dumps(record,indent=2)+'\n')
 PY_HOST_REQUIRED
     ;;
   sdk-proof-build)
@@ -217,6 +278,33 @@ printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
 '''
 
 
+def load_kd3_bundles(options, gnu):
+    """Verify only explicitly supplied immutable fixture inputs; never a home mount."""
+    receipt = module.private_file(options.kd3_python_bundle)
+    value = json.loads(receipt.read_text())
+    root = receipt.parent
+    keys = ('python', 'pyarrow') if gnu else ('python_arm', 'pyarrow_arm')
+    files = [receipt]
+    for key in keys:
+        row = value[key]
+        path = module.private_file(row['path'])
+        require(path.parent == root and row.get('verified') is True and path.stat().st_size == row['bytes']
+                and module.sha(path) == row['sha256'], 'actual official KD3 input differs')
+        files.append(path)
+    component = None
+    if gnu:
+        path = module.private_file(options.kd3_gnu_bundle)
+        component = json.loads(path.read_text())
+        require(component['rust_std_version'] == '1.98.1 (48a229cea 2026-09-01)', 'GNU target/compiler metadata differs')
+        files.append(path)
+        for key in ('archive', 'manifest'):
+            p = module.private_file(component[key])
+            require(p.parent == path.parent and module.sha(p) == component[key + '_sha256'], 'actual GNU target input differs')
+            files.append(p)
+    fingerprints = [(p, (p.stat().st_dev, p.stat().st_ino, p.stat().st_uid, p.stat().st_size, p.stat().st_mtime_ns)) for p in files]
+    return value, component, fingerprints
+
+
 class CombinedRun(module.Ke2Run):
     guest_script = GUEST
     marker = 'MORUNA_COMBINED_DONE'
@@ -226,14 +314,44 @@ class CombinedRun(module.Ke2Run):
 
     def __init__(self, options, inputs, archive, cache):
         super().__init__(options, inputs, archive, cache)
-        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools'):
+        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests'):
             self.memory = 6
         if options.phase in ('boot-host-tools','sdk-proof-build'):
             self.measurement_scope='ARM64 Linux host helper dev/debug0 build and custody only; no optimization/performance/boot/execution claim'
+        if options.phase=='phase-a-tests':
+            self.measurement_scope='Focused ARM64 Phase A unit/integration regressions and clippy only; no native boot, KD3 matrix or release acceptance claim'
         self.guest_script = GUEST.replace('__INPUTS_CENSUS__', inputs['inputs_census_sha256'])
         self.tool_bundle = tool_module.load_bundle(options.tools_bundle)
         self.attachments.append({'path': self.tool_bundle['root'],
                                  'destination': self.tool_bundle['destination'], 'readonly': True})
+        self.kd3_fingerprints=[]
+        if options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
+            gnu=options.phase.endswith('-gnu');target='x86_64-unknown-linux-gnu' if gnu else 'aarch64-unknown-linux-gnu'
+            require(cache['target']==target and cache['profile']=='native-debug0','KD3 fixture target/cache must agree exactly')
+            self.memory=6
+            self.measurement_scope='Actual '+target+' Python/peQL fixture and library dev-debug0 build only; no matrix execution or performance claim'
+            python_bundle,component,self.kd3_fingerprints=load_kd3_bundles(options,gnu)
+            self.attachments.append({'path':str(Path(options.kd3_python_bundle).parent),'destination':'/inputs/kd3-python','readonly':True})
+            payload={'kd3-fixture-producer.py':(ROOT/'kd3-fixture-producer.py').read_text(),'kd3-python-bundle.json':json.dumps(python_bundle)}
+            self.runner_files=self.runner_files+('kd3-fixture-producer.py',)
+            if gnu:
+                loaded=importlib.util.spec_from_file_location('kd3_cross_inputs',ROOT/'cross-tools-vm.py')
+                cm=importlib.util.module_from_spec(loaded);loaded.loader.exec_module(cm)
+                cross=cm.load_inputs(options.cross_bundle, options.rust_bundle)
+                self.attachments.extend([{'path':str(cross['cross_path'].parent),'destination':'/inputs/cross','readonly':True},
+                                         {'path':str(Path(options.kd3_gnu_bundle).parent),'destination':'/inputs/kd3-gnu','readonly':True}])
+                for name in ('cross-tools-linux-smoke.py','personality-producer.py'):
+                    payload[name]=(ROOT/name).read_text()
+                payload['kd3-gnu-bundle.json']=json.dumps(component)
+                self.runner_files=self.runner_files+('cross-tools-linux-smoke.py','personality-producer.py','cross-tools-vm.py')
+                for path in (cross['cross_path'],cross['cross_path'].parent/'manifest.json',cross['cross_path'].parent/'cross-tools.tar.gz'):
+                    z=path.stat();self.kd3_fingerprints.append((path,(z.st_dev,z.st_ino,z.st_uid,z.st_size,z.st_mtime_ns)))
+            encoded=base64.b64encode(json.dumps(payload).encode()).decode()
+            prefix="set -euo pipefail\npython3 - <<'PY_KD3_PAYLOAD'\nimport base64,json,pathlib\nfor name,text in json.loads(base64.b64decode("+repr(encoded)+")).items():\n    pathlib.Path('/tmp',name).write_text(text)\nPY_KD3_PAYLOAD\n"
+            self.guest_script=prefix+self.guest_script.replace('__KD3_TARGET__',target).replace('__KD3_SECONDS__',str(max(1,options.seconds-180)))
+            if gnu:
+                self.guest_script=self.guest_script.replace('--target aarch64-unknown-linux-gnu','--target x86_64-unknown-linux-gnu').replace("['--target','aarch64-unknown-linux-gnu']","['--target','x86_64-unknown-linux-gnu']")
+
 
     def call(self, arguments, *args, **kwargs):
         result = super().call(arguments, *args, **kwargs)
@@ -260,8 +378,78 @@ class CombinedRun(module.Ke2Run):
         return result
 
     def owned(self, cleanup=False):
-        tool_module.load_bundle(self.options.tools_bundle)
+        # Input custody failure must never prevent nonce/config-verified teardown.
+        if not cleanup:
+            for path,expected in self.kd3_fingerprints:
+                z=module.private_file(path).stat();require((z.st_dev,z.st_ino,z.st_uid,z.st_size,z.st_mtime_ns)==expected,'KD3 immutable input changed')
+            tool_module.load_bundle(self.options.tools_bundle)
         return super().owned(cleanup=cleanup)
+
+
+    def execute(self):
+        result=super().execute()
+        if self.options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
+            record={'collected':False,'files':[]}
+            try:
+                require(json.loads((self.evidence/'summary.json').read_text()).get('cleanup') is True,'actual cleanup required before KD3 artifact collection')
+                validate_cache(self.cache,self.cache['owner_nonce'])
+                source=Path(self.cache['path'])/'kd3-fixture-tools'/self.token
+                require(source.is_dir() and not source.is_symlink(),'actual KD3 producer output missing')
+                dest=self.evidence/'kd3-fixture-tools';dest.mkdir(mode=0o700);total=0
+                for path in sorted(source.iterdir()):
+                    info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1 and info.st_size<=256*1024**2,'KD3 artifact type/size/owner differs')
+                    require(path.name in ('manifest.json','manifest.new','moruna-kd3-fixture','_core.so') or path.name.endswith('.log') or (path.name.startswith('cxx-object-') and path.name.endswith('.o')) or (path.name.startswith('cxx-inspect-') and path.name.endswith('.json')),'unexpected KD3 producer file')
+                    total+=info.st_size;require(total<=768*1024**2,'KD3 aggregate artifact bound')
+                    shutil.copy2(path,dest/path.name);record['files'].append({'name':path.name,'bytes':info.st_size,'sha256':module.sha(dest/path.name)})
+                if (dest/'manifest.json').exists():
+                    actual=json.loads((dest/'manifest.json').read_text());record['actual']=actual
+                    if result==0:
+                        require(actual.get('passed') is True and actual['target']==self.cache['target'] and actual['jobs']==1 and actual['profile']=='dev-debug0','actual KD3 producer success/profile differs')
+                        require({x['name'] for x in actual['files']}=={'moruna-kd3-fixture','_core.so'} and len(actual['files'])==2,'actual KD3 binary/library missing')
+                        require(all(x.get('exit')==0 for x in actual['commands']),'actual KD3 command failed')
+                    for row in actual['files']:
+                        artifact=dest/row['name'];require(artifact.stat().st_size==row['bytes'] and module.sha(artifact)==row['sha256'],'actual KD3 artifact SHA differs')
+                        with artifact.open('rb') as f:header=f.read(20)
+                        machine=b'\xb7\x00' if self.cache['target'].startswith('aarch64') else b'\x3e\x00'
+                        require(header[:6]==b'\x7fELF\x02\x01' and header[18:20]==machine,'actual KD3 target ELF differs')
+                    for row in actual['commands']:
+                        if row.get('sha256'):require(module.sha(dest/row['log'])==row['sha256'],'actual KD3 build log SHA differs')
+                    for inspect in dest.glob('cxx-inspect-*.json'):
+                        diagnostic=json.loads(inspect.read_text());name=diagnostic['diagnostic_path']
+                        require(Path(name).name==name and name.startswith('cxx-object-') and name.endswith('.o'),'C++ diagnostic path differs')
+                        obj=dest/name;require(obj.stat().st_size==diagnostic['object_bytes'] and module.sha(obj)==diagnostic['object_sha256'] and diagnostic.get('inspected') is True,'C++ actual object inspection differs')
+                        if result==0:require(diagnostic.get('accepted') is True and not diagnostic['unknown_symbols'],'C++ runtime inspection refused')
+                elif result==0:raise RuntimeError('actual KD3 manifest missing')
+                record['collected']=True
+            except BaseException as error:record['error']=type(error).__name__+': '+str(error);result=1
+            (self.evidence/'kd3-fixture-artifacts.json').write_text(json.dumps(record,indent=2)+'\n')
+            return result
+        if self.options.phase!='phase-a-tests':return result
+        # Keep partial logs even when the guest command timed out. Only read the
+        # owned cache after inherited nonce-verified VM teardown completed.
+        record={'phase':'phase-a-tests','collected':False,'files':[]}
+        try:
+            require(json.loads((self.evidence/'summary.json').read_text()).get('cleanup') is True,'actual cleanup required before phase A log collection')
+            validate_cache(self.cache,self.cache['owner_nonce'])
+            source=Path(self.cache['path'])/'phase-a-tests'/self.token
+            require(source.is_dir() and not source.is_symlink(),'phase A actual logs missing')
+            dest=self.evidence/'phase-a-tests';dest.mkdir(mode=0o700);total=0
+            for path in sorted(source.iterdir()):
+                info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1 and info.st_size<=32*1024**2,'phase A log type/owner/bound differs')
+                require(path.name=='results.json' or path.name=='results.new' or (path.name.endswith('.log') and path.stem in {'account','admission','report','events','vmm','host','build-context','storage','clippy'}),'unexpected phase A evidence')
+                total+=info.st_size;require(total<=128*1024**2,'phase A aggregate log bound')
+                shutil.copy2(path,dest/path.name);record['files'].append({'name':path.name,'bytes':info.st_size,'sha256':hashlib.sha256((dest/path.name).read_bytes()).hexdigest()})
+            if (dest/'results.json').is_file():
+                actual=json.loads((dest/'results.json').read_text());record['actual_results']=actual
+                for command in actual['commands']:
+                    if command.get('sha256'):
+                        log=dest/command['log'];require(log.stat().st_size==command['bytes'] and hashlib.sha256(log.read_bytes()).hexdigest()==command['sha256'],'phase A command log differs')
+                if result==0:require(actual.get('complete') is True and all(item.get('exit')==0 for item in actual['commands']),'phase A success requires actual complete zero exits')
+            elif result==0:raise RuntimeError('phase A result receipt missing')
+            record['collected']=True
+        except BaseException as error:record['error']=type(error).__name__+': '+str(error);result=1
+        (self.evidence/'phase-a-test-artifacts.json').write_text(json.dumps(record,indent=2)+'\n')
+        return result
 
 
 class PersonalityRun(CombinedRun):
@@ -271,7 +459,7 @@ class PersonalityRun(CombinedRun):
 
     def __init__(self, options, inputs, archive, cache):
         require(cache['target']=='x86_64-unknown-linux-musl' and cache['profile']=='release-debug0', 'personality cache must be separate')
-        require(not cache.get('requires_local_clean') or (getattr(options,'reuse_transition',None) and getattr(options,'reuse_summary',None)), 'retarget requires explicit prior reuse summary and transition receipt')
+        require(not cache.get('requires_local_clean') or not getattr(options,'reuse_summary',None) or getattr(options,'reuse_transition',None), 'retained artifacts require the explicit source transition')
         super().__init__(options, inputs, archive, cache)
         self.memory=6
         loaded=importlib.util.spec_from_file_location('personality_cross_inputs',ROOT/'cross-tools-vm.py')
@@ -288,6 +476,11 @@ class PersonalityRun(CombinedRun):
         self.reuse_fingerprints=[]
         if getattr(options,'reuse_summary',None):
             payload['personality-reuse.json']=json.dumps(self.load_reuse(options.reuse_summary))
+        elif cache.get('requires_local_clean'):
+            transition_path=module.private_file(cache['previous_binding_receipt'])
+            transition=json.loads(transition_path.read_text())
+            require(transition.get('moved') is True and transition['to']==cache, 'full rebuild cache transition differs')
+            payload['personality-full-clean.json']=json.dumps({'new_inputs_census_sha256':inputs['inputs_census_sha256'],'sha256':self.cross_module.sha(transition_path)})
         self.layers_fingerprints=[]
         if getattr(options,'layers_tests_kernel_inputs',None):
             provenance_path=module.private_file(options.layers_tests_kernel_inputs)
@@ -542,29 +735,33 @@ printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'storage-tests', 'tests', 'clippy'), default='check')
+    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu'), default='check')
     parser.add_argument('--inputs', required=True)
     parser.add_argument('--archive', required=True)
     parser.add_argument('--cache-journal')
     parser.add_argument('--reuse-summary')
     parser.add_argument('--reuse-transition')
     parser.add_argument('--tools-bundle', required=True)
+    parser.add_argument('--kd3-python-bundle')
+    parser.add_argument('--kd3-gnu-bundle')
     parser.add_argument('--cross-bundle', default=str(ROOT/'cross-tools-archive-1u_y3fit/bundle.json'))
     parser.add_argument('--rust-bundle', default=str(ROOT/'rust-musl-component/musl-target-vgegt4ot/bundle.json'))
     parser.add_argument('--seconds', type=int, default=120)
     options = parser.parse_args()
     options.mode = 'combined-linux'
-    maximum=1050 if options.phase=='personality-artifacts' else 1100 if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools') else 600
+    maximum=1050 if options.phase=='personality-artifacts' else 1100 if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu') else 600
     require(30 <= options.seconds <= maximum, 'Combined stage exceeds its explicit phase bound')
     inputs = json.loads(module.private_file(options.inputs).read_text())
     archive = module.private_file(options.archive)
     module.validate_inputs(inputs, archive, lock_path='Cargo.lock', lock_key='cargo_lock_sha256',
                            max_files=50000, max_bytes=800 * 1024 * 1024)
+    if options.phase in ('kd3-fixture-tools-arm','kd3-fixture-tools-gnu'):
+        require(options.kd3_python_bundle and (not options.phase.endswith('-gnu') or options.kd3_gnu_bundle),'explicit official Python/GNU target bundle required')
     if not options.run:
         print(json.dumps({'prepared_only': True, 'phase': options.phase, 'source_archive_sha256': inputs['archive_sha256']}))
         return 0
     os.umask(0o077)
-    target,profile=('x86_64-unknown-linux-musl','release-debug0') if options.phase=='personality-artifacts' else ('aarch64-unknown-linux-gnu','native-debug0')
+    target,profile=('x86_64-unknown-linux-musl','release-debug0') if options.phase=='personality-artifacts' else ('x86_64-unknown-linux-gnu' if options.phase=='kd3-fixture-tools-gnu' else 'aarch64-unknown-linux-gnu','native-debug0')
     if options.cache_journal:
         cache = json.loads(module.private_file(options.cache_journal).read_text())
         validate_cache(cache, cache['owner_nonce'])
