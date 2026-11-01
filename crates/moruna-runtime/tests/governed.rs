@@ -887,6 +887,20 @@ fn a_programs_bindings_decide_where_a_contract_is() {
 /// Parquet; the run is given a deadline and is cancelled past it, so a hang fails the test.
 #[test]
 fn sc_t24_a_query_with_no_rows_finishes() {
+    // Admission measures the whole process. Earlier governed runs can retain
+    // allocator pages despite the serial lock; use the same fresh-process
+    // boundary as H6 so this run's 256 MiB budget measures only this run.
+    let outcome = apart::run("sc_t24_no_rows_child", &serde_json::json!({"sc_t24": true}));
+    assert_eq!(outcome["completed"], true);
+}
+
+#[test]
+#[ignore = "run by sc_t24 in a process of its own"]
+fn sc_t24_no_rows_child() {
+    let Some(job) = apart::job() else {
+        return;
+    };
+    assert_eq!(job["sc_t24"], true);
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("sc_t24_no_rows");
     let root = scratch.path().join("disk");
@@ -962,4 +976,5 @@ fn sc_t24_a_query_with_no_rows_finishes() {
         expected.fields(),
         "the SQL schema survives"
     );
+    apart::answer(serde_json::json!({"completed": true}));
 }
