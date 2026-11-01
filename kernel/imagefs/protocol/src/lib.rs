@@ -521,11 +521,22 @@ fn scratch_account(p: &mut Probe) -> Result<(), Fail> {
             "8192 bytes written charged its account {used} bytes"
         ));
     }
+    // Each request must fit the channel independently of the directory quota.
+    // A quota-sized body plus its framing would fail in transport, never reaching
+    // the service whose NoSpace policy this probe checks.
+    let chunk = 32 * 1024;
     let mut e = file_req(file)?;
-    0u64.encode(&mut e).map_err(wire)?;
-    Bytes(vec![1; limit as usize])
-        .encode(&mut e)
-        .map_err(wire)?;
+    8192u64.encode(&mut e).map_err(wire)?;
+    Bytes(vec![1; chunk]).encode(&mut e).map_err(wire)?;
+    let written = decode_reply::<u32>(p, 8, e)?;
+    if written != chunk as u32 {
+        return Err(format!(
+            "scratch write returned {written}, expected {chunk}"
+        ));
+    }
+    let mut e = file_req(file)?;
+    (8192u64 + chunk as u64).encode(&mut e).map_err(wire)?;
+    Bytes(vec![1; chunk]).encode(&mut e).map_err(wire)?;
     p.request(8, e)?.failure(code(imagefs::Error::NoSpace))?;
     let mut e = Encoder::new();
     account

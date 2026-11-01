@@ -71,11 +71,13 @@ expect "kk: process vsock0 exited with code 0 ("
 peer="$out/vsock-peer-$cpus.log"
 expect "vsock-peer: ok: the guest connected to port 5000" "$peer"
 expect "vsock-peer: ok: connected to the guest's port 5001 and it answered 'hello back from the guest'" "$peer"
-# Source-derived generic baseline: linux/test's seven check() runs plus granted(),
-# and plane/test shimless()'s two actual run_plane requests. The removed bare
+# Source-derived generic baseline: linux/test's seven check() runs, granted(),
+# hog(), and its post-hog hello; plus plane/test shimless()'s two run_plane requests. The removed bare
 # engine contributed5engine processes+6image tasks; all5strict assertions now
 # remain mandatory on each CPU profile in check-node-fixtures.py (15boots).
-expect "linux: served: 10 programs run"
+# linux-test starts ten programs; the plane regression additionally starts
+# arrow_echo and hello through the same actual personality.
+expect "linux: served: 12 programs run"
 if grep -qF -- "FAIL:" "$peer"; then
   echo "FOUND FAILURE in actual vsock peer log:"
   grep -F -- "FAIL:" "$peer"
