@@ -72,6 +72,7 @@ CFLAGS_x86_64_moruna_user="--target=x86_64-unknown-none -ffreestanding -mno-red-
 RUSTFLAGS="$flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-arg=-static" \
   rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
   -Zunstable-options -Zjson-target-spec "${build_std[@]}" --workspace \
+  --features moruna-storage-service/service \
   --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image
 set +x
 
