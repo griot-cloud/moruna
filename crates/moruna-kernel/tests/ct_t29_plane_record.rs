@@ -194,3 +194,52 @@ fn ct_t29_the_record_check_refuses_with_the_reason() {
     assert!(e.contains("continuation marker"), "{e}");
     refused(&garbage, garbage.len() as u64, "continuation marker");
 }
+
+// Use the actual native adapter arithmetic without its x86-only syscall dependencies.
+#[path = "../../moruna-micro/src/layout.rs"]
+mod native_layout;
+
+#[test]
+fn ct_t29_native_record_length_includes_non_aligned_final_buffer_padding() {
+    let batch = RecordBatch::try_from_iter([
+        ("x", Arc::new(Int64Array::from(vec![7])) as ArrayRef),
+        (
+            "s",
+            Arc::new(StringArray::from_iter_values(["x".repeat(422)])) as ArrayRef,
+        ),
+    ])
+    .expect("non-aligned string payload");
+    let alloc = FakeAllocator::new();
+    let (framing, bodies) = encode_framing(&batch, PAGE as usize, 0, &alloc).expect("encode");
+    let pieces: Vec<_> = bodies
+        .iter()
+        .map(|(offset, body)| (*offset as u64, body.len() as u64))
+        .collect();
+    let unpadded = pieces
+        .iter()
+        .map(|(offset, bytes)| offset + bytes)
+        .max()
+        .expect("body buffers");
+    assert_eq!(unpadded % 8, 6, "the real payload needs two padding bytes");
+    let length = native_layout::record_len(framing.len() as u64, &pieces).expect("bounded length");
+    assert_eq!(length, unpadded + 2);
+    let Need::Framing(n) = framing_need(&framing).expect("framing") else {
+        panic!("complete framing");
+    };
+    assert!(
+        check_record(&framing[..n], unpadded)
+            .expect_err("missing final padding must remain refused")
+            .contains("the record holds")
+    );
+    let mut bytes = vec![0u8; length as usize];
+    bytes[..framing.len()].copy_from_slice(&framing);
+    for (at, body) in bodies {
+        bytes[at..at + body.len()].copy_from_slice(body.as_slice());
+    }
+    assert_eq!(&bytes[unpadded as usize..], &[0, 0]);
+    let checked = check_record(&bytes[..n], length).expect("native record passes the strict check");
+    assert_eq!(checked.rows, 1);
+    let decoded = moruna_kernel::ipc::decode(arrow::buffer::Buffer::from(bytes), PAGE as usize)
+        .expect("zero-padded native record decodes");
+    assert_eq!(decoded, batch);
+}

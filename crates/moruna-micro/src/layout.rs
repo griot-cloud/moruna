@@ -59,11 +59,13 @@ pub fn window_for(input: u64) -> u64 {
 }
 
 /// A record's length: its framing, then each body buffer at its offset, which
-/// `moruna_kernel::ipc::encode_framing` places on pages. The end of the last byte.
+/// `moruna_kernel::ipc::encode_framing` places on pages. IPC declares the body through
+/// the final buffer rounded to eight bytes, including its zero padding.
 pub fn record_len(framing: u64, placed: &[(u64, u64)]) -> Option<u64> {
-    placed.iter().try_fold(framing, |end, (offset, len)| {
+    let end = placed.iter().try_fold(framing, |end, (offset, len)| {
         offset.checked_add(*len).map(|e| e.max(end))
-    })
+    })?;
+    end.checked_add(7).map(|end| end & !7)
 }
 
 /// The name of the port a task calls as `number` (SDD 30 f.7): the ports its entry lists, in
@@ -99,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn kd2_t7_a_record_ends_at_its_last_buffer() {
+    fn kd2_t7_a_record_includes_its_final_ipc_padding() {
         assert_eq!(record_len(4096, &[]), Some(4096));
         assert_eq!(record_len(4096, &[(4096, 80), (8192, 8)]), Some(8200));
         assert_eq!(
@@ -107,6 +109,8 @@ mod tests {
             Some(8192),
             "framing past the buffers"
         );
+        assert_eq!(record_len(4096, &[(12288, 422)]), Some(12712));
+        assert_eq!(record_len(0, &[(u64::MAX, 0)]), None);
         assert_eq!(record_len(0, &[(u64::MAX, 1)]), None);
     }
 
