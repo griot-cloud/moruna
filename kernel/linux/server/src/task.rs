@@ -412,10 +412,13 @@ impl Task {
         self.shared.borrow()
     }
 
-    /// Serves every request queued on the forward's channel.
+    /// Serves a bounded turn so a continuously readable process cannot starve
+    /// other forwards. Unread requests retain the channel's level READABLE signal
+    /// and are picked up by the dispatcher's next turn.
     pub fn serve(&mut self, channel: &Channel) {
+        const REQUESTS_PER_TURN: usize = 16;
         let mut buf = [0u8; request::SIZE];
-        loop {
+        for _ in 0..REQUESTS_PER_TURN {
             match channel.read(&mut buf, &mut []) {
                 Ok((n, _)) if n == request::SIZE => {}
                 Ok((n, _)) => {
