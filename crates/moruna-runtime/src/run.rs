@@ -871,6 +871,33 @@ fn drive(
         None => scheduler.init_instances()?,
     }
 
+    // Native singleton init has already carved and retained its real Account. These are
+    // the same held limits WithOutside adds to every sample, not process growth to fit
+    // independently to each stage. Keep them funded once even if a child later retires.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let fixed_native_bytes = packaged
+        .iter()
+        .filter(|stage| stage.native_singleton())
+        .try_fold(0u64, |total, stage| -> moruna_kernel::Result<u64> {
+            let outside = stage.outside().ok_or_else(|| MorunaError::Config {
+                name: "budget.native_children",
+                msg: "initialized native singleton has no Account observer".into(),
+            })?;
+            let held = outside.in_use()?;
+            if held == 0 {
+                return Err(MorunaError::Config {
+                    name: "budget.native_children",
+                    msg: "initialized native singleton has no retained Account limit".into(),
+                });
+            }
+            total.checked_add(held).ok_or_else(|| MorunaError::Config {
+                name: "budget.native_children",
+                msg: "actual native Account commitment total overflow".into(),
+            })
+        })?;
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let fixed_native_bytes = 0;
+
     // 10. Controller, then the record hook, so the hook exists before any probe record.
     let profiles_dir = resolve_profiles_dir(profiles_dir, home_dir(), &mut notes);
     let controller = Arc::new(Controller::new(
@@ -897,6 +924,7 @@ fn drive(
             arena_bytes,
             baseline_bytes,
             engine_bytes,
+            fixed_native_bytes,
             sink_buffer_bytes,
             checkpoint_enabled,
             checkpoint_interval_ms,

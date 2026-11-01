@@ -56,6 +56,19 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
             });
         }
 
+        if state.cfg.fixed_native_bytes > 0
+            && baseline
+                .saturating_add(state.cfg.arena_bytes)
+                .saturating_add(state.cfg.engine_bytes)
+                .saturating_add(state.cfg.fixed_native_bytes)
+                >= ceiling
+        {
+            return Err(MorunaError::Config {
+                name: "budget.native_children",
+                msg: "retained native Accounts leave no room below the actual run ceiling".into(),
+            });
+        }
+
         // A kernel that allocates device memory on a host with no device cannot be sized;
         // that is a configuration error at prepare, not a failure on morsel 40,000 (h).
         if state.cfg.limits.devices.is_empty()

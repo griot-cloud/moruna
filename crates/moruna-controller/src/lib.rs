@@ -300,6 +300,10 @@ pub struct ControllerConfig {
     /// counts it as resident, beside the baseline and the arena, so no morsel is planned into
     /// it.
     pub engine_bytes: u64,
+    /// Actual retained native child Account limits already present in every sampler reading.
+    /// Funded once outside the arena, before probing; never inferred from process growth.
+    /// Zero for ordinary Linux process-memory accounting.
+    pub fixed_native_bytes: u64,
     /// Bytes of the arena the sink holds for its own file buffer (a Parquet sink encodes a file
     /// in the arena before it writes it): resident, part of `arena_bytes`, and planned by no one,
     /// so the host budget the model divides is `arena_bytes` less this.
@@ -345,6 +349,7 @@ impl Default for ControllerConfig {
             arena_bytes: 0,
             baseline_bytes: 0,
             engine_bytes: 0,
+            fixed_native_bytes: 0,
             sink_buffer_bytes: 0,
             checkpoint_enabled: false,
             checkpoint_interval_ms: 5000,
