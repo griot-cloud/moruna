@@ -206,6 +206,19 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
     } else {
         None
     };
+    if prepared_hook.is_some() {
+        // Portable publication cannot replay a consumed, uncommitted sink input
+        // after restoring stateful kernels. Commit its actual buffered output
+        // while all writers are quiesced, then publish that genuine watermark
+        // before either the sink state or placement lineage is snapshotted.
+        for end in &shared.sinks {
+            {
+                let sink = end.sink.read().unwrap_or_else(|e| e.into_inner());
+                sink.checkpoint_flush()?;
+            }
+            crate::sink_drive::update_watermark(shared, end);
+        }
+    }
     let mut kernel_states: Vec<(StageId, usize, Vec<u8>)> = Vec::new();
     for (index, entry) in shared.stages.iter().enumerate() {
         if entry.kernel.hints().resume != ResumePolicy::Checkpoint {

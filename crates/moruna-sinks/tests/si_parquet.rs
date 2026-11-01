@@ -576,3 +576,65 @@ fn a_slice_of_a_large_buffer_is_measured_by_its_rows() {
     );
     assert_eq!(sink.finish().expect("finish").files.len(), 1);
 }
+
+/// A portable barrier commits encoded inputs before their original queue payloads
+/// are omitted, without finishing the sink or claiming a whole-run success.
+#[test]
+fn portable_checkpoint_flush_commits_and_continues_without_empty_final_file() {
+    let scratch = Scratch::new("portable-flush");
+    let (mut sink, reactor, alloc) = new_sink(&scratch, 1 << 20);
+    sink.open(&table_source_schema()).unwrap();
+    sink.checkpoint_flush().unwrap();
+    assert_eq!(sink.committed_seq(), None);
+    for seq in 0..2 {
+        block_on(sink.write(seq, arena_payload(alloc.fake(), 32, seq as i64))).unwrap();
+        assert_eq!(sink.committed_seq(), seq.checked_sub(1));
+        sink.checkpoint_flush().unwrap();
+        assert_eq!(sink.committed_seq(), Some(seq));
+        assert_eq!(reactor.in_flight(), 0, "original object write completed");
+        assert!(
+            reactor
+                .object(&format!("{}/_SUCCESS", scratch.url()))
+                .is_none()
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&sink.checkpoint().unwrap().unwrap()).unwrap();
+        assert!(state.is_object(), "actual committed ledger checkpoint");
+        assert_eq!(sink.stats().files_committed, seq + 1);
+    }
+    sink.checkpoint_flush().unwrap();
+    assert_eq!(sink.stats().files_committed, 2, "idle flush is idempotent");
+    let summary = sink.finish().unwrap();
+    assert_eq!(summary.rows, 64);
+    assert_eq!(summary.files.len(), 2, "no empty file after final flush");
+    for name in &summary.files {
+        let bytes = reactor
+            .object(&format!("{}/{}", scratch.url(), name))
+            .unwrap();
+        assert_eq!(parquet_metadata(&bytes).file_metadata().num_rows(), 32);
+    }
+    assert!(
+        reactor
+            .object(&format!("{}/_SUCCESS", scratch.url()))
+            .is_some()
+    );
+}
+
+#[test]
+fn portable_checkpoint_flush_refuses_failed_commit_without_watermark() {
+    let scratch = Scratch::new("portable-flush-refused");
+    let (mut sink, reactor, alloc) = new_sink(&scratch, 1 << 20);
+    sink.open(&table_source_schema()).unwrap();
+    block_on(sink.write(0, arena_payload(alloc.fake(), 32, 0))).unwrap();
+    reactor.clone().fail_next(OpKind::WriteObject, 1);
+    assert!(sink.checkpoint_flush().is_err());
+    assert_eq!(sink.committed_seq(), None);
+    assert_eq!(sink.stats().files_committed, 0);
+    assert!(
+        reactor
+            .object(&format!("{}/_SUCCESS", scratch.url()))
+            .is_none()
+    );
+    assert!(block_on(sink.write(1, arena_payload(alloc.fake(), 32, 1))).is_err());
+    assert!(sink.finish().is_err());
+}

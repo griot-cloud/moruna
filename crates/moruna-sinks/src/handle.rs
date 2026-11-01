@@ -98,6 +98,13 @@ impl Sink for SinkHandle {
         }
     }
 
+    fn checkpoint_flush(&self) -> Result<()> {
+        match self {
+            SinkHandle::Plain(sink) => sink.checkpoint_flush(),
+            SinkHandle::Ordered(buffer) => buffer.checkpoint_flush(),
+        }
+    }
+
     fn checkpoint(&self) -> Result<Option<Vec<u8>>> {
         match self {
             SinkHandle::Plain(sink) => sink.checkpoint(),

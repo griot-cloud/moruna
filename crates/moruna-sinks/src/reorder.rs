@@ -261,6 +261,10 @@ impl<S: Sink + ?Sized> Sink for ReorderBuffer<S> {
         state.advance();
     }
 
+    fn checkpoint_flush(&self) -> Result<()> {
+        self.inner.checkpoint_flush()
+    }
+
     fn checkpoint(&self) -> Result<Option<Vec<u8>>> {
         self.inner.checkpoint()
     }
