@@ -32,6 +32,28 @@ printf 'MORUNA_COMBINED_BEGIN %s %s\n' "$token" "$phase"
 printf '%s  /tmp/moruna-source.tar\n' "$archive_sha" | sha256sum -c -
 mkdir -p /proof/source /proof/cargo
 tar -xf /tmp/moruna-source.tar -C /proof/source
+python3 - <<'PY_VENDOR_TIMESTAMPS'
+import hashlib,json,os,pathlib,stat
+root=pathlib.Path('/proof/source/vendor')
+if root.exists():
+    def files():
+        digest=hashlib.sha256();count=0
+        for path in sorted(root.rglob('*')):
+            info=path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                with path.open('rb') as stream: content=hashlib.file_digest(stream,'sha256').hexdigest()
+                row=[str(path.relative_to(root)),info.st_size,info.st_mode,info.st_mtime_ns,content]
+                digest.update(json.dumps(row,separators=(',',':')).encode()+b'\n');count+=1
+            elif not stat.S_ISDIR(info.st_mode):
+                raise SystemExit('vendor must contain only validated regular files/directories')
+        return {'files':count,'sha256':digest.hexdigest()}
+    before=files();directories=[root]+[p for p in root.rglob('*') if p.is_dir()]
+    for path in directories:os.utime(path,ns=(0,0),follow_symlinks=False)
+    after=files()
+    if before!=after:raise SystemExit('vendor file bytes/modes/mtimes changed')
+    if any(p.stat().st_mtime_ns!=0 for p in directories):raise SystemExit('vendor directory timestamp normalization failed')
+    print('VENDOR_DIRECTORY_TIMESTAMPS',json.dumps({'directories':len(directories),'mtime_ns':0,'before':before,'after':after},sort_keys=True))
+PY_VENDOR_TIMESTAMPS
 cd /proof/source
 if [ "$phase" = kd3-prepare-linux ]; then
   # Execution-only: never invalidate or build the retained Cargo artifact cache.
@@ -683,6 +705,28 @@ token="$1"; phase="$2"; archive_sha="$3"
 printf '%s  /tmp/moruna-source.tar\n' "$archive_sha" | sha256sum -c -
 mkdir -p /proof/source /proof/cargo
 tar -xf /tmp/moruna-source.tar -C /proof/source
+python3 - <<'PY_VENDOR_TIMESTAMPS'
+import hashlib,json,os,pathlib,stat
+root=pathlib.Path('/proof/source/vendor')
+if root.exists():
+    def files():
+        digest=hashlib.sha256();count=0
+        for path in sorted(root.rglob('*')):
+            info=path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                with path.open('rb') as stream: content=hashlib.file_digest(stream,'sha256').hexdigest()
+                row=[str(path.relative_to(root)),info.st_size,info.st_mode,info.st_mtime_ns,content]
+                digest.update(json.dumps(row,separators=(',',':')).encode()+b'\n');count+=1
+            elif not stat.S_ISDIR(info.st_mode):
+                raise SystemExit('vendor must contain only validated regular files/directories')
+        return {'files':count,'sha256':digest.hexdigest()}
+    before=files();directories=[root]+[p for p in root.rglob('*') if p.is_dir()]
+    for path in directories:os.utime(path,ns=(0,0),follow_symlinks=False)
+    after=files()
+    if before!=after:raise SystemExit('vendor file bytes/modes/mtimes changed')
+    if any(p.stat().st_mtime_ns!=0 for p in directories):raise SystemExit('vendor directory timestamp normalization failed')
+    print('VENDOR_DIRECTORY_TIMESTAMPS',json.dumps({'directories':len(directories),'mtime_ns':0,'before':before,'after':after},sort_keys=True))
+PY_VENDOR_TIMESTAMPS
 chmod -R a-w /proof/source
 cd /proof/source
 export CARGO_HOME=/proof/cargo CARGO_TARGET_DIR=/proof/target CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1

@@ -258,12 +258,17 @@ def main():
             header = file.read(20)
         machine = b'\xb7\x00' if arch == 'aarch64' else b'\x3e\x00'
         require(header[:6] == b'\x7fELF\x02\x01' and header[18:20] == machine, 'actual libpython ELF target differs')
-        config_file = work / 'pyo3-target.txt'
-        config_file.write_text('implementation=CPython\nversion=' + variables['VERSION']
+        config_text = ('implementation=CPython\nversion=' + variables['VERSION']
                                + '\nshared=true\nabi3=false\nlib_name=' + variables['LDLIBRARY'][3:-3]
                                + '\nlib_dir=' + str(home / 'lib') + '\npointer_width=64\nbuild_flags=\n')
+        config_sha = hashlib.sha256(config_text.encode()).hexdigest()
+        config_file = work / ('pyo3-target-' + config_sha + '.txt')
+        with config_file.open('x') as stream:
+            stream.write(config_text)
+        os.utime(config_file, ns=(0, 0))
+        require(sha(config_file) == config_sha, 'content-addressed PyO3 config differs')
         env['PYO3_CONFIG_FILE'] = str(config_file)
-        report['pyo3_config'] = {'path': str(config_file), 'sha256': sha(config_file),
+        report['pyo3_config'] = {'path': str(config_file), 'sha256': sha(config_file), 'mtime_ns': config_file.stat().st_mtime_ns,
                                  'sysconfig_sha256': sha(configs[0]), 'actual_lib_dir': str(home / 'lib'),
                                  'original_build_lib_dir': variables.get('LIBDIR'), 'target': target}
         save()
