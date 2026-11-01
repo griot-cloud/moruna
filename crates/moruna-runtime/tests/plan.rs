@@ -498,14 +498,14 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
     let (mut printed, mut said) = (Vec::new(), Vec::new());
     let code = moruna_runtime::host::cli::explain(
         &spec,
-        Some("simulated"),
+        Some("no_such_planner"),
         None,
         &kinds,
         &mut printed,
         &mut said,
     );
     assert_eq!(code, exit::SPEC_REFUSED);
-    assert!(String::from_utf8_lossy(&said).contains("no planner `simulated`"));
+    assert!(String::from_utf8_lossy(&said).contains("no planner `no_such_planner`"));
     let bad = dir.join("bad.json");
     let mut refused = doc.clone();
     refused["kernels"][0]["kind"] = json!("no.such");

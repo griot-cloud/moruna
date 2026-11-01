@@ -42,6 +42,10 @@ fn ask(end: &OwnedFd, h: Header, body: &[u8], fd: Option<&OwnedFd>) {
 /// The engine's answer, once `p` has read what was asked.
 fn answer(p: &mut LinuxPlane, end: &OwnedFd) -> (Header, Option<OwnedFd>) {
     let _ = p.next(sys::now() + 50_000_000).expect("next");
+    receive_answer(end)
+}
+
+fn receive_answer(end: &OwnedFd) -> (Header, Option<OwnedFd>) {
     let mut buf = [0u8; 64];
     let got = sys::recv(end.as_fd(), &mut buf, true).expect("an answer");
     let h = Header::read(&buf[..got.len]).expect("a header");
@@ -205,9 +209,12 @@ fn ka2_once_put_a_record_is_written_by_no_descriptor_and_no_mapping() {
     map.bytes_mut()[..record.len()].copy_from_slice(&record);
     drop(map);
     ask(&end, put(0, 0, len), &[], None);
-    let (done, _) = answer(&mut p, &end);
+    // next() processes PUT and returns its real Event::Put. Do not discard it
+    // while receiving PUT_DONE and then expect it to appear a second time.
+    let put_event = p.next(sys::now() + 50_000_000).expect("next");
+    let (done, _) = receive_answer(&end);
     assert_eq!(done.kind, wire::PUT_DONE);
-    let batch = match pump(&mut p).as_slice() {
+    let batch = match put_event.as_slice() {
         [
             Event::Put {
                 batch,

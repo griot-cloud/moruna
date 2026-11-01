@@ -29,6 +29,31 @@ const PRODUCE: u8 = 1;
 const CONSUME: u8 = 2;
 const CALL: u8 = 3;
 
+/// The actual canonical record includes every validity/data buffer and padding;
+/// only the Int64 values, not the IPC record's total size, are 1/64 MiB.
+fn record(rows: u64) -> Vec<u8> {
+    moruna_testkit::plane::record(
+        &moruna_testkit::plane::int64s(rows as usize).expect("actual Int64 batch"),
+    )
+    .expect("actual canonical record")
+}
+
+fn values_offset(bytes: &[u8], rows: u64) -> usize {
+    use moruna_ipc_check::record::{Need, check_record, framing_need};
+    let Need::Framing(length) = framing_need(bytes).expect("actual framing") else {
+        panic!("complete record must contain framing");
+    };
+    let checked = check_record(&bytes[..length], bytes.len() as u64).expect("actual valid record");
+    assert_eq!(checked.rows, rows);
+    assert_eq!(checked.columns.len(), 1);
+    let &(offset, length) = checked.columns[0]
+        .buffers
+        .last()
+        .expect("actual values buffer");
+    assert_eq!(length, rows * 8);
+    usize::try_from(offset).expect("values offset")
+}
+
 fn role(kind: u8, rows: u64, count: u64) -> Vec<u8> {
     let mut out = vec![kind];
     out.extend_from_slice(&rows.to_le_bytes());
@@ -104,10 +129,11 @@ fn plane_role() {
     let plane = Plane::new(socket).expect("the plane");
     match kind {
         PRODUCE => {
-            let framing = moruna_testkit::plane::framing(rows as usize).expect("a framing");
-            let len = 4096 + rows * 8;
-            // The values, made once: each batch is a copy of them, its first value its number.
-            let values: Vec<u8> = (0..rows).flat_map(|v| v.to_le_bytes()).collect();
+            let record = record(rows);
+            let len = record.len() as u64;
+            let values = values_offset(&record, rows);
+            // The actual canonical record is made once; each batch changes only
+            // its first value to its sequence, retaining real validity buffers.
             let mut output = plane.output(0).expect("output 0");
             let (mut gets, mut puts) = (Vec::new(), Vec::new());
             for i in 0..count {
@@ -115,9 +141,8 @@ fn plane_role() {
                 let mut w = output.window().expect("window").expect("a window");
                 gets.push(started.elapsed().as_micros() as u64);
                 let bytes = w.bytes();
-                bytes[..4096].copy_from_slice(&framing);
-                bytes[4096..len as usize].copy_from_slice(&values);
-                bytes[4096..4104].copy_from_slice(&i.to_le_bytes());
+                bytes[..len as usize].copy_from_slice(&record);
+                bytes[values..values + 8].copy_from_slice(&i.to_le_bytes());
                 if count == 1 {
                     let pages = len.div_ceil(4096);
                     let at = |p: u64| w.addr() + p * 4096;
@@ -148,10 +173,11 @@ fn plane_role() {
                 };
                 gets.push(started.elapsed().as_micros() as u64);
                 let bytes = b.bytes();
-                let first = u64::from_le_bytes(bytes[4096..4104].try_into().expect("8"));
+                let values = values_offset(bytes, rows);
+                let first = u64::from_le_bytes(bytes[values..values + 8].try_into().expect("8"));
                 assert_eq!(first, n, "batches in order");
-                let last = bytes.len() - 8;
-                let tail = u64::from_le_bytes(bytes[last..].try_into().expect("8"));
+                let last = values + usize::try_from(rows * 8).expect("values bytes") - 8;
+                let tail = u64::from_le_bytes(bytes[last..last + 8].try_into().expect("8"));
                 assert_eq!(tail, rows - 1, "the last value");
                 if count == 1 {
                     // Every page read, so every page is mapped.
@@ -247,7 +273,7 @@ fn next(p: &mut LinuxPlane) -> Event {
 #[test]
 fn ka2_zero_copy_a_64_mib_batch_is_the_same_pages_in_producer_engine_and_consumer() {
     let rows: u64 = 8 << 20;
-    let len = 4096 + rows * 8;
+    let len = record(rows).len() as u64;
     let mut p = LinuxPlane::new(1 << 28);
     let (producer, mut ptask) = start(&mut p, shape(0, 1, false), role(PRODUCE, rows, 1));
     p.grant(producer, 0, len).expect("grant");
@@ -330,7 +356,7 @@ fn ka2_zero_copy_a_64_mib_batch_is_the_same_pages_in_producer_engine_and_consume
 #[test]
 fn ka2_throughput_1000_batches_of_1_mib_in_order() {
     let rows: u64 = 128 << 10;
-    let len = 4096 + rows * 8;
+    let len = record(rows).len() as u64;
     const COUNT: u64 = 1000;
     const WINDOWS: u64 = 4;
     let mut p = LinuxPlane::new(1 << 28);

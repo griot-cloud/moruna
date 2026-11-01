@@ -753,8 +753,12 @@ fn spawn_child(doc: &Path) -> Child {
             "1",
         ])
         .env(CHILD, doc)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(
+            std::fs::File::create(doc.with_extension("child.stdout")).expect("child stdout"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(doc.with_extension("child.stderr")).expect("child stderr"),
+        ))
         .spawn()
         .expect("the child starts")
 }
@@ -817,13 +821,22 @@ fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
     });
     let deadline = Instant::now() + Duration::from_secs(60);
     while acknowledged.lock().unwrap().is_none() && Instant::now() < deadline {
+        if let Some(status) = child.0.try_wait().expect("actual child status") {
+            panic!(
+                "checkpoint child ended before portable acknowledgement: {status}; stdout: {}; stderr: {}",
+                std::fs::read_to_string(path.with_extension("child.stdout")).unwrap(),
+                std::fs::read_to_string(path.with_extension("child.stderr")).unwrap(),
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let receipt = acknowledged
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("genuine portable acknowledgement before held next call");
+    let receipt = acknowledged.lock().unwrap().clone().unwrap_or_else(|| {
+        panic!(
+            "genuine portable acknowledgement before held next call; stdout: {}; stderr: {}",
+            std::fs::read_to_string(path.with_extension("child.stdout")).unwrap(),
+            std::fs::read_to_string(path.with_extension("child.stderr")).unwrap(),
+        )
+    });
     let portable = observer.read(&receipt);
     let state = portable.manifest["kernel_states"]
         .as_array()

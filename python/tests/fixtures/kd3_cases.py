@@ -288,7 +288,7 @@ def projects(args):
     shutil.copyfile(HERE.parents[2] / "crates/moruna-py/tests/fixtures/kd3_pex_assets.py",
                     args.root / "pex-assets/function.py")
     (args.root / "pex-assets/function.yaml").write_text(
-        "name: assets-identity\nentry: function:readonly_identity\ninput_schema: {x: int64}\n"
+        "name: assets_identity\nentry: function:readonly_identity\ninput_schema: {x: int64}\n"
         "output_schema: {adds: {}}\nhints: {args: true}\n")
     print(json.dumps({"projects": str(args.root), "packaging": "use the canonical moruna package command; no package build performed"}))
 

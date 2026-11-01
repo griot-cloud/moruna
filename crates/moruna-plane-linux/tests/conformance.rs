@@ -252,6 +252,19 @@ fn plane_task() {
     };
     let script = decode_script(&input).expect("the script");
     let plane = Plane::new(socket).expect("the plane");
+    // This child deliberately faults on writes after ownership transfer. Restore
+    // the OS default before confinement: Rust's stack-overflow signal handler
+    // otherwise tries to reinstall SIG_DFL from inside the seccomp filter, so
+    // the handler's forbidden rt_sigaction becomes SIGSYS instead of the real
+    // memory fault. The plane's syscall allowlist remains unchanged.
+    for signal in [libc::SIGSEGV, libc::SIGBUS] {
+        // SAFETY: this isolated child installs no handler or borrowed pointer;
+        // its intended invalid writes must terminate with the kernel's signal.
+        assert_ne!(
+            unsafe { libc::signal(signal, libc::SIG_DFL) },
+            libc::SIG_ERR
+        );
+    }
     seccompiler::apply_filter(&filter()).expect("the filter");
     run_script(&plane, script, &mut results);
     // SAFETY: the task's end, without unwinding through the test harness.

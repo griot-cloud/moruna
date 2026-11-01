@@ -205,7 +205,7 @@ def main():
         call([config['arm']['moruna-kd3-fixture'], 'seed-contract', contracts], 'canonical-contracts', env)
         assets = Path('/kd3')
         call([python, author, 'assets', '--root', assets, '--wasm', packages / 'echo.wasm',
-              '--pex', packages / 'identity.pex', '--pex-assets', packages / 'assets-identity.pex',
+              '--pex', packages / 'identity.pex', '--pex-assets', packages / 'assets_identity.pex',
               '--contracts', contracts], 'actual-assets', env)
         # Neither cases nor their derived-image reference enter the image whose digest they name.
         programs = work / 'programs'

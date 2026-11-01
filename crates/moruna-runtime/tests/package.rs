@@ -494,7 +494,7 @@ fn pk_t17_package_entry_args_and_assets() {
 fn registration_and_live_keys_preserve_distinct_actual_package_arguments() {
     let _serial = support::one_run_at_a_time();
     let scratch = support::Scratch::new("package-live-cost-args");
-    let manifest = moruna_wasm::testing::args_manifest("configured-live-cost");
+    let manifest = moruna_wasm::testing::args_manifest("configured_live_cost");
     let package = package_at(
         scratch.path(),
         &moruna_wasm::testing::configure_component(&manifest.to_json()),

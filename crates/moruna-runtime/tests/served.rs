@@ -14,7 +14,7 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1508,14 +1508,12 @@ fn host(
         let (reader, mut writer, _close) = conn.into_parts();
         let mut reader = BufReader::new(reader);
         let mut seen = Vec::new();
-        let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return seen,
-                Ok(_) => {}
-            }
-            let message: Value = serde_json::from_str(&line).expect("a JSON line");
+            let message = match moruna_runtime::host::protocol::read_json_message(&mut reader) {
+                Ok(None) => return seen,
+                Ok(Some(message)) => message,
+                Err(error) => panic!("actual host protocol message: {error}"),
+            };
             seen.push(message.clone());
             if message["type"] == "port_call" {
                 let reply = if serves && message["port"] == "scale" {

@@ -1001,6 +1001,7 @@ mod tests {
     #[test]
     fn is_shareable_as_the_contract_trait() {
         let tmp = TempDir::new("shape");
+        write(tmp.path(), "self/status", crate::os::STATUS);
         let sampler: Arc<dyn SamplerTrait> =
             Arc::new(Sampler::with_roots(&discovered_at(None), tmp.path()).expect("sampler"));
         let _ = sampler.sample().unwrap();

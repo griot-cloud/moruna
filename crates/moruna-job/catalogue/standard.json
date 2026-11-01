@@ -428,7 +428,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The command to run, replacing the image's entrypoint and cmd."
+            "description": "The command to run, replacing the image's entrypoint and cmd. On the Moruna kernel the\nreference is a manifest digest and the image's config, once verified, gives the command\nwhen this does not (SDD 30 f.12)."
           },
           "env": {
             "type": [
@@ -451,6 +451,16 @@
             "type": "boolean",
             "description": "The command makes the data plane's calls (`batch_get`, `batch_put`) on its descriptor 3\ninstead of reading Arrow IPC on its standard input and writing it on its standard output.",
             "default": false
+          },
+          "ports": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/$defs/PortDoc"
+            },
+            "description": "The ports the command may call (MH 4.10), on the Moruna kernel only: its task's port `n`\nis the `n`th of these in name order, from 1 (SDD 30 f.7)."
           }
         },
         "required": [
@@ -473,7 +483,39 @@
               "MODEL": "small"
             }
           }
-        ]
+        ],
+        "$defs": {
+          "PortDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port the host serves, by the name the host knows it by: the stage's calls go to the\nhost protocol's peer as `port_call` (MH 4.3)."
+              },
+              "guest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name (`Embedding::guest_port`)."
+              },
+              "deadline_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_job::PORT_DEADLINE_MS`), at most a day."
+              }
+            },
+            "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          }
+        }
       },
       "inputs": "batches",
       "outputs": "batches",

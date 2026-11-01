@@ -274,6 +274,7 @@ for rel in ['Cargo.lock','crates/moruna-runtime/src/host/launch_witness.rs','cra
 PY
     test "$witness_status" -eq 0
     ;;
+  ports-tests) run_cargo test -p moruna-runtime --test ports po_t8_a_resumed_run_restores_a_stages_state_bytes -- --exact --nocapture --test-threads=1 ;;
   runtime-tests) run_cargo test --no-fail-fast -p moruna-runtime -p moruna-cost -p moruna-placement -p moruna-scheduler --features moruna-reactor/uring -- --test-threads=2 ;;
   check) run_cargo check --keep-going -p moruna-runtime -p moruna-cost -p moruna-placement -p moruna-scheduler -p moruna-storage -p moruna-reactor -p moruna-plane-linux --all-targets --features moruna-reactor/uring ;;
   tests) run_cargo test -p moruna-event -p moruna-cost -p moruna-storage-format -p moruna-storage -p moruna-reactor -p moruna-vmm -p moruna-plane-linux -p moruna-sandbox --features moruna-reactor/uring -- --test-threads=2 ;;
@@ -320,10 +321,12 @@ class CombinedRun(module.Ke2Run):
 
     def __init__(self, options, inputs, archive, cache):
         super().__init__(options, inputs, archive, cache)
-        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests'):
+        if options.phase in ('witness-tests', 'sdk-proof-build', 'boot-host-tools', 'phase-a-tests', 'ports-tests'):
             self.memory = 6
         if options.phase in ('boot-host-tools','sdk-proof-build'):
             self.measurement_scope='ARM64 Linux host helper dev/debug0 build and custody only; no optimization/performance/boot/execution claim'
+        if options.phase=='ports-tests':
+            self.measurement_scope='One ARM64 portable-port regression replay only; no native boot, full runtime suite or release acceptance claim'
         if options.phase=='phase-a-tests':
             self.measurement_scope='Focused ARM64 Phase A unit/integration regressions and clippy only; no native boot, KD3 matrix or release acceptance claim'
         self.guest_script = GUEST.replace('__INPUTS_CENSUS__', inputs['inputs_census_sha256'])
@@ -812,7 +815,7 @@ printf 'MORUNA_COMBINED_DONE %s %s\n' "$token" "$phase"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
+    parser.add_argument('--phase', choices=('check', 'check-sdk', 'witness-tests', 'sdk-proof-build', 'boot-host-tools', 'personality-artifacts', 'runtime-tests', 'ports-tests', 'storage-tests', 'tests', 'clippy', 'phase-a-tests', 'kd3-fixture-tools-arm', 'kd3-fixture-tools-gnu', 'kd3-prepare-linux'), default='check')
     parser.add_argument('--inputs', required=True)
     parser.add_argument('--archive', required=True)
     parser.add_argument('--cache-journal')
