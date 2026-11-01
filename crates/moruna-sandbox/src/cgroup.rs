@@ -307,6 +307,9 @@ mod tests {
             "cpu.weight",
             "cpu.max",
             "memory.current",
+            // Unlike real cgroup virtual files, this fixture's peak file is an
+            // ordinary directory entry and must be unlinked before rmdir.
+            "memory.peak",
             "cgroup.events",
         ] {
             fs::remove_file(cg.dir().join(f)).unwrap();

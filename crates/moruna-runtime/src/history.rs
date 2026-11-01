@@ -820,6 +820,13 @@ fn worker(
             }
         }
     }
+    // A failed finish may arrive while recv_timeout is asleep. Its timeout branch
+    // only observes that finishing was requested; it is not a completion grant.
+    // Require the actual positive disposition before publishing any complete fact.
+    if error.is_none() && *shared.finishing.lock().unwrap_or_else(|e| e.into_inner()) != Some(true)
+    {
+        error = Some("run or required logical output coverage did not complete".into());
+    }
     let mut complete = Vec::with_capacity(captures.len());
     for (capture, output) in captures.iter_mut().zip(&plan.outputs) {
         if error.is_none() {
@@ -1199,6 +1206,12 @@ mod tests {
         assert!(
             running.finish(false).is_err(),
             "interrupted attempt never completes"
+        );
+        let interrupted = first.publications();
+        assert_eq!(interrupted.len(), 1);
+        assert!(
+            interrupted[0].complete.is_none(),
+            "no interrupted completion fact"
         );
         let resumed = make();
         let mut kernels: Vec<Arc<dyn Kernel>> = vec![Arc::new(IdentityKernel)];

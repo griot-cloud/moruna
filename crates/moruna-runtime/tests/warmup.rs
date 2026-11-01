@@ -747,7 +747,13 @@ fn cm_t55_what_warm_up_consumed_is_reported() {
     assert!(used.wall_seconds > 0.0);
     assert!(used.kernel_worker_seconds.expect("kernel worker time") >= 0.0);
     assert!(used.worker_seconds.expect("worker time") > 0.0, "{used:?}");
-    assert!(used.memory_peak_bytes.expect("memory") > 0);
+    if cfg!(target_vendor = "apple") {
+        assert!(used.memory_peak_bytes.expect("exact OS memory peak") > 0);
+    } else {
+        // The Linux sampler observes peaks; it cannot assert a total lifetime
+        // high-water mark. Billing deliberately omits that non-exact reading.
+        assert_eq!(used.memory_peak_bytes, None);
+    }
     assert!(used.arena_bytes > 0 && used.store_bytes > 0);
     let summary = r.summary();
     assert!(

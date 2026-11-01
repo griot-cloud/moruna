@@ -497,7 +497,25 @@ fn registration_and_live_keys_preserve_distinct_actual_package_arguments() {
     let manifest = moruna_wasm::testing::args_manifest("configured_live_cost");
     let package = package_at(
         scratch.path(),
-        &moruna_wasm::testing::configure_component(&manifest.to_json()),
+        // The diagnostic configure_component deliberately refuses every process
+        // with its arguments. This measurement fixture must actually succeed:
+        // accept configuration through the real ABI, then run the identity body.
+        &component(
+            &manifest.to_json(),
+            IDENTITY,
+            &[],
+            r#"
+  (func (export "configure") (param $ptr i32) (param $len i32) (result i32)
+    (if (i32.eqz (local.get $len)) (then (unreachable)))
+    (if (i32.ne (i32.load8_u (local.get $ptr)) (i32.const 123)) (then (unreachable)))
+    (i32.store8 (i32.const 48) (i32.const 0))
+    (i32.const 48))
+"#,
+            r#"
+  (func (export "configure") (param "args" string) (result (result (error string)))
+    (canon lift (core func $i "configure") (memory $i "memory") (realloc (func $i "cabi_realloc"))))
+"#,
+        ),
         &manifest,
     );
     let settings = CostSettings::directory(scratch.path().join("observations"));
