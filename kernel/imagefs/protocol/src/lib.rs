@@ -485,9 +485,24 @@ fn scratch_account(p: &mut Probe) -> Result<(), Fail> {
             e.name()
         )
     })?;
-    let given = account
+    // Sending authority requires TRANSFER independently of the service policy.
+    let denied = account
         .0
         .duplicate(Rights::READ | Rights::WRITE)
+        .map_err(|e| format!("duplicating untransferable account: {}", e.name()))?;
+    let mut denied_body = Encoder::new();
+    denied.encode(&mut denied_body).map_err(wire)?;
+    if !matches!(
+        p.send_raw(moruna_svc::Kind::Request, 16, 0x7fff_fffe, denied_body),
+        Err(moruna_svc::Transport::Kernel(
+            moruna_svc::Error::AccessDenied
+        ))
+    ) {
+        return Err("scratch account without TRANSFER was not refused by the kernel".into());
+    }
+    let given = account
+        .0
+        .duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER)
         .map_err(|e| format!("duplicating the account: {}", e.name()))?;
     let mut e = Encoder::new();
     given.encode(&mut e).map_err(wire)?;
@@ -515,7 +530,7 @@ fn scratch_account(p: &mut Probe) -> Result<(), Fail> {
     let mut e = Encoder::new();
     account
         .0
-        .duplicate(Rights::READ | Rights::WRITE)
+        .duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER)
         .map_err(|e| format!("duplicating the account: {}", e.name()))?
         .encode(&mut e)
         .map_err(wire)?;

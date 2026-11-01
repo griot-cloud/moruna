@@ -6,7 +6,7 @@
 //! - NT-T7: the protocol's suite for one card, against each;
 //! - NT-T8: the suite for two cards on one link, `net0` and `net1`;
 //! - NT-T9: frames a second from `net0` to `net1` and back, 64-byte and 1514-byte
-//!   frames in batches of 64 with at most 128 frames between the sender and the
+//!   frames in batches bounded by 64 and the channel wire size, with at most 128 frames between the sender and the
 //!   receiver (what one receive queue's buffers hold, so the host's socket buffer is
 //!   not what is measured), printed with how many arrived; at least one must. These are not judged
 //!   further: under TCG they measure the emulator.
@@ -16,6 +16,8 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+
+mod batch;
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -68,6 +70,8 @@ fn stream(
     len: usize,
     total: u64,
 ) -> Result<(u64, u64, u64), String> {
+    let batch_limit = batch::frames_per_send(len, SEND_FRAMES_MAX)
+        .ok_or_else(|| format!("frame of {len} bytes cannot fit a send message"))?;
     let mut tx = open(directory, from)?;
     let mut rx = open(directory, to)?;
     let (src, dst) = (
@@ -82,7 +86,7 @@ fn stream(
     let begin = now();
     while arrived < total {
         while sent < total && sent - arrived < WINDOW {
-            let n = (total - sent).min(SEND_FRAMES_MAX as u64);
+            let n = (total - sent).min(batch_limit as u64);
             let batch: Vec<Frame> = (0..n)
                 .map(|i| net_protocol::frame(dst, src, (sent + i) as u32, len))
                 .collect();

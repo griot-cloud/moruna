@@ -119,8 +119,12 @@ fn accounts() -> Result<(u64, u64), (&'static str, Option<Error>)> {
         Error::QuotaExceeded,
         "a child larger than its parent",
     )?;
+    // Account limits are whole pages; metadata charges need not be. Choose the
+    // first aligned limit strictly beyond the actual remaining room so this
+    // tests quota exhaustion rather than the earlier alignment validation.
+    let past_remaining = (own()?.room() / 4096 + 1) * 4096;
     refused(
-        Account::carve(own()?.room() + 4096, "quota.big"),
+        Account::carve(past_remaining, "quota.big"),
         Error::QuotaExceeded,
         "a child larger than what is left of its own account",
     )?;

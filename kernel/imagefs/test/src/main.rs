@@ -394,9 +394,19 @@ fn scratch(a: &mut Client, b: &mut Client, checks: &Checks) -> Result<String, St
     let quota = 256 * 1024;
     let account = Account::carve(quota, "imagefs-test.scratch")
         .map_err(|e| format!("carving an account of {quota} bytes: {}", e.name()))?;
-    let given = account
+    let denied = account
         .0
         .duplicate(Rights::READ | Rights::WRITE)
+        .map_err(|e| format!("duplicating untransferable account: {}", e.name()))?;
+    if !matches!(
+        b.scratch_account(denied),
+        Err(CallError::Kernel(moruna_svc::Error::AccessDenied))
+    ) {
+        return Err("scratch account without TRANSFER was not refused by the kernel".into());
+    }
+    let given = account
+        .0
+        .duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER)
         .map_err(|e| format!("duplicating the account: {}", e.name()))?;
     call("scratch_account", b.scratch_account(given))?;
     let (file, _) = call(

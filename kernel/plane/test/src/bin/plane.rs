@@ -27,13 +27,15 @@ use alloc::{collections::BTreeMap, format, string::String, vec, vec::Vec};
 use linux_protocol::{Bytes, Plane as LinuxPlane, how, linux, log};
 use moruna_ipc_check::record::{self, Need};
 use moruna_plane::{
-    BatchId, CallId, DataPlane, Event, KernelPlane, PlaneError, Shape, TaskId, kernel::Kernel,
+    BatchId, CallId, DataPlane, Event, KernelPlane, PlaneError, Shape, TaskId,
+    calls::{Calls, Ready, Taken},
+    kernel::Kernel,
 };
 use moruna_record::{record::Decoded, ring::Ring};
 use moruna_svc::{Channel, Console, Handle, deadline_in, now, println, start};
 use moruna_sys::{
     Account, Error, Memory, Process, Rights, Usage, charge, map,
-    plane::{attach, object_frame},
+    plane::{Slot, attach, object_frame},
 };
 use plane_test::{Role, layout, port, role, values};
 
@@ -57,7 +59,76 @@ const TASK_LIMIT: u64 = 16 * MIB;
 /// arrow_echo's account: a static musl program with Arrow, its heap and its threads.
 const SHIMLESS_LIMIT: u64 = 128 * MIB;
 
-type Plane = KernelPlane<Kernel>;
+/// Only arena memory is charged here. The fixture's own heap, reports and other
+/// boot processes must not contaminate the batch ownership measurement.
+struct ArenaCalls {
+    account: Account,
+}
+
+impl Calls for ArenaCalls {
+    type Memory = Memory;
+    type Slot = Slot;
+    type Channel = Channel;
+
+    fn memory(&mut self, bytes: u64) -> Result<Memory, Error> {
+        Memory::create_in(bytes, &self.account.0)
+    }
+    fn share(&mut self, memory: &Memory) -> Result<Memory, Error> {
+        Kernel.share(memory)
+    }
+    fn read(&mut self, memory: &Memory, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+        Kernel.read(memory, offset, buf)
+    }
+    fn write(&mut self, memory: &Memory, offset: u64, data: &[u8]) -> Result<(), Error> {
+        Kernel.write(memory, offset, data)
+    }
+    fn slot(&mut self, output: bool) -> Result<Slot, Error> {
+        Kernel.slot(output)
+    }
+    fn push(
+        &mut self,
+        slot: &Slot,
+        memory: Memory,
+        offset: u64,
+        len: u64,
+        cookie: u64,
+    ) -> Result<(), (Error, Memory)> {
+        Kernel.push(slot, memory, offset, len, cookie)
+    }
+    fn take(&mut self, slot: &Slot) -> Result<Taken<Memory>, Error> {
+        Kernel.take(slot)
+    }
+    fn close(&mut self, slot: &Slot) -> Result<(), Error> {
+        Kernel.close(slot)
+    }
+    fn refuse(&mut self, slot: &Slot, reason: &str) -> Result<(), Error> {
+        Kernel.refuse(slot, reason)
+    }
+    fn channel(&mut self) -> Result<(Channel, Channel), Error> {
+        Kernel.channel()
+    }
+    fn receive(&mut self, channel: &Channel, buf: &mut [u8]) -> Result<usize, Error> {
+        Kernel.receive(channel, buf)
+    }
+    fn send(
+        &mut self,
+        channel: &Channel,
+        bytes: &[u8],
+        memory: Option<Memory>,
+    ) -> Result<(), Error> {
+        Kernel.send(channel, bytes, memory)
+    }
+    fn wait(
+        &mut self,
+        slots: &[&Slot],
+        channels: &[&Channel],
+        deadline: u64,
+    ) -> Result<Ready, Error> {
+        Kernel.wait(slots, channels, deadline)
+    }
+}
+
+type Plane = KernelPlane<ArenaCalls>;
 
 fn plane_error(e: PlaneError) -> String {
     format!("{e:?}")
@@ -420,7 +491,13 @@ fn fan_out(e: &mut Engine, framing: &[u8]) -> Result<String, String> {
         let base = account.usage().map_err(kernel_error("account_info"))?.used;
         watched.push((account, base));
     }
-    let engine_before = Usage::own().map_err(kernel_error("account_info"))?.used;
+    let engine_before = e
+        .plane
+        .calls()
+        .account
+        .usage()
+        .map_err(kernel_error("arena account_info"))?
+        .used;
     let made_before = e.plane.residency().made;
     e.plane.grant(producer, 0, len).map_err(plane_error)?;
     let batch = e.put_from(producer, 120)?;
@@ -463,22 +540,29 @@ fn fan_out(e: &mut Engine, framing: &[u8]) -> Result<String, String> {
             "{shares} shares, and the batch was freed after {freed_after} releases"
         ));
     }
-    // The engine paid for what its arena made, once, and for its handle table's growth
-    // at most twice over (the three duplicates it pushed); nothing for the shares.
+    // The dedicated arena account pays exactly once for newly made objects.
+    // Shares retain those same objects; unrelated engine heap/handle growth and
+    // other boot processes cannot change this account's figures.
     let made = e.plane.residency().made - made_before;
     let object = if made > 0 {
         charge::memory(made / PAGE)
     } else {
         0
     };
-    let engine_paid = Usage::own()
-        .map_err(kernel_error("account_info"))?
+    let engine_paid = e
+        .plane
+        .calls()
+        .account
+        .usage()
+        .map_err(kernel_error("arena account_info"))?
         .used
-        .saturating_sub(engine_before);
-    let table_step = 2 * charge::HANDLE_SLOTS * charge::HANDLE_SLOT;
-    if engine_paid < object || engine_paid > object + table_step {
+        .checked_sub(engine_before)
+        .ok_or_else(|| {
+            String::from("arena account lost an existing object's charge during fan-out")
+        })?;
+    if engine_paid != object {
         return Err(format!(
-            "the engine's account moved {engine_paid} bytes for a batch whose object cost {object}"
+            "the engine's arena account moved {engine_paid} bytes for a batch whose object cost {object}"
         ));
     }
     // Each consumer paid for its mapping's area and tables, not the batch's pages.
@@ -496,7 +580,7 @@ fn fan_out(e: &mut Engine, framing: &[u8]) -> Result<String, String> {
         paid.push(grew);
     }
     Ok(format!(
-        "one batch of {batch_bytes} bytes to 3 consumers, each reading frame {frame:#x}; 3 shares, 3 releases, then freed once; charged once: the engine paid {engine_paid} bytes ({object} for a new object), the consumers {paid:?} for their mappings"
+        "one batch of {batch_bytes} bytes to 3 consumers, each reading frame {frame:#x}; 3 shares, 3 releases, then freed once; charged once: the engine arena paid {engine_paid} bytes ({object} for a new object), the consumers {paid:?} for their mappings"
     ))
 }
 
@@ -1042,12 +1126,24 @@ fn run() -> i64 {
             return 1;
         }
     };
+    let arena_account = match Account::carve(BUDGET, "plane.arena") {
+        Ok(account) => account,
+        Err(error) => {
+            println!(out, "KD1 plane: FAIL: arena account: {}", error.name());
+            return 1;
+        }
+    };
     let mut engine = Engine {
         out,
         resource,
         task_image,
         ro_image,
-        plane: KernelPlane::new(Kernel, BUDGET),
+        plane: KernelPlane::new(
+            ArenaCalls {
+                account: arena_account,
+            },
+            BUDGET,
+        ),
         roles: BTreeMap::new(),
         reports: BTreeMap::new(),
         waits: Vec::new(),

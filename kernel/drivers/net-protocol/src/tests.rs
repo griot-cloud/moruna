@@ -229,3 +229,46 @@ fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
     let s = hub.stats(2);
     assert_eq!((s.tx_frames, s.tx_errors, s.rx_errors), (4, 1, 2));
 }
+
+// Exercise the exact fixture batching arithmetic through the real codec/transport.
+#[path = "../../net-test/src/batch.rs"]
+mod performance_batch;
+
+#[test]
+fn nt_t_performance_batch_fits_the_actual_channel_wire_bound() {
+    use moruna_svc::frame::Transport;
+
+    fn send(count: usize, bytes: usize) -> Result<(), Transport> {
+        let mut encoded = Encoder::new();
+        vec![Frame(vec![0; bytes]); count]
+            .encode(&mut encoded)
+            .expect("encode frames");
+        let (sender, receiver) = Channel::create().expect("channel");
+        frame::send(&sender, Kind::Request, 4, 1, encoded)?;
+        let mut received = frame::recv(&receiver).expect("receive").expect("message");
+        let mut decoder = received.decoder();
+        let frames = Vec::<Frame>::decode(&mut decoder).expect("decode frames");
+        decoder.finish().expect("exact frame body");
+        assert_eq!(frames.len(), count);
+        assert!(frames.iter().all(|frame| frame.0.len() == bytes));
+        Ok(())
+    }
+
+    let large = performance_batch::frames_per_send(1514, SEND_FRAMES_MAX).expect("fits");
+    assert_eq!(large, 43);
+    assert_eq!(send(large, 1514), Ok(()));
+    assert_eq!(send(large + 1, 1514), Err(Transport::TooLarge));
+    assert_eq!(send(SEND_FRAMES_MAX, 1514), Err(Transport::TooLarge));
+    let small = performance_batch::frames_per_send(64, SEND_FRAMES_MAX).expect("fits");
+    assert_eq!(small, SEND_FRAMES_MAX);
+    assert_eq!(send(small, 64), Ok(()));
+    assert_eq!(
+        performance_batch::frames_per_send(usize::MAX, SEND_FRAMES_MAX),
+        None
+    );
+    assert_eq!(
+        performance_batch::frames_per_send(moruna_svc::limits::CHANNEL_MAX_BYTES, SEND_FRAMES_MAX),
+        None
+    );
+    assert_eq!(performance_batch::frames_per_send(64, 0), None);
+}

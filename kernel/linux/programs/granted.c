@@ -1,6 +1,6 @@
 /* KD2-T4 (SDD 30 k): what moruna.linux 2.0 gives a program run with run_granted, as an
    unmodified static musl program sees it:
-   - its start page, through the auxiliary vector, names the one handle it was granted,
+   - its start page, through the auxiliary vector, names its probe and the read-only filesystem capability,
      and the native handle_info call on that handle answers, so a Linux program holds a
      handle and reaches the kernel's own calls;
    - sysinfo, /proc/meminfo and /sys/devices/system/cpu/online say the budget it was
@@ -86,15 +86,33 @@ int main(void) {
     /* The start page. */
     const unsigned char *page = (const unsigned char *)getauxval(AT_MORUNA_START);
     if (!page) return fail("no AT_MORUNA_START in the auxiliary vector");
-    uint32_t magic, count, handle;
+    uint32_t magic, count, handle = 0, filesystem = 0;
+    unsigned probe_count = 0, filesystem_count = 0;
     memcpy(&magic, page, 4);
     memcpy(&count, page + 8, 4);
-    memcpy(&handle, page + 48, 4);
-    if (magic != START_MAGIC || count != 1 || strncmp((const char *)page + 56, "probe", 32) != 0)
-        return fail("the start page does not name the one handle granted");
+    if (magic != START_MAGIC || count != 2)
+        return fail("the start page does not name probe and filesystem");
+    for (uint32_t i = 0; i < count; i++) {
+        const unsigned char *entry = page + 48 + i * 40;
+        uint32_t raw;
+        memcpy(&raw, entry, 4);
+        if (strncmp((const char *)entry + 8, "probe", 32) == 0) {
+            handle = raw;
+            probe_count++;
+        } else if (strncmp((const char *)entry + 8, "filesystem", 32) == 0) {
+            filesystem = raw;
+            filesystem_count++;
+        } else return fail("unexpected start-page grant");
+    }
+    if (probe_count != 1 || filesystem_count != 1 || handle == filesystem)
+        return fail("duplicate or missing start-page grant");
     long info = native1(NATIVE_HANDLE_INFO, handle);
-    if (info < 0) return fail("handle_info on the granted handle");
-    if (native1(NATIVE_HANDLE_INFO, handle + 1) >= 0)
+    if (info < 0 || native1(NATIVE_HANDLE_INFO, filesystem) < 0)
+        return fail("handle_info on an actual granted handle");
+    /* A value absent from both named grants, independent of slot adjacency. */
+    uint32_t absent = 0x7fffffffU;
+    while (absent == handle || absent == filesystem) absent--;
+    if (native1(NATIVE_HANDLE_INFO, absent) >= 0)
         return fail("handle_info answered a value nothing was granted under");
 
     /* The machine. */
