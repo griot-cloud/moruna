@@ -37,7 +37,10 @@ impl Reactor {
     }
 }
 impl Direct for Strict {
-    fn bind(&self, fd: Arc<OwnedFd>) -> Result<Arc<dyn AlignedDevice>> {
+    fn bind(
+        &self,
+        fd: Arc<OwnedFd>,
+    ) -> std::result::Result<Arc<dyn AlignedDevice>, Box<MorunaError>> {
         if !crate::file_blocking::direct_flag(&fd).map_err(|e| MorunaError::Io {
             op: "bind_raw",
             target: "owned descriptor".into(),
@@ -46,7 +49,8 @@ impl Direct for Strict {
             return Err(MorunaError::Config {
                 name: "raw_storage",
                 msg: "raw descriptor is not O_DIRECT".into(),
-            });
+            }
+            .into());
         }
         Ok(Arc::new(Bound {
             reactor: Arc::clone(&self.reactor),

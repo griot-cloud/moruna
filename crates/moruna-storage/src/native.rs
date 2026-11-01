@@ -727,12 +727,11 @@ impl Backend for Client {
                         entries: page,
                         next,
                     } => {
-                        if let Some(next) = &next {
-                            if after.as_ref().is_some_and(|old| next <= old)
-                                || page.last().is_none_or(|last| &last.object.key != next)
-                            {
-                                return Err(Error::Integrity);
-                            }
+                        if let Some(next) = &next
+                            && (after.as_ref().is_some_and(|old| next <= old)
+                                || page.last().is_none_or(|last| &last.object.key != next))
+                        {
+                            return Err(Error::Integrity);
                         }
                         entries.extend(page);
                         match next {

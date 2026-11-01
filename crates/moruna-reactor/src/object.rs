@@ -352,7 +352,7 @@ fn build_s3(cfg: &S3Config, bucket: &str, allow_http: bool) -> Result<object_sto
         // MH 4.6: a `unix://` or `vsock://` endpoint is a socket the host proxies; the client
         // speaks plain HTTP/1.1 over it, path-style, whatever `allow_http` says, because the
         // socket never leaves the machine.
-        match crate::socket::parse_endpoint(v)? {
+        match crate::socket::parse_endpoint(v).map_err(|error| *error)? {
             Some(target) => {
                 b = b
                     .with_endpoint(crate::socket::SOCKET_ENDPOINT)

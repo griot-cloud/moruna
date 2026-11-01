@@ -314,6 +314,49 @@ fn run(path: &Path, adapter: &str) -> Result<Value> {
     }
     let spec = moruna_job::JobSpec::from_value(document)?;
     let job = moruna_job::Job::from_v1(&spec);
+    // Native imagefs grants writable scratch ONLY under /tmp. Each real run
+    // receives fresh private paths; inputs/packages/fixtures remain read-only.
+    let run_text = job
+        .id
+        .as_deref()
+        .ok_or("fixture requires explicit run identity")?;
+    let run = moruna_kernel::RunId::from_hex(run_text)
+        .ok_or("fixture run identity is not canonical")?
+        .to_hex();
+    if run != run_text || assigned.as_deref().is_some_and(|assigned| assigned != run) {
+        return Err("fixture scratch identity differs from actual assigned run".into());
+    }
+    let writable = Path::new("/tmp/kd3").join(&run);
+    let staging = fixture["job"]["staging"]["dir"]
+        .as_str()
+        .ok_or("fixture staging absent")?;
+    if Path::new(staging) != writable.join("staging") {
+        return Err("fixture staging must match actual run scratch".into());
+    }
+    fs::create_dir_all(&writable)?;
+    if let Some(input) = fixture["governed_input"].as_str() {
+        let root = writable.join("governed");
+        for task in &job.tasks {
+            if matches!(task.kind.as_str(), "datafusion" | "peql")
+                && task.settings.get("root").and_then(Value::as_str) != root.to_str()
+            {
+                return Err("governed fixture root differs from actual run scratch".into());
+            }
+        }
+        let mut source = fs::File::open(input)?;
+        let bytes = source.metadata()?.len();
+        if bytes > 16 * 1024 * 1024 {
+            return Err("actual governed fixture input exceeds 16MiB".into());
+        }
+        fs::create_dir_all(&root)?;
+        let mut target = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join("input.parquet"))?;
+        if std::io::copy(&mut source, &mut target)? != bytes {
+            return Err("actual governed input copy length differs".into());
+        }
+    }
     let role = if phase == "readback" {
         if case["role"] != "sink" || mode != "rows" {
             return Err("readback applies to successful sink cases".into());

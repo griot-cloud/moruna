@@ -179,10 +179,10 @@ impl Bucket {
         )
         .await
         .err();
-        if failure.is_none() {
-            if let Err(error_value) = upload.complete().await {
-                failure = Some(error("complete multipart", error_value));
-            }
+        if failure.is_none()
+            && let Err(error_value) = upload.complete().await
+        {
+            failure = Some(error("complete multipart", error_value));
         }
         if let Some(primary) = failure {
             return match upload.abort().await {

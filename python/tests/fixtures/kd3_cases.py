@@ -30,11 +30,20 @@ def write(path, value):
 
 
 def job(source, kernels, sink, root, name, contracts):
-    return {"moruna_spec": 1, "run_id": uuid.uuid4().hex, "source": source,
+    run = uuid.uuid4().hex
+    writable = Path("/tmp/kd3") / run
+    source, sink = dict(source), dict(sink)
+    if source["kind"] == "datafusion":
+        source["root"] = str(writable / "governed")
+    if sink["kind"] == "peql":
+        sink["root"] = str(writable / "governed")
+    else:
+        sink["url"] = str(writable / "output")
+    return {"moruna_spec": 1, "run_id": run, "source": source,
             "kernels": kernels, "sink": sink, "contracts": contracts,
             "budget": {"memory_bytes": 768 << 20}, "ordered": True,
-            "staging": {"dir": str(root / "staging" / name)},
-            "report": {"file": str(root / "reports" / (name + ".json"))}}
+            "staging": {"dir": str(writable / "staging")},
+            "report": {"file": str(writable / "report.json")}}
 
 
 def prepare(args):
@@ -143,10 +152,11 @@ def prepare(args):
         for adapter in ("linux", "native"):
             if case["runner"] == "python-library":
                 for mode in ("rows", "adapter-refusal"):
+                    run = uuid.uuid4().hex
                     cells.append({"case": case["id"], "adapter": adapter, "phase": "execute", "mode": mode,
                                   "runner": "python-library", "script": str(root / "kd3_library.py"),
                                   "matrix": str(root / "matrix.json"),
-                                  "staging": str(root / "staging" / (case["id"] + adapter + mode))})
+                                  "run_id": run, "staging": str(Path("/tmp/kd3") / run / "staging")})
                 continue
             modes = ("rows", "unknown-setting") if case["expect"] == "rows" else ("rows",)
             for mode in modes:
@@ -179,6 +189,8 @@ def prepare(args):
                         stages.append({"kind": "std", "name": "select", "args": {"columns": ["x"]}})
                 document = job(source, stages, sink, root, name, contracts)
                 fixture = {"case": case["id"], "phase": "execute", "mode": mode, "job": document}
+                if case["kind"] in ("datafusion", "peql"):
+                    fixture["governed_input"] = str(root / "governed/input.parquet")
                 if adapter == "linux":
                     fixture.update(sandbox_python=args.sandbox_python, sandbox_cgroup=args.sandbox_cgroup)
                 path = root / "cases" / (name + ".json")

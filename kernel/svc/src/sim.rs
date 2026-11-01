@@ -391,7 +391,7 @@ pub struct Account(pub Handle);
 impl Account {
     pub fn carve(limit: u64, name: &str) -> Result<Self> {
         if limit == 0
-            || limit % 4096 != 0
+            || !limit.is_multiple_of(4096)
             || name.is_empty()
             || name.len() > 32
             || !name

@@ -280,7 +280,9 @@ fn validate_kd3_command(config: &engine::Config) -> Result<(), String> {
         && matches!(config.args.as_slice(), [script, matrix, case, adapter, staging, mode]
             if script == "/kd3/kd3_library.py" && path(matrix) && matrix.ends_with(".json")
             && ["library.iterator", "library.python.source", "library.python.sink", "library.python.kernel"].contains(&case.as_str()) && adapter == "native"
-            && path(staging) && ["rows", "adapter-refusal"].contains(&mode.as_str()));
+            && staging.starts_with("/tmp/kd3/") && !staging.contains("..")
+            && !staging.chars().any(char::is_whitespace)
+            && ["rows", "adapter-refusal"].contains(&mode.as_str()));
     let nonce = config
         .env
         .iter()
@@ -313,6 +315,23 @@ mod kd3_command_tests {
         let mut wrong = config;
         wrong.args[2] = "linux".into();
         assert!(super::validate_kd3_command(&wrong).is_err());
+        let mut library = wrong;
+        library.program = "/opt/python-std/bin/python3".into();
+        library.args = [
+            "/kd3/kd3_library.py",
+            "/kd3/matrix.json",
+            "library.iterator",
+            "native",
+            "/tmp/kd3/staging/one",
+            "rows",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        super::validate_kd3_command(&library).unwrap();
+        library.args[4] = "/kd3/staging/one".into();
+        assert!(super::validate_kd3_command(&library).is_err());
+        library.args[4] = "/tmp/kd3/../outside".into();
+        assert!(super::validate_kd3_command(&library).is_err());
     }
 }
 

@@ -150,7 +150,8 @@ def main():
         lines = [line for line in lines if not line.startswith(("program ", "arg "))]
         config.write_text("\n".join(["program " + command["program"],
             *("arg " + value for value in command["args"]),
-            "env MORUNA_KD3_PROOF_NONCE=" + command["nonce"], *lines]) + "\n")
+            "env MORUNA_KD3_PROOF_NONCE=" + command["nonce"],
+            "env PYTHONHOME=/opt/python-std", "env LD_LIBRARY_PATH=/opt/python-std/lib", *lines]) + "\n")
     with (args.out / "initial.job").open("a") as output: output.write("\n".join(extra_initial) + ("\n" if extra_initial else ""))
     with (args.out / "engine.conf").open("a") as output: output.write("\n".join(extra_engine) + ("\n" if extra_engine else ""))
     (args.out / "profile.json").write_text(json.dumps(profile, indent=2) + "\n")

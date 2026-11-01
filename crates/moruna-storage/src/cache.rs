@@ -337,7 +337,8 @@ fn check_range(version: &Version, offset: u64, dst: &Buffer) -> Result<()> {
 fn binding_bytes(binding: &Binding) -> Result<Vec<u8>> {
     Ok(binding.encode()?)
 }
-fn open(path: &Path) -> Result<Option<(File, Binding, [u8; 12], [u8; 16])>> {
+type OpenedCache = (File, Binding, [u8; 12], [u8; 16]);
+fn open(path: &Path) -> Result<Option<OpenedCache>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -393,15 +394,14 @@ fn write(path: &Path, aad: &[u8], nonce: &[u8; 12], tag: &[u8], ciphertext: &[u8
         }
         fs::rename(&temp, path).map_err(|e| io("publish cache", e))
     })();
-    if result.is_err() {
-        if let Err(e) = fs::remove_file(&temp) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(Error::Cleanup {
-                    primary: Box::new(result.err().ok_or(Error::Integrity)?),
-                    cleanup: Box::new(io("remove cache temporary", e)),
-                });
-            }
-        }
+    if result.is_err()
+        && let Err(e) = fs::remove_file(&temp)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::Cleanup {
+            primary: Box::new(result.err().ok_or(Error::Integrity)?),
+            cleanup: Box::new(io("remove cache temporary", e)),
+        });
     }
     result
 }

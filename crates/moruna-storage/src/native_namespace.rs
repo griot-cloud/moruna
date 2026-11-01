@@ -312,8 +312,7 @@ impl Namespace {
                 let _permit = permit;
                 namespace.exchange(
                     request,
-                    control,
-                    length,
+                    (control, length),
                     reply,
                     buffer,
                     writable,
@@ -339,13 +338,13 @@ impl Namespace {
     fn exchange(
         &self,
         request: format::Request,
-        control: Buffer,
-        length: usize,
+        encoded: (Buffer, usize),
         mut reply: Buffer,
         mut buffer: Option<Buffer>,
         writable: bool,
         cancel: Channel,
     ) -> Result<Transfer> {
+        let (control, length) = encoded;
         let account = &self.parent.connection.account.handle.0;
         let header = Memory::create_in(length.max(1) as u64, account).map_err(super::sdk)?;
         header
@@ -375,14 +374,12 @@ impl Namespace {
                     .map_err(super::sdk)
             })
             .transpose()?;
-        if !writable {
-            if let (Some(mapping), Some(buffer)) = (&payload_map, &buffer) {
-                mapping.write(0, buffer.as_ref()).map_err(super::sdk)?;
-                self.parent
-                    .connection
-                    .copied_in
-                    .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+        if !writable && let (Some(mapping), Some(buffer)) = (&payload_map, &buffer) {
+            mapping.write(0, buffer.as_ref()).map_err(super::sdk)?;
+            self.parent
+                .connection
+                .copied_in
+                .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let mut body = Encoder::new();
         Memory(
@@ -465,16 +462,17 @@ impl Namespace {
                 writable,
                 span,
             )?;
-            if let (Some(mapping), Some(buffer)) = (&payload_map, &mut buffer) {
-                if writable && span > 0 {
-                    mapping
-                        .read(0, &mut buffer.as_mut()[..span as usize])
-                        .map_err(super::sdk)?;
-                    self.parent
-                        .connection
-                        .copied_out
-                        .fetch_add(span, std::sync::atomic::Ordering::Relaxed);
-                }
+            if let (Some(mapping), Some(buffer)) = (&payload_map, &mut buffer)
+                && writable
+                && span > 0
+            {
+                mapping
+                    .read(0, &mut buffer.as_mut()[..span as usize])
+                    .map_err(super::sdk)?;
+                self.parent
+                    .connection
+                    .copied_out
+                    .fetch_add(span, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(response)
         })();

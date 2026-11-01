@@ -18,7 +18,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::rt::TokioIo;
-use moruna_kernel::Result;
 use object_store::client::{
     ClientOptions, HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
     HttpResponseBody, HttpService,
@@ -27,11 +26,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-fn config(msg: &str) -> moruna_kernel::MorunaError {
-    moruna_kernel::MorunaError::Config {
+fn config(msg: &str) -> Box<moruna_kernel::MorunaError> {
+    Box::new(moruna_kernel::MorunaError::Config {
         name: "object_store",
         msg: msg.to_owned(),
-    }
+    })
 }
 
 /// The endpoint the S3 client is given when the real one is a socket: path-style requests,
@@ -64,7 +63,9 @@ impl std::fmt::Display for SocketTarget {
 /// `Some` when `endpoint` names a socket rather than an HTTP URL; a malformed socket endpoint
 /// is `Config { name: "object_store" }` naming it, at the first operation that needs the
 /// client (06 d.1).
-pub fn parse_endpoint(endpoint: &str) -> Result<Option<SocketTarget>> {
+pub fn parse_endpoint(
+    endpoint: &str,
+) -> std::result::Result<Option<SocketTarget>, Box<moruna_kernel::MorunaError>> {
     if let Some(path) = endpoint.strip_prefix("unix://") {
         if !path.starts_with('/') {
             return Err(config(&format!(
@@ -320,7 +321,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_endpoint(bad),
+                    parse_endpoint(bad).map_err(|error| *error),
                     Err(moruna_kernel::MorunaError::Config {
                         name: "object_store",
                         ..

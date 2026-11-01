@@ -24,7 +24,10 @@ pub enum PathMode {
 /// are guaranteed, not merely probed available. Binding verifies O_DIRECT on the owned FD.
 pub trait Direct: Send + Sync {
     /// Bind one retained descriptor; implementations must refuse unavailable/no-fallback paths.
-    fn bind(&self, fd: Arc<OwnedFd>) -> moruna_kernel::Result<Arc<dyn AlignedDevice>>;
+    fn bind(
+        &self,
+        fd: Arc<OwnedFd>,
+    ) -> std::result::Result<Arc<dyn AlignedDevice>, Box<moruna_kernel::MorunaError>>;
 }
 /// A bound strict descriptor. No path reopen, buffered fallback or engine fallback is legal.
 pub trait AlignedDevice: Send + Sync {
@@ -143,11 +146,7 @@ impl Device {
                     file.try_clone()
                         .map_err(|e| io("retain direct descriptor", e))?,
                 ));
-                Selected::Uring(
-                    capability
-                        .bind(fd)
-                        .map_err(|e| Error::Reactor(Box::new(e)))?,
-                )
+                Selected::Uring(capability.bind(fd).map_err(Error::Reactor)?)
             }
         };
         Ok(Arc::new(Self {
