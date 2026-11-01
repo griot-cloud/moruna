@@ -86,6 +86,14 @@ mod proof {
             Ok(())
         }
     }
+    // The console grows concurrently. A poll may end in the middle of a frame;
+    // only a newline commits that frame to the strict receipt parser.
+    fn complete_lines(serial: &str) -> impl Iterator<Item = &str> {
+        serial
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -127,6 +135,35 @@ mod proof {
             assert_eq!(p.bytes, b"{}");
             assert!(p.line(&frame(&c, "KD3E", 2, 1, ""), &c).is_err());
         }
+        #[test]
+        fn partial_live_tail_waits_for_newline_and_is_counted_once_per_snapshot() {
+            let c = config();
+            let first = format!("{}\n", frame(&c, "KD3R", 2, 0, "7b"));
+            let second = format!("{}\n", frame(&c, "KD3R", 2, 1, "7d"));
+            let end = format!("{}\n", frame(&c, "KD3E", 2, 2, ""));
+            // Production reparses each complete snapshot from scratch. Every
+            // intermediate byte prefix must ignore its uncommitted final line.
+            let serial = format!("{first}{second}{end}");
+            for limit in 0..=serial.len() {
+                let snapshot = &serial[..limit];
+                let mut p = parts();
+                for line in complete_lines(snapshot) {
+                    p.line(line, &c).expect("incomplete tail is not a frame");
+                }
+                let expected = usize::from(limit >= first.len())
+                    + usize::from(limit >= first.len() + second.len());
+                assert_eq!(p.chunks, expected);
+                assert_eq!(p.bytes.len(), expected);
+                assert_eq!(p.ended, limit == serial.len());
+            }
+            let malformed = format!("{}\n", frame(&c, "KD3R", 2, 0, "7"));
+            assert!(
+                parts()
+                    .line(complete_lines(&malformed).next().unwrap(), &c)
+                    .is_err()
+            );
+        }
+
         #[test]
         fn gaps_wrong_nonce_short_results_and_oversized_chunks_refuse() {
             let c = config();
@@ -214,11 +251,10 @@ mod proof {
                     chunks: 0,
                     ended: false,
                 };
-                for line in serial.split_terminator('\n') {
+                for line in complete_lines(serial) {
                     parts.line(line, &cfg)?;
                 }
-                let ended = serial
-                    .lines()
+                let ended = complete_lines(serial)
                     .filter(|line| line.contains("KD2 engine: run 1 of 1: the engine "))
                     .collect::<Vec<_>>();
                 if ended.len() > 1 {
