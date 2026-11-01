@@ -36,6 +36,7 @@ struct Facts {
     finished: u64,
     committed: u64,
     files: Vec<String>,
+    ack_files: Vec<String>,
     readback: Option<Box<Facts>>,
 }
 struct Observe {
@@ -105,9 +106,14 @@ impl Sink for Observe {
             facts.finished += 1;
             facts.committed = summary.rows;
             facts.files = summary.files.clone();
+            facts.ack_files = summary.files.clone();
         }
         if let Some(reader) = self.readback.take() {
-            let files = summary.files.clone();
+            let files = reader.resolve_ack_files(&summary.files)?;
+            self.facts
+                .lock()
+                .map_err(|_| invalid("observer poisoned"))?
+                .files = files.clone();
             let read = std::thread::spawn(move || reader.read(files))
                 .join()
                 .map_err(|_| invalid("actual readback thread panicked"))??;
@@ -142,8 +148,50 @@ struct Readback {
     context: moruna_runtime::spec::BuildCtx,
     kind: String,
     target: String,
+    output_prefix: String,
 }
 impl Readback {
+    fn resolve_ack_files(&self, files: &[String]) -> moruna_kernel::Result<Vec<String>> {
+        use std::path::Component;
+        let prefix = Path::new(&self.output_prefix);
+        if !prefix.is_absolute() || self.output_prefix.contains("://") || files.is_empty() {
+            return Err(invalid(
+                "readback needs the actual canonical local sink target and ACK files",
+            ));
+        }
+        let mut resolved = Vec::with_capacity(files.len());
+        for file in files {
+            let path = Path::new(file.strip_prefix("file://").unwrap_or(file));
+            if file.is_empty()
+                || file.contains("://") && !file.starts_with("file://")
+                || path.components().any(|part| {
+                    matches!(
+                        part,
+                        Component::ParentDir | Component::CurDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(invalid("ACK file is not a confined local sink object"));
+            }
+            let full = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                prefix.join(path)
+            };
+            if full == prefix || !full.starts_with(prefix) {
+                return Err(invalid("ACK file escapes its actual sink output prefix"));
+            }
+            let full = full
+                .to_str()
+                .ok_or_else(|| invalid("ACK path is not UTF-8"))?
+                .to_owned();
+            if resolved.contains(&full) {
+                return Err(invalid("duplicate ACK file"));
+            }
+            resolved.push(full);
+        }
+        Ok(resolved)
+    }
     fn read(self, files: Vec<String>) -> moruna_kernel::Result<Facts> {
         use moruna_runtime::kinds::{Context, Entry, Registry, Standalone};
         if files.is_empty() {
@@ -507,8 +555,23 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
     };
     let facts = Arc::new(Mutex::new(Facts::default()));
     let observe = facts.clone();
-    let reader = (case["role"] == "sink" && phase == "execute" && mode == "rows").then(|| {
-        (
+    let reader = if case["role"] == "sink" && phase == "execute" && mode == "rows" {
+        // Resolve through the original sink kind's canonical target seam. In
+        // particular peQL resolves its actual carried binding, not a guessed
+        // root/output path. This only describes the sink; no second run, Guest
+        // claim, write, scan, or arbitrary artifact selection is introduced.
+        use moruna_runtime::kinds::{Context, Entry, Standalone};
+        let index = *built.parts.sinks.first().ok_or("actual sink task absent")?;
+        let task = &job.tasks[index];
+        let doc = moruna_job::KindDoc {
+            kind: task.kind.clone(),
+            settings: task.settings.clone(),
+        };
+        let mut context = Context::new(Arc::new(Standalone)).contracts(job.contracts.clone());
+        let (_, adapter) = kinds.sink(&job.field(index), &task.kind)?;
+        let described = adapter.sink(&Entry::new(job.field(index), None, &doc), &mut context)?;
+        let prefix = job::translate::normalise_target(&described.target);
+        Some((
             if case["kind"] == "peql" {
                 "parquet".to_owned()
             } else {
@@ -518,10 +581,13 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
                 "{}/receipt-readback",
                 fixture["job"]["staging"]["dir"]
                     .as_str()
-                    .unwrap_or("/tmp/kd3-staging")
+                    .ok_or("actual staging absent")?
             ),
-        )
-    });
+            prefix,
+        ))
+    } else {
+        None
+    };
     if built.spec.sinks.len() != 1 {
         return Err("KD3 fixture requires one real sink".into());
     }
@@ -533,10 +599,11 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
             Ok(Box::new(Observe {
                 inner: original.build(context)?,
                 facts: observe,
-                readback: reader.map(|(kind, target)| Readback {
+                readback: reader.map(|(kind, target, output_prefix)| Readback {
                     context: context.clone(),
                     kind,
                     target,
+                    output_prefix,
                 }),
             }))
         })));
@@ -575,7 +642,7 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
     if actual != expected || facts.finished != 1 || facts.committed != expected.len() as u64 {
         return Err("actual rows/finish/committed summary mismatch".into());
     }
-    let execute = json!({"case":id,"adapter":adapter,"phase":phase,"mode":mode,"outcome":"rows","rows":actual,"finish":facts.finished,"committed":facts.committed,"outside_after":outside_after,"files":facts.files,"producer":producer,"run_id":report.run_id.to_string(),"report":report});
+    let execute = json!({"case":id,"adapter":adapter,"phase":phase,"mode":mode,"outcome":"rows","rows":actual,"finish":facts.finished,"committed":facts.committed,"outside_after":outside_after,"files":facts.files,"ack_files":facts.ack_files,"producer":producer,"run_id":report.run_id.to_string(),"report":report});
     if let Some(read) = &facts.readback {
         let mut actual = read.batches.values().flatten().copied().collect::<Vec<_>>();
         actual.sort_unstable();
