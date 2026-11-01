@@ -886,10 +886,10 @@ impl Kernel for StdKernel {
                 return Ok(input);
             }
         };
-        if let Some(capture) = &self.capture {
-            if !matches!(self.op, Op::Project(_)) {
-                capture.emit(capture.tasks.len() - 1, &out)?;
-            }
+        if let Some(capture) = &self.capture
+            && !matches!(self.op, Op::Project(_))
+        {
+            capture.emit(capture.tasks.len() - 1, &out)?;
         }
         drop(input);
         Payload::table(out)

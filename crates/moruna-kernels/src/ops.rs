@@ -202,7 +202,8 @@ pub(crate) fn project_tapped(
     wanted: impl Fn(usize) -> bool,
     mut emit: impl FnMut(usize, &RecordBatch) -> Result<()>,
 ) -> Result<RecordBatch> {
-    let mut cached: Vec<(usize, Vec<(DataType, bool)>, ArrayRef)> = Vec::new();
+    type CachedCast = (usize, Vec<(DataType, bool)>, ArrayRef);
+    let mut cached: Vec<CachedCast> = Vec::new();
     let mut final_batch = None;
     for end in 1..=steps.len() {
         if end != steps.len() && !wanted(end - 1) {
