@@ -41,11 +41,16 @@ def job(source, kernels, sink, root, name, contracts):
         sink["root"] = str(writable / "governed")
     else:
         sink["url"] = str(writable / "output")
-    return {"moruna_spec": 1, "run_id": run, "source": source,
-            "kernels": kernels, "sink": sink, "contracts": contracts,
-            "budget": {"memory_bytes": 768 << 20}, "ordered": True,
-            "staging": {"dir": str(writable / "staging")},
-            "report": {"file": str(writable / "report.json")}}
+    document = {"moruna_spec": 1, "run_id": run, "source": source,
+                "kernels": kernels, "sink": sink,
+                "budget": {"memory_bytes": 768 << 20}, "ordered": True,
+                "staging": {"dir": str(writable / "staging")},
+                "report": {"file": str(writable / "report.json")}}
+    # Only these actual matrix kinds consume governed contracts (KD-I8).
+    # Image/package/std and ordinary file/tensor IO must not carry unused authority.
+    if source["kind"] == "datafusion" or sink["kind"] == "peql":
+        document["contracts"] = contracts
+    return document
 
 
 def assets(args):
