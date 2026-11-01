@@ -405,12 +405,11 @@ mod streaming_tests {
                 let _receiver_already_closed = release.send(());
             }
             drop(std::os::unix::net::UnixStream::connect(&self.path));
-            if let Some(thread) = self.thread.take() {
-                if let Err(cause) = thread.join() {
-                    if !std::thread::panicking() {
-                        std::panic::resume_unwind(cause);
-                    }
-                }
+            if let Some(thread) = self.thread.take()
+                && let Err(cause) = thread.join()
+                && !std::thread::panicking()
+            {
+                std::panic::resume_unwind(cause);
             }
             std::fs::remove_dir_all(self.path.parent().unwrap()).unwrap();
         }

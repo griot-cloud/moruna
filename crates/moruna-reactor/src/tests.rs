@@ -2213,7 +2213,7 @@ fn re_t22_strict_storage_refuses_probed_paths_and_buffered_descriptors() {
             ));
             assert!(matches!(
                 strict.unwrap().bind(fd),
-                Err(MorunaError::Config {
+                Err(cause) if matches!(*cause, MorunaError::Config {
                     name: "raw_storage",
                     ..
                 })

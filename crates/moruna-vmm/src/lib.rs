@@ -20,8 +20,6 @@ pub mod error;
 mod fdt;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod image;
-#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-mod kvm;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod layout;
 mod limits;
@@ -36,12 +34,6 @@ pub mod sys;
 pub(crate) mod testing;
 pub mod vhost_user;
 pub use session::{Budget, ExitStatus};
-
-/// Boot the guest `config` describes and block until it stops; returns the exit code.
-#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-fn boot(config: &config::VmConfig) -> error::Result<i32> {
-    kvm::run(config)
-}
 
 /// Boot the guest `config` describes: refused on a host without KVM, after the configuration
 /// and the image are checked (so a bad configuration is reported as such everywhere).

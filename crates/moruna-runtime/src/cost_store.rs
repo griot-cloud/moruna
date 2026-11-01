@@ -38,7 +38,7 @@ fn storage(error: moruna_storage::Error) -> CostError {
 }
 #[derive(Clone)]
 enum Work {
-    Append(Observation),
+    Append(Box<Observation>),
     Save(ModelId, Vec<u8>),
     Load(ModelId),
     Scan(Option<CostKey>),
@@ -168,7 +168,7 @@ impl ObservationStore for Store {
     }
     fn append(&self, observation: &Observation) -> moruna_cost::Result<()> {
         observation.check().map_err(CostError::Invalid)?;
-        match self.call(Work::Append(observation.clone()))? {
+        match self.call(Work::Append(Box::new(observation.clone())))? {
             Answer::Done => Ok(()),
             _ => Err(failed("append response type")),
         }

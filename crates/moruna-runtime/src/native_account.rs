@@ -2,6 +2,9 @@
 use moruna_kernel::{MemoryBasis, MorunaError, ProcessPeak, Result, Sample, Sampler};
 use std::sync::{Arc, Mutex};
 
+// Private transport boundaries keep the canonical error boxed; Sampler still returns it unchanged.
+type AccountingResult<T> = std::result::Result<T, Box<MorunaError>>;
+
 pub(crate) struct Reading {
     pub(crate) used: u64,
     pub(crate) reserved: u64,
@@ -13,17 +16,17 @@ struct Observed {
     process_peak: ProcessPeak,
 }
 struct NativeAccount {
-    read: Box<dyn Fn() -> Result<Reading> + Send + Sync>,
+    read: Box<dyn Fn() -> AccountingResult<Reading> + Send + Sync>,
     limits: Box<dyn Fn() -> (u64, f64) + Send + Sync>,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
     observed: Mutex<Observed>,
 }
 impl NativeAccount {
     fn new(
-        read: impl Fn() -> Result<Reading> + Send + Sync + 'static,
+        read: impl Fn() -> AccountingResult<Reading> + Send + Sync + 'static,
         limits: impl Fn() -> (u64, f64) + Send + Sync + 'static,
         now: impl Fn() -> u64 + Send + Sync + 'static,
-    ) -> Result<Self> {
+    ) -> AccountingResult<Self> {
         let sampler = Self {
             read: Box::new(read),
             limits: Box::new(limits),
@@ -33,10 +36,12 @@ impl NativeAccount {
         sampler.sample()?; // Fail closed before arena sizing, including the first read.
         Ok(sampler)
     }
-    fn held(&self) -> Result<std::sync::MutexGuard<'_, Observed>> {
-        self.observed.lock().map_err(|_| MorunaError::Config {
-            name: "native.account",
-            msg: "observed sampler state poisoned".into(),
+    fn held(&self) -> AccountingResult<std::sync::MutexGuard<'_, Observed>> {
+        self.observed.lock().map_err(|_| {
+            Box::new(MorunaError::Config {
+                name: "native.account",
+                msg: "observed sampler state poisoned".into(),
+            })
         })
     }
 }
@@ -45,8 +50,8 @@ impl Sampler for NativeAccount {
         MemoryBasis::NativeAccountCharge
     }
     fn sample(&self) -> Result<Sample> {
-        let mut observed = self.held()?;
-        let actual = (self.read)()?;
+        let mut observed = self.held().map_err(|error| *error)?;
+        let actual = (self.read)().map_err(|error| *error)?;
         let (ceiling, cpu) = (self.limits)();
         if actual.limit == 0
             || ceiling == 0
@@ -104,10 +109,10 @@ impl Sampler for NativeAccount {
 }
 
 pub(crate) fn sampler(
-    read: impl Fn() -> Result<Reading> + Send + Sync + 'static,
+    read: impl Fn() -> AccountingResult<Reading> + Send + Sync + 'static,
     limits: impl Fn() -> (u64, f64) + Send + Sync + 'static,
     now: impl Fn() -> u64 + Send + Sync + 'static,
-) -> Result<Arc<dyn Sampler>> {
+) -> AccountingResult<Arc<dyn Sampler>> {
     Ok(Arc::new(NativeAccount::new(read, limits, now)?))
 }
 
@@ -120,7 +125,7 @@ pub(crate) fn child_share(
     children: usize,
     page: u64,
     minimum: u64,
-) -> moruna_kernel::Result<Option<u64>> {
+) -> AccountingResult<Option<u64>> {
     if children == 0 {
         return Ok(None);
     }
@@ -132,7 +137,8 @@ pub(crate) fn child_share(
         return Err(MorunaError::Config {
             name: "budget.native_children",
             msg: "invalid native task reservation geometry".into(),
-        });
+        }
+        .into());
     }
     let remaining = allowance.saturating_sub(arena).saturating_sub(engines);
     let share = (remaining / count) & !(page - 1);
@@ -142,7 +148,7 @@ pub(crate) fn child_share(
             msg: format!(
                 "{children} native singleton children have {remaining} bytes after funded allocations; each needs at least {minimum} bytes"
             ),
-        });
+        }.into());
     }
     Ok(Some(share))
 }
@@ -175,7 +181,8 @@ mod tests {
                         op: "account_info",
                         target: "TEST-ONLY Account".into(),
                         msg: "read refused".into(),
-                    });
+                    }
+                    .into());
                 }
                 Ok(Reading {
                     used: read.used.load(Ordering::SeqCst),
@@ -223,7 +230,10 @@ mod tests {
             matches!(sampler.sample(),Err(MorunaError::Io { target, .. }) if target=="TEST-ONLY Account")
         );
         assert_eq!(sampler.process_peak().bytes, 40);
-        assert!(NativeAccount::new(|| Err(MorunaError::Cancelled), || (400, 1.0), || 99).is_err());
+        assert!(
+            NativeAccount::new(|| Err(MorunaError::Cancelled.into()), || (400, 1.0), || 99)
+                .is_err()
+        );
     }
     #[test]
     fn reserved_child_ceilings_are_not_added_to_native_base_pressure() {
@@ -270,7 +280,7 @@ mod child_share_tests {
         arena: u64,
         engines: u64,
         children: usize,
-    ) -> moruna_kernel::Result<Option<u64>> {
+    ) -> super::AccountingResult<Option<u64>> {
         super::child_share(allowance, arena, engines, children, 4096, 16 << 20)
     }
 

@@ -290,6 +290,8 @@ def main():
         if arch == 'aarch64':
             call(base[:base.index('-p')] + ['-p', 'moruna-vmm', '--example', 'kd3-fixture-boot', '--features', 'kd3-conformance-proof'], 'cargo-fixture-boot')
             artifacts.append(('debug/examples/kd3-fixture-boot', 'kd3-fixture-boot', True))
+            call(base[:base.index('-p')] + ['-p', 'moruna-image', '--bin', 'arrow_echo'], 'cargo-arm-image-helper')
+            artifacts.append(('debug/arrow_echo', 'arrow_echo', True))
         for relative, name, executable in artifacts:
             source = Path('/proof/target') / target / relative
             require(source.is_file() and not source.is_symlink() and 0 < source.stat().st_size <= 1024**3, 'fixture raw artifact missing/over1GiB')

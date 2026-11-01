@@ -46,7 +46,7 @@ fn stream(batches: usize, end: bool) -> Vec<u8> {
 
 /// Every record batch of `bytes`, each laid as a record into a window and checked as the
 /// engine checks a put record; or the first refusal.
-fn records(bytes: Vec<u8>) -> Result<Vec<u64>, String> {
+fn records(bytes: Vec<u8>) -> std::result::Result<Vec<u64>, String> {
     let mut reader = Reader::new(Cursor::new(bytes));
     let mut rows = Vec::new();
     while let Some(pending) = reader.batch()? {

@@ -107,8 +107,7 @@ fn required_tap_refusal_stops_the_fused_call_instead_of_returning_uncaptured_out
         .unwrap();
     let error = bound
         .apply(&mut NoState, Payload::table(input()).unwrap())
-        .err()
-        .expect("required refusal");
+        .expect_err("required refusal");
     assert!(
         error
             .to_string()

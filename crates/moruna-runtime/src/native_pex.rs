@@ -246,7 +246,7 @@ impl NativeState {
                         features: None,
                     });
                 }
-                return Err(fail(message));
+                Err(fail(message))
             }
             reply => Ok((reply, body)),
         }

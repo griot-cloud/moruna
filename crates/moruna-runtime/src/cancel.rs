@@ -79,10 +79,10 @@ impl Started {
         if let Some(scheduler) = self.scheduler.take() {
             scheduler.shutdown();
         }
-        if let Some(history) = self.history.take() {
-            if let Err(error) = history.finish(false) {
-                notes.push(error.to_string());
-            }
+        if let Some(history) = self.history.take()
+            && let Err(error) = history.finish(false)
+        {
+            notes.push(error.to_string());
         }
         if let Some(placement) = self.placement.take() {
             placement.shutdown();

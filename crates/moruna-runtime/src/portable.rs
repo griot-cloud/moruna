@@ -190,6 +190,10 @@ impl EngineCheckpoints {
 
     /// Publish actual immutable segment chunks and inline kernel/sink state. Return only the
     /// bucket acknowledgement; a local-only publication remains typed PortablePending.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Public checkpoint publication explicitly binds authority, immutable targets, CAS condition and pre-admitted buffers; preserve its integration contract"
+    )]
     pub async fn publish(
         &self,
         access: &Access,
@@ -609,6 +613,10 @@ struct WriterState {
 impl Publisher {
     /// Create a single-writer native port with no pre-existing bucket receipt. To resume an
     /// existing writer, call `resume_at` using the freshly authorized actual bucket readback.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Public publisher admission keeps explicit authority, two backend targets, separate buffer budgets and deadline; no implicit defaults"
+    )]
     pub fn new(
         authority: Arc<Checkpoints>,
         access: Arc<Access>,

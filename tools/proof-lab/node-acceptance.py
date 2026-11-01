@@ -195,9 +195,14 @@ def validate_kd3(raw,inputs):
         summary=private_file(ref['summary']);mp=private_file(ref['manifest']);s=json.loads(summary.read_text());m=json.loads(mp.read_text())
         require(s.get('stage_passed') is True and s.get('cleanup') is True and s.get('guest_exit')==0 and s.get('phase')=='kd3-fixture-tools-'+role,'actual fixture producer lacks pass/cleanup')
         require(m.get('passed') is True and m.get('target')==('aarch64-unknown-linux-gnu' if role=='arm' else 'x86_64-unknown-linux-gnu'),'actual fixture target differs')
-        names={e['name'] for e in m['files']};require(names==({'moruna-kd3-fixture','_core.so','kd3-fixture-boot'} if role=='arm' else {'moruna-kd3-fixture','_core.so'}),'actual fixture artifact census differs')
+        names={e['name'] for e in m['files']};require(names==({'moruna-kd3-fixture','_core.so','kd3-fixture-boot','arrow_echo'} if role=='arm' else {'moruna-kd3-fixture','_core.so'}),'actual fixture artifact census differs')
+        collection=private_file(summary.parent/'kd3-fixture-artifacts.json');collected=json.loads(collection.read_text())
+        require(collected.get('collected') is True and 'error' not in collected and collected.get('actual')==m,'post-cleanup actual fixture collection differs')
+        require(all(command.get('exit')==0 for command in m['commands']) and m['commands'],'actual fixture producer commands did not all succeed')
+        for item in m['files']:
+            artifact=private_file(mp.parent/item['name']);require(artifact.stat().st_size==item['bytes'] and sha(artifact)==item['sha256'],'retained actual fixture artifact changed')
         records[role]=m
-        for path in (summary,mp):
+        for path in (summary,mp,collection):
             z=path.stat();inputs['fingerprints'].append({'path':str(path),'bytes':z.st_size,'sha256':sha(path),'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
     launcher=relative(v['launcher']);row=next(e for e in records['arm']['files'] if e['name']=='kd3-fixture-boot')
     require(launcher.stat().st_size==row['bytes'] and sha(launcher)==row['sha256'] and launcher.stat().st_mode&0o111,'KD3 launcher differs from actual ARM producer')
@@ -219,7 +224,8 @@ def validate_kd3(raw,inputs):
     require(keys==required,'prepared KD3 execution cells omit required cases/modes')
     for name in ('image_record','image_digest','layer_list'):relative(v[name])
     layerdir=Path(v['layer_dir']);require(not layerdir.is_absolute() and '..' not in layerdir.parts and (root/layerdir).is_dir(),'KD3 derived layer directory differs')
-    require(all((root/layerdir/('stack-'+str(i)+'.img')).relative_to(root).as_posix() in bypath for i in range(1,1+len(list((root/layerdir).glob('stack-*.img'))))),'KD3 canonical stack has gaps')
+    layer_count=len(list((root/layerdir).glob('stack-*.img')));require(1<=layer_count<=14,'KD3 layer stack must leave room for two real fixture devices')
+    require(all((root/layerdir/('stack-'+str(i)+'.img')).relative_to(root).as_posix() in bypath for i in range(1,1+layer_count)),'KD3 canonical stack has gaps')
     for row in actual:
         path=root/row['path'];z=path.stat();inputs['fingerprints'].append({'path':str(path),'bytes':z.st_size,'sha256':row['sha256'],'device':z.st_dev,'inode':z.st_ino,'mtime_ns':z.st_mtime_ns,'uid':z.st_uid,'mode':stat.S_IMODE(z.st_mode)})
     for path in (plan,manifest):

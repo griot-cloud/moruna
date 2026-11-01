@@ -274,16 +274,15 @@ mod tests {
                 if self.corrupt.load(Ordering::SeqCst) {
                     return Err(Error::Integrity);
                 }
-                if let Some(entry) = self.entry.lock().unwrap().as_ref() {
-                    if entry.object == *object
-                        && entry.version == *version
-                        && entry.offset == offset
-                        && entry.bytes.len() == destination.len()
-                    {
-                        destination.as_mut().copy_from_slice(&entry.bytes);
-                        self.hits.fetch_add(1, Ordering::SeqCst);
-                        return Ok(Lookup::Hit(destination));
-                    }
+                if let Some(entry) = self.entry.lock().unwrap().as_ref()
+                    && entry.object == *object
+                    && entry.version == *version
+                    && entry.offset == offset
+                    && entry.bytes.len() == destination.len()
+                {
+                    destination.as_mut().copy_from_slice(&entry.bytes);
+                    self.hits.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Lookup::Hit(destination));
                 }
                 Ok(Lookup::Miss(destination))
             })

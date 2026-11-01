@@ -958,12 +958,11 @@ fn st_t6_cancelled_sdk_consumer_keeps_charge_and_destination_until_current_body_
                 let _receiver_already_closed = release.send(());
             }
             drop(std::os::unix::net::UnixStream::connect(&self.path));
-            if let Some(worker) = self.worker.take() {
-                if let Err(cause) = worker.join() {
-                    if !std::thread::panicking() {
-                        std::panic::resume_unwind(cause);
-                    }
-                }
+            if let Some(worker) = self.worker.take()
+                && let Err(cause) = worker.join()
+                && !std::thread::panicking()
+            {
+                std::panic::resume_unwind(cause);
             }
         }
     }

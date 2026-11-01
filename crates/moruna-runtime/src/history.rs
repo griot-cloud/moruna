@@ -607,7 +607,13 @@ impl Historical {
             .name("historical-rows".into())
             .spawn(move || {
                 let result = worker(
-                    &plan, captures, prefixes, rx, alloc, encoding, &state, ready_tx,
+                    &plan,
+                    captures,
+                    prefixes,
+                    rx,
+                    alloc,
+                    encoding,
+                    (&state, ready_tx),
                 );
                 if let Err(reason) = &result {
                     state.fail(reason.clone());
@@ -690,9 +696,9 @@ fn worker(
     rx: mpsc::Receiver<Message>,
     alloc: Arc<dyn Allocator>,
     encoding: moruna_kernel::Buffer,
-    shared: &Shared,
-    ready: mpsc::Sender<Result<(), String>>,
+    startup: (&Shared, mpsc::Sender<Result<(), String>>),
 ) -> Result<(), String> {
+    let (shared, ready) = startup;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

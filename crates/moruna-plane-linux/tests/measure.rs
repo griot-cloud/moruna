@@ -74,10 +74,11 @@ fn mapping(addr: u64) -> (u64, BTreeMap<String, u64>) {
             }
             continue;
         }
-        if inside && first.ends_with(':') {
-            if let Some(kb) = parts.next().and_then(|v| v.parse::<u64>().ok()) {
-                fields.insert(first.trim_end_matches(':').to_string(), kb);
-            }
+        if inside
+            && first.ends_with(':')
+            && let Some(kb) = parts.next().and_then(|v| v.parse::<u64>().ok())
+        {
+            fields.insert(first.trim_end_matches(':').to_string(), kb);
         }
     }
     (inode, fields)
@@ -250,19 +251,17 @@ fn ka2_zero_copy_a_64_mib_batch_is_the_same_pages_in_producer_engine_and_consume
     let mut p = LinuxPlane::new(1 << 28);
     let (producer, mut ptask) = start(&mut p, shape(0, 1, false), role(PRODUCE, rows, 1));
     p.grant(producer, 0, len).expect("grant");
-    let batch = loop {
-        match next(&mut p) {
-            Event::Put {
-                batch,
-                rows: r,
-                bytes,
-                ..
-            } => {
-                assert_eq!((r, bytes), (rows, len));
-                break batch;
-            }
-            other => panic!("{other:?}"),
+    let batch = match next(&mut p) {
+        Event::Put {
+            batch,
+            rows: r,
+            bytes,
+            ..
+        } => {
+            assert_eq!((r, bytes), (rows, len));
+            batch
         }
+        other => panic!("{other:?}"),
     };
     let (consumer, mut ctask) = start(&mut p, shape(1, 0, false), role(CONSUME, rows, 1));
     p.offer(consumer, 0, batch).expect("offer");

@@ -301,7 +301,7 @@ fn ka2_the_library_serves_many_threads_on_one_socket() {
                 s.spawn(move || {
                     let mut got = 0;
                     while let Some(b) = input.get().expect("get") {
-                        assert_eq!(b.bytes(), &record[..]);
+                        assert_eq!(b.bytes(), record);
                         got += 1;
                     }
                     got
@@ -353,7 +353,7 @@ fn ka2_the_library_serves_many_threads_on_one_socket() {
         caller.join().expect("the caller");
         writer.join().expect("the writer");
         let mine = p.map(put.expect("put")).expect("map");
-        assert_eq!(mine.bytes(), &record[..]);
+        assert_eq!(mine.bytes(), record);
     });
     drop(plane);
     let rest = pump(&mut p);

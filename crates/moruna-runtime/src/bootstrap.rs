@@ -163,7 +163,7 @@ impl Bindings {
             || !slot(&value.account_slot)
             || !slot(&value.storage_slot)
             || value.control_bytes == 0
-            || value.control_bytes % 4096 != 0
+            || !value.control_bytes.is_multiple_of(4096)
             || value.metadata_bytes == 0
             || value.operation_ms == 0
         {
@@ -189,33 +189,31 @@ impl Bindings {
                 .validate()
                 .map_err(|_| refused("malformed governed target identity"))?;
         }
-        if let Some(cache_slot) = &value.cache_slot {
-            if !slot(cache_slot)
+        if let Some(cache_slot) = &value.cache_slot
+            && (!slot(cache_slot)
                 || cache_slot == &value.storage_slot
                 || value
                     .checkpoint
                     .as_ref()
-                    .is_some_and(|checkpoint| &checkpoint.local_service_slot == cache_slot)
-            {
-                return Err(refused(
-                    "cache requires a distinct actual CacheScratch service slot",
-                ));
-            }
+                    .is_some_and(|checkpoint| &checkpoint.local_service_slot == cache_slot))
+        {
+            return Err(refused(
+                "cache requires a distinct actual CacheScratch service slot",
+            ));
         }
-        if let Some(checkpoint) = &value.checkpoint {
-            if !slot(&checkpoint.local_service_slot)
+        if let Some(checkpoint) = &value.checkpoint
+            && (!slot(&checkpoint.local_service_slot)
                 || checkpoint.local_service_slot == value.storage_slot
                 || checkpoint.chunk_bytes == 0
                 || checkpoint.encoding_bytes == 0
-                || checkpoint.timeout_ms == 0
-            {
-                return Err(refused(
-                    "checkpoint needs distinct actual local/home services and positive budgets",
-                ));
-            }
+                || checkpoint.timeout_ms == 0)
+        {
+            return Err(refused(
+                "checkpoint needs distinct actual local/home services and positive budgets",
+            ));
         }
-        if let Some(capture) = &value.capture {
-            if capture.outputs.is_empty()
+        if let Some(capture) = &value.capture
+            && (capture.outputs.is_empty()
                 || capture.outputs.iter().any(|output| {
                     !output.required
                         || output.task.is_empty()
@@ -227,23 +225,21 @@ impl Bindings {
                 || capture.queue_bytes == 0
                 || capture.queue_batches == 0
                 || capture.encoding_bytes == 0
-                || capture.drain_ms == 0
-            {
-                return Err(refused(
-                    "required retained output identity/admission invalid",
-                ));
-            }
+                || capture.drain_ms == 0)
+        {
+            return Err(refused(
+                "required retained output identity/admission invalid",
+            ));
         }
-        if let Some(cost) = &value.cost {
-            if cost.model.is_empty()
+        if let Some(cost) = &value.cost
+            && (cost.model.is_empty()
                 || cost.records == 0
                 || cost.object_bytes == 0
                 || cost.scan_bytes == 0
                 || cost.queue == 0
-                || cost.retention == 0
-            {
-                return Err(refused("governed cost admission invalid"));
-            }
+                || cost.retention == 0)
+        {
+            return Err(refused("governed cost admission invalid"));
         }
         Ok(value)
     }

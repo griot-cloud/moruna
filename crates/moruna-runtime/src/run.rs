@@ -286,32 +286,35 @@ fn drive(
             let native = if moruna_micro::on_kernel() {
                 let watched = watch.as_ref().map(|watch| watch.limits());
                 let fixed = discovered.limits.clone();
-                Some(crate::native_account::sampler(
-                    || {
-                        // ACCOUNT_INFO(0) is handled for this actual calling
-                        // Process before personality forwarding; no startup slot
-                        // is taken and the Linux server's Account is never used.
-                        let usage = moruna_sys::Usage::own().map_err(|e| MorunaError::Io {
-                            op: "account_info",
-                            target: "current native Account".into(),
-                            msg: e.name().into(),
-                        })?;
-                        // Lifetime usage.peak is deliberately not an interval/RSS mark.
-                        Ok(crate::native_account::Reading {
-                            used: usage.used,
-                            reserved: usage.reserved,
-                            limit: usage.limit,
-                        })
-                    },
-                    move || match &watched {
-                        Some(limits) => {
-                            let limits = limits.load();
-                            (limits.memory_ceiling, limits.cpu_quota)
-                        }
-                        None => (fixed.memory_ceiling, fixed.cpu_quota),
-                    },
-                    moruna_sys::now,
-                )?)
+                Some(
+                    crate::native_account::sampler(
+                        || {
+                            // ACCOUNT_INFO(0) is handled for this actual calling
+                            // Process before personality forwarding; no startup slot
+                            // is taken and the Linux server's Account is never used.
+                            let usage = moruna_sys::Usage::own().map_err(|e| MorunaError::Io {
+                                op: "account_info",
+                                target: "current native Account".into(),
+                                msg: e.name().into(),
+                            })?;
+                            // Lifetime usage.peak is deliberately not an interval/RSS mark.
+                            Ok(crate::native_account::Reading {
+                                used: usage.used,
+                                reserved: usage.reserved,
+                                limit: usage.limit,
+                            })
+                        },
+                        move || match &watched {
+                            Some(limits) => {
+                                let limits = limits.load();
+                                (limits.memory_ceiling, limits.cpu_quota)
+                            }
+                            None => (fixed.memory_ceiling, fixed.cpu_quota),
+                        },
+                        moruna_sys::now,
+                    )
+                    .map_err(|error| *error)?,
+                )
             } else {
                 None
             };
@@ -581,12 +584,12 @@ fn drive(
             &run_id.to_hex(),
             resume.as_deref(),
         )?);
-    } else if let Some(path) = &resume {
-        if crate::history::checkpoint_prefixes(path, 64 * 1024 * 1024)?.is_some() {
-            return Err(RunError::bare(MorunaError::Resume(
-                "checkpoint requires its original historical capture authority".into(),
-            )));
-        }
+    } else if let Some(path) = &resume
+        && crate::history::checkpoint_prefixes(path, 64 * 1024 * 1024)?.is_some()
+    {
+        return Err(RunError::bare(MorunaError::Resume(
+            "checkpoint requires its original historical capture authority".into(),
+        )));
     }
     let pipeline = Pipeline {
         sources: sources.clone(),
@@ -653,7 +656,8 @@ fn drive(
                 count,
                 moruna_micro::layout::PAGE,
                 moruna_micro::layout::TASK_MIN,
-            )?;
+            )
+            .map_err(|error| *error)?;
             for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
                 let share = share.ok_or_else(|| MorunaError::Config {
                     name: "budget.native_children",
@@ -851,10 +855,11 @@ fn drive(
             ),
         );
     }
-    if components.checkpoints.is_none() && checkpoint_enabled {
-        if let Some(history) = &started.history {
-            scheduler.set_manifest_preparation(history.checkpoint().preparation(alloc.clone()));
-        }
+    if components.checkpoints.is_none()
+        && checkpoint_enabled
+        && let Some(history) = &started.history
+    {
+        scheduler.set_manifest_preparation(history.checkpoint().preparation(alloc.clone()));
     }
     if let Some(handle) = &checkpoint_handle {
         handle.attach(&scheduler);

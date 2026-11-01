@@ -60,49 +60,6 @@ pub fn poll(fds: &[PollFd], timeout: Duration) -> std::io::Result<Vec<Ready>> {
         .collect())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixStream;
-
-    #[test]
-    fn vm_t11_poll_reports_readiness() {
-        let (mut a, b) = UnixStream::pair().unwrap();
-        let fds = [PollFd {
-            fd: b.as_raw_fd(),
-            read: true,
-            write: false,
-        }];
-        let r = poll(&fds, Duration::from_millis(1)).unwrap();
-        assert_eq!(r, vec![Ready::default()]);
-        a.write_all(b"x").unwrap();
-        let r = poll(&fds, Duration::from_millis(100)).unwrap();
-        assert!(r[0].read);
-        let w = poll(
-            &[PollFd {
-                fd: a.as_raw_fd(),
-                read: false,
-                write: true,
-            }],
-            Duration::from_millis(100),
-        )
-        .unwrap();
-        assert!(w[0].write);
-        let bad = poll(
-            &[PollFd {
-                fd: 1_000_000,
-                read: true,
-                write: false,
-            }],
-            Duration::ZERO,
-        )
-        .unwrap();
-        assert!(bad[0].error);
-    }
-}
-
 static STOP_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static SIGNAL_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 extern "C" fn stop_signal(signal: libc::c_int) {
@@ -155,5 +112,48 @@ impl Drop for Termination {
             unsafe { libc::sigaction(*signal, &self.previous[index], core::ptr::null_mut()) };
         }
         SIGNAL_OWNER.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn vm_t11_poll_reports_readiness() {
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let fds = [PollFd {
+            fd: b.as_raw_fd(),
+            read: true,
+            write: false,
+        }];
+        let r = poll(&fds, Duration::from_millis(1)).unwrap();
+        assert_eq!(r, vec![Ready::default()]);
+        a.write_all(b"x").unwrap();
+        let r = poll(&fds, Duration::from_millis(100)).unwrap();
+        assert!(r[0].read);
+        let w = poll(
+            &[PollFd {
+                fd: a.as_raw_fd(),
+                read: false,
+                write: true,
+            }],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(w[0].write);
+        let bad = poll(
+            &[PollFd {
+                fd: 1_000_000,
+                read: true,
+                write: false,
+            }],
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(bad[0].error);
     }
 }

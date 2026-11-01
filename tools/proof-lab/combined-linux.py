@@ -398,14 +398,14 @@ class CombinedRun(module.Ke2Run):
                 dest=self.evidence/'kd3-fixture-tools';dest.mkdir(mode=0o700);total=0
                 for path in sorted(source.iterdir()):
                     info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1 and info.st_size<=512*1024**2,'KD3 artifact type/size/owner differs')
-                    require(path.name in ('manifest.json','manifest.new','moruna-kd3-fixture','_core.so','kd3-fixture-boot') or path.name.endswith('.log') or (path.name.startswith('cxx-object-') and path.name.endswith('.o')) or (path.name.startswith('cxx-inspect-') and path.name.endswith('.json')),'unexpected KD3 producer file')
+                    require(path.name in ('manifest.json','manifest.new','moruna-kd3-fixture','_core.so','kd3-fixture-boot','arrow_echo') or path.name.endswith('.log') or (path.name.startswith('cxx-object-') and path.name.endswith('.o')) or (path.name.startswith('cxx-inspect-') and path.name.endswith('.json')),'unexpected KD3 producer file')
                     total+=info.st_size;require(total<=2*1024**3,'KD3 aggregate test-artifact bound')
                     shutil.copy2(path,dest/path.name);record['files'].append({'name':path.name,'bytes':info.st_size,'sha256':module.sha(dest/path.name)})
                 if (dest/'manifest.json').exists():
                     actual=json.loads((dest/'manifest.json').read_text());record['actual']=actual
                     if result==0:
                         require(actual.get('passed') is True and actual['target']==self.cache['target'] and actual['jobs']==1 and actual['profile']=='dev-debug0','actual KD3 producer success/profile differs')
-                        required={'moruna-kd3-fixture','_core.so'} | ({'kd3-fixture-boot'} if self.cache['target'].startswith('aarch64') else set())
+                        required={'moruna-kd3-fixture','_core.so'} | ({'kd3-fixture-boot','arrow_echo'} if self.cache['target'].startswith('aarch64') else set())
                         require({x['name'] for x in actual['files']}==required and len(actual['files'])==len(required),'actual KD3 binary/library/boot helper missing')
                         require(all(x.get('exit')==0 for x in actual['commands']),'actual KD3 command failed')
                     for row in actual['files']:
