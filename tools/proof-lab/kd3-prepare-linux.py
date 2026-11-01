@@ -230,8 +230,42 @@ def main():
                            arm_programs, 'kd3-linux', arm_layout, '/kc1/bin/arrow_echo'], 'derive-arm', env)
         bundle = out / 'bundle'
         bundle.mkdir()
+        # Conversion expands a real Linux rootfs, including case-distinct
+        # symlinks. Its scratch MUST stay on the VM-local Linux filesystem,
+        # not the host-backed APFS artifact cache mounted at /proof/target.
+        probe = work / 'case-sensitive-probe'
+        probe.mkdir()
+        (probe / 'Case').write_bytes(b'upper')
+        with (probe / 'case').open('xb') as stream:
+            stream.write(b'lower')
+        require((probe / 'Case').read_bytes() == b'upper' and (probe / 'case').read_bytes() == b'lower'
+                and (probe / 'Case').stat().st_ino != (probe / 'case').stat().st_ino,
+                'canonical stack scratch requires actual case-sensitive filesystem')
+        local_stack = work / 'native-stack'
+        call([layer, 'stack', native_layout, native_digest, local_stack, '2'], 'canonical-native-stack', env)
         stack = bundle / 'layers'
-        call([layer, 'stack', native_layout, native_digest, stack, '2'], 'canonical-native-stack', env)
+        stack.mkdir()
+        images = list(local_stack.glob('stack-*.img'))
+        require(1 <= len(images) <= 14
+                and {image.name for image in images} == {'stack-' + str(i) + '.img' for i in range(1, len(images) + 1)},
+                'canonical native stack must be contiguous and leave two fixture devices')
+        transferred = []
+        for name in [*sorted(image.name for image in images), 'stack.layers', 'image.record', 'image.digest']:
+            original, target = local_stack / name, stack / name
+            info = original.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                    and 0 < info.st_size <= (2 * 1024**3 if name.endswith('.img') else 512 * 1024**2),
+                    'canonical finished stack output type/size differs')
+            digest = sha(original)
+            shutil.copy2(original, target)
+            require(target.stat().st_size == info.st_size and sha(target) == digest,
+                    'canonical stack copy changed actual bytes')
+            transferred.append({'path': 'layers/' + name, 'bytes': info.st_size, 'sha256': digest})
+        report['stack_transfer'] = {'source_filesystem_device': local_stack.stat().st_dev,
+                                    'artifact_filesystem_device': stack.stat().st_dev,
+                                    'case_sensitive_probe': True, 'files': transferred,
+                                    'temporary_rootfs_copied': False}
+        save()
         authored = work / 'authored'
         call([python, author, 'cases', '--root', assets, '--output', authored,
               '--image', native_digest, '--image-layout', native_layout,

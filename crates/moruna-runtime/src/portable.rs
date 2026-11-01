@@ -247,8 +247,16 @@ impl EngineCheckpoints {
                     let engine = engine.ok_or_else(|| {
                         invalid("portable checkpoint lacks resident snapshot authority")
                     })?;
-                    let payload = engine.checkpoint_payload(lineage).map_err(|_| {
-                        invalid("portable checkpoint position has no actual retained bytes")
+                    let payload = engine.checkpoint_payload(lineage).map_err(|cause| {
+                        moruna_storage::Error::Io {
+                            operation: "pin portable checkpoint payload",
+                            source: std::io::Error::other(format!(
+                                "stage={} seq={} source={} root={} origin={}:{}:{}..{} kind={} bytes={}: {cause:?}",
+                                lineage.stage, lineage.seq, lineage.source, lineage.root,
+                                lineage.node, lineage.split, lineage.row_start, lineage.row_end,
+                                lineage.kind, lineage.bytes,
+                            )),
+                        }
                     })?;
                     next_segment = next_segment.checked_add(1).ok_or_else(|| {
                         invalid("checkpoint synthetic segment namespace exhausted")
