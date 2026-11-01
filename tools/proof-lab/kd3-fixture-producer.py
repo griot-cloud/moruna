@@ -306,7 +306,7 @@ def main():
             require(header[:6] == b'\x7fELF\x02\x01' and header[18:20] == machine and 0 < dest.stat().st_size <= 512 * 1024**2, 'actual target ELF/512MiB test-artifact bound differs')
             report['files'].append({'name': name, 'bytes': dest.stat().st_size, 'sha256': sha(dest), 'original_path': str(source),
                                     'original_bytes': raw_bytes, 'original_sha256': raw_hash, 'strip_tool_sha256': sha(strip),
-                                    'strip_version': subprocess.check_output([str(strip), '--version'], text=True).splitlines()[0]})
+                                    'strip_version': subprocess.check_output([str(strip), '--version'], text=True, env=env).splitlines()[0]})
             save()
         if arch == 'aarch64':
             shutil.copytree('/proof/source/python/moruna', site / 'moruna')

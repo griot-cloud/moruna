@@ -62,7 +62,13 @@ RUSTFLAGS="$flags" cargo build --release --locked --target "$target" "${build_st
 # and argv evidence if Cargo rejects the custom target before compiling a crate.
 rustup run nightly-2026-07-21 cargo --version
 rustup run nightly-2026-07-21 rustc --version
+# The audited freestanding Ring build uses Clang's -nostdlibinc and a real ELF
+# baremetal target. Bind only this userland invocation, never host/musl tools.
+user_cc="${CC_x86_64_moruna_user:-clang}"
+"$user_cc" --version
 set -x
+CC_x86_64_moruna_user="$user_cc" \
+CFLAGS_x86_64_moruna_user="--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector ${CFLAGS_x86_64_moruna_user:-}" \
 RUSTFLAGS="$flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-arg=-static" \
   rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
   -Zunstable-options -Zjson-target-spec "${build_std[@]}" --workspace \

@@ -472,9 +472,13 @@ fn rc_t19_a_sample_older_than_the_watcher() {
 #[test]
 fn accounting_read_failure_terminates_instead_of_reusing_prior_sample() {
     let rig = rig(GIB, 2, run(100 * MIB, GIB, 2.0, 1, 4));
-    rig.controller.prepare().unwrap();
+    // Ticks sample only in Running; preparation alone deliberately admits no tick work.
+    rig.run_up();
+    assert!(rig.knobs.terminated().is_none());
+    let samples_before = rig.sampler.samples_taken();
     rig.sampler.set_read_failure(true);
     rig.controller.tick_once();
+    assert_eq!(rig.sampler.samples_taken(), samples_before + 1);
     let cause = rig
         .knobs
         .terminated()
