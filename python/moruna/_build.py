@@ -961,7 +961,7 @@ def image_config(
     runtime: Runtime, function: Function, layers: Sequence[LayerInfo], options: Options
 ) -> dict[str, Any]:
     """The image config: the runtime's environment with this image's added, the shim as the
-    command, the working directory ``/app``, and where it all came from."""
+    command with an explicit shim workdir, its initial directory ``/``, and its origin."""
     ours = {
         "PYTHONPATH": f"/{APP_DIR}:/{SITE_PACKAGES}",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -985,8 +985,8 @@ def image_config(
         "os": "linux",
         "config": {
             "Env": env,
-            "Cmd": [PYTHON, f"/{SHIM_DIR}/shim.py", function.entry],
-            "WorkingDir": f"/{APP_DIR}",
+            "Cmd": [PYTHON, f"/{SHIM_DIR}/shim.py", "--workdir", f"/{APP_DIR}", function.entry],
+            "WorkingDir": "/",
             "Labels": labels,
         },
         "rootfs": {"type": "layers", "diff_ids": [layer.diff_id for layer in layers]},

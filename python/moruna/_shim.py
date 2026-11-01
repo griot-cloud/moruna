@@ -1,7 +1,9 @@
 """The shim of an image built from Python code (SDD 30 f.3): layer 3 of ``moruna build``.
 
 This file is copied into every such image as ``/opt/moruna/shim.py`` and run as the image's
-command, ``python3 /opt/moruna/shim.py <module>:<name>``. It speaks the contract of SDD 19 f.6 and
+command, ``python3 /opt/moruna/shim.py --workdir /app <module>:<name>``. The explicit
+workdir is applied before importing the function; plain-entry invocations retain their caller's
+working directory. It speaks the contract of SDD 19 f.6 and
 nothing else: one Arrow IPC stream on standard input, one on standard output, one record batch
 out for each record batch in, in order; when the input ends it writes the end-of-stream marker
 and exits 0. A run that applied no batch ends the input without a byte, and the shim then writes
@@ -130,12 +132,21 @@ def take_streams() -> tuple[BinaryIO, BinaryIO]:
 
 
 def main(argv: list[str]) -> int:
-    """``shim.py <module>:<name>``: the exit status of the process."""
+    """``shim.py [--workdir ABSOLUTE_PATH] <module>:<name>``: the process exit status."""
+    workdir = None
+    if argv and argv[0] == "--workdir":
+        if len(argv) != 3 or not os.path.isabs(argv[1]) or "\x00" in argv[1]:
+            print("usage: shim.py [--workdir ABSOLUTE_PATH] <module>:<name>", file=sys.stderr)
+            return EXIT_USAGE
+        workdir = argv[1]
+        argv = argv[2:]
     if len(argv) != 1:
-        print("usage: shim.py <module>:<name>", file=sys.stderr)
+        print("usage: shim.py [--workdir ABSOLUTE_PATH] <module>:<name>", file=sys.stderr)
         return EXIT_USAGE
     source, sink = take_streams()
     try:
+        if workdir is not None:
+            os.chdir(workdir)
         serve(resolve(argv[0]), source, sink)
     except ShimError as exc:
         print(f"moruna-shim: {exc}", file=sys.stderr)

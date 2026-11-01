@@ -250,10 +250,12 @@ def test_bd_t10_the_image_is_what_the_kind_reads(project: Project, tmp_path: Pat
     assert config["config"]["Cmd"] == [
         "/usr/local/bin/python3",
         "/opt/moruna/shim.py",
+        "--workdir",
+        "/app",
         "kernel_a:add",
     ]
     assert "Entrypoint" not in config["config"]
-    assert config["config"]["WorkingDir"] == "/app"
+    assert config["config"]["WorkingDir"] == "/"
     env = dict(e.split("=", 1) for e in config["config"]["Env"])
     assert env["PATH"] == "/usr/local/bin:/usr/bin" and env["LANG"] == "C.UTF-8", "the runtime's"
     assert env["PYTHONPATH"] == "/app:/opt/moruna/site-packages"

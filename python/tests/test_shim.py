@@ -410,3 +410,56 @@ def test_bd_t6_a_stateful_object_resolves_to_a_call_with_its_state(
         """,
     )
     assert shim.resolve("inproc_state:kernel")(batch(1)) == 2
+
+
+@pytest.mark.parametrize("explicit_workdir", [False, True])
+def test_image_workdir_precedes_user_import_and_preserves_relative_assets(
+    image: Path, explicit_workdir: bool
+) -> None:
+    """The generated command starts in /, then genuinely enters /app before user code."""
+    (image / "app" / "bias.txt").write_text("7")
+    entry = kernel_module(
+        image,
+        "relative_assets",
+        """
+        from pathlib import Path
+        import moruna
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        IMPORT_BIAS = int(Path("bias.txt").read_text())
+
+        @moruna.kernel
+        def apply(batch):
+            bias = IMPORT_BIAS + int(Path("bias.txt").read_text())
+            return pa.RecordBatch.from_arrays([pc.add(batch.column("id"), bias)], schema=batch.schema)
+        """,
+    ) + ":apply"
+    args = [sys.executable, str(image / "opt" / "moruna" / "shim.py")]
+    if explicit_workdir:
+        args += ["--workdir", str(image / "app")]
+    args.append(entry)
+    done = subprocess.run(
+        args,
+        input=stream(batch(1, 2), batch(3)),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(image / "app"),
+             "PYTHONDONTWRITEBYTECODE": "1"},
+        cwd="/" if explicit_workdir else image / "app",
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == shim.EXIT_DONE, done.stderr.decode()
+    assert [b.column("id").to_pylist() for b in read_all(done.stdout)] == [[15, 16], [17]]
+    assert done.stdout.endswith(END)
+
+
+def test_explicit_workdir_failure_is_not_a_completed_stream(image: Path) -> None:
+    done = subprocess.run(
+        [sys.executable, str(image / "opt" / "moruna" / "shim.py"), "--workdir",
+         str(image / "absent"), "relative_assets:apply"],
+        input=stream(batch(1)), capture_output=True, check=False, timeout=60,
+    )
+    assert done.returncode == shim.EXIT_FAILED
+    assert b"FileNotFoundError" in done.stderr
+    assert done.stdout == b""
