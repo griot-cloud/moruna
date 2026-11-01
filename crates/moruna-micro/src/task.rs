@@ -827,9 +827,21 @@ impl TaskState {
                     if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
                         return Err(MorunaError::Cancelled);
                     }
-                    if let Some(Err(why)) = self.answer(0) {
-                        let why = why.clone();
-                        return Err(kernel_error(format!("image `{}`: {why}", self.name)));
+                    match self.answer(0) {
+                        Some(Err(why)) => {
+                            let why = why.clone();
+                            return Err(kernel_error(format!("image `{}`: {why}", self.name)));
+                        }
+                        Some(Ok(ended)) if ended.how != how::EXITED || ended.code != 0 => {
+                            // This is the ORIGINAL decoded Linux terminal reply,
+                            // not inferred EOF from a closed slot. A failed child
+                            // cannot answer another morsel; preserve its status
+                            // and drained stderr instead of waiting forever for
+                            // an independent plane-drain notification. Successful
+                            // termination still waits for the real plane EOF.
+                            return Err(self.failed("the task reported unsuccessful termination"));
+                        }
+                        _ => {}
                     }
                 }
             }
