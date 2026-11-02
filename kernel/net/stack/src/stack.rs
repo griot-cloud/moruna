@@ -236,6 +236,10 @@ struct Udp {
     send: Option<(Pending, Endpoint, Vec<u8>)>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Socket state stays inline in the per-connection map without a separate TCP allocation"
+)]
 enum Sock {
     Tcp(Tcp),
     Listener(Listener),

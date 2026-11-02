@@ -274,9 +274,9 @@ fn full_account_unmap(resource: &Handle) -> Outcome {
             None,
         ))?;
     let mut held: [Option<Memory>; 256] = core::array::from_fn(|_| None);
-    for i in 0..objects as usize {
+    for (i, slot) in held.iter_mut().enumerate().take(objects as usize) {
         let pages = if i == 0 { pages - objects + 1 } else { 1 };
-        held[i] = Some(
+        *slot = Some(
             Memory::create_in(pages * charge::PAGE, &account.0)
                 .map_err(|e| ("filling the test account exactly", Some(e)))?,
         );
