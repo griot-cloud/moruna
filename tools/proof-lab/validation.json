@@ -439,6 +439,26 @@
         }
       ],
       "scope": "Actual local TCG12timer passes and exit33 onall3profiles. Remote KVM deadline acceptance remains pending."
+    },
+    "ci_storage_fixture_followup": {
+      "failed_run": "https://github.com/griot-cloud/moruna/actions/runs/41410969177",
+      "failed_head": "129a63b30b10f2f9266e74cd9b14ac35392738e1",
+      "failure": "Canonical single-device provision test: nonblocking image lease WouldBlock at Preflight",
+      "cause": "Concurrent CLI fork/exec can inherit a locked open-file description until exec despite CLOEXEC. Parent close alone does not release a lease retained by that child. Deterministic host fork/exec mechanism reproduced.",
+      "correction": "Test-local mutex excludes this binary CLI-spawn window from all image-provision lease fixtures. All production exclusivity, geometry and neighboring-byte assertions unchanged; no retries or production changes.",
+      "local_focused_result": "11 passed, zero failed; four applicable Mac provisioning tests passed. Linux-only lease refusal remains required in CI.",
+      "broader_mac_result": "27 passed, 2 failed: unchanged ST6 ordinary Unix-socket tests. Both passed in the Linux CI run. This record does not claim complete Mac storage-target acceptance.",
+      "logs": {
+        "focused_st_t4": {
+          "path": "/tmp/moruna-storage-provision-final-local.log",
+          "sha256": "37e14317007d6960782579749fb9df62e378e40bb14c926999363573910d9856"
+        },
+        "broader_mac": {
+          "path": "/tmp/moruna-storage-lease-final-local.log",
+          "sha256": "a605ba7dddfd1335a684ba779fc34fae2b6a92f62a20c63aa3ca28d8f47c8813"
+        }
+      },
+      "remote_corrected_result": "PENDING"
     }
   }
 }

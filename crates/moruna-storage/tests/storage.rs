@@ -19,6 +19,15 @@ use moruna_storage::{
 use moruna_testkit::FakeAllocator;
 use zeroize::Zeroizing;
 
+// Image leases use an open-file-description lock. A concurrent process spawn
+// can inherit another test's locked descriptor until exec closes CLOEXEC files.
+// Keep this binary's CLI spawning and image-provision lease checks disjoint;
+// this never retries or relaxes a refused production lease.
+fn provision_process_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -2024,6 +2033,7 @@ fn st_t4_inactive_copy_does_not_publish_when_root_write_is_refused() {
 
 #[test]
 fn st_t4_explicit_provisioner_initializes_each_role_but_never_overwrites_existing_roots() {
+    let _process_guard = provision_process_guard();
     use moruna_storage::provision::{self, Phase};
     use moruna_storage_format::banks::Root;
     use std::os::unix::fs::FileExt;
@@ -2072,6 +2082,7 @@ fn st_t4_explicit_provisioner_initializes_each_role_but_never_overwrites_existin
 
 #[test]
 fn st_t4_provisioner_checks_exact_geometry_and_both_blank_root_cells_before_any_write() {
+    let _process_guard = provision_process_guard();
     use moruna_storage::provision::{self, Phase};
     use moruna_storage_format::banks::Root;
     use std::os::unix::fs::FileExt;
@@ -2119,6 +2130,7 @@ fn st_t4_provisioner_checks_exact_geometry_and_both_blank_root_cells_before_any_
 #[cfg(target_os = "linux")]
 #[test]
 fn st_t4_provisioner_refuses_an_existing_exclusive_image_lease_without_waiting() {
+    let _process_guard = provision_process_guard();
     use moruna_storage::provision::{self, Phase};
     use moruna_storage_format::banks::Root;
     let temp = Scratch::new();
@@ -2147,6 +2159,7 @@ fn st_t4_provisioner_refuses_an_existing_exclusive_image_lease_without_waiting()
 
 #[test]
 fn st_t4_supported_provision_cli_plans_formats_and_refuses_repeat_or_unknown_options() {
+    let _process_guard = provision_process_guard();
     use std::process::Command;
     let temp = Scratch::new();
     let root = temp.0.join("cache.root");
@@ -2601,6 +2614,7 @@ fn st_t5_exact_checkpoint_publication_needs_no_prefix_list_grant() {
 
 #[test]
 fn st_t4_provisioner_uses_canonical_single_device_regions_without_touching_neighbors() {
+    let _process_guard = provision_process_guard();
     use moruna_storage::provision;
     use moruna_storage_format::{
         banks::Root,
