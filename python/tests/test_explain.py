@@ -46,7 +46,12 @@ def test_pn_t26_explain_returns_the_plan(tmp_path: Path) -> None:
 
 def test_pn_t26_explain_refuses_by_name(tmp_path: Path) -> None:
     path = _document(tmp_path)
-    with pytest.raises(moruna.PlanError, match="no planner `simulated`"):
+    with pytest.raises(moruna.PlanError, match="no planner `no_such_planner`"):
+        moruna.explain(path, planner="no_such_planner")
+    with pytest.raises(
+        moruna.PlanError,
+        match="model: the simulated planner simulates with a cost model, and none is given",
+    ):
         moruna.explain(path, planner="simulated")
     doc = json.loads(path.read_text())
     doc["kernels"][0]["kind"] = "no.such"
