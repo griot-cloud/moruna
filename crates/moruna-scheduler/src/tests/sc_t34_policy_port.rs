@@ -140,7 +140,18 @@ fn sc_t34_the_policy_is_a_setting() {
     let stats = rig.scheduler.scheduler_stats().policy;
     assert_eq!(stats.name, FIFO);
     assert!(stats.decisions > 0 && stats.admitted > 0, "{stats:?}");
-    assert_eq!(stats.over_budget, 0, "fifo decides well inside the floor");
+    // The real monotonic timer includes gathering and host descheduling. Even FIFO can
+    // truthfully overrun the floor; selecting it must preserve that accounting, not promise
+    // that an arbitrarily preempted thread finishes within fifty microseconds.
+    assert!(stats.over_budget <= stats.decisions, "{stats:?}");
+    assert!(stats.fallbacks <= stats.over_budget, "{stats:?}");
+    assert!(
+        stats.decision_ns >= stats.over_budget * (crate::decide::DECISION_BUDGET_FLOOR_NS + 1),
+        "every overrun exceeds the actual decision-budget floor: {stats:?}"
+    );
+    let mut written = rig.sink.written();
+    written.sort_unstable();
+    assert_eq!(written, (0..4).collect::<Vec<u64>>(), "every batch once");
 }
 
 /// A policy that takes longer than any budget: what 9.4 step 4 falls back from.

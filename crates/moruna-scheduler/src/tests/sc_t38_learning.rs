@@ -230,7 +230,15 @@ fn sc_t38_a_model_that_turns_wrong_drifts_and_the_run_completes() {
     };
     let online = Arc::new(Online::new(InUse::new(Box::new(model), None), dir.store()));
     let rig = RigBuilder::new()
-        .cfg(|cfg| cfg.policy = LOOKAHEAD.into())
+        .cfg(|cfg| {
+            cfg.policy = LOOKAHEAD.into();
+            // This assertion measures three wrong predictions after the model's
+            // twentieth settled observation. Concurrent admissions may already
+            // carry correct predictions from before that turn, so use one worker
+            // to make the prediction/settlement boundary deterministic.
+            cfg.workers_max = 1;
+            cfg.workers_active = 1;
+        })
         .source(FakeSource::new().splits(40, 16, 128).sub_splittable(false))
         .kernel(Arc::new(FakeKernel::new()))
         .go();
