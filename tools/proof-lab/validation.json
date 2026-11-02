@@ -459,6 +459,34 @@
         }
       },
       "remote_corrected_result": "PENDING"
+    },
+    "public_node_ci_wiring_followup": {
+      "failed_ci_run": "https://github.com/griot-cloud/moruna/actions/runs/41410969177",
+      "original_ci_case_report": "not retained by prior workflow; no original exception is claimed",
+      "generic_boots_in_failed_ci": "all1/2/4CPU checks passed before node case1 failed",
+      "local_failed_reproductions": [
+        "moruna-canonical-node-diagnostic-0gzw8nc7: missing guest.uds was interpreted as expired owner before QEMU boot",
+        "moruna-canonical-node-readiness-6t93agj2: after socket readiness, guest rejected raw PEM as native Wire DER roots"
+      ],
+      "corrections": [
+        "Wait for real host socket creation within existing case deadline; check actual backend/QEMU liveness",
+        "CI uses existing net-proof.py prepare root encoder, not raw system PEM; TLS validation retained",
+        "Print bounded actual failure report and retain allowlisted small node logs/results"
+      ],
+      "actual_local_public_matrix": {
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-public-node15-zynct0np/receipt.json",
+        "receipt_sha256": "f10c0b6963a47a764fc0d6b72b5dcc988960e2506bdfb695d46b2690f908566a",
+        "passed": 15,
+        "profiles": [
+          1,
+          2,
+          4
+        ],
+        "transport": "public non-SDK canonical CLI",
+        "scope": "Actual public non-SDK15 matrix affected by readiness/native-roots wiring. Retained unchanged GNU-release actors, uid1001 ARM-hosted x86 TCG; source-bound reuse, not a full fresh-source rebuild",
+        "cleanup": true
+      },
+      "remote_corrected_result": "PENDING"
     }
   }
 }

@@ -14,6 +14,7 @@ from pathlib import Path
 import socket
 import shutil
 import subprocess
+import sys
 import time
 
 MIB = 1024 * 1024
@@ -27,6 +28,32 @@ def digest(path):
         for block in iter(lambda: stream.read(MIB), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def print_failure(out, record, stream=None):
+    """Bounded actual verdict/tool tails; never dump configuration or authority files."""
+    stream = stream if stream is not None else sys.stderr
+    summary = {name: record.get(name) for name in
+               ("passed", "cleanup", "error", "input_integrity_error", "owned_children")}
+    for name in ("error", "input_integrity_error"):
+        if summary[name] is not None:
+            summary[name] = str(summary[name])[-2048:]
+    print("node CI failure " + json.dumps(summary, sort_keys=True), file=stream)
+    print(f"actual evidence: {out / 'result.json'}", file=stream)
+    for name in ("prepare.log", "backend.log", "qemu.log", "peer.log", "serial.log"):
+        path = out / name
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+            with path.open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                size = log.tell()
+                log.seek(max(0, size - 8192))
+                tail = log.read(8192).decode(errors="replace")
+            print(f"{name} (last {min(size, 8192)} of {size} bytes): "
+                  + json.dumps(tail), file=stream)
+        except OSError as error:
+            print(f"{name}: diagnostic read failed: {error}", file=stream)
 
 
 def main():
@@ -338,6 +365,14 @@ def main():
                 raise ValueError("actual controlled KE2 peer endpoint required")
             qemu_args += ["-netdev", f"user,id=ke2-user,restrict=on,dhcpstart=10.0.2.15,guestfwd=tcp:10.0.2.100:47012-tcp:127.0.0.1:{port}", "-device", "virtio-net-pci,netdev=ke2-user,mac=52:54:00:4b:45:02,romfile=,addr=0x14,disable-legacy=on"]
         qemu = spawn(qemu_args, "qemu.log")
+        if not args.io_phase:
+            # The peer treats a missing host socket as an expired owner. Its
+            # socket is created only after QEMU connects the actual vsock device.
+            while not (out / "guest.uds").exists():
+                remaining()
+                if backend.poll() is not None or qemu.poll() is not None:
+                    raise RuntimeError("actual VM or vsock backend exited before the host socket was ready")
+                time.sleep(0.01)
         if args.io_phase:
             required = ["KE2 user DHCP: ok:", "KE2 user DNS: ok:", "KE2 user TLS: ok:", "KE2 conformance moruna.net: ok:",
                         f"KE3 native storage: {args.io_phase}:", "KE3 native storage: ok:",
@@ -424,6 +459,8 @@ def main():
         record["cleanup"] = cleaned
         record["passed"] = bool(record["passed"] and cleaned)
         (out / "result.json").write_text(json.dumps(record, indent=2) + "\n")
+        if not record["passed"]:
+            print_failure(out, record)
         if (args.sdk_proof or fixture_mode) and not record["passed"]:
             raise SystemExit(f"SDK node CI case failed; actual evidence: {out / 'result.json'}")
     if not record["passed"]:

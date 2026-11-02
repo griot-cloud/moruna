@@ -292,8 +292,9 @@ jobs:
       - name: Required five production-node job cases on one, two and four CPUs
         if: steps.changed.outputs.kernel == 'true'
         run: |
+          python3 kernel/tools/net-proof.py prepare "$RUNNER_TEMP/boot"
           kernel/tools/node-fixtures.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/native-node-ci" \
-            "$(command -v qemu-system-x86_64)" /etc/ssl/certs/ca-certificates.crt 180
+            "$(command -v qemu-system-x86_64)" "$RUNNER_TEMP/boot/ke2/roots" 180
       - name: Strict deadline latency on one, two and four CPUs, with bounded contenders
         if: steps.changed.outputs.kernel == 'true'
         run: kernel/tools/deadline-boot.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/deadline-boot"
@@ -320,12 +321,43 @@ jobs:
           tool: cargo-deny@0.20.2
       - if: steps.changed.outputs.kernel == 'true'
         run: cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
+      - name: Retain bounded production-node diagnostics
+        if: always() && steps.changed.outputs.kernel == 'true'
+        run: |
+          python3 - <<'PY_NODE_LOGS'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          source, output = root / "native-node-ci", root / "native-node-ci-logs"
+          output.mkdir(exist_ok=True)
+          retained = []
+          for cpu in (1, 2, 4):
+              for case in range(1, 6):
+                  for name in ("result.json", "prepare.log", "backend.log", "qemu.log", "peer.log", "serial.log"):
+                      relative = pathlib.Path(f"cpu{cpu}/case{case}") / name
+                      path = source / relative
+                      if not path.is_file() or path.is_symlink():
+                          continue
+                      size = path.stat().st_size
+                      bound = 256 * 1024 if name == "result.json" else 64 * 1024
+                      if name == "result.json" and size > bound:
+                          retained.append({"path": str(relative), "bytes": size, "omitted": "JSON exceeds bound"})
+                          continue
+                      with path.open("rb") as stream:
+                          stream.seek(max(0, size - bound))
+                          data = stream.read(bound)
+                      destination = output / relative
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      destination.write_bytes(data)
+                      retained.append({"path": str(relative), "original_bytes": size, "retained_bytes": len(data)})
+          (output / "retained.json").write_text(json.dumps(retained, indent=2) + "\n")
+          PY_NODE_LOGS
       - if: always() && steps.changed.outputs.kernel == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kernel-serial-logs
           path: |
             ${{ runner.temp }}/serial-*.log
+            ${{ runner.temp }}/native-node-ci-logs/**
             ${{ runner.temp }}/boot/manifest
             ${{ runner.temp }}/boot/expect
             ${{ runner.temp }}/boot/console*.log
