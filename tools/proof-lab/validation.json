@@ -487,6 +487,36 @@
         "cleanup": true
       },
       "remote_corrected_result": "PENDING"
+    },
+    "remote_functional_kernel_5132": {
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41420167767",
+      "job": 125193531667,
+      "head": "5132f35f00bab9fb91f1bf178f042966d9018541",
+      "generic_profiles": [
+        1,
+        2,
+        4
+      ],
+      "public_node_cases_passed": 15,
+      "controlled_KVM_deadline_cases_passed": 12,
+      "deadline_lateness_us": [
+        765,
+        688,
+        686,
+        686,
+        471,
+        199,
+        909,
+        575,
+        732,
+        267,
+        910,
+        738
+      ],
+      "deadline_limit_us": 50000,
+      "log": "/tmp/moruna-ci-5132-kernel.log",
+      "log_sha256": "16ba30d782b80cca6c7cedbffa2d5446e4814cf140e9c30ca6b97338afbc160e",
+      "overall_job_result": "FAILED at subsequent non-probe Clippy: copied/frame_at probe-only methods not gated; functional passes do not claim overall job success"
     }
   }
 }

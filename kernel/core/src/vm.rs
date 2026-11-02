@@ -290,7 +290,8 @@ impl Space {
         self.copied.fetch_add(n as u64, Ordering::Relaxed);
     }
 
-    /// The bytes the kernel has copied into or out of this space.
+    /// The bytes the kernel has copied into or out of this space (probe ABI only).
+    #[cfg(feature = "probe")]
     pub fn copied(&self) -> u64 {
         self.copied.load(Ordering::Relaxed)
     }
@@ -355,7 +356,8 @@ impl Space {
         Ok(())
     }
 
-    /// The physical address of the page holding `addr`, if a page is there.
+    /// The physical address of the page holding `addr`, if a page is there (probe ABI only).
+    #[cfg(feature = "probe")]
     pub fn frame_at(&self, addr: u64) -> Result<u64, Error> {
         use ostd::mm::HasPaddr;
         let page = addr & !(PAGE_SIZE - 1);
