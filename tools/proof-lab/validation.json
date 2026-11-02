@@ -565,7 +565,7 @@
       "peer_sha256": "590c5fac280d59eced7bb79bdbaaa9fc88a60ea3dd3e66d6e7ad5af93ed87aa4",
       "execution_scope": "Genuine Cargo-built peer from2abd; retained unchanged guest/native actors. No fresh full guest-runtime rebuild claim.",
       "build_history": "Incomplete cache prevented direct crate resolution; genuine Cargo dependency rebuild resumed across bounded intervals. No corrected pass claimed until actual executable and execution.",
-      "remote_corrected_result": "PENDING"
+      "remote_corrected_result": "PASS all15 CPU1/2/4 real node cases with immutable inputs and cleanup in run41445573100 at a477f29"
     },
     "remote_main_job_8a099de": {
       "result": "SUCCESS complete build/test/lint, real image runtime, peQL/Iceberg, Python kernels and installed Linux wheel",
@@ -573,6 +573,16 @@
       "head": "8a099deefc067cdd289046bb747874ffc477572b",
       "wheel_tests": "204 passed,11 skipped",
       "log_sha256": "649092880306e61b470d3d72afb850be1317c76d20727012b12f7dd10bd43a9d"
+    },
+    "ci_native_c_compiler_followup": {
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41445573100",
+      "head": "a477f29d48aba9cdde6b7ed56de3213e5bfee351",
+      "functional_steps": "Kernel build, generic boots, all15 node cases and strict CPU1/2/4 deadline step SUCCESS",
+      "failure": "Clippy native-user ring build inherited default GCC cc; rejects Clang -nostdlibinc. No production execution failure.",
+      "correction": "Set CC_x86_64_moruna_user=clang and canonical freestanding CFLAGS in CI lint step, matching build.sh and already-passing local strict lint configuration.",
+      "local_verification": "Workflow YAML parsed; compiler/flags checked against actual successful local e4ab2834 strict runner and build.sh. No new VM or runtime source change required.",
+      "log_sha256": "ea9554e466d33137943aade7a29c3fae4e1be3a293ab786490047d0d59a2bcfb",
+      "remote_corrected_result": "PENDING"
     }
   }
 }
