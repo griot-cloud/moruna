@@ -21,9 +21,9 @@ struct Child {
 fn take(name: &str) -> Result<Handle, String> {
     start::take(name).ok_or_else(|| format!("missing boot capability {name}"))
 }
-fn prepare(
-    console: &Console,
-) -> Result<(Vec<Child>, Lifecycle, Vec<Channel>, Option<Channel>), String> {
+type Prepared = (Vec<Child>, Lifecycle, Vec<Channel>, Option<Channel>);
+
+fn prepare(console: &Console) -> Result<Prepared, String> {
     let config = Memory(take("config")?);
     // Image data objects are zero padded. Never accept an unterminated oversized
     // config or silently truncate it to the first mapped page.
