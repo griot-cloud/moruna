@@ -289,11 +289,18 @@ pub fn cases(digest: &str) -> [(&'static str, Value); 5] {
     tap["ports"] = json!({"tap":{"host":"tap"}});
     let mut fail = image(digest);
     fail["command"] = json!(["python3", "/kd2/transform.py", "--fail-after", "1"]);
+    let mut failure_job = doc(vec![fail]);
+    // This case checks the Python task's intentional failure after one answered
+    // batch, not budget refusal. At 384 MiB the controller can correctly stop
+    // its modeled minimum footprint first (147 MB against 135 MB headroom in
+    // CI). Fund the interpreter here without changing enforcement or the
+    // surrounding 1 GiB process limit; all other cases retain their budgets.
+    failure_job["budget"]["memory_bytes"] = json!(512u64 << 20);
     let mut bad = image(digest);
     bad["command"] = json!(["/kc1/bin/badrecord"]);
     [
         ("rows", doc(vec![python.clone(), tap.clone()])),
-        ("a task that fails", doc(vec![fail])),
+        ("a task that fails", failure_job),
         ("a refused record", doc(vec![bad])),
         ("cancel", doc(vec![python, tap.clone()])),
         ("an image nobody named", doc(vec![image(NOBODY), tap])),
