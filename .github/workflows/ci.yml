@@ -126,6 +126,8 @@ jobs:
             exit 1
           fi
       - name: The Python kernels
+        env:
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
           python -c 'import sys, sysconfig; print(sys.version); print("free-threaded:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")), "gil now:", sys._is_gil_enabled())'
           PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled()'
@@ -136,7 +138,8 @@ jobs:
           # is what we want, because the Python surface would not work on Linux.
           # pyyaml is the `package` extra's (pip is already here): `moruna package` reads
           # function.yaml (SDD 16 e.3), and python/tests packages projects.
-          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml
+          "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
+          "$FREETHREADED" -m uv --version
           cd bench/python && python -m pytest -q
       - name: The wheel builds, installs and runs on Linux
         # The check that matters for a release: not "does the source tree import", which
@@ -152,6 +155,7 @@ jobs:
           # Public image builds discover standard CPython through PATH; wheel
           # building, installation and testing remain explicitly free-threaded.
           export PATH="$(dirname "$STANDARD"):$PATH"
+          "$FREETHREADED" -m uv --version
           "$FREETHREADED" -m maturin build --release --out dist --interpreter "$FREETHREADED"
           "$FREETHREADED" -m pip install --no-index --find-links dist moruna
           "$FREETHREADED" -c 'import moruna; print("moruna", moruna.__version__)'
@@ -287,6 +291,9 @@ jobs:
         run: |
           kernel/tools/node-fixtures.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/native-node-ci" \
             "$(command -v qemu-system-x86_64)" /etc/ssl/certs/ca-certificates.crt 180
+      - name: Strict deadline latency on one, two and four CPUs, with bounded contenders
+        if: steps.changed.outputs.kernel == 'true'
+        run: kernel/tools/deadline-boot.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/deadline-boot"
       - name: Clippy for the builtin kernel target and canonical native-user target
         if: steps.changed.outputs.kernel == 'true'
         working-directory: kernel

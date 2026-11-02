@@ -95,6 +95,7 @@ bin="${CARGO_TARGET_DIR:-$kernel/target}/$user_target_name/release"
 kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
 rm -rf "$out"
 mkdir -p "$out"
+cp "$bin/deadline" "$out/deadline"
 # The layer disks are the host writer's (moruna-image, the root workspace, on its own
 # toolchain); the boot description gives their lists as `data:` handles.
 (cd "$kernel/.." && cargo run --quiet --release --locked -p moruna-image --features testing \

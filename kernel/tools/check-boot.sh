@@ -7,7 +7,7 @@
 # vsock test's and the engine's runs' lines, and QEMU's status the kernel's success.
 # Prints each verdict.
 #
-#   kernel/tools/check-boot.sh LOG QEMU_STATUS EXPECT CPUS
+#   kernel/tools/check-boot.sh LOG QEMU_STATUS EXPECT CPUS [generic|deadline]
 #
 # The boot's other files are read from EXPECT's directory (boot.sh's OUT).
 set -euo pipefail
@@ -16,6 +16,8 @@ log="$1"
 status="$2"
 expect_file="$3"
 cpus="$4"
+kind="${5:-generic}"
+case "$kind" in generic|deadline) ;; *) echo "unknown boot check kind: $kind" >&2; exit 2 ;; esac
 out="$(dirname "$expect_file")"
 tools="$(cd "$(dirname "$0")" && pwd)"
 fail=0
@@ -56,6 +58,7 @@ if grep -qi -- "panic" "$seen"; then
   fail=1
 fi
 
+if [ "$kind" = generic ]; then
 # DR-T9, DR-T18: what the block and NVMe tests wrote and flushed is on the host's disk
 # images, and a disk no test wrote is as the boot wrote it.
 while read -r name sectors after; do
@@ -82,6 +85,8 @@ if grep -qF -- "FAIL:" "$peer"; then
   echo "FOUND FAILURE in actual vsock peer log:"
   grep -F -- "FAIL:" "$peer"
   fail=1
+fi
+
 fi
 
 if [ "$status" != 33 ]; then

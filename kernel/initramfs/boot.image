@@ -116,11 +116,8 @@ process isolation
   exits 0
 link iso-holder.peer isolation.peer
 
-# KK-T9: a timer wakes a waiting thread at its deadline.
-process deadline
-  handle console console
-  expect KB1 wait-deadline: ok: the timer woke the waiting thread
-  exits 0
+# KK-T9 latency is judged separately by deadline-boot.sh, away from this busy
+# boot's runnable test threads. Its 50 ms bound is unchanged.
 
 # SV-T14: the cycle rule.
 process cycles

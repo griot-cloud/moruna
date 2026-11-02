@@ -393,6 +393,52 @@
           "failed": 0
         }
       ]
+    },
+    "ci_environment_and_deadline_followup": {
+      "failed_run": "https://github.com/griot-cloud/moruna/actions/runs/41399488127",
+      "failed_head": "e6d8507489d2136bc725c046df937f261147f610",
+      "wheel_failure": "24 failed, 180 passed, 11 skipped; missing uv in CI free-threaded test interpreter",
+      "wheel_correction": "Install uv explicitly in that interpreter and check python -m uv --version before fresh-wheel tests; local fresh-wheel suite already included uv",
+      "boot_failure": "Deadline lateness164257876ns on1CPU and86094881ns on2CPUs;4CPU passed. Crowded boot31processes plus FPU workers exceeded the bounded-contender fixture assumption.",
+      "boot_correction": "Move unchanged deadline ELF and timing/timeout assertions into mandatory controlled CPU1/2/4 boots with4smallprocesses. All unrelated generic checks retained. No production timer/scheduler changes or raised thresholds.",
+      "local_receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-deadline-local-upeoub37/receipt.json",
+      "local_receipt_sha256": "48e3558fe8f8f937a846244c29a0f0be12500dc292984807e6f94314a1a6527a",
+      "local_results": [
+        {
+          "cpus": 1,
+          "timer_passes": 4,
+          "lateness_us": [
+            1616,
+            3371,
+            4241,
+            4582
+          ],
+          "serial_sha256": "cc6fe52b1a8165153edcba9da2a1a695117edd915ee1c459111f4331fe080eda"
+        },
+        {
+          "cpus": 2,
+          "timer_passes": 4,
+          "lateness_us": [
+            1005,
+            970,
+            2725,
+            2326
+          ],
+          "serial_sha256": "876e9be083203a2436085a891172eb345fc72b21781d7ee65938f3bf0eeb1372"
+        },
+        {
+          "cpus": 4,
+          "timer_passes": 4,
+          "lateness_us": [
+            1775,
+            1823,
+            2940,
+            998
+          ],
+          "serial_sha256": "fa3d6fa065876308886204ab00a268f0b9d9752e95ef3239d8a35262d8eb1d4d"
+        }
+      ],
+      "scope": "Actual local TCG12timer passes and exit33 onall3profiles. Remote KVM deadline acceptance remains pending."
     }
   }
 }
