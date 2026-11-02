@@ -366,6 +366,33 @@
         "genuine_public_builder": "PENDING"
       },
       "release": "NOT PUBLISHED"
+    },
+    "ci_fixture_followup": {
+      "original_run": "https://github.com/griot-cloud/moruna/actions/runs/41383031711",
+      "original_head": "2d88d1bd5d98d7a73a920020d1eb1820adf0a0ff",
+      "correction_head": "f7256a8",
+      "scope": "Test fixtures only; no production code, budgets or runtime thresholds changed. Original CI failures retained.",
+      "corrections": [
+        "Checkpoint request synchronizes on Running instead of Init attachment",
+        "FIFO checks real overrun/fallback accounting and exact batch IDs instead of guaranteeing zero host preemption",
+        "Drift-boundary fixture uses one worker, retaining all original drift and delivery assertions"
+      ],
+      "local_results": [
+        {
+          "name": "scheduler",
+          "log": "/tmp/moruna-scheduler-final-local.log",
+          "sha256": "2f62dae5e0b250b3cba57453fc185270ddfd342b07815e5d38ec9b5a4d8bca2e",
+          "passed": 96,
+          "failed": 0
+        },
+        {
+          "name": "checkpoint",
+          "log": "/tmp/moruna-checkpoint-final-local.log",
+          "sha256": "985227ce2a8c20a5ba356f0d1359f1c1fe19aba4d06ffa3637efee72204d3594",
+          "passed": 1,
+          "failed": 0
+        }
+      ]
     }
   }
 }

@@ -71,10 +71,10 @@ or coverage-gate pass is claimed. Version 0.6.0 remains unreleased. Scope is Pha
 | Area | Current status | Still needed before deployment |
 | ---- | -------------- | ------------------------------ |
 | Compiler dependencies | ✅ | None |
-| Runtime, SDK, checkpoints/history | Termination regressions and SDK cases passed | Installed wheel passed; coverage excluded by user |
+| Runtime, SDK, checkpoints/history | ✅ | None locally; coverage excluded by user |
 | Node launcher and admission | ✅ | None |
-| Combined application | Image sandbox tests passed; iterator delivery corrected | 92-result scoped comparison and installed wheel passed |
-| Deployment artifacts | Normal engine and tools built; 0.6.0 unreleased | Verify final affected artifacts and complete release gates |
+| Combined application | ✅ | None |
+| Deployment artifacts | Local functional acceptance complete; 0.6.0 unreleased | Required PR checks, merge and publication |
 
 ## Remaining acceptance
 
@@ -91,6 +91,4 @@ launcher. Supported local OCI inputs do not imply automatic registry push or pul
 Canonical repository entry points are `kernel/tools/build.sh`,
 `kernel/node/tools/proof.py`, `kernel/node/tools/io-proof.py`, and their existing
 configure/package tools. The [proof lab](../tools/proof-lab/README.md) preserves
-historical orchestration and input constraints. Native execution uses descriptors and artifacts built from source; the legacy
-Linux OCI guest is not the native launcher. Supported runnables and local OCI
-inputs do not imply automatic registry push or pull.
+historical orchestration and input constraints.
