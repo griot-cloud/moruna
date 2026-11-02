@@ -34,7 +34,7 @@ use moruna_plane::{
 use moruna_record::{record::Decoded, ring::Ring};
 use moruna_svc::{Channel, Console, Handle, deadline_in, now, println, start};
 use moruna_sys::{
-    Account, Error, Memory, Process, Rights, Usage, charge, map,
+    Account, Error, Memory, Process, Rights, charge, map,
     plane::{Slot, attach, object_frame},
 };
 use plane_test::{Role, layout, port, role, values};
