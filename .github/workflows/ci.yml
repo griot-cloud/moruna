@@ -75,9 +75,13 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: standard
         with:
-          # One interpreter: CPython 3.14 free-threaded, which is what S8 is
-          # about. The GIL path is the same interpreter under PYTHON_GIL=1.
+          python-version: "3.14"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: freethreaded
+        with:
+          # FT remains the default for the existing Rust/GIL and kernel tests.
           python-version: "3.14t"
       - name: Format, lints and the documentation checker
         run: |
@@ -140,17 +144,24 @@ jobs:
         # publish work on the platform we publish it for". python/tests drives a real
         # pass through the installed wheel, so this is also where a Linux-only runtime
         # defect would surface (2026-09-23; before this, nothing proved either).
+        env:
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
-          maturin build --release --out dist
-          python -m pip install --no-index --find-links dist moruna
-          python -c 'import moruna; print("moruna", moruna.__version__)'
+          "$STANDARD" -c 'import sysconfig; assert not sysconfig.get_config_var("Py_GIL_DISABLED")'
+          # Public image builds discover standard CPython through PATH; wheel
+          # building, installation and testing remain explicitly free-threaded.
+          export PATH="$(dirname "$STANDARD"):$PATH"
+          "$FREETHREADED" -m maturin build --release --out dist --interpreter "$FREETHREADED"
+          "$FREETHREADED" -m pip install --no-index --find-links dist moruna
+          "$FREETHREADED" -c 'import moruna; print("moruna", moruna.__version__)'
           # From outside the tree, always. pytest puts the test's own root on sys.path,
           # so running python/tests in place lets python/moruna (the source package,
           # with no compiled _core) shadow the wheel that was just installed, and the
           # suite then tests something that cannot work while reporting on something
           # that can.
           cp -R python/tests /tmp/moruna-tests
-          cd /tmp && python -m pytest -q /tmp/moruna-tests
+          cd /tmp && "$FREETHREADED" -m pytest -q /tmp/moruna-tests
 
   # The microkernel (SDD 20 k, SDD 23 k), on a pull request that touches kernel/ or this
   # file, and never on a push: kernel/ is its own Cargo workspace on a pinned nightly,
