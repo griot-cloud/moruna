@@ -19,11 +19,6 @@ Account-based memory sampling and controller admission, and the strict node proo
 entry points. The pinned ring sources under `kernel/vendor/` are build inputs,
 including their upstream test fixtures; they are not compiler output.
 
-The human has authorized Phase A implementation, local testing, coordination with
-Griot for the shared test slot, and release 0.6.0 after acceptance. Earlier BOARD
-restrictions describe previous authorization. Griot source, data and its Moruna
-dependency pin remain outside this change.
-
 ## Verified results and remaining work
 
 The source-bound [validation ledger](../tools/proof-lab/validation.json) preserves
@@ -34,71 +29,68 @@ passed. All 15 canonical SDK cases passed on 1, 2 and 4 CPUs using the normal
 engine, including propagation of the original Python exception and Exit 4.
 The ten image-sandbox tests also passed with actual namespace isolation.
 
-The broader KD3 comparison found a separate iterator defect: a finite plan for
-only the first batch let the scheduler report completion without requesting later
-batches. That defect, all 21 cross-adapter cases and 92 required result cells,
-and the full local quality gate remain release blockers. Previously passing
-artifacts retain their original source identities; they do not certify later
-changes to their compiled inputs.
+The iterator defect is corrected: streaming sources read through actual end of
+iteration, preserve empty batches and propagate later errors. Subsequent fixes
+include shared frame-pool coalescing, bounded Linux service fairness, reuse of
+read-only file backing, correct readlink errors, and strict host receipt framing.
+Current native producer `3473d1cecd0f` has 52 verified artifacts. The generic
+native regression passed in `4e414311af8d`. Runtime source remains `501ac3be`;
+its normal producer `b33342ce1858` has 17 verified artifacts. All 15 canonical
+SDK cases passed with that producer, on the earlier imagefs 256 MiB profile.
+The genuine public-builder smoke passed in `549620ddce57` with all original
+100,000-row, relative-asset and one-CPU assertions.
 
-The work is Phase A only. The original four-hour target ending at 14:54 Nairobi
-on 2026-11-01 was missed. Version 0.6.0 remains unreleased.
+GNU release producer `3b15a968d00d` completed its actual guest build. Its original
+collector error remains recorded; independent verification `d594eff2` checks all
+retained artifacts without rewriting that failure. Release Linux comparison
+passed all 41 cases and 46 receipts (`PLAN 0c394`). Native PEX passed with the
+provisioned imagefs capacity (`89d`). Native cells 0 through 35 passed under that
+profile. Cell 36 exposed a refusal-reporting fixture mismatch, corrected in
+`d7670ad2`; corrected cells 36 through 40 now passed. The unchanged canonical
+comparator exited zero over all 92 actual results across 21 cases, including
+every sink readback (`kd3-scoped-actual-comparison-2tm752pc`). This is an
+explicit source-bound multi-run comparison, not a single-run journal flag.
+SDK15 also passed all CPU1/2/4 cases on the 768 MiB imagefs profile, with
+actual successful cleanup on all three profile turns. The current 3ab free-threaded installed wheel passed 204 tests with 11 skips
+in 68.28 seconds. Its actual test command exited zero and verified the three
+new getters on the extension installed inside the fresh virtual environment.
+The outer wrapper subsequently failed only while parsing results (`re` was not
+imported); the original failed report and collector record remain unchanged.
+The separate functional receipt records this distinction, successful cleanup
+and restored linker state.
+
+The tested node has 3 GiB, with imagefs provisioned at 768 MiB for simultaneous
+parent/child ELF and Python DSO backing. The job remains 1 GiB, its account
+1408 MiB, scratch 256 MiB and admission 1536 MiB. Auxiliary accounts total
+2880 MiB; configure and supervisor still enforce actual boot-room and carve
+checks. This proof-profile change does not raise a job's budget.
+
+Coverage measurement is explicitly excluded by the user; no coverage percentage
+or coverage-gate pass is claimed. Version 0.6.0 remains unreleased. Scope is Phase A.
 
 | Area | Current status | Still needed before deployment |
 | ---- | -------------- | ------------------------------ |
 | Compiler dependencies | ✅ | None |
-| Runtime, SDK, checkpoints/history | Termination regressions and SDK cases passed | Fix iterator delivery; pass full local quality, coverage and Python checks |
+| Runtime, SDK, checkpoints/history | Termination regressions and SDK cases passed | Installed wheel passed; coverage excluded by user |
 | Node launcher and admission | ✅ | None |
-| Combined application | Image sandbox tests passed; KD3 found missing iterator rows | Pass Linux/native rows, refusals and readback on final source |
+| Combined application | Image sandbox tests passed; iterator delivery corrected | 92-result scoped comparison and installed wheel passed |
 | Deployment artifacts | Normal engine and tools built; 0.6.0 unreleased | Verify final affected artifacts and complete release gates |
 
-## Resume sequence
+## Remaining acceptance
 
-1. Fix iterator streaming and add regressions that exercise multiple batches,
-   empty batches and an exception after the first batch. Preserve backpressure
-   and finite-plan behavior for other sources.
-2. Rebuild every artifact whose compiled inputs change. Rerun affected SDK and
-   sandbox checks on those artifacts; retain all original producer identities.
-3. Complete all 21 cross-adapter cases and 92 required result cells. Native sink
-   readback reads actual acknowledged objects through canonical source adapters.
-   Stop on failures; do not combine stale successes to claim final acceptance.
-4. Pass the full unmodified local `tools/quality/check.sh`, including its coverage
-   floor and the fresh free-threaded Python wheel suite. Only then push the final
-   integration and complete canonical CI and publication of 0.6.0.
+1. Preserve the source-bound SDK, builder, generic boot and KD3 receipts, including
+   the explicit multi-run 92-result provenance and original failed attempts.
+2. Review final documentation and complete the existing CI/release sequence.
+   Publication remains pending; no release tag or package publication is implied
+   by this local validation record.
 
-Local acceptance uses ARM Linux and x86 QEMU TCG. No remote KVM server is
-available; emulated results do not establish native KVM execution. The original
-Griot VM remains stopped with the human's authorization. Return the shared heavy
-test slot to the Griot chat explicitly when local heavy checks finish.
+Local acceptance uses ARM Linux and x86 QEMU TCG. KVM was not run. Native
+execution uses source-built descriptors and artifacts, not the legacy Linux OCI
+launcher. Supported local OCI inputs do not imply automatic registry push or pull.
 
 Canonical repository entry points are `kernel/tools/build.sh`,
 `kernel/node/tools/proof.py`, `kernel/node/tools/io-proof.py`, and their existing
 configure/package tools. The [proof lab](../tools/proof-lab/README.md) preserves
-historical orchestration and input constraints. Use the normal full pre-push gate
-for release; the earlier WIP hook bypass was not a release quality waiver.
-
-## Consolidation checks
-
-Rust formatting, documentation checks, 76 changed Python syntax checks, five
-shell syntax checks, stub checks and DCO self-tests passed. The normal commit
-hook reached clippy but no compiler started: the shared heavy-work reservation
-is held by the running Griot VM. Full compilation, tests, coverage and Python
-runtime checks remain pending for this branch. The source whitespace check
-passes with unchanged vendored/generated sources and patch fixtures excluded.
-
-The invalid ServedCall-header fixture uses `NOPE` instead of `XXXX` so the
-repository stub-marker scan does not mistake test input for unfinished code.
-Its expected `CallError::Magic` rejection is unchanged. Two documentation
-headings also use the repository's required punctuation.
-
-The human approved: "Push WIP snapshot; defer heavy checks" on 2026-11-01.
-This publication uses the existing `MORUNA_SKIP_QUALITY=1` switch for this
-commit/push only. Hook configuration and CI are unchanged. The deferred
-compilation, runtime and coverage gates above remain outstanding.
-
-The inherited integration history had accidentally tracked 4,458 compiler-output
-files under `target-linux/` (about 2.18 GB). The initial upload was stopped before
-a remote branch was created. This source-only consolidation omits those files
-and their introducing commit; local artifacts and the original integration
-branch are preserved. The root ignore rules prevent those outputs being added
-again.
+historical orchestration and input constraints. Native execution uses descriptors and artifacts built from source; the legacy
+Linux OCI guest is not the native launcher. Supported runnables and local OCI
+inputs do not imply automatic registry push or pull.

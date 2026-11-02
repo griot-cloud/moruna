@@ -13,7 +13,7 @@
   },
   "latest_private_common_sha256": "d4f5ac087c1a8517143629b06bd44b7f77f036f0f1d2a94c22927002ccb55720",
   "latest_private_adapter_sha256_before_documentation_normalization": "f7157d92b2142bb034f660068f4201bf4f1573e83951ee5b2f7c616124f19705",
-  "latest_correction_execution": "NOT RUN; previously passed case1 does not certify corrected source",
+  "latest_correction_execution": "Historical initial diagnostic field; current acceptance is recorded in phase_a_060.current_acceptance",
   "runs": [
     {
       "run": "moruna-proof-501-45b8167b8230",
@@ -161,8 +161,8 @@
       "overall_stage": "FAILED clippy: four manual-is-multiple-of findings; source corrected, recheck pending",
       "cleanup": true
     },
-    "matrix": "21 cases/92 cells NOT YET EXECUTED",
-    "SDK_boots": "15 required, NOT YET ACCEPTED for0.6.0",
+    "matrix": "PASS strict92actualresults/21cases, explicit multi-run source-bound provenance; no single-run flag",
+    "SDK_boots": "PASS15 current501 binary actors on imagefs768 profile; original prior256 profile evidence preserved separately",
     "release": "NOT PUBLISHED",
     "active_table_areas": [
       "Compiler dependencies",
@@ -170,6 +170,202 @@
       "Node launcher and admission",
       "Combined application",
       "Deployment artifacts"
-    ]
+    ],
+    "historical_initial_snapshot": {
+      "host_producer": {
+        "run": "moruna-proof-501-99b59f573a99",
+        "version": "0.6.0",
+        "tools": 8,
+        "focused_tests_passed": 6,
+        "cleanup": true
+      },
+      "engine_producer": {
+        "run": "moruna-proof-501-2233d130525c",
+        "version": "0.6.0",
+        "passed": true,
+        "cleanup": true,
+        "note": "Predates the same-scope context clone; final source rebuild still required"
+      },
+      "regression": {
+        "run": "moruna-proof-501-a12ec7ad1466",
+        "passed_tests": 245,
+        "ignored_tests": 2,
+        "failed_tests": 0,
+        "overall_stage": "FAILED clippy: four manual-is-multiple-of findings; source corrected, recheck pending",
+        "cleanup": true
+      },
+      "matrix": "21 cases/92 cells NOT YET EXECUTED",
+      "SDK_boots": "15 required, NOT YET ACCEPTED for0.6.0"
+    },
+    "current_acceptance": {
+      "runtime_source_head": "501ac3be4416e17079d4a17476a088cd7f81085b",
+      "profile_commit": "9e7668a9099e17b9b4e7da0e2eb52312dea9650c",
+      "reporting_fixture_commit": "d7670ad20b500ed1b58aa60d4cdd66418f5f9ab0",
+      "execution": "ARM Linux host; x86 QEMU TCG; KVM not run",
+      "coverage": "EXCLUDED_BY_USER; no90percent pass claimed",
+      "native52": {
+        "run": "3473d1cecd0f",
+        "status": "PASS52 verified"
+      },
+      "generic_native_regression": {
+        "run": "4e414311af8d",
+        "status": "PASS"
+      },
+      "normal_personality": {
+        "run": "b33342ce1858",
+        "status": "PASS17 verified"
+      },
+      "SDK15": {
+        "status": "PASS",
+        "profile_imagefs_mib": 256,
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/current501-sdk15-receipts/complete.json",
+        "receipt_sha256": "8eb73b81c6db84258007becb273eae76aecfe619a73991d44d5c248c45ad2a21",
+        "index_sha256": "442db728249949d2ee8b5b896e687dbc64dc9e2c2b66b0c4ad75e3bd40c3ab23",
+        "journal_sha256": "20f97cde45f6eae6436dd8a8ffe4df622c504d1e0a9b8cb087c460389f62eb2c"
+      },
+      "genuine_public_builder": {
+        "run": "549620ddce57",
+        "status": "PASS",
+        "cpus": 1,
+        "rows": 100000
+      },
+      "GNU_release": {
+        "run": "3b15a968d00d",
+        "guest_build": "PASS",
+        "original_collector_error": "PRESERVED; collected false",
+        "independent_verification": "gnu-release-3b15-independent-artifact-verification.json",
+        "verification_sha256": "d594eff25ceb26647909232cbb2c8a5ec806f357ff85e48a2a2552dca8b2c486"
+      },
+      "Linux_release_comparison": {
+        "status": "PASS41cases/46receipts",
+        "plan_prefix": "0c394"
+      },
+      "node_profile": {
+        "node_mib": 3072,
+        "imagefs_mib": 768,
+        "job_mib": 1024,
+        "job_account_mib": 1408,
+        "scratch_mib": 256,
+        "admission_mib": 1536,
+        "auxiliary_total_mib": 2880,
+        "actual_carve_guards": "UNCHANGED; actual successful PEX boot"
+      },
+      "native_PEX": {
+        "run_prefix": "89d",
+        "status": "PASS"
+      },
+      "native_cells_0_through_35": "PASS actual768release; retained per-cell receipts required",
+      "pending": {
+        "release_publication": "PENDING canonical CI/release sequence"
+      },
+      "release": "NOT PUBLISHED",
+      "corrected_native_cells_36_through_40": {
+        "status": "PASS",
+        "output": "node-kd3-d767-corrected-output",
+        "cells": [
+          36,
+          37,
+          38,
+          39,
+          40
+        ]
+      },
+      "canonical_92_result_composite": {
+        "status": "PASS",
+        "classification": "SCOPED_ACTUAL_MULTI_RUN_COMPARISON_NOT_SINGLE_RUN_ACCEPTANCE",
+        "directory": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/kd3-scoped-actual-comparison-2tm752pc",
+        "result_sha256": "64893aae5d8e00ec4f5063beb9f0f7f7abfb15ea580d4038027199c66d9e7ce1",
+        "comparison_exit": 0,
+        "actual_receipts": 92,
+        "required_cases": 21,
+        "comparator_sha256": "ae266dc64e65aa09d2775ebaa0fec4d8f0257039db8c73154e79e031bd518c44",
+        "matrix_sha256": "87694207b1573e1a18b261c5a166e79f3b6a13949c202f3fdb9d4eb5fccef7f3",
+        "log_sha256": "96e76643c61c87cb4430d73956a883700bd9ef78623feaf401b1f490307af5fe",
+        "ledger_sha256": "41a52de7884e50475ffd543b132ae19d6cf1e81eeee63b7e1b07bc481bf2a76b"
+      },
+      "SDK15_imagefs768": {
+        "status": "PASS15",
+        "cpus": [
+          1,
+          2,
+          4
+        ],
+        "profile_imagefs_mib": 768,
+        "journal": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/node-kd3-d767-corrected-output/journal.json",
+        "journal_sha256": "a05a912b393a5c9036eb9b5d370db601e35dfa002e7162db90f51497566d8a18",
+        "log": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/imagefs768-sdk15-final.log",
+        "log_sha256": "09476773441bebeac971a1c184569977842a3e90bb89cbbd5a96d38c07a6afb4",
+        "profile_turns": [
+          {
+            "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-887c336aca7f/summary.json",
+            "sha256": "b13e6c7567eafa3e7cbb7d7bc09d7cfbe6294144f24cf35f206dcc2f432c4a01",
+            "phase_passed": true,
+            "guest_exit": 0,
+            "cleanup": true
+          },
+          {
+            "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-1e5e92d928c2/summary.json",
+            "sha256": "ec38a234654017dded04d23229268defe456645ed34731d426ab4ecd8b0738a3",
+            "phase_passed": true,
+            "guest_exit": 0,
+            "cleanup": true
+          },
+          {
+            "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-ea1468ea8b96/summary.json",
+            "sha256": "793a22e96b622d756b3eabc9aa44ae2d5c24d18bc1980c180e7a2e97082f5334",
+            "phase_passed": true,
+            "guest_exit": 0,
+            "cleanup": true
+          }
+        ]
+      },
+      "python_facade_source": "3ab5bcfbb14582d52f5335e5f95c6e9952470536",
+      "installed_wheel_3ab": {
+        "status": "FUNCTIONAL PASS; wrapper bookkeeping failed afterward",
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/installed-wheel-3ab-a884-functional-receipt.json",
+        "receipt_sha256": "baf308d15734f46a7eb619322a64539bcaa496776e916a34f3b1ca5089f43dfc",
+        "source_head": "3ab5bcfbb14582d52f5335e5f95c6e9952470536",
+        "inputs_census_sha256": "9551882cdfe5c7642d761e8c9005b5e777aa75d90fbeb6afa918ba0b7c7b3eb9",
+        "nonce": "a8844b3575055ad79163071e99759baf",
+        "actual_command_exit": 0,
+        "pytest": {
+          "passed": 204,
+          "skipped": 11,
+          "failed": 0,
+          "seconds": 68.28
+        },
+        "installed_getter_smoke": "PASS actualfreshvenvextension",
+        "original_report_passed": false,
+        "original_error": "NameError: name 're' is not defined",
+        "original_guest_exit": 1,
+        "original_report_sha256": "febd010c9f5ddd1fdf6146a4381e02d08c422d2251ac16b06b1aaa6de556fd9c",
+        "actual_log_sha256": "894122327739f02e19e52c400cefbe2d83743f42c9de874119f7ae000d2dfee3",
+        "cleanup": true,
+        "linker_restored": true
+      }
+    },
+    "coverage": "EXCLUDED_BY_USER",
+    "historical_prior_acceptance": {
+      "source_head": "3dcd519f4b56cc0ed47b7dc8e456f1c5396ca283",
+      "execution": "ARM Linux host; x86 QEMU TCG; KVM not run",
+      "coverage": "EXCLUDED_BY_USER; no coverage pass claimed",
+      "SDK15": {
+        "status": "PASS",
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/readlink-3dc-sdk15-receipts/complete.json",
+        "receipt_sha256": "bfb8be4cdb19fe196b88eaa4355af98a15ba3fa382367a8881c93d266e70bd6e",
+        "index_sha256": "b8fc1a9c87cbdee4755d249fd9d948bb7a871b23edf6d46a0e363a890aec8552",
+        "journal_sha256": "358e92e24cc31ae0065fc7a01fc31e2014993d01b483fb87d6c9c9e377ea8a4c",
+        "native_producer": "7b4e7e7ac6ba",
+        "personality_producer": "6404d394e8b2",
+        "host_producer": "159b19752e19"
+      },
+      "pending": {
+        "installed_wheel": "PENDING",
+        "native_KD3_21_cases_92_cells": "PENDING",
+        "generic_native_regression": "PENDING",
+        "genuine_public_builder": "PENDING"
+      },
+      "release": "NOT PUBLISHED"
+    }
   }
 }
