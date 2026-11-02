@@ -160,9 +160,11 @@ def test_the_check_is_seeded(tmp_path: Path) -> None:
     loaded = _check._load(str(module))
     [(name, value)] = _check.kernels_of(loaded)
     a = _check.check_one(name, value, 3, None)
-    b = _check.check_one(name, value, 3, None)
+    b = _check.check_one(name, value, 3, {})
     assert [x["bytes_in"] for x in a["batches"]] == [x["bytes_in"] for x in b["batches"]]
     assert a["seed"] == 3
+    with pytest.raises(TypeError, match="mapping"):
+        _check.check_one(name, value, 3, [])  # type: ignore[arg-type]
 
 
 def test_declarations_translate_and_bad_ones_are_refused() -> None:

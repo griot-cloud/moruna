@@ -100,9 +100,11 @@ def _warm_up(
     }
 
 
-def check_one(name: str, value: Any, seed: int, warm: dict[str, Any]) -> dict[str, Any]:
+def check_one(name: str, value: Any, seed: int, warm: dict[str, Any] | None) -> dict[str, Any]:
     """One kernel through the harness; the JSON report of MH 4.9 as a dict."""
-    return json.loads(_core.check_kernel(value, name=name, seed=seed, **warm))
+    return json.loads(
+        _core.check_kernel(value, name=name, seed=seed, **({} if warm is None else warm))
+    )
 
 
 def check_package(
