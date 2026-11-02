@@ -32,6 +32,21 @@ out="${1:-$kernel/target/boot}"
 description="${2:-$kernel/initramfs/boot.image}"
 python_layout="${3:-$kernel/target/oci/python}"
 host_target="${4:-$kernel/../target/host}"
+# Resolve caller-relative inputs before changing into the kernel workspace.
+absolute_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+out="$(absolute_path "$out")"
+description="$(absolute_path "$description")"
+python_layout="$(absolute_path "$python_layout")"
+host_target="$(absolute_path "$host_target")"
+if [ ! -f "$description" ]; then
+  echo "build.sh: image description does not exist: $description" >&2
+  exit 1
+fi
 target=x86_64-unknown-none
 # Pinned nightly JSON target selects the user ABI; never override kernel soft-float.
 user_target="$kernel/targets/x86_64-moruna-user.json"
