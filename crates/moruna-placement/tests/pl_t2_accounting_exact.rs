@@ -1,5 +1,6 @@
-//! PL-T2 accounting_exact (PL-I3): resident plus reserved per tier equals the model after
-//! every event and never exceeds the budget.
+//! PL-T2 accounting_exact (PL-I3, PL-I21): resident plus reserved per tier equals the model
+//! after every event and never exceeds the budget; the catalog's totals and each queue's figure
+//! follow the batches exactly, the `Disk` slot counting what is only on disk.
 
 mod common;
 
@@ -28,11 +29,11 @@ fn pl_t2_accounting_exact() {
 
     let budgets = [0u64, host_budget, host_budget, 1 << 30, 0];
     let check = |label: &str| {
-        let detail = engine.detailed_stats();
         let stats = engine.stats();
         for (slot, budget) in budgets.iter().enumerate() {
-            let resident: u64 = stats.queues.iter().map(|q| q.bytes_by_tier[slot]).sum();
-            let reserved = detail.reservations[slot];
+            // One snapshot, taken under the catalog lock: the two figures are read together.
+            let resident = stats.catalog.resident_by_tier[slot];
+            let reserved = stats.catalog.reserved_by_tier[slot];
             assert!(
                 resident + reserved <= *budget,
                 "{label}: tier slot {slot} holds {resident} + {reserved} reserved, budget {budget}"
@@ -48,12 +49,20 @@ fn pl_t2_accounting_exact() {
         for (_, state) in engine.entry_states(0) {
             if let Some(tier) = state.resident_tier() {
                 expected[tier.index()] += bytes;
+            } else if matches!(state, moruna_placement::state::State::OnDisk(_)) {
+                expected[TierKind::Disk.index()] += bytes;
             }
         }
         assert_eq!(
             engine.detailed_stats().per_queue[0].bytes_by_tier,
             expected,
-            "{label}: the tier counters do not match the entries"
+            "{label}: the queue's figure does not match its entries"
+        );
+        // One queue, every consumer released: the catalog holds exactly the queue's batches.
+        assert_eq!(
+            engine.stats().catalog.resident_by_tier,
+            expected,
+            "{label}: the catalog's totals do not match the batches"
         );
     };
 
@@ -67,13 +76,14 @@ fn pl_t2_accounting_exact() {
                 .expect("push");
             next += 1;
             check("after push");
-        } else if engine
+        } else if let Some(morsel) = engine
             .pop(0, common::want_host(), Locality::Any)
             .expect("pop")
-            .is_some()
         {
+            check("after pop, held");
+            engine.release(0, morsel.seq).expect("release");
             out += 1;
-            check("after pop");
+            check("after release");
         }
     }
     common::settle(&reactor);
@@ -81,11 +91,11 @@ fn pl_t2_accounting_exact() {
     model("after the moves settled");
 
     engine.close(0);
-    while engine
+    while let Some((morsel, _)) = engine
         .pop_blocking(0, common::want_host(), Locality::Any)
         .expect("pop_blocking")
-        .is_some()
     {
+        engine.release(0, morsel.seq).expect("release");
         out += 1;
         check("while draining");
     }

@@ -394,6 +394,9 @@ impl PyKernel {
         let after = hooks::arrow_pool(py);
         let mut counts = end.counts;
         counts.arrow = hooks::arrow_counts(before, after);
+        if let Some(cause) = end.accounting_failure {
+            return (Err(cause), counts);
+        }
         let returned = match (returned, end.refusal) {
             (Err(_), Some(refusal)) => Err(MorunaError::Refused {
                 stage: UNKNOWN_STAGE,

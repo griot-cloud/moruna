@@ -13,17 +13,26 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use moruna_kernel::{
-    CheckpointExtras, Fingerprint, MorunaError, NodeId, Origin, PayloadKind, ResumePoint,
-    ResumePolicy, RunId, SegmentRef, Seq, SourceCursor, Split, StageId,
+    CheckpointExtras, Fingerprint, MorselFeatures, MorunaError, NodeId, Origin, PayloadKind,
+    ResumePoint, ResumePolicy, RunId, SegmentRef, Seq, SourceCursor, Split, StageId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::PlacementEngine;
+use crate::catalog::NewBuffer;
 use crate::staging::Segment;
-use crate::state::Entry;
+use crate::state::{Entry, State};
 
-/// The manifest version this build writes and the only one it reads (e.5).
-pub const MANIFEST_VERSION: u32 = 1;
+/// The manifest version this build writes and the only one it reads (e.5): 2 records each
+/// source's cursor and plan, each sink's state and watermark, and a lineage row per position
+/// (d.16).
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// Canonical placement segment filename under an explicitly selected run directory.
+/// Portable checkpoint materialization uses the same naming authority as live staging.
+pub fn segment_file(run_directory: &Path, segment: u32) -> PathBuf {
+    run_directory.join(format!("seg-{segment:06}.seg"))
+}
 
 /// Only the identity fields of a manifest, so the facade can build a `PlacementConfig` with
 /// the manifest's run id before `restore` (d.1).
@@ -52,10 +61,15 @@ pub struct DiskRef {
     pub len: u64,
 }
 
-/// One uncommitted morsel (e.5).
+/// One position of a source morsel some sink has not committed (e.5): a queue a morsel derived
+/// from it is in, with the number it has there.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LineageRow {
-    /// The morsel.
+    /// The source that read it.
+    pub source: u16,
+    /// The number the source read it as.
+    pub root: u64,
+    /// The morsel's number on the queue.
     pub seq: u64,
     /// Its origin split.
     pub split: u32,
@@ -65,7 +79,7 @@ pub struct LineageRow {
     pub row_end: u64,
     /// The node that read the split.
     pub node: u16,
-    /// The stage whose output the morsel currently is.
+    /// The queue the morsel is in.
     pub stage: u16,
     /// `table` or `tensor`.
     pub kind: String,
@@ -97,9 +111,11 @@ pub struct CursorRow {
     pub next_seq: u64,
 }
 
-/// One read the source drive had issued and not yet pushed to Q0 (e.5, MH 4.7).
+/// One read a source's drive had issued and not yet pushed to its queues (e.5, MH 4.7).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuedRow {
+    /// The source.
+    pub source: u16,
     /// The sequence number the read was given.
     pub seq: u64,
     /// Its split.
@@ -140,28 +156,27 @@ pub struct Manifest {
     pub nodes: Vec<u16>,
     /// Whether the staging directory survives the node.
     pub durable_staging: bool,
-    /// BLAKE3 hex over the source plan.
-    pub plan_digest: String,
+    /// BLAKE3 hex over each source's plan, source 0 first.
+    pub plan_digests: Vec<String>,
     /// Kernel fingerprints per stage 1..n, hex.
     pub kernels: Vec<String>,
     /// `reinit`, `checkpoint` or `forbid` per stage 1..n.
     pub resume_policy: Vec<String>,
     /// Number of queues.
-    pub stages: u16,
-    /// The watermark at the write.
-    pub committed_seq: Option<u64>,
-    /// Where the source drive is.
-    pub source_cursor: CursorRow,
-    /// Reads issued behind the cursor that had not reached Q0, ascending `seq`. Absent from a
-    /// manifest written before F8.4, which reads as empty: such a manifest loses a read in
-    /// flight exactly as it always did, and nothing else.
-    #[serde(default)]
+    pub queues: u16,
+    /// Each sink's watermark at the write, sink 0 first.
+    pub committed: Vec<Option<u64>>,
+    /// Where each source's drive is, source 0 first.
+    pub source_cursors: Vec<CursorRow>,
+    /// Reads issued behind a cursor that had not reached their source's queues, by source then
+    /// ascending `seq`.
     pub issued: Vec<IssuedRow>,
-    /// Base64 of `Sink::checkpoint`.
-    pub sink_state: Option<String>,
+    /// Base64 of each sink's `Sink::checkpoint`, sink 0 first.
+    pub sink_states: Vec<Option<String>>,
     /// `Checkpoint` kernels only.
     pub kernel_states: Vec<KernelStateRow>,
-    /// One row per uncommitted morsel, ascending `seq`.
+    /// One row per position of each source morsel some sink has not committed, by source and
+    /// root.
     pub lineage: Vec<LineageRow>,
     /// Every segment file the lineage references.
     pub segments: Vec<SegmentRow>,
@@ -214,6 +229,15 @@ fn kind_of_name(name: &str) -> Option<PayloadKind> {
 
 fn resume(path: &Path, what: impl std::fmt::Display) -> MorunaError {
     MorunaError::Resume(format!("{}: {what}", path.display()))
+}
+
+/// One batch a `restore` brings back: one disk record and every position that names it (f.18).
+struct RestoredBatch {
+    seg: SegmentRef,
+    kind: PayloadKind,
+    bytes: u64,
+    consumers: Vec<(StageId, Seq)>,
+    origin: Origin,
 }
 
 /// Read a manifest from disk and parse it (f.13).
@@ -286,8 +310,8 @@ pub fn find_manifest(
 pub struct ManifestMatch<'a> {
     /// The run's kernel fingerprints, stages 1..n.
     pub fingerprints: &'a [Fingerprint],
-    /// The run's plan digest (e.5), when its source is already built.
-    pub plan_digest: Option<[u8; 32]>,
+    /// The run's plan digests (e.5), source 0 first, when its sources are already built.
+    pub plan_digests: Option<Vec<[u8; 32]>>,
     /// The run's job document digest, when it was built from one.
     pub spec_digest: Option<&'a str>,
 }
@@ -302,8 +326,8 @@ impl ManifestMatch<'_> {
         if manifest.kernels != given {
             return Some("kernel fingerprints differ".into());
         }
-        if let Some(digest) = &self.plan_digest
-            && manifest.plan_digest != hex(digest)
+        if let Some(digests) = &self.plan_digests
+            && manifest.plan_digests != digests.iter().map(|d| hex(d)).collect::<Vec<_>>()
         {
             return Some("plan digest differs".into());
         }
@@ -384,6 +408,68 @@ pub fn find_resumable_manifest(
 }
 
 impl PlacementEngine {
+    /// Pin the actual payload of an unresolved manifest position while its producers and
+    /// consumers are quiesced by the scheduler. Tier moves may retain/release their own
+    /// references concurrently; no queue lock survives this call and no IO is issued.
+    /// Missing/evicted/device-only bytes remain an explicit refusal, never a source query.
+    pub fn checkpoint_payload(
+        &self,
+        row: &LineageRow,
+    ) -> moruna_kernel::Result<crate::state::PayloadRef> {
+        let index = self.check_stage(row.stage)?;
+        let queue = self.lock_queue(index);
+        let entry = queue
+            .order
+            .iter()
+            .find(|entry| entry.seq == row.seq)
+            .ok_or_else(|| {
+                MorunaError::Resume("checkpoint position has no retained payload".into())
+            })?;
+        if entry.stage != row.stage
+            || entry.origin.node.0 != row.node
+            || entry.origin.split != row.split
+            || entry.origin.row_start != row.row_start
+            || entry.origin.row_end != row.row_end
+        {
+            return Err(MorunaError::Resume(
+                "checkpoint retained position identity changed".into(),
+            ));
+        }
+        // Queue (position 2) precedes catalog (position 3). A queue entry only names
+        // its batch: residency, size and payload have exactly one authority, the catalog.
+        // Validate both mappings before pinning so a stale/rebound position cannot export
+        // another batch. This is not a consumer take and does not alter holders or totals.
+        let catalog = self.lock_catalog();
+        if catalog.of_entry(row.stage, row.seq) != Some(entry.buffer) {
+            return Err(MorunaError::Resume(
+                "checkpoint position no longer names its catalog batch".into(),
+            ));
+        }
+        let buffer = catalog
+            .get(entry.buffer)
+            .ok_or_else(|| MorunaError::Resume("checkpoint catalog batch is unavailable".into()))?;
+        if !buffer.consumers.contains(&(row.stage, row.seq))
+            || kind_name(buffer.kind) != row.kind
+            || buffer.bytes != row.bytes
+        {
+            return Err(MorunaError::Resume(
+                "checkpoint retained batch identity changed".into(),
+            ));
+        }
+        let payload = buffer.payload.as_ref().ok_or_else(|| {
+            MorunaError::Resume("checkpoint position requires unavailable bytes".into())
+        })?;
+        if payload.kind() != buffer.kind {
+            return Err(MorunaError::Resume(
+                "checkpoint catalog payload kind changed".into(),
+            ));
+        }
+        // Clone the actual Arrow/tensor ownership while the catalog is locked. DMA
+        // completion or eviction can later release its copy without invalidating this pin.
+        // Encoding and IO happen only after both guards leave this call.
+        Ok(payload.reference())
+    }
+
     /// `checkpoint` (f.12). Runs on the caller's thread, never under a queue lock, and the
     /// lineage lock is held only for the snapshot.
     pub(crate) fn write_manifest(
@@ -394,30 +480,82 @@ impl PlacementEngine {
         let Some(dir) = self.run_dir.clone() else {
             return Err(MorunaError::Resume("no staging directory".into()));
         };
-        let committed_seq = extras.committed_seq.or_else(|| self.committed_seq());
-        let snapshot = self.lineage_snapshot(committed_seq);
+        let sinks = usize::from(self.cfg.topology.sinks());
+        let engine_committed = self.sink_watermarks();
+        let committed: Vec<Option<Seq>> = (0..sinks)
+            .map(|sink| {
+                extras
+                    .committed
+                    .get(sink)
+                    .copied()
+                    .flatten()
+                    .or(engine_committed.get(sink).copied().flatten())
+            })
+            .collect();
+        let above: Vec<Option<Seq>> = (0..self.cfg.topology.sources())
+            .map(|source| self.source_watermark(source, &committed))
+            .collect();
+        let snapshot = self.lineage_snapshot(&above);
         let mut referenced: HashSet<u32> = HashSet::new();
         let mut lineage = Vec::with_capacity(snapshot.len());
-        for (seq, record) in snapshot {
-            if let Some(disk) = record.disk {
-                referenced.insert(disk.segment);
+        // Where a waiting morsel's bytes have a disk copy is its batch's, in the catalog (f.18):
+        // read after the lineage lock is released (preamble 4.2).
+        let catalog = self.lock_catalog();
+        let disk_of = |stage: StageId, seq: Seq, consumed: bool| -> Option<SegmentRef> {
+            if consumed {
+                return None;
             }
-            lineage.push(LineageRow {
-                seq,
-                split: record.origin.split,
-                row_start: record.origin.row_start,
-                row_end: record.origin.row_end,
-                node: record.origin.node.0,
-                stage: record.stage,
-                kind: kind_name(record.kind).to_string(),
-                bytes: record.bytes,
-                disk: record.disk.map(|disk| DiskRef {
-                    segment: disk.segment,
-                    offset: disk.offset,
-                    len: disk.len,
-                }),
-            });
+            let buffer = catalog.get(catalog.of_entry(stage, seq)?)?;
+            if !buffer.consumers.contains(&(stage, seq)) {
+                return None;
+            }
+            buffer.disk
+        };
+        for ((source, root), record) in snapshot {
+            let row =
+                |stage: StageId, seq: Seq, kind, bytes, disk: Option<SegmentRef>| LineageRow {
+                    source,
+                    root,
+                    seq,
+                    split: record.origin.split,
+                    row_start: record.origin.row_start,
+                    row_end: record.origin.row_end,
+                    node: record.origin.node.0,
+                    stage,
+                    kind: kind_name(kind).to_string(),
+                    bytes,
+                    disk: disk.map(|disk| DiskRef {
+                        segment: disk.segment,
+                        offset: disk.offset,
+                        len: disk.len,
+                    }),
+                };
+            if record.positions.is_empty() {
+                // A record with no position is read again from its origin on resume.
+                let stage = self
+                    .cfg
+                    .topology
+                    .source_outputs(source)
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                lineage.push(row(stage, root, PayloadKind::Table, 0, None));
+            }
+            for position in &record.positions {
+                let disk = disk_of(position.stage, position.seq, position.consumed);
+                if let Some(disk) = disk {
+                    referenced.insert(disk.segment);
+                }
+                lineage.push(row(
+                    position.stage,
+                    position.seq,
+                    position.kind,
+                    position.bytes,
+                    disk,
+                ));
+            }
         }
+        drop(catalog);
         let segments: Vec<SegmentRow> = {
             let staging = self.lock_staging();
             let mut rows: Vec<SegmentRow> = staging
@@ -447,7 +585,7 @@ impl PlacementEngine {
                 .unwrap_or_default(),
             nodes: vec![self.cfg.node.0],
             durable_staging: self.cfg.durable_staging,
-            plan_digest: hex(&self.cfg.plan_digest),
+            plan_digests: self.cfg.plan_digests.iter().map(|d| hex(d)).collect(),
             kernels: self
                 .cfg
                 .fingerprints
@@ -460,34 +598,54 @@ impl PlacementEngine {
                 .iter()
                 .map(|policy| policy_name(*policy).to_string())
                 .collect(),
-            stages: self.cfg.stages,
-            committed_seq,
-            source_cursor: CursorRow {
-                split_index: extras.source_cursor.split_index,
-                row_offset: extras.source_cursor.row_offset,
-                next_seq: extras.source_cursor.next_seq,
-            },
+            queues: self.cfg.topology.queue_count(),
+            committed: committed.clone(),
+            source_cursors: (0..usize::from(self.cfg.topology.sources()))
+                .map(|source| {
+                    let cursor = extras
+                        .source_cursors
+                        .get(source)
+                        .copied()
+                        .unwrap_or_default();
+                    CursorRow {
+                        split_index: cursor.split_index,
+                        row_offset: cursor.row_offset,
+                        next_seq: cursor.next_seq,
+                    }
+                })
+                .collect(),
             issued: {
-                let mut rows: Vec<IssuedRow> = extras
-                    .issued
-                    .iter()
-                    .filter(|(seq, _)| committed_seq.is_none_or(|watermark| *seq > watermark))
-                    .map(|(seq, origin)| IssuedRow {
-                        seq: *seq,
-                        split: origin.split,
-                        row_start: origin.row_start,
-                        row_end: origin.row_end,
-                        node: origin.node.0,
-                    })
-                    .collect();
-                rows.sort_by_key(|row| row.seq);
-                rows.dedup_by_key(|row| row.seq);
+                let mut rows: Vec<IssuedRow> = Vec::new();
+                for (source, reads) in extras.issued.iter().enumerate() {
+                    let watermark = above.get(source).copied().flatten();
+                    rows.extend(
+                        reads
+                            .iter()
+                            .filter(|(seq, _)| watermark.is_none_or(|w| *seq > w))
+                            .map(|(seq, origin)| IssuedRow {
+                                source: source as u16,
+                                seq: *seq,
+                                split: origin.split,
+                                row_start: origin.row_start,
+                                row_end: origin.row_end,
+                                node: origin.node.0,
+                            }),
+                    );
+                }
+                rows.sort_by_key(|row| (row.source, row.seq));
+                rows.dedup_by_key(|row| (row.source, row.seq));
                 rows
             },
-            sink_state: extras
-                .sink_state
-                .as_ref()
-                .map(|state| base64::engine::general_purpose::STANDARD.encode(state)),
+            sink_states: (0..sinks)
+                .map(|sink| {
+                    extras
+                        .sink_states
+                        .get(sink)
+                        .cloned()
+                        .flatten()
+                        .map(|state| base64::engine::general_purpose::STANDARD.encode(state))
+                })
+                .collect(),
             kernel_states: extras
                 .kernel_states
                 .iter()
@@ -546,7 +704,7 @@ impl PlacementEngine {
     pub(crate) fn restore_from(
         &self,
         path: &Path,
-        plan: &[Split],
+        plans: &[Vec<Split>],
         fingerprints: &[Fingerprint],
     ) -> moruna_kernel::Result<ResumePoint> {
         let manifest = read_manifest(path)?;
@@ -566,20 +724,40 @@ impl PlacementEngine {
                 ),
             ));
         }
-        let computed = hex(&plan_digest(plan));
-        if manifest.plan_digest != computed {
+        let computed: Vec<String> = plans.iter().map(|plan| hex(&plan_digest(plan))).collect();
+        if manifest.plan_digests != computed {
             return Err(resume(
                 path,
                 format!(
-                    "plan digest {} does not match the plan's {computed}",
-                    manifest.plan_digest
+                    "plan digest {} does not match the plan's {}",
+                    manifest.plan_digests.join(","),
+                    computed.join(",")
                 ),
             ));
         }
-        if hex(&self.cfg.plan_digest) != computed {
+        let configured: Vec<String> = self.cfg.plan_digests.iter().map(|d| hex(d)).collect();
+        if configured != computed {
             return Err(resume(
                 path,
                 "the configured plan digest does not match the plan".to_string(),
+            ));
+        }
+        if manifest.queues != self.cfg.topology.queue_count()
+            || manifest.committed.len() != usize::from(self.cfg.topology.sinks())
+            || manifest.source_cursors.len() != usize::from(self.cfg.topology.sources())
+        {
+            return Err(resume(
+                path,
+                format!(
+                    "written for a run of {} queues, {} sources and {} sinks; this one has {}, \
+                     {} and {}",
+                    manifest.queues,
+                    manifest.source_cursors.len(),
+                    manifest.committed.len(),
+                    self.cfg.topology.queue_count(),
+                    self.cfg.topology.sources(),
+                    self.cfg.topology.sinks()
+                ),
             ));
         }
         let given: Vec<String> = fingerprints.iter().map(Fingerprint::to_hex).collect();
@@ -673,92 +851,202 @@ impl PlacementEngine {
                 ));
             }
         }
-        if let Some(seq) = manifest.committed_seq {
-            self.committed.store(seq, Ordering::Release);
+        for (sink, watermark) in manifest.committed.iter().enumerate() {
+            if let (Some(seq), Some(cell)) = (watermark, self.sink_watermarks.get(sink)) {
+                cell.store(*seq, Ordering::Release);
+            }
         }
-        let mut to_recompute: Vec<(Seq, Origin)> = Vec::new();
-        let mut restored: Vec<(StageId, Entry)> = Vec::new();
+        let above: Vec<Option<Seq>> = (0..self.cfg.topology.sources())
+            .map(|source| self.source_watermark(source, &manifest.committed))
+            .collect();
+        for (source, watermark) in above.iter().enumerate() {
+            if let (Some(seq), Some(cell)) = (watermark, self.source_watermarks.get(source)) {
+                cell.store(*seq, Ordering::Release);
+            }
+        }
+        let covered = |source: u16, root: u64| {
+            above
+                .get(usize::from(source))
+                .copied()
+                .flatten()
+                .is_some_and(|watermark| root <= watermark)
+        };
+        // f.13 for a DAG (d.16): a source morsel whose every position has a disk copy comes back
+        // at each of them; any other is read again from its origin and replayed to every queue
+        // its source gives, and each sink drops what its own watermark already covers. In a
+        // chain a source morsel has one position, so this is the chain's rule exactly.
+        let mut roots: std::collections::BTreeMap<(u16, u64), Vec<&LineageRow>> =
+            std::collections::BTreeMap::new();
+        for row in manifest
+            .lineage
+            .iter()
+            .filter(|row| !covered(row.source, row.root))
+        {
+            if usize::from(row.source) >= plans.len() {
+                return Err(resume(
+                    path,
+                    format!("source {} is outside the run", row.source),
+                ));
+            }
+            roots.entry((row.source, row.root)).or_default().push(row);
+        }
+        let mut to_recompute: Vec<Vec<(Seq, Origin)>> = vec![Vec::new(); plans.len()];
+        // One batch per disk record (f.18): a batch fanned out before it was spilled was written
+        // once, and each of its positions names the same record, so it comes back as one batch
+        // with one consumer per position.
+        let mut batches: Vec<RestoredBatch> = Vec::new();
         let mut per_segment: HashMap<u32, u64> = HashMap::new();
+        let mut by_record: HashMap<(u32, u64), usize> = HashMap::new();
         {
             let mut lineage = self.lock_lineage();
             lineage.clear();
-            let covered = |seq: u64| {
-                manifest
-                    .committed_seq
-                    .is_some_and(|watermark| seq <= watermark)
-            };
-            for row in manifest.lineage.iter().filter(|row| !covered(row.seq)) {
-                let Some(kind) = kind_of_name(&row.kind) else {
-                    return Err(resume(path, format!("unknown payload kind {}", row.kind)));
-                };
+            for (&(source, root), rows) in &roots {
+                let first = rows[0];
                 let origin = Origin {
+                    split: first.split,
+                    row_start: first.row_start,
+                    row_end: first.row_end,
+                    node: NodeId(first.node),
+                };
+                if !rows.iter().all(|row| row.disk.is_some()) {
+                    to_recompute[usize::from(source)].push((root, origin));
+                    continue;
+                }
+                let mut positions = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let Some(kind) = kind_of_name(&row.kind) else {
+                        return Err(resume(path, format!("unknown payload kind {}", row.kind)));
+                    };
+                    let Some(disk) = row.disk.as_ref() else {
+                        continue;
+                    };
+                    if usize::from(row.stage) >= self.queues.len() {
+                        return Err(resume(
+                            path,
+                            format!("stage {} is outside the run", row.stage),
+                        ));
+                    }
+                    let seg = SegmentRef {
+                        segment: disk.segment,
+                        offset: disk.offset,
+                        len: disk.len,
+                    };
+                    positions.push(crate::lineage::Position {
+                        stage: row.stage,
+                        seq: row.seq,
+                        kind,
+                        bytes: row.bytes,
+                        consumed: false,
+                    });
+                    match by_record.get(&(seg.segment, seg.offset)) {
+                        Some(&at) => batches[at].consumers.push((row.stage, row.seq)),
+                        None => {
+                            *per_segment.entry(seg.segment).or_insert(0) += 1;
+                            by_record.insert((seg.segment, seg.offset), batches.len());
+                            batches.push(RestoredBatch {
+                                seg,
+                                kind,
+                                bytes: row.bytes,
+                                consumers: vec![(row.stage, row.seq)],
+                                origin: origin.clone(),
+                            });
+                        }
+                    }
+                }
+                lineage.insert(
+                    (source, root),
+                    crate::lineage::Lineage {
+                        origin,
+                        positions,
+                        committed: false,
+                    },
+                );
+            }
+        }
+        let mut restored: Vec<(StageId, Entry)> = Vec::new();
+        {
+            let mut catalog = self.lock_catalog();
+            for RestoredBatch {
+                seg,
+                kind,
+                bytes,
+                consumers,
+                origin,
+            } in batches
+            {
+                let Some(&(first, _)) = consumers.first() else {
+                    continue;
+                };
+                let owner = match self.cfg.topology.link(first) {
+                    Some(link) => link.from,
+                    None => {
+                        return Err(resume(path, format!("stage {first} is outside the run")));
+                    }
+                };
+                let id = catalog
+                    .insert(NewBuffer {
+                        bytes,
+                        kind,
+                        owner,
+                        payload: None,
+                        state: State::OnDisk(seg),
+                        disk: Some(seg),
+                        recomputable: self.cfg.topology.source_of(first).is_some(),
+                        consumers: consumers.clone(),
+                        outside: false,
+                    })
+                    .map_err(|e| resume(path, e))?;
+                for (stage, seq) in consumers {
+                    restored.push((
+                        stage,
+                        Entry {
+                            seq,
+                            stage,
+                            origin: origin.clone(),
+                            features: MorselFeatures::default(),
+                            buffer: id,
+                        },
+                    ));
+                }
+            }
+        }
+        restored.sort_by_key(|(stage, entry)| (entry.seq, *stage));
+        // MH 4.7: a read in flight at the write is behind its cursor and in no queue; it is
+        // read again unless the lineage caught it too (the drive pushes, then forgets, so a
+        // read that landed between the two snapshots is in both).
+        let mut issued: Vec<Vec<(Seq, Origin)>> = vec![Vec::new(); plans.len()];
+        for row in manifest
+            .issued
+            .iter()
+            .filter(|row| !covered(row.source, row.seq))
+        {
+            let Some(reads) = issued.get_mut(usize::from(row.source)) else {
+                return Err(resume(
+                    path,
+                    format!("source {} is outside the run", row.source),
+                ));
+            };
+            reads.push((
+                row.seq,
+                Origin {
                     split: row.split,
                     row_start: row.row_start,
                     row_end: row.row_end,
                     node: NodeId(row.node),
-                };
-                let disk = row.disk.as_ref().map(|disk| SegmentRef {
-                    segment: disk.segment,
-                    offset: disk.offset,
-                    len: disk.len,
-                });
-                lineage.insert(
-                    row.seq,
-                    crate::lineage::Lineage {
-                        origin: origin.clone(),
-                        stage: row.stage,
-                        kind,
-                        bytes: row.bytes,
-                        disk,
-                        consumed: false,
-                        committed: false,
-                    },
-                );
-                match disk {
-                    Some(seg) => {
-                        *per_segment.entry(seg.segment).or_insert(0) += 1;
-                        restored.push((
-                            row.stage,
-                            Entry::on_disk(row.seq, row.stage, origin, row.bytes, kind, seg),
-                        ));
-                    }
-                    None => to_recompute.push((row.seq, origin)),
-                }
-            }
+                },
+            ));
         }
-        restored.sort_by_key(|(_, entry)| entry.seq);
-        // MH 4.7: a read in flight at the write is behind the cursor and in no queue; it is
-        // read again unless the lineage caught it too (the drive pushes, then forgets, so a
-        // read that landed between the two snapshots is in both).
-        let known: HashSet<u64> = manifest.lineage.iter().map(|row| row.seq).collect();
-        let issued: Vec<(Seq, Origin)> = manifest
-            .issued
-            .iter()
-            .filter(|row| {
-                manifest
-                    .committed_seq
-                    .is_none_or(|watermark| row.seq > watermark)
-            })
-            .map(|row| {
-                (
-                    row.seq,
-                    Origin {
-                        split: row.split,
-                        row_start: row.row_start,
-                        row_end: row.row_end,
-                        node: NodeId(row.node),
-                    },
-                )
-            })
-            .collect();
-        to_recompute.extend(
-            issued
-                .iter()
-                .filter(|(seq, _)| !known.contains(seq))
-                .cloned(),
-        );
-        to_recompute.sort_by_key(|(seq, _)| *seq);
-        to_recompute.dedup_by_key(|(seq, _)| *seq);
+        for (source, reads) in issued.iter().enumerate() {
+            let recompute = &mut to_recompute[source];
+            recompute.extend(
+                reads
+                    .iter()
+                    .filter(|(seq, _)| !roots.contains_key(&(source as u16, *seq)))
+                    .cloned(),
+            );
+            recompute.sort_by_key(|(seq, _)| *seq);
+            recompute.dedup_by_key(|(seq, _)| *seq);
+        }
         {
             let mut staging = self.lock_staging();
             staging.segments.clear();
@@ -798,8 +1086,7 @@ impl PlacementEngine {
                 return Err(resume(path, format!("stage {stage} is outside the run")));
             }
             let mut queue = self.lock_queue(index);
-            queue.order.push_back(entry);
-            self.counters[index].count.fetch_add(1, Ordering::Relaxed);
+            self.enqueue(&mut queue, entry);
         }
         self.restored.store(true, Ordering::Release);
         // The restored heads are on disk; nothing else will trigger the first promotion.
@@ -812,9 +1099,8 @@ impl PlacementEngine {
         tracing::info!(
             target: "placement.restore",
             on_disk,
-            to_recompute = to_recompute.len(),
-            committed_seq = manifest.committed_seq,
-            next_seq = manifest.source_cursor.next_seq
+            to_recompute = to_recompute.iter().map(Vec::len).sum::<usize>(),
+            committed = ?manifest.committed,
         );
         let extras = CheckpointExtras {
             kernel_states: manifest
@@ -827,16 +1113,25 @@ impl PlacementEngine {
                         .map(|state| (row.stage, row.instance as usize, state))
                 })
                 .collect(),
-            sink_state: manifest
-                .sink_state
-                .as_ref()
-                .and_then(|state| base64::engine::general_purpose::STANDARD.decode(state).ok()),
-            committed_seq: manifest.committed_seq,
-            source_cursor: SourceCursor {
-                split_index: manifest.source_cursor.split_index,
-                row_offset: manifest.source_cursor.row_offset,
-                next_seq: manifest.source_cursor.next_seq,
-            },
+            sink_states: manifest
+                .sink_states
+                .iter()
+                .map(|state| {
+                    state.as_ref().and_then(|state| {
+                        base64::engine::general_purpose::STANDARD.decode(state).ok()
+                    })
+                })
+                .collect(),
+            committed: manifest.committed.clone(),
+            source_cursors: manifest
+                .source_cursors
+                .iter()
+                .map(|cursor| SourceCursor {
+                    split_index: cursor.split_index,
+                    row_offset: cursor.row_offset,
+                    next_seq: cursor.next_seq,
+                })
+                .collect(),
             issued,
         };
         Ok(ResumePoint {

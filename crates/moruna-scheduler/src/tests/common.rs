@@ -6,8 +6,9 @@
 //! order of the `close` and `set_committed` calls `FakePlacement` does not keep;
 //! `NamingSource`, `NamingSink` and `NamingKernel`, which record the name of the thread each
 //! call ran on (SC-T1); `SlowSource`, whose read future resolves only after a number of polls
-//! (SC-T3); and the stateful kernels of SC-T6, SC-T15 and SC-T18, which need behaviour no fake
-//! knob provides.
+//! (SC-T3); `HeldSource`, whose reads of the later splits stay pending until the test lets
+//! them go (SC-T16, SC-T21); and the stateful kernels of SC-T6, SC-T15 and SC-T18, which need
+//! behaviour no fake knob provides.
 
 #![allow(dead_code)]
 
@@ -56,6 +57,10 @@ pub fn cfg() -> SchedulerConfig {
         heartbeat_interval_ms: 1000,
         resuming: false,
         node: moruna_kernel::LOCAL_NODE,
+        policy: crate::policies::ADMISSION.to_string(),
+        policies: crate::policies::standard(),
+        clock: std::sync::Arc::new(crate::decide::SystemClock::default()),
+        disk_bytes_per_second: crate::decide::DISK_BYTES_PER_SECOND,
     }
 }
 
@@ -197,11 +202,11 @@ impl RigBuilder {
             Some(sink) => sink,
             None => Box::new(self.sink.clone()),
         };
-        let pipeline = Pipeline {
+        let pipeline = Pipeline::chain(
             source,
-            kernels: self.kernels,
-            sink: SinkHandle::wrap(inner, self.ordered, 256 * 1024 * 1024),
-        };
+            self.kernels,
+            SinkHandle::wrap(inner, self.ordered, 256 * 1024 * 1024),
+        );
         let scheduler = Scheduler::new(
             self.cfg,
             pipeline,
@@ -261,6 +266,57 @@ impl RecordingPlacement {
     }
 }
 
+impl moruna_kernel::Residency for RecordingPlacement {
+    fn snapshot(&self) -> moruna_kernel::CatalogSnapshot {
+        self.inner.snapshot()
+    }
+    fn head(&self, stage: StageId) -> Option<moruna_kernel::Head> {
+        self.inner.head(stage)
+    }
+    fn reserve(&self, tier: moruna_kernel::Tier, bytes: u64) -> Result<moruna_kernel::Reserve> {
+        self.inner.reserve(tier, bytes)
+    }
+    fn push_reserved(
+        &self,
+        stages: &[StageId],
+        morsel: Morsel,
+        claim: moruna_kernel::Reservation,
+    ) -> Result<()> {
+        self.inner.push_reserved(stages, morsel, claim)
+    }
+    fn replace_reserved(
+        &self,
+        stage: StageId,
+        morsel: Morsel,
+        claim: moruna_kernel::Reservation,
+    ) -> Result<()> {
+        self.recorder
+            .replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(morsel.seq);
+        self.inner.replace_reserved(stage, morsel, claim)
+    }
+    fn push_spilled(&self, stages: &[StageId], morsel: Morsel) -> Result<()> {
+        self.inner.push_spilled(stages, morsel)
+    }
+    fn shed(&self, tier: TierKind, bytes: u64) -> bool {
+        self.inner.shed(tier, bytes)
+    }
+    fn spill(&self, batch: moruna_kernel::BufferId) -> Result<()> {
+        self.inner.spill(batch)
+    }
+    fn reload(&self, batch: moruna_kernel::BufferId) -> Result<()> {
+        self.inner.reload(batch)
+    }
+    fn observe(&self, observer: Arc<dyn moruna_kernel::CatalogObserver>) {
+        self.inner.observe(observer);
+    }
+    fn floor(&self, tier: moruna_kernel::Tier, batch: u64) -> moruna_kernel::CatalogFloor {
+        self.inner.floor(tier, batch)
+    }
+}
+
 impl Placement for RecordingPlacement {
     fn push(&self, stage: StageId, morsel: Morsel) -> Result<()> {
         self.inner.push(stage, morsel)
@@ -277,6 +333,10 @@ impl Placement for RecordingPlacement {
         locality: Locality,
     ) -> Result<Option<(Morsel, u64)>> {
         self.inner.pop_blocking(stage, want, locality)
+    }
+
+    fn release(&self, stage: StageId, seq: Seq) -> Result<()> {
+        self.inner.release(stage, seq)
     }
 
     fn peek_resident(&self, stage: StageId, want: PayloadSpec, locality: Locality) -> bool {
@@ -300,13 +360,13 @@ impl Placement for RecordingPlacement {
         self.inner.shutdown();
     }
 
-    fn set_committed(&self, seq: Seq) {
+    fn set_committed(&self, sink: u16, seq: Seq) {
         self.recorder
             .committed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(seq);
-        self.inner.set_committed(seq);
+        self.inner.set_committed(sink, seq);
     }
 
     fn checkpoint(&self, extras: &CheckpointExtras) -> Result<PathBuf> {
@@ -316,10 +376,10 @@ impl Placement for RecordingPlacement {
     fn restore(
         &self,
         manifest: &Path,
-        plan: &[Split],
+        plans: &[Vec<Split>],
         fingerprints: &[Fingerprint],
     ) -> Result<ResumePoint> {
-        self.inner.restore(manifest, plan, fingerprints)
+        self.inner.restore(manifest, plans, fingerprints)
     }
 
     fn is_full(&self, stage: StageId) -> bool {
@@ -596,6 +656,8 @@ pub struct StatefulKernel {
     pub applies: Arc<Mutex<Vec<(usize, std::thread::ThreadId)>>>,
     busy: Arc<Mutex<Vec<bool>>>,
     latch: Option<Latch>,
+    /// The morsel whose first value this is waits in `apply` until the condition holds.
+    stall: Option<(i64, Arc<dyn Fn() -> bool + Send + Sync>)>,
 }
 
 /// A latch a test closes in front of a kernel.
@@ -696,12 +758,25 @@ impl StatefulKernel {
             applies: Arc::new(Mutex::new(Vec::new())),
             busy: Arc::new(Mutex::new(vec![false; instances])),
             latch: None,
+            stall: None,
         }
     }
 
     /// Hold `apply` at `latch` once it has let its quota through (SC-T16).
     pub fn gated(mut self, latch: Latch) -> StatefulKernel {
         self.latch = Some(latch);
+        self
+    }
+
+    /// Keep the first morsel of `split` in `apply` until `until` holds: the worker that has it
+    /// is, in effect, descheduled by the host while the other carries the later morsels on
+    /// (SC-T16).
+    pub fn stalling(
+        mut self,
+        split: moruna_kernel::SplitId,
+        until: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> StatefulKernel {
+        self.stall = Some((FakeSource::value_at(split, 0), until));
         self
     }
 
@@ -772,8 +847,8 @@ impl KernelState for WatchedState {
         Ok(Some((self.instance as u64).to_le_bytes().to_vec()))
     }
 
-    fn footprint(&self) -> Option<u64> {
-        Some(self.instance as u64)
+    fn footprint(&self) -> moruna_kernel::Result<Option<u64>> {
+        Ok(Some(self.instance as u64))
     }
 }
 
@@ -853,6 +928,14 @@ impl Kernel for StatefulKernel {
         if !self.latency.is_zero() {
             std::thread::sleep(self.latency);
         }
+        if let Some((value, until)) = self.stall.as_ref()
+            && first_value(&input) == Some(*value)
+        {
+            assert!(
+                wait_for(Duration::from_secs(30), || until()),
+                "the stalled morsel's condition never held"
+            );
+        }
         if let Some(latch) = self.latch.as_ref() {
             latch.pass();
         }
@@ -863,6 +946,94 @@ impl Kernel for StatefulKernel {
             }
         }
         Ok(input)
+    }
+}
+
+/// The first value of a `FakeSource` table's one column, which names the split it was read from
+/// (`FakeSource::value_at`).
+fn first_value(input: &Payload) -> Option<i64> {
+    use moruna_kernel::arrow::array::{Array, Int64Array};
+    let Payload::Table(batch, _) = input else {
+        return None;
+    };
+    let values = batch
+        .columns()
+        .first()?
+        .as_any()
+        .downcast_ref::<Int64Array>()?;
+    (!values.is_empty()).then(|| values.value(0))
+}
+
+/// A `FakeSource` whose reads of every split from `from` on stay pending until the test lets
+/// them go, so a run is held with reads demonstrably in flight and cannot finish, whatever order
+/// the workers take the morsels of the earlier splits in.
+pub struct HeldSource {
+    inner: FakeSource,
+    from: moruna_kernel::SplitId,
+    pub release: Arc<AtomicBool>,
+    /// Reads of the held splits issued so far.
+    pub pending: Arc<AtomicUsize>,
+}
+
+impl HeldSource {
+    pub fn new(inner: FakeSource, from: moruna_kernel::SplitId) -> HeldSource {
+        HeldSource {
+            inner,
+            from,
+            release: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Source for HeldSource {
+    fn schema(&self) -> SourceSchema {
+        Source::schema(&self.inner)
+    }
+
+    fn plan(&self) -> Result<Vec<Split>> {
+        Source::plan(&self.inner)
+    }
+
+    fn read<'a>(
+        &'a self,
+        split: &'a Split,
+        rows: Option<RowRange>,
+        alloc: &'a dyn Allocator,
+        tier: moruna_kernel::Tier,
+    ) -> BoxFuture<'a, Result<Payload>> {
+        let held = split.id >= self.from;
+        if held {
+            self.pending.fetch_add(1, Ordering::SeqCst);
+        }
+        let release = Arc::clone(&self.release);
+        let mut inner = Source::read(&self.inner, split, rows, alloc, tier);
+        Box::pin(std::future::poll_fn(move |cx| {
+            if held && !release.load(Ordering::SeqCst) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            inner.as_mut().poll(cx)
+        }))
+    }
+
+    fn repeatable(&self) -> bool {
+        Source::repeatable(&self.inner)
+    }
+}
+
+/// Runs its closure when it goes out of scope, a failed assertion's unwinding included.
+///
+/// A test that holds a run (at a latch, or with a source it has not released) and then asserts
+/// inside `std::thread::scope` must end the run on every way out: the scope joins the run's
+/// thread before the panic propagates, and a run nobody releases never ends, so a failed
+/// assertion became a test that waited for ever instead of one that failed with its message
+/// (SC-T16 and SC-T21; on CI the job ran into its six-hour limit).
+pub struct Release<F: FnMut()>(pub F);
+
+impl<F: FnMut()> Drop for Release<F> {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }
 
@@ -1058,4 +1229,14 @@ impl Cases {
     pub fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
+}
+
+/// What `policy` decides for `state`, its actions in order.
+pub fn decided(
+    policy: &mut dyn moruna_kernel::SchedulingPolicy,
+    state: &moruna_kernel::SchedulerState<'_>,
+) -> Vec<moruna_kernel::Action> {
+    let mut actions = Vec::new();
+    policy.decide(state, &mut actions);
+    actions
 }

@@ -29,3 +29,9 @@ moruna-testkit = { workspace = true }
 default = []
 cuda = ["dep:cudarc"]
 rdma = []
+
+# The eviction order's benchmark (09 f.18, PL-B1): known-future against an LRU comparator that
+# lives in the bench alone. `cargo bench -p moruna-placement --bench known_future`.
+[[bench]]
+name = "known_future"
+harness = false

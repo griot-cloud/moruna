@@ -9,7 +9,7 @@ Moruna requires Python 3.14 or later and `pyarrow>=17`. The names below are avai
 | [Sources](python-sources.md) | Built-in constructors, `Source` methods and `Split` attributes. |
 | [Sinks](python-sinks.md) | Built-in constructors and `Sink` methods. |
 | [Standard kernels](python-standard-kernels.md) | Every `moruna.std` function and `StdKernel` attributes. |
-| [Results and errors](python-results.md) | `RunReport`, `inspect_host`, and the exception hierarchy. |
+| [Results and errors](python-results.md) | `RunReport`, `inspect_host`, `explain`, `check`, and the exception hierarchy. |
 
 For longer examples, see [Running jobs from Python](python.md), [Writing kernels](kernels.md), and [Custom sources and sinks](sources-and-sinks.md).
 

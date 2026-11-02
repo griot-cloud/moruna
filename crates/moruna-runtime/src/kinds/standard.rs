@@ -57,6 +57,7 @@ impl RunnableKind for Std {
             deterministic: Fact::Yes,
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Builtin,
+            served: None,
         }
     }
 

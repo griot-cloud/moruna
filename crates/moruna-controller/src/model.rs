@@ -157,6 +157,7 @@ pub(crate) fn resting_anon(state: &ControllerState) -> u64 {
         .saturating_add(state.cfg.sink_buffer_bytes)
         .saturating_add(state.arena_draining)
         .saturating_add(state.cfg.engine_bytes)
+        .saturating_add(state.cfg.fixed_native_bytes)
 }
 
 /// The anonymous bytes the run may add above the resting figure before the ceiling S1 measures
@@ -206,20 +207,14 @@ pub(crate) fn anon_for_kernels(state: &ControllerState) -> u64 {
 /// The headroom the kernels may be planned into at all, fixed term included: `KERNEL_ANON_SHARE`
 /// of what the arena left above itself, less the bytes the instances hold.
 pub(crate) fn for_kernels(state: &ControllerState) -> u64 {
-    scale(
-        anon_headroom(state).saturating_sub(state.state_total),
-        KERNEL_ANON_SHARE,
-    )
+    kernel_envelope(anon_headroom(state), state.state_total)
 }
 
 /// What one in-flight morsel of a stage costs the process outside the arena (f.3): the anon
 /// analogue of `allowance`.
 pub(crate) fn anon_allowance(state: &ControllerState, at: usize, target: u64) -> u64 {
     let ctl = &state.stages[at];
-    scale(
-        target,
-        ctl.a_anon.max(MIN_AMPLIFICATION) * f64::from(ctl.safety),
-    )
+    anon_work(target, ctl.a_anon, ctl.safety)
 }
 
 /// The anonymous footprint a proposed set of targets would reach, above the resting figure: the
@@ -828,4 +823,191 @@ pub(crate) fn resize(state: &mut ControllerState, actions: &mut Actions) {
     actions.budgets = Some(tier_budgets);
     refresh_envelopes(state);
     apply::assert_consistent(state);
+}
+
+/// Canonical anonymous kernel planning envelope, shared with pre-dispatch admission.
+pub(crate) fn kernel_envelope(headroom: u64, state: u64) -> u64 {
+    scale(headroom.saturating_sub(state), KERNEL_ANON_SHARE)
+}
+
+/// Canonical anonymous allowance of one in-flight morsel.
+pub(crate) fn anon_work(target: u64, amplification: f64, safety: f32) -> u64 {
+    scale(
+        target,
+        amplification.max(MIN_AMPLIFICATION) * f64::from(safety),
+    )
+}
+
+#[cfg(test)]
+mod native_commitment_tests {
+    use super::*;
+    use crate::{Controller, ControllerConfig, KernelInfo, PlanSummary};
+    use moruna_kernel::{Fingerprint, KernelHints, KernelKind, ProbeResult, Topology};
+    use moruna_testkit::{FakeKnobs, FakePlacement, FakeSampler, FakeTrace};
+    use std::sync::Arc;
+
+    fn controller(fixed: u64) -> Controller {
+        let cfg = ControllerConfig {
+            limits: moruna_kernel::Limits {
+                memory_ceiling: 402653184,
+                ..ControllerConfig::default().limits
+            },
+            baseline_bytes: 10026192,
+            arena_bytes: 117440512,
+            fixed_native_bytes: fixed,
+            plan: PlanSummary {
+                total_bytes: 1 << 30,
+                ..Default::default()
+            },
+            workers_max: 2,
+            ..Default::default()
+        };
+        let probe = |peak_delta| ProbeResult {
+            bytes_in: cfg.probe_bytes,
+            rows_in: 100,
+            peak_delta,
+            dev_peak_delta: 0,
+            wall_ns: 1,
+            cpu_ns: 1,
+        };
+        let knobs = FakeKnobs::new()
+            .probe_result(1, probe(12 << 20))
+            .probe_result(2, probe(18 << 20));
+        let kernels = (1..=2)
+            .map(|stage| KernelInfo {
+                stage,
+                fingerprint: Fingerprint([stage as u8; 32]),
+                schema_hash: [stage as u8; 32],
+                hints: KernelHints::default(),
+                kind: KernelKind::Stateful {
+                    max_instances: std::num::NonZeroUsize::new(1).unwrap(),
+                },
+            })
+            .collect();
+        Controller::new(
+            cfg,
+            Arc::new(knobs.clone()),
+            Arc::new(knobs.clone()),
+            Arc::new(knobs),
+            Arc::new(FakeSampler::new().scripted(vec![moruna_kernel::Sample {
+                anon_bytes: 10026192 + 117440512 + fixed,
+                at_ns: 1,
+                ..Default::default()
+            }])),
+            Arc::new(FakeTrace::new()),
+            Arc::new(FakePlacement::new()),
+            Topology::chain(2),
+            kernels,
+        )
+        .expect("controller")
+    }
+
+    #[test]
+    fn native_commitments_are_funded_once_not_fitted_again_per_stage() {
+        // Actual page-rounded pool in the native two-stage job, not the pre-carve estimate.
+        let retained = 2 * 57389056;
+        // First just the funded pool, then the actual failed run's no-growth pressure.
+        for (before, expected_local_fixed) in [(242244816, 0), (269442656, 27197840)] {
+            let ctl = controller(retained);
+            ctl.prepare().unwrap();
+            {
+                let mut state = ctl.inner.held();
+                state.phase = crate::Phase::Running;
+                state.active_workers = 1;
+                let floor = state.cfg.morsel_min;
+                for stage in &mut state.stages {
+                    stage.target = floor;
+                }
+                assert_eq!(resting_anon(&state), 242244816);
+                assert_eq!(anon_headroom(&state), 160408368);
+            }
+            for stage in 1..=2 {
+                // Same full pair of live reservations seen by both stage hooks. This uses
+                // the normal worker record shape and real immediate breach + tick paths.
+                let bytes = 4 << 20;
+                let record = moruna_kernel::TraceRecord {
+                    seq: 1,
+                    stage,
+                    worker: 0,
+                    instance: 0,
+                    t_start_ns: 1000,
+                    t_end_ns: 1500,
+                    rows_in: 10000,
+                    bytes_in: bytes,
+                    rows_out: 10000,
+                    bytes_out: bytes,
+                    tier_in: 2,
+                    tier_out: 2,
+                    feat_mean_string_len: 0.0,
+                    feat_null_ratio: 0.0,
+                    feat_column_bytes: vec![bytes],
+                    knob_morsel_target: bytes,
+                    knob_active_workers: 1,
+                    knob_read_ahead: 2,
+                    mem_anon_before: before,
+                    mem_anon_peak: before,
+                    dev_mem_peak: 0,
+                    cpu_time_us: 500,
+                    throttled_delta_us: 0,
+                    q_bytes_before: vec![0; 3],
+                    q_bytes_after: vec![0; 3],
+                    staging_bytes_delta: 0,
+                    placement_miss_wait_us: 0,
+                    state_bytes: 0,
+                    sizer: 0,
+                    outcome: moruna_kernel::Outcome::Ok,
+                    error: None,
+                    alloc: moruna_kernel::KernelAlloc::default(),
+                };
+                ctl.on_record(&record);
+                ctl.tick_once();
+            }
+            let state = ctl.inner.held();
+            assert!(
+                !state.terminated,
+                "shared reservation must not cause Budget termination"
+            );
+            for stage in &state.stages {
+                assert_eq!(
+                    stage.c_anon, expected_local_fixed,
+                    "only unfunded residual enters the actual fit"
+                );
+            }
+            assert_eq!(anon_fixed(&state), 2 * expected_local_fixed);
+            assert_eq!(state.cfg.limits.memory_ceiling, 402653184);
+            assert!(
+                resting_anon(&state) + anon_footprint(&state, &[state.cfg.morsel_min; 2])
+                    < state.cfg.limits.memory_ceiling
+            );
+            assert!(state.breach_line() < state.cfg.limits.memory_ceiling);
+        }
+    }
+
+    #[test]
+    fn native_commitments_do_not_erase_distinct_stage_local_probe_constants() {
+        let ctl = controller(2 * 57389056);
+        ctl.prepare().unwrap();
+        ctl.probe_all().unwrap();
+        let state = ctl.inner.held();
+        assert_eq!(state.stages[0].c_anon, 12 << 20);
+        assert_eq!(state.stages[1].c_anon, 18 << 20);
+        assert_eq!(
+            anon_fixed(&state),
+            30 << 20,
+            "independent local growth still adds"
+        );
+        assert_eq!(resting_anon(&state), 242244816);
+    }
+
+    #[test]
+    fn native_commitments_refuse_when_real_fixed_funding_exhausts_the_ceiling() {
+        let ctl = controller(402653184 - 10026192 - 117440512);
+        assert!(matches!(
+            ctl.prepare(),
+            Err(moruna_kernel::MorunaError::Config {
+                name: "budget.native_children",
+                ..
+            })
+        ));
+    }
 }

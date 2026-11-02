@@ -1,0 +1,21 @@
+[package]
+name = "node-admission"
+description = "Long-lived capability-scoped native Moruna job admission process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[[bin]]
+name = "node-admission"
+path = "src/main.rs"
+test = false
+bench = false
+[dependencies]
+moruna-svc.workspace = true
+moruna-sys.workspace = true
+node-protocol = { path = "../protocol", version = "=0.1.0" }
+
+moruna-node = { path = "../core", version = "=0.1.0" }
+
+moruna-storage-service = { path = "../../storage", version = "=0.1.0" }
+moruna-storage-format = { path = "../../../crates/moruna-storage-format", version = "=0.6.0", default-features = false, features = ["pure"] }

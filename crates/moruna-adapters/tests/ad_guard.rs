@@ -136,7 +136,7 @@ fn gate() -> Arc<MemoryGate> {
         anon_bytes: 100 * MIB,
         ..Sample::default()
     }]);
-    MemoryGate::new(Arc::new(sampler) as Arc<dyn Sampler>, 110 * MIB)
+    MemoryGate::new(Arc::new(sampler) as Arc<dyn Sampler>, 110 * MIB).unwrap()
 }
 
 struct Rig {

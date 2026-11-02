@@ -117,13 +117,11 @@ fn pl_t24_the_engine_refuses_a_configuration_it_cannot_honour() {
     let io: Arc<dyn Reactor> = Arc::new(FakeReactor::new());
     let base = common::config(1, None, common::budgets(1 << 30, 0, 0));
 
-    let mut none = base.clone();
-    none.stages = 0;
-    match moruna_placement::PlacementEngine::new(none, allocator.clone(), io.clone()) {
-        Err(MorunaError::Config { name, .. }) => assert_eq!(name, "stages"),
-        Err(other) => panic!("expected Config, got {other}"),
-        Ok(_) => panic!("expected Config, got an engine"),
-    }
+    // A run with no queue has no topology: it is refused before an engine is configured.
+    assert!(matches!(
+        moruna_kernel::Topology::new(0, 0, 0, Vec::new()),
+        Err(MorunaError::Plan(_))
+    ));
     let mut pageless = base.clone();
     pageless.page_bytes = 0;
     match moruna_placement::PlacementEngine::new(pageless, allocator.clone(), io.clone()) {
@@ -139,7 +137,9 @@ fn pl_t24_the_engine_refuses_a_configuration_it_cannot_honour() {
         Ok(_) => panic!("expected Config, got an engine"),
     }
     assert_eq!(
-        moruna_placement::PlacementConfig::default().stages,
+        moruna_placement::PlacementConfig::default()
+            .topology
+            .queue_count(),
         1,
         "the default configuration is one queue and no staging directory"
     );

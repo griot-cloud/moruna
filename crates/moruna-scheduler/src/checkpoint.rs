@@ -16,6 +16,64 @@ use moruna_kernel::{CheckpointExtras, MorunaError, Result, ResumePolicy, Sink, S
 use crate::instances;
 use crate::shared::Shared;
 
+/// The control claim is an atomic lease, never a mutex held across kernel code or IO.
+/// Original drive owners drain and acknowledge; timeout releases the gate without taking
+/// ownership of any unfinished future or reactor completion.
+struct Barrier<'a>(&'a Shared);
+impl<'a> Barrier<'a> {
+    fn enter(shared: &'a Shared) -> Result<Self> {
+        if shared
+            .control_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(MorunaError::Resume(
+                "another scheduler control operation is active".into(),
+            ));
+        }
+        let barrier = Self(shared);
+        shared.close_gate();
+        for end in &shared.sources {
+            end.checkpoint_paused.store(false, Ordering::SeqCst);
+        }
+        for end in &shared.sinks {
+            end.checkpoint_paused.store(false, Ordering::SeqCst);
+        }
+        shared.checkpoint_pause.store(true, Ordering::SeqCst);
+        shared.unpark_all();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if shared.is_cancelled() || shared.exit_claimed.load(Ordering::SeqCst) {
+                return Err(MorunaError::Cancelled);
+            }
+            let sources = shared
+                .sources
+                .iter()
+                .all(|end| end.checkpoint_paused.load(Ordering::SeqCst));
+            let sinks = shared.sinks.iter().all(|end| {
+                end.drained.load(Ordering::SeqCst) || end.checkpoint_paused.load(Ordering::SeqCst)
+            });
+            if shared.knobs.slots.busy() == 0 && sources && sinks {
+                return Ok(barrier);
+            }
+            if Instant::now() >= deadline {
+                return Err(MorunaError::Resume(
+                    "checkpoint barrier could not drain admitted work within 30 seconds".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+impl Drop for Barrier<'_> {
+    fn drop(&mut self) {
+        self.0.checkpoint_pause.store(false, Ordering::SeqCst);
+        self.0.open_gate();
+        self.0.control_active.store(false, Ordering::SeqCst);
+        self.0.unpark_all();
+    }
+}
+
 /// How many manifest writes may fail in a row before the run ends (f.12, placement h).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
@@ -84,10 +142,22 @@ pub(crate) fn request(shared: &Shared) -> Option<u64> {
 
 /// Request a manifest and wait until one started after the request is on disk (MH 4.7): the
 /// entry point the host protocol's `checkpoint` message calls through the facade. Refuses when
-/// the run writes no manifests, and gives up after `timeout` naming why: a run that is not in
-/// `Running` has no checkpoint thread to serve it, and one whose writes fail has said so on
-/// its own already (f.12).
+/// the run writes no manifests, and at once when the run is not live: only a live run has a
+/// checkpoint thread to serve it. Gives up after `timeout` naming why; a run whose writes fail
+/// has said so on its own already (f.12).
+///
+/// The refusal comes before the request is counted. Counted first, as it was, a request made
+/// before `run` timed out and told its caller no manifest was written for it, and then stayed
+/// outstanding: the checkpoint thread served it the moment it started, writing a manifest
+/// nobody was waiting for, and the next caller's count was one off (SC-T21).
 pub(crate) fn checkpoint_and_wait(shared: &Shared, timeout: Duration) -> Result<PathBuf> {
+    if shared.checkpoint_enabled() && !shared.run_state().is_live() {
+        return Err(MorunaError::Resume(format!(
+            "no manifest can be written now: the run is {:?}, and only a running run has a \
+             checkpoint thread",
+            shared.run_state()
+        )));
+    }
     let Some(ticket) = request(shared) else {
         return Err(MorunaError::Resume(
             "checkpointing is off for this run".into(),
@@ -124,6 +194,31 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
         ));
     }
     let started = Instant::now();
+    let preparation = shared
+        .manifest_preparation
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    // Admission happens while the drives/workers can still release their working sets.
+    let prepared_hook = preparation.map(|prepare| prepare()).transpose()?;
+    let _barrier = if prepared_hook.is_some() && !shared.checkpoint_quiet.load(Ordering::SeqCst) {
+        Some(Barrier::enter(shared)?)
+    } else {
+        None
+    };
+    if prepared_hook.is_some() {
+        // Portable publication cannot replay a consumed, uncommitted sink input
+        // after restoring stateful kernels. Commit its actual buffered output
+        // while all writers are quiesced, then publish that genuine watermark
+        // before either the sink state or placement lineage is snapshotted.
+        for end in &shared.sinks {
+            {
+                let sink = end.sink.read().unwrap_or_else(|e| e.into_inner());
+                sink.checkpoint_flush()?;
+            }
+            crate::sink_drive::update_watermark(shared, end);
+        }
+    }
     let mut kernel_states: Vec<(StageId, usize, Vec<u8>)> = Vec::new();
     for (index, entry) in shared.stages.iter().enumerate() {
         if entry.kernel.hints().resume != ResumePolicy::Checkpoint {
@@ -145,25 +240,34 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
             kernel_states.push((entry.stage, instance, bytes));
         }
     }
-    // The watermark is read before the sink's state, so the state holds at least every file
+    // Each watermark is read before its sink's state, so the state holds at least every file
     // at or below it: a file the sink commits in between is in the state and above the
     // watermark, which resume deletes and recomputes. Read the other way round, a file
     // committed in between was in neither, and its morsels were lost (MH 4.7, H5).
-    let committed_seq = shared
-        .committed
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .reached;
-    let sink_state = {
-        let sink = shared.sink.read().unwrap_or_else(|e| e.into_inner());
-        sink.checkpoint()?
-    };
-    let (source_cursor, issued) = crate::source_drive::cursor(shared);
+    let mut committed = Vec::with_capacity(shared.sinks.len());
+    let mut sink_states = Vec::with_capacity(shared.sinks.len());
+    for end in &shared.sinks {
+        committed.push(
+            end.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reached,
+        );
+        let sink = end.sink.read().unwrap_or_else(|e| e.into_inner());
+        sink_states.push(sink.checkpoint()?);
+    }
+    let mut source_cursors = Vec::with_capacity(shared.sources.len());
+    let mut issued = Vec::with_capacity(shared.sources.len());
+    for end in &shared.sources {
+        let (cursor, reads) = crate::source_drive::cursor(end);
+        source_cursors.push(cursor);
+        issued.push(reads);
+    }
     let extras = CheckpointExtras {
         kernel_states,
-        sink_state,
-        committed_seq,
-        source_cursor,
+        sink_states,
+        committed: committed.clone(),
+        source_cursors: source_cursors.clone(),
         issued,
     };
     // Nothing of this component is locked here, which is what preamble 4.2 requires.
@@ -173,7 +277,7 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    if let Some(hook) = hook {
+    if let Some(hook) = prepared_hook.or(hook) {
         hook(&path)?;
     }
     let took = started.elapsed().as_micros() as u64;
@@ -185,9 +289,8 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
         .unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
     tracing::debug!(
         target: "sched.checkpoint",
-        committed_seq = committed_seq.unwrap_or_default(),
-        split_index = source_cursor.split_index,
-        row_offset = source_cursor.row_offset,
+        committed = ?committed,
+        cursors = ?source_cursors,
         duration_us = took,
         "manifest written"
     );
@@ -233,5 +336,76 @@ pub(crate) fn stop(shared: &Shared) {
         .take();
     if let Some(handle) = handle {
         let _ = handle.join();
+    }
+}
+
+#[cfg(test)]
+mod portable_barrier_tests {
+    use super::*;
+    use crate::tests::common::{RigBuilder, manifest_lock};
+    use moruna_testkit::{FakePlacement, FakeSink};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn admission_precedes_pause_and_publication_observes_original_drive_acknowledgements() {
+        let _serial = manifest_lock();
+        let rig = RigBuilder::new()
+            .cfg(|cfg| cfg.checkpoint_enabled = true)
+            .sink(FakeSink::new().resumable(true))
+            .placement(FakePlacement::new().with_manifest_store())
+            .stages(1)
+            .go();
+        let shared = Arc::downgrade(&rig.scheduler.shared);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        rig.scheduler.set_manifest_preparation(Arc::new(move || {
+            let shared = shared.upgrade().unwrap();
+            assert!(!shared.checkpoint_pause.load(Ordering::SeqCst));
+            assert!(!shared.control_active.load(Ordering::SeqCst));
+            assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 0);
+            let observed = observed.clone();
+            Ok(Arc::new(move |_| {
+                assert!(shared.checkpoint_pause.load(Ordering::SeqCst));
+                assert!(shared.control_active.load(Ordering::SeqCst));
+                assert_eq!(shared.knobs.slots.busy(), 0);
+                assert!(
+                    shared
+                        .sources
+                        .iter()
+                        .all(|end| end.checkpoint_paused.load(Ordering::SeqCst))
+                );
+                assert!(
+                    shared
+                        .sinks
+                        .iter()
+                        .all(|end| end.checkpoint_paused.load(Ordering::SeqCst))
+                );
+                assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 1);
+                Err(MorunaError::Resume("test publication refused".into()))
+            }))
+        }));
+        let error = checkpoint_now(&rig.scheduler.shared).unwrap_err();
+        assert!(
+            matches!(error, MorunaError::Resume(reason) if reason == "test publication refused")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!rig.scheduler.shared.checkpoint_pause.load(Ordering::SeqCst));
+        assert!(!rig.scheduler.shared.control_active.load(Ordering::SeqCst));
+        assert!(rig.scheduler.shared.last_manifest.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn admission_refusal_never_closes_worker_or_drive_gates() {
+        let rig = RigBuilder::new()
+            .cfg(|cfg| cfg.checkpoint_enabled = true)
+            .stages(1)
+            .go();
+        rig.scheduler.set_manifest_preparation(Arc::new(|| {
+            Err(MorunaError::Resume("no charged reservation".into()))
+        }));
+        assert!(checkpoint_now(&rig.scheduler.shared).is_err());
+        assert!(!rig.scheduler.shared.checkpoint_pause.load(Ordering::SeqCst));
+        assert!(!rig.scheduler.shared.control_active.load(Ordering::SeqCst));
+        assert_eq!(rig.scheduler.shared.checkpoints.load(Ordering::SeqCst), 0);
     }
 }

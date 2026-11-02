@@ -434,7 +434,7 @@ impl WasmKernel {
         let _ = self.ports.set(ports);
     }
 
-    /// The stage's ports, once bound.
+    /// The stage's ports, once bound, for the run's cancellation and wait lifecycle.
     pub fn ports(&self) -> Option<&Arc<StagePorts>> {
         self.ports.get()
     }
@@ -510,6 +510,9 @@ impl WasmState {
     /// What a trap or a call error is (f.4): a refusal when the limiter refused during the call,
     /// fuel, or the trap as wasmtime said it.
     fn failure(&mut self, error: wasmtime::Error) -> MorunaError {
+        if let Some(cause) = self.store.data_mut().take_accounting_failure() {
+            return cause;
+        }
         if let Some(trap) = error.downcast_ref::<calls::CallTrap>() {
             return trap.0.clone().into_error(UNKNOWN_STAGE);
         }
@@ -640,8 +643,8 @@ impl KernelState for WasmState {
         Ok(Some(state))
     }
 
-    fn footprint(&self) -> Option<u64> {
-        Some(self.store.data().size())
+    fn footprint(&self) -> moruna_kernel::Result<Option<u64>> {
+        Ok(Some(self.store.data().size()))
     }
 }
 

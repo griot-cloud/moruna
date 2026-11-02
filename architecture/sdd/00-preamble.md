@@ -41,7 +41,13 @@ Twelve components. The number is also the build order and the SDD file number. A
 | 16 | Function package | `16-package.md` | 1, 12's check harness, 17 | a package is one file whose fingerprint is `sha256` of its bytes, read once; its manifest is complete and closed; a hosted run loads no kernel by import path (added 2026-10-15, `architecture/function-packages.md`) |
 | 17 | Packaged-kernel runtimes | `17-sandbox.md` | 1, 5 (the guard, the boundary copy), 16 | each runtime is a `Kernel`; a `.wasm` reaches nothing but its world, a `.pex` runs in a confined child with the guard inside it; neither has Moruna's access to the machine (added 2026-10-15) |
 | 18 | The kinds a run is made of | `18-kinds.md` | 1, 7, 8, 16, 17 | every part of a document is a kind a registry resolves by name, or refuses naming the kinds it has; each kind is one adapter of its role's port with a declaration, and passes that port's conformance suite (added 2026-10-28, decision AP1) |
+| 19 | An OCI image as a kind | `19-image.md` | 1, 17, 18 | an image is a read, verified and unpacked OCI layout and its command; the `image` kind runs the command in the sandbox as one confined process per stage, Arrow IPC over its standard input and output, and it ends the run when the process does not end as it should (added 2026-10-28, board KA1) |
+| 20 | The microkernel core | `20-microkernel.md` | none (its own workspace, `kernel/`, on OSTD) | a process names objects only through handles in its own table, and rights never grow; the kernel holds processes, threads, memory, channels, timers, interrupts and device memory, and every other service is a process started from the boot manifest (added 2026-10-28, BOARD EK KB1, decision MK1) |
+| 21 | The record and its ring | `21-record.md` | nothing internal | a record is byte for byte the layout of the event bus the node's records reach, and decodes as whole, incomplete or corrupt as that bus does; the ring takes records from many producers at once without blocking any of them, and returns each to its one consumer exactly once, or counts it as dropped (added 2026-10-28, KB4) |
 | 22 | The job document and the catalogue, for embedders | `22-job.md` | 18 | an embedder reads Moruna's kinds and checks a job document against them, collecting every refusal, with a crate that depends on `serde`, `serde_json`, `schemars` and `thiserror` only; the declaration and document types have one home there; the embedded catalogue equals the registry's listing (added 2026-10-28, board item KA4) |
+| 23 | The SDK for servers and drivers | `23-svc.md` | 20 (`moruna-abi`, `moruna-sys`, `moruna-loader`; its own workspace, `kernel/`) | a protocol is declared once and the declaration is both ends; a connection opens with a handshake refused on a mismatch of name or major; a body decodes to exactly one value or nothing; a server never blocks on one client; an example server is added to a boot by its description alone, touching no kernel file (added 2026-10-28, BOARD EK KB2) |
+| 24 | The cost model's foundation | `24-cost.md` | 22 | what a unit takes from a run is predicted as a distribution with its basis, by a model chosen by a setting from a registry, learned from raw observations a store keeps so a new model learns the same history; the default model is recursive least squares on logarithms with forgetting; a crate that depends on `moruna-job`, `serde`, `serde_json` and `thiserror` only (added 2026-10-29, board item KD6a; `architecture/adaptive-runtime.md` sections 3 to 7) |
+| 26 | The plan of a job | `26-plan.md` | 22 | a job's plan says what runs when and how before it runs: steps with stable ids, groups, resources and estimates; a planner is an adapter of one port chosen by a setting; every plan passes the plan's check before it is shown or run, and a run starts from one and reports against it (added 2026-10-29, board item KA7) |
 
 The agent building component N is handed this preamble, `01-contracts.md`, and `0N-<name>.md`, and the fakes for every interface N consumes (section 6.4).
 
@@ -59,6 +65,7 @@ graph LR
   sinks["moruna-sinks (8)"]
   placement["moruna-placement (9)"]
   scheduler["moruna-scheduler (10)"]
+  cost["moruna-cost (24)"]
   controller["moruna-controller (11)"]
   runtime["moruna-runtime (facade)"]
   py["moruna-py (12)"]
@@ -85,6 +92,8 @@ graph LR
   scheduler --> kernel
   scheduler -.->|dyn Placement| placement
   scheduler -->|SinkHandle, ReorderBuffer| sinks
+  scheduler -->|Online, the simulator: KD7c| cost
+  controller -->|Online, the model sizer: KD7c| cost
   runtime --> arena
   runtime --> discovery
   runtime --> trace
@@ -397,12 +406,15 @@ Every tunable in every component. Owner is who may set it at runtime: `user` (Py
 moruna/
   Cargo.toml                 workspace; members below; shared [workspace.dependencies] with pinned versions
   crates/
-    moruna-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 only.
+    moruna-kernel/            component 1: contracts. Depends on arrow, dlpark, thiserror, blake3 and moruna-types only.
+    moruna-types/             the type grammar of a schema declaration (MH 4.9), read and written without Arrow; depends on nothing (01 CT-I16, 22 JB-I15; added 2026-10-29, KA6)
     moruna-arena/             component 2
     moruna-discovery/         component 3
     moruna-trace/             component 4
     moruna-adapters/          component 5: the Python kernel adapter only (feature: python)
-    moruna-reactor/           component 6
+    moruna-reactor/           component 6; consumes the shared storage host-proxy connector
+    moruna-storage-format/    component 32: no_std + alloc identity and durable frame codec, shared by host/native-node adapters
+    moruna-storage/           component 32: governed bucket storage, encrypted cache, checkpoint/artifact publication and strict raw IO adapter
     moruna-sources/           component 7
     moruna-sinks/             component 8
     moruna-placement/         component 9
@@ -414,8 +426,11 @@ moruna/
     moruna-datafusion/        engine bridge: hosts a kernel inside DataFusion; depends on moruna-kernel and datafusion only (feature: datafusion)
     moruna-package/           component 16: the function package: manifest, reader, fingerprint, tree (added 2026-10-15)
     moruna-wasm/              component 17: a `.wasm` package in wasmtime
-    moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux)
-    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars and thiserror only (added 2026-10-28)
+    moruna-sandbox/           component 17: a `.pex` package in a confined child (Linux); component 19's `ImageKernel`
+    moruna-image/             component 19: an OCI layout read, verified and unpacked into a root (pure Rust; added 2026-10-28)
+    moruna-record/            component 21: the record layout and the multi-producer ring that carries it (no dependency; added 2026-10-28)
+    moruna-job/               component 22: the declaration, listing and job document types, the catalogue and `check`; depends on serde, serde_json, schemars, thiserror, flatbuffers, flexbuffers and moruna-types only (added 2026-10-28)
+    moruna-plan/              component 26: the plan document, the planner port and the `levels` planner, `explain`, `check_plan`; depends on moruna-job, flatbuffers, serde, serde_json, sha2 and thiserror (added 2026-10-29)
     moruna-testkit/           fakes for every contracts interface, exactly the table in contracts d.15; depends on moruna-kernel only; wave 0
   python/moruna/              Python package source (thin; the module is moruna-py)
   bench/                     benchmark suite: data generator, kernels, runner, baselines (section 6.5); owned by the bench agent
@@ -448,8 +463,8 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `thiserror` | all | error types | |
 | `tracing` | all except 1 | log events (not the morsel trace) | `moruna-kernel` depends on `arrow`, `dlpark`, `thiserror` and `blake3` only (6.1, 01 section a), and, since KA10, on `lz4_flex`, `zstd` and `flatbuffers` to inflate compressed Arrow IPC (01 e.8) |
 | `blake3` | 1, 9, 11, bench | fingerprint, trace schema hash, profile keys | |
-| `serde` | 4, 8, 9, 11 | derive for the manifest, sink checkpoint, profile records, run meta | features: `derive` |
-| `serde_json` | 4, 7, 8, 9, 11, 12 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config` | the only text format in the runtime |
+| `serde` | 4, 8, 9, 11, 24 | derive for the manifest, sink checkpoint, profile records, run meta, the cost model's observations and fitted state | features: `derive` |
+| `serde_json` | 4, 7, 8, 9, 11, 12, 24 | the manifest (9 e.5), sink checkpoint (8 e.5), profile store, `PlacementConfig::config`, the cost model's observation records and fitted state (24 e.2, e.4) | the only text format in the runtime; component 24 writes a float of fitted state as its bits rather than enable `float_roundtrip`, a feature every crate in the build would share |
 | `base64` | 8, 9 | kernel and sink state bytes inside the JSON manifest and checkpoint | |
 | `libc` | 2, 3, 6, 10 | `mmap`, `madvise`, `mlock`, `O_DIRECT`, `pread`/`pwrite`, cgroup and rlimit calls | |
 | `bytes` | 6, 7, 8, bench | `object_store` payloads on the write path (a `Bytes` over an arena view, no copy) | |
@@ -471,10 +486,22 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `zip` | 16 | the `.pex` archive | `default-features = false`, feature `deflate`; added 2026-10-15 |
 | `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |
 | `vm-fdt`, `acpi_tables` | `moruna-vmm` | the aarch64 device tree and the x86_64 ACPI tables that describe the guest's devices and hot-pluggable CPUs | |
+| `tar` | 19 (`moruna-image`) | OCI layers are tar | `default-features = false` (no `xattr`: entries are read and written by the crate itself); added 2026-10-28, named in 19 d.4 |
+| `flate2`, `zstd` | 19 (`moruna-image`) | OCI layers are gzip or zstd compressed | already in the graph at these versions (`zstd` 0.14.0, the one `zstd-sys` 2.1.0 serves); `zstd` with `default-features = false`; added 2026-10-28, named in 19 d.4 |
 | `schemars` | 18 (runtime), 12 | the settings schema each kind declares: JSON Schema 2020-12 derived from the type its adapter reads its settings with (18 e.2, decision KD1) | already in the graph through `parcel-core` at this version; default features (`derive`, `std`); added 2026-10-28, named in 18 d.5 |
 | `lz4_flex` | 1 (and the testkit) | Arrow IPC `LZ4_FRAME` buffers: the frame decoder behind the checked inflation of contracts e.8 | `default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"]`; already in the graph through arrow-ipc's compression, so one version; added with KA10 |
 | `zstd` | 1 (and the testkit) | Arrow IPC `ZSTD` buffers: the frame's content size and the bounded one-shot decompressor of contracts e.8 | `default-features = false`; the version arrow-ipc uses; added with KA10 |
 | `flatbuffers` | 1 (and the testkit) | the record batch message that describes an inflated batch (contracts e.8): the builders arrow-ipc generated, which need the crate they were generated for | `default-features = false`; the version arrow-ipc uses; added with KA10 |
+
+KS1 direct-use additions approved by the integrating PM on 2026-10-30 use packages already locked and cached; they change no existing version, source or checksum. The new graph adds `moruna-storage-format` and `moruna-storage`, moves the socket connector's existing HTTP dependencies to storage, and enables zeroize edges on AES, AES-GCM, BLAKE3 and arrayvec. The format crate has no SDK/filesystem/Tokio dependency and does not globally enable its optional pure-hash feature on host builds.
+
+| dependency | component | direct purpose | exact existing pin and features |
+|---|---|---|---|
+| `aes-gcm` | 32 portable cache | authenticated workspace/node-epoch cache encryption | 0.10.3; default features off, `aes`, `alloc`, `zeroize` |
+| `aes` | 32 portable cache | AES-256 key schedule with zeroizing Drop, not only zeroizing input bytes | 0.8.4; `zeroize` |
+| `ghash` | 32 portable cache | enable zeroization of the existing GCM authentication state, not a new algorithm | 0.5.1; default features off, `zeroize`; approved 2026-10-30 |
+| `polyval` | 32 portable cache | enable zeroizing Drop in the authoritative supported backend; nonzeroizing backend selection is refused | 0.6.2; default features off, `zeroize`; approved 2026-10-30 |
+| `zeroize` | 32 portable cache | scoped workspace/node/derived keys and keyed-hash state | 1.9.0; `alloc`; upstream AES enables target-specific support |
 
 There is no `cufile` crate: the reactor's GDS path (feature `gds`) is a hand-written minimal FFI over `libcufile`, kept in the reactor and listed in its section l. Adding a crate this table lacks is an E2 item the PM may approve when the crate is named in the requesting SDD's d.2; a version bump of a pinned crate is the human's decision (section 7). The bench agent has no SDD, so section 6.5 is its d.2 for this purpose: the PM may approve a crate for `bench/` when it is needed by the work 6.5 describes and enters no shipping crate's graph (`bench` is not a dependency of any crate in 6.1), and the same table row records it as used by bench (decided by the PM 2026-09-22, after the F1.6 agent found the route closed and hand-rolled its argument parsing and its random number generator instead, which stand).
 

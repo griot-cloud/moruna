@@ -1,6 +1,7 @@
 //! The boot state the kernel expects when the first vCPU starts, computed without KVM: the
 //! x86_64 long-mode GDT, identity page tables, e820 map and register values, and the aarch64
-//! register ids and values. The Linux-only KVM code writes these into the vCPUs.
+//! register ids and values. These layout models are retained for unit tests;
+//! production native boot uses the checked QEMU microkernel launcher.
 
 use vm_memory::{Bytes, GuestAddress};
 
@@ -82,17 +83,6 @@ pub fn segment(entry: u64, index: u16) -> Segment {
         avl: ((entry >> 52) & 1) as u8,
     }
 }
-
-/// `CR0.PE`.
-pub const CR0_PE: u64 = 1;
-/// `CR0.PG`.
-pub const CR0_PG: u64 = 1 << 31;
-/// `CR4.PAE`.
-pub const CR4_PAE: u64 = 1 << 5;
-/// `EFER.LME`.
-pub const EFER_LME: u64 = 1 << 8;
-/// `EFER.LMA`.
-pub const EFER_LMA: u64 = 1 << 10;
 
 /// Write the GDT, an empty IDT, and page tables identity-mapping the first GiB with 2 MiB
 /// pages (what the 64-bit boot protocol needs before the kernel builds its own).

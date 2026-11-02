@@ -5,8 +5,6 @@
 //! argument of every `__call__`. `instances` independent states come from `instances` calls of
 //! `setup`, not from cloning anything.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use moruna_kernel::{DeviceId, KernelState, MorunaError, Result, ResumePolicy};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -23,7 +21,6 @@ pub struct PyState {
     device: Option<DeviceId>,
     resume: ResumePolicy,
     has_footprint: bool,
-    footprint_complained: AtomicBool,
 }
 
 impl PyState {
@@ -43,7 +40,6 @@ impl PyState {
             device,
             resume,
             has_footprint,
-            footprint_complained: AtomicBool::new(false),
         }
     }
 
@@ -92,50 +88,37 @@ impl KernelState for PyState {
         }
     }
 
-    /// e.1: `footprint(state)` when the class defines it. An `int` becomes `Some`, `None` stays
-    /// `None`, and anything else is complained about once and then treated as unknown, because
-    /// the contract has no error channel here and a state whose size cannot be read is exactly
-    /// the `None` the controller already handles (RC f.3).
-    fn footprint(&self) -> Option<u64> {
+    /// Python None is genuinely unknown; raised/invalid readings propagate as errors.
+    fn footprint(&self) -> Result<Option<u64>> {
         if !self.has_footprint {
-            return None;
+            return Ok(None);
         }
         Python::attach(|py| {
-            let value = match self
+            let value = self
                 .callable
                 .bind(py)
                 .call_method1("footprint", (self.state.bind(py),))
-            {
-                Ok(value) => value,
-                Err(e) => {
-                    self.complain_once(format!("footprint raised: {}", py_err_message(py, &e)));
-                    return None;
-                }
-            };
+                .map_err(|e| {
+                    kernel_error(format!(
+                        "footprint raised for instance {}: {}",
+                        self.instance,
+                        py_err_message(py, &e)
+                    ))
+                })?;
             if value.is_none() {
-                return None;
+                return Ok(None);
             }
-            match value.extract::<u64>() {
-                Ok(bytes) => Some(bytes),
-                Err(_) => {
-                    self.complain_once(
-                        "footprint returned neither an int nor None; the state size is unknown"
-                            .to_string(),
-                    );
-                    None
-                }
-            }
+            value.extract::<u64>().map(Some).map_err(|e| {
+                kernel_error(format!(
+                    "footprint must return an unsigned integer or None: {}",
+                    py_err_message(py, &e)
+                ))
+            })
         })
     }
 }
 
 impl PyState {
-    fn complain_once(&self, message: String) {
-        if !self.footprint_complained.swap(true, Ordering::SeqCst) {
-            tracing::warn!(target: "adapter.footprint", instance = self.instance, "{message}");
-        }
-    }
-
     /// Replace the state with the value `restore(ctx, data)` returned (f.7).
     ///
     /// Every argument is one field of the state being built, so there is nothing to group.

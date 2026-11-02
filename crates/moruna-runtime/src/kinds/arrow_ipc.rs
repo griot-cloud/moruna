@@ -90,6 +90,7 @@ impl SourceKind for ArrowIpc {
             deterministic: Fact::Yes,
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Builtin,
+            served: None,
         }
     }
 
@@ -139,6 +140,7 @@ impl SinkKind for ArrowIpc {
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
+            served: None,
         }
     }
 

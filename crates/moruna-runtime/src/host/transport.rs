@@ -1,6 +1,7 @@
 //! Addresses and sockets for the host protocol (MH 4.3): a Unix socket anywhere, a vsock socket
-//! on Linux. One peer, one connection, so there is no multiplexing and no framing beyond the
-//! newline.
+//! on Linux, and on the Moruna kernel a stream of its vsock driver (SDD 30 f.2), which the
+//! engine reaches through the connection it was granted. One peer, one connection, so there is
+//! no multiplexing and no framing beyond the newline.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -120,7 +121,43 @@ impl Conn {
 pub fn connect(address: &Address) -> io::Result<Conn> {
     match address {
         Address::Unix(path) => Conn::unix(std::os::unix::net::UnixStream::connect(path)?),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Address::Vsock { cid, port } if moruna_micro::on_kernel() => {
+            micro::conn(micro::driver()?.connect(*cid, *port)?)
+        }
         Address::Vsock { cid, port } => vsock::connect(*cid, *port),
+    }
+}
+
+/// The vsock of the Moruna kernel (SDD 30 f.2): the engine's one connection to its driver,
+/// granted under `vsock`, and the streams it opens as a [`Conn`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod micro {
+    use std::io;
+    use std::sync::{Arc, OnceLock};
+
+    use moruna_micro::vsock::{Driver, Stream};
+
+    use super::Conn;
+
+    /// The slot the engine's connection to the vsock driver is granted under.
+    const SLOT: &str = "vsock";
+
+    pub(super) fn driver() -> io::Result<Arc<Driver>> {
+        static DRIVER: OnceLock<Result<Arc<Driver>, String>> = OnceLock::new();
+        DRIVER
+            .get_or_init(|| Driver::open(SLOT).map_err(|e| e.to_string()))
+            .clone()
+            .map_err(io::Error::other)
+    }
+
+    pub(super) fn conn(stream: Stream) -> io::Result<Conn> {
+        let (reader, writer, closer) = stream.into_parts();
+        Ok(Conn {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            closer,
+        })
     }
 }
 
@@ -133,6 +170,9 @@ enum ListenerKind {
     Unix(std::os::unix::net::UnixListener, PathBuf),
     #[cfg(target_os = "linux")]
     Vsock(std::os::fd::OwnedFd),
+    /// A port of the Moruna kernel's vsock driver (SDD 30 f.2).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Kernel(moruna_micro::vsock::Listener),
 }
 
 impl Listener {
@@ -142,6 +182,8 @@ impl Listener {
             ListenerKind::Unix(listener, _) => Conn::unix(listener.accept()?.0),
             #[cfg(target_os = "linux")]
             ListenerKind::Vsock(fd) => vsock::accept(fd),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            ListenerKind::Kernel(listener) => micro::conn(listener.accept()?.0),
         }
     }
 }
@@ -154,6 +196,8 @@ impl Drop for Listener {
             }
             #[cfg(target_os = "linux")]
             ListenerKind::Vsock(_) => {}
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            ListenerKind::Kernel(_) => {}
         }
     }
 }
@@ -163,6 +207,12 @@ pub fn listen(address: &Address) -> io::Result<Listener> {
     match address {
         Address::Unix(path) => Ok(Listener {
             inner: ListenerKind::Unix(std::os::unix::net::UnixListener::bind(path)?, path.clone()),
+        }),
+        // On the Moruna kernel the driver listens for every cid: the address's is the host's
+        // business (`-1`, `VMADDR_CID_ANY`, in every document that listens).
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Address::Vsock { port, .. } if moruna_micro::on_kernel() => Ok(Listener {
+            inner: ListenerKind::Kernel(micro::driver()?.listen(*port)?),
         }),
         #[cfg(target_os = "linux")]
         Address::Vsock { cid, port } => Ok(Listener {

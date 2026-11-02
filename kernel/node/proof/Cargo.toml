@@ -1,0 +1,23 @@
+[package]
+name = "moruna-node-proof"
+description = "Actual kernel Account and Memory origin acceptance program"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[[bin]]
+name = "node-memory-proof"
+path = "src/main.rs"
+test = false
+bench = false
+[dependencies]
+moruna-svc.workspace = true
+moruna-storage-service = { path = "../../storage", version = "=0.1.0" }
+moruna-storage-format = { path = "../../../crates/moruna-storage-format", version = "=0.6.0", default-features = false, features = ["pure"] }
+moruna-sys = { workspace = true, features = ["heap"] }
+
+[[bin]]
+name = "node-storage-proof"
+path = "src/bin/storage.rs"
+test = false
+bench = false

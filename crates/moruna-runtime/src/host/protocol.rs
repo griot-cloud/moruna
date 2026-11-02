@@ -1,19 +1,26 @@
-//! The host protocol's messages (MH 4.3): newline-delimited JSON, one object per line,
-//! `type` first. Moruna sends `hello`, `heartbeat`, `limits_changed`, `event`, `port_call`,
-//! `port_cancel`, `report` and `exit`; it reads `spec`, `cancel`, `checkpoint` and `port_reply`,
-//! and nothing else. No message a peer can send enlarges a run.
+//! The host protocol's messages (MH 4.3): lines of JSON, one object per line, `type` first, and
+//! one framed binary message, the `event`. Moruna sends `hello`, `heartbeat`, `limits_changed`,
+//! `event`, `port_call`, `port_cancel`, `report` and `exit`; it reads `spec`, `cancel`,
+//! `checkpoint` and `port_reply`, and nothing else. No message a peer can send enlarges a run.
 //!
-//! An `event` is one fact of the run's execution, versioned on its own (`v`, [`EVENTS_VERSION`])
-//! and named by its `kind`: version 1 had the task lifecycle; version 2 added `logs`, what the
-//! run's output store holds for each producer so far; version 3 added a running task's wait on a
-//! port (`task_waiting` with `reason: port_call` and the `port`, MH 4.10); version 4 adds the
-//! failure code `internal`, a crash: a panic of Moruna's own that unwound the run. A peer refuses
-//! a version it does not read rather than guess at it.
+//! An `event` is one fact of the run's execution, versioned on its own ([`EVENTS_VERSION`]) and
+//! named by its kind: version 1 had the task lifecycle; version 2 added `logs`, what the run's
+//! output store holds for each producer so far; version 3 added a running task's wait on a port
+//! (`task_waiting` with `reason: port_call` and the `port`, MH 4.10); version 4 added the failure
+//! code `internal`, a crash: a panic of Moruna's own that unwound the run; version 5 made
+//! `task_registered`'s `upstream` the list of tasks a task takes its input from, the job's edges
+//! (SDD 22 e.4); version 6 ran a job from its plan (SDD 26): every task event names the plan step
+//! that runs the task (`step`), `attempt_started` names the plan (`plan`), and `step_started` and
+//! `step_ended` tell each step's start and end; version 7 makes the event a record (SDD 21)
+//! whose body is FlatBuffers (`moruna-event`), sent as a frame (`moruna_event::frame`) in place of
+//! a line, and written to the run's output store when no peer is there. The JSON of version 6,
+//! with the same field names, is the rendering of a record for people (`moruna run
+//! --events-json`, [`read_json_message`]). A peer refuses a version it does not read rather than
+//! guess at it.
 //!
-//! What a task prints is never on the socket. Each record of it is an `event` of kind `log`
-//! ([`LogLine`]) in the run's output store (`report.logs`), numbered by its own producer; the
-//! socket says only how far each producer's records reach, how many bytes they hold, and how
-//! many were cut or dropped.
+//! What a task prints is never on the socket. Each record of it is an `event` of kind `log` in
+//! the run's output store (`report.logs`), numbered by its own producer; the socket says only how
+//! far each producer's records reach, how many bytes they hold, and how many were cut or dropped.
 //!
 //! The port messages (MH 4.10) are versioned on their own (`v`, [`PORTS_VERSION`]): a stage's
 //! call to a host port is a `port_call`, answered by the peer's `port_reply` for the same `call`;
@@ -87,395 +94,32 @@ impl Heartbeat {
     }
 }
 
-/// The version of the `event` message this build writes (MH 4.3).
-pub const EVENTS_VERSION: u32 = 4;
-
 /// The version of the port messages this build writes and reads (MH 4.10).
 pub const PORTS_VERSION: u32 = 1;
 
-/// One `event` (MH 4.3): who produced it and when, then the fact.
-///
-/// `attempt` is the document's `report.attempt`; `start` is this process's own id, minted when it
-/// starts, so an attempt that a host ran twice is two producers; `seq` counts this process's
-/// events from 1 with no gap, in the order they are written; `t_us` is microseconds on this
-/// process's monotonic clock since it began the run. A peer that has seen `(start, seq)` has
-/// seen the event, however often it is relayed.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct EventMsg {
-    /// [`EVENTS_VERSION`].
-    pub v: u32,
-    /// The document's `report.attempt`.
-    pub attempt: u32,
-    /// This process's id: 32 lowercase hex characters.
-    pub start: String,
-    /// From 1, with no gap.
-    pub seq: u64,
-    /// When the fact became true, in microseconds since the process began the run.
-    pub t_us: u64,
-    /// The fact.
-    #[serde(flatten)]
-    pub body: Event,
-}
+/// The event types of the protocol (MH 4.3): the facts of a run, told as records by
+/// `moruna-event`. They are re-exported here because they are the protocol's, and a host that
+/// speaks it names them by this module.
+pub use moruna_event::{
+    CancelDisposition, Counters, EVENTS_VERSION, Element, Event, EventMsg, FailureCode,
+    FailureScope, LogReach, LogStream, Phase, SkipReason, StepOutcome, TaskOutcome, WaitReason,
+};
 
-/// The facts of version 4: the task lifecycle, the output store's reach (MH 4.3), a running
-/// task's waits on its ports (MH 4.10) and a crash's failures (`internal`). A task is one element of the chain, named by the id the
-/// document's `report.tasks` gives it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Event {
-    /// First: this process runs the document's attempt; `resumed` when from a manifest.
-    AttemptStarted {
-        /// A resume of an earlier process's run.
-        resumed: bool,
-    },
-    /// Once per task, before anything else is said of it.
-    TaskRegistered {
-        /// The task.
-        task: String,
-        /// `source`, `kernel` or `sink`.
-        element: Element,
-        /// Its place in the chain: 0 the source, 1..=n the kernels, n+1 the sink.
-        stage: u16,
-        /// The task whose output it takes; `null` for the source.
-        upstream: Option<String>,
-        /// The host's tasks it carries as one group (`report.tasks`); empty for one task.
-        members: Vec<String>,
-    },
-    /// It cannot start yet, and why; or, running, it waits on a port's answer (`port_call`), until
-    /// a `task_phase` says what it does again.
-    TaskWaiting {
-        /// The task.
-        task: String,
-        /// Why.
-        reason: WaitReason,
-        /// The tasks it waits on.
-        blocking: Vec<String>,
-        /// The port it waits on, for `port_call`; `null` otherwise.
-        port: Option<String>,
-    },
-    /// Its input is there; it starts when a worker or a drive takes it.
-    TaskReady {
-        /// The task.
-        task: String,
-    },
-    /// It took its first input (a source: issued its first read; a sink: was handed its first
-    /// morsel, or began its commit with none).
-    TaskStarted {
-        /// The task.
-        task: String,
-        /// What it is doing.
-        phase: Phase,
-    },
-    /// What it is doing changed.
-    TaskPhase {
-        /// The task.
-        task: String,
-        /// What it is doing now.
-        phase: Phase,
-    },
-    /// It ended without failing itself: drained and done, stopped by another's failure, or
-    /// cancelled.
-    TaskCompleted {
-        /// The task.
-        task: String,
-        /// How.
-        outcome: TaskOutcome,
-        /// From its start to its end on this process's clock; `null` when it never started (a
-        /// stage that never had input).
-        duration_us: Option<u64>,
-        /// What it did, when it ran to its end (`succeeded`); `null` otherwise.
-        counters: Option<Counters>,
-        /// The task whose failure stopped it.
-        cause: Option<String>,
-    },
-    /// It failed, or the attempt did (`scope: attempt`, `task: null`) for a reason no one task
-    /// owns. `message` is the engine's own sentence about the failure and quotes no data; the
-    /// failure's full words are in the report. For `internal`, a crash, which has no report,
-    /// `message` is what Moruna's panic said.
-    TaskFailed {
-        /// The task; `null` when the scope is the attempt.
-        task: Option<String>,
-        /// A stable code.
-        code: FailureCode,
-        /// A sentence that names stages, morsels and sizes, never a value.
-        message: String,
-        /// `task` or `attempt`.
-        scope: FailureScope,
-        /// Whether the same document may succeed when run again.
-        retryable: bool,
-    },
-    /// It never started and never will.
-    TaskSkipped {
-        /// The task.
-        task: String,
-        /// Why.
-        reason: SkipReason,
-        /// The task whose failure skipped it.
-        blocking: Option<String>,
-    },
-    /// The peer's `cancel` reached the run.
-    CancelAcknowledged,
-    /// The run has stopped since a `cancel` reached it, and how it ended.
-    CancelEnded {
-        /// `cancelled`, or `completed` / `failed` when the run ended first.
-        disposition: CancelDisposition,
-    },
-    /// How far the output store reaches for each producer whose reach changed (at most one
-    /// such event every [`crate::host::logs::LOGS_EVERY`]), and, last, for every producer with
-    /// `drained` set. The counts only grow: a peer that hears one late or twice is not misled.
-    Logs {
-        /// One entry per producer.
-        producers: Vec<LogReach>,
-    },
-}
-
-/// One producer's records in the output store so far (MH 4.3 `logs`): a task's, or the
-/// engine's own (`task: null`), in this process.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct LogReach {
-    /// The task; `null` for output no task can be named for.
-    pub task: Option<String>,
-    /// Records `1..=records` of the producer are in the store, whole.
-    pub records: u64,
-    /// The bytes of their text.
-    pub bytes: u64,
-    /// Records the store cut short.
-    pub truncated: u64,
-    /// Records dropped before the store, written faster than it keeps or past what it holds.
-    pub dropped: u64,
-    /// Bytes dropped with them.
-    pub dropped_bytes: u64,
-    /// This process writes nothing more for the producer.
-    pub drained: bool,
-}
-
-/// What a record of output is: a task's stream, a logging framework's record, or Moruna's own
-/// word about the output (records dropped, the store's end). Only Moruna writes `platform`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LogStream {
-    /// Standard output.
-    Stdout,
-    /// Standard error; it says nothing about severity.
-    Stderr,
-    /// A logging framework's record, with the level it said.
-    Structured,
-    /// Moruna's own.
-    Platform,
-}
-
-/// One record of a producer's output as the store keeps it (MH 4.3 `log`): an `event` whose
-/// `seq` counts the producer's records from 1 with no gap, never written to the socket.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct LogLine {
-    /// `"event"`.
-    #[serde(rename = "type")]
-    pub kind_of: &'static str,
-    /// [`EVENTS_VERSION`].
-    pub v: u32,
-    /// The document's `report.attempt`.
-    pub attempt: u32,
-    /// This process's id.
-    pub start: String,
-    /// The producer's count, from 1.
-    pub seq: u64,
-    /// When the bytes were handed over, in microseconds since the process began the run.
-    pub t_us: u64,
-    /// `"log"`.
-    pub kind: &'static str,
-    /// `<start>/<producer>/<seq>`: the record's id, the same wherever it is read.
-    pub id: String,
-    /// The task; `null` for output no task can be named for.
-    pub task: Option<String>,
-    /// Which stream.
-    pub stream: LogStream,
-    /// The level a logging framework said; `null` for a stream, which says none.
-    pub level: Option<&'static str>,
-    /// Bytes of `text`, as UTF-8.
-    pub bytes: u64,
-    /// The record: one line without its newline, a group of lines (an exception), or a piece
-    /// of a longer line.
-    pub text: String,
-    /// The line goes on in the next record.
-    pub partial: bool,
-    /// This record goes on from the last one's line.
-    pub continued: bool,
-    /// Bytes of the record that were cut and are nowhere.
-    pub truncated: u64,
-}
-
-impl LogLine {
-    /// The record as one line, newline included.
-    pub fn line(&self) -> String {
-        let mut text = serde_json::to_string(self).unwrap_or_default();
-        text.push('\n');
-        text
+/// The protocol's view of the scheduler's counters.
+pub fn counters_of(c: &moruna_kernel::StageCounters) -> Counters {
+    Counters {
+        morsels: c.morsels,
+        rows_in: c.rows_in,
+        rows_out: c.rows_out,
+        bytes_in: c.bytes_in,
+        bytes_out: c.bytes_out,
+        skipped: c.skipped,
+        errors: c.errors,
     }
-}
-
-/// What a task is (MH 4.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Element {
-    /// The chain's source.
-    Source,
-    /// One kernel stage.
-    Kernel,
-    /// The chain's sink.
-    Sink,
-}
-
-/// Why a task waits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WaitReason {
-    /// The engine is still being made ready: discovery, the arena, the plan.
-    EnginePreparing,
-    /// No input has reached it yet.
-    AwaitingInput,
-    /// It called a port and waits for the answer (MH 4.10).
-    PortCall,
-}
-
-/// What a running task is doing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    /// Working on the morsels the controller measures the chain with, before the run proper.
-    Calibrating,
-    /// A source reading.
-    Reading,
-    /// A kernel applying.
-    Applying,
-    /// A sink writing.
-    Writing,
-    /// Its input is closed: working through what is left.
-    Draining,
-    /// A sink committing what it wrote.
-    Committing,
-}
-
-/// How a task that did not fail itself ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskOutcome {
-    /// Drained and done: a source exhausted, a kernel through its last input, a sink committed.
-    Succeeded,
-    /// Running when another task's failure ended the attempt.
-    Stopped,
-    /// Running when a `cancel` ended the attempt.
-    Cancelled,
-}
-
-/// What a task did, measured where it happened.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct Counters {
-    /// Morsels taken (a kernel, the sink) or produced (the source).
-    pub morsels: u64,
-    /// Rows taken.
-    pub rows_in: u64,
-    /// Rows produced; the sink's, rows written.
-    pub rows_out: u64,
-    /// Bytes taken.
-    pub bytes_in: u64,
-    /// Bytes produced; the sink's, bytes written.
-    pub bytes_out: u64,
-    /// Morsels the error policy skipped.
-    pub skipped: u64,
-    /// Morsels whose kernel failed.
-    pub errors: u64,
-}
-
-impl Counters {
-    /// The protocol's view of the scheduler's counters.
-    pub fn of(c: &moruna_kernel::StageCounters) -> Counters {
-        Counters {
-            morsels: c.morsels,
-            rows_in: c.rows_in,
-            rows_out: c.rows_out,
-            bytes_in: c.bytes_in,
-            bytes_out: c.bytes_out,
-            skipped: c.skipped,
-            errors: c.errors,
-        }
-    }
-}
-
-/// A failure's stable code (MH 4.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureCode {
-    /// The document was refused.
-    SpecRefused,
-    /// A kernel failed and the error policy ended the run.
-    KernelError,
-    /// A morsel's footprint exceeded the budget.
-    BudgetExceeded,
-    /// The allocator guard refused a kernel's allocation past the ceiling.
-    MemoryRefused,
-    /// The source could not read.
-    SourceError,
-    /// The sink could not write or commit.
-    SinkError,
-    /// An allocation exceeded its tier's budget.
-    AllocRefused,
-    /// An IO operation failed.
-    IoError,
-    /// Staging or placement failed.
-    StagingError,
-    /// A table-to-tensor conversion failed.
-    ConvertError,
-    /// A configuration value was refused.
-    ConfigRefused,
-    /// The plan was refused.
-    PlanRefused,
-    /// Resume was refused.
-    ResumeRefused,
-    /// The run needs something this build does not do.
-    Unsupported,
-    /// The engine stopped as cancelled with no cancel asked of it.
-    Cancelled,
-    /// A crash: a panic of Moruna's own unwound the run, a defect of the engine and never a
-    /// cancel. Every task still running fails with it, or the attempt does when none was.
-    Internal,
-}
-
-/// Who a failure belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureScope {
-    /// The task the event names.
-    Task,
-    /// The attempt as a whole: no one task owns the cause.
-    Attempt,
-}
-
-/// Why a task was skipped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkipReason {
-    /// Another task failed first (`blocking`).
-    FailedTask,
-    /// The attempt failed for a reason no task owns.
-    AttemptFailed,
-    /// The run was cancelled first.
-    Cancelled,
-}
-
-/// How a cancelled run ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CancelDisposition {
-    /// The cancel stopped it.
-    Cancelled,
-    /// It completed before the cancel could stop it.
-    Completed,
-    /// It failed before the cancel could stop it.
-    Failed,
 }
 
 /// A message from Moruna to its peer (MH 4.3).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outbound {
     /// First, on connect.
@@ -498,8 +142,6 @@ pub enum Outbound {
         /// `memory` or `cpu`.
         reason: String,
     },
-    /// One fact of the run's execution (MH 4.3), between `hello` and `report`.
-    Event(EventMsg),
     /// A stage calls a host port (MH 4.10); the peer answers with `port_reply`.
     PortCall {
         /// [`PORTS_VERSION`].
@@ -528,6 +170,9 @@ pub enum Outbound {
     Report {
         /// `RunReport` as JSON (04 d.1).
         report: serde_json::Value,
+        /// How the run went against its plan (SDD 26 e.3): the plan it ran, the order its steps
+        /// started in, each step's start, end and use, and every deviation from the plan.
+        plan: Option<serde_json::Value>,
     },
     /// Last.
     Exit {
@@ -549,13 +194,17 @@ impl Outbound {
 }
 
 /// A message from the peer to Moruna (MH 4.3).
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Inbound {
     /// The job document, in serve mode; once.
     Spec {
         /// The document.
         spec: serde_json::Value,
+        /// The plan to run it by, its FlatBuffers as standard base64 (SDD 26); absent: the
+        /// document is planned by the default planner.
+        #[serde(default)]
+        plan: Option<String>,
     },
     /// Cancel the run: the manifest is written and the process exits 130.
     Cancel,
@@ -623,9 +272,75 @@ pub fn read_line(reader: &mut dyn std::io::BufRead, max: usize) -> std::io::Resu
     }
 }
 
+/// One message of the protocol as it arrives: a line of JSON, or the record of an `event`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message {
+    /// A line, newline included.
+    Line(String),
+    /// The record of one event, the frame's mark taken off (`moruna_event::decode` reads it).
+    Event(Vec<u8>),
+}
+
+/// Read the next message of Moruna's side of the conversation: a framed event or a line of at most
+/// `max_line` bytes. `Ok(None)` at the end of the stream.
+pub fn read_message(
+    reader: &mut dyn std::io::BufRead,
+    max_line: usize,
+) -> std::io::Result<Option<Message>> {
+    match moruna_event::frame::next_is_frame(reader)? {
+        None => Ok(None),
+        Some(true) => moruna_event::frame::read_frame(reader).map(|r| Some(Message::Event(r))),
+        Some(false) => Ok(read_line(reader, max_line)?.map(Message::Line)),
+    }
+}
+
+/// [`read_message`] with every message as JSON, as people and the tests of a host read it: a line
+/// is parsed, an event's record is rendered as the `event` line of version 6's field names
+/// (`moruna_event::EventMsg::to_value`). A line that is not JSON and a record that is not an event
+/// are `InvalidData` errors.
+pub fn read_json_message(
+    reader: &mut dyn std::io::BufRead,
+) -> std::io::Result<Option<serde_json::Value>> {
+    let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+    match read_message(reader, MAX_SPEC_LINE)? {
+        None => Ok(None),
+        Some(Message::Line(line)) => serde_json::from_str(&line)
+            .map(Some)
+            .map_err(|e| invalid(format!("a line that is not JSON ({e}): {line}"))),
+        Some(Message::Event(record)) => moruna_event::decode(&record)
+            .map(|event| Some(event.to_value()))
+            .map_err(|e| invalid(format!("a frame that is not an event: {e}"))),
+    }
+}
+
+/// Every message in `bytes` as JSON, as [`read_json_message`] reads them one by one.
+pub fn json_messages(bytes: &[u8]) -> std::io::Result<Vec<serde_json::Value>> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let mut messages = Vec::new();
+    while let Some(message) = read_json_message(&mut reader)? {
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An event as a peer reads it, with the parts the JSON does not show filled in.
+    fn msg(attempt: u32, start: String, seq: u64, t_us: u64, body: Event) -> EventMsg {
+        EventMsg {
+            run: None,
+            plan: None,
+            attempt,
+            seq,
+            ts_ns: 0,
+            t_us,
+            msg_id: format!("{attempt}-{start}-{seq}"),
+            start,
+            body,
+        }
+    }
 
     /// MH 4.3, byte for byte: `type` first, then the fields in the order the table lists them,
     /// nulls written out.
@@ -682,10 +397,11 @@ mod tests {
         assert!(changed.line().ends_with(",\"reason\":\"memory\"}\n"));
         let report = Outbound::Report {
             report: serde_json::json!({"run_id": "ab"}),
+            plan: Some(serde_json::json!({"plan": "cd"})),
         };
         assert_eq!(
             report.line(),
-            "{\"type\":\"report\",\"report\":{\"run_id\":\"ab\"}}\n"
+            "{\"type\":\"report\",\"report\":{\"run_id\":\"ab\"},\"plan\":{\"plan\":\"cd\"}}\n"
         );
         let exit = Outbound::Exit {
             code: 130,
@@ -701,30 +417,23 @@ mod tests {
     /// nulls written out.
     #[test]
     fn an_event_is_byte_exact() {
-        let event = |body| {
-            Outbound::Event(EventMsg {
-                v: EVENTS_VERSION,
-                attempt: 2,
-                start: "0f".repeat(16),
-                seq: 7,
-                t_us: 1500,
-                body,
-            })
-            .line()
-        };
+        let event = |body| msg(2, "0f".repeat(16), 7, 1500, body).json_line();
         assert_eq!(
             event(Event::TaskStarted {
                 task: "orders".into(),
+                step: Some("s0123456789abcdef".into()),
                 phase: Phase::Reading,
             }),
             format!(
-                "{{\"type\":\"event\",\"v\":4,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
-                 \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\"phase\":\"reading\"}}\n",
+                "{{\"type\":\"event\",\"v\":7,\"attempt\":2,\"start\":\"{}\",\"seq\":7,\
+                 \"t_us\":1500,\"kind\":\"task_started\",\"task\":\"orders\",\
+                 \"step\":\"s0123456789abcdef\",\"phase\":\"reading\"}}\n",
                 "0f".repeat(16)
             )
         );
         let failed = event(Event::TaskFailed {
             task: None,
+            step: None,
             code: FailureCode::IoError,
             message: "the read_file operation failed".into(),
             scope: FailureScope::Attempt,
@@ -732,7 +441,7 @@ mod tests {
         });
         assert!(
             failed.ends_with(
-                "\"kind\":\"task_failed\",\"task\":null,\"code\":\"io_error\",\
+                "\"kind\":\"task_failed\",\"task\":null,\"step\":null,\"code\":\"io_error\",\
                  \"message\":\"the read_file operation failed\",\"scope\":\"attempt\",\
                  \"retryable\":true}\n"
             ),
@@ -740,6 +449,7 @@ mod tests {
         );
         let crashed = event(Event::TaskFailed {
             task: Some("orders".into()),
+            step: Some("s1".into()),
             code: FailureCode::Internal,
             message: "index out of bounds".into(),
             scope: FailureScope::Task,
@@ -747,7 +457,7 @@ mod tests {
         });
         assert!(
             crashed.ends_with(
-                "\"kind\":\"task_failed\",\"task\":\"orders\",\"code\":\"internal\",\
+                "\"kind\":\"task_failed\",\"task\":\"orders\",\"step\":\"s1\",\"code\":\"internal\",\
                  \"message\":\"index out of bounds\",\"scope\":\"task\",\"retryable\":false}\n"
             ),
             "{crashed}"
@@ -755,19 +465,21 @@ mod tests {
         assert!(event(Event::CancelAcknowledged).ends_with("\"kind\":\"cancel_acknowledged\"}\n"));
         let waiting = event(Event::TaskWaiting {
             task: "triage".into(),
+            step: Some("s2".into()),
             reason: WaitReason::PortCall,
             blocking: Vec::new(),
             port: Some("model".into()),
         });
         assert!(
             waiting.ends_with(
-                "\"kind\":\"task_waiting\",\"task\":\"triage\",\"reason\":\"port_call\",\
+                "\"kind\":\"task_waiting\",\"task\":\"triage\",\"step\":\"s2\",\"reason\":\"port_call\",\
                  \"blocking\":[],\"port\":\"model\"}\n"
             ),
             "{waiting}"
         );
         let done = event(Event::TaskCompleted {
             task: "t1".into(),
+            step: Some("s3".into()),
             outcome: TaskOutcome::Succeeded,
             duration_us: None,
             counters: Some(Counters::default()),
@@ -781,6 +493,34 @@ mod tests {
             ),
             "{done}"
         );
+        // Version 6: the plan's steps.
+        assert!(
+            event(Event::AttemptStarted {
+                resumed: false,
+                plan: Some("ab".into()),
+            })
+            .ends_with("\"kind\":\"attempt_started\",\"resumed\":false,\"plan\":\"ab\"}\n")
+        );
+        assert!(
+            event(Event::StepStarted {
+                step: "s3".into(),
+                plan: "ab".into(),
+                group: 2,
+            })
+            .ends_with("\"kind\":\"step_started\",\"step\":\"s3\",\"plan\":\"ab\",\"group\":2}\n")
+        );
+        assert!(
+            event(Event::StepEnded {
+                step: "s3".into(),
+                plan: "ab".into(),
+                outcome: StepOutcome::Skipped,
+                duration_us: None,
+            })
+            .ends_with(
+                "\"kind\":\"step_ended\",\"step\":\"s3\",\"plan\":\"ab\",\
+                 \"outcome\":\"skipped\",\"duration_us\":null}\n"
+            )
+        );
     }
 
     /// `logs` on the socket and a `log` record in the store (MH 4.3): the same `event` framing,
@@ -788,13 +528,12 @@ mod tests {
     /// only counts.
     #[test]
     fn output_is_counted_on_the_socket_and_kept_in_the_store() {
-        let logs = Outbound::Event(EventMsg {
-            v: EVENTS_VERSION,
-            attempt: 1,
-            start: "0f".repeat(16),
-            seq: 9,
-            t_us: 10,
-            body: Event::Logs {
+        let logs = msg(
+            1,
+            "0f".repeat(16),
+            9,
+            10,
+            Event::Logs {
                 producers: vec![
                     LogReach {
                         task: Some("k1".into()),
@@ -808,8 +547,8 @@ mod tests {
                     LogReach::default(),
                 ],
             },
-        })
-        .line();
+        )
+        .json_line();
         assert!(
             logs.ends_with(
                 "\"kind\":\"logs\",\"producers\":[{\"task\":\"k1\",\"records\":3,\"bytes\":40,\
@@ -819,28 +558,26 @@ mod tests {
             ),
             "{logs}"
         );
-        let record = LogLine {
-            kind_of: "event",
-            v: EVENTS_VERSION,
-            attempt: 1,
-            start: "0f".repeat(16),
-            seq: 4,
-            t_us: 77,
-            kind: "log",
-            id: format!("{}/k1/4", "0f".repeat(16)),
-            task: Some("k1".into()),
-            stream: LogStream::Stderr,
-            level: None,
-            bytes: 2,
-            text: "hi".into(),
-            partial: false,
-            continued: true,
-            truncated: 0,
-        };
+        let record = msg(
+            1,
+            "0f".repeat(16),
+            4,
+            77,
+            Event::Log {
+                task: Some("k1".into()),
+                stream: LogStream::Stderr,
+                level: None,
+                bytes: 2,
+                text: "hi".into(),
+                partial: false,
+                continued: true,
+                truncated: 0,
+            },
+        );
         assert_eq!(
-            record.line(),
+            record.json_line(),
             format!(
-                "{{\"type\":\"event\",\"v\":4,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
+                "{{\"type\":\"event\",\"v\":7,\"attempt\":1,\"start\":\"{s}\",\"seq\":4,\
                  \"t_us\":77,\"kind\":\"log\",\"id\":\"{s}/k1/4\",\"task\":\"k1\",\
                  \"stream\":\"stderr\",\"level\":null,\"bytes\":2,\"text\":\"hi\",\
                  \"partial\":false,\"continued\":true,\"truncated\":0}}\n",
@@ -863,7 +600,15 @@ mod tests {
         assert_eq!(
             Inbound::parse("{\"type\":\"spec\",\"spec\":{\"a\":1}}"),
             Ok(Inbound::Spec {
-                spec: serde_json::json!({"a": 1})
+                spec: serde_json::json!({"a": 1}),
+                plan: None,
+            })
+        );
+        assert_eq!(
+            Inbound::parse("{\"type\":\"spec\",\"spec\":{},\"plan\":\"TVBMMQ==\"}"),
+            Ok(Inbound::Spec {
+                spec: serde_json::json!({}),
+                plan: Some("TVBMMQ==".into()),
             })
         );
         assert!(Inbound::parse("{\"type\":\"resize\",\"memory\":1}").is_err());

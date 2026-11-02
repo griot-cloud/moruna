@@ -6,9 +6,11 @@
 //! never whether it fits the budget.
 
 mod learned;
+mod model;
 mod rule;
 
 pub use learned::LearnedSizer;
+pub use model::ModelSizer;
 pub use rule::RuleSizer;
 
 use moruna_kernel::{MorselFeatures, StageId, TraceRecord};

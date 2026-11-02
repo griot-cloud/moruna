@@ -19,6 +19,7 @@ use arrow::ipc::reader::RecordBatchDecoder;
 use arrow::ipc::writer::{IpcWriteOptions, StreamEncoder};
 use arrow::ipc::{CompressionType, MetadataVersion, root_as_message};
 use arrow::record_batch::RecordBatch;
+use moruna_ipc_check::frame::{self, buffer_entries, framing_target, message_len, round_up};
 
 mod check;
 mod inflate;
@@ -32,21 +33,12 @@ use crate::buffer::{Allocator, Buffer};
 use crate::error::MorunaError;
 use crate::tier::Tier;
 
-/// The IPC continuation marker that precedes every message length.
-const CONTINUATION: [u8; 4] = [0xff; 4];
-/// One flatbuffer `Buffer` struct: an `i64` offset then an `i64` length, inline.
-const BUFFER_ENTRY: usize = 16;
-
 fn bad(msg: impl Into<String>) -> MorunaError {
     MorunaError::Io {
         op: "ipc",
         target: "record".into(),
         msg: msg.into(),
     }
-}
-
-fn round_up(value: u64, to: u64) -> u64 {
-    value.div_ceil(to) * to
 }
 
 /// How the body buffers of a written record are compressed (08 e.3).
@@ -204,7 +196,7 @@ fn encode(
         match framing_len {
             None => {
                 framing.extend_from_slice(piece.as_slice());
-                framing_len = framing_target(&framing)?;
+                framing_len = framing_target(&framing).map_err(bad)?;
                 if framing_len.is_some_and(|target| target < framing.len()) {
                     return Err(bad("the encoder split a message header across buffers"));
                 }
@@ -229,8 +221,8 @@ fn encode(
 
     // The record batch message's buffer entries, in schema order, as the encoder laid them out
     // with 8-byte alignment; each is rewritten to its page-aligned place below.
-    let rb_start = message_len(&framing)? + 8;
-    let entries = buffer_entries(&framing[rb_start..])?;
+    let rb_start = message_len(&framing).map_err(bad)? + 8;
+    let entries = buffer_entries(&framing[rb_start..]).map_err(bad)?;
 
     // Map each entry to the body buffer the encoder pushed for it, walking the tail and its
     // padding buffers in step with the declared offsets.
@@ -264,44 +256,18 @@ fn encode(
         bodies.push(body.clone());
     }
 
-    // The page-aligned layout: the framing is page-rounded, then every body buffer starts at
-    // the next page boundary after the previous one.
+    // The page-aligned layout (e.7, KA11): the framing is page-rounded, every body buffer starts
+    // at the next page boundary after the previous one, and the message's entries and body length
+    // are rewritten to match, in place.
     let framing_padded = round_up(framing_len as u64, page);
+    let lengths: Vec<u64> = bodies.iter().map(|b| b.len() as u64).collect();
+    let offsets = frame::page_layout(&mut framing, &lengths, page, base_offset).map_err(bad)?;
     let mut placed = Vec::with_capacity(bodies.len());
-    let mut cursor = base_offset + framing_padded;
-    let body_base = base_offset + framing_len as u64;
-    let mut layout = Vec::with_capacity(bodies.len());
-    let mut body_end = 0u64;
-    for body in bodies {
-        let absolute = cursor;
-        let relative = absolute - body_base;
-        if !body.is_empty() {
-            body_end = body_end.max(relative + body.len() as u64);
-        }
-        layout.push((relative, body.len() as u64));
-        cursor = round_up(absolute + body.len() as u64, page);
+    for (absolute, body) in offsets.into_iter().zip(bodies) {
         let offset = usize::try_from(absolute)
             .map_err(|_| bad(format!("body offset {absolute} does not fit this platform")))?;
         placed.push((offset, body));
     }
-
-    // The message declares the body's length, and a reader holds the block of an IPC file to it:
-    // Arrow C++ refuses a file whose footer block and message disagree about it, and one whose
-    // block lengths are not multiples of 8 (KA11). The deviation of this layout is where the
-    // buffers sit, not what the length means, so it is the span from the end of the message to
-    // the end of the last byte of a buffer, padded to 8, which is what the file holds. An empty
-    // buffer lies inside that span wherever the layout put it: its offset is clamped to the
-    // span's end, since a reader slices the body at every entry's offset, empty ones included.
-    let body_len = round_up(body_end, 8);
-    for (i, (relative, length)) in layout.into_iter().enumerate() {
-        let at = if length == 0 {
-            relative.min(body_len)
-        } else {
-            relative
-        };
-        write_entry(&mut framing[rb_start..], i, at as i64, length as i64)?;
-    }
-    write_body_length(&mut framing[rb_start..], body_len)?;
 
     let mut buf = alloc.alloc(framing_padded as usize, host_tier(alloc))?;
     let bytes: &mut [u8] = &mut buf;
@@ -319,7 +285,7 @@ pub fn decode(buf: ArrowBuffer, page_bytes: usize) -> crate::Result<RecordBatch>
     }
     let page = page_bytes as u64;
     let bytes = buf.as_slice();
-    let schema_len = message_len(bytes)?;
+    let schema_len = message_len(bytes).map_err(bad)?;
     let schema_message = root_as_message(&bytes[8..8 + schema_len])
         .map_err(|e| bad(format!("schema message: {e}")))?;
     // A staging record is never compressed, so nothing may be inflated for it: a compressed one
@@ -333,7 +299,7 @@ pub fn decode(buf: ArrowBuffer, page_bytes: usize) -> crate::Result<RecordBatch>
     };
     let schema = std::sync::Arc::new(arrow::ipc::convert::fb_to_schema(schema_fb));
     let rb_start = 8 + schema_len;
-    let rb_len = message_len(&bytes[rb_start..])?;
+    let rb_len = message_len(&bytes[rb_start..]).map_err(bad)?;
     let rb_message = root_as_message(&bytes[rb_start + 8..rb_start + 8 + rb_len])
         .map_err(|e| bad(format!("record batch message: {e}")))?;
     let version = match rb_message.version() {
@@ -348,7 +314,7 @@ pub fn decode(buf: ArrowBuffer, page_bytes: usize) -> crate::Result<RecordBatch>
     else {
         return Err(bad("the second message is not a record batch"));
     };
-    for (offset, length) in buffer_entries(&bytes[rb_start..rb_start + 8 + rb_len])? {
+    for (offset, length) in buffer_entries(&bytes[rb_start..rb_start + 8 + rb_len]).map_err(bad)? {
         if length == 0 {
             continue;
         }
@@ -388,166 +354,4 @@ fn host_tier(alloc: &dyn Allocator) -> Tier {
     } else {
         Tier::Host
     }
-}
-
-/// The declared length of the message whose continuation marker starts `bytes`.
-fn message_len(bytes: &[u8]) -> crate::Result<usize> {
-    if bytes.len() < 8 {
-        return Err(bad("a message header needs 8 bytes"));
-    }
-    if bytes[0..4] != CONTINUATION {
-        return Err(bad("the continuation marker is missing"));
-    }
-    let len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-    if len == 0 {
-        return Err(bad("the message length is zero"));
-    }
-    if bytes.len() < 8 + len {
-        return Err(bad(format!(
-            "a message of {len} bytes is past the end of the buffer"
-        )));
-    }
-    Ok(len)
-}
-
-/// `Some(total framing length)` once `framing` holds both complete message headers, `None`
-/// while either is still incomplete.
-fn framing_target(framing: &[u8]) -> crate::Result<Option<usize>> {
-    if framing.len() < 8 {
-        return Ok(None);
-    }
-    if framing[0..4] != CONTINUATION {
-        return Err(bad("the continuation marker is missing"));
-    }
-    let first = u32::from_le_bytes([framing[4], framing[5], framing[6], framing[7]]) as usize;
-    let rb_start = 8 + first;
-    if framing.len() < rb_start + 8 {
-        return Ok(None);
-    }
-    if framing[rb_start..rb_start + 4] != CONTINUATION {
-        return Err(bad(
-            "the record batch message's continuation marker is missing",
-        ));
-    }
-    let second = u32::from_le_bytes([
-        framing[rb_start + 4],
-        framing[rb_start + 5],
-        framing[rb_start + 6],
-        framing[rb_start + 7],
-    ]) as usize;
-    Ok(Some(rb_start + 8 + second))
-}
-
-/// Where the record batch message's buffer entries begin inside `message` (the 8-byte header
-/// and the flatbuffer), and how many there are.
-fn entries_span(message: &[u8]) -> crate::Result<(usize, usize)> {
-    let len = message_len(message)?;
-    let flatbuffer = &message[8..8 + len];
-    let parsed =
-        root_as_message(flatbuffer).map_err(|e| bad(format!("record batch message: {e}")))?;
-    let record_batch = parsed
-        .header_as_record_batch()
-        .ok_or_else(|| bad("the message is not a record batch"))?;
-    let buffers = record_batch
-        .buffers()
-        .ok_or_else(|| bad("the record batch has no buffers"))?;
-    let raw = buffers.bytes();
-    let base = flatbuffer.as_ptr() as usize;
-    let start = raw.as_ptr() as usize;
-    if start < base || start + raw.len() > base + flatbuffer.len() {
-        return Err(bad("the buffer vector is outside the message"));
-    }
-    Ok((8 + (start - base), raw.len() / BUFFER_ENTRY))
-}
-
-/// The `(offset, length)` of every buffer entry of a record batch message.
-fn buffer_entries(message: &[u8]) -> crate::Result<Vec<(u64, u64)>> {
-    let (start, count) = entries_span(message)?;
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let at = start + i * BUFFER_ENTRY;
-        let mut offset = [0u8; 8];
-        let mut length = [0u8; 8];
-        offset.copy_from_slice(&message[at..at + 8]);
-        length.copy_from_slice(&message[at + 8..at + 16]);
-        let offset = i64::from_le_bytes(offset);
-        let length = i64::from_le_bytes(length);
-        if offset < 0 || length < 0 {
-            return Err(bad("a buffer entry has a negative offset or length"));
-        }
-        out.push((offset as u64, length as u64));
-    }
-    Ok(out)
-}
-
-/// Where the record batch message's `bodyLength` lives in `message` (the 8-byte header and the
-/// flatbuffer), found through the flatbuffer's own vtable. `None` when the field is absent,
-/// which flatbuffers does for a value of zero.
-fn body_length_at(message: &[u8]) -> crate::Result<Option<usize>> {
-    /// The field slot of `Message.bodyLength` in the schema `Message.fbs`: version, header type,
-    /// header, body length, custom metadata.
-    const BODY_LENGTH_SLOT: usize = 3;
-    let len = message_len(message)?;
-    let flatbuffer = &message[8..8 + len];
-    let word = |at: usize, width: usize| -> crate::Result<&[u8]> {
-        flatbuffer
-            .get(at..at + width)
-            .ok_or_else(|| bad("the message flatbuffer is truncated"))
-    };
-    let root = u32::from_le_bytes(word(0, 4)?.try_into().map_err(|_| bad("root offset"))?) as usize;
-    let back = i32::from_le_bytes(
-        word(root, 4)?
-            .try_into()
-            .map_err(|_| bad("vtable offset"))?,
-    );
-    let vtable = (root as i64 - back as i64)
-        .try_into()
-        .map_err(|_| bad("the message's vtable is outside it"))?;
-    let vtable_len = u16::from_le_bytes(word(vtable, 2)?.try_into().map_err(|_| bad("vtable"))?);
-    let slot = 4 + 2 * BODY_LENGTH_SLOT;
-    if (vtable_len as usize) < slot + 2 {
-        return Ok(None);
-    }
-    let field = u16::from_le_bytes(
-        word(vtable + slot, 2)?
-            .try_into()
-            .map_err(|_| bad("vtable slot"))?,
-    ) as usize;
-    if field == 0 {
-        return Ok(None);
-    }
-    word(root + field, 8)?;
-    Ok(Some(8 + root + field))
-}
-
-/// Set the record batch message's `bodyLength` to `length`, in place (KA11). A flatbuffer omits
-/// a field that is zero, so a zero length is the message as the encoder wrote it, and a length
-/// the message has no room for is refused rather than written somewhere else.
-fn write_body_length(message: &mut [u8], length: u64) -> crate::Result<()> {
-    match body_length_at(message)? {
-        Some(at) => message[at..at + 8].copy_from_slice(&(length as i64).to_le_bytes()),
-        None if length == 0 => {}
-        None => return Err(bad("the record batch message has no body length to set")),
-    }
-    let flatbuffer_len = message_len(message)?;
-    let parsed = root_as_message(&message[8..8 + flatbuffer_len])
-        .map_err(|e| bad(format!("record batch message: {e}")))?;
-    if parsed.bodyLength() as u64 != length {
-        return Err(bad("the record batch message's body length did not take"));
-    }
-    Ok(())
-}
-
-/// Rewrite one buffer entry of a record batch message in place.
-fn write_entry(message: &mut [u8], index: usize, offset: i64, length: i64) -> crate::Result<()> {
-    let (start, count) = entries_span(message)?;
-    if index >= count {
-        return Err(bad(format!(
-            "buffer entry {index} of {count} does not exist"
-        )));
-    }
-    let at = start + index * BUFFER_ENTRY;
-    message[at..at + 8].copy_from_slice(&offset.to_le_bytes());
-    message[at + 8..at + 16].copy_from_slice(&length.to_le_bytes());
-    Ok(())
 }

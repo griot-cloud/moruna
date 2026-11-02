@@ -1141,7 +1141,7 @@ mod tests {
         assert_eq!(found.cgroup_path, Some(root.join("memory")));
 
         let sampler = Sampler::new(&found).expect("sampler over the v1 fixture");
-        assert_eq!(sampler.sample().anon_bytes, 1024);
+        assert_eq!(sampler.sample().unwrap().anon_bytes, 1024);
     }
 
     /// DS-T15 ceiling_scope, through `discover`: with an explicit budget inside a cgroup, the
@@ -1171,13 +1171,17 @@ mod tests {
         assert_eq!(explicit.limits.source, LimitSource::Explicit);
         assert!(alone(&explicit.notes), "{:?}", explicit.notes);
         let sampler = Sampler::with_roots(&explicit, &roots.proc_dir).expect("sampler");
-        assert_eq!(sampler.sample().anon_bytes, 1600 * 1024, "RssAnon");
+        assert_eq!(sampler.sample().unwrap().anon_bytes, 1600 * 1024, "RssAnon");
 
         let pod = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
         assert_eq!(pod.limits.source, LimitSource::Cgroup);
         assert!(!alone(&pod.notes), "{:?}", pod.notes);
         let sampler = Sampler::with_roots(&pod, &roots.proc_dir).expect("sampler");
-        assert_eq!(sampler.sample().anon_bytes, 1048576, "the cgroup's anon");
+        assert_eq!(
+            sampler.sample().unwrap().anon_bytes,
+            1048576,
+            "the cgroup's anon"
+        );
     }
 
     /// h, normal path (laptop): `discover` on the real host answers, leaves no `Unknown`, and
@@ -1198,7 +1202,7 @@ mod tests {
         }
         assert_eq!(found.host_tier, TierKind::Host, "no device on this host");
         let sampler = Sampler::new(&found).expect("sampler");
-        assert!(sampler.sample().anon_bytes > 0);
+        assert!(sampler.sample().unwrap().anon_bytes > 0);
         assert!(!found.notes.is_empty());
     }
 

@@ -165,7 +165,7 @@ impl Machine {
         let mut discovered =
             moruna_discovery::discover(&DiscoveryInput::default()).expect("discovery");
         let sampler = moruna_discovery::Sampler::new(&discovered).expect("a sampler");
-        let baseline = sampler.sample().anon_bytes;
+        let baseline = sampler.sample().unwrap().anon_bytes;
         let ceiling = (ram_for(baseline + room) as f64 * 0.9) as u64;
         discovered.limits.memory_ceiling = ceiling;
         discovered.limits.memory_kill = None;
@@ -668,6 +668,7 @@ fn resident_now() -> u64 {
     moruna_discovery::Sampler::new(&discovered)
         .expect("sampler")
         .sample()
+        .unwrap()
         .anon_bytes
 }
 

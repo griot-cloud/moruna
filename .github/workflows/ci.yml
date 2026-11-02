@@ -35,7 +35,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [main]
+    # v1 is the 1.0 line (BOARD EK): its pull requests are checked like main's, and
+    # nothing on it releases, because the release path below runs only on a push to main.
+    branches: [main, v1]
   # A merge to main, which is the only way a commit reaches it: the branch is
   # protected and takes pull requests. This is the release path's trigger, and it
   # does nothing unless the version in Cargo.toml has no tag yet.
@@ -72,24 +74,45 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          # One interpreter: CPython 3.14 free-threaded, which is what S8 is
-          # about. The GIL path is the same interpreter under PYTHON_GIL=1.
+          cache-on-failure: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: standard
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: freethreaded
+        with:
+          # FT remains the default for the existing Rust/GIL and kernel tests.
           python-version: "3.14t"
       - name: Format, lints and the documentation checker
         run: |
           cargo fmt --all -- --check
           tools/lint/no_tier_wildcard.sh
           tools/docs/check_docs.py
+      - name: JB-I12 and PN-I14, the job and plan documents' generated code is what their schemas generate
+        run: tools/flatc/generate.sh --check
       - name: The documentation site builds, warnings as errors
         run: |
           python -m pip install --quiet -r docs/requirements.txt
           sphinx-build -W --keep-going -q -b html docs docs/_build/html
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: The image kind, for real (SDD 19 k)
+        # An image's command runs in its own namespaces, under Landlock and seccomp, in a cgroup
+        # Moruna made: that needs root and a cgroup v2 directory with `memory` and `cpu` handed to
+        # its children, which the runner has once it is asked. The tests are `--ignored` for a
+        # machine with neither; here they run, as root, with the directory.
+        run: |
+          bin="$(cargo test -p moruna-image --test image_kind --locked --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.name == "image_kind") | .executable')"
+          test -x "$bin"
+          sudo mkdir -p /sys/fs/cgroup/moruna-ci
+          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-ci/cgroup.subtree_control
+          sudo env MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-ci "$bin" --ignored --test-threads=1
       - name: peQL with its Iceberg binding compiled in (moruna-datafusion's peql-iceberg)
         # A host that embeds peQL with `iceberg` unifies that feature into Moruna's build, so the
         # governed ends must compile and pass with it on, not only in the default graph.
@@ -105,6 +128,8 @@ jobs:
             exit 1
           fi
       - name: The Python kernels
+        env:
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
           python -c 'import sys, sysconfig; print(sys.version); print("free-threaded:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")), "gil now:", sys._is_gil_enabled())'
           PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled()'
@@ -115,7 +140,8 @@ jobs:
           # is what we want, because the Python surface would not work on Linux.
           # pyyaml is the `package` extra's (pip is already here): `moruna package` reads
           # function.yaml (SDD 16 e.3), and python/tests packages projects.
-          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml
+          "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
+          "$FREETHREADED" -m uv --version
           cd bench/python && python -m pytest -q
       - name: The wheel builds, installs and runs on Linux
         # The check that matters for a release: not "does the source tree import", which
@@ -123,17 +149,229 @@ jobs:
         # publish work on the platform we publish it for". python/tests drives a real
         # pass through the installed wheel, so this is also where a Linux-only runtime
         # defect would surface (2026-09-23; before this, nothing proved either).
+        env:
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
         run: |
-          maturin build --release --out dist
-          python -m pip install --no-index --find-links dist moruna
-          python -c 'import moruna; print("moruna", moruna.__version__)'
+          "$STANDARD" -c 'import sysconfig; assert not sysconfig.get_config_var("Py_GIL_DISABLED")'
+          # Public image builds discover standard CPython through PATH; wheel
+          # building, installation and testing remain explicitly free-threaded.
+          export PATH="$(dirname "$STANDARD"):$PATH"
+          "$FREETHREADED" -m uv --version
+          "$FREETHREADED" -m maturin build --release --out dist --interpreter "$FREETHREADED"
+          "$FREETHREADED" -m pip install --no-index --find-links dist moruna
+          "$FREETHREADED" -c 'import moruna; print("moruna", moruna.__version__)'
           # From outside the tree, always. pytest puts the test's own root on sys.path,
           # so running python/tests in place lets python/moruna (the source package,
           # with no compiled _core) shadow the wheel that was just installed, and the
           # suite then tests something that cannot work while reporting on something
           # that can.
           cp -R python/tests /tmp/moruna-tests
-          cd /tmp && python -m pytest -q /tmp/moruna-tests
+          cd /tmp && "$FREETHREADED" -m pytest -q /tmp/moruna-tests
+
+  # The microkernel (SDD 20 k, SDD 23 k), on a pull request that touches kernel/ or this
+  # file, and never on a push: kernel/ is its own Cargo workspace on a pinned nightly,
+  # built with plain cargo for x86_64-unknown-none and booted under QEMU with KVM when
+  # the runner has it (TCG otherwise), on one, two and four CPUs. Each boot's serial line
+  # must carry every line the boot description expects, every CPU online and having run
+  # a process, no failure and no panic, and QEMU must exit with the kernel's success
+  # status. A commit that changes kernel/examples/ must touch no file of the kernel.
+  kernel:
+    name: the microkernel builds and boots (KB1)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      # Asterinas pins QEMU 10.2.1 for OSTD 0.19.0 (tools/dev_env/nix/packages/qemu.nix
+      # and osdk/tools/docker/Dockerfile, tag v0.19.0): Ubuntu 24.04's 8.2 has known
+      # problems with it. Built from the release tarball, checked by its digest, cached.
+      QEMU_VERSION: "10.2.1"
+      QEMU_SHA256: a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: changed
+        name: Did this pull request change a native boot or engine proof input?
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Native job boots execute the root runtime and its transitive crates too.
+          # A runtime/codec/pin-only change must not silently skip the mandatory peer.
+          if git diff --quiet "$BASE...HEAD" -- kernel/ crates/ Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows/ci.yml; then
+            echo "native boot, engine, codec and pinned build inputs are unchanged"
+            echo "kernel=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "kernel=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the kernel's pinned toolchain (kernel/rust-toolchain.toml)
+        if: steps.changed.outputs.kernel == 'true'
+        working-directory: kernel
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.changed.outputs.kernel == 'true'
+        with:
+          # Root target includes MUSL output and nested target/host helpers.
+          # Keep it one cache root: listing target/host again would overlap.
+          workspaces: |
+            . -> target
+            kernel -> target
+          cache-on-failure: true
+      - id: qemu-cache
+        if: steps.changed.outputs.kernel == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/qemu
+          key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-vhost-user-ubuntu-24.04-v3
+      - name: Build QEMU ${{ env.QEMU_VERSION }}
+        if: steps.changed.outputs.kernel == 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
+          curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
+          echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
+          mkdir qemu-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-src
+          cd qemu-src
+          # vhost-user builds vhost-user-vsock-pci, the vsock every boot has (SDD 30 f.11),
+          # whose back end is build.sh's moruna-vhost-vsock: no host kernel module.
+          ./configure --prefix=/opt/qemu --target-list=x86_64-softmmu \
+            --without-default-features --enable-kvm --enable-tcg --enable-vhost-user \
+            --disable-docs --disable-werror
+          make -j"$(nproc)"
+          sudo make install
+      - name: QEMU on the path, and KVM for this user when the runner has it
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          echo /opt/qemu/bin >> "$GITHUB_PATH"
+          /opt/qemu/bin/qemu-system-x86_64 --version
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the boot runs under TCG"
+      - name: Format and host tests of ABI, loaders, handles, quotas, SDK, image and device libraries
+        if: steps.changed.outputs.kernel == 'true'
+        working-directory: kernel
+        run: |
+          cargo fmt --all -- --check
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-quota -p moruna-svc -p moruna-image
+            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
+            -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol)
+          cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
+          cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
+      - name: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)
+        if: steps.changed.outputs.kernel == 'true'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: kernel/tools/check-examples.sh "$BASE" HEAD
+      - name: The Linux personality's image (SDD 28 k), musl for its static programs, and python:3.14-slim's layers
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          # This step runs at the root: rust-toolchain.toml selects the engine's
+          # pinned stable toolchain, not kernel/'s nightly. musl-tools supplies C,
+          # but does not install Rust's std for this target.
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+          kernel/tools/python-layout.sh "$RUNNER_TEMP/python"
+      - name: Build the kernel, the programs and the boot image
+        if: steps.changed.outputs.kernel == 'true'
+        run: kernel/tools/build.sh "$RUNNER_TEMP/boot" kernel/initramfs/boot.image "$RUNNER_TEMP/python"
+      - name: Boot under QEMU on one, two and four CPUs and judge each serial line
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          fail=0
+          for cpus in 1 2 4; do
+            echo "::group::boot on $cpus CPUs"
+            set +e
+            kernel/tools/boot.sh "$RUNNER_TEMP/boot" 900 "$cpus" | tee "$RUNNER_TEMP/serial-$cpus.log"
+            status="${PIPESTATUS[0]}"
+            set -e
+            echo "::endgroup::"
+            echo "verdict of the boot on $cpus CPUs:"
+            kernel/tools/check-boot.sh "$RUNNER_TEMP/serial-$cpus.log" "$status" "$RUNNER_TEMP/boot/expect" "$cpus" || fail=1
+          done
+          exit "$fail"
+      - name: Required five production-node job cases on one, two and four CPUs
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          python3 kernel/tools/net-proof.py prepare "$RUNNER_TEMP/boot"
+          kernel/tools/node-fixtures.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/native-node-ci" \
+            "$(command -v qemu-system-x86_64)" "$RUNNER_TEMP/boot/ke2/roots" 180
+      - name: Strict deadline latency on one, two and four CPUs, with bounded contenders
+        if: steps.changed.outputs.kernel == 'true'
+        run: kernel/tools/deadline-boot.sh "$RUNNER_TEMP/boot" "$RUNNER_TEMP/deadline-boot"
+      - name: Clippy for the builtin kernel target and canonical native-user target
+        if: steps.changed.outputs.kernel == 'true'
+        working-directory: kernel
+        env:
+          RUSTFLAGS: --cfg polyval_force_soft -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y
+          # Match build.sh: ring's freestanding JSON target requires Clang,
+          # not the runner's default GCC (which rejects -nostdlibinc).
+          CC_x86_64_moruna_user: clang
+          CFLAGS_x86_64_moruna_user: --target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector
+        run: |
+          unset CARGO_ENCODED_RUSTFLAGS
+          build_std=(-Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
+          # Preserve the builtin soft-float kernel target; only native userland
+          # uses the canonical SSE2/SysV JSON target, exactly as build.sh does.
+          cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" \
+            -p moruna-microkernel-boot -- -D warnings
+          RUSTFLAGS="$RUSTFLAGS -Zunstable-options -C link-arg=-T$PWD/sys/user.ld -C link-arg=-static" \
+            cargo clippy -Zunstable-options -Zjson-target-spec --release --locked \
+            --target "$PWD/targets/x86_64-moruna-user.json" "${build_std[@]}" --workspace \
+            --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image -- -D warnings
+      - name: Licences of the kernel workspace (MPL-2.0 for OSTD, DECISIONS.md MK1)
+        if: steps.changed.outputs.kernel == 'true'
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: cargo-deny@0.20.2
+      - if: steps.changed.outputs.kernel == 'true'
+        run: cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
+      - name: Retain bounded production-node diagnostics
+        if: always() && steps.changed.outputs.kernel == 'true'
+        run: |
+          python3 - <<'PY_NODE_LOGS'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          source, output = root / "native-node-ci", root / "native-node-ci-logs"
+          output.mkdir(exist_ok=True)
+          retained = []
+          for cpu in (1, 2, 4):
+              for case in range(1, 6):
+                  for name in ("result.json", "prepare.log", "backend.log", "qemu.log", "peer.log", "serial.log"):
+                      relative = pathlib.Path(f"cpu{cpu}/case{case}") / name
+                      path = source / relative
+                      if not path.is_file() or path.is_symlink():
+                          continue
+                      size = path.stat().st_size
+                      bound = 256 * 1024 if name == "result.json" else 64 * 1024
+                      if name == "result.json" and size > bound:
+                          retained.append({"path": str(relative), "bytes": size, "omitted": "JSON exceeds bound"})
+                          continue
+                      with path.open("rb") as stream:
+                          stream.seek(max(0, size - bound))
+                          data = stream.read(bound)
+                      destination = output / relative
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      destination.write_bytes(data)
+                      retained.append({"path": str(relative), "original_bytes": size, "retained_bytes": len(data)})
+          (output / "retained.json").write_text(json.dumps(retained, indent=2) + "\n")
+          PY_NODE_LOGS
+      - if: always() && steps.changed.outputs.kernel == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-serial-logs
+          path: |
+            ${{ runner.temp }}/serial-*.log
+            ${{ runner.temp }}/native-node-ci-logs/**
+            ${{ runner.temp }}/boot/manifest
+            ${{ runner.temp }}/boot/expect
+            ${{ runner.temp }}/boot/console*.log
+            ${{ runner.temp }}/boot/vsock*
+          if-no-files-found: warn
+          retention-days: 14
 
   # Weekly and on demand: the checks that answer to the outside world rather
   # than to a commit, and the ones that need a real cgroup ceiling.

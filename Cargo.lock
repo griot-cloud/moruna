@@ -45,6 +45,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -59,6 +60,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -282,6 +284,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "arrow"
@@ -874,6 +879,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -892,6 +898,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "block-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
 ]
 
 [[package]]
@@ -2558,6 +2571,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "devices-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2856,6 +2876,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2886,6 +2916,19 @@ dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
  "zlib-rs",
+]
+
+[[package]]
+name = "flexbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bc752b3d049e0705749b9999d0b130d6cf62935bc7762fd3bdb7636047abe43"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "num_enum 0.5.11",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -3098,6 +3141,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -3595,6 +3639,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagefs-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3986,6 +4037,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4203,8 +4261,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-abi"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-adapters"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "dlpark",
@@ -4219,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-arena"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "cudarc",
  "libc",
@@ -4230,7 +4292,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-bench"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "blake3",
@@ -4248,8 +4310,10 @@ dependencies = [
 
 [[package]]
 name = "moruna-controller"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
+ "moruna-cost",
+ "moruna-job",
  "moruna-kernel",
  "moruna-testkit",
  "serde",
@@ -4258,12 +4322,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-cost"
+version = "0.6.0"
+dependencies = [
+ "moruna-job",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "moruna-datafusion"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "datafusion",
  "futures",
  "moruna-kernel",
+ "moruna-reactor",
  "moruna-sources",
  "moruna-testkit",
  "peql",
@@ -4273,7 +4348,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-discovery"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "cudarc",
@@ -4283,9 +4358,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "moruna-job"
-version = "0.5.9"
+name = "moruna-event"
+version = "0.6.0"
 dependencies = [
+ "flatbuffers",
+ "moruna-record",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "moruna-image"
+version = "0.6.0"
+dependencies = [
+ "arrow",
+ "flate2",
+ "getrandom 0.4.3",
+ "moruna-image",
+ "moruna-imagefs",
+ "moruna-job",
+ "moruna-plane-linux",
+ "moruna-runtime",
+ "parquet",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror 2.0.20",
+ "tracing",
+ "zstd 0.13.3",
+]
+
+[[package]]
+name = "moruna-imagefs"
+version = "0.1.0"
+
+[[package]]
+name = "moruna-ipc-check"
+version = "0.1.0"
+
+[[package]]
+name = "moruna-job"
+version = "0.6.0"
+dependencies = [
+ "flatbuffers",
+ "flexbuffers",
+ "moruna-types",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -4294,14 +4413,16 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernel"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "blake3",
  "dlpark",
  "flatbuffers",
  "lz4_flex",
+ "moruna-ipc-check",
  "moruna-testkit",
+ "moruna-types",
  "serde_json",
  "thiserror 2.0.20",
  "zstd 0.13.3",
@@ -4309,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernels"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "moruna-kernel",
@@ -4319,9 +4440,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "moruna-package"
-version = "0.5.9"
+name = "moruna-micro"
+version = "0.6.0"
 dependencies = [
+ "imagefs-protocol",
+ "libc",
+ "linux-protocol",
+ "moruna-adapters",
+ "moruna-kernel",
+ "moruna-plane",
+ "moruna-record",
+ "moruna-svc",
+ "moruna-sys",
+ "tracing",
+ "vsock-protocol",
+]
+
+[[package]]
+name = "moruna-package"
+version = "0.6.0"
+dependencies = [
+ "moruna-job",
  "moruna-kernel",
  "serde",
  "serde_json",
@@ -4332,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-placement"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -4349,8 +4488,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-plan"
+version = "0.6.0"
+dependencies = [
+ "flatbuffers",
+ "moruna-cost",
+ "moruna-job",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "moruna-plane"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-ipc-check",
+ "moruna-sys",
+]
+
+[[package]]
+name = "moruna-plane-linux"
+version = "0.6.0"
+dependencies = [
+ "libc",
+ "moruna-abi",
+ "moruna-ipc-check",
+ "moruna-plane",
+ "moruna-testkit",
+ "seccompiler",
+]
+
+[[package]]
 name = "moruna-polars"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "moruna-kernel",
  "polars",
@@ -4359,22 +4532,29 @@ dependencies = [
 
 [[package]]
 name = "moruna-py"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "moruna-adapters",
  "moruna-arena",
+ "moruna-cost",
+ "moruna-datafusion",
  "moruna-discovery",
+ "moruna-event",
  "moruna-job",
  "moruna-kernel",
  "moruna-kernels",
+ "moruna-micro",
  "moruna-package",
  "moruna-placement",
+ "moruna-plan",
  "moruna-reactor",
  "moruna-runtime",
  "moruna-sandbox",
  "moruna-sinks",
  "moruna-sources",
+ "moruna-storage",
+ "moruna-sys",
  "moruna-trace",
  "moruna-wasm",
  "parquet",
@@ -4384,13 +4564,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "moruna-reactor"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "cudarc",
@@ -4401,16 +4582,23 @@ dependencies = [
  "io-uring",
  "libc",
  "moruna-kernel",
+ "moruna-micro",
+ "moruna-storage",
  "moruna-testkit",
  "object_store",
+ "seccompiler",
  "socket2",
  "tokio",
  "tracing",
 ]
 
 [[package]]
+name = "moruna-record"
+version = "0.6.0"
+
+[[package]]
 name = "moruna-runtime"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4425,20 +4613,30 @@ dependencies = [
  "moruna-adapters",
  "moruna-arena",
  "moruna-controller",
+ "moruna-cost",
  "moruna-datafusion",
  "moruna-discovery",
+ "moruna-event",
+ "moruna-image",
  "moruna-job",
  "moruna-kernel",
  "moruna-kernels",
+ "moruna-micro",
  "moruna-package",
  "moruna-placement",
+ "moruna-plan",
  "moruna-reactor",
+ "moruna-record",
  "moruna-sandbox",
  "moruna-scheduler",
  "moruna-sinks",
  "moruna-sources",
+ "moruna-storage",
+ "moruna-storage-format",
+ "moruna-sys",
  "moruna-testkit",
  "moruna-trace",
+ "moruna-types",
  "moruna-vmm",
  "moruna-wasm",
  "parcel-core",
@@ -4457,14 +4655,19 @@ dependencies = [
 
 [[package]]
 name = "moruna-sandbox"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "landlock",
  "libc",
+ "moruna-abi",
  "moruna-adapters",
  "moruna-arena",
+ "moruna-image",
+ "moruna-ipc-check",
  "moruna-kernel",
  "moruna-package",
+ "moruna-plane",
+ "moruna-plane-linux",
  "moruna-testkit",
  "pyo3",
  "seccompiler",
@@ -4476,11 +4679,14 @@ dependencies = [
 
 [[package]]
 name = "moruna-scheduler"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "crossbeam",
  "libc",
+ "moruna-cost",
+ "moruna-job",
  "moruna-kernel",
+ "moruna-placement",
  "moruna-sinks",
  "moruna-testkit",
  "thiserror 2.0.20",
@@ -4489,7 +4695,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sinks"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -4507,7 +4713,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sources"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -4524,18 +4730,92 @@ dependencies = [
 ]
 
 [[package]]
-name = "moruna-testkit"
-version = "0.5.9"
+name = "moruna-storage"
+version = "0.6.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
+ "blake3",
+ "bytes",
+ "futures",
+ "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "moruna-kernel",
+ "moruna-micro",
+ "moruna-storage-format",
+ "moruna-storage-service",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-testkit",
+ "object_store",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.20",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "moruna-storage-format"
+version = "0.6.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "blake3",
+ "ghash",
+ "polyval",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "moruna-storage-service"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "block-protocol",
+ "devices-protocol",
+ "moruna-storage-format",
+ "moruna-svc",
+ "moruna-sys",
+ "netstack-protocol",
+]
+
+[[package]]
+name = "moruna-svc"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-sys",
+]
+
+[[package]]
+name = "moruna-sys"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+]
+
+[[package]]
+name = "moruna-testkit"
+version = "0.6.0"
+dependencies = [
+ "arrow",
  "flatbuffers",
  "lz4_flex",
+ "moruna-ipc-check",
  "moruna-kernel",
  "zstd 0.13.3",
 ]
 
 [[package]]
 name = "moruna-trace"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "crossbeam",
@@ -4548,10 +4828,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-types"
+version = "0.6.0"
+
+[[package]]
 name = "moruna-vmm"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "acpi_tables",
+ "base64 0.23.1",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -4571,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-wasm"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "moruna-adapters",
  "moruna-kernel",
@@ -4618,6 +4903,13 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+]
+
+[[package]]
+name = "netstack-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
 ]
 
 [[package]]
@@ -4764,12 +5056,33 @@ dependencies = [
 
 [[package]]
 name = "num_enum"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f646caf906c20226733ed5b1374287eb97e3c2a5c227ce668c1f2ce20ae57c9"
+dependencies = [
+ "num_enum_derive 0.5.11",
+]
+
+[[package]]
+name = "num_enum"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
 dependencies = [
- "num_enum_derive",
+ "num_enum_derive 0.7.6",
  "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcbff9bc912032c62bf65ef1d5aea88983b420f4f839db1e9b0c281a25c9c799"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5866,6 +6179,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -5927,6 +6241,16 @@ checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
 dependencies = [
  "proc-macro2",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "proc-macro-crate"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f4c021e1093a56626774e81216a4ce732a735e5bad4868a03f3ed65ca0c3919"
+dependencies = [
+ "once_cell",
+ "toml_edit",
 ]
 
 [[package]]
@@ -7199,6 +7523,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7398,6 +7732,23 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+
+[[package]]
+name = "toml_edit"
+version = "0.19.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b5bb770da30e5cbfde35a2d7b9b8a2c4b8ef89548a7a6aeab5c9a576e3e7421"
+dependencies = [
+ "indexmap 2.14.2",
+ "toml_datetime",
+ "winnow",
 ]
 
 [[package]]
@@ -7830,7 +8181,7 @@ dependencies = [
  "jiff",
  "memchr",
  "num-traits",
- "num_enum",
+ "num_enum 0.7.6",
  "parking_lot",
  "paste",
  "pin-project-lite",
@@ -8407,6 +8758,13 @@ dependencies = [
  "vortex-mask",
  "vortex-session",
  "zigzag",
+]
+
+[[package]]
+name = "vsock-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
 ]
 
 [[package]]
@@ -9015,6 +9373,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "0.5.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"

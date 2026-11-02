@@ -9,10 +9,19 @@ publish.workspace = true
 description = "Moruna runtime facade"
 
 [dependencies]
+moruna-event = { workspace = true }
+moruna-record = { workspace = true }
 moruna-kernel = { workspace = true }
 # The kinds' declarations and the job document, which an embedder reads without running anything
 # (SDD 22).
 moruna-job = { workspace = true }
+# A run starts from its plan (SDD 26): the levels planner when the caller gives none, and the
+# plan's check before anything runs.
+moruna-plan = { workspace = true }
+# The runtime's cost configuration (`cost`: the observation store, the model a setting chooses,
+# its fitted state) and warm-up in `check` (AR sections 5 to 7, KD6b), both through the traits.
+moruna-cost = { workspace = true }
+# A run's events are records (SDD 21) of FlatBuffers (SDD 12, MH 4.3 version 7).
 moruna-arena = { workspace = true }
 moruna-discovery = { workspace = true }
 moruna-trace = { workspace = true }
@@ -25,10 +34,19 @@ moruna-placement = { workspace = true }
 moruna-scheduler = { workspace = true }
 moruna-controller = { workspace = true }
 moruna-kernels = { workspace = true }
+# Sole governed historical artifact publisher/reader (KS1).
+moruna-storage = { workspace = true }
+# Shared bootstrap/session/cache contracts are used on every compiled target.
+moruna-storage-format = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
 # A packaged kernel (SDD 16, 17): the package and the runtime of a .wasm.
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }
 moruna-sandbox = { workspace = true }
+# An image kernel's root (SDD 19).
+moruna-image = { workspace = true }
+# The engine on the Moruna kernel (SDD 30): its vsock, and an image's task on the data plane.
+moruna-micro = { workspace = true }
 # `moruna run --vm` (MH 4.8.4): the monitor's library seam, `boot_and_run`.
 moruna-vmm = { workspace = true }
 # The peQL ends of a run (MH 4.5), feature `peql`.
@@ -54,6 +72,10 @@ libc = { workspace = true }
 
 [dev-dependencies]
 zip = { workspace = true }
+# PN-T34: the simulated planner, which needs a cost model, sees the run's checkpoint cadence.
+moruna-cost = { workspace = true }
+# KD-T15: the type grammar's descriptions, converted by moruna-kernel.
+moruna-types = { workspace = true }
 arrow = { workspace = true }
 # The test components of a .wasm package (SDD 17 k).
 moruna-wasm = { workspace = true, features = ["testing"] }
@@ -84,6 +106,11 @@ name = "governed"
 path = "tests/governed.rs"
 required-features = ["peql"]
 
+# The engine's command line without the Python adapter (SDD 30 d.4): what the Moruna kernel runs.
+[[bin]]
+name = "moruna-engine"
+path = "src/bin/moruna-engine.rs"
+
 [[example]]
 name = "append_column"
 path = "../../examples/append_column.rs"
@@ -91,6 +118,8 @@ path = "../../examples/append_column.rs"
 
 [features]
 default = []
+# Explicit test-only SDK boot proof; production starts remain KVM-only.
+native-tcg-proof = ["moruna-vmm/native-tcg-proof"]
 cuda = ["moruna-arena/cuda", "moruna-discovery/cuda", "moruna-reactor/cuda", "moruna-placement/cuda"]
 uring = ["moruna-reactor/uring"]
 gds = ["cuda", "moruna-reactor/gds"]
@@ -98,3 +127,9 @@ rdma = ["moruna-arena/rdma", "moruna-reactor/rdma", "moruna-placement/rdma"]
 python = ["moruna-adapters/python", "moruna-sources/python", "moruna-sandbox/python"]
 # `"kind": "datafusion"` sources and `"kind": "peql"` sinks in the job document (MH 4.5).
 peql = ["dep:moruna-datafusion", "moruna-datafusion/peql", "dep:parcel-core", "dep:parcel-runtime"]
+
+# The actual granted microkernel start page exists only in this guest profile.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+moruna-micro = { workspace = true }
+moruna-sys = { workspace = true }
+moruna-storage = { workspace = true, features = ["native"] }

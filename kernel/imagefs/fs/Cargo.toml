@@ -1,0 +1,9 @@
+[package]
+name = "moruna-imagefs"
+description = "The image filesystem's reader: Moruna's layer files, read through verified pages, merged into one tree with a scratch directory, and the page cache (SDD 27)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

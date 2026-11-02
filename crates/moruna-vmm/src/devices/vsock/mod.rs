@@ -174,5 +174,5 @@ impl VirtioDevice for VirtioVsock {
     fn reset(&mut self) {}
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests;

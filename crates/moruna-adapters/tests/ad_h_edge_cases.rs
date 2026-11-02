@@ -191,10 +191,9 @@ fn stateful(attribute: &str, module: &str) -> PyKernelSpec {
     spec
 }
 
-/// e.1: a `footprint` that answers with something other than an int or `None` leaves the state
-/// size unknown rather than failing the run, and so does one that raises.
+/// Invalid or raised footprint readings fail explicitly; only genuine None is unknown.
 #[test]
-fn a_footprint_that_is_not_an_int_is_unknown() {
+fn a_footprint_that_is_invalid_or_raises_is_an_error() {
     let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
     for (attribute, module) in [("awkward", "ad_h_awkward"), ("raises", "ad_h_raises")] {
         let kernel = PyKernel::new(stateful(attribute, module)).expect("a well formed kernel");
@@ -205,9 +204,9 @@ fn a_footprint_that_is_not_an_int_is_unknown() {
             alloc: Arc::clone(&alloc),
         };
         let state = kernel.init(&ctx).expect("setup runs");
-        assert_eq!(state.footprint(), None);
-        // Complained about once, then quiet.
-        assert_eq!(state.footprint(), None);
+        assert!(matches!(state.footprint(), Err(MorunaError::Kernel { .. })));
+        // Repeated failure cannot turn into an apparently valid unknown/zero.
+        assert!(matches!(state.footprint(), Err(MorunaError::Kernel { .. })));
     }
 }
 
@@ -422,7 +421,7 @@ fn a_footprint_of_none_is_unknown_and_ctx_has_a_repr() {
             alloc: Arc::clone(&alloc),
         };
         let state = kernel.init(&ctx).expect("setup runs");
-        assert_eq!(state.footprint(), None);
+        assert_eq!(state.footprint().unwrap(), None);
         let seen: String = Python::attach(|py| {
             let mut state = state;
             let py_state = state

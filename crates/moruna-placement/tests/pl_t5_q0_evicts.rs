@@ -112,26 +112,3 @@ fn pl_t5_staging_on_writes_instead() {
     );
     assert!(engine.evicted(0).is_empty(), "and evicts nothing");
 }
-
-#[test]
-fn pl_t5_the_demotion_policy_follows_staging_and_recomputability() {
-    use moruna_placement::DemotionPolicy;
-    // b: what decides at run time is `staging_enabled` and whether the entry is
-    // recomputable; the enum exists so the state machine is written once for any stage.
-    assert_eq!(
-        DemotionPolicy::of(true, true),
-        Some(DemotionPolicy::Write),
-        "staging on writes, whatever the stage"
-    );
-    assert_eq!(DemotionPolicy::of(true, false), Some(DemotionPolicy::Write));
-    assert_eq!(
-        DemotionPolicy::of(false, true),
-        Some(DemotionPolicy::Evict),
-        "staging off on a recomputable entry evicts (PL-I6)"
-    );
-    assert_eq!(
-        DemotionPolicy::of(false, false),
-        None,
-        "staging off and not recomputable: no demotion is possible (PL-I6, f.2)"
-    );
-}

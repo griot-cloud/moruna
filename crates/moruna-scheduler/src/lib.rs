@@ -1,7 +1,8 @@
 //! Moruna component 10, the scheduler: workers, drives, the admission rule and the trace.
 //!
-//! Design: `architecture/sdd/10-scheduler.md`. The scheduler turns a linear chain of stages
-//! into work for a pool of role-free threads. It owns the workers, the stage table, the
+//! Design: `architecture/sdd/10-scheduler.md`. The scheduler turns a run's DAG of sources,
+//! kernel stages and sinks (contracts d.16), a linear chain being the simplest, into work for a
+//! pool of role-free threads. It owns the workers, the stage table, the
 //! admission rule (f.3), the stateful instance pools (f.4), the source and sink drives (f.5,
 //! f.6), completion detection (f.7), the error policy (f.8), the probe protocol (f.9), the
 //! checkpoint thread (f.12), the resume path (f.13), the worker heartbeat (f.14) and the
@@ -12,9 +13,9 @@
 //! probe protocol without knowing its internals.
 //!
 //! Two properties hold by construction rather than by care. A worker only ever runs
-//! `Kernel::apply`: it never issues an IO operation and never waits on a `Completion`, because
-//! the only code that does either lives in the two drive threads (SC-I1, `source_drive` and
-//! `sink_drive`). And every morsel leaves exactly one trace record per stage, because the only
+//! `Kernel::apply_port`: it never issues an IO operation and never waits on a `Completion`,
+//! because the only code that does either lives in the drive threads, one per source and one per
+//! sink (SC-I1, `source_drive` and `sink_drive`). And every morsel leaves exactly one trace record per stage, because the only
 //! two places that build one are `worker::build_record`, called once at the end of a task, and
 //! the probe (SC-I4, G-I4).
 
@@ -34,12 +35,14 @@ use moruna_kernel::{
 
 mod checkpoint;
 mod cputime;
+mod decide;
 mod heartbeat;
 mod instances;
 mod knobs;
+mod learning;
 mod lifecycle;
-mod pick;
 mod pipeline;
+pub mod policies;
 mod policy;
 mod probe;
 mod shared;
@@ -49,17 +52,18 @@ mod source_drive;
 mod stats;
 mod worker;
 
-pub use pipeline::{Pipeline, SchedulerConfig};
+pub use decide::{Clock, DISK_BYTES_PER_SECOND, SystemClock};
+pub use pipeline::{Pipeline, SchedulerConfig, validate_graph};
 
 use shared::Shared;
 
 /// How a run ended (d.1).
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// The source was exhausted, every queue drained and the sink finished.
+    /// Every source was exhausted, every queue drained and every sink finished.
     Completed {
-        /// What the sink wrote.
-        sink: moruna_kernel::SinkSummary,
+        /// What each sink wrote, sink 0 first.
+        sinks: Vec<moruna_kernel::SinkSummary>,
     },
     /// The runtime ended the run itself with a diagnostic (G-I8).
     ///
@@ -82,6 +86,10 @@ pub enum RunOutcome {
 /// Called on the checkpoint thread with each manifest the placement engine has written, before
 /// the write counts as done (MH 4.7): a failure is a failed manifest write (f.12).
 pub type ManifestHook = Arc<dyn Fn(&std::path::Path) -> Result<()> + Send + Sync>;
+
+/// Acquire actual checkpoint resources before workers/drives are quiesced. The returned
+/// hook owns that admission until publication finishes; refusal leaves the run ungated.
+pub type ManifestPreparation = Arc<dyn Fn() -> Result<ManifestHook> + Send + Sync>;
 
 /// The workers, the drives, the stage table and the admission rule (a).
 pub struct Scheduler {
@@ -112,6 +120,33 @@ impl Scheduler {
         instances::init_instances(&self.shared)
     }
 
+    /// The run's cost model (f.22): `online`, the models the embedder opened with the store they
+    /// learn into, and each kernel stage's key, stage 1 first. From here on every unit a policy
+    /// weighs is predicted by the deciding model, every unit that finishes is settled into it,
+    /// and what was learned is written to the store as the run goes and at its end. Refused
+    /// once the run has started, when a model is set already, or when the keys are not one per
+    /// kernel stage.
+    pub fn set_cost(
+        &self,
+        online: Arc<moruna_cost::Online>,
+        keys: Vec<moruna_cost::CostKey>,
+    ) -> Result<()> {
+        if self.shared.run_state() != shared::RunState::Init {
+            return Err(MorunaError::Config {
+                name: "cost.model",
+                msg: "the cost model is set before the run starts".into(),
+            });
+        }
+        let learning = learning::Learning::new(online, keys, self.shared.stages.len())?;
+        self.shared
+            .learning
+            .set(learning)
+            .map_err(|_| MorunaError::Config {
+                name: "cost.model",
+                msg: "the run's cost model is set already".into(),
+            })
+    }
+
     /// What every manifest is handed once it is on disk (MH 4.7).
     pub fn set_manifest_hook(&self, hook: ManifestHook) {
         *self
@@ -119,6 +154,16 @@ impl Scheduler {
             .manifest_hook
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// Install a pre-barrier admission and publication operation. Replaces the ordinary
+    /// manifest hook for this run; no allocation waiting is allowed after the pause begins.
+    pub fn set_manifest_preparation(&self, prepare: ManifestPreparation) {
+        *self
+            .shared
+            .manifest_preparation
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(prepare);
     }
 
     /// The run's record of which stages wait on a port (MH 4.10): read into the counters the
@@ -192,7 +237,7 @@ impl Scheduler {
         (self.shared.knobs.cpu_bound(), self.shared.cfg.workers_max)
     }
 
-    /// The kernels of the chain, in stage order, for the facade's fingerprint list.
+    /// The kernels of the run, in stage order, for the facade's fingerprint list.
     pub fn kernels(&self) -> Vec<Arc<dyn Kernel>> {
         self.shared
             .stages

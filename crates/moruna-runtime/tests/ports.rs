@@ -9,9 +9,11 @@
 
 #![allow(clippy::result_large_err)]
 
+#[path = "support/portable.rs"]
+mod portable_fixture;
 mod support;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -54,6 +56,27 @@ impl moruna_runtime::kinds::Embedding for Embedder {
 /// The registry of a program that answers `echo`.
 fn embedding() -> moruna_runtime::kinds::Registry {
     moruna_runtime::kinds::Registry::standard().with_embedding(Arc::new(Embedder))
+}
+
+struct CheckpointEmbedder(Arc<moruna_runtime::portable::Publisher>);
+impl moruna_runtime::kinds::Embedding for CheckpointEmbedder {
+    fn guest_port(&self, name: &str) -> Option<Arc<dyn GuestPort>> {
+        (name == "echo").then(|| Arc::new(Echo) as Arc<dyn GuestPort>)
+    }
+    fn checkpoints(
+        &self,
+        _: &moruna_job::Job,
+        run: moruna_kernel::RunId,
+    ) -> moruna_kernel::Result<Option<Arc<moruna_runtime::portable::Publisher>>> {
+        assert_eq!(self.0.access.run, run.to_hex());
+        Ok(Some(self.0.clone()))
+    }
+}
+fn checkpoint_embedding(
+    publisher: Arc<moruna_runtime::portable::Publisher>,
+) -> moruna_runtime::kinds::Registry {
+    moruna_runtime::kinds::Registry::standard()
+        .with_embedding(Arc::new(CheckpointEmbedder(publisher)))
 }
 
 fn no_env(_: &str) -> Option<String> {
@@ -153,14 +176,12 @@ impl Host {
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(reader);
                 let mut calls = 0usize;
-                let mut line = String::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => return,
-                        Ok(_) => {}
-                    }
-                    let message: Value = serde_json::from_str(&line).expect("a JSON line");
+                    let message =
+                        match moruna_runtime::host::protocol::read_json_message(&mut reader) {
+                            Ok(None) | Err(_) => return,
+                            Ok(Some(message)) => message,
+                        };
                     messages
                         .lock()
                         .unwrap()
@@ -251,14 +272,23 @@ fn events(messages: &[(Instant, Value)]) -> Vec<Value> {
 fn converse(
     scratch: &Path,
     name: &str,
+    doc: Value,
+    policy: impl Fn(usize, &Value) -> Reply + Send + 'static,
+) -> (i32, Vec<(Instant, Value)>) {
+    converse_registry(scratch, name, doc, policy, embedding())
+}
+fn converse_registry(
+    scratch: &Path,
+    name: &str,
     mut doc: Value,
     policy: impl Fn(usize, &Value) -> Reply + Send + 'static,
+    kinds: moruna_runtime::kinds::Registry,
 ) -> (i32, Vec<(Instant, Value)>) {
     let socket = socket_path(name);
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let path = write_doc(scratch, &doc);
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
-    let runner = std::thread::spawn(move || run_cli(&path, &embedding(), CancelToken::new()));
+    let runner = std::thread::spawn(move || run_cli(&path, &kinds, CancelToken::new()));
     let host = Host::serve(listener, policy);
     let code = runner.join().expect("the runner");
     let messages = host.join();
@@ -504,7 +534,8 @@ fn po_t6_the_document_refuses_ports_it_cannot_serve() {
             Err(refused) => return refused.to_string(),
         };
         match build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
+            &support::planned(&moruna_job::Job::from_v1(&job)),
             &embedding(),
             BuildOptions {
                 strict: true,
@@ -694,8 +725,22 @@ fn po_t8_child() {
     let Ok(path) = std::env::var(CHILD) else {
         return;
     };
-    let code = run_cli(Path::new(&path), &embedding(), CancelToken::new());
+    let path = Path::new(&path);
+    let fixture = portable_fixture::Fixture::open(path.parent().unwrap(), "writer", RUN_ID);
+    let code = run_cli(
+        path,
+        &checkpoint_embedding(fixture.publisher),
+        CancelToken::new(),
+    );
     println!("CHILD-EXIT {code}");
+}
+
+struct KillOnDrop(Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn spawn_child(doc: &Path) -> Child {
@@ -708,8 +753,12 @@ fn spawn_child(doc: &Path) -> Child {
             "1",
         ])
         .env(CHILD, doc)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(
+            std::fs::File::create(doc.with_extension("child.stdout")).expect("child stdout"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(doc.with_extension("child.stderr")).expect("child stderr"),
+        ))
         .spawn()
         .expect("the child starts")
 }
@@ -726,23 +775,15 @@ fn state_in(manifest: &Path) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.as_slice().try_into().ok()?))
 }
 
-/// PO-T8, O1's third gate (MH 4.10, MH 4.7): a stateful stage whose run is killed while it waits
-/// on its host resumes, on a machine whose staging disk is empty, from the copy of its manifest
-/// on an object-store prefix, with its state as the waiting call's batch began.
-///
-/// The first process answers the probe's call and two more and holds the fourth; a manifest
-/// written while it waits is copied to `staging.url` with the stage's state, 3: the count before
-/// the fourth batch. The process is killed with `SIGKILL`, the staging directory emptied, and the
-/// same document run again: its first call carries 4, the restored count and one, where a fresh
-/// stage's would carry 1, and the output is every row.
+/// PO-T8: kill the real stateful engine after a genuine governed bucket-format acknowledgement,
+/// wipe its staging disk, materialize every dependency under a new node context, and resume.
+/// The storage fixture is durable-format conformance, not a cloud/raw-device claim.
 #[test]
 fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("po_t8");
     let rows = 80_000;
     let package = caller_package(scratch.path(), "stub", true);
-    let store = scratch.path().join("store");
-    std::fs::create_dir_all(&store).expect("the store");
     let mut doc = document(
         scratch.path(),
         rows,
@@ -750,43 +791,84 @@ fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
         package,
         json!({"stub": {"host": "stub"}}),
     );
-    doc["checkpoint"] = json!({"enabled": true, "interval_ms": 500, "keep": false});
-    doc["staging"]["url"] = json!(format!("file://{}", store.display()));
+    doc["checkpoint"] = json!({"enabled": true, "interval_ms": 50, "keep": true});
     doc["resume"] = json!("auto");
     let socket = socket_path("t8");
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let path = write_doc(scratch.path(), &doc);
-    let copy = store.join(format!("moruna-{RUN_ID}")).join("manifest.json");
+    let observer = Arc::new(portable_fixture::Fixture::open(
+        scratch.path(),
+        "observer",
+        RUN_ID,
+    ));
+    let acknowledged = Arc::new(Mutex::new(None));
 
     // The first machine.
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
-    let mut child = spawn_child(&path);
-    const HELD: usize = 4;
-    let host = Host::serve(
-        listener,
-        |n, _| if n == HELD { Reply::Hold } else { Reply::Echo },
+    let mut child = KillOnDrop(spawn_child(&path));
+    let observed = observer.clone();
+    let pinned = acknowledged.clone();
+    let host = Host::serve(listener, move |_, _| {
+        if let Some(receipt) = observed.latest() {
+            *pinned.lock().unwrap() = Some(receipt);
+            Reply::Hold
+        } else {
+            // Leave a real admitted task active long enough for the periodic portable
+            // barrier to close admission, then let its original owner finish normally.
+            std::thread::sleep(Duration::from_millis(100));
+            Reply::Echo
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while acknowledged.lock().unwrap().is_none() && Instant::now() < deadline {
+        if let Some(status) = child.0.try_wait().expect("actual child status") {
+            panic!(
+                "checkpoint child ended before portable acknowledgement: {status}; stdout: {}; stderr: {}",
+                std::fs::read_to_string(path.with_extension("child.stdout")).unwrap(),
+                std::fs::read_to_string(path.with_extension("child.stderr")).unwrap(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let receipt = acknowledged.lock().unwrap().clone().unwrap_or_else(|| {
+        panic!(
+            "genuine portable acknowledgement before held next call; stdout: {}; stderr: {}",
+            std::fs::read_to_string(path.with_extension("child.stdout")).unwrap(),
+            std::fs::read_to_string(path.with_extension("child.stderr")).unwrap(),
+        )
+    });
+    let portable = observer.read(&receipt);
+    let state = portable.manifest["kernel_states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["stage"] == 1)
+        .unwrap();
+    let state_bytes = B64.decode(state["state"].as_str().unwrap()).unwrap();
+    let saved_count = u64::from_le_bytes(state_bytes.try_into().unwrap());
+    assert!(
+        saved_count > 0,
+        "the real stateful stage ran before checkpointing"
     );
     assert!(
-        host.wait_for(Duration::from_secs(60), |m| m
+        portable.manifest["lineage"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter(|(_, m)| m["type"] == "port_call")
-            .count()
-            >= HELD),
-        "the stage reached its held call"
+            .all(|row| row["disk"].is_null())
     );
-    let held_count = count_of(&host.of_type("port_call")[HELD - 1]);
-    assert_eq!(held_count, HELD as u64);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while state_in(&copy) != Some(held_count - 1) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert!(
+        !portable.dependencies.is_empty(),
+        "actual queued rows have immutable byte dependencies"
+    );
+    let held_count = count_of(host.of_type("port_call").last().unwrap());
     assert_eq!(
-        state_in(&copy),
-        Some(held_count - 1),
-        "a manifest written while the stage waited is on the store, with its state"
+        held_count,
+        saved_count + 1,
+        "checkpoint state precedes the genuinely held next batch"
     );
-    child.kill().expect("SIGKILL");
-    let _ = child.wait();
+    child.0.kill().expect("SIGKILL");
+    let _ = child.0.wait();
     drop(host);
     let _ = std::fs::remove_file(&socket);
 
@@ -794,7 +876,17 @@ fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
     let staging = scratch.path().join("staging");
     std::fs::remove_dir_all(&staging).expect("the staging disk is gone");
     std::fs::create_dir_all(&staging).expect("a new staging disk");
-    let (code, messages) = converse(scratch.path(), "t8b", doc, |_, _| Reply::Echo);
+    let new_node = portable_fixture::Fixture::open(scratch.path(), "restorer", RUN_ID);
+    let restored = new_node.restore(&receipt, &staging);
+    assert_eq!(state_in(&restored), Some(saved_count));
+    doc["resume"] = json!(restored.display().to_string());
+    let (code, messages) = converse_registry(
+        scratch.path(),
+        "t8b",
+        doc,
+        |_, _| Reply::Echo,
+        checkpoint_embedding(new_node.publisher),
+    );
     let report = report_file(scratch.path());
     assert_eq!(code, exit::COMPLETED, "{}", report["exit"]);
     assert_eq!(report["report"]["resumed"], true);
@@ -808,7 +900,7 @@ fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
         count_of(&first),
         held_count,
         "the stage's state was restored: it counts on from {}",
-        held_count - 1
+        saved_count
     );
     let started = events(&messages)
         .into_iter()
@@ -817,7 +909,7 @@ fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
     assert_eq!(started["resumed"], true);
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
     assert!(
-        !copy.exists(),
-        "the completed run's copy is removed with its directory"
+        observer.latest().is_some(),
+        "a genuine governed checkpoint receipt is retained rather than deleted as a raw URL copy"
     );
 }

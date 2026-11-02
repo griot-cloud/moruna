@@ -1,6 +1,6 @@
 {
   "moruna_kinds": 1,
-  "moruna": "0.5.7",
+  "moruna": "0.5.9",
   "sources": [
     {
       "name": "arrow_ipc",
@@ -405,6 +405,132 @@
   ],
   "kernels": [
     {
+      "name": "image",
+      "role": "kernel",
+      "summary": "An OCI image's command in a sandboxed process, its batches on the data plane: Arrow IPC over its standard input and output, or the plane's calls",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "layout": {
+            "type": "string",
+            "description": "A local OCI image layout: a directory holding `oci-layout`, `index.json` and `blobs/`."
+          },
+          "reference": {
+            "type": "string",
+            "description": "The image to run: a manifest digest (`sha256:...`) or the name the layout's `index.json`\ngives it (`org.opencontainers.image.ref.name`)."
+          },
+          "command": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The command to run, replacing the image's entrypoint and cmd. On the Moruna kernel the\nreference is a manifest digest and the image's config, once verified, gives the command\nwhen this does not (SDD 30 f.12)."
+          },
+          "env": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment added to the image's own; the process gets nothing else."
+          },
+          "cache": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where unpacked images are kept; `images` beside the run's output when it is a directory."
+          },
+          "plane": {
+            "type": "boolean",
+            "description": "The command makes the data plane's calls (`batch_get`, `batch_put`) on its descriptor 3\ninstead of reading Arrow IPC on its standard input and writing it on its standard output.",
+            "default": false
+          },
+          "ports": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/$defs/PortDoc"
+            },
+            "description": "The ports the command may call (MH 4.10), on the Moruna kernel only: its task's port `n`\nis the `n`th of these in name order, from 1 (SDD 30 f.7)."
+          }
+        },
+        "required": [
+          "layout",
+          "reference"
+        ],
+        "description": "An `image` entry's settings (SDD 19 d.2).",
+        "title": "image",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "layout": "/disk/images/scorer",
+            "reference": "scorer:1",
+            "command": [
+              "/usr/bin/scorer",
+              "--column",
+              "text"
+            ],
+            "env": {
+              "MODEL": "small"
+            }
+          }
+        ],
+        "$defs": {
+          "PortDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port the host serves, by the name the host knows it by: the stage's calls go to the\nhost protocol's peer as `port_call` (MH 4.3)."
+              },
+              "guest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name (`Embedding::guest_port`)."
+              },
+              "deadline_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_job::PORT_DEADLINE_MS`), at most a day."
+              }
+            },
+            "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          }
+        }
+      },
+      "inputs": "batches",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "no",
+      "preserves_columns": "no",
+      "isolation": "confined"
+    },
+    {
       "name": "package",
       "role": "kernel",
       "summary": "A function package, one .wasm or .pex file pinned by its sha256",
@@ -465,7 +591,7 @@
                   "string",
                   "null"
                 ],
-                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name ([`super::Embedding::guest_port`])."
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name (`Embedding::guest_port`)."
               },
               "deadline_ms": {
                 "type": [
@@ -474,7 +600,7 @@
                 ],
                 "format": "uint64",
                 "minimum": 0,
-                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_kernel::ports::PORT_DEADLINE_MS`), at most a day."
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_job::PORT_DEADLINE_MS`), at most a day."
               }
             },
             "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
@@ -531,7 +657,8 @@
               "mask",
               "explode",
               "concat_str",
-              "date_trunc"
+              "date_trunc",
+              "union"
             ]
           },
           "args": {

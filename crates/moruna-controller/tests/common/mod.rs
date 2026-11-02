@@ -343,6 +343,7 @@ impl Rig {
             Arc::new(sampler.clone()),
             Arc::new(trace.clone()),
             Arc::new(placement.clone()),
+            moruna_kernel::Topology::chain(kernels.len() as u16),
             kernels,
         )
         .expect("controller");
@@ -479,7 +480,7 @@ impl Prober for Watcher<FakeKnobs> {
 }
 
 impl Sampler for Watcher<FakeSampler> {
-    fn sample(&self) -> Sample {
+    fn sample(&self) -> moruna_kernel::Result<Sample> {
         self.check("Sampler::sample");
         self.inner.sample()
     }
@@ -510,6 +511,63 @@ pub struct WatchedPlacement {
     pub other_calls: AtomicU64,
 }
 
+/// The controller reaches no catalog action (G-I5): every one is recorded as another call.
+impl moruna_kernel::Residency for WatchedPlacement {
+    fn snapshot(&self) -> moruna_kernel::CatalogSnapshot {
+        self.other();
+        moruna_kernel::CatalogSnapshot::default()
+    }
+    fn head(&self, _stage: StageId) -> Option<moruna_kernel::Head> {
+        self.other();
+        None
+    }
+    fn reserve(&self, _tier: moruna_kernel::Tier, _bytes: u64) -> Result<moruna_kernel::Reserve> {
+        self.other();
+        Ok(moruna_kernel::Reserve::Refused { need: 0, budget: 0 })
+    }
+    fn push_reserved(
+        &self,
+        _stages: &[StageId],
+        _morsel: moruna_kernel::Morsel,
+        _claim: moruna_kernel::Reservation,
+    ) -> Result<()> {
+        self.other();
+        Ok(())
+    }
+    fn replace_reserved(
+        &self,
+        _stage: StageId,
+        _morsel: moruna_kernel::Morsel,
+        _claim: moruna_kernel::Reservation,
+    ) -> Result<()> {
+        self.other();
+        Ok(())
+    }
+    fn push_spilled(&self, _stages: &[StageId], _morsel: moruna_kernel::Morsel) -> Result<()> {
+        self.other();
+        Ok(())
+    }
+    fn shed(&self, _tier: moruna_kernel::TierKind, _bytes: u64) -> bool {
+        self.other();
+        false
+    }
+    fn spill(&self, _batch: moruna_kernel::BufferId) -> Result<()> {
+        self.other();
+        Ok(())
+    }
+    fn reload(&self, _batch: moruna_kernel::BufferId) -> Result<()> {
+        self.other();
+        Ok(())
+    }
+    fn observe(&self, _observer: std::sync::Arc<dyn moruna_kernel::CatalogObserver>) {
+        self.other();
+    }
+    fn floor(&self, _tier: moruna_kernel::Tier, batch: u64) -> moruna_kernel::CatalogFloor {
+        self.other();
+        moruna_kernel::CatalogFloor::of(0, 0, batch, u64::MAX)
+    }
+}
+
 impl Placement for WatchedPlacement {
     fn push(&self, _stage: StageId, _morsel: moruna_kernel::Morsel) -> Result<()> {
         self.other();
@@ -536,6 +594,11 @@ impl Placement for WatchedPlacement {
         Ok(None)
     }
 
+    fn release(&self, _stage: StageId, _seq: moruna_kernel::Seq) -> Result<()> {
+        self.other();
+        Ok(())
+    }
+
     fn peek_resident(
         &self,
         _stage: StageId,
@@ -560,7 +623,7 @@ impl Placement for WatchedPlacement {
         self.other();
     }
 
-    fn set_committed(&self, _seq: Seq) {
+    fn set_committed(&self, _sink: u16, _seq: Seq) {
         self.other();
     }
 
@@ -574,7 +637,7 @@ impl Placement for WatchedPlacement {
     fn restore(
         &self,
         _manifest: &std::path::Path,
-        _plan: &[moruna_kernel::Split],
+        _plans: &[Vec<moruna_kernel::Split>],
         _fingerprints: &[Fingerprint],
     ) -> Result<moruna_kernel::ResumePoint> {
         self.other();

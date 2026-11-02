@@ -36,7 +36,7 @@ use moruna_kernel::{
     AllocStats, Allocator, Buffer, DeviceId, Guarantee, MorunaError, Result, Tier, TierKind,
 };
 
-use crate::classes::{GRANULE, SMALL_BUDGET_BYTES, Space};
+use crate::classes::{GRANULE, SMALL_BUDGET_BYTES, Space, Watermark};
 use crate::region::Mapping;
 
 pub use crate::stats::ArenaStats;
@@ -112,6 +112,8 @@ struct Inner {
     /// The host regions, oldest first. Read-locked on every allocation and release, and
     /// write-locked only by `grow`, `shrink` and the release that retires a drained region.
     host: RwLock<Vec<Arc<HostRegion>>>,
+    /// Every host region's charges together, and their high-water mark.
+    host_watermark: Arc<Watermark>,
     devices: Vec<RegionAlloc>,
     host_tier: Tier,
     page_bytes: usize,
@@ -206,12 +208,14 @@ impl Arena {
         )?;
         let pinned = host.pinned;
         let host_tier = if pinned { Tier::PinnedHost } else { Tier::Host };
+        let host_watermark = Arc::new(Watermark::default());
         let host_alloc = Arc::new(HostRegion {
             space: Space::new(
                 host.mapping.base(),
                 host.mapping.bytes(),
                 host_tier,
                 host_bytes < SMALL_BUDGET_BYTES,
+                Arc::clone(&host_watermark),
             ),
             _mapping: host.mapping,
             draining: AtomicBool::new(false),
@@ -229,6 +233,7 @@ impl Arena {
         Ok(Arc::new(Arena {
             inner: Arc::new(Inner {
                 host: RwLock::new(vec![host_alloc]),
+                host_watermark,
                 devices,
                 host_tier,
                 page_bytes: cfg.page_bytes,
@@ -287,6 +292,7 @@ impl Arena {
                 added,
                 inner.host_tier,
                 added < SMALL_BUDGET_BYTES,
+                Arc::clone(&inner.host_watermark),
             ),
             _mapping: host.mapping,
             draining: AtomicBool::new(false),
@@ -379,6 +385,7 @@ impl Arena {
                     region::align_down(got, align),
                     Tier::Device(*id),
                     got < SMALL_BUDGET_BYTES,
+                    Arc::default(),
                 ),
                 _mapping: mapping,
                 index: usize::from(id.0),
@@ -415,6 +422,18 @@ impl Arena {
             Some(space) => space.bytes(),
             None => 0,
         }
+    }
+
+    /// The most host bytes the arena has had in use at once since [`Arena::reset_host_peak`]
+    /// (or since it was made), exact: every charge raises the mark as it is made, whichever
+    /// region it is in. What warm-up's peak of a unit reads (SDD 24 p.4).
+    pub fn host_peak(&self) -> u64 {
+        self.inner.host_watermark.peak()
+    }
+
+    /// Start a new host high-water mark at the bytes in use now.
+    pub fn reset_host_peak(&self) {
+        self.inner.host_watermark.reset();
     }
 
     /// Largest single allocation currently possible in `tier`, for controller diagnostics
@@ -703,6 +722,42 @@ mod tests {
         );
         #[cfg(feature = "cuda")]
         let _ = r;
+    }
+
+    #[test]
+    fn the_host_peak_is_the_most_in_use_at_once_and_resets() {
+        let arena = Arena::new(cfg(64 << 20)).expect("arena");
+        assert_eq!(arena.host_peak(), 0);
+        let held = arena.alloc(1 << 20, Tier::Host).expect("held");
+        let spike = arena.alloc(8 << 20, Tier::Host).expect("spike");
+        let at_spike = arena.stats().host_in_use;
+        drop(spike);
+        assert!(arena.stats().host_in_use < at_spike);
+        assert_eq!(
+            arena.host_peak(),
+            at_spike,
+            "a freed spike is still the peak"
+        );
+        arena.reset_host_peak();
+        assert_eq!(arena.host_peak(), arena.stats().host_in_use);
+        let after_reset = arena.host_peak();
+        let small = arena.alloc(2 << 20, Tier::Host).expect("small");
+        let at_small = arena.stats().host_in_use;
+        drop(small);
+        assert_eq!(arena.host_peak(), at_small);
+        assert!(at_small > after_reset && at_small < at_spike);
+        drop(held);
+
+        // A region added by `grow` charges the same mark: a buffer the first region cannot hold.
+        let arena = Arena::new(cfg(4 << 20)).expect("arena");
+        arena.grow(32 << 20).expect("grown");
+        let grown = arena
+            .alloc(20 << 20, Tier::Host)
+            .expect("only the grown region holds it");
+        let charged = arena.stats().host_in_use;
+        drop(grown);
+        assert!(charged >= 20 << 20);
+        assert_eq!(arena.host_peak(), charged);
     }
 
     #[test]

@@ -1,0 +1,509 @@
+//! SV-T9 (SDD 23, k): the boot image tool parses a description, refuses a bad one by
+//! line, renders the manifest the kernel parses, checks every program is loadable,
+//! and writes an initramfs the kernel's reader reads back.
+
+use std::{fs, path::PathBuf, process::Command};
+
+use moruna_abi::{Rights, manifest::Manifest};
+use moruna_image::{DescSource, Description, archive, build};
+use moruna_loader::cpio;
+
+/// A static ELF64 image the kernel's loader accepts: one read-and-execute segment.
+fn program() -> Vec<u8> {
+    let mut b = vec![0u8; 0x1000 + 16];
+    b[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    b[4] = 2;
+    b[5] = 1;
+    b[6] = 1;
+    b[16..18].copy_from_slice(&2u16.to_le_bytes());
+    b[18..20].copy_from_slice(&62u16.to_le_bytes());
+    b[24..32].copy_from_slice(&0x40_1000u64.to_le_bytes());
+    b[32..40].copy_from_slice(&64u64.to_le_bytes());
+    b[54..56].copy_from_slice(&56u16.to_le_bytes());
+    b[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64;
+    b[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+    b[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes());
+    b[ph + 8..ph + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 16..ph + 24].copy_from_slice(&0x40_1000u64.to_le_bytes());
+    b[ph + 32..ph + 40].copy_from_slice(&16u64.to_le_bytes());
+    b[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes());
+    b
+}
+
+const DESCRIPTION: &str = "\
+# a test image
+moruna-image 1
+expect kk: 1 CPUs online
+
+process supervisor
+  handle console console
+  handle root.process root.process
+  handle program:child child-image
+  expect supervisor: ok
+  exits 0
+
+process ping
+  handle console console rights=write,transfer
+  exits 0
+process pong pong-program
+  memory 16MiB
+  faults page fault at 0x0 on read
+
+link ping.peer pong.peer:read,write,wait
+link supervisor.a-very-long-slot-name-indeed pong.back
+";
+
+fn programs(names: &[&str]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "moruna-image-test-{}-{}",
+        std::process::id(),
+        names.join("-")
+    ));
+    fs::create_dir_all(&dir).expect("temp dir");
+    for name in names {
+        fs::write(dir.join(name), program()).expect("program");
+    }
+    dir
+}
+
+#[test]
+fn sv_t9_a_description_renders_the_manifest_the_kernel_parses() {
+    let d = Description::parse(DESCRIPTION).expect("parses");
+    assert_eq!(d.processes.len(), 3);
+    assert_eq!(d.processes[2].program, "pong-program");
+    assert_eq!(
+        d.processes[0].handles[2].source,
+        DescSource::Program("child".into())
+    );
+    assert_eq!(
+        d.processes[1].handles[0].rights,
+        Some(Rights::WRITE | Rights::TRANSFER)
+    );
+    assert_eq!(
+        d.links[0].ends[1].rights,
+        Some(Rights::READ | Rights::WRITE | Rights::WAIT)
+    );
+    assert_eq!(
+        d.programs().into_iter().collect::<Vec<_>>(),
+        ["child", "ping", "pong-program", "supervisor"]
+    );
+    let (manifest, text) = d.manifest().expect("manifest");
+    assert_eq!(Manifest::parse(text.as_bytes()), Ok(manifest.clone()));
+    assert_eq!(manifest.channels, ["ping.peer", "link1"]);
+    assert_eq!(
+        manifest
+            .processes
+            .iter()
+            .map(|p| p.memory)
+            .collect::<Vec<_>>(),
+        [None, None, Some(16 << 20)]
+    );
+    assert!(text.contains("process pong bin/pong-program\nmemory 16777216\n"));
+    assert!(text.contains("handle file:bin/child child-image"));
+    assert!(text.contains("handle channel:ping.peer.1 peer rights=read,write,wait"));
+    let expect = d.expectations();
+    assert_eq!(expect[0], "kk: 1 CPUs online");
+    assert!(expect.contains(
+        &"kk: moruna microkernel, abi 2.5: started 3 processes from the manifest".to_string()
+    ));
+    assert!(expect.contains(&"kk: process supervisor exited with code 0 (".to_string()));
+    assert!(expect.contains(&"kk: process pong faulted: page fault at 0x0 on read".to_string()));
+    assert!(expect.contains(&"supervisor: ok".to_string()));
+    assert_eq!(
+        expect.last().map(String::as_str),
+        Some("kk: every process has ended; the supervisor succeeded; powering off")
+    );
+}
+
+#[test]
+fn sv_t9_a_bad_description_is_refused_by_line() {
+    let cases: &[(&str, usize, &str)] = &[
+        ("", 0, "empty"),
+        ("moruna-image 2\n", 1, "first line"),
+        ("moruna-image 1\nprocess\n", 2, "process NAME"),
+        ("moruna-image 1\nprocess Bad\n", 2, "not 1 to 32 bytes"),
+        ("moruna-image 1\nprocess a\nprocess a\n", 3, "twice"),
+        ("moruna-image 1\nhandle console c\n", 2, "must follow"),
+        (
+            "moruna-image 1\nprocess a\nhandle disk d\n",
+            3,
+            "not a handle source",
+        ),
+        (
+            "moruna-image 1\nprocess a\nhandle console\n",
+            3,
+            "handle SOURCE",
+        ),
+        (
+            "moruna-image 1\nprocess a\nhandle console c read\n",
+            3,
+            "rights=",
+        ),
+        (
+            "moruna-image 1\nprocess a\nhandle console c rights=fly\n",
+            3,
+            "not a right",
+        ),
+        ("moruna-image 1\nprocess a\nlink a.x\n", 3, "link PROCESS"),
+        ("moruna-image 1\nprocess a\nlink a b.y\n", 3, "PROCESS.SLOT"),
+        ("moruna-image 1\nprocess a\nexits zero\n", 3, "exit code"),
+        ("moruna-image 1\nexits 0\n", 2, "must follow"),
+        ("moruna-image 1\nexpect\n", 2, "needs its text"),
+        ("moruna-image 1\nfrobnicate\n", 2, "not a directive"),
+        ("moruna-image 1\nmemory 4096\n", 2, "must follow"),
+        ("moruna-image 1\nprocess a\nmemory\n", 3, "memory SIZE"),
+        ("moruna-image 1\nprocess a\nmemory 12TB\n", 3, "not a size"),
+        (
+            "moruna-image 1\nprocess a\nmemory 4095\n",
+            3,
+            "whole number of pages",
+        ),
+        (
+            "moruna-image 1\nprocess a\nmemory 0MiB\n",
+            3,
+            "whole number of pages",
+        ),
+        (
+            "moruna-image 1\nprocess a\nmemory 4KiB\nmemory 8KiB\n",
+            4,
+            "two `memory` lines",
+        ),
+        (
+            "moruna-image 1\ndriver 1af4:1042 virtio-blk block\n",
+            2,
+            "must follow",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 virtio-blk\n",
+            3,
+            "driver VVVV",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4-1042 virtio-blk block\n",
+            3,
+            "in hex",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 Blk block\n",
+            3,
+            "program `Blk`",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 blk Block\n",
+            3,
+            "service `Block`",
+        ),
+        (
+            "moruna-image 1\nprocess a\ndriver 1af4:1042 blk block\ndriver 1af4:1042 blk disk\n",
+            4,
+            "two drivers",
+        ),
+    ];
+    for (text, line, words) in cases {
+        let e = Description::parse(text).expect_err(text);
+        assert_eq!(e.line, *line, "{text:?}: {e}");
+        assert!(e.reason.contains(words), "{text:?}: {e}");
+    }
+    let d = Description::parse("moruna-image 1\nprocess a\nlink a.x b.y\n").expect("parses");
+    assert!(
+        d.manifest()
+            .expect_err("no b")
+            .to_string()
+            .starts_with("line 3: no process `b`")
+    );
+    let d = Description::parse("moruna-image 1\nprocess a\nprocess b\nhandle root.process r\n")
+        .expect("parses");
+    let e = d.manifest().expect_err("root outside the supervisor");
+    assert_eq!(e.line, 0);
+    assert!(e.reason.contains("handle root.process r"), "{e}");
+    assert!(e.to_string().contains("first"), "{e}");
+}
+
+#[test]
+fn sv_t9_the_archive_reads_back_with_the_kernels_reader() {
+    let files = vec![
+        ("bin/a".to_string(), vec![1u8, 2, 3]),
+        ("bin/sub/b".to_string(), vec![]),
+        ("manifest".to_string(), b"moruna-manifest 1\n".to_vec()),
+    ];
+    let bytes = archive(&files).expect("archive");
+    let read = cpio::files(&bytes).expect("reads");
+    assert_eq!(read.len(), 3);
+    assert_eq!(cpio::find(&read, "bin/sub/b"), Some(&[][..]));
+    assert_eq!(cpio::find(&read, "bin/a"), Some(&[1u8, 2, 3][..]));
+}
+
+#[test]
+fn sv_t9_build_checks_every_program_and_writes_the_image() {
+    let dir = programs(&["supervisor", "child", "ping", "pong-program"]);
+    let image = build(DESCRIPTION, &dir, &dir).expect("builds");
+    let read = cpio::files(&image.initramfs).expect("reads");
+    assert_eq!(
+        cpio::find(&read, "manifest"),
+        Some(image.manifest.as_bytes())
+    );
+    assert!(cpio::find(&read, "bin/pong-program").is_some());
+    assert_eq!(image.expect.len(), 7);
+    fs::write(dir.join("child"), b"not an elf").expect("write");
+    let e = build(DESCRIPTION, &dir, &dir).err().expect("refused");
+    assert!(
+        e.reason
+            .contains("program `child` is not an image the kernel loads"),
+        "{e}"
+    );
+    fs::remove_file(dir.join("child")).expect("remove");
+    let e = build(DESCRIPTION, &dir, &dir).err().expect("refused");
+    assert!(e.reason.starts_with("program `child`:"), "{e}");
+    assert!(build("moruna-image 9", &dir, &dir).is_err());
+    fs::remove_dir_all(dir).expect("clean");
+}
+
+#[test]
+fn sv_t9_the_command_writes_the_image_and_says_why_it_cannot() {
+    let tool = env!("CARGO_BIN_EXE_moruna-image");
+    let dir = programs(&["supervisor", "child", "ping", "pong-program", "cli"]);
+    let description = dir.join("boot.image");
+    fs::write(&description, DESCRIPTION).expect("description");
+    let out = dir.join("out");
+    let run = Command::new(tool)
+        .args([&description, &dir, &out])
+        .output()
+        .expect("runs");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(out.join("initramfs.cpio").is_file());
+    assert_eq!(
+        fs::read_to_string(out.join("expect"))
+            .expect("expect")
+            .lines()
+            .count(),
+        7
+    );
+    assert!(
+        fs::read_to_string(out.join("manifest"))
+            .expect("manifest")
+            .starts_with("moruna-manifest 1")
+    );
+    let usage = Command::new(tool).output().expect("runs");
+    assert_eq!(usage.status.code(), Some(2));
+    let missing = Command::new(tool)
+        .args([&dir.join("nothing"), &dir, &out])
+        .output()
+        .expect("runs");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).starts_with("moruna-image: "));
+    fs::write(&description, "moruna-image 1\nprocess ghost\n").expect("description");
+    let ghost = Command::new(tool)
+        .args([&description, &dir, &out])
+        .output()
+        .expect("runs");
+    assert!(String::from_utf8_lossy(&ghost.stderr).contains("program `ghost`"));
+    let blocked = Command::new(tool)
+        .args([&dir.join("boot.image"), &dir, &dir.join("cli")])
+        .output()
+        .expect("runs");
+    assert!(!blocked.status.success());
+    fs::remove_dir_all(dir).expect("clean");
+}
+
+const DEVICES: &str = "\
+moruna-image 1
+process supervisor
+  handle console console
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma rights=write,duplicate
+  exits 0
+process devices
+  handle console console
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1043 virtio-console console
+  driver 1af4:1049 virtio-console entropy
+link supervisor.devices devices.supervisor
+";
+
+#[test]
+fn dr_t8_driver_lines_render_a_table_and_give_the_images() {
+    let d = Description::parse(DEVICES).expect("parses");
+    assert_eq!(d.processes[1].drivers.drivers.len(), 3);
+    assert_eq!(
+        d.programs().into_iter().collect::<Vec<_>>(),
+        ["devices", "supervisor", "virtio-blk", "virtio-console"]
+    );
+    let tables = d.tables();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].0, "etc/devices.drivers");
+    let table = moruna_driver_table::Table::parse(&tables[0].1).expect("table");
+    assert_eq!(table, d.processes[1].drivers);
+    let (_, text) = d.manifest().expect("manifest");
+    assert!(text.contains("handle root.ecam root.ecam\n"));
+    assert!(text.contains("handle root.msi root.msi\n"));
+    assert!(text.contains("handle root.dma root.dma rights=write,duplicate\n"));
+    assert!(text.contains("handle file:etc/devices.drivers drivers\n"));
+    assert!(text.contains("handle file:bin/virtio-blk driver.virtio-blk\n"));
+    assert_eq!(text.matches("driver.virtio-console").count(), 1);
+    let dir = programs(&["supervisor", "devices", "virtio-blk", "virtio-console"]);
+    let image = build(DEVICES, &dir, &dir).expect("builds");
+    let read = cpio::files(&image.initramfs).expect("reads");
+    assert_eq!(
+        cpio::find(&read, "etc/devices.drivers"),
+        Some(tables[0].1.as_bytes())
+    );
+    assert!(cpio::find(&read, "bin/virtio-console").is_some());
+    fs::remove_dir_all(dir).expect("clean");
+}
+
+/// SDD 27: a `data:` handle carries a file of the build's data directory, at
+/// `data/PATH`; a path that could leave the directory, and a file that is not there,
+/// are refused.
+#[test]
+fn if_t18_data_handles_carry_the_builds_files() {
+    let dir = programs(&["imagefs", "imagefs-test"]);
+    fs::create_dir_all(dir.join("layers")).expect("dir");
+    fs::write(dir.join("layers/imagefs.layers"), b"moruna-layers 1\n").expect("data");
+    let text = "\
+moruna-image 1
+process imagefs
+  handle data:layers/imagefs.layers layers
+process imagefs-test
+  handle data:layers/imagefs.layers checks
+link imagefs-test.fs imagefs.listen-test
+";
+    let image = build(text, &dir, &dir).expect("builds");
+    let read = cpio::files(&image.initramfs).expect("reads");
+    assert_eq!(
+        cpio::find(&read, "data/layers/imagefs.layers"),
+        Some(&b"moruna-layers 1\n"[..])
+    );
+    assert!(
+        image
+            .manifest
+            .contains("handle file:data/layers/imagefs.layers layers")
+    );
+    assert_eq!(
+        read.iter()
+            .filter(|f| f.path == "data/layers/imagefs.layers")
+            .count(),
+        1,
+        "one copy for two handles"
+    );
+    for bad in ["../x", "/abs", "a//b", "a/./b", "UPPER", ""] {
+        let text = format!("moruna-image 1\nprocess imagefs\n  handle data:{bad} layers\n");
+        let e = Description::parse(&text).expect_err("refused");
+        assert_eq!(e.line, 3, "{bad}: {e}");
+    }
+    let e = build(
+        "moruna-image 1\nprocess imagefs\n  handle data:missing layers\n",
+        &dir,
+        &dir,
+    )
+    .err()
+    .expect("refused");
+    assert!(e.reason.starts_with("data `missing`:"), "{e}");
+    fs::remove_dir_all(dir).expect("clean");
+}
+
+/// DR-T19 (SDD 25, k): `machine` lines carry the QEMU arguments of a test's devices
+/// and `disk` lines the images the boot writes and checks; the tool writes both files
+/// and refuses, by line, what boot.sh could not pass on safely.
+#[test]
+fn dr_t19_machine_and_disk_lines_describe_the_boots_machine() {
+    let text = "\
+moruna-image 1
+machine -drive file={out}/nvme0-{cpus}.img,format=raw,if=none,id=nvme0
+machine   -device nvme,drive=nvme0,serial=ke1-nvme0,addr=0x10
+disk nvme0 32768 b
+process supervisor
+  handle console console
+  exits 0
+disk nvme1 8192 a
+";
+    let d = Description::parse(text).expect("parses");
+    assert_eq!(
+        d.machine,
+        [
+            "-drive file={out}/nvme0-{cpus}.img,format=raw,if=none,id=nvme0",
+            "-device nvme,drive=nvme0,serial=ke1-nvme0,addr=0x10",
+        ]
+    );
+    assert_eq!(d.disks.len(), 2);
+    assert_eq!(d.disks[0].sectors, 32768);
+    assert_eq!(d.disks[0].after, moruna_image::Pattern::B);
+    assert_eq!(d.disks[1].after, moruna_image::Pattern::A);
+    let dir = programs(&["supervisor"]);
+    let image = build(text, &dir, &dir).expect("builds");
+    assert_eq!(image.disks, ["nvme0 32768 b", "nvme1 8192 a"]);
+    assert_eq!(image.machine.len(), 2);
+    let description = dir.join("machine.image");
+    fs::write(&description, text).expect("description");
+    let out = dir.join("out");
+    let run = Command::new(env!("CARGO_BIN_EXE_moruna-image"))
+        .args([&description, &dir, &out])
+        .output()
+        .expect("runs");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("disks")).expect("disks"),
+        "nvme0 32768 b\nnvme1 8192 a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("machine"))
+            .expect("machine")
+            .lines()
+            .count(),
+        2
+    );
+    fs::remove_dir_all(dir).expect("clean");
+    let refused: &[(&str, &str)] = &[
+        ("machine\n", "needs its QEMU arguments"),
+        ("machine -device \"nvme\"\n", "may not"),
+        ("machine -drive file=$HOME/x\n", "may not"),
+        ("machine -drive file=a;b\n", "may not"),
+        ("machine -drive file={home}/x\n", "placeholder"),
+        ("machine -drive file={out\n", "placeholder"),
+        ("disk nvme0 8192\n", "disk NAME"),
+        ("disk Nvme 8192 a\n", "not 1 to 32 bytes"),
+        ("disk nvme0 0 a\n", "sectors"),
+        ("disk nvme0 lots a\n", "sectors"),
+        ("disk nvme0 4194304 a\n", "sectors"),
+        ("disk nvme0 8 c\n", "pattern"),
+        ("disk nvme0 8 a\ndisk nvme0 8 b\n", "twice"),
+    ];
+    for (body, words) in refused {
+        let text = format!("moruna-image 1\n{body}");
+        let e = Description::parse(&text).expect_err(&text);
+        let line = if body.matches('\n').count() == 2 {
+            3
+        } else {
+            2
+        };
+        assert_eq!(e.line, line, "{text:?}: {e}");
+        assert!(e.reason.contains(words), "{text:?}: {e}");
+    }
+}
+
+/// Shared memfd RAM must use the boot script's one fixed RAM decision. Admit
+/// that exact placeholder without broadening machine directives into shell input.
+#[test]
+fn machine_memory_placeholder_is_explicit_and_unknown_expansions_stay_refused() {
+    let text = "moruna-image 1\nmachine -object memory-backend-memfd,id=ram0,size={memory},share=on\nprocess supervisor\n  handle console console\n  exits 0\n";
+    let parsed = Description::parse(text).expect("canonical RAM placeholder");
+    assert_eq!(
+        parsed.machine,
+        ["-object memory-backend-memfd,id=ram0,size={memory},share=on"]
+    );
+    for bad in ["{ram}", "${memory}", "{memory_extra}", "$(memory)"] {
+        assert!(
+            Description::parse(&text.replace("{memory}", bad)).is_err(),
+            "{bad}"
+        );
+    }
+}

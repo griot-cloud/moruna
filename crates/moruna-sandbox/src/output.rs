@@ -77,18 +77,120 @@ impl ChildOutput {
     }
 }
 
-fn bytes(mut from: std::fs::File, stream: Stream, to: Option<(Arc<dyn OutputSink>, StageId)>) {
+fn bytes(from: std::fs::File, stream: Stream, to: Option<(Arc<dyn OutputSink>, StageId)>) {
+    forward(from, stream, to, None);
+}
+
+/// What a child wrote on its standard error, kept to its last lines (SDD 19 f.7): the words a
+/// failure is reported with.
+#[derive(Default)]
+pub struct Tail {
+    state: std::sync::Mutex<TailState>,
+    ended: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TailState {
+    lines: std::collections::VecDeque<String>,
+    partial: Vec<u8>,
+    done: bool,
+}
+
+/// How many lines of a child's standard error a failure quotes.
+pub const TAIL_LINES: usize = 20;
+
+impl Tail {
+    fn push(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for &b in bytes {
+            if b == b'\n' {
+                let line =
+                    String::from_utf8_lossy(&std::mem::take(&mut state.partial)).into_owned();
+                state.lines.push_back(line);
+                if state.lines.len() > TAIL_LINES {
+                    state.lines.pop_front();
+                }
+            } else if state.partial.len() < RECORD_LINE_MAX {
+                state.partial.push(b);
+            }
+        }
+    }
+
+    fn finish(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.partial.is_empty() {
+            let line = String::from_utf8_lossy(&std::mem::take(&mut state.partial)).into_owned();
+            state.lines.push_back(line);
+            if state.lines.len() > TAIL_LINES {
+                state.lines.pop_front();
+            }
+        }
+        state.done = true;
+        self.ended.notify_all();
+    }
+
+    /// The last lines, once the child's standard error has ended or `wait` has passed (a
+    /// process the child started may hold the pipe open after the child is gone).
+    pub fn lines(&self, wait: std::time::Duration) -> Vec<String> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _) = self
+            .ended
+            .wait_timeout_while(state, wait, |s| !s.done)
+            .unwrap_or_else(|e| e.into_inner());
+        let mut lines: Vec<String> = state.lines.iter().cloned().collect();
+        if !state.partial.is_empty() {
+            lines.push(String::from_utf8_lossy(&state.partial).into_owned());
+        }
+        let skip = lines.len().saturating_sub(TAIL_LINES);
+        lines.split_off(skip)
+    }
+}
+
+/// A child's standard error alone, forwarded as its stage's and kept in `tail`: one thread,
+/// ended when the child's end of the pipe is.
+pub fn follow_stderr(
+    fd: OwnedFd,
+    to: Option<(Arc<dyn OutputSink>, StageId)>,
+    kernel: &str,
+    tail: Arc<Tail>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("moruna-{kernel}-stderr"))
+        .spawn({
+            let tail = Arc::clone(&tail);
+            move || {
+                forward(std::fs::File::from(fd), Stream::Stderr, to, Some(&tail));
+                tail.finish();
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(target: "sandbox", %error, kernel, "no thread for a child's stderr");
+        tail.finish();
+    }
+}
+
+fn forward(
+    mut from: std::fs::File,
+    stream: Stream,
+    to: Option<(Arc<dyn OutputSink>, StageId)>,
+    tail: Option<&Tail>,
+) {
     let _hold = to.as_ref().map(|(sink, _)| sink.hold());
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
         match from.read(&mut buf) {
             Ok(0) => return,
-            Ok(n) => match &to {
-                Some((sink, stage)) => sink.bytes(Some(*stage), stream, &buf[..n]),
-                None => {
-                    let _ = io::stderr().write_all(&buf[..n]);
+            Ok(n) => {
+                if let Some(tail) = tail {
+                    tail.push(&buf[..n]);
                 }
-            },
+                match &to {
+                    Some((sink, stage)) => sink.bytes(Some(*stage), stream, &buf[..n]),
+                    None => {
+                        let _ = io::stderr().write_all(&buf[..n]);
+                    }
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return,
         }

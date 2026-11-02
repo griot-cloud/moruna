@@ -77,6 +77,12 @@ impl Arena {
     /// The `ArenaStats` of section j, which `Allocator::stats` has no room for.
     /// Added 2026-09-22: section j named the struct and no method exposed it.
     pub fn arena_stats(&self) -> ArenaStats;
+    /// The most host bytes in use at once since `reset_host_peak` (or since `new`), exact
+    /// across every host region: one mark the regions share. Added 2026-10-29 for warm-up's
+    /// peak (SDD 24 p.4, CM-I21).
+    pub fn host_peak(&self) -> u64;
+    /// Start a new host high-water mark at the bytes in use now.
+    pub fn reset_host_peak(&self);
 }
 
 /// Contracts d.3. The arena overrides every method, including the three with
@@ -200,6 +206,8 @@ Per-class mutex (one per class per tier), one bump lock per region, atomics for 
 **AR-T10 small_budget_mode.** Region of 256 MiB serves classes 0..=12 by splitting; class 13 fails with `Alloc`. e.1.
 
 **AR-T13 region_serves_its_free_space.** A 1.5 GiB region takes a mixed workload across classes 0..=10 and the large path, in rotation, until an allocation genuinely cannot fit: every failure comes with `largest_free` below the request and `in_use` plus the free lists accounting for the region, never with a gigabyte free and a refused 80,000 bytes. Releasing everything makes the region serve the same workload again. e.1, f.3, AR-I2.
+
+**AR-T14 the_host_peak_is_the_most_in_use_at_once_and_resets.** A freed spike is still the peak; a reset starts the mark at what is in use; a buffer only a grown region can hold charges the same mark. (Unit test in `src/lib.rs`, 2026-10-29.)
 
 **AR-T11 flat_footprint.** After `new`, RSS (from `/proc/self/statm`) is within 2% of the region size and does not grow during AR-T5. f.1.
 

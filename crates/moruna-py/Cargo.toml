@@ -23,7 +23,15 @@ required-features = ["python"]
 moruna-kernel = { workspace = true }
 arrow = { workspace = true }
 moruna-runtime = { workspace = true }
+moruna-datafusion = { workspace = true, optional = true }
+moruna-cost = { workspace = true }
+moruna-storage = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
 moruna-job = { workspace = true }
+# `moruna.explain(...)` and the plan every run starts from (SDD 26).
+moruna-plan = { workspace = true }
+# `moruna.read_events(...)`: the events a run wrote as records (MH 4.3 version 7).
+moruna-event = { workspace = true }
 moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
 moruna-wasm = { workspace = true }
@@ -65,5 +73,16 @@ python = [
 uring = ["moruna-runtime/uring"]
 # A governed plan as the source and a contract write as the sink (MH 4.5); what the guest
 # binary is built with.
-peql = ["moruna-runtime/peql"]
+peql = ["moruna-runtime/peql", "dep:moruna-datafusion", "moruna-datafusion/peql"]
 cuda = ["moruna-runtime/cuda"]
+
+# KD3's real cross-adapter fixture; no new runtime/library authority.
+[[bin]]
+name = "moruna-kd3-fixture"
+path = "src/bin/kd3-fixture.rs"
+required-features = ["python"]
+
+# The private KD3 native fixture consumes the same actual read-only start grant.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+moruna-micro = { workspace = true }
+moruna-sys = { workspace = true }

@@ -53,7 +53,7 @@ It refuses to know: the package format (16), how the run is planned or scheduled
 
 **SB-I8. The guard runs inside the child, on the same rules.** The child installs the hooks of 05 f.10 and f.11, opens the frame of 05 f.12 around each call, and its gate (05 f.9) measures the child's memory against the stage ceiling read from the counters page; a call's `KernelAlloc` (`python`, `numpy`, `arrow`) returns with its reply and Moruna hands it to the scheduler with `set_kernel_alloc` (contracts d.7). A refusal in the child ends the call as `MorunaError::Refused` in Moruna with the child's figures.
 
-**SB-I9. The controller sees a packaged stage between batches.** The process's sampler adds, at every sample, each live child's in-use (the larger of the counters page's `in_use` and the child cgroup's `memory.current`) to `anon_bytes`, so the run's ceiling governs Moruna and its children together.
+**SB-I9. The controller sees a packaged stage between batches.** The process's sampler adds, at every sample, each live child's in-use (the larger of the counters page's `in_use` and the child cgroup's `memory.current`) to `anon_bytes`, so the run's ceiling governs Moruna and its children together. Amended 2026-10-29 (SDD 24 p.4): `outside()` also keeps the child cgroup's `memory.peak` as a high-water mark, reset (`reset_peak`) and read (`peak`) through one open file, as Linux 6.12 and later reset it per file; an older kernel refuses the reset, named.
 
 **SB-I10. The template holds no thread when it forks.** Before its first fork, and before every fork, the template checks that it has exactly one thread (`/proc/self/task`) and refuses the request naming the count otherwise.
 
@@ -216,7 +216,7 @@ A stage's instance is used by one worker at a time (`Stateful { max_instances: 1
 - A kernel that tries to read `/etc/passwd`, the disk or `/proc`: `ENOENT` (not in its namespace) or `EACCES` (Landlock).
 - A kernel that tries `socket()`: `EPERM`.
 - The template dies: every child it forked keeps running; the next `start` request restarts it.
-- A run on a host that is not Linux: a `.pex` stage is refused when built ("a .pex runs in the sandbox, which needs Linux"); a `.wasm` runs.
+- A run on a host that is not Linux: a `.pex` stage is refused when built ("a .pex runs in the sandbox, which needs Linux (so does an image's command, SDD 19)"); a `.wasm` runs.
 - A kernel that keeps a reference to its input batch past the call (a stateful kernel's buffer, a cache, a closure): the batch keeps its own bytes, because its region stays leased until the last buffer over it goes (SB-I13); the stage holds that much of the mapping, which its footprint and the profile show. When the kept inputs fill the data area, a call waits for releases (`lease_wait_us`) and is refused after `LEASE_WAIT`; a kernel that must keep many batches copies the rows it needs.
 
 ## i. Configuration
@@ -296,7 +296,7 @@ The following run on Linux with a sandbox host (a privileged container: tests ta
 
 ## l. Implementation notes for the agent
 
-`unsafe` is permitted in `moruna-sandbox`'s `mapping.rs` (`mmap`, `memfd_create`, `fallocate`, the atomics over the mapping), `confine.rs` (`unshare`, `mount`, `pivot_root`, `prctl`, `capset`), `fdpass.rs` (`sendmsg` with `SCM_RIGHTS`), `template.rs` (`dup2` and `fcntl` in `pre_exec`), `kernel.rs` (`pidfd_open`, `pidfd_send_signal`), `python.rs` (taking the two descriptors the template passed, the memoryviews and foreign buffers over the mapping) the test of `seccomp.rs` (a forked child that installs the filters) and `coverage.rs` (the profile runtime's buffer), and in `moruna-wasm`'s `cwasm.rs` (`Component::deserialize`, whose bytes are trusted as the tree is: written beside the package by whoever ran `aot` with write access there, 16 PK-I7). The Linux-only modules are `#[cfg(target_os = "linux")]`; on other systems the crate builds and `SandboxKernel::new` refuses.
+`unsafe` is permitted in `moruna-sandbox`'s `mapping.rs` (`mmap`, `memfd_create`, `fallocate`, the atomics over the mapping), `confine.rs` (`unshare`, `mount`, `pivot_root`, `prctl`, `capset`), `fdpass.rs` (`sendmsg` with `SCM_RIGHTS`; its tests' `recvmsg`, and a forked child that holds a peer's descriptor while the peer is shut down, which is how a peer is ended in a test binary whose other tests fork children that never exec), `template.rs` (`dup2` and `fcntl` in `pre_exec`), `kernel.rs` (`pidfd_open`, `pidfd_send_signal`), `python.rs` (taking the two descriptors the template passed, the memoryviews and foreign buffers over the mapping) the test of `seccomp.rs` (a forked child that installs the filters) and `coverage.rs` (the profile runtime's buffer), and in `moruna-wasm`'s `cwasm.rs` (`Component::deserialize`, whose bytes are trusted as the tree is: written beside the package by whoever ran `aot` with write access there, 16 PK-I7). The Linux-only modules are `#[cfg(target_os = "linux")]`; on other systems the crate builds and `SandboxKernel::new` refuses.
 
 Coverage counts the forked children. A child of the template and the test's forked child end through `_exit`, which skips the exit handler that writes a coverage build's profile, and a confined child cannot open the profile's path; so in a coverage build (`cfg(coverage)`, which `cargo llvm-cov` sets) the template is given `LLVM_PROFILE_FILE`, each such child creates a file of its own beside that path before it confines itself, and writes the profile runtime's buffer into it before it ends. The crate's coverage is measured on Linux with the instrumented `_core` module the template imports.
 
@@ -326,3 +326,28 @@ None.
 **SB-O1. The child's Arrow allocating in Moruna's arena.** A memory pool over the shared region, shipped as a small extension, removes the outgoing copy (FP 4, "a later refinement").
 
 **SB-O2. A PID namespace for the child.** Signals to other processes are refused by seccomp (SB-I5); a PID namespace would hide them as well.
+
+### Fallible accounting correction (2026-10-30)
+
+StageMemory and ImageMemory propagate memory.current IO errors; missing not-yet-created children alone mean zero. ChildSampler propagates IO/parse errors, and package/wasm footprint reads use the same fallible contract. WithOutside does not return a partial/stale sample when any child fails. MemoryGate construction is fallible; accounting failures close admission and travel separately from measured budget Refusal through FrameEnd/wasm trap to the original terminal diagnostic, even when Python catches MemoryError. No source-only change is a runtime-proof claim.
+
+### Native package process adapter (source checkpoint, 2026-10-30)
+
+The native adapter uses the existing KD2 Task, actual child Account and record plane,
+not host Linux cgroups or namespaces. Exact canonical package snapshot bytes travel
+in a versioned checked control record; package metadata, interpreter/platform checks,
+factory arguments, declared schemas, state and checkpoint handling reuse the package
+loader. Reply/output windows are admitted before submitting the input. Python output
+is captured at its actual command-thread OutputSink, bounded to 8192 logical
+bytes including record overhead, and replayed with its original stream/level in the
+parent's current stage; overflow is a loud failure. Unattributed raw descriptor writes
+remain actual stderr, never parsed as data or attributed to a guessed stage.
+
+Inputs.assets resolves through the actual engine filesystem startup capability's
+imagefs3 export_directory operation. Linux3 receives that real readonly directory
+channel and mounts it at actor-local /assets; a pathname alone is not authority.
+Missing capability, source lookup, accounting and cleanup failures remain errors.
+A child Account observer is released only after real terminal acknowledgement and
+actual used/reserved retirement; uncertain originals retain their owner and fail
+accounting rather than reporting zero. These are source contracts pending actual
+native package execution; codec/model success cannot certify adapter parity.

@@ -36,7 +36,14 @@ fn pl_t12_q0_staging_on() {
             .push(0, common::table_morsel(&alloc, seq, 0, 64))
             .expect("push");
         common::settle(&reactor);
-        let held: u64 = engine.stats().queues[0].bytes_by_tier.iter().sum();
+        // Memory tiers only: the `Disk` slot counts what the queue holds on disk (f.18).
+        let held: u64 = engine.stats().queues[0]
+            .bytes_by_tier
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| *slot != TierKind::Disk.index())
+            .map(|(_, bytes)| bytes)
+            .sum();
         assert!(
             held <= bytes * (resident + u64::from(window)),
             "the resident set stayed near the window: {held} bytes"
@@ -73,6 +80,7 @@ fn pl_t12_q0_staging_on() {
         .pop_blocking(0, common::want_host(), Locality::Any)
         .expect("pop_blocking")
     {
+        engine.release(0, morsel.seq).expect("release");
         order.push(morsel.seq);
     }
     assert_eq!(order, (0..entries).collect::<Vec<_>>(), "in order (PL-I5)");

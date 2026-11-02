@@ -1,0 +1,11 @@
+[package]
+name = "moruna-mmio"
+description = "Width-exact access to device registers and shared rings for Moruna drivers: one trait over a mapped window, with an in-memory window for host tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-svc.workspace = true

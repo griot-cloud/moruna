@@ -55,7 +55,8 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    /// A draw below `n` (`n > 0`).
+    pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }

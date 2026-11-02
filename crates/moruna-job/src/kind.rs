@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::port::PortDoc;
+use crate::rules::{RulesFault, SchemaRules};
+
 /// The format version of `moruna kinds` (the [`Listing`]).
 pub const LISTING_VERSION: u32 = 1;
 
@@ -100,6 +103,22 @@ pub enum Isolation {
     /// Code from a package, run apart from the process: a `.wasm` in its sandbox, a `.pex` in a
     /// confined child (17, decision FP1).
     Confined,
+    /// Code of the program running Moruna, reached through a port it serves (SDD 18 e.4): Moruna
+    /// runs none of it, and hands each batch to the port named by the declaration's `served`.
+    Embedder,
+}
+
+impl Isolation {
+    /// The isolation's name in a refusal and in the listing.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Isolation::Builtin => "builtin",
+            Isolation::Imported => "imported",
+            Isolation::Caller => "caller",
+            Isolation::Confined => "confined",
+            Isolation::Embedder => "embedder",
+        }
+    }
 }
 
 /// What a kind may need from the machine and the run (e.1).
@@ -131,6 +150,14 @@ impl Needs {
             contracts: Fact::No,
         }
     }
+
+    /// What a served kind needs: the port it calls, and nothing else (SDD 18 e.4).
+    pub fn a_port() -> Needs {
+        Needs {
+            model_port: Fact::Yes,
+            ..Needs::nothing()
+        }
+    }
 }
 
 /// What a kind is (e.1): what an embedder reads to know what can run and how to configure it, and
@@ -160,6 +187,55 @@ pub struct Declaration {
     pub preserves_columns: Fact,
     /// Where its code comes from and runs.
     pub isolation: Isolation,
+    /// For a kind the program running Moruna declares and serves (`isolation: embedder`): the
+    /// port each batch is handed to and the rules of what goes in and comes out (SDD 18 e.4).
+    /// Absent for every kind whose code Moruna runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<Served>,
+}
+
+/// How a kind its embedder serves is run (SDD 18 e.4): every batch of a task of the kind is handed
+/// to `port` with the task's settings, and what the port answers is the task's output.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Served {
+    /// Where each batch goes, and how long one call may wait for its answer (MH 4.10).
+    pub port: PortDoc,
+    /// What the kind takes, spelled as a package's declaration spells it (SDD 16 e.2,
+    /// [`SchemaRules`]); absent: any columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+    /// What it gives, likewise, and relative to what it takes when its keys are `adds`, `drops`
+    /// and `changes`; absent: whatever the port answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+impl Served {
+    /// Served by `port`, with no schema rules.
+    pub fn by(port: PortDoc) -> Served {
+        Served {
+            port,
+            input_schema: None,
+            output_schema: None,
+        }
+    }
+
+    /// The rules of what the kind takes, when it declares them.
+    pub fn input_rules(&self) -> Result<Option<SchemaRules>, RulesFault> {
+        self.input_schema
+            .as_ref()
+            .map(|v| SchemaRules::parse(v, "served.input_schema", false))
+            .transpose()
+    }
+
+    /// The rules of what it gives, when it declares them.
+    pub fn output_rules(&self) -> Result<Option<SchemaRules>, RulesFault> {
+        self.output_schema
+            .as_ref()
+            .map(|v| SchemaRules::parse(v, "served.output_schema", true))
+            .transpose()
+    }
 }
 
 impl Declaration {
@@ -219,11 +295,56 @@ impl Declaration {
             return fail("has a property `kind`, which is the document's, not a setting");
         }
         match schema.get("examples").and_then(|v| v.as_array()) {
-            Some(examples) if !examples.is_empty() && examples.iter().all(|e| e.is_object()) => {
-                Ok(())
-            }
-            _ => fail("has no `examples`, or one that is not an object"),
+            Some(examples) if !examples.is_empty() && examples.iter().all(|e| e.is_object()) => {}
+            _ => return fail("has no `examples`, or one that is not an object"),
         }
+        self.check_served()
+    }
+
+    /// A kind its embedder serves says so twice, by its isolation and by `served`, and is a
+    /// kernel that calls the port it names, whose schema rules are rules (SDD 18 KD-I11).
+    fn check_served(&self) -> core::result::Result<(), String> {
+        let name = &self.name;
+        let served = match (&self.served, self.isolation) {
+            (None, Isolation::Embedder) => {
+                return Err(format!(
+                    "`{name}` is isolated as `embedder` and names no `served`: a kind its \
+                     embedder serves names the port that serves it"
+                ));
+            }
+            (None, _) => return Ok(()),
+            (Some(served), Isolation::Embedder) => served,
+            (Some(_), _) => {
+                return Err(format!(
+                    "`{name}` names `served` and is isolated as `{}`: a kind its embedder serves \
+                     is isolated as `embedder`",
+                    self.isolation.as_str()
+                ));
+            }
+        };
+        if self.role != Role::Kernel {
+            return Err(format!(
+                "`{name}` is a {} served by a port: a served kind is a kernel, and a source or a \
+                 sink of the embedder's own is registered with its adapter",
+                self.role
+            ));
+        }
+        if self.needs.model_port != Fact::Yes {
+            return Err(format!(
+                "`{name}` is served by a port and says it calls none: a served kind's \
+                 `needs.model_port` is `yes`"
+            ));
+        }
+        let port = |key: Option<&str>, reason: String| {
+            let at = key.map_or_else(|| "served.port".to_string(), |k| format!("served.port.{k}"));
+            format!("`{name}`'s {at}: {reason}")
+        };
+        served.port.place().map_err(|f| port(f.key, f.reason))?;
+        served.port.deadline().map_err(|f| port(f.key, f.reason))?;
+        for rules in [served.input_rules(), served.output_rules()] {
+            rules.map_err(|f| format!("`{name}`'s {f}"))?;
+        }
+        Ok(())
     }
 
     /// The examples of its settings schema.

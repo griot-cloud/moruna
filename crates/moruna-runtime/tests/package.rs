@@ -9,8 +9,9 @@ use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::arrow::ipc::writer::StreamWriter;
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_package::Inputs;
-use moruna_runtime::check::Verdict;
 use moruna_runtime::check::package::check_package;
+use moruna_runtime::check::{Verdict, WarmUp};
+use moruna_runtime::cost::CostSettings;
 use moruna_runtime::packaged::{self, PackageHost};
 use moruna_wasm::testing::{IDENTITY, component, constant, manifest, package_at};
 
@@ -38,11 +39,17 @@ fn pk_t13_check_through_the_runtime() {
     let m = manifest("echo", false, true);
     let package = package_at(&dir, &component(&m.to_json(), IDENTITY, &[], "", ""), &m);
     let path = package.path.clone();
-    let profiles = dir.join("profiles");
+    // Warm-up through the package's runtime (SDD 24 p.2): each start-up opens the file again.
+    let mut warm = WarmUp::new(
+        CostSettings::directory(dir.join("observations"))
+            .open()
+            .unwrap(),
+    );
+    warm.budget = std::time::Duration::from_secs(10);
     let report = check_package(
         &path,
         7,
-        Some(profiles.clone()),
+        Some(warm),
         &PackageHost::default(),
         Inputs::default(),
     )
@@ -53,13 +60,73 @@ fn pk_t13_check_through_the_runtime() {
     assert_eq!(report.fingerprint, format!("sha256:{}", sha256_hex(&file)));
     assert_eq!(report.exit_code(), 0);
     assert!(report.notes.iter().any(|n| n.contains("compiled")));
-    let row = report.profile.as_ref().expect("a profile row");
-    let written = row.path.as_ref().expect("written to the directory");
-    assert!(
-        written.display().to_string().contains(&sha256_hex(&file)),
-        "the row is keyed by the package's fingerprint: {}",
-        written.display()
+    let Some(Ok(warm_up)) = &report.warm_up else {
+        panic!("warmed up: {}", report.summary())
+    };
+    assert_eq!(warm_up.key.kind, "package");
+    assert_eq!(
+        warm_up.key.fingerprint.to_hex(),
+        sha256_hex(&file),
+        "the cost is keyed by the package's fingerprint"
     );
+    // Compare the actual registration-produced key with the exact live scheduler entry
+    // point. Package path, pin and sandbox metadata must not turn into extra settings.
+    let doc = moruna_job::JobSpec::new(
+        moruna_job::KindDoc::of(
+            "parquet",
+            &serde_json::json!({"url":"file:///unused-by-key-test"}),
+        )
+        .unwrap(),
+        vec![
+            moruna_job::KindDoc::of(
+                "package",
+                &serde_json::json!({"path":path,"fingerprint":package.fingerprint_string()}),
+            )
+            .unwrap(),
+        ],
+        moruna_job::KindDoc::of(
+            "parquet",
+            &serde_json::json!({"url":"file:///unused-output-by-key-test"}),
+        )
+        .unwrap(),
+    );
+    let job = moruna_job::Job::from_v1(&doc);
+    let parts = moruna_runtime::job::Parts {
+        sources: vec![0],
+        stages: vec![vec![1]],
+        sinks: vec![2],
+    };
+    let loaded = packaged::open(&path, None, &PackageHost::default(), Inputs::default()).unwrap();
+    let input = moruna_kernel::SourceSchema::Table(
+        loaded
+            .kernel()
+            .declared()
+            .input
+            .unwrap()
+            .synthetic_schema()
+            .unwrap(),
+    );
+    let learning = moruna_runtime::cost::RunLearning::for_job(
+        CostSettings::directory(dir.join("observations"))
+            .open_online()
+            .unwrap(),
+        &job,
+        &parts,
+    )
+    .unwrap();
+    let keys = learning
+        .keys(
+            &[loaded.kernel()],
+            &moruna_kernel::Topology::chain(1),
+            &[input],
+        )
+        .unwrap();
+    assert_eq!(
+        keys[0], warm_up.key,
+        "actual registered measurements are the exact live executable key"
+    );
+    assert!(warm_up.progress.start_up && warm_up.kernel.start_cold_seconds.is_some());
+    assert!(warm_up.observations > 0);
     assert!(report.to_json()["alloc"]["linear"].is_object());
     assert!(report.summary().contains("linear"));
 
@@ -181,7 +248,8 @@ fn package_document(scratch: &std::path::Path, rows: u64, package: &str, pin: &s
 
 fn run_document(job: &JobSpec, host: PackageHost) -> moruna_runtime::RunReport {
     let built = build(
-        job,
+        &moruna_job::Job::from_v1(job),
+        &support::planned(&moruna_job::Job::from_v1(job)),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -396,7 +464,8 @@ fn pk_t17_package_entry_args_and_assets() {
         edit(&mut doc["kernels"][0]);
         let job = JobSpec::from_value(doc).unwrap();
         build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
+            &support::planned(&moruna_job::Job::from_v1(&job)),
             &Registry::standard(),
             BuildOptions {
                 strict: true,
@@ -419,4 +488,102 @@ fn pk_t17_package_entry_args_and_assets() {
     try_build(&args_pkg, &|_| {}).unwrap();
     let e = try_build(&args_pkg, &|k| k["args"] = json!([1])).unwrap_err();
     assert!(e.contains("kernels[0].args"), "{e}");
+}
+
+#[test]
+fn registration_and_live_keys_preserve_distinct_actual_package_arguments() {
+    let _serial = support::one_run_at_a_time();
+    let scratch = support::Scratch::new("package-live-cost-args");
+    let manifest = moruna_wasm::testing::args_manifest("configured_live_cost");
+    let package = package_at(
+        scratch.path(),
+        // The diagnostic configure_component deliberately refuses every process
+        // with its arguments. This measurement fixture must actually succeed:
+        // accept configuration through the real ABI, then run the identity body.
+        &component(
+            &manifest.to_json(),
+            IDENTITY,
+            &[],
+            r#"
+  (func (export "configure") (param $ptr i32) (param $len i32) (result i32)
+    (if (i32.eqz (local.get $len)) (then (unreachable)))
+    (if (i32.ne (i32.load8_u (local.get $ptr)) (i32.const 123)) (then (unreachable)))
+    (i32.store8 (i32.const 48) (i32.const 0))
+    (i32.const 48))
+"#,
+            r#"
+  (func (export "configure") (param "args" string) (result (result (error string)))
+    (canon lift (core func $i "configure") (memory $i "memory") (realloc (func $i "cabi_realloc"))))
+"#,
+        ),
+        &manifest,
+    );
+    let settings = CostSettings::directory(scratch.path().join("observations"));
+    let mut measured = Vec::new();
+    for x in [1, 2] {
+        let inputs = Inputs {
+            args: Some(serde_json::json!({"x":x})),
+            ..Inputs::default()
+        };
+        let mut warm = WarmUp::new(settings.clone().open().unwrap());
+        warm.budget = std::time::Duration::from_millis(250);
+        let report = check_package(
+            &package.path,
+            0,
+            Some(warm),
+            &PackageHost::default(),
+            inputs.clone(),
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::Agreed, "{}", report.summary());
+        let Some(Ok(warmed)) = &report.warm_up else {
+            panic!("actual argument warm-up failed: {}", report.summary())
+        };
+        assert!(warmed.observations > 0);
+        let doc=moruna_job::JobSpec::new(
+            moruna_job::KindDoc::of("parquet",&serde_json::json!({"url":"file:///key-only-input"})).unwrap(),
+            vec![moruna_job::KindDoc::of("package",&serde_json::json!({"path":package.path,"fingerprint":package.fingerprint_string(),"args":{"x":x}})).unwrap()],
+            moruna_job::KindDoc::of("parquet",&serde_json::json!({"url":"file:///key-only-output"})).unwrap());
+        let job = moruna_job::Job::from_v1(&doc);
+        let parts = moruna_runtime::job::Parts {
+            sources: vec![0],
+            stages: vec![vec![1]],
+            sinks: vec![2],
+        };
+        let loaded = packaged::open(&package.path, None, &PackageHost::default(), inputs).unwrap();
+        let schema = moruna_kernel::SourceSchema::Table(
+            loaded
+                .kernel()
+                .declared()
+                .input
+                .unwrap()
+                .synthetic_schema()
+                .unwrap(),
+        );
+        let live = moruna_runtime::cost::RunLearning::for_job(
+            settings.clone().open_online().unwrap(),
+            &job,
+            &parts,
+        )
+        .unwrap()
+        .keys(
+            &[loaded.kernel()],
+            &moruna_kernel::Topology::chain(1),
+            &[schema],
+        )
+        .unwrap();
+        assert_eq!(
+            live[0], warmed.key,
+            "actual registration/run argument identities agree"
+        );
+        measured.push(warmed.key.clone());
+    }
+    assert_eq!(
+        measured[0].fingerprint, measured[1].fingerprint,
+        "the same real executable was checked twice"
+    );
+    assert_ne!(
+        measured[0].settings, measured[1].settings,
+        "different actual invocation arguments cannot share a profile row"
+    );
 }

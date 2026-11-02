@@ -320,7 +320,9 @@ def test_pk_t13_check_a_package(scratch: Path, capsys) -> None:
     )
     package = root / "echo.wasm"
     capsys.readouterr()
-    code = _check.main([str(package), "--json", "--profiles-dir", str(scratch / "profiles")])
+    code = _check.main(
+        [str(package), "--json", "--store", str(scratch / "observations"), "--budget", "10"]
+    )
     report = json.loads(capsys.readouterr().out)
     assert code == 0, report
     (kernel,) = report["kernels"]
@@ -328,16 +330,18 @@ def test_pk_t13_check_a_package(scratch: Path, capsys) -> None:
     assert kernel["verdict"] == "agreed"
     assert kernel["fingerprint"] == "sha256:" + hashlib.sha256(package.read_bytes()).hexdigest()
     assert kernel["alloc"]["linear"]["requests"] >= 0
+    assert kernel["warm_up"]["observations"] > 0, kernel["warm_up"]
+    assert kernel["warm_up"]["key"]["kind"] == "package"
     # A package that loops runs out of fuel and is refused, not hung.
     (scratch / "l").mkdir()
     loops = wasm_project(scratch / "l", ECHO_YAML.replace("name: echo", "name: loops"))
     loops_component = str(FIXTURES / "loops.component.wasm")
     assert _package.main([str(loops), "--wasm", loops_component, "--out", str(loops)]) == 0
     capsys.readouterr()
-    assert _check.main([str(loops / "loops.wasm"), "--no-profile"]) == 2
+    assert _check.main([str(loops / "loops.wasm"), "--no-warm-up"]) == 2
     assert "fuel exhausted" in capsys.readouterr().out
     # A .pex on this host: refused when the sandbox cannot run it, named.
-    assert _check.main([str(scratch / "nothing.pex"), "--no-profile"]) == 2
+    assert _check.main([str(scratch / "nothing.pex"), "--no-warm-up"]) == 2
     capsys.readouterr()
 
 
@@ -473,7 +477,7 @@ def test_pk_t15_load_a_pex(scratch: Path, dataset, capsys) -> None:
     assert command.main(["aot", str(pex)]) == 0
     assert (root / "shout.pex.tree" / "MORUNA-TREE").is_file()
     capsys.readouterr()
-    args = [str(pex), "--json", "--no-profile", "--sandbox-python", SANDBOX_PYTHON]
+    args = [str(pex), "--json", "--no-warm-up", "--sandbox-python", SANDBOX_PYTHON]
     assert _check.main([*args, "--sandbox-cgroup", SANDBOX_CGROUP]) == 0
     (report,) = json.loads(capsys.readouterr().out)["kernels"]
     assert report["kind"] == "pex" and report["verdict"] == "agreed"
@@ -496,6 +500,6 @@ def test_pk_t18_package_report(scratch: Path, capsys, monkeypatch) -> None:
     assert report["name"] == "echo" and report["format"] == "wasm"
     assert report["fingerprint"] == "sha256:" + hashlib.sha256(out.read_bytes()).hexdigest()
     assert report["manifest"]["declaration"]["input_schema"] == {"n": "int64", "s": "string"}
-    assert _check.main([str(out), "--json", "--no-profile"]) == 0
+    assert _check.main([str(out), "--json", "--no-warm-up"]) == 0
     (checked,) = json.loads(capsys.readouterr().out)["kernels"]
     assert checked["manifest"] == report["manifest"]

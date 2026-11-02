@@ -1,0 +1,11 @@
+[package]
+name = "echo-conformance"
+description = "Runs the echo protocol's conformance suite against a server of it on the Moruna microkernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+echo-protocol = { path = "../echo-protocol", version = "=0.1.0" }

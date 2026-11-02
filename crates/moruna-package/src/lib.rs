@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 pub use host::{compatible, host_target};
 pub use manifest::{DeclarationDoc, Hints, Manifest};
-pub use tree::{Tree, tree, write_beside};
+pub use tree::{Tree, private_tree, tree, write_beside};
 pub use wasm::{embed_manifest, wasm_manifest};
 
 /// The manifest's name: the `.pex` zip entry and the `.wasm` custom section (16 e.1, e.5).

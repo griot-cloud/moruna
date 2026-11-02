@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
+use super::packet::HOST_CID;
 use super::packet::{HDR_BYTES, Header, SHUTDOWN_RCV, SHUTDOWN_SEND, TYPE_STREAM, op};
-use crate::config::HOST_CID;
 use crate::devices::Mem;
 use crate::error::{Result, VmmError};
 use crate::sys::{PollFd, Ready};

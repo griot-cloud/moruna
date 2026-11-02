@@ -28,18 +28,24 @@
 #![allow(clippy::result_large_err)]
 
 mod allocator;
+pub mod bootstrap;
 pub mod cancel;
 pub mod check;
 pub mod checkpoint;
 pub mod config;
-pub mod durable;
+pub mod cost;
+pub mod cost_store;
 pub mod elastic;
 pub mod error;
+pub mod history;
 pub mod host;
 pub mod job;
 pub mod kinds;
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), test))]
+mod object_cache;
 pub mod observe;
 pub mod packaged;
+pub mod portable;
 pub mod report;
 pub mod run;
 pub mod spec;
@@ -56,3 +62,11 @@ pub use moruna_discovery::{
 };
 pub use moruna_kernel::{CancelToken, ErrorPolicy, RunId, SizerKind};
 pub use moruna_trace::{ExitReason, RunReport};
+
+/// Real charged native PEX process adapter, using the existing checked record plane.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod native_pex;
+
+// The native backend is explicit; tests use only its private injected usage reader.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+mod native_account;

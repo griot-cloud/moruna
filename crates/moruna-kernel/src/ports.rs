@@ -22,10 +22,6 @@ use crate::stages::{StageEvent, StageHook};
 
 /// The most bytes a call's request or its answer may hold.
 pub const PORT_BYTES_MAX: usize = 64 << 20;
-/// A port's deadline when its entry names none: half an hour.
-pub const PORT_DEADLINE_MS: u64 = 30 * 60 * 1000;
-/// The longest deadline an entry may name: a day.
-pub const PORT_DEADLINE_MAX_MS: u64 = 24 * 60 * 60 * 1000;
 /// How often a waiting call looks at the run's cancel and its deadline.
 const WAKE: Duration = Duration::from_millis(5);
 /// The sentinel the stage of a call has before a build binds it.

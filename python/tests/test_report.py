@@ -31,6 +31,9 @@ def test_py_t5_report_object(
     as_json = json.loads(report.to_json())
     for field in as_json:
         assert hasattr(report, field), f"the report has no attribute `{field}`"
+    assert report.buffers == as_json.get("buffers")
+    assert report.policy == as_json.get("policy")
+    assert report.memory_basis == as_json.get("memory_basis")
     assert report.run_id == as_json["run_id"]
     assert report.trace_path is None
 

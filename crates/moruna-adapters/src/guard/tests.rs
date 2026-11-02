@@ -9,6 +9,19 @@ use moruna_testkit::FakeSampler;
 
 use super::*;
 
+trait BudgetAdmission {
+    fn budget_admit(&self, bytes: u64) -> Result<(), Refusal>;
+}
+impl BudgetAdmission for MemoryGate {
+    fn budget_admit(&self, bytes: u64) -> Result<(), Refusal> {
+        self.admit(bytes).map_err(|error| match error {
+            GateError::Budget(refusal) => refusal,
+            GateError::Accounting(cause) => {
+                panic!("unexpected accounting failure in measured-budget fixture: {cause}")
+            }
+        })
+    }
+}
 const MIB: u64 = 1024 * 1024;
 
 fn sample(anon: u64, ceiling: u64) -> Sample {
@@ -21,7 +34,7 @@ fn sample(anon: u64, ceiling: u64) -> Sample {
 
 fn gate_over(samples: Vec<Sample>, ceiling: u64) -> (Arc<MemoryGate>, FakeSampler) {
     let sampler = FakeSampler::new().scripted(samples);
-    let gate = MemoryGate::new(Arc::new(sampler.clone()) as Arc<dyn Sampler>, ceiling);
+    let gate = MemoryGate::new(Arc::new(sampler.clone()) as Arc<dyn Sampler>, ceiling).unwrap();
     (gate, sampler)
 }
 
@@ -34,9 +47,9 @@ fn some() -> *mut u8 {
 fn ad_t13_gate_admits_within_the_estimate_without_measuring() {
     let (gate, sampler) = gate_over(vec![sample(100 * MIB, 0)], 200 * MIB);
     assert_eq!(sampler.samples_taken(), 1, "one measurement at creation");
-    assert_eq!(gate.admit(50 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(50 * MIB), Ok(()));
     gate.settle(50 * MIB);
-    assert_eq!(gate.admit(50 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(50 * MIB), Ok(()));
     assert_eq!(sampler.samples_taken(), 1, "the fast path takes no sample");
     assert_eq!(gate.measurements(), 1);
     assert!(format!("{gate:?}").contains("pending"));
@@ -53,15 +66,15 @@ fn ad_t13_gate_measures_before_it_refuses() {
         ],
         200 * MIB,
     );
-    assert_eq!(gate.admit(80 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(80 * MIB), Ok(()));
     gate.settle(80 * MIB);
     // 100 + 80 + 40 > 200 on the estimate; the fresh measurement (60) leaves room.
-    assert_eq!(gate.admit(40 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(40 * MIB), Ok(()));
     gate.settle(40 * MIB);
     assert_eq!(sampler.samples_taken(), 2);
     // 60 + 40 since + 120 > 200: measured again; the fresh 150 replaces what was admitted
     // before it (it is resident now or never will be, f.9), and 150 + 120 > 200.
-    let refused = gate.admit(120 * MIB);
+    let refused = gate.budget_admit(120 * MIB);
     assert_eq!(
         refused,
         Err(Refusal {
@@ -73,7 +86,7 @@ fn ad_t13_gate_measures_before_it_refuses() {
     assert_eq!(gate.refusals(), 1);
     assert_eq!(gate.measurements(), 3);
     // The refused bytes were not kept: a small request fits again on the estimate.
-    assert_eq!(gate.admit(5 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(5 * MIB), Ok(()));
 }
 
 #[test]
@@ -82,21 +95,29 @@ fn ad_t13_bytes_in_flight_stay_counted_over_a_measurement() {
     // allocation had not returned; when that allocation then failed, its credit came off a
     // second time, and the estimate sat a whole request below what the process held.
     let (gate, sampler) = gate_over(vec![sample(100 * MIB, 0)], 200 * MIB);
-    assert_eq!(gate.admit(80 * MIB), Ok(()), "admitted, not yet allocated");
+    assert_eq!(
+        gate.budget_admit(80 * MIB),
+        Ok(()),
+        "admitted, not yet allocated"
+    );
     // Another request needs a measurement while the 80 are in flight: the measurement cannot
     // contain them, so they stay on top of it.
     let refused = gate
-        .admit(30 * MIB)
+        .budget_admit(30 * MIB)
         .expect_err("100 + 80 in flight + 30 > 200");
     assert_eq!(refused.in_use, 180 * MIB);
     assert_eq!(sampler.samples_taken(), 2);
     // The allocator underneath fails: exactly the 80 go back.
     gate.credit(80 * MIB);
     let refused = gate
-        .admit(180 * MIB)
+        .budget_admit(180 * MIB)
         .expect_err("100 held + 180 > 200, whatever came back before");
     assert_eq!(refused.in_use, 100 * MIB);
-    assert_eq!(gate.admit(100 * MIB), Ok(()), "and what fits is admitted");
+    assert_eq!(
+        gate.budget_admit(100 * MIB),
+        Ok(()),
+        "and what fits is admitted"
+    );
 }
 
 #[test]
@@ -111,7 +132,7 @@ fn ad_t13_concurrent_requests_never_pass_the_ceiling() {
         for _ in 0..4 {
             scope.spawn(|| {
                 for _ in 0..100_000 {
-                    if gate.admit(1024 * MIB).is_ok() {
+                    if gate.budget_admit(1024 * MIB).is_ok() {
                         admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         gate.credit(1024 * MIB);
                     }
@@ -132,15 +153,17 @@ fn ad_t13_gate_takes_the_ceiling_of_the_sample() {
         1000 * MIB,
     );
     assert_eq!(
-        gate.admit(100 * MIB),
+        gate.budget_admit(100 * MIB),
         Ok(()),
         "110 under 1000 on the estimate"
     );
-    let refused = gate.admit(900 * MIB).expect_err("past the sample's 50 MiB");
+    let refused = gate
+        .budget_admit(900 * MIB)
+        .expect_err("past the sample's 50 MiB");
     assert_eq!(refused.ceiling, 50 * MIB);
     let (named, _) = gate_over(vec![sample(10 * MIB, 30 * MIB)], 1000 * MIB);
     assert!(
-        named.admit(25 * MIB).is_err(),
+        named.budget_admit(25 * MIB).is_err(),
         "the first sample's ceiling is in force"
     );
 }
@@ -148,11 +171,11 @@ fn ad_t13_gate_takes_the_ceiling_of_the_sample() {
 #[test]
 fn ad_t13_no_ceiling_admits_everything_and_credit_makes_room() {
     let (open, _) = gate_over(vec![sample(10 * MIB, 0)], 0);
-    assert_eq!(open.admit(u64::MAX), Ok(()));
+    assert_eq!(open.budget_admit(u64::MAX), Ok(()));
     let (gate, sampler) = gate_over(vec![sample(100 * MIB, 0)], 200 * MIB);
-    assert_eq!(gate.admit(90 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(90 * MIB), Ok(()));
     gate.credit(90 * MIB);
-    assert_eq!(gate.admit(90 * MIB), Ok(()));
+    assert_eq!(gate.budget_admit(90 * MIB), Ok(()));
 
     assert_eq!(
         sampler.samples_taken(),
@@ -234,7 +257,7 @@ fn ad_t13_failed_underlying_is_credited_and_reentrancy_is_not_counted() {
     assert_eq!(end.counts.python.requests, 2);
     assert_eq!(end.counts.python.bytes, 91 * MIB);
     assert_eq!(
-        gate.admit(99 * MIB),
+        gate.budget_admit(99 * MIB),
         Ok(()),
         "90 credited back, 1 held: fits"
     );
@@ -389,4 +412,38 @@ fn ad_t13_arrow_from_the_pool() {
     // Memory given back: never negative.
     let c = arrow_counts((100, 500, 1000, 10), (50, 500, 1000, 10));
     assert_eq!((c.bytes, c.requests, c.peak), (0, 0, 0));
+}
+
+#[test]
+fn failed_accounting_closes_gate_without_fabricated_budget() {
+    let sampler = FakeSampler::new().scripted(vec![sample(100 * MIB, 200 * MIB)]);
+    let gate = MemoryGate::new(Arc::new(sampler.clone()), 200 * MIB).unwrap();
+    sampler.set_read_failure(true);
+    assert!(
+        matches!(gate.admit(200*MIB),Err(GateError::Accounting(moruna_kernel::MorunaError::Io{msg,..}))if msg.contains("accounting source unavailable"))
+    );
+    assert!(matches!(gate.admit(1), Err(GateError::Accounting(_))));
+    assert_eq!(
+        gate.refusals(),
+        0,
+        "a read error is not measured budget refusal"
+    );
+}
+
+#[test]
+fn accounting_failure_survives_a_kernel_catching_the_allocator_failure() {
+    let sampler = FakeSampler::new().scripted(vec![sample(100 * MIB, 110 * MIB)]);
+    let gate = MemoryGate::new(Arc::new(sampler.clone()), 110 * MIB).unwrap();
+    let kernel = KernelMemory::new(true);
+    kernel.bind(gate);
+    sampler.set_read_failure(true);
+    let (recovered, end) = kernel.frame(|| {
+        assert!(allocate(50 * MIB, some).is_null());
+        "caught allocator failure"
+    });
+    assert_eq!(recovered, "caught allocator failure");
+    assert!(end.refusal.is_none());
+    assert!(
+        matches!(end.accounting_failure,Some(moruna_kernel::MorunaError::Io{msg,..})if msg.contains("accounting source unavailable"))
+    );
 }

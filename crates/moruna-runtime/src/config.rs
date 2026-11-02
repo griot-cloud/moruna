@@ -67,8 +67,10 @@ pub fn resolved(
     sizer: moruna_kernel::SizerKind,
     checkpoint_enabled: bool,
     checkpoint_interval_ms: u64,
+    policy: &str,
 ) -> serde_json::Value {
     serde_json::json!({
+        "scheduler.policy": policy,
         "budget.host": budget_host,
         "budget.reserve_fraction": RESERVE_FRACTION,
         "budget.disk": budget_disk,

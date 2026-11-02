@@ -336,6 +336,9 @@ impl FileEngine for FlakyEngine {
     fn name(&self) -> &'static str {
         "flaky"
     }
+    fn terminal_failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A file engine that holds every request for a while before delegating, so a test can be sure
@@ -362,6 +365,9 @@ impl FileEngine for SlowEngine {
 
     fn name(&self) -> &'static str {
         "slow"
+    }
+    fn terminal_failure(&self) -> Option<String> {
+        None
     }
 }
 
@@ -1619,6 +1625,9 @@ impl FileEngine for SilentEngine {
     fn name(&self) -> &'static str {
         "silent"
     }
+    fn terminal_failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// G-I8 at start: a host that will not give the reactor a thread is diagnosed, not signalled.
@@ -1669,6 +1678,9 @@ impl FileEngine for HoldingEngine {
 
     fn name(&self) -> &'static str {
         "holding"
+    }
+    fn terminal_failure(&self) -> Option<String> {
+        None
     }
 }
 
@@ -2144,4 +2156,174 @@ fn re_t14_a_callback_registered_late_runs_on_a_reactor_thread() {
     assert!(ok, "the write succeeded");
     assert!(elsewhere, "the late callback ran on the registering thread");
     reactor.shutdown();
+}
+
+/// The controlled engine reports its identity but performs no kernel IO. Only construction
+/// and actual FD-flag refusal are tested here, never physical uring/direct behavior.
+#[cfg(target_os = "linux")]
+#[test]
+fn re_t22_strict_storage_refuses_probed_paths_and_buffered_descriptors() {
+    use std::os::fd::OwnedFd;
+    struct Controlled(HoldingEngine);
+    impl FileEngine for Controlled {
+        fn submit(&self, req: FileReq, done: Done) {
+            self.0.submit(req, done);
+        }
+        fn name(&self) -> &'static str {
+            "uring"
+        }
+        fn terminal_failure(&self) -> Option<String> {
+            None
+        }
+    }
+    let alloc = FakeAllocator::new();
+    for guarantee in [Guarantee::Probed(true), Guarantee::Present] {
+        let mut host = profile(Guarantee::Probed(false));
+        host.io_uring = guarantee;
+        host.direct_io_staging = guarantee;
+        let engine = Arc::new(Controlled(HoldingEngine::default()));
+        let reactor = build(
+            config(host),
+            &alloc,
+            Hooks {
+                force_uring: true,
+                engine: Some(engine.clone()),
+                ..Hooks::default()
+            },
+        );
+        let strict = reactor.strict_storage();
+        if guarantee == Guarantee::Probed(true) {
+            assert!(matches!(
+                strict,
+                Err(MorunaError::Config {
+                    name: "raw_storage",
+                    ..
+                })
+            ));
+        } else {
+            let dir = scratch_dir("strict-buffered-refusal");
+            let path = dir.join("buffered");
+            write_file(&path, &[0; 4096]);
+            let fd = Arc::new(OwnedFd::from(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap(),
+            ));
+            assert!(matches!(
+                strict.unwrap().bind(fd),
+                Err(cause) if matches!(*cause, MorunaError::Config {
+                    name: "raw_storage",
+                    ..
+                })
+            ));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        assert_eq!(
+            engine.0.held(),
+            0,
+            "no rejected operation reached the engine"
+        );
+        assert_eq!(reactor.stats().fallbacks, 0);
+        reactor.shutdown();
+    }
+}
+
+/// Native file/SDK executors must not initialize Tokio's Unix signal socket pair,
+/// even when a caller has unified the `signal` feature into the same binary.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn re_native_executor_completes_with_socketpair_refused() {
+    const CHILD: &str = "MORUNA_REACTOR_SOCKETPAIR_REFUSAL_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok("1") {
+        use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+        let filter = SeccompFilter::new(
+            [(libc::SYS_socketpair, Vec::new())].into_iter().collect(),
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::ENOSYS as u32),
+            TargetArch::try_from(std::env::consts::ARCH).expect("supported Linux architecture"),
+        )
+        .expect("socketpair-only refusal filter");
+        let program: BpfProgram = filter.try_into().expect("filter program");
+        seccompiler::apply_filter(&program).expect("apply filter in this isolated child only");
+        assert_eq!(
+            std::os::unix::net::UnixStream::pair()
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS)
+        );
+        let dir = scratch_dir("native-time-only");
+        let path = dir.join("actual-file");
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        let runtime = crate::configure_runtime_for(&mut builder, true)
+            .build()
+            .expect("native executor without OS-I/O driver");
+        let data = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::task::spawn_blocking(move || {
+                        std::fs::write(&path, b"actual native file executor")?;
+                        std::fs::read(path)
+                    })
+                    .await
+                    .expect("original blocking operation completed")
+                })
+                .await
+                .expect("timer deadline")
+            })
+            .expect("real blocking file operation");
+        assert_eq!(data, b"actual native file executor");
+        drop(runtime);
+        std::fs::remove_dir_all(dir).expect("remove owned file fixture");
+        // Positive control: the ordinary host policy still requests the OS driver,
+        // which really cannot initialize under this same syscall refusal.
+        let host = std::panic::catch_unwind(|| {
+            crate::configure_runtime_for(&mut tokio::runtime::Builder::new_current_thread(), false)
+                .build()
+        });
+        assert!(
+            !matches!(host, Ok(Ok(_))),
+            "host OS-I/O policy must not silently become native time-only"
+        );
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "tests::re_native_executor_completes_with_socketpair_refused",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("isolated syscall-refusal child");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if child.try_wait().expect("child status").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop bounded child");
+            let output = child.wait_with_output().expect("reap bounded child");
+            panic!(
+                "native executor child timed out: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().expect("collect child");
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

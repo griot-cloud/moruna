@@ -1,0 +1,61 @@
+[package]
+name = "moruna-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna's OCI images: a layout read, verified and unpacked into a root filesystem (SDD 19)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+getrandom = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+tracing = { workspace = true }
+# The layer files' format and reader, shared with the microkernel's image filesystem
+# (SDD 27): the writer here lays files out with it and reads them back with it.
+moruna-imagefs = { workspace = true }
+# The test fixture's: the image kind's tests run `arrow_echo` as an image's command.
+arrow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The test fixture's: `plane_echo` makes the data plane's calls through the task library.
+moruna-plane-linux = { workspace = true }
+
+[features]
+default = []
+# `testing`: the layouts and layers the image kind's tests build (SDD 19 k).
+testing = []
+
+[dev-dependencies]
+moruna-image = { workspace = true, features = ["testing"] }
+moruna-job = { workspace = true }
+moruna-runtime = { workspace = true }
+parquet = { workspace = true }
+
+# A program an image's command runs in the image kind's tests (SDD 19 k): it reads an Arrow IPC
+# stream on standard input and writes one back, with a column added. Never part of a build a
+# user runs; `test = false` keeps cargo from running it as a test.
+[[bin]]
+name = "arrow_echo"
+path = "tests/fixtures/arrow_echo.rs"
+test = false
+
+# A program that makes the data plane's calls itself, an image's command in the image kind's
+# `plane` tests (SDD 19, SDD 29 d.1 on Linux).
+[[bin]]
+name = "plane_echo"
+path = "tests/fixtures/plane_echo.rs"
+test = false
+
+# An image as the microkernel's layer files (SDD 27 f.1); with `testing`, also the CI
+# boot's fixture.
+[[bin]]
+name = "moruna-layer"
+path = "src/bin/moruna-layer.rs"

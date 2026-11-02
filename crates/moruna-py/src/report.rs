@@ -177,6 +177,24 @@ impl PyRunReport {
         field(py, &self.inner, "read")
     }
 
+    /// `moruna_trace::RunReport::buffers`, in the same shape as `to_json`; otherwise `None`.
+    #[getter]
+    fn buffers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        field(py, &self.inner, "buffers")
+    }
+
+    /// `moruna_trace::RunReport::policy`, in the same shape as `to_json`; otherwise `None`.
+    #[getter]
+    fn policy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        field(py, &self.inner, "policy")
+    }
+
+    /// `moruna_trace::RunReport::memory_basis`; `None` means legacy process-anonymous memory.
+    #[getter]
+    fn memory_basis(&self) -> Option<String> {
+        self.inner.memory_basis.clone()
+    }
+
     /// How the run ended: `"Completed"`, `"Cancelled"`, or `{"Terminated": {"diagnostic": ...}}`,
     /// which is the shape `to_json` gives the same field.
     #[getter]
@@ -533,6 +551,7 @@ mod tests {
                 pinned: false,
                 rdma: false,
             },
+            memory_basis: None,
             peak_anon_bytes: 4 << 30,
             peak_fraction_of_ceiling: 0.5,
             peak_ceiling_bytes: 8 << 30,
@@ -557,6 +576,8 @@ mod tests {
             late_records: 0,
             write: None,
             read: None,
+            buffers: None,
+            policy: None,
         }
     }
 

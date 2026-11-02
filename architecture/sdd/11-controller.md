@@ -1,11 +1,11 @@
 # Moruna SDD 11: Resource controller (`moruna-controller`)
 
 **Document type:** software design document, component 11 of 12
-**Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KD7c (the `model` sizer: f.16, RC-T22) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/moruna-runtime-design.md` section 5.8; decisions D2, D3, D7; criteria S1, S2, S3, S6, S11; global invariants G-I1, G-I5, G-I8, G-I10
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` d.10 (`Placement::set_budgets`, `TierBudgets`), d.11 (`Knobs`, `Knob`, `KnobSnapshot`, `StatsSource`, `SchedulerStats`, `Prober`, `ProbeResult`, `SizerKind`), d.12 (`Limits`, `Sampler`, `Sample`), d.13 (`TraceRecord`, `TraceTail`)
 **Component location:** `crates/moruna-controller`, Rust
-**Consumes:** contracts (1) only; the sampler (3), the trace tail (4), the placement engine (9, `set_budgets`) and the scheduler (10, `Knobs`, `StatsSource`, `Prober`) arrive as trait objects. **Consumed by:** runtime facade (12)
+**Consumes:** contracts (1), and `moruna-cost` (24) for the `model` sizer (KD7c, f.16); the sampler (3), the trace tail (4), the placement engine (9, `set_budgets`) and the scheduler (10, `Knobs`, `StatsSource`, `Prober`) arrive as trait objects. **Consumed by:** runtime facade (12)
 
 **Decisions worth your eye:** (1) the sizing decision is a trait with a rule implementation shipped and a learned implementation stubbed, and the envelope that clamps both is computed from the probe and the budget by the controller, never by the sizer; (2) there are two working-set inequalities, one on the arena's capacity and one on the process's anonymous memory, and both are enforced as a hard check before any knob is written, so an inconsistent set of knobs is impossible by construction; the second is the one S1 is measured from and it is fitted to `TraceRecord::mem_anon_peak`; (3) the profile store is a JSON file per kernel fingerprint and schema hash, advisory only, overridden by the probe on drift; (4) the controller names no other crate: everything it touches is a contracts trait, so it is testable entirely with the testkit fakes.
 
@@ -203,6 +203,7 @@ pub struct RuleSizer { /* f.4 */ }
 // not carry them; the alternative would break section l's rule that a sizer reads nothing but
 // its `Observation` (executor, 2026-09-22).
 pub struct LearnedSizer { /* stub in v1: returns RuleSizer's proposal with predicted_peak = None; the phase 8 implementation replaces the body without changing the trait */ }
+pub struct ModelSizer;   // KD7c, f.16: new(Arc<moruna_cost::Online>, CostKey, &PlanSummary); name "model"
 
 #[derive(Clone, Debug)]
 pub struct ControllerSummary {
@@ -335,6 +336,8 @@ A run that would have completed over budget fails. A criterion that moves to mee
 
 **f.15 Limits a tick takes (amended 2026-09-30).** Two writers hand the controller the machine's limits: the facade's watcher, through `follow_limits`, `set_arena` and `set_engine` (in that order, after it publishes the new limits into the sampler's cell), and each tick, through the ceiling and CPU limit its `Sample` carries. The tick samples with no lock held (RC-I10), so the watcher can make its calls between the sample and the tick taking it, and the sample then carries the limits those calls replaced. Taken, they put back the ceiling the machine had a moment before beside the arena it has now. Measured on `memory_follows_the_machine`: a sample taken 20 microseconds before a raise from 272 MB to 809 MB set the ceiling back to 272 MB after `follow_limits` had raised it, the watcher's `set_arena` then reported the grown arena of 483 MB, nothing was pending or draining, `anon_headroom` was 0, and a record at the floor on one worker ended the run with "footprint exceeds budget 0" (3 of 65 runs under load). So the controller counts the watcher's calls (`facade_limits`), the tick reads the count before it samples, and it takes the sample's limits only if the count has not moved since; otherwise the watcher's limits stand, and the next tick's sample, which carries them, changes nothing. A sample taken after the publish and before the calls carries the new limits early, which the calls then repeat. RC-T19.
 
+**f.16 The `model` sizer (KD7c; adaptive-runtime 0, G4; 24 f.10).** When the run has a cost model, the embedder installs `ModelSizer` for each stage (`set_sizer_factory`), so the morsel is the model's: `propose` (after damping, RC-I3) asks `Online::morsel(key, a probe batch at the plan's bytes per row, the plan's rows, envelope.max as one unit's memory, the active workers)` and proposes its rows times the bytes per row (the plan's, else the last morsel's; with neither it keeps the target), held to the envelope, so the controller has nothing to clamp and the two never pull apart; RC-I2 and f.8 still hold over it like any sizer. Its predicted peak is the model's peak line at the proposed rows once the model's peak rests on measurements (`Measured` or `WarmUp`), and none before: the scheduler settles each unit's peak, the anonymous memory above the sample before its apply, the very figure f.8 scores against (10 f.22). It learns nothing itself; its confidence is the model's observations over 50, at most 1.
+
 ## g. Concurrency within the component
 
 One tick thread. All mutable state (the per-stage table of e.1, the phase of e.2, the sizer, the budgets, the notes) sits in a single `Mutex<ControllerState>`; every public method takes `&self` and locks it, so the facade shares the controller as `Arc<Controller>` and installs `on_record` as the scheduler's record hook before it calls `prepare` (12 f.1), with no `&mut` borrow to conflict with the hook. `on_record` runs on the recording worker (it is the scheduler's `RecordHook`) and pushes a compact copy of the record's numeric fields into a bounded lock-free queue (capacity 65,536; overflow drops the oldest with a counter, since the trace is the durable copy and the controller only needs recency) drained by the tick thread. All knob writes happen on the tick thread except the breach path in f.7 and the device path in f.11, which run on the calling worker thread under the controller's single mutex (held for microseconds; lock order position 6 in preamble 4.2, after the trace channel at 5, since `on_record` is called after `record`). No lock is held across any call into another component: the mutex is released before `Knobs::set`, `stats.scheduler_stats()`, `sampler.sample()`, `trace.tail()` and `placement.set_budgets()`, and a tick's decisions are computed from copies taken under the lock (RC-I10).
@@ -372,6 +375,8 @@ Tests drive the controller with the contracts d.15 fakes and name only their kno
 **RC-T20 resume_without_a_profile.** `probe_missing` with no profile for a stage and a `Prober` that answers `Plan("the source plan is exhausted; there is nothing to probe with")` reaches `Probed`, seeds `a_k` from the stage's hint, and adds the note naming the stage; `probe_all` with the same prober returns the error. f.14.
 
 **RC-T21 anon_bound_on_a_greedy_kernel.** (`python/tests/test_budget.py`, on a built wheel) A Python kernel that builds a list of 20,000 strings and a pyarrow array from it, 200,000 rows at 20,000 to a row group. At 512 MiB the run either completes with `peak_fraction_of_ceiling ≤ 1.0` or raises `moruna.BudgetError` whose message names the morsel, the stage, a footprint and a budget the footprint exceeds; at 2 GiB it must *complete* with `peak_fraction_of_ceiling ≤ 1.0`, which is what stops the bound being a refusal of everything. Both runs are driven in a subprocess, because the arena is sized from the process's anonymous memory before it exists and a test sharing a process with twenty earlier runs measures their allocator retention instead. Against the wheel of 2026-09-22 the 512 MiB case fails at 1.09–1.11. f.3, f.7, S1, S6, G-I1, G-I8.
+
+**RC-T22 the_model_sizes_the_morsel** (`tests/rc_t22_the_model_sizes_the_morsel.rs`, KD7c). A model that learned 200 units of a millisecond a batch and 100 ns a row, peaking at the batch's bytes: the `model` sizer proposes exactly the model's morsel (about 190,000 rows, bound by the overhead) in bytes, which the envelope does not clamp, with a predicted peak within a quarter of the bytes; a tight envelope bounds it inside; damping is honoured; a model that never measured a peak predicts none; with no row width known the target stands, and the last morsel's width is used when the plan has none. f.16, RC-I2.
 
 **RC-T1 consistent_knobs.** Property test: for random budgets, `a_k`s and worker counts, every written knob set satisfies both working-set inequalities of b. RC-I1.
 
@@ -443,6 +448,7 @@ None. (The learned sizer's model is Phase 8; the stub and the shadow error track
 | preamble 4.2 (tick bound) | RC-I10 | RC-T17 |
 | architecture 7 (device out of memory) | f.11 | RC-T18 |
 | MH 4.4 (a tick against the watcher) | f.15 | RC-T19 |
+| adaptive-runtime G4 (the morsel from the cost model) | f.16, RC-I2 | RC-T22 |
 
 ## o. Deferred (post-v1)
 

@@ -12,7 +12,7 @@ use moruna_kernel::{
 use moruna_sinks::SinkHandle;
 use moruna_testkit::{FakeKernel, FakePlacement, FakeSink, FakeSource};
 
-use super::common::{RigBuilder, StatefulKernel, cfg, manifest_lock};
+use super::common::{RigBuilder, StatefulKernel, cfg, manifest_lock, wait_for};
 use crate::{Pipeline, RunOutcome, Scheduler, SchedulerConfig};
 
 /// h: zero splits. Q0 closes at once, the queues close in order and the sink finishes empty.
@@ -22,13 +22,13 @@ fn sc_h_zero_splits() {
         .source(FakeSource::new().splits(0, 0, 0))
         .stages(2)
         .go();
-    let RunOutcome::Completed { sink } = (match rig.scheduler.run(CancelToken::new()) {
+    let RunOutcome::Completed { sinks } = (match rig.scheduler.run(CancelToken::new()) {
         Ok(outcome) => outcome,
         Err(e) => panic!("run: {e}"),
     }) else {
         panic!("a run with no splits still completes");
     };
-    assert_eq!(sink.rows, 0);
+    assert_eq!(sinks[0].rows, 0);
     assert_eq!(rig.sink.finish_calls(), 1);
     assert!(rig.trace.records().is_empty(), "no morsel, no record");
 }
@@ -42,7 +42,7 @@ fn sc_h_zero_kernels() {
         .source(FakeSource::new().splits(2, 6, 48))
         .go();
     match rig.scheduler.run(CancelToken::new()) {
-        Ok(RunOutcome::Completed { sink }) => assert_eq!(sink.rows, 12),
+        Ok(RunOutcome::Completed { sinks }) => assert_eq!(sinks[0].rows, 12),
         other => panic!("expected Completed, got {other:?}"),
     }
     assert!(
@@ -68,7 +68,7 @@ fn sc_h_read_ahead_zero_keeps_a_floor_of_one() {
         .stages(1)
         .go();
     match rig.scheduler.run(CancelToken::new()) {
-        Ok(RunOutcome::Completed { sink }) => assert_eq!(sink.rows, 12),
+        Ok(RunOutcome::Completed { sinks }) => assert_eq!(sinks[0].rows, 12),
         other => panic!("expected Completed, got {other:?}"),
     }
     assert_eq!(
@@ -131,7 +131,9 @@ fn sc_h_sink_failure_terminates() {
 }
 
 /// f.8: `Knobs::terminate` takes the terminate path from the controller's thread, whatever the
-/// error policy says.
+/// error policy says. The terminate is sent once the run is running, not after a sleep: on a
+/// loaded host the run's thread had not reached `run` 20 ms after it was spawned, the terminate
+/// landed in `Init`, and `run` then refused to start, which is right and is not this test.
 #[test]
 fn sc_h_controller_terminate() {
     let rig = RigBuilder::new()
@@ -146,7 +148,14 @@ fn sc_h_controller_terminate() {
         .go();
     let outcome = std::thread::scope(|scope| {
         let handle = scope.spawn(|| rig.scheduler.run(CancelToken::new()));
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            wait_for(Duration::from_secs(30), || rig
+                .scheduler
+                .shared()
+                .run_state()
+                .is_live()),
+            "the run never started"
+        );
         rig.scheduler
             .terminate(MorunaError::Staging("the controller said so".into()));
         match handle.join() {
@@ -396,11 +405,11 @@ fn sc_d1_ordered_sink_handle() {
             morsel_max: 1 << 20,
             ..cfg()
         },
-        Pipeline {
-            source: Arc::new(FakeSource::new().splits(1, 8, 64)),
-            kernels: vec![Arc::new(FakeKernel::new())],
-            sink: handle,
-        },
+        Pipeline::chain(
+            Arc::new(FakeSource::new().splits(1, 8, 64)),
+            vec![Arc::new(FakeKernel::new())],
+            handle,
+        ),
         Arc::new(FakePlacement::new()),
         Arc::new(moruna_testkit::FakeAllocator::new()),
         Arc::new(moruna_testkit::FakeTrace::new()),
@@ -509,11 +518,11 @@ fn sc_f5_ordered_sink_completes_in_order() {
             morsel_max: 1 << 20,
             ..cfg()
         },
-        Pipeline {
-            source: Arc::new(FakeSource::new().splits(2, 20, 160)),
-            kernels: vec![Arc::new(FakeKernel::new()), Arc::new(FakeKernel::new())],
-            sink: handle,
-        },
+        Pipeline::chain(
+            Arc::new(FakeSource::new().splits(2, 20, 160)),
+            vec![Arc::new(FakeKernel::new()), Arc::new(FakeKernel::new())],
+            handle,
+        ),
         Arc::new(FakePlacement::new()),
         Arc::new(moruna_testkit::FakeAllocator::new()),
         Arc::new(moruna_testkit::FakeTrace::new().capacity(1 << 14)),
@@ -663,4 +672,207 @@ fn sc_f8_device_out_of_memory_reaches_the_hook_first() {
         assert_eq!(record.outcome, moruna_kernel::Outcome::Skipped);
     }
     assert_eq!(rig.sink.skipped().len(), 3);
+}
+
+#[test]
+fn sc_h_termination_retires_ordered_write_waiting_for_failed_lower_sequence() {
+    use moruna_kernel::{Allocator, BoxFuture, Payload, RowRange, Sink, Source, Split, Tier};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    // The source owns the sequence assignment. Hold split/sequence zero, while
+    // split one completes normally; no scheduler or placement behavior is faked.
+    struct HoldFirst {
+        inner: FakeSource,
+        release: Arc<AtomicBool>,
+    }
+    impl Source for HoldFirst {
+        fn schema(&self) -> SourceSchema {
+            Source::schema(&self.inner)
+        }
+        fn plan(&self) -> moruna_kernel::Result<Vec<Split>> {
+            self.inner.plan()
+        }
+        fn read<'a>(
+            &'a self,
+            split: &'a Split,
+            rows: Option<RowRange>,
+            alloc: &'a dyn Allocator,
+            tier: Tier,
+        ) -> BoxFuture<'a, moruna_kernel::Result<Payload>> {
+            let held = split.id == 0;
+            let mut inner = self.inner.read(split, rows, alloc, tier);
+            Box::pin(std::future::poll_fn(move |cx| {
+                if held && !self.release.load(Ordering::Acquire) {
+                    // Same cooperative held-read pattern as common::HeldSource.
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                inner.as_mut().poll(cx)
+            }))
+        }
+    }
+    let release = Arc::new(AtomicBool::new(false));
+    let source = Arc::new(HoldFirst {
+        inner: FakeSource::new().splits(2, 1, 8),
+        release: Arc::clone(&release),
+    });
+    let sink = FakeSink::new();
+    let scheduler = Arc::new(
+        Scheduler::new(
+            SchedulerConfig {
+                workers_max: 1,
+                workers_active: 1,
+                read_ahead: 2,
+                initial_morsel_target: 8,
+                morsel_min: 8,
+                ..cfg()
+            },
+            Pipeline::chain(
+                source,
+                // Apply zero sees sequence one and succeeds. Only after its actual
+                // sink future is held do we release sequence zero into apply one.
+                vec![Arc::new(FakeKernel::new().fail_on(&[1]))],
+                SinkHandle::wrap(Box::new(sink.clone()), true, 0),
+            ),
+            Arc::new(FakePlacement::new()),
+            Arc::new(moruna_testkit::FakeAllocator::new()),
+            Arc::new(moruna_testkit::FakeTrace::new().capacity(1 << 14)),
+            Arc::new(moruna_testkit::FakeSampler::new()),
+        )
+        .expect("scheduler"),
+    );
+    let (send, receive) = mpsc::sync_channel(1);
+    let running = Arc::clone(&scheduler);
+    // Deliberately not a scoped thread: on the old regression a failed bounded
+    // receive must fail the test, rather than auto-joining the wedged run.
+    let run = std::thread::spawn(move || {
+        let result = running.run(CancelToken::new());
+        let _ = send.send(result);
+    });
+    let queued = wait_for(Duration::from_secs(5), || {
+        let handle = scheduler.shared().sinks[0]
+            .sink
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        handle.is_stalled() && handle.next_expected() == Some(0)
+    });
+    // Also release on a fixture failure, so the test never leaves a held source
+    // behind. This is a condition handoff, never a timing sleep.
+    release.store(true, Ordering::Release);
+    assert!(queued, "sequence one never reached the real reorder buffer");
+    let outcome = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scheduler termination hung while joining an ordered sink drive")
+        .expect("run");
+    run.join().expect("run thread");
+    let RunOutcome::Terminated { diagnostic, .. } = outcome else {
+        panic!("expected the original kernel failure, got {outcome:?}");
+    };
+    assert!(
+        matches!(diagnostic, MorunaError::Kernel { ref msg, .. }
+        if msg == "FakeKernel::fail_on(1)"),
+        "{diagnostic}"
+    );
+    assert!(
+        sink.written().is_empty(),
+        "queued sequence one entered the inner sink"
+    );
+    assert!(
+        sink.skipped().is_empty(),
+        "failed sequence zero was falsely skipped"
+    );
+    assert_eq!(sink.committed_seq(), None, "no commit ACK was produced");
+    assert_eq!(
+        sink.finish_calls(),
+        0,
+        "termination did not finish the sink"
+    );
+}
+
+/// An opt-in stream has no finite plan covering its later batches. Empty batches are not EOF.
+#[test]
+fn sc_h_streaming_source_uses_actual_eof_and_preserves_late_error() {
+    use moruna_kernel::{Allocator, BoxFuture, Payload, Result, RowRange, Source, Split, Tier};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct Stream {
+        batches: Mutex<VecDeque<u64>>,
+        fail: bool,
+    }
+    impl Source for Stream {
+        fn schema(&self) -> SourceSchema {
+            Source::schema(&FakeSource::new())
+        }
+        fn plan(&self) -> Result<Vec<Split>> {
+            FakeSource::new().splits(1, 17, 136).plan()
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a Split,
+            _: Option<RowRange>,
+            _: &'a dyn Allocator,
+            _: Tier,
+        ) -> BoxFuture<'a, Result<Payload>> {
+            panic!("a streaming source must not be read through its finite estimate")
+        }
+        fn repeatable(&self) -> bool {
+            false
+        }
+        fn streaming(&self) -> bool {
+            true
+        }
+        fn read_next<'a>(
+            &'a self,
+            alloc: &'a dyn Allocator,
+            tier: Tier,
+        ) -> BoxFuture<'a, Result<Option<Payload>>> {
+            Box::pin(async move {
+                let rows = self.batches.lock().unwrap().pop_front();
+                match rows {
+                    Some(rows) => {
+                        let source = FakeSource::new().splits(1, rows, rows * 8);
+                        let plan = source.plan()?;
+                        source.read(&plan[0], None, alloc, tier).await.map(Some)
+                    }
+                    None if self.fail => Err(MorunaError::Source {
+                        split: 0,
+                        msg: "late iterator error".into(),
+                    }),
+                    None => Ok(None),
+                }
+            })
+        }
+    }
+    for (batches, fail) in [(vec![], false), (vec![0, 17, 240], false), (vec![17], true)] {
+        let rows: u64 = batches.iter().sum();
+        let source = Arc::new(Stream {
+            batches: Mutex::new(batches.into()),
+            fail,
+        });
+        let rig = RigBuilder::new()
+            .source_over(source.clone())
+            .ordered(true)
+            .go();
+        assert_eq!(
+            source.batches.lock().unwrap().iter().sum::<u64>(),
+            rows,
+            "planning must not eagerly pull a stream"
+        );
+        match rig.scheduler.run(CancelToken::new()) {
+            Ok(RunOutcome::Completed { sinks }) if !fail => {
+                assert_eq!(sinks[0].rows, rows);
+                assert_eq!(rig.sink.finish_calls(), 1);
+            }
+            Ok(RunOutcome::Terminated { diagnostic, .. }) if fail => {
+                assert!(
+                    diagnostic.to_string().contains("late iterator error"),
+                    "{diagnostic}"
+                );
+                assert_eq!(rig.sink.finish_calls(), 0);
+            }
+            other => panic!("stream outcome: {other:?}"),
+        }
+    }
 }

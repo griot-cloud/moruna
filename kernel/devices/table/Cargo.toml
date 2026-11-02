@@ -1,0 +1,10 @@
+[package]
+name = "moruna-driver-table"
+description = "The driver table of a Moruna boot image: which driver program serves which PCI vendor and device, and the name its service is published under"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true

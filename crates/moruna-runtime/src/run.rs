@@ -12,7 +12,7 @@ use moruna_discovery::{
 };
 use moruna_kernel::{
     Allocator, CancelToken, Kernel, Knobs, MorunaError, ObjectMetadata, Placement, Prober, Reactor,
-    RunId, Sampler, SourceSchema, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
+    RunId, Sampler, Sink, StatsSource, TierBudgets, TierKind, TraceSink, TraceTail,
 };
 use moruna_placement::{PlacementConfig, PlacementEngine, manifest::plan_digest};
 use moruna_reactor::ReactorConfig;
@@ -77,22 +77,18 @@ pub(crate) fn mint_run_id() -> Result<RunId> {
     Ok(RunId(bytes))
 }
 
-/// The chain's schemas, stage 0 first (12 f.1: computed here so `KernelInfo::schema_hash` is
-/// the stage's input schema hash). The scheduler validates the chain again at `new`; this
-/// walk fails on the same errors and earlier.
-fn chain_schemas(
-    source_schema: SourceSchema,
-    kernels: &[Arc<dyn Kernel>],
-) -> moruna_kernel::Result<Vec<SourceSchema>> {
-    let mut schemas = Vec::with_capacity(kernels.len() + 1);
-    let mut schema = source_schema;
-    schemas.push(schema.clone());
-    for kernel in kernels {
-        kernel.accepts().check(&schema)?;
-        schema = kernel.output_schema(&schema)?;
-        schemas.push(schema.clone());
+fn resolve_run_id(
+    header: Option<&moruna_placement::manifest::ManifestHeader>,
+    assigned: Option<RunId>,
+) -> moruna_kernel::Result<RunId> {
+    match (header, assigned) {
+        (Some(header), Some(assigned)) if header.run_id != assigned => Err(MorunaError::Resume(
+            "materialized checkpoint run differs from explicitly assigned run identity".into(),
+        )),
+        (Some(header), _) => Ok(header.run_id),
+        (None, Some(assigned)) => Ok(assigned),
+        (None, None) => mint_run_id().map_err(|error| error.into_parts().error),
     }
-    Ok(schemas)
 }
 
 /// The whole lifecycle. Every `?` leaves `started` holding what is running, so `run_with`
@@ -105,12 +101,14 @@ fn drive(
 ) -> Result<RunReport> {
     let start_ns = report::now_ns();
     let RunSpec {
-        source: source_spec,
-        kernels,
+        sources: source_specs,
+        mut kernels,
+        topology,
         #[cfg(feature = "python")]
         py_kernels,
         packaged,
-        sink: sink_spec,
+        ports: stage_ports,
+        sinks: sink_specs,
         engine_memory,
         sink_memory,
         budget,
@@ -124,6 +122,7 @@ fn drive(
         error_policy,
         ordered,
         sizer,
+        policy,
         profiles_dir,
         object_store,
         host_profile,
@@ -187,7 +186,7 @@ fn drive(
             let found = auto_manifest(
                 discovered.profile.staging_dir.as_deref(),
                 &kernels,
-                &source_spec,
+                &source_specs,
                 spec_digest.as_deref(),
             )?;
             match &found {
@@ -209,11 +208,7 @@ fn drive(
     if let (Some(path), Some(digest)) = (&resume, &spec_digest) {
         check_spec_digest(path, digest)?;
     }
-    let run_id = match (&header, components.run_id) {
-        (Some(header), _) => header.run_id,
-        (None, Some(id)) => id,
-        (None, None) => mint_run_id()?,
-    };
+    let run_id = resolve_run_id(header.as_ref(), components.run_id)?;
     let node = match &header {
         Some(header) => header.node,
         None => moruna_kernel::LOCAL_NODE,
@@ -284,10 +279,55 @@ fn drive(
     // process already holds (see `arena_host_bytes`).
     let sampler: Arc<dyn Sampler> = match components.sampler {
         Some(sampler) => sampler,
-        None => match &watch {
-            Some(watch) => Arc::new(DiscoverySampler::following(&discovered, watch.limits())?),
-            None => Arc::new(DiscoverySampler::new(&discovered)?),
-        },
+        None => {
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            let native: Option<Arc<dyn Sampler>> = None;
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let native = if moruna_micro::on_kernel() {
+                let watched = watch.as_ref().map(|watch| watch.limits());
+                let fixed = discovered.limits.clone();
+                Some(
+                    crate::native_account::sampler(
+                        || {
+                            // ACCOUNT_INFO(0) is handled for this actual calling
+                            // Process before personality forwarding; no startup slot
+                            // is taken and the Linux server's Account is never used.
+                            let usage = moruna_sys::Usage::own().map_err(|e| MorunaError::Io {
+                                op: "account_info",
+                                target: "current native Account".into(),
+                                msg: e.name().into(),
+                            })?;
+                            // Lifetime usage.peak is deliberately not an interval/RSS mark.
+                            Ok(crate::native_account::Reading {
+                                used: usage.used,
+                                reserved: usage.reserved,
+                                limit: usage.limit,
+                            })
+                        },
+                        move || match &watched {
+                            Some(limits) => {
+                                let limits = limits.load();
+                                (limits.memory_ceiling, limits.cpu_quota)
+                            }
+                            None => (fixed.memory_ceiling, fixed.cpu_quota),
+                        },
+                        moruna_sys::now,
+                    )
+                    .map_err(|error| *error)?,
+                )
+            } else {
+                None
+            };
+            match native {
+                Some(sampler) => sampler,
+                None => match &watch {
+                    Some(watch) => {
+                        Arc::new(DiscoverySampler::following(&discovered, watch.limits())?)
+                    }
+                    None => Arc::new(DiscoverySampler::new(&discovered)?),
+                },
+            }
+        }
     };
     // SB-I9: the memory a packaged stage's child holds is the run's, and every sample says so.
     let outside: Vec<_> = packaged.iter().filter_map(|p| p.outside()).collect();
@@ -297,37 +337,44 @@ fn drive(
         Arc::new(crate::packaged::WithOutside::new(sampler, outside))
     };
 
+    let memory_basis = sampler.memory_basis();
+    if memory_basis == moruna_kernel::MemoryBasis::NativeAccountCharge {
+        notes.push("native Account charged-byte pressure, not process RSS; file residency and CPU billing are not measured; peaks are observed samples, not kernel interval marks; registered child reservations are added once by outside accounting".into());
+    }
+
     // 2. Arena. The baseline is sampled here, before the region exists (12 f.1, 02 f.1,
     // 11 f.1): the arena touches every page at `new`, so a sample taken after it contains the
     // arena and subtracting it later would charge the arena twice.
-    let baseline_bytes = sampler.sample().anon_bytes;
+    let baseline_bytes = sampler.sample()?.anon_bytes;
     let kernel_state = expected_kernel_state(&kernels);
     // The engines at the ends of the run get their shares before the arena is sized, and the
     // arena is sized over what is left: together they stay inside the ceiling (MH 4.5).
     let sizing = Sizing {
         baseline: baseline_bytes,
         kernel_state,
-        out_of_arena: expected_out_of_arena_amplification(&kernels, engine_memory.is_some()),
+        out_of_arena: expected_out_of_arena_amplification(&kernels, !engine_memory.is_empty()),
         page_bytes: limits.page_bytes,
-        engine: engine_memory.is_some(),
-        sink: sink_memory.is_some(),
+        engine: !engine_memory.is_empty(),
+        sink: !sink_memory.is_empty(),
+        queues: u64::from(topology.queue_count()),
     };
     let shares = sizing.divide(limits.memory_ceiling, &mut notes);
-    if let Some(engine) = &engine_memory {
-        engine.set_limit(shares.engine);
+    // Several engines at one end of a run share that end's share equally (contracts d.16).
+    for engine in &engine_memory {
+        let share = shares.engine / engine_memory.len() as u64;
+        engine.set_limit(share);
         notes.push(format!(
-            "the source's plan may hold {} bytes outside the arena: its operators reserve a \
-             tenth of it and spill to the staging directory past that, four tenths are held \
+            "the source's plan may hold {share} bytes outside the arena: its operators reserve \
+             a tenth of it and spill to the staging directory past that, four tenths are held \
              back for what they hold beyond their reservations, and half is its batches in \
-             flight",
-            shares.engine
+             flight"
         ));
     }
-    if let Some(sink) = &sink_memory {
-        sink.set_limit(shares.sink);
+    for sink in &sink_memory {
+        let share = shares.sink / sink_memory.len() as u64;
+        sink.set_limit(share);
         notes.push(format!(
-            "the sink's writes may hold {} bytes outside the arena",
-            shares.sink
+            "the sink's writes may hold {share} bytes outside the arena"
         ));
     }
     let engine_bytes = shares.engine.saturating_add(shares.sink);
@@ -430,18 +477,29 @@ fn drive(
         object_metadata,
         run_id,
         arena_bytes,
-        sink_buffer: std::sync::atomic::AtomicU64::new(0),
+        sinks: topology.sinks(),
+        sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
-    let source = source_spec.build(&ctx)?;
+    let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
+    for spec in source_specs {
+        sources.push(spec.build(&ctx)?);
+    }
     // What an engine source's engine decided when it planned the read: true of the run whatever
     // becomes of it, since the plan was made (and its budgets charged) when the source was built.
-    let source_read = source.read_report();
-    let sink = sink_spec.build(&ctx)?;
+    let source_read = sources.iter().find_map(|source| source.read_report());
+    let mut built_sinks: Vec<Box<dyn Sink>> = Vec::with_capacity(sink_specs.len());
+    for spec in sink_specs {
+        built_sinks.push(spec.build(&ctx)?);
+    }
     let sink_buffer_bytes = ctx.sink_buffer_bytes();
     // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
     // is at most half a file, so every morsel fits an ordinary file and none needs a buffer of
     // its own that the arena may no longer be able to give.
-    let mut morsel_max = match sink_buffer_bytes {
+    let claim = match sink_buffer_bytes {
+        0 => 0,
+        _ => ctx.file_buffer_share(),
+    };
+    let mut morsel_max = match claim {
         0 => config::MORSEL_MAX_BYTES,
         claim => (claim / 4).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
     };
@@ -449,12 +507,16 @@ fn drive(
         notes.push(format!(
             "morsels are at most {morsel_max} bytes, half of one of the sink's two {} byte file \
              buffers",
-            sink_buffer_bytes / 2
+            claim / 2
         ));
     }
     // An engine sink holds working memory in proportion to the morsel it writes, so its share
     // bounds the morsel as well.
-    if let Some(bytes) = sink_memory.as_ref().and_then(|sink| sink.morsel_max()) {
+    if let Some(bytes) = sink_memory
+        .iter()
+        .filter_map(|sink| sink.morsel_max())
+        .min()
+    {
         let bytes = bytes.clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES);
         if bytes < morsel_max {
             morsel_max = bytes;
@@ -464,9 +526,12 @@ fn drive(
             ));
         }
     }
-    let plan = source.plan()?;
-    let plan_summary = summarise(&plan);
-    let repeatable = source.repeatable();
+    let mut plans = Vec::with_capacity(sources.len());
+    for source in &sources {
+        plans.push(source.plan()?);
+    }
+    let plan_summary = summarise(&plans.concat());
+    let repeatable = sources.iter().all(|source| source.repeatable());
     if resume.is_some() && !repeatable {
         return Err(RunError::bare(MorunaError::Resume(
             "the source is not repeatable, so this run cannot be resumed".into(),
@@ -475,10 +540,17 @@ fn drive(
     // 12 f.7, SC f.1: a sink whose checkpoint is `None` before it is opened cannot be resumed,
     // and the scheduler turns checkpointing off for it; the report says so, as it does for a
     // one-shot source (a user's `moruna.Sink` without `checkpoint`, 08 f.10, is the usual case).
-    if checkpoint && sink.checkpoint()?.is_none() {
-        notes.push("sink: no resume, the sink does not checkpoint".to_string());
+    let mut sink_handles = Vec::with_capacity(built_sinks.len());
+    for sink in built_sinks {
+        if checkpoint && sink.checkpoint()?.is_none() {
+            notes.push("sink: no resume, the sink does not checkpoint".to_string());
+        }
+        sink_handles.push(SinkHandle::wrap(
+            sink,
+            ordered,
+            config::ORDERING_BUFFER_BYTES,
+        ));
     }
-    let sink_handle = SinkHandle::wrap(sink, ordered, config::ORDERING_BUFFER_BYTES);
 
     // 6. Kernels built: bind the arena, walk the chain, build the controller's view of them.
     // 05 f.9, E13: one gate for the run, bound to every Python kernel and every packaged one; it
@@ -488,7 +560,8 @@ fn drive(
     #[cfg(not(feature = "python"))]
     let python_present = false;
     let gate = (python_present || !packaged.is_empty())
-        .then(|| moruna_adapters::guard::MemoryGate::new(sampler.clone(), limits.memory_ceiling));
+        .then(|| moruna_adapters::guard::MemoryGate::new(sampler.clone(), limits.memory_ceiling))
+        .transpose()?;
     #[cfg(feature = "python")]
     for (_, py_kernel) in &py_kernels {
         py_kernel.bind_allocator(alloc.clone());
@@ -497,22 +570,103 @@ fn drive(
         }
     }
     if let Some(gate) = &gate {
-        for stage in &packaged {
+        for stage in packaged.iter().filter(|stage| !stage.native_singleton()) {
             stage.bind(gate, &sampler, limits.memory_ceiling);
         }
     }
-    let schemas = chain_schemas(source.schema(), &kernels)?;
+    // The run's DAG, checked here so `KernelInfo::schema_hash` is each stage's input schema hash
+    // (its port 0's, 12 f.1); the scheduler checks it again at `new`.
+    if let Some(history) = components.history {
+        started.history = Some(history.start(
+            &mut kernels,
+            alloc.clone(),
+            guard.token(),
+            &run_id.to_hex(),
+            resume.as_deref(),
+        )?);
+    } else if let Some(path) = &resume
+        && crate::history::checkpoint_prefixes(path, 64 * 1024 * 1024)?.is_some()
+    {
+        return Err(RunError::bare(MorunaError::Resume(
+            "checkpoint requires its original historical capture authority".into(),
+        )));
+    }
+    let pipeline = Pipeline {
+        sources: sources.clone(),
+        kernels: kernels.clone(),
+        sinks: sink_handles,
+        topology: topology.clone(),
+    };
+    let schemas = moruna_scheduler::validate_graph(&pipeline)?;
     let kernel_infos: Vec<KernelInfo> = kernels
         .iter()
         .enumerate()
-        .map(|(at, kernel)| KernelInfo {
-            stage: (at + 1) as moruna_kernel::StageId,
-            fingerprint: kernel.fingerprint(),
-            schema_hash: schemas[at].hash(),
-            hints: kernel.hints(),
-            kind: kernel.kind(),
+        .map(|(at, kernel)| {
+            let stage = (at + 1) as moruna_kernel::StageId;
+            let input = topology.inputs(stage).first().copied().unwrap_or(0);
+            KernelInfo {
+                stage,
+                fingerprint: kernel.fingerprint(),
+                schema_hash: schemas[usize::from(input)].hash(),
+                hints: kernel.hints(),
+                kind: kernel.kind(),
+            }
         })
         .collect();
+
+    // Native singleton commitments must also leave the controller's initial
+    // minimum-morsel work funded, before any child is started.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(gate) = &gate {
+        let count = packaged
+            .iter()
+            .filter(|stage| stage.native_singleton())
+            .count();
+        if count > 0 {
+            for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
+                if !matches!(stage.kernel().kind(), moruna_kernel::KernelKind::Stateful { max_instances } if max_instances.get() == 1)
+                {
+                    return Err(MorunaError::Config {
+                        name: "budget.native_children",
+                        msg: "native child share requires exactly one live instance per stage"
+                            .into(),
+                    }
+                    .into());
+                }
+            }
+            let planning = moruna_controller::fixed_commitment_budget(
+                &moruna_controller::FixedCommitmentInput {
+                    ceiling_bytes: limits.memory_ceiling,
+                    baseline_bytes,
+                    arena_bytes,
+                    engine_bytes,
+                    morsel_min: config::MORSEL_MIN_BYTES,
+                    safety_initial: config::SAFETY_INITIAL,
+                },
+                &kernel_infos,
+            )?;
+            let physical = sizing
+                .allowance(limits.memory_ceiling)
+                .saturating_sub(arena_bytes)
+                .saturating_sub(engine_bytes);
+            let share = crate::native_account::child_share(
+                physical.min(planning),
+                0,
+                0,
+                count,
+                moruna_micro::layout::PAGE,
+                moruna_micro::layout::TASK_MIN,
+            )
+            .map_err(|error| *error)?;
+            for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
+                let share = share.ok_or_else(|| MorunaError::Config {
+                    name: "budget.native_children",
+                    msg: "native singleton has no admitted child share".into(),
+                })?;
+                stage.bind(gate, &sampler, share);
+            }
+        }
+    }
 
     // 7. Placement.
     // `budget.disk` (03 f.6): discovery computed it, from the explicit limit, the environment
@@ -526,7 +680,6 @@ fn drive(
                 .to_string(),
         );
     }
-    let stages = (kernels.len() + 1) as u16;
     let host_budget =
         (limits.memory_ceiling as f64 * (1.0 - config::RESERVE_FRACTION as f64)) as u64;
     let mut budgets = TierBudgets {
@@ -551,7 +704,7 @@ fn drive(
                 PlacementConfig {
                     run_id,
                     node,
-                    stages,
+                    topology: topology.clone(),
                     budgets: budgets.clone(),
                     staging_dir: staging_dir.clone(),
                     durable_staging: discovered.profile.durable_staging.is_guaranteed(),
@@ -563,7 +716,7 @@ fn drive(
                         && cfg!(feature = "gds")
                         && io_paths.gds,
                     devices: limits.devices.iter().map(|d| d.id).collect(),
-                    plan_digest: plan_digest(&plan),
+                    plan_digests: plans.iter().map(|plan| plan_digest(plan)).collect(),
                     fingerprints: kernels.iter().map(|k| k.fingerprint()).collect(),
                     resume_policy: kernels.iter().map(|k| k.hints().resume).collect(),
                     config: with_spec_digest(
@@ -577,10 +730,12 @@ fn drive(
                             sizer,
                             checkpoint_enabled,
                             checkpoint_interval_ms,
+                            &policy,
                         ),
                         spec_digest.as_deref(),
                     ),
                     checkpoint_enabled,
+                    eviction: Arc::new(moruna_placement::catalog::KnownFuture),
                 },
                 alloc.clone(),
                 reactor.clone(),
@@ -590,10 +745,16 @@ fn drive(
         }
     };
     started.placement = Some(placement.clone());
-    if !repeatable {
-        // 07 SO-I8, PL-I6: a one-shot source's Q0 is staged rather than evicted. An iterator
-        // source is one; a `moruna.Source` that sets `repeatable = False` is the other (07 e.6).
-        placement.set_staging(0, true);
+    for (index, source) in sources.iter().enumerate() {
+        if source.repeatable() {
+            continue;
+        }
+        // 07 SO-I8, PL-I6: a one-shot source's queues are staged rather than evicted. An
+        // iterator source is one; a `moruna.Source` that sets `repeatable = False` is the other
+        // (07 e.6).
+        for &queue in topology.source_outputs(index as u16) {
+            placement.set_staging(queue, true);
+        }
         notes.push("source is not repeatable (an iterator source, or repeatable = False): no resume, Q0 staged".to_string());
     }
 
@@ -601,7 +762,7 @@ fn drive(
     let resume_point = match &resume {
         Some(path) => Some(placement.restore(
             path,
-            &plan,
+            &plans,
             &kernels.iter().map(|k| k.fingerprint()).collect::<Vec<_>>(),
         )?),
         None => None,
@@ -625,18 +786,24 @@ fn drive(
             heartbeat_interval_ms: config::HEARTBEAT_INTERVAL_MS,
             resuming: resume.is_some(),
             node,
+            policy: policy.clone(),
+            policies: moruna_scheduler::policies::standard(),
+            clock: Arc::new(moruna_scheduler::SystemClock::default()),
+            // Discovery measures no disk bandwidth: the scheduler's declared figure, what a
+            // lookahead plays a spill and a read-back at.
+            disk_bytes_per_second: moruna_scheduler::DISK_BYTES_PER_SECOND,
         },
-        Pipeline {
-            source: source.clone(),
-            kernels: kernels.clone(),
-            sink: sink_handle,
-        },
+        pipeline,
         placement.clone(),
         alloc.clone(),
         trace_sink,
         sampler.clone(),
     )?);
     started.scheduler = Some(scheduler.clone());
+    if let Some(learning) = components.learning {
+        let keys = learning.keys(&kernels, &topology, &schemas)?;
+        scheduler.set_cost(learning.online, keys)?;
+    }
     if let Some(hook) = components.stage_hook.clone() {
         scheduler.set_stage_hook(hook);
     }
@@ -652,34 +819,48 @@ fn drive(
         cancel: guard.token(),
         waits,
     };
-    for stage in &packaged {
-        stage.bind_run_ports(&run_ports);
+    for ports in &stage_ports {
+        ports.bind_run(run_ports.clone());
     }
-    // MH 4.7: each manifest is copied to `staging.url` before its write counts as done.
-    let durable_copy = match (&staging_url, checkpoint_enabled) {
-        (Some(prefix), true) => {
-            let files = Arc::new(
-                moruna_reactor::ObjectFiles::new(object_store.clone()).map_err(RunError::bare)?,
-            );
-            let url = crate::durable::manifest_url(prefix, &run_id);
-            let (hook_files, hook_url) = (files.clone(), url.clone());
-            scheduler.set_manifest_hook(Arc::new(move |path| {
-                crate::durable::copy_manifest(&hook_files, path, &hook_url)
-            }));
-            notes.push(format!("staging.url: every manifest is copied to {url}"));
-            Some((files, url))
+    if staging_url.is_some() {
+        return Err(RunError::bare(MorunaError::Config {
+            name: "staging.url",
+            msg: "raw manifest copying is not portable; use an explicit scoped native checkpoint port".into(),
+        }));
+    }
+    if let Some(checkpoints) = &components.checkpoints {
+        if checkpoints.access.run != run_id.to_hex() || !checkpoint_enabled {
+            return Err(RunError::bare(MorunaError::Resume(
+                "portable checkpoint port identity or checkpoint readiness mismatch".into(),
+            )));
         }
-        (Some(prefix), false) => {
-            return Err(RunError::bare(MorunaError::Config {
-                name: "staging.url",
-                msg: format!(
-                    "{prefix}: the run writes no manifests to copy (checkpointing is off: it \
-                     needs a staging directory, a disk budget and a repeatable source)"
-                ),
-            }));
+        let engine = engine.as_ref().ok_or_else(|| {
+            RunError::bare(MorunaError::Resume(
+                "portable checkpoints require the native placement snapshot authority".into(),
+            ))
+        })?;
+        // Prevent eviction-to-requery from creating missing immutable dependencies. Every
+        // queue may stage its actual bytes from the beginning, including repeatable sources.
+        for queue in 0..topology.queue_count() {
+            placement.set_staging(queue, true);
         }
-        (None, _) => None,
-    };
+        scheduler.set_manifest_preparation(
+            checkpoints.preparation(
+                alloc.clone(),
+                engine.clone(),
+                started
+                    .history
+                    .as_ref()
+                    .map(crate::history::HistoryRun::checkpoint),
+            ),
+        );
+    }
+    if components.checkpoints.is_none()
+        && checkpoint_enabled
+        && let Some(history) = &started.history
+    {
+        scheduler.set_manifest_preparation(history.checkpoint().preparation(alloc.clone()));
+    }
     if let Some(handle) = &checkpoint_handle {
         handle.attach(&scheduler);
     }
@@ -689,6 +870,33 @@ fn drive(
         Some(point) => scheduler.apply_resume_point(point)?,
         None => scheduler.init_instances()?,
     }
+
+    // Native singleton init has already carved and retained its real Account. These are
+    // the same held limits WithOutside adds to every sample, not process growth to fit
+    // independently to each stage. Keep them funded once even if a child later retires.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let fixed_native_bytes = packaged
+        .iter()
+        .filter(|stage| stage.native_singleton())
+        .try_fold(0u64, |total, stage| -> moruna_kernel::Result<u64> {
+            let outside = stage.outside().ok_or_else(|| MorunaError::Config {
+                name: "budget.native_children",
+                msg: "initialized native singleton has no Account observer".into(),
+            })?;
+            let held = outside.in_use()?;
+            if held == 0 {
+                return Err(MorunaError::Config {
+                    name: "budget.native_children",
+                    msg: "initialized native singleton has no retained Account limit".into(),
+                });
+            }
+            total.checked_add(held).ok_or_else(|| MorunaError::Config {
+                name: "budget.native_children",
+                msg: "actual native Account commitment total overflow".into(),
+            })
+        })?;
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let fixed_native_bytes = 0;
 
     // 10. Controller, then the record hook, so the hook exists before any probe record.
     let profiles_dir = resolve_profiles_dir(profiles_dir, home_dir(), &mut notes);
@@ -716,6 +924,7 @@ fn drive(
             arena_bytes,
             baseline_bytes,
             engine_bytes,
+            fixed_native_bytes,
             sink_buffer_bytes,
             checkpoint_enabled,
             checkpoint_interval_ms,
@@ -726,6 +935,7 @@ fn drive(
         sampler.clone(),
         trace_tail,
         placement.clone(),
+        topology.clone(),
         kernel_infos,
     )?);
     started.controller = Some(controller.clone());
@@ -795,20 +1005,47 @@ fn drive(
         None => (Vec::new(), Vec::new()),
     };
     let outcome = outcome?;
+    if let Some(history) = started.history.take() {
+        // A successful error-policy skip is not complete historical task coverage.
+        let lost = scheduler
+            .scheduler_stats()
+            .per_stage
+            .iter()
+            .any(|stage| stage.errors != 0 || stage.skipped != 0);
+        history.finish(matches!(outcome, RunOutcome::Completed { .. }) && !lost)?;
+    }
     notes.extend(watch_notes);
-    if let Some(engine) = engine_after {
+    for engine in engine_after {
         notes.push(engine.note());
     }
-    if let Some(sink) = sink_after {
+    for sink in sink_after {
         notes.push(sink.note());
     }
 
     // 12. stop, finish, report. One last sample, so a rise of the process's high-water mark
     // since the last tick is in the peak the report states.
-    let _ = sampler.sample();
-    let process_peak = sampler.process_peak();
-    let process_usage = sampler.process_usage();
-    let (exit, outcome_manifest) = report::exit_of(&outcome);
+    let accounting_error = sampler.sample().err();
+    let accounting_failed = accounting_error.is_some();
+    let mut process_peak = sampler.process_peak();
+    let mut process_usage = sampler.process_usage();
+    let (mut exit, outcome_manifest) = report::exit_of(&outcome);
+    let final_failure = final_accounting_failure(&outcome, accounting_error, &mut notes);
+    if let Some(cause) = &final_failure {
+        exit = moruna_trace::ExitReason::Terminated {
+            diagnostic: cause.to_string(),
+        };
+    }
+    if accounting_failed {
+        // Earlier observations remain evidence, but cannot certify the final window.
+        process_peak.exact = false;
+        process_usage.measured = false;
+    }
+    // 10 f.3: what the policy decided, read before the scheduler is unwound.
+    let policy = started.scheduler.as_ref().map(|scheduler| {
+        moruna_trace::PolicyReport::of(
+            &moruna_kernel::StatsSource::scheduler_stats(scheduler.as_ref()).policy,
+        )
+    });
     let summary = started
         .controller
         .take()
@@ -834,18 +1071,6 @@ fn drive(
             dir.display()
         ));
     }
-    // MH 4.7: a completed run's copy goes with its directory, so a resume of the job finds no
-    // run to continue.
-    if matches!(exit, moruna_trace::ExitReason::Completed)
-        && !checkpoint_keep
-        && let Some((files, url)) = &durable_copy
-        && let Err(error) = files.delete(url)
-    {
-        notes.push(format!(
-            "the manifest's copy {url} was not removed, so a resume of this job would find it: \
-             {error}"
-        ));
-    }
     let gil = gil_states(
         #[cfg(feature = "python")]
         &py_kernels,
@@ -862,13 +1087,18 @@ fn drive(
         io_paths,
         controller: summary,
         drains,
+        memory_basis,
         process_peak,
         process_usage,
         write: match &outcome {
-            RunOutcome::Completed { sink } => sink.write.clone(),
+            RunOutcome::Completed { sinks } => sinks.iter().find_map(|sink| sink.write.clone()),
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
         },
         read: source_read,
+        policy,
+        buffers: engine.as_ref().map(|engine| {
+            moruna_trace::BufferReport::of(engine.eviction_order(), &engine.catalog_stats())
+        }),
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {
@@ -878,6 +1108,11 @@ fn drive(
         })
     })?;
     let computed = report::compute(&view, &limits, &meta);
+    if let Some(cause) = final_failure {
+        return Err(RunError::bare(cause)
+            .with_report(Some(computed))
+            .with_manifest(manifest));
+    }
     match outcome {
         RunOutcome::Completed { .. } => Ok(computed),
         RunOutcome::Terminated { diagnostic, .. } => Err(RunError::bare(diagnostic)
@@ -887,6 +1122,17 @@ fn drive(
             .with_report(Some(computed))
             .with_manifest(manifest)),
     }
+}
+
+/// Preserve an established terminal cause while making failed cleanup accounting visible.
+fn final_accounting_failure(
+    outcome: &RunOutcome,
+    failure: Option<MorunaError>,
+    notes: &mut Vec<String>,
+) -> Option<MorunaError> {
+    let cause = failure?;
+    notes.push(format!("final accounting sample failed: {cause}"));
+    matches!(outcome, RunOutcome::Completed { .. }).then_some(cause)
 }
 
 /// `staging.durable` as the profile override discovery is handed (MH 4.7, 03 d.1). A caller's
@@ -926,7 +1172,7 @@ fn durable_profile(
 fn auto_manifest(
     staging_dir: Option<&std::path::Path>,
     kernels: &[Arc<dyn Kernel>],
-    source: &crate::spec::SourceSpec,
+    sources: &[crate::spec::SourceSpec],
     spec_digest: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let Some(dir) = staging_dir else {
@@ -934,13 +1180,18 @@ fn auto_manifest(
     };
     let fingerprints: Vec<moruna_kernel::Fingerprint> =
         kernels.iter().map(|k| k.fingerprint()).collect();
-    let plan_digest = match source {
-        crate::spec::SourceSpec::Built(source) => Some(plan_digest(&source.plan()?)),
-        crate::spec::SourceSpec::Build(_) => None,
-    };
+    let mut plan_digests = Some(Vec::with_capacity(sources.len()));
+    for source in sources {
+        match (source, plan_digests.as_mut()) {
+            (crate::spec::SourceSpec::Built(source), Some(digests)) => {
+                digests.push(plan_digest(&source.plan()?));
+            }
+            _ => plan_digests = None,
+        }
+    }
     let want = moruna_placement::manifest::ManifestMatch {
         fingerprints: &fingerprints,
-        plan_digest,
+        plan_digests,
         spec_digest,
     };
     Ok(PlacementEngine::find_resumable_manifest(dir, &want)?)
@@ -1037,6 +1288,8 @@ struct Sizing {
     page_bytes: usize,
     engine: bool,
     sink: bool,
+    /// The run's queues: the buffer catalog's floor holds every one's promotion window.
+    queues: u64,
 }
 
 /// The least an engine source's share may be: a pool of 4 MiB, a tenth of it, holds sixteen
@@ -1060,6 +1313,7 @@ impl Sizing {
                 && allowance.saturating_sub(shares.engine + shares.sink) >= ARENA_FLOOR_BYTES
                 && (!self.engine || shares.engine >= ENGINE_FLOOR_BYTES)
                 && (!self.sink || shares.sink >= SINK_FLOOR_BYTES)
+                && self.catalog_floor(ceiling).holds()
         };
         // Every term grows with the ceiling, so the floor is found by bisection, to a page.
         let (mut low, mut high) = (0u64, 1u64 << 50);
@@ -1074,9 +1328,26 @@ impl Sizing {
         high
     }
 
+    /// The buffer catalog's floor at `ceiling` (placement f.18 rule 13, KD7b): every queue's
+    /// promotion window and one unit's input and output, at the smallest morsel the controller
+    /// can make, within the placement's budget (the ceiling less the reserve).
+    fn catalog_floor(&self, ceiling: u64) -> moruna_kernel::CatalogFloor {
+        let budget = (ceiling as f64 * (1.0 - config::RESERVE_FRACTION as f64)) as u64;
+        moruna_kernel::CatalogFloor::of(
+            self.queues,
+            self.queues * u64::from(moruna_kernel::DEFAULT_PROMOTION_WINDOW),
+            config::MORSEL_MIN_BYTES,
+            budget,
+        )
+    }
+
     /// What the floor is made of, for the refusal.
     fn floor_terms(&self) -> String {
         let mut terms = vec![format!("an arena of {ARENA_FLOOR_BYTES} bytes")];
+        terms.push(format!(
+            "a buffer catalog of {}",
+            self.catalog_floor(0).terms()
+        ));
         if self.engine {
             terms.push(format!(
                 "{ENGINE_FLOOR_BYTES} bytes for the source's plan, {ENGINE_SHARE} of what the \
@@ -1433,20 +1704,20 @@ mod tests {
             Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>
         );
         assert_eq!(
-            auto_manifest(None, &[], &built, None).expect("no dir"),
+            auto_manifest(None, &[], std::slice::from_ref(&built), None).expect("no dir"),
             None
         );
         let dir = std::env::temp_dir().join(format!("moruna-auto-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         assert_eq!(
-            auto_manifest(Some(&dir), &[], &built, None).expect("empty"),
+            auto_manifest(Some(&dir), &[], std::slice::from_ref(&built), None).expect("empty"),
             None
         );
         let later = crate::spec::SourceSpec::Build(Box::new(|_| {
             Ok(Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>)
         }));
         assert_eq!(
-            auto_manifest(Some(&dir), &[], &later, None).expect("empty"),
+            auto_manifest(Some(&dir), &[], std::slice::from_ref(&later), None).expect("empty"),
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1756,6 +2027,7 @@ mod tests {
             page_bytes: 4096,
             engine,
             sink,
+            queues: 2,
         }
     }
 
@@ -1808,6 +2080,29 @@ mod tests {
         };
         assert!(stateful.floor() > floor);
         assert!(stateful.floor_terms().contains("kernel state"));
+        // KD7b: a run of many queues needs room for every queue's promotion window, at the
+        // smallest morsel, and the floor grows with them; it says so.
+        let wide = Sizing {
+            queues: 64,
+            ..plain
+        };
+        let catalog = wide.catalog_floor(wide.floor());
+        assert!(
+            wide.floor() > floor,
+            "the catalog's floor is the larger term"
+        );
+        assert!(catalog.holds(), "{catalog:?}");
+        assert!(!wide.catalog_floor(wide.floor() - (8 << 20)).holds());
+        assert_eq!(
+            catalog.bytes,
+            (64 * u64::from(moruna_kernel::DEFAULT_PROMOTION_WINDOW) + 2)
+                * config::MORSEL_MIN_BYTES
+        );
+        assert!(
+            wide.floor_terms().contains("buffer catalog"),
+            "{}",
+            wide.floor_terms()
+        );
     }
 
     /// A process already over the ceiling leaves the arena nothing, and the controller's own
@@ -1869,15 +2164,90 @@ mod tests {
         assert_eq!(summarise(&[]).max_split_bytes, 0);
     }
 
-    /// The chain walk refuses a kernel whose `accepts` does not match the schema it is given.
+    /// The run's DAG is walked before anything is built: a copy's one queue carries its
+    /// source's schema, and a topology that does not match the run's parts is refused.
     #[test]
-    fn the_chain_walk_checks_every_stage() {
-        let schema = SourceSchema::Tensor {
-            dtype: moruna_kernel::DType::F32,
-            shape: vec![-1, 8],
-        };
-        let schemas = chain_schemas(schema.clone(), &[]).expect("an empty chain is the source");
+    fn the_graph_walk_checks_every_stage() {
+        use moruna_testkit::{FakeSink, FakeSource};
+        let source = Arc::new(FakeSource::new()) as Arc<dyn moruna_kernel::Source>;
+        let schema = source.schema();
+        let sink = || SinkHandle::wrap(Box::new(FakeSink::new()), false, 1 << 20);
+        let copy = Pipeline::chain(source.clone(), Vec::new(), sink());
+        let schemas = moruna_scheduler::validate_graph(&copy).expect("a copy is the source");
         assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].hash(), schema.hash());
+        let wrong = Pipeline {
+            topology: moruna_kernel::Topology::chain(2),
+            ..Pipeline::chain(source, Vec::new(), sink())
+        };
+        assert!(moruna_scheduler::validate_graph(&wrong).is_err());
+    }
+
+    #[test]
+    fn assigned_guest_run_identity_cannot_be_replaced_by_resume_metadata() {
+        let assigned = RunId([7; 16]);
+        let header = moruna_placement::manifest::ManifestHeader {
+            version: moruna_placement::manifest::MANIFEST_VERSION,
+            run_id: assigned,
+            node: moruna_kernel::NodeId(4),
+            hostname: "original-producer-node".into(),
+            written_ns: 1,
+        };
+        assert_eq!(resolve_run_id(None, Some(assigned)).unwrap(), assigned);
+        assert_eq!(
+            resolve_run_id(Some(&header), Some(assigned)).unwrap(),
+            assigned
+        );
+        assert_eq!(resolve_run_id(Some(&header), None).unwrap(), assigned);
+        assert!(matches!(
+            resolve_run_id(Some(&header), Some(RunId([8; 16]))),
+            Err(MorunaError::Resume(_))
+        ));
+    }
+
+    #[test]
+    fn final_accounting_failure_preserves_existing_terminal_facts() {
+        let failure = || MorunaError::Io {
+            op: "read",
+            target: "memory.current".into(),
+            msg: "account disappeared".into(),
+        };
+        let mut notes = Vec::new();
+        let terminated = RunOutcome::Terminated {
+            diagnostic: MorunaError::Config {
+                name: "original",
+                msg: "kernel refused".into(),
+            },
+            manifest: None,
+        };
+        assert!(final_accounting_failure(&terminated, Some(failure()), &mut notes).is_none());
+        assert!(matches!(
+            terminated,
+            RunOutcome::Terminated {
+                diagnostic: MorunaError::Config {
+                    name: "original",
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            final_accounting_failure(
+                &RunOutcome::Cancelled { manifest: None },
+                Some(failure()),
+                &mut notes
+            )
+            .is_none()
+        );
+        assert!(
+            matches!(final_accounting_failure(&RunOutcome::Completed { sinks: Vec::new() }, Some(failure()), &mut notes), Some(MorunaError::Io { target, .. }) if target == "memory.current")
+        );
+        assert_eq!(notes.len(), 3);
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains("account disappeared"))
+        );
     }
 
     /// A run id is 16 bytes and two of them differ.

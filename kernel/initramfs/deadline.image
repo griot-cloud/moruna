@@ -1,0 +1,19 @@
+# Mandatory KK-T9 latency gate: four small independent timer processes, no I/O
+# servers, spin tests or dynamically spawned workload. Same deadline ELF/bounds.
+moruna-image 1
+process deadline-a deadline
+  handle console console
+  expect KB1 wait-deadline: ok: the timer woke the waiting thread
+  exits 0
+process deadline-b deadline
+  handle console console
+  expect KB1 wait-deadline: ok: the timer woke the waiting thread
+  exits 0
+process deadline-c deadline
+  handle console console
+  expect KB1 wait-deadline: ok: the timer woke the waiting thread
+  exits 0
+process deadline-d deadline
+  handle console console
+  expect KB1 wait-deadline: ok: the timer woke the waiting thread
+  exits 0

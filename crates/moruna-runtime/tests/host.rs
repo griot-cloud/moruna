@@ -19,6 +19,7 @@ use moruna_job::JobSpec;
 use moruna_kernel::{CancelToken, Kernel};
 use moruna_runtime::host::cli;
 use moruna_runtime::host::exit;
+use moruna_runtime::host::protocol;
 use moruna_runtime::host::session::{self, HEARTBEAT, read_report_file};
 use moruna_runtime::host::transport::{self, Address};
 use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
@@ -141,7 +142,10 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(from_file["exit"]["code"], 0);
     assert_eq!(from_file["run_id"], RUN_ID);
     let job = JobSpec::from_value(doc.clone()).expect("the document");
-    assert_eq!(from_file["spec_digest"], moruna_runtime::job::digest(&job));
+    assert_eq!(
+        from_file["spec_digest"],
+        moruna_plan::job_digest(&moruna_job::Job::from_v1(&job))
+    );
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
 
     // The same run through the library's own construction.
@@ -187,16 +191,14 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(read_back_rows(&out2), rows);
 }
 
-/// Read every message until `exit`, with the instant each arrived.
+/// Read every message until `exit`, with the instant each arrived; an event's frame is read as
+/// the JSON its record renders.
 fn drain(reader: &mut dyn BufRead) -> Vec<(Instant, Value)> {
     let mut messages = Vec::new();
-    let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return messages,
-            Ok(_) => {
-                let value: Value = serde_json::from_str(&line).expect("a JSON line");
+        match protocol::read_json_message(reader) {
+            Ok(None) | Err(_) => return messages,
+            Ok(Some(value)) => {
                 let last = value["type"] == "exit";
                 messages.push((Instant::now(), value));
                 if last {
@@ -208,9 +210,9 @@ fn drain(reader: &mut dyn BufRead) -> Vec<(Instant, Value)> {
 }
 
 fn read_one(reader: &mut dyn BufRead) -> Value {
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("a line");
-    serde_json::from_str(&line).expect("a JSON line")
+    protocol::read_json_message(reader)
+        .expect("a message")
+        .expect("a message before the end")
 }
 
 /// The next message that is not an `event`.
@@ -250,7 +252,7 @@ fn ho_t6_heartbeat_cadence_and_report_delivery() {
     let mut doc = document(scratch.path(), 16_000, 8, Some("sleep"));
     doc["report"]["socket"] = json!(format!("unix://{}", socket.display()));
     let digest = JobSpec::from_value(doc.clone()).expect("doc");
-    let digest = moruna_runtime::job::digest(&digest);
+    let digest = moruna_plan::job_digest(&moruna_job::Job::from_v1(&digest));
     let path = write_doc(scratch.path(), &doc);
 
     let listener = transport::listen(&Address::Unix(socket.clone())).expect("listen");
@@ -695,14 +697,17 @@ fn ho_t13_report_file_placement() {
     let path = write_doc(scratch.path(), &doc);
     let outcome = session::run_file(
         &path,
+        None,
         &kinds(),
         &session::HostOptions {
+            cost: None,
             strict: true,
             env: &no_env,
             cancel: CancelToken::new(),
             heartbeat: HEARTBEAT,
             packages: moruna_runtime::packaged::PackageHost::default(),
             capture_process: false,
+            events: Default::default(),
         },
     );
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
@@ -774,7 +779,7 @@ fn well_formed(messages: &[(Instant, Value)], attempt: u64) -> Vec<Value> {
     assert_eq!(start.len(), 32);
     let mut last_t = 0;
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e["v"], 4, "{e}");
+        assert_eq!(e["v"], 7, "{e}");
         assert_eq!(e["attempt"], attempt, "{e}");
         assert_eq!(e["start"], start.as_str(), "{e}");
         assert_eq!(e["seq"], i as u64 + 1, "{e}");
@@ -843,7 +848,7 @@ fn ho_t16_a_real_run_tells_its_task_lifecycle() {
         vec![("orders", 0), ("double", 1), ("refined", 2)]
     );
     assert_eq!(registered[1]["members"], json!(["clean", "double"]));
-    assert_eq!(registered[1]["upstream"], "orders");
+    assert_eq!(registered[1]["upstream"], json!(["orders"]));
     for task in ["orders", "double", "refined"] {
         let registered = first(&events, task, "task_registered").unwrap();
         let waiting = first(&events, task, "task_waiting").unwrap();
@@ -1020,7 +1025,7 @@ fn ho_t20_fused_kernels_are_one_group() {
     assert_eq!(registered[1]["task"], "rename");
     assert_eq!(registered[1]["members"], json!(["rename", "keep"]));
     assert_eq!(registered[2]["task"], "write");
-    assert_eq!(registered[2]["upstream"], "rename");
+    assert_eq!(registered[2]["upstream"], json!(["rename"]));
     assert!(events.iter().all(|e| e["task"] != "keep"));
     let group = ended(&events, "rename");
     assert_eq!(group["outcome"], "succeeded");

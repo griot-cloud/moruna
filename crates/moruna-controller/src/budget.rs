@@ -23,7 +23,7 @@ const DEVICE_QUEUE_SHARE: f64 = 0.6;
 /// (12 f.1, 02 f.1). A sample is still taken, for the tick clock and the throttling counter.
 pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
     // Sampling is a call into another component, so it happens with no lock held (RC-I10).
-    let sample = ctl.peers().sampler.sample();
+    let sample = ctl.peers().sampler.sample()?;
 
     let (budgets, tier_budgets) = {
         let mut state = ctl.held();
@@ -53,6 +53,19 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
                      existed and the reserve is {reserve}",
                     state.cfg.morsel_min
                 ),
+            });
+        }
+
+        if state.cfg.fixed_native_bytes > 0
+            && baseline
+                .saturating_add(state.cfg.arena_bytes)
+                .saturating_add(state.cfg.engine_bytes)
+                .saturating_add(state.cfg.fixed_native_bytes)
+                >= ceiling
+        {
+            return Err(MorunaError::Config {
+                name: "budget.native_children",
+                msg: "retained native Accounts leave no room below the actual run ceiling".into(),
             });
         }
 

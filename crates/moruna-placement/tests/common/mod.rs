@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod dag;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +80,7 @@ pub fn config(stages: u16, dir: Option<PathBuf>, budgets: TierBudgets) -> Placem
     PlacementConfig {
         run_id: RunId([7; 16]),
         node: moruna_kernel::LOCAL_NODE,
-        stages,
+        topology: moruna_kernel::Topology::chain(stages - 1),
         budgets,
         staging_dir: dir,
         durable_staging: false,
@@ -88,7 +90,7 @@ pub fn config(stages: u16, dir: Option<PathBuf>, budgets: TierBudgets) -> Placem
         page_bytes: PAGE,
         gds: false,
         devices: vec![DeviceId(0)],
-        plan_digest: moruna_placement::manifest::plan_digest(&plan()),
+        plan_digests: vec![moruna_placement::manifest::plan_digest(&plan())],
         fingerprints: vec![Fingerprint::compute("test", b"1")],
         resume_policy: vec![ResumePolicy::Reinit],
         config: serde_json::json!({
@@ -96,6 +98,7 @@ pub fn config(stages: u16, dir: Option<PathBuf>, budgets: TierBudgets) -> Placem
             "page": { "bytes": PAGE }
         }),
         checkpoint_enabled: true,
+        eviction: std::sync::Arc::new(moruna_placement::catalog::KnownFuture),
     }
 }
 
@@ -157,6 +160,44 @@ pub fn int_batch(alloc: &FakeAllocator, rows: usize, tier: Tier) -> RecordBatch 
     }
 }
 
+/// A one-column table morsel holding exactly `values`, in arena memory of the host tier: what a
+/// test that checks a consumer got the right bytes pushes.
+pub fn valued_morsel(alloc: &FakeAllocator, seq: Seq, stage: StageId, values: &[i32]) -> Morsel {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buffer = alloc.arrow_buffer(&bytes, alloc.host_tier());
+    let data = ArrayData::builder(DataType::Int32)
+        .len(values.len())
+        .add_buffer(buffer)
+        .build();
+    let data = match data {
+        Ok(data) => data,
+        Err(e) => panic!("valued_morsel: {e}"),
+    };
+    let column: ArrayRef = make_array(data);
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+    let batch = match RecordBatch::try_new(schema, vec![column]) {
+        Ok(batch) => batch,
+        Err(e) => panic!("valued_morsel: {e}"),
+    };
+    let payload = match Payload::table(batch) {
+        Ok(payload) => payload,
+        Err(e) => panic!("valued_morsel: {e}"),
+    };
+    Morsel::new(seq, stage, payload, origin(seq))
+}
+
+/// The values of a one-column table morsel, as a consumer reads them.
+pub fn values_of(morsel: &Morsel) -> Vec<i32> {
+    use moruna_kernel::arrow::array::{Array, Int32Array};
+    let Payload::Table(batch, _) = &morsel.payload else {
+        panic!("morsel {} is not a table", morsel.seq);
+    };
+    let Some(column) = batch.column(0).as_any().downcast_ref::<Int32Array>() else {
+        panic!("morsel {} is not one Int32 column", morsel.seq);
+    };
+    (0..column.len()).map(|i| column.value(i)).collect()
+}
+
 /// A table morsel resident in the allocator's host tier.
 pub fn table_morsel(alloc: &FakeAllocator, seq: Seq, stage: StageId, rows: usize) -> Morsel {
     let batch = int_batch(alloc, rows, alloc.host_tier());
@@ -206,6 +247,17 @@ pub fn want_device() -> PayloadSpec {
         kind: PayloadKind::Tensor,
         tier: TierPref::Device,
     }
+}
+
+/// Pop the head and release it at once, as a consumer that is done with it does (contracts
+/// d.10 `release`).
+pub fn take(engine: &PlacementEngine, stage: StageId) -> Option<Morsel> {
+    use moruna_kernel::Placement;
+    let morsel = engine
+        .pop(stage, want_host(), moruna_kernel::Locality::Any)
+        .expect("pop")?;
+    engine.release(stage, morsel.seq).expect("release");
+    Some(morsel)
 }
 
 /// Wait until every operation the fake was given has resolved, so a test can observe the

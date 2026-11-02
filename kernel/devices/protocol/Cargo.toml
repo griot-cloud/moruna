@@ -1,0 +1,10 @@
+[package]
+name = "devices-protocol"
+description = "The device manager's protocols: moruna.devices.directory (find a driver's service by name) and moruna.devices.control (restart a driver, inspect a device's windows)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

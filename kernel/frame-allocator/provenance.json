@@ -1,0 +1,27 @@
+{
+  "added_files": [],
+  "archive_sha256": "1a3da8b8f6c7bc557dd9f3acb5608e21b072f32734550f6492091bbdb7091e07",
+  "crate": "osdk-frame-allocator",
+  "license": "MPL-2.0",
+  "modified_upstream_files": {
+    "Cargo.toml": {
+      "patched_sha256": "4dc1c2bd98874ffd1ad9e08779ddb7fbcfed9de8622f3f17e631c827205357b5",
+      "upstream_sha256": "c6240b1d3429985d7829f4f9f1e8e0eabfacf43122c3ded35129b12e82bbc040"
+    },
+    "src/lib.rs": {
+      "patched_sha256": "cc4027abae79cc265d52e25a182716c484d383edf2248f0d34f57d7cf5625ab2",
+      "upstream_sha256": "83eff99cb45fba6738437c948e029c4cad264d5791766efb430d9d2addacf977"
+    },
+    "src/pools/mod.rs": {
+      "patched_sha256": "594654974dd31fd6b3a772d2795cb5addba74b4ccf24a274f5ef0eb532f360a7",
+      "upstream_sha256": "a3d804f1a198b90990f1caa8734820909e2be0f3d8b674248a94a1f3edb53978"
+    }
+  },
+  "official_archive": "https://static.crates.io/crates/osdk-frame-allocator/osdk-frame-allocator-0.19.0.crate",
+  "probe_scope": "Real OSTD IPI callbacks return alternating eight-page chunks across requested CPUs; isolated 64-page physical region, actual shared insertion/allocation code, exact address/empty pool assertions. Kernel boot probe only; no execution result claimed.",
+  "scope": "One shared existing BuddySet replaces unbounded per-CPU buddy pools. Existing bounded caches, allocation rounding, metadata and account semantics unchanged. Actual tests pending.",
+  "upstream_files": "upstream-files.json",
+  "upstream_manifest_sha256": "dcb3f223021e7f368c4fc5147c8e6280e237ad7915592c95403dc7f1cb9c2496",
+  "vendor_path": "../vendor/osdk-frame-allocator-0.19.0",
+  "version": "0.19.0"
+}

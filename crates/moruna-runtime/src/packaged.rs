@@ -27,24 +27,55 @@ pub enum Packaged {
     /// A `.pex` in a confined child.
     #[cfg(target_os = "linux")]
     Pex(Arc<moruna_sandbox::SandboxKernel>),
+    /// A PEX in an actual charged native process, not a Linux sandbox emulation.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    NativePex(Arc<crate::native_pex::NativePex>),
+    /// An image's command in a confined process (SDD 19).
+    #[cfg(target_os = "linux")]
+    Image(Arc<moruna_sandbox::ImageKernel>),
+    /// An image's command as a task of the data plane, on the Moruna kernel (SDD 30 f.5).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Task(Arc<moruna_micro::task::ImageTask>),
 }
 
 impl Packaged {
+    /// Native tasks retain their entire carved Account until certified retirement.
+    /// These variants each have exactly one live state instance.
+    pub(crate) fn native_singleton(&self) -> bool {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if matches!(self, Self::Task(_) | Self::NativePex(_)) {
+            return true;
+        }
+        false
+    }
+
     /// The kernel, as a run uses it.
     pub fn kernel(&self) -> Arc<dyn Kernel> {
         match self {
             Packaged::Wasm(k) => Arc::clone(k) as Arc<dyn Kernel>,
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => Arc::clone(k) as Arc<dyn Kernel>,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(k) => Arc::clone(k) as Arc<dyn Kernel>,
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => Arc::clone(k) as Arc<dyn Kernel>,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => Arc::clone(k) as Arc<dyn Kernel>,
         }
     }
 
-    /// The package.
-    pub fn package(&self) -> &Arc<Package> {
+    /// The package; an image has none.
+    pub fn package(&self) -> Option<&Arc<Package>> {
         match self {
-            Packaged::Wasm(k) => k.package(),
+            Packaged::Wasm(k) => Some(k.package()),
             #[cfg(target_os = "linux")]
-            Packaged::Pex(k) => k.package(),
+            Packaged::Pex(k) => Some(k.package()),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(k) => Some(k.package()),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(_) => None,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(_) => None,
         }
     }
 
@@ -54,12 +85,21 @@ impl Packaged {
             Packaged::Wasm(k) => k.notes().to_vec(),
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => k.notes(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(k) => k.notes(),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(_) => Vec::new(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(_) => Vec::new(),
         }
     }
 
-    /// `wasm` or `pex`, for a check report.
+    /// `wasm`, `pex` or `image`, for a check report.
     pub fn kind(&self) -> &'static str {
-        self.package().format.as_str()
+        match self.package() {
+            Some(package) => package.format.as_str(),
+            None => "image",
+        }
     }
 
     /// Bind the run (17 f.4, f.7): a `.wasm` answers to the run's gate; a `.pex`'s stage
@@ -74,6 +114,12 @@ impl Packaged {
             Packaged::Wasm(k) => k.bind_gate(Arc::clone(gate)),
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => k.bind_run(Arc::clone(sampler), ceiling),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(k) => k.bind_run(ceiling),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => k.bind_run(Arc::clone(sampler), ceiling),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => k.bind_run(ceiling),
         }
         let _ = (sampler, ceiling);
     }
@@ -84,18 +130,23 @@ impl Packaged {
         let discovered = moruna_discovery::discover(&moruna_discovery::DiscoveryInput::default())?;
         let sampler: Arc<dyn Sampler> = Arc::new(moruna_discovery::Sampler::new(&discovered)?);
         let ceiling = discovered.limits.memory_ceiling;
-        let gate = moruna_adapters::guard::MemoryGate::new(Arc::clone(&sampler), ceiling);
+        let gate = moruna_adapters::guard::MemoryGate::new(Arc::clone(&sampler), ceiling)?;
         self.bind(&gate, &sampler, ceiling);
         Ok(())
     }
 
-    /// The stage's ports (MH 4.10): a `.wasm`'s `call` reaches them; a `.pex` calls none, and a
-    /// document that lists ports for one is refused before this.
+    /// The stage's ports (MH 4.10): a `.wasm`'s `call` reaches them, and an image's task's
+    /// `port_call` on the Moruna kernel (SDD 30 f.7); a `.pex` calls none, nor an image on a
+    /// Linux node, and a document that lists ports for one is refused before this.
     pub fn bind_ports(&self, ports: Arc<moruna_kernel::StagePorts>) {
         match self {
             Packaged::Wasm(k) => k.bind_ports(ports),
             #[cfg(target_os = "linux")]
-            Packaged::Pex(_) => {}
+            Packaged::Pex(_) | Packaged::Image(_) => {}
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => k.bind_ports(ports),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(_) => {}
         }
     }
 
@@ -108,7 +159,11 @@ impl Packaged {
                 }
             }
             #[cfg(target_os = "linux")]
-            Packaged::Pex(_) => {}
+            Packaged::Pex(_) | Packaged::Image(_) => {}
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => k.bind_run_ports(run),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(k) => k.bind_run_ports(run),
         }
     }
 
@@ -118,6 +173,13 @@ impl Packaged {
             Packaged::Wasm(_) => None,
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => Some(k.outside()),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(k) => Some(k.outside()),
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => Some(k.outside()),
+            // The task's account, which the kernel holds it to (SDD 30 f.11).
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => Some(k.outside()),
         }
     }
 
@@ -127,6 +189,12 @@ impl Packaged {
             Packaged::Wasm(_) => {}
             #[cfg(target_os = "linux")]
             Packaged::Pex(k) => k.limits_changed(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::NativePex(_) => {}
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => k.limits_changed(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(_) => {}
         }
     }
 }
@@ -151,6 +219,11 @@ pub fn open(
 
 #[cfg(target_os = "linux")]
 fn pex(package: Arc<Package>, host: &PackageHost, inputs: Inputs) -> Result<Packaged> {
+    #[cfg(target_arch = "x86_64")]
+    if moruna_micro::on_kernel() {
+        return crate::native_pex::NativePex::new(package, host, inputs)
+            .map(|kernel| Packaged::NativePex(Arc::new(kernel)));
+    }
     let missing = |option: &str| MorunaError::Config {
         name: "sandbox",
         msg: format!(
@@ -197,20 +270,39 @@ impl WithOutside {
         }
     }
 
-    fn held(&self) -> u64 {
-        self.outside.iter().map(|o| o.in_use()).sum()
+    fn held(&self) -> moruna_kernel::Result<u64> {
+        self.outside.iter().try_fold(0u64, |sum, outside| {
+            sum.checked_add(outside.in_use()?)
+                .ok_or_else(|| moruna_kernel::MorunaError::Config {
+                    name: "outside_memory",
+                    msg: "accounted byte total overflow".into(),
+                })
+        })
     }
 }
 
 impl Sampler for WithOutside {
-    fn sample(&self) -> moruna_kernel::Sample {
-        let mut sample = self.inner.sample();
-        let held = self.held();
-        sample.anon_bytes = sample.anon_bytes.saturating_add(held);
-        sample.peak_anon_bytes = sample.peak_anon_bytes.saturating_add(held);
+    fn memory_basis(&self) -> moruna_kernel::MemoryBasis {
+        self.inner.memory_basis()
+    }
+    fn sample(&self) -> moruna_kernel::Result<moruna_kernel::Sample> {
+        let mut sample = self.inner.sample()?;
+        let held = self.held()?;
+        sample.anon_bytes = sample.anon_bytes.checked_add(held).ok_or_else(|| {
+            moruna_kernel::MorunaError::Config {
+                name: "outside_memory",
+                msg: "sample byte total overflow".into(),
+            }
+        })?;
+        sample.peak_anon_bytes = sample.peak_anon_bytes.checked_add(held).ok_or_else(|| {
+            moruna_kernel::MorunaError::Config {
+                name: "outside_memory",
+                msg: "peak byte total overflow".into(),
+            }
+        })?;
         self.peak
             .fetch_max(sample.anon_bytes, std::sync::atomic::Ordering::AcqRel);
-        sample
+        Ok(sample)
     }
 
     fn reset_peak(&self) {
@@ -244,8 +336,8 @@ mod tests {
     struct Held(AtomicU64);
 
     impl OutsideMemory for Held {
-        fn in_use(&self) -> u64 {
-            self.0.load(Ordering::Acquire)
+        fn in_use(&self) -> moruna_kernel::Result<u64> {
+            Ok(self.0.load(Ordering::Acquire))
         }
     }
 
@@ -260,15 +352,15 @@ mod tests {
         }]));
         let child = Arc::new(Held(AtomicU64::new(50)));
         let sampler = WithOutside::new(inner, vec![child.clone() as Arc<dyn OutsideMemory>]);
-        let s = sampler.sample();
+        let s = sampler.sample().unwrap();
         assert_eq!(
             (s.anon_bytes, s.peak_anon_bytes, s.ceiling_bytes),
             (150, 150, 1000)
         );
         child.0.store(400, Ordering::Release);
-        assert_eq!(sampler.sample().anon_bytes, 500);
+        assert_eq!(sampler.sample().unwrap().anon_bytes, 500);
         child.0.store(0, Ordering::Release);
-        assert_eq!(sampler.sample().anon_bytes, 100);
+        assert_eq!(sampler.sample().unwrap().anon_bytes, 100);
         let peak = sampler.process_peak();
         assert!(peak.bytes >= 500 && !peak.exact, "{peak:?}");
         sampler.reset_peak();
@@ -326,5 +418,58 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn outside_read_failure_is_terminal_evidence_not_a_zero_or_stale_sample() {
+        struct Failed;
+        impl OutsideMemory for Failed {
+            fn in_use(&self) -> moruna_kernel::Result<u64> {
+                Err(moruna_kernel::MorunaError::Io {
+                    op: "read",
+                    target: "memory.current".into(),
+                    msg: "TEST-ONLY account unavailable".into(),
+                })
+            }
+        }
+        let inner: Arc<dyn Sampler> = Arc::new(FakeSampler::new().scripted(vec![Sample {
+            anon_bytes: 100,
+            ..Sample::default()
+        }]));
+        let sampler = WithOutside::new(inner, vec![Arc::new(Failed)]);
+        assert!(
+            matches!(sampler.sample(),Err(moruna_kernel::MorunaError::Io{target,msg,..})if target=="memory.current"&&msg.contains("account unavailable"))
+        );
+    }
+    #[test]
+    fn native_basis_and_child_reservation_are_forwarded_once() {
+        struct Charged;
+        impl moruna_kernel::Sampler for Charged {
+            fn memory_basis(&self) -> moruna_kernel::MemoryBasis {
+                moruna_kernel::MemoryBasis::NativeAccountCharge
+            }
+            fn sample(&self) -> moruna_kernel::Result<moruna_kernel::Sample> {
+                Ok(moruna_kernel::Sample {
+                    anon_bytes: 40,
+                    ..Default::default()
+                })
+            }
+            fn reset_peak(&self) {}
+            fn process_peak(&self) -> moruna_kernel::ProcessPeak {
+                Default::default()
+            }
+        }
+        struct Child;
+        impl moruna_kernel::OutsideMemory for Child {
+            fn in_use(&self) -> moruna_kernel::Result<u64> {
+                Ok(200)
+            }
+        }
+        let sampler = WithOutside::new(Arc::new(Charged), vec![Arc::new(Child)]);
+        assert_eq!(sampler.sample().unwrap().anon_bytes, 240);
+        assert_eq!(
+            sampler.memory_basis(),
+            moruna_kernel::MemoryBasis::NativeAccountCharge
+        );
+        assert!(!sampler.process_usage().measured);
     }
 }

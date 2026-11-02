@@ -562,23 +562,27 @@ fn rt_t9_checkpoint_on_demand_and_resume_auto() {
     spec.checkpoint_interval_ms = 600_000;
     spec.resume_auto = true;
     spec.staging_durable = true;
+    let (running, started) = std::sync::mpsc::channel();
     let components = moruna_runtime::Components {
         checkpoint: Some(handle.clone()),
+        stage_hook: Some(Arc::new(move |event| {
+            if matches!(event, moruna_kernel::StageEvent::Running) {
+                running
+                    .send(())
+                    .expect("the checkpoint requester is waiting");
+            }
+        })),
         ..moruna_runtime::Components::default()
     };
     let asker = handle.clone();
     let (report, asked) = std::thread::scope(|scope| {
         let asked = scope.spawn(move || {
-            let start = std::time::Instant::now();
-            while !asker.is_attached() {
-                assert!(
-                    start.elapsed() < std::time::Duration::from_secs(60),
-                    "the run never attached the handle"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            // Attached as soon as the scheduler exists; the checkpoint thread starts at `run`,
-            // so the first requests may wait for it.
+            // Attachment includes Init. Wait for the scheduler's real Running
+            // event; requests can then queue while its checkpoint thread starts.
+            started
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the run entered Running");
+            assert!(asker.is_attached(), "the running run has its handle");
             let path = asker
                 .checkpoint_within(std::time::Duration::from_secs(60))
                 .expect("a manifest on demand");

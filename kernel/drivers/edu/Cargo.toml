@@ -1,0 +1,12 @@
+[package]
+name = "edu"
+description = "A driver for QEMU's edu test device: a process on the Moruna microkernel serving moruna.test.edu, added to the driver table with no kernel change"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-pci = { path = "../pci", version = "=0.1.0" }
+edu-protocol = { path = "../edu-protocol", version = "=0.1.0" }

@@ -53,3 +53,12 @@ moruna.polars(fn, *, accepts="table", **declarations) -> moruna.KernelSpec
 ```
 
 Wraps an unannotated Polars function taking and returning a `DataFrame` or `LazyFrame`. `accepts` has the same choices as `moruna.kernel`. Supported declaration names are `input_schema`, `output_schema`, and `lockfile`, with the same meanings above. Returns a stateless `KernelSpec`.
+
+## `moruna.build`
+
+```python
+moruna.build(fn, *, out="moruna-image", tag=None, platform=None, lock=None, files=(),
+             index_url=None, find_links=(), no_index=False) -> Built
+```
+
+Builds the kernel `fn`, bound to a name at the top level of its module, as an OCI image the `image` kind runs. It is `moruna build MODULE:FUNCTION` from Python: see [Command line](cli.md). `out` is the OCI layout directory, `tag` the image's name in it (default `<function>:latest`), `platform` `linux/aarch64` or `linux/x86_64`, `lock` a `uv.lock` or `requirements.lock` (default: the nearest above the module), and `files` the files the function reads. The returned object has `digest` (the image's), `reference`, `layout`, `lock`, and `layers`, each with `role`, `blob.digest` and `blob.size`. A refused build raises `moruna.ConfigError` naming the cause.

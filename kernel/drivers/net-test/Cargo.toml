@@ -1,0 +1,12 @@
+[package]
+name = "net-test"
+description = "NT-T7 to NT-T9: the net protocol's suites against virtio-net on two cards the boot joins by a socket, and frames a second through them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+net-protocol = { path = "../net-protocol", version = "=0.1.0" }
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

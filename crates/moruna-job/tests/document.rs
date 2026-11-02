@@ -259,6 +259,7 @@ fn declared(role: Role) -> Declaration {
         deterministic: Fact::Yes,
         preserves_columns: Fact::Yes,
         isolation: Isolation::Builtin,
+        served: None,
     }
 }
 
@@ -404,4 +405,30 @@ fn jb_t20_listing_reads_back() {
         listing
     );
     assert!(text.contains("\n  "), "indented for a person");
+}
+
+/// JB-T40: `checkpoint.interval_ms` is clamped by one function every reader uses: below the
+/// range to 500 ms and above it to 60,000 ms, each with its note; inside it, unchanged and
+/// without one.
+#[test]
+fn jb_t40_the_checkpoint_interval_is_clamped_once() {
+    use moruna_job::{CHECKPOINT_INTERVAL_BOUNDS_MS, checkpoint_interval_ms};
+    assert_eq!(CHECKPOINT_INTERVAL_BOUNDS_MS, (500, 60_000));
+    assert_eq!(
+        checkpoint_interval_ms(100),
+        (
+            500,
+            Some("clamped checkpoint.interval_ms from 100 to 500".to_string())
+        )
+    );
+    assert_eq!(
+        checkpoint_interval_ms(90_000),
+        (
+            60_000,
+            Some("clamped checkpoint.interval_ms from 90000 to 60000".to_string())
+        )
+    );
+    assert_eq!(checkpoint_interval_ms(5_000), (5_000, None));
+    assert_eq!(checkpoint_interval_ms(500), (500, None));
+    assert_eq!(checkpoint_interval_ms(60_000), (60_000, None));
 }

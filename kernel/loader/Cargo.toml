@@ -1,0 +1,9 @@
+[package]
+name = "moruna-loader"
+description = "The Moruna microkernel's boot-time readers: the cpio newc initramfs and static ELF64 executables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

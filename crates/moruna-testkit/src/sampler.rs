@@ -1,6 +1,6 @@
 //! `FakeSampler`, the `Sampler` fake of contracts d.15.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moruna_kernel::{ProcessPeak, Sample, Sampler};
@@ -10,6 +10,7 @@ struct Inner {
     cursor: AtomicU64,
     live: bool,
     samples_taken: AtomicU64,
+    fail_reads: AtomicBool,
     peak_resets: AtomicU64,
     /// The highest of every sample handed out, as `process_peak` reports it.
     peak: Mutex<ProcessPeak>,
@@ -38,12 +39,18 @@ impl FakeSampler {
                 cursor: AtomicU64::new(0),
                 live: false,
                 samples_taken: AtomicU64::new(0),
+                fail_reads: AtomicBool::new(false),
                 peak_resets: AtomicU64::new(0),
                 peak: Mutex::new(ProcessPeak::default()),
             }),
         }
     }
 
+    /// Test knob: make actual Sampler calls return a typed accounting read error.
+    /// No prior/zero sample is returned while this is set.
+    pub fn set_read_failure(&self, failed: bool) {
+        self.inner.fail_reads.store(failed, Ordering::SeqCst);
+    }
     /// Knob: return this sequence of samples, then repeat the last one.
     pub fn scripted(self, samples: Vec<Sample>) -> FakeSampler {
         {
@@ -63,6 +70,7 @@ impl FakeSampler {
                 cursor: AtomicU64::new(self.inner.cursor.load(Ordering::SeqCst)),
                 live: true,
                 samples_taken: AtomicU64::new(self.samples_taken()),
+                fail_reads: AtomicBool::new(self.inner.fail_reads.load(Ordering::SeqCst)),
                 peak_resets: AtomicU64::new(self.peak_resets()),
                 peak: Mutex::new(self.process_peak()),
             }),
@@ -117,8 +125,15 @@ impl FakeSampler {
 }
 
 impl Sampler for FakeSampler {
-    fn sample(&self) -> Sample {
+    fn sample(&self) -> moruna_kernel::Result<Sample> {
         self.inner.samples_taken.fetch_add(1, Ordering::SeqCst);
+        if self.inner.fail_reads.load(Ordering::SeqCst) {
+            return Err(moruna_kernel::MorunaError::Io {
+                op: "read",
+                target: "TEST-ONLY sampler".into(),
+                msg: "accounting source unavailable".into(),
+            });
+        }
         let sample = self.next_sample();
         let bytes = sample.anon_bytes.max(sample.peak_anon_bytes);
         let mut peak = self.inner.peak.lock().unwrap_or_else(|e| e.into_inner());
@@ -130,7 +145,7 @@ impl Sampler for FakeSampler {
                 since_ns: sample.at_ns,
             };
         }
-        sample
+        Ok(sample)
     }
 
     fn reset_peak(&self) {

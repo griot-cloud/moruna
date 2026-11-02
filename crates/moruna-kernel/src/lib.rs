@@ -13,10 +13,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod buffer;
+pub mod catalog;
 pub mod completion;
 pub mod declare;
 pub mod error;
 pub mod fingerprint;
+pub mod graph;
 pub mod ids;
 pub mod ipc;
 pub mod kernel;
@@ -27,6 +29,7 @@ pub mod mrb1;
 pub mod output;
 pub mod payload;
 pub mod placement;
+pub mod policy;
 pub mod ports;
 pub mod reactor;
 pub mod sink;
@@ -45,29 +48,39 @@ pub use arrow;
 pub use dlpark;
 
 pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
+pub use catalog::{
+    BatchView, BufferId, CatalogEvent, CatalogFloor, CatalogObserver, CatalogSnapshot, ClaimHolder,
+    DEFAULT_PROMOTION_WINDOW, Future, Head, Location, Reservation, Reserve, Residency,
+};
 pub use completion::{Completion, CompletionSender, Dispatch};
 pub use declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, TypeDecl};
 pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
+pub use graph::{Affine, Consumer, Link, MAX_PATHS, Producer, Topology};
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{
     AllocCounts, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind, KernelState,
-    NoState, ResumePolicy, set_kernel_alloc, take_kernel_alloc,
+    LogicalRows, LogicalTaskRows, NoState, ResumePolicy, set_kernel_alloc, take_kernel_alloc,
 };
 pub use knobs::{
     CancelToken, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, RecordHook,
     SchedulerStats, SizerKind, StageStats, StatsSource,
 };
 pub use limits::{
-    Device, Guarantee, HostProfile, LimitSource, Limits, OutsideMemory, ProcessPeak, ProcessUsage,
-    Sample, Sampler,
+    Device, Guarantee, HostProfile, LimitSource, Limits, MemoryBasis, OutsideMemory, ProcessPeak,
+    ProcessUsage, Sample, Sampler,
 };
 pub use morsel::{Morsel, MorselFeatures, Origin};
 pub use output::{Level, OutputSink, Stream};
 pub use payload::{DType, Payload, PayloadKind, PayloadSpec, SourceSchema, TierPref};
 pub use placement::{
-    CheckpointExtras, Locality, Placement, PlacementStats, QueueStats, ResumePoint, SourceCursor,
-    TierBudgets,
+    CatalogStats, CheckpointExtras, Locality, Placement, PlacementStats, QueueStats, ResumePoint,
+    SourceCursor, TierBudgets,
+};
+pub use policy::{
+    Action, DriftStat, LearningStats, Machine, Overhead, PolicyAdapter, PolicyCounters, PolicyId,
+    PolicyStats, PortView, PredictedBy, Prediction, Reads, Ready, SchedulerState,
+    SchedulingPolicies, SchedulingPolicy, Spread, StageView, is_policy_name,
 };
 pub use ports::{
     Abandon, Answer, CallFailure, GuestCall, GuestPort, GuestRoute, Port, PortCall, Route,

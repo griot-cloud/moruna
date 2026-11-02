@@ -1,0 +1,11 @@
+[package]
+name = "moruna-nvme"
+description = "NVMe over PCI for Moruna drivers: the controller's registers, admin and I/O queue pairs, commands and completions, PRP lists and Identify, in safe Rust, every value the device returns checked"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true
+moruna-mmio = { path = "../mmio", version = "=0.1.0" }

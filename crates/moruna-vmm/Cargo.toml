@@ -6,34 +6,52 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Moruna packaged as a microVM: the monitor that boots the Moruna guest on KVM"
+description = "Explicit native Moruna microkernel artifact launcher with owned Linux KVM processes"
 
 [[bin]]
 name = "moruna-vmm"
 path = "src/main.rs"
+
+# The vsock device as a vhost-user back end, for a QEMU machine with no vhost-vsock module
+# (SDD 30 f.11): the boot's vsock on this repository's proof machines.
+[[bin]]
+name = "moruna-vhost-vsock"
+path = "src/bin/moruna-vhost-vsock.rs"
 
 [dependencies]
 moruna-kernel = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# A job document version 2 is FlatBuffers, relayed to the guest as base64 (SDD 22 e.4).
+base64 = { workspace = true }
 libc = { workspace = true }
-vm-memory = { workspace = true }
-virtio-queue = { workspace = true }
-virtio-bindings = { workspace = true }
-vm-superio = { workspace = true }
-vm-fdt = { workspace = true }
-acpi_tables = { workspace = true }
-linux-loader = { workspace = true }
 sha2 = { workspace = true }
 
+# The actual vhost-user server is portable Linux userspace, independent of KVM.
 [target.'cfg(target_os = "linux")'.dependencies]
+vm-memory = { workspace = true }
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
 kvm-ioctls = { workspace = true }
 kvm-bindings = { workspace = true }
 vmm-sys-util = { workspace = true }
 
 [dev-dependencies]
+vm-memory = { workspace = true }
+virtio-bindings = { workspace = true }
+vm-superio = { workspace = true }
+vm-fdt = { workspace = true }
+acpi_tables = { workspace = true }
+linux-loader = { workspace = true }
 virtio-queue = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []
+# Explicit proof-only software-emulated boot, never a production KVM fallback.
+native-tcg-proof = []
+
+# Explicit fixture command/console proof only; production launcher stays strict KVM.
+kd3-conformance-proof = ["native-tcg-proof"]

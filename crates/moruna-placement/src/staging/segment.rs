@@ -144,7 +144,7 @@ impl PlacementEngine {
     pub(crate) fn segment_path(&self, segment: u32) -> Option<PathBuf> {
         self.run_dir
             .as_ref()
-            .map(|dir| dir.join(format!("seg-{segment:06}.seg")))
+            .map(|dir| crate::manifest::segment_file(dir, segment))
     }
 
     /// Find room for a record of `need` bytes in the queue's active segment, rolling to a

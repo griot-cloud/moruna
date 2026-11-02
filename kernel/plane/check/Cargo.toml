@@ -1,0 +1,9 @@
+[package]
+name = "moruna-ipc-check"
+description = "The Arrow IPC check (contracts CT-I13, e.8) in no_std safe Rust: a bounds-checked flatbuffer reader, the schema and record batch walk, the page-aligned record's framing, and the data plane's record check (SDD 29)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

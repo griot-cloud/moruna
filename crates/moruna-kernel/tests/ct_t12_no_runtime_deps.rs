@@ -47,8 +47,9 @@ fn ct_t12_no_runtime_deps() {
         );
     }
 
-    // The dependencies it does have are the four the preamble's table allows (6.1, 6.2).
-    for expected in ["arrow", "dlpark", "thiserror", "blake3"] {
+    // The dependencies it does have are the four the preamble's table allows (6.1, 6.2), and the
+    // type grammar (`moruna-types`, KA6), a workspace crate that depends on nothing.
+    for expected in ["arrow", "dlpark", "thiserror", "blake3", "moruna-types"] {
         assert!(names.contains(&expected), "{expected} is missing:\n{tree}");
     }
 }

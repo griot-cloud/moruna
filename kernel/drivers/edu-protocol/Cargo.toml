@@ -1,0 +1,10 @@
+[package]
+name = "edu-protocol"
+description = "moruna.test.edu: the protocol of the driver for QEMU's edu test device, and its conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

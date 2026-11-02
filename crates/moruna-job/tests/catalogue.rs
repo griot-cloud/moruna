@@ -38,13 +38,15 @@ fn declaration(role: Role, name: &str) -> Declaration {
         deterministic: Fact::Yes,
         preserves_columns: Fact::Yes,
         isolation: Isolation::Builtin,
+        served: None,
     }
 }
 
-/// JB-T1 dependencies_are_the_four: the crate an embedder depends on names `serde`,
-/// `serde_json`, `schemars` and `thiserror`, and nothing else, in its dependencies (SDD 22 JB-I1).
+/// JB-T1 dependencies_are_the_seven: the crate an embedder depends on names `flatbuffers`,
+/// `flexbuffers`, `moruna-types`, `serde`, `serde_json`, `schemars` and `thiserror`, and nothing
+/// else, in its dependencies (SDD 22 JB-I1).
 #[test]
-fn jb_t1_dependencies_are_the_four() {
+fn jb_t1_dependencies_are_the_seven() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("the manifest");
     let mut section = "";
@@ -64,10 +66,18 @@ fn jb_t1_dependencies_are_the_four() {
         }
     }
     found.sort();
-    let wanted: Vec<(String, String)> = ["schemars", "serde", "serde_json", "thiserror"]
-        .iter()
-        .map(|n| ("dependencies".to_string(), n.to_string()))
-        .collect();
+    let wanted: Vec<(String, String)> = [
+        "flatbuffers",
+        "flexbuffers",
+        "moruna-types",
+        "schemars",
+        "serde",
+        "serde_json",
+        "thiserror",
+    ]
+    .iter()
+    .map(|n| ("dependencies".to_string(), n.to_string()))
+    .collect();
     assert_eq!(found, wanted);
 }
 
@@ -80,7 +90,7 @@ fn jb_t2_embedded_catalogues() {
         names(&standard, Role::Source),
         ["arrow_ipc", "parquet", "tensor", "vortex"]
     );
-    assert_eq!(names(&standard, Role::Kernel), ["package", "std"]);
+    assert_eq!(names(&standard, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&standard, Role::Sink),
         ["arrow_ipc", "parquet", "tensor", "vortex"]
@@ -90,7 +100,7 @@ fn jb_t2_embedded_catalogues() {
         names(&governed, Role::Source),
         ["arrow_ipc", "datafusion", "parquet", "tensor", "vortex"]
     );
-    assert_eq!(names(&governed, Role::Kernel), ["package", "std"]);
+    assert_eq!(names(&governed, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&governed, Role::Sink),
         ["arrow_ipc", "parquet", "peql", "tensor", "vortex"]

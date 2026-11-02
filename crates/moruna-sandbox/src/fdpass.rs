@@ -71,8 +71,8 @@ mod tests {
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
         msg.msg_controllen = control.len() as _;
-        // SAFETY: as above.
-        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        // SAFETY: as above. The descriptors arrive close-on-exec, as every one the test makes.
+        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
         assert!(n >= 0);
         let mut fds = Vec::new();
         // SAFETY: walking the headers the kernel wrote into `control`.
@@ -106,9 +106,53 @@ mod tests {
         assert_eq!(&got, b"ok");
         drop(x);
         assert!(send_with_fds(&a, b"", &[]).is_err());
-        // A peer that is gone: the send fails with its cause, no signal.
+        peer_gone(&a, b);
+    }
+
+    /// A peer that is gone: the send fails with its cause, no signal. The peer ends with
+    /// `shutdown`, which acts on the socket, not with dropping `b`, which closes only this
+    /// process's descriptor of it. Other tests of this binary fork children that never exec
+    /// (seccomp, confine), and a child forked while `b` is open holds a copy of it until it
+    /// exits; close-on-exec does not close it, because there is no exec. Dropping `b` then
+    /// left the socket open and the send succeeded.
+    fn peer_gone(a: &UnixStream, b: UnixStream) {
+        b.shutdown(std::net::Shutdown::Both).unwrap();
         drop(b);
-        let e = send_with_fds(&a, b"late", &[]).unwrap_err();
+        let e = send_with_fds(a, b"late", &[]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+    }
+
+    /// The interleaving that failed, made certain: a forked child holds `b` (as a child of
+    /// another test does when it forks between `pair` and the end of the test above) for as
+    /// long as the send takes, and the peer is still gone.
+    #[test]
+    fn a_peer_held_by_a_forked_child_is_still_gone() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (hold, release) = UnixStream::pair().unwrap();
+        // SAFETY: the child closes its copy of `release`, blocks in `read` on `hold` and
+        // `_exit`s; every other descriptor it inherited, `b` among them, stays open until then.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let mut byte = [0u8; 1];
+            // SAFETY: closing a descriptor this child owns, a read into a live one-byte buffer,
+            // then the end of the child. With its own `release` closed, the read ends when the
+            // parent writes or when the parent's `release` closes, a failed assertion included.
+            unsafe {
+                libc::close(release.as_raw_fd());
+                libc::read(hold.as_raw_fd(), byte.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        drop(hold);
+        peer_gone(&a, b);
+        (&release).write_all(b"x").unwrap();
+        let mut status = 0;
+        // SAFETY: waiting for the child this test forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{status:#x}"
+        );
     }
 }

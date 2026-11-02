@@ -3,19 +3,43 @@
 //! `Reinit` ones, and refuses to resume a sink that cannot say what it committed. f.13, S17.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use moruna_kernel::{CancelToken, Fingerprint, MorunaError, Placement, ResumePoint, Sink, Source};
 use moruna_testkit::{FakePlacement, FakeSink, FakeSource};
 
-use super::common::{Latch, RigBuilder, StatefulKernel, manifest_lock, wait_for};
+use super::common::{HeldSource, Release, RigBuilder, StatefulKernel, manifest_lock, wait_for};
 
 const SPLITS: u32 = 4;
 const ROWS: u64 = 60;
+/// The first split whose reads the killed run holds pending.
+const HELD_FROM: u32 = 2;
+/// The sink commits every this many sequence numbers.
+const COMMIT_EVERY: u64 = 10;
 
 fn source() -> FakeSource {
     FakeSource::new().splits(SPLITS, ROWS, ROWS * 8)
+}
+
+/// The reads of the splits before the held ones: one per morsel, and the lowest sequence
+/// numbers, since the splits are read in plan order. Final once a held read is pending.
+fn unheld_reads(source: &FakeSource) -> u64 {
+    source
+        .reads()
+        .iter()
+        .filter(|(split, _)| *split < HELD_FROM)
+        .count() as u64
+}
+
+/// True once a held read is pending and the watermark covers every whole block of
+/// `commit_every` the unheld morsels make: everything the held run can commit, it has.
+fn committed_all_it_can(source: &FakeSource, pending: &AtomicUsize, sink: &FakeSink) -> bool {
+    if pending.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let blocks = unheld_reads(source) / COMMIT_EVERY;
+    blocks > 0 && Sink::committed_seq(sink) == Some(blocks * COMMIT_EVERY - 1)
 }
 
 #[test]
@@ -30,7 +54,7 @@ fn sc_t16_resume_equivalence() {
             cfg.initial_morsel_target = 8;
         })
         .source(source())
-        .sink(FakeSink::new().resumable(true).commit_every(10))
+        .sink(FakeSink::new().resumable(true).commit_every(COMMIT_EVERY))
         .stages(3)
         .go();
     match reference.scheduler.run(CancelToken::new()) {
@@ -43,14 +67,21 @@ fn sc_t16_resume_equivalence() {
     // The run that is killed. `FakePlacement`'s manifest store is process wide and keyed on one
     // path, so the resumed engine finds this run's manifest.
     let placement = FakePlacement::new().with_manifest_store();
-    let sink = FakeSink::new().resumable(true).commit_every(10);
-    // The kill lands in the middle of the run because the run cannot get past the latch, not
-    // because the host was slow enough: a kernel latency only made a completed first run
-    // unlikely, and this test asserted `Cancelled` about it. The latch sits at the last stage,
-    // so the morsels it lets through reach the sink and move the watermark, and the ones behind
-    // it are what the resume has to recompute. Stages 1 and 2 keep their instances free, so the
-    // checkpoint thread can still take them for `KernelState::checkpoint` (f.12).
-    let gate = Latch::after(20);
+    let sink = FakeSink::new().resumable(true).commit_every(COMMIT_EVERY);
+    // The kill lands in the middle of the run because the run cannot finish, not because the
+    // host was slow enough: a kernel latency only made a completed first run unlikely, and this
+    // test asserted `Cancelled` about it. The reads of the last two splits stay pending until
+    // the test lets them go, so the run is held with reads in flight, which the manifest names
+    // and the resume reads again (MH 4.7). The first two splits are read in full first, and
+    // they are the lowest sequence numbers, so every one of them reaches the sink and the
+    // watermark moves whatever order the workers take them in. A latch at the last stage that
+    // let through the first calls to arrive did not promise that: a worker the host descheduled
+    // holding a low sequence let the other fill the latch's quota with later ones, the low one
+    // was then held, the sink never committed, and the test waited on that commit for ever.
+    let reads = source();
+    let held = HeldSource::new(reads.clone(), HELD_FROM);
+    let release = held.release.clone();
+    let pending = held.pending.clone();
     let checkpointing = Arc::new(StatefulKernel::new(2).checkpointing());
     let reinit = Arc::new(StatefulKernel::new(2));
     let first = RigBuilder::new()
@@ -61,12 +92,12 @@ fn sc_t16_resume_equivalence() {
             cfg.checkpoint_enabled = true;
             cfg.checkpoint_interval_ms = 10;
         })
-        .source(source())
+        .source_over(Arc::new(held))
         .sink(sink.clone())
         .placement(placement.clone())
         .kernel(checkpointing.clone())
         .kernel(reinit.clone())
-        .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
+        .kernel(Arc::new(StatefulKernel::new(0)))
         .go();
     if let Err(e) = first.scheduler.init_instances() {
         panic!("init_instances: {e}");
@@ -75,19 +106,31 @@ fn sc_t16_resume_equivalence() {
     let token = cancel.clone();
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| first.scheduler.run(token));
+        let _release = Release(|| {
+            cancel.cancel();
+            release.store(true, Ordering::SeqCst);
+        });
         assert!(
-            wait_for(Duration::from_secs(5), || {
-                Sink::committed_seq(&first.sink).is_some()
+            wait_for(Duration::from_secs(30), || {
+                committed_all_it_can(&reads, &pending, &first.sink)
                     && !first.fake_placement.manifests_written().is_empty()
             }),
-            "the first run never committed anything"
+            "the first run never committed the splits before the held ones"
         );
-        assert!(
-            gate.wait_holding(Duration::from_secs(30)),
-            "the latch never held a morsel, so the run was not still in flight"
-        );
+        // Cancelled, and released only once the engine is shut down: the drive lets its reads
+        // resolve before it ends (f.10), a read that resolves then is refused by the engine, so
+        // it is never pushed and stays issued in the final manifest, which restore hands back.
+        // Released any earlier, a read could be pushed and carried to the sink before the
+        // shutdown, and the kill would leave nothing to recompute.
         cancel.cancel();
-        gate.open();
+        assert!(
+            wait_for(Duration::from_secs(30), || first
+                .fake_placement
+                .shutdown_calls()
+                > 0),
+            "the cancelled run never shut its engine down"
+        );
+        release.store(true, Ordering::SeqCst);
         match handle.join() {
             Ok(Ok(crate::RunOutcome::Cancelled { .. })) => {}
             other => panic!("the first run was meant to be cancelled mid-flight, got {other:?}"),
@@ -97,7 +140,6 @@ fn sc_t16_resume_equivalence() {
         Some(path) => path,
         None => panic!("the first run wrote no manifest"),
     };
-    let reads_before = first.source.reads().len();
     drop(first);
 
     // The resumed run, over a restored engine.
@@ -107,13 +149,13 @@ fn sc_t16_resume_equivalence() {
         Err(e) => panic!("plan: {e}"),
     };
     let point: ResumePoint =
-        match resumed_placement.restore(&manifest, &plan, &[] as &[Fingerprint]) {
+        match resumed_placement.restore(&manifest, &[plan], &[] as &[Fingerprint]) {
             Ok(point) => point,
             Err(e) => panic!("restore: {e}"),
         };
-    let committed = point.extras.committed_seq;
-    let point_next_seq = point.extras.source_cursor.next_seq;
-    let issued_at_kill: Vec<u64> = point.extras.issued.iter().map(|(seq, _)| *seq).collect();
+    let committed = point.extras.committed[0];
+    let point_next_seq = point.extras.source_cursors[0].next_seq;
+    let issued_at_kill: Vec<u64> = point.extras.issued[0].iter().map(|(seq, _)| *seq).collect();
     for seq in &issued_at_kill {
         assert!(
             *seq < point_next_seq,
@@ -121,11 +163,11 @@ fn sc_t16_resume_equivalence() {
         );
         assert!(
             committed.is_none_or(|watermark| *seq > watermark)
-                == point.to_recompute.iter().any(|(s, _)| s == seq),
+                == point.to_recompute[0].iter().any(|(s, _)| s == seq),
             "restore hands back every issued read above the watermark, and only those (MH 4.7)"
         );
     }
-    let to_recompute = point.to_recompute.len();
+    let to_recompute = point.to_recompute[0].len();
 
     assert!(
         to_recompute > 0,
@@ -147,9 +189,7 @@ fn sc_t16_resume_equivalence() {
         .placement(resumed_placement)
         .kernel(second_checkpointing.clone())
         .kernel(second_reinit.clone())
-        // The same chain the killed run had, latch and all: the latch of the first run is open
-        // by now and holds nothing.
-        .kernel(Arc::new(StatefulKernel::new(0).gated(gate.clone())))
+        .kernel(Arc::new(StatefulKernel::new(0)))
         .go();
     if let Err(e) = second.scheduler.apply_resume_point(point) {
         panic!("apply_resume_point: {e}");
@@ -239,11 +279,70 @@ fn sc_t16_resume_equivalence() {
         reads.len() < SPLITS as usize * ROWS as usize,
         "the resumed run re-read the whole input"
     );
-    let _ = reads_before;
     assert!(
         watermark < SPLITS as u64 * ROWS,
         "the watermark is inside the run"
     );
+}
+
+/// The interleaving that left SC-T16's first run without a commit, made certain: the worker
+/// with sequence 0 is kept in stage 1 until the other has carried every other morsel of the
+/// splits before the held ones to the sink. Sequence 0 still gets there, so the watermark moves
+/// and covers all of them, and the run is still held by its pending reads. The latch this
+/// replaced held the first calls past its quota whatever their sequence, so it held sequence 0
+/// here every time and the sink never committed.
+#[test]
+fn sc_t16_the_lowest_sequence_reaching_the_sink_last_still_commits() {
+    let reads = source();
+    let held = HeldSource::new(reads.clone(), HELD_FROM);
+    let release = held.release.clone();
+    let pending = held.pending.clone();
+    let sink = FakeSink::new().resumable(true).commit_every(COMMIT_EVERY);
+    let (watched, counted, waiting) = (sink.clone(), reads.clone(), pending.clone());
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 2;
+            cfg.workers_active = 2;
+            cfg.initial_morsel_target = 8;
+        })
+        .source_over(Arc::new(held))
+        .sink(sink)
+        .kernel(Arc::new(StatefulKernel::new(0).stalling(
+            0,
+            Arc::new(move || {
+                waiting.load(Ordering::SeqCst) > 0
+                    && watched.written().len() as u64 + 1 >= unheld_reads(&counted)
+            }),
+        )))
+        .kernel(Arc::new(StatefulKernel::new(0)))
+        .kernel(Arc::new(StatefulKernel::new(0)))
+        .go();
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| rig.scheduler.run(token));
+        let _release = Release(|| {
+            cancel.cancel();
+            release.store(true, Ordering::SeqCst);
+        });
+        assert!(
+            wait_for(Duration::from_secs(30), || committed_all_it_can(
+                &reads, &pending, &rig.sink
+            )),
+            "the sink never committed the splits before the held ones: {:?}",
+            Sink::committed_seq(&rig.sink)
+        );
+        assert!(
+            rig.sink.written().contains(&0),
+            "sequence 0, kept back behind every other, reached the sink"
+        );
+        cancel.cancel();
+        release.store(true, Ordering::SeqCst);
+        match handle.join() {
+            Ok(Ok(crate::RunOutcome::Cancelled { .. })) => {}
+            other => panic!("the run was meant to be cancelled while held, got {other:?}"),
+        }
+    });
 }
 
 #[test]

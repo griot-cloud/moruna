@@ -75,27 +75,46 @@ fn host(python: Option<String>, cgroup: Option<String>) -> PackageHost {
     }
 }
 
-/// `_core.check_package(path, *, seed, profiles_dir, sandbox_python, sandbox_cgroup)`: the
-/// harness of MH 4.9 through the package's runtime (16 f.9); the JSON report plus `summary`.
+/// `_core.check_package(path, *, seed, warm_up, store, budget, statistics, model,
+/// sandbox_python, sandbox_cgroup, args, assets)`: the harness of MH 4.9 through the package's
+/// runtime (16 f.9), warmed up through it unless `warm_up` is false; the JSON report plus
+/// `summary`.
 #[pyfunction]
-#[pyo3(signature = (path, *, seed = 0, profiles_dir = None, sandbox_python = None, sandbox_cgroup = None, args = None, assets = None))]
+#[pyo3(signature = (path, *, seed = 0, warm_up = true, store = None, budget = 60.0, statistics = None, model = None, sandbox_python = None, sandbox_cgroup = None, args = None, assets = None, cost = None))]
 #[allow(clippy::too_many_arguments)]
 pub fn check_package(
     py: Python<'_>,
     path: &str,
     seed: u64,
-    profiles_dir: Option<String>,
+    warm_up: bool,
+    store: Option<String>,
+    budget: f64,
+    statistics: Option<String>,
+    model: Option<String>,
     sandbox_python: Option<String>,
     sandbox_cgroup: Option<String>,
     args: Option<String>,
     assets: Option<String>,
+    cost: Option<PyRef<'_, crate::engine::PyCostSession>>,
 ) -> PyResult<String> {
+    let _guard = crate::run::RunningGuard::acquire()
+        .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
     let host = host(sandbox_python, sandbox_cgroup);
     let inputs = inputs(args.as_deref(), assets)?;
+    let cost_settings = cost.map(|cost| cost.settings());
     let path = PathBuf::from(path);
-    let profiles = profiles_dir.map(PathBuf::from);
     let report = py
-        .detach(move || check_through_runtime(&path, seed, profiles, &host, inputs))
+        .detach(move || {
+            let warm = crate::check::warm_up_of(
+                warm_up,
+                store.as_deref(),
+                budget,
+                statistics.as_deref(),
+                model.as_deref(),
+                cost_settings,
+            )?;
+            check_through_runtime(&path, seed, warm, &host, inputs)
+        })
         .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
     let mut json = report.to_json();
     if let serde_json::Value::Object(map) = &mut json {
@@ -273,7 +292,15 @@ pub fn load(
             Ok((packaged, arena, state))
         })
         .map_err(|e| to_py_err(py, &e, Attachments::default()))?;
-    let package = packaged.package();
+    let package = packaged.package().cloned().ok_or_else(|| {
+        to_py_err(
+            py,
+            &moruna_kernel::MorunaError::Plan(
+                "moruna.load opens a package, and an image is not one".into(),
+            ),
+            Attachments::default(),
+        )
+    })?;
     Ok(PyPackageKernel {
         path: path.to_string(),
         fingerprint: package.fingerprint_string(),

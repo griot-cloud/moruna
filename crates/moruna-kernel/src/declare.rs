@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use moruna_types::{ColumnType, TimeUnit as GrammarUnit, TypeName};
 
 use crate::error::MorunaError;
 
@@ -421,147 +422,126 @@ pub fn json_string(s: &str) -> String {
     out
 }
 
-/// The canonical spelling of an Arrow type in the type grammar (MH 4.9). It is pyarrow's
-/// `str(type)` for every type the grammar has, so a declaration written in either language reads
-/// the same in a report.
+/// The canonical spelling of an Arrow type in the type grammar (MH 4.9): the spelling of the
+/// description that names it (`moruna_types`, the grammar's one writer), which is pyarrow's
+/// `str(type)`, so a declaration written in either language reads the same in a report. A type
+/// the grammar does not have is spelled as Arrow prints it.
 pub fn type_name(dt: &DataType) -> String {
-    match dt {
-        DataType::Null => "null".into(),
-        DataType::Boolean => "bool".into(),
-        DataType::Int8 => "int8".into(),
-        DataType::Int16 => "int16".into(),
-        DataType::Int32 => "int32".into(),
-        DataType::Int64 => "int64".into(),
-        DataType::UInt8 => "uint8".into(),
-        DataType::UInt16 => "uint16".into(),
-        DataType::UInt32 => "uint32".into(),
-        DataType::UInt64 => "uint64".into(),
-        DataType::Float16 => "halffloat".into(),
-        DataType::Float32 => "float".into(),
-        DataType::Float64 => "double".into(),
-        DataType::Utf8 => "string".into(),
-        DataType::LargeUtf8 => "large_string".into(),
-        DataType::Utf8View => "string_view".into(),
-        DataType::Binary => "binary".into(),
-        DataType::LargeBinary => "large_binary".into(),
-        DataType::BinaryView => "binary_view".into(),
-        DataType::Date32 => "date32[day]".into(),
-        DataType::Date64 => "date64[ms]".into(),
-        DataType::Timestamp(unit, tz) => match tz {
-            None => format!("timestamp[{}]", unit_name(unit)),
-            Some(tz) => format!("timestamp[{}, tz={tz}]", unit_name(unit)),
-        },
-        DataType::Decimal128(p, s) => format!("decimal128({p}, {s})"),
-        DataType::List(item) => format!("list<item: {}>", type_name(item.data_type())),
-        DataType::LargeList(item) => {
-            format!("large_list<item: {}>", type_name(item.data_type()))
+    match named(dt) {
+        Some(name) => name.to_string(),
+        None => format!("{dt}"),
+    }
+}
+
+/// The Arrow type a description of the grammar names (MH 4.9): the converter from what
+/// `moruna_types::parse` reads. A list's item is the field of the description's name, nullable.
+pub fn data_type(name: &TypeName) -> DataType {
+    match name {
+        TypeName::Null => DataType::Null,
+        TypeName::Bool => DataType::Boolean,
+        TypeName::Int8 => DataType::Int8,
+        TypeName::Int16 => DataType::Int16,
+        TypeName::Int32 => DataType::Int32,
+        TypeName::Int64 => DataType::Int64,
+        TypeName::UInt8 => DataType::UInt8,
+        TypeName::UInt16 => DataType::UInt16,
+        TypeName::UInt32 => DataType::UInt32,
+        TypeName::UInt64 => DataType::UInt64,
+        TypeName::HalfFloat => DataType::Float16,
+        TypeName::Float => DataType::Float32,
+        TypeName::Double => DataType::Float64,
+        TypeName::String => DataType::Utf8,
+        TypeName::LargeString => DataType::LargeUtf8,
+        TypeName::StringView => DataType::Utf8View,
+        TypeName::Binary => DataType::Binary,
+        TypeName::LargeBinary => DataType::LargeBinary,
+        TypeName::BinaryView => DataType::BinaryView,
+        TypeName::Date32 => DataType::Date32,
+        TypeName::Date64 => DataType::Date64,
+        TypeName::Timestamp(unit, zone) => {
+            DataType::Timestamp(time_unit(*unit), zone.as_deref().map(Arc::from))
         }
-        other => format!("{other}"),
+        TypeName::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+        TypeName::List(field, item) => {
+            DataType::List(Arc::new(Field::new(field, data_type(item), true)))
+        }
+        TypeName::LargeList(field, item) => {
+            DataType::LargeList(Arc::new(Field::new(field, data_type(item), true)))
+        }
     }
 }
 
-fn unit_name(unit: &TimeUnit) -> &'static str {
-    match unit {
-        TimeUnit::Second => "s",
-        TimeUnit::Millisecond => "ms",
-        TimeUnit::Microsecond => "us",
-        TimeUnit::Nanosecond => "ns",
-    }
-}
-
-fn parse_unit(s: &str) -> Option<TimeUnit> {
-    Some(match s.trim() {
-        "s" => TimeUnit::Second,
-        "ms" => TimeUnit::Millisecond,
-        "us" => TimeUnit::Microsecond,
-        "ns" => TimeUnit::Nanosecond,
+/// The description of the grammar that names `dt`, for writing it: `None` for a type the grammar
+/// does not have. A list's item is named by its field; whether the item may be null is not part
+/// of a spelling, so a list of non-nullable items is named as the list of nullable ones.
+pub fn named(dt: &DataType) -> Option<TypeName> {
+    Some(match dt {
+        DataType::Null => TypeName::Null,
+        DataType::Boolean => TypeName::Bool,
+        DataType::Int8 => TypeName::Int8,
+        DataType::Int16 => TypeName::Int16,
+        DataType::Int32 => TypeName::Int32,
+        DataType::Int64 => TypeName::Int64,
+        DataType::UInt8 => TypeName::UInt8,
+        DataType::UInt16 => TypeName::UInt16,
+        DataType::UInt32 => TypeName::UInt32,
+        DataType::UInt64 => TypeName::UInt64,
+        DataType::Float16 => TypeName::HalfFloat,
+        DataType::Float32 => TypeName::Float,
+        DataType::Float64 => TypeName::Double,
+        DataType::Utf8 => TypeName::String,
+        DataType::LargeUtf8 => TypeName::LargeString,
+        DataType::Utf8View => TypeName::StringView,
+        DataType::Binary => TypeName::Binary,
+        DataType::LargeBinary => TypeName::LargeBinary,
+        DataType::BinaryView => TypeName::BinaryView,
+        DataType::Date32 => TypeName::Date32,
+        DataType::Date64 => TypeName::Date64,
+        DataType::Timestamp(unit, zone) => TypeName::Timestamp(
+            match unit {
+                TimeUnit::Second => GrammarUnit::Second,
+                TimeUnit::Millisecond => GrammarUnit::Millisecond,
+                TimeUnit::Microsecond => GrammarUnit::Microsecond,
+                TimeUnit::Nanosecond => GrammarUnit::Nanosecond,
+            },
+            zone.as_deref().map(str::to_string),
+        ),
+        DataType::Decimal128(p, s) => TypeName::Decimal128(*p, *s),
+        DataType::List(item) => {
+            TypeName::List(item.name().clone(), Box::new(named(item.data_type())?))
+        }
+        DataType::LargeList(item) => {
+            TypeName::LargeList(item.name().clone(), Box::new(named(item.data_type())?))
+        }
         _ => return None,
     })
 }
 
-/// Parse a type in the grammar of MH 4.9: pyarrow's `str(type)` spellings (`int64`, `double`,
-/// `string`, `timestamp[us, tz=UTC]`, `list<item: int64>`, `decimal128(10, 2)`), the aliases
-/// `boolean`, `float32`, `float64`, `utf8`, `large_utf8`, `str`, `date32`, `date64`,
-/// `list<int64>`, and `any`. An unknown spelling is a `Plan` error naming it.
-pub fn parse_type(s: &str) -> crate::Result<TypeDecl> {
-    let t = s.trim();
-    let unknown = || MorunaError::Plan(format!("unknown type `{s}` in a schema declaration"));
-    let simple = match t {
-        "any" => return Ok(TypeDecl::Any),
-        "null" => Some(DataType::Null),
-        "bool" | "boolean" => Some(DataType::Boolean),
-        "int8" => Some(DataType::Int8),
-        "int16" => Some(DataType::Int16),
-        "int32" => Some(DataType::Int32),
-        "int64" => Some(DataType::Int64),
-        "uint8" => Some(DataType::UInt8),
-        "uint16" => Some(DataType::UInt16),
-        "uint32" => Some(DataType::UInt32),
-        "uint64" => Some(DataType::UInt64),
-        "halffloat" | "float16" => Some(DataType::Float16),
-        "float" | "float32" => Some(DataType::Float32),
-        "double" | "float64" => Some(DataType::Float64),
-        "string" | "utf8" | "str" => Some(DataType::Utf8),
-        "large_string" | "large_utf8" => Some(DataType::LargeUtf8),
-        "string_view" => Some(DataType::Utf8View),
-        "binary" => Some(DataType::Binary),
-        "large_binary" => Some(DataType::LargeBinary),
-        "binary_view" => Some(DataType::BinaryView),
-        "date32" | "date32[day]" => Some(DataType::Date32),
-        "date64" | "date64[ms]" => Some(DataType::Date64),
-        _ => None,
-    };
-    if let Some(dt) = simple {
-        return Ok(TypeDecl::Exact(dt));
+fn time_unit(unit: GrammarUnit) -> TimeUnit {
+    match unit {
+        GrammarUnit::Second => TimeUnit::Second,
+        GrammarUnit::Millisecond => TimeUnit::Millisecond,
+        GrammarUnit::Microsecond => TimeUnit::Microsecond,
+        GrammarUnit::Nanosecond => TimeUnit::Nanosecond,
     }
-    if let Some(inner) = t
-        .strip_prefix("timestamp[")
-        .and_then(|r| r.strip_suffix(']'))
-    {
-        let mut parts = inner.splitn(2, ',');
-        let unit = parts.next().and_then(parse_unit).ok_or_else(unknown)?;
-        let tz = match parts.next() {
-            None => None,
-            Some(rest) => {
-                let tz = rest.trim().strip_prefix("tz=").ok_or_else(unknown)?;
-                Some(Arc::from(tz.trim()))
-            }
-        };
-        return Ok(TypeDecl::Exact(DataType::Timestamp(unit, tz)));
-    }
-    if let Some(inner) = t
-        .strip_prefix("decimal128(")
-        .and_then(|r| r.strip_suffix(')'))
-    {
-        let mut parts = inner.split(',');
-        let p: u8 = parts
-            .next()
-            .and_then(|v| v.trim().parse().ok())
-            .ok_or_else(unknown)?;
-        let s: i8 = parts
-            .next()
-            .and_then(|v| v.trim().parse().ok())
-            .ok_or_else(unknown)?;
-        return Ok(TypeDecl::Exact(DataType::Decimal128(p, s)));
-    }
-    for (prefix, large) in [("list<", false), ("large_list<", true)] {
-        if let Some(inner) = t.strip_prefix(prefix).and_then(|r| r.strip_suffix('>')) {
-            let (name, item) = match inner.split_once(':') {
-                Some((name, item)) if !name.contains('<') => (name.trim(), item),
-                _ => ("item", inner),
-            };
-            let TypeDecl::Exact(item) = parse_type(item)? else {
-                return Err(unknown());
-            };
-            let field = Arc::new(Field::new(name, item, true));
-            return Ok(TypeDecl::Exact(if large {
-                DataType::LargeList(field)
-            } else {
-                DataType::List(field)
-            }));
+}
+
+impl From<&ColumnType> for TypeDecl {
+    /// The kernel contract's type of what the grammar read.
+    fn from(ty: &ColumnType) -> TypeDecl {
+        match ty {
+            ColumnType::Any => TypeDecl::Any,
+            ColumnType::Exact(name) => TypeDecl::Exact(data_type(name)),
         }
     }
-    Err(unknown())
+}
+
+/// A type in the grammar of MH 4.9, as the kernel contract's type: read by `moruna_types::parse`,
+/// the grammar's one reader, and converted. An unknown spelling is a `Plan` error naming it.
+pub fn parse_type(s: &str) -> crate::Result<TypeDecl> {
+    moruna_types::parse(s)
+        .map(|ty| TypeDecl::from(&ty))
+        .map_err(|e| MorunaError::Plan(e.to_string()))
 }
 
 #[cfg(test)]

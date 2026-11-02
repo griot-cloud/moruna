@@ -3,8 +3,9 @@
 //! removed after the child exits.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// `cpu.weight`: the cgroup default, what Moruna's own threads weigh (17 i).
@@ -38,6 +39,9 @@ fn write_refused(path: &Path, e: io::Error) -> io::Error {
 #[derive(Debug)]
 pub struct StageCgroup {
     dir: PathBuf,
+    /// `memory.peak`, held open: since Linux 6.12 a write resets the mark the open file reports,
+    /// so the reset and the read go through one file.
+    peak: Mutex<Option<fs::File>>,
 }
 
 /// `cpu.max` for a quota of `cores`: `max` when the quota is unknown (0).
@@ -67,7 +71,10 @@ impl StageCgroup {
         }
         let dir = parent.join(name);
         fs::create_dir(&dir).map_err(|e| with_path(&dir, e))?;
-        let cgroup = StageCgroup { dir };
+        let cgroup = StageCgroup {
+            dir,
+            peak: Mutex::new(None),
+        };
         cgroup.write("memory.max", &ceiling.to_string())?;
         cgroup.write("memory.swap.max", "0")?;
         cgroup.write("cpu.weight", &CPU_WEIGHT.to_string())?;
@@ -108,6 +115,51 @@ impl StageCgroup {
             .map_err(|e| io::Error::other(format!("memory.current: {e}")))
     }
 
+    /// Start a new `memory.peak` at what the cgroup holds now (Linux 6.12 and later: a write
+    /// to the open file resets the mark it reports). A kernel whose `memory.peak` cannot be
+    /// written refuses, named.
+    pub fn reset_memory_peak(&self) -> io::Result<()> {
+        let path = self.dir.join("memory.peak");
+        let mut held = self
+            .peak
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.is_none() {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| with_path(&path, e))?;
+            *held = Some(file);
+        }
+        let Some(file) = held.as_mut() else {
+            return Err(io::Error::other("memory.peak: not open"));
+        };
+        file.write_all(b"reset\n").map_err(|e| with_path(&path, e))
+    }
+
+    /// `memory.peak` since [`StageCgroup::reset_memory_peak`], read through the file it reset.
+    pub fn memory_peak(&self) -> io::Result<u64> {
+        let path = self.dir.join("memory.peak");
+        let mut held = self
+            .peak
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(file) = held.as_mut() else {
+            return Err(io::Error::other(format!(
+                "{}: no mark was started",
+                path.display()
+            )));
+        };
+        let mut text = String::new();
+        file.rewind().map_err(|e| with_path(&path, e))?;
+        file.read_to_string(&mut text)
+            .map_err(|e| with_path(&path, e))?;
+        text.trim()
+            .parse()
+            .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))
+    }
+
     /// `memory.max`, as written.
     pub fn memory_max(&self) -> io::Result<String> {
         Ok(self.read("memory.max")?.trim().to_string())
@@ -116,6 +168,25 @@ impl StageCgroup {
     /// `cpu.max`, as written.
     pub fn cpu_max_now(&self) -> io::Result<String> {
         Ok(self.read("cpu.max")?.trim().to_string())
+    }
+
+    /// Kill every process in the cgroup (`cgroup.kill`, Linux 5.14); a kernel without the file
+    /// leaves the caller's own signal as the only way.
+    pub fn kill(&self) {
+        let _ = self.write("cgroup.kill", "1");
+    }
+
+    /// How many of the cgroup's processes the kernel killed for exceeding `memory.max`.
+    pub fn oom_kills(&self) -> u64 {
+        self.read("memory.events")
+            .ok()
+            .and_then(|events| {
+                events
+                    .lines()
+                    .find_map(|l| l.strip_prefix("oom_kill "))
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .unwrap_or(0)
     }
 
     /// Whether a process is still in the cgroup.
@@ -128,6 +199,11 @@ impl StageCgroup {
 
     /// Remove the cgroup, waiting up to `EMPTY_WAIT` for its processes to be gone.
     pub fn remove(&self) -> io::Result<()> {
+        // The open `memory.peak` is closed first: nothing of the cgroup is held past it.
+        *self
+            .peak
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let deadline = Instant::now() + EMPTY_WAIT;
         loop {
             match fs::remove_dir(&self.dir) {
@@ -183,6 +259,20 @@ mod tests {
         assert_eq!(cg.memory_max().unwrap(), "7");
         cg.set_cpu_max(0.0).unwrap();
         assert_eq!(cg.cpu_max_now().unwrap(), "max 100000");
+        let none = cg.memory_peak().unwrap_err().to_string();
+        assert!(none.contains("no mark was started"), "{none}");
+        let missing = cg.reset_memory_peak().unwrap_err().to_string();
+        assert!(missing.contains("memory.peak"), "{missing}");
+        fs::write(cg.dir().join("memory.peak"), "500\n").unwrap();
+        cg.reset_memory_peak().unwrap();
+        fs::write(cg.dir().join("memory.peak"), "640\n").unwrap();
+        assert_eq!(
+            cg.memory_peak().unwrap(),
+            640,
+            "read through the file it reset"
+        );
+        fs::write(cg.dir().join("memory.peak"), "x\n").unwrap();
+        assert!(cg.memory_peak().is_err());
         assert!(cg.memory_current().is_err(), "no memory.current yet");
         fs::write(cg.dir().join("memory.current"), "123\n").unwrap();
         assert_eq!(cg.memory_current().unwrap(), 123);
@@ -192,6 +282,20 @@ mod tests {
         assert!(cg.populated().unwrap());
         fs::write(cg.dir().join("cgroup.events"), "populated 0\n").unwrap();
         assert!(!cg.populated().unwrap());
+        assert_eq!(cg.oom_kills(), 0, "no memory.events yet");
+        fs::write(
+            cg.dir().join("memory.events"),
+            "low 0\nmax 4\noom 2\noom_kill 2\n",
+        )
+        .unwrap();
+        assert_eq!(cg.oom_kills(), 2);
+        cg.kill();
+        assert_eq!(
+            fs::read_to_string(cg.dir().join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        fs::remove_file(cg.dir().join("cgroup.kill")).unwrap();
+        fs::remove_file(cg.dir().join("memory.events")).unwrap();
         // Made twice: refused naming the directory.
         let e = StageCgroup::create(&dir, "stage", 1, 1.0).unwrap_err();
         assert!(e.to_string().contains("stage"), "{e}");
@@ -203,6 +307,9 @@ mod tests {
             "cpu.weight",
             "cpu.max",
             "memory.current",
+            // Unlike real cgroup virtual files, this fixture's peak file is an
+            // ordinary directory entry and must be unlinked before rmdir.
+            "memory.peak",
             "cgroup.events",
         ] {
             fs::remove_file(cg.dir().join(f)).unwrap();

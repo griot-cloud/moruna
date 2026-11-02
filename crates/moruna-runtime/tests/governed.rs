@@ -238,7 +238,8 @@ fn child_run() {
     let job = JobSpec::from_value(job).expect("the document parses");
     let env = |_: &str| None;
     let outcome = match build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -684,7 +685,8 @@ fn refusal(
     .expect("parses");
     let env = |_: &str| None;
     build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         BuildOptions {
             strict: false,
@@ -856,7 +858,8 @@ fn a_programs_bindings_decide_where_a_contract_is() {
         .expect("parses");
         let env = |_: &str| None;
         build(
-            &job,
+            &moruna_job::Job::from_v1(&job),
+            &support::planned(&moruna_job::Job::from_v1(&job)),
             kinds,
             BuildOptions {
                 strict: false,
@@ -884,6 +887,20 @@ fn a_programs_bindings_decide_where_a_contract_is() {
 /// Parquet; the run is given a deadline and is cancelled past it, so a hang fails the test.
 #[test]
 fn sc_t24_a_query_with_no_rows_finishes() {
+    // Admission measures the whole process. Earlier governed runs can retain
+    // allocator pages despite the serial lock; use the same fresh-process
+    // boundary as H6 so this run's 256 MiB budget measures only this run.
+    let outcome = apart::run("sc_t24_no_rows_child", &serde_json::json!({"sc_t24": true}));
+    assert_eq!(outcome["completed"], true);
+}
+
+#[test]
+#[ignore = "run by sc_t24 in a process of its own"]
+fn sc_t24_no_rows_child() {
+    let Some(job) = apart::job() else {
+        return;
+    };
+    assert_eq!(job["sc_t24"], true);
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("sc_t24_no_rows");
     let root = scratch.path().join("disk");
@@ -904,7 +921,8 @@ fn sc_t24_a_query_with_no_rows_finishes() {
     .expect("the document parses");
     let env = |_: &str| None;
     let built = build(
-        &job,
+        &moruna_job::Job::from_v1(&job),
+        &support::planned(&moruna_job::Job::from_v1(&job)),
         &Registry::standard(),
         BuildOptions {
             strict: true,
@@ -933,4 +951,30 @@ fn sc_t24_a_query_with_no_rows_finishes() {
     };
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     assert_eq!(support::read_back_rows(&out), 0, "the output holds no rows");
+    assert!(
+        out.join("_SUCCESS").is_file(),
+        "the sink committed the result"
+    );
+    let files: Vec<_> = std::fs::read_dir(&out)
+        .expect("output directory")
+        .map(|entry| entry.expect("output entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "an empty result is a real schema-bearing file"
+    );
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(&files[0]).expect("empty output file"),
+    )
+    .expect("the empty output is valid Parquet");
+    assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+    let expected = Schema::new(vec![Field::new("answer", DataType::Int64, false)]);
+    assert_eq!(
+        reader.schema().fields(),
+        expected.fields(),
+        "the SQL schema survives"
+    );
+    apart::answer(serde_json::json!({"completed": true}));
 }

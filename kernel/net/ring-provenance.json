@@ -1,0 +1,30 @@
+{
+  "crate": "ring",
+  "version": "0.17.14",
+  "registry": "https://crates.io/api/v1/crates/ring/0.17.14/download",
+  "crate_sha256": "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7",
+  "upstream_build_rs_sha256": "9d1928ffb1d8e15766c1c1b9ead73e4b81a21703dd25f7c27b87842a2e6e9cee",
+  "proposed_build_patch": "ring-none.patch",
+  "patch_sha256": "61b97c52ecaaea21b84f0f59f707926cd9fc2e4c9bfe9ae90cb5b4175243501e",
+  "licenses": [
+    "ISC",
+    "MIT",
+    "OpenSSL"
+  ],
+  "scope": "Enabled after actual x86_64-unknown-none C compile failed via host assert.h/features-time64.h. Only build.rs differs from exact upstream archive; crypto sources and licenses unchanged. ELF selection and freestanding Clang flags only. Baremetal compile/link and boot remain pending.",
+  "upstream_issue": "https://github.com/briansmith/ring/issues/1832",
+  "vendor_path": "../vendor/ring-0.17.14",
+  "upstream_files": 391,
+  "upstream_files_manifest": "ring-upstream-files.sha256",
+  "upstream_files_manifest_sha256": "a27bf1fe601a2963eb15535e9f3305df9be681592779425b242f3364f6fdb6e6",
+  "patched_build_rs_sha256": "43f0ae20f86b0e1ad83f2fa2cd30d494eff4cf3f057f6b25d2bb9aca9e66dfb8",
+  "patch_enabled": true,
+  "assembly_link_evidence": {
+    "native_log": "moruna-proof-501-b6543db848af/013-exec.log",
+    "observed_object": "4f701d2e06800872-x86_64-mont-elf.o",
+    "observed_object_bytes": 800,
+    "elf_magic": "7f454c46",
+    "elf_e_machine": 62,
+    "note": "Real retained x86_64 ELF object has empty upstream guarded assembly and no GNU-stack section; build configuration now explicitly selects ELF preprocessing macro. Macro/defined-symbol replay and actual relink remain pending."
+  }
+}

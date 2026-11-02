@@ -15,12 +15,19 @@ pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The classes a user subclasses for a source or a sink of their own (07 e.6, 08 f.10).
     crate::extend::register(m)?;
     crate::kernel::register(m)?;
+    // The kinds the program serves itself (`@moruna.kind`, SDD 18 KD-I11) and the listing.
+    crate::kinds::register(m)?;
     crate::check::register(m)?;
+    crate::engine::register(m)?;
     crate::package::register(m)?;
     crate::report::register(m)?;
     m.add_function(wrap_pyfunction!(crate::inspect::inspect_host, m)?)?;
     m.add_function(wrap_pyfunction!(crate::run::run, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::explain::explain, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::events::read_events, m)?)?;
     crate::cli::register(m)?;
     crate::output::register(m)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    crate::native_pex::register(m)?;
     Ok(())
 }

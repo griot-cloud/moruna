@@ -1,0 +1,11 @@
+[package]
+name = "node-protocol"
+description = "Capability-authorized Moruna node job admission contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[dependencies]
+moruna-svc.workspace = true
+
+moruna-node = { path = "../core", version = "=0.1.0" }

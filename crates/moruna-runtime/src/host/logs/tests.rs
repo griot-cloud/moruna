@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use super::super::protocol::EVENTS_VERSION;
 use super::*;
 
 fn pieces(assembler: &mut Assembler, chunks: &[&[u8]]) -> Vec<Piece> {
@@ -95,6 +96,44 @@ fn a_traceback_is_one_record() {
     assert_eq!(pieces(&mut b, &[text.as_bytes()]).len(), 12);
 }
 
+/// Two stages' writes interleave whole, so one traceback can follow another with nothing between
+/// them: they are two records. Only the chaining sentence Python writes between a traceback and
+/// the next makes the next the same group's (HO-T21 failed one run in some when two workers of a
+/// stage wrote at once and the second traceback was taken for a chained one).
+#[test]
+fn a_traceback_straight_after_another_is_its_own_record() {
+    let tb = "Traceback (most recent call last):\n  File \"k.py\", line 7, in apply\nValueError: bad row\n";
+    let mut a = Assembler::new(true);
+    let out = pieces(&mut a, &[format!("{tb}{tb}after\n").as_bytes()]);
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(out[0].text.starts_with("Traceback") && out[0].text.ends_with("ValueError: bad row"));
+    assert_eq!(out[0].text, out[1].text);
+    assert_eq!(out[2].text, "after");
+    // The same, a blank line between: still two.
+    let mut a = Assembler::new(true);
+    let out = pieces(&mut a, &[format!("{tb}\n{tb}after\n").as_bytes()]);
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(
+        out[0].text.ends_with("ValueError: bad row"),
+        "{:?}",
+        out[0].text
+    );
+    // And one that chains, with its sentence, is one.
+    let chained = format!(
+        "{tb}\nDuring handling of the above exception, another exception occurred:\n\n{tb}after\n"
+    );
+    let mut a = Assembler::new(true);
+    let out = pieces(&mut a, &[chained.as_bytes()]);
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(out[0].text.contains("During handling"));
+    // The direct cause is a chain too.
+    let caused = format!(
+        "{tb}\nThe above exception was the direct cause of the following exception:\n\n{tb}after\n"
+    );
+    let mut a = Assembler::new(true);
+    assert_eq!(pieces(&mut a, &[caused.as_bytes()]).len(), 2);
+}
+
 /// An unfinished line goes out as a partial record after it has waited, and the rest of the
 /// line continues it; a traceback that stopped coming goes out as it is.
 #[test]
@@ -155,6 +194,17 @@ fn scratch(tag: &str) -> PathBuf {
 
 const START: &str = "0123456789abcdef0123456789abcdef";
 
+/// Whose records these are.
+fn meta(attempt: u32) -> Meta {
+    Meta {
+        run: "fedcba9876543210fedcba9876543210".into(),
+        plan: Some("p0123456789abcdef".into()),
+        attempt,
+        start: START.into(),
+        epoch_ns: 1_000_000_000,
+    }
+}
+
 fn last_reach(events: &[Event]) -> Vec<LogReach> {
     match events.last() {
         Some(Event::Logs { producers }) => producers.clone(),
@@ -170,8 +220,7 @@ fn interleaved_output_of_concurrent_stages_is_attributed() {
     let (told, tell) = told();
     let capture = Capture::start(
         attempt_dir(&dir, 1, START),
-        1,
-        START.into(),
+        meta(1),
         vec!["src".into(), "k1".into(), "k2".into(), "snk".into()],
         Instant::now(),
         tell,
@@ -256,8 +305,7 @@ fn a_flood_is_bounded_and_counted() {
     let (told, tell) = told();
     let capture = Capture::start(
         attempt_dir(&dir, 1, START),
-        1,
-        START.into(),
+        meta(1),
         vec!["src".into(), "k1".into(), "snk".into()],
         Instant::now(),
         tell,
@@ -308,8 +356,7 @@ fn output_after_its_task_ended_is_drained() {
     let (told, tell) = told();
     let capture = Capture::start(
         attempt_dir(&dir, 2, START),
-        2,
-        START.into(),
+        meta(2),
         vec!["src".into(), "k1".into(), "snk".into()],
         Instant::now(),
         tell,
@@ -343,8 +390,7 @@ fn a_store_that_cannot_be_written_is_told() {
     let (told, tell) = told();
     let capture = Capture::start(
         file.join("store"),
-        1,
-        START.into(),
+        meta(1),
         vec!["src".into(), "snk".into()],
         Instant::now(),
         tell,
@@ -373,8 +419,7 @@ fn the_process_own_output_is_the_engines() {
         let (_told, tell) = told();
         let capture = Capture::start(
             dir.clone(),
-            1,
-            START.into(),
+            meta(1),
             vec!["src".into(), "snk".into()],
             Instant::now(),
             tell,

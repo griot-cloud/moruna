@@ -1,0 +1,401 @@
+# The boot CI runs (SDD 20 k, SDD 23 k): the supervisor first, then one process per
+# test. kernel/tools/build.sh builds it with moruna-image, which renders the manifest,
+# packs the initramfs and writes the lines the boot must print (the expect, exits and
+# faults lines below) for kernel/tools/check-boot.sh. Adding a server to the image is
+# adding its process, its handles and its links here.
+moruna-image 1
+
+# The machine (SDD 25 e.4): kernel/tools/boot.sh gives QEMU these arguments, {out} and
+# {cpus} replaced by the boot's directory and CPU count, and writes each disk with
+# pattern A before the boot; check-boot.sh checks each holds its pattern after it.
+# Every virtio device is modern only, so its device id is 0x1040 + its virtio type.
+# 00:03 and 00:04: two virtio consoles, the first's output in a file the boot check
+# reads with the serial log, the second's input a line boot.sh writes.
+machine -device virtio-serial-pci,id=serial0,addr=0x3,disable-legacy=on
+machine -chardev file,id=console0,path={out}/console0-{cpus}.log
+machine -device virtconsole,bus=serial0.0,chardev=console0
+machine -device virtio-serial-pci,id=serial1,addr=0x4,disable-legacy=on
+machine -chardev file,id=console1,path={out}/console1-{cpus}.log,input-path={out}/console1-input.txt
+machine -device virtconsole,bus=serial1.0,chardev=console1
+# 00:05: block0, 4 MiB that block-test reads (pattern A) and writes (pattern B); reads
+# throttled to 8 MiB/s so DR-T11's 32 MiB of reads are in flight when the driver is
+# killed, on any number of CPUs.
+disk disk 8192 b
+machine -drive file={out}/disk-{cpus}.img,format=raw,if=none,id=disk0,throttling.bps-read=8388608
+machine -device virtio-blk-pci,drive=disk0,addr=0x5,disable-legacy=on
+# 00:07: QEMU's edu test device (DR-T17).
+machine -device edu,addr=0x7
+# 00:08 and 00:09: the image filesystem's two layer disks, read only (block1 and
+# block2, written by build.sh; SDD 27 k).
+machine -drive file={out}/layers/layer-1.img,format=raw,if=none,id=layer1,readonly=on
+machine -device virtio-blk-pci,drive=layer1,addr=0x8,disable-legacy=on
+machine -drive file={out}/layers/layer-2.img,format=raw,if=none,id=layer2,readonly=on
+machine -device virtio-blk-pci,drive=layer2,addr=0x9,disable-legacy=on
+# 00:06: the vsock, guest cid 3, as a vhost-user device (SDD 30 f.11): its back end is
+# moruna-vmm's vsock device in a process of the host's (moruna-vhost-vsock, which boot.sh
+# starts at this socket), so the machine needs no vhost-vsock kernel module. A vhost-user
+# back end maps the guest's memory, so the memory is a shared memfd of boot.sh's sole -m setting ({memory}).
+machine -object memory-backend-memfd,id=ram0,size={memory},share=on
+machine -numa node,memdev=ram0
+machine -chardev socket,id=vsock0,path={out}/vhost-vsock-{cpus}.sock
+machine -device vhost-user-vsock-pci,chardev=vsock0,addr=0x6
+# 00:10 and 00:11: two NVMe controllers (QEMU's nvme, 1b36:0010), a namespace each:
+# nvme0, 16 MiB that nvme-test reads (pattern A), writes (pattern B) and measures;
+# nvme1, 4 MiB, reads throttled to 8 MiB/s so DR-T26's reads are in flight when its
+# driver is killed (SDD 25 f.15, k).
+disk nvme0 32768 b
+machine -drive file={out}/nvme0-{cpus}.img,format=raw,if=none,id=nvme0
+machine -device nvme,drive=nvme0,serial=ke1-nvme0,addr=0x10
+disk nvme1 8192 a
+machine -drive file={out}/nvme1-{cpus}.img,format=raw,if=none,id=nvme1,throttling.bps-read=8388608
+machine -device nvme,drive=nvme1,serial=ke1-nvme1,addr=0x11
+# 00:12 and 00:13: two virtio-net cards (1af4:1041), net0 and net1, joined by QEMU's
+# socket backend: what one sends leaves QEMU as a UDP datagram to the other's port on
+# the host and arrives at the other (SDD 29 k). No option ROM: nothing boots from them.
+machine -netdev socket,id=link0,udp=127.0.0.1:47011,localaddr=127.0.0.1:47010
+machine -device virtio-net-pci,netdev=link0,mac=52:54:00:4b:45:00,romfile=,addr=0x12,disable-legacy=on
+machine -netdev socket,id=link1,udp=127.0.0.1:47010,localaddr=127.0.0.1:47011
+machine -device virtio-net-pci,netdev=link1,mac=52:54:00:4b:45:01,romfile=,addr=0x13,disable-legacy=on
+
+# KK-T11, SV-T13: the root resources, a child started from its image, and a driver
+# started holding only a narrowed device page and interrupt line. DR-T7: the calls ABI
+# 1.2 added; then the supervisor hands the device manager the device roots.
+process supervisor
+  handle console console
+  handle root.process root.process
+  handle root.device root.device
+  handle root.interrupt root.interrupt
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma
+  handle program:child child-image
+  handle program:driver driver-image
+  expect KB1 spawn: ok: child runs, started by the supervisor with 1 handle
+  expect kk: process child exited with code 0 (
+  expect KB1 supervisor: ok:
+  expect KB2 narrowing: ok:
+  expect kk: process driver exited with code 0 (
+  expect KB3 kernel calls: ok:
+  expect kk: process killee was killed through a handle to it
+  expect KC1 remote memory: ok:
+  expect KD2 grant: ok:
+  exits 0
+
+# KK-T10: a fault ends its process and nothing else.
+process fault
+  handle console console
+  expect KB1 fault: about to read address 0
+  faults page fault at 0x0 on read
+
+# KK-T6: ping-pong over one channel.
+process ping
+  handle console console
+  expect KB1 ping-pong: ok: 10000 round trips over one channel
+  exits 0
+process pong
+  exits 0
+link ping.peer pong.peer:read,write,wait
+
+# KK-T7: a read-only memory object travels over a channel.
+process xfer-a
+  handle console console
+  exits 0
+process xfer-b
+  handle console console
+  expect KB1 handle-transfer: ok: 2 pages arrived through a read-only handle with the pattern intact; mapping them writable was refused with access denied
+  exits 0
+link xfer-a.peer xfer-b.peer
+
+# KK-T8: no value names another process's object.
+process iso-holder
+  handle console console
+  exits 0
+process isolation
+  handle console console
+  expect KB1 isolation: ok:
+  exits 0
+link iso-holder.peer isolation.peer
+
+# KK-T9 latency is judged separately by deadline-boot.sh, away from this busy
+# boot's runnable test threads. Its 50 ms bound is unchanged.
+
+# SV-T14: the cycle rule.
+process cycles
+  handle console console
+  expect KB2 cycles: ok:
+  exits 0
+
+# SV-T10, SV-T11: the echo example, written only against moruna-svc. The server
+# listens on each `listen*` slot; the client and the conformance suite each reach it
+# through one.
+process echo-server
+  handle console console
+  expect KB2 echo-server: ok:
+  exits 0
+process echo-client
+  handle console console
+  expect KB2 echo: ok:
+  exits 0
+process echo-conformance
+  handle console console
+  expect KB2 conformance moruna.example.echo: ok:
+  exits 0
+link echo-client.server echo-server.listen-client
+link echo-conformance.server echo-server.listen-conformance
+
+# SDD 25: the device manager. It enumerates PCI and starts one driver process per
+# device its table names (a driver is a line here), each holding only its own device;
+# its directory publishes block0, console0, console1 and vsock0. Clients reach the directory, and only the tests reach control, through the
+# links below.
+process devices
+  handle console console
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1043 virtio-console console
+  driver 1af4:1053 virtio-vsock vsock
+  driver 1234:11e8 edu edu
+  driver 1b36:0010 nvme nvme
+  driver 1af4:1041 virtio-net net
+  driver 1ae0:0042 gve net
+  expect KB3 devices: started
+  expect KB3 block0: virtio-blk up: 8192 sectors of 512 bytes
+  expect KB3 console0: virtio-console up
+  expect KB3 console1: virtio-console up
+  expect KB3 devices: block0 ended; started it again (start 2)
+  expect kk: process block0 was killed through a handle to it
+  expect kk: process block0 exited with code 0 (
+  expect kk: process console0 exited with code 0 (
+  expect kk: process console1 exited with code 0 (
+  expect KB3 edu0: edu up: identification 0x10000ed
+  expect kk: process edu0 exited with code 0 (
+  expect KB3 block1: virtio-blk up:
+  expect KB3 block2: virtio-blk up:
+  expect kk: process block1 exited with code 0 (
+  expect kk: process block2 exited with code 0 (
+  expect KB3 block3: virtio-blk up:
+  expect KB3 block7: virtio-blk up:
+  expect kk: process block3 exited with code 0 (
+  expect kk: process block7 exited with code 0 (
+  expect KE1 nvme0: nvme up:
+  expect KE1 nvme1: nvme up:
+  expect KB3 devices: nvme1 ended; started it again (start 2)
+  expect kk: process nvme1 was killed through a handle to it
+  expect KE1 nvme0: served
+  expect KE1 nvme1: served
+  expect kk: process nvme0 exited with code 0 (
+  expect kk: process nvme1 exited with code 0 (
+  expect KE1 net0: virtio-net up: 52:54:00:4b:45:00, MTU 1500
+  expect KE1 net1: virtio-net up: 52:54:00:4b:45:01, MTU 1500
+  expect KE1 net0: served until every client left
+  expect KE1 net1: served until every client left
+  expect kk: process net0 exited with code 0 (
+  expect kk: process net1 exited with code 0 (
+  expect KB3 devices: ok:
+  exits 0
+link supervisor.devices devices.supervisor
+
+# DR-T9 to DR-T11: the disk through block0, its conformance suite, and block0 killed
+# under 32 reads and restarted.
+process block-test
+  handle console console
+  expect KB3 block: ok:
+  expect KB3 conformance moruna.driver.block: ok:
+  expect KB3 driver crash: ok:
+  exits 0
+link block-test.directory devices.directory-block
+link block-test.control devices.control-block
+
+# DR-T12: lines through console0 (its file is judged with the serial log), a line
+# read from console1, and the console conformance suite.
+process console-test
+  handle console console
+  expect KB3 console: ok:
+  expect KB3 conformance moruna.driver.console: ok:
+  expect KB3 console0: line 1 of 3 through the driver
+  expect KB3 console0: line 3 of 3 through the driver
+  expect KB3 console1 read: KB3 console input: hello from the host
+  exits 0
+link console-test.directory devices.directory-console
+
+# DR-T13: vsock to the host, through the vhost-user back end; check-boot.sh requires its
+# lines and the host peer's.
+process vsock-test
+  handle console console
+  exits 0
+link vsock-test.directory devices.directory-vsock
+
+# DR-T14: a driver's resources reach its own device only.
+process driver-isolation
+  handle console console
+  expect KB3 driver isolation: ok:
+  exits 0
+link driver-isolation.control devices.control-isolation
+
+# DR-T17: a fourth driver, for QEMU's edu test device, added as one line of the
+# device manager's table above and this process, with no kernel change.
+process edu-test
+  handle console console
+  expect KB3 edu: ok:
+  exits 0
+link edu-test.directory devices.directory-edu
+
+# DR-T18, DR-T25 to DR-T27: the NVMe driver, the same block protocol as virtio-blk:
+# the namespace's data through nvme0, the block suite over it, its throughput and
+# latency, and nvme1 killed under 32 reads and started again.
+process nvme-test
+  handle console console
+  expect KE1 nvme: ok:
+  expect KE1 conformance moruna.driver.block over nvme0: ok:
+  expect KE1 nvme0 performance: sequential write:
+  expect KE1 nvme0 performance: sequential read:
+  expect KE1 nvme0 performance: 4 KiB reads at queue depth 1:
+  expect KE1 nvme0 performance: 4 KiB reads at queue depth 32:
+  expect KE1 nvme driver crash: ok:
+  exits 0
+link nvme-test.directory devices.directory-nvme
+link nvme-test.control devices.control-nvme
+
+# NT-T7 to NT-T9: the network card protocol over virtio-net: the suite for one card
+# against each, the suite for two cards on one link, and frames a second.
+process net-test
+  handle console console
+  expect KE1 conformance moruna.driver.net over net0: ok:
+  expect KE1 conformance moruna.driver.net over net1: ok:
+  expect KE1 conformance moruna.driver.net over net0 and net1 on one link: ok:
+  expect KE1 net performance: net0 to net1:
+  expect KE1 net performance: net1 to net0:
+  exits 0
+link net-test.directory devices.directory-net
+
+# SDD 27: the image filesystem server over the two read-only layer disks the boot
+# attaches (block1 and block2, written by build.sh), lowest first as its layer list
+# says; and IF-T12 to IF-T17 against it: the cold start counted, the merged tree
+# checked against the host's list, map against read, a second client served from the
+# cache, the scratch directory's quota and the image read only, and the protocol's
+# conformance suite.
+process imagefs
+  handle console console
+  handle data:layers/imagefs.layers layers
+  expect KC2 imagefs: up: 2 layers, lowest first: block1
+  expect KC2 imagefs: served
+  exits 0
+link imagefs.directory devices.directory-imagefs
+process imagefs-test
+  handle console console
+  handle data:layers/imagefs.checks checks
+  expect KC2 cold start: ok:
+  expect KC2 tree: ok:
+  expect KC2 map: ok:
+  expect KC2 cache: ok:
+  expect KC2 scratch: ok:
+  expect KC2 conformance moruna.imagefs: ok:
+  expect KB5 imagefs protocol: ok:
+  exits 0
+link imagefs-test.fs imagefs.listen-test
+
+# KK-T13: the calls ABI 2.0 added for a process's own memory and threads.
+process vm
+  handle console console
+  expect KC1 kernel calls: ok:
+  exits 0
+
+# KB5-T2 to KB5-T4 (SDD 20 f.18): memory accounts. The process has an account of its own
+# of 64 MiB carved out of the machine's; it checks an account's figures, its peak and the
+# sum of its children, then starts three children in accounts carved out of its own: one
+# refused an object past its account, one ended by the kernel at the first page its
+# account cannot pay for, and one that runs on beside them. The supervisor gives it a
+# process resource.
+process quota
+  memory 64MiB
+  handle console console
+  handle program:quota-hog hog-image
+  expect KB5 accounts: ok:
+  expect KB5 quota: ok:
+  expect KB5 full account: ok:
+  expect kk: process quota-touch faulted: a page fault at
+  expect could not be charged: account quota-touch has no room for 4128 bytes (limit 4194304 bytes,
+  expect kk: process quota-call exited with code 0 (
+  expect kk: process quota-steady exited with code 0 (
+  exits 0
+link supervisor.quota quota.supervisor
+
+# SDD 28: the Linux personality. Every program it runs with run_granted or run_plane is
+# charged to the account its starter carved (SDD 20 f.18); KB5-T1 runs one past its
+# account. A second image filesystem serves the Linux image:
+# the official python:3.14-slim image's four layers and one of the C test programs
+# and the engine above them, on block3 to block7 (build.sh). The personality server gets its process
+# resource from the supervisor, and a connection to that image filesystem for each
+# program it runs; LX-T10 to LX-T16 run unmodified Linux programs through it: static
+# musl, its threads, dynamic glibc, a refused call, isolation, the forward's round
+# trip, and CPython 3.14.
+process imagefs-linux imagefs
+  handle console console
+  handle data:linux/stack.layers layers
+  expect KC2 imagefs: up: 5 layers, lowest first: block3
+  exits 0
+link imagefs-linux.directory devices.directory-linux
+process linux
+  handle console console
+  expect linux: up:
+  expect linux: served:
+  exits 0
+link supervisor.linux linux.supervisor
+link linux.fs imagefs-linux.listen-linux
+process linux-test
+  handle console console
+  expect KC1 musl hello: ok:
+  expect KC1 musl threads: ok:
+  expect KC1 glibc dynamic: ok:
+  expect KC1 refused call: ok:
+  expect KC1 isolation: ok:
+  expect KC1 forward: ok:
+  expect KC1 cpython: ok: python3 -c printed 2432902008176640000
+  expect KD2 granted: ok:
+  expect KB5 hog: ok:
+  expect KB5 linux protocol: ok:
+  expect kk: process lx-hog faulted: a page fault at
+  expect could not be charged: account linux-test.hog has no room for 4128 bytes (limit 16777216 bytes,
+  exits 0
+link linux-test.server linux.listen-test
+
+# SDD 29: the data plane. An engine on moruna-plane runs DP-T10 to DP-T17 as tasks, each a
+# process with no handle and a plane of slots and a port: a 64 MiB batch moved in its
+# frames with no copy, a fan-out of one batch to three tasks, the check's refusals before
+# the engine sees a record, isolation, port calls, 1,000 batches of 1 MiB, and KA1's
+# arrow_echo, unmodified, through the Linux personality's descriptors 0 and 1. The
+# supervisor gives it a process resource; build.sh writes its fixtures to plane/.
+process plane
+  handle console console
+  handle program:plane-task task-image
+  handle program:plane-ro ro-image
+  handle data:plane/good.fixture good
+  handle data:plane/big.fixture big
+  handle data:plane/mib.fixture mib
+  handle data:plane/refusals.fixture refusals
+  handle data:plane/echo.fixture echo
+  expect KD1 zero copy: ok:
+  expect KD1 fan-out: ok:
+  expect KD1 check: refused garbage:
+  expect KD1 check: refused outside:
+  expect KD1 check: ok:
+  expect KD1 isolation: ok:
+  expect kk: process plane-ro faulted: page fault at
+  expect kk: process plane-bad-0 faulted: its record on slot 0 was refused by the engine's check:
+  expect KD1 port: ok:
+  expect KD1 throughput: ok:
+  expect KD1 shimless: ok:
+  exits 0
+link supervisor.plane plane.supervisor
+link plane.linux linux.listen-plane
+
+# The five SDD30 job assertions are REQUIRED dedicated production-node boots
+# (tools/node-fixtures.sh), each with actual canonical startup/storage authority.
+# Real SSE2/x87 isolation: sixteen simultaneous live workers across two processes.
+process fpu-a
+  handle console console
+  expect NATIVE FPU: ok: seed 324468736 eight live workers preserved SIMD FP control and x87 state;
+  exits 0
+process fpu-b
+  handle console console
+  expect NATIVE FPU: ok: seed 610795520 eight live workers preserved SIMD FP control and x87 state;
+  exits 0
+link fpu-a.peer fpu-b.peer

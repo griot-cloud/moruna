@@ -1,0 +1,10 @@
+[package]
+name = "console-protocol"
+description = "moruna.driver.console: a console's protocol, lines out and lines in, and its conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

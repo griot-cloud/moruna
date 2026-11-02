@@ -82,6 +82,13 @@ pub trait Sink: Send + Sync {
     fn skip(&self, seq: Seq) {
         let _ = seq;
     }
+    /// Commit buffered output before a portable checkpoint, while the scheduler has
+    /// quiesced every writer. Does not finish the sink or publish a success marker.
+    /// A default implementation promises no additional commits; missing portable
+    /// payloads still refuse publication rather than being silently omitted.
+    fn checkpoint_flush(&self) -> crate::Result<()> {
+        Ok(())
+    }
     /// Opaque sink state for the run manifest (for a file sink: committed file
     /// names and the next file index). Called at every manifest write, and once at
     /// startup: a resumable sink returns `Some` even before its first write (an

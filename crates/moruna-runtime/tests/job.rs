@@ -42,6 +42,13 @@ fn jb_t25_catalogue_is_the_registry() {
     ] {
         let names: Vec<&str> = listed.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, catalogue().names(role).collect::<Vec<_>>());
+        // The published files are Moruna's own kinds: none an embedder serves (SDD 18 KD-I11).
+        assert!(
+            catalogue()
+                .declarations(role)
+                .all(|d| d.served.is_none() && d.isolation != moruna_job::Isolation::Embedder),
+            "a served kind in the published catalogue"
+        );
     }
     // Without the feature the governed kinds are not the registry's, and the standard catalogue
     // is what it is.
@@ -262,7 +269,7 @@ fn schema_refusals(catalogue: &Catalogue, role: Role, doc: &KindDoc) -> Vec<moru
     let (field, _) = place(role);
     // A kind that is not declared, or one that needs a contract this test does not carry, is not
     // a verdict on the settings.
-    check(&job, catalogue)
+    check(&moruna_job::Job::from_v1(&job), catalogue)
         .err()
         .unwrap_or_default()
         .into_iter()
@@ -573,6 +580,7 @@ fn jb_t28_check_job_command() {
                 deterministic: moruna_job::Fact::Yes,
                 preserves_columns: moruna_job::Fact::Yes,
                 isolation: moruna_job::Isolation::Builtin,
+                served: None,
             }
         }
 

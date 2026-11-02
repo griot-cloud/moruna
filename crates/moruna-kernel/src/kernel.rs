@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::Result;
 use crate::buffer::Allocator;
 use crate::declare::Declared;
 use crate::error::MorunaError;
@@ -155,8 +156,8 @@ pub trait KernelState: Send {
     /// state that grows with morsels seen and budget for it (RC f.3); a kernel
     /// whose state accumulates should implement it, because the linear model
     /// `a_k * bytes_in` does not describe it and the alternative is a breach.
-    fn footprint(&self) -> Option<u64> {
-        None
+    fn footprint(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 
@@ -179,8 +180,44 @@ pub struct InitCtx {
     pub alloc: Arc<dyn Allocator>,
 }
 
+/// A logical task's requested row boundaries inside one executable stage.
+/// The ordered task list survives fusion; an empty port list requests no retained rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalTaskRows {
+    /// Logical task identity from the checked document, never an executable stage number.
+    pub task: String,
+    /// Logical output ports whose exact rows must be delivered.
+    pub ports: Vec<String>,
+}
+
+/// An engine-installed logical row tap, independent from any storage implementation.
+/// A required capture's refusal is a real kernel error and must stop the run.
+pub trait LogicalRows: Send + Sync {
+    /// One exact logical task/output-port batch, before a later fused operation changes it.
+    fn append(
+        &self,
+        task: &str,
+        port: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> crate::Result<()>;
+}
+
 /// The user's transformation (component 5 adapts foreign ones).
 pub trait Kernel: Send + Sync + 'static {
+    /// Install exact logical-row taps before execution. Opaque kinds refuse required capture;
+    /// they must not pretend final executable output is every fused task's intermediate output.
+    /// Supported kinds return a run-local bound executable after validating their actual fused
+    /// representation; the shared original must remain untouched for other concurrent runs.
+    fn with_logical_rows(
+        &self,
+        _tasks: &[LogicalTaskRows],
+        _rows: Arc<dyn LogicalRows>,
+    ) -> crate::Result<Arc<dyn Kernel>> {
+        Err(MorunaError::Unsupported(
+            "kernel has no logical row boundary capability",
+        ))
+    }
+
     /// Stable identity plus configuration hash (e.6).
     fn fingerprint(&self) -> Fingerprint;
     /// Stateless or stateful.
@@ -213,6 +250,49 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Payload>;
+    /// The end of the input (contracts d.7, amended 2026-10-28): called once per live instance,
+    /// after the last `apply` of the run and before the sink finishes. A kernel that runs
+    /// something apart (an image's process) ends its input here and answers for how it ended; an
+    /// `Err` ends the run. The default does nothing, which is every kernel that holds nothing
+    /// apart.
+    fn finish(&self, state: &mut dyn KernelState) -> crate::Result<()> {
+        let _ = state;
+        Ok(())
+    }
+    /// How many input ports the kernel takes at most (d.16): a stage that takes several inputs
+    /// numbers them from 0 and is refused at build when it has more than this. One for a
+    /// kernel of one input, which is every kernel that does not say otherwise.
+    fn max_inputs(&self) -> u16 {
+        1
+    }
+    /// `apply` for a batch that came in on input port `port` (d.16). A kernel that takes one
+    /// input leaves it alone: port 0 is `apply`, and a stage of one input never sees another
+    /// port. A kernel that takes several overrides it and is told, on every call, which input
+    /// the batch is; the batches of different ports arrive in no particular order, each once.
+    fn apply_port(
+        &self,
+        state: &mut dyn KernelState,
+        port: u16,
+        input: Payload,
+    ) -> crate::Result<Payload> {
+        match port {
+            0 => self.apply(state, input),
+            other => Err(MorunaError::Plan(format!(
+                "the kernel takes one input and was handed a batch on its port {other}"
+            ))),
+        }
+    }
+    /// The output schema for the given input schemas, port 0 first (d.16); errors are plan-time
+    /// errors. A kernel of one input leaves it alone: one schema is `output_schema`.
+    fn output_schema_of(&self, inputs: &[SourceSchema]) -> crate::Result<SourceSchema> {
+        match inputs {
+            [one] => self.output_schema(one),
+            many => Err(MorunaError::Plan(format!(
+                "the kernel takes one input and is given {}",
+                many.len()
+            ))),
+        }
+    }
     /// The checkpoint of `instance` while it is inside `apply` and waiting on a port (MH 4.10):
     /// its state as it was when that `apply` began, which is what a resume restores before the
     /// morsel is applied again. `None` when the instance is not waiting on a port, and for every

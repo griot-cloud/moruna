@@ -221,7 +221,7 @@ fn sb_t11_pex_identity() {
         assert_eq!(call(&k, state.as_mut()).unwrap(), batch());
     }
     assert_eq!(pid_of(&mut state), pid);
-    assert!(state.footprint().unwrap() > 0);
+    assert!(state.footprint().unwrap().unwrap() > 0);
     assert_eq!(state.checkpoint().unwrap(), None);
     assert!(format!("{k:?}").contains("SandboxKernel"));
     assert_eq!(k.target(), target());
@@ -450,14 +450,14 @@ def holds(batch):
 "#;
     let k = kernel(pex(&dir, "holds", function, json!({}), &[]), 2 * GIB);
     let outside = k.outside();
-    assert_eq!(outside.in_use(), 0, "no child yet");
+    assert_eq!(outside.in_use().unwrap(), 0, "no child yet");
     let mut state = k.init(&ctx()).unwrap();
-    let before = outside.in_use();
+    let before = outside.in_use().unwrap();
     call(&k, state.as_mut()).unwrap();
-    let after = outside.in_use();
+    let after = outside.in_use().unwrap();
     assert!(after >= before + (60 << 20), "{before} then {after}");
     drop(state);
-    assert_eq!(outside.in_use(), 0, "the child is gone");
+    assert_eq!(outside.in_use().unwrap(), 0, "the child is gone");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -799,7 +799,7 @@ class keeper:
     assert_eq!(leases, 1, "the batch let go of was released");
     assert!(bytes > 0);
     assert!(
-        state.footprint().unwrap() >= bytes,
+        state.footprint().unwrap().unwrap() >= bytes,
         "the profile shows the mapping the kernel holds"
     );
     let _ = std::fs::remove_dir_all(dir);

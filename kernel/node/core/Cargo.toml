@@ -1,0 +1,10 @@
+[package]
+name = "moruna-node"
+description = "Standalone Moruna node configuration and service lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+moruna-sys.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "console-test"
+description = "DR-T12: lines through the console driver to a virtio console, a line read from another, and the console protocol's conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+console-protocol = { path = "../console-protocol", version = "=0.1.0" }
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

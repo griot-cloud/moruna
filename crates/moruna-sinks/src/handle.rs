@@ -34,6 +34,14 @@ impl SinkHandle {
         }
     }
 
+    /// Stop ordered writes that have not entered the inner sink. Plain and
+    /// already submitted writes retain their original completion ownership.
+    pub fn cancel_queued_writes(&self) {
+        if let Self::Ordered(buffer) = self {
+            buffer.cancel_queued_writes();
+        }
+    }
+
     /// `None` for `Plain`.
     pub fn next_expected(&self) -> Option<Seq> {
         match self {
@@ -95,6 +103,13 @@ impl Sink for SinkHandle {
         match self {
             SinkHandle::Plain(sink) => sink.skip(seq),
             SinkHandle::Ordered(buffer) => buffer.skip(seq),
+        }
+    }
+
+    fn checkpoint_flush(&self) -> Result<()> {
+        match self {
+            SinkHandle::Plain(sink) => sink.checkpoint_flush(),
+            SinkHandle::Ordered(buffer) => buffer.checkpoint_flush(),
         }
     }
 

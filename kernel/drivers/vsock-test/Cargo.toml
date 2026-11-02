@@ -1,0 +1,12 @@
+[package]
+name = "vsock-test"
+description = "DR-T13: a stream to the host and one from it through the vsock driver, and the vsock protocol's conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+vsock-protocol = { path = "../vsock-protocol", version = "=0.1.0" }
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

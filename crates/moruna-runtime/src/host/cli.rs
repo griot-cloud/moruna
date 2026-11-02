@@ -1,15 +1,14 @@
-//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3, SDD 22 d.3): `run`, `run --vm`, `serve`,
-//! `kinds`, `check-job`, `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
+//! The `moruna` command line (MH 4.2, 4.8.4, SDD 18 d.3, SDD 22 d.3, SDD 26 d.5): `run`,
+//! `run --vm`, `serve`, `kinds`, `check-job`, `explain`, `--version`. The binary is a thin `main` over [`main`] with the registry of the kinds it can
 //! run: the Python adapter's binary adds the Python kinds to [`Registry::standard`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use moruna_vmm::config::{DiskConfig, VmConfig};
-
 use moruna_kernel::CancelToken;
 
+use super::events::EventOptions;
 use super::session::{self, HEARTBEAT, HostOptions, Outcome};
 use super::transport::Address;
 use super::{VERSION, exit};
@@ -18,35 +17,105 @@ use crate::kinds::Registry;
 use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
-pub const USAGE: &str = "usage: moruna run <spec.json> [--strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
-       moruna run --vm <spec.json> --image <dir-or-oci> [--disk <path>[:ro|:rw]]...
-       moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--sandbox-python <path>] [--sandbox-cgroup <dir>]
-       moruna kinds
-       moruna check-job <spec.json>
-       moruna --version";
+pub const USAGE: &str = "usage: moruna run <spec.json> [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
+       moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory>
+       moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
+       moruna kinds [--kinds <kinds.json>]...
+       moruna check-job <spec.json> [--kinds <kinds.json>]...
+       moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>] [--kinds <kinds.json>]...
+       moruna --version
+
+--kinds names a file of the kinds the program running Moruna serves: a JSON array of
+declarations, each with `isolation: embedder` and `served` (SDD 18 e.4).";
+
+/// The commands that take `--kinds`: every one that reads or runs a document, and `kinds`.
+const TAKES_KINDS: [&str; 5] = ["run", "serve", "kinds", "check-job", "explain"];
+
+/// `--kinds <file>` taken out of a command line, wherever it stands: the files, in order, and
+/// the rest of the line. A command other than [`TAKES_KINDS`], and `run --vm`, whose guest names
+/// its own kinds, are refused it.
+pub fn split_kinds(args: &[String]) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let mut files = Vec::new();
+    let mut rest = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--kinds" {
+            let path = it
+                .next()
+                .ok_or_else(|| "moruna: --kinds needs a file of declarations".to_string())?;
+            files.push(PathBuf::from(path));
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    if files.is_empty() {
+        return Ok((files, rest));
+    }
+    let command = rest.first().map(String::as_str).unwrap_or("");
+    if !TAKES_KINDS.contains(&command) {
+        return Err(format!(
+            "moruna: --kinds is taken by {}, and not by `{command}`",
+            TAKES_KINDS.join(", ")
+        ));
+    }
+    if command == "run" && rest.iter().any(|a| a == "--vm") {
+        return Err(
+            "moruna run --vm: the guest's `moruna serve` is given its own kinds; drop --kinds"
+                .to_string(),
+        );
+    }
+    Ok((files, rest))
+}
+
+/// `kinds` with every served kind the files declare (SDD 18 KD-I11), or why one could not be:
+/// a file not there, not a JSON array of declarations, or a declaration `Registry::declare`
+/// refuses, each naming the file.
+pub fn with_declared(kinds: &Registry, files: &[PathBuf]) -> Result<Registry, String> {
+    let mut extended = kinds.clone();
+    for file in files {
+        let named = |why: String| format!("moruna: --kinds {}: {why}", file.display());
+        let text = std::fs::read_to_string(file).map_err(|e| named(e.to_string()))?;
+        let declarations: Vec<moruna_job::Declaration> = serde_json::from_str(&text)
+            .map_err(|e| named(format!("not a JSON array of declarations: {e}")))?;
+        for declaration in declarations {
+            extended
+                .declare(declaration)
+                .map_err(|e| named(e.to_string()))?;
+        }
+    }
+    Ok(extended)
+}
 
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `moruna run <spec.json> [--strict]`.
+    /// `moruna run <spec.json> [--plan <plan.mplan>] [--strict] [--events-json]`.
     Run {
         /// The document.
         spec: String,
+        /// The plan to run it by (SDD 26); absent: the default planner's.
+        plan: Option<PathBuf>,
         /// Refuse any field the environment would fill.
         strict: bool,
         /// What a `.pex` package's sandbox needs (17 e.6).
         packages: PackageHost,
+        /// Print every event of the run to standard output as a line of JSON, rendered from its
+        /// record (MH 4.3 version 7).
+        events_json: bool,
     },
-    /// `moruna run --vm <spec.json> --image <path> [--disk <path>[:ro]]...` (MH 4.8.4): boot
-    /// the guest with the disks attached, send it the document, relay what it says, exit with
-    /// its code. The guest's `moruna serve` is strict, so there is no `--strict` here.
+    /// `moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory> [--plan <plan>]`:
+    /// boot the checked native node, send the document/plan, relay actual events,
+    /// and return its explicit job result. The guest's `moruna serve` is strict, so there is no `--strict` here.
     RunVm {
         /// The document.
         spec: String,
-        /// The guest image: a directory or an OCI layout.
+        /// Exact checked native node-image.json descriptor; directories and OCI
+        /// layouts are not interpreted as microkernel images.
         image: PathBuf,
-        /// The disks the guest sees, in order.
-        disks: Vec<DiskConfig>,
+        /// Existing durable run-claim directory; never a temporary default.
+        witness: PathBuf,
+        /// Optional exact plan delivered through the canonical Spec message.
+        plan: Option<PathBuf>,
     },
     /// `moruna serve --listen <address> [--no-strict]`; strict unless told otherwise, because
     /// serve is the hosted path (MH 4.1).
@@ -58,6 +127,17 @@ pub enum Command {
         /// What a `.pex` package's sandbox needs (17 e.6).
         packages: PackageHost,
     },
+    /// Read actual governed historical rows through the host's scoped native reader.
+    TaskOutput {
+        /// Exact immutable manifest metadata reference, never a live source query.
+        manifest: PathBuf,
+        /// One complete Arrow stream, or None to print the manifest facts.
+        chunk: Option<usize>,
+        /// New destination file for a requested Arrow stream.
+        out: Option<PathBuf>,
+        /// Explicit maximum retained-read capacity.
+        max_bytes: Option<u64>,
+    },
     /// `moruna kinds` (SDD 18 e.3): every kind this binary can run, its declaration, as JSON.
     Kinds,
     /// `moruna check-job <spec.json>` (SDD 22 d.3): read a document and check it against the
@@ -65,6 +145,16 @@ pub enum Command {
     CheckJob {
         /// The document.
         spec: String,
+    },
+    /// `moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>]` (SDD 26 d.5): the
+    /// document's plan, as JSON on standard output, and as the plan document at `out`.
+    Explain {
+        /// The document.
+        spec: String,
+        /// The planner, by name; absent: the default.
+        planner: Option<String>,
+        /// Where the plan document goes.
+        out: Option<PathBuf>,
     },
     /// `moruna --version`.
     Version,
@@ -75,14 +165,21 @@ pub enum Command {
 /// Parse the arguments after the program name. The error is the line to print before
 /// [`USAGE`].
 pub fn parse(args: &[String]) -> Result<Command, String> {
+    let (args, _) = cost_options(args)?;
+    parse_command(&args)
+}
+
+fn parse_command(args: &[String]) -> Result<Command, String> {
     let mut rest = args.iter().map(String::as_str);
     match rest.next() {
         Some("run") => {
             let mut spec = None;
+            let mut plan = None;
             let mut strict = false;
             let mut vm = false;
+            let mut events_json = false;
             let mut image = None;
-            let mut disks = Vec::new();
+            let mut witness = None;
             let mut packages = PackageHost::default();
             while let Some(arg) = rest.next() {
                 if sandbox_option(arg, &mut rest, &mut packages, "moruna run")? {
@@ -90,22 +187,30 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 }
                 match arg {
                     "--strict" => strict = true,
+                    "--events-json" => events_json = true,
                     "--vm" => vm = true,
+                    "--plan" => {
+                        let path = rest
+                            .next()
+                            .ok_or_else(|| "moruna run: --plan needs a path".to_string())?;
+                        plan = Some(PathBuf::from(path));
+                    }
                     "--image" => {
                         let path = rest
                             .next()
                             .ok_or_else(|| "moruna run: --image needs a path".to_string())?;
                         image = Some(PathBuf::from(path));
                     }
-                    "--disk" => {
-                        let disk = rest
-                            .next()
-                            .ok_or_else(|| "moruna run: --disk needs a path".to_string())?;
-                        disks.push(
-                            moruna_vmm::cli::parse_disk(disk)
-                                .map_err(|e| format!("moruna run: {e}"))?,
-                        );
+                    "--launch-witness" => {
+                        let path = rest.next().ok_or("--launch-witness needs a directory")?;
+                        if witness.replace(PathBuf::from(path)).is_some() {
+                            return Err("duplicate --launch-witness".into());
+                        }
                     }
+                    "--disk" => return Err(
+                        "moruna run --vm: --disk is retired; node-image.json defines exact devices"
+                            .into(),
+                    ),
                     flag if flag.starts_with("--") => {
                         return Err(format!("moruna run: unknown option `{flag}`"));
                     }
@@ -119,7 +224,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             }
             let spec = spec.ok_or_else(|| "moruna run: which document?".to_string())?;
             if !vm {
-                if image.is_some() || !disks.is_empty() {
+                if image.is_some() || witness.is_some() {
                     return Err(
                         "moruna run: --image and --disk describe a guest, and need --vm"
                             .to_string(),
@@ -127,9 +232,18 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 }
                 return Ok(Command::Run {
                     spec,
+                    plan,
                     strict,
                     packages,
+                    events_json,
                 });
+            }
+            if events_json {
+                return Err(
+                    "moruna run --vm: the guest's events are printed as JSON already; drop \
+                     --events-json"
+                        .to_string(),
+                );
             }
             if strict {
                 return Err(
@@ -145,7 +259,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 );
             }
             let image = image.ok_or_else(|| "moruna run --vm: --image is required".to_string())?;
-            Ok(Command::RunVm { spec, image, disks })
+            let witness = witness.ok_or("moruna run --vm: --launch-witness is required")?;
+            Ok(Command::RunVm {
+                spec,
+                image,
+                plan,
+                witness,
+            })
         }
         Some("serve") => {
             let mut listen = None;
@@ -175,6 +295,51 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 packages,
             })
         }
+        Some("task-output") => {
+            let manifest = rest
+                .next()
+                .filter(|value| !value.starts_with("--"))
+                .ok_or_else(|| "moruna task-output: which pinned manifest reference?".to_owned())?;
+            let mut chunk = None;
+            let mut out = None;
+            let mut max_bytes = None;
+            while let Some(arg) = rest.next() {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| format!("moruna task-output: {arg} needs a value"))?;
+                match arg {
+                    "--chunk" if chunk.is_none() => {
+                        chunk = Some(value.parse::<usize>().map_err(|_| {
+                            "moruna task-output: chunk is a nonnegative index".to_owned()
+                        })?)
+                    }
+                    "--out" if out.is_none() => out = Some(PathBuf::from(value)),
+                    "--max-bytes" if max_bytes.is_none() => {
+                        max_bytes = Some(value.parse::<u64>().map_err(|_| {
+                            "moruna task-output: max-bytes is a positive byte budget".to_owned()
+                        })?)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "moruna task-output: unknown or repeated option {arg}"
+                        ));
+                    }
+                }
+            }
+            if (chunk.is_some() && (out.is_none() || max_bytes.is_none_or(|bytes| bytes == 0)))
+                || (chunk.is_none() && (out.is_some() || max_bytes.is_some()))
+            {
+                return Err(
+                    "moruna task-output: a chunk requires --out and positive --max-bytes".into(),
+                );
+            }
+            Ok(Command::TaskOutput {
+                manifest: PathBuf::from(manifest),
+                chunk,
+                out,
+                max_bytes,
+            })
+        }
         Some("kinds") => match rest.next() {
             None => Ok(Command::Kinds),
             Some(extra) => Err(format!(
@@ -193,6 +358,38 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     "moruna check-job: one document, and `{extra}` is a second"
                 )),
             }
+        }
+        Some("explain") => {
+            let mut spec = None;
+            let mut planner = None;
+            let mut out = None;
+            while let Some(arg) = rest.next() {
+                match arg {
+                    "--planner" => {
+                        let name = rest
+                            .next()
+                            .ok_or_else(|| "moruna explain: --planner needs a name".to_string())?;
+                        planner = Some(name.to_string());
+                    }
+                    "--out" => {
+                        let path = rest
+                            .next()
+                            .ok_or_else(|| "moruna explain: --out needs a path".to_string())?;
+                        out = Some(PathBuf::from(path));
+                    }
+                    flag if flag.starts_with("--") => {
+                        return Err(format!("moruna explain: unknown option `{flag}`"));
+                    }
+                    path if spec.is_none() => spec = Some(path.to_string()),
+                    extra => {
+                        return Err(format!(
+                            "moruna explain: one document, and `{extra}` is a second"
+                        ));
+                    }
+                }
+            }
+            let spec = spec.ok_or_else(|| "moruna explain: which document?".to_string())?;
+            Ok(Command::Explain { spec, planner, out })
         }
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
@@ -218,6 +415,59 @@ fn sandbox_option<'a>(
         .ok_or_else(|| format!("{command}: {arg} needs a path"))?;
     *slot = Some(PathBuf::from(value));
     Ok(true)
+}
+
+/// Strip the cost configuration once at the surface; the same settings open registration's
+/// observation store for live scheduling. No model/store alias or environment fallback.
+fn cost_options(
+    args: &[String],
+) -> Result<(Vec<String>, Option<crate::cost::CostSettings>), String> {
+    let mut clean = Vec::new();
+    let mut store = None;
+    let mut model = None;
+    let mut at = 0;
+    while at < args.len() {
+        let slot = match args[at].as_str() {
+            "--cost-store" => Some(&mut store),
+            "--cost-model" => Some(&mut model),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            if slot.is_some() {
+                return Err(format!("{} is repeated", args[at]));
+            }
+            at += 1;
+            let value = args
+                .get(at)
+                .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                .ok_or_else(|| {
+                    "cost options require a nonempty store path or model name".to_owned()
+                })?;
+            *slot = Some(value.clone());
+        } else {
+            clean.push(args[at].clone());
+        }
+        at += 1;
+    }
+    if store.is_none() && model.is_none() {
+        return Ok((clean, None));
+    }
+    if !matches!(clean.first().map(String::as_str), Some("run" | "serve"))
+        || clean.iter().any(|arg| arg == "--vm")
+    {
+        return Err("cost options configure native run/serve; a VM guest requires its own explicit configuration".into());
+    }
+    let directory = store
+        .map(PathBuf::from)
+        .or_else(crate::cost::default_store_dir)
+        .ok_or_else(|| {
+            "--cost-store is required when no default observation directory exists".to_owned()
+        })?;
+    let mut settings = crate::cost::CostSettings::directory(directory);
+    if let Some(model) = model {
+        settings.model = model;
+    }
+    Ok((clean, Some(settings)))
 }
 
 /// Run a command line and return the process's exit code (MH 4.2). `cancel` is the surface's
@@ -246,11 +496,41 @@ fn main_as(
     heartbeat: Duration,
     capture_process: bool,
 ) -> i32 {
-    let command = match parse(args) {
+    let (files, args) = match split_kinds(args) {
+        Ok(split) => split,
+        Err(line) => {
+            eprintln!("{line}\n{USAGE}");
+            return exit::SPEC_REFUSED;
+        }
+    };
+    let (args, cost) = match cost_options(&args) {
+        Ok(configured) => configured,
+        Err(reason) => {
+            eprintln!("{reason}\n{USAGE}");
+            return exit::SPEC_REFUSED;
+        }
+    };
+    let command = match parse_command(&args) {
         Ok(command) => command,
         Err(line) => {
             eprintln!("{line}\n{USAGE}");
             return exit::SPEC_REFUSED;
+        }
+    };
+    // SDD 18 KD-I11: the kinds the program running Moruna serves, given for this invocation.
+    let declared;
+    let kinds = if files.is_empty() {
+        kinds
+    } else {
+        match with_declared(kinds, &files) {
+            Ok(extended) => {
+                declared = extended;
+                &declared
+            }
+            Err(line) => {
+                eprintln!("{line}");
+                return exit::SPEC_REFUSED;
+            }
         }
     };
     let outcome = match command {
@@ -262,6 +542,27 @@ fn main_as(
             println!("{USAGE}");
             return exit::COMPLETED;
         }
+        Command::TaskOutput {
+            manifest,
+            chunk,
+            out,
+            max_bytes,
+        } => {
+            match task_output(
+                kinds,
+                &manifest,
+                chunk,
+                out.as_deref(),
+                max_bytes,
+                &mut std::io::stdout().lock(),
+            ) {
+                Ok(()) => return exit::COMPLETED,
+                Err(reason) => {
+                    eprintln!("moruna task-output: {reason}");
+                    return exit::SPEC_REFUSED;
+                }
+            }
+        }
         Command::Kinds => {
             println!("{}", kinds.listing().to_json());
             return exit::COMPLETED;
@@ -269,25 +570,63 @@ fn main_as(
         Command::CheckJob { spec } => {
             return check_job(Path::new(&spec), kinds, &mut std::io::stderr().lock());
         }
-        Command::RunVm { spec, image, disks } => {
-            return run_vm(Path::new(&spec), &image, &disks);
+        Command::Explain { spec, planner, out } => {
+            return explain(
+                Path::new(&spec),
+                planner.as_deref(),
+                out.as_deref(),
+                kinds,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+        }
+        Command::RunVm {
+            spec,
+            image,
+            plan,
+            witness,
+        } => {
+            return run_vm(Path::new(&spec), &image, plan.as_deref(), &witness, cancel);
         }
         Command::Run {
             spec,
+            plan,
             strict,
             packages,
-        } => session::run_file(
-            Path::new(&spec),
-            kinds,
-            &HostOptions {
-                strict,
-                env,
-                cancel,
-                heartbeat,
-                packages,
-                capture_process,
-            },
-        ),
+            events_json,
+        } => {
+            let events = if events_json {
+                match events_stream() {
+                    Ok(json) => EventOptions {
+                        ring: None,
+                        json: Some(json),
+                    },
+                    Err(error) => {
+                        eprintln!(
+                            "moruna run: --events-json: standard output cannot be written to: {error}"
+                        );
+                        return exit::FAILED;
+                    }
+                }
+            } else {
+                EventOptions::default()
+            };
+            session::run_file(
+                Path::new(&spec),
+                plan.as_deref(),
+                kinds,
+                &HostOptions {
+                    cost: cost.clone(),
+                    strict,
+                    env,
+                    cancel,
+                    heartbeat,
+                    packages,
+                    capture_process,
+                    events,
+                },
+            )
+        }
         Command::Serve {
             listen,
             strict,
@@ -296,12 +635,14 @@ fn main_as(
             &listen,
             kinds,
             &HostOptions {
+                cost: cost.clone(),
                 strict,
                 env,
                 cancel,
                 heartbeat,
                 packages,
                 capture_process,
+                events: EventOptions::default(),
             },
         ),
     };
@@ -309,14 +650,22 @@ fn main_as(
     outcome.code
 }
 
+/// A handle on the process's standard output that stays its own while the run captures
+/// descriptor 1 as the engine's output: the stream `--events-json` prints to.
+fn events_stream() -> std::io::Result<std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>> {
+    use std::os::fd::AsFd;
+    let own = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(Box::new(own))))
+}
+
 /// `moruna check-job` (SDD 22 d.3): the document at `spec` against the kinds of `kinds`, every
 /// refusal written to `out` as `<field>: <message>`. Exits 0 when there is none, with the exit
 /// code of a refused document (2) when there is one or the document cannot be read, and 1 when
 /// the kinds themselves cannot be checked against.
 pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
-    let read = std::fs::read_to_string(spec)
+    let read = std::fs::read(spec)
         .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
-        .and_then(|text| moruna_job::JobSpec::from_json(&text));
+        .and_then(|bytes| super::session::read_document(&bytes).map_err(|(_, refused)| refused));
     let job = match read {
         Ok(job) => job,
         Err(refused) => {
@@ -345,22 +694,319 @@ pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
     }
 }
 
-/// `moruna run --vm` (MH 4.8.4) on the monitor this build has: KVM, which is Linux-only.
+/// `moruna explain` (SDD 26 d.5): the plan of the document at `spec` by the planner `planner`
+/// names (the default when it names none), for the run's resources (the document's budget, what
+/// discovery finds where it leaves one to discovery), the document checked against the kinds of
+/// `kinds` first. The plan's JSON goes to `out`, and with `plan_file`, the plan document is
+/// written there for `moruna run --plan`. Exits 0 with a plan; 2 when the document, its kinds or
+/// the planner's name is refused, each refusal written to `err`; 1 when the kinds cannot be
+/// checked against, a planner fails, or the plan cannot be written.
+pub fn explain(
+    spec: &Path,
+    planner: Option<&str>,
+    plan_file: Option<&Path>,
+    kinds: &Registry,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let read = std::fs::read(spec)
+        .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
+        .and_then(|bytes| super::session::read_document(&bytes).map_err(|(_, refused)| refused));
+    let job = match read {
+        Ok(job) => job,
+        Err(refused) => {
+            let _ = writeln!(err, "{refused}");
+            return exit::SPEC_REFUSED;
+        }
+    };
+    let plan = match crate::job::plan::explain(&job, planner, kinds) {
+        Ok(plan) => plan,
+        Err(crate::job::plan::ExplainError::Plan(moruna_plan::PlanError::Job(refusals))) => {
+            for refusal in &refusals {
+                let _ = writeln!(err, "{refusal}");
+            }
+            return exit::SPEC_REFUSED;
+        }
+        Err(
+            e @ crate::job::plan::ExplainError::Plan(moruna_plan::PlanError::UnknownPlanner {
+                ..
+            }),
+        ) => {
+            let _ = writeln!(err, "moruna explain: {e}");
+            return exit::SPEC_REFUSED;
+        }
+        Err(e) => {
+            let _ = writeln!(err, "moruna explain: {e}");
+            return exit::FAILED;
+        }
+    };
+    if let Some(path) = plan_file
+        && let Err(e) = std::fs::write(path, plan.to_flatbuffer())
+    {
+        let _ = writeln!(
+            err,
+            "moruna explain: the plan could not be written to {}: {e}",
+            path.display()
+        );
+        return exit::FAILED;
+    }
+    let _ = writeln!(out, "{}", plan.to_json());
+    exit::COMPLETED
+}
+
 #[cfg(target_os = "linux")]
-fn run_vm(spec: &Path, image: &Path, disks: &[DiskConfig]) -> i32 {
-    run_vm_with(
-        spec,
-        image,
-        disks,
-        moruna_vmm::session::default_cid(),
-        &mut std::io::stdout(),
-        moruna_vmm::boot,
-    )
+struct StopWatcher<'a>(&'a std::sync::atomic::AtomicBool);
+#[cfg(target_os = "linux")]
+impl Drop for StopWatcher<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Moruna 1.0 boots only the checked native microkernel artifact descriptor.
+#[cfg(target_os = "linux")]
+fn run_vm(
+    spec: &Path,
+    image: &Path,
+    plan: Option<&Path>,
+    witness: &Path,
+    cancel: CancelToken,
+) -> i32 {
+    let result = (|| -> moruna_vmm::error::Result<moruna_vmm::ExitStatus> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        std::fs::File::open(spec)
+            .map_err(|e| moruna_vmm::error::VmmError::io("open", spec.display().to_string(), &e))?
+            .take(super::protocol::MAX_SPEC_LINE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| moruna_vmm::error::VmmError::io("read", spec.display().to_string(), &e))?;
+        if bytes.len() > super::protocol::MAX_SPEC_LINE {
+            return Err(moruna_vmm::error::VmmError::config(
+                "spec",
+                "exceeds canonical protocol ceiling",
+            ));
+        }
+        let document = super::session::read_document(&bytes)
+            .map_err(|(_, e)| moruna_vmm::error::VmmError::config("spec", e.to_string()))?;
+        let budget = vm_budget(&document)
+            .map_err(|e| moruna_vmm::error::VmmError::config("budget", e.to_string()))?;
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| moruna_vmm::error::VmmError::config("run directory", e.to_string()))?;
+        let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let directory = std::env::temp_dir().join(format!("moruna-node-{name}"));
+        let executable = std::env::current_exe()
+            .map_err(|e| moruna_vmm::error::VmmError::io("resolve", "runtime executable", &e))?;
+        let backend = executable
+            .parent()
+            .ok_or_else(|| {
+                moruna_vmm::error::VmmError::config("backend", "executable parent unavailable")
+            })?
+            .join("moruna-vhost-vsock");
+        let plan = plan
+            .map(|path| {
+                use base64::Engine as _;
+                let metadata = std::fs::metadata(path)
+                    .map_err(|e| moruna_vmm::error::VmmError::io("metadata", "plan", &e))?;
+                if metadata.len() > super::protocol::MAX_SPEC_LINE as u64 {
+                    return Err(moruna_vmm::error::VmmError::config(
+                        "plan",
+                        "exceeds canonical control ceiling",
+                    ));
+                }
+                let bytes = std::fs::read(path)
+                    .map_err(|e| moruna_vmm::error::VmmError::io("read", "plan", &e))?;
+                super::session::read_plan(&bytes)
+                    .map_err(|e| moruna_vmm::error::VmmError::config("plan", e.to_string()))?;
+                Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+            })
+            .transpose()?;
+        let spec = moruna_vmm::session::spec_value(&bytes)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+        let assigned = document
+            .id
+            .as_deref()
+            .and_then(moruna_kernel::RunId::from_hex)
+            .ok_or_else(|| {
+                moruna_vmm::error::VmmError::config(
+                    "run",
+                    "native admission requires canonical document id",
+                )
+            })?;
+        let mut run = super::native::NativeRun::start(
+            super::launch_witness::Admission {
+                run_id: assigned,
+                node_boot: moruna_kernel::RunId(nonce),
+                attempt: 0,
+                directory: witness,
+            },
+            image,
+            budget,
+            &directory,
+            super::native::Tools {
+                qemu: Path::new("qemu-system-x86_64"),
+                vsock: &backend,
+            },
+            super::protocol::Inbound::Spec { spec, plan },
+            deadline,
+        )?;
+        let control = run.control();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            let _stop_watcher = StopWatcher(&done);
+            let watcher = scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if cancel.is_cancelled() {
+                        let _ = control.send(&super::protocol::Inbound::Cancel);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            let outcome = (|| {
+                let mut messages = 0usize;
+                loop {
+                    let message = run.next(deadline)?;
+                    let message = match message {
+                        super::native::Message::Control(message) => message,
+                        super::native::Message::Event(event) => {
+                            std::io::stdout()
+                                .write_all(event.json_line().as_bytes())
+                                .map_err(|e| {
+                                    moruna_vmm::error::VmmError::io(
+                                        "write",
+                                        "guest event output",
+                                        &e,
+                                    )
+                                })?;
+                            messages += 1;
+                            continue;
+                        }
+                    };
+                    std::io::stdout()
+                        .write_all(message.line().as_bytes())
+                        .map_err(|e| {
+                            moruna_vmm::error::VmmError::io("write", "guest output", &e)
+                        })?;
+                    messages += 1;
+                    match message {
+                        super::protocol::Outbound::PortCall { v, call, port, .. } => {
+                            if v != super::protocol::PORTS_VERSION {
+                                return Err(moruna_vmm::error::VmmError::config(
+                                    "port",
+                                    "unsupported guest port version",
+                                ));
+                            }
+                            control.send(&super::protocol::Inbound::PortReply {
+                                v,
+                                call,
+                                ok: None,
+                                error: Some(format!(
+                                    "host port {port} is not configured by this CLI"
+                                )),
+                            })?;
+                        }
+                        super::protocol::Outbound::Exit { code, .. } => {
+                            return Ok(moruna_vmm::ExitStatus { code, messages });
+                        }
+                        _ => {}
+                    }
+                }
+            })();
+            done.store(true, std::sync::atomic::Ordering::Release);
+            let _ = watcher.join();
+            outcome
+        });
+        let cleanup = run.shutdown();
+        let result = result.and_then(|status| cleanup.map(|()| status));
+        // Preserve actual serial/backend diagnostics for a failed run.
+        if result.is_ok() {
+            let _ = std::fs::remove_dir_all(&directory);
+        } else {
+            eprintln!(
+                "moruna run --vm: diagnostics retained at {}",
+                directory.display()
+            );
+        }
+        result
+    })();
+    match result {
+        Ok(status) => status.code,
+        Err(error) => {
+            eprintln!("moruna run --vm: {error}");
+            error.exit_code()
+        }
+    }
+}
+
+/// Native historical read adapter used by the CLI. SDK/MCP embedders call `ReadPort` directly;
+/// scope/version/hash/encoding decisions stay entirely in the sole governed storage reader.
+pub fn task_output(
+    kinds: &Registry,
+    manifest: &Path,
+    chunk: Option<usize>,
+    out: Option<&Path>,
+    max_bytes: Option<u64>,
+    printed: &mut dyn Write,
+) -> Result<(), String> {
+    let reader = kinds
+        .embedding()
+        .historical_reader()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "this host has no authorized historical output reader".to_owned())?;
+    if std::fs::metadata(manifest)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 64 * 1024
+    {
+        return Err("pinned manifest reference exceeds its metadata budget".into());
+    }
+    let bytes = std::fs::read(manifest).map_err(|error| error.to_string())?;
+    let pinned: moruna_storage::Metadata = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid pinned manifest reference: {error}"))?;
+    let runtime =
+        moruna_reactor::configure_runtime(&mut tokio::runtime::Builder::new_current_thread())
+            .build()
+            .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let manifest = reader
+            .manifest(&pinned)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(index) = chunk {
+            let budget = max_bytes
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| "an explicit read byte budget is required".to_owned())?;
+            let path = out.ok_or_else(|| "an output file is required".to_owned())?;
+            let bytes = reader
+                .chunk(&manifest, index, budget)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| error.to_string())?;
+            file.write_all(bytes.as_ref())
+                .map_err(|error| error.to_string())?;
+        } else {
+            serde_json::to_writer_pretty(&mut *printed, &manifest)
+                .map_err(|error| error.to_string())?;
+            writeln!(printed).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
 }
 
 /// `moruna run --vm` where there is no KVM: refused by name, before anything is read.
 #[cfg(not(target_os = "linux"))]
-fn run_vm(_spec: &Path, _image: &Path, _disks: &[DiskConfig]) -> i32 {
+fn run_vm(
+    _spec: &Path,
+    _image: &Path,
+    _plan: Option<&Path>,
+    _witness: &Path,
+    _cancel: CancelToken,
+) -> i32 {
     eprintln!(
         "moruna run --vm: the microVM runs on KVM, which is Linux-only, and this is {}",
         std::env::consts::OS
@@ -368,11 +1014,11 @@ fn run_vm(_spec: &Path, _image: &Path, _disks: &[DiskConfig]) -> i32 {
     exit::FAILED
 }
 
-/// The guest's budget, from the document (MH 4.8.4): it boots with `budget.memory_bytes` and
-/// `budget.cpu` rounded up to whole vCPUs, and may be grown to `budget.elastic`'s maxima. A
-/// document that leaves either to discovery is refused: a guest has no machine to discover
-/// until it is booted with one.
-pub fn vm_budget(spec: &moruna_job::JobSpec) -> Result<moruna_vmm::Budget, moruna_job::SpecError> {
+/// Requested job limits from the document, with fractional CPU rounded upward.
+/// Native admission checks these against the descriptor's fixed engine contract;
+/// physical node RAM/CPUs are distinct and never inferred by changing QEMU -m.
+/// Missing explicit job memory/CPU is refused before launch.
+pub fn vm_budget(spec: &moruna_job::Job) -> Result<moruna_vmm::Budget, moruna_job::SpecError> {
     use moruna_job::SpecError;
     let memory = spec.budget.memory_bytes.ok_or_else(|| {
         SpecError::new(
@@ -402,42 +1048,6 @@ pub fn vm_budget(spec: &moruna_job::JobSpec) -> Result<moruna_vmm::Budget, morun
     })
 }
 
-/// [`run_vm`] with the guest's CID, the relay's output and the monitor chosen by the caller:
-/// the real monitor is [`moruna_vmm::boot`], and a test passes one that plays the guest.
-pub fn run_vm_with(
-    spec: &Path,
-    image: &Path,
-    disks: &[DiskConfig],
-    cid: u32,
-    out: &mut dyn Write,
-    monitor: fn(&VmConfig) -> moruna_vmm::error::Result<i32>,
-) -> i32 {
-    let doc = match std::fs::read_to_string(spec)
-        .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
-        .and_then(|text| moruna_job::JobSpec::from_json(&text))
-        .and_then(|doc| vm_budget(&doc))
-    {
-        Ok(budget) => budget,
-        Err(refused) => {
-            eprintln!("moruna run --vm: {refused}");
-            return exit::SPEC_REFUSED;
-        }
-    };
-    match moruna_vmm::session::boot_and_run_with(spec, image, disks, doc, cid, out, monitor) {
-        Ok(status) => {
-            eprintln!(
-                "moruna run --vm: exit {} after {} messages from the guest",
-                status.code, status.messages
-            );
-            status.code
-        }
-        Err(error) => {
-            eprintln!("moruna run --vm: {error}");
-            error.exit_code()
-        }
-    }
-}
-
 /// The one line `moruna` prints to stderr when a job ends.
 pub fn summary(outcome: &Outcome) -> String {
     let what = match &outcome.diagnostic {
@@ -464,17 +1074,43 @@ mod tests {
             parse(&args(&["run", "job.json"])),
             Ok(Command::Run {
                 spec: "job.json".into(),
+                plan: None,
                 strict: false,
                 packages: PackageHost::default(),
+                events_json: false,
             })
         );
         assert_eq!(
             parse(&args(&["run", "--strict", "job.json"])),
             Ok(Command::Run {
                 spec: "job.json".into(),
+                plan: None,
                 strict: true,
                 packages: PackageHost::default(),
+                events_json: false,
             })
+        );
+        assert_eq!(
+            parse(&args(&["run", "job.json", "--events-json"])),
+            Ok(Command::Run {
+                spec: "job.json".into(),
+                plan: None,
+                strict: false,
+                packages: PackageHost::default(),
+                events_json: true,
+            })
+        );
+        assert!(
+            parse(&args(&[
+                "run",
+                "--vm",
+                "job.json",
+                "--image",
+                "/i",
+                "--events-json"
+            ]))
+            .unwrap_err()
+            .contains("printed as JSON already")
         );
         assert_eq!(
             parse(&args(&["serve", "--listen", "vsock://-1:5000"])),
@@ -508,8 +1144,10 @@ mod tests {
             ])),
             Ok(Command::Run {
                 spec: "job.json".into(),
+                plan: None,
                 strict: false,
                 packages: host.clone(),
+                events_json: false,
             })
         );
         assert_eq!(
@@ -553,22 +1191,35 @@ mod tests {
         );
         assert_eq!(
             parse(&args(&[
-                "run", "--vm", "job.json", "--image", "/img", "--disk", "/d1:ro", "--disk", "/d2",
+                "run",
+                "--vm",
+                "job.json",
+                "--image",
+                "/node-image.json",
+                "--plan",
+                "/job.mplan",
+                "--launch-witness",
+                "/launches"
             ])),
             Ok(Command::RunVm {
                 spec: "job.json".into(),
-                image: "/img".into(),
-                disks: vec![
-                    DiskConfig {
-                        path: "/d1".into(),
-                        read_only: true
-                    },
-                    DiskConfig {
-                        path: "/d2".into(),
-                        read_only: false
-                    },
-                ],
+                image: "/node-image.json".into(),
+                plan: Some("/job.mplan".into()),
+                witness: "/launches".into()
             })
+        );
+        assert!(
+            parse(&args(&[
+                "run",
+                "--vm",
+                "job.json",
+                "--image",
+                "/node-image.json",
+                "--disk",
+                "/d"
+            ]))
+            .unwrap_err()
+            .contains("retired")
         );
         assert_eq!(parse(&args(&["--version"])), Ok(Command::Version));
         assert_eq!(parse(&args(&["help"])), Ok(Command::Help));
@@ -616,142 +1267,31 @@ mod tests {
         );
     }
 
-    /// A monitor that plays the guest: it serves the vsock device's host socket the way the
-    /// muxer does, checks the budget it was booted with and the disk it was given, takes the
-    /// `spec` line and answers as Moruna would, with exit code 4.
-    fn guest(c: &VmConfig) -> moruna_vmm::error::Result<i32> {
-        use std::io::{BufRead, BufReader, Write};
-        assert_eq!(c.memory_bytes, 512 << 20);
-        assert_eq!(c.memory_max_bytes, 1 << 30);
-        assert_eq!((c.cpus, c.cpus_max), (2, 4));
-        assert_eq!(c.disks.len(), 1);
-        assert!(c.disks[0].read_only);
-        let listener = std::os::unix::net::UnixListener::bind(&c.vsock.uds_path).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let mut conn = BufReader::new(stream);
-        let mut line = String::new();
-        conn.read_line(&mut line).unwrap();
-        assert_eq!(line, "CONNECT 5000\n");
-        conn.get_mut().write_all(b"OK 1073741824\n").unwrap();
-        line.clear();
-        conn.read_line(&mut line).unwrap();
-        let spec: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(spec["type"], "spec");
-        assert_eq!(spec["spec"]["budget"]["memory_bytes"], 512 << 20);
-        conn.get_mut()
-            .write_all(b"{\"type\":\"hello\"}\n{\"type\":\"exit\",\"code\":4}\n")
-            .unwrap();
-        let _ = std::fs::remove_file(&c.vsock.uds_path);
-        Ok(4)
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("moruna-vm-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("img")).unwrap();
-        dir
-    }
-
-    /// `moruna run --vm` boots the guest at the document's budget with the disks it was given,
-    /// sends the document, relays what Moruna says and exits with Moruna's own code (MH 4.8.4),
-    /// through the same seam the KVM monitor is called through.
     #[test]
-    fn run_vm_boots_at_the_documents_budget_and_relays_the_guest() {
-        let dir = scratch("relay");
-        let spec = dir.join("job.json");
-        std::fs::write(
-            &spec,
-            serde_json::json!({
-                "moruna_spec": 1,
-                "source": {"kind": "parquet", "url": "/data/in.parquet"},
-                "sink": {"kind": "parquet", "url": "/data/out"},
-                "budget": {"memory_bytes": 512u64 << 20, "cpu": 1.5,
-                           "elastic": {"memory_max_bytes": 1u64 << 30, "cpu_max": 4}},
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let disk = dir.join("data.img");
-        std::fs::write(&disk, vec![0u8; 4096]).unwrap();
-        let disks = vec![DiskConfig {
-            path: disk,
-            read_only: true,
-        }];
-        let mut out = Vec::new();
-        let cid = 300_000 + std::process::id();
-        let code = run_vm_with(&spec, &dir.join("img"), &disks, cid, &mut out, guest);
-        assert_eq!(code, 4, "Moruna's own code");
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "{\"type\":\"hello\"}\n{\"type\":\"exit\",\"code\":4}\n"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A document that leaves the budget to discovery, or is not a document, is refused before
-    /// a guest is booted, by the field; a monitor that fails reports its own code.
-    #[test]
-    fn run_vm_refuses_what_it_cannot_boot() {
-        fn never(_: &VmConfig) -> moruna_vmm::error::Result<i32> {
-            panic!("no guest is booted for a refused document")
-        }
-        fn fails(_: &VmConfig) -> moruna_vmm::error::Result<i32> {
-            Err(moruna_vmm::error::VmmError::NoKvm("absent".into()))
-        }
-        let dir = scratch("refuse");
-        let spec = dir.join("job.json");
-        let doc = |budget: serde_json::Value| {
-            serde_json::json!({
-                "moruna_spec": 1,
-                "source": {"kind": "parquet", "url": "/data/in.parquet"},
-                "sink": {"kind": "parquet", "url": "/data/out"},
-                "budget": budget,
-            })
-            .to_string()
+    fn native_vm_budget_requires_explicit_memory_and_cpu() {
+        let document = |budget: serde_json::Value| {
+            moruna_job::Job::from_v1(&moruna_job::JobSpec::from_json(&serde_json::json!({
+            "moruna_spec": 1, "source": {"kind":"parquet","url":"/in"}, "sink":{"kind":"parquet","url":"/out"}, "budget":budget
+        }).to_string()).unwrap())
         };
-        let img = dir.join("img");
-        let mut out = Vec::new();
-        for (budget, field) in [
-            (serde_json::json!({"cpu": 1.0}), "budget.memory_bytes"),
-            (
-                serde_json::json!({"memory_bytes": 512u64 << 20}),
-                "budget.cpu",
-            ),
-            (
-                serde_json::json!({"memory_bytes": 512u64 << 20, "cpu": 0.0}),
-                "budget.cpu",
-            ),
-        ] {
-            std::fs::write(&spec, doc(budget)).unwrap();
-            let parsed =
-                moruna_job::JobSpec::from_json(&std::fs::read_to_string(&spec).unwrap()).unwrap();
-            assert_eq!(vm_budget(&parsed).unwrap_err().field, field);
-            assert_eq!(
-                run_vm_with(&spec, &img, &[], 1, &mut out, never),
-                exit::SPEC_REFUSED
-            );
-        }
-        std::fs::write(&spec, "not json").unwrap();
         assert_eq!(
-            run_vm_with(&spec, &img, &[], 1, &mut out, never),
-            exit::SPEC_REFUSED
+            vm_budget(&document(serde_json::json!({"cpu":1.0})))
+                .unwrap_err()
+                .field,
+            "budget.memory_bytes"
         );
         assert_eq!(
-            run_vm_with(&dir.join("absent.json"), &img, &[], 1, &mut out, never),
-            exit::SPEC_REFUSED
+            vm_budget(&document(serde_json::json!({"memory_bytes":536870912})))
+                .unwrap_err()
+                .field,
+            "budget.cpu"
         );
-        std::fs::write(
-            &spec,
-            doc(serde_json::json!({"memory_bytes": 512u64 << 20, "cpu": 1.0})),
-        )
+        let budget = vm_budget(&document(
+            serde_json::json!({"memory_bytes":536870912,"cpu":1.5}),
+        ))
         .unwrap();
-        let cid = 400_000 + std::process::id();
-        assert_eq!(
-            run_vm_with(&spec, &img, &[], cid, &mut out, fails),
-            moruna_vmm::error::EXIT_CONFIG
-        );
-        assert!(out.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(budget.memory_bytes, 536870912);
+        assert_eq!(budget.cpus, 2);
     }
 
     /// Off Linux, `moruna run --vm` is refused by name before anything is read.
@@ -761,7 +1301,15 @@ mod tests {
         let kinds = Registry::standard();
         let env = |_: &str| None;
         let code = main_with(
-            &args(&["run", "--vm", "/no/such/spec.json", "--image", "/no/img"]),
+            &args(&[
+                "run",
+                "--vm",
+                "/no/such/spec.json",
+                "--image",
+                "/no/img",
+                "--launch-witness",
+                "/launches",
+            ]),
             &kinds,
             CancelToken::new(),
             &env,
@@ -778,6 +1326,7 @@ mod tests {
             report: None,
             report_file: Some("/tmp/r.json".into()),
             notes: Vec::new(),
+            plan: None,
         };
         assert_eq!(summary(&outcome), "moruna: exit 0; report: /tmp/r.json");
         outcome.code = 2;
@@ -787,5 +1336,70 @@ mod tests {
             summary(&outcome),
             "moruna: exit 2: spec refused: x: y; no report file"
         );
+    }
+}
+
+#[cfg(test)]
+mod historical_cost_options_tests {
+    use super::*;
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+    #[test]
+    fn explicit_cost_store_model_and_pinned_historical_reads_parse_or_refuse() {
+        let (clean, cost) = cost_options(&args(&[
+            "run",
+            "job.json",
+            "--cost-store",
+            "/tmp/explicit-history",
+            "--cost-model",
+            "loglinear",
+        ]))
+        .unwrap();
+        assert_eq!(clean, args(&["run", "job.json"]));
+        assert_eq!(cost.unwrap().model, "loglinear");
+        assert!(cost_options(&args(&["run", "job.json", "--cost-model"])).is_err());
+        assert!(
+            cost_options(&args(&[
+                "run",
+                "--vm",
+                "job.json",
+                "--cost-store",
+                "/tmp/store"
+            ]))
+            .is_err()
+        );
+        assert!(matches!(
+            parse(&args(&["task-output", "pin.json"])).unwrap(),
+            Command::TaskOutput { chunk: None, .. }
+        ));
+        assert!(parse(&args(&["task-output", "pin.json", "--chunk", "0"])).is_err());
+        assert!(
+            parse(&args(&[
+                "task-output",
+                "pin.json",
+                "--chunk",
+                "0",
+                "--out",
+                "rows.arrow",
+                "--max-bytes",
+                "0"
+            ]))
+            .is_err()
+        );
+        assert!(matches!(
+            parse(&args(&[
+                "task-output",
+                "pin.json",
+                "--chunk",
+                "0",
+                "--out",
+                "rows.arrow",
+                "--max-bytes",
+                "4096"
+            ]))
+            .unwrap(),
+            Command::TaskOutput { chunk: Some(0), .. }
+        ));
     }
 }

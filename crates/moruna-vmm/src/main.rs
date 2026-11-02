@@ -1,4 +1,4 @@
-//! `moruna-vmm`: boot the Moruna guest, or resize, inspect or stop a running one.
+//! `moruna-vmm`: supervise one explicit native microkernel artifact with owned tools.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

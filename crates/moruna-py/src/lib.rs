@@ -20,16 +20,33 @@ pub mod handles;
 pub mod size;
 pub mod translate;
 
+/// The extension's Rust heap, counted while a warm-up runs, so that a unit's peak memory holds
+/// a spike its call allocated and freed (SDD 24 p.4); at other times one relaxed load per
+/// allocation. A library cannot install a global allocator for its embedder; the extension is
+/// the program here.
+#[cfg(feature = "python")]
+#[global_allocator]
+static ALLOCATOR: moruna_runtime::check::warmup::CountingAllocator =
+    moruna_runtime::check::warmup::CountingAllocator;
+
 #[cfg(feature = "python")]
 pub mod check;
 #[cfg(feature = "python")]
 pub mod cli;
+#[cfg(feature = "python")]
+pub mod engine;
 #[cfg(feature = "python")]
 pub mod errors;
 // `moruna.Source`, `moruna.Sink` and `moruna.Split`, the classes a user extends (07 e.6, 08
 // f.10, 2026-09-29).
 #[cfg(feature = "python")]
 pub mod extend;
+// `moruna.explain(...)`, a job document's plan (SDD 26).
+#[cfg(feature = "python")]
+pub mod explain;
+// `moruna.read_events(...)`, the events a run wrote as records (MH 4.3 version 7).
+#[cfg(feature = "python")]
+pub mod events;
 #[cfg(feature = "python")]
 pub mod inspect;
 #[cfg(feature = "python")]
@@ -57,3 +74,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "python")]
 pub mod module;
+
+/// The real native PEX process entrypoint.
+#[cfg(all(feature = "python", target_os = "linux", target_arch = "x86_64"))]
+pub mod native_pex;

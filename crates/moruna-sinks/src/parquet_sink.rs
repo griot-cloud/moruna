@@ -316,7 +316,7 @@ impl ParquetSink {
         }
         // Validation is done: from here a failure is the encoder's or the store's, and it moves
         // the sink to `Failed` (e.1), where `finish` reports it and the committed files stand.
-        let out = if first {
+        let out = if inner.current.is_none() {
             match self.open_file(inner, 0) {
                 Ok(()) => self.encode_checked(inner, seq, batch, rows, bytes),
                 Err(e) => Err(e),
@@ -511,25 +511,31 @@ impl Sink for ParquetSink {
             let mut inner = self.lock();
             // A run that wrote nothing never adopted a schema, so the one `open` was given is
             // what the empty file carries (h).
-            if inner.current.is_none() {
+            if inner.current.is_none() && inner.ledger.committed().is_empty() {
                 inner.schema = inner.declared.clone();
                 self.open_file(&mut inner, 0)?;
             }
-            self.roll(&mut inner, 0, false)?
+            if inner.current.is_some() {
+                Some(self.roll(&mut inner, 0, false)?)
+            } else {
+                None
+            }
         };
-        let Pending {
+        if let Some(Pending {
             entry,
             seqs,
             completion,
             buf,
-        } = pending;
-        let outcome = completion.wait();
-        self.buffers.keep_spare(buf);
-        match outcome {
-            Ok(()) => self.commit(entry, &seqs),
-            Err(e) => {
-                self.fail(&e);
-                return Err(e);
+        }) = pending
+        {
+            let outcome = completion.wait();
+            self.buffers.keep_spare(buf);
+            match outcome {
+                Ok(()) => self.commit(entry, &seqs),
+                Err(e) => {
+                    self.fail(&e);
+                    return Err(e);
+                }
             }
         }
         self.write_success()?;
@@ -550,6 +556,49 @@ impl Sink for ParquetSink {
 
     fn skip(&self, seq: Seq) {
         self.lock().ledger.skip(seq);
+    }
+
+    fn checkpoint_flush(&self) -> Result<()> {
+        let pending = {
+            let mut inner = self.lock();
+            if matches!(inner.phase, Phase::Finished) {
+                return Ok(());
+            }
+            inner.phase.require_open()?;
+            if inner
+                .current
+                .as_ref()
+                .is_none_or(|file| file.seqs.is_empty())
+            {
+                return Ok(());
+            }
+            match self.roll(&mut inner, 0, false) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    inner.phase = Phase::Failed(error.to_string());
+                    inner.current = None;
+                    return Err(error);
+                }
+            }
+        };
+        let Pending {
+            entry,
+            seqs,
+            completion,
+            buf,
+        } = pending;
+        let outcome = completion.wait();
+        self.buffers.keep_spare(buf);
+        match outcome {
+            Ok(()) => {
+                self.commit(entry, &seqs);
+                Ok(())
+            }
+            Err(error) => {
+                self.fail(&error);
+                Err(error)
+            }
+        }
     }
 
     fn checkpoint(&self) -> Result<Option<Vec<u8>>> {

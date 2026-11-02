@@ -1,0 +1,4 @@
+# Native kernel ABI proof: no devices, network, storage or simulated authority.
+moruna-image 1
+process node-memory-proof
+  handle console console

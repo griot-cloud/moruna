@@ -1,0 +1,10 @@
+[package]
+name = "linux-protocol"
+description = "moruna.linux: running an unmodified Linux program as a process on the Moruna microkernel, and what it did (SDD 28)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

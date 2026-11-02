@@ -16,15 +16,6 @@ pub enum Arch {
     Aarch64,
 }
 
-impl Arch {
-    /// The architecture this monitor was built for.
-    #[cfg(target_arch = "x86_64")]
-    pub const HOST: Arch = Arch::X86_64;
-    /// The architecture this monitor was built for.
-    #[cfg(not(target_arch = "x86_64"))]
-    pub const HOST: Arch = Arch::Aarch64;
-}
-
 /// One MiB.
 const MIB: u64 = 1 << 20;
 

@@ -180,6 +180,9 @@ pub enum Stage {
     /// A loaded package (`moruna.load`), which the run opens again by its path and pin under
     /// its own runtime (12 f.8).
     Package(moruna_runtime::packaged::PackageHost),
+    /// A task of a kind the program serves itself (`@moruna.kind`, SDD 18 KD-I11): its
+    /// declaration and the callable that answers its port.
+    Served(Box<moruna_job::Declaration>, Py<PyAny>),
 }
 
 /// The kernels of one run, in stage order, from whatever `moruna.run` was given: one kernel, a
@@ -207,6 +210,14 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stag
             out.push(Stage::Package(package.get().host.clone()));
             continue;
         }
+        if let Ok(task) = item.cast::<crate::kinds::PyDeclaredTask>() {
+            let task = task.get();
+            out.push(Stage::Served(
+                Box::new(task.declaration.clone()),
+                task.serve.clone_ref(py),
+            ));
+            continue;
+        }
         if item.is_callable() {
             // "a plain function passed as a kernel is wrapped as if decorated with defaults" (f.3).
             let handle = build(
@@ -231,8 +242,8 @@ pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stag
             continue;
         }
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "a kernel must be produced by @moruna.kernel or moruna.std, or be callable, and {} is \
-             none of these",
+            "a kernel must be produced by @moruna.kernel, moruna.std or a @moruna.kind, or be \
+             callable, and {} is none of these",
             type_name(&item)
         )));
     }

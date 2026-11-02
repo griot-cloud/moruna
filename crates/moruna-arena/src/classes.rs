@@ -9,8 +9,8 @@
 //! `unsafe` is permitted in this module for the pointer arithmetic that turns an offset
 //! into an address (section l); every block cites AR-I1 or AR-I2.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use moruna_kernel::Tier;
 
@@ -82,6 +82,43 @@ pub(crate) enum Release {
     Double,
 }
 
+/// The bytes a tier's spaces have charged, together, and the most they have held at once since
+/// the mark was last reset: one per tier, shared by every region of it, so a tier that has grown
+/// by regions still has one exact high-water mark (warm-up's peak, SDD 24 p.4).
+#[derive(Debug, Default)]
+pub(crate) struct Watermark {
+    live: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl Watermark {
+    fn charge(&self, bytes: u64) {
+        let live = self.live.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.peak.fetch_max(live, Ordering::AcqRel);
+    }
+
+    fn release(&self, bytes: u64) {
+        self.live.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// The bytes charged now.
+    pub(crate) fn live(&self) -> u64 {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The most charged at once since the last [`Watermark::reset`].
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+
+    /// Start a new mark at what is charged now.
+    pub(crate) fn reset(&self) {
+        self.peak.store(self.live(), Ordering::Release);
+        // A charge between the two loads raised `live` after the store; take it.
+        self.peak.fetch_max(self.live(), Ordering::AcqRel);
+    }
+}
+
 /// One region's allocator: the class free lists, the granule maps that turn a pointer back
 /// into its slot, and the top area shared by slab claims and large allocations.
 pub(crate) struct Space {
@@ -100,6 +137,7 @@ pub(crate) struct Space {
     top: Mutex<TopArea>,
     in_use: AtomicU64,
     double_release: AtomicU64,
+    watermark: Arc<Watermark>,
 }
 
 // SAFETY: `base` is the region's address, which the `Mapping` beside this `Space` owns for
@@ -114,7 +152,13 @@ impl Space {
     /// granule and the region's base is aligned to at least the granule, so every class
     /// slot is aligned to its own size and therefore to `ALIGNMENT` and, when the class is
     /// at least that big, to the page size (AR-I1).
-    pub(crate) fn new(base: *mut u8, bytes: u64, tier: Tier, small_mode: bool) -> Space {
+    pub(crate) fn new(
+        base: *mut u8,
+        bytes: u64,
+        tier: Tier,
+        small_mode: bool,
+        watermark: Arc<Watermark>,
+    ) -> Space {
         let granules = (bytes / GRANULE) as usize;
         let mark: Box<[AtomicU8]> = (0..granules).map(|_| AtomicU8::new(MARK_NONE)).collect();
         let outstanding: Box<[AtomicU64]> = (0..granules).map(|_| AtomicU64::new(0)).collect();
@@ -134,6 +178,7 @@ impl Space {
             }),
             in_use: AtomicU64::new(0),
             double_release: AtomicU64::new(0),
+            watermark,
         };
         if small_mode {
             space.seed_small_mode();
@@ -395,6 +440,7 @@ impl Space {
             .ok_or(OutOfSpace)?;
         self.mark_range(off, charged, MARK_LARGE);
         self.in_use.fetch_add(charged, Ordering::Relaxed);
+        self.watermark.charge(charged);
         Ok(off)
     }
 
@@ -402,6 +448,7 @@ impl Space {
     fn activate(&self, off: u64, requested: u64, charged: u64) {
         self.outstanding[(off / GRANULE) as usize].store(requested, Ordering::Release);
         self.in_use.fetch_add(charged, Ordering::Relaxed);
+        self.watermark.charge(charged);
     }
 
     /// Return `len` bytes at `ptr` (f.4). A zero-length buffer owns nothing and returns
@@ -444,6 +491,7 @@ impl Space {
             }
             self.lock_free(c).push(slot);
             self.in_use.fetch_sub(size, Ordering::Relaxed);
+            self.watermark.release(size);
             return Release::Freed;
         }
     }
@@ -453,6 +501,7 @@ impl Space {
             LargeRelease::Freed { offset, charged } => {
                 self.mark_range(offset, charged, MARK_NONE);
                 self.in_use.fetch_sub(charged, Ordering::Relaxed);
+                self.watermark.release(charged);
                 Release::Freed
             }
             LargeRelease::Partial => Release::Partial,
@@ -501,7 +550,7 @@ mod tests {
         // longer than the space, and the `Vec` outlives the `Space`.
         let ptr = unsafe { raw.add(base as usize) };
         Heap {
-            space: Space::new(ptr, bytes, Tier::Host, small_mode),
+            space: Space::new(ptr, bytes, Tier::Host, small_mode, Arc::default()),
             _backing: backing,
         }
     }

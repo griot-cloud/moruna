@@ -89,6 +89,7 @@ pub(crate) fn check(shared: &Shared) {
     if !shared.run_state().is_live() {
         return;
     }
+    crate::decide::stall_check(shared);
     let interval_ns = shared.cfg.heartbeat_interval_ms.saturating_mul(1_000_000);
     let now = now_ns();
     let mut dead: Option<(u16, StageId, Seq)> = None;

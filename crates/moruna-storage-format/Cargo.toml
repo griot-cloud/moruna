@@ -1,0 +1,26 @@
+[package]
+name = "moruna-storage-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "No-std storage identities and the single versioned durable extent/commit codec"
+
+[dependencies]
+blake3 = { version = "=1.8.7", default-features = false }
+serde = { version = "=1.0.229", default-features = false, features = ["alloc", "derive"], optional = true }
+
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"], optional = true }
+aes = { version = "=0.8.4", features = ["zeroize"], optional = true }
+zeroize = { version = "=1.9.0", features = ["alloc"], optional = true }
+
+ghash = { version = "=0.5.1", default-features = false, features = ["zeroize"], optional = true }
+polyval = { version = "=0.6.2", default-features = false, features = ["zeroize"], optional = true }
+
+[features]
+default = []
+crypto = ["dep:aes-gcm", "dep:aes", "dep:zeroize", "blake3/zeroize", "dep:ghash", "dep:polyval"]
+serde = ["dep:serde"]
+pure = ["blake3/pure"]

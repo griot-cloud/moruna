@@ -54,6 +54,11 @@ select = ["E", "F", "I", "UP", "B", "PL"]
 # `run` and `kernel` have the argument lists d.2 fixes, and they are keyword-only past the
 # first three; `polars` imports polars inside the function so `import moruna` does not need it.
 "python/moruna/__init__.py" = ["PLR0913", "PLC0415"]
+# `check` and `check_package` take the command's settings, keyword-only past the target.
+"python/moruna/_check.py" = ["PLR0913"]
+# `kind` has the keyword-only arguments of a declaration (SDD 18 e.1, e.4), as `kernel` has the
+# decorator's.
+"python/moruna/_kinds.py" = ["PLR0913"]
 # A test asserts against the numbers the design fixes (32 hexadecimal characters of a run id,
 # 40 lines of the report layout); naming each one a constant hides what is being asserted.
 "python/tests/*" = ["PLR2004"]

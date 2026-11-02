@@ -1,48 +1,44 @@
-//! Moruna packaged as a microVM: `moruna-vmm`, the monitor that boots the Moruna guest on
-//! KVM (MH 4.8).
-//!
-//! The monitor boots exactly one guest for exactly one run and exits with the run's exit code.
-//! It attaches the block devices it is given, exposes the guest's vsock as Unix sockets, and
-//! resizes memory and vCPUs within the maxima given at boot. There is no network device and
-//! no way to configure one.
-//!
-//! Everything but [`kvm`] is portable and tested on any host; [`kvm`] is Linux-only.
+//! Moruna 1.0 native microkernel launcher: checked artifacts, explicit Linux KVM
+//! tools and owned QEMU/vsock lifetimes. Linux-guest monitor internals are test-only.
 
 #![deny(missing_docs)]
 #![allow(clippy::result_large_err)]
 
-pub mod acpi;
-pub mod boot;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod acpi;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod boot;
 pub mod cli;
-pub mod config;
-pub mod control;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod config;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod control;
+#[cfg(any(target_os = "linux", all(test, target_arch = "x86_64")))]
 pub mod devices;
 pub mod error;
-pub mod fdt;
-pub mod image;
-#[cfg(target_os = "linux")]
-pub mod kvm;
-pub mod layout;
-pub mod loader;
-pub mod machine;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fdt;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod image;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod layout;
+mod limits;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod loader;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod machine;
+pub mod microkernel;
 pub mod session;
 pub mod sys;
-
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) mod testing;
-
-pub use session::{Budget, ExitStatus, boot_and_run};
-
-/// Boot the guest `config` describes and block until it stops; returns the exit code.
-#[cfg(target_os = "linux")]
-pub fn boot(config: &config::VmConfig) -> error::Result<i32> {
-    kvm::run(config)
-}
+pub mod vhost_user;
+pub use session::{Budget, ExitStatus};
 
 /// Boot the guest `config` describes: refused on a host without KVM, after the configuration
 /// and the image are checked (so a bad configuration is reported as such everywhere).
-#[cfg(not(target_os = "linux"))]
-pub fn boot(config: &config::VmConfig) -> error::Result<i32> {
+#[cfg(all(test, not(target_os = "linux"), target_arch = "x86_64"))]
+fn boot(config: &config::VmConfig) -> error::Result<i32> {
     config.validate()?;
     image::resolve(&config.image)?;
     Err(error::VmmError::NoKvm(format!(
@@ -51,7 +47,7 @@ pub fn boot(config: &config::VmConfig) -> error::Result<i32> {
     )))
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, not(target_os = "linux"), target_arch = "x86_64"))]
 mod tests {
     use super::*;
 

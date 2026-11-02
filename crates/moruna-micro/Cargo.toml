@@ -1,0 +1,28 @@
+[package]
+name = "moruna-micro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The engine on the Moruna microkernel (SDD 30): the same engine as on a Linux node, a Linux program the personality started with granted handles, reaching the vsock driver, the personality and the data plane through the kernel's own calls"
+
+[dependencies]
+moruna-kernel = { workspace = true }
+moruna-adapters = { workspace = true }
+tracing = { workspace = true }
+
+# The kernel's calls exist on the Moruna kernel only, and it runs x86-64 programs: everything
+# that makes them is built for that target alone. Elsewhere the crate says the kernel is not
+# there, and nothing else.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+libc = { workspace = true }
+moruna-sys = { workspace = true }
+moruna-svc = { workspace = true, features = ["native"] }
+moruna-plane = { workspace = true, features = ["native"] }
+vsock-protocol = { workspace = true }
+linux-protocol = { workspace = true }
+moruna-record = { workspace = true }
+
+imagefs-protocol = { workspace = true }

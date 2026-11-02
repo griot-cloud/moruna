@@ -1,0 +1,13 @@
+[package]
+name = "virtio-net"
+description = "The virtio network driver: a process on the Moruna microkernel serving moruna.driver.net for one virtio-net card, with a queue pair per CPU where the device offers several"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-pci = { path = "../pci", version = "=0.1.0" }
+moruna-virtio = { path = "../virtio", version = "=0.1.0" }
+net-protocol = { path = "../net-protocol", version = "=0.1.0" }

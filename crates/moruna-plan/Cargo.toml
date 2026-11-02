@@ -1,0 +1,25 @@
+[package]
+name = "moruna-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Moruna's plan of a job: what runs when and how, the planner port, explain and the plan's check"
+
+# What an embedder depends on to ask Moruna how it would run a job before it runs it (SDD 26,
+# `architecture/adaptive-runtime.md` sections 4, 8 and 11). It sits above `moruna-job`, which it
+# reads jobs with, and above `moruna-cost`, whose estimates, model port and simulator it plans
+# with: `moruna-cost` depends on `moruna-job`, so the plan cannot live there. Nothing from Arrow,
+# DataFusion or the runtime.
+[dependencies]
+moruna-job = { workspace = true }
+moruna-cost = { workspace = true }
+# The plan document is FlatBuffers, as the job document is (SDD 26 e.1).
+flatbuffers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The job's digest (MH 4.1) and the plan's and its steps' ids are SHA-256.
+sha2 = { workspace = true }
+thiserror = { workspace = true }

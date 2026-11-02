@@ -1,0 +1,588 @@
+{
+  "recorded_client_date": "2026-11-01",
+  "branch": "codex/moruna-consolidated-20261101",
+  "base_head": "38447a99447151aec77eb28272a8a32e682052f3",
+  "source_candidate_patch_sha256": "371fcf02b04d5b4659dea879bdf55422f1e522a5984fdadb229fb3911113a6fe",
+  "candidate_path_changes": 1105,
+  "latest_frozen_source": {
+    "archive_sha256": "7276fa78291a44d5fbb6f631359d87a89e8ca9a20da54a8e946750dce0c09cdf",
+    "archive_bytes": 137489647,
+    "inputs_census_sha256": "f0ef4f206d0cc7913538a660f914201262f89e0d130c1d13d1cfa858c6eb91cb",
+    "source_census_sha256": "1d00986233d148a401994f741e8be63fe4571567017613c75e7ae49398b56e64",
+    "cargo_lock_sha256": "1caedfbc967afa51d87907f057928d3f5b5fd7808640084c33a7153cb771f1a0"
+  },
+  "latest_private_common_sha256": "d4f5ac087c1a8517143629b06bd44b7f77f036f0f1d2a94c22927002ccb55720",
+  "latest_private_adapter_sha256_before_documentation_normalization": "f7157d92b2142bb034f660068f4201bf4f1573e83951ee5b2f7c616124f19705",
+  "latest_correction_execution": "Historical initial diagnostic field; current acceptance is recorded in phase_a_060.current_acceptance",
+  "runs": [
+    {
+      "run": "moruna-proof-501-45b8167b8230",
+      "summary_sha256": "6f13578a06b95cc1c2e46959aca23b8b8c0bce79dfa20115fd5c4eaac5d729a2",
+      "phase": "witness-tests",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "a6e12073007e9d5b6183a039fb28716eb3cb631c61955f4747f18fbf7cf4d6bf",
+      "inputs_census_sha256": "04f3498f4c4e2e62f6b574a2b453c50c4ab7eb8bcf761f31a914d610eca91e0a",
+      "scope": "14 host witness tests passed; not kernel execution"
+    },
+    {
+      "run": "moruna-proof-501-568870ac5dd3",
+      "summary_sha256": "059ebe72759365541bdf443a8694ea2b2cf6c8c73e95c76192fbd1c2a492e470",
+      "phase": "link",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "16c10d15d973f3dd157164228ded1ab929bc90a127715c7d2281f66f642e2787",
+      "inputs_census_sha256": "daf9e7d8cd2ad7a9bb0a16d425c2b5d922860d291bfbe12b07a31720fdb4b66d",
+      "scope": "52 native artifacts and permission-origin fixture; not KVM deployment"
+    },
+    {
+      "run": "moruna-proof-501-3e682418af86",
+      "summary_sha256": "4ec504692b0fd9d9e814e174bbc6fba2e3d0e7d848ef73b4811cea956bc70235",
+      "phase": "personality-artifacts",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "7581ec2121187bde7c220619ccf6540be47420600080faa22df2ff63f72c2beb",
+      "inputs_census_sha256": "cb19b3ea1e5cc28eabe50034dc64cc7e81016b08afb6af08da8f8ce05c084525",
+      "scope": "Engine build with 21 focused tests passed"
+    },
+    {
+      "run": "moruna-proof-501-86ac3876204d",
+      "summary_sha256": "537e16cf810e5cb0d505acaf4ec9c2d3e4c74e9fba0309a208b7ff8f350f3e76",
+      "phase": "sdk-proof-build",
+      "guest_exit": 0,
+      "cleanup": true,
+      "source_archive_sha256": "d41132f402882cd2c5123fd750d52921607a078009e13b942836f7adb6be785e",
+      "inputs_census_sha256": "e8d9a533730defb8bf05f40f04ce8a87cd4c0679fd0718efc5dd8914259e98ab",
+      "scope": "Six sink-ack tests and one ARM driver passed; source predates diagnostic correction"
+    },
+    {
+      "run": "moruna-proof-501-c04dd942e5fb",
+      "summary_sha256": "1f329fb8b7ab9089cf7b0c45744bfb7c638c4698c32b2ddf36d135c8af966855",
+      "phase": "profile",
+      "guest_exit": 1,
+      "cleanup": true,
+      "source_archive_sha256": null,
+      "inputs_census_sha256": null,
+      "scope": "CPU1 case1 passed; case2 failed; cases3-5 unrun"
+    }
+  ],
+  "CPU1_cases": [
+    {
+      "case": 1,
+      "result_sha256": "bf66e57bd8f3811edb23f2c0768987626ed3373a210311b1f6a016838ef34ac1",
+      "passed": true,
+      "cleanup": true,
+      "inputs_sha256": "38d5e4a9d7100fbc391aa6fb2b925a7b75a9b36d40ae8f2e33e880f6da309991",
+      "run_id": "c1000101000000000000000000000000",
+      "owned_children": [],
+      "inputs_unchanged": true,
+      "error": null
+    },
+    {
+      "case": 2,
+      "result_sha256": "c102f406519b377ad5cd680dbbdfc81f32d54c0647e4a32252b96d2073bd7222",
+      "passed": false,
+      "cleanup": false,
+      "inputs_sha256": "38d5e4a9d7100fbc391aa6fb2b925a7b75a9b36d40ae8f2e33e880f6da309991",
+      "run_id": "c1000102000000000000000000000000",
+      "owned_children": [],
+      "inputs_unchanged": true,
+      "error": "Command '['/proof/build/kd3-native-proof', '/proof/evidence/cpu1/case2/sdk-config.json']' returned non-zero exit status 1."
+    }
+  ],
+  "remaining": [
+    "Rebuild driver from corrected source and run six focused tests",
+    "Run all five canonical SDK cases in order on CPU1, CPU2 and CPU4 with same inputs",
+    "Run native connection/refusal and durable storage/recovery proof",
+    "Run actual Linux x86 KVM staging",
+    "Verify full Griot application on Moruna"
+  ],
+  "large_local_artifact_store": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux",
+  "artifact_note": "Source and proof tooling are tracked here. Large raw logs, compiler caches, vendor archives and executable/VM images remain local artifacts and are not part of this commit.",
+  "consolidation_checks": {
+    "rust_format": "PASS cargo fmt --all -- --check",
+    "docs": "PASS 26 pages",
+    "python_syntax": "PASS 76 changed Python files",
+    "shell_syntax": "PASS 5 changed shell files",
+    "merge_markers": "None in authored source",
+    "no_stubs": "PASS after equivalent invalid-header fixture replacement",
+    "DCO_self_test": "PASS",
+    "authored_whitespace": "PASS excluding byte-preserved vendored/generated sources and patch fixture",
+    "clippy": "DEFERRED before compiler start: Griot VM holds shared heavy-work reservation",
+    "full_tests_coverage_python": "NOT RUN for consolidated branch",
+    "normal_commit_hook": "Stopped at clippy resource guard; no commit created by that attempt",
+    "Griot_changes": "None during consolidation, baseline diff and status hashes verified"
+  },
+  "consolidation_source_adjustments": [
+    "Preserved pre-existing BOARD, SDD10 and governed regression edits through clean three-way reconciliation",
+    "Normalized two documentation heading punctuation marks for repository conventions",
+    "Changed invalid ServedCall test magic from XXXX to NOPE to avoid false stub-marker detection; same Magic rejection assertion",
+    "Included independently reviewed exact one-file failure-diagnostic adapter validation patch"
+  ],
+  "publication_authorization": {
+    "client_date": "2026-11-01",
+    "human_instruction": "Push WIP snapshot; defer heavy checks",
+    "scope": "This Moruna integration branch only; no Griot source/service changes; no deployment",
+    "hook_handling": "Existing MORUNA_SKIP_QUALITY=1 for this authorized WIP commit/push only; no persistent hook/config change"
+  },
+  "source_assembly_base_head": "38447a99447151aec77eb28272a8a32e682052f3",
+  "publication_base_head": "67c0787046c8b2d1fce7e17cb194a1a6dd49a6e2",
+  "excluded_compiler_output_history": {
+    "commit": "4864632fa7f66e935b271eefbd98d2b22a7ec418",
+    "files": 4458,
+    "bytes": 2184376510,
+    "source_fixes": "Retained in consolidated tree",
+    "local_artifacts": "Retained on disk",
+    "original_integration_branch": "Unchanged",
+    "initial_upload": "Stopped; no remote branch created"
+  },
+  "phase_a_060": {
+    "deadline_utc": "2026-11-01T11:54:37Z",
+    "local_scope": "User requests ARM Linux tests and local x86 QEMU; no SSH/KVM host",
+    "host_producer": {
+      "run": "moruna-proof-501-99b59f573a99",
+      "version": "0.6.0",
+      "tools": 8,
+      "focused_tests_passed": 6,
+      "cleanup": true
+    },
+    "engine_producer": {
+      "run": "moruna-proof-501-2233d130525c",
+      "version": "0.6.0",
+      "passed": true,
+      "cleanup": true,
+      "note": "Predates the same-scope context clone; final source rebuild still required"
+    },
+    "regression": {
+      "run": "moruna-proof-501-a12ec7ad1466",
+      "passed_tests": 245,
+      "ignored_tests": 2,
+      "failed_tests": 0,
+      "overall_stage": "FAILED clippy: four manual-is-multiple-of findings; source corrected, recheck pending",
+      "cleanup": true
+    },
+    "matrix": "PASS strict92actualresults/21cases, explicit multi-run source-bound provenance; no single-run flag",
+    "SDK_boots": "PASS15 current501 binary actors on imagefs768 profile; original prior256 profile evidence preserved separately",
+    "release": "NOT PUBLISHED",
+    "active_table_areas": [
+      "Compiler dependencies",
+      "Runtime, SDK, checkpoints/history",
+      "Node launcher and admission",
+      "Combined application",
+      "Deployment artifacts"
+    ],
+    "historical_initial_snapshot": {
+      "host_producer": {
+        "run": "moruna-proof-501-99b59f573a99",
+        "version": "0.6.0",
+        "tools": 8,
+        "focused_tests_passed": 6,
+        "cleanup": true
+      },
+      "engine_producer": {
+        "run": "moruna-proof-501-2233d130525c",
+        "version": "0.6.0",
+        "passed": true,
+        "cleanup": true,
+        "note": "Predates the same-scope context clone; final source rebuild still required"
+      },
+      "regression": {
+        "run": "moruna-proof-501-a12ec7ad1466",
+        "passed_tests": 245,
+        "ignored_tests": 2,
+        "failed_tests": 0,
+        "overall_stage": "FAILED clippy: four manual-is-multiple-of findings; source corrected, recheck pending",
+        "cleanup": true
+      },
+      "matrix": "21 cases/92 cells NOT YET EXECUTED",
+      "SDK_boots": "15 required, NOT YET ACCEPTED for0.6.0"
+    },
+    "current_acceptance": {
+      "runtime_source_head": "501ac3be4416e17079d4a17476a088cd7f81085b",
+      "profile_commit": "9e7668a9099e17b9b4e7da0e2eb52312dea9650c",
+      "reporting_fixture_commit": "d7670ad20b500ed1b58aa60d4cdd66418f5f9ab0",
+      "execution": "ARM Linux host; x86 QEMU TCG; KVM not run",
+      "coverage": "EXCLUDED_BY_USER; no90percent pass claimed",
+      "native52": {
+        "run": "3473d1cecd0f",
+        "status": "PASS52 verified"
+      },
+      "generic_native_regression": {
+        "run": "4e414311af8d",
+        "status": "PASS"
+      },
+      "normal_personality": {
+        "run": "b33342ce1858",
+        "status": "PASS17 verified"
+      },
+      "SDK15": {
+        "status": "PASS",
+        "profile_imagefs_mib": 256,
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/current501-sdk15-receipts/complete.json",
+        "receipt_sha256": "8eb73b81c6db84258007becb273eae76aecfe619a73991d44d5c248c45ad2a21",
+        "index_sha256": "442db728249949d2ee8b5b896e687dbc64dc9e2c2b66b0c4ad75e3bd40c3ab23",
+        "journal_sha256": "20f97cde45f6eae6436dd8a8ffe4df622c504d1e0a9b8cb087c460389f62eb2c"
+      },
+      "genuine_public_builder": {
+        "run": "549620ddce57",
+        "status": "PASS",
+        "cpus": 1,
+        "rows": 100000
+      },
+      "GNU_release": {
+        "run": "3b15a968d00d",
+        "guest_build": "PASS",
+        "original_collector_error": "PRESERVED; collected false",
+        "independent_verification": "gnu-release-3b15-independent-artifact-verification.json",
+        "verification_sha256": "d594eff25ceb26647909232cbb2c8a5ec806f357ff85e48a2a2552dca8b2c486"
+      },
+      "Linux_release_comparison": {
+        "status": "PASS41cases/46receipts",
+        "plan_prefix": "0c394"
+      },
+      "node_profile": {
+        "node_mib": 3072,
+        "imagefs_mib": 768,
+        "job_mib": 1024,
+        "job_account_mib": 1408,
+        "scratch_mib": 256,
+        "admission_mib": 1536,
+        "auxiliary_total_mib": 2880,
+        "actual_carve_guards": "UNCHANGED; actual successful PEX boot"
+      },
+      "native_PEX": {
+        "run_prefix": "89d",
+        "status": "PASS"
+      },
+      "native_cells_0_through_35": "PASS actual768release; retained per-cell receipts required",
+      "pending": {
+        "release_publication": "PENDING canonical CI/release sequence"
+      },
+      "release": "NOT PUBLISHED",
+      "corrected_native_cells_36_through_40": {
+        "status": "PASS",
+        "output": "node-kd3-d767-corrected-output",
+        "cells": [
+          36,
+          37,
+          38,
+          39,
+          40
+        ]
+      },
+      "canonical_92_result_composite": {
+        "status": "PASS",
+        "classification": "SCOPED_ACTUAL_MULTI_RUN_COMPARISON_NOT_SINGLE_RUN_ACCEPTANCE",
+        "directory": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/kd3-scoped-actual-comparison-2tm752pc",
+        "result_sha256": "64893aae5d8e00ec4f5063beb9f0f7f7abfb15ea580d4038027199c66d9e7ce1",
+        "comparison_exit": 0,
+        "actual_receipts": 92,
+        "required_cases": 21,
+        "comparator_sha256": "ae266dc64e65aa09d2775ebaa0fec4d8f0257039db8c73154e79e031bd518c44",
+        "matrix_sha256": "87694207b1573e1a18b261c5a166e79f3b6a13949c202f3fdb9d4eb5fccef7f3",
+        "log_sha256": "96e76643c61c87cb4430d73956a883700bd9ef78623feaf401b1f490307af5fe",
+        "ledger_sha256": "41a52de7884e50475ffd543b132ae19d6cf1e81eeee63b7e1b07bc481bf2a76b"
+      },
+      "SDK15_imagefs768": {
+        "status": "PASS15",
+        "cpus": [
+          1,
+          2,
+          4
+        ],
+        "profile_imagefs_mib": 768,
+        "journal": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/node-kd3-d767-corrected-output/journal.json",
+        "journal_sha256": "a05a912b393a5c9036eb9b5d370db601e35dfa002e7162db90f51497566d8a18",
+        "log": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/imagefs768-sdk15-final.log",
+        "log_sha256": "09476773441bebeac971a1c184569977842a3e90bb89cbbd5a96d38c07a6afb4",
+        "profile_turns": [
+          {
+            "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-887c336aca7f/summary.json",
+            "sha256": "b13e6c7567eafa3e7cbb7d7bc09d7cfbe6294144f24cf35f206dcc2f432c4a01",
+            "phase_passed": true,
+            "guest_exit": 0,
+            "cleanup": true
+          },
+          {
+            "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-1e5e92d928c2/summary.json",
+            "sha256": "ec38a234654017dded04d23229268defe456645ed34731d426ab4ecd8b0738a3",
+            "phase_passed": true,
+            "guest_exit": 0,
+            "cleanup": true
+          },
+          {
+            "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-ea1468ea8b96/summary.json",
+            "sha256": "793a22e96b622d756b3eabc9aa44ae2d5c24d18bc1980c180e7a2e97082f5334",
+            "phase_passed": true,
+            "guest_exit": 0,
+            "cleanup": true
+          }
+        ]
+      },
+      "python_facade_source": "3ab5bcfbb14582d52f5335e5f95c6e9952470536",
+      "installed_wheel_3ab": {
+        "status": "FUNCTIONAL PASS; wrapper bookkeeping failed afterward",
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/installed-wheel-3ab-a884-functional-receipt.json",
+        "receipt_sha256": "baf308d15734f46a7eb619322a64539bcaa496776e916a34f3b1ca5089f43dfc",
+        "source_head": "3ab5bcfbb14582d52f5335e5f95c6e9952470536",
+        "inputs_census_sha256": "9551882cdfe5c7642d761e8c9005b5e777aa75d90fbeb6afa918ba0b7c7b3eb9",
+        "nonce": "a8844b3575055ad79163071e99759baf",
+        "actual_command_exit": 0,
+        "pytest": {
+          "passed": 204,
+          "skipped": 11,
+          "failed": 0,
+          "seconds": 68.28
+        },
+        "installed_getter_smoke": "PASS actualfreshvenvextension",
+        "original_report_passed": false,
+        "original_error": "NameError: name 're' is not defined",
+        "original_guest_exit": 1,
+        "original_report_sha256": "febd010c9f5ddd1fdf6146a4381e02d08c422d2251ac16b06b1aaa6de556fd9c",
+        "actual_log_sha256": "894122327739f02e19e52c400cefbe2d83743f42c9de874119f7ae000d2dfee3",
+        "cleanup": true,
+        "linker_restored": true
+      }
+    },
+    "coverage": "EXCLUDED_BY_USER",
+    "historical_prior_acceptance": {
+      "source_head": "3dcd519f4b56cc0ed47b7dc8e456f1c5396ca283",
+      "execution": "ARM Linux host; x86 QEMU TCG; KVM not run",
+      "coverage": "EXCLUDED_BY_USER; no coverage pass claimed",
+      "SDK15": {
+        "status": "PASS",
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/readlink-3dc-sdk15-receipts/complete.json",
+        "receipt_sha256": "bfb8be4cdb19fe196b88eaa4355af98a15ba3fa382367a8881c93d266e70bd6e",
+        "index_sha256": "b8fc1a9c87cbdee4755d249fd9d948bb7a871b23edf6d46a0e363a890aec8552",
+        "journal_sha256": "358e92e24cc31ae0065fc7a01fc31e2014993d01b483fb87d6c9c9e377ea8a4c",
+        "native_producer": "7b4e7e7ac6ba",
+        "personality_producer": "6404d394e8b2",
+        "host_producer": "159b19752e19"
+      },
+      "pending": {
+        "installed_wheel": "PENDING",
+        "native_KD3_21_cases_92_cells": "PENDING",
+        "generic_native_regression": "PENDING",
+        "genuine_public_builder": "PENDING"
+      },
+      "release": "NOT PUBLISHED"
+    },
+    "ci_fixture_followup": {
+      "original_run": "https://github.com/griot-cloud/moruna/actions/runs/41383031711",
+      "original_head": "2d88d1bd5d98d7a73a920020d1eb1820adf0a0ff",
+      "correction_head": "f7256a8",
+      "scope": "Test fixtures only; no production code, budgets or runtime thresholds changed. Original CI failures retained.",
+      "corrections": [
+        "Checkpoint request synchronizes on Running instead of Init attachment",
+        "FIFO checks real overrun/fallback accounting and exact batch IDs instead of guaranteeing zero host preemption",
+        "Drift-boundary fixture uses one worker, retaining all original drift and delivery assertions"
+      ],
+      "local_results": [
+        {
+          "name": "scheduler",
+          "log": "/tmp/moruna-scheduler-final-local.log",
+          "sha256": "2f62dae5e0b250b3cba57453fc185270ddfd342b07815e5d38ec9b5a4d8bca2e",
+          "passed": 96,
+          "failed": 0
+        },
+        {
+          "name": "checkpoint",
+          "log": "/tmp/moruna-checkpoint-final-local.log",
+          "sha256": "985227ce2a8c20a5ba356f0d1359f1c1fe19aba4d06ffa3637efee72204d3594",
+          "passed": 1,
+          "failed": 0
+        }
+      ]
+    },
+    "ci_environment_and_deadline_followup": {
+      "failed_run": "https://github.com/griot-cloud/moruna/actions/runs/41399488127",
+      "failed_head": "e6d8507489d2136bc725c046df937f261147f610",
+      "wheel_failure": "24 failed, 180 passed, 11 skipped; missing uv in CI free-threaded test interpreter",
+      "wheel_correction": "Install uv explicitly in that interpreter and check python -m uv --version before fresh-wheel tests; local fresh-wheel suite already included uv",
+      "boot_failure": "Deadline lateness164257876ns on1CPU and86094881ns on2CPUs;4CPU passed. Crowded boot31processes plus FPU workers exceeded the bounded-contender fixture assumption.",
+      "boot_correction": "Move unchanged deadline ELF and timing/timeout assertions into mandatory controlled CPU1/2/4 boots with4smallprocesses. All unrelated generic checks retained. No production timer/scheduler changes or raised thresholds.",
+      "local_receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-deadline-local-upeoub37/receipt.json",
+      "local_receipt_sha256": "48e3558fe8f8f937a846244c29a0f0be12500dc292984807e6f94314a1a6527a",
+      "local_results": [
+        {
+          "cpus": 1,
+          "timer_passes": 4,
+          "lateness_us": [
+            1616,
+            3371,
+            4241,
+            4582
+          ],
+          "serial_sha256": "cc6fe52b1a8165153edcba9da2a1a695117edd915ee1c459111f4331fe080eda"
+        },
+        {
+          "cpus": 2,
+          "timer_passes": 4,
+          "lateness_us": [
+            1005,
+            970,
+            2725,
+            2326
+          ],
+          "serial_sha256": "876e9be083203a2436085a891172eb345fc72b21781d7ee65938f3bf0eeb1372"
+        },
+        {
+          "cpus": 4,
+          "timer_passes": 4,
+          "lateness_us": [
+            1775,
+            1823,
+            2940,
+            998
+          ],
+          "serial_sha256": "fa3d6fa065876308886204ab00a268f0b9d9752e95ef3239d8a35262d8eb1d4d"
+        }
+      ],
+      "scope": "Actual local TCG12timer passes and exit33 onall3profiles. Remote KVM deadline acceptance remains pending."
+    },
+    "ci_storage_fixture_followup": {
+      "failed_run": "https://github.com/griot-cloud/moruna/actions/runs/41410969177",
+      "failed_head": "129a63b30b10f2f9266e74cd9b14ac35392738e1",
+      "failure": "Canonical single-device provision test: nonblocking image lease WouldBlock at Preflight",
+      "cause": "Concurrent CLI fork/exec can inherit a locked open-file description until exec despite CLOEXEC. Parent close alone does not release a lease retained by that child. Deterministic host fork/exec mechanism reproduced.",
+      "correction": "Test-local mutex excludes this binary CLI-spawn window from all image-provision lease fixtures. All production exclusivity, geometry and neighboring-byte assertions unchanged; no retries or production changes.",
+      "local_focused_result": "11 passed, zero failed; four applicable Mac provisioning tests passed. Linux-only lease refusal remains required in CI.",
+      "broader_mac_result": "27 passed, 2 failed: unchanged ST6 ordinary Unix-socket tests. Both passed in the Linux CI run. This record does not claim complete Mac storage-target acceptance.",
+      "logs": {
+        "focused_st_t4": {
+          "path": "/tmp/moruna-storage-provision-final-local.log",
+          "sha256": "37e14317007d6960782579749fb9df62e378e40bb14c926999363573910d9856"
+        },
+        "broader_mac": {
+          "path": "/tmp/moruna-storage-lease-final-local.log",
+          "sha256": "a605ba7dddfd1335a684ba779fc34fae2b6a92f62a20c63aa3ca28d8f47c8813"
+        }
+      },
+      "remote_corrected_result": "PASS in complete main job at5132, run41420167767"
+    },
+    "public_node_ci_wiring_followup": {
+      "failed_ci_run": "https://github.com/griot-cloud/moruna/actions/runs/41410969177",
+      "original_ci_case_report": "not retained by prior workflow; no original exception is claimed",
+      "generic_boots_in_failed_ci": "all1/2/4CPU checks passed before node case1 failed",
+      "local_failed_reproductions": [
+        "moruna-canonical-node-diagnostic-0gzw8nc7: missing guest.uds was interpreted as expired owner before QEMU boot",
+        "moruna-canonical-node-readiness-6t93agj2: after socket readiness, guest rejected raw PEM as native Wire DER roots"
+      ],
+      "corrections": [
+        "Wait for real host socket creation within existing case deadline; check actual backend/QEMU liveness",
+        "CI uses existing net-proof.py prepare root encoder, not raw system PEM; TLS validation retained",
+        "Print bounded actual failure report and retain allowlisted small node logs/results"
+      ],
+      "actual_local_public_matrix": {
+        "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-public-node15-zynct0np/receipt.json",
+        "receipt_sha256": "f10c0b6963a47a764fc0d6b72b5dcc988960e2506bdfb695d46b2690f908566a",
+        "passed": 15,
+        "profiles": [
+          1,
+          2,
+          4
+        ],
+        "transport": "public non-SDK canonical CLI",
+        "scope": "Actual public non-SDK15 matrix affected by readiness/native-roots wiring. Retained unchanged GNU-release actors, uid1001 ARM-hosted x86 TCG; source-bound reuse, not a full fresh-source rebuild",
+        "cleanup": true
+      },
+      "remote_corrected_result": "PASS all15 public cases, CPU1/2/4 at5132, run41420167767"
+    },
+    "remote_functional_kernel_5132": {
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41420167767",
+      "job": 125193531667,
+      "head": "5132f35f00bab9fb91f1bf178f042966d9018541",
+      "generic_profiles": [
+        1,
+        2,
+        4
+      ],
+      "public_node_cases_passed": 15,
+      "controlled_KVM_deadline_cases_passed": 12,
+      "deadline_lateness_us": [
+        765,
+        688,
+        686,
+        686,
+        471,
+        199,
+        909,
+        575,
+        732,
+        267,
+        910,
+        738
+      ],
+      "deadline_limit_us": 50000,
+      "log": "/tmp/moruna-ci-5132-kernel.log",
+      "log_sha256": "16ba30d782b80cca6c7cedbffa2d5446e4814cf140e9c30ca6b97338afbc160e",
+      "overall_job_result": "FAILED at subsequent non-probe Clippy: copied/frame_at probe-only methods not gated; functional passes do not claim overall job success"
+    },
+    "remote_main_job_5132": {
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41420167767",
+      "job": 125193531256,
+      "head": "5132f35f00bab9fb91f1bf178f042966d9018541",
+      "result": "SUCCESS: complete build/test/lint, real image runtime, peQL/Iceberg, Python kernels and fresh installed wheel",
+      "wheel_tests": "204 passed, 11 skipped",
+      "log": "/tmp/moruna-ci-5132-main.log",
+      "log_sha256": "584263dd464791b794e6d5430f10bc9bddbd93b0ed4ae56ddfca8696ce814b55"
+    },
+    "native_lint_followup": {
+      "plain_and_probe_local": "Both strict builtin kernel profiles passed with probe-only VM getter gating",
+      "native_user_findings": "Cargo JSON-target flags needed forwarding after external clippy subcommand; full workspace then found machine-applicable idioms plus10 intentional I/O RefCell leases and2 explicit argument-count exceptions",
+      "changes": "Reviewed mechanical idioms preserve short-circuit authorization, read zeroing, compaction liveness and bounded rounding. Narrow expect attributes document required original-I/O guards and distinct authority inputs; no global lint disabling or early guard release.",
+      "reviewed_machine_patch_sha256": "1a8df6c198c527e1622dc461da66e9637f39a414693c5c32c7ee42114893fa13",
+      "final_strict_all_profiles": {
+        "result": "PASS: plain=0 probe=0 user=0, all with -D warnings; native user uses --keep-going to expose the full workspace",
+        "source_head": "e4ab2834be9d5010bf10e5c91520e4717bb6e1b0",
+        "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-407a8c174ba1/summary.json",
+        "summary_sha256": "6c17273dae854957c66ea86927027d24ecf88a0945426cc223463c90b6b15acb",
+        "inputs_census_sha256": "1192ab79551a1b8c91fab8daaf4d9435ecd4044e1445fdf1074c7ef08278094d",
+        "source_archive_sha256": "e834fe4c95cabf087f7d95d19077a48c3547ce186637ce7bb515c6fd0049de9c",
+        "cleanup": true,
+        "scope": "ARM Linux host cross-checks exact x86_64 kernel/user targets; no new boot claim. Subsequent changes only licence policy and this validation record."
+      },
+      "additional_findings": "Named supervisor prepared-state tuple; iterator for quota fixture held slots; narrow documented expectations retain distinct block-transfer protocol inputs and inline bounded socket-map state. No new runtime allocation or I/O lease changes."
+    },
+    "kernel_licenses_local": {
+      "result": "PASS: bans ok, licenses ok, sources ok",
+      "tool": "cargo-deny 0.20.2",
+      "change": "Package-scoped 0BSD exceptions for existing smoltcp and managed dependencies; no workspace-wide licence allowance",
+      "log": "/tmp/moruna-kernel-deny-final.log",
+      "log_sha256": "bb503636d1ddda9f6923ed261aaabc1e4efaa8d6109a31cd3eecdfe4fd40ee39"
+    },
+    "node_failure_fixture_budget_followup": {
+      "failed_ci_run": "https://github.com/griot-cloud/moruna/actions/runs/41433825630",
+      "failed_head": "8a099deefc067cdd289046bb747874ffc477572b",
+      "actual_failure": "CPU1 case2: modeled minimum footprint147320011 exceeded available135259760; budget exit3 preempted intended Python error exit4. Production enforcement correctly refused; strict test rejected wrong cause.",
+      "runtime_delta": "No runtime/controller budget behavior changed between prior passing5132 and8a099de. Exact source of measurement variance is not claimed.",
+      "scope": "Only canonical intentional-Python-failure case2 job budget384\u2192512MiB. Other4 cases stay384MiB; process1GiB/account1408MiB, production enforcement and every strict verdict assertion unchanged.",
+      "old384_local": "One actual replay passed on TCG; CI preemption did not reproduce locally. Not rerun until green.",
+      "local_corrected_source": "2abd6b387b960d3341df58030479d2b2e8fd1931",
+      "local_corrected_result": "STRICT PASS: intended Python failure after one answered batch; canonical matrix15/15 CPU1/2/4 passed, every case cleanup/input integrity true",
+      "receipt": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-a0213e45c729/receipt.json",
+      "receipt_sha256": "d4a0667983f482e842f39da37eb56bdf96a3268a4b18aaead2e3a15861da5476",
+      "peer_sha256": "590c5fac280d59eced7bb79bdbaaa9fc88a60ea3dd3e66d6e7ad5af93ed87aa4",
+      "execution_scope": "Genuine Cargo-built peer from2abd; retained unchanged guest/native actors. No fresh full guest-runtime rebuild claim.",
+      "build_history": "Incomplete cache prevented direct crate resolution; genuine Cargo dependency rebuild resumed across bounded intervals. No corrected pass claimed until actual executable and execution.",
+      "remote_corrected_result": "PASS all15 CPU1/2/4 real node cases with immutable inputs and cleanup in run41445573100 at a477f29"
+    },
+    "remote_main_job_8a099de": {
+      "result": "SUCCESS complete build/test/lint, real image runtime, peQL/Iceberg, Python kernels and installed Linux wheel",
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41433825630",
+      "head": "8a099deefc067cdd289046bb747874ffc477572b",
+      "wheel_tests": "204 passed,11 skipped",
+      "log_sha256": "649092880306e61b470d3d72afb850be1317c76d20727012b12f7dd10bd43a9d"
+    },
+    "ci_native_c_compiler_followup": {
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41445573100",
+      "head": "a477f29d48aba9cdde6b7ed56de3213e5bfee351",
+      "functional_steps": "Kernel build, generic boots, all15 node cases and strict CPU1/2/4 deadline step SUCCESS",
+      "failure": "Clippy native-user ring build inherited default GCC cc; rejects Clang -nostdlibinc. No production execution failure.",
+      "correction": "Set CC_x86_64_moruna_user=clang and canonical freestanding CFLAGS in CI lint step, matching build.sh and already-passing local strict lint configuration.",
+      "local_verification": "Workflow YAML parsed; compiler/flags checked against actual successful local e4ab2834 strict runner and build.sh. No new VM or runtime source change required.",
+      "log_sha256": "ea9554e466d33137943aade7a29c3fae4e1be3a293ab786490047d0d59a2bcfb",
+      "remote_corrected_result": "PENDING"
+    }
+  }
+}

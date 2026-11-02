@@ -1,0 +1,12 @@
+[package]
+name = "nvme-test"
+description = "DR-T18 and DR-T25 to DR-T27: the NVMe driver against a disk of a known pattern, the block protocol's conformance suite over NVMe, a driver killed mid-request, and its throughput and latency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+block-protocol = { path = "../block-protocol", version = "=0.1.0" }
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

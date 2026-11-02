@@ -44,6 +44,8 @@ pub(crate) trait FileEngine: Send + Sync {
     fn submit(&self, req: FileReq, done: Done);
     /// The engine's name, for the counters and the fallback warn.
     fn name(&self) -> &'static str;
+    /// A terminal engine diagnostic after a completion channel closes unexpectedly.
+    fn terminal_failure(&self) -> Option<String>;
 }
 
 /// `pread`/`pwrite` on `tokio`'s blocking pool (f.2).
@@ -67,6 +69,9 @@ impl FileEngine for BlockingEngine {
 
     fn name(&self) -> &'static str {
         "blocking"
+    }
+    fn terminal_failure(&self) -> Option<String> {
+        None
     }
 }
 
@@ -155,6 +160,18 @@ pub(crate) fn set_nocache(fd: &OwnedFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Verify the actual owned descriptor's direct flag when binding a strict raw capability.
+#[cfg(target_os = "linux")]
+pub(crate) fn direct_flag(fd: &OwnedFd) -> io::Result<bool> {
+    // SAFETY: F_GETFL reads flags of the live borrowed descriptor and uses no pointer.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags & libc::O_DIRECT != 0)
+    }
 }
 
 #[cfg(test)]

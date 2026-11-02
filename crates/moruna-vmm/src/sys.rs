@@ -60,6 +60,61 @@ pub fn poll(fds: &[PollFd], timeout: Duration) -> std::io::Result<Vec<Ready>> {
         .collect())
 }
 
+static STOP_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static SIGNAL_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" fn stop_signal(signal: libc::c_int) {
+    STOP_SIGNAL.store(signal, std::sync::atomic::Ordering::Relaxed);
+}
+/// CLI-only ownership of its termination handlers; embedding APIs install none.
+pub(crate) struct Termination {
+    previous: [libc::sigaction; 2],
+}
+impl Termination {
+    pub(crate) fn install() -> std::io::Result<Self> {
+        use std::sync::atomic::Ordering;
+        if SIGNAL_OWNER
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "termination handlers already owned",
+            ));
+        }
+        STOP_SIGNAL.store(0, Ordering::Relaxed);
+        // SAFETY: sigaction is a C POD, initialized before use; the handler only
+        // stores a lock-free atomic integer and never allocates, locks or calls IO.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = stop_signal as *const () as usize;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        let mut previous: [libc::sigaction; 2] = unsafe { core::mem::zeroed() };
+        for (index, signal) in [libc::SIGINT, libc::SIGTERM].iter().enumerate() {
+            if unsafe { libc::sigaction(*signal, &action, &mut previous[index]) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if index == 1 {
+                    unsafe { libc::sigaction(libc::SIGINT, &previous[0], core::ptr::null_mut()) };
+                }
+                SIGNAL_OWNER.store(false, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(Self { previous })
+    }
+    pub(crate) fn signal(&self) -> Option<i32> {
+        let signal = STOP_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+        (signal != 0).then_some(signal)
+    }
+}
+impl Drop for Termination {
+    fn drop(&mut self) {
+        // SAFETY: this CLI owns both installations and restores the saved POD actions.
+        for (index, signal) in [libc::SIGINT, libc::SIGTERM].iter().enumerate() {
+            unsafe { libc::sigaction(*signal, &self.previous[index], core::ptr::null_mut()) };
+        }
+        SIGNAL_OWNER.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

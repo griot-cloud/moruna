@@ -7,12 +7,14 @@ timing, and the two outputs hold the same rows.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import pathlib
 import subprocess
 import sys
 
 import pyarrow.parquet as pq
+import pytest
 
 import moruna
 
@@ -87,15 +89,17 @@ def _run(document: dict, scratch: pathlib.Path, *extra: str) -> tuple[int, dict]
 
 
 def test_ho_t14_file_run_equals_library_run(
-    dataset: tuple[str, str, int], scratch: pathlib.Path, small_sink
+    dataset: tuple[str, str, int], scratch: pathlib.Path, small_sink, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # noqa: ANN001
     src_url, out_url, rows = dataset
     (scratch / "kernels.py").write_text(KERNELS)
-    sys.path.insert(0, str(scratch))
-    try:
-        import kernels  # noqa: PLC0415
-    finally:
-        sys.path.remove(str(scratch))
+    # Earlier checks load other temporary kernels.py files. Import this exact
+    # file afresh and restore the previous module entry when this test ends.
+    spec = importlib.util.spec_from_file_location("kernels", scratch / "kernels.py")
+    assert spec is not None and spec.loader is not None
+    kernels = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "kernels", kernels)
+    spec.loader.exec_module(kernels)
 
     from_file_out = scratch / "from_file"
     code, envelope = _run(_document(scratch, src_url, from_file_out, "shout"), scratch)
@@ -166,8 +170,8 @@ def loud(batch):
 def _records(logs: pathlib.Path, task: str) -> list[dict]:
     [attempt] = [p for p in logs.iterdir() if p.name.startswith("a1-")]
     records = []
-    for segment in sorted((attempt / task).glob("*.jsonl")):
-        records.extend(json.loads(line) for line in segment.read_text().splitlines())
+    for segment in sorted((attempt / task).glob("*.mrec")):
+        records.extend(moruna.read_events(segment))
     return records
 
 

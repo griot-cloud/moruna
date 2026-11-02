@@ -48,6 +48,8 @@ impl Drop for CancelOnDrop {
 /// What the facade has started so far, in start order.
 #[derive(Default)]
 pub struct Started {
+    /// Required row publisher, finalized after workers stop and before storage teardown.
+    pub(crate) history: Option<crate::history::HistoryRun>,
     /// The trace writer; `finish` produces the view the report is computed from.
     pub trace: Option<Arc<TraceWriter>>,
     /// The reactor.
@@ -76,6 +78,11 @@ impl Started {
         }
         if let Some(scheduler) = self.scheduler.take() {
             scheduler.shutdown();
+        }
+        if let Some(history) = self.history.take()
+            && let Err(error) = history.finish(false)
+        {
+            notes.push(error.to_string());
         }
         if let Some(placement) = self.placement.take() {
             placement.shutdown();

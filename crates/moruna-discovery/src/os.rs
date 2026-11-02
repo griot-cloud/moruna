@@ -44,7 +44,7 @@ pub(crate) fn parse_meminfo_field(text: &str, key: &str) -> Option<u64> {
 /// The process's own anonymous and file backed resident bytes (f.2), which the sampler reads
 /// outside a cgroup and inside one whose limit is not the ceiling (DS-I4): from
 /// `/proc/self/status` where there is a `/proc`, from the platform otherwise. `None` when neither
-/// answers, which leaves the sampler repeating its last sample.
+/// answers; a failed current reading propagates instead of repeating a prior sample.
 ///
 /// The anonymous half is the DS-I4 quantity on both paths: `RssAnon` from `status` (the kernel's
 /// own count of the process's resident anonymous pages, every thread's heap and every arena
@@ -52,13 +52,25 @@ pub(crate) fn parse_meminfo_field(text: &str, key: &str) -> Option<u64> {
 /// `probes::platform_anon_and_file`). Never `VmRSS`, which adds `RssFile` and `RssShmem`: the
 /// mapped text of the binary and its libraries, and every file the process has mapped, are
 /// pages the kernel can drop and the process never allocated.
-pub(crate) fn process_memory(proc_root: &Path, _page: usize) -> Option<(u64, u64)> {
-    if let Ok(text) = std::fs::read_to_string(proc_root.join("self/status"))
-        && let Some(pair) = parse_status(&text)
-    {
-        return Some(pair);
+pub(crate) fn process_memory(proc_root: &Path, _page: usize) -> moruna_kernel::Result<(u64, u64)> {
+    let reading = std::fs::read_to_string(proc_root.join("self/status")).and_then(|text| {
+        parse_status(&text).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "required process memory counters missing or malformed",
+            )
+        })
+    });
+    match reading {
+        Ok(reading) => Ok(reading),
+        Err(cause) => {
+            probes::platform_anon_and_file().ok_or_else(|| moruna_kernel::MorunaError::Io {
+                op: "read",
+                target: "process memory".into(),
+                msg: cause.to_string(),
+            })
+        }
     }
-    probes::platform_anon_and_file()
 }
 
 /// `/proc/self/status`: anonymous memory is `RssAnon`, and the file backed part is `RssFile`
@@ -128,8 +140,8 @@ mod tests {
         let proc_dir = tmp.path().join("proc");
         write(&proc_dir, "self/status", STATUS);
         assert_eq!(
-            process_memory(&proc_dir, 4096),
-            Some((1600 * 1024, (300 + 100) * 1024))
+            process_memory(&proc_dir, 4096).unwrap(),
+            (1600 * 1024, (300 + 100) * 1024)
         );
         assert_eq!(parse_status(STATUS), Some((1_638_400, 409_600)));
         assert_eq!(
@@ -147,7 +159,7 @@ mod tests {
         assert_eq!(parse_status(""), None);
 
         // The real host answers on every supported target.
-        assert!(process_memory(Path::new("/proc"), page_bytes()).is_some_and(|(anon, _)| anon > 0));
+        assert!(process_memory(Path::new("/proc"), page_bytes()).is_ok_and(|(anon, _)| anon > 0));
 
         // Pointed at a root with no `self/status`, only a platform with its own interface
         // answers. The figure itself moves between calls, so only its presence is asserted.
@@ -155,11 +167,14 @@ mod tests {
         let fallback = process_memory(&absent, 4096);
         if cfg!(target_vendor = "apple") {
             assert!(
-                fallback.is_some_and(|(anon, file)| anon > 0 && file > 0),
+                fallback.is_ok_and(|(anon, file)| anon > 0 && file > 0),
                 "macOS reports phys_footprint and the file backed bytes through mach"
             );
         } else {
-            assert_eq!(fallback, None, "this target reads /proc and nothing else");
+            assert!(
+                fallback.is_err(),
+                "this target reads /proc and nothing else"
+            );
         }
     }
 

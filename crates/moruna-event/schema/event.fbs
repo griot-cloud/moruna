@@ -1,0 +1,144 @@
+// Moruna's run events, version 7 (MH 4.3, SDD 12 PY-I11 and PY-I12, SDD 26): one fact of a run's
+// execution, the body of one `moruna-record` record (SDD 21).
+//
+// The record carries what every event has, in its own fields and headers: `seq` is the event's
+// number in its attempt, `ts` is unix nanoseconds, `subject` names the kind, `msg_id` is
+// `<attempt>-<start>-<seq>`, and the headers `run`, `attempt`, `plan`, `step` and `task` say whose it is.
+// This table carries the rest: the process that told it (`start`), the instant on that process's
+// monotonic clock (`t_us`), and the fact (`body`). A field that is absent reads as the `null` the
+// version 6 JSON wrote.
+//
+// The Rust in `src/generated/event_generated.rs` is generated from this file by
+// `tools/flatc/generate.sh` (flatc 25.12.19, the version of the `flatbuffers` crate) and is
+// committed; CI regenerates it and fails when it differs. Change this file, then run the script.
+
+namespace moruna.event.fb;
+
+file_identifier "MEV1";
+file_extension "mevt";
+
+// What a task is.
+enum Element : ubyte { Source = 0, Kernel = 1, Sink = 2 }
+
+// Why a task waits.
+enum WaitReason : ubyte { EnginePreparing = 0, AwaitingInput = 1, PortCall = 2 }
+
+// What a running task is doing.
+enum Phase : ubyte { Calibrating = 0, Reading = 1, Applying = 2, Writing = 3, Draining = 4, Committing = 5 }
+
+// How a task that did not fail itself ended.
+enum TaskOutcome : ubyte { Succeeded = 0, Stopped = 1, Cancelled = 2 }
+
+// How a plan step ended: the first of these any of its tasks ended with.
+enum StepOutcome : ubyte { Failed = 0, Cancelled = 1, Stopped = 2, Skipped = 3, Succeeded = 4 }
+
+// A failure's stable code.
+enum FailureCode : ubyte {
+  SpecRefused = 0, KernelError = 1, BudgetExceeded = 2, MemoryRefused = 3, SourceError = 4,
+  SinkError = 5, AllocRefused = 6, IoError = 7, StagingError = 8, ConvertError = 9,
+  ConfigRefused = 10, PlanRefused = 11, ResumeRefused = 12, Unsupported = 13, Cancelled = 14,
+  Internal = 15
+}
+
+// Who a failure belongs to.
+enum FailureScope : ubyte { Task = 0, Attempt = 1 }
+
+// Why a task was skipped.
+enum SkipReason : ubyte { FailedTask = 0, AttemptFailed = 1, Cancelled = 2 }
+
+// How a cancelled run ended.
+enum CancelDisposition : ubyte { Cancelled = 0, Completed = 1, Failed = 2 }
+
+// What a record of output is.
+enum LogStream : ubyte { Stdout = 0, Stderr = 1, Structured = 2, Platform = 3 }
+
+// What a task did, measured where it happened.
+struct Counters {
+  morsels: ulong;
+  rows_in: ulong;
+  rows_out: ulong;
+  bytes_in: ulong;
+  bytes_out: ulong;
+  skipped: ulong;
+  errors: ulong;
+}
+
+// First: this process runs the document's attempt; `resumed` when from a manifest. `plan` is
+// absent when the document was refused before it was planned.
+table AttemptStarted { resumed: bool; plan: string; }
+
+// A step of the plan started: the first of its tasks started.
+table StepStarted { step: string; plan: string; group: uint; }
+
+// A step of the plan ended: every one of its tasks ended. `duration_us` is absent when it never
+// started.
+table StepEnded { step: string; plan: string; outcome: StepOutcome; duration_us: ulong = null; }
+
+// Once per task, before anything else is said of it. `step` is absent only when the document was
+// refused before it was planned.
+table TaskRegistered {
+  task: string; step: string; element: Element; stage: ushort;
+  upstream: [string]; members: [string];
+}
+
+// It cannot start yet, and why; or, running, it waits on a port's answer.
+table TaskWaiting { task: string; step: string; reason: WaitReason; blocking: [string]; port: string; }
+
+// Its input is there; it starts when a worker or a drive takes it.
+table TaskReady { task: string; step: string; }
+
+// It took its first input.
+table TaskStarted { task: string; step: string; phase: Phase; }
+
+// What it is doing changed.
+table TaskPhase { task: string; step: string; phase: Phase; }
+
+// It ended without failing itself. `duration_us` and `counters` are absent when it never started
+// or did not run to its end; `cause` names the task whose failure stopped it.
+table TaskCompleted {
+  task: string; step: string; outcome: TaskOutcome; duration_us: ulong = null;
+  counters: Counters; cause: string;
+}
+
+// It failed, or the attempt did (`scope` Attempt, `task` absent).
+table TaskFailed {
+  task: string; step: string; code: FailureCode; message: string; scope: FailureScope;
+  retryable: bool;
+}
+
+// It never started and never will.
+table TaskSkipped { task: string; step: string; reason: SkipReason; blocking: string; }
+
+// The peer's `cancel` reached the run.
+table CancelAcknowledged {}
+
+// The run has stopped since a `cancel` reached it, and how it ended.
+table CancelEnded { disposition: CancelDisposition; }
+
+// One producer's records in the output store so far; `task` is absent for the engine's own.
+table LogReach {
+  task: string; records: ulong; bytes: ulong; truncated: ulong; dropped: ulong;
+  dropped_bytes: ulong; drained: bool;
+}
+
+// How far the output store reaches for each producer whose reach changed.
+table Logs { producers: [LogReach]; }
+
+// One record of a producer's output as the store keeps it; the record's `seq` counts the
+// producer's records from 1. `task` is absent for output no task can be named for, `level` for a
+// stream, which says none.
+table Log {
+  task: string; stream: LogStream; level: string; bytes: ulong; text: string;
+  partial: bool; continued: bool; truncated: ulong;
+}
+
+// Every kind of event, in the order of the subject ids (`moruna_event::Kind`).
+union Body {
+  AttemptStarted, StepStarted, StepEnded, TaskRegistered, TaskWaiting, TaskReady, TaskStarted,
+  TaskPhase, TaskCompleted, TaskFailed, TaskSkipped, CancelAcknowledged, CancelEnded, Logs, Log
+}
+
+// The event.
+table Event { start: string; t_us: ulong; body: Body; }
+
+root_type Event;

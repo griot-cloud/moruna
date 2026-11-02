@@ -512,7 +512,7 @@ pub fn corruptions(
 }
 
 /// `stream` with its first field's type id set to 229, which no Arrow type has: the IPC reader's
-/// schema converter panics on it (`unimplemented!("Type <UNKNOWN 229> not supported")`).
+/// schema converter panics on it with "Type <UNKNOWN 229> not supported".
 pub fn unknown_type(stream: &[u8]) -> Vec<u8> {
     let ((start, len), _) = messages(stream)[0];
     for at in start..start + len {

@@ -27,9 +27,11 @@ use std::time::{Duration, Instant};
 
 use moruna_kernel::{
     Fingerprint, KernelHints, KernelKind, KnobSnapshot, Knobs, Limits, MorunaError, Placement,
-    Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, TraceRecord, TraceTail,
+    Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, Topology, TraceRecord,
+    TraceTail,
 };
 
+mod admission;
 mod apply;
 mod breach;
 mod budget;
@@ -43,7 +45,10 @@ pub mod sizer;
 mod summary;
 mod tick;
 
-pub use sizer::{Envelope, LearnedSizer, Observation, Proposal, RuleSizer, Sizer, SizerOutcome};
+pub use admission::{FixedCommitmentInput, fixed_commitment_budget};
+pub use sizer::{
+    Envelope, LearnedSizer, ModelSizer, Observation, Proposal, RuleSizer, Sizer, SizerOutcome,
+};
 pub use summary::{Bottleneck, ControllerSummary};
 
 /// The contracts' result type; every error here is an `MorunaError` value (contracts d.14).
@@ -295,6 +300,10 @@ pub struct ControllerConfig {
     /// counts it as resident, beside the baseline and the arena, so no morsel is planned into
     /// it.
     pub engine_bytes: u64,
+    /// Actual retained native child Account limits already present in every sampler reading.
+    /// Funded once outside the arena, before probing; never inferred from process growth.
+    /// Zero for ordinary Linux process-memory accounting.
+    pub fixed_native_bytes: u64,
     /// Bytes of the arena the sink holds for its own file buffer (a Parquet sink encodes a file
     /// in the arena before it writes it): resident, part of `arena_bytes`, and planned by no one,
     /// so the host budget the model divides is `arena_bytes` less this.
@@ -340,6 +349,7 @@ impl Default for ControllerConfig {
             arena_bytes: 0,
             baseline_bytes: 0,
             engine_bytes: 0,
+            fixed_native_bytes: 0,
             sink_buffer_bytes: 0,
             checkpoint_enabled: false,
             checkpoint_interval_ms: 5000,
@@ -469,6 +479,8 @@ pub(crate) struct StageCtl {
     pub waiting: bool,
 }
 
+const INITIAL_ANON_AMPLIFICATION: f64 = 4.0;
+
 impl StageCtl {
     /// Fold one record's reading into the window and refit both terms of f.3 from it.
     ///
@@ -495,8 +507,8 @@ impl StageCtl {
         StageCtl {
             stage,
             a_k: 4.0,
-            a_anon: 4.0,
-            a_anon_seed: 4.0,
+            a_anon: INITIAL_ANON_AMPLIFICATION,
+            a_anon_seed: INITIAL_ANON_AMPLIFICATION,
             c_anon: 0,
             anon_points: VecDeque::new(),
             a_k_dev: 0.0,
@@ -602,6 +614,8 @@ impl RecordSummary {
 /// Everything the controller mutates, behind one mutex (g).
 pub(crate) struct ControllerState {
     pub cfg: ControllerConfig,
+    /// The run's shape: its queues and which stages take and give which (contracts d.16).
+    pub topology: Topology,
     pub kernels: Vec<KernelInfo>,
     pub phase: Phase,
     pub budgets: Budgets,
@@ -664,9 +678,9 @@ impl ControllerState {
         self.stages.len()
     }
 
-    /// The queues, Q0 to Qn: one more than the kernel stages.
+    /// The queues: one per edge of the run's DAG (Q0 to Qn in a chain).
     pub(crate) fn queue_count(&self) -> usize {
-        self.stage_count() + 1
+        usize::from(self.topology.queue_count())
     }
 
     pub(crate) fn stage_mut(&mut self, stage: StageId) -> Option<&mut StageCtl> {
@@ -931,7 +945,7 @@ impl Controller {
     /// Build a controller over the four components it reads and writes, all as trait objects.
     ///
     /// Fails with `Config` when the stages the kernels name are not the contiguous range
-    /// `1..=S` the linear chain requires.
+    /// `1..=S` the topology has.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: ControllerConfig,
@@ -941,8 +955,19 @@ impl Controller {
         sampler: Arc<dyn Sampler>,
         trace: Arc<dyn TraceTail>,
         placement: Arc<dyn Placement>,
+        topology: Topology,
         kernels: Vec<KernelInfo>,
     ) -> Result<Controller> {
+        if usize::from(topology.stages()) != kernels.len() {
+            return Err(MorunaError::Config {
+                name: "pipeline",
+                msg: format!(
+                    "the topology has {} kernel stages and {} kernels were given",
+                    topology.stages(),
+                    kernels.len()
+                ),
+            });
+        }
         let mut kernels = kernels;
         kernels.sort_by_key(|k| k.stage);
         for (at, kernel) in kernels.iter().enumerate() {
@@ -971,6 +996,7 @@ impl Controller {
         let now = Instant::now();
         let state = ControllerState {
             cfg,
+            topology,
             kernels,
             phase: Phase::Created,
             budgets: Budgets::default(),

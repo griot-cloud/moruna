@@ -32,7 +32,7 @@ pub const MAX_VCPUS: u32 = 64;
 /// block devices take GSIs 8 to 23.
 pub const MAX_DISKS: usize = 16;
 /// The host's vsock CID; a guest CID must be above it (vsock(7): 0, 1 and 2 are reserved).
-pub const HOST_CID: u32 = 2;
+pub use crate::devices::vsock::packet::HOST_CID;
 
 /// One block device the host names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

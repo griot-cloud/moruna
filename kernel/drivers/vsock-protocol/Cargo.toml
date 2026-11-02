@@ -1,0 +1,10 @@
+[package]
+name = "vsock-protocol"
+description = "moruna.driver.vsock: stream sockets to the host over virtio-vsock, and the protocol's conformance suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true

@@ -70,10 +70,14 @@ struct Shared {
 impl Shared {
     /// The child's memory now: the larger of what it last wrote and what its cgroup holds
     /// (SB-I9).
-    fn in_use(&self) -> u64 {
+    fn in_use(&self) -> Result<u64> {
         let page = self.mapping.counter(field::IN_USE).load(Ordering::Acquire);
-        let cgroup = self.cgroup.memory_current().unwrap_or(0);
-        page.max(cgroup)
+        let cgroup = self.cgroup.memory_current().map_err(|e| MorunaError::Io {
+            op: "read",
+            target: "memory.current".into(),
+            msg: e.to_string(),
+        })?;
+        Ok(page.max(cgroup))
     }
 }
 
@@ -84,8 +88,43 @@ struct StageMemory {
 }
 
 impl OutsideMemory for StageMemory {
-    fn in_use(&self) -> u64 {
-        lock(&self.child).as_ref().map_or(0, |c| c.in_use())
+    fn in_use(&self) -> Result<u64> {
+        lock(&self.child)
+            .as_ref()
+            .map(|c| c.in_use())
+            .transpose()
+            .map(|value| value.unwrap_or(0))
+    }
+
+    /// The child's cgroup `memory.peak` (SDD 24 p.4); no child yet, no mark.
+    fn reset_peak(&self) -> moruna_kernel::Result<bool> {
+        let Some(child) = lock(&self.child).clone() else {
+            return Ok(false);
+        };
+        child
+            .cgroup
+            .reset_memory_peak()
+            .map(|()| true)
+            .map_err(|e| moruna_kernel::MorunaError::Io {
+                op: "reset",
+                target: "memory.peak".into(),
+                msg: e.to_string(),
+            })
+    }
+
+    fn peak(&self) -> moruna_kernel::Result<Option<u64>> {
+        let Some(child) = lock(&self.child).clone() else {
+            return Ok(None);
+        };
+        child
+            .cgroup
+            .memory_peak()
+            .map(Some)
+            .map_err(|e| moruna_kernel::MorunaError::Io {
+                op: "read",
+                target: "memory.peak".into(),
+                msg: e.to_string(),
+            })
     }
 }
 
@@ -212,7 +251,7 @@ impl SandboxKernel {
                 self.package.manifest.name
             ))
         })?;
-        let sample = binding.sampler.sample();
+        let sample = binding.sampler.sample()?;
         let ceiling = if sample.ceiling_bytes > 0 {
             sample.ceiling_bytes
         } else {
@@ -225,7 +264,7 @@ impl SandboxKernel {
     /// Write the stage ceiling to the page (the child's gate reads it) and then `memory.max`,
     /// when it moved.
     fn send_ceiling(&self, shared: &Shared) -> Result<u64> {
-        let (ceiling, cores) = self.stage_limits(shared.in_use())?;
+        let (ceiling, cores) = self.stage_limits(shared.in_use()?)?;
         let page = shared.mapping.counter(field::CEILING);
         if page.load(Ordering::Acquire) != ceiling {
             page.store(ceiling, Ordering::Release);
@@ -594,7 +633,7 @@ impl SandboxState {
     }
 
     /// The child's memory now.
-    pub fn in_use(&self) -> u64 {
+    pub fn in_use(&self) -> Result<u64> {
         self.child.shared.in_use()
     }
 
@@ -691,8 +730,11 @@ impl KernelState for SandboxState {
 
     /// The child's memory and the mapping it holds in leased inputs (SB-I13): what a kernel
     /// that keeps its inputs costs, in the profile.
-    fn footprint(&self) -> Option<u64> {
-        Some(self.in_use() + self.child.regions.leased_bytes())
+    fn footprint(&self) -> Result<Option<u64>> {
+        self.in_use()?
+            .checked_add(self.child.regions.leased_bytes())
+            .map(Some)
+            .ok_or_else(|| kernel_error("accounted footprint overflow".into()))
     }
 }
 

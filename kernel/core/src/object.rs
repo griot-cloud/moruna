@@ -1,0 +1,173 @@
+//! Kernel objects and handles (SDD 20, e.1 and e.2).
+//!
+//! An object is reached only through a handle: an object plus the rights the holder
+//! has over it. The set of object types is the kernel's whole vocabulary; everything
+//! else is built by processes out of these.
+
+use alloc::{sync::Arc, vec::Vec};
+use core::ops::Range;
+
+use moruna_abi::{Error, ObjectType, ResourceKind, Rights, charge, resource_range};
+use ostd::sync::SpinLock;
+
+use crate::{
+    account::{Account, Charge},
+    channel::Endpoint,
+    clock::Timer,
+    interrupt::Interrupt,
+    memory::{DeviceMemory, MemoryObject, Pin, Pinned},
+    plane::SlotEnd,
+    process::{Process, Thread},
+    signal::Signaller,
+};
+
+/// The kernel's debug console: a write-only sink to the serial line, given only to the
+/// processes the manifest marks.
+pub struct Console;
+
+/// A capability to create objects of one kind out of nothing: processes, or device
+/// memory, interrupt lines, message-signalled interrupts and device pins within
+/// `range` (physical addresses, GSIs, MSI slots or PCI requester ids). A root resource
+/// covers its kind's whole range; `resource_narrow` derives one over a sub-range, so a
+/// supervisor can hand an untrusted driver only its own device.
+pub struct Resource {
+    pub kind: ResourceKind,
+    pub range: Range<u64>,
+    /// A DMA resource's pins whose handles closed without the resource's holder saying
+    /// the device is done with them (SDD 25, f.4): their pages stay allocated, and
+    /// mapped for the device, until `dma_release`. Empty for every other kind.
+    pub quarantine: SpinLock<Vec<Pinned>>,
+    _charge: Charge,
+}
+
+/// The most pins one DMA resource keeps in quarantine; `memory_pin` is `Limit` beyond.
+pub const QUARANTINE_MAX: usize = 4096;
+
+const _: () = assert!(core::mem::size_of::<Resource>() as u64 <= charge::OBJECT);
+const _: () = assert!(core::mem::size_of::<Console>() as u64 <= charge::OBJECT);
+
+impl Resource {
+    /// A resource of `kind` over `range`, its record charged to `account`.
+    pub fn new(
+        kind: ResourceKind,
+        range: Range<u64>,
+        account: &Arc<Account>,
+    ) -> Result<Resource, Error> {
+        Ok(Resource {
+            kind,
+            range,
+            quarantine: SpinLock::new(Vec::new()),
+            _charge: Charge::new(account, charge::OBJECT)?,
+        })
+    }
+
+    /// The root resource of `kind`, covering everything of that kind.
+    pub fn root(kind: ResourceKind, account: &Arc<Account>) -> Result<Resource, Error> {
+        let range = match kind {
+            ResourceKind::Process => 0..0,
+            ResourceKind::DeviceMemory => 0..resource_range::DEVICE_END,
+            ResourceKind::Interrupt => 0..resource_range::INTERRUPT_END,
+            ResourceKind::Msi => 0..resource_range::MSI_END,
+            ResourceKind::Dma => 0..resource_range::DMA_END,
+        };
+        Resource::new(kind, range, account)
+    }
+
+    /// Whether `start .. start + len` lies inside this resource's range.
+    pub fn covers(&self, start: u64, len: u64) -> bool {
+        start
+            .checked_add(len)
+            .is_some_and(|end| start >= self.range.start && end <= self.range.end)
+    }
+}
+
+#[derive(Clone)]
+pub enum Object {
+    Process(Arc<Process>),
+    Thread(Arc<Thread>),
+    Channel(Arc<Endpoint>),
+    Memory(Arc<MemoryObject>),
+    Timer(Arc<Timer>),
+    Interrupt(Arc<Interrupt>),
+    DeviceMemory(Arc<DeviceMemory>),
+    Console(Arc<Console>),
+    Resource(Arc<Resource>),
+    /// Held for its drop, which hands the pages to the quarantine.
+    Pin(#[expect(dead_code, reason = "held for its drop")] Arc<Pin>),
+    /// The engine's end of a data-plane slot (ABI 2.1).
+    Slot(Arc<SlotEnd>),
+    /// A memory account (ABI 2.3).
+    Account(Arc<Account>),
+}
+
+impl Object {
+    pub fn kind(&self) -> ObjectType {
+        match self {
+            Object::Process(_) => ObjectType::Process,
+            Object::Thread(_) => ObjectType::Thread,
+            Object::Channel(_) => ObjectType::Channel,
+            Object::Memory(_) => ObjectType::Memory,
+            Object::Timer(_) => ObjectType::Timer,
+            Object::Interrupt(_) => ObjectType::Interrupt,
+            Object::DeviceMemory(_) => ObjectType::DeviceMemory,
+            Object::Console(_) => ObjectType::Console,
+            Object::Resource(_) => ObjectType::Resource,
+            Object::Pin(_) => ObjectType::Pin,
+            Object::Slot(_) => ObjectType::Slot,
+            Object::Account(_) => ObjectType::Account,
+        }
+    }
+
+    /// The signals of a waitable object; `None` for an object with none.
+    pub fn signaller(&self) -> Option<&Signaller> {
+        match self {
+            Object::Process(p) => Some(&p.signaller),
+            Object::Thread(t) => Some(&t.signaller),
+            Object::Channel(e) => Some(e.signaller()),
+            Object::Timer(t) => Some(&t.signaller),
+            Object::Interrupt(i) => Some(&*i.signaller),
+            Object::Slot(s) => Some(s.0.signaller()),
+            Object::Memory(_)
+            | Object::DeviceMemory(_)
+            | Object::Console(_)
+            | Object::Resource(_)
+            | Object::Pin(_)
+            | Object::Account(_) => None,
+        }
+    }
+
+    /// The rights a newly created object's first handle carries.
+    pub fn default_rights(kind: ObjectType) -> Rights {
+        let base = Rights::DUPLICATE | Rights::TRANSFER;
+        match kind {
+            ObjectType::Process
+            | ObjectType::Thread
+            | ObjectType::Channel
+            | ObjectType::Timer
+            | ObjectType::Interrupt
+            | ObjectType::Slot => base | Rights::READ | Rights::WRITE | Rights::WAIT,
+            ObjectType::Memory | ObjectType::DeviceMemory => {
+                base | Rights::READ | Rights::WRITE | Rights::MAP
+            }
+            ObjectType::Console | ObjectType::Resource => base | Rights::WRITE,
+            // Read its figures; carve from it, or charge a process or memory to it.
+            ObjectType::Account => base | Rights::READ | Rights::WRITE,
+            // A pin is only ever closed; closing needs no right.
+            ObjectType::Pin => Rights::NONE,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Handle {
+    pub object: Object,
+    pub rights: Rights,
+}
+
+impl Handle {
+    /// A handle with the default rights of the object's type.
+    pub fn new(object: Object) -> Handle {
+        let rights = Object::default_rights(object.kind());
+        Handle { object, rights }
+    }
+}

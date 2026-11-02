@@ -1,5 +1,8 @@
 //! The virtio-vsock packet header (virtio 1.2, 5.10.6): 44 bytes, little-endian.
 
+/// The host's standard vsock CID; guests must use a CID above the reserved range.
+pub const HOST_CID: u32 = 2;
+
 /// Header size.
 pub const HDR_BYTES: usize = 44;
 /// Socket type: stream (the only type this device carries).

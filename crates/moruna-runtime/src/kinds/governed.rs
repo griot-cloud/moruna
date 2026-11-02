@@ -407,6 +407,7 @@ impl SourceKind for Datafusion {
             deterministic: Fact::Yes,
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Builtin,
+            served: None,
         }
     }
 
@@ -482,6 +483,7 @@ impl SinkKind for Peql {
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
+            served: None,
         }
     }
 
@@ -540,6 +542,19 @@ mod tests {
     use crate::kinds::{Registry, Standalone};
     use moruna_job::{JobSpec, KindDoc};
 
+    /// The default planner's plan of `job` for a run of four workers and a GiB (SDD 26 f.5).
+    fn planned(job: &moruna_job::Job) -> moruna_plan::Plan {
+        crate::job::plan::levels(
+            job,
+            moruna_plan::Resources {
+                workers: 4,
+                memory_start_bytes: 1 << 30,
+                memory_ceiling_bytes: 1 << 30,
+            },
+        )
+        .expect("planned")
+    }
+
     fn no_env(_: &str) -> Option<String> {
         None
     }
@@ -559,7 +574,12 @@ mod tests {
     }
 
     fn refusal(job: &JobSpec) -> String {
-        match build(job, &Registry::standard(), opts()) {
+        match build(
+            &moruna_job::Job::from_v1(job),
+            &planned(&moruna_job::Job::from_v1(job)),
+            &Registry::standard(),
+            opts(),
+        ) {
             Err(MorunaError::Config { msg, .. }) => msg,
             Err(other) => panic!("not a document refusal: {other}"),
             Ok(_) => panic!("built"),
@@ -699,9 +719,15 @@ mod tests {
         job.sink
             .settings
             .insert("root".into(), json!(format!("file://{root}")));
-        let built = build(&job, &Registry::standard(), opts()).expect("builds");
+        let built = build(
+            &moruna_job::Job::from_v1(&job),
+            &planned(&moruna_job::Job::from_v1(&job)),
+            &Registry::standard(),
+            opts(),
+        )
+        .expect("builds");
         assert!(built.spec.spec_digest.is_some());
-        assert!(built.spec.engine_memory.is_some() && built.spec.sink_memory.is_some());
+        assert!(built.spec.engine_memory.len() == 1 && built.spec.sink_memory.len() == 1);
         let mut not_a_caller = job.clone();
         not_a_caller
             .sink
@@ -749,7 +775,13 @@ mod tests {
             "excluded_url".into(),
             json!(disk.join("scratch").join("excluded").display().to_string()),
         );
-        build(&excluding, &Registry::standard(), opts()).expect("kept apart, it builds");
+        build(
+            &moruna_job::Job::from_v1(&excluding),
+            &planned(&moruna_job::Job::from_v1(&excluding)),
+            &Registry::standard(),
+            opts(),
+        )
+        .expect("kept apart, it builds");
         let _ = std::fs::remove_dir_all(&disk);
     }
 

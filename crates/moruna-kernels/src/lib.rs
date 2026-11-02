@@ -2,7 +2,7 @@
 //! written (MH 4.9).
 //!
 //! `cast`, `rename`, `select`, `drop`, `filter(expr)`, `fill_null`, `dedupe(keys)`,
-//! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str` and `date_trunc`, each a
+//! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str`, `date_trunc` and `union`, each a
 //! [`StdKernel`] built from its name and a JSON object of arguments. Each declares its input and
 //! output schemas as a function of its arguments, so every one of them is checkable; each ships
 //! a first profile as its hints; none enters Python, so each releases the GIL by construction;
@@ -29,8 +29,9 @@ use std::sync::Arc;
 use moruna_kernel::arrow::datatypes::{DataType, Schema, SchemaRef};
 use moruna_kernel::declare::{ColumnDecl, Declared, SchemaDecl};
 use moruna_kernel::{
-    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError, NoState,
-    Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
+    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, LogicalRows,
+    LogicalTaskRows, MorunaError, NoState, Payload, PayloadKind, PayloadSpec, Result, ResumePolicy,
+    SourceSchema, TierPref,
 };
 use serde_json::Value;
 use sha2::Digest;
@@ -43,7 +44,7 @@ use crate::ops::{Algo, MaskMode, Step, TruncUnit};
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every standard kernel's name, in the order of MH 4.9.
-pub const NAMES: [&str; 12] = [
+pub const NAMES: [&str; 13] = [
     "cast",
     "rename",
     "select",
@@ -56,6 +57,7 @@ pub const NAMES: [&str; 12] = [
     "explode",
     "concat_str",
     "date_trunc",
+    "union",
 ];
 
 /// What a standard kernel does.
@@ -96,6 +98,9 @@ enum Op {
         unit: TruncUnit,
         output: Option<String>,
     },
+    /// `union`: the batches of every input port, each as it came, into one output (a stage of
+    /// several inputs, contracts d.16).
+    Union,
 }
 
 /// A standard kernel: its name, its canonical arguments, what it does and what it declares.
@@ -107,6 +112,36 @@ pub struct StdKernel {
     declared: Declared,
     fingerprint: Fingerprint,
     amplification: f64,
+    capture: Option<Arc<LogicalBinding>>,
+}
+
+struct LogicalBinding {
+    tasks: Vec<LogicalTaskRows>,
+    rows: Arc<dyn LogicalRows>,
+}
+
+impl core::fmt::Debug for LogicalBinding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LogicalBinding")
+            .field("tasks", &self.tasks)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogicalBinding {
+    fn emit(
+        &self,
+        index: usize,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+    ) -> Result<()> {
+        let task = self.tasks.get(index).ok_or_else(|| {
+            MorunaError::Plan("logical tap index differs from fused executable".into())
+        })?;
+        for port in &task.ports {
+            self.rows.append(&task.task, port, batch)?;
+        }
+        Ok(())
+    }
 }
 
 /// The fingerprint of MH 4.9: SHA-256 over `"moruna-std\0" || name || "\0" || canonical args ||
@@ -405,6 +440,17 @@ impl StdKernel {
                     1.0,
                 )
             }
+            "union" => {
+                args::only(name, args, &[])?;
+                (
+                    Op::Union,
+                    Declared {
+                        input: None,
+                        output: unchanged(),
+                    },
+                    0.0,
+                )
+            }
             other => {
                 return Err(MorunaError::Plan(format!(
                     "moruna.std has no kernel `{other}` (the standard kernels are {})",
@@ -420,6 +466,7 @@ impl StdKernel {
             op,
             declared,
             amplification,
+            capture: None,
         })
     }
 
@@ -480,6 +527,7 @@ impl StdKernel {
                 columns, output, ..
             } => ops::concat_schema(columns, output, input),
             Op::Trunc { column, output, .. } => ops::trunc_schema(column, output.as_deref(), input),
+            Op::Union => Ok(Arc::new(input.clone())),
         }
     }
 }
@@ -512,6 +560,7 @@ pub fn fuse(first: &StdKernel, second: &StdKernel) -> Option<StdKernel> {
         declared: Declared::default(),
         fingerprint: Fingerprint(hasher.finalize().into()),
         amplification: first.amplification.max(second.amplification),
+        capture: None,
     };
     fused.declared = fused_declaration(first, second, &fused);
     Some(fused)
@@ -599,12 +648,40 @@ impl KernelState for Seen {
         Ok(Some(out))
     }
 
-    fn footprint(&self) -> Option<u64> {
-        Some(self.bytes + self.keys.len() as u64 * 32)
+    fn footprint(&self) -> moruna_kernel::Result<Option<u64>> {
+        Ok(Some(self.bytes + self.keys.len() as u64 * 32))
     }
 }
 
 impl Kernel for StdKernel {
+    fn with_logical_rows(
+        &self,
+        tasks: &[LogicalTaskRows],
+        rows: Arc<dyn LogicalRows>,
+    ) -> Result<Arc<dyn Kernel>> {
+        let boundaries = match &self.op {
+            Op::Project(steps) => steps.len(),
+            Op::FillFilter(..) => 2,
+            _ => 1,
+        };
+        if self.capture.is_some()
+            || tasks.len() != boundaries
+            || tasks
+                .iter()
+                .any(|task| task.task.is_empty() || task.ports.iter().any(String::is_empty))
+        {
+            return Err(MorunaError::Plan(
+                "logical task bindings do not match standard fused boundaries".into(),
+            ));
+        }
+        let mut bound = self.clone();
+        bound.capture = Some(Arc::new(LogicalBinding {
+            tasks: tasks.to_vec(),
+            rows,
+        }));
+        Ok(Arc::new(bound))
+    }
+
     fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
     }
@@ -648,6 +725,59 @@ impl Kernel for StdKernel {
             SourceSchema::Table(schema) => Ok(SourceSchema::Table(self.table_output(schema)?)),
             SourceSchema::Tensor { .. } => Err(MorunaError::Plan(format!(
                 "moruna.std.{} takes a table, and the input is a tensor",
+                self.name
+            ))),
+        }
+    }
+
+    /// `union` takes any number of inputs; every other standard kernel one.
+    fn max_inputs(&self) -> u16 {
+        match self.op {
+            Op::Union => u16::MAX,
+            _ => 1,
+        }
+    }
+
+    /// `union` gives what each of its inputs gives, so every input has one schema; every other
+    /// standard kernel takes one input.
+    fn output_schema_of(&self, inputs: &[SourceSchema]) -> Result<SourceSchema> {
+        match (&self.op, inputs) {
+            (_, [one]) => self.output_schema(one),
+            (Op::Union, [first, rest @ ..]) => {
+                let first = self.output_schema(first)?;
+                for (port, schema) in rest.iter().enumerate() {
+                    let other = self.output_schema(schema)?;
+                    if let (SourceSchema::Table(a), SourceSchema::Table(b)) = (&first, &other)
+                        && a.fields() != b.fields()
+                    {
+                        return Err(MorunaError::Plan(format!(
+                            "moruna.std.union takes inputs of one schema, and its port {} gives \
+                             {b:?} where port 0 gives {a:?}",
+                            port + 1
+                        )));
+                    }
+                }
+                Ok(first)
+            }
+            (_, many) => Err(MorunaError::Plan(format!(
+                "moruna.std.{} takes one input and is given {}",
+                self.name,
+                many.len()
+            ))),
+        }
+    }
+
+    /// `union` takes a batch on any port as it came; every other standard kernel takes port 0.
+    fn apply_port(
+        &self,
+        state: &mut dyn KernelState,
+        port: u16,
+        input: Payload,
+    ) -> Result<Payload> {
+        match (&self.op, port) {
+            (Op::Union, _) | (_, 0) => self.apply(state, input),
+            (_, other) => Err(MorunaError::Plan(format!(
+                "moruna.std.{} takes one input and was handed a batch on its port {other}",
                 self.name
             ))),
         }
@@ -699,10 +829,28 @@ impl Kernel for StdKernel {
             )));
         };
         let out = match &self.op {
-            Op::Project(steps) => ops::project(steps, batch)?,
+            Op::Project(steps) => match &self.capture {
+                Some(capture) => ops::project_tapped(
+                    steps,
+                    batch,
+                    |index| !capture.tasks[index].ports.is_empty(),
+                    |index, rows| capture.emit(index, rows),
+                )?,
+                None => ops::project(steps, batch)?,
+            },
             Op::Filter(expr) => ops::filter(expr, batch)?,
             Op::Fill(values) => ops::fill(values, batch)?,
-            Op::FillFilter(values, expr) => ops::fill_then_filter(values, expr, batch)?,
+            Op::FillFilter(values, expr) => {
+                if let Some(capture) = &self.capture
+                    && !capture.tasks[0].ports.is_empty()
+                {
+                    // This requested intermediate was intentionally elided by the fused fast path.
+                    // Materialize it once for retention, while the final operation stays fused.
+                    let filled = ops::fill(values, batch)?;
+                    capture.emit(0, &filled)?;
+                }
+                ops::fill_then_filter(values, expr, batch)?
+            }
             Op::Dedupe(keys) => {
                 let seen = state.as_any_mut().downcast_mut::<Seen>().ok_or_else(|| {
                     MorunaError::Plan("moruna.std.dedupe was given a state it did not make".into())
@@ -731,7 +879,18 @@ impl Kernel for StdKernel {
                 unit,
                 output,
             } => ops::date_trunc(column, *unit, output.as_deref(), batch)?,
+            Op::Union => {
+                if let Some(capture) = &self.capture {
+                    capture.emit(0, batch)?;
+                }
+                return Ok(input);
+            }
         };
+        if let Some(capture) = &self.capture
+            && !matches!(self.op, Op::Project(_))
+        {
+            capture.emit(capture.tasks.len() - 1, &out)?;
+        }
         drop(input);
         Payload::table(out)
     }

@@ -78,3 +78,28 @@ fn tr_t3_pure_report_in_its_meta() {
         RunReport::compute(&view, &limits(), &meta(ExitReason::Cancelled)).to_json()
     );
 }
+
+#[test]
+fn native_pressure_basis_is_explicit_and_legacy_json_remains_unchanged() {
+    let legacy = compute("t3-basis-legacy");
+    let legacy_json: serde_json::Value = serde_json::from_str(&legacy.to_json()).unwrap();
+    assert!(legacy_json.get("memory_basis").is_none());
+    let dir = TempDir::new("t3-basis-native");
+    let writer = TraceWriter::start(config(dir.path())).unwrap();
+    let view = writer.finish().unwrap();
+    let mut info = meta(ExitReason::Completed);
+    info.memory_basis = moruna_kernel::MemoryBasis::NativeAccountCharge;
+    info.process_peak = moruna_kernel::ProcessPeak {
+        bytes: 42,
+        at_ns: info.start_ns,
+        since_ns: info.start_ns,
+        exact: false,
+    };
+    let report = RunReport::compute(&view, &limits(), &info);
+    let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+    assert_eq!(json["memory_basis"], "native_account_charge");
+    assert!(!report.usage_measured);
+    assert_eq!(report.cpu_ns, 0);
+    assert_eq!(report.mem_byte_seconds, 0);
+    assert!(report.notes.iter().any(|n| n.contains("not process RSS")));
+}

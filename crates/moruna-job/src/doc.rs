@@ -17,6 +17,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// `checkpoint.interval_ms` when the document leaves it out.
 pub const CHECKPOINT_INTERVAL_MS: u64 = 5000;
 
+/// The range `checkpoint.interval_ms` is clamped into (preamble section 5).
+pub const CHECKPOINT_INTERVAL_BOUNDS_MS: (u64, u64) = (500, 60_000);
+
+/// `checkpoint.interval_ms` as every reader of it uses it, the run's build, `moruna.run`'s
+/// arguments and the planner alike, so none of them sees another cadence: `given` clamped into
+/// [`CHECKPOINT_INTERVAL_BOUNDS_MS`], and the note PY-I10 requires when it moved
+/// (`clamped checkpoint.interval_ms from <given> to <bound>`).
+pub fn checkpoint_interval_ms(given: u64) -> (u64, Option<String>) {
+    let (lo, hi) = CHECKPOINT_INTERVAL_BOUNDS_MS;
+    let used = given.clamp(lo, hi);
+    let note =
+        (used != given).then(|| format!("clamped checkpoint.interval_ms from {given} to {used}"));
+    (used, note)
+}
+
 /// The one version of the document this build reads (MH 4.1).
 pub const SPEC_VERSION: u32 = 1;
 
@@ -328,7 +343,8 @@ pub struct AzureDoc {
 pub struct CheckpointDoc {
     /// Write the manifest periodically.
     pub enabled: bool,
-    /// The cadence, clamped to 500 to 60,000 ms with a note.
+    /// The cadence as the document gives it; a run uses it clamped
+    /// ([`checkpoint_interval_ms`]).
     pub interval_ms: u64,
     /// Keep the run directory and the final manifest after a completed run.
     pub keep: bool,

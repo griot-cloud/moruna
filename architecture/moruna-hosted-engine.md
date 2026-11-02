@@ -94,7 +94,9 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
 
 ### 4.1 The job document: `RunSpec` as a file
 
-`RunSpec` (`spec.rs:106`) already is the document; it is a Rust struct. The change is a serialization and a loader.
+**The job document is version 2 (KA5, 2026-10-29):** a DAG of tasks in FlatBuffers (`crates/moruna-job/schema/job.fbs`, file identifier `MJB2`; SDD 22 d.4, e.4, e.5). A task is a source, kernel or sink kind with its settings (FlexBuffers, checked against the kind's JSON Schema) and its named ports; an edge joins an output port to an input port; a task or an edge may be a barrier. Every field of version 1 below other than `source`, `kernels`, `sink` and `report.tasks` carries over unchanged (`run_id` is the job's `id`; a task's id is its event id). The version 1 JSON document below is still read, as the DAG with one path it is (`Job::from_v1`), so every version 1 document runs unchanged; `moruna run` takes a file of either version (FlatBuffers when it carries the identifier, JSON otherwise) and `moruna serve`'s `spec` message carries a version 1 document as JSON or a version 2 document's bytes as a base64 string. JSON is a rendering of version 2 for people, never read back. The runtime's build (`moruna_runtime::job::build`) takes a version 2 `Job`.
+
+`RunSpec` (`spec.rs:106`) already is the document; it is a Rust struct. The change is a serialization and a loader. (Version 1, below.)
 
 ```jsonc
 {
@@ -135,7 +137,7 @@ Every row was read in `/Users/brackly/Desktop/Projects/amoru` at `7ce3c4d` (main
 ```
 
 Rules:
-- **Kinds are named, not enumerated.** `source.kind`, `kernels[].kind` and `sink.kind` are strings the program's registry of kinds resolves when the document is built, each to the adapter registered under it for that role, or a refusal at `<field>.kind` naming the kinds of that role the program has (SDD 18 KD-I1). The rest of an entry is that kind's settings, which the kind's declaration describes as a JSON Schema and its adapter reads (SDD 18 e.2); `moruna kinds` lists every declaration. The document itself names no kind.
+- **Kinds are named, not enumerated.** `source.kind`, `kernels[].kind` and `sink.kind` are strings the program's registry of kinds resolves when the document is built, each to the adapter registered under it for that role, or a refusal at `<field>.kind` naming the kinds of that role the program has (SDD 18 KD-I1). The rest of an entry is that kind's settings, which the kind's declaration describes as a JSON Schema and its adapter reads (SDD 18 e.2); `moruna kinds` lists every declaration. The document itself names no kind. A kind the program running Moruna serves itself is declared beside them and run by handing each batch to its port (SDD 18 KD-I11, e.4, e.5, amended 2026-10-29 by KA6); the `moruna` binary is given such kinds by `--kinds <file>` on `run`, `serve`, `kinds`, `check-job` and `explain` (SDD 18 d.3).
 - Every field of the Rust `RunSpec` has a JSON field; the Python surface's `run(...)` becomes a constructor of the same struct, so there is one code path (H1).
 - **Precedence:** a spec field set → the spec wins; a spec field `null` → discovery, then the environment variable if the field has one, then the default. `moruna run` prints every field it resolved from the environment as a `notes` entry, and **refuses** when `--strict` (the hosted default) and any such resolution happened (H8).
 - The spec is content-addressed: `sha256(canonical JSON)` is the `plan digest` the manifest already records (parent §10), so a resume with a changed spec is refused as today.
@@ -155,24 +157,39 @@ The Python package keeps `moruna.run(...)`; it builds the same `RunSpec` and cal
 
 ### 4.3 The host protocol
 
-Newline-delimited JSON over the socket named in `report.socket` (vsock in a guest; a Unix socket in tests). One peer. Messages from Moruna:
+Lines of JSON, one object per line, and one framed binary message, the `event` (version 7, below), over the socket named in `report.socket` (vsock in a guest; a Unix socket in tests). One peer. A message from Moruna that starts with `{` is a line; one that starts with the NUL byte is an event's frame. Messages from Moruna:
 
 | message | when | fields |
 |---|---|---|
 | `hello` | on connect | `moruna_version`, `spec_digest`, `limits` (as discovered) |
 | `heartbeat` | every ≤ 2 s | `committed_seq`, `rows_out`, `bytes_out`, `active_workers`, `ceiling_bytes`, `anon_bytes`, `bottleneck`, `staging_bytes` |
 | `limits_changed` | when discovery observes a change (§4.4) | old and new `Limits`, `reason` (`"memory"`, `"cpu"`) |
-| `event` | as each fact of the run becomes true, between `hello` and `report` | `v`, `attempt`, `start`, `seq`, `t_us`, then `kind` and its fields: the task lifecycle (`attempt_started`, `task_registered`, `task_waiting`, `task_ready`, `task_started`, `task_phase`, `task_completed`, `task_failed`, `task_skipped`, `cancel_acknowledged`, `cancel_ended`). Version 2 added `logs`, how far the run's output store reaches for each producer. Version 3 (amended 2026-10-21) adds a running task's wait on a port: `task_waiting` with `reason: "port_call"` and `port` (the name its entry lists; `null` for the other reasons), until a `task_phase` says what it does again (§4.10). `task_failed` carries `task` (`null` when the attempt failed), `code`, `message`, `scope` (`task`, `attempt`) and `retryable`; `code` is one of `spec_refused`, `kernel_error`, `budget_exceeded`, `memory_refused`, `source_error`, `sink_error`, `alloc_refused`, `io_error`, `staging_error`, `convert_error`, `config_refused`, `plan_refused`, `resume_refused`, `unsupported`, `cancelled` and `internal`. Version 4 (amended 2026-10-28) adds `internal`, a crash: a panic of Moruna's own that unwound the run. Every task still running fails `internal`, not retryable, its `message` what the panic said; the attempt does when no task was running; a task that never started is skipped `attempt_failed`. A crash is never told as a cancel: a run let go of with no panic still ends its tasks `cancelled` |
+| `event` | as each fact of the run becomes true, between `hello` and `report` | `v`, `attempt`, `start`, `seq`, `t_us`, then `kind` and its fields: the task lifecycle (`attempt_started`, `task_registered`, `task_waiting`, `task_ready`, `task_started`, `task_phase`, `task_completed`, `task_failed`, `task_skipped`, `cancel_acknowledged`, `cancel_ended`). Version 2 added `logs`, how far the run's output store reaches for each producer. Version 3 (amended 2026-10-21) adds a running task's wait on a port: `task_waiting` with `reason: "port_call"` and `port` (the name its entry lists; `null` for the other reasons), until a `task_phase` says what it does again (§4.10). `task_failed` carries `task` (`null` when the attempt failed), `code`, `message`, `scope` (`task`, `attempt`) and `retryable`; `code` is one of `spec_refused`, `kernel_error`, `budget_exceeded`, `memory_refused`, `source_error`, `sink_error`, `alloc_refused`, `io_error`, `staging_error`, `convert_error`, `config_refused`, `plan_refused`, `resume_refused`, `unsupported`, `cancelled` and `internal`. Version 4 (amended 2026-10-28) adds `internal`, a crash: a panic of Moruna's own that unwound the run. Every task still running fails `internal`, not retryable, its `message` what the panic said; the attempt does when no task was running; a task that never started is skipped `attempt_failed`. A crash is never told as a cancel: a run let go of with no panic still ends its tasks `cancelled`. Version 5 (amended 2026-10-29, KA5) makes `task_registered`'s `upstream` the list of task ids a task takes its input from, its input ports in order (the job's edges; empty for a source), names each task by the id the document gives it, and `stage` is 0 for a source, the stage's number for a kernel stage and one more than the last for a sink. Version 6 (amended 2026-10-29, KA7) runs a job from its plan (SDD 26): every task event carries `step`, the id of the plan step that runs the task (`null` only for a document refused before it was planned); `attempt_started` carries `plan`, the plan's id; `step_started` (`step`, `plan`, `group`) is told when a step's first task starts and `step_ended` (`step`, `plan`, `outcome`, `duration_us`) when its last task ends, `outcome` the first of `failed`, `cancelled`, `stopped`, `skipped`, `succeeded` any of its tasks ended with. Version 7 (amended 2026-10-29, KA8) makes the event a record (SDD 21) and not a line, with the same facts and the same fields: see "The event as a record" below |
 | `port_call` | a stage calls a host port (§4.10) | `v` (1), `call` (unique in the process), `stage`, `port` (the host's name for it), `deadline_ms`, `request` (base64) |
 | `port_cancel` | Moruna stops waiting for a call: its deadline passed, or the run was cancelled | `v`, `call`, `reason` (`"deadline"`, `"cancelled"`) |
-| `report` | before exit | the full `RunReport` JSON |
+| `report` | before exit | the full `RunReport` JSON, and `plan`: how the run went against its plan (SDD 26 e.3: the plan's id, the order its steps started in, each step's start, end and use, every deviation) |
 | `exit` | last message | `code`, `diagnostic?` |
+
+**The event as a record (version 7, KA8).** An event is one `moruna-record` record (SDD 21), on the connection as a frame: the NUL byte, then the record exactly as `moruna_record::encode_into` writes it, whose first four bytes say how many bytes follow them, so a reader needs no other delimiter. The record's fields are the event's, and `msg_id` makes delivery idempotent:
+
+| record field | holds |
+|---|---|
+| `seq` | the event's number in its process's attempt, from 1 with no gap, in the order the events became true; a `log` record (the output store's, below) is numbered by its own producer instead |
+| `ts` | unix nanoseconds of the instant the fact became true |
+| `subject` | the kind: `0x4D450000` plus its number in the schema's union, 1 `attempt_started`, 2 `step_started`, 3 `step_ended`, 4 `task_registered`, 5 `task_waiting`, 6 `task_ready`, 7 `task_started`, 8 `task_phase`, 9 `task_completed`, 10 `task_failed`, 11 `task_skipped`, 12 `cancel_acknowledged`, 13 `cancel_ended`, 14 `logs`, 15 `log` |
+| `msg_id` | `<attempt>-<start>-<seq>`, where `start` is the telling process's own id (32 random hex characters, minted when it starts): unique by construction, so two processes of one attempt, a resumed run's attempt and any two runs tell disjoint ids, and a consumer that de-duplicates by `msg_id` never drops a real event; a `log`: `<attempt>-<start>-<producer>-<seq>` (`<producer>` is the task, or `_engine`), whose JSON rendering's `id` stays `<start>/<producer>/<seq>` |
+| headers | `run` (the run's id), `attempt` (the document's `report.attempt`), `plan` (the plan's id), `step` and `task`; each absent where it does not apply: `plan` only for a document refused before it was planned, `step` and `task` for the events of a task (`step` also for a step's own), `task` absent for an attempt-scoped failure and for the engine's own output |
+| body | the fact as FlatBuffers (`crates/moruna-event/schema/event.fbs`, file identifier `MEV1`): the process's `start` id, `t_us`, and a union over the fifteen kinds with exactly the fields version 6's JSON had; an absent field reads as the `null` it was |
+
+The JSON of version 6 is the record's rendering at the edge, for people: `moruna run --events-json` prints each event of the run to standard output as one line, `type` first, `v` 7, `attempt`, `start`, `seq`, `t_us`, `kind` and the fact's fields, every field written out and nulls included, and `moruna run --vm` prints the guest's events the same way. A reader of the connection that wants JSON renders the record (`moruna_event::EventMsg::json_line`); one that wants the fields reads the FlatBuffers (`moruna_event::decode`, which verifies untrusted bytes and never panics).
+
+Where a run's events go: to the peer on the connection, as frames, when there is one; to `_events.mrec` in the attempt's directory of the run's output store (`<logs>/a<attempt>-<start>/`), the records back to back, when there is none; and, in process, into the `moruna_runtime::host::events::EventRing` the embedder gave the run (`HostOptions.events`), which it drains while the run goes on and which never makes the run wait, a full ring refusing the record and counting it. A record of output, `log`, is the same record: the store's segments are `<task>/<first seq>.mrec`, records back to back, each segment written whole.
 
 Messages to Moruna:
 
 | message | effect |
 |---|---|
-| `spec` (serve mode only) | the `RunSpec`; a second `spec` is refused |
+| `spec` (serve mode only) | the `RunSpec`, and optionally `plan`, the plan document's FlatBuffers as base64 (SDD 26), which the run starts from instead of the default planner's; a second `spec` is refused |
 | `cancel` | the existing `CancelToken`; manifest written; exit 130 |
 | `checkpoint` | write the manifest now (the host is about to destroy the guest) |
 | `port_reply` | the answer to `port_call` `call`: `v` (1), `call`, and exactly one of `ok` (base64) or `error` (the port's refusal, handed to the stage); one that answers nothing waiting is a note in the report (§4.10) |
@@ -278,7 +295,7 @@ moruna run --vm <spec.json> [--image ...] [--disk ...]   (boots, sends the spec,
 3. **run** each batch through the kernel in-process with the arena and the trace on, exactly as a run would.
 4. **compare** the produced schema with `output_schema`; refuse on a mismatch naming the column and the types.
 5. **allocations** (E13, 2026-10-02): the report's `alloc` gives, over the synthetic batches, what the kernel asked for from each source the allocator guard counts (adapters 05 f.10 to f.14, the run report's per-stage `alloc` of 04 d.1), and `memory_guard` whether refusal would be on, so a function can be judged by what it asks for outside Arrow before it meets real data.
-6. **profile**: write the first profile-store row for the kernel's fingerprint (amplification p50/p95, state bytes, wall per row, GIL held or released) so a later `run` sizes from evidence.
+6. **warm-up** (amended 2026-10-29, KD6b): `adaptive-runtime.md` section 6 replaces the profile row. The agreeing kernel runs at sizes, workers and distinct counts on generated data; every unit goes to the observation store, the cost model is fitted, and the report carries its cost per 10,000 rows and what warm-up consumed. No profile-store row is written.
 7. **fingerprint**: `sha256(canonical source ∥ lockfile bytes ∥ Moruna ABI version)`, printed, and recorded in the profile row; the same value a hosted `RunSpec` pins in `kernels[].fingerprint`.
 
 Output is a JSON report (`--json`) and a human summary; exit 0 on a checkable, agreeing kernel, 2 on a refused one. A Rust kernel is checked the same way through a small harness the `Kernel` trait exposes.
@@ -326,6 +343,7 @@ A kernel that reasons over its batches (a model's agent, a lookup against a serv
 | `16-package.md`, `17-sandbox.md` (2026-10-21) | the world's `call` import and its verification; the host function, its trap, the entry state of a stateful stage with ports (§4.10) |
 | `13-host.md` (2026-10-21) | `port_call`, `port_reply`, `port_cancel`, version 1; `event` version 3's port wait; the port line bound (§4.3, §4.10) |
 | `12-python.md` (2026-10-28) | PY-I11: a crash fails every running task `internal` with the panic's words, then the panic leaves the session; a run let go of is a cancel; `event` version 4 (§4.3) |
+| `12-python.md` (2026-10-29, KA8) | PY-I13: every event is a record, its fact FlatBuffers, delivered with an idempotent `msg_id`; `event` version 7, the frame, the events file and the ring (§4.3) |
 | `12-python.md` (2026-10-28, HO-T16) | PY-I12: each task's lifecycle events are one order whatever the order of the threads that told its facts; a task that starts while it waits is told `task_ready` first; `t_us` never runs backwards (§4.3) |
 
 ---

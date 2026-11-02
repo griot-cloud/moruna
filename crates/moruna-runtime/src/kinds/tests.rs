@@ -87,6 +87,7 @@ impl RunnableKind for Probe {
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: self.isolation,
+            served: None,
         }
     }
 
@@ -159,7 +160,7 @@ fn kd_t2_rust_is_not_registered() {
         e.to_string(),
         refusal(SpecError::new(
             "kernels[0].kind",
-            "no kernel kind `rust` is registered; this build runs package, std",
+            "no kernel kind `rust` is registered; this build runs image, package, std",
         ))
         .to_string()
     );
@@ -295,6 +296,52 @@ fn kd_t4_standard_conformance() {
     assert!(passed.properties.contains(&"KD-C7"));
 }
 
+/// IM-T16 the_image_kind_is_declared (SDD 19 d.2, e.5): the declaration is one the registry
+/// accepts and says what an image is; its settings are read, and refused, before anything is
+/// unpacked, on every platform; where there is no sandbox the stage is refused by name, and where
+/// there is, without a cgroup it says what it needs. The conformance suite runs over a real layout
+/// in `crates/moruna-image/tests/image_kind.rs`, on Linux.
+#[test]
+fn im_t16_the_image_kind_is_declared() {
+    let kind = image::Image;
+    let declared = kind.declaration();
+    assert_eq!(declared.check(Role::Kernel), Ok(()));
+    assert_eq!(declared, kind.declaration());
+    assert_eq!(declared.name, "image");
+    assert_eq!(declared.isolation, Isolation::Confined);
+    assert_eq!(declared.needs, Needs::nothing());
+    assert_eq!(declared.deterministic, Fact::No);
+    assert_eq!(declared.preserves_columns, Fact::No);
+    assert_eq!(
+        (declared.inputs, declared.outputs),
+        (Flow::Batches, Flow::Batches)
+    );
+    assert_eq!(declared.examples().len(), 1);
+    assert!(Registry::standard().kernel("kernels[0]", "image").is_ok());
+
+    let build = |value: Value| {
+        let doc = doc(value);
+        let mut cx = Context::new(Arc::new(Standalone));
+        kind.stage(&Entry::new("kernels[0]", Some(0), &doc), &mut cx)
+            .err()
+            .expect("refused")
+            .to_string()
+    };
+    let e = build(json!({"kind": "image", "layout": "/l"}));
+    assert!(e.contains("kernels[0]") && e.contains("reference"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "volume": "/v"}));
+    assert!(e.contains("kernels[0]") && e.contains("volume"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "command": "ls"}));
+    assert!(e.contains("kernels[0]"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "env": {"A": 1}}));
+    assert!(e.contains("kernels[0]"), "{e}");
+    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r"}));
+    #[cfg(not(target_os = "linux"))]
+    assert!(e.contains("needs Linux"), "{e}");
+    #[cfg(target_os = "linux")]
+    assert!(e.contains("--sandbox-cgroup"), "{e}");
+}
+
 /// SO-T39 ipc_source_conformance (07 e.9; KD-I5): the `arrow_ipc` kind passes the source port's
 /// suite and declares what the design says of it.
 #[test]
@@ -339,7 +386,7 @@ fn kd_t6_listing() {
     assert_eq!(listing.moruna, env!("CARGO_PKG_VERSION"));
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
-    assert_eq!(names(&listing.kernels), ["package", "std"]);
+    assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
     let mut sinks = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
     let mut sources = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
     if cfg!(feature = "peql") {
@@ -362,9 +409,13 @@ fn kd_t6_listing() {
     let back: Listing = serde_json::from_str(&text).expect("reads back");
     assert_eq!(back, listing);
     let json: Value = serde_json::from_str(&text).expect("json");
-    assert_eq!(json["kernels"][1]["settings"]["$schema"], SCHEMA_DIALECT);
+    let std_kernel = json["kernels"]
+        .as_array()
+        .and_then(|kernels| kernels.iter().find(|k| k["name"] == "std"))
+        .expect("std is listed");
+    assert_eq!(std_kernel["settings"]["$schema"], SCHEMA_DIALECT);
     assert_eq!(
-        json["kernels"][1]["settings"]["properties"]["name"]["enum"],
+        std_kernel["settings"]["properties"]["name"]["enum"],
         json!(moruna_kernels::NAMES)
     );
     // Listed by name, so a kind added before it does not move the check: Parquet reaches an
@@ -525,16 +576,29 @@ fn kd_t11_fusion_through_the_port() {
         packages: crate::packaged::PackageHost::default(),
         host_ports: None,
     };
-    let built = crate::job::build(&job, &kinds, opts()).expect("builds");
-    assert_eq!(built.stage_kernels, vec![vec![0, 1], vec![2, 3], vec![4]]);
+    let dag = |job: &moruna_job::JobSpec| moruna_job::Job::from_v1(job);
+    let plan = |job: &moruna_job::Job| {
+        crate::job::plan::levels(
+            job,
+            moruna_plan::Resources {
+                workers: 4,
+                memory_start_bytes: 1 << 30,
+                memory_ceiling_bytes: 1 << 30,
+            },
+        )
+        .expect("planned")
+    };
+    let built = crate::job::build(&dag(&job), &plan(&dag(&job)), &kinds, opts()).expect("builds");
+    // The document's tasks each stage carries: the kernels are tasks 1 to 5.
+    assert_eq!(built.parts.stages, vec![vec![1, 2], vec![3, 4], vec![5]]);
     assert_eq!(built.spec.kernels.len(), 3);
     job.kernels.swap(1, 2);
-    let built = crate::job::build(&job, &kinds, opts()).expect("builds");
+    let built = crate::job::build(&dag(&job), &plan(&dag(&job)), &kinds, opts()).expect("builds");
     assert_eq!(
-        built.stage_kernels.len(),
+        built.parts.stages.len(),
         5,
         "no two neighbours join: {:?}",
-        built.stage_kernels
+        built.parts.stages
     );
 }
 

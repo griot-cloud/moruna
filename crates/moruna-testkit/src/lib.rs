@@ -20,11 +20,16 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// KA10's bombs, shared with moruna-kernel's tests, name this crate by its name.
+extern crate self as moruna_testkit;
+
 pub mod allocator;
+pub mod dag;
 pub mod ipc;
 pub mod kernel;
 pub mod knobs;
 pub mod placement;
+pub mod plane;
 pub mod reactor;
 pub mod sampler;
 pub mod sink;
