@@ -1,6 +1,7 @@
 # Supply-chain policy for the kernel workspace (kernel/), its own Cargo workspace and
 # so its own `cargo-deny` configuration. The root deny.toml's rules apply unchanged;
-# the one difference is MPL-2.0 on the licence allow list, for OSTD (DECISIONS.md MK1).
+# differences are MPL-2.0 for OSTD (DECISIONS.md MK1), and scoped 0BSD
+# exceptions for the native network stack's smoltcp and managed dependencies.
 #
 #   cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
 #
@@ -35,6 +36,17 @@ allow = [
   "MPL-2.0",
 ]
 confidence-threshold = 0.93
+
+# The native network stack's existing dependencies use the BSD Zero Clause
+# licence. Keep this exception package-scoped rather than allowing new 0BSD
+# dependencies across the workspace without review.
+[[licenses.exceptions]]
+crate = "smoltcp"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+crate = "managed"
+allow = ["0BSD"]
 
 [bans]
 multiple-versions = "allow"

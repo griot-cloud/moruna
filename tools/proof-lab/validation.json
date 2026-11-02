@@ -458,7 +458,7 @@
           "sha256": "a605ba7dddfd1335a684ba779fc34fae2b6a92f62a20c63aa3ca28d8f47c8813"
         }
       },
-      "remote_corrected_result": "PENDING"
+      "remote_corrected_result": "PASS in complete main job at5132, run41420167767"
     },
     "public_node_ci_wiring_followup": {
       "failed_ci_run": "https://github.com/griot-cloud/moruna/actions/runs/41410969177",
@@ -486,7 +486,7 @@
         "scope": "Actual public non-SDK15 matrix affected by readiness/native-roots wiring. Retained unchanged GNU-release actors, uid1001 ARM-hosted x86 TCG; source-bound reuse, not a full fresh-source rebuild",
         "cleanup": true
       },
-      "remote_corrected_result": "PENDING"
+      "remote_corrected_result": "PASS all15 public cases, CPU1/2/4 at5132, run41420167767"
     },
     "remote_functional_kernel_5132": {
       "run": "https://github.com/griot-cloud/moruna/actions/runs/41420167767",
@@ -532,7 +532,24 @@
       "native_user_findings": "Cargo JSON-target flags needed forwarding after external clippy subcommand; full workspace then found machine-applicable idioms plus10 intentional I/O RefCell leases and2 explicit argument-count exceptions",
       "changes": "Reviewed mechanical idioms preserve short-circuit authorization, read zeroing, compaction liveness and bounded rounding. Narrow expect attributes document required original-I/O guards and distinct authority inputs; no global lint disabling or early guard release.",
       "reviewed_machine_patch_sha256": "1a8df6c198c527e1622dc461da66e9637f39a414693c5c32c7ee42114893fa13",
-      "final_strict_all_profiles": "PENDING; no overall Clippy success is claimed yet"
+      "final_strict_all_profiles": {
+        "result": "PASS: plain=0 probe=0 user=0, all with -D warnings; native user uses --keep-going to expose the full workspace",
+        "source_head": "e4ab2834be9d5010bf10e5c91520e4717bb6e1b0",
+        "summary": "/private/var/folders/1d/f7v5jtsj3hd43ltj5v94smnr0000gn/T/moruna-v1-codex-tq3aoqyt/linux/moruna-proof-501-407a8c174ba1/summary.json",
+        "summary_sha256": "6c17273dae854957c66ea86927027d24ecf88a0945426cc223463c90b6b15acb",
+        "inputs_census_sha256": "1192ab79551a1b8c91fab8daaf4d9435ecd4044e1445fdf1074c7ef08278094d",
+        "source_archive_sha256": "e834fe4c95cabf087f7d95d19077a48c3547ce186637ce7bb515c6fd0049de9c",
+        "cleanup": true,
+        "scope": "ARM Linux host cross-checks exact x86_64 kernel/user targets; no new boot claim. Subsequent changes only licence policy and this validation record."
+      },
+      "additional_findings": "Named supervisor prepared-state tuple; iterator for quota fixture held slots; narrow documented expectations retain distinct block-transfer protocol inputs and inline bounded socket-map state. No new runtime allocation or I/O lease changes."
+    },
+    "kernel_licenses_local": {
+      "result": "PASS: bans ok, licenses ok, sources ok",
+      "tool": "cargo-deny 0.20.2",
+      "change": "Package-scoped 0BSD exceptions for existing smoltcp and managed dependencies; no workspace-wide licence allowance",
+      "log": "/tmp/moruna-kernel-deny-final.log",
+      "log_sha256": "bb503636d1ddda9f6923ed261aaabc1e4efaa8d6109a31cd3eecdfe4fd40ee39"
     }
   }
 }
