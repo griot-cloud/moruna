@@ -315,7 +315,7 @@ jobs:
           cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" \
             -p moruna-microkernel-boot -- -D warnings
           RUSTFLAGS="$RUSTFLAGS -Zunstable-options -C link-arg=-T$PWD/sys/user.ld -C link-arg=-static" \
-            cargo -Zunstable-options -Zjson-target-spec clippy --release --locked \
+            cargo clippy -Zunstable-options -Zjson-target-spec --release --locked \
             --target "$PWD/targets/x86_64-moruna-user.json" "${build_std[@]}" --workspace \
             --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image -- -D warnings
       - name: Licences of the kernel workspace (MPL-2.0 for OSTD, DECISIONS.md MK1)

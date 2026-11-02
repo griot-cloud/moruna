@@ -188,18 +188,14 @@ impl Nvme {
         buffer: Memory,
     ) -> Outcome {
         let fail = |e: block::Error| Outcome::Failure(e.code());
-        if write {
-            if let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
-                return fail(error);
-            }
+        if write && let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
+            return fail(error);
         }
         if let Err(e) = self.check(write, sector, count) {
             return fail(e);
         }
-        if !write {
-            if let Err(error) = self.writer.can_read(cx.connection()) {
-                return Outcome::Failure(error.code());
-            }
+        if !write && let Err(error) = self.writer.can_read(cx.connection()) {
+            return Outcome::Failure(error.code());
         }
         let bytes = block_protocol::bytes(&self.info, count);
         let Ok(n) = Pin::pages(&self.dma, &buffer.0, !write) else {
@@ -257,18 +253,14 @@ impl Nvme {
         sector: u64,
         count: u32,
     ) -> Outcome {
-        if write {
-            if let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
-                return Outcome::Failure(error.code());
-            }
+        if write && let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
+            return Outcome::Failure(error.code());
         }
         if let Err(e) = self.check(write, sector, count) {
             return Outcome::Failure(e.code());
         }
-        if !write {
-            if let Err(error) = self.writer.can_read(cx.connection()) {
-                return Outcome::Failure(error.code());
-            }
+        if !write && let Err(error) = self.writer.can_read(cx.connection()) {
+            return Outcome::Failure(error.code());
         }
         let bytes = block_protocol::bytes(&self.info, count);
         let first = page as usize;

@@ -211,7 +211,7 @@ fn receive_body(
     socket: u32,
     max: u32,
 ) -> Result<(Encoder, moruna_svc::Memory), Fail> {
-    let size = (u64::from(max.max(1)).min(RECEIVE_MAX as u64) + 4095) / 4096 * 4096;
+    let size = u64::from(max.max(1)).min(RECEIVE_MAX as u64).div_ceil(4096) * 4096;
     let memory = moruna_svc::Memory::create_in(size, &p.account.0).map_err(wire)?;
     let loan = moruna_svc::Memory(
         memory
@@ -242,7 +242,7 @@ fn received(memory: &moruna_svc::Memory, result: Answered<u32>) -> Result<Answer
             if n == 0 {
                 return Ok(Ok(Vec::new()));
             }
-            let size = (u64::from(n) + 4095) / 4096 * 4096;
+            let size = u64::from(n).div_ceil(4096) * 4096;
             let mapping = memory.map(0, size, moruna_svc::map::READ).map_err(wire)?;
             let mut bytes = vec![0; n as usize];
             mapping.read(0, &mut bytes).map_err(wire)?;

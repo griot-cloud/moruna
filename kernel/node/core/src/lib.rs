@@ -484,7 +484,7 @@ impl InitialJob {
             match words.as_slice() {
                 ["budget", bytes] if budget.is_none() => {
                     let bytes: u64 = bytes.parse().map_err(|_| ConfigError::Budget)?;
-                    if bytes == 0 || bytes % 4096 != 0 {
+                    if bytes == 0 || !bytes.is_multiple_of(4096) {
                         return Err(ConfigError::Budget);
                     }
                     budget = Some(bytes);

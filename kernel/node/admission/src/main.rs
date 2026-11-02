@@ -61,11 +61,12 @@ impl Watch for End {
                 done.complete(pending, Outcome::reply(job.state));
             }
         }
-        if shared.closing && shared.jobs.values().all(|j| j.state != RUNNING) {
-            if let Some(pending) = shared.shutdown.take() {
-                done.complete(pending, Outcome::reply(()));
-                shared.shutdown_done = true;
-            }
+        if shared.closing
+            && shared.jobs.values().all(|j| j.state != RUNNING)
+            && let Some(pending) = shared.shutdown.take()
+        {
+            done.complete(pending, Outcome::reply(()));
+            shared.shutdown_done = true;
         }
         false
     }
@@ -464,8 +465,8 @@ fn run() -> i64 {
     let factory = shared.clone();
     let mut dispatcher = Dispatcher::new();
     shared.borrow_mut().watch_capacity = Some(dispatcher.watch_capacity());
-    if let Some(listener) = listener {
-        if dispatcher
+    if let Some(listener) = listener
+        && dispatcher
             .listen(
                 Channel(listener),
                 Box::new(move || {
@@ -476,9 +477,8 @@ fn run() -> i64 {
                 }),
             )
             .is_err()
-        {
-            return 1;
-        }
+    {
+        return 1;
     }
     let mut masters = alloc::vec![(authority_channel, authority_kind)];
     for (slot, kind) in [("local.authority", "local")] {

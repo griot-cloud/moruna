@@ -123,12 +123,10 @@ impl Volume {
                 .object
                 .key
                 .starts_with(moruna_storage_format::namespace::ROOT_PREFIX)
+                && let Some(live) = live
+                && !live.contains(&old.metadata)?
             {
-                if let Some(live) = live {
-                    if !live.contains(&old.metadata)? {
-                        continue;
-                    }
-                }
+                continue;
             }
             let new = next
                 .geometry()

@@ -1051,10 +1051,10 @@ impl Drop for Task {
                 scratch.close(*id);
             }
         }
-        if let Ok(mut sh) = self.shared.try_borrow_mut() {
-            if !self.readonly {
-                sh.served += 1;
-            }
+        if let Ok(mut sh) = self.shared.try_borrow_mut()
+            && !self.readonly
+        {
+            sh.served += 1;
         }
     }
 }

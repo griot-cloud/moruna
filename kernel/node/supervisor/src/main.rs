@@ -252,14 +252,13 @@ fn shutdown(
 ) -> Result<(), String> {
     lifecycle.stop();
     let graceful_deadline = now().saturating_add(5_000_000_000);
-    if let Some(channel) = control.take() {
-        if let Ok(mut client) = node_protocol::control::Client::connect(channel, graceful_deadline)
-        {
-            client
-                .core()
-                .set_timeout(graceful_deadline.saturating_sub(now()));
-            let _ = client.shutdown();
-        }
+    if let Some(channel) = control.take()
+        && let Ok(mut client) = node_protocol::control::Client::connect(channel, graceful_deadline)
+    {
+        client
+            .core()
+            .set_timeout(graceful_deadline.saturating_sub(now()));
+        let _ = client.shutdown();
     }
     // Stop creators and observe quiescence before declaring their escrow set final.
     // A bounded timeout is an explicit incomplete teardown, never a false success.

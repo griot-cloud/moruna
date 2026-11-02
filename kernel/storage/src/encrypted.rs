@@ -243,6 +243,10 @@ impl Encrypted {
             total as u64,
         ))
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Request authority, immutable version, offset, length, destination, fill mode, service Account and verifier are distinct checked inputs."
+    )]
     fn range(
         &mut self,
         request: &Request<'_>,

@@ -262,19 +262,19 @@ impl Block {
         buffer: Memory,
     ) -> Outcome {
         let fail = |e: block::Error| Outcome::Failure(e.code());
-        if matches!(op, Op::Write) {
-            if let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
-                return fail(error);
-            }
+        if matches!(op, Op::Write)
+            && let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0))
+        {
+            return fail(error);
         }
         if let Err(e) = self.check(&op, sector, count) {
             return fail(e);
         }
         let read = matches!(op, Op::Read);
-        if matches!(op, Op::Read) {
-            if let Err(error) = self.writer.can_read(cx.connection()) {
-                return Outcome::Failure(error.code());
-            }
+        if matches!(op, Op::Read)
+            && let Err(error) = self.writer.can_read(cx.connection())
+        {
+            return Outcome::Failure(error.code());
         }
         let bytes = block_protocol::bytes(&self.info, count);
         let Ok(n) = Pin::pages(&self.device.dma, &buffer.0, read) else {
@@ -331,18 +331,18 @@ impl Block {
         sector: u64,
         count: u32,
     ) -> Outcome {
-        if matches!(op, Op::Write) {
-            if let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0)) {
-                return Outcome::Failure(error.code());
-            }
+        if matches!(op, Op::Write)
+            && let Err(error) = self.writer.authorize(cx.connection(), token.unwrap_or(0))
+        {
+            return Outcome::Failure(error.code());
         }
         if let Err(e) = self.check(&op, sector, count) {
             return Outcome::Failure(e.code());
         }
-        if matches!(op, Op::Read) {
-            if let Err(error) = self.writer.can_read(cx.connection()) {
-                return Outcome::Failure(error.code());
-            }
+        if matches!(op, Op::Read)
+            && let Err(error) = self.writer.can_read(cx.connection())
+        {
+            return Outcome::Failure(error.code());
         }
         let bytes = block_protocol::bytes(&self.info, count);
         let first = page as usize;

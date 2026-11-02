@@ -517,6 +517,22 @@
       "log": "/tmp/moruna-ci-5132-kernel.log",
       "log_sha256": "16ba30d782b80cca6c7cedbffa2d5446e4814cf140e9c30ca6b97338afbc160e",
       "overall_job_result": "FAILED at subsequent non-probe Clippy: copied/frame_at probe-only methods not gated; functional passes do not claim overall job success"
+    },
+    "remote_main_job_5132": {
+      "run": "https://github.com/griot-cloud/moruna/actions/runs/41420167767",
+      "job": 125193531256,
+      "head": "5132f35f00bab9fb91f1bf178f042966d9018541",
+      "result": "SUCCESS: complete build/test/lint, real image runtime, peQL/Iceberg, Python kernels and fresh installed wheel",
+      "wheel_tests": "204 passed, 11 skipped",
+      "log": "/tmp/moruna-ci-5132-main.log",
+      "log_sha256": "584263dd464791b794e6d5430f10bc9bddbd93b0ed4ae56ddfca8696ce814b55"
+    },
+    "native_lint_followup": {
+      "plain_and_probe_local": "Both strict builtin kernel profiles passed with probe-only VM getter gating",
+      "native_user_findings": "Cargo JSON-target flags needed forwarding after external clippy subcommand; full workspace then found machine-applicable idioms plus10 intentional I/O RefCell leases and2 explicit argument-count exceptions",
+      "changes": "Reviewed mechanical idioms preserve short-circuit authorization, read zeroing, compaction liveness and bounded rounding. Narrow expect attributes document required original-I/O guards and distinct authority inputs; no global lint disabling or early guard release.",
+      "reviewed_machine_patch_sha256": "1a8df6c198c527e1622dc461da66e9637f39a414693c5c32c7ee42114893fa13",
+      "final_strict_all_profiles": "PENDING; no overall Clippy success is claimed yet"
     }
   }
 }

@@ -654,6 +654,10 @@ impl Owner {
     /// Queue privileged maintenance with the ACTUAL service Account and configured
     /// ceilings. No tenant account fallback, role selector or client GC root list exists.
     /// A real kick channel starts idle work; existing original tasks drain first.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "Maintenance keeps the exclusive volume borrow through original compaction I/O after active tasks drain; competing acquisition returns Busy."
+    )]
     pub(crate) fn request_maintenance(
         self: &Rc<Self>,
         account: Rc<moruna_sys::Account>,
@@ -699,11 +703,11 @@ impl Owner {
             result: result.clone(),
             signal,
         });
-        if let Err((error, _)) = self.kick.write(&[1], []) {
-            if error != moruna_svc::Error::ShouldWait {
-                self.maintenance.borrow_mut().take();
-                return Err(Refusal::Unavailable);
-            }
+        if let Err((error, _)) = self.kick.write(&[1], [])
+            && error != moruna_svc::Error::ShouldWait
+        {
+            self.maintenance.borrow_mut().take();
+            return Err(Refusal::Unavailable);
         }
         Ok(Maintenance { result, wake })
     }

@@ -780,17 +780,18 @@ impl Backend for Volume {
                 }
             }
         })();
-        if result.is_err() && matches!(request.operation, Operation::Read { .. }) {
-            if let Some(destination) = payload.as_ref() {
-                let zero = [0; 256];
-                let mut at = 0;
-                while at < destination.len() {
-                    let count = (destination.len() - at).min(zero.len() as u64) as usize;
-                    destination
-                        .write(at, &zero[..count])
-                        .map_err(|_| Refusal::Unavailable)?;
-                    at += count as u64;
-                }
+        if result.is_err()
+            && matches!(request.operation, Operation::Read { .. })
+            && let Some(destination) = payload.as_ref()
+        {
+            let zero = [0; 256];
+            let mut at = 0;
+            while at < destination.len() {
+                let count = (destination.len() - at).min(zero.len() as u64) as usize;
+                destination
+                    .write(at, &zero[..count])
+                    .map_err(|_| Refusal::Unavailable)?;
+                at += count as u64;
             }
         }
         if matches!(result, Err(Refusal::Unavailable | Refusal::Integrity)) {

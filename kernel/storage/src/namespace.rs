@@ -500,6 +500,10 @@ pub use format::{Io, Opened};
 impl Namespace {
     /// Acquire one actual channel-owned logical lease and mount/create its exact root on
     /// the existing physical owner. No host path, fallback device or role is selected.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Volume, registry, root, scope, Account, limits, creation policy and verifier are distinct authority and admission inputs."
+    )]
     pub async fn open(
         volume: Rc<RefCell<Volume>>,
         registry: Rc<RefCell<Registry>>,
@@ -531,6 +535,10 @@ impl Namespace {
         let metadata_budget =
             Memory::create_in(reservation, &account.0).map_err(|_| Refusal::Capacity)?;
         let result = (async {
+            #[expect(
+                clippy::await_holding_refcell_ref,
+                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+            )]
             let mut raw = volume.try_borrow_mut().map_err(|_| Refusal::Unavailable)?;
             let (workspace, bucket, role) = raw.identity();
             if workspace != root.workspace
@@ -639,6 +647,10 @@ impl Namespace {
         self.authorize(verifier, Action::Publish)?;
         let mut next = self.index.clone();
         let result = (async {
+            #[expect(
+                clippy::await_holding_refcell_ref,
+                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+            )]
             let mut raw = self
                 .volume
                 .try_borrow_mut()
@@ -702,6 +714,10 @@ impl Namespace {
         let next_handle = self.next_handle.checked_add(1).ok_or(Refusal::Capacity)?;
         let _active = Active::enter(&self._lease.registry, &self._lease.poisoned)?;
         self.authorize(verifier, Action::Read)?;
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+        )]
         let mut raw = self
             .volume
             .try_borrow_mut()
@@ -790,6 +806,10 @@ impl Namespace {
         let _active = Active::enter(&self._lease.registry, &self._lease.poisoned)?;
         self.authorize(verifier, Action::Read)?;
         let linked = {
+            #[expect(
+                clippy::await_holding_refcell_ref,
+                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+            )]
             let mut raw = self
                 .volume
                 .try_borrow_mut()
@@ -828,6 +848,10 @@ impl Namespace {
         let _active = Active::enter(&self._lease.registry, &self._lease.poisoned)?;
         self.authorize(verifier, Action::Read)?;
         let id = self.opened(handle, false)?;
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+        )]
         let mut raw = self
             .volume
             .try_borrow_mut()
@@ -1029,6 +1053,10 @@ impl Namespace {
             if destination.len() > self.limits.transfer_bytes {
                 return Err(Refusal::Capacity);
             }
+            #[expect(
+                clippy::await_holding_refcell_ref,
+                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+            )]
             let mut raw = self
                 .volume
                 .try_borrow_mut()
@@ -1300,6 +1328,10 @@ impl Namespace {
             Err(error) => Io::Failed(0, error),
         }
     }
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The volume borrow retains the exclusive owner through original sync I/O; contention is refused with Unavailable."
+    )]
     async fn sync(
         &mut self,
         handle: Option<u64>,
@@ -1672,6 +1704,10 @@ impl LiveSet {
     }
     /// Collect from the sole owner's committed namespace-root enumeration. All outside
     /// reserved-prefix objects remain the compactor's unconditional responsibility.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "Frozen liveness reads retain the actual volume owner through original I/O; competing borrows return Busy and the freeze barrier stays held."
+    )]
     pub(crate) async fn collect(&mut self, frozen: Frozen) -> Result<(), Refusal> {
         if self.frozen.is_some() || !Rc::ptr_eq(&self.owner, &frozen.state.registry.borrow().owner)
         {
@@ -1913,9 +1949,8 @@ impl Namespace {
                     length,
                     payload_offset,
                 } => {
-                    let empty;
-                    if bytes == 0 {
-                        empty = Some(
+                    let empty = if bytes == 0 {
+                        Some(
                             Loan::new(
                                 Memory::create_in(1, &self.account.0)
                                     .map_err(|_| Refusal::Capacity)?,
@@ -1924,10 +1959,10 @@ impl Namespace {
                                 writable,
                             )
                             .map_err(|_| Refusal::Invalid)?,
-                        );
+                        )
                     } else {
-                        empty = None;
-                    }
+                        None
+                    };
                     let original = payload
                         .as_ref()
                         .or(empty.as_ref())
