@@ -504,6 +504,10 @@ impl Namespace {
         clippy::too_many_arguments,
         reason = "Volume, registry, root, scope, Account, limits, creation policy and verifier are distinct authority and admission inputs."
     )]
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+    )]
     pub async fn open(
         volume: Rc<RefCell<Volume>>,
         registry: Rc<RefCell<Registry>>,
@@ -535,10 +539,6 @@ impl Namespace {
         let metadata_budget =
             Memory::create_in(reservation, &account.0).map_err(|_| Refusal::Capacity)?;
         let result = (async {
-            #[expect(
-                clippy::await_holding_refcell_ref,
-                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
-            )]
             let mut raw = volume.try_borrow_mut().map_err(|_| Refusal::Unavailable)?;
             let (workspace, bucket, role) = raw.identity();
             if workspace != root.workspace
@@ -638,6 +638,10 @@ impl Namespace {
                 .with_version(&self.metadata.version)?,
         )
     }
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+    )]
     async fn transaction<T>(
         &mut self,
         verifier: &dyn Verifier,
@@ -647,10 +651,6 @@ impl Namespace {
         self.authorize(verifier, Action::Publish)?;
         let mut next = self.index.clone();
         let result = (async {
-            #[expect(
-                clippy::await_holding_refcell_ref,
-                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
-            )]
             let mut raw = self
                 .volume
                 .try_borrow_mut()
@@ -700,6 +700,10 @@ impl Namespace {
     }
     /// Open exact visible bytes. Creating a name is a real root transaction. An existing
     /// name under exclusive-create refuses; handle admission occurs before publication.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+    )]
     pub async fn open_file(
         &mut self,
         path: &str,
@@ -714,10 +718,6 @@ impl Namespace {
         let next_handle = self.next_handle.checked_add(1).ok_or(Refusal::Capacity)?;
         let _active = Active::enter(&self._lease.registry, &self._lease.poisoned)?;
         self.authorize(verifier, Action::Read)?;
-        #[expect(
-            clippy::await_holding_refcell_ref,
-            reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
-        )]
         let mut raw = self
             .volume
             .try_borrow_mut()
@@ -800,16 +800,16 @@ impl Namespace {
     }
     /// Close actual handle. The final open reference to an unlinked inode is removed by
     /// a real root commit before releasing it. Errors keep the handle live for retry.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+    )]
     pub async fn close(&mut self, handle: u64, verifier: &dyn Verifier) -> Result<(), Refusal> {
         let id = self.opened(handle, false)?;
         let last = self.open.iter().filter(|entry| entry.inode == id).count() == 1;
         let _active = Active::enter(&self._lease.registry, &self._lease.poisoned)?;
         self.authorize(verifier, Action::Read)?;
         let linked = {
-            #[expect(
-                clippy::await_holding_refcell_ref,
-                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
-            )]
             let mut raw = self
                 .volume
                 .try_borrow_mut()
@@ -844,14 +844,14 @@ impl Namespace {
         Ok(())
     }
     /// Actual file or directory facts, freshly authorized, including unlinked open files.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+    )]
     pub async fn stat(&mut self, handle: u64, verifier: &dyn Verifier) -> Result<Opened, Refusal> {
         let _active = Active::enter(&self._lease.registry, &self._lease.poisoned)?;
         self.authorize(verifier, Action::Read)?;
         let id = self.opened(handle, false)?;
-        #[expect(
-            clippy::await_holding_refcell_ref,
-            reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
-        )]
         let mut raw = self
             .volume
             .try_borrow_mut()
@@ -1037,6 +1037,10 @@ impl Editor<'_> {
 impl Namespace {
     /// Read actual durable bytes and zero holes, with true EOF short-read count. Only the
     /// completed prefix is exposed. Cancellation never releases the active driver's loan.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
+    )]
     pub async fn read_at(
         &mut self,
         handle: u64,
@@ -1053,10 +1057,6 @@ impl Namespace {
             if destination.len() > self.limits.transfer_bytes {
                 return Err(Refusal::Capacity);
             }
-            #[expect(
-                clippy::await_holding_refcell_ref,
-                reason = "The mutable volume is an exclusive original-I/O lease; competing tasks use try_borrow_mut and refuse rather than reenter."
-            )]
             let mut raw = self
                 .volume
                 .try_borrow_mut()
