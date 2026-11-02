@@ -31,6 +31,22 @@ def emit(value):
     print(f"KD3E {case} {run} {nonce} {len(raw)} {(len(raw)+95)//96}", flush=True)
 
 
+def refusal_run_id(adapter, staging, runtime_run_id):
+    """Correlate a refusal with the admitted fixture declaration, retaining absent reports."""
+    if adapter != "native":
+        return runtime_run_id
+    path = pathlib.PurePosixPath(staging)
+    parts = path.parts
+    if path.as_posix() != staging or len(parts) != 5 or parts[:3] != ("/", "tmp", "kd3") or parts[4] != "staging":
+        raise ValueError("native refusal staging does not name the admitted fixture run")
+    declared = parts[3]
+    if len(declared) != 32 or any(c not in "0123456789abcdef" for c in declared):
+        raise ValueError("native refusal staging run is not canonical")
+    if runtime_run_id is not None and runtime_run_id != declared:
+        raise ValueError("runtime refusal run differs from admitted fixture declaration")
+    return declared
+
+
 def main():
     if len(sys.argv) not in (5, 6):
         raise ValueError("usage: kd3_library.py MATRIX CASE ADAPTER STAGING [rows|adapter-refusal]")
@@ -128,7 +144,8 @@ def main():
             raise
         emit({"case": case_id, "adapter": adapter, "phase": "execute", "mode": mode,
                           "outcome": "refused", "diagnostic": str(error),
-                          "partial_rows": output.values, "finish": output.finished, "run_id": error.run_id, "python_runtime": "standard CPython GIL; explicit allow_gil"})
+                          "partial_rows": output.values, "finish": output.finished, "run_id": refusal_run_id(adapter, staging, error.run_id),
+                          "runtime_run_id": error.run_id, "run_id_basis": "admitted fixture staging declaration" if adapter == "native" else "runtime report", "python_runtime": "standard CPython GIL; explicit allow_gil"})
         return
     if mode == "adapter-refusal":
         raise AssertionError("actual source/kernel/sink failure was not propagated")
