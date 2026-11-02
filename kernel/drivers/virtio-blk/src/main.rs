@@ -321,6 +321,10 @@ impl Block {
     }
 
     /// A transfer between the disk and pages of a registration.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The protocol keeps connection authority, registration pages and disk range distinct"
+    )]
     fn transfer_at(
         &mut self,
         cx: &mut Context<'_>,
