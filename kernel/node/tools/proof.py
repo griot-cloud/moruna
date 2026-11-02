@@ -143,7 +143,10 @@ def main():
         profile = {"version": 1, "node_memory_bytes": RAM, "cpus": args.cpus, "agent_port": PORT,
                    "job_memory_bytes": 1024 * MIB, "job_account_bytes": 1408 * MIB, "scratch_bytes": 256 * MIB,
                    "engine_program": "/moruna/bin/moruna-engine", "storage_provider": "single-node-home",
-                   "service_accounts": {"devices": 128 * MIB, "imagefs": 256 * MIB, "linux": 256 * MIB,
+                   # imagefs owns simultaneous parent/child ELF backing and Python DSOs.
+                   # Auxiliary accounts total 2880 MiB within this 3 GiB node; the
+                   # unchanged configure/supervisor checks enforce actual boot room.
+                   "service_accounts": {"devices": 128 * MIB, "imagefs": 768 * MIB, "linux": 256 * MIB,
                                         "network": 64 * MIB, "admission": 1536 * MIB, "storage": 128 * MIB}}
         (out / "profile.json").write_text(json.dumps(profile) + "\n")
         (out / "storage.conf").write_text("moruna-storage 1\ntimeout-ns 5000000000\nbody-limit 1048576\nsession-limit 4\nprovider single-node-home\nblock-service nvme0\nalignment 4096\n")
