@@ -87,7 +87,7 @@ class CollectSink(moruna.Sink):
         self.finished += 1
 
 
-@moruna.kernel
+@moruna.function
 def shout(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch.append_column("loud", pc.utf8_upper(batch.column("text")))
 
@@ -98,7 +98,7 @@ def test_a_source_through_a_kernel_into_a_sink(staging: dict[str, object]) -> No
     sink = CollectSink()
     report = moruna.run(source, shout, sink, **staging)
 
-    assert report.exit == "Completed", report
+    assert report.exit["status"] == "completed", report
     assert sorted(sink.ids) == list(range(ROWS)), "exactly the table's rows, each once"
     assert sorted(sink.loud) == sorted(f"ROW {i}" for i in range(ROWS))
     assert sink.finished == 1, "finish once, after the last write"
@@ -220,7 +220,7 @@ class Numbers(moruna.Source):
         return pa.record_batch({"id": pa.array(range(base + start, base + end), pa.int64())})
 
 
-@moruna.kernel
+@moruna.function
 def hold(batch):
     # The first run cannot end: the morsel holding the first row of split HOLD says so in a
     # file and waits for the parent's SIGKILL. The morsels before it pass, reach the sink and
@@ -263,7 +263,7 @@ class Files(moruna.Sink):
 
 report = moruna.run(Numbers(), [hold], Files(out), staging_dir=staging, staging_limit="2GiB",
                    checkpoint_interval=0.5, resume=None if mode == "fresh" else "auto")
-print(json.dumps({"exit": report.exit, "resumed": report.resumed, "run_id": report.run_id}))
+print(json.dumps({"exit": report.exit["status"], "resumed": report.resumed, "run_id": report.run_id}))
 """
 
 
@@ -307,7 +307,7 @@ def test_a_killed_run_resumes_into_a_sink_that_checkpoints(scratch: pathlib.Path
     )
     assert resumed.returncode == 0, resumed.stderr
     result = json.loads(resumed.stdout.strip().splitlines()[-1])
-    assert result["exit"] == "Completed"
+    assert result["exit"] == "completed"
     assert result["resumed"] is True
 
     ids: list[int] = []
@@ -339,7 +339,7 @@ def test_iterator_stream_reaches_real_eof(sizes: list[int], staging: dict[str, o
 
     sink = CollectSink()
     report = moruna.run(moruna.IteratorSource(batches(), schema=schema), [], sink, ordered=True, **staging)
-    assert report.exit == "Completed", report
+    assert report.exit["status"] == "completed", report
     assert sink.ids == list(range(sum(sizes)))
     assert sink.finished == 1
     assert pulled == sizes

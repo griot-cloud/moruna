@@ -15,7 +15,7 @@ from moruna import _core
 STUB = pathlib.Path(moruna.__file__).with_name("_core.pyi")
 
 
-@moruna.kernel
+@moruna.function
 def identity(batch):  # noqa: ANN001, ANN202
     return batch
 

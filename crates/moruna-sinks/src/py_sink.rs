@@ -28,8 +28,8 @@ use pyo3::types::{PyAnyMethods, PyBytes};
 use serde::{Deserialize, Serialize};
 
 use moruna_kernel::{
-    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary,
-    SourceSchema, TierPref,
+    BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkCommit,
+    SinkSummary, SourceSchema, TierPref,
 };
 
 use crate::{Phase, require_host};
@@ -242,20 +242,21 @@ impl Sink for PySink {
         let outcome = Python::attach(|py| {
             let bound = self.object.bind(py);
             if !bound.hasattr(pyo3::intern!(py, "finish")).unwrap_or(false) {
-                return Ok(());
+                return Ok(None);
             }
-            bound
+            let given = bound
                 .call_method0(pyo3::intern!(py, "finish"))
-                .map(|_| ())
-                .map_err(|e| format!("{}.finish(): {e}", self.name))
+                .map_err(|e| format!("{}.finish(): {e}", self.name))?;
+            commit_of(&given).map_err(|e| format!("{}.finish(): {e}", self.name))
         });
         inner.phase = Phase::Finished;
-        outcome.map_err(MorunaError::Sink)?;
+        let commit = outcome.map_err(MorunaError::Sink)?;
         Ok(SinkSummary {
             rows: inner.stats.rows,
             bytes: inner.stats.bytes,
             files: Vec::new(),
             write: None,
+            commit,
         })
     }
 
@@ -410,6 +411,64 @@ fn class_name(value: &Bound<'_, PyAny>) -> String {
         .get_type()
         .name()
         .map_or_else(|_| "object".to_string(), |n| n.to_string())
+}
+
+/// What a user's `finish()` returned, as the version it committed: `None` commits none; a
+/// mapping with `snapshot_id` (a string or an int) and, optionally, `version` (a string) is the
+/// snapshot it committed. Anything else is refused, naming what was returned.
+fn commit_of(given: &Bound<'_, PyAny>) -> std::result::Result<Option<SinkCommit>, String> {
+    if given.is_none() {
+        return Ok(None);
+    }
+    let Ok(map) = given.cast::<pyo3::types::PyDict>() else {
+        return Err(format!(
+            "returned {}; finish() returns None, or a dict naming the snapshot it committed \
+             ({{\"snapshot_id\": ..., \"version\": ...}})",
+            given
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ));
+    };
+    for key in map.keys() {
+        let key: String = key
+            .extract()
+            .map_err(|_| "returned a commit with a key that is not a string".to_string())?;
+        if key != "snapshot_id" && key != "version" {
+            return Err(format!(
+                "returned a commit with `{key}`; a commit names `snapshot_id` and `version`"
+            ));
+        }
+    }
+    let snapshot = map
+        .get_item("snapshot_id")
+        .map_err(|e| e.to_string())?
+        .filter(|v| !v.is_none())
+        .ok_or_else(|| {
+            "returned a commit without `snapshot_id`; every commit names its snapshot".to_string()
+        })?;
+    let snapshot_id = if let Ok(text) = snapshot.extract::<String>() {
+        text
+    } else if let Ok(number) = snapshot.extract::<i64>() {
+        number.to_string()
+    } else {
+        return Err("returned a `snapshot_id` that is neither a string nor an int".to_string());
+    };
+    if snapshot_id.is_empty() {
+        return Err("returned an empty `snapshot_id`".to_string());
+    }
+    let version = match map.get_item("version").map_err(|e| e.to_string())? {
+        Some(v) if !v.is_none() => Some(
+            v.extract::<String>()
+                .map_err(|_| "returned a `version` that is not a string".to_string())?,
+        ),
+        _ => None,
+    };
+    Ok(Some(SinkCommit {
+        snapshot_id,
+        version,
+    }))
 }
 
 #[cfg(test)]

@@ -4,14 +4,14 @@ Moruna requires Python 3.14 or later and `pyarrow>=17`. The names below are avai
 
 | Reference | What you can look up |
 | --- | --- |
-| [`moruna.run`](python-run.md) | All run arguments, defaults, return value and failures. |
-| [Kernels](python-kernels.md) | `moruna.kernel`, `KernelSpec`, `moruna.polars`, state methods and declarations. |
+| [Jobs and `moruna.run`](python-run.md) | `moruna.Job`, its spec, `Task`, `Source`, `Function`, `Sink`, needs and the resolver, the writer, and every run argument. |
+| [Functions](python-kernels.md) | `moruna.function`, `moruna.polars`, `Function.build`, state methods and declarations. |
 | [Sources](python-sources.md) | Built-in constructors, `Source` methods and `Split` attributes. |
 | [Sinks](python-sinks.md) | Built-in constructors and `Sink` methods. |
-| [Standard kernels](python-standard-kernels.md) | Every `moruna.std` function and `StdKernel` attributes. |
-| [Results and errors](python-results.md) | `RunReport`, `inspect_host`, `explain`, `check`, and the exception hierarchy. |
+| [Standard functions](python-standard-kernels.md) | Every `moruna.std` function. |
+| [Results and errors](python-results.md) | `RunReport`, `inspect_host`, `check`, and the exception hierarchy. |
 
-For longer examples, see [Running jobs from Python](python.md), [Writing kernels](kernels.md), and [Custom sources and sinks](sources-and-sinks.md).
+For longer examples, see [Running jobs from Python](python.md), [Writing functions](kernels.md), and [Custom sources and sinks](sources-and-sinks.md).
 
 ```{toctree}
 :hidden:

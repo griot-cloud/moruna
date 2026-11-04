@@ -72,6 +72,8 @@ pub struct RunMeta {
     /// What the engine behind the source said about the read it planned
     /// (`Source::read_report`); `None` for a source with no such engine.
     pub read: Option<SourceRead>,
+    /// What each sink wrote, sink 0 first, when the run completed; empty otherwise.
+    pub sinks: Vec<moruna_kernel::SinkSummary>,
     /// The placement engine's buffer catalog at the end of the run (placement f.18); `None` for
     /// a run given a placement of its own.
     pub buffers: Option<BufferReport>,
@@ -386,6 +388,45 @@ impl LimitsSummary {
     }
 }
 
+/// What one sink wrote, for the report: its place among the run's sinks, its rows, bytes and
+/// files, the rows its engine handed back rather than commit, and the version it committed.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SinkOutcome {
+    /// The sink's place among the run's sinks, document order.
+    pub sink: usize,
+    /// Rows written.
+    pub rows: u64,
+    /// Bytes written.
+    pub bytes: u64,
+    /// The files or objects produced.
+    pub files: Vec<String>,
+    /// Rows the sink's engine handed back rather than commit; 0 when it handed back none.
+    pub excluded_rows: u64,
+    /// The snapshot the write committed, for a sink that commits one.
+    pub snapshot_id: Option<String>,
+    /// The sink's name for that version, when it gives one.
+    pub version: Option<String>,
+}
+
+impl SinkOutcome {
+    /// Sink `sink`'s outcome from what it reported when it finished.
+    pub fn of(sink: usize, summary: &moruna_kernel::SinkSummary) -> SinkOutcome {
+        SinkOutcome {
+            sink,
+            rows: summary.rows,
+            bytes: summary.bytes,
+            files: summary.files.clone(),
+            excluded_rows: summary
+                .write
+                .as_ref()
+                .and_then(|w| w.excluded.as_ref())
+                .map_or(0, |e| e.rows),
+            snapshot_id: summary.commit.as_ref().map(|c| c.snapshot_id.clone()),
+            version: summary.commit.as_ref().and_then(|c| c.version.clone()),
+        }
+    }
+}
+
 /// One stage's row of the report (d.1, f.2).
 #[derive(Clone, Debug, Serialize)]
 pub struct StageReport {
@@ -520,6 +561,9 @@ pub struct RunReport {
     /// `{"engine", "report"}`. Absent from the JSON for every other run.
     #[serde(serialize_with = "read_json", skip_serializing_if = "Option::is_none")]
     pub read: Option<SourceRead>,
+    /// What each sink wrote, sink 0 first, when the run completed: rows, bytes, files and the
+    /// version it committed. Empty for a run that did not complete.
+    pub sinks: Vec<SinkOutcome>,
     /// What the buffer catalog did (placement f.18): bytes spilled and reloaded, evictions, misses
     /// weighted by reload cost, peaks beside budgets. Absent from the JSON for a run given a
     /// placement of its own.
@@ -958,6 +1002,12 @@ impl RunReport {
             late_records: trace.late_records(),
             write: meta.write.clone(),
             read: meta.read.clone(),
+            sinks: meta
+                .sinks
+                .iter()
+                .enumerate()
+                .map(|(i, s)| SinkOutcome::of(i, s))
+                .collect(),
             buffers: meta.buffers.clone(),
             policy: meta.policy.clone(),
         }

@@ -262,7 +262,7 @@ fn jb_t42_check_against_an_extended_catalogue() {
     assert_eq!(
         said(&refused),
         [
-            "tasks[2].kind: no kernel kind `judge` is declared; this catalogue runs image, \
+            "tasks[2].kind: no function kind `judge` is declared; this catalogue runs image, \
           package, std"
         ]
     );

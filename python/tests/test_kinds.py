@@ -59,16 +59,16 @@ def test_py_t39_declare_and_list() -> None:
     }
     assert declaration["summary"] == "Upper-cases `text` into `loud`, with a suffix."
     listing = moruna.kinds(shout)
-    kernels = [k["name"] for k in listing["kernels"]]
+    kernels = [k["name"] for k in listing["functions"]]
     assert "shout" in kernels and "std" in kernels and "python" in kernels
-    assert [k for k in listing["kernels"] if k["name"] == "shout"][0] == declaration
-    assert "shout" not in [k["name"] for k in moruna.kinds()["kernels"]]
+    assert [k for k in listing["functions"] if k["name"] == "shout"][0] == declaration
+    assert "shout" not in [k["name"] for k in moruna.kinds()["functions"]]
 
 
 def test_py_t40_refusals() -> None:
     """A name a kind of ``moruna.run`` has already, a settings schema that is not a closed one
     with examples, and rules that are not rules are refused when the kind is declared."""
-    with pytest.raises(moruna.ConfigError, match="a kernel kind `std` is registered already"):
+    with pytest.raises(moruna.ConfigError, match="a function kind `std` is registered already"):
         moruna.kind(name="std")(lambda batch, call: batch)
     with pytest.raises(moruna.ConfigError, match="additionalProperties"):
         moruna.kind(name="open", settings={**SETTINGS, "additionalProperties": True})(
@@ -87,7 +87,7 @@ def test_py_t41_serve_and_run(dataset: tuple[str, str, int], small_sink, staging
     report = moruna.run(
         moruna.ParquetSource(src_url), shout(suffix="!"), small_sink(out_url), **staging
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     back = _out(out_url)
     assert back.num_rows == rows
     assert back.column("loud")[0].as_py() == "ROW 0!"
@@ -105,14 +105,14 @@ def test_py_t42_a_task_fails_loud(dataset: tuple[str, str, int], small_sink, sta
     def broken(batch: pa.RecordBatch, call: moruna.KindCall) -> pa.RecordBatch:
         raise ValueError("the service is down")
 
-    with pytest.raises(moruna.KernelError, match="the service is down"):
+    with pytest.raises(moruna.FunctionError, match="the service is down"):
         moruna.run(moruna.ParquetSource(src_url), broken(), small_sink(out_url), **staging)
 
     @moruna.kind(name="liar", output_schema={"adds": {"score": "double"}})
     def liar(batch: pa.RecordBatch, call: moruna.KindCall) -> pa.RecordBatch:
         return batch
 
-    with pytest.raises(moruna.KernelError, match="column `score`: declared double, not produced"):
+    with pytest.raises(moruna.FunctionError, match="column `score`: declared double, not produced"):
         moruna.run(moruna.ParquetSource(src_url), liar(), small_sink(out_url), **staging)
 
 
@@ -137,7 +137,7 @@ def test_py_t43_kinds_in_a_row(dataset: tuple[str, str, int], small_sink, stagin
         small_sink(out_url),
         **staging,
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     back = _out(out_url)
     assert back.num_rows == rows
     assert back.column("half")[9].as_py() == 4

@@ -77,7 +77,7 @@ impl PyKernelHandle {
             .getattr("__name__")
             .and_then(|n| n.extract::<String>())
             .unwrap_or_else(|_| type_name(self.callable.bind(py)));
-        format!("KernelSpec({name}, stateful={})", self.stateful)
+        format!("function({name}, stateful={})", self.stateful)
     }
 }
 
@@ -104,7 +104,7 @@ pub fn build(
 ) -> PyResult<PyKernelHandle> {
     if !obj.is_callable() && !stateful {
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "a stateless kernel must be callable, and {} is not",
+            "a stateless function must be callable, and {} is not",
             type_name(obj)
         )));
     }
@@ -228,7 +228,7 @@ pub fn stage_of(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Stage> {
         return Ok(Stage::Py(handle.kernel));
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "a kernel must be produced by @moruna.kernel, moruna.std or a @moruna.kind, or be \
+        "a function is made by @moruna.function, moruna.std or a @moruna.kind, or is \
          callable, and {} is none of these",
         type_name(item)
     )))

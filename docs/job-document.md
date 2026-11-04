@@ -1,12 +1,14 @@
 # Job document
 
-A job document is a JSON object describing one job. Only `moruna_spec`, `source` and `sink` are required; every other field has the same default as the matching `moruna.run` argument. Fields that are absent or `null` are filled from the environment, then from the machine, then from the default. Unknown fields are refused.
+A job document describes one job. It has two forms. Version 2 is the job as a DAG of tasks, in FlatBuffers (file identifier `MJB2`, schema `crates/moruna-job/schema/job.fbs`): what `moruna.Job.spec()` writes and `moruna.Job.read` reads (see [Version 2](#version-2-a-dag-of-tasks)). Version 1 is the JSON object described below, a chain from one source through its functions to one sink, which Moruna reads as the DAG of one path.
+
+A version 1 document is a JSON object describing one job. Only `moruna_spec`, `source` and `sink` are required; every other field has the same default as the matching `moruna.run` argument. Fields that are absent or `null` are filled from the environment, then from the machine, then from the default. Unknown fields are refused.
 
 ```json
 {
   "moruna_spec": 1,
   "source": {"kind": "parquet", "url": "reviews/"},
-  "kernels": [{"kind": "python", "module": "kernels.py", "callable": "score"}],
+  "kernels": [{"kind": "python", "ref": "reviews.functions:score"}],
   "sink": {"kind": "parquet", "url": "reviews-scored/"},
   "budget": {"memory_bytes": 8589934592}
 }
@@ -19,7 +21,7 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 | `moruna_spec` | integer | required | The document format version; `1`. |
 | `run_id` | string | generated | The job's id, 32 lowercase hexadecimal characters. |
 | `source` | object | required | Where the input comes from. |
-| `kernels` | list | `[]` | The kernels, in order; empty copies the source to the sink. |
+| `kernels` | list | `[]` | The functions, in order; empty copies the source to the sink. |
 | `sink` | object | required | Where the output goes. |
 | `budget` | object | discovered | Memory and CPU. |
 | `staging` | object | discovered | The directory for spilled data and checkpoints. |
@@ -30,8 +32,8 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
 | `ordered` | boolean | `false` | Deliver results to the sink in source order. |
 | `sizer` | string | `"rule"` | `"rule"` or `"learned"`. |
 | `trace` | string | none | Path of a file for the per-morsel trace. |
-| `profiles_dir` | string | `~/.moruna/profiles` | Where kernel profiles are stored. |
-| `allow_gil` | boolean | `false` | Run Python kernels on the standard build of Python. |
+| `profiles_dir` | string | `~/.moruna/profiles` | Where function profiles are stored. |
+| `allow_gil` | boolean | `false` | Run Python functions on the standard build of Python. |
 | `report` | object | report file only | Where the report goes. |
 | `contracts` | list | `[]` | The contracts a `datafusion` source reads and a `peql` sink writes under, compiled. |
 
@@ -66,21 +68,23 @@ A job document is a JSON object describing one job. Only `moruna_spec`, `source`
  "caller": {"id": "svc-scoring", "tenant": "acme", "purpose": "reporting"}}
 ```
 
+**`python`**: a `moruna.Source` class by reference: `ref` (`module:Class`), `params`, `needs` and `fingerprint`, as for a [`python` function](#kernels).
+
 An `iterator` source exists only in Python and is refused in a document.
 
 ## kernels
 
-Each entry has a `kind`.
+The functions. Each entry has a `kind`.
 
-**`python`**: `module` is a module name or a path to a `.py` file, and `callable` is the name of the kernel in it, dotted for a nested name. The decorator's options can be given here as well: `stateful`, `instances`, `accepts`, `tier`, `device_memory`, `releases_gil`, `expected_amplification`, `preferred_rows`, `resume`, `state_bytes` and `memory_guard`.
+**`python`**: code by reference, as for a source or a sink of the `python` kind: `ref` is `module:attribute`, a `moruna.Function` class (constructed with `params`) or a function decorated with `@moruna.function`, on the interpreter's path; `params` are the class's constructor arguments, data only; `needs` names what the runner must supply it (`moruna run --resolver`); `fingerprint` pins its code. The decorator's options are the decorator's, in the code.
 
-**`std`**: `name` is a standard kernel, such as `"filter"`, and `args` is an object of its arguments.
+**`std`**: `name` is a standard function, such as `"filter"`, and `args` is an object of its arguments.
 
 ```json
 {"kind": "std", "name": "select", "args": {"columns": ["review_id", "score"]}}
 ```
 
-Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded kernel's fingerprint differs, so a document cannot run a kernel that has changed since it was checked.
+Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded function's fingerprint differs, so a document cannot run a function that has changed since it was checked.
 
 ## sink
 
@@ -108,6 +112,8 @@ The run report's `write` says what was done: `report.violations` (rows by rule),
  "on_violation": "exclude", "excluded_url": "/staging/excluded"}
 ```
 
+**`python`**: a `moruna.Sink` class by reference: `ref`, `params`, `needs` and `fingerprint`, as for a [`python` function](#kernels). What its `finish` returns as a commit (`snapshot_id`, `version`) is in the report's `sinks`.
+
 ## contracts
 
 Each entry is one contract, as peQL registers a compiled one: `document`, the contract's document; `compiled`, its compiled form exactly as parcel wrote it; `functions`, the function modules the compiled form pins; and `audiences`, the tenants it is published to for this job besides its owner (`public` is everyone). The job's peQL engine holds these contracts in memory and nothing else: it reads no contract from `root` and writes none there, and a contract the job names that is not listed here is refused by name. A document that lists contracts and has no `datafusion` source or `peql` sink is refused.
@@ -133,7 +139,7 @@ Without `elastic`, the job keeps the limits it started with. See [Machines that 
 
 ## object_store
 
-`s3` takes `endpoint`, `region`, `access_key_id`, `secret_access_key`, `session_token` and `bucket`. `gcs` takes `service_account_path`, `service_account_json` and `bucket`. `azure` takes `account`, `access_key` and `container`. `allow_http` permits endpoints without TLS, and `local_root` sets the directory `file://` URLs are relative to. An `endpoint` can be a `unix://` or `vsock://` socket, for a host that provides object storage without a network.
+`s3` takes `endpoint`, `region` and `bucket`. `gcs` takes `bucket`. `azure` takes `account` and `container`. A document holds no credential, and a field that would carry one (`access_key_id`, `secret_access_key`, `session_token`, `service_account_path`, `service_account_json`, `access_key`) is refused: the runner supplies credentials when the job runs, from `moruna.run(..., storage=...)` or from where the job runs (the provider's environment variables, the machine's identity). `allow_http` permits endpoints without TLS, and `local_root` sets the directory `file://` URLs are relative to. An `endpoint` can be a `unix://` or `vsock://` socket, for a host that provides object storage without a network.
 
 ## checkpoint
 
@@ -149,3 +155,11 @@ Without `elastic`, the job keeps the limits it started with. See [Machines that 
 | --- | --- |
 | `file` | Where to write the report; `<run_id>` in the path is replaced with the job's id. By default, `moruna-<run_id>.report.json` in the staging directory, or in the current directory. |
 | `socket` | A `unix://` or `vsock://` address to connect to and send progress and the report; see [the host protocol](cli.md#the-host-protocol). |
+
+## Version 2: a DAG of tasks
+
+Version 2 holds the job as tasks and edges. A task has an `id` (1 to 128 letters, digits, `_`, `-`, `.` and `:`, starting with a letter or a digit), a `role` (`Source`, `Function` or `Sink`), a `kind` and its `settings` (the kind's settings as above, a FlexBuffers map), its named input and output ports, and optionally `barrier` and `members`. An edge joins one task's output port to another task's input port. One output may feed many inputs; a function may take several inputs, each fed by exactly one edge. The document also has the job's `name` and every top-level field above (`budget`, `staging`, `object_store`, `checkpoint` and the rest), in the same meaning.
+
+A job spec, what `moruna.Job.spec()` writes, is a version 2 document with the job's name, tasks and edges and nothing else: a task gives on its port `out`, a function or a sink of one input takes it on `in`, and one of several inputs takes each on a port named after the task that feeds it. `moruna.Job.read` refuses a document that also sets run settings, naming them, because they are `moruna.run`'s arguments; `moruna run` runs such a document as it is.
+
+`moruna.Job.spec().digest()` is `"sha256:"` and the hex of SHA-256 over exactly the document's bytes, and the run report names it as `job_digest`.

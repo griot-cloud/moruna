@@ -9,7 +9,7 @@ Use these pages to look up the Python API, every field of a job document, the `m
 :link: python-api
 :link-type: doc
 
-`moruna.run`, the kernel decorator, sources, sinks, standard kernels and exceptions.
+`moruna.run`, the function decorator, sources, sinks, standard functions and exceptions.
 :::
 
 :::{grid-item-card} Job document

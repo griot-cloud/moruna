@@ -126,5 +126,6 @@
     "small dataset: no adaptation"
   ],
   "overflow_failed": false,
-  "late_records": 0
+  "late_records": 0,
+  "sinks": []
 }

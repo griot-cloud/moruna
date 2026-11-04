@@ -12,8 +12,8 @@ end-of-stream marker, so the engine sees the process end and says why.
 
 It imports only the standard library and ``pyarrow``, and it never imports ``moruna``: inside an
 image ``import moruna`` finds ``/opt/moruna/moruna/__init__.py`` (``_standin.py``), which holds
-the two names a kernel's module uses at import time. A decorated function is found by what a
-``moruna.KernelSpec`` and the stand-in's spec both have, a ``wrapped`` callable and a ``stateful``
+the names a function's module uses at import time. A function is found by what a
+``moruna.Function`` and the stand-in's both have, a ``wrapped`` callable and a ``stateful``
 flag, so this file runs unchanged against either.
 """
 
@@ -41,7 +41,7 @@ class ShimError(Exception):
 def resolve(entry: str) -> Callable[[pa.RecordBatch], Any]:
     """The callable a ``<module>:<name>`` entry names, as ``call(batch)``.
 
-    A decorated kernel is its ``wrapped`` callable; a stateful one has its ``setup`` called once
+    A decorated function is its ``wrapped`` callable; a stateful one has its ``setup`` called once
     (the instance is 0 and there is no device) and is called with the state it returned.
     """
     module_name, _, name = entry.partition(":")

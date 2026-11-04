@@ -1,6 +1,6 @@
 # Quickstart
 
-In this example, you will create a Parquet dataset of 500,000 product reviews, write a kernel that gives each review a score, and run it inside a 1 GiB memory budget. Moruna reads the reviews in pieces, runs your kernel on each, and writes the scored reviews to a new dataset.
+In this example, you will create a Parquet dataset of 500,000 product reviews, write a function that gives each review a score, and run it inside a 1 GiB memory budget. Moruna reads the reviews in pieces, runs your function on each, and writes the scored reviews to a new dataset.
 
 You need Python 3.14 on Linux (x86-64) or macOS (Apple silicon). The example takes about a minute.
 
@@ -10,13 +10,13 @@ You need Python 3.14 on Linux (x86-64) or macOS (Apple silicon). The example tak
 pip install moruna
 ```
 
-This also installs `pyarrow`, which Moruna uses to pass data to your kernels. Check that it works:
+This also installs `pyarrow`, which Moruna uses to pass data to your functions. Check that it works:
 
 ```bash
 python -c "import moruna; print(moruna.__version__)"
 ```
 
-Moruna runs Python kernels in parallel on the free-threaded build of Python 3.14, often installed as `python3.14t`. On the standard build, Python runs one thread at a time, and Moruna asks you to confirm by passing `allow_gil=True` to `moruna.run`. The example works on either build.
+Moruna runs Python functions in parallel on the free-threaded build of Python 3.14, often installed as `python3.14t`. On the standard build, Python runs one thread at a time, and Moruna asks you to confirm by passing `allow_gil=True` to `moruna.run`. The example works on either build.
 
 ## 2. Create some data
 
@@ -48,9 +48,9 @@ python make_data.py
 wrote 500,000 reviews
 ```
 
-## 3. Write a kernel and run it
+## 3. Write a function and run it
 
-A kernel receives a batch of rows as a `pyarrow.RecordBatch` and returns a batch. This one counts the positive words in each review and adds the result as a new `score` column. Save the following as `score.py`:
+A function receives a batch of rows as a `pyarrow.RecordBatch` and returns a batch. This one counts the positive words in each review and adds the result as a new `score` column. Save the following as `score.py`:
 
 ```python
 import pyarrow as pa
@@ -58,7 +58,7 @@ import moruna
 
 POSITIVE = {"great", "love", "perfect", "fine"}
 
-@moruna.kernel
+@moruna.function
 def score(batch):
     texts = batch.column("text").to_pylist()
     scores = [sum(w in POSITIVE for w in t.split()) / 12 for t in texts]

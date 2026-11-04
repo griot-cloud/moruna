@@ -20,7 +20,7 @@ def test_py_t9_reentrancy(
     second_out = scratch / "out2"
     second_out.mkdir()
 
-    @moruna.kernel
+    @moruna.function
     def slow(batch):  # noqa: ANN001, ANN202
         time.sleep(0.5)
         return batch

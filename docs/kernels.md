@@ -1,8 +1,8 @@
-# Writing kernels
+# Writing functions
 
-A kernel is the part of a job you write: a function that receives a batch of rows and returns a batch of rows. Moruna calls it once for every morsel, on several threads at once, and never tells it how large the dataset is. Anything a kernel can do to one batch, Moruna can do to a dataset of any size.
+A function is the part of a job you write: a function that receives a batch of rows and returns a batch of rows. Moruna calls it once for every morsel, on several threads at once, and never tells it how large the dataset is. Anything a function can do to one batch, Moruna can do to a dataset of any size.
 
-## A Python kernel
+## A Python function
 
 Decorate a function that takes a `pyarrow.RecordBatch` and returns one:
 
@@ -11,18 +11,18 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import moruna
 
-@moruna.kernel
+@moruna.function
 def loud(batch):
     return batch.append_column("loud", pc.utf8_upper(batch.column("text")))
 ```
 
-A kernel may add, remove or change columns, and may return fewer rows than it received.
+A function may add, remove or change columns, and may return fewer rows than it received.
 
-`moruna.run` also accepts an undecorated function and wraps it with the default settings. Decorating it lets you give Moruna information it would otherwise measure. For example, `expected_amplification=8` says the kernel uses about eight times the memory of its input, and `preferred_rows=2048` asks for batches of about that many rows, which suits a model that works best at a fixed batch size. Moruna still measures the kernel and adjusts; these values are where it starts.
+`moruna.run` also accepts an undecorated function and wraps it with the default settings. Decorating it lets you give Moruna information it would otherwise measure. For example, `expected_amplification=8` says the function uses about eight times the memory of its input, and `preferred_rows=2048` asks for batches of about that many rows, which suits a model that works best at a fixed batch size. Moruna still measures the function and adjusts; these values are where it starts.
 
-## Checking a kernel
+## Checking a function
 
-A kernel that declares its schemas can be checked before it runs on real data. `input_schema` names the columns and types the kernel needs; `output_schema` describes what it returns, either in full or as the columns it `adds`, `drops` or `changes`:
+A function that declares its schemas can be checked before it runs on real data. `input_schema` names the columns and types the function needs; `output_schema` describes what it returns, either in full or as the columns it `adds`, `drops` or `changes`:
 
 ```python
 import pyarrow as pa
@@ -30,7 +30,7 @@ import moruna
 
 POSITIVE = {"great", "love", "perfect", "fine"}
 
-@moruna.kernel(
+@moruna.function(
     input_schema={"text": pa.string()},
     output_schema={"adds": {"score": pa.float64()}},
 )
@@ -40,10 +40,10 @@ def score(batch):
     return batch.append_column("score", pa.array(scores, pa.float64()))
 ```
 
-Save it as `kernels.py` and run `moruna check`:
+Save it as `functions.py` and run `moruna check`:
 
 ```text
-moruna check kernels.py
+moruna check functions.py
 score (python): agreed
   fingerprint sha256:cadf1a2ed66f5962ab6043268a9f5ddfad6430d3170ed053d8bfa4685dd6b9a4
   gil free_threaded
@@ -53,33 +53,33 @@ score (python): agreed
   warm-up used 9.84 s wall, 9.61 s worker, 412.3 MiB peak, 61.2 KiB to the store
 ```
 
-`moruna check` builds batches from the input schema, including an empty batch, a single row, all-null columns and edge values such as empty strings and the largest integers, and runs the kernel on each. It then compares what the kernel returned with the declared output. A kernel that disagrees is refused, with the column and the types named:
+`moruna check` builds batches from the input schema, including an empty batch, a single row, all-null columns and edge values such as empty strings and the largest integers, and runs the function on each. It then compares what the function returned with the declared output. A function that disagrees is refused, with the column and the types named:
 
 ```text
 score (python): refused
   batch one_row: column `score`: declared int64, produced double
 ```
 
-The command exits with 0 when every kernel agrees and 2 when any is refused, so you can run it in continuous integration. A kernel that agrees is then warmed up: it runs on generated data of growing size, at more than one worker, and with skewed as well as even keys, and the cost model learns from every measurement. The report gives what the kernel costs per 10,000 rows, how much faster it is with more workers, how much skew slows it, and what the warm-up itself took. The measurements are kept (by default in `~/.moruna/observations`), so what is learned here is what a plan of a job uses. The **fingerprint** identifies this exact kernel; a job document can require it, so that a changed kernel is not run by mistake. Pass `--json` for a machine-readable report and `--kernel NAME` to check one kernel in a module.
+The command exits with 0 when every function agrees and 2 when any is refused, so you can run it in continuous integration. A function that agrees is then warmed up: it runs on generated data of growing size, at more than one worker, and with skewed as well as even keys, and the cost model learns from every measurement. The report gives what the function costs per 10,000 rows, how much faster it is with more workers, how much skew slows it, and what the warm-up itself took. The measurements are kept (by default in `~/.moruna/observations`), so what is learned here is what a plan of a job uses. The **fingerprint** identifies this exact function; a job document can require it, so that a changed function is not run by mistake. Pass `--json` for a machine-readable report and `--function NAME` to check one function in a module.
 
-## Polars kernels
+## Polars functions
 
-A function annotated as taking and returning a Polars `DataFrame` is a Polars kernel. The batch reaches it as a Polars frame without being copied, and the frame it returns goes back the same way:
+A function annotated as taking and returning a Polars `DataFrame` is a Polars function. The batch reaches it as a Polars frame without being copied, and the frame it returns goes back the same way:
 
 ```python
 import polars as pl
 import moruna
 
-@moruna.kernel
+@moruna.function
 def shout(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(pl.col("text").str.to_uppercase().alias("loud"))
 ```
 
 `pl.LazyFrame` works the same way. For a function without annotations, wrap it with `moruna.polars(fn)`.
 
-## Kernels that keep state
+## Functions that keep state
 
-Some kernels need something expensive before their first batch, such as a model loaded from disk. A **stateful** kernel is an object with a `setup` method, which builds the state once, and a `__call__` method, which receives that state with every batch:
+Some functions need something expensive before their first batch, such as a model loaded from disk. A **stateful** function is an object with a `setup` method, which builds the state once, and a `__call__` method, which receives that state with every batch:
 
 ```python
 import pyarrow as pa
@@ -93,26 +93,26 @@ class Scorer:
         scores = model.predict(batch.column("text").to_pylist())
         return batch.append_column("score", pa.array(scores, pa.float64()))
 
-score = moruna.kernel(Scorer(), stateful=True, instances=4)
+score = moruna.function(Scorer(), stateful=True, instances=4)
 ```
 
-`instances` is the number of copies of the state Moruna may create; each worker uses one at a time, so a stateful kernel never receives two batches at once for the same state. `ctx.instance` tells `setup` which copy it is building. If the state is large, pass its size in bytes as `state_bytes` so Moruna can plan for it before `setup` runs.
+`instances` is the number of copies of the state Moruna may create; each worker uses one at a time, so a stateful function never receives two batches at once for the same state. `ctx.instance` tells `setup` which copy it is building. If the state is large, pass its size in bytes as `state_bytes` so Moruna can plan for it before `setup` runs.
 
-When a stateful job is resumed after being stopped, Moruna calls `setup` again by default. A kernel whose state depends on the rows it has already seen, such as a running total, should instead pass `resume="checkpoint"` and define `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Moruna saves the state with each checkpoint and restores it on resume.
+When a stateful job is resumed after being stopped, Moruna calls `setup` again by default. A function whose state depends on the rows it has already seen, such as a running total, should instead pass `resume="checkpoint"` and define `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Moruna saves the state with each checkpoint and restores it on resume.
 
-## Standard kernels
+## Standard functions
 
-Common transformations are available as standard kernels, which you configure with arguments instead of writing code. They are written in Rust, never take Python's global lock, and adjacent ones are combined into a single step where possible.
+Common transformations are available as standard functions, which you configure with arguments instead of writing code. They are written in Rust, never take Python's global lock, and adjacent ones are combined into a single step where possible.
 
 ```python
-kernels = [
+functions = [
     moruna.std.filter(expr="review_id < 1000"),
     moruna.std.select(columns=["review_id", "text"]),
     loud,
 ]
 ```
 
-| Kernel | Does |
+| Function | Does |
 | --- | --- |
 | `select(columns)`, `drop(columns)` | Keep or remove columns |
 | `rename(columns)` | Rename columns, given a mapping from old name to new |
@@ -126,8 +126,8 @@ kernels = [
 | `concat_str(columns, separator, output)` | Join columns into one text column |
 | `date_trunc(column, unit, output)` | Truncate timestamps to a year, month, day, hour, minute or second |
 | `union()` | Pass on the batches of every input port, each as it came; every input has one schema. In a job document version 2, a task with one input port for each producer |
-| `join()` | For each morsel, the columns of every input port side by side, port order: every input a branch of one upstream through kernels that keep its rows. A row count that differs or a column two inputs give is refused naming the ports. In a job document version 2, a task with one input port for each branch |
+| `join()` | For each morsel, the columns of every input port side by side, port order: every input a branch of one upstream through functions that keep its rows. A row count that differs or a column two inputs give is refused naming the ports. In a job document version 2, a task with one input port for each branch |
 
-Every standard kernel declares its schemas, so `moruna check` checks them too.
+Every standard function declares its schemas, so `moruna check` checks them too.
 
 Next: [Running jobs from the command line](command-line.md).

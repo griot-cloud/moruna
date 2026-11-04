@@ -41,9 +41,6 @@ pub mod errors;
 // f.10, 2026-09-29).
 #[cfg(feature = "python")]
 pub mod extend;
-// `moruna.explain(...)`, a job document's plan (SDD 26).
-#[cfg(feature = "python")]
-pub mod explain;
 // `moruna.read_events(...)`, the events a run wrote as records (MH 4.3 version 7).
 #[cfg(feature = "python")]
 pub mod events;

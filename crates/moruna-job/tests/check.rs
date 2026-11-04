@@ -111,7 +111,7 @@ fn jb_t7_unknown_kinds() {
         [
             "source.kind: no source kind `csv` is declared; this catalogue reads arrow_ipc, \
              parquet, tensor, vortex",
-            "kernels[0].kind: no kernel kind `java` is declared; this catalogue runs image, package, std",
+            "kernels[0].kind: no function kind `java` is declared; this catalogue runs image, package, std",
             "sink.kind: no sink kind `std` is declared; this catalogue writes arrow_ipc, parquet, \
              tensor, vortex",
         ]

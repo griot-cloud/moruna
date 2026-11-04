@@ -33,7 +33,7 @@ def budget() -> int:
     return int((held + (512 << 20)) / 0.9)
 
 
-@moruna.kernel
+@moruna.function
 def shout(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Upper case the text and keep the rest, which is real work without its cost."""
     return pa.RecordBatch.from_arrays(
@@ -63,7 +63,7 @@ def vortex_dataset(scratch: pathlib.Path) -> tuple[pathlib.Path, pa.Table]:
         budget=budget(),
         ordered=True,
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     return vx, table
 
 
@@ -89,7 +89,7 @@ def test_py_t19_vortex_source_through_a_kernel(
         moruna.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB"),
         budget=budget(),
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     assert report.stages[0]["rows_in"] == ROWS, report.stages
     back = pq.read_table(str(out)).sort_by("id")
     assert back.num_rows == ROWS
@@ -111,7 +111,7 @@ def test_py_t19_vortex_round_trip_and_projection(
         budget=budget(),
         ordered=True,
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     out = scratch / "projected"
     report = moruna.run(
         moruna.VortexSource(str(again), columns=["score", "id"]),
@@ -119,7 +119,7 @@ def test_py_t19_vortex_round_trip_and_projection(
         moruna.ParquetSink(f"file://{out}", row_group_bytes="16MiB", file_bytes="64MiB"),
         budget=budget(),
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     back = pq.read_table(str(out)).sort_by("id")
     assert back.column_names == ["id", "score"]
     assert back.column("score").to_pylist() == table.column("score").to_pylist()
@@ -154,5 +154,5 @@ def test_py_t19_vortex_handles_validate_what_they_are_given(
         moruna.VortexSink(str(scratch / "clamped"), file_bytes=1024),
         budget=budget(),
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     assert any("sink.file_bytes" in note for note in report.notes), report.notes

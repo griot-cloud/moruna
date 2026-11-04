@@ -384,7 +384,7 @@ fn kd_t12_declare_and_list() {
             .expect_err("a built-in's name");
         assert_eq!(
             refused.to_string(),
-            format!("config kinds: a kernel kind `{builtin}` is registered already")
+            format!("config kinds: a function kind `{builtin}` is registered already")
         );
     }
     assert!(more.declare(scale("scale", PortDoc::guest("x"))).is_err());

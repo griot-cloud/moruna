@@ -332,7 +332,7 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
         let target = match role {
             "source" => &mut document["source"],
             "sink" => &mut document["sink"],
-            "kernel" => document["kernels"]
+            "function" => document["kernels"]
                 .as_array_mut()
                 .ok_or("kernels absent")?
                 .iter_mut()
@@ -472,7 +472,7 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
     } else {
         None
     };
-    let mut kinds = _core::kinds::command()?.with_embedding(Arc::new(FixtureEmbedding));
+    let mut kinds = _core::kinds::command(None)?.with_embedding(Arc::new(FixtureEmbedding));
     kinds.declare(moruna_job::Declaration {
         name:"fixture.echo".into(),role:moruna_job::Role::Kernel,summary:"KD3 actual embedder identity handler".into(),
         settings:json!({"$schema":moruna_job::SCHEMA_DIALECT,"type":"object","additionalProperties":false,"properties":{},"examples":[{}]}),

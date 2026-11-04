@@ -282,7 +282,7 @@ fn ck_not_checkable_and_plan_refusals() {
     let report = check(wrong_input, CheckOptions::new("wrong")).expect("runs");
     assert_eq!(report.verdict, Verdict::Refused);
     assert!(report.batches.iter().any(|b| b.error.is_some()));
-    assert!(report.summary().contains("kernel failed"));
+    assert!(report.summary().contains("function failed"));
     assert!(report.to_json()["batches"][1]["error"].is_string());
 }
 

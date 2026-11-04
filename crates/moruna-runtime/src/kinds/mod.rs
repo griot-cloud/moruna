@@ -369,7 +369,7 @@ pub fn check_pin(entry: &Entry<'_>, pinned: Option<&str>, kernel: &dyn Kernel) -
     if want != have {
         return Err(entry.refuse(
             "fingerprint",
-            format!("the document pins {want} and the loaded kernel's is {have}"),
+            format!("the document pins {want} and the loaded function's is {have}"),
         ));
     }
     Ok(())

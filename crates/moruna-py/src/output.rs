@@ -26,7 +26,7 @@ impl OutputStream {
             2 => Stream::Stderr,
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "a kernel's output is on descriptor 1 or 2, not {other}"
+                    "a function's output is on descriptor 1 or 2, not {other}"
                 )));
             }
         };

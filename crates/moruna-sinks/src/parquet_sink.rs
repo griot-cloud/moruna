@@ -547,6 +547,7 @@ impl Sink for ParquetSink {
             bytes,
             files: inner.ledger.names(),
             write: None,
+            commit: None,
         })
     }
 

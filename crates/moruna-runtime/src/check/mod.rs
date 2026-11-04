@@ -243,7 +243,7 @@ impl CheckReport {
         };
         json!({
             "moruna_check": CHECK_FORMAT,
-            "kernel": self.name,
+            "function": self.name,
             "kind": self.kind,
             "fingerprint": self.fingerprint,
             "verdict": self.verdict.as_str(),
@@ -278,7 +278,10 @@ impl CheckReport {
         for batch in &self.batches {
             if let Some(error) = &batch.error {
                 let first = error.lines().next().unwrap_or("");
-                out.push_str(&format!("  batch {}: kernel failed: {first}\n", batch.name));
+                out.push_str(&format!(
+                    "  batch {}: function failed: {first}\n",
+                    batch.name
+                ));
             }
         }
         for (batch, d) in self.refusals() {
@@ -365,12 +368,12 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
             _ => "output_schema",
         };
         report.reason = Some(format!(
-            "not checkable: the kernel declares no {missing}; it still runs on the library path"
+            "not checkable: the function declares no {missing}; it still runs on the library path"
         ));
         return Ok(report);
     };
     if kernel.accepts().kind == PayloadKind::Tensor {
-        report.reason = Some("not checkable: a tensor kernel has no table declaration".into());
+        report.reason = Some("not checkable: a tensor function has no table declaration".into());
         return Ok(report);
     }
     let schema = match input_decl.synthetic_schema() {
@@ -388,7 +391,7 @@ pub fn check(kernel: Arc<dyn Kernel>, opts: CheckOptions) -> Result<CheckReport>
     {
         report.verdict = Verdict::Refused;
         report.reason = Some(format!(
-            "refused: the kernel rejects its own declared input at plan time: {e}"
+            "refused: the function rejects its own declared input at plan time: {e}"
         ));
         return Ok(report);
     }
@@ -642,7 +645,7 @@ impl Harness {
             }
             Ok(Payload::Tensor(_, _)) => {
                 outcome.error =
-                    Some("the kernel returned a tensor for a table declaration".to_string());
+                    Some("the function returned a tensor for a table declaration".to_string());
             }
             Err(e) => outcome.error = Some(e.to_string()),
         }

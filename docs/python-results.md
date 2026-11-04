@@ -2,14 +2,23 @@
 
 ## `moruna.RunReport`
 
-`moruna.run(...) -> RunReport`. The runtime constructs it; attributes are read-only. `str(report)` returns a compact summary; `report.to_json() -> str` returns the full serialized report. [The run report](run-report.md) details its nested fields.
+`moruna.run(...) -> RunReport`. The runtime computes it; it is not edited. `str(report)` returns a page of at most forty lines; [The run report](run-report.md) details the fields Moruna's trace adds.
+
+A report is one JSON document with one canonical form. `report.bytes()` is that document as UTF-8 JSON with its keys sorted at every level and no whitespace between tokens, so the same report always gives the same bytes; `report.digest()` is `"sha256:"` and the hex of SHA-256 over exactly those bytes; `report.to_json()` is the same text, and `moruna.RunReport.from_bytes(data)` reads the bytes (or a file of them) back, refusing bytes that are not a report in that form with `ValueError`. A host that forwards the bytes unchanged can certify them by that digest, beside the spec's. `moruna.run(..., spec_to=target)` writes them through its writer after the run.
 
 | Attribute | Type | Meaning |
 | --- | --- | --- |
-| `run_id`, `resumed`, `manifest` | `str`, `bool`, `str \| None` | Run id, resume state and latest checkpoint path. |
-| `exit` | `str \| dict` | `"Completed"`, `"Cancelled"`, or `{"Terminated": {"diagnostic": ...}}`. |
-| `wall_s` | `float` | Elapsed seconds. |
-| `limits_initial`, `limits`, `limits_timeline` | `dict`, `dict`, list | Initial host limits, compatibility alias, and limit changes. |
+| `moruna_report`, `moruna` | `int`, `str` | The document's format (1) and the Moruna that wrote it. |
+| `run_id` | `str` | The run's id, 32 hex characters. |
+| `job_digest` | `str \| None` | The spec's digest; `None` for a job that holds a task a spec cannot hold. |
+| `exit` | `dict` | `code` (0 completed, 130 cancelled, otherwise the command's exit code for the failure), `status` (`"completed"`, `"terminated"`, `"cancelled"`) and `diagnostic`. |
+| `tasks` | list of dicts | Per task, in job order: `key`, `role`, `kind`, `rows_in`, `rows_out`, `bytes_in`, `bytes_out`, `time_s`, `busy_s`, `excluded_rows`, `skipped_morsels`, `errors`, the `stage` that ran it and the tasks `fused_with` it. A figure the run does not measure for the task is `None`. |
+| `resources` | `dict` | `cpu_ns`, `peak_memory_bytes`, `mem_byte_seconds`, `usage_measured` and `memory_basis`. |
+| `sinks` | list of dicts | Per sink: `task`, `target` (as its settings name it), `rows`, `bytes`, `files`, `excluded_rows`, and `snapshot_id` and `version` when it committed a version. |
+| `plan` | `dict \| None` | The plan the run started from, when `moruna.run(..., explain=True)` asked for it. |
+| `trace_path` | `str \| None` | Written trace file, if requested. |
+| `resumed`, `manifest`, `wall_s` | `bool`, `str \| None`, `float` | Resume state, latest checkpoint path, elapsed seconds. |
+| `limits_initial`, `limits_timeline` | `dict`, list | Initial host limits and limit changes. |
 | `peak_anon_bytes`, `peak_ceiling_bytes`, `peak_fraction_of_ceiling` | `int`, `int`, `float` | Peak memory, denominator and fraction. |
 | `worker_busy_fraction`, `cpu_throttled_fraction` | `float` | Worker use and CPU throttling. |
 | `cpu_ns`, `mem_byte_seconds`, `usage_measured` | `int`, `int`, `bool` | Measured CPU and memory usage. |
@@ -20,8 +29,7 @@
 | `sizer_used`, `sizer_fallback_at` | `str`, `int \| None` | Sizer and optional fallback morsel. |
 | `stages`, `drains`, `bottleneck_timeline` | lists | Per-stage statistics, arena drains and bottlenecks. |
 | `notes`, `overflow_failed`, `late_records` | `list[str]`, `bool`, `int` | Decisions and trace completeness. |
-| `snapshot` | `dict \| None` | Committed snapshot ids, when available. |
-| `trace_path` | `str \| None` | Written trace file, if requested. |
+| `write`, `read` | `dict \| None` | What the engine behind a governed sink or source reported. |
 
 ## `moruna.inspect_host`
 
@@ -31,23 +39,15 @@ moruna.inspect_host() -> dict
 
 Runs host discovery without a job. The dictionary contains `limits` (`memory_ceiling`, `memory_kill`, `cpu_quota`, `page_bytes`, `source`, `devices`), `anon_bytes` (memory already held), `host_profile` (feature guarantees and staging location), `host_tier`, `cgroup_path`, and `notes`. Discovery failures raise a `MorunaError` subclass.
 
-## `moruna.explain`
-
-```python
-moruna.explain(job, *, planner=None) -> dict
-```
-
-Returns the plan Moruna would run the job document `job` by (a path, or the document's bytes), without running it. The dictionary contains `id`, `job_digest`, `planner`, `resources`, `steps` (each with `id`, `tasks`, `depends_on`, `group`, `resources` and `cost`, every cost field a `p50`, `p95`, `unit`, `basis` and `observations`), `groups` (the steps that may run side by side, in the order they start) and `totals` (`finish`, `critical_path`, `peak_memory_bytes` and the resources held). The same document gives the same step ids every time, and the events of its run name them. A refused document raises `moruna.ConfigError` naming the field; an unknown planner raises `moruna.PlanError`.
-
 ## `moruna.check`
 
 ```python
-moruna.check(target, *, kernel=None, seed=0, warm_up=True, store=None, budget=60.0,
+moruna.check(target, *, function=None, seed=0, warm_up=True, store=None, budget=60.0,
              statistics=None, model=None, sandbox_python=None, sandbox_cgroup=None,
              args=None, assets=None) -> dict
 ```
 
-Checks every kernel in `target` (a module name, a `.py` file or a package) against its declared schemas and warms up each one that agrees, as `moruna check --json` does, and returns the same report: `exit`, `error` and `kernels`, one report per kernel. A kernel's `warm_up` holds `cost_per_10000_rows` (each field a `p50`, `p95`, `unit`, `basis` and `observations`), `kernel` (start-up, speed-up at 2 and 4 workers, state and checkpoint), `skew` and `selectivity` (marked `value_dependent`, since generated data has no real distribution), `progress` (how far the warm-up got and why it stopped), and `consumed` (wall and worker seconds, memory and the bytes written to the store, for charging). When a warm-up cannot run, `warm_up` holds `error` instead and `exit` is 2. `store` is the observation store's directory, `budget` the warm-up's seconds, `statistics` the input table's statistics (a dictionary, or a path to a JSON file) and `model` the cost model by name.
+Checks every function in `target` (a module name, a `.py` file or a package) against its declared schemas and warms up each one that agrees, as `moruna check --json` does, and returns the same report: `exit`, `error` and `functions`, one report per function, each naming its `function`. A function's `warm_up` holds `cost_per_10000_rows` (each field a `p50`, `p95`, `unit`, `basis` and `observations`), `kernel` (start-up, speed-up at 2 and 4 workers, state and checkpoint), `skew` and `selectivity` (marked `value_dependent`, since generated data has no real distribution), `progress` (how far the warm-up got and why it stopped), and `consumed` (wall and worker seconds, memory and the bytes written to the store, for charging). When a warm-up cannot run, `warm_up` holds `error` instead and `exit` is 2. `store` is the observation store's directory, `budget` the warm-up's seconds, `statistics` the input table's statistics (a dictionary, or a path to a JSON file) and `model` the cost model by name.
 
 ## Exceptions
 
@@ -56,16 +56,16 @@ Runtime exceptions inherit from `moruna.MorunaError`, which inherits from `Excep
 | Class | Typical cause |
 | --- | --- |
 | `moruna.ConfigError` | Bad run configuration or unsupported host setting. |
-| `moruna.PlanError` | Incompatible source, kernel or sink. |
+| `moruna.PlanError` | Incompatible source, function or sink. |
 | `moruna.BudgetError` | Memory budget or guarded allocation exceeded. |
-| `moruna.KernelError` | Kernel failed and the error policy stopped the run. |
+| `moruna.FunctionError` | A function failed and the error policy stopped the run. |
 | `moruna.IoError` | Source, sink, object store or staging I/O failed. |
 | `moruna.ResumeError` | Checkpoint cannot be used. |
 | `moruna.Cancelled` | Interrupted run; `error.report` may contain partial progress. |
 
 ```python
 try:
-    report = moruna.run(source, kernels, sink)
+    report = moruna.run(job)
 except moruna.MorunaError as error:
     print(error.kind, error.message, error.diagnostic)
     if error.report is not None:

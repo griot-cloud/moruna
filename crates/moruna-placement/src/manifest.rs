@@ -324,7 +324,7 @@ impl ManifestMatch<'_> {
         }
         let given: Vec<String> = self.fingerprints.iter().map(Fingerprint::to_hex).collect();
         if manifest.kernels != given {
-            return Some("kernel fingerprints differ".into());
+            return Some("function fingerprints differ".into());
         }
         if let Some(digests) = &self.plan_digests
             && manifest.plan_digests != digests.iter().map(|d| hex(d)).collect::<Vec<_>>()
@@ -762,7 +762,7 @@ impl PlacementEngine {
         }
         let given: Vec<String> = fingerprints.iter().map(Fingerprint::to_hex).collect();
         if manifest.kernels != given {
-            return Err(resume(path, "kernel fingerprints differ"));
+            return Err(resume(path, "function fingerprints differ"));
         }
         if let Some(stage) = manifest
             .resume_policy

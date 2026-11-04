@@ -1,6 +1,6 @@
 # Concepts
 
-Moruna runs a **job**: it reads data from a **source**, passes it through one or more **kernels**, and writes the result to a **sink**, all inside a **memory budget**. You write the kernels. Moruna decides how much data each kernel receives at a time, how many run at once, and when to use disk instead of memory.
+Moruna runs a **job**: it reads data from a **source**, passes it through one or more **functions**, and writes the result to a **sink**, all inside a **memory budget**. You write the functions. Moruna decides how much data each function receives at a time, how many run at once, and when to use disk instead of memory.
 
 ## A job
 
@@ -24,27 +24,27 @@ report = moruna.run(
 
 `score` is Acme's function, and `storage` says where the bucket is; the credentials come from the usual AWS environment variables. Moruna reads the reviews a piece at a time, runs `score` on each piece, writes the results, and returns a report of what happened.
 
-## Kernels
+## Functions
 
-A **kernel** is a function that takes a batch of rows and returns a batch of rows. Batches are Apache Arrow record batches, so a kernel can use `pyarrow`, NumPy, Polars or any library that reads Arrow data.
+A **function** is a function that takes a batch of rows and returns a batch of rows. Batches are Apache Arrow record batches, so a function can use `pyarrow`, NumPy, Polars or any library that reads Arrow data.
 
 ```python
 import pyarrow as pa
 import moruna
 
-@moruna.kernel
+@moruna.function
 def score(batch):
     texts = batch.column("text").to_pylist()
     return batch.append_column("score", pa.array([model(t) for t in texts]))
 ```
 
-A kernel sees only its batch. It does not open files, choose batch sizes or manage threads, which is what lets Moruna run it on any amount of data. A job can chain several kernels; each receives what the previous one returned.
+A function sees only its batch. It does not open files, choose batch sizes or manage threads, which is what lets Moruna run it on any amount of data. A job can chain several functions; each receives what the previous one returned.
 
-Some transformations do not need your own code. Moruna includes **standard kernels** for common operations such as filtering rows, selecting and renaming columns, casting types and removing duplicates. Learn more in [Writing kernels](kernels.md).
+Some transformations do not need your own code. Moruna includes **standard functions** for common operations such as filtering rows, selecting and renaming columns, casting types and removing duplicates. Learn more in [Writing functions](kernels.md).
 
 ## The memory budget
 
-The **budget** is the most memory the whole process may use, including Python, your libraries and your kernels' own data, not only the data Moruna holds. Moruna keeps the process under it for the entire run.
+The **budget** is the most memory the whole process may use, including Python, your libraries and your functions' own data, not only the data Moruna holds. Moruna keeps the process under it for the entire run.
 
 You can set the budget with `budget=`. If you do not, Moruna reads the limit of the container it runs in, or uses most of the machine's memory when there is no container limit. It never asks for a batch size, a worker count or a buffer size: the budget is the only setting a job needs.
 
@@ -52,17 +52,17 @@ If the budget is too small for the job, for example because a single piece of da
 
 ## Morsels
 
-Moruna divides the input into **morsels**, pieces of data sized to fit the budget. Before the job starts, it runs your kernel on one morsel and measures how much memory the kernel used compared with the size of its input. A kernel that builds a list of Python strings from its batch may use several times the memory of the batch itself; a kernel that adds one number per row uses very little.
+Moruna divides the input into **morsels**, pieces of data sized to fit the budget. Before the job starts, it runs your function on one morsel and measures how much memory the function used compared with the size of its input. A function that builds a list of Python strings from its batch may use several times the memory of the batch itself; a function that adds one number per row uses very little.
 
-Moruna uses that measurement to choose the morsel size and the number of kernels that run at once. It keeps measuring during the job and adjusts both, so a kernel whose memory use grows is given smaller morsels.
+Moruna uses that measurement to choose the morsel size and the number of functions that run at once. It keeps measuring during the job and adjusts both, so a function whose memory use grows is given smaller morsels.
 
 ## Workers and threads
 
-Kernels run on **worker** threads, several at once. On the free-threaded build of CPython 3.14, Python kernels run in parallel on every core. On the standard build, Python holds a lock that lets only one thread run Python code at a time, so Moruna asks you to confirm with `allow_gil=True` before running Python kernels there.
+Functions run on **worker** threads, several at once. On the free-threaded build of CPython 3.14, Python functions run in parallel on every core. On the standard build, Python holds a lock that lets only one thread run Python code at a time, so Moruna asks you to confirm with `allow_gil=True` before running Python functions there.
 
 ## Spilling to disk
 
-When the data waiting between steps does not fit in memory, Moruna moves it to a **staging directory** on disk and reads it back when it is needed. This lets a job continue when, for example, the sink writes more slowly than the kernels produce results. Moruna chooses the staging directory itself and limits it to part of the free disk space unless you set one.
+When the data waiting between steps does not fit in memory, Moruna moves it to a **staging directory** on disk and reads it back when it is needed. This lets a job continue when, for example, the sink writes more slowly than the functions produce results. Moruna chooses the staging directory itself and limits it to part of the free disk space unless you set one.
 
 ## Reports and resuming
 

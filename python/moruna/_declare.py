@@ -181,7 +181,7 @@ def polars_callable(fn: Any, kind: str) -> Any:
             result = result.collect()
         if not isinstance(result, pl.DataFrame):
             raise TypeError(
-                f"a Polars kernel returns a polars.DataFrame or LazyFrame, not "
+                f"a Polars function returns a polars.DataFrame or LazyFrame, not "
                 f"{type(result).__name__}"
             )
         if result.n_chunks() > 1:

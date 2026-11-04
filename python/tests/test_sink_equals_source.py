@@ -34,7 +34,7 @@ def test_py_t14_a_sibling_prefix_is_allowed(
     src_url, out_url, _ = dataset
     # The run itself completes, which is the proof that nothing refused it.
     report = moruna.run(moruna.ParquetSource(src_url), [], small_sink(out_url), **staging)
-    assert report.exit == "Completed"
+    assert report.exit["status"] == "completed"
 
     with pytest.raises(moruna.PlanError):
         moruna.run(moruna.ParquetSource(src_url), [], moruna.ParquetSink(src_url))

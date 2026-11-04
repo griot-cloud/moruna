@@ -16,7 +16,7 @@ import moruna
 def test_the_hierarchy_is_the_one_e2_names() -> None:
     for subclass in (
         moruna.PlanError,
-        moruna.KernelError,
+        moruna.FunctionError,
         moruna.BudgetError,
         moruna.IoError,
         moruna.ConfigError,
@@ -30,18 +30,18 @@ def test_the_hierarchy_is_the_one_e2_names() -> None:
 def test_a_kernel_that_raises_is_a_kernel_error(
     dataset: tuple[str, str, int], small_sink, staging
 ) -> None:  # noqa: ANN001
-    """h, failures: a kernel exception arrives as `KernelError` with the traceback attached."""
+    """h, failures: a kernel exception arrives as `FunctionError` with the traceback attached."""
     src_url, out_url, _ = dataset
 
-    @moruna.kernel
+    @moruna.function
     def explode(batch):  # noqa: ANN001, ANN202
         raise ValueError("the kernel said no")
 
-    with pytest.raises(moruna.KernelError) as caught:
+    with pytest.raises(moruna.FunctionError) as caught:
         moruna.run(moruna.ParquetSource(src_url), explode, small_sink(out_url), **staging)
 
     error = caught.value
-    assert error.kind == "Kernel"
+    assert error.kind == "Function"
     assert isinstance(error.diagnostic, dict)
     assert "the kernel said no" in error.diagnostic["traceback"]
     assert "ValueError" in error.diagnostic["traceback"]

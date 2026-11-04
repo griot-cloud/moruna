@@ -78,19 +78,13 @@ fn every_section() -> Job {
         s3: Some(S3Doc {
             endpoint: Some("unix:///s".into()),
             region: Some("r".into()),
-            access_key_id: Some("k".into()),
-            secret_access_key: Some("s".into()),
-            session_token: Some("t".into()),
             bucket: Some("b".into()),
         }),
         gcs: Some(moruna_job::GcsDoc {
-            service_account_path: Some("/sa".into()),
-            service_account_json: None,
             bucket: Some("g".into()),
         }),
         azure: Some(moruna_job::AzureDoc {
             account: Some("a".into()),
-            access_key: None,
             container: Some("c".into()),
         }),
         local_root: Some("/root".into()),

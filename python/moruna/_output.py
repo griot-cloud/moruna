@@ -1,4 +1,4 @@
-"""A Python kernel's output in a run, by stage (MH 4.3 ``log``).
+"""A Python function's output in a run, by stage (MH 4.3 ``log``).
 
 ``install`` replaces ``sys.stdout`` and ``sys.stderr`` with streams that hand what a worker
 thread writes to the stage the worker works for, and gives ``logging``'s root logger a handler
@@ -27,7 +27,7 @@ class _Records(logging.Handler):
 
 
 def install() -> None:
-    """Route this interpreter's kernel output by stage, once."""
+    """Route this interpreter's function output by stage, once."""
     if isinstance(sys.stdout, _core._OutputStream):
         return
     sys.stdout = _core._OutputStream(1, sys.stdout)

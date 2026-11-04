@@ -1,18 +1,18 @@
-# Kernels
+# Functions
 
-## `moruna.kernel`
+## `moruna.function`
 
 ```python
-moruna.kernel(
+moruna.function(
     fn=None, *, stateful=False, instances=1, device_memory=False,
     accepts="table", tier="host", releases_gil=None,
     expected_amplification=None, preferred_rows=None, resume="reinit",
     state_bytes=None, input_schema=None, output_schema=None,
     lockfile=None, memory_guard=True,
-) -> moruna.KernelSpec | decorator
+) -> moruna.Function | decorator
 ```
 
-Use `@moruna.kernel`, `@moruna.kernel(...)`, or `moruna.kernel(obj, ...)`. When `fn` is omitted, the call returns a decorator; otherwise it returns a `KernelSpec`. A stateless function receives and returns a `pyarrow.RecordBatch`. An annotated Polars `DataFrame` or `LazyFrame` function is converted through Polars.
+Use `@moruna.function`, `@moruna.function(...)`, or `moruna.function(obj, ...)`. When `fn` is omitted, the call returns a decorator; otherwise it returns a `moruna.Function`, which a job takes as a task. A stateless function receives and returns a `pyarrow.RecordBatch`. An annotated Polars `DataFrame` or `LazyFrame` function is converted through Polars.
 
 | Parameter | Type and default | Meaning |
 | --- | --- | --- |
@@ -32,33 +32,34 @@ Use `@moruna.kernel`, `@moruna.kernel(...)`, or `moruna.kernel(obj, ...)`. When 
 | `lockfile` | path or bytes, optional | Contents are included in the fingerprint; paths are read at decoration time. |
 | `memory_guard` | `bool = True` | Refuse an allocation that crosses the process memory ceiling. |
 
-Schema mappings accept Arrow types, their string spellings, Python `int`, `float`, `str`, `bool`, and supported Polars types. A stateful object supplies `setup(self, ctx) -> state` and `__call__(self, state, batch) -> batch`; `ctx` has `instance` and `device`. It may supply `footprint(self, state)`, and `finish(self, state) -> batch | None`, which is called once per instance when the kernel's input has ended, after its last `__call__`. A batch `finish` returns goes downstream like any other; `None` gives nothing; an exception ends the run with a `KernelError` naming the kernel. A kernel that must see the whole run before giving its result (one that collects every batch) gives it from `finish` and takes `instances=1`: with more instances, each instance's `finish` gives what that instance saw. On resume, a `resume="reinit"` kernel's `finish` sees only the batches after the checkpoint, so a whole-run kernel that must survive a resume uses `resume="checkpoint"`. With `resume="checkpoint"`, it must also implement `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Invalid declarations or options raise `TypeError` or `ValueError` at decoration time.
+Schema mappings accept Arrow types, their string spellings, Python `int`, `float`, `str`, `bool`, and supported Polars types. A stateful object supplies `setup(self, ctx) -> state` and `__call__(self, state, batch) -> batch`; `ctx` has `instance` and `device`. It may supply `footprint(self, state)`, and `finish(self, state) -> batch | None`, which is called once per instance when the function's input has ended, after its last `__call__`. A batch `finish` returns goes downstream like any other; `None` gives nothing; an exception ends the run with a `FunctionError` naming the function. A function that must see the whole run before giving its result (one that collects every batch) gives it from `finish` and takes `instances=1`: with more instances, each instance's `finish` gives what that instance saw. On resume, a `resume="reinit"` function's `finish` sees only the batches after the checkpoint, so a whole-run function that must survive a resume uses `resume="checkpoint"`. With `resume="checkpoint"`, it must also implement `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Invalid declarations or options raise `TypeError` or `ValueError` at decoration time.
 
-## `moruna.KernelSpec`
+## A decorated `moruna.Function`
 
-The frozen object returned by `moruna.kernel` has no public constructor.
+What `moruna.function` returns is a `moruna.Function` (see [Tasks](python-run.md#tasks) for a function written as a class) with no public constructor.
 
 | Member | Type | Meaning |
 | --- | --- | --- |
 | `__call__(*args, **kwargs)` | delegated call | Calls the wrapped Python object and returns its result. |
 | `wrapped` | object | Original callable. |
-| `stateful` | `bool` | Whether this kernel keeps state. |
+| `stateful` | `bool` | Whether this function keeps state. |
 | `memory_guard` | `bool` | Whether allocation refusal is on. |
 | `fingerprint` | `str` | 64-character lowercase hexadecimal fingerprint. |
+| `build(...)` | method | Packages the function as an OCI image; see below. |
 
 ## `moruna.polars`
 
 ```python
-moruna.polars(fn, *, accepts="table", **declarations) -> moruna.KernelSpec
+moruna.polars(fn, *, accepts="table", **declarations) -> moruna.Function
 ```
 
-Wraps an unannotated Polars function taking and returning a `DataFrame` or `LazyFrame`. `accepts` has the same choices as `moruna.kernel`. Supported declaration names are `input_schema`, `output_schema`, and `lockfile`, with the same meanings above. Returns a stateless `KernelSpec`.
+Wraps an unannotated Polars function taking and returning a `DataFrame` or `LazyFrame`. `accepts` has the same choices as `moruna.function`. Supported declaration names are `input_schema`, `output_schema`, and `lockfile`, with the same meanings above. Returns a stateless `moruna.Function`.
 
-## `moruna.build`
+## `Function.build`
 
 ```python
-moruna.build(fn, *, out="moruna-image", tag=None, platform=None, lock=None, files=(),
-             index_url=None, find_links=(), no_index=False) -> Built
+function.build(*, out="moruna-image", tag=None, platform=None, lock=None, files=(),
+               index_url=None, find_links=(), no_index=False) -> Built
 ```
 
-Builds the kernel `fn`, bound to a name at the top level of its module, as an OCI image the `image` kind runs. It is `moruna build MODULE:FUNCTION` from Python: see [Command line](cli.md). `out` is the OCI layout directory, `tag` the image's name in it (default `<function>:latest`), `platform` `linux/aarch64` or `linux/x86_64`, `lock` a `uv.lock` or `requirements.lock` (default: the nearest above the module), and `files` the files the function reads. The returned object has `digest` (the image's), `reference`, `layout`, `lock`, and `layers`, each with `role`, `blob.digest` and `blob.size`. A refused build raises `moruna.ConfigError` naming the cause.
+Builds the function, bound to a name at the top level of its module, as an OCI image the `image` kind runs. It is `moruna build MODULE:FUNCTION` from Python: see [Command line](cli.md). `out` is the OCI layout directory, `tag` the image's name in it (default `<function>:latest`), `platform` `linux/aarch64` or `linux/x86_64`, `lock` a `uv.lock` or `requirements.lock` (default: the nearest above the module), and `files` the files the function reads. The returned object has `digest` (the image's), `reference`, `layout`, `lock`, and `layers`, each with `role`, `blob.digest` and `blob.size`. A refused build raises `moruna.ConfigError` naming the cause.

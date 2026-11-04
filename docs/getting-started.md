@@ -11,14 +11,14 @@ Start with Concepts if these ideas are new to you, or follow the Quickstart to s
 :link: concepts
 :link-type: doc
 
-Understand jobs, kernels, budgets and morsels, and what Moruna decides for you.
+Understand jobs, functions, budgets and morsels, and what Moruna decides for you.
 :::
 
 :::{grid-item-card} Quickstart
 :link: quickstart
 :link-type: doc
 
-Install Moruna, write a kernel and run it over a Parquet dataset inside a memory budget.
+Install Moruna, write a function and run it over a Parquet dataset inside a memory budget.
 :::
 ::::
 

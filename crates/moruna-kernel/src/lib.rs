@@ -87,7 +87,7 @@ pub use ports::{
     RunPorts, StagePorts, StageWaits,
 };
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
-pub use sink::{ExcludedRows, Sink, SinkSummary, SinkWrite};
+pub use sink::{ExcludedRows, Sink, SinkCommit, SinkSummary, SinkWrite};
 pub use source::{RowRange, Source, SourceRead, Split};
 pub use stages::{StageCounters, StageEvent, StageHook};
 pub use tensor::{DeleterHook, Dlpack, ManagedTensor};

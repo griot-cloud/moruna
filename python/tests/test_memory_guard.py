@@ -34,7 +34,7 @@ src, out = d / "in", d / "out"
 pq.write_table(pa.table({"id": pa.array(range(20_000), pa.int64())}), src / "part-0.parquet",
                row_group_size=5_000)
 
-@moruna.kernel(memory_guard=guard)
+@moruna.function(memory_guard=guard)
 def greedy(batch):
     # Twice the budget in one request, never touched: the guard refuses it, nothing else would.
     np.empty(1024 * 1024 * 1024, dtype=np.uint8)
@@ -44,7 +44,7 @@ result = {}
 try:
     report = moruna.run(moruna.ParquetSource(f"file://{src}/part-0.parquet"), [greedy],
                         moruna.ParquetSink(f"file://{out}"), budget="512MiB", on_error=policy)
-    result = {"exit": str(report.exit), "report": json.loads(report.to_json())}
+    result = {"exit": report.exit["status"], "report": json.loads(report.to_json())}
 except moruna.BudgetError as err:
     result = {"exit": "Budget", "kind": err.kind, "message": str(err),
               "diagnostic": {k: v for k, v in err.diagnostic.items() if k != "features"}}
@@ -84,7 +84,7 @@ def test_py_t20_refusal_end_to_end(scratch: pathlib.Path) -> None:
     assert "kernel __main__.greedy" in result["message"], result["message"]
     assert "requested 1073741824 bytes" in result["message"], result["message"]
     diagnostic = result["diagnostic"]
-    assert diagnostic["kernel"] == "__main__.greedy"
+    assert diagnostic["function"] == "__main__.greedy"
     assert diagnostic["requested"] == 1024**3
     assert diagnostic["in_use"] + diagnostic["requested"] > diagnostic["ceiling"]
     alloc = _alloc(result)
@@ -96,7 +96,7 @@ def test_py_t20_refusal_end_to_end(scratch: pathlib.Path) -> None:
 def test_py_t20_switch_off_is_not_refused_and_still_counted(scratch: pathlib.Path) -> None:
     (scratch / "off").mkdir()
     _, result = _run(scratch / "off", guard=False)
-    assert result["exit"] == "Completed", result
+    assert result["exit"] == "completed", result
     alloc = _alloc(result)
     assert alloc["refusal_on"] is False
     assert alloc["numpy"]["requested_bytes"] >= 1024**3
@@ -106,7 +106,7 @@ def test_py_t20_switch_off_is_not_refused_and_still_counted(scratch: pathlib.Pat
 def test_py_t20_refusal_skipped_under_skip(scratch: pathlib.Path) -> None:
     (scratch / "skip").mkdir()
     _, result = _run(scratch / "skip", guard=True, policy="skip")
-    assert result["exit"] == "Completed", result
+    assert result["exit"] == "completed", result
     stage = result["report"]["stages"][0]
     assert stage["skipped"] >= 1
     assert stage["alloc"]["numpy"]["refused"] == stage["skipped"] + stage["errors"]
@@ -118,12 +118,12 @@ def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
 
     src, out, rows = dataset
 
-    @moruna.kernel
+    @moruna.function
     def mixed(batch):
         np.ones(1024 * 1024, dtype=np.uint8)
         return batch.append_column("twice", pa.array([v * 2 for v in batch.column("id").to_pylist()]))
 
-    @moruna.kernel(memory_guard=False)
+    @moruna.function(memory_guard=False)
     def mixed_off(batch):
         return mixed.wrapped(batch)
 
@@ -157,13 +157,13 @@ def test_py_t21_memory_guard_is_not_in_the_fingerprint_and_check_reports_it() ->
         np.ones(1024 * 1024, dtype=np.uint8)
         return batch
 
-    on = moruna.kernel(input_schema={"n": pa.int64()}, output_schema={"n": pa.int64()})(body)
-    off = moruna.kernel(
+    on = moruna.function(input_schema={"n": pa.int64()}, output_schema={"n": pa.int64()})(body)
+    off = moruna.function(
         input_schema={"n": pa.int64()}, output_schema={"n": pa.int64()}, memory_guard=False
     )(body)
     assert on.fingerprint == off.fingerprint
     for kernel, guarded in ((on, True), (off, False)):
-        report = json.loads(moruna._core.check_kernel(kernel))
+        report = json.loads(moruna._core.check_kernel(kernel._handle))
         assert report["memory_guard"] is guarded
         alloc = report["alloc"]
         assert alloc["refusal_on"] is False, "a check binds no gate, so nothing is refused"

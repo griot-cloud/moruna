@@ -62,7 +62,7 @@ def write_through_the_sink(
         budget=budget(),
         ordered=ordered,
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     return out
 
 
@@ -123,7 +123,7 @@ def run_to_parquet(source: moruna.ArrowIpcSource, out: pathlib.Path) -> pa.Table
         budget=budget(),
         ordered=True,
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     return pq.read_table(str(out)).sort_by("id")
 
 

@@ -37,13 +37,13 @@ In a job document, the same settings are `"staging": {"dir": "staging"}` and `"r
 
 ## What must stay the same
 
-A checkpoint belongs to one job: the same source, kernels, sink and options. With `resume="auto"`, Moruna ignores checkpoints that belong to a different job and starts from the beginning. If you name a checkpoint that belongs to a different job, it refuses with a `ResumeError` that says what differs, for example `kernel fingerprints differ`.
+A checkpoint belongs to one job: the same source, functions, sink and options. With `resume="auto"`, Moruna ignores checkpoints that belong to a different job and starts from the beginning. If you name a checkpoint that belongs to a different job, it refuses with a `ResumeError` that says what differs, for example `function fingerprints differ`.
 
-Moruna identifies a kernel by its code. A kernel whose behaviour depends on something outside its code, such as a file it reads or a command-line argument, looks unchanged to Moruna when that input changes, so start such a job again without `resume` after changing its inputs.
+Moruna identifies a function by its code. A function whose behaviour depends on something outside its code, such as a file it reads or a command-line argument, looks unchanged to Moruna when that input changes, so start such a job again without `resume` after changing its inputs.
 
-## Kernels with state
+## Functions with state
 
-A stateful kernel builds its state again with `setup` when a job resumes, which suits a kernel whose state is a loaded model. A kernel whose state depends on the rows it has seen, such as a running count, would lose that state. Such a kernel should declare `resume="checkpoint"` and implement `checkpoint` and `restore`; Moruna then saves its state with every checkpoint and restores it on resume. See [Kernels that keep state](kernels.md#kernels-that-keep-state).
+A stateful function builds its state again with `setup` when a job resumes, which suits a function whose state is a loaded model. A function whose state depends on the rows it has seen, such as a running count, would lose that state. Such a function should declare `resume="checkpoint"` and implement `checkpoint` and `restore`; Moruna then saves its state with every checkpoint and restores it on resume. See [Functions that keep state](kernels.md#functions-that-keep-state).
 
 ## Resuming on another machine
 

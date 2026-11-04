@@ -4,9 +4,28 @@
 
 use serde_json::Value;
 
-/// `value` as a FlexBuffers buffer.
+/// `value` as a FlexBuffers buffer: the same bytes for the same value whatever order its maps
+/// were built in, every map's keys written in sorted order, so a document read and written again
+/// is the same bytes.
 pub(crate) fn encode(value: &Value) -> Result<Vec<u8>, String> {
-    flexbuffers::to_vec(value).map_err(|e| format!("not encodable as FlexBuffers: {e}"))
+    flexbuffers::to_vec(sorted(value)).map_err(|e| format!("not encodable as FlexBuffers: {e}"))
+}
+
+/// `value` with every map's keys in sorted order.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), sorted(&map[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
 }
 
 /// The deepest a value read from FlexBuffers may nest.
@@ -289,6 +308,19 @@ fn kind_of(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A map built in any order encodes to the same bytes.
+    #[test]
+    fn map_order_does_not_change_the_bytes() {
+        let a: Value =
+            serde_json::from_str(r#"{"url": "x", "options": {"b": 1, "a": [{"z": 1, "y": 2}]}}"#)
+                .expect("json");
+        let b: Value =
+            serde_json::from_str(r#"{"options": {"a": [{"y": 2, "z": 1}], "b": 1}, "url": "x"}"#)
+                .expect("json");
+        assert_eq!(encode(&a).expect("a"), encode(&b).expect("b"));
+        assert_eq!(decode(&encode(&a).expect("a")).expect("back"), a);
+    }
     use serde_json::json;
 
     #[test]

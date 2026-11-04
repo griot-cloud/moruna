@@ -1,4 +1,4 @@
-"""``moruna build``: a Python kernel as an OCI image of four layers (SDD 30).
+"""``moruna build``: a Python function as an OCI image of four layers (SDD 30).
 
 The image is what the ``image`` kind runs on a Linux node (SDD 19) and the Moruna kernel runs
 too (SDD 27, 28)::
@@ -6,7 +6,7 @@ too (SDD 27, 28)::
     1. runtime       python:3.14-slim's own layers, by digest, copied and never rebuilt
     2. dependencies  the project's locked dependencies, installed for the image's platform
     3. shim          ``_shim.py``, the stand-in ``moruna`` module and ``_declare.py``
-    4. function      the file that defines the kernel, and the files it names
+    4. function      the file that defines the function, and the files it names
 
 Layers 2 to 4 are uncompressed tars written the same way every time (sorted entries, time 0,
 owner 0:0, modes 0644 and 0755), so a layer's digest, the sha256 of its tar, depends only on what
@@ -836,7 +836,7 @@ def stage_shim(dest: Path) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class Function:
-    """What a build needs to know of a kernel: where it is imported from and what it names."""
+    """What a build needs to know of a function: where it is imported from and what it names."""
 
     module: str  # dotted, as the shim imports it
     name: str  # the attribute of the module
@@ -1129,11 +1129,11 @@ def _runtime_layer(runtime: Runtime, descriptor: dict[str, Any], position: int) 
 
 
 # ---------------------------------------------------------------------------------------------
-# The kernel a build is asked for
+# The function a build is asked for
 
 
 def function_of(target: Any, name: str | None = None) -> Function:
-    """The ``Function`` of a decorated kernel, or of a plain function or class instance, found in
+    """The ``Function`` of a decorated function, or of a plain function or class instance, found in
     the module that defines it (the build imports it by that name, as the shim will)."""
     inner = getattr(target, "wrapped", target)
     while hasattr(inner, "__wrapped__"):
@@ -1142,13 +1142,13 @@ def function_of(target: Any, name: str | None = None) -> Function:
     module = sys.modules.get(module_name)
     if module is None or getattr(module, "__file__", None) is None:
         raise Refused(
-            f"{module_name}: the module that defines the kernel is not a file that can be imported"
+            f"{module_name}: the module that defines the function is not a file that can be imported"
         )
     if name is None:
         names = [n for n, v in vars(module).items() if v is target]
         if not names:
             raise Refused(
-                f"{module_name} does not bind the kernel to a name the image could import; "
+                f"{module_name} does not bind the function to a name the image could import; "
                 "assign it at the top level of the module"
             )
         name = names[0]
@@ -1185,7 +1185,7 @@ def build(  # noqa: PLR0913, the keywords are the command's options
     no_index: bool = False,
     version: str | None = None,
 ) -> Built:
-    """Build the kernel ``target`` (a decorated function, a function or a stateful instance
+    """Build the function ``target`` (a decorated function, a function or a stateful instance
     bound to a name of the module that defines it; ``name`` says which when the module binds it
     twice) as an image: see ``build_image``. The keywords are ``moruna build``'s options."""
     function = dataclasses.replace(
@@ -1222,11 +1222,11 @@ def build(  # noqa: PLR0913, the keywords are the command's options
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="moruna build",
-        description="Build a Python kernel as an OCI image of four layers (runtime, locked "
+        description="Build a Python function as an OCI image of four layers (runtime, locked "
         "dependencies, shim, function) that the image kind runs.",
     )
     add = parser.add_argument
-    add("kernel", help="<module>:<function>; the module is a dotted name or a .py path")
+    add("function", help="<module>:<function>; the module is a dotted name or a .py path")
     add("--out", default="moruna-image", help="the OCI layout directory (default: moruna-image)")
     add("--tag", help="the image's name in the layout (default: <function>:latest)")
     add("--platform", help="linux/aarch64 or linux/x86_64 (default: this Linux's, or aarch64)")
@@ -1245,10 +1245,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """``moruna build <module>:<function>``: the exit status, 2 for a refusal."""
     args = _parser().parse_args(argv)
-    module_name, _, name = args.kernel.partition(":")
+    module_name, _, name = args.function.partition(":")
     if not module_name or not name:
         print(
-            f"moruna build: {args.kernel}: name the kernel as <module>:<function>", file=sys.stderr
+            f"moruna build: {args.function}: name the function as <module>:<function>", file=sys.stderr
         )
         return EXIT_REFUSED
     from moruna import _check, _core  # noqa: PLC0415, only the engine's package loads a module

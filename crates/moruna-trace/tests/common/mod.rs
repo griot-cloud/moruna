@@ -125,6 +125,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         end_ns: 11_000_000_000,
         resumed: false,
         manifest: None,
+        sinks: Vec::new(),
         notes: vec!["discovery: cgroup v2 ceiling".to_string()],
         gil: vec![(2, GilState::FreeThreaded)],
         io_paths: IoPaths {

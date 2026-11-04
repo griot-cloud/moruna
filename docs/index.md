@@ -20,7 +20,7 @@ content_max_width: 68rem
 <h2 class="home-section-title">Documentation</h2>
 <nav class="home-cards" aria-label="Documentation sections">
   <a class="home-card" href="getting-started.html"><span class="card-number">01</span><h3>Getting started</h3><p>Learn the concepts, then run your first job.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
-  <a class="home-card" href="using.html"><span class="card-number">02</span><h3>Using Moruna</h3><p>Write kernels, run jobs from Python or the command line, and choose where they run.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
+  <a class="home-card" href="using.html"><span class="card-number">02</span><h3>Using Moruna</h3><p>Write functions, run jobs from Python or the command line, and choose where they run.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
   <a class="home-card" href="execution.html"><span class="card-number">03</span><h3>How it works</h3><p>Understand how Moruna sizes work, keeps memory under the limit and resumes.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
   <a class="home-card" href="reference.html"><span class="card-number">04</span><h3>Reference</h3><p>Look up functions, the job document, commands and the run report.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
 </nav>

@@ -74,7 +74,7 @@ def test_a_tensor_job_runs_end_to_end_and_the_kernel_sees_a_dlpack_tensor(
     src, array = vectors
     seen: dict[str, object] = {}
 
-    @moruna.kernel(accepts="tensor")
+    @moruna.function(accepts="tensor")
     def normalise(t):  # noqa: ANN001, ANN202
         # What a tensor kernel receives: an object that speaks DLPack, so NumPy (or torch)
         # takes it without a copy. What it returns is anything that speaks DLPack back.
@@ -93,7 +93,7 @@ def test_a_tensor_job_runs_end_to_end_and_the_kernel_sees_a_dlpack_tensor(
         ordered=True,
     )
 
-    assert report.exit == "Completed", report
+    assert report.exit["status"] == "completed", report
     assert report.stages[0]["rows_out"] == ROWS, report.stages
     assert seen == {"dlpack": True, "dtype": "float32", "ndim": 2}, seen
 
@@ -114,7 +114,7 @@ def test_a_tensor_source_names_files_not_directories(
     with pytest.raises(moruna.MorunaError) as failure:
         moruna.run(
             moruna.TensorSource(str(scratch), tensors=["vectors"]),
-            [moruna.kernel(lambda t: t, accepts="tensor")],
+            [moruna.function(lambda t: t, accepts="tensor")],
             moruna.TensorSink(str(scratch / "out-dir"), format="safetensors"),
             budget=budget(),
         )

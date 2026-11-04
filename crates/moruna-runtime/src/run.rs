@@ -1095,6 +1095,10 @@ fn drive(
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
         },
         read: source_read,
+        sinks: match &outcome {
+            RunOutcome::Completed { sinks } => sinks.clone(),
+            RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => Vec::new(),
+        },
         policy,
         buffers: engine.as_ref().map(|engine| {
             moruna_trace::BufferReport::of(engine.eviction_order(), &engine.catalog_stats())

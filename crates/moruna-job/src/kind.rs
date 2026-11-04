@@ -8,7 +8,7 @@ use crate::port::PortDoc;
 use crate::rules::{RulesFault, SchemaRules};
 
 /// The format version of `moruna kinds` (the [`Listing`]).
-pub const LISTING_VERSION: u32 = 1;
+pub const LISTING_VERSION: u32 = 2;
 
 /// The JSON Schema dialect every settings schema is written in (decision KD1).
 pub const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -19,7 +19,8 @@ pub const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 pub enum Role {
     /// The input ([`SourceKind`]).
     Source,
-    /// A stage between them ([`RunnableKind`]).
+    /// A stage between them ([`RunnableKind`]): a function. The Rust name is the runtime's.
+    #[serde(rename = "function")]
     Kernel,
     /// The output ([`SinkKind`]).
     Sink,
@@ -30,13 +31,13 @@ impl Role {
     pub fn as_str(&self) -> &'static str {
         match self {
             Role::Source => "source",
-            Role::Kernel => "kernel",
+            Role::Kernel => "function",
             Role::Sink => "sink",
         }
     }
 
     /// What a kind of this role does, for the sentence naming the kinds of a role: a source
-    /// "reads", a kernel "runs", a sink "writes".
+    /// "reads", a function "runs", a sink "writes".
     pub fn verb(&self) -> &'static str {
         match self {
             Role::Source => "reads",
@@ -269,7 +270,7 @@ impl Declaration {
         if !flows_fit {
             return Err(format!(
                 "`{}` takes {} and gives {}, which a {} does not: a source gives batches, a \
-                 kernel takes and gives batches, a sink takes batches",
+                 function takes and gives batches, a sink takes batches",
                 self.name,
                 self.inputs.as_str(),
                 self.outputs.as_str(),
@@ -443,7 +444,8 @@ pub struct Listing {
     pub moruna: String,
     /// The source kinds.
     pub sources: Vec<Declaration>,
-    /// The runnable kinds.
+    /// The runnable kinds: the functions.
+    #[serde(rename = "functions")]
     pub kernels: Vec<Declaration>,
     /// The sink kinds.
     pub sinks: Vec<Declaration>,

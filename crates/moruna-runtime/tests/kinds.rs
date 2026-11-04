@@ -197,7 +197,7 @@ fn kd_t5_add_a_kind() {
     assert!(
         refused
             .to_string()
-            .contains("kernels[0].kind: no kernel kind `test.scale` is registered"),
+            .contains("kernels[0].kind: no function kind `test.scale` is registered"),
         "{refused}"
     );
 

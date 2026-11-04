@@ -5,11 +5,13 @@ The `moruna` command is installed with the Python package. Run `moruna --help` f
 ## moruna run
 
 ```text
-moruna run JOB.json [--plan PLAN.mplan] [--strict]
-moruna run --vm JOB.json --image IMAGE [--disk PATH[:ro|:rw]]...
+moruna run JOB [--plan PLAN.mplan] [--strict] [--resolver MODULE:ATTRIBUTE]
+moruna run --vm JOB --image IMAGE [--disk PATH[:ro|:rw]]...
 ```
 
-Runs the job described in `JOB.json` and exits when it ends, printing one line with the exit code and the report's location.
+Runs the job described in `JOB`, a job document (version 2 FlatBuffers, such as a `moruna.Job`'s spec, or version 1 JSON), and exits when it ends, printing one line with the exit code and the report's location.
+
+- `--resolver MODULE:ATTRIBUTE` names the `moruna.Resolver` (or a callable that returns one) that supplies what the job's `python` tasks need. Each `python` task is imported by its `ref`, constructed with its `params` and checked against its `fingerprint`; a need the resolver cannot supply, or any need without `--resolver`, refuses the document (exit 2), naming the task and the need. `moruna serve` takes `--resolver` too.
 
 - `--plan` runs the job by a plan `moruna explain --out` wrote, instead of the plan Moruna makes for it. A plan of another job, or one that is not a plan of this job, is refused before anything runs.
 - `--strict` refuses a document that would take any setting from an environment variable, naming the setting.
@@ -18,15 +20,15 @@ Runs the job described in `JOB.json` and exits when it ends, printing one line w
 ## moruna explain
 
 ```text
-moruna explain JOB.json [--planner NAME] [--out PLAN.mplan]
+moruna explain JOB [--planner NAME] [--out PLAN.mplan]
 ```
 
-Prints the plan Moruna would run the job by, as JSON, without running it: its steps in the order they start, each with the tasks it runs, the steps it waits for, its group (the steps that may run beside it), the resources it is given and its estimated cost, then the job's totals. The same job planned twice has the same step ids, and the events of its run name them, so a screen can show the plan and mark each step as it starts and ends. `--planner` chooses the planner (`levels` by default); `--out` also writes the plan for `moruna run --plan`. Exits 2 when the document is refused or the planner is unknown.
+Prints the plan Moruna would run the job by, as JSON, without running it: its steps in the order they start, each with the tasks it runs, the steps it waits for, its group (the steps that may run beside it), the resources it is given and its estimated cost, then the job's totals. The same job planned twice has the same step ids, and the events of its run name them, so a screen can show the plan and mark each step as it starts and ends. `--planner` chooses the planner (`levels` by default); `--out` also writes the plan for `moruna run --plan`. Exits 2 when the document is refused or the planner is unknown. It plans with the same function as `moruna.Job.read(JOB).explain()`.
 
 ## moruna serve
 
 ```text
-moruna serve --listen ADDRESS [--no-strict]
+moruna serve --listen ADDRESS [--no-strict] [--resolver MODULE:ATTRIBUTE]
 ```
 
 Waits on `ADDRESS`, a `unix:///path` or `vsock://CID:PORT` address, for one job document, runs it while reporting on the same connection, and exits. Serve is strict by default; `--no-strict` allows settings from environment variables.
@@ -34,13 +36,13 @@ Waits on `ADDRESS`, a `unix:///path` or `vsock://CID:PORT` address, for one job 
 ## moruna check
 
 ```text
-moruna check TARGET [--kernel NAME] [--json] [--seed N] [--store DIR] [--budget SECONDS]
+moruna check TARGET [--function NAME] [--json] [--seed N] [--store DIR] [--budget SECONDS]
                     [--statistics FILE] [--cost-model NAME] [--no-warm-up]
 ```
 
-Checks every kernel in `TARGET`, a module name, a path to a `.py` file or a package, against its declared schemas, using generated batches. Each kernel that agrees is then warmed up: run on generated data at 1,000 to 1,000,000 rows, at 1, 2 and 4 workers, and, for a stateful kernel, at increasing numbers of distinct keys. Every measurement is kept in an observation store and the cost model is fitted from it, so the report gives what the kernel costs per 10,000 rows and what the warm-up itself used.
+Checks every function in `TARGET`, a module name, a path to a `.py` file or a package, against its declared schemas, using generated batches. Each function that agrees is then warmed up: run on generated data at 1,000 to 1,000,000 rows, at 1, 2 and 4 workers, and, for a stateful function, at increasing numbers of distinct keys. Every measurement is kept in an observation store and the cost model is fitted from it, so the report gives what the function costs per 10,000 rows and what the warm-up itself used.
 
-- `--kernel NAME` checks only the named kernel.
+- `--function NAME` checks only the named function.
 - `--json` prints the report as JSON.
 - `--seed N` changes the seed used to generate batches; the default is 0, so repeated checks use the same batches.
 - `--store DIR` is where measurements are kept; the default is `~/.moruna/observations`.
@@ -56,7 +58,7 @@ moruna build MODULE:FUNCTION [--out DIR] [--tag NAME] [--platform linux/aarch64|
              [--lock PATH] [--file PATH]... [--json]
 ```
 
-Builds a Python kernel as an OCI image the `image` kind runs. `MODULE` is a module name or a path to a `.py` file, and `FUNCTION` is the kernel in it. The image is written to the OCI layout directory `--out` (default `moruna-image`) under `--tag` (default `FUNCTION:latest`) and has four layers: the Python 3.14 runtime, the dependencies the project's lock pins, Moruna's shim, and the function. Layers 2 to 4 carry compiled bytecode, so a start compiles nothing; the build needs a standard (not free threaded) CPython 3.14 on the path to write it, and installs only wheels. The command prints the image's digest and each layer's digest and size.
+Builds a Python function as an OCI image the `image` kind runs, as `function.build()` does from Python. `MODULE` is a module name or a path to a `.py` file, and `FUNCTION` is the function in it. The image is written to the OCI layout directory `--out` (default `moruna-image`) under `--tag` (default `FUNCTION:latest`) and has four layers: the Python 3.14 runtime, the dependencies the project's lock pins, Moruna's shim, and the function. Layers 2 to 4 carry compiled bytecode, so a start compiles nothing; the build needs a standard (not free threaded) CPython 3.14 on the path to write it, and installs only wheels. The command prints the image's digest and each layer's digest and size.
 
 - A lock is required: a `uv.lock` or a `requirements.lock` with a hash on every pin, found next to the module or above it, or `--lock PATH`. Nothing is resolved without one.
 - `--platform` defaults to this machine's on Linux and to `linux/aarch64` on a Mac.
@@ -71,11 +73,11 @@ The same function built twice is the same image, and functions with one lock sha
 
 | Code | `moruna run` and `moruna serve` | `moruna check` |
 | --- | --- | --- |
-| 0 | The job completed. | Every kernel agrees with its declaration and was warmed up. |
+| 0 | The job completed. | Every function agrees with its declaration and was warmed up. |
 | 1 | The job failed reading or writing data. | |
-| 2 | The document was refused; the message names the field. | A kernel was refused, or its warm-up could not run. |
+| 2 | The document was refused; the message names the field. | A function was refused, or its warm-up could not run. |
 | 3 | The budget cannot hold the job. | |
-| 4 | A kernel failed and the error policy stopped the job. | |
+| 4 | A function failed and the error policy stopped the job. | |
 | 5 | Resuming was refused. | |
 | 130 | The job was cancelled. | |
 

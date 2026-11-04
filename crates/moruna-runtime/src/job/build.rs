@@ -81,6 +81,9 @@ pub struct Built {
     pub env_resolved: Vec<(&'static str, &'static str)>,
     /// Which task each source, stage and sink is.
     pub parts: Parts,
+    /// Where each sink writes, sink 0 first, as its kind names the target from its settings
+    /// (empty for a sink that names none).
+    pub sink_targets: Vec<String>,
 }
 
 /// The fields of `job` left `null` that an environment variable would fill (MH 4.1).
@@ -249,6 +252,7 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         .filter(|&i| job.tasks[i].role == Role::Sink)
         .collect();
     let mut sinks = Vec::with_capacity(sink_tasks.len());
+    let mut sink_targets = Vec::with_capacity(sink_tasks.len());
     for (ordinal, &i) in sink_tasks.iter().enumerate() {
         let (_, kind) = kinds.sink(&job.field(i), &job.tasks[i].kind)?;
         let built = kind.sink(
@@ -256,6 +260,7 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
             &mut cx,
         )?;
         translate::check_sink_not_source(&built.target, &targets)?;
+        sink_targets.push(built.target.clone());
         sinks.push(built);
     }
     // A kind that keeps files beside the output (an image's unpacked layers, 19 d.2) defaults
@@ -491,6 +496,7 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         discovery,
         env_resolved,
         parts,
+        sink_targets,
     })
 }
 
@@ -675,25 +681,25 @@ fn host_profile_of(job: &Job) -> Result<Option<HostProfile>> {
     }))
 }
 
+/// The object store a document names: endpoints and names, and no credential. The runner
+/// supplies credentials on the `RunSpec` it builds (`moruna.run(..., storage=...)`), or the
+/// store's client reads them where it runs (its environment, its instance's identity).
 fn object_store_of(doc: &ObjectStoreDoc) -> ObjectStoreConfig {
     ObjectStoreConfig {
         s3: doc.s3.as_ref().map(|s| S3Config {
             endpoint: s.endpoint.clone(),
             region: s.region.clone(),
-            access_key_id: s.access_key_id.clone(),
-            secret_access_key: s.secret_access_key.clone(),
-            session_token: s.session_token.clone(),
             bucket: s.bucket.clone(),
+            ..S3Config::default()
         }),
         gcs: doc.gcs.as_ref().map(|g| GcsConfig {
-            service_account_path: g.service_account_path.as_deref().map(PathBuf::from),
-            service_account_json: g.service_account_json.clone(),
             bucket: g.bucket.clone(),
+            ..GcsConfig::default()
         }),
         azure: doc.azure.as_ref().map(|a| AzureConfig {
             account: a.account.clone(),
-            access_key: a.access_key.clone(),
             container: a.container.clone(),
+            ..AzureConfig::default()
         }),
         local_root: doc.local_root.as_deref().map(PathBuf::from),
         allow_http: doc.allow_http,

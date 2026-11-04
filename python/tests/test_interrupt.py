@@ -28,7 +28,7 @@ pq.write_table(pa.table({"id": pa.array(range(200_000), pa.int64())}),
 
 main_thread = threading.main_thread().ident
 
-@moruna.kernel
+@moruna.function
 def slow(batch):
     time.sleep(1.0)
     return batch
@@ -52,7 +52,7 @@ except moruna.Cancelled as e:
                 "seconds": time.monotonic() - started,
                 "kind": e.kind,
                 "has_report": e.report is not None,
-                "exit": e.report.exit if e.report is not None else None,
+                "exit": e.report.exit["status"] if e.report is not None else None,
                 "signal_thread": threading.current_thread().ident,
             }
             print(json.dumps(_payload), flush=True)
@@ -97,7 +97,7 @@ def test_py_t6_keyboard_interrupt(scratch: pathlib.Path) -> None:
     assert result["cancelled"] is True, f"{result} stderr={err!r}"
     assert result["kind"] == "Cancelled"
     assert result["has_report"] is True, "the partial report is attached (PY-I6)"
-    assert result["exit"] == "Cancelled"
+    assert result["exit"] == "cancelled"
     # Within two seconds of the longest kernel, which is one second here; the four seconds are
     # the wait before the signal was sent.
     assert result["seconds"] - 4.0 < 3.0, result

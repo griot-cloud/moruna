@@ -1,7 +1,7 @@
-"""BD-T28 (SDD 30 k): ``moruna.build`` and ``moruna build`` over the engine's own objects.
+"""BD-T28 (SDD 30 k): ``Function.build()`` and ``moruna build`` over the engine's own objects.
 
 The builder's tests (``test_build.py``) run without the engine; this is what needs it: a real
-``KernelSpec`` is read as a kernel, and the package's two doors refuse a project with no lock the
+``moruna.Function`` is read as a function, and the package's two doors refuse a project with no lock the
 same way, before anything is fetched. It needs a built ``moruna`` and no network.
 """
 
@@ -25,7 +25,7 @@ import moruna
 import pyarrow as pa
 
 
-@moruna.kernel(input_schema={"id": "int64"}, output_schema={"adds": {"c": "int64"}})
+@moruna.function(input_schema={"id": "int64"}, output_schema={"adds": {"c": "int64"}})
 def stateless(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch
 
@@ -38,11 +38,11 @@ class Counter:
         return batch
 
 
-counter = moruna.kernel(Counter(), stateful=True)
+counter = moruna.function(Counter(), stateful=True)
 """
 
 
-def test_bd_t28_a_real_kernel_spec_is_read_as_a_function(tmp_path: Path) -> None:
+def test_bd_t28_a_real_function_is_read_as_a_function(tmp_path: Path) -> None:
     (tmp_path / "kernels.py").write_text(KERNEL)
     module = support.load_path(tmp_path / "kernels.py", "kernels")
     stateless = _build.function_of(module.stateless)
@@ -60,7 +60,7 @@ def test_bd_t28_no_lock_is_refused_by_both_doors_before_anything_is_fetched(tmp_
     module = support.load_path(tmp_path / "kernels.py", "kernels")
     out = tmp_path / "image"
     with pytest.raises(moruna.ConfigError, match=r"build refused: no lock: .*needs a uv\.lock"):
-        moruna.build(module.stateless, out=out, cache=tmp_path / "cache")
+        module.stateless.build(out=out, cache=tmp_path / "cache")
     done = subprocess.run(
         [
             sys.executable,

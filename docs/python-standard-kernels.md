@@ -1,6 +1,6 @@
-# Standard kernels
+# Standard functions
 
-Each `moruna.std` function returns a [`StdKernel`](#morunastdkernel) for `moruna.run`. `None` for an optional option delegates to the standard kernel's default.
+Each `moruna.std` function returns a [`moruna.Function`](#standard-functions-as-tasks) a job takes as a task. `None` for an optional option delegates to the standard function's default.
 
 | Function signature | Result |
 | --- | --- |
@@ -16,11 +16,11 @@ Each `moruna.std` function returns a [`StdKernel`](#morunastdkernel) for `moruna
 | `explode(column: str)` | One row per list element; null/empty lists give one null element. |
 | `concat_str(columns: Sequence[str], separator: str \| None = None, output: str \| None = None)` | Append joined text; separator defaults to empty, output name to `"concat"`; null if any input is null. |
 | `date_trunc(column: str, unit: str, output: str \| None = None)` | Truncate a date/timestamp to `"year"`, `"month"`, `"day"`, `"hour"`, `"minute"`, or `"second"`; replace input unless `output` names a new column. |
-| `join()` | For each morsel, the columns of every input side by side, in input order. Several inputs, each a branch of one upstream through kernels that keep its rows and their order ([`Graph`](python-run.md#morunagraph)). A row count that differs between inputs, or a column two inputs give, raises an error naming the inputs. |
-| `union()` | Pass on every batch of every input as it came; every input has one schema. Several inputs ([`Graph`](python-run.md#morunagraph)). |
+| `join()` | For each morsel, the columns of every input side by side, in input order. Several inputs, each a branch of one upstream through functions that keep its rows and their order ([`moruna.Job`](python-run.md#morunajob)). A row count that differs between inputs, or a column two inputs give, raises an error naming the inputs. |
+| `union()` | Pass on every batch of every input as it came; every input has one schema. Several inputs ([`moruna.Job`](python-run.md#morunajob)). |
 
-`filter` supports comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), `is_null(c)`, `is_not_null(c)`, `and`, `or`, `not`, and parentheses. Put names with spaces in backquotes, for example `` `order amount` > 0 ``. Invalid standard-kernel arguments raise a planning error at construction.
+`filter` supports comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), `is_null(c)`, `is_not_null(c)`, `and`, `or`, `not`, and parentheses. Put names with spaces in backquotes, for example `` `order amount` > 0 ``. Invalid standard-function arguments raise a planning error at construction.
 
-## `moruna.StdKernel`
+## Standard functions as tasks
 
-Frozen result of a `moruna.std` function, with no public constructor. Its read-only attributes are `name: str` (for example `"filter"`), `args: str` (canonical JSON), and `fingerprint: str` (64 lowercase hexadecimal characters).
+The `moruna.Function` a `moruna.std` function returns has no public constructor; a spec names it by the kind `std`, its name and its arguments. Its read-only attributes are `name: str` (for example `"filter"`), `args: str` (canonical JSON), and `fingerprint: str` (64 lowercase hexadecimal characters).

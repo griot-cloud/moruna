@@ -297,13 +297,13 @@ fn jb_t18_declaration_check() {
     wrong(
         Role::Kernel,
         &|d| d.role = Role::Sink,
-        "registered as a kernel",
+        "registered as a function",
     );
     wrong(Role::Kernel, &|d| d.summary = " ".into(), "has no summary");
     wrong(
         Role::Kernel,
         &|d| d.inputs = Flow::Files,
-        "which a kernel does not",
+        "which a function does not",
     );
     wrong(
         Role::Source,

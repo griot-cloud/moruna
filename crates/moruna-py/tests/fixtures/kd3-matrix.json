@@ -332,49 +332,49 @@
     },
     {
       "id": "kernel.std",
-      "role": "kernel",
+      "role": "function",
       "kind": "std",
       "runner": "document",
       "expect": "rows"
     },
     {
       "id": "kernel.package.wasm",
-      "role": "kernel",
+      "role": "function",
       "kind": "package",
       "runner": "document",
       "expect": "rows"
     },
     {
       "id": "kernel.package.pex",
-      "role": "kernel",
+      "role": "function",
       "kind": "package",
       "runner": "document",
       "expect": "rows"
     },
     {
       "id": "kernel.package.pex.assets",
-      "role": "kernel",
+      "role": "function",
       "kind": "package",
       "runner": "document",
       "expect": "rows"
     },
     {
       "id": "kernel.image",
-      "role": "kernel",
+      "role": "function",
       "kind": "image",
       "runner": "document",
       "expect": "rows"
     },
     {
       "id": "kernel.served",
-      "role": "kernel",
+      "role": "function",
       "kind": "fixture.echo",
       "runner": "document",
       "expect": "rows"
     },
     {
       "id": "kernel.python.imported",
-      "role": "kernel",
+      "role": "function",
       "kind": "python",
       "runner": "document",
       "expect": "strict-import-refusal"
@@ -402,7 +402,7 @@
     },
     {
       "id": "library.python.kernel",
-      "role": "kernel",
+      "role": "function",
       "kind": "python",
       "runner": "python-library",
       "expect": "rows"

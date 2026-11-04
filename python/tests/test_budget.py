@@ -46,7 +46,7 @@ pq.write_table(
 pa.default_memory_pool().release_unused()
 gc.collect()
 
-@moruna.kernel
+@moruna.function
 def greedy(batch):
     # Every byte here is outside the arena: a Python str per row, a list of them, and a pyarrow
     # array built from that. It costs several times the morsel it was given, which is the class
@@ -61,8 +61,8 @@ try:
     report = moruna.run(moruna.ParquetSource(f"file://{src}/part-0.parquet"), [greedy],
                        moruna.ParquetSink(f"file://{out}"),
                        budget=budget)
-    result = {"exit": str(report.exit),
-              "ceiling": report.limits["memory_ceiling"],
+    result = {"exit": report.exit["status"],
+              "ceiling": report.limits_initial["memory_ceiling"],
               "peak": report.peak_anon_bytes,
               "fraction": report.peak_fraction_of_ceiling,
               "rows_out": report.stages[0]["rows_out"],
@@ -81,7 +81,7 @@ except moruna.BudgetError as err:
     result = {"exit": "Budget", "diagnostic": str(err)}
     if err.report is not None:
         result |= {"peak": err.report.peak_anon_bytes,
-                   "ceiling": err.report.limits["memory_ceiling"],
+                   "ceiling": err.report.limits_initial["memory_ceiling"],
                    "fraction": err.report.peak_fraction_of_ceiling,
                    "report": json.loads(err.report.to_json())}
 # Which budget this host was actually given, so a failure names the number it was asserted at.
@@ -154,8 +154,8 @@ def test_s1_a_tight_budget_is_never_exceeded(scratch: pathlib.Path) -> None:
             "whole machine on a shared CI runner. The runtime says so rather than pretending: "
             f"{result['diagnostic']}"
         )
-    assert result["exit"] in ("Completed", "Budget"), result
-    if result["exit"] == "Completed":
+    assert result["exit"] in ("completed", "Budget"), result
+    if result["exit"] == "completed":
         assert result["rows_out"] == 200_000, result
     else:
         # G-I8: a refusal says what it refused on, in figures. Which figures depends on which
@@ -185,7 +185,7 @@ def test_s1_the_same_kernel_completes_where_the_budget_can_hold_it(
     """
     result = _run(scratch, "2GiB")
 
-    assert result["exit"] == "Completed", result
+    assert result["exit"] == "completed", result
     assert result["rows_out"] == 200_000, result
     assert result["fraction"] <= 1.0, (
         f"S1: peak anonymous memory {result['peak']} exceeded the ceiling "

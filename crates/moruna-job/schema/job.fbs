@@ -1,6 +1,6 @@
 // Moruna's job document, version 2 (SDD 22 e.4): a run as a DAG of tasks.
 //
-// A task is a kind (a source, a kernel or a sink, resolved by the registry of kinds) with its
+// A task is a kind (a source, a function or a sink, resolved by the registry of kinds) with its
 // settings and its named ports; an edge joins one task's output port to another task's input
 // port and carries the flow the producer declares. A task or an edge marked as a barrier is an
 // enforcement point: nothing may be moved across it, and no edge may go around it.
@@ -15,7 +15,7 @@ file_identifier "MJB2";
 file_extension "mjob";
 
 // Which part of a run a task is, and so which port its kind's adapter implements.
-enum Role : ubyte { Source = 0, Kernel = 1, Sink = 2 }
+enum Role : ubyte { Source = 0, Function = 1, Sink = 2 }
 
 // What an edge carries: what its producer gives and its consumer takes.
 enum Flow : ubyte { Batches = 0, Files = 1, Nothing = 2 }
@@ -23,7 +23,7 @@ enum Flow : ubyte { Batches = 0, Files = 1, Nothing = 2 }
 // A platform's declaration about one guarantee; `Unset` is a guarantee left to discovery.
 enum Guarantee : ubyte { Unset = 0, Present = 1, Absent = 2 }
 
-// What happens after a kernel error; `Budget` skips up to `ErrorPolicy.budget` morsels.
+// What happens after a function error; `Budget` skips up to `ErrorPolicy.budget` morsels.
 enum ErrorPolicyKind : ubyte { Terminate = 0, Skip = 1, Budget = 2 }
 
 // Which decision function sizes morsels.
@@ -38,7 +38,7 @@ table Task {
   kind: string (required);
   // The kind's settings, a FlexBuffers map, checked against the kind's JSON Schema (KD1).
   settings: [ubyte] (flexbuffer);
-  // Its input ports by name, in the order the kernel numbers them (port 0 first).
+  // Its input ports by name, in the order the function numbers them (port 0 first).
   inputs: [string];
   // Its output ports by name.
   outputs: [string];
@@ -82,24 +82,26 @@ table Staging {
   durable: bool = null;
 }
 
+// An object store's endpoints and names. A document holds no credential: the runner supplies
+// credentials when the job runs (the slots that held them are deprecated, never read).
 table S3 {
   endpoint: string;
   region: string;
-  access_key_id: string;
-  secret_access_key: string;
-  session_token: string;
+  access_key_id: string (deprecated);
+  secret_access_key: string (deprecated);
+  session_token: string (deprecated);
   bucket: string;
 }
 
 table Gcs {
-  service_account_path: string;
-  service_account_json: string;
+  service_account_path: string (deprecated);
+  service_account_json: string (deprecated);
   bucket: string;
 }
 
 table Azure {
   account: string;
-  access_key: string;
+  access_key: string (deprecated);
   container: string;
 }
 
@@ -171,6 +173,8 @@ table Job {
   allow_gil: bool;
   report: Report;
   contracts: [Contract];
+  // The job's name, as its author gave it; absent: unnamed. Events and the report do not use it.
+  name: string;
 }
 
 root_type Job;

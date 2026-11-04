@@ -88,7 +88,7 @@ ADD_COLUMN = """
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    @moruna.kernel(input_schema={"id": "int64"}, output_schema={"adds": {"doubled": "int64"}})
+    @moruna.function(input_schema={"id": "int64"}, output_schema={"adds": {"doubled": "int64"}})
     def add_doubled(batch):
         return batch.append_column("doubled", pc.multiply(batch.column("id"), 2))
 """
@@ -245,7 +245,7 @@ def test_bd_t5_a_stateful_kernel_is_set_up_once_and_called_with_its_state(image:
                     state["seen"] += batch.num_rows
                     return batch.append_column("seen", pa.array([state["seen"]] * batch.num_rows))
 
-            running = moruna.kernel(Running(), stateful=True)
+            running = moruna.function(Running(), stateful=True)
             """,
         )
         + ":running"
@@ -270,7 +270,7 @@ def test_bd_t5_the_stand_in_refuses_the_rest_of_moruna(image: Path) -> None:
     assert done.returncode == 1
     assert (
         "moruna.run" in done.stderr.decode()
-        and "holds only kernel and polars" in done.stderr.decode()
+        and "holds only function, polars, Task and Function" in done.stderr.decode()
     )
 
 
@@ -429,7 +429,7 @@ def test_image_workdir_precedes_user_import_and_preserves_relative_assets(
 
         IMPORT_BIAS = int(Path("bias.txt").read_text())
 
-        @moruna.kernel
+        @moruna.function
         def apply(batch):
             bias = IMPORT_BIAS + int(Path("bias.txt").read_text())
             return pa.RecordBatch.from_arrays([pc.add(batch.column("id"), bias)], schema=batch.schema)
