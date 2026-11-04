@@ -215,8 +215,11 @@ pub struct Tools<'a> {
     pub qemu: &'a Path,
     /// Existing moruna-vhost-vsock helper executable.
     pub vsock: &'a Path,
+    /// Where the run's jail is accounted: a delegated cgroup, or none.
+    pub cgroup: &'a moruna_vmm::jail::Cgroup,
 }
-type NodeLauncher = fn(&Path, Budget, &Path, &Path, &Path) -> Result<RunningNode>;
+type NodeLauncher =
+    fn(&Path, Budget, &Path, &Path, &Path, &moruna_vmm::jail::Cgroup) -> Result<RunningNode>;
 struct NodeBackend<'a> {
     tools: Tools<'a>,
     launch: NodeLauncher,
@@ -523,6 +526,7 @@ impl NativeRun {
             runtime_dir,
             backend.tools.qemu,
             backend.tools.vsock,
+            backend.tools.cgroup,
         )?;
         witness.advance(Phase::Launched)?;
         let reader = node.connect(
@@ -754,6 +758,7 @@ mod tests {
                 Tools {
                     qemu: &self.0.join("absent-qemu"),
                     vsock: &self.0.join("absent-vsock"),
+                    cgroup: &moruna_vmm::jail::Cgroup::Undelegated,
                 },
                 prepared,
                 Instant::now() + Duration::from_secs(5),

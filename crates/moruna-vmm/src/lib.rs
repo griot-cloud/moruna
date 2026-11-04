@@ -1,5 +1,6 @@
 //! Moruna 1.0 native microkernel launcher: checked artifacts, explicit Linux KVM
-//! tools and owned QEMU/vsock lifetimes. Linux-guest monitor internals are test-only.
+//! tools and owned QEMU/vsock lifetimes, each in a per-run jail. Linux-guest monitor
+//! internals are test-only.
 
 #![deny(missing_docs)]
 #![allow(clippy::result_large_err)]
@@ -20,6 +21,7 @@ pub mod error;
 mod fdt;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod image;
+pub mod jail;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod layout;
 mod limits;
