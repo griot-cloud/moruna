@@ -233,9 +233,12 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         .collect();
     let mut sources = Vec::with_capacity(source_tasks.len());
     let mut targets: Vec<String> = Vec::new();
-    for &i in &source_tasks {
+    for (ordinal, &i) in source_tasks.iter().enumerate() {
         let (_, kind) = kinds.source(&job.field(i), &job.tasks[i].kind)?;
-        let built = kind.source(&Entry::new(job.field(i), None, &entries[i]), &mut cx)?;
+        let built = kind.source(
+            &Entry::new(job.field(i), Some(ordinal), &entries[i]),
+            &mut cx,
+        )?;
         targets.extend(built.targets.iter().cloned());
         sources.push(built);
     }
@@ -246,9 +249,12 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         .filter(|&i| job.tasks[i].role == Role::Sink)
         .collect();
     let mut sinks = Vec::with_capacity(sink_tasks.len());
-    for &i in &sink_tasks {
+    for (ordinal, &i) in sink_tasks.iter().enumerate() {
         let (_, kind) = kinds.sink(&job.field(i), &job.tasks[i].kind)?;
-        let built = kind.sink(&Entry::new(job.field(i), None, &entries[i]), &mut cx)?;
+        let built = kind.sink(
+            &Entry::new(job.field(i), Some(ordinal), &entries[i]),
+            &mut cx,
+        )?;
         translate::check_sink_not_source(&built.target, &targets)?;
         sinks.push(built);
     }
@@ -300,7 +306,32 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     }
     notes.extend(cx.take_notes());
 
-    let topology = topology_of(job, &source_tasks, &sink_tasks, &assembled, &stage_of)?;
+    let mut topology = topology_of(job, &source_tasks, &sink_tasks, &assembled, &stage_of)?;
+    // d.16: a kernel that joins its inputs by morsel takes branches of one upstream, numbered
+    // alike; each is aligned in stage order, so a join downstream of another sees it numbered.
+    for (at, assembling) in assembled.iter().enumerate() {
+        if !assembling.stage.kernel.aligns_inputs() {
+            continue;
+        }
+        let stage = (at + 1) as StageId;
+        let i = assembling.tasks[0];
+        if let Some(port) = topology.misaligned(stage)? {
+            let task = &job.tasks[i];
+            let name = |p: usize| task.inputs.get(p).map_or("?", String::as_str);
+            return Err(refusal(SpecError::new(
+                format!("{}.inputs.{}", job.field(i), name(usize::from(port))),
+                format!(
+                    "`{}` joins its inputs by morsel, and its input `{}` does not carry the \
+                     morsels its input `{}` carries: every input of a join is a branch of one \
+                     upstream, through kernels that keep its morsels",
+                    task.id,
+                    name(usize::from(port)),
+                    name(0)
+                ),
+            )));
+        }
+        topology = topology.align(&[stage])?;
+    }
     let parts = Parts {
         sources: source_tasks.clone(),
         stages: assembled.iter().map(|a| a.tasks.clone()).collect(),

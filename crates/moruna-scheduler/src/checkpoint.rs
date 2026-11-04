@@ -74,6 +74,10 @@ impl Drop for Barrier<'_> {
     }
 }
 
+/// Why no manifest is written once a stage's finish has given a batch (f.12).
+const FINISH_GAVE: &str = "a stage's finish gave batches made at the end of its input, which no \
+                           manifest can record; the run's last manifest is the one before them";
+
 /// How many manifest writes may fail in a row before the run ends (f.12, placement h).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
@@ -104,7 +108,13 @@ pub(crate) fn thread(shared: Arc<Shared>) {
         // Read before the write starts, so a request that arrives during it is served by the
         // next one and never by a manifest whose snapshot is older than the request.
         let serving = shared.checkpoint_requested.load(Ordering::SeqCst);
+        if shared.finish_gave.load(Ordering::SeqCst) {
+            // f.12: a stage's finish gave batches no manifest can record; the last manifest
+            // stays the one a resume starts from.
+            continue;
+        }
         match checkpoint_now(&shared) {
+            Err(_) if shared.finish_gave.load(Ordering::SeqCst) => continue,
             Ok(_) => {
                 failures = 0;
                 shared
@@ -165,6 +175,9 @@ pub(crate) fn checkpoint_and_wait(shared: &Shared, timeout: Duration) -> Result<
     };
     let deadline = Instant::now() + timeout;
     while shared.checkpoint_served.load(Ordering::SeqCst) < ticket {
+        if shared.finish_gave.load(Ordering::SeqCst) {
+            return Err(MorunaError::Resume(FINISH_GAVE.into()));
+        }
         if Instant::now() >= deadline {
             return Err(MorunaError::Resume(format!(
                 "no manifest was written within {} ms of the request; the run is {:?}",
@@ -192,6 +205,14 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
         return Err(MorunaError::Resume(
             "checkpointing is off for this run".into(),
         ));
+    }
+    // f.6, f.12: never while a stage's instances finish, and never after one gave a batch.
+    let _manifest = shared
+        .manifest_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if shared.finish_gave.load(Ordering::SeqCst) {
+        return Err(MorunaError::Resume(FINISH_GAVE.into()));
     }
     let started = Instant::now();
     let preparation = shared

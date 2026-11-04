@@ -769,3 +769,233 @@ fn sc_t31_random_dags_run_to_their_reference() {
         }
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// SC-T40: a join by morsel.
+// ------------------------------------------------------------------------------------------
+
+/// Every row of every Parquet file under `dir`, each as its columns' names and values rendered
+/// as text, in the order the files and their rows are in (an ordered sink writes one file here).
+fn rendered_rows(dir: &Path) -> Vec<Vec<(String, String)>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("the output directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("parquet"))
+        .collect();
+    files.sort();
+    let mut rows = Vec::new();
+    for path in files {
+        let file = std::fs::File::open(&path).expect("an output file");
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("a reader")
+            .build()
+            .expect("batches");
+        for batch in reader {
+            let batch = batch.expect("a batch");
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .zip(batch.columns())
+                        .map(|(field, column)| {
+                            (
+                                field.name().clone(),
+                                moruna_kernel::arrow::util::display::array_value_to_string(
+                                    column, row,
+                                )
+                                .expect("a value renders"),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// SC-T40 a_join_equals_the_chain: a source fanned out to itself and to a branch that hashes
+/// `id` and keeps only the hash, joined by morsel, gives an ordered sink the rows the chain of
+/// the hash alone gives, column for column and row for row; the join keeps the source's
+/// numbers, so the sink has one path.
+#[test]
+fn sc_t40_a_join_equals_the_chain() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("sc_t40");
+    let input = scratch.path().join("in.parquet");
+    write_parquet(&input, 40_000, 8);
+    let url = |p: &Path| format!("file://{}", p.display());
+    let (joined, chained) = (
+        scratch.path().join("joined"),
+        scratch.path().join("chained"),
+    );
+    std::fs::create_dir_all(&joined).expect("dir");
+    std::fs::create_dir_all(&chained).expect("dir");
+    let hash = || {
+        entry(json!({"kind": "std", "name": "hash", "args": {"columns": ["id"], "output": "h"}}))
+    };
+    let mut graph = configured(
+        Job::new(
+            vec![
+                Task::source("in", entry(json!({"kind": "parquet", "url": url(&input)}))),
+                Task::kernel("hash", hash()),
+                Task::kernel(
+                    "only-h",
+                    entry(json!({"kind": "std", "name": "select", "args": {"columns": ["h"]}})),
+                ),
+                Task::kernel_with_inputs(
+                    "both",
+                    entry(json!({"kind": "std", "name": "join"})),
+                    &["in", "only-h"],
+                ),
+                Task::sink(
+                    "out",
+                    entry(json!({"kind": "parquet", "url": url(&joined)})),
+                ),
+            ],
+            vec![
+                Edge::between("in", "hash"),
+                Edge::between("hash", "only-h"),
+                Edge::new("in", "out", "both", "in"),
+                Edge::new("only-h", "out", "both", "only-h"),
+                Edge::between("both", "out"),
+            ],
+        ),
+        &scratch,
+    );
+    graph.ordered = true;
+    let built = build(&graph, &planned(&graph), &Registry::standard(), opts()).expect("builds");
+    assert_eq!(
+        built.spec.topology.paths(0),
+        &[(0, moruna_kernel::Affine::IDENTITY)]
+    );
+    run(built.spec);
+    let mut chain = configured(
+        Job::new(
+            vec![
+                Task::source("in", entry(json!({"kind": "parquet", "url": url(&input)}))),
+                Task::kernel("hash", hash()),
+                Task::sink(
+                    "out",
+                    entry(json!({"kind": "parquet", "url": url(&chained)})),
+                ),
+            ],
+            vec![Edge::between("in", "hash"), Edge::between("hash", "out")],
+        ),
+        &scratch,
+    );
+    chain.ordered = true;
+    let built = build(&chain, &planned(&chain), &Registry::standard(), opts()).expect("builds");
+    run(built.spec);
+    let (from_join, from_chain) = (rendered_rows(&joined), rendered_rows(&chained));
+    assert_eq!(from_join.len(), 40_000);
+    assert_eq!(from_join, from_chain);
+}
+
+/// SC-T40 a_join_refuses_what_is_not_one_morsel: the build refuses a join of two sources,
+/// naming the task's input; the run refuses a branch that drops rows, naming the ports and the
+/// counts, and a column two branches give, naming the column; the same branch that keeps only
+/// its new column runs.
+#[test]
+fn sc_t40_a_join_refuses_what_is_not_one_morsel() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("sc_t40_refused");
+    let input = scratch.path().join("in.parquet");
+    write_parquet(&input, 4_000, 2);
+    let url = |p: &Path| format!("file://{}", p.display());
+    let out = scratch.path().join("out");
+    std::fs::create_dir_all(&out).expect("dir");
+    let join = || entry(json!({"kind": "std", "name": "join"}));
+    let two_sources = configured(
+        Job::new(
+            vec![
+                Task::source("a", entry(json!({"kind": "parquet", "url": url(&input)}))),
+                Task::source("b", entry(json!({"kind": "parquet", "url": url(&input)}))),
+                Task::kernel_with_inputs("both", join(), &["a", "b"]),
+                Task::sink("out", entry(json!({"kind": "parquet", "url": url(&out)}))),
+            ],
+            vec![
+                Edge::new("a", "out", "both", "a"),
+                Edge::new("b", "out", "both", "b"),
+                Edge::between("both", "out"),
+            ],
+        ),
+        &scratch,
+    );
+    let refused = build(
+        &two_sources,
+        &planned(&two_sources),
+        &Registry::standard(),
+        opts(),
+    )
+    .err()
+    .expect("refused")
+    .to_string();
+    assert!(
+        refused.contains("tasks[2].inputs.b")
+            && refused.contains("`both` joins its inputs by morsel, and its input `b`"),
+        "{refused}"
+    );
+
+    // The source, and a branch of it through `first` then `then`, joined.
+    let branch = |first: serde_json::Value, then: serde_json::Value| {
+        configured(
+            Job::new(
+                vec![
+                    Task::source("in", entry(json!({"kind": "parquet", "url": url(&input)}))),
+                    Task::kernel("first", entry(first)),
+                    Task::kernel("then", entry(then)),
+                    Task::kernel_with_inputs("both", join(), &["in", "then"]),
+                    Task::sink("out", entry(json!({"kind": "parquet", "url": url(&out)}))),
+                ],
+                vec![
+                    Edge::between("in", "first"),
+                    Edge::between("first", "then"),
+                    Edge::new("in", "out", "both", "in"),
+                    Edge::new("then", "out", "both", "then"),
+                    Edge::between("both", "out"),
+                ],
+            ),
+            &scratch,
+        )
+    };
+    let keep_h = json!({"kind": "std", "name": "select", "args": {"columns": ["h"]}});
+    for (first, then, said) in [
+        (
+            json!({"kind": "std", "name": "filter", "args": {"expr": "id < 10"}}),
+            json!({"kind": "std", "name": "rename", "args": {"columns": {"id": "i", "value": "v"}}}),
+            "rows on its port 1 and",
+        ),
+        (
+            json!({"kind": "std", "name": "hash", "args": {"columns": ["id"], "output": "h"}}),
+            json!({"kind": "std", "name": "fill_null", "args": {"values": {"value": 0}}}),
+            "the column `id` on its port 0 and again on its port 1",
+        ),
+        (
+            json!({"kind": "std", "name": "hash", "args": {"columns": ["id"], "output": "h"}}),
+            keep_h.clone(),
+            "",
+        ),
+    ] {
+        if said.is_empty() {
+            let job = branch(first, then);
+            let built = build(&job, &planned(&job), &Registry::standard(), opts()).expect("builds");
+            run(built.spec);
+            continue;
+        }
+        let job = branch(first, then);
+        let refused = match build(&job, &planned(&job), &Registry::standard(), opts()) {
+            Err(e) => e.to_string(),
+            Ok(built) => match Runtime::run(built.spec, CancelToken::new()) {
+                Ok(_) => panic!("the join ran"),
+                Err(e) => e.to_string(),
+            },
+        };
+        assert!(
+            refused.contains("moruna.std.join") && refused.contains(said),
+            "{refused}"
+        );
+    }
+}

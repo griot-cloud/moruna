@@ -198,6 +198,21 @@ pub fn validate_graph(pipeline: &Pipeline) -> Result<Vec<SourceSchema>> {
                 kernel.max_inputs()
             )));
         }
+        // d.16: a kernel that joins its inputs by morsel needs a topology that numbers them so,
+        // and only such a kernel may have one.
+        if kernel.aligns_inputs() != topology.is_aligned(stage) {
+            return Err(MorunaError::Plan(if kernel.aligns_inputs() {
+                format!(
+                    "stage {stage}'s kernel joins its inputs by morsel, and the topology does not \
+                     align them (Topology::align)"
+                )
+            } else {
+                format!(
+                    "the topology aligns stage {stage}'s inputs, and its kernel does not join them \
+                     by morsel"
+                )
+            }));
+        }
         let mut given = Vec::with_capacity(inputs.len());
         for (port, &q) in inputs.iter().enumerate() {
             let Some(schema) = schemas[usize::from(q)].clone() else {

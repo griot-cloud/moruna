@@ -47,7 +47,7 @@ impl Kernel for Finishing {
         self.inner.apply(state, input)
     }
 
-    fn finish(&self, _state: &mut dyn KernelState) -> Result<()> {
+    fn finish(&self, _state: &mut dyn KernelState) -> Result<Option<Payload>> {
         self.finishes.fetch_add(1, Ordering::SeqCst);
         if self.panic {
             panic!("the end of the input broke it");
@@ -59,7 +59,7 @@ impl Kernel for Finishing {
                 msg: msg.into(),
                 features: None,
             }),
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 }

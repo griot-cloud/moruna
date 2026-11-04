@@ -94,7 +94,9 @@ fn finalize(shared: &Arc<Shared>, mut exit: Exit) -> crate::RunOutcome {
     // than one `checkpoint.interval_ms` had no tick, so `checkpoint.keep` kept an empty
     // directory and 12 f.7's promise that the report names a manifest was false.
     checkpoint::stop(shared);
+    // f.6: a stage's finish that gave batches leaves the last manifest before them as the run's.
     let final_manifest = shared.checkpoint_enabled()
+        && !shared.finish_gave.load(Ordering::SeqCst)
         && (!matches!(exit, Exit::Completed(_)) || shared.cfg.checkpoint_keep);
     if final_manifest && let Err(error) = checkpoint::checkpoint_now(shared) {
         let portable = shared

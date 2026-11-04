@@ -369,7 +369,7 @@ impl Kernel for NativePex {
             _ => Err(fail("call reply differs from actual output body")),
         }
     }
-    fn finish(&self, state: &mut dyn KernelState) -> Result<()> {
+    fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
         let state = state
             .as_any_mut()
             .downcast_mut::<NativeState>()

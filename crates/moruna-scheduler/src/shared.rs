@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use crossbeam::sync::{Parker, Unparker};
 use moruna_kernel::{
-    Allocator, CancelToken, Kernel, KernelKind, KernelState, MorunaError, PayloadSpec, Placement,
-    PlacementStats, Producer, RecordHook, Result, Sampler, Seq, Sink, SinkSummary, Source,
-    SourceSchema, Split, StageCounters, StageEvent, StageHook, StageId, Topology, TraceSink,
+    Allocator, CancelToken, Kernel, KernelKind, KernelState, Morsel, MorunaError, PayloadSpec,
+    Placement, PlacementStats, Produced, Producer, RecordHook, Result, Sampler, Seq, Sink,
+    SinkSummary, Source, SourceSchema, Split, StageCounters, StageEvent, StageHook, StageId,
+    Topology, TraceSink,
 };
 use moruna_sinks::SinkHandle;
 
@@ -118,6 +119,12 @@ pub(crate) struct StageEntry {
     pub(crate) rows_out: AtomicU64,
     pub(crate) bytes_in: AtomicU64,
     pub(crate) bytes_out: AtomicU64,
+    /// For a stage that joins its inputs by morsel (d.16): the morsels taken so far of each
+    /// number whose set is not complete yet, by number, each by port. `None` for every other.
+    pub(crate) pending: Option<Mutex<std::collections::BTreeMap<Seq, Vec<Option<Morsel>>>>>,
+    /// How many batches the stage's `finish` gave, once it has finished (f.6, d.16); 0 from the
+    /// start for a stateless stage, which has no `finish` to call.
+    pub(crate) finished: std::sync::OnceLock<Seq>,
 }
 
 impl StageEntry {
@@ -157,6 +164,9 @@ pub(crate) enum WorkerJob {
     },
     /// One probe of one stage, on the input port that holds its morsel (f.9).
     Probe { stage: StageId, port: u16 },
+    /// `Kernel::finish` for every live instance of one stateful stage whose inputs have ended,
+    /// then its output queues closed (f.6).
+    Finish { stage_ix: usize },
     /// The SC-T19 seam: leave the loop without reporting (f.14).
     #[cfg(test)]
     Die,
@@ -415,6 +425,13 @@ pub(crate) struct Shared {
     pub(crate) recomputed: AtomicU64,
     pub(crate) shutdown_done: AtomicBool,
     pub(crate) exit_claimed: AtomicBool,
+    /// A stage's `finish` has given a batch (f.6, f.12): from then on no manifest is written,
+    /// because a batch made at the end of a stage's input has no origin a resume could read it
+    /// again from.
+    pub(crate) finish_gave: AtomicBool,
+    /// Held by the checkpoint thread while it writes a manifest and by a stage's finish while
+    /// its instances finish (f.6, f.12), so neither waits on the other's instances.
+    pub(crate) manifest_lock: Mutex<()>,
 }
 
 /// A `RunState` or a drive mode as one atomic byte.
@@ -545,6 +562,13 @@ impl Shared {
                     rows_out: AtomicU64::new(0),
                     bytes_in: AtomicU64::new(0),
                     bytes_out: AtomicU64::new(0),
+                    pending: kernel
+                        .aligns_inputs()
+                        .then(|| Mutex::new(std::collections::BTreeMap::new())),
+                    finished: match kernel.kind() {
+                        KernelKind::Stateless => std::sync::OnceLock::from(0),
+                        KernelKind::Stateful { .. } => std::sync::OnceLock::new(),
+                    },
                 }
             })
             .collect();
@@ -710,6 +734,8 @@ impl Shared {
             recomputed: AtomicU64::new(0),
             shutdown_done: AtomicBool::new(false),
             exit_claimed: AtomicBool::new(false),
+            finish_gave: AtomicBool::new(false),
+            manifest_lock: Mutex::new(()),
         });
         tracing::info!(
             target: "sched.start",
@@ -923,6 +949,18 @@ impl Shared {
         self.placement.stats().queues.iter().all(|q| q.count == 0)
     }
 
+    /// What the run has given so far (contracts d.16): each source's count once it is read to
+    /// the end, each stage's finish once it has finished.
+    pub(crate) fn produced(&self) -> Produced {
+        let read = crate::source_drive::counts(self);
+        let finished: Vec<Option<Seq>> = self
+            .stages
+            .iter()
+            .map(|entry| entry.finished.get().copied())
+            .collect();
+        self.topology.produced(&read, &finished)
+    }
+
     pub(crate) fn send_job(&self, worker: u16, job: WorkerJob) -> Receiver<Result<JobOutput>> {
         let (reply, rx) = unbounded();
         let index = worker as usize % self.jobs.len();
@@ -1094,10 +1132,92 @@ impl Shared {
                 return false;
             }
         }
-        for &q in &entry.outputs {
+        // d.16: a join's inputs have ended, so a number whose set is not complete never will be.
+        self.settle_unjoined(index);
+        // f.6: a stateful stage's instances are finished on a worker, which pushes what they give
+        // and then closes the stage's outputs (`instances::run_finish`).
+        if entry.pool.is_some() {
+            let workers = self.jobs.len().max(1);
+            drop(self.send_job(
+                (index % workers) as u16,
+                WorkerJob::Finish { stage_ix: index },
+            ));
+            return true;
+        }
+        self.close_outputs(index);
+        true
+    }
+
+    /// Close stage `index`'s output queues (f.7).
+    pub(crate) fn close_outputs(&self, index: usize) {
+        for &q in &self.stages[index].outputs {
             self.close_in_engine(q);
         }
-        true
+    }
+
+    /// The sets a join holds that its ended inputs will never complete (d.16). A set short of a
+    /// morsel the error policy skipped upstream is dropped with it; any other is the run's end,
+    /// naming the stage, the number and the ports it came on, because a join whose branches do
+    /// not keep their morsels would otherwise drop rows without a word.
+    fn settle_unjoined(&self, index: usize) {
+        let entry = &self.stages[index];
+        let Some(pending) = entry.pending.as_ref() else {
+            return;
+        };
+        let left = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        let Some((&seq, first)) = left.iter().next() else {
+            return;
+        };
+        let came: Vec<String> = first
+            .iter()
+            .enumerate()
+            .filter(|(_, morsel)| morsel.is_some())
+            .map(|(port, _)| port.to_string())
+            .collect();
+        let sets = left.len();
+        let mut release_error = None;
+        for (number, ports) in left {
+            for (port, morsel) in ports.into_iter().enumerate() {
+                if morsel.is_some()
+                    && let Err(e) = self.placement.release(entry.inputs[port], number)
+                {
+                    release_error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = release_error {
+            crate::policy::terminate(self, e);
+            return;
+        }
+        if self.errors_total.load(Ordering::SeqCst) > 0
+            && self.cfg.error_policy != moruna_kernel::ErrorPolicy::Terminate
+        {
+            entry.skipped.fetch_add(sets as u32, Ordering::SeqCst);
+            tracing::warn!(
+                target: "sched.policy",
+                stage = entry.stage,
+                sets,
+                "a join dropped the morsels whose partner the error policy skipped"
+            );
+            return;
+        }
+        crate::policy::terminate(
+            self,
+            MorunaError::Kernel {
+                stage: entry.stage,
+                seq,
+                msg: format!(
+                    "the join's inputs ended, and morsel {seq} came on its port{} {} only \
+                     ({sets} morsel{} unjoined): a join takes the morsel of each number from every \
+                     input, so every branch must keep its input's morsels, and a batch a \
+                     kernel's finish gives reaches its own branch alone",
+                    if came.len() == 1 { "" } else { "s" },
+                    came.join(", "),
+                    if sets == 1 { "" } else { "s" },
+                ),
+                features: None,
+            },
+        );
     }
 }
 

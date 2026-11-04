@@ -42,7 +42,8 @@ pub struct Entry<'d> {
 }
 
 impl<'d> Entry<'d> {
-    /// The entry `doc` at `field`; `index` is its place in `kernels`, for a kernel.
+    /// The entry `doc` at `field`; `index` is its place among the tasks of its role, in
+    /// document order (a version 1 document's place in `kernels`, for a kernel).
     pub fn new(field: impl Into<String>, index: Option<usize>, doc: &'d KindDoc) -> Entry<'d> {
         Entry {
             field: field.into(),
@@ -61,7 +62,7 @@ impl<'d> Entry<'d> {
         format!("{}.{name}", self.field)
     }
 
-    /// Its place in `kernels`, for a kernel.
+    /// Its place among the tasks of its role, in document order.
     pub fn index(&self) -> Option<usize> {
         self.index
     }

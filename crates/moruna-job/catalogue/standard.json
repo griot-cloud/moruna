@@ -658,7 +658,8 @@
               "explode",
               "concat_str",
               "date_trunc",
-              "union"
+              "union",
+              "join"
             ]
           },
           "args": {

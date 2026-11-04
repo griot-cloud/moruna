@@ -9,7 +9,7 @@ use moruna_kernel::arrow::array::{
 };
 use moruna_kernel::arrow::compute::kernels::{boolean, cast, filter, take, zip};
 use moruna_kernel::arrow::datatypes::{
-    DataType, Field, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType,
+    DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
 };
 use moruna_kernel::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -835,6 +835,83 @@ pub(crate) fn date_trunc(
         Some(_) => columns.push(truncated),
     }
     batch_of("date_trunc", schema, columns, batch.num_rows())
+}
+
+/// The schema `join` gives for its inputs' schemas, port 0 first: every input's fields in port
+/// order, the first input's metadata. `Err` with the words of the refusal when two inputs give a
+/// column of one name: a join puts branches side by side, and a name in two would be ambiguous.
+pub(crate) fn joined_schema(inputs: &[SchemaRef]) -> core::result::Result<Schema, String> {
+    let mut fields = Vec::new();
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (port, schema) in inputs.iter().enumerate() {
+        for field in schema.fields() {
+            if let Some(first) = seen.insert(field.name().as_str(), port) {
+                return Err(format!(
+                    "is given the column `{}` on its port {first} and again on its port {port}: \
+                     the branches of a join give columns of different names (drop or rename one \
+                     before the join)",
+                    field.name()
+                ));
+            }
+            fields.push(Arc::clone(field));
+        }
+    }
+    let metadata = inputs
+        .first()
+        .map(|schema| schema.metadata().clone())
+        .unwrap_or_default();
+    Ok(Schema::new_with_metadata(fields, metadata))
+}
+
+/// The schema `join` is planned with: [`joined_schema`] with a name a later input gives again
+/// left out rather than refused. What a kernel says of its output before it runs is, for a kernel
+/// that cannot say (a Python kernel answers with its input's schema), a guess the first batch
+/// corrects, so a join is refused on the batches it is given and never on a plan's guess.
+pub(crate) fn planned_join_schema(inputs: &[SchemaRef]) -> Schema {
+    let mut fields: Vec<FieldRef> = Vec::new();
+    for schema in inputs {
+        for field in schema.fields() {
+            if !fields.iter().any(|f| f.name() == field.name()) {
+                fields.push(Arc::clone(field));
+            }
+        }
+    }
+    let metadata = inputs
+        .first()
+        .map(|schema| schema.metadata().clone())
+        .unwrap_or_default();
+    Schema::new_with_metadata(fields, metadata)
+}
+
+/// `join` over the morsel of one number from every input, port 0 first: the columns side by
+/// side, the arrays shared, never copied. `Err` with the words of the refusal when an input has
+/// a row count port 0's does not, or two give a column of one name.
+pub(crate) fn join(batches: &[RecordBatch]) -> core::result::Result<RecordBatch, String> {
+    let Some(first) = batches.first() else {
+        return Err("was given no input".into());
+    };
+    let rows = first.num_rows();
+    for (port, batch) in batches.iter().enumerate().skip(1) {
+        if batch.num_rows() != rows {
+            return Err(format!(
+                "is given {} rows on its port {port} and {rows} on its port 0 for one morsel: \
+                 every branch of a join keeps its input's rows, in their order",
+                batch.num_rows()
+            ));
+        }
+    }
+    let schemas: Vec<SchemaRef> = batches.iter().map(RecordBatch::schema).collect();
+    let schema = Arc::new(joined_schema(&schemas)?);
+    let columns = batches
+        .iter()
+        .flat_map(|batch| batch.columns().iter().cloned())
+        .collect();
+    RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(|e| format!("could not put its inputs side by side: {e}"))
 }
 
 #[cfg(test)]

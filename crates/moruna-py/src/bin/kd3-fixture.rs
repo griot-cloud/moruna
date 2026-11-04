@@ -204,7 +204,7 @@ impl Readback {
                 .map_err(|e| invalid(format!("actual receipt source: {e}")))?;
         let (_, adapter) = registry.source("source", &self.kind)?;
         let source = adapter
-            .source(&Entry::new("source", None, &source_doc), &mut context)?
+            .source(&Entry::new("source", Some(0), &source_doc), &mut context)?
             .spec
             .build(&self.context)?;
         let sink_kind = if self.kind == "tensor" {
@@ -217,7 +217,7 @@ impl Readback {
                 .map_err(|e| invalid(format!("readback sink: {e}")))?;
         let (_, adapter) = registry.sink("sink", sink_kind)?;
         let inner = adapter
-            .sink(&Entry::new("sink", None, &sink_doc), &mut context)?
+            .sink(&Entry::new("sink", Some(0), &sink_doc), &mut context)?
             .spec
             .build(&self.context)?;
         let facts = Arc::new(Mutex::new(Facts::default()));
@@ -569,7 +569,7 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
         };
         let mut context = Context::new(Arc::new(Standalone)).contracts(job.contracts.clone());
         let (_, adapter) = kinds.sink(&job.field(index), &task.kind)?;
-        let described = adapter.sink(&Entry::new(job.field(index), None, &doc), &mut context)?;
+        let described = adapter.sink(&Entry::new(job.field(index), Some(0), &doc), &mut context)?;
         let prefix = job::translate::normalise_target(&described.target);
         Some((
             if case["kind"] == "peql" {

@@ -250,14 +250,18 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Payload>;
-    /// The end of the input (contracts d.7, amended 2026-10-28): called once per live instance,
-    /// after the last `apply` of the run and before the sink finishes. A kernel that runs
-    /// something apart (an image's process) ends its input here and answers for how it ended; an
-    /// `Err` ends the run. The default does nothing, which is every kernel that holds nothing
-    /// apart.
-    fn finish(&self, state: &mut dyn KernelState) -> crate::Result<()> {
+    /// The end of the input (contracts d.7, amended 2026-10-28 and 2026-11-04): called once per
+    /// live instance of a stateful stage, in instance order, once every input of the stage has
+    /// ended and its last `apply` has returned, and before the stage's output queues close. A
+    /// kernel that runs something apart (an image's process) ends its input here and answers for
+    /// how it ended; a kernel that must see the whole run before it gives anything (one that
+    /// collects every batch) gives it here. A payload it returns goes downstream like the output
+    /// of an `apply`, numbered after every number the stage's input could carry (d.16); `None`
+    /// gives nothing. An `Err` ends the run. The default gives nothing, which is every kernel that
+    /// holds nothing apart.
+    fn finish(&self, state: &mut dyn KernelState) -> crate::Result<Option<Payload>> {
         let _ = state;
-        Ok(())
+        Ok(None)
     }
     /// How many input ports the kernel takes at most (d.16): a stage that takes several inputs
     /// numbers them from 0 and is refused at build when it has more than this. One for a
@@ -281,6 +285,27 @@ pub trait Kernel: Send + Sync + 'static {
                 "the kernel takes one input and was handed a batch on its port {other}"
             ))),
         }
+    }
+    /// Whether the kernel joins its inputs by morsel (d.16, 2026-11-04): instead of one
+    /// `apply_port` per batch on each port, the stage waits until the morsel with one number has
+    /// arrived on every port and hands them over together to [`Kernel::apply_aligned`], whose one
+    /// output keeps that number. Every input of such a stage must carry the morsels of one
+    /// upstream, numbered alike, which the topology checks ([`crate::Topology::align`]). `false`
+    /// for every kernel that does not say otherwise.
+    fn aligns_inputs(&self) -> bool {
+        false
+    }
+    /// `apply` for the morsel of one number from every input port, port 0 first (d.16), for a
+    /// kernel whose [`Kernel::aligns_inputs`] is `true`. The default refuses, for every other.
+    fn apply_aligned(
+        &self,
+        state: &mut dyn KernelState,
+        inputs: Vec<Payload>,
+    ) -> crate::Result<Payload> {
+        let _ = (state, inputs);
+        Err(MorunaError::Plan(
+            "the kernel does not join its inputs by morsel and was handed them joined".into(),
+        ))
     }
     /// The output schema for the given input schemas, port 0 first (d.16); errors are plan-time
     /// errors. A kernel of one input leaves it alone: one schema is `output_schema`.

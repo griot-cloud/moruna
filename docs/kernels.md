@@ -126,6 +126,7 @@ kernels = [
 | `concat_str(columns, separator, output)` | Join columns into one text column |
 | `date_trunc(column, unit, output)` | Truncate timestamps to a year, month, day, hour, minute or second |
 | `union()` | Pass on the batches of every input port, each as it came; every input has one schema. In a job document version 2, a task with one input port for each producer |
+| `join()` | For each morsel, the columns of every input port side by side, port order: every input a branch of one upstream through kernels that keep its rows. A row count that differs or a column two inputs give is refused naming the ports. In a job document version 2, a task with one input port for each branch |
 
 Every standard kernel declares its schemas, so `moruna check` checks them too.
 

@@ -2,8 +2,8 @@
 //! written (MH 4.9).
 //!
 //! `cast`, `rename`, `select`, `drop`, `filter(expr)`, `fill_null`, `dedupe(keys)`,
-//! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str`, `date_trunc` and `union`, each a
-//! [`StdKernel`] built from its name and a JSON object of arguments. Each declares its input and
+//! `hash(cols, algo)`, `mask(cols, mode)`, `explode`, `concat_str`, `date_trunc`, `union` and
+//! `join`, each a [`StdKernel`] built from its name and a JSON object of arguments. Each declares its input and
 //! output schemas as a function of its arguments, so every one of them is checkable; each ships
 //! a first profile as its hints; none enters Python, so each releases the GIL by construction;
 //! and two adjacent ones are fused into one stage where their combination is one operation
@@ -44,7 +44,7 @@ use crate::ops::{Algo, MaskMode, Step, TruncUnit};
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every standard kernel's name, in the order of MH 4.9.
-pub const NAMES: [&str; 13] = [
+pub const NAMES: [&str; 14] = [
     "cast",
     "rename",
     "select",
@@ -58,6 +58,7 @@ pub const NAMES: [&str; 13] = [
     "concat_str",
     "date_trunc",
     "union",
+    "join",
 ];
 
 /// What a standard kernel does.
@@ -101,6 +102,9 @@ enum Op {
     /// `union`: the batches of every input port, each as it came, into one output (a stage of
     /// several inputs, contracts d.16).
     Union,
+    /// `join`: the morsel of one number from every input port, their columns side by side in
+    /// port order, into one batch with that number (contracts d.16, `Kernel::aligns_inputs`).
+    Join,
 }
 
 /// A standard kernel: its name, its canonical arguments, what it does and what it declares.
@@ -451,6 +455,17 @@ impl StdKernel {
                     0.0,
                 )
             }
+            "join" => {
+                args::only(name, args, &[])?;
+                (
+                    Op::Join,
+                    Declared {
+                        input: None,
+                        output: None,
+                    },
+                    0.0,
+                )
+            }
             other => {
                 return Err(MorunaError::Plan(format!(
                     "moruna.std has no kernel `{other}` (the standard kernels are {})",
@@ -527,7 +542,7 @@ impl StdKernel {
                 columns, output, ..
             } => ops::concat_schema(columns, output, input),
             Op::Trunc { column, output, .. } => ops::trunc_schema(column, output.as_deref(), input),
-            Op::Union => Ok(Arc::new(input.clone())),
+            Op::Union | Op::Join => Ok(Arc::new(input.clone())),
         }
     }
 }
@@ -622,6 +637,16 @@ pub fn fuse_chain(chain: Vec<StdKernel>) -> Vec<StdKernel> {
         out.push(kernel);
     }
     out
+}
+
+/// A refusal of `join` with the words it gives, at the morsel the scheduler names (CT-I10).
+fn join_refusal(msg: String) -> MorunaError {
+    MorunaError::Kernel {
+        stage: moruna_kernel::StageId::MAX,
+        seq: moruna_kernel::Seq::MAX,
+        msg: format!("moruna.std.join {msg}"),
+        features: None,
+    }
 }
 
 /// The state of a `dedupe` instance: the key bytes seen so far.
@@ -730,12 +755,45 @@ impl Kernel for StdKernel {
         }
     }
 
-    /// `union` takes any number of inputs; every other standard kernel one.
+    /// `union` and `join` take any number of inputs; every other standard kernel one.
     fn max_inputs(&self) -> u16 {
         match self.op {
-            Op::Union => u16::MAX,
+            Op::Union | Op::Join => u16::MAX,
             _ => 1,
         }
+    }
+
+    /// `join` takes the morsel of one number from every input at once (contracts d.16).
+    fn aligns_inputs(&self) -> bool {
+        matches!(self.op, Op::Join)
+    }
+
+    /// `join`: the inputs' columns side by side, port 0's first. Every input has the rows of
+    /// the one upstream morsel they were made from, so a row count that differs, or a column
+    /// two inputs both give, is refused naming the ports.
+    fn apply_aligned(&self, _state: &mut dyn KernelState, inputs: Vec<Payload>) -> Result<Payload> {
+        let Op::Join = self.op else {
+            return Err(MorunaError::Plan(format!(
+                "moruna.std.{} does not join its inputs by morsel",
+                self.name
+            )));
+        };
+        let mut batches = Vec::with_capacity(inputs.len());
+        for (port, input) in inputs.into_iter().enumerate() {
+            match input {
+                Payload::Table(batch, _) => batches.push(batch),
+                Payload::Tensor(..) => {
+                    return Err(join_refusal(format!(
+                        "takes tables, and its port {port} was given a tensor"
+                    )));
+                }
+            }
+        }
+        let out = ops::join(&batches).map_err(join_refusal)?;
+        if let Some(capture) = &self.capture {
+            capture.emit(0, &out)?;
+        }
+        Payload::table(out)
     }
 
     /// `union` gives what each of its inputs gives, so every input has one schema; every other
@@ -743,6 +801,22 @@ impl Kernel for StdKernel {
     fn output_schema_of(&self, inputs: &[SourceSchema]) -> Result<SourceSchema> {
         match (&self.op, inputs) {
             (_, [one]) => self.output_schema(one),
+            (Op::Join, many) => {
+                let mut tables = Vec::with_capacity(many.len());
+                for (port, schema) in many.iter().enumerate() {
+                    match schema {
+                        SourceSchema::Table(schema) => tables.push(Arc::clone(schema)),
+                        SourceSchema::Tensor { .. } => {
+                            return Err(MorunaError::Plan(format!(
+                                "moruna.std.join takes tables, and its port {port} gives a tensor"
+                            )));
+                        }
+                    }
+                }
+                Ok(SourceSchema::Table(Arc::new(ops::planned_join_schema(
+                    &tables,
+                ))))
+            }
             (Op::Union, [first, rest @ ..]) => {
                 let first = self.output_schema(first)?;
                 for (port, schema) in rest.iter().enumerate() {
@@ -775,6 +849,11 @@ impl Kernel for StdKernel {
         input: Payload,
     ) -> Result<Payload> {
         match (&self.op, port) {
+            (Op::Join, _) => Err(MorunaError::Plan(
+                "moruna.std.join takes the morsel of one number from every input at once, and \
+                 was handed one batch on its own"
+                    .into(),
+            )),
             (Op::Union, _) | (_, 0) => self.apply(state, input),
             (_, other) => Err(MorunaError::Plan(format!(
                 "moruna.std.{} takes one input and was handed a batch on its port {other}",
@@ -879,7 +958,7 @@ impl Kernel for StdKernel {
                 unit,
                 output,
             } => ops::date_trunc(column, *unit, output.as_deref(), batch)?,
-            Op::Union => {
+            Op::Union | Op::Join => {
                 if let Some(capture) = &self.capture {
                     capture.emit(0, batch)?;
                 }

@@ -767,63 +767,67 @@ impl Kernel for ImageKernel {
     }
 
     /// SDD 19 f.6, f.7: the input ends; the output must end where the input did and the process
-    /// must exit with status 0.
-    fn finish(&self, state: &mut dyn KernelState) -> Result<()> {
-        let st = state
-            .as_any_mut()
-            .downcast_mut::<ImageState>()
-            .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
-        if let Err(e) = st.plane.finish(st.task, INPUT) {
-            let words = plane_words(&e, &st.plane);
-            return Err(st.failed(true, format!("its input could not be ended: {words}")));
-        }
-        // A window is there for a batch it should not write, so that one is named.
-        st.grant()?;
-        match st.next()? {
-            Event::Ended { .. } => {}
-            Event::Put { batch, .. } => {
-                let _ = st.plane.drop_batch(batch);
-                let cause = format!(
-                    "its output holds more record batches than the {} sent",
-                    st.sent
-                );
-                return Err(st.failed(false, cause));
+    /// must exit with status 0. It gives nothing at its end: every batch an image writes answers one
+    /// it was sent.
+    fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
+        let ended = (|| -> Result<()> {
+            let st = state
+                .as_any_mut()
+                .downcast_mut::<ImageState>()
+                .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
+            if let Err(e) = st.plane.finish(st.task, INPUT) {
+                let words = plane_words(&e, &st.plane);
+                return Err(st.failed(true, format!("its input could not be ended: {words}")));
             }
-            Event::Refused { reason, .. } => {
-                return Err(st.failed(
-                    false,
-                    format!("its output was refused by the engine's check: {reason}"),
-                ));
+            // A window is there for a batch it should not write, so that one is named.
+            st.grant()?;
+            match st.next()? {
+                Event::Ended { .. } => {}
+                Event::Put { batch, .. } => {
+                    let _ = st.plane.drop_batch(batch);
+                    let cause = format!(
+                        "its output holds more record batches than the {} sent",
+                        st.sent
+                    );
+                    return Err(st.failed(false, cause));
+                }
+                Event::Refused { reason, .. } => {
+                    return Err(st.failed(
+                        false,
+                        format!("its output was refused by the engine's check: {reason}"),
+                    ));
+                }
+                other => return Err(st.failed(false, format!("its plane said {other:?}"))),
             }
-            other => return Err(st.failed(false, format!("its plane said {other:?}"))),
-        }
-        if let Some(fault) = st.bridge.as_ref().and_then(Bridge::fault) {
-            return Err(st.child.failed(false, fault));
-        }
-        let child = &mut st.child;
-        match child.reap(EXIT_WAIT) {
-            Some(Exit::Code(0)) => Ok(()),
-            Some(exit) => {
-                let lines = child.tail.lines(STDERR_WAIT);
-                let oom = child.cgroup.oom_kills() > 0;
-                Err(kernel_error(with_stderr(
-                    describe(exit, oom, &child.name),
-                    &lines,
-                )))
+            if let Some(fault) = st.bridge.as_ref().and_then(Bridge::fault) {
+                return Err(st.child.failed(false, fault));
             }
-            None => {
-                child.kill();
-                let lines = child.tail.lines(STDERR_WAIT);
-                Err(kernel_error(with_stderr(
-                    format!(
-                        "image `{}` did not exit within {} seconds of the end of its input",
-                        child.name,
-                        EXIT_WAIT.as_secs()
-                    ),
-                    &lines,
-                )))
+            let child = &mut st.child;
+            match child.reap(EXIT_WAIT) {
+                Some(Exit::Code(0)) => Ok(()),
+                Some(exit) => {
+                    let lines = child.tail.lines(STDERR_WAIT);
+                    let oom = child.cgroup.oom_kills() > 0;
+                    Err(kernel_error(with_stderr(
+                        describe(exit, oom, &child.name),
+                        &lines,
+                    )))
+                }
+                None => {
+                    child.kill();
+                    let lines = child.tail.lines(STDERR_WAIT);
+                    Err(kernel_error(with_stderr(
+                        format!(
+                            "image `{}` did not exit within {} seconds of the end of its input",
+                            child.name,
+                            EXIT_WAIT.as_secs()
+                        ),
+                        &lines,
+                    )))
+                }
             }
-        }
+        })();
+        ended.map(|()| None)
     }
 }
 
