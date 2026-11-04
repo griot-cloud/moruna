@@ -258,7 +258,7 @@ pub fn command() -> Result<Registry> {
 }
 
 /// The library's `python` kernel kind: the kernels `moruna.run` was given, handed back by the
-/// entry's place in `kernels`. Objects the caller holds, not code imported by path.
+/// entry's place among the run's kernels. Objects the caller holds, not code imported by path.
 pub struct Given {
     /// Entry by entry; `None` for an entry another kind builds.
     pub kernels: Vec<Option<Arc<PyKernel>>>,
@@ -310,19 +310,34 @@ fn held_declaration(name: &str, role: Role, summary: &str) -> Declaration {
     }
 }
 
-/// Take the object `moruna.run` was given, once.
-fn take<T>(slot: &Mutex<Option<T>>, what: &str) -> Result<T> {
-    slot.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .ok_or_else(|| MorunaError::Plan(format!("{what} was named without its object")))
+/// Take the object `moruna.run` was given for the entry at its role's place `entry.index()`,
+/// once.
+fn take<T>(slots: &Mutex<Vec<Option<T>>>, entry: &Entry<'_>, what: &str) -> Result<T> {
+    entry
+        .index()
+        .and_then(|at| {
+            slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(at)
+                .and_then(Option::take)
+        })
+        .ok_or_else(|| {
+            MorunaError::Plan(format!(
+                "{}: {what} was named without its object",
+                entry.field()
+            ))
+        })
 }
 
-/// The library's `iterator` source kind: the Python iterable `moruna.run` was given, with its
-/// schema.
+/// A Python iterable and the schema it promises.
+pub type Held = (Py<PyAny>, SourceSchema);
+
+/// The library's `iterator` source kind: the Python iterables `moruna.run` was given, with their
+/// schemas.
 pub struct Iterable {
-    /// The iterable and its schema, taken once.
-    pub object: Mutex<Option<(Py<PyAny>, SourceSchema)>>,
+    /// Each source's iterable and its schema, by its place among the run's sources, taken once.
+    pub objects: Mutex<Vec<Option<Held>>>,
 }
 
 impl SourceKind for Iterable {
@@ -336,7 +351,7 @@ impl SourceKind for Iterable {
 
     fn source(&self, entry: &Entry<'_>, _cx: &mut Context) -> Result<BuiltSource> {
         let Nothing {} = entry.settings()?;
-        let (iterator, schema) = take(&self.object, "an IteratorSource")?;
+        let (iterator, schema) = take(&self.objects, entry, "an IteratorSource")?;
         Ok(BuiltSource {
             spec: moruna_runtime::SourceSpec::Build(Box::new(move |ctx| {
                 Ok(Arc::new(moruna_sources::PyIteratorSource::new(
@@ -351,10 +366,10 @@ impl SourceKind for Iterable {
     }
 }
 
-/// The library's `python` source kind: the user's `moruna.Source` subclass instance (07 e.6).
+/// The library's `python` source kind: the user's `moruna.Source` subclass instances (07 e.6).
 pub struct UserSource {
-    /// The instance, taken once.
-    pub object: Mutex<Option<Py<PyAny>>>,
+    /// Each source's instance, by its place among the run's sources, taken once.
+    pub objects: Mutex<Vec<Option<Py<PyAny>>>>,
 }
 
 impl SourceKind for UserSource {
@@ -364,7 +379,7 @@ impl SourceKind for UserSource {
 
     fn source(&self, entry: &Entry<'_>, _cx: &mut Context) -> Result<BuiltSource> {
         let Nothing {} = entry.settings()?;
-        let object = take(&self.object, "a moruna.Source")?;
+        let object = take(&self.objects, entry, "a moruna.Source")?;
         // `PySource::new` calls the user's `plan()` at the lifecycle's "sources built" step, so a
         // plan error surfaces before a sink is opened or a morsel is read (12 f.1).
         Ok(BuiltSource {
@@ -380,11 +395,11 @@ impl SourceKind for UserSource {
     }
 }
 
-/// The library's `python` sink kind: the user's `moruna.Sink` subclass instance (08 f.10). It
+/// The library's `python` sink kind: the user's `moruna.Sink` subclass instances (08 f.10). It
 /// names no location of its own, so the sink equals source rule has nothing to compare.
 pub struct UserSink {
-    /// The instance, taken once.
-    pub object: Mutex<Option<Py<PyAny>>>,
+    /// Each sink's instance, by its place among the run's sinks, taken once.
+    pub objects: Mutex<Vec<Option<Py<PyAny>>>>,
 }
 
 impl SinkKind for UserSink {
@@ -394,7 +409,7 @@ impl SinkKind for UserSink {
 
     fn sink(&self, entry: &Entry<'_>, _cx: &mut Context) -> Result<BuiltSink> {
         let Nothing {} = entry.settings()?;
-        let object = take(&self.object, "a moruna.Sink")?;
+        let object = take(&self.objects, entry, "a moruna.Sink")?;
         Ok(BuiltSink {
             spec: moruna_runtime::SinkSpec::Build(Box::new(move |_ctx| {
                 Ok(Box::new(moruna_sinks::PySink::new(object)?) as Box<dyn moruna_kernel::Sink>)
@@ -470,7 +485,8 @@ fn declared_kind(text: &str) -> Result<Declaration> {
         name: "kinds",
         msg: format!("not a declaration: {e}"),
     })?;
-    library(Vec::new(), None, None, None, Vec::new())?.declare(declaration.clone())?;
+    library(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+        .declare(declaration.clone())?;
     Ok(declaration)
 }
 
@@ -526,7 +542,8 @@ fn declared_task(
 fn kinds(py: Python<'_>, declarations: Vec<String>) -> PyResult<String> {
     let to_err =
         |e: MorunaError| crate::errors::to_py_err(py, &e, crate::errors::Attachments::default());
-    let mut registry = library(Vec::new(), None, None, None, Vec::new()).map_err(to_err)?;
+    let mut registry =
+        library(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).map_err(to_err)?;
     for text in &declarations {
         let declaration = declared_kind(text).map_err(to_err)?;
         registry.declare(declaration).map_err(to_err)?;
@@ -544,14 +561,15 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// What `moruna.run` runs with: the runtime's kinds, [`Given`] over its kernels, the objects it
-/// holds as their kinds, and the kinds the program serves (`served`, each declaration with the
-/// callable that answers its guest port), declared in the order given; the same kind given twice
-/// is declared once, and two declarations of one name are refused.
+/// holds as their kinds (each at its task's place among its role's: `iterables` and `sources` by
+/// source, `sinks` by sink), and the kinds the program serves (`served`, each declaration with
+/// the callable that answers its guest port), declared in the order given; the same kind given
+/// twice is declared once, and two declarations of one name are refused.
 pub fn library(
     kernels: Vec<Option<Arc<PyKernel>>>,
-    iterable: Option<(Py<PyAny>, SourceSchema)>,
-    source: Option<Py<PyAny>>,
-    sink: Option<Py<PyAny>>,
+    iterables: Vec<Option<Held>>,
+    sources: Vec<Option<Py<PyAny>>>,
+    sinks: Vec<Option<Py<PyAny>>>,
     served: Vec<(Declaration, Py<PyAny>)>,
 ) -> Result<Registry> {
     let mut ports: BTreeMap<String, Arc<dyn GuestPort>> = BTreeMap::new();
@@ -586,13 +604,13 @@ pub fn library(
     let mut kinds = Registry::standard().with_embedding(Arc::new(Serving(ports)));
     kinds.register_kernel(Arc::new(Given { kernels }))?;
     kinds.register_source(Arc::new(Iterable {
-        object: Mutex::new(iterable),
+        objects: Mutex::new(iterables),
     }))?;
     kinds.register_source(Arc::new(UserSource {
-        object: Mutex::new(source),
+        objects: Mutex::new(sources),
     }))?;
     kinds.register_sink(Arc::new(UserSink {
-        object: Mutex::new(sink),
+        objects: Mutex::new(sinks),
     }))?;
     for declaration in declared {
         kinds.declare(declaration)?;

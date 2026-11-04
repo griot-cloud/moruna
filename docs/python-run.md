@@ -2,7 +2,8 @@
 
 ```python
 moruna.run(
-    source, kernels, sink, *, budget=None, cpu=None, trace=None,
+    source=None, kernels=None, sink=None, *, graph=None,
+    budget=None, cpu=None, trace=None,
     staging_dir=None, staging_limit=None, on_error="terminate",
     ordered=False, sizer="rule", profiles_dir=None, storage=None,
     host_profile=None, allow_gil=False, checkpoint=True,
@@ -10,13 +11,14 @@ moruna.run(
 ) -> moruna.RunReport
 ```
 
-Runs the source through each kernel and writes results to the sink. `kernels` may be one kernel or a list in execution order. A plain callable is wrapped with the defaults of `moruna.kernel`; an empty list copies the source.
+Runs the source through each kernel and writes results to the sink, or runs the DAG `graph` (a [`moruna.Graph`](#morunagraph)). Pass a source, kernels and a sink, or `graph=`, not both. `kernels` may be one kernel or a list in execution order. A plain callable is wrapped with the defaults of `moruna.kernel`; an empty list copies the source.
 
 | Parameter | Type and default | Meaning |
 | --- | --- | --- |
-| `source` | source handle, required | Built-in source or `Source` subclass instance. |
-| `kernels` | kernel or list, required | `KernelSpec`, `StdKernel`, plain callable, or a list of these. |
-| `sink` | sink handle, required | Built-in sink or `Sink` subclass instance. |
+| `source` | source handle | Built-in source or `Source` subclass instance. |
+| `kernels` | kernel or list | `KernelSpec`, `StdKernel`, plain callable, or a list of these. |
+| `sink` | sink handle | Built-in sink or `Sink` subclass instance. |
+| `graph` | `Graph \| None = None` | A DAG of named tasks, in place of `source`, `kernels` and `sink`. |
 | `budget` | `int \| str \| None = None` | Whole-process memory ceiling in bytes or a size string such as `"8GiB"`; `None` uses discovery. |
 | `cpu` | `float \| None = None` | CPU quota; `None` uses discovery. |
 | `trace` | `str \| None = None` | File or directory for a per-morsel trace. |
@@ -47,3 +49,41 @@ report = moruna.run(
 )
 print(report.run_id, report.stages[0]["rows_out"])
 ```
+
+## `moruna.Graph`
+
+```python
+g = moruna.Graph()
+g.source(name, source) -> str
+g.kernel(name, kernel, inputs) -> str      # inputs: a task name or a list of them
+g.sink(name, sink, input) -> str
+g.tasks -> tuple[moruna.GraphTask, ...]    # (role, name, object, inputs), in the order added
+```
+
+A run as a DAG of named tasks. A task takes its inputs from the tasks it names, which may be added before or after it. One task's output may feed several tasks (fan-out), and a kernel may take several inputs (fan-in), each on a port named after the task that feeds it. Branches that are ready at the same time run at the same time on the worker pool. `moruna.std.join()` puts the columns of branches of one upstream side by side, morsel by morsel; `moruna.std.union()` passes on every batch of every input.
+
+Adding a name twice raises `ValueError`; a name or an input that is not a string raises `TypeError`. `moruna.run(graph=g)` refuses unknown names, cycles and outputs no task reads with one `ConfigError` that names every one of them, before anything starts.
+
+```python
+import moruna
+import pyarrow as pa
+import pyarrow.compute as pc
+
+@moruna.kernel
+def words(batch: pa.RecordBatch) -> pa.RecordBatch:
+    return pa.record_batch({"words": pc.count_substring(batch["text"], " ")})
+
+@moruna.kernel
+def length(batch: pa.RecordBatch) -> pa.RecordBatch:
+    return pa.record_batch({"length": pc.utf8_length(batch["text"])})
+
+g = moruna.Graph()
+g.source("rows", moruna.ParquetSource("reviews.parquet", columns=["id", "text"]))
+g.kernel("words", words, inputs="rows")
+g.kernel("length", length, inputs="rows")
+g.kernel("all", moruna.std.join(), inputs=["rows", "words", "length"])
+g.sink("out", moruna.ParquetSink("reviews-scored"), input="all")
+report = moruna.run(graph=g, budget="2GiB")
+```
+
+Each row of `reviews-scored` holds `id`, `text`, `words` and `length`, the same rows the chain `[words, length]` would give if each kernel appended its column.

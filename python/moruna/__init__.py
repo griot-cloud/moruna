@@ -70,6 +70,7 @@ from moruna._core import (
     inspect_host,
     load,
 )
+from moruna._graph import Graph, GraphTask
 from moruna._kinds import DeclaredKind, KindCall, kind, kinds
 
 __version__: str = _core.__version__
@@ -111,6 +112,9 @@ __all__ = [
 # A source or a sink of the user's own (SDD 07 e.6, 08 f.10).
 __all__ += ["Sink", "Source", "Split"]
 
+# A run as a DAG of named tasks (SDD 12 d.2, SDD 22 d.4).
+__all__ += ["Graph", "GraphTask"]
+
 # A function package (SDD 16 d.3).
 __all__ += ["PackageKernel", "load"]
 
@@ -121,10 +125,11 @@ __all__ += ["DeclaredKind", "KindCall", "kind", "kinds"]
 
 
 def run(
-    source: Any,
-    kernels: Any,
-    sink: Any,
+    source: Any = None,
+    kernels: Any = None,
+    sink: Any = None,
     *,
+    graph: Graph | None = None,
     budget: int | str | None = None,
     cpu: float | None = None,
     trace: str | None = None,
@@ -144,7 +149,12 @@ def run(
     cost: CostSession | None = None,
     engine_ports: EnginePorts | None = None,
 ) -> RunReport:
-    """Run one pipeline from ``source`` through ``kernels`` to ``sink`` and return its report.
+    """Run one pipeline from ``source`` through ``kernels`` to ``sink``, or the DAG ``graph``
+    (a ``moruna.Graph``), and return its report.
+
+    The chain is the graph with one path; the two are built into the same job. A graph's
+    unknown task names, cycles and outputs no task reads are refused with ``ConfigError``
+    naming every one of them, before anything starts.
 
     ``kernels`` may be one kernel or a list of them, in stage order; a plain callable is wrapped
     as if it had been decorated with ``@moruna.kernel`` and its defaults, and a task of a
@@ -171,6 +181,7 @@ def run(
         source,
         kernels,
         sink,
+        graph=graph,
         budget=budget,
         cpu=cpu,
         trace=trace,
@@ -304,10 +315,15 @@ def kernel(
 
     ``stateful=False`` (the default) takes a plain callable ``f(batch) -> batch``.
     ``stateful=True`` takes an object with ``setup(self, ctx) -> state`` and
-    ``__call__(self, state, batch) -> batch``, and optionally ``footprint(self, state)``; ``ctx``
-    exposes ``.instance`` and ``.device``. ``resume="checkpoint"`` also requires
-    ``checkpoint(self, state) -> bytes`` and ``restore(self, ctx, data) -> state``, and is refused
-    at decoration when either is missing.
+    ``__call__(self, state, batch) -> batch``, and optionally ``footprint(self, state)`` and
+    ``finish(self, state)``; ``ctx`` exposes ``.instance`` and ``.device``. ``finish`` is called
+    once per instance when the kernel's input has ended, after its last ``__call__``; a batch it
+    returns goes downstream like any other, ``None`` gives nothing, and an exception ends the run
+    naming the kernel. A kernel that must see the whole run before it gives anything (one that
+    collects every batch) gives its result there, and takes ``instances=1``: with more, each
+    instance sees only the batches it was given and each instance's ``finish`` is called.
+    ``resume="checkpoint"`` also requires ``checkpoint(self, state) -> bytes`` and
+    ``restore(self, ctx, data) -> state``, and is refused at decoration when either is missing.
 
     ``input_schema`` and ``output_schema`` declare what the kernel takes and gives, which makes
     it checkable (``python -m moruna check``): a ``pyarrow.Schema`` is exact, a mapping of

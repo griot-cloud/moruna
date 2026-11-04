@@ -39,9 +39,11 @@ __all__ = [
     "fill_null",
     "filter",
     "hash",
+    "join",
     "mask",
     "rename",
     "select",
+    "union",
 ]
 
 
@@ -132,3 +134,19 @@ def date_trunc(column: str, unit: str, output: str | None = None) -> Any:
     """Truncate a timestamp or date32 column to ``year``, ``month``, ``day``, ``hour``,
     ``minute`` or ``second`` (in UTC), in place or into a new column ``output``."""
     return _build("date_trunc", {"column": column, "unit": unit, "output": output})
+
+
+def join() -> Any:
+    """Join branches of one upstream side by side: for each morsel, the columns every input
+    gives for it, port order, in one batch with that morsel's rows. A kernel of a ``moruna.Graph``
+    with several inputs (``inputs=["a", "b"]``), each a branch of the same upstream through
+    kernels that keep its rows and their order. A row count that differs between inputs, or a
+    column two inputs both give, is refused naming the ports; drop or rename such a column in a
+    branch before the join."""
+    return _build("join", {})
+
+
+def union() -> Any:
+    """Pass on the batches of every input, each as it came; every input has one schema. A kernel
+    of a ``moruna.Graph`` with several inputs."""
+    return _build("union", {})

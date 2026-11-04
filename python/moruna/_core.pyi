@@ -301,10 +301,11 @@ def load(
     assets: str | None = None,
 ) -> PackageKernel: ...
 def run(
-    source: Any,
-    kernels: Any,
-    sink: Any,
+    source: Any = ...,
+    kernels: Any = ...,
+    sink: Any = ...,
     *,
+    graph: Any = ...,
     budget: int | str | None = ...,
     cpu: float | None = ...,
     trace: str | None = ...,

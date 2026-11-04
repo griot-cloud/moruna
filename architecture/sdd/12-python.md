@@ -1,7 +1,7 @@
 # Moruna SDD 12: Python surface and runtime facade (`moruna-py`, `moruna-runtime`, `python/moruna`)
 
 **Document type:** software design document, component 12 of 12
-**Status:** DRAFT · 2026-09-15 (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-09-15, amended 2026-11-04 for 0.6.1 (`moruna.Graph` and `moruna.run(graph=...)`, a stateful kernel's `finish`: PY-I15, PY-I16, d.2, PY-T44 to PY-T47) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** `architecture/moruna-runtime-design.md` section 5.10, 6 (hosting), 4.3 (D4); criteria S2, S8, S12; global invariants G-I9, G-I10
 **Preamble:** `00-preamble.md`; **Contracts:** `01-contracts.md` (all)
 **Component location:** `crates/moruna-runtime` (facade, Rust; built in wave 4 because RC-T12 needs it), `crates/moruna-py` (PyO3 module) and `python/moruna` (package), both wave 5; Python 3.13 and 3.14
@@ -62,6 +62,10 @@ It refuses to know: anything a component owns. If logic appears here that is not
 **PY-I13. Every run event is a record (added 2026-10-29, KA8).** The facts PY-I11 and PY-I12 order are each a `moruna-record` record (SDD 21) whose body is the fact as FlatBuffers (`crates/moruna-event`, `schema/event.fbs`; MH 4.3 version 7): `seq` the event's number in its attempt, `ts` unix nanoseconds, `subject` the kind's, `msg_id` `<attempt>-<start>-<seq>` (`start` the telling process's own id), and the headers `run`, `attempt`, `plan`, `step` and `task`, absent where they do not apply. The session writes records, never lines of JSON: to the peer as a frame, to `_events.mrec` in the run's output store when no peer is there, and into the ring an embedder gave the run, which the run never waits for. The JSON of version 6, with its field names, is rendered from the record at the edge (`moruna run --events-json`, `moruna run --vm`, `moruna.read_events`). Nothing changes of what is told or in what order: PY-I11 and PY-I12 hold of the records exactly as they held of the lines, and `msg_id` makes the delivery of one event, however often it is relayed, one event. `moruna_event::decode` takes anyone's bytes (the record's checks, the FlatBuffers verifier, every value an event holds) and never panics; a record whose subject, `msg_id` and body disagree is refused.
 **PY-I14. A kind the program serves is declared and served from Python (added 2026-10-29, KA6).** `@moruna.kind(name=..., settings=..., input_schema=..., output_schema=..., deadline_ms=...)` builds the kind's declaration in the format of SDD 18 e.1 and e.4 (`isolation: embedder`, `served.port` the guest port of the kind's name), checks it as `Registry::declare` does when it is declared (a name a kind of `moruna.run` has, a settings schema outside the validator's subset, rules that are not rules: `ConfigError` naming why), and serves it with the decorated callable: `moruna.run` declares the kinds of the tasks it is given and answers each one's guest port by `moruna._kinds._answer`, which reads the request (SDD 18 e.5) with pyarrow, calls `serve(batch, KindCall(kind, settings, input))` and writes what it returns (a `RecordBatch`, a `Table` or a list of record batches of one schema) as an Arrow IPC stream. An exception is the port's refusal and fails the task with its message. `moruna.kinds(*declared)` is what `moruna kinds` lists for `moruna.run`'s registry, with the declared kinds among the kernels. SDD 18 KD-I11.
 
+**PY-I15. A run is a job, whether a chain or a graph (0.6.1, SDD 22 JB-I18).** `moruna.run(source, kernels, sink)` and `moruna.run(graph=g)` build the same `moruna_job::Job` version 2, through one function, and run it through the one build (12 f.3, MH 4.1): the chain is the graph of one path, its tasks `source`, `kernel-1` .. `kernel-n` and `sink` named in a refusal as `source`, `kernels[i]` and `sink`; a graph's tasks keep their names and are named in a refusal as `graph["<name>"]`. The in-process objects (a `moruna.Source`, an `IteratorSource`'s iterable, a Python kernel, a `moruna.Sink`) are bound to their tasks by reference, by each task's place among the tasks of its role, never by import. A graph's task names, ports and edges are checked (`moruna_job::check_graph`) before anything is built, and every refusal is in the one `ConfigError`: an unknown name, a cycle, an output no task reads, a name twice. Exactly one of the two forms is given, or `TypeError`. Concurrent runs in one process stay refused (g).
+
+**PY-I16. A stateful kernel's `finish` is called (0.6.1, SDD 10 SC-I17).** When the object of a stateful Python kernel defines `finish(self, state)`, it is called once per instance when the kernel's input ends, after its last `__call__`, with that instance's state, inside the same frame as `__call__` (the allocator guard, the NumPy and Arrow counts, AD f.10 to f.14). What it returns is landed like `__call__`'s output and goes downstream; `None` gives nothing; an exception ends the run as `KernelError` whose message names the kernel (`<module>.<qualname>.finish`) and carries the traceback. A kernel that must see the whole run before it gives anything takes `instances=1`; with more, each instance's `finish` gives what that instance saw. Resume follows the stateful kernel's rules (10 f.16 item 11): a `reinit` kernel resumed from a manifest sees only the batches after it, so a whole-run kernel that must survive a resume declares `resume="checkpoint"`.
+
 ## d. Interfaces
 
 ### d.1 Runtime facade (Rust)
@@ -114,12 +118,22 @@ impl Runtime {
 ### d.2 Python API (`python/moruna/__init__.py`)
 
 ```python
-def run(source, kernels, sink, *, budget=None, cpu=None, trace=None, staging_dir=None,
-        staging_limit=None, on_error="terminate", ordered=False, sizer="rule",
+def run(source=None, kernels=None, sink=None, *, graph=None, budget=None, cpu=None, trace=None,
+        staging_dir=None, staging_limit=None, on_error="terminate", ordered=False, sizer="rule",
         profiles_dir=None, storage=None, host_profile=None, allow_gil=False,
         checkpoint=True, checkpoint_interval=5.0, keep_checkpoint=False,
         resume=None) -> RunReport
     # resume: None | "auto" | run id (str, 32 hex characters) | path to a manifest.json
+    # a source, kernels and a sink, or graph= (a Graph), not both (PY-I15; 0.6.1)
+
+class Graph:           # 0.6.1, PY-I15: a run as a DAG of named tasks, joined by name
+    def source(self, name: str, source) -> str             # a moruna.*Source or a moruna.Source instance
+    def kernel(self, name: str, kernel, inputs: str | Sequence[str]) -> str   # anything `run` takes as a kernel
+    def sink(self, name: str, sink, input: str) -> str      # a moruna.*Sink or a moruna.Sink instance
+    tasks: tuple[GraphTask, ...]                            # (role, name, object, inputs), in the order added
+    # a name twice: ValueError, a name or an input that is not a string: TypeError, both at once; an unknown
+    # name, a cycle, an output no task reads: ConfigError at `run`, every one named. A kernel of one input
+    # takes it on port `in`, one of several on ports named after the tasks that feed it.
 
 def kernel(fn=None, *, stateful=False, instances=1, device_memory=False,
            accepts="table", tier="host", releases_gil=None,
@@ -131,7 +145,8 @@ def kernel(fn=None, *, stateful=False, instances=1, device_memory=False,
                                 # ceiling (05 AD-I8); False turns refusal off and leaves counting on (AD-I10)
     # stateful=False: fn is a plain callable f(batch) -> batch
     # stateful=True: fn is a class instance with setup(self, ctx) -> state and __call__(self, state, batch) -> batch,
-    #                optionally footprint(self, state) -> int | None; ctx exposes .instance and .device (05 b)
+    #                optionally footprint(self, state) -> int | None and (0.6.1, PY-I16) finish(self, state) ->
+    #                batch | None, called once per instance at the end of its input; ctx exposes .instance and .device (05 b)
 
 class ParquetSource:   def __init__(self, urls: str | list[str], *, columns=None, filters=None)
 class VortexSource:    def __init__(self, urls: str | list[str], *, columns=None, split_bytes=None)   # 07 e.7, e.8; 2026-09-29
@@ -352,6 +367,14 @@ Python tests run under the four interpreter builds in CI; Rust facade tests use 
 **PY-T38 public_event_wire_conformance.** (`crates/moruna-event/tests/wire.rs`, KA8) Independent FlatBuffers builders and verified public accessors check every event table with omitted/default and populated fields, every union alternative and wrong-alternative accessor, counter setters without neighbouring-field loss, schema enum names and unknown diagnostics, and ordinary versus size-prefixed framing. Structurally valid unknown enum values are refused by `decode` with the precise field and reason; absence of a body is not a valid event. Generated tables remain inside the same 90% coverage gate as other code; these are public wire-contract checks, not a generated-code exemption. PY-I13, SDD 21 RC-I3.
 **PY-T39 to PY-T43 served_kinds.** (`python/tests/test_kinds.py`, KA6, 2026-10-29) PY-T39: a declared kind's declaration is SDD 18 e.4's, its port the guest port of its name, and `moruna.kinds(kind)` lists it with `moruna.run`'s kinds and `moruna.kinds()` without it. PY-T40: a name a kind has (`std`), an open settings schema, an unknown type in a rule and a decorated object that is not callable are refused at declaration. PY-T41: a run of a Parquet source through a declared kind into a Parquet sink writes every row, each the callable's transform. PY-T42: settings the kind's schema refuses are refused before the run (`ConfigError` naming the setting); a callable that raises, and one whose answer lacks a declared column, fail the task (`KernelError`, with the exception's words or the column). PY-T43: two declared kinds and a Python kernel in one run, with a `Table` and a list of batches as answers, each seeing what the one before gave. PY-I14.
 
+**PY-T44 a_graph_runs.** (`python/tests/test_graph.py`, 0.6.1) A `moruna.Source` fanned out to two Python kernels and joined by `moruna.std.join()` gives an ordered `moruna.Sink`, row for row and column for column, what the same two kernels give in a chain (`kernels=[loud, length]`); two sources unioned by `moruna.std.union()` and fanned out to two sinks give each sink its rows, each object bound to its own task. PY-I15, SDD 22 JB-I18, SDD 10 SC-I18.
+
+**PY-T45 a_graph_is_refused_by_name.** (same file) An unknown input name and an output no task reads are both named in one `ConfigError`; a cycle names the tasks on it; a join of two sources names the join; a column two branches give and a branch that halves its rows are refused naming the ports; a name twice is a `ValueError` and a name that is not a string a `TypeError` when added; a chain and a graph at once, or neither, is a `TypeError`. PY-I15, SDD 22 JB-I19.
+
+**PY-T46 ready_branches_run_at_once.** (same file) A fan-out of one batch to four kernels that each block for T = 1 s, joined: the four calls overlap (the latest start is before the earliest end) and the batch takes under 2.5 T, where in series it takes at least 4 T (measured 1.01 s on CPython 3.14t with no GIL, 2026-11-04). SDD 10 f.16 item 12.
+
+**PY-T47 finish.** (same file) A stateful kernel that counts every row and gives the count from `finish`: with `instances=1`, `finish` once and one row holding every row's count reaches the sink; with `instances=2`, each instance's `finish` once, and the counts add up to every row; in a graph, a later kernel takes what `finish` gave, and a `finish` that returns `None` gives nothing; a `finish` that raises ends the run with `KernelError` naming `<kernel>.finish` and the exception, and the sink is not finished. PY-I16, SDD 10 SC-I17.
+
 ## l. Implementation notes for the agent
 
 Rust files: `crates/moruna-runtime/src/{lib.rs, spec.rs (RunSpec, Components), run.rs (f.1, f.7), report.rs (f.2), cancel.rs}` (wave 4, so RC-T12 can drive real components through it); `crates/moruna-py/src/{lib.rs (module, gil_used = false), sources.rs, sinks.rs, extend.rs (`Split`, `Source`, `Sink`, the classes a user extends, and the checks of what a subclass must define; 2026-09-29), kernel.rs (decorator support: a frozen `#[pyclass] KernelSpec` holding the `PyKernel`), run.rs (f.3, f.4, f.5), report.rs, errors.rs (e.2), inspect.rs}` and the Python files per e.3 (wave 5). Every `#[pyclass]` is `frozen`; state that must change lives in Rust behind a `Mutex` or is returned as a new object. `_core.pyi` is written by hand and kept in step by PY-T5. `unsafe` not permitted outside what PyO3 generates.
@@ -389,6 +412,8 @@ None. (The GPU-wheel question is PY-O1 in section o; it does not block hand-off.
 | MH 4.3 `event` (each task's lifecycle is one order, whatever the timing; HO-T16, 2026-10-28) | PY-I12 | PY-T28, PY-T29, HO-T16 |
 | MH 4.3 `event` version 7 (every event is a record with a FlatBuffers body; KA8, 2026-10-29), SDD 21, SDD 26 e.2 | PY-I13 | PY-T30 to PY-T38 |
 | SDD 18 KD-I11 (a kind the program serves, declared and served from Python; KA6, 2026-10-29) | PY-I14 | PY-T39 to PY-T43 |
+| 0.6.1 (`moruna.run` takes a graph; SDD 22 JB-I18, JB-I19) | PY-I15, d.2 `Graph` | PY-T44, PY-T45, PY-T46 |
+| 0.6.1 (a stateful kernel's `finish`; SDD 10 SC-I17) | PY-I16, d.2 `kernel` | PY-T47 |
 
 ## o. Deferred (post-v1)
 

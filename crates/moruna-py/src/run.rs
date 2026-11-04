@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use moruna_adapters::python_gil_enabled;
 use moruna_job::{
-    AzureDoc, ErrorPolicyDoc, GcsDoc, JobSpec, KindDoc, ObjectStoreDoc, S3Doc, SizerDoc, SpecError,
-    Urls,
+    AzureDoc, Edge, ErrorPolicyDoc, GcsDoc, IN, Job, KindDoc, OUT, ObjectStoreDoc, Role, S3Doc,
+    SizerDoc, SpecError, Task, Urls, V1_SINK, V1_SOURCE,
 };
 use moruna_kernel::{CancelToken, DType, MorunaError, SourceSchema};
 use moruna_runtime::job::BuildOptions;
@@ -30,7 +30,7 @@ use pyo3::types::{PyAny, PyDict};
 
 use crate::errors::{Attachments, to_py_err};
 use crate::handles::{IteratorSchema, SinkSpec, SourceSpec};
-use crate::kernel::{PyKernelHandle, Stage, kernels_of};
+use crate::kernel::{PyKernelHandle, Stage, stage_of};
 use crate::report::PyRunReport;
 use crate::sources::type_name;
 use crate::translate::{
@@ -73,20 +73,142 @@ impl Drop for RunningGuard {
     }
 }
 
-/// `moruna.run` (d.2). Every argument beyond the first three is keyword-only and optional:
-/// `moruna.run(source, kernels, sink)` is a complete call (PY-I3).
+/// One task of a run as `moruna.run` was given it (d.2): its role, its id, the field a refusal
+/// names it by, the object, and the ids of the tasks that feed its inputs, port order.
+struct Given<'py> {
+    role: Role,
+    id: String,
+    at: String,
+    object: Bound<'py, PyAny>,
+    inputs: Vec<String>,
+}
+
+/// `moruna.run(source, kernels, sink)` as the DAG with one path it is (SDD 22 JB-I10): the tasks
+/// `source`, `kernel-1` .. `kernel-n` and `sink`, each fed by the one before, named in a refusal
+/// by the field a version 1 document writes them under.
+fn chain<'py>(
+    source: &Bound<'py, PyAny>,
+    kernels: &Bound<'py, PyAny>,
+    sink: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Given<'py>>> {
+    let items: Vec<Bound<'py, PyAny>> = if kernels.is_instance_of::<pyo3::types::PyList>()
+        || kernels.is_instance_of::<pyo3::types::PyTuple>()
+    {
+        kernels.try_iter()?.collect::<PyResult<Vec<_>>>()?
+    } else {
+        vec![kernels.clone()]
+    };
+    let mut tasks = Vec::with_capacity(items.len() + 2);
+    tasks.push(Given {
+        role: Role::Source,
+        id: V1_SOURCE.into(),
+        at: "source".into(),
+        object: source.clone(),
+        inputs: Vec::new(),
+    });
+    for (i, item) in items.into_iter().enumerate() {
+        let before = tasks[i].id.clone();
+        tasks.push(Given {
+            role: Role::Kernel,
+            id: format!("kernel-{}", i + 1),
+            at: format!("kernels[{i}]"),
+            object: item,
+            inputs: vec![before],
+        });
+    }
+    let before = tasks[tasks.len() - 1].id.clone();
+    tasks.push(Given {
+        role: Role::Sink,
+        id: V1_SINK.into(),
+        at: "sink".into(),
+        object: sink.clone(),
+        inputs: vec![before],
+    });
+    Ok(tasks)
+}
+
+/// `moruna.run(graph=...)`: the tasks of a `moruna.Graph` (`Graph.tasks`, each a tuple of its
+/// role, its name, its object and the names of the tasks that feed it), in the order they were
+/// added, named in a refusal as `graph["<name>"]`.
+fn graph<'py>(graph: &Bound<'py, PyAny>) -> PyResult<Vec<Given<'py>>> {
+    let listed = graph.getattr("tasks").map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "graph= takes a moruna.Graph, not {}",
+            type_name(graph)
+        ))
+    })?;
+    let mut tasks = Vec::new();
+    for entry in listed.try_iter()? {
+        let (role, id, object, inputs): (String, String, Bound<'py, PyAny>, Vec<String>) =
+            entry?.extract()?;
+        let role = match role.as_str() {
+            "source" => Role::Source,
+            "kernel" => Role::Kernel,
+            "sink" => Role::Sink,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "a graph task is a source, a kernel or a sink, not `{other}`"
+                )));
+            }
+        };
+        tasks.push(Given {
+            role,
+            at: format!("graph[{id:?}]"),
+            id,
+            object,
+            inputs,
+        });
+    }
+    Ok(tasks)
+}
+
+/// The tasks and edges of the job the given tasks are (SDD 22 d.4): a task with one input takes
+/// it on `in`, one with several takes each on a port named after the task that feeds it, and
+/// every task gives on `out`; an edge of batches joins each input to the output it names.
+fn graph_of(tasks: &[Given<'_>], entries: Vec<KindDoc>) -> (Vec<Task>, Vec<Edge>) {
+    let mut out = Vec::with_capacity(tasks.len());
+    let mut edges = Vec::new();
+    for (given, entry) in tasks.iter().zip(entries) {
+        let ports: Vec<String> = match given.inputs.as_slice() {
+            [_] => vec![IN.to_string()],
+            many => many.to_vec(),
+        };
+        let mut task = match given.role {
+            Role::Source => Task::source(given.id.clone(), entry),
+            Role::Kernel => Task::kernel(given.id.clone(), entry),
+            Role::Sink => Task::sink(given.id.clone(), entry),
+        };
+        // A source has no input port, whatever it was given: an edge into one is refused there.
+        if given.role != Role::Source {
+            task.inputs = ports.clone();
+        }
+        task.at = Some(given.at.clone());
+        for (from, port) in given.inputs.iter().zip(&ports) {
+            edges.push(Edge::new(from.clone(), OUT, given.id.clone(), port.clone()));
+        }
+        out.push(task);
+    }
+    (out, edges)
+}
+
+/// `moruna.run` (d.2). A run is a source, kernels and a sink, the chain `moruna.run(source,
+/// kernels, sink)` is a complete call of (PY-I3), or a `moruna.Graph` (`graph=`), a DAG of
+/// tasks; both are built into the one job model (SDD 22 d.4). Every other argument is
+/// keyword-only and optional.
 #[pyfunction]
-#[pyo3(signature = (source, kernels, sink, *, budget = None, cpu = None, trace = None,
-                    staging_dir = None, staging_limit = None, on_error = None, ordered = false,
-                    sizer = "rule", profiles_dir = None, storage = None, host_profile = None,
-                    allow_gil = false, checkpoint = true, checkpoint_interval = 5.0,
-                    keep_checkpoint = false, resume = None, cost = None, engine_ports = None))]
+#[pyo3(signature = (source = None, kernels = None, sink = None, *, graph = None, budget = None,
+                    cpu = None, trace = None, staging_dir = None, staging_limit = None,
+                    on_error = None, ordered = false, sizer = "rule", profiles_dir = None,
+                    storage = None, host_profile = None, allow_gil = false, checkpoint = true,
+                    checkpoint_interval = 5.0, keep_checkpoint = false, resume = None,
+                    cost = None, engine_ports = None))]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     py: Python<'_>,
-    source: &Bound<'_, PyAny>,
-    kernels: &Bound<'_, PyAny>,
-    sink: &Bound<'_, PyAny>,
+    source: Option<&Bound<'_, PyAny>>,
+    kernels: Option<&Bound<'_, PyAny>>,
+    sink: Option<&Bound<'_, PyAny>>,
+    graph: Option<&Bound<'_, PyAny>>,
     budget: Option<&Bound<'_, PyAny>>,
     cpu: Option<f64>,
     trace: Option<String>,
@@ -108,9 +230,38 @@ pub fn run(
 ) -> PyResult<PyRunReport> {
     let _guard = map(py, RunningGuard::acquire())?;
 
-    let source_spec = sources::spec_of(source)?;
-    let (sink_spec, sink_notes) = sinks::spec_of(sink)?;
-    let stages = kernels_of(py, kernels)?;
+    let tasks = match (source, kernels, sink, graph) {
+        (Some(source), Some(kernels), Some(sink), None) => chain(source, kernels, sink)?,
+        (None, None, None, Some(g)) => self::graph(g)?,
+        (_, _, _, Some(_)) => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "moruna.run takes a graph= or a source, kernels and a sink, not both",
+            ));
+        }
+        _ => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "moruna.run takes a source, kernels and a sink, or a moruna.Graph as graph=",
+            ));
+        }
+    };
+
+    // Each task as its kind sees it, in document order: the sources' and sinks' specs, the
+    // kernels' stages.
+    let mut source_specs: Vec<(SourceSpec, &Bound<'_, PyAny>)> = Vec::new();
+    let mut sink_specs: Vec<SinkSpec> = Vec::new();
+    let mut sink_notes = Vec::new();
+    let mut stages: Vec<Stage> = Vec::new();
+    for task in &tasks {
+        match task.role {
+            Role::Source => source_specs.push((sources::spec_of(&task.object)?, &task.object)),
+            Role::Sink => {
+                let (spec, notes) = sinks::spec_of(&task.object)?;
+                sink_specs.push(spec);
+                sink_notes.extend(notes);
+            }
+            Role::Kernel => stages.push(stage_of(py, &task.object)?),
+        }
+    }
     let any_python = stages.iter().any(|s| matches!(s, Stage::Py(_)));
     // 12 f.8: the sandbox host the loaded packages were given; a run has one.
     let mut packages = moruna_runtime::packaged::PackageHost::default();
@@ -159,7 +310,11 @@ pub fn run(
         resume,
     };
     let translated = map(py, translate(raw, sink_notes))?;
-    map(py, check_sink_not_source(&sink_spec, &source_spec))?;
+    for sink_spec in &sink_specs {
+        for (source_spec, _) in &source_specs {
+            map(py, check_sink_not_source(sink_spec, source_spec))?;
+        }
+    }
 
     // f.4, PY-I4: before any Rust component starts.
     if any_python && python_gil_enabled() && !translated.allow_gil {
@@ -188,37 +343,64 @@ pub fn run(
         ));
     }
 
-    // 12 f.3, MH 4.1: the arguments become the job document a file would hold, and the
-    // document becomes the `RunSpec` through the one function that builds every run.
-    let iterator = iterator_object(py, source)?;
+    // 12 f.3, MH 4.1: the arguments become the job a document would hold, and the job becomes
+    // the `RunSpec` through the one function that builds every run.
     let trace_path = translated.trace_path.clone();
-    let described = kernel_docs(py, kernels)?;
-    let (job, notes) = map(
-        py,
-        job_of(
-            translated,
-            &source_spec,
-            &sink_spec,
-            described,
-            object_store,
-        )
-        .map_err(refusal),
-    )?;
-    let iterable = match (&source_spec, iterator) {
-        (SourceSpec::Iterator { schema }, Some(object)) => {
-            Some((object, map(py, source_schema(clone_schema(schema)))?))
-        }
-        _ => None,
-    };
-    // A user's `moruna.Source` and `moruna.Sink` (07 e.6, 08 f.10): the objects themselves.
-    let user_source = match source_spec {
-        SourceSpec::Python => Some(source.clone().unbind()),
-        _ => None,
-    };
-    let user_sink = match sink_spec {
-        SinkSpec::Python => Some(sink.clone().unbind()),
-        _ => None,
-    };
+    let mut entries = Vec::with_capacity(tasks.len());
+    let (mut sources_at, mut sinks_at) = (source_specs.iter(), sink_specs.iter());
+    for task in &tasks {
+        let entry = match task.role {
+            Role::Source => source_doc(&sources_at.next().expect("one spec per source").0),
+            Role::Sink => sink_doc(sinks_at.next().expect("one spec per sink")),
+            Role::Kernel => Ok(kernel_doc(py, &task.object)?),
+        };
+        entries.push(map(py, entry.map_err(refusal))?);
+    }
+    let (job_tasks, edges) = graph_of(&tasks, entries);
+    let (job, notes) = job_of(translated, Job::new(job_tasks, edges), object_store);
+    // SDD 22 JB-I13: a graph's names, ports and edges are checked before anything is built,
+    // and every refusal is named, not only the first.
+    if graph.is_some()
+        && let Err(refusals) = moruna_job::check_graph(&job)
+    {
+        return Err(map_err(
+            py,
+            &MorunaError::Config {
+                name: "graph",
+                msg: refusals
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            },
+        ));
+    }
+
+    // The objects the library's kinds hand back, each at its task's place among its role's.
+    let mut iterables = Vec::with_capacity(source_specs.len());
+    let mut user_sources = Vec::with_capacity(source_specs.len());
+    for (spec, object) in &source_specs {
+        iterables.push(match spec {
+            SourceSpec::Iterator { schema } => match iterator_object(py, object)? {
+                Some(iterable) => Some((iterable, map(py, source_schema(clone_schema(schema)))?)),
+                None => None,
+            },
+            _ => None,
+        });
+        user_sources.push(match spec {
+            SourceSpec::Python => Some(Bound::clone(object).unbind()),
+            _ => None,
+        });
+    }
+    let user_sinks: Vec<Option<Py<PyAny>>> = tasks
+        .iter()
+        .filter(|task| task.role == Role::Sink)
+        .zip(&sink_specs)
+        .map(|(task, spec)| match spec {
+            SinkSpec::Python => Some(task.object.clone().unbind()),
+            _ => None,
+        })
+        .collect();
     let mut served = Vec::new();
     let mut given = Vec::with_capacity(stages.len());
     for stage in stages {
@@ -233,10 +415,9 @@ pub fn run(
     }
     let kinds = map(
         py,
-        crate::kinds::library(given, iterable, user_source, user_sink, served),
+        crate::kinds::library(given, iterables, user_sources, user_sinks, served),
     )?;
     // A run starts from its plan (SDD 26 f.5): the default planner's, as `moruna run` does.
-    let job = moruna_job::Job::from_v1(&job);
     let plan = map(py, moruna_runtime::job::plan::default_plan(&job))?;
     let built = map(
         py,
@@ -291,17 +472,10 @@ pub fn run(
     drive(py, built.spec, trace_path, components)
 }
 
-/// The document `moruna.run`'s arguments describe (MH 4.1). Every value was translated and
-/// clamped already, so building it clamps nothing twice; the notes the translation made come
-/// back to go first in the report.
-fn job_of(
-    t: Translated,
-    source: &SourceSpec,
-    sink: &SinkSpec,
-    kernels: Vec<KindDoc>,
-    object_store: ObjectStoreDoc,
-) -> Result<(JobSpec, Vec<String>), SpecError> {
-    let mut job = JobSpec::new(source_doc(source)?, kernels, sink_doc(sink)?);
+/// The job `moruna.run`'s arguments describe (MH 4.1): `job`'s tasks and edges with the run's
+/// settings. Every value was translated and clamped already, so building it clamps nothing
+/// twice; the notes the translation made come back to go first in the report.
+fn job_of(t: Translated, mut job: Job, object_store: ObjectStoreDoc) -> (Job, Vec<String>) {
     job.budget.memory_bytes = t.budget;
     job.budget.cpu = t.cpu;
     job.trace = t.trace_path.map(|p| p.to_string_lossy().into_owned());
@@ -328,7 +502,7 @@ fn job_of(
         ResumeArg::RunId(hex) => hex,
         ResumeArg::Path(p) => p.to_string_lossy().into_owned(),
     });
-    Ok((job, t.notes))
+    (job, t.notes)
 }
 
 fn source_doc(source: &SourceSpec) -> Result<KindDoc, SpecError> {
@@ -449,72 +623,61 @@ fn sink_doc(sink: &SinkSpec) -> Result<KindDoc, SpecError> {
     }
 }
 
-/// Each kernel `moruna.run` was given, described as a document names it: a standard kernel by
-/// name and arguments, a package by path and pin, a Python kernel by its module and qualified
-/// name. The Python objects themselves are what [`crate::kinds::Given`] hands back.
-fn kernel_docs(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<KindDoc>> {
-    let items: Vec<Bound<'_, PyAny>> = if value.is_instance_of::<pyo3::types::PyList>()
-        || value.is_instance_of::<pyo3::types::PyTuple>()
-    {
-        value.try_iter()?.collect::<PyResult<Vec<_>>>()?
-    } else {
-        vec![value.clone()]
-    };
+/// A kernel `moruna.run` was given, described as a document names it: a standard kernel by name
+/// and arguments, a package by path and pin, a Python kernel by its module and qualified name.
+/// The Python objects themselves are what [`crate::kinds::Given`] hands back.
+fn kernel_doc(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<KindDoc> {
     let text = |obj: &Bound<'_, PyAny>, attr: &str| {
         obj.getattr(attr)
             .and_then(|v| v.extract::<String>())
             .unwrap_or_else(|_| format!("<{}>", type_name(obj)))
     };
-    let mut docs = Vec::with_capacity(items.len());
-    for item in &items {
-        let doc = if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
-            let kernel = &std.get().kernel;
-            KindDoc::of(
-                "std",
-                &moruna_runtime::kinds::standard::Settings {
-                    name: kernel.name().to_string(),
-                    args: Some(kernel.args().clone()),
-                    fingerprint: None,
-                },
-            )
-        } else if let Ok(task) = item.cast::<crate::kinds::PyDeclaredTask>() {
-            let task = task.get();
-            Ok(KindDoc::new(
-                task.declaration.name.clone(),
-                task.settings.clone(),
-            ))
-        } else if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
-            let package = package.get();
-            KindDoc::of(
-                "package",
-                &moruna_runtime::kinds::package::Settings {
-                    path: package.path.clone(),
-                    fingerprint: package.fingerprint.clone(),
-                    args: package.inputs.args.clone(),
-                    assets: package
-                        .inputs
-                        .assets
-                        .as_ref()
-                        .map(|a| a.display().to_string()),
-                    ports: None,
-                },
-            )
-        } else {
-            let target = match item.cast::<PyKernelHandle>() {
-                Ok(handle) => handle.get().callable.bind(py).clone(),
-                Err(_) => item.clone(),
-            };
-            KindDoc::of(
-                "python",
-                &crate::kinds::Settings::named(
-                    text(&target, "__module__"),
-                    text(&target, "__qualname__"),
-                ),
-            )
+    let doc = if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
+        let kernel = &std.get().kernel;
+        KindDoc::of(
+            "std",
+            &moruna_runtime::kinds::standard::Settings {
+                name: kernel.name().to_string(),
+                args: Some(kernel.args().clone()),
+                fingerprint: None,
+            },
+        )
+    } else if let Ok(task) = item.cast::<crate::kinds::PyDeclaredTask>() {
+        let task = task.get();
+        Ok(KindDoc::new(
+            task.declaration.name.clone(),
+            task.settings.clone(),
+        ))
+    } else if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
+        let package = package.get();
+        KindDoc::of(
+            "package",
+            &moruna_runtime::kinds::package::Settings {
+                path: package.path.clone(),
+                fingerprint: package.fingerprint.clone(),
+                args: package.inputs.args.clone(),
+                assets: package
+                    .inputs
+                    .assets
+                    .as_ref()
+                    .map(|a| a.display().to_string()),
+                ports: None,
+            },
+        )
+    } else {
+        let target = match item.cast::<PyKernelHandle>() {
+            Ok(handle) => handle.get().callable.bind(py).clone(),
+            Err(_) => item.clone(),
         };
-        docs.push(doc.map_err(|e| map_err(py, &refusal(e)))?);
-    }
-    Ok(docs)
+        KindDoc::of(
+            "python",
+            &crate::kinds::Settings::named(
+                text(&target, "__module__"),
+                text(&target, "__qualname__"),
+            ),
+        )
+    };
+    doc.map_err(|e| map_err(py, &refusal(e)))
 }
 
 fn clone_schema(schema: &IteratorSchema) -> IteratorSchema {

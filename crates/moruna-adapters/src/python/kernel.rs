@@ -151,6 +151,8 @@ pub struct PyKernel {
     resume: ResumePolicy,
     declared: Declared,
     has_footprint: bool,
+    /// A stateful kernel's object defines `finish(self, state)` (contracts d.7, 2026-11-04).
+    has_finish: bool,
     fingerprint: Fingerprint,
     source_available: bool,
     gil: AtomicU8,
@@ -200,6 +202,7 @@ impl PyKernel {
                 }
             }
             let has_footprint = callable.hasattr("footprint").unwrap_or(false);
+            let has_finish = spec.stateful && callable.hasattr("finish").unwrap_or(false);
             let printed = fingerprint::compute(py, &spec);
             let name = fingerprint::kernel_name(py, &spec);
             let gil = if gil_enabled_in(py) {
@@ -228,6 +231,7 @@ impl PyKernel {
                 resume: spec.resume,
                 declared: spec.declared.clone(),
                 has_footprint,
+                has_finish,
                 fingerprint: printed.fingerprint,
                 source_available: printed.source_available,
                 gil: AtomicU8::new(gil),
@@ -381,16 +385,23 @@ impl PyKernel {
         state: &mut dyn KernelState,
         argument: Bound<'py, PyAny>,
     ) -> (Result<Bound<'py, PyAny>>, KernelAlloc) {
+        let callable = self.callable.bind(py).clone();
+        self.framed(py, || self.invoke(py, state, &callable, argument))
+    }
+
+    /// One call of the kernel's code inside the frame of f.10 to f.14: the hooks, the NumPy
+    /// handler, the Arrow pool reads and the allocator guard, around `call` alone.
+    fn framed<'py>(
+        &self,
+        py: Python<'py>,
+        call: impl FnOnce() -> Result<Bound<'py, PyAny>>,
+    ) -> (Result<Bound<'py, PyAny>>, KernelAlloc) {
         hooks::install_python_hooks(py);
-        let callable = self.callable.bind(py);
         let capsule = self.numpy_capsule(py);
         let before = hooks::arrow_pool(py);
         // 05 f.12: the frame covers the call alone, so what the adapter itself allocates to
         // cross is not charged to the kernel; the NumPy handler is in for the frame.
-        let (returned, end) = hooks::with_numpy_handler(py, capsule, || {
-            self.memory
-                .frame(|| self.invoke(py, state, callable, argument))
-        });
+        let (returned, end) = hooks::with_numpy_handler(py, capsule, || self.memory.frame(call));
         let after = hooks::arrow_pool(py);
         let mut counts = end.counts;
         counts.arrow = hooks::arrow_counts(before, after);
@@ -541,6 +552,71 @@ impl Kernel for PyKernel {
             )?;
             Ok(Box::new(restored) as Box<dyn KernelState>)
         })
+    }
+
+    /// Contracts d.7 (2026-11-04): a stateful kernel's `finish(self, state)`, when its object
+    /// defines one, called once per instance at the end of the stage's input. What it returns
+    /// is a batch like `__call__`'s, landed in the arena the same way; `None` gives nothing. An
+    /// exception is the kernel's error, naming the kernel and `finish`.
+    fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
+        if !self.has_finish {
+            return Ok(None);
+        }
+        let Some(alloc) = self.alloc.get().cloned() else {
+            return Err(MorunaError::Config {
+                name: "adapter",
+                msg: "finish before bind_allocator; the facade binds the arena in its kernels built step".into(),
+            });
+        };
+        let _serialised = self.serialise_guard();
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let called = Python::attach(|py| -> Result<Option<(Imported, Py<PyAny>)>> {
+            let py_state = state
+                .as_any_mut()
+                .downcast_mut::<PyState>()
+                .ok_or_else(|| {
+                    kernel_error(
+                        "a stateful Python kernel was given a state it did not make".into(),
+                    )
+                })?;
+            let instance_state = py_state.state.bind(py).clone();
+            let callable = self.callable.bind(py).clone();
+            let (returned, counts) = self.framed(py, || {
+                callable
+                    .call_method1("finish", (instance_state,))
+                    .map_err(|e| {
+                        kernel_error(format!("{}.finish: {}", self.name, py_err_message(py, &e)))
+                    })
+            });
+            set_kernel_alloc(counts);
+            let returned = returned?;
+            if returned.is_none() {
+                return Ok(None);
+            }
+            let imported = cross::import(py, &returned).map_err(|e| match e {
+                MorunaError::Kernel { msg, .. } => kernel_error(format!(
+                    "{}.finish returned what is not a batch: {msg}",
+                    self.name
+                )),
+                other => other,
+            })?;
+            Ok(Some((imported, returned.unbind())))
+        });
+        let (imported, returned) = match called {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                self.exceptions.fetch_add(1, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
+        let landed = super::copy::land(imported, &alloc);
+        Python::attach(move |_| drop(returned));
+        let landed = landed?;
+        if landed.copied_bytes > 0 {
+            self.boundary_copies.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Some(landed.payload))
     }
 
     /// f.1 and f.2. The interpreter is attached for the export, the call and the import, and for
