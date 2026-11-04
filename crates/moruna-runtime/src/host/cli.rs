@@ -846,6 +846,9 @@ fn run_vm(
             super::native::Tools {
                 qemu: Path::new("qemu-system-x86_64"),
                 vsock: &backend,
+                // `moruna run --vm` is not told of a delegated cgroup; its VM keeps its fixed
+                // memory and CPUs, and its jail's namespaces.
+                cgroup: &moruna_vmm::jail::Cgroup::Undelegated,
             },
             super::protocol::Inbound::Spec { spec, plan },
             deadline,

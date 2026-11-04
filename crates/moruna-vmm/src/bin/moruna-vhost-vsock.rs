@@ -2,7 +2,9 @@
 //! a vhost-user back end for QEMU's `vhost-user-vsock-pci`, its host side the muxer's Unix
 //! sockets (a host process connects to the `--uds` path and writes `CONNECT <port>\n`; a guest
 //! connection to host port `P` reaches `<uds>_P`). It serves the one front end that connects
-//! and exits when it goes: 0, or 1 with the reason on standard error.
+//! and exits when it goes: 0, or 1 with the reason on standard error. Before it binds anything
+//! it confines itself with its own system-call filter (`moruna_vmm::jail::seccomp`); a call
+//! outside it kills the process.
 
 fn main() {
     std::process::exit(run());
@@ -36,6 +38,10 @@ fn run() -> i32 {
         eprintln!("{USAGE}");
         return 2;
     };
+    if let Err(e) = moruna_vmm::jail::seccomp::confine_vsock_backend() {
+        eprintln!("moruna-vhost-vsock: {e}");
+        return 1;
+    }
     match moruna_vmm::vhost_user::backend::serve(&socket, cid, &uds) {
         Ok(()) => 0,
         Err(e) => {

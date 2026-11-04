@@ -264,6 +264,8 @@ mod proof {
             &cfg.runtime_dir,
             &cfg.qemu,
             &cfg.backend,
+            // The proof machine delegates no cgroup; the jail's namespaces still apply.
+            &moruna_vmm::jail::Cgroup::Undelegated,
         )?;
         let deadline = Instant::now() + Duration::from_secs(cfg.seconds);
         let outcome = (|| -> Result<serde_json::Value> {

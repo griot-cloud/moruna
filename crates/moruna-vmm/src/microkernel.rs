@@ -1,9 +1,11 @@
 //! The Moruna 1.0 production launcher is Linux/x86_64 KVM only, with no fallback.
-//! A nondefault explicit TCG proof entry shares the same owned launch machinery.
+//! A nondefault explicit TCG proof entry shares the same owned launch machinery,
+//! jail included.
 //! QEMU supplies the existing q35 PCI and Multiboot boot boundary.
 use crate::{
     Budget,
     error::{Result, VmmError},
+    jail::{self, Cgroup},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -16,7 +18,6 @@ use std::{
         net::UnixStream,
     },
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -237,20 +238,86 @@ fn snapshot(root: &Path, artifact: &Artifact, destination: &Path) -> Result<()> 
     Ok(())
 }
 
-/// An owned node VM and its owned vsock helper. Dropping it kills and reaps both;
-/// no PID files, shared sockets or external processes are signalled.
+/// The run's private directory, created by the launcher and removed with everything in it,
+/// and with the run's cgroup leaf, when the run ends or its launch fails.
+struct RunDir {
+    path: PathBuf,
+    leaf: Option<jail::Leaf>,
+    removed: bool,
+}
+impl RunDir {
+    fn remove(&mut self) -> Result<()> {
+        if self.removed {
+            return Ok(());
+        }
+        let leaf = match &mut self.leaf {
+            Some(leaf) => leaf.remove(),
+            None => Ok(()),
+        };
+        let dir = fs::remove_dir_all(&self.path)
+            .map_err(|e| VmmError::io("remove run directory", self.path.display().to_string(), &e));
+        if dir.is_ok() {
+            self.removed = true;
+        }
+        leaf.and(dir)
+    }
+}
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = self.remove();
+    }
+}
+
+/// The last bytes of a log in the run's directory, for an error that names its cause.
+fn log_tail(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    let tail = &bytes[bytes.len().saturating_sub(2048)..];
+    String::from_utf8_lossy(tail).trim().to_string()
+}
+
+/// An owned node VM and its owned vsock helper, each in its own jail. Dropping it kills and
+/// reaps both, removes the run's cgroup leaf and its directory; no PID files, shared sockets
+/// or external processes are signalled.
 pub struct RunningNode {
-    qemu: Mutex<Child>,
-    backend: Mutex<Child>,
+    qemu: Mutex<jail::Jailed>,
+    backend: Mutex<jail::Jailed>,
     uds: PathBuf,
     agent_port: u32,
     _disk_leases: Vec<File>,
     qmp: PathBuf,
+    run: RunDir,
 }
 impl RunningNode {
     /// Declared runtime service port; readiness still requires a real connection.
     pub fn agent_port(&self) -> u32 {
         self.agent_port
+    }
+    /// The jailed QEMU's and vsock back end's pids in this process's PID namespace, for
+    /// inspection.
+    pub fn processes(&self) -> [i32; 2] {
+        [&self.qemu, &self.backend].map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).pid())
+    }
+    /// The run's cgroup leaf, when the host delegates one.
+    pub fn cgroup(&self) -> Option<&Path> {
+        self.run.leaf.as_ref().map(jail::Leaf::path)
+    }
+    /// The run's private directory, removed when the run ends.
+    pub fn runtime_dir(&self) -> &Path {
+        &self.run.path
+    }
+    /// What QEMU and the vsock back end wrote to their standard error, before the run's
+    /// directory is removed with them.
+    pub fn logs(&self) -> String {
+        let mut text = String::new();
+        for (name, file) in [("qemu", "qemu.log"), ("vsock back end", "backend.log")] {
+            let tail = log_tail(&self.run.path.join(file));
+            if !tail.is_empty() {
+                text.push_str(&format!("{name}: {tail}\n"));
+            }
+        }
+        text
     }
     fn alive(&self) -> bool {
         [&self.qemu, &self.backend].iter().all(|child| {
@@ -270,8 +337,8 @@ impl RunningNode {
         }
         crate::session::connect_guest(&self.uds, port, deadline, &|| self.alive())
     }
-    /// Explicitly stop and reap both owned processes, reporting cleanup errors.
-    /// Drop remains a final fallback and never signals an unrelated numeric PID.
+    /// Explicitly stop and reap both owned processes, then remove the run's cgroup leaf and
+    /// directory, reporting every error. Drop does the same and ignores them.
     pub fn shutdown(&mut self) -> Result<()> {
         let qemu = self
             .qemu
@@ -284,11 +351,14 @@ impl RunningNode {
                 .get_mut()
                 .map_err(|_| bad("backend child lock poisoned"))?,
         );
-        graceful.and(stopped).and(backend)
+        let removed = self.run.remove();
+        graceful.and(stopped).and(backend).and(removed)
     }
 
     /// Observe the actual emulator process exit, independently of job result
-    /// delivery over the guest service protocol.
+    /// delivery over the guest service protocol. A vsock back end that has ended while QEMU
+    /// runs, or has failed at all (a signal, its filter's `SIGSYS` among them, or a nonzero
+    /// code), is an error naming its status and its log, whatever QEMU did after it.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>> {
         let status = self
             .qemu
@@ -296,18 +366,24 @@ impl RunningNode {
             .map_err(|_| VmmError::Control("owned QEMU state poisoned".into()))?
             .try_wait()
             .map_err(|e| VmmError::io("wait", "owned node QEMU", &e))?;
-        if status.is_none()
-            && self
-                .backend
-                .lock()
-                .map_err(|_| VmmError::Control("owned vsock state poisoned".into()))?
-                .try_wait()
-                .map_err(|e| VmmError::io("wait", "owned vsock backend", &e))?
-                .is_some()
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|_| VmmError::Control("owned vsock state poisoned".into()))?
+            .try_wait()
+            .map_err(|e| VmmError::io("wait", "owned vsock backend", &e))?;
+        if let Some(ended) = backend
+            && (status.is_none() || !ended.success())
         {
-            return Err(VmmError::Control(
-                "owned vsock backend exited while node was running".into(),
-            ));
+            return Err(VmmError::Control(format!(
+                "owned vsock backend {} ({ended}): {}",
+                if status.is_none() {
+                    "exited while node was running"
+                } else {
+                    "failed"
+                },
+                log_tail(&self.run.path.join("backend.log"))
+            )));
         }
         Ok(status)
     }
@@ -331,7 +407,7 @@ fn qmp_reply(reader: &mut BufReader<UnixStream>) -> Result<serde_json::Value> {
     }
     Err(bad("QMP event burst exceeded shutdown bound"))
 }
-fn quit_qemu(child: &mut Child, path: &Path) -> Result<()> {
+fn quit_qemu(child: &mut jail::Jailed, path: &Path) -> Result<()> {
     if child
         .try_wait()
         .map_err(|e| VmmError::io("wait", "owned QEMU", &e))?
@@ -391,7 +467,7 @@ fn quit_qemu(child: &mut Child, path: &Path) -> Result<()> {
         "QEMU failed graceful quit/drain deadline; forced teardown required",
     ))
 }
-fn stop_checked(child: &mut Child) -> Result<()> {
+fn stop_checked(child: &mut jail::Jailed) -> Result<()> {
     if child
         .try_wait()
         .map_err(|e| VmmError::io("wait", "owned child", &e))?
@@ -406,40 +482,28 @@ fn stop_checked(child: &mut Child) -> Result<()> {
         .map_err(|e| VmmError::io("reap", "owned child", &e))?;
     Ok(())
 }
-fn stop(child: &mut Child) {
-    if !matches!(child.try_wait(), Ok(Some(_))) {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
 impl Drop for RunningNode {
     fn drop(&mut self) {
         let _ = self.shutdown();
-        stop(self.qemu.get_mut().unwrap_or_else(|p| p.into_inner()));
-        stop(self.backend.get_mut().unwrap_or_else(|p| p.into_inner()));
-    }
-}
-struct OwnedChild(Option<Child>);
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            stop(child);
-        }
     }
 }
 
 /// Start exactly one microkernel node with explicit KVM and q35 PCI. The caller
-/// supplies a new private directory and exact tool paths; no executable is installed
-/// or downloaded. Every boot input is snapshotted and digest-verified before spawn.
-/// `budget` is the requested document budget; actual fixed node RAM/CPUs come
-/// from the single parsed descriptor after admission. Non-Linux/x86_64 hosts and
-/// unavailable KVM fail explicitly.
+/// supplies a new private directory, exact tool paths (a bare name is looked up in `PATH`
+/// as `execvp` would) and where the run is accounted; no executable is installed or
+/// downloaded. Every boot input is snapshotted and digest-verified before spawn, and QEMU
+/// and the vsock back end each start in their own jail (`crate::jail`). `budget` is the
+/// requested document budget; actual fixed node RAM/CPUs come from the single parsed
+/// descriptor after admission. Non-Linux/x86_64 hosts and unavailable KVM fail explicitly.
+/// The jailed processes are children of the calling thread's process and are killed and
+/// reaped when the returned node is shut down or dropped.
 pub fn launch(
     descriptor: &Path,
     budget: Budget,
     runtime_dir: &Path,
     qemu: &Path,
     vhost_backend: &Path,
+    cgroup: &Cgroup,
 ) -> Result<RunningNode> {
     launch_owned(
         descriptor,
@@ -447,13 +511,14 @@ pub fn launch(
         runtime_dir,
         qemu,
         vhost_backend,
+        cgroup,
         Acceleration::Kvm,
     )
 }
 
 /// Explicit TEST-ONLY software emulation proof. Never selected by production
 /// `launch`, by host capability discovery, or as a KVM failure fallback. This
-/// shares descriptor, budget, device, QMP and owned-child teardown with KVM;
+/// shares descriptor, budget, device, jail, QMP and owned-child teardown with KVM;
 /// results establish boot/protocol correctness, never KVM performance.
 #[cfg(feature = "native-tcg-proof")]
 pub fn launch_tcg_proof(
@@ -462,6 +527,7 @@ pub fn launch_tcg_proof(
     runtime_dir: &Path,
     qemu: &Path,
     vhost_backend: &Path,
+    cgroup: &Cgroup,
 ) -> Result<RunningNode> {
     launch_owned(
         descriptor,
@@ -469,6 +535,7 @@ pub fn launch_tcg_proof(
         runtime_dir,
         qemu,
         vhost_backend,
+        cgroup,
         Acceleration::TcgProof,
     )
 }
@@ -491,7 +558,7 @@ impl Acceleration {
                 OpenOptions::new()
                     .read(true)
                     .write(true)
-                    .open("/dev/kvm")
+                    .open(KVM)
                     .map_err(|e| VmmError::NoKvm(e.to_string()))?;
             }
             #[cfg(feature = "native-tcg-proof")]
@@ -524,16 +591,60 @@ impl Acceleration {
             ],
         }
     }
+    /// The device nodes QEMU's jail shows: `/dev/null`, on which QEMU probes for
+    /// open-file-description locks before it locks its disk images, and `/dev/kvm` to a KVM
+    /// boot only. No other jail is shown a device.
+    fn devices(self) -> Vec<jail::Entry> {
+        let null = jail::Entry::Device {
+            path: PathBuf::from(NULL),
+        };
+        match self {
+            Self::Kvm => vec![
+                null,
+                jail::Entry::Device {
+                    path: PathBuf::from(KVM),
+                },
+            ],
+            #[cfg(feature = "native-tcg-proof")]
+            Self::TcgProof => vec![null],
+        }
+    }
 }
+const KVM: &str = "/dev/kvm";
+const NULL: &str = "/dev/null";
+/// QEMU's own system-call filter, installed before it creates the machine: no obsolete
+/// calls, no change of identity, no new process or program, no change of scheduling or
+/// resource limits.
+pub const QEMU_SANDBOX: &str =
+    "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny";
+
+fn private_dir(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(|e| VmmError::io("create private directory", path.display().to_string(), &e))
+}
+fn file_entry(path: &Path, access: jail::Access) -> jail::Entry {
+    jail::Entry::File {
+        path: path.to_path_buf(),
+        access,
+        exec: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch_owned(
     descriptor: &Path,
     budget: Budget,
     runtime_dir: &Path,
     qemu: &Path,
     vhost_backend: &Path,
+    cgroup: &Cgroup,
     acceleration: Acceleration,
 ) -> Result<RunningNode> {
     acceleration.check_host()?;
+    let qemu = jail::resolve_program(qemu)?;
+    let vhost_backend = jail::resolve_program(vhost_backend)?;
     let descriptor = descriptor
         .canonicalize()
         .map_err(|e| VmmError::io("resolve", descriptor.display().to_string(), &e))?;
@@ -561,19 +672,15 @@ fn launch_owned(
     let root = descriptor
         .parent()
         .ok_or_else(|| bad("descriptor parent unavailable"))?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(runtime_dir)
-        .map_err(|e| {
-            VmmError::io(
-                "create private directory",
-                runtime_dir.display().to_string(),
-                &e,
-            )
-        })?;
-    let runtime_dir = runtime_dir
-        .canonicalize()
-        .map_err(|e| VmmError::io("resolve", runtime_dir.display().to_string(), &e))?;
+    private_dir(runtime_dir)?;
+    let mut run = RunDir {
+        path: runtime_dir
+            .canonicalize()
+            .map_err(|e| VmmError::io("resolve", runtime_dir.display().to_string(), &e))?,
+        leaf: None,
+        removed: false,
+    };
+    let runtime_dir = run.path.clone();
     if runtime_dir
         .as_os_str()
         .as_encoded_bytes()
@@ -691,125 +798,182 @@ fn launch_owned(
         writable.push((path, disk.serial.clone()));
         disk_leases.push(file);
     }
-    let socket = runtime_dir.join("vhost.sock");
-    let uds = runtime_dir.join("guest.uds");
-    let qmp = runtime_dir.join("qmp.sock");
-    if socket.as_os_str().len() >= 100 || uds.as_os_str().len() >= 100 {
+    // Each socket lives in a directory of its own, so each jail is shown only the sockets it
+    // uses: QEMU its QMP socket and the back end's vhost-user socket, the back end that socket
+    // and the host side of the guest's vsock.
+    let qmp_dir = runtime_dir.join("qmp");
+    let vsock_dir = runtime_dir.join("vsock");
+    let guest_dir = runtime_dir.join("guest");
+    let qemu_root = runtime_dir.join("jail-qemu");
+    let backend_root = runtime_dir.join("jail-vsock");
+    for dir in [&qmp_dir, &vsock_dir, &guest_dir, &qemu_root, &backend_root] {
+        private_dir(dir)?;
+    }
+    let socket = vsock_dir.join("vhost.sock");
+    let uds = guest_dir.join("guest.uds");
+    let qmp = qmp_dir.join("qmp.sock");
+    if [&socket, &uds, &qmp]
+        .iter()
+        .any(|p| p.as_os_str().len() >= 100)
+    {
         return Err(bad("private runtime socket path too long"));
     }
-    let backend_log = File::create(runtime_dir.join("backend.log"))
-        .map_err(|e| VmmError::io("create", "backend log", &e))?;
-    let mut backend = OwnedChild(Some(
-        Command::new(vhost_backend)
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--cid")
-            .arg(artifacts.cid.to_string())
-            .arg("--uds")
-            .arg(&uds)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(backend_log)
-            .spawn()
-            .map_err(|e| VmmError::io("spawn", "owned vsock backend", &e))?,
-    ));
+    let serial = runtime_dir.join("serial.log");
+    File::create(&serial).map_err(|e| VmmError::io("create", "serial log", &e))?;
+    if let Cgroup::Delegated(parent) = cgroup {
+        run.leaf = Some(jail::Leaf::create(
+            parent,
+            jail::Size::for_vm(budget.memory_bytes, budget.cpus)?,
+        )?);
+    }
+    let leaf = run.leaf.as_ref().map(jail::Leaf::fd);
+    let null = || {
+        OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| VmmError::io("open", "/dev/null", &e))
+    };
+    let mut backend_entries = jail::program_entries(&vhost_backend)?;
+    backend_entries.push(jail::Entry::Dir {
+        path: vsock_dir.clone(),
+        access: jail::Access::Write,
+    });
+    backend_entries.push(jail::Entry::Dir {
+        path: guest_dir.clone(),
+        access: jail::Access::Write,
+    });
+    let mut backend = jail::spawn(jail::Spec {
+        program: &vhost_backend,
+        args: vec![
+            "--socket".into(),
+            socket.clone().into(),
+            "--cid".into(),
+            artifacts.cid.to_string().into(),
+            "--uds".into(),
+            uds.clone().into(),
+        ],
+        entries: jail::settle(backend_entries)?,
+        root: &backend_root,
+        stdout: null()?,
+        stderr: File::create(runtime_dir.join("backend.log"))
+            .map_err(|e| VmmError::io("create", "backend log", &e))?,
+        cgroup: leaf,
+    })?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() {
-        if backend
-            .0
-            .as_mut()
-            .and_then(|c| c.try_wait().ok())
-            .flatten()
-            .is_some()
-            || Instant::now() >= deadline
-        {
-            return Err(bad("vsock backend did not bind its owned socket"));
+        let exited = backend
+            .try_wait()
+            .map_err(|e| VmmError::io("wait", "owned vsock backend", &e))?;
+        if exited.is_some() || Instant::now() >= deadline {
+            return Err(bad(format!(
+                "vsock backend did not bind its owned socket ({}): {}",
+                exited.map_or("still running".to_string(), |s| s.to_string()),
+                log_tail(&runtime_dir.join("backend.log"))
+            )));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let mut command = Command::new(qemu);
-    command
-        .args(acceleration.arguments())
-        .args([
-            "-display",
-            "none",
-            "-monitor",
-            "none",
-            "-no-reboot",
-            "-nodefaults",
-        ])
-        .args([
-            "-m",
-            &format!("{}M", budget.memory_bytes / (1024 * 1024)),
-            "-smp",
-            &budget.cpus.to_string(),
-        ])
-        .args([
-            "-object",
-            &format!(
-                "memory-backend-memfd,id=ram0,size={},share=on",
-                budget.memory_bytes
-            ),
-            "-numa",
-            "node,memdev=ram0",
-        ])
-        .args([
-            "-chardev",
-            &format!("socket,id=vsock0,path={}", socket.display()),
-            "-device",
-            "vhost-user-vsock-pci,chardev=vsock0,addr=0x6",
-        ])
-        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-        .arg("-kernel")
-        .arg(&kernel)
-        .arg("-initrd")
-        .arg(&initramfs)
-        .arg("-qmp")
-        .arg(format!("unix:{},server=on,wait=off", qmp.display()))
-        .arg("-serial")
-        .arg(format!("file:{}", runtime_dir.join("serial.log").display()));
+    let mut args: Vec<std::ffi::OsString> = acceleration
+        .arguments()
+        .iter()
+        .map(|a| std::ffi::OsString::from(*a))
+        .collect();
+    let mut push = |items: &[&str]| args.extend(items.iter().map(|a| std::ffi::OsString::from(*a)));
+    push(&["-sandbox", QEMU_SANDBOX]);
+    push(&[
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-no-reboot",
+        "-nodefaults",
+    ]);
+    push(&[
+        "-m",
+        &format!("{}M", budget.memory_bytes / (1024 * 1024)),
+        "-smp",
+        &budget.cpus.to_string(),
+    ]);
+    push(&[
+        "-object",
+        &format!(
+            "memory-backend-memfd,id=ram0,size={},share=on",
+            budget.memory_bytes
+        ),
+        "-numa",
+        "node,memdev=ram0",
+    ]);
+    push(&[
+        "-chardev",
+        &format!("socket,id=vsock0,path={}", socket.display()),
+        "-device",
+        "vhost-user-vsock-pci,chardev=vsock0,addr=0x6",
+    ]);
+    push(&["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    push(&["-kernel", &kernel.display().to_string()]);
+    push(&["-initrd", &initramfs.display().to_string()]);
+    push(&[
+        "-qmp",
+        &format!("unix:{},server=on,wait=off", qmp.display()),
+    ]);
+    push(&["-serial", &format!("file:{}", serial.display())]);
+    let mut qemu_entries = jail::program_entries(&qemu)?;
+    qemu_entries.extend(jail::qemu_data_entries(&qemu)?);
+    qemu_entries.extend(acceleration.devices());
+    qemu_entries.push(file_entry(&kernel, jail::Access::Read));
+    qemu_entries.push(file_entry(&initramfs, jail::Access::Read));
+    qemu_entries.push(file_entry(&serial, jail::Access::Write));
+    qemu_entries.push(jail::Entry::Dir {
+        path: qmp_dir,
+        access: jail::Access::Write,
+    });
+    qemu_entries.push(jail::Entry::Dir {
+        path: vsock_dir,
+        access: jail::Access::Read,
+    });
     for (index, disk) in disks.iter().enumerate() {
-        command
-            .arg("-drive")
-            .arg(format!(
+        push(&[
+            "-drive",
+            &format!(
                 "file={},format=raw,if=none,id=layer{index},readonly=on",
                 disk.display()
-            ))
-            .arg("-device")
-            .arg(format!(
-                "virtio-blk-pci,drive=layer{index},disable-legacy=on"
-            ));
+            ),
+            "-device",
+            &format!("virtio-blk-pci,drive=layer{index},disable-legacy=on"),
+        ]);
+        qemu_entries.push(file_entry(disk, jail::Access::Read));
     }
     for (index, (path, serial)) in writable.iter().enumerate() {
-        command
-            .arg("-drive")
-            .arg(format!(
-                "file={},format=raw,if=none,id=home{index}",
-                path.display()
-            ))
-            .arg("-device")
-            .arg(format!("nvme,drive=home{index},serial={serial}"));
+        push(&[
+            "-drive",
+            &format!("file={},format=raw,if=none,id=home{index}", path.display()),
+            "-device",
+            &format!("nvme,drive=home{index},serial={serial}"),
+        ]);
+        qemu_entries.push(file_entry(path, jail::Access::Write));
     }
+    // The descriptor may ask for QEMU's user-mode network (Moruna knows nothing of the host
+    // it runs on). In the jail it is the guest's only network path, and it ends at the jail's
+    // new, empty network namespace: the guest reaches slirp's own virtual gateway and nothing
+    // of the node or beyond it.
     if artifacts.user_network {
-        command.args([
+        push(&[
             "-netdev",
             "user,id=net0",
             "-device",
             "virtio-net-pci,netdev=net0,disable-legacy=on",
         ]);
     }
-    let log = File::create(runtime_dir.join("qemu.log"))
-        .map_err(|e| VmmError::io("create", "QEMU log", &e))?;
-    let qemu = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log)
-        .spawn()
-        .map_err(|e| VmmError::io("spawn", "owned node QEMU", &e))?;
-    let backend = backend
-        .0
-        .take()
-        .ok_or_else(|| bad("lost owned vsock backend"))?;
+    let qemu = jail::spawn(jail::Spec {
+        program: &qemu,
+        args,
+        entries: jail::settle(qemu_entries)?,
+        root: &qemu_root,
+        stdout: null()?,
+        stderr: File::create(runtime_dir.join("qemu.log"))
+            .map_err(|e| VmmError::io("create", "QEMU log", &e))?,
+        cgroup: leaf,
+    })?;
     Ok(RunningNode {
         qemu: Mutex::new(qemu),
         backend: Mutex::new(backend),
@@ -817,6 +981,7 @@ fn launch_owned(
         agent_port: artifacts.agent_port,
         _disk_leases: disk_leases,
         qmp,
+        run,
     })
 }
 
@@ -916,6 +1081,7 @@ mod tests {
             Path::new("uncreated-native-owner"),
             Path::new("unexecuted-qemu"),
             Path::new("unexecuted-helper"),
+            &Cgroup::Undelegated,
         )
         .err()
         .expect("unsupported host must refuse");

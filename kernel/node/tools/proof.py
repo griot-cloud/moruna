@@ -318,8 +318,8 @@ def main():
             record["sdk"] = {"descriptor_path": str(descriptor_path), "descriptor_sha256": digest(descriptor_path),
                              "key": key, "witness_path": str(witness), "witness_sha256": digest(witness),
                              "result_sha256": digest(evidence / "result.json"), "terminal_sha256": digest(evidence / "terminal.json")}
-            # Preserve the SDK owner's real logs under original checker names.
-            (out / "serial.log").write_bytes((runtime / "serial.log").read_bytes())
+            # The launcher removes the run's directory; the SDK proof kept the console as evidence.
+            (out / "serial.log").write_bytes((evidence / "serial.log").read_bytes())
             serial = (out / "serial.log").read_text(errors="replace")
             if f"kk: {args.cpus} CPUs online" not in serial or "panic" in serial.lower() or "FAIL:" in serial:
                 raise RuntimeError("actual SDK CPU-online proof missing or native panic observed")
