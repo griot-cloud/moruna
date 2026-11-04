@@ -320,6 +320,17 @@ fn qemu_and_its_vsock_back_end_boot_jailed_and_leave_nothing() {
         );
         assert_eq!(read("cpu.max"), "100000 100000");
     }
+    // The host side of the guest's vsock is a Unix socket the jailed back end listens on in
+    // its own namespaces: the host reaches it by path (this guest has no vsock driver, so the
+    // request stays pending and the back end keeps serving).
+    {
+        use std::io::Write as _;
+        let mut host =
+            std::os::unix::net::UnixStream::connect(runtime.join("guest/guest.uds")).unwrap();
+        host.write_all(b"CONNECT 5000\n").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(node.try_wait().unwrap().is_none(), "{}", node.logs());
+    }
     print!("{}", node.logs());
     node.shutdown().unwrap();
     assert!(!runtime.exists(), "the run's directory goes with the run");
