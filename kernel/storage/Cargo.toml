@@ -9,7 +9,7 @@ description = "Native governed object storage over actual caller Memory, block a
 [dependencies]
 moruna-svc.workspace = true
 blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
-moruna-storage-format = { path = "../../crates/moruna-storage-format", version = "=0.6.1", features = ["pure", "crypto"] }
+moruna-storage-format = { path = "../../crates/moruna-storage-format", version = "=0.6.2", features = ["pure", "crypto"] }
 
 [target.'cfg(target_os = "none")'.dependencies]
 moruna-sys.workspace = true

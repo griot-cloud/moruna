@@ -8,7 +8,7 @@ members = ["bench", "crates/*"]
 exclude = ["kernel"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -17,40 +17,40 @@ publish = false
 
 [workspace.dependencies]
 # Actual kernel/native prerequisites, integrated from the KD2/KB5/KE2 lanes.
-moruna-micro = { path = "crates/moruna-micro", version = "0.6.1" }
+moruna-micro = { path = "crates/moruna-micro", version = "0.6.2" }
 moruna-sys = { path = "kernel/sys", version = "=0.1.0" }
 moruna-svc = { path = "kernel/svc", version = "=0.1.0" }
 moruna-storage-service = { path = "kernel/storage", version = "=0.1.0" }
 # Workspace crates (preamble 6.1; the crate graph is preamble 1.3).
-moruna-kernel = { path = "crates/moruna-kernel", version = "0.6.1" }
-moruna-types = { path = "crates/moruna-types", version = "0.6.1" }
-moruna-arena = { path = "crates/moruna-arena", version = "0.6.1" }
-moruna-discovery = { path = "crates/moruna-discovery", version = "0.6.1" }
-moruna-trace = { path = "crates/moruna-trace", version = "0.6.1" }
-moruna-adapters = { path = "crates/moruna-adapters", version = "0.6.1" }
-moruna-storage-format = { path = "crates/moruna-storage-format", version = "0.6.1" }
-moruna-storage = { path = "crates/moruna-storage", version = "0.6.1" }
-moruna-reactor = { path = "crates/moruna-reactor", version = "0.6.1" }
-moruna-sources = { path = "crates/moruna-sources", version = "0.6.1" }
-moruna-sinks = { path = "crates/moruna-sinks", version = "0.6.1" }
-moruna-placement = { path = "crates/moruna-placement", version = "0.6.1" }
-moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.6.1" }
-moruna-controller = { path = "crates/moruna-controller", version = "0.6.1" }
-moruna-runtime = { path = "crates/moruna-runtime", version = "0.6.1" }
-moruna-job = { path = "crates/moruna-job", version = "0.6.1" }
-moruna-cost = { path = "crates/moruna-cost", version = "0.6.1" }
-moruna-plan = { path = "crates/moruna-plan", version = "0.6.1" }
-moruna-event = { path = "crates/moruna-event", version = "0.6.1" }
-moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.6.1" }
-moruna-testkit = { path = "crates/moruna-testkit", version = "0.6.1" }
-moruna-vmm = { path = "crates/moruna-vmm", version = "0.6.1" }
-moruna-kernels = { path = "crates/moruna-kernels", version = "0.6.1" }
-moruna-package = { path = "crates/moruna-package", version = "0.6.1" }
-moruna-wasm = { path = "crates/moruna-wasm", version = "0.6.1" }
-moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.6.1" }
-moruna-image = { path = "crates/moruna-image", version = "0.6.1" }
-moruna-plane-linux = { path = "crates/moruna-plane-linux", version = "0.6.1" }
-moruna-record = { path = "crates/moruna-record", version = "0.6.1", default-features = false }
+moruna-kernel = { path = "crates/moruna-kernel", version = "0.6.2" }
+moruna-types = { path = "crates/moruna-types", version = "0.6.2" }
+moruna-arena = { path = "crates/moruna-arena", version = "0.6.2" }
+moruna-discovery = { path = "crates/moruna-discovery", version = "0.6.2" }
+moruna-trace = { path = "crates/moruna-trace", version = "0.6.2" }
+moruna-adapters = { path = "crates/moruna-adapters", version = "0.6.2" }
+moruna-storage-format = { path = "crates/moruna-storage-format", version = "0.6.2" }
+moruna-storage = { path = "crates/moruna-storage", version = "0.6.2" }
+moruna-reactor = { path = "crates/moruna-reactor", version = "0.6.2" }
+moruna-sources = { path = "crates/moruna-sources", version = "0.6.2" }
+moruna-sinks = { path = "crates/moruna-sinks", version = "0.6.2" }
+moruna-placement = { path = "crates/moruna-placement", version = "0.6.2" }
+moruna-scheduler = { path = "crates/moruna-scheduler", version = "0.6.2" }
+moruna-controller = { path = "crates/moruna-controller", version = "0.6.2" }
+moruna-runtime = { path = "crates/moruna-runtime", version = "0.6.2" }
+moruna-job = { path = "crates/moruna-job", version = "0.6.2" }
+moruna-cost = { path = "crates/moruna-cost", version = "0.6.2" }
+moruna-plan = { path = "crates/moruna-plan", version = "0.6.2" }
+moruna-event = { path = "crates/moruna-event", version = "0.6.2" }
+moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.6.2" }
+moruna-testkit = { path = "crates/moruna-testkit", version = "0.6.2" }
+moruna-vmm = { path = "crates/moruna-vmm", version = "0.6.2" }
+moruna-kernels = { path = "crates/moruna-kernels", version = "0.6.2" }
+moruna-package = { path = "crates/moruna-package", version = "0.6.2" }
+moruna-wasm = { path = "crates/moruna-wasm", version = "0.6.2" }
+moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.6.2" }
+moruna-image = { path = "crates/moruna-image", version = "0.6.2" }
+moruna-plane-linux = { path = "crates/moruna-plane-linux", version = "0.6.2" }
+moruna-record = { path = "crates/moruna-record", version = "0.6.2", default-features = false }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
