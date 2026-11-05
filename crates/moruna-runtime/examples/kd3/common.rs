@@ -263,18 +263,23 @@ pub fn failure(seen: &Seen, words: &[&str]) -> Result<String> {
         return Err("missing failure summary".into());
     }
     let report = seen.report.as_ref().ok_or("missing failure report")?;
-    let stages = report["stages"]
+    let tasks = report["tasks"]
         .as_array()
-        .ok_or("missing failure report stages")?;
-    if !stages.iter().any(|stage| {
-        stage["stage"].as_u64() == Some(1)
-            && stage["errors"].as_u64().is_some_and(|errors| errors > 0)
+        .ok_or("missing failure report tasks")?;
+    if !tasks.iter().any(|task| {
+        task["key"] == "kernel-1"
+            && task["failed_morsels"]
+                .as_u64()
+                .is_some_and(|failed| failed > 0)
     }) {
         return Err("failure report did not acknowledge kernel-1 error".into());
     }
     // TaskFailed deliberately quotes no data; the canonical report and Exit
     // carry the full failure. Require both to agree before checking its cause.
-    let diagnostic = report["exit"]["Terminated"]["diagnostic"]
+    if report["exit"]["status"] != "terminated" {
+        return Err(format!("failure report exit is not terminated: {}", report["exit"]).into());
+    }
+    let diagnostic = report["exit"]["diagnostic"]
         .as_str()
         .filter(|text| !text.is_empty())
         .ok_or("missing terminated failure diagnostic")?;
