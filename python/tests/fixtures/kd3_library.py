@@ -94,7 +94,7 @@ def main():
         def finish(self):
             self.finished += 1
 
-    @moruna.kernel
+    @moruna.function
     def identity(actual):
         if mode == "adapter-refusal":
             raise RuntimeError("KD3 real kernel refusal")
@@ -149,7 +149,7 @@ def main():
         return
     if mode == "adapter-refusal":
         raise AssertionError("actual source/kernel/sink failure was not propagated")
-    if report.exit != "Completed" or output.finished != 1 or sorted(output.values) != sorted(expected):
+    if report.exit["status"] != "completed" or output.finished != 1 or sorted(output.values) != sorted(expected):
         raise AssertionError(f"actual execution differs: {report.exit}, finish={output.finished}, rows={output.values}")
     emit({"case": case_id, "adapter": adapter, "phase": "execute", "mode": "rows",
                       "outcome": "rows", "rows": sorted(output.values), "finish": output.finished,

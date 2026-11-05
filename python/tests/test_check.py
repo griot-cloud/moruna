@@ -1,5 +1,5 @@
 """MH 4.9 through the package: ``python -m moruna check`` (CK-T5, CK-T8, CK-T9), the schema
-declarations on ``@moruna.kernel`` (MH 4.9), the Python fingerprint (MH 4.9), and the Polars
+declarations on ``@moruna.function`` (MH 4.9), the Python fingerprint (MH 4.9), and the Polars
 signature (MH 4.9)."""
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import moruna
 
-@moruna.kernel(input_schema={"text": pa.string()}, output_schema={"adds": {"upper": "string"}})
+@moruna.function(input_schema={"text": pa.string()}, output_schema={"adds": {"upper": "string"}})
 def shout(batch):
     return batch.append_column("upper", pc.utf8_upper(batch.column("text")))
 """
@@ -38,7 +38,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import moruna
 
-@moruna.kernel(input_schema={"n": "int64"}, output_schema={"adds": {"half": "int64"}})
+@moruna.function(input_schema={"n": "int64"}, output_schema={"adds": {"half": "int64"}})
 def halve(batch):
     return batch.append_column("half", pc.divide(pc.cast(batch.column("n"), pa.float64()), 2.0))
 """
@@ -48,7 +48,7 @@ MIXED = (
     + """
 cleaned = moruna.std.fill_null(values={"text": ""})
 
-@moruna.kernel
+@moruna.function
 def undeclared(batch):
     return batch
 """
@@ -61,12 +61,12 @@ import moruna
 def doubled(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns((pl.col("n") * 2).alias("twice"))
 
-@moruna.kernel(input_schema={"n": "int64", "s": "string"},
+@moruna.function(input_schema={"n": "int64", "s": "string"},
                output_schema={"adds": {}})
 def lazily(frame: pl.LazyFrame) -> pl.LazyFrame:
     return frame.filter(pl.col("n") > 0).with_columns(pl.col("s").str.to_uppercase())
 
-doubled = moruna.kernel(doubled, input_schema={"n": "int64"},
+doubled = moruna.function(doubled, input_schema={"n": "int64"},
                         output_schema={"adds": {"twice": "int64"}})
 """
 
@@ -96,8 +96,8 @@ def test_ck_t9_an_agreeing_module_exits_0_and_is_warmed_up(tmp_path: Path) -> No
     report = json.loads(out)
     assert report["exit"] == 0
     assert report["moruna_check"] == 2
-    [kernel] = report["kernels"]
-    assert kernel["kernel"] == "shout"
+    [kernel] = report["functions"]
+    assert kernel["function"] == "shout"
     assert kernel["verdict"] == "agreed"
     assert kernel["fingerprint"].startswith("sha256:")
     assert kernel["gil"] in ("free_threaded", "serialised")
@@ -129,19 +129,19 @@ def test_ck_t9_kernel_selection_and_no_kernels(tmp_path: Path) -> None:
     module = write(tmp_path, "mixed", MIXED)
     code, out, _ = run_check(str(module), "--json", "--no-warm-up")
     report = json.loads(out)
-    verdicts = {k["kernel"]: k["verdict"] for k in report["kernels"]}
+    verdicts = {k["function"]: k["verdict"] for k in report["functions"]}
     assert verdicts == {"shout": "agreed", "cleaned": "agreed", "undeclared": "not_checkable"}
     assert code == 2
-    code, out, _ = run_check(str(module), "--kernel", "cleaned", "--no-warm-up")
+    code, out, _ = run_check(str(module), "--function", "cleaned", "--no-warm-up")
     assert code == 0, out
     assert "cleaned (std): agreed" in out
-    code, _, err = run_check(str(module), "--kernel", "missing")
+    code, _, err = run_check(str(module), "--function", "missing")
     assert code == 2
-    assert "no kernel named 'missing'" in err
+    assert "no function named 'missing'" in err
     empty = write(tmp_path, "empty", "x = 1\n")
     code, _, err = run_check(str(empty))
     assert code == 2
-    assert "no kernels" in err
+    assert "no functions" in err
     broken = write(tmp_path, "broken", "raise RuntimeError('nope')\n")
     code, out, _ = run_check(str(broken), "--json")
     assert code == 2
@@ -158,7 +158,7 @@ def test_main_dispatches_check_and_leaves_the_rest_to_the_rust_command() -> None
 def test_the_check_is_seeded(tmp_path: Path) -> None:
     module = write(tmp_path, "seeded", AGREEING)
     loaded = _check._load(str(module))
-    [(name, value)] = _check.kernels_of(loaded)
+    [(name, value)] = _check.functions_of(loaded)
     a = _check.check_one(name, value, 3, None)
     b = _check.check_one(name, value, 3, {})
     assert [x["bytes_in"] for x in a["batches"]] == [x["bytes_in"] for x in b["batches"]]
@@ -169,17 +169,17 @@ def test_the_check_is_seeded(tmp_path: Path) -> None:
 
 def test_declarations_translate_and_bad_ones_are_refused() -> None:
     schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
-    k = moruna.kernel(lambda b: b, input_schema=schema, output_schema=schema)
+    k = moruna.function(lambda b: b, input_schema=schema, output_schema=schema)
     assert k.fingerprint
     with pytest.raises(TypeError):
-        moruna.kernel(lambda b: b, input_schema=["a"])
+        moruna.function(lambda b: b, input_schema=["a"])
     with pytest.raises(TypeError):
-        moruna.kernel(lambda b: b, input_schema={"a": object()})
+        moruna.function(lambda b: b, input_schema={"a": object()})
     with pytest.raises(moruna.PlanError):
-        moruna.kernel(lambda b: b, input_schema={"a": "tensor"})
+        moruna.function(lambda b: b, input_schema={"a": "tensor"})
     with pytest.raises(TypeError):
-        moruna.kernel(lambda b: b, output_schema={"drops": "a"})
-    relative = moruna.kernel(
+        moruna.function(lambda b: b, output_schema={"drops": "a"})
+    relative = moruna.function(
         lambda b: b,
         input_schema={"a": int, "b": float, "c": str, "d": bool},
         output_schema={"drops": ["a"], "changes": {"b": "float32"}, "adds": {"e": "any"}},
@@ -191,15 +191,15 @@ def test_the_fingerprint_follows_source_schema_and_lockfile(tmp_path: Path) -> N
     def f(batch):
         return batch
 
-    base = moruna.kernel(f).fingerprint
-    assert moruna.kernel(f).fingerprint == base
-    assert moruna.kernel(f, input_schema={"a": "int64"}).fingerprint != base
+    base = moruna.function(f).fingerprint
+    assert moruna.function(f).fingerprint == base
+    assert moruna.function(f, input_schema={"a": "int64"}).fingerprint != base
     lock = tmp_path / "uv.lock"
     lock.write_bytes(b"one")
-    with_lock = moruna.kernel(f, lockfile=lock).fingerprint
+    with_lock = moruna.function(f, lockfile=lock).fingerprint
     assert with_lock != base
-    assert moruna.kernel(f, lockfile=b"one").fingerprint == with_lock
-    assert moruna.kernel(f, lockfile=b"two").fingerprint != with_lock
+    assert moruna.function(f, lockfile=b"one").fingerprint == with_lock
+    assert moruna.function(f, lockfile=b"two").fingerprint != with_lock
 
 
 def test_ck_t5_every_standard_kernel_checks_through_the_binding() -> None:
@@ -221,7 +221,7 @@ def test_ck_t5_every_standard_kernel_checks_through_the_binding() -> None:
         assert kernel.name == name
         assert len(kernel.fingerprint) == 64
         assert name in repr(kernel)
-        report = json.loads(moruna._core.check_kernel(kernel, seed=1))
+        report = json.loads(moruna._core.check_kernel(kernel._handle, seed=1))
         assert report["verdict"] == "agreed", report["summary"]
         assert report["kind"] == "std"
     with pytest.raises(moruna.PlanError):
@@ -269,7 +269,7 @@ def test_ck_t8_a_polars_signature_checks_and_runs(tmp_path: Path) -> None:
     code, out, _ = run_check(str(module), "--json", "--no-warm-up")
     report = json.loads(out)
     assert code == 0, out
-    assert {k["kernel"] for k in report["kernels"]} == {"doubled", "lazily"}
+    assert {k["function"] for k in report["functions"]} == {"doubled", "lazily"}
     loaded = _check._load(str(module))
     doubled = loaded.doubled
     src = tmp_path / "in.parquet"
@@ -303,7 +303,7 @@ def test_an_undecorated_polars_function_is_found_and_wrapped(tmp_path: Path) -> 
         """,
     )
     loaded = _check._load(str(module))
-    [(name, kernel)] = _check.kernels_of(loaded)
+    [(name, kernel)] = _check.functions_of(loaded)
     assert name == "plain"
     report = _check.check_one(name, kernel, 0, _check._warm_up(False, None, 60.0, None, None))
     assert report["verdict"] == "not_checkable"
@@ -329,7 +329,7 @@ def test_cm_t58_python_check_returns_the_fitted_cost(tmp_path: Path) -> None:
         statistics={"columns": [{"name": "text", "bytes_mean": 24.0, "null_fraction": 0.5}]},
     )
     assert result["exit"] == 0, result
-    [kernel] = result["kernels"]
+    [kernel] = result["functions"]
     cost = kernel["warm_up"]["cost_per_10000_rows"]
     assert cost["duration"]["p50"] > 0
     assert cost["duration"]["p95"] >= cost["duration"]["p50"]
@@ -345,11 +345,11 @@ def test_cm_t58_python_check_returns_the_fitted_cost(tmp_path: Path) -> None:
     # Statistics naming a column the input does not have refuse warm-up, saying so.
     ghost = moruna.check(str(module), store=str(store), statistics={"columns": [{"name": "ghost"}]})
     assert ghost["exit"] == 2
-    assert "`ghost`" in ghost["kernels"][0]["warm_up"]["error"]
+    assert "`ghost`" in ghost["functions"][0]["warm_up"]["error"]
     # A model that is not registered is refused, naming the ones that are.
     refused = moruna.check(str(module), store=str(store), model="nope")
     assert refused["exit"] == 2
     assert "loglinear" in refused["error"]
     # Without warm-up there is no cost, and nothing is written.
     plain = moruna.check(str(module), warm_up=False)
-    assert plain["kernels"][0]["warm_up"] is None
+    assert plain["functions"][0]["warm_up"] is None

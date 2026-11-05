@@ -426,6 +426,10 @@ impl Sink for PeqlSink {
             .map_err(|e| finish_err(&self.contract, e))?;
         let files = report.files.iter().map(|f| f.path.clone()).collect();
         let rows = report.rows_written as u64;
+        let commit = report.snapshot.map(|s| moruna_kernel::SinkCommit {
+            snapshot_id: s.snapshot_id.to_string(),
+            version: None,
+        });
         let report = serde_json::to_value(&report).map_err(|e| {
             MorunaError::Sink(format!(
                 "peQL: `{}` is committed, and its write report could not be serialised: {e}",
@@ -441,6 +445,7 @@ impl Sink for PeqlSink {
                 report,
                 excluded: self.excluded.as_ref().map(|e| e.rows()),
             }),
+            commit,
         })
     }
 }

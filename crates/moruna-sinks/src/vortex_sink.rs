@@ -632,6 +632,7 @@ impl Sink for VortexSink {
             bytes,
             files: inner.ledger.names(),
             write: None,
+            commit: None,
         })
     }
 

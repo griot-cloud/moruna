@@ -20,12 +20,12 @@ import pyarrow.parquet as pq
 import moruna
 
 
-@moruna.kernel
+@moruna.function
 def identity(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch
 
 
-@moruna.kernel
+@moruna.function
 def normalise(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Lower case the text column, which is the shape of real work without its cost."""
     text = pc.utf8_lower(batch.column("text"))
@@ -44,7 +44,7 @@ pq.write_table(pa.table({"id": pa.array(range(rows), pa.int64()),
                          "text": pa.array([f"row {i}" for i in range(rows)])}),
                src / "part-0.parquet", row_group_size=2_000)
 
-@moruna.kernel
+@moruna.function
 def identity(batch):
     return batch
 
@@ -54,7 +54,7 @@ report = moruna.run(moruna.ParquetSource(f"file://{src}/part-0.parquet"),
                    moruna.ParquetSink(f"file://{out}"))
 back = pq.read_table(str(out))
 print(json.dumps({
-    "exit": report.exit,
+    "exit": report.exit["status"],
     "run_id": report.run_id,
     "rows_in": report.stages[0]["rows_in"],
     "rows_out": report.stages[0]["rows_out"],
@@ -81,7 +81,7 @@ def test_py_t3_no_parameters(scratch: pathlib.Path) -> None:
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout.strip().splitlines()[-1])
 
-    assert result["exit"] == "Completed"
+    assert result["exit"] == "completed"
     assert len(result["run_id"]) == 32
     assert result["rows_in"] == 10_000
     assert result["rows_out"] == 10_000
@@ -101,7 +101,7 @@ def test_py_t3_normalise(
         moruna.ParquetSource(src_url), [normalise], small_sink(out_url), **staging
     )
 
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     # A Parquet sink has no engine that judges its writes, nor a Parquet source one that
     # governs its reads.
     assert report.write is None
@@ -120,7 +120,7 @@ def test_a_plain_function_is_wrapped(
     report = moruna.run(
         moruna.ParquetSource(src_url), lambda batch: batch, small_sink(out_url), **staging
     )
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     assert report.stages[0]["rows_out"] == rows
 
 
@@ -130,6 +130,6 @@ def test_no_kernels_is_a_copy(
     """h: `kernels=[]` is allowed; the pipeline is source to sink."""
     src_url, out_url, rows = dataset
     report = moruna.run(moruna.ParquetSource(src_url), [], small_sink(out_url), **staging)
-    assert report.exit == "Completed", report.notes
+    assert report.exit["status"] == "completed", report.notes
     out = pathlib.Path(out_url.removeprefix("file://"))
     assert pq.read_table(str(out)).num_rows == rows

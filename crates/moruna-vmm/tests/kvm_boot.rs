@@ -1,8 +1,9 @@
 //! Actual native artifact gate, explicitly invoked on Linux x86 KVM with supplied
-//! MORUNA_NODE_DESCRIPTOR, MORUNA_QEMU, MORUNA_VSOCK_BACKEND and MORUNA_NODE_PROOF_DIR.
+//! MORUNA_NODE_DESCRIPTOR, MORUNA_QEMU, MORUNA_VSOCK_BACKEND, MORUNA_NODE_PROOF_DIR and
+//! MORUNA_NODE_CGROUP (a delegated cgroup v2 directory, or `none`).
 //! No Linux guest/OCI fixture or TCG fallback is accepted.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use moruna_vmm::{Budget, microkernel};
+use moruna_vmm::{Budget, jail::Cgroup, microkernel};
 use std::{
     io::BufRead,
     path::PathBuf,
@@ -33,6 +34,7 @@ fn native_node_accepts_actual_engine_connection_and_reaps_owned_processes() {
         &proof,
         &required("MORUNA_QEMU"),
         &required("MORUNA_VSOCK_BACKEND"),
+        &Cgroup::parse(&required("MORUNA_NODE_CGROUP").to_string_lossy()).unwrap(),
     )
     .unwrap();
     let mut stream = node
@@ -63,4 +65,5 @@ fn native_node_accepts_actual_engine_connection_and_reaps_owned_processes() {
     drop(stream);
     node.shutdown().unwrap();
     assert!(node.try_wait().unwrap().is_some());
+    assert!(!proof.exists(), "the run's directory goes with the run");
 }

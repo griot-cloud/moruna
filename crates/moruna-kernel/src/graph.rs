@@ -13,6 +13,14 @@
 //! the numbers on a sink's queue are a function of the sources' numbers ([`Topology::paths`]).
 //! A linear chain of `n` kernels is the topology [`Topology::chain`]: queue `k` from stage `k`
 //! (the source when `k` is 0) to stage `k + 1` (the sink when `k` is `n`), every number kept.
+//!
+//! Two amendments (2026-11-04). A stage that joins its inputs by morsel ([`Topology::align`],
+//! `Kernel::aligns_inputs`) takes the morsel numbered `s` from every port at once and gives one
+//! output numbered `s`, so it numbers like a stage of one input; its inputs must carry the
+//! morsels of one upstream, numbered alike. And a stateful stage's `Kernel::finish` may give
+//! batches at the end of its input: they are numbered from the stage's *finish base*, one past
+//! the highest number its input can carry, so they follow every other number on its output
+//! ([`Produced`]).
 
 use crate::error::MorunaError;
 use crate::ids::{Seq, StageId};
@@ -104,6 +112,42 @@ pub struct Topology {
     source_outputs: Vec<Vec<StageId>>,
     sink_inputs: Vec<StageId>,
     paths: Vec<Vec<(u16, Affine)>>,
+    /// Stage `s` joins its inputs by morsel (`aligned[s - 1]`).
+    aligned: Vec<bool>,
+}
+
+/// What a run's sources and stages have given so far, as the numbers a queue will and will not
+/// carry are judged by ([`Topology::produced`]): each source's count, and for each stage its
+/// finish base and the highest number its output carries, each `None` while not known yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Produced {
+    read: Vec<Option<Seq>>,
+    finished: Vec<Option<Seq>>,
+    /// Stage `s`'s finish base: one past the highest number its input can carry, 0 when its input
+    /// carries none.
+    base: Vec<Option<Seq>>,
+    /// The highest number stage `s`'s output carries, its finish's included: `Some(None)` when it
+    /// carries none.
+    last: Vec<Option<Option<Seq>>>,
+}
+
+impl Produced {
+    /// Stage `stage`'s finish base: the number its finish's first batch has, `None` while an
+    /// input could still carry more.
+    pub fn base(&self, stage: StageId) -> Option<Seq> {
+        usize::from(stage)
+            .checked_sub(1)
+            .and_then(|i| self.base.get(i).copied().flatten())
+    }
+}
+
+/// The highest of two known highest numbers, `None` (no morsel) the lowest.
+fn higher(a: Option<Seq>, b: Option<Seq>) -> Option<Seq> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
 }
 
 fn plan(msg: impl Into<String>) -> MorunaError {
@@ -226,9 +270,74 @@ impl Topology {
             source_outputs,
             sink_inputs: sink_queue,
             paths: Vec::new(),
+            aligned: vec![false; usize::from(stages)],
         };
         topology.paths = topology.walk_paths()?;
         Ok(topology)
+    }
+
+    /// The same topology with the stages `stages` joining their inputs by morsel (d.16,
+    /// 2026-11-04): each takes the morsel numbered `s` from every port at once and gives one
+    /// output numbered `s`. Refused (`Plan`) unless every port of each carries exactly what its
+    /// port 0 carries, the morsels of the same sources along maps that number them alike: a join
+    /// by morsel is a join of branches of one upstream.
+    pub fn align(mut self, stages: &[StageId]) -> crate::Result<Topology> {
+        for &stage in stages {
+            let Some(slot) = usize::from(stage)
+                .checked_sub(1)
+                .and_then(|i| self.aligned.get_mut(i))
+            else {
+                return Err(plan(format!(
+                    "stage {stage} joins its inputs by morsel, and the run has no stage {stage}"
+                )));
+            };
+            *slot = true;
+        }
+        for &stage in stages {
+            if let Some(port) = self.misaligned(stage)? {
+                return Err(plan(format!(
+                    "stage {stage} joins its inputs by morsel, and its port {port} does not carry \
+                     the morsels its port 0 carries: every input of a join is a branch of one \
+                     upstream that keeps its morsels and their numbers"
+                )));
+            }
+        }
+        self.paths = self.walk_paths()?;
+        Ok(self)
+    }
+
+    /// The first port of stage `stage` that does not carry exactly what its port 0 carries, the
+    /// morsels of the same sources numbered alike, as this topology numbers them: what
+    /// [`Topology::align`] refuses a join for.
+    pub fn misaligned(&self, stage: StageId) -> crate::Result<Option<u16>> {
+        let arrivals = self.arrivals()?;
+        let inputs = self.inputs(stage);
+        let Some(&first) = inputs.first() else {
+            return Ok(None);
+        };
+        Ok(inputs
+            .iter()
+            .position(|&q| arrivals[usize::from(q)] != arrivals[usize::from(first)])
+            .map(|port| port as u16))
+    }
+
+    /// True when stage `stage` joins its inputs by morsel.
+    pub fn is_aligned(&self, stage: StageId) -> bool {
+        usize::from(stage)
+            .checked_sub(1)
+            .and_then(|i| self.aligned.get(i))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// How many ports stage `stage` numbers its output by: one for a stage of one input and for
+    /// one that joins its inputs by morsel, its port count otherwise.
+    fn numbering_ports(&self, stage: StageId) -> u64 {
+        if self.is_aligned(stage) {
+            1
+        } else {
+            self.inputs(stage).len() as u64
+        }
     }
 
     /// The linear chain of one source, `kernels` stages and one sink: queue `k` from stage `k`
@@ -262,50 +371,67 @@ impl Topology {
             source_outputs: vec![vec![0]],
             sink_inputs: vec![kernels],
             paths: vec![vec![(0, Affine::IDENTITY)]],
+            aligned: vec![false; n],
         }
+    }
+
+    /// What each queue carries, by queue: every `(source, map)` such that the queue carries
+    /// `map.apply(s)` for each morsel `s` the source reads, sorted. Computed stage by stage in
+    /// stage order, which is an order in which every queue goes forward; a stage that joins its
+    /// inputs by morsel carries what its port 0 carries, numbered as it is.
+    fn arrivals(&self) -> crate::Result<Vec<Vec<(u16, Affine)>>> {
+        let too_many = || {
+            plan(format!(
+                "the run's DAG has more than {MAX_PATHS} paths from its sources to its sinks"
+            ))
+        };
+        let mut carried: Vec<Vec<(u16, Affine)>> = vec![Vec::new(); self.links.len()];
+        for (source, outputs) in self.source_outputs.iter().enumerate() {
+            for &q in outputs {
+                carried[usize::from(q)].push((source as u16, Affine::IDENTITY));
+            }
+        }
+        for stage in 1..=self.stages {
+            let ports = self.numbering_ports(stage);
+            let inputs = self.inputs(stage);
+            let taken = if self.is_aligned(stage) {
+                &inputs[..1]
+            } else {
+                inputs
+            };
+            let mut out: Vec<(u16, Affine)> = Vec::new();
+            for (port, &q) in taken.iter().enumerate() {
+                for (source, map) in &carried[usize::from(q)] {
+                    let next = map.then(ports, port as u64).ok_or_else(|| {
+                        plan("the run's DAG numbers its morsels past what a sequence number holds")
+                    })?;
+                    out.push((*source, next));
+                }
+            }
+            out.sort_by_key(|(source, map)| (*source, map.a, map.b));
+            out.dedup();
+            if out.len() > MAX_PATHS {
+                return Err(too_many());
+            }
+            for &q in self.outputs(stage) {
+                carried[usize::from(q)] = out.clone();
+            }
+        }
+        Ok(carried)
     }
 
     /// Every path from a source to each sink, as the map from the source's numbers to the sink's.
     fn walk_paths(&self) -> crate::Result<Vec<Vec<(u16, Affine)>>> {
-        let mut paths: Vec<Vec<(u16, Affine)>> = vec![Vec::new(); usize::from(self.sinks)];
-        let mut stack: Vec<(u16, StageId, Affine)> = Vec::new();
-        let mut walked = 0usize;
-        for (source, outputs) in self.source_outputs.iter().enumerate() {
-            for &q in outputs {
-                stack.push((source as u16, q, Affine::IDENTITY));
-            }
-        }
-        while let Some((source, q, map)) = stack.pop() {
-            walked += 1;
-            if walked > MAX_PATHS * 64 {
-                return Err(plan(format!(
-                    "the run's DAG has more than {MAX_PATHS} paths from its sources to its sinks"
-                )));
-            }
-            match self.links[usize::from(q)].to {
-                Consumer::Sink(t) => {
-                    let into = &mut paths[usize::from(t)];
-                    into.push((source, map));
-                    if paths.iter().map(Vec::len).sum::<usize>() > MAX_PATHS {
-                        return Err(plan(format!(
-                            "the run's DAG has more than {MAX_PATHS} paths from its sources to \
-                             its sinks"
-                        )));
-                    }
-                }
-                Consumer::Kernel { stage, port } => {
-                    let ports = self.inputs(stage).len() as u64;
-                    let next = map.then(ports, u64::from(port)).ok_or_else(|| {
-                        plan("the run's DAG numbers its morsels past what a sequence number holds")
-                    })?;
-                    for &out in self.outputs(stage) {
-                        stack.push((source, out, next));
-                    }
-                }
-            }
-        }
-        for sink in &mut paths {
-            sink.sort_by_key(|(source, map)| (*source, map.a, map.b));
+        let carried = self.arrivals()?;
+        let paths: Vec<Vec<(u16, Affine)>> = self
+            .sink_inputs
+            .iter()
+            .map(|&q| carried[usize::from(q)].clone())
+            .collect();
+        if paths.iter().map(Vec::len).sum::<usize>() > MAX_PATHS {
+            return Err(plan(format!(
+                "the run's DAG has more than {MAX_PATHS} paths from its sources to its sinks"
+            )));
         }
         Ok(paths)
     }
@@ -397,7 +523,7 @@ impl Topology {
 
     /// The number stage `stage` gives its output for input `seq` taken on `port`.
     pub fn out_seq(&self, stage: StageId, port: u16, seq: Seq) -> Seq {
-        let ports = self.inputs(stage).len() as u64;
+        let ports = self.numbering_ports(stage);
         if ports <= 1 {
             seq
         } else {
@@ -412,7 +538,7 @@ impl Topology {
             return None;
         };
         let inputs = self.inputs(stage);
-        let ports = inputs.len() as u64;
+        let ports = self.numbering_ports(stage);
         if ports <= 1 {
             return inputs.first().map(|&q| (q, seq));
         }
@@ -458,27 +584,99 @@ impl Topology {
         out
     }
 
-    /// Whether a morsel numbered `seq` reaches queue `q`, given how many each source read
-    /// (`read[i]`, `None` while source `i` is still reading): `None` while it depends on a
-    /// source still reading. What a sink tells a number no morsel will ever have by.
-    pub fn reaches(&self, q: StageId, seq: Seq, read: &[Option<Seq>]) -> Option<bool> {
-        let (source, root) = self.root(q, seq)?;
-        read.get(usize::from(source))
-            .copied()
-            .flatten()
-            .map(|n| root < n)
+    /// What the run has given so far, from each source's count (`read[i]`, `None` while source
+    /// `i` is still reading) and each stage's finish (`finished[s - 1]`, how many batches stage
+    /// `s`'s `finish` gave, `None` until it has finished; `Some(0)` for a stage that gives nothing
+    /// at its end). Computed stage by stage in stage order: a stage's finish base is one past the
+    /// highest number any input of it can carry, mapped to its output's numbers, and the highest
+    /// number its output carries is the last of its finish's batches when it gave any.
+    pub fn produced(&self, read: &[Option<Seq>], finished: &[Option<Seq>]) -> Produced {
+        let n = usize::from(self.stages);
+        let mut base = vec![None; n];
+        let mut last: Vec<Option<Option<Seq>>> = vec![None; n];
+        for stage in 1..=self.stages {
+            let at = usize::from(stage - 1);
+            let mut input: Option<Option<Seq>> = Some(None);
+            for (port, &q) in self.inputs(stage).iter().enumerate() {
+                let carried = match self.links[usize::from(q)].from {
+                    Producer::Source(i) => read
+                        .get(usize::from(i))
+                        .copied()
+                        .flatten()
+                        .map(|count| count.checked_sub(1)),
+                    Producer::Kernel(t) => last.get(usize::from(t) - 1).copied().flatten(),
+                };
+                input = match (input, carried) {
+                    (Some(so_far), Some(here)) => Some(higher(
+                        so_far,
+                        here.map(|seq| self.out_seq(stage, port as u16, seq)),
+                    )),
+                    _ => None,
+                };
+            }
+            base[at] = input.map(|highest| highest.map_or(0, |h| h.saturating_add(1)));
+            last[at] = match (finished.get(at).copied().flatten(), input) {
+                (Some(0), input) => input,
+                (Some(count), Some(_)) => base[at].map(|b| Some(b + count - 1)),
+                _ => None,
+            };
+        }
+        Produced {
+            read: read.to_vec(),
+            finished: finished.to_vec(),
+            base,
+            last,
+        }
     }
 
-    /// The highest number a morsel reaches sink `sink` with, given every source's count, or
-    /// `None` when no morsel reaches it.
-    pub fn last_at_sink(&self, sink: u16, read: &[Seq]) -> Option<Seq> {
-        self.paths(sink)
-            .iter()
-            .filter_map(|(source, map)| {
-                let n = *read.get(usize::from(*source))?;
-                map.apply(n.checked_sub(1)?)
-            })
-            .max()
+    /// Whether a morsel numbered `seq` reaches queue `q`, given what the run has given
+    /// ([`Topology::produced`]): `None` while it depends on a source still reading or a stage not
+    /// yet finished. What a sink tells a number no morsel will ever have by.
+    pub fn reaches(&self, q: StageId, seq: Seq, produced: &Produced) -> Option<bool> {
+        match self.link(q)?.from {
+            Producer::Source(i) => produced
+                .read
+                .get(usize::from(i))
+                .copied()
+                .flatten()
+                .map(|count| seq < count),
+            Producer::Kernel(stage) => {
+                let at = usize::from(stage) - 1;
+                let finished = produced.finished.get(at).copied().flatten();
+                let base = produced.base.get(at).copied().flatten();
+                if let Some(base) = base
+                    && seq >= base
+                {
+                    // One of the stage's finish's batches, or none.
+                    return finished.map(|count| seq - base < count);
+                }
+                let (from, at_from) = self.parent(q, seq)?;
+                let upstream = self.reaches(from, at_from, produced);
+                match (base, finished) {
+                    // Below the base, or a stage that gives nothing at its end: what its input
+                    // carried.
+                    (Some(_), _) | (None, Some(0)) => upstream,
+                    // The base is not known yet, so a number its input does not carry may still be
+                    // one its finish gives.
+                    _ => upstream.filter(|reached| *reached),
+                }
+            }
+        }
+    }
+
+    /// The highest number a morsel reaches sink `sink` with: `Some(None)` when none does, `None`
+    /// while that depends on a source still reading or a stage not yet finished.
+    pub fn last_at_sink(&self, sink: u16, produced: &Produced) -> Option<Option<Seq>> {
+        let q = self.sink_input(sink)?;
+        match self.link(q)?.from {
+            Producer::Source(i) => produced
+                .read
+                .get(usize::from(i))
+                .copied()
+                .flatten()
+                .map(|count| count.checked_sub(1)),
+            Producer::Kernel(stage) => produced.last.get(usize::from(stage) - 1).copied().flatten(),
+        }
     }
 }
 
@@ -553,11 +751,16 @@ mod tests {
         );
         assert_eq!(t.to_sinks(0, 5), vec![(0, 10)]);
         assert_eq!(t.to_sinks(1, 5), vec![(0, 11)]);
-        assert_eq!(t.reaches(4, 11, &[Some(6)]), Some(true));
-        assert_eq!(t.reaches(4, 13, &[Some(6)]), Some(false));
-        assert_eq!(t.reaches(4, 13, &[None]), None);
-        assert_eq!(t.last_at_sink(0, &[6]), Some(11));
-        assert_eq!(t.last_at_sink(0, &[0]), None);
+        let none = [Some(0); 3];
+        let six = t.produced(&[Some(6)], &none);
+        assert_eq!(t.reaches(4, 11, &six), Some(true));
+        assert_eq!(t.reaches(4, 13, &six), Some(false));
+        assert_eq!(t.reaches(4, 13, &t.produced(&[None], &none)), None);
+        assert_eq!(t.last_at_sink(0, &six), Some(Some(11)));
+        assert_eq!(
+            t.last_at_sink(0, &t.produced(&[Some(0)], &none)),
+            Some(None)
+        );
     }
 
     /// Fan-out of one source to two sinks, and fan-in of two sources into one stage.
@@ -611,9 +814,10 @@ mod tests {
         )
         .expect("fan-in");
         assert_eq!(fan_in.root(2, 7), Some((1, 3)));
-        assert_eq!(fan_in.reaches(2, 7, &[Some(1), Some(4)]), Some(true));
-        assert_eq!(fan_in.reaches(2, 6, &[Some(1), Some(4)]), Some(false));
-        assert_eq!(fan_in.last_at_sink(0, &[1, 4]), Some(7));
+        let read = fan_in.produced(&[Some(1), Some(4)], &[Some(0)]);
+        assert_eq!(fan_in.reaches(2, 7, &read), Some(true));
+        assert_eq!(fan_in.reaches(2, 6, &read), Some(false));
+        assert_eq!(fan_in.last_at_sink(0, &read), Some(Some(7)));
     }
 
     /// Every shape a run cannot have is refused, naming what is wrong.
@@ -736,6 +940,207 @@ mod tests {
             )
             .contains("goes forward")
         );
+    }
+
+    fn diamond() -> Topology {
+        Topology::new(
+            1,
+            3,
+            1,
+            vec![
+                Link {
+                    from: Producer::Source(0),
+                    to: k(1, 0),
+                },
+                Link {
+                    from: Producer::Source(0),
+                    to: k(2, 0),
+                },
+                Link {
+                    from: Producer::Kernel(1),
+                    to: k(3, 0),
+                },
+                Link {
+                    from: Producer::Kernel(2),
+                    to: k(3, 1),
+                },
+                Link {
+                    from: Producer::Kernel(3),
+                    to: Consumer::Sink(0),
+                },
+            ],
+        )
+        .expect("a diamond is a DAG")
+    }
+
+    /// CT-T32: a stage that joins its inputs by morsel numbers like a stage of one input: the
+    /// diamond's join keeps every number, the sink has one path, and a skip on either branch
+    /// lands on the one number.
+    #[test]
+    fn ct_t32_a_join_by_morsel_keeps_every_number() {
+        let t = diamond()
+            .align(&[3])
+            .expect("both ports carry the source's morsels");
+        assert!(t.is_aligned(3));
+        assert!(!t.is_aligned(1));
+        assert_eq!(t.out_seq(3, 0, 5), 5);
+        assert_eq!(t.out_seq(3, 1, 5), 5);
+        assert_eq!(t.parent(4, 5), Some((2, 5)));
+        assert_eq!(t.root(4, 5), Some((0, 5)));
+        assert_eq!(t.paths(0), &[(0, Affine::IDENTITY)]);
+        assert_eq!(t.to_sinks(0, 5), vec![(0, 5)]);
+        assert_eq!(t.to_sinks(1, 5), vec![(0, 5)]);
+        let produced = t.produced(&[Some(6)], &[Some(0); 3]);
+        assert_eq!(t.last_at_sink(0, &produced), Some(Some(5)));
+        assert_eq!(t.reaches(4, 5, &produced), Some(true));
+        assert_eq!(t.reaches(4, 6, &produced), Some(false));
+    }
+
+    /// CT-T32: a join of inputs that do not carry one upstream's morsels numbered alike is
+    /// refused, naming the stage and the port: two sources, and a branch through a union.
+    #[test]
+    fn ct_t32_a_join_of_other_morsels_is_refused() {
+        let two_sources = Topology::new(
+            2,
+            1,
+            1,
+            vec![
+                Link {
+                    from: Producer::Source(0),
+                    to: k(1, 0),
+                },
+                Link {
+                    from: Producer::Source(1),
+                    to: k(1, 1),
+                },
+                Link {
+                    from: Producer::Kernel(1),
+                    to: Consumer::Sink(0),
+                },
+            ],
+        )
+        .expect("fan-in");
+        assert_eq!(two_sources.misaligned(1).expect("walks"), Some(1));
+        let refused = two_sources.align(&[1]).expect_err("two upstreams");
+        assert!(
+            refused
+                .to_string()
+                .contains("stage 1 joins its inputs by morsel, and its port 1"),
+            "{refused}"
+        );
+        // Stage 2 unions the source with stage 1; stage 3 joins stage 1 with that union.
+        let through_union = Topology::new(
+            1,
+            3,
+            1,
+            vec![
+                Link {
+                    from: Producer::Source(0),
+                    to: k(1, 0),
+                },
+                Link {
+                    from: Producer::Source(0),
+                    to: k(2, 0),
+                },
+                Link {
+                    from: Producer::Kernel(1),
+                    to: k(2, 1),
+                },
+                Link {
+                    from: Producer::Kernel(1),
+                    to: k(3, 0),
+                },
+                Link {
+                    from: Producer::Kernel(2),
+                    to: k(3, 1),
+                },
+                Link {
+                    from: Producer::Kernel(3),
+                    to: Consumer::Sink(0),
+                },
+            ],
+        )
+        .expect("a DAG");
+        assert!(through_union.align(&[3]).is_err());
+        assert!(diamond().align(&[4]).is_err(), "no stage 4");
+    }
+
+    /// CT-T33: a stage's finish numbers its batches from one past the highest number its input
+    /// carries; what follows it numbers after them; a sink knows its last number once every
+    /// stage that could give one at its end has finished, and not before.
+    #[test]
+    fn ct_t33_finish_batches_follow_every_input_number() {
+        let chain = Topology::chain(2);
+        let open = chain.produced(&[Some(5)], &[None, Some(0)]);
+        assert_eq!(open.base(1), Some(5));
+        assert_eq!(open.base(2), None, "stage 1 may still give at its end");
+        assert_eq!(chain.last_at_sink(0, &open), None);
+        assert_eq!(chain.reaches(2, 4, &open), Some(true));
+        assert_eq!(chain.reaches(2, 5, &open), None);
+        let done = chain.produced(&[Some(5)], &[Some(2), Some(0)]);
+        assert_eq!(done.base(1), Some(5));
+        assert_eq!(done.base(2), Some(7));
+        assert_eq!(chain.last_at_sink(0, &done), Some(Some(6)));
+        assert_eq!(chain.reaches(2, 6, &done), Some(true));
+        assert_eq!(chain.reaches(2, 7, &done), Some(false));
+        assert_eq!(chain.reaches(1, 6, &done), Some(true));
+        let reading = chain.produced(&[None], &[Some(2), Some(0)]);
+        assert_eq!(reading.base(1), None);
+        assert_eq!(chain.last_at_sink(0, &reading), None);
+        let empty = chain.produced(&[Some(0)], &[Some(1), Some(0)]);
+        assert_eq!(
+            empty.base(1),
+            Some(0),
+            "a stage given nothing numbers its finish from 0"
+        );
+        assert_eq!(chain.last_at_sink(0, &empty), Some(Some(0)));
+
+        // Source 0 (3 morsels) through stage 1, which gives 2 at its end, into port 0 of the
+        // union at stage 2; source 1 (10 morsels) into its port 1.
+        let union = Topology::new(
+            2,
+            2,
+            1,
+            vec![
+                Link {
+                    from: Producer::Source(0),
+                    to: k(1, 0),
+                },
+                Link {
+                    from: Producer::Kernel(1),
+                    to: k(2, 0),
+                },
+                Link {
+                    from: Producer::Source(1),
+                    to: k(2, 1),
+                },
+                Link {
+                    from: Producer::Kernel(2),
+                    to: Consumer::Sink(0),
+                },
+            ],
+        )
+        .expect("a DAG");
+        let given = union.produced(&[Some(3), Some(10)], &[Some(2), Some(0)]);
+        assert_eq!(given.base(1), Some(3));
+        assert_eq!(given.base(2), Some(20));
+        assert_eq!(union.last_at_sink(0, &given), Some(Some(19)));
+        assert_eq!(union.reaches(3, 8, &given), Some(true), "stage 1's second");
+        assert_eq!(union.reaches(3, 10, &given), Some(false), "it gave two");
+        assert_eq!(union.reaches(3, 7, &given), Some(true), "source 1's third");
+        assert_eq!(union.reaches(3, 6, &given), Some(true), "stage 1's first");
+        let waiting = union.produced(&[Some(3), Some(10)], &[None, Some(0)]);
+        assert_eq!(
+            union.reaches(3, 4, &waiting),
+            Some(true),
+            "source 0's third"
+        );
+        assert_eq!(
+            union.reaches(3, 8, &waiting),
+            None,
+            "stage 1 has not finished"
+        );
+        assert_eq!(union.reaches(3, 7, &waiting), Some(true));
     }
 
     /// The maps compose, invert and refuse what overflows.

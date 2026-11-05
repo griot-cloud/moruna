@@ -194,9 +194,13 @@ impl Bench for Harnessed<'_> {
         let first =
             result.map_err(|e| format!("start-up ({label}): the first invocation failed: {e}"));
         drop(first?);
-        kernel
-            .finish(state.as_mut())
-            .map_err(|e| format!("start-up ({label}): finish failed: {e}"))?;
+        // The start-up ends the instance's input as a run would; what a finish gives has no
+        // stage after it here, so it is measured with the start-up and dropped.
+        drop(
+            kernel
+                .finish(state.as_mut())
+                .map_err(|e| format!("start-up ({label}): finish failed: {e}"))?,
+        );
         self.sample()?;
         Ok(seconds)
     }

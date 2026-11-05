@@ -930,47 +930,51 @@ impl Kernel for ImageTask {
     }
 
     /// SDD 19 f.6, f.7 on the kernel: the input ends; the task puts nothing more, ends its
-    /// stream and exits 0.
-    fn finish(&self, state: &mut dyn KernelState) -> Result<()> {
-        let st = state
-            .as_any_mut()
-            .downcast_mut::<TaskState>()
-            .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
-        if !Arc::ptr_eq(&st.memory, &self.memory) {
-            return Err(kernel_error(
-                "image: state belongs to another actual task owner".into(),
-            ));
-        }
-        st.plane
-            .finish(st.task, 0)
-            .map_err(|e| plane_error(&st.name, "ending the task's input", e))?;
-        match st.wait(self.ports.get(), &self.port_names)? {
-            Seen::Put(out) => {
-                let _ = st.plane.drop_batch(out);
-                let cause = format!(
-                    "its output holds more record batches than the {} sent",
-                    st.sent
-                );
-                Err(st.failed(&cause))
+    /// stream and exits 0. It gives nothing at its end: every batch an
+    /// image writes answers one it was sent.
+    fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
+        let ended = (|| -> Result<()> {
+            let st = state
+                .as_any_mut()
+                .downcast_mut::<TaskState>()
+                .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
+            if !Arc::ptr_eq(&st.memory, &self.memory) {
+                return Err(kernel_error(
+                    "image: state belongs to another actual task owner".into(),
+                ));
             }
-            Seen::Ended => match st.answer(END_SECONDS * SECONDS) {
-                Some(Ok(e)) if e.how == how::EXITED && e.code == 0 => {
-                    let (served, refused) = (e.served, e.refused.clone());
-                    st.drain_log();
-                    let footprint = st.footprint();
-                    tracing::info!(
-                        target: "micro",
-                        image = %st.name,
-                        served,
-                        refused = ?refused,
-                        stage = st.stage,
-                        %footprint,
-                        "image task exited 0"
+            st.plane
+                .finish(st.task, 0)
+                .map_err(|e| plane_error(&st.name, "ending the task's input", e))?;
+            match st.wait(self.ports.get(), &self.port_names)? {
+                Seen::Put(out) => {
+                    let _ = st.plane.drop_batch(out);
+                    let cause = format!(
+                        "its output holds more record batches than the {} sent",
+                        st.sent
                     );
-                    Ok(())
+                    Err(st.failed(&cause))
                 }
-                _ => Err(st.failed("it ended")),
-            },
-        }
+                Seen::Ended => match st.answer(END_SECONDS * SECONDS) {
+                    Some(Ok(e)) if e.how == how::EXITED && e.code == 0 => {
+                        let (served, refused) = (e.served, e.refused.clone());
+                        st.drain_log();
+                        let footprint = st.footprint();
+                        tracing::info!(
+                            target: "micro",
+                            image = %st.name,
+                            served,
+                            refused = ?refused,
+                            stage = st.stage,
+                            %footprint,
+                            "image task exited 0"
+                        );
+                        Ok(())
+                    }
+                    _ => Err(st.failed("it ended")),
+                },
+            }
+        })();
+        ended.map(|()| None)
     }
 }

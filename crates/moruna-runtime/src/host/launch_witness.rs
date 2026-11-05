@@ -466,6 +466,7 @@ mod tests {
             super::super::native::Tools {
                 qemu: Path::new("no-qemu"),
                 vsock: Path::new("no-helper"),
+                cgroup: &moruna_vmm::jail::Cgroup::Undelegated,
             },
             super::super::protocol::Inbound::Cancel,
             std::time::Instant::now() + std::time::Duration::from_secs(1),

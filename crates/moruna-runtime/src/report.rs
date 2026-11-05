@@ -84,6 +84,8 @@ pub struct MetaInput {
     pub write: Option<moruna_kernel::SinkWrite>,
     /// What the source's engine said about the read it planned, when the source was built.
     pub read: Option<moruna_kernel::SourceRead>,
+    /// What each sink reported when it finished, when the run completed.
+    pub sinks: Vec<moruna_kernel::SinkSummary>,
     /// The placement engine's buffer catalog at the end of the run, when the facade built the
     /// engine (placement f.18).
     pub buffers: Option<moruna_trace::BufferReport>,
@@ -126,6 +128,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         process_usage: input.process_usage,
         write: input.write,
         read: input.read,
+        sinks: input.sinks,
         buffers: input.buffers,
         policy: input.policy,
     }
@@ -208,6 +211,7 @@ mod tests {
             process_usage: moruna_kernel::ProcessUsage::default(),
             write: None,
             read: None,
+            sinks: Vec::new(),
             policy: None,
             buffers: Some(moruna_trace::BufferReport::of(
                 "known_future",
@@ -252,6 +256,7 @@ mod tests {
             process_usage: moruna_kernel::ProcessUsage::default(),
             write: None,
             read: None,
+            sinks: Vec::new(),
             buffers: None,
             policy: None,
         });

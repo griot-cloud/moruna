@@ -16,7 +16,7 @@ import pytest
 import moruna
 
 REFUSAL = (
-    "Python kernels require a free-threaded interpreter (python3.13t or python3.14t); "
+    "Python functions require a free-threaded interpreter (python3.13t or python3.14t); "
     "pass allow_gil=True to run serialised"
 )
 
@@ -31,7 +31,7 @@ src, out = d / "in", d / "out"
 src.mkdir(exist_ok=True); out.mkdir(exist_ok=True)
 pq.write_table(pa.table({"id": pa.array(range(1000), pa.int64())}), src / "p.parquet")
 
-@moruna.kernel
+@moruna.function
 def identity(batch):
     return batch
 
@@ -77,7 +77,7 @@ def test_a_free_threaded_interpreter_is_not_refused(
         pytest.skip("this interpreter has a GIL; the refusal path is the subprocess test")
     src_url, out_url, _ = dataset
 
-    @moruna.kernel
+    @moruna.function
     def identity(batch):  # noqa: ANN001, ANN202
         return batch
 
@@ -88,4 +88,4 @@ def test_a_free_threaded_interpreter_is_not_refused(
         **staging,
     )
     assert report.gil_serialised is False
-    assert report.gil == [(1, "FreeThreaded")]
+    assert report.gil == [[1, "FreeThreaded"]]

@@ -47,7 +47,7 @@ pq.write_table(pa.table({"id": pa.array(range(rows), pa.int64()),
                          "text": pa.array([f"row-{i}" for i in range(rows)])}),
                src / "part-0.parquet", row_group_size=20_000)
 
-@moruna.kernel
+@moruna.function
 def append_upper(batch):
     return batch.append_column("upper", pc.utf8_upper(batch.column("text")))
 
@@ -73,7 +73,7 @@ except moruna.ConfigError as err:
 run_s = time.perf_counter() - started
 back = pq.read_table(str(out))
 print(json.dumps({
-    "exit": report.exit,
+    "exit": report.exit["status"],
     "run_s": run_s,
     "rows_out": report.stages[0]["rows_out"],
     "rows_back": back.num_rows,
@@ -125,7 +125,7 @@ def test_a_python_kernel_over_200k_rows_finishes_inside_a_wall_clock_bound(
         f"serialised={result['gil_serialised']}"
     )
 
-    assert result["exit"] == "Completed"
+    assert result["exit"] == "completed"
     assert result["rows_out"] == ROWS
     assert result["rows_back"] == ROWS
     assert result["has_upper"] is True

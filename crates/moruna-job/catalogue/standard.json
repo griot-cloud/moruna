@@ -1,5 +1,5 @@
 {
-  "moruna_kinds": 1,
+  "moruna_kinds": 2,
   "moruna": "0.5.9",
   "sources": [
     {
@@ -403,10 +403,10 @@
       "isolation": "builtin"
     }
   ],
-  "kernels": [
+  "functions": [
     {
       "name": "image",
-      "role": "kernel",
+      "role": "function",
       "summary": "An OCI image's command in a sandboxed process, its batches on the data plane: Arrow IPC over its standard input and output, or the plane's calls",
       "settings": {
         "type": "object",
@@ -532,7 +532,7 @@
     },
     {
       "name": "package",
-      "role": "kernel",
+      "role": "function",
       "summary": "A function package, one .wasm or .pex file pinned by its sha256",
       "settings": {
         "type": "object",
@@ -636,7 +636,7 @@
     },
     {
       "name": "std",
-      "role": "kernel",
+      "role": "function",
       "summary": "A standard kernel of moruna-kernels, built by name and arguments",
       "settings": {
         "type": "object",
@@ -658,7 +658,8 @@
               "explode",
               "concat_str",
               "date_trunc",
-              "union"
+              "union",
+              "join"
             ]
           },
           "args": {

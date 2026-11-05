@@ -232,15 +232,15 @@ pub(crate) fn panicked(shared: &Shared, panic: &(dyn std::any::Any + Send)) {
 }
 
 /// f.11, contracts d.16: the numbers this sink's queue will never deliver, skipped as soon as
-/// the sources they would come from are read to the end, so its watermark (and an ordered sink's
-/// next expected number) moves past them. A number is looked at once: from `gaps_from` up to
-/// the highest the queue delivered, or, once every source is read, to the last a morsel can have
-/// here. Returns whether it skipped any.
+/// the sources they would come from are read to the end and the stages whose finish could give
+/// them have finished, so its watermark (and an ordered sink's next expected number) moves past
+/// them. A number is looked at once: from `gaps_from` up to the highest the queue delivered, or,
+/// once everything upstream is known, to the last a morsel can have here. Returns whether it
+/// skipped any.
 fn skip_gaps(shared: &Shared, end: &SinkEnd, sink: &SinkHandle) -> bool {
-    let counts = crate::source_drive::counts(shared);
-    let all_read: Option<Vec<Seq>> = counts.iter().copied().collect();
-    let bound = match &all_read {
-        Some(read) => shared.topology.last_at_sink(end.index, read),
+    let produced = shared.produced();
+    let bound = match shared.topology.last_at_sink(end.index, &produced) {
+        Some(last) => last,
         None => *end.highest.lock().unwrap_or_else(|e| e.into_inner()),
     };
     let Some(bound) = bound else {
@@ -250,7 +250,7 @@ fn skip_gaps(shared: &Shared, end: &SinkEnd, sink: &SinkHandle) -> bool {
     {
         let mut from = end.gaps_from.lock().unwrap_or_else(|e| e.into_inner());
         while *from <= bound {
-            match shared.topology.reaches(end.queue, *from, &counts) {
+            match shared.topology.reaches(end.queue, *from, &produced) {
                 Some(true) => {}
                 Some(false) => {
                     sink.skip(*from);
@@ -377,19 +377,10 @@ fn finish(shared: &Shared) {
     if !shared.claim_exit() {
         return;
     }
-    // Every stage's input has ended: a kernel that runs something apart ends it and answers for
-    // how it ended, before the sink commits anything (contracts d.7 `finish`).
-    if let Err(e) = crate::instances::finish_instances(shared) {
-        shared.set_run_state(RunState::Terminating);
-        shared.publish_exit(Exit::Terminated(e));
-        shared.unpark_all();
-        return;
-    }
+    // Every stage has finished before its outputs closed (f.6, `instances::run_finish`), so what
+    // the run gave is known to its last number.
     shared.set_run_state(RunState::Finishing);
-    let read: Vec<Seq> = crate::source_drive::counts(shared)
-        .into_iter()
-        .map(Option::unwrap_or_default)
-        .collect();
+    let produced = shared.produced();
     let mut summaries = Vec::with_capacity(shared.sinks.len());
     for end in &shared.sinks {
         shared.tell(moruna_kernel::StageEvent::SinkCommitting { sink: end.index });
@@ -407,7 +398,7 @@ fn finish(shared: &Shared) {
         };
         match summary {
             Ok(summary) => {
-                if let Some(last) = shared.topology.last_at_sink(end.index, &read) {
+                if let Some(Some(last)) = shared.topology.last_at_sink(end.index, &produced) {
                     publish(shared, end, last);
                 }
                 let ends = &end.input;

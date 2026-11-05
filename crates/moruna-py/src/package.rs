@@ -199,7 +199,7 @@ impl PyPackageKernel {
     ) -> PyResult<Bound<'py, PyAny>> {
         let input: PyRecordBatch = batch.extract().map_err(|e| {
             pyo3::exceptions::PyTypeError::new_err(format!(
-                "a package kernel takes a pyarrow.RecordBatch: {e}"
+                "a package function takes a pyarrow.RecordBatch: {e}"
             ))
         })?;
         let input = input.into_inner();
@@ -219,7 +219,7 @@ impl PyPackageKernel {
                 .into_pyarrow(py)
                 .map(|b| b.into_any()),
             Payload::Tensor(..) => Err(pyo3::exceptions::PyTypeError::new_err(
-                "a package kernel returned a tensor",
+                "a package function returned a tensor",
             )),
         }
     }

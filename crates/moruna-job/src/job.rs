@@ -75,6 +75,9 @@ pub struct Job {
     /// The contracts the job's kinds read and write under (MH 4.5).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub contracts: Vec<ContractEntry>,
+    /// The job's name, as its author gave it; absent: unnamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// One task: a kind of a role, its settings and its named ports.
@@ -293,6 +296,7 @@ impl Job {
             allow_gil: false,
             report: Reporting::default(),
             contracts: Vec::new(),
+            name: None,
         }
     }
 
@@ -371,6 +375,7 @@ impl Job {
                 logs: spec.report.logs.clone(),
             },
             contracts: spec.contracts.clone(),
+            name: None,
         }
     }
 

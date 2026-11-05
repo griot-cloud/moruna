@@ -368,8 +368,24 @@ impl Kernel for FinalRows {
     ) -> moruna_kernel::Result<moruna_kernel::Payload> {
         self.capture(self.kernel.apply_port(state, port, input)?)
     }
-    fn finish(&self, state: &mut dyn moruna_kernel::KernelState) -> moruna_kernel::Result<()> {
-        self.kernel.finish(state)
+    fn finish(
+        &self,
+        state: &mut dyn moruna_kernel::KernelState,
+    ) -> moruna_kernel::Result<Option<moruna_kernel::Payload>> {
+        self.kernel
+            .finish(state)?
+            .map(|output| self.capture(output))
+            .transpose()
+    }
+    fn aligns_inputs(&self) -> bool {
+        self.kernel.aligns_inputs()
+    }
+    fn apply_aligned(
+        &self,
+        state: &mut dyn moruna_kernel::KernelState,
+        inputs: Vec<moruna_kernel::Payload>,
+    ) -> moruna_kernel::Result<moruna_kernel::Payload> {
+        self.capture(self.kernel.apply_aligned(state, inputs)?)
     }
     fn max_inputs(&self) -> u16 {
         self.kernel.max_inputs()

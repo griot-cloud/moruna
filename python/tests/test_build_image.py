@@ -135,7 +135,7 @@ def test_bd_t26_the_same_function_built_twice_is_one_image(tmp_path: Path) -> No
 
     one = build_image(Path(EXAMPLE) / "kernel.py", "add_doubled", tmp_path / "one", "a:1")
     module = support.load_path(Path(EXAMPLE) / "kernel.py", "kernel")
-    built = moruna.build(module.add_doubled, out=tmp_path / "two", tag="a:1")
+    built = module.add_doubled.build(out=tmp_path / "two", tag="a:1")
     assert one["image"] == built.digest
     assert [layer["digest"] for layer in one["layers"]] == [
         layer.blob.digest for layer in built.layers

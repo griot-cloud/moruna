@@ -34,6 +34,7 @@ mod sc_t35_liveness;
 mod sc_t36_residency_greedy;
 mod sc_t37_lookahead;
 mod sc_t38_learning;
+mod sc_t39_a_finish_gives_downstream;
 mod sc_t3_source_admission;
 mod sc_t4_one_record_per_morsel_stage;
 mod sc_t5_knobs_immediate;

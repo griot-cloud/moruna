@@ -839,8 +839,7 @@ fn every_sink_kind_builds() {
     );
     let mut store = ObjectStoreDoc {
         gcs: Some(GcsDoc {
-            service_account_path: Some("/sa.json".into()),
-            ..GcsDoc::default()
+            bucket: Some("g".into()),
         }),
         azure: Some(AzureDoc {
             account: Some("acct".into()),
@@ -1016,7 +1015,7 @@ fn kd_t9_v1_documents_resolve() {
             .expect("rust is refused");
         assert!(
             e.to_string().contains(
-                "kernels[0].kind: no kernel kind `rust` is registered; this build runs \
+                "kernels[0].kind: no function kind `rust` is registered; this build runs \
                  image, package, std"
             ),
             "{e}"

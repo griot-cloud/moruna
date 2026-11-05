@@ -518,7 +518,7 @@ fn jb_t28_check_job_command() {
         lines[0],
         "source.settings.url: `parquet` settings: `url` is required"
     );
-    assert!(lines[1].starts_with("kernels[0].kind: no kernel kind `java` is declared; "));
+    assert!(lines[1].starts_with("kernels[0].kind: no function kind `java` is declared; "));
     assert_eq!(
         lines[2],
         "sink.settings.bogus: `parquet` settings: `bogus` is not a setting of `parquet`"

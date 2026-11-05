@@ -27,7 +27,7 @@ def shout(batch):
     return batch.append_column("loud", pc.utf8_upper(batch.column("text")))
 
 
-@moruna.kernel(expected_amplification=2.0)
+@moruna.function(expected_amplification=2.0)
 def decorated(batch):
     return batch
 """
@@ -35,7 +35,10 @@ def decorated(batch):
 
 def _projection(report: dict) -> dict:
     return {
-        "exit": report["exit"],
+        # The command's report names the exit as the trace does; the library's report as a
+        # code and a status.
+        "exit": report["exit"]["status"] if isinstance(report["exit"], dict)
+        else report["exit"].lower(),
         "resumed": report["resumed"],
         "limits": (report["limits_initial"]["memory_ceiling"], report["limits_initial"]["cpu_quota"]),
         "gil_serialised": report["gil_serialised"],
@@ -61,7 +64,7 @@ def _document(scratch: pathlib.Path, src_url: str, out: pathlib.Path, callable_:
         "moruna_spec": 1,
         "source": {"kind": "parquet", "url": src_url},
         "kernels": [
-            {"kind": "python", "module": str(scratch / "kernels.py"), "callable": callable_}
+            {"kind": "python", "ref": f"{scratch / 'kernels.py'}:{callable_}"}
         ],
         "sink": {
             "kind": "parquet",
@@ -120,21 +123,6 @@ def test_ho_t14_file_run_equals_library_run(
     assert _projection(envelope["report"]) == _projection(json.loads(library.to_json()))
     assert len(_rows(from_file_out)) == rows
     assert _rows(from_file_out) == _rows(pathlib.Path(out_url.removeprefix("file://")))
-
-
-def test_ho_t14_hints_on_a_decorated_kernel_are_refused(
-    dataset: tuple[str, str, int], scratch: pathlib.Path
-) -> None:
-    src_url, _, _ = dataset
-    (scratch / "kernels.py").write_text(KERNELS)
-    document = _document(scratch, src_url, scratch / "out", "decorated")
-    document["kernels"][0]["preferred_rows"] = 10
-    code, envelope = _run(document, scratch)
-    assert code == 2
-    assert envelope["exit"]["diagnostic"].startswith(
-        "spec refused: kernels[0].preferred_rows: `decorated` is already decorated"
-    )
-    assert envelope["report"] is None
 
 
 def test_ho_t14_the_command_says_its_version() -> None:

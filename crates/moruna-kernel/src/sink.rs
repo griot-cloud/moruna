@@ -18,6 +18,19 @@ pub struct SinkSummary {
     /// writes through an engine which judges its writes (a peQL contract); `None` for every
     /// other write.
     pub write: Option<SinkWrite>,
+    /// The version the write committed, for a sink that commits one (a table snapshot); `None`
+    /// for a sink that commits none.
+    pub commit: Option<SinkCommit>,
+}
+
+/// A version a sink committed: the snapshot a reader finds the write under, which every
+/// committing sink names, and the sink's own name for the version when it has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SinkCommit {
+    /// The snapshot the write committed, as the store names it.
+    pub snapshot_id: String,
+    /// The version the sink gives the snapshot, when it gives one.
+    pub version: Option<String>,
 }
 
 /// A write as the engine that committed it reports it, in that engine's own words: Moruna

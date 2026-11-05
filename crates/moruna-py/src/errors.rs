@@ -23,7 +23,7 @@ create_exception!(
     MorunaError,
     "The pipeline cannot be planned."
 );
-create_exception!(_core, KernelError, MorunaError, "A kernel raised.");
+create_exception!(_core, FunctionError, MorunaError, "A function raised.");
 create_exception!(
     _core,
     BudgetError,
@@ -71,7 +71,7 @@ pub fn kind_of(err: &RsError) -> &'static str {
     match err {
         RsError::Plan(_) => "Plan",
         RsError::Source { .. } => "Source",
-        RsError::Kernel { .. } => "Kernel",
+        RsError::Kernel { .. } => "Function",
         RsError::Sink(_) => "Sink",
         RsError::Alloc { .. } => "Alloc",
         RsError::Io { .. } => "Io",
@@ -90,7 +90,7 @@ pub fn kind_of(err: &RsError) -> &'static str {
 pub fn class_of(py: Python<'_>, err: &RsError) -> Py<PyType> {
     let class = match err {
         RsError::Plan(_) | RsError::Convert(_) => py.get_type::<PlanError>(),
-        RsError::Kernel { .. } => py.get_type::<KernelError>(),
+        RsError::Kernel { .. } => py.get_type::<FunctionError>(),
         RsError::Budget { .. } | RsError::Alloc { .. } | RsError::Refused { .. } => {
             py.get_type::<BudgetError>()
         }
@@ -190,7 +190,7 @@ pub fn diagnostic<'py>(py: Python<'py>, err: &RsError) -> PyResult<Bound<'py, Py
         } => {
             d.set_item("stage", stage)?;
             d.set_item("seq", seq)?;
-            d.set_item("kernel", kernel)?;
+            d.set_item("function", kernel)?;
             d.set_item("requested", requested)?;
             d.set_item("in_use", in_use)?;
             d.set_item("ceiling", ceiling)?;
@@ -244,7 +244,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add("MorunaError", py.get_type::<MorunaError>())?;
     m.add("PlanError", py.get_type::<PlanError>())?;
-    m.add("KernelError", py.get_type::<KernelError>())?;
+    m.add("FunctionError", py.get_type::<FunctionError>())?;
     m.add("BudgetError", py.get_type::<BudgetError>())?;
     m.add("IoError", py.get_type::<IoError>())?;
     m.add("ConfigError", py.get_type::<ConfigError>())?;
@@ -313,8 +313,8 @@ mod tests {
                         msg: "ValueError: boom".into(),
                         features: Some(features()),
                     },
-                    "KernelError",
-                    "Kernel",
+                    "FunctionError",
+                    "Function",
                 ),
                 (
                     RsError::Budget {

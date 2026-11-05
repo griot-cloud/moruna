@@ -24,7 +24,7 @@ pip install moruna
 import moruna
 import pyarrow as pa
 
-@moruna.kernel
+@moruna.function
 def shout(batch):
     loud = pa.array([s.as_py().upper() for s in batch.column("text")])
     return batch.append_column("loud", loud)
@@ -38,13 +38,13 @@ report = moruna.run(
 print(report)
 ```
 
-Moruna requires Python 3.14. On the standard build of Python, add `allow_gil=True`; on the free-threaded build, Python kernels run on every core. The [quickstart](https://griot-cloud.github.io/moruna/quickstart.html) builds a dataset and runs this end to end.
+Moruna requires Python 3.14. On the standard build of Python, add `allow_gil=True`; on the free-threaded build, Python functions run on every core. The [quickstart](https://griot-cloud.github.io/moruna/quickstart.html) builds a dataset and runs this end to end.
 
 ## Documentation
 
 | | |
 | --- | --- |
-| **[Getting started](https://griot-cloud.github.io/moruna/getting-started.html)**<br>Learn the concepts, then run your first job. | **[Using Moruna](https://griot-cloud.github.io/moruna/using.html)**<br>Write kernels, run jobs from Python or the command line, and choose where they run. |
+| **[Getting started](https://griot-cloud.github.io/moruna/getting-started.html)**<br>Learn the concepts, then run your first job. | **[Using Moruna](https://griot-cloud.github.io/moruna/using.html)**<br>Write functions, run jobs from Python or the command line, and choose where they run. |
 | **[How it works](https://griot-cloud.github.io/moruna/execution.html)**<br>Understand how Moruna sizes work, keeps memory under the limit and resumes. | **[Reference](https://griot-cloud.github.io/moruna/reference.html)**<br>Look up functions, the job document, commands and the run report. |
 
 Read the [documentation website](https://griot-cloud.github.io/moruna/).

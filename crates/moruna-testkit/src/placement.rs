@@ -539,7 +539,7 @@ impl Placement for FakePlacement {
         }
         if !found.fingerprints.is_empty() && found.fingerprints != fingerprints {
             return Err(MorunaError::Resume(format!(
-                "{}: the kernel fingerprints differ from the manifest's",
+                "{}: the function fingerprints differ from the manifest's",
                 manifest.display()
             )));
         }

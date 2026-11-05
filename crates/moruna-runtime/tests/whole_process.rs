@@ -124,6 +124,7 @@ impl Sink for Hoarder {
             bytes: 0,
             files: Vec::new(),
             write: None,
+            commit: None,
         })
     }
 }

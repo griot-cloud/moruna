@@ -263,7 +263,8 @@ pub struct StagingDoc {
     pub durable: Option<bool>,
 }
 
-/// `object_store` (MH 4.1).
+/// `object_store` (MH 4.1): endpoints and names. A document holds no credential; the runner
+/// supplies credentials when the job runs, and a field that would carry one is refused.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObjectStoreDoc {
@@ -293,15 +294,6 @@ pub struct S3Doc {
     /// Region.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
-    /// Access key id.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_key_id: Option<String>,
-    /// Secret access key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secret_access_key: Option<String>,
-    /// Session token.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_token: Option<String>,
     /// Default bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
@@ -311,12 +303,6 @@ pub struct S3Doc {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GcsDoc {
-    /// Service account file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_account_path: Option<String>,
-    /// Service account key as JSON.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_account_json: Option<String>,
     /// Default bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
@@ -329,9 +315,6 @@ pub struct AzureDoc {
     /// Storage account.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    /// Access key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_key: Option<String>,
     /// Default container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,

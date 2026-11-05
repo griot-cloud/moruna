@@ -32,7 +32,7 @@ def _run(scratch: pathlib.Path, src_url: str, *extra: str) -> tuple[subprocess.C
     document = {
         "moruna_spec": 1,
         "source": {"kind": "parquet", "url": src_url},
-        "kernels": [{"kind": "python", "module": str(scratch / "kernels.py"), "callable": "keep"}],
+        "kernels": [{"kind": "python", "ref": f"{scratch / 'kernels.py'}:keep"}],
         "sink": {
             "kind": "parquet",
             "url": str(scratch / "out"),

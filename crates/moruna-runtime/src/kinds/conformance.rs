@@ -95,7 +95,7 @@ impl core::fmt::Display for Violation {
 /// The source port's suite.
 pub fn source(kind: &dyn SourceKind, harness: &Harness) -> core::result::Result<Passed, Violation> {
     let build = |doc: &KindDoc, cx: &mut Context| {
-        kind.source(&Entry::new("source", None, doc), cx)
+        kind.source(&Entry::new("source", Some(0), doc), cx)
             .map(|_| ())
     };
     suite(
@@ -110,8 +110,9 @@ pub fn source(kind: &dyn SourceKind, harness: &Harness) -> core::result::Result<
 
 /// The sink port's suite.
 pub fn sink(kind: &dyn SinkKind, harness: &Harness) -> core::result::Result<Passed, Violation> {
-    let build =
-        |doc: &KindDoc, cx: &mut Context| kind.sink(&Entry::new("sink", None, doc), cx).map(|_| ());
+    let build = |doc: &KindDoc, cx: &mut Context| {
+        kind.sink(&Entry::new("sink", Some(0), doc), cx).map(|_| ())
+    };
     suite(
         kind.declaration(),
         kind.declaration(),

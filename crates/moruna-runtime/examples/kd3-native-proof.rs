@@ -218,6 +218,7 @@ mod proof {
             Tools {
                 qemu: &cfg.qemu,
                 vsock: &cfg.vsock,
+                cgroup: &moruna_vmm::jail::Cgroup::Undelegated,
             },
             prepared,
             deadline,
@@ -268,6 +269,12 @@ mod proof {
         let transcript_sync = transcript.sync_all();
         let owned = format!("{:?}", run.reconcile());
         drop(control);
+        // The launcher removes the run's directory with the run: keep the guest console as
+        // evidence while it still exists.
+        let console = std::fs::copy(
+            cfg.runtime_directory.join("serial.log"),
+            cfg.evidence_directory.join("serial.log"),
+        );
         // Cleanup is attempted before any fallible evidence write below. A disk-full
         // diagnostic must not prevent the real owner from draining/reaping children.
         let terminal = run.cancel();
@@ -275,6 +282,7 @@ mod proof {
             Ok(seen) => json!({"seen":seen}),
             Err(error) => json!({"error":error.to_string()}),
         };
+        console?;
         persist(&cfg.evidence_directory.join("observed.json"), &observed)?;
         persist(
             &cfg.evidence_directory.join("owned-before-cleanup.json"),

@@ -146,9 +146,47 @@ fn run_job(shared: &Shared, worker: u16, job: WorkerJob) -> Result<JobOutput> {
                 None => JobOutput::Done,
             })
         }
+        WorkerJob::Finish { stage_ix } => instances::run_finish(shared, worker, stage_ix),
         #[cfg(test)]
         WorkerJob::Die => Ok(JobOutput::Done),
     }
+}
+
+/// What a stage that joins its inputs by morsel was given (d.16).
+enum Gathered {
+    /// The morsel of this number from every port, port 0 first.
+    Complete(Vec<Morsel>),
+    /// A port of this number has not given its morsel yet.
+    Waiting,
+}
+
+/// Keep `morsel`, taken on `port`, with the others of its number, and hand the set over once
+/// every port has given one (d.16). A second morsel of one number on one port is a topology the
+/// build should have refused, and ends the run.
+fn gather(shared: &Shared, stage_ix: usize, port: u16, morsel: Morsel) -> Result<Gathered> {
+    let entry = &shared.stages[stage_ix];
+    let Some(pending) = entry.pending.as_ref() else {
+        return Ok(Gathered::Complete(vec![morsel]));
+    };
+    let ports = entry.inputs.len();
+    let seq = morsel.seq;
+    let mut held = pending.lock().unwrap_or_else(|e| e.into_inner());
+    let set = held
+        .entry(seq)
+        .or_insert_with(|| (0..ports).map(|_| None).collect());
+    let slot = &mut set[usize::from(port)];
+    if slot.is_some() {
+        return Err(MorunaError::Plan(format!(
+            "stage {} was given morsel {seq} twice on its port {port}",
+            entry.stage
+        )));
+    }
+    *slot = Some(morsel);
+    if set.iter().any(Option::is_none) {
+        return Ok(Gathered::Waiting);
+    }
+    let set = held.remove(&seq).unwrap_or_default();
+    Ok(Gathered::Complete(set.into_iter().flatten().collect()))
 }
 
 /// How long the probe waits for the morsel the source drive is pushing for it (f.9).
@@ -272,14 +310,55 @@ pub(crate) fn run_task(
         }
     };
 
-    let Morsel {
+    // d.16: a stage that joins its inputs by morsel waits for the morsel of this number on every
+    // port; a probe takes the others' heads itself, as the controller probes in stage order.
+    let gathered = if entry.pending.is_some() {
+        let mut found = gather(shared, stage_ix, port, morsel);
+        if probing {
+            for (other, &queue) in entry.inputs.iter().enumerate() {
+                if other == usize::from(port) || !matches!(found, Ok(Gathered::Waiting)) {
+                    continue;
+                }
+                match claim_and_pop(shared, queue, entry.spec, true) {
+                    Ok(Some((next, _))) => found = gather(shared, stage_ix, other as u16, next),
+                    Ok(None) => {}
+                    Err(e) => found = Err(e),
+                }
+            }
+        }
+        match found {
+            Ok(Gathered::Complete(set)) => set,
+            other => {
+                if let Some(held) = held {
+                    instances::release(shared, stage_ix, held, false);
+                }
+                entry.running.fetch_sub(1, Ordering::SeqCst);
+                return other.map(|_| None);
+            }
+        }
+    } else {
+        vec![morsel]
+    };
+    let joined = gathered.len() > 1 || entry.pending.is_some();
+    let mut gathered = gathered.into_iter();
+    let Some(Morsel {
         seq: seq_in,
         stage: _,
         payload,
-        bytes: bytes_in,
+        bytes: first_bytes,
         origin,
         features,
-    } = morsel;
+    }) = gathered.next()
+    else {
+        entry.running.fetch_sub(1, Ordering::SeqCst);
+        return Ok(None);
+    };
+    let mut others = Vec::new();
+    let mut bytes_in = first_bytes;
+    for morsel in gathered {
+        bytes_in += morsel.bytes;
+        others.push(morsel.payload);
+    }
     // The unit's number: the input's, or for a stage of several inputs the one its output gets
     // (contracts d.16), so the record and the diagnostic name one morsel of this stage.
     let seq = shared.topology.out_seq(stage, port, seq_in);
@@ -338,7 +417,14 @@ pub(crate) fn run_task(
         };
         let kernel = entry.kernel.clone();
         std::panic::catch_unwind(AssertUnwindSafe(move || {
-            kernel.apply_port(state, port, payload)
+            if joined {
+                let mut inputs = Vec::with_capacity(others.len() + 1);
+                inputs.push(payload);
+                inputs.extend(others);
+                kernel.apply_aligned(state, inputs)
+            } else {
+                kernel.apply_port(state, port, payload)
+            }
         }))
     };
     let c1 = thread_cpu_ns();
@@ -346,7 +432,15 @@ pub(crate) fn run_task(
     // The unit is done with its input: the share it took is released, before its output is
     // pushed, so the batch's bytes leave memory first when this was its last consumer
     // (placement f.18).
-    let released = shared.placement.release(input, seq_in);
+    let released = if joined {
+        entry
+            .inputs
+            .iter()
+            .map(|&queue| shared.placement.release(queue, seq_in))
+            .fold(Ok(()), Result::and)
+    } else {
+        shared.placement.release(input, seq_in)
+    };
     crate::decide::unit_finished(shared, t1.saturating_sub(t0));
     // What the call asked for, which a counting kernel left on this thread (contracts d.7, E13).
     let alloc = moruna_kernel::take_kernel_alloc();

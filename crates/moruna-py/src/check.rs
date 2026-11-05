@@ -112,7 +112,7 @@ pub fn check_kernel(
                     .bind(py)
                     .getattr("__name__")
                     .and_then(|n| n.extract::<String>())
-                    .unwrap_or_else(|_| "kernel".into())
+                    .unwrap_or_else(|_| "function".into())
             });
             let mut opts = CheckOptions::new(label);
             opts.kind = "python";
@@ -130,7 +130,7 @@ pub fn check_kernel(
             (Arc::new(std) as Arc<dyn Kernel>, opts)
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "moruna check takes a kernel made by @moruna.kernel or moruna.std, not {}",
+                "moruna check takes a function made by @moruna.function or moruna.std, not {}",
                 type_name(kernel)
             )));
         };

@@ -1,5 +1,5 @@
 {
-  "moruna_kinds": 1,
+  "moruna_kinds": 2,
   "moruna": "0.5.7",
   "sources": [
     {
@@ -84,7 +84,7 @@
       "isolation": "builtin"
     }
   ],
-  "kernels": [],
+  "functions": [],
   "sinks": [
     {
       "name": "peql",

@@ -1,6 +1,6 @@
 # The run report
 
-Every job produces a run report, computed from a record Moruna keeps of every morsel. `moruna.run` returns it, a failed job attaches it to its exception as `error.report`, and the `moruna` command writes it to a file. Printing a report gives a summary; `report.to_json()` gives every field.
+Every job produces a run report, computed from a record Moruna keeps of every morsel. `moruna.run` returns it, a failed job attaches it to its exception as `error.report`, and the `moruna` command writes it to a file. Printing a report gives a summary; `report.bytes()` is its canonical form, every field, with its digest `report.digest()` (see [Results and errors](python-results.md)).
 
 ## Job fields
 
@@ -9,22 +9,27 @@ These are attributes of the report object and keys of `to_json()`.
 | Field | Meaning |
 | --- | --- |
 | `run_id` | The job's id. |
-| `exit` | `"Completed"`, or the reason the job stopped. |
+| `job_digest` | The digest of the job's spec, `sha256:` and hex. |
+| `tasks` | Per task: its key, role and kind, rows and bytes in and out, its time, the rows it set aside. |
+| `resources` | The CPU time and the peak memory the run used. |
+| `sinks` | Per sink: its task, its target, what it wrote, and the `snapshot_id` and `version` it committed. |
+| `plan` | The plan the run started from, when asked for. |
+| `exit` | `code`, `status` (`"completed"`, `"terminated"` or `"cancelled"`) and `diagnostic`, the reason the job stopped. |
 | `resumed` | Whether the job continued from a checkpoint. |
 | `manifest` | The path of the latest checkpoint, if one was kept. |
 | `wall_s` | Seconds from start to finish. |
-| `limits` | The memory limit, CPU quota and devices the job started with, and where they came from. |
+| `limits_initial` | The memory limit, CPU quota and devices the job started with, and where they came from. |
 | `peak_anon_bytes` | The most memory the whole process held during the job. |
 | `peak_fraction_of_ceiling` | `peak_anon_bytes` as a fraction of the memory limit in force at that moment. |
-| `worker_busy_fraction` | The share of worker time spent running kernels. |
+| `worker_busy_fraction` | The share of worker time spent running functions. |
 | `cpu_throttled_fraction` | The share of time the operating system held the process back for exceeding its CPU quota. |
 | `source_bytes_per_s` | How fast the source delivered data. |
 | `staging_engaged` | Whether the job spilled to disk. |
 | `staging_bytes_written` | How much it spilled. |
-| `gil` | For each stage, whether Python kernels ran free-threaded or under Python's global lock. |
+| `gil` | For each stage, whether Python functions ran free-threaded or under Python's global lock. |
 | `sizer_used` | How morsels were sized. |
-| `bottleneck_timeline` | What the pipeline was waiting for, and for how long: reading, a kernel or writing. |
-| `stages` | One entry per kernel; see below. |
+| `bottleneck_timeline` | What the pipeline was waiting for, and for how long: reading, a function or writing. |
+| `stages` | One entry per function; see below. |
 | `notes` | Decisions Moruna made and facts it found, in sentences. |
 | `trace_path` | The trace file, if `trace` was set. |
 | `write` | For a `peql` sink, what peQL said about the write it committed: `{"engine": "peql", "report": …}`, the report holding the rows written, `on_violation`, `violations` (rows that broke each rule), `rows_excluded`, the files added and the verdict; with `excluded` (`url`, `files`, `rows`) when the write excluded rows. `null` otherwise. |
@@ -34,30 +39,30 @@ These are attributes of the report object and keys of `to_json()`.
 
 ## Stage fields
 
-`stages` has one entry for each kernel, in order.
+`stages` has one entry for each function, in order.
 
 | Field | Meaning |
 | --- | --- |
-| `morsels` | Morsels the kernel processed. |
+| `morsels` | Morsels the function processed. |
 | `rows_in`, `rows_out` | Rows received and returned. |
 | `bytes_in`, `bytes_out` | Bytes received and returned. |
-| `wall_s`, `kernel_busy_s` | Time the stage was active, and time spent inside the kernel across all workers. |
+| `wall_s`, `kernel_busy_s` | Time the stage was active, and time spent inside the function across all workers. |
 | `rows_per_s`, `bytes_per_s` | Throughput. |
-| `amplification_p50`, `amplification_p95` | The kernel's memory use as a multiple of its input: typical and near the highest. |
+| `amplification_p50`, `amplification_p95` | The function's memory use as a multiple of its input: typical and near the highest. |
 | `errors`, `skipped` | Morsels that failed, and morsels skipped under the error policy. |
-| `state_bytes_max`, `state_growth` | For a stateful kernel, the largest state and how much it grew. |
-| `alloc` | For a Python kernel, the memory it asked for itself, outside the data Moruna hands it; `null` for other kernels. See below. |
+| `state_bytes_max`, `state_growth` | For a stateful function, the largest state and how much it grew. |
+| `alloc` | For a Python function, the memory it asked for itself, outside the data Moruna hands it; `null` for other functions. See below. |
 
-`alloc` has `refusal_on` (whether a request past the memory ceiling would be refused, the decorator's `memory_guard`), then one entry each for `python` (Python objects), `numpy` (NumPy arrays) and `arrow` (pyarrow's memory pool), each with `requested_bytes`, `requests`, `largest_request_bytes`, `peak_bytes` (the most one call held at once) and `refused`, and finally `peak_bytes` (the most one call held at once, all sources together), `outside_arrow_peak_bytes` and `outside_arrow_fraction`. A field that cannot be measured for a source is `null`: the peak of Python objects, and the largest request and refusals for Arrow, whose figures come from the pool's own statistics around each call (with several workers they include what the others asked for at the same time). A kernel that works in Arrow and asks for little else has a small `outside_arrow_fraction`.
+`alloc` has `refusal_on` (whether a request past the memory ceiling would be refused, the decorator's `memory_guard`), then one entry each for `python` (Python objects), `numpy` (NumPy arrays) and `arrow` (pyarrow's memory pool), each with `requested_bytes`, `requests`, `largest_request_bytes`, `peak_bytes` (the most one call held at once) and `refused`, and finally `peak_bytes` (the most one call held at once, all sources together), `outside_arrow_peak_bytes` and `outside_arrow_fraction`. A field that cannot be measured for a source is `null`: the peak of Python objects, and the largest request and refusals for Arrow, whose figures come from the pool's own statistics around each call (with several workers they include what the others asked for at the same time). A function that works in Arrow and asks for little else has a small `outside_arrow_fraction`.
 
 ## Reading a report
 
 A few patterns come up often:
 
 - **`peak_fraction_of_ceiling` is low and `worker_busy_fraction` is high.** The job was limited by CPU, not memory. More cores would make it faster; more memory would not.
-- **`worker_busy_fraction` is low.** The kernels were waiting, usually for the source or the sink. `bottleneck_timeline` says which.
-- **`staging_engaged` is true.** Data waited long enough to be written to disk, usually because the sink was slower than the kernels. The job was correct but slower than it could have been.
-- **A stage's `alloc.outside_arrow_fraction` is high.** The kernel builds most of its working memory as Python objects or NumPy arrays rather than Arrow. It costs memory Moruna can only observe, and is where a rewrite in Arrow, Polars or a standard kernel pays.
+- **`worker_busy_fraction` is low.** The functions were waiting, usually for the source or the sink. `bottleneck_timeline` says which.
+- **`staging_engaged` is true.** Data waited long enough to be written to disk, usually because the sink was slower than the functions. The job was correct but slower than it could have been.
+- **A stage's `alloc.outside_arrow_fraction` is high.** The function builds most of its working memory as Python objects or NumPy arrays rather than Arrow. It costs memory Moruna can only observe, and is where a rewrite in Arrow, Polars or a standard function pays.
 - **`amplification_p95` is much higher than `amplification_p50`.** Some morsels cost far more memory than most, which makes Moruna size conservatively. Look for rows much larger than the rest.
 
 The notes explain each decision Moruna made in a sentence, and are the first place to look when a job behaves unexpectedly.

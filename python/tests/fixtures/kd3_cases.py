@@ -118,7 +118,7 @@ def assets(args):
                         moruna.VortexSink(str(root / "data/vortex")),
                         budget=768 << 20, staging_dir=str(root / "staging/prepare-vortex"),
                         staging_limit=128 << 20, checkpoint=False)
-    if result.exit != "Completed":
+    if result.exit["status"] != "completed":
         raise RuntimeError("actual Vortex preparation did not complete")
     write(root / "contracts.json", contracts)
     write(root / "packages.json", packages)
@@ -152,7 +152,7 @@ def cases(args):
                "image": {"kind": "image", "reference": args.image, "layout": str(args.image_layout),
                          "command": ["/kc1/bin/arrow_echo"]},
                "fixture.echo": {"kind": "fixture.echo"},
-               "python": {"kind": "python", "module": str(root / "imported.py"), "callable": "identity"}}
+               "python": {"kind": "python", "ref": f"{root / 'imported.py'}:identity"}}
     cells = []
     for case in matrix["cases"]:
         for adapter in ("linux", "native"):
@@ -197,7 +197,7 @@ def cases(args):
                     if case["kind"] == "peql":
                         sink = {"kind": "peql", "root": str(root / "governed"), "contract": "kd3/output",
                                 "caller": caller, "mode": "overwrite"}
-                if case["role"] == "kernel":
+                if case["role"] == "function":
                     if case["kind"] == "package":
                         stage = dict(packages[case["id"].removeprefix("kernel.package.")])
                         if case["id"].endswith(".assets"):

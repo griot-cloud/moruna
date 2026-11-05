@@ -1,12 +1,12 @@
 # Running jobs from the command line
 
-The `moruna` command runs a job described in a JSON file, a **job document**. The document holds everything `moruna.run` takes as arguments: the source, the kernels, the sink, the budget and the other options. A scheduler, a container entry point or a virtual machine can run a job this way without a Python program written for it.
+The `moruna` command runs a job described in a JSON file, a **job document**. The document holds everything `moruna.run` takes as arguments: the source, the functions, the sink, the budget and the other options. A scheduler, a container entry point or a virtual machine can run a job this way without a Python program written for it.
 
 The command is installed with the Python package. A job from a document and the same job from Python run identically.
 
 ## A job document
 
-This document runs the quickstart's scoring kernel over the reviews dataset, after removing reviews with no text:
+This document runs the quickstart's scoring function over the reviews dataset, after removing reviews with no text:
 
 ```json
 {
@@ -18,7 +18,7 @@ This document runs the quickstart's scoring kernel over the reviews dataset, aft
   },
   "kernels": [
     {"kind": "std", "name": "filter", "args": {"expr": "is_not_null(text)"}},
-    {"kind": "python", "module": "kernels.py", "callable": "score"}
+    {"kind": "python", "ref": "functions.py:score"}
   ],
   "sink": {"kind": "parquet", "url": "reviews-scored/"},
   "budget": {"memory_bytes": 1073741824},
@@ -26,7 +26,7 @@ This document runs the quickstart's scoring kernel over the reviews dataset, aft
 }
 ```
 
-`moruna_spec` is the version of the document format and is always `1`. A Python kernel is named by its `module`, a module name or a path to a `.py` file, and the `callable` inside it. A standard kernel is named by `name`, with its arguments in `args`. Paths in the document are relative to the directory you run the command from.
+`moruna_spec` is the version of the document format and is always `1`. A Python function is named by its `ref`, `module:attribute`, the module a module name or a path to a `.py` file; a `moruna.Function` class also takes its `params`, and a task with `needs` is given them by the resolver `--resolver` names. A standard function is named by `name`, with its arguments in `args`. Paths in the document are relative to the directory you run the command from.
 
 Fields you leave out take the same defaults as `moruna.run`. Every field is described in the [job document reference](job-document.md).
 
@@ -45,7 +45,7 @@ The command prints one line when the job ends, with its exit code and where the 
 | 1 | The job failed reading or writing data. |
 | 2 | The document was refused; the message names the field. |
 | 3 | The budget cannot hold the job. |
-| 4 | A kernel failed and the error policy stopped the job. |
+| 4 | A function failed and the error policy stopped the job. |
 | 5 | Resuming was refused. |
 | 130 | The job was cancelled. |
 
@@ -70,14 +70,14 @@ moruna serve --listen unix:///run/moruna.sock
 
 The host connects, sends the document, and receives newline-separated JSON messages: a greeting with the limits Moruna found, a progress message at least every two seconds, a message when the machine's limits change, the full report and finally the exit code. The host can send `cancel` to stop the job, or `checkpoint` to have it save its progress immediately, for example before the host shuts the machine down. `moruna serve` runs one job and exits, and it is strict by default. The messages are listed in the [command reference](cli.md#the-host-protocol).
 
-## Checking kernels
+## Checking functions
 
-`moruna check` loads a module or file and checks every kernel in it against its declared schemas, without a source, a sink or any real data:
+`moruna check` loads a module or file and checks every function in it against its declared schemas, without a source, a sink or any real data:
 
 ```text
-moruna check kernels.py
+moruna check functions.py
 ```
 
-See [Checking a kernel](kernels.md#checking-a-kernel) for what it tests and what it reports.
+See [Checking a function](functions.md#checking-a-function) for what it tests and what it reports.
 
 Next: [Where Moruna runs](hosting.md).

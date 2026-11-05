@@ -1,7 +1,7 @@
 # Moruna SDD 22: The job document and the catalogue, for embedders (`moruna-job`)
 
 **Document type:** software design document, component 22
-**Status:** DRAFT · 2026-10-28, amended 2026-10-29 by KA5 (the job document version 2, a DAG of tasks: d.4, e.4, e.5, JB-I10 to JB-I14, JB-T29 to JB-T39) and by KA6 (kinds their embedder serves, checked against the catalogue they extend: d.5, e.6, JB-I16, JB-I17, JB-T41 to JB-T45) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
+**Status:** DRAFT · 2026-10-28, amended 2026-10-29 by KA5 (the job document version 2, a DAG of tasks: d.4, e.4, e.5, JB-I10 to JB-I14, JB-T29 to JB-T39) and by KA6 (kinds their embedder serves, checked against the catalogue they extend: d.5, e.6, JB-I16, JB-I17, JB-T41 to JB-T45), and on 2026-11-04 for 0.6.1 (a program's graph is a job; a join by morsel: JB-I18, JB-I19, e.5, JB-T46, JB-T47) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted; the human flips it)
 **Parent:** board items KA4 and KA5 (`BOARD.md`, wave B); SDD 18 (the kinds a run is made of); `architecture/moruna-hosted-engine.md` (MH) section 4.1; brief MC2 (`architecture/agents/briefs/waves-a-b-c.md` section 5)
 **Preamble:** `00-preamble.md`; **Cited:** 18 (KD-I1, KD-I2, KD-I4, KD-I8, e.1 to e.3, decision KD1), 12 f.9, MH 4.1, MH 4.5
 **Component location:** `crates/moruna-job/` (`src/kind.rs`, `src/doc.rs`, `src/job.rs`, `src/flatbuffer.rs`, `src/flex.rs`, `src/canonical.rs`, `src/catalogue.rs`, `src/check.rs`, `src/schema.rs`, `src/port.rs`, `src/rules.rs`, `src/call.rs`, `schema/job.fbs`, `src/generated/job_generated.rs` (generated, committed), `catalogue/standard.json`, `catalogue/peql.json`), `tools/flatc/generate.sh`, `crates/moruna-runtime/src/host/cli.rs` (`moruna check-job`), `crates/moruna-runtime/tests/job.rs` (the tests that need the registry)
@@ -66,6 +66,10 @@ It refuses to know: how a kind is built or run (the runtime's), the registry (th
 
 **JB-I17. A job's columns are judged where the job knows them, and only there (KA6).** `check` refuses an edge into a served kind whose declared input rules the columns along it do not fit, and a served kind whose relative output rules drop or change a column its closed input does not have (e.6), each with `RefusalCode::Schema` naming the column. What a source or a kind Moruna runs gives is not known without running it, so nothing fed by one is refused for its columns; an open side's missing column and an unordered side's position are not refused either. The runtime checks every batch against the same rules when it runs (SDD 18 KD-I11).
 
+
+**JB-I18. A program's graph is a job (0.6.1).** A DAG a program builds in memory (`moruna.Graph`, SDD 12 PY-I15) is a `Job` version 2 and nothing else: its tasks are `Task`s of their role and kind, its inputs `Edge`s of batches from the named task's `out`, a kernel of one input taking it on `in` and one of several on ports named after the tasks that feed it; it is checked by `check_graph`, every refusal named, before it is built; and the runtime builds it as it builds a document (JB-I9). Its in-process objects are bound to their tasks by reference: the library's kinds hand each task the object at its place among the tasks of its role (`Entry::index`, SDD 18), so the job carries no second model of the graph and no import path. The chain `moruna.run(source, kernels, sink)` is the same job with one path, the job `Job::from_v1` reads a version 1 document as (JB-I10).
+
+**JB-I19. A join by morsel takes branches of one upstream (0.6.1).** A kernel that joins its inputs by morsel (`Kernel::aligns_inputs`, contracts d.7; the standard `join`) is built only when every input carries the morsels of one upstream numbered alike (`Topology::misaligned`, contracts d.16): branches of one source or task through kernels of one input. Otherwise the build refuses at `<task>.inputs.<port>`, naming the join and the two inputs: ``` `both` joins its inputs by morsel, and its input `b` does not carry the morsels its input `a` carries ```.
 ## d. Interfaces
 
 ### d.1 The crate
@@ -287,6 +291,8 @@ JSON is a rendering of the document for people (`Job::to_json`, with `"moruna_jo
 
 A task's role decides its ports: a source has output ports and no input port, a sink input ports and no output port, a kernel both. An edge joins an output port to an input port; one output port may feed several input ports (fan-out), and a kernel may take several input ports (fan-in), port 0 first in the order its `inputs` list them, each fed by exactly one edge. Every output port is read by at least one edge and every input port fed by exactly one. The edges form no cycle; `Job::topological_order` orders the tasks so every edge goes forward, ties in document order (Kahn's algorithm).
 
+A kernel whose kind joins its inputs **by morsel** (0.6.1, JB-I19; the standard `join`) is given the morsel of one number from every input at once and gives one batch with that number, so it takes branches of one upstream that keep its morsels: a fan-out of one task through kernels of one input each, joined again. The standard `join` puts the inputs' columns side by side in port order; on each batch it refuses a row count that differs from port 0's and a column name two inputs give, naming the ports, because a kernel's schema before it runs may be a guess (a Python kernel's is its input's) and the batches are what it is judged on. The standard `union` passes every batch of every input on as it came.
+
 A **barrier** is an enforcement point (a contract boundary, masking): nothing may be moved across it, and what crosses it passes through it. A barrier task needs something on both sides. For a barrier task `B`, an edge from a task upstream of `B` to a task downstream of `B`, neither being `B`, goes around it and is refused at the edge. For a barrier edge `a -> b`, any other edge from `a` or a task upstream of it to `b` or a task downstream of it goes around it. The planner (KA7) reads the marks; this crate only refuses a document that bypasses one.
 
 ### e.6 The columns along the edges (KA6)
@@ -394,6 +400,10 @@ Test names are the ids' lowercase with a slug (`jb_t6_every_example_passes`).
 
 **JB-T45 schema_rules.** Exact, subset and relative spellings read as the rules they are, every malformed one refused with its field and reason, an alias read as its type by the grammar, and `Known` and `misfits` judging only what is known. The grammar's own tests (`crates/moruna-types`: every type reads back from its spelling, every alias reads as its name, spellings outside the grammar are refused) are its. JB-I16.
 
+**JB-T46 a_graph_is_a_job** (`python/tests/test_graph.py`, SDD 12 PY-T44, PY-T45, 0.6.1). A `moruna.Graph` of a fan-out and a join runs to what the chain of its kernels gives, row for row; one of two sources and two sinks gives each sink its rows, each in-process object bound to its own task; an unknown name and an output no task reads are named together in one refusal, and a cycle names the tasks on it. JB-I13, JB-I18.
+
+**JB-T47 a_join_takes_one_upstream** (`moruna-runtime/tests/dag.rs`, SDD 10 SC-T40; `python/tests/test_graph.py`, PY-T45, 0.6.1). A join of two sources is refused at `tasks[2].inputs.b` naming the join; one of a source and a branch of it through kernels of one input builds and runs. JB-I19.
+
 ## l. Implementation notes for the agent
 
 A new kind adds nothing here: its declaration is in the runtime, and the catalogue files are regenerated from `moruna kinds` (e.1); JB-T25 fails until they are. A kind whose settings type needs a JSON Schema keyword outside the subset adds the keyword to `schema.rs` (`VALIDATING`, `walk`, `admit_at`), to the table in e.3, and to JB-T12 to JB-T17, and JB-T26 proves the validator and the kind still agree. Do not add a JSON Schema crate: the subset is closed on purpose (JB-I7).
@@ -416,6 +426,7 @@ None.
 | KA5 (the job is a DAG, in FlatBuffers) | JB-I10 to JB-I14 | JB-T29 to JB-T39 |
 | preamble section 5 (`checkpoint.interval_ms`'s range), KD6c | JB-I15 | JB-T40, SDD 26 PN-T34 |
 | KA6 (an embedder's kinds checked against the catalogue they extend, without running) | JB-I1, JB-I4, JB-I16, JB-I17 | JB-T1, JB-T41 to JB-T45, KD-T15 |
+| 0.6.1 (`moruna.run` takes a graph; a join of branches of one upstream) | JB-I18, JB-I19, e.5 | JB-T46, JB-T47 |
 
 ## o. Deferred (post-v1)
 

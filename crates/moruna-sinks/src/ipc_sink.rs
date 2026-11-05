@@ -760,6 +760,7 @@ impl Sink for ArrowIpcSink {
             bytes,
             files: inner.ledger.names(),
             write: None,
+            commit: None,
         })
     }
 

@@ -2,6 +2,7 @@
 use crate::{
     Budget,
     error::{Result, VmmError},
+    jail::Cgroup,
     microkernel,
 };
 use std::{
@@ -22,6 +23,8 @@ pub struct Boot {
     pub vsock_backend: PathBuf,
     /// Finite node lifetime; termination signals can stop it earlier.
     pub lifetime: Duration,
+    /// The delegated cgroup the run's leaf is made under, or none.
+    pub cgroup: Cgroup,
 }
 /// The supported production command.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,7 +37,7 @@ pub enum Command {
     Version,
 }
 /// Production usage; every artifact/tool/owner path is explicit.
-pub const USAGE: &str = "moruna-vmm boot --descriptor FILE --runtime-dir NEW_DIR --qemu FILE --vsock-backend FILE --lifetime-seconds N\n";
+pub const USAGE: &str = "moruna-vmm boot --descriptor FILE --runtime-dir NEW_DIR --qemu FILE --vsock-backend FILE --lifetime-seconds N --cgroup DIR|none\n";
 fn bad(message: impl Into<String>) -> VmmError {
     VmmError::config("native command", message)
 }
@@ -58,6 +61,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 "--qemu",
                 "--vsock-backend",
                 "--lifetime-seconds",
+                "--cgroup",
             ]
             .contains(&pair[0].as_str())
             || pair[1].is_empty()
@@ -84,9 +88,10 @@ pub fn parse(args: &[String]) -> Result<Command> {
         qemu: get("--qemu")?.into(),
         vsock_backend: get("--vsock-backend")?.into(),
         lifetime: Duration::from_secs(seconds),
+        cgroup: Cgroup::parse(get("--cgroup")?)?,
     }))
 }
-fn boot(command: Boot, out: &mut dyn Write) -> Result<i32> {
+fn boot(command: Boot, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
     let termination = crate::sys::Termination::install()
         .map_err(|e| VmmError::io("install", "owned CLI signals", &e))?;
     let descriptor = microkernel::inspect(&command.descriptor)?;
@@ -103,10 +108,13 @@ fn boot(command: Boot, out: &mut dyn Write) -> Result<i32> {
         &command.runtime_dir,
         &command.qemu,
         &command.vsock_backend,
+        &command.cgroup,
     )?;
     let deadline = Instant::now() + command.lifetime;
     loop {
         if let Some(status) = node.try_wait()? {
+            // The run's directory, logs included, goes with the run: say what they hold first.
+            write!(err, "{}", node.logs()).map_err(|e| VmmError::io("write", "node logs", &e))?;
             node.shutdown()?;
             let code = status
                 .code()
@@ -141,7 +149,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 1
             };
         }
-        Ok(Command::Boot(command)) => boot(command, out),
+        Ok(Command::Boot(command)) => boot(command, out, err),
         Err(error) => Err(error),
     };
     match result {
@@ -160,8 +168,27 @@ mod tests {
     }
     #[test]
     fn native_command_requires_actual_artifacts_tools_owner_and_finite_lifetime() {
-        let valid = "boot --descriptor node.json --runtime-dir new --qemu qemu --vsock-backend helper --lifetime-seconds 30";
-        assert!(matches!(parse(&args(valid)).unwrap(), Command::Boot(_)));
+        let valid = "boot --descriptor node.json --runtime-dir new --qemu qemu --vsock-backend helper --lifetime-seconds 30 --cgroup none";
+        assert!(matches!(
+            parse(&args(valid)).unwrap(),
+            Command::Boot(Boot {
+                cgroup: Cgroup::Undelegated,
+                ..
+            })
+        ));
+        let delegated = valid.replace("--cgroup none", "--cgroup /sys/fs/cgroup/griot.service");
+        assert!(matches!(
+            parse(&args(&delegated)).unwrap(),
+            Command::Boot(Boot { cgroup: Cgroup::Delegated(path), .. }) if path == std::path::Path::new("/sys/fs/cgroup/griot.service")
+        ));
+        // Where the run is accounted is always said: never assumed, never relative.
+        assert!(parse(&args(&valid.replace(" --cgroup none", ""))).is_err());
+        assert!(
+            parse(&args(
+                &valid.replace("--cgroup none", "--cgroup griot.service")
+            ))
+            .is_err()
+        );
         for suffix in [
             "--image old",
             "--disk root",

@@ -1,7 +1,7 @@
 # Moruna SDD 01: Contracts crate (`moruna-kernel`)
 
 **Document type:** software design document, component 1 of 12
-**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I15, CT-T28) and by KD7a and KD7b (the buffer catalog's port and the scheduling policy's: d.10, d.17, d.18, CT-T29, CT-T30), and by KD7c (predictions with a spread, the machine and the stages' snapshot, the policy's counters, the learning stats: d.18, CT-T31) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
+**Status:** DRAFT · 2026-09-15, amended 2026-10-29 by KA5 (the run's shape and the input port on `apply`: d.16, d.7, d.10, CT-I15, CT-T28) and by KD7a and KD7b (the buffer catalog's port and the scheduling policy's: d.10, d.17, d.18, CT-T29, CT-T30), and by KD7c (predictions with a spread, the machine and the stages' snapshot, the policy's counters, the learning stats: d.18, CT-T31), and on 2026-11-04 for 0.6.1 (`Kernel::finish` gives a payload, a kernel that joins its inputs by morsel, the topology that aligns it and numbers what a finish gives: d.7, d.16, CT-T32, CT-T33) (becomes HANDOFF-READY when section m is empty and the preamble's E1 and E2 assumptions are accepted)
 
 KA6 also adds the single type grammar in `moruna-types`, converted by contracts (CT-I16, CT-T12).
 **Parent:** `architecture/moruna-runtime-design.md` sections 5.1 to 5.4, 5.9; decisions D9, D10; criteria S7, S9, S13
@@ -602,12 +602,22 @@ pub trait Kernel: Send + Sync + 'static {
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
     /// safe to call concurrently on different `state`s. Returns a resident payload.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload>;
-    /// The end of the input (amended 2026-10-28, board KA1): called once per live instance of a
-    /// stateful stage, after the last `apply` of the run and before the sink finishes. A kernel
-    /// that runs something apart from the process (an image's command, 19) ends that thing's
-    /// input here and answers for how it ended; an `Err` ends the run as a kernel's failure
-    /// (10 f.6). The default does nothing, so no other kernel changes.
-    fn finish(&self, state: &mut dyn KernelState) -> Result<()> { let _ = state; Ok(()) }
+    /// The end of the input (amended 2026-10-28, board KA1; 2026-11-04, 0.6.1): called once per
+    /// live instance of a stateful stage, in instance order, once every input of the stage has
+    /// ended and its last `apply` has returned, and before its output queues close (10 SC-I17).
+    /// A kernel that runs something apart from the process (an image's command, 19) ends that
+    /// thing's input here and answers for how it ended; a kernel that must see the whole run
+    /// before it gives anything gives it here. The payload it returns goes downstream like an
+    /// `apply`'s, numbered from the stage's finish base (d.16); `None` gives nothing; an `Err`
+    /// ends the run as a kernel's failure. The default gives nothing.
+    fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> { let _ = state; Ok(None) }
+    /// Whether the kernel joins its inputs by morsel (d.16; 0.6.1): the stage hands it the
+    /// morsel of one number from every port at once, through `apply_aligned`, and its output
+    /// keeps that number. Default false.
+    fn aligns_inputs(&self) -> bool { false }
+    /// `apply` for the morsel of one number from every input port, port 0 first, for a kernel
+    /// that joins its inputs by morsel. The default refuses (`Plan`).
+    fn apply_aligned(&self, state: &mut dyn KernelState, inputs: Vec<Payload>) -> Result<Payload> { .. }
     /// How many input ports the kernel takes at most (d.16; KA5, 2026-10-29). A stage given
     /// more is refused at build. Default 1.
     fn max_inputs(&self) -> u16 { 1 }
@@ -1238,15 +1248,25 @@ impl Topology {
     pub fn root(&self, q: StageId, seq: Seq) -> Option<(u16, Seq)>;
     pub fn paths(&self, sink: u16) -> &[(u16, Affine)];
     pub fn to_sinks(&self, q: StageId, seq: Seq) -> Vec<(u16, Seq)>;
-    pub fn reaches(&self, q: StageId, seq: Seq, read: &[Option<Seq>]) -> Option<bool>;
-    pub fn last_at_sink(&self, sink: u16, read: &[Seq]) -> Option<Seq>;
+    pub fn align(self, stages: &[StageId]) -> Result<Topology>;   // 0.6.1: joins by morsel
+    pub fn is_aligned(&self, stage: StageId) -> bool;
+    pub fn misaligned(&self, stage: StageId) -> Result<Option<u16>>;
+    pub fn produced(&self, read: &[Option<Seq>], finished: &[Option<Seq>]) -> Produced;
+    pub fn reaches(&self, q: StageId, seq: Seq, produced: &Produced) -> Option<bool>;
+    pub fn last_at_sink(&self, sink: u16, produced: &Produced) -> Option<Option<Seq>>;
 }
+pub struct Produced { /* each source's count, each stage's finish count, base and last */ }
+impl Produced { pub fn base(&self, stage: StageId) -> Option<Seq>; }
 pub const MAX_PATHS: usize = 4096;
 ```
 
 `Topology::new` refuses (`Plan`) a link to a source, stage or sink the run does not have; a stage whose input ports are not `0..k` each fed by one queue, or that gives nothing; a source that gives nothing; a sink that takes other than one queue; a link between stages that does not go from a lower stage to a higher one (so the numbering is an order in which every queue goes forward, and the graph has no cycle); a run with no source or no sink; more than `MAX_PATHS` paths from the sources to the sinks.
 
 **Numbers.** Each source numbers what it reads from 0. A stage of one input gives its output for input `s` the number `s`; a stage of `k` inputs gives its output for `s` taken on port `p` the number `s · k + p`. So the morsels on one queue have distinct numbers, the numbers on a queue are a function of its sources' numbers, `parent` and `root` invert the map, and each path from a source to a sink is an `Affine` map (the product of the port counts on it, and an offset). A sink reached by one path from one source (every chain's sink) receives `0, 1, 2, ...`; one reached by several, or by a source shorter than another it is joined with, may have numbers no morsel will ever have, which the scheduler skips once the sources they would come from are read to the end (10 f.16).
+
+**Joins by morsel (0.6.1).** `align(stages)` marks stages whose kernel joins its inputs by morsel (`Kernel::aligns_inputs`): such a stage numbers like a stage of one input (its output for `s` is `s`, whatever the port), `parent` follows its port 0, and the paths through it are counted once. It is refused (`Plan`, naming the stage and the port; `misaligned` names the port alone) unless every port carries exactly what port 0 carries: the same `(source, map)` pairs, so the morsels of one upstream numbered alike. Two sources, or a branch through a stage of several inputs, are not one upstream.
+
+**What a finish gives (0.6.1).** A stateful stage's `finish` may give batches at the end of its input (d.7). They are numbered from the stage's **finish base**, one past the highest number any of its inputs can carry mapped to its output's numbers (0 when they carry none), one number per batch; numbers after the stage follow from them as from any other. `produced(read, finished)` takes each source's count (`None` while it reads) and each stage's finish count (`None` until it has finished; `Some(0)` for a stage that gives nothing at its end) and computes, stage by stage in stage order, each stage's base and the highest number its output carries. `reaches` is `None` for a number that may still be a finish's batch, and `last_at_sink` is `None` (not known yet) while a stage upstream may still give one and `Some(None)` when nothing reaches the sink. In a chain the finish batches follow the last source number one after another, so a chain's sink still receives every number.
 
 **Sharing.** `Payload::share` is the same bytes a second time (a `RecordBatch` clone, `ManagedTensor::share`): what a fan-out pushes into its second and later queues (CT-I15).
 
@@ -1543,6 +1563,10 @@ Unit tests in `crates/moruna-kernel/tests/`, named `ct_tN_*`.
 
 **CT-T29 a_claim_goes_back_once** (`catalog.rs`, KD7b). A claim dropped unused gives its bytes back to its holder; taken over with `into_claim` or joined to another it gives nothing back; joining claims of two slots is refused and the refused one goes back; a claim outliving its holder is dropped quietly. d.17.
 
+**CT-T32 a_join_by_morsel** (`graph.rs`, 0.6.1). The diamond's join, aligned, keeps every number on either port, its parent is port 0's, its sink has one path, and a skip on either branch lands on the one number; a join of two sources and one of a branch through a union are refused naming the stage and the port, and an aligned stage the run does not have is refused. d.16.
+
+**CT-T33 finish_batches_follow_every_input_number** (`graph.rs`, 0.6.1). In a chain of two stages over five morsels, a first stage that gave two at its end has base 5 and the second base 7, the sink's last number is 6 and 7 never reaches it; before the first stage finishes, the sink's last number and a number at or past its base are not known, and the numbers below are; a source still reading leaves the base unknown; a stage given nothing numbers its finish from 0. Through a union of a three-morsel source's finishing stage and a ten-morsel source: base 3 and 20, last 19, the stage's two finish batches and the other source's numbers reach the sink and a third finish number does not; before the stage finishes, its finish numbers are not known and every other number is. d.16.
+
 **CT-T30 policies_by_name** (`policy.rs`, KD7b). A policy name is a lowercase word, taken once; the registry makes a registered one and refuses an unknown name naming the registered ones. d.18.
 
 **CT-T31 a_prediction_claims_its_p95** (`policy.rs`, KD7c). A spread holds its p95 at its median or above and an exact one is a point; a prediction claims its output's p95; a measured ratio is the default source; a policy that counts nothing reports no counters. d.18.
@@ -1586,6 +1610,7 @@ None. (Four E10 items the wave 0 agent raised, issues #5 to #8, were resolved by
 | untrusted IPC (2026-10-28) | CT-I13, e.7, e.8 | CT-T22 |
 | compressed IPC (KA10, 2026-10-28) | CT-I14, e.7, e.8 | CT-T23, CT-T24, CT-T25, CT-T26, CT-T27 |
 | the run as a DAG (KA5, 2026-10-29) | CT-I15, d.7, d.10, d.16 | CT-T28 |
+| 0.6.1 (a finish that gives, a join by morsel) | d.7, d.16 | CT-T32, CT-T33 |
 | the buffer catalog's port and the policy's (KD7b, adaptive-runtime 9.1 to 9.4) | d.10, d.17, d.18 | CT-T29, CT-T30, PL-T38, SC-T33, SC-T34 |
 | predictions with a spread, the snapshot, the policy's counters, learning (KD7c, adaptive-runtime 9.3, 9.4, 9.6) | d.18 | CT-T31, SC-T36, SC-T37, SC-T38 |
 

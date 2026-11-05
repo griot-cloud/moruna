@@ -145,7 +145,7 @@ fn kd_t1_resolve_or_refuse() {
     let e = error_of(empty.kernel("kernels[0]", "std"));
     assert!(
         e.to_string()
-            .contains("no kernel kind `std` is registered; this build has no kernel kinds"),
+            .contains("no function kind `std` is registered; this build has no function kinds"),
         "{e}"
     );
 }
@@ -160,7 +160,7 @@ fn kd_t2_rust_is_not_registered() {
         e.to_string(),
         refusal(SpecError::new(
             "kernels[0].kind",
-            "no kernel kind `rust` is registered; this build runs image, package, std",
+            "no function kind `rust` is registered; this build runs image, package, std",
         ))
         .to_string()
     );
@@ -202,9 +202,12 @@ fn kd_t3_registration_refusals() {
         (with(&|d| d.name = "Upper".into()), "not a kind name"),
         (with(&|d| d.name = "9lives".into()), "not a kind name"),
         (with(&|d| d.name = "x".repeat(65)), "not a kind name"),
-        (with(&|d| d.role = Role::Sink), "registered as a kernel"),
+        (with(&|d| d.role = Role::Sink), "registered as a function"),
         (with(&|d| d.summary = " ".into()), "no summary"),
-        (with(&|d| d.inputs = Flow::Files), "which a kernel does not"),
+        (
+            with(&|d| d.inputs = Flow::Files),
+            "which a function does not",
+        ),
         (
             with(&|d| d.settings["$schema"] = json!("draft-07")),
             "dialect",
@@ -409,7 +412,7 @@ fn kd_t6_listing() {
     let back: Listing = serde_json::from_str(&text).expect("reads back");
     assert_eq!(back, listing);
     let json: Value = serde_json::from_str(&text).expect("json");
-    let std_kernel = json["kernels"]
+    let std_kernel = json["functions"]
         .as_array()
         .and_then(|kernels| kernels.iter().find(|k| k["name"] == "std"))
         .expect("std is listed");

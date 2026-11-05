@@ -56,7 +56,7 @@ pub use completion::{Completion, CompletionSender, Dispatch};
 pub use declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, TypeDecl};
 pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
-pub use graph::{Affine, Consumer, Link, MAX_PATHS, Producer, Topology};
+pub use graph::{Affine, Consumer, Link, MAX_PATHS, Produced, Producer, Topology};
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{
     AllocCounts, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind, KernelState,
@@ -87,7 +87,7 @@ pub use ports::{
     RunPorts, StagePorts, StageWaits,
 };
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
-pub use sink::{ExcludedRows, Sink, SinkSummary, SinkWrite};
+pub use sink::{ExcludedRows, Sink, SinkCommit, SinkSummary, SinkWrite};
 pub use source::{RowRange, Source, SourceRead, Split};
 pub use stages::{StageCounters, StageEvent, StageHook};
 pub use tensor::{DeleterHook, Dlpack, ManagedTensor};

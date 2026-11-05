@@ -2,9 +2,9 @@
 
 ``run`` and ``serve`` are the Rust command's; this module hands it the arguments and returns its
 exit code. ``check`` loads Python modules, so it is answered here, by ``moruna._check``, which
-calls the Rust harness for each kernel it finds, or runs a package through its runtime (SDD 16
+calls the Rust harness for each function it finds, or runs a package through its runtime (SDD 16
 f.9). ``package`` drives pip, so it is answered here too, by ``moruna._package`` (16 f.4), and so
-is ``build``, which drives uv to make an OCI image of a kernel (``moruna._build``, SDD 30).
+is ``build``, which drives uv to make an OCI image of a function (``moruna._build``, SDD 30).
 """
 
 from __future__ import annotations

@@ -13,7 +13,7 @@ an embedder's port anywhere else::
         return batch.append_column("loud", pyarrow.compute.utf8_upper(batch["text"]))
 
     moruna.run(source, shout(), sink)
-    moruna.kinds(shout)   # the listing, with `shout` among the kernels
+    moruna.kinds(shout)   # the listing, with `shout` among the functions
 """
 
 from __future__ import annotations
@@ -81,8 +81,7 @@ def _fact(value: bool | str, where: str) -> str:
 
 class DeclaredKind:
     """A kind the program serves itself: its declaration, and the callable that answers each of
-    its batches. Calling it with settings is a task of the kind, which ``moruna.run`` takes
-    where it takes a kernel."""
+    its batches. Calling it with settings is a task of the kind, a ``moruna.Function``."""
 
     def __init__(self, declaration: dict[str, Any], serve: Callable[..., Any]) -> None:
         self._declaration = declaration
@@ -106,7 +105,11 @@ class DeclaredKind:
     def __call__(self, **settings: Any) -> Any:
         """A task of this kind with ``settings``, checked against the kind's settings schema
         when the run is built."""
-        return _core.declared_task(json.dumps(self._declaration), json.dumps(settings), self._serve)
+        from moruna._job import _wrap  # noqa: PLC0415, the package imports this module
+
+        return _wrap(
+            _core.declared_task(json.dumps(self._declaration), json.dumps(settings), self._serve)
+        )
 
     def __repr__(self) -> str:
         return f"<moruna.DeclaredKind {self.name!r}>"
@@ -133,7 +136,7 @@ def kind(
 
     ``settings`` is the JSON Schema (2020-12) of a task's settings: a closed object with
     ``examples``; absent, the kind takes none. ``input_schema`` and ``output_schema`` are spelled
-    as ``@moruna.kernel``'s are; a reply that is not what ``output_schema`` declares fails the
+    as ``@moruna.function``'s are; a reply that is not what ``output_schema`` declares fails the
     task naming the column. ``deadline_ms`` bounds one call (absent: half an hour).
 
     Refused with ``moruna.ConfigError`` naming why: a name a kind of ``moruna.run`` has already,
@@ -154,7 +157,7 @@ def kind(
         doc = (getattr(serve, "__doc__", None) or "").strip().splitlines()
         declaration = {
             "name": name,
-            "role": "kernel",
+            "role": "function",
             "summary": summary or (doc[0] if doc else f"{name}, served by the program"),
             "settings": dict(settings) if settings is not None else NO_SETTINGS,
             "inputs": "batches",
@@ -181,7 +184,7 @@ def kind(
 
 def kinds(*declared: DeclaredKind) -> dict[str, Any]:
     """Every kind ``moruna.run`` can run, with ``declared`` among them, as ``moruna kinds`` lists
-    them (SDD 18 e.3): ``{"moruna_kinds", "moruna", "sources", "kernels", "sinks"}``."""
+    them (SDD 18 e.3): ``{"moruna_kinds", "moruna", "sources", "functions", "sinks"}``."""
     for each in declared:
         if not isinstance(each, DeclaredKind):
             raise TypeError(f"moruna.kinds() takes @moruna.kind kinds, not {type(each).__name__}")

@@ -1,509 +1,247 @@
-//! The `RunReport` object (PY-I5).
+//! The run report (PY-I5) as `moruna.run` returns it: one JSON document, which
+//! `moruna.RunReport` (`python/moruna/_report.py`) reads and serialises canonically.
 //!
-//! `run` returns a report, it does not only print one. The attributes are exactly the fields of
-//! `moruna_trace::RunReport` (04 d.1), `__str__` gives the fixed layout of at most forty lines,
-//! `to_json()` is the trace crate's own serialisation, and `trace_path` is the file the trace was
-//! written to when one was asked for.
+//! The document is the trace's report (`moruna_trace::RunReport`, 04 d.1) with what the job adds:
+//! the format (`moruna_report`), the spec's digest (`job_digest`), how the run ended as an exit
+//! code and a diagnostic (`exit`), one entry per task (`tasks`), what the run consumed
+//! (`resources`), one entry per sink with the version it committed (`sinks`), the plan when it
+//! was asked for (`plan`) and the trace file (`trace_path`).
 
-use std::path::PathBuf;
-
-use moruna_trace::{ExitReason, RunReport};
+use moruna_job::Role;
+use moruna_kernel::MorunaError;
+use moruna_trace::{ExitReason, RunReport, StageReport};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule};
+use serde_json::{Value, json};
 
-/// The run report as Python sees it.
-#[pyclass(frozen, module = "moruna._core", name = "RunReport")]
-pub struct PyRunReport {
-    pub(crate) inner: RunReport,
-    pub(crate) trace_path: Option<PathBuf>,
+use crate::run::ReportContext;
+
+/// The report document's format version.
+pub const REPORT_FORMAT: u32 = 1;
+
+/// The report of a run as the JSON document `moruna.RunReport` reads: `report` and what
+/// `context` knows of the job, `error` the error the run ended with, when it failed.
+pub(crate) fn report_json(
+    report: &RunReport,
+    error: Option<&MorunaError>,
+    context: &ReportContext,
+) -> String {
+    report_value(report, error, context).to_string()
 }
 
-impl PyRunReport {
-    /// Wrap a report the facade produced.
-    pub fn new(inner: RunReport, trace_path: Option<PathBuf>) -> PyRunReport {
-        PyRunReport { inner, trace_path }
-    }
-}
-
-/// One field of the report as Python objects, taken from the same serialisation `to_json`
-/// uses, so an attribute and the JSON cannot disagree about the field's shape.
-fn field<'py>(py: Python<'py>, report: &RunReport, name: &str) -> PyResult<Bound<'py, PyAny>> {
-    let whole = serde_json::to_value(report)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let text = whole
-        .get(name)
-        .map_or_else(|| "null".to_string(), |v| v.to_string());
-    py.import("json")?.call_method1("loads", (text,))
-}
-
-#[pymethods]
-impl PyRunReport {
-    /// `moruna_trace::RunReport::run_id` (04 d.1).
-    #[getter]
-    fn run_id(&self) -> String {
-        self.inner.run_id.clone()
-    }
-
-    /// `moruna_trace::RunReport::resumed` (04 d.1).
-    #[getter]
-    fn resumed(&self) -> bool {
-        self.inner.resumed
-    }
-
-    /// `moruna_trace::RunReport::manifest` (04 d.1).
-    #[getter]
-    fn manifest(&self) -> Option<String> {
-        self.inner.manifest.clone()
-    }
-
-    /// `moruna_trace::RunReport::wall_s` (04 d.1).
-    #[getter]
-    fn wall_s(&self) -> f64 {
-        self.inner.wall_s
-    }
-
-    /// `moruna_trace::RunReport::peak_anon_bytes` (04 d.1).
-    #[getter]
-    fn peak_anon_bytes(&self) -> u64 {
-        self.inner.peak_anon_bytes
-    }
-
-    /// `moruna_trace::RunReport::peak_fraction_of_ceiling` (04 d.1).
-    #[getter]
-    fn peak_fraction_of_ceiling(&self) -> f64 {
-        self.inner.peak_fraction_of_ceiling
-    }
-
-    /// `moruna_trace::RunReport::worker_busy_fraction` (04 d.1).
-    #[getter]
-    fn worker_busy_fraction(&self) -> f64 {
-        self.inner.worker_busy_fraction
-    }
-
-    /// `moruna_trace::RunReport::cpu_throttled_fraction` (04 d.1).
-    #[getter]
-    fn cpu_throttled_fraction(&self) -> f64 {
-        self.inner.cpu_throttled_fraction
-    }
-
-    /// `moruna_trace::RunReport::source_bytes_per_s` (04 d.1).
-    #[getter]
-    fn source_bytes_per_s(&self) -> f64 {
-        self.inner.source_bytes_per_s
-    }
-
-    /// `moruna_trace::RunReport::source_bandwidth` (04 d.1).
-    #[getter]
-    fn source_bandwidth(&self) -> f64 {
-        self.inner.source_bandwidth
-    }
-
-    /// `moruna_trace::RunReport::staging_bandwidth` (04 d.1).
-    #[getter]
-    fn staging_bandwidth(&self) -> f64 {
-        self.inner.staging_bandwidth
-    }
-
-    /// `moruna_trace::RunReport::staging_bytes_written` (04 d.1).
-    #[getter]
-    fn staging_bytes_written(&self) -> u64 {
-        self.inner.staging_bytes_written
-    }
-
-    /// `moruna_trace::RunReport::staging_engaged` (04 d.1).
-    #[getter]
-    fn staging_engaged(&self) -> bool {
-        self.inner.staging_engaged
-    }
-
-    /// `moruna_trace::RunReport::gil_serialised` (04 d.1).
-    #[getter]
-    fn gil_serialised(&self) -> bool {
-        self.inner.gil_serialised
-    }
-
-    /// `moruna_trace::RunReport::sizer_used` (04 d.1).
-    #[getter]
-    fn sizer_used(&self) -> String {
-        self.inner.sizer_used.clone()
-    }
-
-    /// `moruna_trace::RunReport::sizer_fallback_at` (04 d.1).
-    #[getter]
-    fn sizer_fallback_at(&self) -> Option<u64> {
-        self.inner.sizer_fallback_at
-    }
-
-    /// `moruna_trace::RunReport::bottleneck_timeline` (04 d.1).
-    #[getter]
-    fn bottleneck_timeline(&self) -> Vec<(f64, String)> {
-        self.inner.bottleneck_timeline.clone()
-    }
-
-    /// `moruna_trace::RunReport::notes` (04 d.1).
-    #[getter]
-    fn notes(&self) -> Vec<String> {
-        self.inner.notes.clone()
-    }
-
-    /// `moruna_trace::RunReport::overflow_failed` (04 d.1).
-    #[getter]
-    fn overflow_failed(&self) -> bool {
-        self.inner.overflow_failed
-    }
-
-    /// `moruna_trace::RunReport::late_records` (04 d.1).
-    #[getter]
-    fn late_records(&self) -> u64 {
-        self.inner.late_records
-    }
-
-    /// `moruna_trace::RunReport::write` (04 d.1): `{"engine", "report"}`, what the engine behind
-    /// the run's sink said about the write it committed (a peQL contract's verdict over the rows
-    /// written, the rows that broke each rule and the snapshot committed), with `"excluded"`
-    /// when the sink kept rows the engine handed back, in the shape `to_json` gives it;
-    /// otherwise `None`.
-    #[getter]
-    fn write<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        field(py, &self.inner, "write")
-    }
-
-    /// `moruna_trace::RunReport::read` (04 d.1): `{"engine", "report"}`, what the engine behind
-    /// the run's source said about the read it planned (a peQL plan's resolution of every
-    /// contract it read, with the rows each view left out by rule), in the shape `to_json` gives
-    /// it; otherwise `None`.
-    #[getter]
-    fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        field(py, &self.inner, "read")
-    }
-
-    /// `moruna_trace::RunReport::buffers`, in the same shape as `to_json`; otherwise `None`.
-    #[getter]
-    fn buffers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        field(py, &self.inner, "buffers")
-    }
-
-    /// `moruna_trace::RunReport::policy`, in the same shape as `to_json`; otherwise `None`.
-    #[getter]
-    fn policy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        field(py, &self.inner, "policy")
-    }
-
-    /// `moruna_trace::RunReport::memory_basis`; `None` means legacy process-anonymous memory.
-    #[getter]
-    fn memory_basis(&self) -> Option<String> {
-        self.inner.memory_basis.clone()
-    }
-
-    /// How the run ended: `"Completed"`, `"Cancelled"`, or `{"Terminated": {"diagnostic": ...}}`,
-    /// which is the shape `to_json` gives the same field.
-    #[getter]
-    fn exit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(match &self.inner.exit {
-            ExitReason::Completed => "Completed".into_pyobject(py)?.into_any(),
-            ExitReason::Cancelled => "Cancelled".into_pyobject(py)?.into_any(),
-            ExitReason::Terminated { diagnostic } => {
-                let inner = PyDict::new(py);
-                inner.set_item("diagnostic", diagnostic)?;
-                let outer = PyDict::new(py);
-                outer.set_item("Terminated", inner)?;
-                outer.into_any()
-            }
-        })
-    }
-
-    /// The limits the run started with, field by field. The name the report used before the
-    /// limits could change during a run, kept so programs written against it still work; the
-    /// report's own name for it is `limits_initial`.
-    #[getter]
-    fn limits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.limits_initial(py)
-    }
-
-    /// `moruna_trace::RunReport::limits_initial` (04 d.1): the limits the run started with.
-    #[getter]
-    fn limits_initial<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let l = &self.inner.limits_initial;
-        let d = PyDict::new(py);
-        d.set_item("memory_ceiling", l.memory_ceiling)?;
-        d.set_item("memory_kill", l.memory_kill)?;
-        d.set_item("cpu_quota", l.cpu_quota)?;
-        d.set_item("source", &l.source)?;
-        let devices = PyList::empty(py);
-        for dev in &l.devices {
-            let e = PyDict::new(py);
-            e.set_item("id", dev.id)?;
-            e.set_item("name", &dev.name)?;
-            e.set_item("total_bytes", dev.total_bytes)?;
-            e.set_item("free_bytes", dev.free_bytes)?;
-            devices.append(e)?;
+fn report_value(report: &RunReport, error: Option<&MorunaError>, context: &ReportContext) -> Value {
+    let mut value = serde_json::to_value(report).unwrap_or_else(|e| {
+        json!({"run_id": report.run_id, "notes": [format!("the report did not serialise: {e}")]})
+    });
+    let (code, status, diagnostic) = match (&report.exit, error) {
+        (ExitReason::Completed, None) => (moruna_runtime::host::exit::COMPLETED, "completed", None),
+        (ExitReason::Cancelled, _) | (_, Some(MorunaError::Cancelled)) => {
+            (moruna_runtime::host::exit::CANCELLED, "cancelled", None)
         }
-        d.set_item("devices", devices)?;
-        Ok(d)
+        (ExitReason::Terminated { diagnostic }, error) => (
+            error.map_or(
+                moruna_runtime::host::exit::FAILED,
+                moruna_runtime::host::exit_code,
+            ),
+            "terminated",
+            Some(diagnostic.clone()),
+        ),
+        (ExitReason::Completed, Some(error)) => (
+            moruna_runtime::host::exit_code(error),
+            "terminated",
+            Some(error.to_string()),
+        ),
+    };
+    let object = value
+        .as_object_mut()
+        .expect("a report serialises as an object");
+    // Every field is in the document, `null` when the run has nothing for it, so a reader
+    // finds the same keys in every report.
+    for optional in ["write", "read", "buffers", "policy", "memory_basis"] {
+        object.entry(optional).or_insert(Value::Null);
     }
+    object.insert("moruna_report".into(), json!(REPORT_FORMAT));
+    object.insert("moruna".into(), json!(crate::VERSION));
+    object.insert("job_digest".into(), json!(context.job_digest));
+    object.insert(
+        "exit".into(),
+        json!({"code": code, "status": status, "diagnostic": diagnostic}),
+    );
+    object.insert("tasks".into(), Value::Array(tasks(report, context)));
+    object.insert(
+        "resources".into(),
+        json!({
+            "cpu_ns": report.cpu_ns,
+            "peak_memory_bytes": report.peak_anon_bytes,
+            "memory_basis": report.memory_basis,
+            "mem_byte_seconds": report.mem_byte_seconds,
+            "usage_measured": report.usage_measured,
+        }),
+    );
+    object.insert("sinks".into(), Value::Array(sinks(report, context)));
+    object.insert("plan".into(), context.plan.clone().unwrap_or(Value::Null));
+    object.insert(
+        "trace_path".into(),
+        json!(
+            context
+                .trace_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+        ),
+    );
+    value
+}
 
-    /// `moruna_trace::RunReport::limits_timeline` (04 d.1): each change to the machine's limits
-    /// during the run, as `(t_ms, limits)`, in the shape `to_json` gives it.
-    #[getter]
-    fn limits_timeline<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        field(py, &self.inner, "limits_timeline")
-    }
+/// The stage that runs task `i`, 1-based, and the stage's report, when the trace saw it.
+fn stage_of<'r>(
+    report: &'r RunReport,
+    context: &ReportContext,
+    i: usize,
+) -> Option<(u16, Vec<usize>, Option<&'r StageReport>)> {
+    let at = context
+        .parts
+        .stages
+        .iter()
+        .position(|tasks| tasks.contains(&i))?;
+    let stage = u16::try_from(at + 1).ok()?;
+    Some((
+        stage,
+        context.parts.stages[at].clone(),
+        report.stages.iter().find(|s| s.stage == stage),
+    ))
+}
 
-    /// `moruna_trace::RunReport::drains` (04 d.1): every shrink of the arena and how long it took
-    /// to drain, in the shape `to_json` gives it.
-    #[getter]
-    fn drains<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        field(py, &self.inner, "drains")
-    }
-
-    /// `moruna_trace::RunReport::cpu_ns` (04 d.1): the process's CPU time, user plus system.
-    #[getter]
-    fn cpu_ns(&self) -> u64 {
-        self.inner.cpu_ns
-    }
-
-    /// `moruna_trace::RunReport::mem_byte_seconds` (04 d.1): memory held, integrated over time.
-    #[getter]
-    fn mem_byte_seconds(&self) -> u64 {
-        self.inner.mem_byte_seconds
-    }
-
-    /// `moruna_trace::RunReport::usage_measured` (04 d.1): whether the two figures above were
-    /// measured.
-    #[getter]
-    fn usage_measured(&self) -> bool {
-        self.inner.usage_measured
-    }
-
-    /// `moruna_trace::RunReport::peak_ceiling_bytes` (04 d.1): the ceiling the peak fraction was
-    /// taken against.
-    #[getter]
-    fn peak_ceiling_bytes(&self) -> u64 {
-        self.inner.peak_ceiling_bytes
-    }
-
-    /// Which direct paths the run took (G-I7).
-    #[getter]
-    fn io_paths<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let p = &self.inner.io_paths;
-        let d = PyDict::new(py);
-        d.set_item("direct_io", p.direct_io)?;
-        d.set_item("io_uring", p.io_uring)?;
-        d.set_item("gds", p.gds)?;
-        d.set_item("pinned", p.pinned)?;
-        d.set_item("rdma", p.rdma)?;
-        Ok(d)
-    }
-
-    /// One `(stage, state)` pair per Python stage, the state being `"FreeThreaded"` or
-    /// `"Serialised"` (05 d.1).
-    #[getter]
-    fn gil(&self) -> Vec<(u16, String)> {
-        self.inner
-            .gil
-            .iter()
-            .map(|(stage, state)| (*stage, format!("{state:?}")))
-            .collect()
-    }
-
-    /// One entry per stage the trace saw.
-    #[getter]
-    fn stages<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let list = PyList::empty(py);
-        for s in &self.inner.stages {
-            let d = PyDict::new(py);
-            d.set_item("stage", s.stage)?;
-            d.set_item("morsels", s.morsels)?;
-            d.set_item("rows_in", s.rows_in)?;
-            d.set_item("rows_out", s.rows_out)?;
-            d.set_item("bytes_in", s.bytes_in)?;
-            d.set_item("bytes_out", s.bytes_out)?;
-            d.set_item("wall_s", s.wall_s)?;
-            d.set_item("kernel_busy_s", s.kernel_busy_s)?;
-            d.set_item("rows_per_s", s.rows_per_s)?;
-            d.set_item("bytes_per_s", s.bytes_per_s)?;
-            d.set_item("amplification_p50", s.amplification_p50)?;
-            d.set_item("amplification_p95", s.amplification_p95)?;
-            d.set_item("placement_miss_wait_s", s.placement_miss_wait_s)?;
-            d.set_item("errors", s.errors)?;
-            d.set_item("skipped", s.skipped)?;
-            d.set_item("state_bytes_max", s.state_bytes_max)?;
-            d.set_item("state_growth", s.state_growth)?;
-            // E13: what the stage's kernel asked for, per source (04 d.1), as the JSON has it.
-            let alloc = match &s.alloc {
-                Some(a) => {
-                    let text = serde_json::to_string(a).map_err(|e| {
-                        pyo3::exceptions::PyValueError::new_err(format!("stage alloc: {e}"))
-                    })?;
-                    py.import("json")?.call_method1("loads", (text,))?.unbind()
+/// One entry per task, document order: its key, role and kind; rows and bytes in and out; its
+/// time; the rows it set aside. A figure the run does not measure for the task is `null`.
+fn tasks(report: &RunReport, context: &ReportContext) -> Vec<Value> {
+    let job = &context.job;
+    let sink_outcome = |i: usize| {
+        let ordinal = context.parts.sinks.iter().position(|&t| t == i)?;
+        report.sinks.iter().find(|s| s.sink == ordinal)
+    };
+    // What task `i` takes from a task feeding it, when that is measured: a function of one input
+    // takes all it is given; a sink takes what it writes.
+    let taken = |i: usize| -> Option<(u64, u64)> {
+        let task = &job.tasks[i];
+        match task.role {
+            Role::Kernel if task.inputs.len() == 1 => stage_of(report, context, i)
+                .and_then(|(_, tasks, s)| (tasks.first() == Some(&i)).then_some(s).flatten())
+                .map(|s| (s.rows_in, s.bytes_in)),
+            Role::Sink => sink_outcome(i).map(|s| (s.rows, s.bytes)),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(job.tasks.len());
+    for (i, task) in job.tasks.iter().enumerate() {
+        let mut entry = json!({
+            "key": task.id,
+            "role": task.role.as_str(),
+            "kind": task.kind,
+            "stage": null,
+            "fused_with": [],
+            "rows_in": null,
+            "rows_out": null,
+            "bytes_in": null,
+            "bytes_out": null,
+            "time_s": null,
+            "busy_s": null,
+            "excluded_rows": 0,
+            "skipped_morsels": 0,
+            "errors": 0,
+        });
+        match task.role {
+            Role::Source => {
+                let consumers = job
+                    .edges
+                    .iter()
+                    .filter(|e| e.from.task == task.id)
+                    .filter_map(|e| job.tasks.iter().position(|t| t.id == e.to.task));
+                if let Some((rows, bytes)) = consumers.filter_map(taken).next() {
+                    entry["rows_out"] = json!(rows);
+                    entry["bytes_out"] = json!(bytes);
                 }
-                None => py.None(),
-            };
-            d.set_item("alloc", alloc)?;
-            list.append(d)?;
-        }
-        Ok(list)
-    }
-
-    /// The trace file, when `trace=` asked for one.
-    #[getter]
-    fn trace_path(&self) -> Option<String> {
-        self.trace_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
-
-    /// The report as JSON, exactly `moruna_trace::RunReport::to_json`.
-    fn to_json(&self) -> String {
-        self.inner.to_json()
-    }
-
-    fn __str__(&self) -> String {
-        self.render()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "RunReport(run_id={}, exit={}, wall_s={:.3})",
-            self.inner.run_id,
-            exit_name(&self.inner.exit),
-            self.inner.wall_s
-        )
-    }
-}
-
-impl PyRunReport {
-    /// The fixed layout (PY-I5). At most forty lines: the head is eleven, each stage is one, and
-    /// the notes are folded into a count with the first three shown, so a run with many stages or
-    /// many notes still prints a page (PY-T5 asserts the bound).
-    fn render(&self) -> String {
-        let r = &self.inner;
-        let mut out = Vec::new();
-        out.push(format!(
-            "moruna run {} {}{}",
-            r.run_id,
-            exit_name(&r.exit),
-            if r.resumed { " (resumed)" } else { "" }
-        ));
-        out.push(format!(
-            "wall {:.2}s   peak {} ({:.0}% of ceiling {})   workers busy {:.0}%",
-            r.wall_s,
-            bytes(r.peak_anon_bytes),
-            r.peak_fraction_of_ceiling * 100.0,
-            bytes(r.limits_initial.memory_ceiling),
-            r.worker_busy_fraction * 100.0
-        ));
-        out.push(format!(
-            "cpu quota {:.2} ({})   throttled {:.1}%",
-            r.limits_initial.cpu_quota,
-            r.limits_initial.source,
-            r.cpu_throttled_fraction * 100.0
-        ));
-        out.push(format!(
-            "source {}/s   staging {}/s, {} written{}",
-            bytes(r.source_bandwidth as u64),
-            bytes(r.staging_bandwidth as u64),
-            bytes(r.staging_bytes_written),
-            if r.staging_engaged { "" } else { " (unused)" }
-        ));
-        out.push(format!(
-            "io: direct_io={} io_uring={} gds={} pinned={}",
-            r.io_paths.direct_io, r.io_paths.io_uring, r.io_paths.gds, r.io_paths.pinned
-        ));
-        out.push(format!(
-            "sizer {}{}   gil {}",
-            r.sizer_used,
-            match r.sizer_fallback_at {
-                Some(seq) => format!(" (fell back at morsel {seq})"),
-                None => String::new(),
-            },
-            if r.gil.is_empty() {
-                "no python stage".to_string()
-            } else if r.gil_serialised {
-                "serialised".to_string()
-            } else {
-                "free threaded".to_string()
             }
-        ));
-        if let Some(m) = &r.manifest {
-            out.push(format!("manifest {m}"));
-        }
-        if r.overflow_failed || r.late_records > 0 {
-            out.push(format!(
-                "trace incomplete: overflow_failed={} late_records={}",
-                r.overflow_failed, r.late_records
-            ));
-        }
-        out.push(String::new());
-        out.push(format!(
-            "{:>5}  {:>9}  {:>12}  {:>12}  {:>8}  {:>6}  {:>7}",
-            "stage", "morsels", "rows in", "rows out", "rows/s", "errors", "skipped"
-        ));
-        // Twelve head lines are already used; forty is the bound, and the tail below takes four.
-        const MAX_STAGE_LINES: usize = 22;
-        for s in r.stages.iter().take(MAX_STAGE_LINES) {
-            out.push(format!(
-                "{:>5}  {:>9}  {:>12}  {:>12}  {:>8.3e}  {:>6}  {:>7}",
-                s.stage, s.morsels, s.rows_in, s.rows_out, s.rows_per_s, s.errors, s.skipped
-            ));
-        }
-        if r.stages.len() > MAX_STAGE_LINES {
-            out.push(format!(
-                "... {} more stages (report.stages has them all)",
-                r.stages.len() - MAX_STAGE_LINES
-            ));
-        }
-        if !r.notes.is_empty() {
-            out.push(String::new());
-            out.push(format!("notes ({}):", r.notes.len()));
-            for note in r.notes.iter().take(2) {
-                out.push(format!("  {note}"));
+            Role::Kernel => {
+                if let Some((stage, members, found)) = stage_of(report, context, i) {
+                    entry["stage"] = json!(stage);
+                    entry["fused_with"] = json!(
+                        members
+                            .iter()
+                            .filter(|&&m| m != i)
+                            .map(|&m| job.tasks[m].id.clone())
+                            .collect::<Vec<_>>()
+                    );
+                    if let Some(s) = found {
+                        entry["rows_in"] = json!(s.rows_in);
+                        entry["rows_out"] = json!(s.rows_out);
+                        entry["bytes_in"] = json!(s.bytes_in);
+                        entry["bytes_out"] = json!(s.bytes_out);
+                        entry["time_s"] = json!(s.wall_s);
+                        entry["busy_s"] = json!(s.kernel_busy_s);
+                        entry["skipped_morsels"] = json!(s.skipped);
+                        entry["errors"] = json!(s.errors);
+                    }
+                }
             }
-            if r.notes.len() > 2 {
-                out.push(format!(
-                    "  ... {} more (report.notes has them all)",
-                    r.notes.len() - 2
-                ));
+            Role::Sink => {
+                if let Some(s) = sink_outcome(i) {
+                    entry["rows_in"] = json!(s.rows);
+                    entry["bytes_in"] = json!(s.bytes);
+                    entry["excluded_rows"] = json!(s.excluded_rows);
+                }
             }
         }
-        out.join("\n")
+        out.push(entry);
     }
+    out
 }
 
-fn exit_name(exit: &ExitReason) -> String {
-    match exit {
-        ExitReason::Completed => "completed".to_string(),
-        ExitReason::Cancelled => "cancelled".to_string(),
-        ExitReason::Terminated { diagnostic } => format!("terminated: {diagnostic}"),
-    }
+/// One entry per sink, document order: its task, its target as its settings name it, what it
+/// wrote, and the version it committed (`snapshot_id`, which every committing sink names, and
+/// `version`).
+fn sinks(report: &RunReport, context: &ReportContext) -> Vec<Value> {
+    report
+        .sinks
+        .iter()
+        .map(|s| {
+            let task = context
+                .parts
+                .sinks
+                .get(s.sink)
+                .and_then(|&i| context.job.tasks.get(i));
+            let target = context
+                .sink_targets
+                .get(s.sink)
+                .filter(|t| !t.is_empty())
+                .cloned();
+            json!({
+                "task": task.map(|t| t.id.clone()),
+                "target": target,
+                "rows": s.rows,
+                "bytes": s.bytes,
+                "files": s.files,
+                "excluded_rows": s.excluded_rows,
+                "snapshot_id": s.snapshot_id,
+                "version": s.version,
+            })
+        })
+        .collect()
 }
 
-fn bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// Add the report class to the module.
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyRunReport>()?;
-    Ok(())
+/// The report document as the Python object `moruna.RunReport` is.
+pub(crate) fn to_python(py: Python<'_>, text: &str) -> PyResult<Py<PyAny>> {
+    Ok(py
+        .import("moruna._report")?
+        .getattr("RunReport")?
+        .call_method1("_from_json", (text,))?
+        .unbind())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moruna_job::{Edge, Job, KindDoc, Task};
     use moruna_kernel::{GilState, IoPaths};
-    use moruna_trace::{LimitsSummary, StageReport};
+    use moruna_trace::{LimitsSummary, SinkOutcome, StageReport};
 
     fn stage(stage: u16) -> StageReport {
         StageReport {
@@ -576,53 +314,111 @@ mod tests {
             late_records: 0,
             write: None,
             read: None,
+            sinks: Vec::new(),
             buffers: None,
             policy: None,
         }
     }
 
-    /// PY-T5 report_object: `__str__` is at most forty lines however many stages and notes the
-    /// run produced, and `to_json` round-trips.
-    #[test]
-    fn py_t5_report_object() {
-        for (stages, notes) in [(0, 0), (3, 2), (60, 40)] {
-            let r = PyRunReport::new(report(stages, notes), None);
-            let text = r.render();
-            let lines = text.lines().count();
-            assert!(lines <= 40, "{stages} stages, {notes} notes: {lines} lines");
-            assert!(text.contains("moruna run"));
+    fn context() -> ReportContext {
+        let entry = |kind: &str| KindDoc::new(kind, serde_json::Map::new());
+        let job = Job::new(
+            vec![
+                Task::source("rows", entry("parquet")),
+                Task::kernel("shout", entry("python")),
+                Task::kernel("keep", entry("std")),
+                Task::sink("out", entry("python")),
+                Task::sink("copy", entry("parquet")),
+            ],
+            vec![
+                Edge::new("rows", "out", "shout", "in"),
+                Edge::new("shout", "out", "keep", "in"),
+                Edge::new("keep", "out", "out", "in"),
+                Edge::new("rows", "out", "copy", "in"),
+            ],
+        );
+        ReportContext {
+            job,
+            parts: moruna_runtime::job::Parts {
+                sources: vec![0],
+                stages: vec![vec![1, 2]],
+                sinks: vec![3, 4],
+            },
+            sink_targets: vec![String::new(), "file:///copy".into()],
+            job_digest: Some("sha256:ab".into()),
+            plan: None,
+            trace_path: None,
         }
-        let r = PyRunReport::new(report(2, 1), Some(PathBuf::from("/tmp/t.arrow")));
-        let json: serde_json::Value =
-            serde_json::from_str(&r.to_json()).expect("to_json is valid JSON");
-        assert_eq!(json["run_id"], "0".repeat(32));
-        assert_eq!(json["stages"].as_array().map(|a| a.len()), Some(2));
-        assert_eq!(json["io_paths"]["direct_io"], true);
     }
 
+    /// The report a run returns names its job's digest, its exit as a code, every task by its
+    /// key with what it took and gave, what it consumed, and every sink with the version it
+    /// committed; a fused stage's figures are its tasks', which name each other.
     #[test]
-    fn byte_rendering_and_exit_names() {
-        assert_eq!(bytes(512), "512 B");
-        assert_eq!(bytes(2048), "2.0 KiB");
-        assert_eq!(bytes(3 << 30), "3.0 GiB");
-        assert_eq!(exit_name(&ExitReason::Cancelled), "cancelled");
-        assert_eq!(
-            exit_name(&ExitReason::Terminated {
-                diagnostic: "kernel stage 1".into()
-            }),
-            "terminated: kernel stage 1"
-        );
+    fn the_report_names_the_job() {
         let mut r = report(1, 0);
-        r.exit = ExitReason::Cancelled;
-        r.resumed = true;
-        r.overflow_failed = true;
-        r.late_records = 3;
-        r.gil_serialised = true;
-        r.sizer_fallback_at = Some(9);
-        let text = PyRunReport::new(r, None).render();
-        assert!(text.contains("(resumed)"));
-        assert!(text.contains("trace incomplete"));
-        assert!(text.contains("fell back at morsel 9"));
-        assert!(text.contains("serialised"));
+        r.sinks = vec![
+            SinkOutcome {
+                sink: 0,
+                rows: 1_000,
+                bytes: 10,
+                files: Vec::new(),
+                excluded_rows: 3,
+                snapshot_id: Some("42".into()),
+                version: Some("v7".into()),
+            },
+            SinkOutcome {
+                sink: 1,
+                rows: 1_000,
+                bytes: 20,
+                files: vec!["part-0.parquet".into()],
+                excluded_rows: 0,
+                snapshot_id: None,
+                version: None,
+            },
+        ];
+        r.cpu_ns = 5;
+        let value = report_value(&r, None, &context());
+        assert_eq!(value["moruna_report"], json!(REPORT_FORMAT));
+        assert_eq!(value["job_digest"], "sha256:ab");
+        assert_eq!(
+            value["exit"],
+            json!({"code": 0, "status": "completed", "diagnostic": null})
+        );
+        assert_eq!(value["resources"]["cpu_ns"], 5);
+        assert_eq!(value["resources"]["peak_memory_bytes"], 4u64 << 30);
+        let tasks = value["tasks"].as_array().expect("tasks");
+        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks[0]["key"], "rows");
+        assert_eq!(tasks[0]["rows_out"], 1_000);
+        assert_eq!(tasks[1]["fused_with"], json!(["keep"]));
+        assert_eq!(tasks[2]["fused_with"], json!(["shout"]));
+        assert_eq!(tasks[1]["stage"], 1);
+        assert_eq!(tasks[1]["rows_in"], 1_000);
+        assert_eq!(tasks[3]["excluded_rows"], 3);
+        let sinks = value["sinks"].as_array().expect("sinks");
+        assert_eq!(sinks[0]["task"], "out");
+        assert_eq!(sinks[0]["target"], Value::Null);
+        assert_eq!(sinks[0]["snapshot_id"], "42");
+        assert_eq!(sinks[0]["version"], "v7");
+        assert_eq!(sinks[1]["task"], "copy");
+        assert_eq!(sinks[1]["target"], "file:///copy");
+        assert_eq!(sinks[1]["files"], json!(["part-0.parquet"]));
+
+        let mut failed = report(1, 0);
+        failed.exit = ExitReason::Terminated {
+            diagnostic: "function stage 1".into(),
+        };
+        let error = MorunaError::Plan("x".into());
+        let value = report_value(&failed, Some(&error), &context());
+        assert_eq!(value["exit"]["status"], "terminated");
+        assert_eq!(value["exit"]["diagnostic"], "function stage 1");
+        assert_eq!(
+            value["exit"]["code"],
+            json!(moruna_runtime::host::exit_code(&error))
+        );
+        failed.exit = ExitReason::Cancelled;
+        let value = report_value(&failed, None, &context());
+        assert_eq!(value["exit"]["code"], 130);
     }
 }

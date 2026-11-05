@@ -670,7 +670,7 @@ def test_bd_t19_the_kernel_a_build_is_asked_for(project: Project) -> None:
     module.decorated = Spec()
     found = build.function_of(module.decorated)
     assert (found.name, found.fingerprint, found.stateful) == ("decorated", "sha256:abc", True)
-    with pytest.raises(build.Refused, match="does not bind the kernel to a name"):
+    with pytest.raises(build.Refused, match="does not bind the function to a name"):
         build.function_of(Spec())
     built = project.build(module.decorated)
     labels = json.loads(blob(built.layout, manifest_of(built)["config"]["digest"]))["config"][
@@ -722,7 +722,7 @@ def test_bd_t20_the_command_refuses_a_kernel_with_no_function(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert build.main(["not_a_kernel_name"]) == build.EXIT_REFUSED
-    assert "name the kernel as <module>:<function>" in capsys.readouterr().err
+    assert "name the function as <module>:<function>" in capsys.readouterr().err
 
 
 def test_bd_t21_the_wheels_and_bytecode_are_made_by_the_runtimes_cpython(

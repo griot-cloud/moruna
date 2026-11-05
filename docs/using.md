@@ -19,11 +19,11 @@ Read Parquet, Vortex or tensor files or your own iterator, write the results, an
 Read from, or write to, anything Moruna does not support itself, with a Python class of your own.
 :::
 
-:::{grid-item-card} Writing kernels
-:link: kernels
+:::{grid-item-card} Writing functions
+:link: functions
 :link-type: doc
 
-Write Python and Polars kernels, keep state between batches, use the standard kernels, and check a kernel before you run it.
+Write Python and Polars functions, keep state between batches, use the standard functions, and check a function before you run it.
 :::
 
 :::{grid-item-card} Running jobs from the command line
@@ -46,7 +46,7 @@ Run on a laptop, in a container or Kubernetes pod, or in an isolated virtual mac
 
 python
 sources-and-sinks
-kernels
+functions
 command-line
 hosting
 ```

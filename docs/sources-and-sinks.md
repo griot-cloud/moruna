@@ -3,7 +3,7 @@
 Moruna reads Parquet, Vortex and tensor files, and writes Parquet, Vortex, tensor and Arrow IPC files. For anything else, write a class of your own in Python. Subclass `moruna.Source` to read from somewhere Moruna does not, and `moruna.Sink` to write somewhere it does not. `moruna.run` accepts an instance of either wherever it accepts the built-in ones:
 
 ```python
-report = moruna.run(MySource(...), [kernel], MySink(...), budget="8GiB")
+report = moruna.run(MySource(...), [function], MySink(...), budget="8GiB")
 ```
 
 Your source and sink run inside the same budget as the rest of the job. Moruna still sizes the work, reads ahead, spills to disk and resumes, as long as your classes follow the rules below.
@@ -165,4 +165,4 @@ An exception in your source or sink stops the job, and the message includes your
 | `restore`, or a checkpoint that cannot be used | `moruna.ResumeError` |
 | A class without `plan`, `read` or `write`, or with `checkpoint` but no `restore` | `TypeError` |
 
-Next: [Writing kernels](kernels.md).
+Next: [Writing functions](functions.md).

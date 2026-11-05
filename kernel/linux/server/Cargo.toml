@@ -16,6 +16,6 @@ moruna-sys = { workspace = true, features = ["heap"] }
 # SDD 29 f.8: a data-plane task's standard streams made into records and back, with the
 # record check's framing, and its text written to the engine's log ring as records.
 moruna-ipc-check.workspace = true
-moruna-record = { path = "../../../crates/moruna-record", version = "=0.6.0", default-features = false }
+moruna-record = { path = "../../../crates/moruna-record", version = "=0.6.2", default-features = false }
 
 moruna-node = { path = "../../node/core", version = "=0.1.0" }

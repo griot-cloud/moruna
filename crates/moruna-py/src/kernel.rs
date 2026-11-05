@@ -77,7 +77,7 @@ impl PyKernelHandle {
             .getattr("__name__")
             .and_then(|n| n.extract::<String>())
             .unwrap_or_else(|_| type_name(self.callable.bind(py)));
-        format!("KernelSpec({name}, stateful={})", self.stateful)
+        format!("function({name}, stateful={})", self.stateful)
     }
 }
 
@@ -104,7 +104,7 @@ pub fn build(
 ) -> PyResult<PyKernelHandle> {
     if !obj.is_callable() && !stateful {
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "a stateless kernel must be callable, and {} is not",
+            "a stateless function must be callable, and {} is not",
             type_name(obj)
         )));
     }
@@ -185,69 +185,53 @@ pub enum Stage {
     Served(Box<moruna_job::Declaration>, Py<PyAny>),
 }
 
-/// The kernels of one run, in stage order, from whatever `moruna.run` was given: one kernel, a
-/// list, a decorated object, a standard kernel or a plain callable (f.3), one per entry.
-pub fn kernels_of(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stage>> {
-    let items: Vec<Bound<'_, PyAny>> = if value.is_instance_of::<pyo3::types::PyList>()
-        || value.is_instance_of::<pyo3::types::PyTuple>()
-    {
-        value.try_iter()?.collect::<PyResult<Vec<_>>>()?
-    } else {
-        vec![value.clone()]
-    };
-    let mut out: Vec<Stage> = Vec::with_capacity(items.len());
-    for item in items {
-        if let Ok(handle) = item.cast::<PyKernelHandle>() {
-            out.push(Stage::Py(Arc::clone(&handle.get().kernel)));
-            continue;
-        }
-        if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
-            // Fusion happens where the job document is built, so every entry stays an entry.
-            out.push(Stage::Std(Box::new(std.get().kernel.clone())));
-            continue;
-        }
-        if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
-            out.push(Stage::Package(package.get().host.clone()));
-            continue;
-        }
-        if let Ok(task) = item.cast::<crate::kinds::PyDeclaredTask>() {
-            let task = task.get();
-            out.push(Stage::Served(
-                Box::new(task.declaration.clone()),
-                task.serve.clone_ref(py),
-            ));
-            continue;
-        }
-        if item.is_callable() {
-            // "a plain function passed as a kernel is wrapped as if decorated with defaults" (f.3).
-            let handle = build(
-                py,
-                &item,
-                false,
-                1,
-                false,
-                "table",
-                "host",
-                None,
-                None,
-                None,
-                "reinit",
-                None,
-                Declared::default(),
-                None,
-                None,
-                true,
-            )?;
-            out.push(Stage::Py(handle.kernel));
-            continue;
-        }
-        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "a kernel must be produced by @moruna.kernel, moruna.std or a @moruna.kind, or be \
-             callable, and {} is none of these",
-            type_name(&item)
-        )));
+/// One kernel of a run, from whatever `moruna.run` was given for it: a decorated object, a
+/// standard kernel, a loaded package, a task of a declared kind or a plain callable (f.3).
+pub fn stage_of(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Stage> {
+    if let Ok(handle) = item.cast::<PyKernelHandle>() {
+        return Ok(Stage::Py(Arc::clone(&handle.get().kernel)));
     }
-    Ok(out)
+    if let Ok(std) = item.cast::<crate::check::PyStdKernel>() {
+        // Fusion happens where the job document is built, so every entry stays an entry.
+        return Ok(Stage::Std(Box::new(std.get().kernel.clone())));
+    }
+    if let Ok(package) = item.cast::<crate::package::PyPackageKernel>() {
+        return Ok(Stage::Package(package.get().host.clone()));
+    }
+    if let Ok(task) = item.cast::<crate::kinds::PyDeclaredTask>() {
+        let task = task.get();
+        return Ok(Stage::Served(
+            Box::new(task.declaration.clone()),
+            task.serve.clone_ref(py),
+        ));
+    }
+    if item.is_callable() {
+        // "a plain function passed as a kernel is wrapped as if decorated with defaults" (f.3).
+        let handle = build(
+            py,
+            item,
+            false,
+            1,
+            false,
+            "table",
+            "host",
+            None,
+            None,
+            None,
+            "reinit",
+            None,
+            Declared::default(),
+            None,
+            None,
+            true,
+        )?;
+        return Ok(Stage::Py(handle.kernel));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "a function is made by @moruna.function, moruna.std or a @moruna.kind, or is \
+         callable, and {} is none of these",
+        type_name(item)
+    )))
 }
 
 /// A declaration from the tuple `moruna._declare.declaration` builds (MH 4.9): `("exact",

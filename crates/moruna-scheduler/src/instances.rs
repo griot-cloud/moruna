@@ -1,6 +1,8 @@
 //! The stateful instance pools: eager creation, affinity, retirement and the resume path
 //! (f.4, f.13, SC-I6).
 
+use std::sync::atomic::Ordering;
+
 use moruna_kernel::{DeviceId, InitCtx, KernelState, MorunaError, Result};
 
 use crate::shared::{JobOutput, Shared, WorkerJob};
@@ -74,79 +76,176 @@ pub(crate) fn run_init(
     Ok(JobOutput::Done)
 }
 
-/// `Kernel::finish` for every live instance of every stateful stage, in stage order, once the
-/// last queue is closed and drained (f.6, contracts d.7). The first `Err` is returned as it is,
-/// with the stage named; a panic in `finish` is that stage's failure like an `Err`.
-pub(crate) fn finish_instances(shared: &Shared) -> Result<()> {
-    for (stage_ix, entry) in shared.stages.iter().enumerate() {
-        let Some(pool) = entry.pool.as_ref() else {
+/// The body of `WorkerJob::Finish` (f.6, contracts d.7): `Kernel::finish` for every live
+/// instance of one stateful stage, in instance order, once every input of the stage has ended
+/// and its last `apply` has returned; what each gives is pushed into the stage's outputs,
+/// numbered from the stage's finish base (contracts d.16), and then the outputs close, so the
+/// stages and sinks downstream take it like any other morsel. A failure ends the run, naming the
+/// stage; the outputs close either way, so nothing waits for them.
+pub(crate) fn run_finish(shared: &Shared, worker: u16, stage_ix: usize) -> Result<JobOutput> {
+    if let Err(e) = finish_stage(shared, worker, stage_ix) {
+        crate::policy::terminate(shared, e);
+    }
+    shared.close_outputs(stage_ix);
+    shared.advance_closes();
+    shared.unpark_all();
+    Ok(JobOutput::Done)
+}
+
+fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
+    let entry = &shared.stages[stage_ix];
+    let stage = entry.stage;
+    let Some(pool) = entry.pool.as_ref() else {
+        let _ = entry.finished.set(0);
+        return Ok(());
+    };
+    // Every input has ended, so the numbers they carried are known: the finish base is one past
+    // the highest (d.16).
+    let base = shared.produced().base(stage).ok_or_else(|| {
+        MorunaError::Plan(format!(
+            "stage {stage}'s inputs ended and the numbers they carried are not known"
+        ))
+    })?;
+    // f.12: no manifest is taken while the instances are finishing, and none after one gave a
+    // batch; the checkpoint thread waits for this lock rather than for an instance.
+    let _manifest = shared
+        .manifest_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // The checkpoint barrier waits for busy slots, so the finish holds one like a task.
+    let _slot = shared.knobs.slots.claim();
+    let _working = shared.work_for(stage);
+    let mut given: u64 = 0;
+    for instance in 0..pool.max {
+        let taken = {
+            let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+            match slots.get_mut(instance) {
+                Some(slot) if slot.in_use => {
+                    return Err(MorunaError::Plan(format!(
+                        "stage {stage} instance {instance} was in use when the stage's input \
+                         ended"
+                    )));
+                }
+                Some(slot) if !slot.retired => {
+                    slot.in_use = true;
+                    slot.state.take()
+                }
+                _ => None,
+            }
+        };
+        let Some(mut state) = taken else {
             continue;
         };
-        for instance in 0..pool.max {
-            let taken = {
-                let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
-                match slots.get_mut(instance) {
-                    Some(slot) if !slot.retired && !slot.in_use => {
-                        slot.in_use = true;
-                        slot.state.take()
-                    }
-                    _ => None,
-                }
-            };
-            let Some(mut state) = taken else {
-                continue;
-            };
-            let kernel = entry.kernel.clone();
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                kernel.finish(state.as_mut())
-            }));
-            {
-                let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(slot) = slots.get_mut(instance) {
-                    slot.in_use = false;
-                    slot.state = Some(state);
-                }
-            }
-            let stage = shared.stages[stage_ix].stage;
-            // The last morsel any source issued: a job may read from several (d.16).
-            let last = shared
-                .sources
-                .iter()
-                .map(|source| {
-                    crate::source_drive::cursor(source)
-                        .0
-                        .next_seq
-                        .saturating_sub(1)
-                })
-                .max()
-                .unwrap_or(0);
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(MorunaError::Kernel { msg, features, .. })) => {
-                    return Err(MorunaError::Kernel {
-                        stage,
-                        seq: last,
-                        msg,
-                        features,
-                    });
-                }
-                Ok(Err(other)) => return Err(other),
-                Err(panic) => {
-                    return Err(MorunaError::Kernel {
-                        stage,
-                        seq: last,
-                        msg: format!(
-                            "panic in finish: {}",
-                            crate::worker::panic_message(panic.as_ref())
-                        ),
-                        features: None,
-                    });
-                }
+        let s0 = shared.sampler.sample()?;
+        let q_before = crate::worker::tier_totals(&shared.placement_stats());
+        let t0 = crate::cputime::now_ns();
+        let c0 = crate::cputime::thread_cpu_ns();
+        let kernel = entry.kernel.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            kernel.finish(state.as_mut())
+        }));
+        let c1 = crate::cputime::thread_cpu_ns();
+        let t1 = crate::cputime::now_ns();
+        let alloc = moruna_kernel::take_kernel_alloc();
+        let retire = !matches!(outcome, Ok(Ok(_)));
+        {
+            let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = slots.get_mut(instance) {
+                slot.in_use = false;
+                slot.retired = retire;
+                slot.state = if retire { None } else { Some(state) };
             }
         }
+        let seq = base.saturating_add(given);
+        let payload = match outcome {
+            Ok(Ok(Some(payload))) => payload,
+            Ok(Ok(None)) => continue,
+            Ok(Err(MorunaError::Kernel { msg, features, .. })) => {
+                return Err(MorunaError::Kernel {
+                    stage,
+                    seq,
+                    msg,
+                    features,
+                });
+            }
+            Ok(Err(other)) => return Err(other),
+            Err(panic) => {
+                return Err(MorunaError::Kernel {
+                    stage,
+                    seq,
+                    msg: format!(
+                        "panic in finish: {}",
+                        crate::worker::panic_message(panic.as_ref())
+                    ),
+                    features: None,
+                });
+            }
+        };
+        // f.12: from here on no manifest is written; this batch has no origin to read it again
+        // from.
+        shared.finish_gave.store(true, Ordering::SeqCst);
+        let rows = payload.rows();
+        let bytes = payload.bytes();
+        let tier = payload.tier().index() as u8;
+        let morsel = moruna_kernel::Morsel::new(seq, stage, payload, FINISHED);
+        crate::decide::admit_push(shared, &entry.outputs, morsel, None)?;
+        given += 1;
+        entry.rows_out.fetch_add(rows, Ordering::SeqCst);
+        entry.bytes_out.fetch_add(bytes, Ordering::SeqCst);
+        entry.tasks.fetch_add(1, Ordering::SeqCst);
+        entry
+            .busy_ns
+            .fetch_add(t1.saturating_sub(t0), Ordering::SeqCst);
+        for &q in &entry.outputs {
+            shared.fed(q);
+        }
+        let s1 = shared.sampler.sample()?;
+        let q_after = crate::worker::tier_totals(&shared.placement_stats());
+        // SC-I4: the batch is a morsel of this stage, and leaves one record like every other.
+        let record = crate::worker::build_record(
+            shared,
+            crate::worker::RecordInput {
+                seq,
+                stage,
+                worker,
+                instance,
+                t0,
+                t1,
+                rows_in: 0,
+                bytes_in: 0,
+                rows_out: rows,
+                bytes_out: bytes,
+                tier_in: tier,
+                tier_out: tier,
+                features: &moruna_kernel::MorselFeatures::default(),
+                s0,
+                s1,
+                cpu_ns: c1.saturating_sub(c0),
+                q_before,
+                q_after,
+                miss_wait_us: 0,
+                state_bytes: 0,
+                outcome: moruna_kernel::Outcome::Ok,
+                error: None,
+                alloc,
+            },
+        );
+        crate::worker::emit(shared, record);
     }
+    // Before the outputs close: a sink that sees them closed knows every number they carried.
+    let _ = entry.finished.set(given);
     Ok(())
 }
+
+/// The origin of a batch a stage's `finish` gave (contracts d.5): no split's rows, because it
+/// was read from none. Its queues are a stage's, which the placement engine never recomputes
+/// from an origin, and no manifest is written once one exists (f.12).
+const FINISHED: moruna_kernel::Origin = moruna_kernel::Origin {
+    split: moruna_kernel::SplitId::MAX,
+    row_start: 0,
+    row_end: 0,
+    node: moruna_kernel::LOCAL_NODE,
+};
 
 /// The body of `WorkerJob::Restore`, run on the owning worker (f.13).
 pub(crate) fn run_restore(

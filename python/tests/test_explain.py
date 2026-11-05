@@ -1,4 +1,5 @@
-"""`moruna.explain(...)` (SDD 26 d.5, PN-T26): a job document's plan as a dict, before it runs."""
+"""`moruna.Job.read(...).explain()` (SDD 26 d.5, PN-T26): a job document's plan as a dict, before
+it runs."""
 
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ def _document(tmp_path: Path) -> Path:
 
 def test_pn_t26_explain_returns_the_plan(tmp_path: Path) -> None:
     path = _document(tmp_path)
-    plan = moruna.explain(path)
+    plan = moruna.Job.read(path).explain()
     assert plan["moruna_plan"] == 1
     assert plan["planner"] == {"name": "levels", "version": 1}
     steps = plan["steps"]
@@ -39,7 +40,7 @@ def test_pn_t26_explain_returns_the_plan(tmp_path: Path) -> None:
     assert steps[0]["cost"]["duration"]["basis"] == "default"
     assert plan["totals"]["critical_path"] == [s["id"] for s in steps]
 
-    again = moruna.explain(path.read_bytes())
+    again = moruna.Job.read(path.read_bytes()).explain()
     assert [s["id"] for s in again["steps"]] == [s["id"] for s in steps]
     assert again["id"] == plan["id"]
 
@@ -47,14 +48,14 @@ def test_pn_t26_explain_returns_the_plan(tmp_path: Path) -> None:
 def test_pn_t26_explain_refuses_by_name(tmp_path: Path) -> None:
     path = _document(tmp_path)
     with pytest.raises(moruna.PlanError, match="no planner `no_such_planner`"):
-        moruna.explain(path, planner="no_such_planner")
+        moruna.Job.read(path).explain(planner="no_such_planner")
     with pytest.raises(
         moruna.PlanError,
         match="model: the simulated planner simulates with a cost model, and none is given",
     ):
-        moruna.explain(path, planner="simulated")
+        moruna.Job.read(path).explain(planner="simulated")
     doc = json.loads(path.read_text())
     doc["kernels"][0]["kind"] = "no.such"
     path.write_text(json.dumps(doc))
     with pytest.raises(moruna.ConfigError, match="no.such"):
-        moruna.explain(path)
+        moruna.Job.read(path).explain()

@@ -13,7 +13,7 @@ import pytest
 import moruna
 
 
-@moruna.kernel
+@moruna.function
 def identity(batch):  # noqa: ANN001, ANN202
     return batch
 
@@ -74,7 +74,7 @@ def test_py_t13_budget_reaches_discovery_unclamped(dataset: tuple[str, str, int]
         budget=1 << 62,
     )
     assert not [n for n in report.notes if n.startswith("clamped budget.host")]
-    assert report.limits["memory_ceiling"] < (1 << 62), "discovery clamped it, not the surface"
+    assert report.limits_initial["memory_ceiling"] < (1 << 62), "discovery clamped it, not the surface"
 
 
 def test_py_t13_a_size_string_is_parsed(
@@ -93,7 +93,7 @@ def test_py_t13_a_size_string_is_parsed(
         budget="4GiB",
         **staging,
     )
-    assert report.limits["memory_ceiling"] <= 4 << 30
+    assert report.limits_initial["memory_ceiling"] <= 4 << 30
 
 
 def test_py_t13_a_bad_size_string_is_refused(dataset: tuple[str, str, int]) -> None:

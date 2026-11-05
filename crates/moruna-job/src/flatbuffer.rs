@@ -146,6 +146,7 @@ impl Job {
                 Some(p) => Some(read_host_profile(p)?),
             },
             allow_gil: root.allow_gil(),
+            name: root.name().map(str::to_string),
             report: root
                 .report()
                 .map(|r| Reporting {
@@ -218,6 +219,7 @@ impl Job {
         };
         let id = opt_str(&mut b, &self.id);
         let resume = opt_str(&mut b, &self.resume);
+        let name = opt_str(&mut b, &self.name);
         let trace = opt_str(&mut b, &self.trace);
         let profiles_dir = opt_str(&mut b, &self.profiles_dir);
         let root = fb::Job::create(
@@ -244,6 +246,7 @@ impl Job {
                 allow_gil: self.allow_gil,
                 report: Some(report),
                 contracts: Some(contracts),
+                name,
             },
         );
         fb::finish_job_buffer(&mut b, root);
@@ -261,7 +264,7 @@ pub fn is_job_flatbuffer(bytes: &[u8]) -> bool {
 fn read_task(i: usize, task: fb::Task<'_>) -> Result<Task, JobError> {
     let role = match task.role() {
         fb::Role::Source => Role::Source,
-        fb::Role::Kernel => Role::Kernel,
+        fb::Role::Function => Role::Kernel,
         fb::Role::Sink => Role::Sink,
         other => {
             return Err(JobError::field(
@@ -307,7 +310,7 @@ fn write_task<'b>(
             id: Some(id),
             role: match task.role {
                 Role::Source => fb::Role::Source,
-                Role::Kernel => fb::Role::Kernel,
+                Role::Kernel => fb::Role::Function,
                 Role::Sink => fb::Role::Sink,
             },
             kind: Some(kind),
@@ -484,19 +487,13 @@ fn read_object_store(o: fb::ObjectStore<'_>) -> ObjectStoreDoc {
         s3: o.s3().map(|s| S3Doc {
             endpoint: s.endpoint().map(str::to_string),
             region: s.region().map(str::to_string),
-            access_key_id: s.access_key_id().map(str::to_string),
-            secret_access_key: s.secret_access_key().map(str::to_string),
-            session_token: s.session_token().map(str::to_string),
             bucket: s.bucket().map(str::to_string),
         }),
         gcs: o.gcs().map(|g| GcsDoc {
-            service_account_path: g.service_account_path().map(str::to_string),
-            service_account_json: g.service_account_json().map(str::to_string),
             bucket: g.bucket().map(str::to_string),
         }),
         azure: o.azure().map(|a| AzureDoc {
             account: a.account().map(str::to_string),
-            access_key: a.access_key().map(str::to_string),
             container: a.container().map(str::to_string),
         }),
         local_root: o.local_root().map(str::to_string),
@@ -511,47 +508,24 @@ fn write_object_store<'b>(
     let s3 = d.s3.as_ref().map(|s| {
         let endpoint = opt_str(b, &s.endpoint);
         let region = opt_str(b, &s.region);
-        let access_key_id = opt_str(b, &s.access_key_id);
-        let secret_access_key = opt_str(b, &s.secret_access_key);
-        let session_token = opt_str(b, &s.session_token);
         let bucket = opt_str(b, &s.bucket);
         fb::S3::create(
             b,
             &fb::S3Args {
                 endpoint,
                 region,
-                access_key_id,
-                secret_access_key,
-                session_token,
                 bucket,
             },
         )
     });
     let gcs = d.gcs.as_ref().map(|g| {
-        let service_account_path = opt_str(b, &g.service_account_path);
-        let service_account_json = opt_str(b, &g.service_account_json);
         let bucket = opt_str(b, &g.bucket);
-        fb::Gcs::create(
-            b,
-            &fb::GcsArgs {
-                service_account_path,
-                service_account_json,
-                bucket,
-            },
-        )
+        fb::Gcs::create(b, &fb::GcsArgs { bucket })
     });
     let azure = d.azure.as_ref().map(|a| {
         let account = opt_str(b, &a.account);
-        let access_key = opt_str(b, &a.access_key);
         let container = opt_str(b, &a.container);
-        fb::Azure::create(
-            b,
-            &fb::AzureArgs {
-                account,
-                access_key,
-                container,
-            },
-        )
+        fb::Azure::create(b, &fb::AzureArgs { account, container })
     });
     let local_root = opt_str(b, &d.local_root);
     fb::ObjectStore::create(

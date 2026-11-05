@@ -276,7 +276,7 @@ fn task_entry<'c>(
             code: RefusalCode::Flow,
             message: format!(
                 "`{}` takes {} and gives {}, which a {} does not: a source gives batches, a \
-                 kernel takes and gives batches, a sink takes batches",
+                 function takes and gives batches, a sink takes batches",
                 declared.name,
                 declared.inputs.as_str(),
                 declared.outputs.as_str(),
@@ -726,11 +726,11 @@ mod tests {
             said,
             [
                 "source: `odd` takes batches and gives batches, which a source does not: a \
-                 source gives batches, a kernel takes and gives batches, a sink takes batches",
-                "kernels[0]: `odd` takes files and gives batches, which a kernel does not: a \
-                 source gives batches, a kernel takes and gives batches, a sink takes batches",
+                 source gives batches, a function takes and gives batches, a sink takes batches",
+                "kernels[0]: `odd` takes files and gives batches, which a function does not: a \
+                 source gives batches, a function takes and gives batches, a sink takes batches",
                 "sink: `odd` takes batches and gives batches, which a sink does not: a source \
-                 gives batches, a kernel takes and gives batches, a sink takes batches",
+                 gives batches, a function takes and gives batches, a sink takes batches",
             ]
         );
         assert!(found.iter().all(|r| r.code == RefusalCode::Flow));

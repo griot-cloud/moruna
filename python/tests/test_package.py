@@ -325,7 +325,7 @@ def test_pk_t13_check_a_package(scratch: Path, capsys) -> None:
     )
     report = json.loads(capsys.readouterr().out)
     assert code == 0, report
-    (kernel,) = report["kernels"]
+    (kernel,) = report["functions"]
     assert kernel["kind"] == "wasm"
     assert kernel["verdict"] == "agreed"
     assert kernel["fingerprint"] == "sha256:" + hashlib.sha256(package.read_bytes()).hexdigest()
@@ -479,7 +479,7 @@ def test_pk_t15_load_a_pex(scratch: Path, dataset, capsys) -> None:
     capsys.readouterr()
     args = [str(pex), "--json", "--no-warm-up", "--sandbox-python", SANDBOX_PYTHON]
     assert _check.main([*args, "--sandbox-cgroup", SANDBOX_CGROUP]) == 0
-    (report,) = json.loads(capsys.readouterr().out)["kernels"]
+    (report,) = json.loads(capsys.readouterr().out)["functions"]
     assert report["kind"] == "pex" and report["verdict"] == "agreed"
 
 
@@ -501,5 +501,5 @@ def test_pk_t18_package_report(scratch: Path, capsys, monkeypatch) -> None:
     assert report["fingerprint"] == "sha256:" + hashlib.sha256(out.read_bytes()).hexdigest()
     assert report["manifest"]["declaration"]["input_schema"] == {"n": "int64", "s": "string"}
     assert _check.main([str(out), "--json", "--no-warm-up"]) == 0
-    (checked,) = json.loads(capsys.readouterr().out)["kernels"]
+    (checked,) = json.loads(capsys.readouterr().out)["functions"]
     assert checked["manifest"] == report["manifest"]

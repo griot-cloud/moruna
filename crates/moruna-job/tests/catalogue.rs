@@ -170,7 +170,7 @@ fn jb_t3_add_refusals() {
         matches!(&refused, CatalogueError::Refused { role: Role::Kernel, why } if why.contains("is not a kind name")),
         "{refused}"
     );
-    assert!(refused.to_string().starts_with("not a kernel kind: "));
+    assert!(refused.to_string().starts_with("not a function kind: "));
     broken.name = "fine".into();
     broken.inputs = Flow::Files;
     assert!(matches!(
@@ -302,8 +302,17 @@ fn jb_t5_from_listing() {
         ..listing.clone()
     };
     let refused = Catalogue::from_listing(later).expect_err("another format");
-    assert_eq!(refused, CatalogueError::Format { found: 2 });
-    assert!(refused.to_string().contains("format 2"));
+    assert_eq!(
+        refused,
+        CatalogueError::Format {
+            found: LISTING_VERSION + 1
+        }
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("format {}", LISTING_VERSION + 1))
+    );
 
     let mut twice = listing.clone();
     twice.sources.push(declaration(Role::Source, "s"));

@@ -371,3 +371,105 @@ fn every_kernel_declares_both_halves_releases_the_gil_and_has_a_stable_fingerpri
     assert_eq!(a, b);
     assert_ne!(a, c);
 }
+
+/// `join` (contracts d.16, SDD 10 SC-I18): the morsel of one number from every input, the
+/// columns side by side in port order with the arrays shared, its plan schema without a name a
+/// later input gives again, and refusals that name the ports; it takes no batch on its own.
+#[test]
+fn join_puts_branches_side_by_side() {
+    let join = StdKernel::new("join", &json!({})).expect("join");
+    assert!(join.aligns_inputs());
+    assert_eq!(join.max_inputs(), u16::MAX);
+    assert!(matches!(join.kind(), KernelKind::Stateless));
+    assert!(StdKernel::new("join", &json!({"on": "id"})).is_err());
+    let input = batch();
+    let only = |names: &[&str]| {
+        let indices: Vec<usize> = names
+            .iter()
+            .map(|n| input.schema().index_of(n).expect("a column"))
+            .collect();
+        input.project(&indices).expect("projected")
+    };
+    let (left, right) = (only(&["id", "name"]), only(&["score"]));
+    let planned = join
+        .output_schema_of(&[
+            SourceSchema::Table(left.schema()),
+            SourceSchema::Table(input.schema()),
+        ])
+        .expect("planned");
+    let SourceSchema::Table(planned) = planned else {
+        panic!("a table schema")
+    };
+    assert_eq!(
+        names_of(&planned),
+        names(&input),
+        "a name given again is left out"
+    );
+    assert!(
+        join.output_schema_of(&[
+            SourceSchema::Table(left.schema()),
+            SourceSchema::Tensor {
+                dtype: moruna_kernel::DType::F32,
+                shape: vec![1],
+            },
+        ])
+        .is_err()
+    );
+
+    let mut state = NoState;
+    let table = |b: &RecordBatch| Payload::table(b.clone()).expect("payload");
+    let out = join
+        .apply_aligned(&mut state, vec![table(&left), table(&right)])
+        .expect("joined");
+    let Payload::Table(out, _) = out else {
+        panic!("a table")
+    };
+    assert_eq!(names(&out), ["id", "name", "score"]);
+    assert_eq!(out.num_rows(), 4);
+    assert!(
+        std::ptr::eq(
+            out.column(2).to_data().buffers()[0].as_ptr(),
+            right.column(0).to_data().buffers()[0].as_ptr()
+        ),
+        "the arrays are shared, not copied"
+    );
+
+    let refused = |inputs: Vec<Payload>| {
+        join.apply_aligned(&mut NoState, inputs)
+            .expect_err("refused")
+            .to_string()
+    };
+    let said = refused(vec![
+        table(&left),
+        table(&input.slice(0, 3).project(&[2]).expect("score")),
+    ]);
+    assert!(
+        said.contains("is given 3 rows on its port 1 and 4 on its port 0"),
+        "{said}"
+    );
+    let said = refused(vec![table(&left), table(&only(&["name"]))]);
+    assert!(
+        said.contains("the column `name` on its port 0 and again on its port 1"),
+        "{said}"
+    );
+    assert!(refused(Vec::new()).contains("was given no input"));
+    let said = join
+        .apply_port(&mut NoState, 1, table(&left))
+        .expect_err("one batch alone")
+        .to_string();
+    assert!(said.contains("every input at once"), "{said}");
+    // On its own, as a stage of one input would be, it passes its input on.
+    let alone = run("join", json!({}), &left);
+    assert_eq!(names(&alone), ["id", "name"]);
+    // Every other standard kernel takes its inputs one by one.
+    let cast = StdKernel::new("cast", &json!({"columns": {"id": "double"}})).expect("cast");
+    assert!(!cast.aligns_inputs());
+    assert!(
+        cast.apply_aligned(&mut NoState, vec![table(&left)])
+            .is_err()
+    );
+}
+
+fn names_of(schema: &Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
+}

@@ -1,16 +1,16 @@
-"""``python -m moruna check``: is this a kernel, and what does it cost (MH 4.9).
+"""``python -m moruna check``: is this a function, and what does it cost (MH 4.9).
 
 A ``.wasm`` or ``.pex`` package is checked through its own runtime (SDD 16 f.9), never in
 process, so the verdict is the one a hosted run would give; its fingerprint is the file's.
 
-Loads a module or a file, finds its kernels (decorated functions, standard kernels, and plain
+Loads a module or a file, finds its functions (decorated functions, standard functions, and plain
 functions whose annotated signature is Polars frame to Polars frame), runs each through the
 check harness of ``moruna-runtime`` on synthetic batches from its declared input schema, and
-reports: the verdict, the fingerprint, every refusal naming the column and the types. A kernel
+reports: the verdict, the fingerprint, every refusal naming the column and the types. A function
 that agrees is then warmed up (AR section 6): run at sizes, workers and distinct counts on
 generated data, every unit written to the observation store and the cost model fitted, so the
 report carries what the function costs per 10,000 rows and what warm-up itself consumed. Exit 0
-when every kernel checked agrees with its declaration and was warmed up, 2 otherwise (MH 4.9).
+when every function checked agrees with its declaration and was warmed up, 2 otherwise (MH 4.9).
 
 ``moruna.check(target, ...)`` is the same as a function: it returns the report this command
 prints with ``--json``.
@@ -53,24 +53,28 @@ def _load(target: str) -> Any:
     return importlib.import_module(target)
 
 
-def kernels_of(module: Any, only: str | None = None) -> list[tuple[str, Any]]:
-    """The module's kernels, in definition order: every ``KernelSpec``, every standard kernel,
-    and every function defined in the module whose signature is a Polars frame to a frame,
-    which is wrapped as ``@moruna.kernel`` would wrap it (MH 4.9)."""
-    from moruna import kernel  # noqa: PLC0415, the package imports this module
+def functions_of(module: Any, only: str | None = None) -> list[tuple[str, Any]]:
+    """The module's functions, in definition order, as the extension's objects: every
+    ``@moruna.function``, every standard function, and every function defined in the module
+    whose signature is a Polars frame to a frame, which is wrapped as ``@moruna.function`` would
+    wrap it (MH 4.9)."""
+    from moruna._job import _Handle, function  # noqa: PLC0415, the package imports this module
 
     found: list[tuple[str, Any]] = []
     for name, value in vars(module).items():
         if name.startswith("_") or (only is not None and name != only):
             continue
-        if isinstance(value, _core.KernelSpec | _core.StdKernel):
-            found.append((name, value))
+        if isinstance(value, _Handle) and isinstance(
+            value._handle, _core.KernelSpec | _core.StdKernel
+        ):
+            found.append((name, value._handle))
         elif (
             callable(value)
+            and not isinstance(value, type)
             and getattr(value, "__module__", None) == module.__name__
             and polars_signature(value) is not None
         ):
-            found.append((name, kernel(value)))
+            found.append((name, function(value)._handle))
     return found
 
 
@@ -101,7 +105,7 @@ def _warm_up(
 
 
 def check_one(name: str, value: Any, seed: int, warm: dict[str, Any] | None) -> dict[str, Any]:
-    """One kernel through the harness; the JSON report of MH 4.9 as a dict."""
+    """One function through the harness; the JSON report of MH 4.9 as a dict."""
     return json.loads(
         _core.check_kernel(value, name=name, seed=seed, **({} if warm is None else warm))
     )
@@ -134,7 +138,7 @@ def check_package(
 def check(
     target: str,
     *,
-    kernel: str | None = None,
+    function: str | None = None,
     seed: int = 0,
     warm_up: bool = True,
     store: str | None = None,
@@ -147,8 +151,8 @@ def check(
     args: str | None = None,
     assets: str | None = None,
 ) -> dict[str, Any]:
-    """Check ``target`` (a module name, a ``.py`` file or a package) and warm up each kernel
-    that agrees; the report ``python -m moruna check --json`` prints. Each kernel's
+    """Check ``target`` (a module name, a ``.py`` file or a package) and warm up each function
+    that agrees; the report ``python -m moruna check --json`` prints. Each function's
     ``warm_up.cost_per_10000_rows`` is its fitted cost, every estimate naming its basis;
     ``warm_up.consumed`` is what warm-up took, for an embedder to charge; ``warm_up.error`` says
     why a warm-up could not run.
@@ -176,12 +180,12 @@ def check(
                 )
             )
         else:
-            found = kernels_of(_load(target), kernel)
+            found = functions_of(_load(target), function)
             if not found:
                 error = (
-                    f"no kernel named {kernel!r} in {target}"
-                    if kernel
-                    else f"no kernels in {target}: decorate a function with @moruna.kernel"
+                    f"no function named {function!r} in {target}"
+                    if function
+                    else f"no functions in {target}: decorate a function with @moruna.function"
                 )
             for name, value in found:
                 reports.append(check_one(name, value, seed, warm))
@@ -193,18 +197,18 @@ def check(
         "target": target,
         "exit": code,
         "error": error,
-        "kernels": reports,
+        "functions": reports,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m moruna check",
-        description="Check that a module's kernels agree with their declared schemas, and warm "
+        description="Check that a module's functions agree with their declared schemas, and warm "
         "each one up: what it costs, measured and fitted.",
     )
     parser.add_argument("target", help="a module name, a path to a .py file, or a package")
-    parser.add_argument("--kernel", help="check only the kernel with this name")
+    parser.add_argument("--function", help="check only the function with this name")
     parser.add_argument("--json", action="store_true", help="print the JSON report")
     parser.add_argument("--seed", type=int, default=0, help="seed of the generated batches")
     parser.add_argument(
@@ -230,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result = check(
         args.target,
-        kernel=args.kernel,
+        function=args.function,
         seed=args.seed,
         warm_up=not args.no_warm_up,
         store=args.store,
@@ -245,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        for report in result["kernels"]:
+        for report in result["functions"]:
             print(report["summary"], end="")
         if result["error"]:
             print(f"moruna check: {result['error']}", file=sys.stderr)

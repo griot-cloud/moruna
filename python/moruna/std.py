@@ -1,6 +1,6 @@
-"""Moruna's standard kernels, constructed by arguments rather than written (MH 4.9).
+"""Moruna's standard functions, constructed by arguments rather than written (MH 4.9).
 
-Each function returns a kernel object ``moruna.run`` takes wherever it takes a decorated one::
+Each returns a ``moruna.Function``, which a job takes wherever it takes a decorated one::
 
     import moruna
 
@@ -13,7 +13,7 @@ Each function returns a kernel object ``moruna.run`` takes wherever it takes a d
         sink,
     )
 
-The kernels are written in Rust. None of them enters the interpreter, so a chain of them never
+The functions are written in Rust. None of them enters the interpreter, so a chain of them never
 takes the GIL, and two adjacent ones are fused into one stage where their combination is one
 operation (``select`` after ``cast``, and any run of ``cast``, ``rename``, ``select`` and
 ``drop``, is one projection; ``filter`` after ``fill_null`` is one pass). Each declares its
@@ -39,15 +39,19 @@ __all__ = [
     "fill_null",
     "filter",
     "hash",
+    "join",
     "mask",
     "rename",
     "select",
+    "union",
 ]
 
 
 def _build(name: str, args: dict[str, Any]) -> Any:
+    from moruna._job import _wrap  # noqa: PLC0415, the package imports this module
+
     present = {k: v for k, v in args.items() if v is not None}
-    return _core.std_kernel(name, json.dumps(present, sort_keys=True))
+    return _wrap(_core.std_kernel(name, json.dumps(present, sort_keys=True)))
 
 
 def _names(value: str | Sequence[str]) -> list[str]:
@@ -78,7 +82,7 @@ def drop(columns: str | Sequence[str]) -> Any:
     return _build("drop", {"columns": _names(columns)})
 
 
-def filter(expr: str) -> Any:  # noqa: A001, the name is the kernel's
+def filter(expr: str) -> Any:  # noqa: A001, the name is the function's
     """Keep the rows where ``expr`` is true.
 
     ``expr`` compares columns with literals or with each other (``==``, ``!=``, ``<``, ``<=``,
@@ -98,7 +102,7 @@ def dedupe(keys: str | Sequence[str]) -> Any:
     return _build("dedupe", {"keys": _names(keys)})
 
 
-def hash(  # noqa: A001, the name is the kernel's
+def hash(  # noqa: A001, the name is the function's
     columns: str | Sequence[str], algo: str | None = None, output: str | None = None
 ) -> Any:
     """Append ``output`` (default ``"hash"``): a hex digest, ``sha256`` (the default) or
@@ -132,3 +136,19 @@ def date_trunc(column: str, unit: str, output: str | None = None) -> Any:
     """Truncate a timestamp or date32 column to ``year``, ``month``, ``day``, ``hour``,
     ``minute`` or ``second`` (in UTC), in place or into a new column ``output``."""
     return _build("date_trunc", {"column": column, "unit": unit, "output": output})
+
+
+def join() -> Any:
+    """Join branches of one upstream side by side: for each morsel, the columns every input
+    gives for it, port order, in one batch with that morsel's rows. A function of a ``moruna.Job``
+    with several inputs (``inputs=[a, b]``), each a branch of the same upstream through
+    functions that keep its rows and their order. A row count that differs between inputs, or a
+    column two inputs both give, is refused naming the ports; drop or rename such a column in a
+    branch before the join."""
+    return _build("join", {})
+
+
+def union() -> Any:
+    """Pass on the batches of every input, each as it came; every input has one schema. A
+    function of a ``moruna.Job`` with several inputs."""
+    return _build("union", {})
