@@ -474,10 +474,12 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
                     &wire,
                     None,
                     None,
-                    exit::CANCELLED,
-                    Some("cancelled before a spec arrived".to_string()),
+                    crate::report_doc::Exit {
+                        code: exit::CANCELLED,
+                        diagnostic: Some("cancelled before a spec arrived".to_string()),
+                    },
                     None,
-                    None,
+                    (None, None),
                 );
             }
             Ok(Inbound::Checkpoint) => {
@@ -564,10 +566,12 @@ fn run_planned(
                 wire,
                 None,
                 None,
-                exit_code(&error),
-                Some(diagnostic(&error)),
+                crate::report_doc::Exit {
+                    code: exit_code(&error),
+                    diagnostic: Some(diagnostic(&error)),
+                },
                 None,
-                None,
+                (None, None),
             );
         }
     };
@@ -589,13 +593,15 @@ fn run_planned(
                 wire,
                 Some(&file),
                 Some((&fallback_id.to_hex(), &digest)),
-                exit_code(&error),
-                Some(format!(
-                    "the run's events have no producer id: {}",
-                    diagnostic(&error)
-                )),
+                crate::report_doc::Exit {
+                    code: exit_code(&error),
+                    diagnostic: Some(format!(
+                        "the run's events have no producer id: {}",
+                        diagnostic(&error)
+                    )),
+                },
                 None,
-                None,
+                (None, None),
             );
         }
     };
@@ -615,15 +621,15 @@ fn run_planned(
                 packages: opts.packages.clone(),
                 host_ports: host_ports.clone(),
                 pulled_images: opts.pulled_images.clone(),
-                args: run_args,
+                args: run_args.clone(),
                 held: Vec::new(),
             },
         ) {
-            Ok(built) => Ok((plan, built)),
+            Ok(built) => Ok((plan, built, run_args)),
             Err(error) => Err((Some(plan), error)),
         },
     };
-    let (plan, built) = match built {
+    let (plan, built, run_args) = match built {
         Ok(built) => built,
         Err((plan, error)) => {
             // Refused before a stage exists: the document's tasks as it names them, each skipped,
@@ -655,12 +661,20 @@ fn run_planned(
                 wire,
                 Some(&file),
                 Some((&fallback_id.to_hex(), &digest)),
-                exit_code(&error),
-                Some(diagnostic(&error)),
+                crate::report_doc::Exit {
+                    code: exit_code(&error),
+                    diagnostic: Some(diagnostic(&error)),
+                },
                 None,
-                None,
+                (None, None),
             );
         }
+    };
+    let mut context = crate::report_doc::ReportContext {
+        plan: Some(plan.to_value()),
+        trace_path: job.trace.as_deref().map(PathBuf::from),
+        args: run_args.into_iter().collect(),
+        ..crate::report_doc::ReportContext::of(&job, &built)
     };
     // One task per stage: fused standard kernels are one group (MH 4.9).
     let layout = Layout::of(&job, Some(&built.parts));
@@ -717,10 +731,12 @@ fn run_planned(
                 wire,
                 Some(&file),
                 Some((&fallback_id.to_hex(), &digest)),
-                exit_code(&error),
-                Some(diagnostic(&error)),
+                crate::report_doc::Exit {
+                    code: exit_code(&error),
+                    diagnostic: Some(diagnostic(&error)),
+                },
                 None,
-                None,
+                (None, None),
             );
         }
     };
@@ -840,8 +856,13 @@ fn run_planned(
                 })
             })()
         };
+        let mut store = None;
         let result = match services {
             Ok(mut components) => {
+                store = components
+                    .learning
+                    .as_ref()
+                    .map(|learning| learning.online.store().clone());
                 components.run_id = Some(run_id);
                 components.observer = Some(observer);
                 components
@@ -853,20 +874,20 @@ fn run_planned(
             }
             Err(error) => Err(crate::error::RunError::bare(error)),
         };
-        (run_id, file, result)
+        (run_id, file, result, store)
     }));
     stop.store(true, Ordering::SeqCst);
     if let Some(beat) = beat {
         let _ = beat.join();
     }
     match &driven {
-        Ok((_, _, Ok(_))) => lifecycle.end(Ending::Completed),
-        Ok((_, _, Err(failure)))
+        Ok((_, _, Ok(_), _)) => lifecycle.end(Ending::Completed),
+        Ok((_, _, Err(failure), _))
             if matches!(failure.error, MorunaError::Cancelled) && opts.cancel.is_cancelled() =>
         {
             lifecycle.end(Ending::Cancelled)
         }
-        Ok((_, _, Err(failure))) => lifecycle.end(Ending::Failed(&failure.error)),
+        Ok((_, _, Err(failure), _)) => lifecycle.end(Ending::Failed(&failure.error)),
         Err(panic) => lifecycle.end(Ending::Crashed(&panic_message(&**panic))),
     }
     // Output that came after its task ended is still its task's: the last of it is written
@@ -888,10 +909,11 @@ fn run_planned(
     // result (12 d.1) nor an exit code (MH 4.2) names a defect of Moruna's own, and a crash is
     // never told as one of them. The process that ran Moruna sees the panic, as it would have
     // with no session.
-    let (run_id, file, result) = match driven {
+    let (run_id, file, result, store) = match driven {
         Ok(driven) => driven,
         Err(panic) => std::panic::resume_unwind(panic),
     };
+    context.store = store;
     let (code, diagnostic, report) = match result {
         Ok(report) => (exit::COMPLETED, None, Some(report)),
         Err(error) => {
@@ -910,10 +932,9 @@ fn run_planned(
         wire,
         Some(&file),
         Some((&run_id.to_hex(), &digest)),
-        code,
-        diagnostic,
+        crate::report_doc::Exit { code, diagnostic },
         report,
-        ran,
+        (ran, Some(&context)),
     )
 }
 
@@ -946,33 +967,32 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     "Moruna panicked with something other than text".to_string()
 }
 
-/// The report file, then `report` and `exit` (MH 4.1, f.5).
+/// The report file, then `report` and `exit` (MH 4.1, f.5): the report document (schema 2.0,
+/// `crate::report_doc`) in its canonical bytes, the same document `moruna.run` returns.
 fn finish(
     wire: &Arc<Wire>,
     file: Option<&Path>,
     identity: Option<(&str, &str)>,
-    code: i32,
-    diagnostic: Option<String>,
+    exit: crate::report_doc::Exit,
     mut report: Option<RunReport>,
-    plan: Option<PlanRun>,
+    (plan, context): (Option<PlanRun>, Option<&crate::report_doc::ReportContext>),
 ) -> Outcome {
     let notes = wire.take_notes();
     if let Some(report) = report.as_mut() {
         report.notes.extend(notes.iter().cloned());
     }
+    let (run_id, digest) = identity.unwrap_or(("", ""));
+    let identity = (run_id, (!digest.is_empty()).then_some(digest));
+    let mut document = crate::report_doc::document(identity, report.as_ref(), &exit, context);
+    if report.is_none()
+        && let Some(serde_json::Value::Array(kept)) = document.get_mut("notes")
+    {
+        kept.extend(notes.iter().cloned().map(serde_json::Value::String));
+    }
+    let bytes = moruna_job::canonical_json(&document).into_bytes();
     let mut written = None;
     if let Some(path) = file {
-        let (run_id, digest) = identity.unwrap_or(("", ""));
-        let envelope = envelope(
-            run_id,
-            digest,
-            code,
-            diagnostic.as_deref(),
-            report.as_ref(),
-            plan.as_ref(),
-            &notes,
-        );
-        match write_file(path, &envelope) {
+        match write_file(path, &bytes) {
             Ok(()) => written = Some(path.to_path_buf()),
             Err(error) => wire.note(format!(
                 "the report file {} could not be written: {error}",
@@ -980,12 +1000,13 @@ fn finish(
             )),
         }
     }
-    if let Some(report) = &report {
+    if report.is_some() {
         wire.send(&Outbound::Report {
-            report: serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            report: document,
             plan: plan.as_ref().and_then(|p| serde_json::to_value(p).ok()),
         });
     }
+    let crate::report_doc::Exit { code, diagnostic } = exit;
     wire.send(&Outbound::Exit {
         code,
         diagnostic: diagnostic.clone(),
@@ -1033,10 +1054,12 @@ fn refused_without_document(
         wire,
         file.as_deref(),
         Some((&run_id, "")),
-        exit::SPEC_REFUSED,
-        Some(refusal.to_string()),
+        crate::report_doc::Exit {
+            code: exit::SPEC_REFUSED,
+            diagnostic: Some(refusal.to_string()),
+        },
         None,
-        None,
+        (None, None),
     )
 }
 
@@ -1198,43 +1221,15 @@ fn path_for(file: Option<&str>, staging_dir: Option<&str>, run_id: &str) -> Path
     }
 }
 
-/// The report file's content (MH 4.1).
-fn envelope(
-    run_id: &str,
-    digest: &str,
-    code: i32,
-    diagnostic: Option<&str>,
-    report: Option<&RunReport>,
-    plan: Option<&PlanRun>,
-    notes: &[String],
-) -> serde_json::Value {
-    serde_json::json!({
-        "moruna_report": 1,
-        "run_id": run_id,
-        "spec_digest": if digest.is_empty() { serde_json::Value::Null } else { digest.into() },
-        "exit": { "code": code, "diagnostic": diagnostic },
-        "host_notes": notes,
-        "report": match report {
-            Some(r) => serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
-            None => serde_json::Value::Null,
-        },
-        "plan": match plan {
-            Some(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
-            None => serde_json::Value::Null,
-        },
-    })
-}
-
 /// Write through a temporary file and a rename, so a reader never sees half a report.
-fn write_file(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    let text = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text.as_bytes())?;
+    std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
 

@@ -6,15 +6,19 @@ The `moruna` command is installed with the Python package. Run `moruna --help` f
 
 ```text
 moruna run JOB [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan PLAN.mplan] [--strict]
+           [--cost-store DIR] [--cost-model NAME]
 moruna run --vm JOB --image IMAGE [--disk PATH[:ro|:rw]]...
 ```
 
 Runs the job described in `JOB`, a job document (version 2 FlatBuffers, such as a `moruna.Job`'s spec, or version 1 JSON), and exits when it ends, printing one line with the exit code and the report's location.
 
+The report file is the [run report](run-report.md), schema 2.0, in its canonical bytes: the same document `moruna.run` returns and a writer port writes, which `moruna.RunReport.from_bytes(path)` reads back. It is written for every run, a refused one too; one refused before it started has its identity, its `exit` (`status` `"refused"`), its notes and each task `skipped`. The trace, when the document sets `trace`, is a file of its own (`trace_path`).
+
 - `--arg NAME=VALUE` gives a run argument the job declares, read by its declared type; every declared argument must be given, and a missing one, one that does not read as its type and one the job does not declare are refused (exit 2), naming each.
 - `--resolver MODULE:ATTRIBUTE` names the `moruna.Resolver` (or a callable that returns one) that supplies what the job's image tasks need: for each need, a callable taking the request's bytes and returning the answer's, which the run serves as a port ([Images and ports](images.md#the-port-protocol)), and for a registry the job's images are pulled from, its credentials as the need `registry:<HOST>`. A need the resolver cannot supply, or any need without `--resolver`, refuses the document (exit 2), naming the task and the need.
 - A spec whose image tasks are not built (a draft) is refused (exit 2), naming every unbuilt task; the registry images a runnable spec names are pulled into `~/.cache/moruna/images` before the run starts, every digest checked.
 
+- `--cost-store DIR` keeps what the run measures in the observation store at `DIR` (by default `~/.moruna/observations` when `--cost-model` is given), from which the cost model learns, and each task's recommendation in the report draws on every run of it the store holds; `--cost-model NAME` chooses the model (`loglinear` by default).
 - `--plan` runs the job by a plan `moruna explain --out` wrote, instead of the plan Moruna makes for it. A plan of another job, or one that is not a plan of this job, is refused before anything runs.
 - `--strict` refuses a document that would take any setting from an environment variable, naming the setting.
 - `--vm` runs the job in a virtual machine with no network; Linux with KVM only. `--image` is the guest image directory or OCI layout, and each `--disk` attaches a disk image, read-only with `:ro`. See [An isolated virtual machine](hosting.md#an-isolated-virtual-machine).
@@ -104,7 +108,7 @@ Moruna sends:
 | `hello` | On connecting | `moruna_version`, `spec_digest`, `limits` |
 | `heartbeat` | At least every 2 seconds | `t_ms`, `committed_seq`, `rows_out`, `bytes_out`, `active_workers`, `ceiling_bytes`, `anon_bytes`, `bottleneck`, `staging_bytes` |
 | `limits_changed` | When the machine's memory or cores change | `old`, `new`, `reason` (`memory` or `cpu`) |
-| `report` | Before exiting, if the job produced a report | `report`, the full run report |
+| `report` | Before exiting, if the job produced a report | `report`, the run report the report file holds; `plan`, how the run went against its plan: the order its steps started in, each step's start, end and use, and every deviation |
 | `exit` | Last | `code`, and `diagnostic` when the code is not 0 |
 
 The peer sends:

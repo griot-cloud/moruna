@@ -120,9 +120,9 @@ fn run(in_use: &mut InUse, store: &dyn ObservationStore, rng: &mut Rng, units: u
         in_use.observe(&k, &inputs, &outcome);
         let observation = Observation::settled(
             k.clone(),
-            inputs,
-            outcome,
+            (inputs, outcome),
             n,
+            None,
             in_use.deciding().id(),
             Some(&prediction),
         );
@@ -342,9 +342,9 @@ fn cm_t17_shadow_mode() {
     plain.observe(&k, &batch(1e3), &Outcome::new(Origin::WarmUp));
     let observation = Observation::settled(
         k.clone(),
-        batch(1e3),
-        Outcome::new(Origin::WarmUp),
+        (batch(1e3), Outcome::new(Origin::WarmUp)),
         1,
+        None,
         plain.deciding().id(),
         None,
     );

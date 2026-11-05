@@ -427,6 +427,21 @@ impl SinkOutcome {
     }
 }
 
+/// What identifies every part of a run, which its cost keys are made of
+/// ([`RunReport::part_digests`]): each part's schema hash, in place order, and each kernel
+/// stage's fingerprint.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartDigests {
+    /// Each source's output schema; `None` where the run resolved none.
+    pub source_schemas: Vec<Option<[u8; 32]>>,
+    /// Each kernel stage's input schema, stage 1 first.
+    pub stage_schemas: Vec<Option<[u8; 32]>>,
+    /// Each kernel stage's kernel fingerprint, stage 1 first.
+    pub stage_fingerprints: Vec<[u8; 32]>,
+    /// Each sink's input schema.
+    pub sink_schemas: Vec<Option<[u8; 32]>>,
+}
+
 /// One stage's row of the report (d.1, f.2).
 #[derive(Clone, Debug, Serialize)]
 pub struct StageReport {
@@ -594,6 +609,12 @@ pub struct RunReport {
     /// the run never started its scheduler.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+    /// What identifies each part of the run, as the run resolved it: a source's schema is the
+    /// one it gives, a stage's its first input's, a sink's the one it is given; a stage's
+    /// fingerprint is its kernel's. Filled by the facade that knows them; empty when none did.
+    /// The cost model's key is made of them (`CostKey::schema`, `CostKey::fingerprint`).
+    #[serde(skip)]
+    pub part_digests: PartDigests,
 }
 
 /// `SinkWrite` is the contracts' type (d.8); serialised here as `{"engine", "report"}`, the
@@ -1109,6 +1130,7 @@ impl RunReport {
                 .collect(),
             buffers: meta.buffers.clone(),
             policy: meta.policy.clone(),
+            part_digests: PartDigests::default(),
         }
     }
 

@@ -93,6 +93,11 @@ pub struct Built {
     pub sink_targets: Vec<String>,
     /// The ports each task calls, by its place in the job: what the report counts per need.
     pub task_ports: Vec<(usize, Arc<StagePorts>)>,
+    /// What identifies each task's code, by its place in the job, as its cost key names it: an
+    /// image task's build key ([`crate::cost::image_identity`]), else its kind's declaration
+    /// ([`crate::cost::declaration_identity`]); a kernel stage's kernel fingerprint stands
+    /// for a built-in kernel's (its program).
+    pub identities: Vec<moruna_cost::Digest>,
 }
 
 /// The fields of `job` left `null` that an environment variable would fill (MH 4.1).
@@ -238,6 +243,15 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         };
         declared.push(found);
     }
+    let identities: Vec<moruna_cost::Digest> = job
+        .tasks
+        .iter()
+        .zip(&declared)
+        .map(|(task, found)| {
+            crate::cost::image_identity(task)
+                .unwrap_or_else(|| crate::cost::declaration_identity(found))
+        })
+        .collect();
 
     // KD-I6, 16 PK-I8: a hosted run loads no code by import path.
     if opts.strict {
@@ -534,6 +548,7 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         parts,
         sink_targets,
         task_ports: port_tasks,
+        identities,
     })
 }
 

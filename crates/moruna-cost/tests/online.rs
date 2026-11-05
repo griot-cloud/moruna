@@ -42,7 +42,7 @@ fn stream(online: &Online, k: &CostKey, rng: &mut Rng, units: u64, per_row: f64,
             errors.push((p50 / o.duration.expect("measured") - 1.0).abs());
         }
         online
-            .settle(k, &inputs, Some(&prediction), &o, n)
+            .settle(k, &inputs, Some(&prediction), &o, n, None)
             .expect("settles");
     }
     errors.sort_by(f64::total_cmp);
@@ -109,7 +109,7 @@ fn cm_t40_a_run_learns_online_and_writes_off_the_hot_path() {
 
     let mut bad = Outcome::new(Origin::Run);
     bad.set(Target::Duration, f64::NAN);
-    let refused = online.settle(&k, &batch(1e3), None, &bad, 1).err();
+    let refused = online.settle(&k, &batch(1e3), None, &bad, 1, None).err();
     assert!(
         matches!(refused, Some(CostError::Invalid(_))),
         "{refused:?}"
@@ -167,7 +167,7 @@ fn cm_t41_drift_is_found_widens_forgets_and_settles() {
         }
         plain.observe(&k, &inputs, &o);
         online
-            .settle(&k, &inputs, Some(&prediction), &o, 200 + n)
+            .settle(&k, &inputs, Some(&prediction), &o, 200 + n, None)
             .expect("settles");
         if began.is_none() && online.is_drifting(&k) {
             began = Some(n + 1);
@@ -203,7 +203,7 @@ fn cm_t41_drift_is_found_widens_forgets_and_settles() {
         let prediction = online.predict(&k, &inputs);
         let o = outcome(&mut rng, rows, 3e-6);
         online
-            .settle(&k, &inputs, Some(&prediction), &o, 300 + n)
+            .settle(&k, &inputs, Some(&prediction), &o, 300 + n, None)
             .expect("settles");
         if !online.is_drifting(&k) {
             settled = Some(n);
@@ -512,7 +512,7 @@ fn cm_t44_concurrent_flushes_preserve_order_and_accounting() {
     measured.set(Target::Duration, 1e-6);
     for at in 0..2 {
         online
-            .settle(&k, &inputs, None, &measured, at)
+            .settle(&k, &inputs, None, &measured, at, None)
             .expect("settles");
     }
     let first_online = Arc::clone(&online);
@@ -520,7 +520,7 @@ fn cm_t44_concurrent_flushes_preserve_order_and_accounting() {
     gate.wait_until_waiting();
     for at in 2..4 {
         online
-            .settle(&k, &inputs, None, &measured, at)
+            .settle(&k, &inputs, None, &measured, at, None)
             .expect("settles");
     }
     assert_eq!(online.pending(), 2);
@@ -558,4 +558,42 @@ fn cm_t44_concurrent_flushes_preserve_order_and_accounting() {
     );
     assert!(report.store_error.is_none());
     std::fs::remove_dir_all(&root).expect("removes own scratch");
+}
+
+/// A settled unit names the run that measured it, when the run is given, and a key's history
+/// counts the distinct runs its records name: what a report's recommendation says it drew on.
+#[test]
+fn a_unit_names_its_run_and_a_history_counts_runs() {
+    let root = scratch("runs");
+    let store = Arc::new(LocalStore::open(&root).expect("opens"));
+    let online = Online::new(InUse::new(loglinear(), None), store.clone());
+    let k = key("std", 9);
+    let inputs = batch(1e3);
+    let mut measured = Outcome::new(Origin::Run);
+    measured.set(Target::Duration, 1e-3);
+    let (first, second): (Arc<str>, Arc<str>) = (Arc::from("run-1"), Arc::from("run-2"));
+    for (at, run) in [
+        (1, Some(&first)),
+        (2, Some(&first)),
+        (3, Some(&second)),
+        (4, None),
+    ] {
+        online
+            .settle(&k, &inputs, None, &measured, at, run)
+            .expect("settles");
+    }
+    online.flush().expect("flushes");
+    let history = store.scan(&k).expect("scans");
+    let runs: Vec<Option<&str>> = history
+        .observations
+        .iter()
+        .map(|o| o.run.as_deref())
+        .collect();
+    assert_eq!(runs, [Some("run-1"), Some("run-1"), Some("run-2"), None]);
+    assert_eq!(
+        history.runs(),
+        2,
+        "a record that names no run is not counted"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

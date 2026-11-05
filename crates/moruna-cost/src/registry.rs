@@ -241,17 +241,18 @@ impl InUse {
 }
 
 impl Observation {
-    /// The record of a settled unit: decided by `model`, with what each model in use predicted
-    /// for it, the deciding model's first (section 5.2).
+    /// The record of a settled unit of `run`: decided by `model`, with what each model in use
+    /// predicted for it, the deciding model's first (section 5.2).
     pub fn settled(
         key: CostKey,
-        inputs: Inputs,
-        outcome: Outcome,
+        (inputs, outcome): (Inputs, Outcome),
         at_ms: u64,
+        run: Option<String>,
         model: ModelId,
         prediction: Option<&Prediction>,
     ) -> Observation {
         let mut observation = Observation::new(key, inputs, outcome, at_ms);
+        observation.run = run;
         observation.model = Some(model);
         if let Some(p) = prediction {
             observation.predictions.push(p.deciding.clone());

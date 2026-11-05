@@ -125,11 +125,13 @@ impl Scheduler {
     /// weighs is predicted by the deciding model, every unit that finishes is settled into it,
     /// and what was learned is written to the store as the run goes and at its end. Refused
     /// once the run has started, when a model is set already, or when the keys are not one per
-    /// kernel stage.
+    /// kernel stage. Every unit settled names `run`, when it is given, so a reader of the store
+    /// counts runs as well as units.
     pub fn set_cost(
         &self,
         online: Arc<moruna_cost::Online>,
         keys: Vec<moruna_cost::CostKey>,
+        run: Option<Arc<str>>,
     ) -> Result<()> {
         if self.shared.run_state() != shared::RunState::Init {
             return Err(MorunaError::Config {
@@ -137,7 +139,7 @@ impl Scheduler {
                 msg: "the cost model is set before the run starts".into(),
             });
         }
-        let learning = learning::Learning::new(online, keys, self.shared.stages.len())?;
+        let learning = learning::Learning::new(online, keys, run, self.shared.stages.len())?;
         self.shared
             .learning
             .set(learning)

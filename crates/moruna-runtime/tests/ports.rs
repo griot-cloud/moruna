@@ -690,19 +690,15 @@ fn waits_and_keeps_heartbeating(name: &str, wait: Duration) {
         .count();
     assert!(waited >= HELD, "{waited} waits told");
     let report = report_file(scratch.path());
-    let timeline = report["report"]["bottleneck_timeline"].to_string();
+    let timeline = report["bottleneck_timeline"].to_string();
     assert!(timeline.contains("Waiting"), "{timeline}");
     // Its manifests kept being written while its one instance was busy: no write failed for
     // it, or the run would have ended (10 f.12: three in a row end it).
     assert!(
-        report["report"]["notes"]
-            .as_array()
+        report["notes"].as_array().unwrap().iter().all(|n| !n
+            .as_str()
             .unwrap()
-            .iter()
-            .all(|n| !n
-                .as_str()
-                .unwrap()
-                .contains("busy for the whole checkpoint")),
+            .contains("busy for the whole checkpoint")),
         "{report}"
     );
     let _ = std::fs::remove_file(&socket);
@@ -892,7 +888,7 @@ fn po_t8_a_resumed_run_restores_a_stages_state_bytes() {
     );
     let report = report_file(scratch.path());
     assert_eq!(code, exit::COMPLETED, "{}", report["exit"]);
-    assert_eq!(report["report"]["resumed"], true);
+    assert_eq!(report["resumed"], true);
     let first = messages
         .iter()
         .find(|(_, m)| m["type"] == "port_call")

@@ -1,6 +1,6 @@
 # The run report
 
-Every job produces a run report, computed from a record Moruna keeps of every morsel. `moruna.run` returns it, a failed job attaches it to its exception as `error.report`, and the `moruna` command writes it to a file. Printing a report gives a summary; `report.bytes()` is its canonical form, every field, with its digest `report.digest()` (see [Results and errors](python-results.md)). The report gives a screen and any host enough to show each task, and to decide how to run it better the next time.
+Every job produces a run report, computed from a record Moruna keeps of every morsel. `moruna.run` returns it, a failed job attaches it to its exception as `error.report`, and `moruna run` writes it to its report file and sends it in the host protocol's `report` message ([The command line](cli.md)): one document, in the same canonical bytes, however the run was started. Printing a report gives a summary; `report.bytes()` is its canonical form, every field, with its digest `report.digest()` (see [Results and errors](python-results.md)). The report gives a screen and any host enough to show each task, and to decide how to run it better the next time.
 
 ## The schema
 
@@ -38,11 +38,11 @@ The trace's own fields follow the same rule: a field it measures in seconds, nan
 | `job_digest` | The digest of the job's spec, `sha256:` and hex; `null` for a job a spec cannot hold. |
 | `args` | The run's argument values, by name. |
 | `host` | Where it ran: `platform` (`os/arch`), `cpus`, `memory_limit_bytes`, `cpu_quota_cores`, `limits_source` and `devices`. |
-| `exit` | `code`, `status` (`"completed"`, `"terminated"` or `"cancelled"`) and `diagnostic`, the reason the job stopped. |
+| `exit` | `code`, `status` (`"completed"`, `"terminated"`, `"cancelled"`, or `"refused"` when the document, its budget or its resume was refused before the run started) and `diagnostic`, the reason the job stopped. A run refused before it started has no trace: its document has its identity, `exit`, `notes`, `args`, `plan` and each task `skipped`. |
 | `tasks` | One entry per task, in the spec's order; see below. |
 | `resources` | `cpu_core_s`, `peak_memory_bytes` (the whole process's) and `memory_basis`, how it was measured. |
 | `sinks` | Per sink: its `task`, its `target`, `rows`, `bytes`, `files`, `excluded_rows`, and the `snapshot_id` and `version` it committed (every committing sink names its snapshot). |
-| `plan` | The plan the run started from, when asked for (`explain=True`); `null` otherwise. |
+| `plan` | The plan the run started from: `moruna run` always reports it, `moruna.run` when asked for (`explain=True`); `null` otherwise. |
 | `plan_steps` | With a plan, each step's actual start and end: `step`, `tasks`, `started_at_ms`, `ended_at_ms`, so the parallelism the run achieved shows beside the plan's groups. |
 | `resumed`, `manifest` | Whether the job continued from a checkpoint, and the latest checkpoint kept. |
 | `wall_ms` | From start to finish. |
@@ -79,8 +79,18 @@ Each task's `key` is exactly its name in the spec: a host joins a report to the 
 | `input_wait_ms`, `output_wait_ms` | Between two of its morsels, the time its instances waited for the next input to be ready, and the time they waited with it ready (held back by memory admission or a full queue downstream), summed over instances. |
 | `needs` | Per need: `calls`, `bytes_in`, `bytes_out` and `time_ms`. A task this process ran is measured through the object the resolver supplied; an image task at its port. |
 | `planned` | With a plan: its `step`, the plan's prediction per morsel (`duration_ms` and `memory_bytes`, each `p50`, `p95`, `basis` and `observations`), and what was observed per morsel beside it. |
-| `observation` | Its measurement in the form the cost model stores (`moruna-cost`): `key` (`role`, `kind`, `settings`), `outcome` (`origin`, and per morsel `duration`, `worker_time`, `peak_memory`, `rows_out`, `bytes_out`, `state_growth`, in seconds and bytes as the store keeps them) and `units`, the morsels it is the mean of, so another host can aggregate it across runs. |
-| `recommendation` | For the next run: `memory` (`value_bytes`), `cpu` (`value_cores`) and `instances` (`value`), each with its `basis` as data: the statistic and percentile it used, what was observed, how many observations and runs it drew on, and, when the plan predicted it, `last_prediction_error_ratio`. |
+| `observation` | Its measurement in the form the cost model stores (`moruna-cost`); see below. |
+| `recommendation` | For the next run: `memory` (`value_bytes`), `cpu` (`value_cores`), `instances` (`value`) and `morsel_duration_ms` (`p50`, `p95`), each with its `basis` as data; see below. |
+
+### Observations and recommendations
+
+A task's `observation` is what the cost model keeps of it, under its full cost key, so the observations of one task from different runs aggregate:
+
+- `key`: `role`, `kind`, `fingerprint` (the code it runs: an image task's build key, or its manifest's digest for an image Moruna did not build; a built-in function's kernel fingerprint, its program; a built-in source's or sink's, the digest of its kind's declaration in the catalogue), `settings` (the digest of its settings, as registration digests them) and `schema` (the hash of the schema it takes in; a source's, the schema it gives). A function fused with others is observed as its stage, kind `fused`, on the stage's first task; the others have none.
+- `run`: the run that measured it.
+- `unit` and `outcome`: a function's unit is one morsel (`"morsel"`), and `outcome` is the mean of its `units` morsels: `origin`, `duration` and `worker_time` in seconds, `rows_out`, `bytes_out` and `state_growth`, as the store keeps a unit. A morsel's memory is not measured in a shared process, so it has none. A source's or a sink's unit is the run (`"run"`): the rows and bytes it gave or wrote.
+
+A function's `recommendation` says, in each entry's `basis`, what it drew on. `source` is `"store"` when the run kept its measurements in an observation store (`moruna run --cost-store`, `moruna.run(cost=...)`) and the store holds the task's key: the entry then draws on every record of the key the store keeps, across runs, with `runs` (the distinct runs those records name), `observations` (the records) and `summarised_observations` (older records the store keeps only as a summary). `source` is `"this_run"` otherwise, with `runs` 1 and `observations` the morsels. `memory` is always this run's (the store keeps no memory of a unit): the task's peak, `statistic` `peak`, `percentile` 100, and, when the plan predicted it, `last_prediction_error_ratio`. `cpu` from the store is the cores one instance used over every stored unit (`observed_worker_ms` over `observed_duration_ms`) times the `instances` this run needed. `morsel_duration_ms` from the store is the median and 95th percentile of every stored unit's duration.
 
 `alloc` has `refusal_on` (whether a request past the memory ceiling would be refused, the decorator's `memory_guard`), then one entry each for `python` (Python objects), `numpy` (NumPy arrays) and `arrow` (pyarrow's memory pool), each with `requested_bytes`, `requests`, `largest_request_bytes`, `peak_bytes` (the most one call held at once) and `refused`, and finally `peak_bytes`, `outside_arrow_peak_bytes` and `outside_arrow_fraction`.
 

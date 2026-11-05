@@ -99,3 +99,44 @@ def test_the_pyclasses_are_frozen(dataset: tuple[str, str, int]) -> None:
         except AttributeError:
             continue
         raise AssertionError(f"{type(obj).__name__} accepted an attribute")
+
+
+def test_observations_aggregate_across_runs_in_the_store(
+    dataset: tuple[str, str, int], scratch, small_sink, staging
+) -> None:  # noqa: ANN001
+    """A task's observation carries its full cost key, the same in every run of the same code;
+    with an observation store, its recommendation draws on every run the store holds and says
+    how many; without one, on this run only."""
+    src_url, out_url, _ = dataset
+    cost = moruna.CostSession(str(scratch / "observations"))
+
+    def function_task(report: moruna.RunReport) -> dict:
+        return next(t for t in report.to_dict()["tasks"] if t["role"] == "function")
+
+    alone = function_task(
+        moruna.run(moruna.ParquetSource(src_url), identity, small_sink(out_url), **staging)
+    )
+    assert alone["recommendation"]["cpu"]["basis"]["source"] == "this_run"
+    assert alone["recommendation"]["cpu"]["basis"]["runs"] == 1
+
+    seen = []
+    for i in range(2):
+        report = moruna.run(
+            moruna.ParquetSource(src_url),
+            identity,
+            small_sink(f"{out_url}_{i}"),
+            cost=cost,
+            **staging,
+        )
+        seen.append((report.run_id, function_task(report)))
+    (first_run, first), (second_run, second) = seen
+    key = first["observation"]["key"]
+    assert set(key) == {"role", "kind", "fingerprint", "settings", "schema"}
+    assert key == second["observation"]["key"] == alone["observation"]["key"]
+    assert first["observation"]["run"] == first_run
+    assert second["observation"]["run"] == second_run
+    assert first["recommendation"]["cpu"]["basis"]["source"] == "store"
+    assert first["recommendation"]["cpu"]["basis"]["runs"] == 1
+    assert second["recommendation"]["cpu"]["basis"]["runs"] == 2
+    assert second["recommendation"]["morsel_duration_ms"]["basis"]["runs"] == 2
+    assert second["recommendation"]["memory"]["basis"]["source"] == "this_run"

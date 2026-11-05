@@ -35,17 +35,11 @@ def decorated(batch):
 
 def _projection(report: dict) -> dict:
     return {
-        # The command's report names the exit as the trace does; the library's report as a
-        # code and a status.
-        "exit": report["exit"]["status"] if isinstance(report["exit"], dict)
-        else report["exit"].lower(),
+        "exit": report["exit"]["status"],
         "resumed": report["resumed"],
         "limits": (report["limits_initial"]["memory_ceiling"], report["limits_initial"]["cpu_quota"]),
         "gil_serialised": report["gil_serialised"],
-        # The command's report is the trace's, by stage; the library's is by task.
-        "functions": [(s["rows_in"], s["rows_out"]) for s in report["stages"]]
-        if "stages" in report
-        else [(t["rows_in"], t["rows_out"]) for t in report["tasks"] if t["role"] == "function"],
+        "functions": [(t["rows_in"], t["rows_out"]) for t in report["tasks"] if t["role"] == "function"],
     }
 
 
@@ -88,7 +82,9 @@ def _run(document: dict, scratch: pathlib.Path, *extra: str) -> tuple[int, dict]
         timeout=300,
         check=False,
     )
-    return done.returncode, json.loads((scratch / "report.json").read_text())
+    # The report file is the run report in its canonical bytes, as `moruna.run` returns it.
+    report = moruna.RunReport.from_bytes(scratch / "report.json")
+    return done.returncode, report.to_dict()
 
 
 def test_ho_t14_file_run_equals_library_run(
@@ -105,10 +101,11 @@ def test_ho_t14_file_run_equals_library_run(
     spec.loader.exec_module(kernels)
 
     from_file_out = scratch / "from_file"
-    code, envelope = _run(_document(scratch, src_url, from_file_out, "shout"), scratch)
-    assert code == 0, envelope["exit"]
-    assert envelope["exit"] == {"code": 0, "diagnostic": None}
-    assert envelope["spec_digest"].startswith("sha256:")
+    code, from_file = _run(_document(scratch, src_url, from_file_out, "shout"), scratch)
+    assert code == 0, from_file["exit"]
+    assert from_file["exit"] == {"code": 0, "status": "completed", "diagnostic": None}
+    assert from_file["schema_version"] == "2.0"
+    assert from_file["job_digest"].startswith("sha256:")
 
     library = moruna.run(
         moruna.ParquetSource(src_url),
@@ -120,7 +117,7 @@ def test_ho_t14_file_run_equals_library_run(
         staging_limit=2 << 30,
         allow_gil=True,
     )
-    assert _projection(envelope["report"]) == _projection(json.loads(library.to_json()))
+    assert _projection(from_file) == _projection(json.loads(library.to_json()))
     assert len(_rows(from_file_out)) == rows
     assert _rows(from_file_out) == _rows(pathlib.Path(out_url.removeprefix("file://")))
 

@@ -48,7 +48,7 @@ fn online(dir: &std::path::Path, units: u64, peaks: bool) -> Arc<Online> {
             outcome.set(Target::PeakMemory, (rows * WIDTH) as f64);
         }
         online
-            .settle(&k, &inputs, Some(&prediction), &outcome, n)
+            .settle(&k, &inputs, Some(&prediction), &outcome, n, None)
             .expect("settles");
     }
     Arc::new(online)

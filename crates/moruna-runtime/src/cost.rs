@@ -188,6 +188,93 @@ pub struct StageCost {
     pub kind: String,
     /// Canonical settings digest, identical to registration for an unfused task.
     pub settings: moruna_cost::Digest,
+    /// The code's identity when the job names it: an image task's ([`image_identity`]); `None`
+    /// for a stage the kernel's own fingerprint identifies (a built-in kind's program, a fused
+    /// stage).
+    pub fingerprint: Option<moruna_cost::Digest>,
+}
+
+/// The code an image task runs, as its cost key names it: its build key, or its manifest's
+/// digest for an image Moruna did not build; `None` for a task of another kind, or an image not
+/// yet built.
+pub fn image_identity(task: &moruna_job::Task) -> Option<moruna_cost::Digest> {
+    if task.kind != moruna_job::IMAGE_KIND {
+        return None;
+    }
+    let image = task.settings.get("image")?;
+    let name = ["build_key", "digest"]
+        .iter()
+        .find_map(|field| image.get(*field).and_then(serde_json::Value::as_str))?;
+    moruna_cost::Digest::from_hex(name.strip_prefix("sha256:")?)
+}
+
+/// The catalogue's identity of a built-in kind: the digest of its declaration's canonical JSON,
+/// which changes when what the kind is changes.
+pub fn declaration_identity(declaration: &moruna_job::Declaration) -> moruna_cost::Digest {
+    use sha2::Digest as _;
+    let value = serde_json::to_value(declaration).unwrap_or(serde_json::Value::Null);
+    moruna_cost::Digest(sha2::Sha256::digest(moruna_job::canonical_json(&value).as_bytes()).into())
+}
+
+/// One identity per executable kernel stage of `job`, in scheduler order: what the live
+/// learner and the run's report both key a stage by. Logical task names are deliberately
+/// excluded: renaming identical work is not new work.
+pub fn stage_identities(
+    job: &moruna_job::Job,
+    parts: &crate::job::Parts,
+) -> Result<Vec<StageCost>> {
+    let mut stages = Vec::with_capacity(parts.stages.len());
+    for members in &parts.stages {
+        let tasks = members
+            .iter()
+            .map(|&at| job.tasks.get(at))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| MorunaError::Plan("cost stage names an absent logical task".into()))?;
+        if tasks.is_empty()
+            || tasks
+                .iter()
+                .any(|task| task.role != moruna_job::Role::Kernel)
+        {
+            return Err(MorunaError::Plan(
+                "cost stage must contain executable kernel tasks".into(),
+            ));
+        }
+        let (kind, settings, fingerprint) = if let [task] = tasks.as_slice() {
+            (
+                task.kind.clone(),
+                registration_settings(
+                    &task.kind,
+                    &serde_json::Value::Object(task.settings.clone()),
+                ),
+                image_identity(task),
+            )
+        } else {
+            (
+                "fused".to_string(),
+                crate::check::warmup::settings_digest(&serde_json::Value::Array(
+                    tasks
+                        .iter()
+                        .map(|task| {
+                            serde_json::json!({
+                                "kind": task.kind,
+                                "settings": registration_settings(
+                                    &task.kind,
+                                    &serde_json::Value::Object(task.settings.clone()),
+                                ),
+                            })
+                        })
+                        .collect(),
+                )),
+                None,
+            )
+        };
+        stages.push(StageCost {
+            kind,
+            settings,
+            fingerprint,
+        });
+    }
+    Ok(stages)
 }
 
 /// One live model/store authority and the stages whose real measurements teach it.
@@ -217,47 +304,16 @@ pub fn registration_settings(kind: &str, settings: &serde_json::Value) -> moruna
 }
 
 impl RunLearning {
-    /// Match the built plan's executable stages to canonical logical settings, retaining fusion.
-    /// Logical task names are deliberately excluded: renaming identical work is not new work.
+    /// The live learner of `job`'s stages ([`stage_identities`]).
     pub fn for_job(
         online: Arc<moruna_cost::Online>,
         job: &moruna_job::Job,
         parts: &crate::job::Parts,
     ) -> Result<Self> {
-        let mut stages = Vec::with_capacity(parts.stages.len());
-        for members in &parts.stages {
-            let tasks = members
-                .iter()
-                .map(|&at| job.tasks.get(at))
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    MorunaError::Plan("cost stage names an absent logical task".into())
-                })?;
-            if tasks.is_empty()
-                || tasks
-                    .iter()
-                    .any(|task| task.role != moruna_job::Role::Kernel)
-            {
-                return Err(MorunaError::Plan(
-                    "cost stage must contain executable kernel tasks".into(),
-                ));
-            }
-            let (kind, settings) = if tasks.len() == 1 {
-                (
-                    tasks[0].kind.clone(),
-                    registration_settings(
-                        &tasks[0].kind,
-                        &serde_json::Value::Object(tasks[0].settings.clone()),
-                    ),
-                )
-            } else {
-                ("fused".to_string(), crate::check::warmup::settings_digest(&serde_json::Value::Array(tasks.iter().map(|task| {
-                    serde_json::json!({"kind": task.kind, "settings": registration_settings(&task.kind,&serde_json::Value::Object(task.settings.clone()))})
-                }).collect())))
-            };
-            stages.push(StageCost { kind, settings });
-        }
-        Ok(Self { online, stages })
+        Ok(Self {
+            online,
+            stages: stage_identities(job, parts)?,
+        })
     }
     /// Actual executable keys installed in the live scheduler; registration conformance uses
     /// this same entry point, not a second reconstruction of fingerprints/schema/settings.
@@ -286,7 +342,9 @@ impl RunLearning {
                 Ok(moruna_cost::CostKey {
                     role: moruna_job::Role::Kernel,
                     kind: identity.kind.clone(),
-                    fingerprint: moruna_cost::Digest(kernels[at].fingerprint().0),
+                    fingerprint: identity
+                        .fingerprint
+                        .unwrap_or(moruna_cost::Digest(kernels[at].fingerprint().0)),
                     settings: identity.settings,
                     schema: moruna_cost::Digest(schema.hash()),
                 })
@@ -432,7 +490,7 @@ mod tests {
         let mut live = Outcome::new(Origin::Run);
         live.set(Target::Duration, 0.01).set(Target::RowsOut, 3.0);
         online
-            .settle(&key, &inputs, Some(&predicted), &live, 1)
+            .settle(&key, &inputs, Some(&predicted), &live, 1, None)
             .unwrap();
         online.flush().unwrap();
         let history = store.scan(&key).unwrap();

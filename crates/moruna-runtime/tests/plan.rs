@@ -313,15 +313,19 @@ fn pn_t21_a_run_from_its_plan() {
     );
     assert_eq!(behind.blocking, [step_of(&expected, "slow")]);
 
-    // The report file and the `report` message carry the same account.
+    // The report file holds the report document, with the plan the run started from and each
+    // step's actual start and end; the `report` message carries the same document, and how the
+    // run went against the plan beside it.
     let file = outcome.report_file.expect("a report file");
-    let envelope = session::read_report_file(&file).expect("the report file");
-    assert_eq!(envelope["plan"]["plan"], expected.id.as_str());
-    assert_eq!(envelope["plan"]["order"].as_array().map(Vec::len), Some(6));
+    let document = session::read_report_file(&file).expect("the report file");
+    assert_eq!(document["schema_version"], "2.0");
+    assert_eq!(document["plan"]["id"], expected.id.as_str());
+    assert_eq!(document["plan_steps"].as_array().map(Vec::len), Some(6));
     let report = lines
         .iter()
         .find(|l| l["type"] == "report")
         .expect("a report message");
+    assert_eq!(report["report"], document);
     assert_eq!(report["plan"]["plan"], expected.id.as_str());
 }
 

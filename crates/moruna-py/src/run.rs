@@ -22,6 +22,7 @@ use moruna_runtime::job::refusal;
 use moruna_runtime::kinds::parquet::compression_name;
 use moruna_runtime::kinds::tensor::tensor_format_name;
 use moruna_runtime::kinds::{arrow_ipc, parquet, tensor, vortex};
+use moruna_runtime::report_doc::ReportContext;
 use moruna_runtime::{RunSpec, Runtime};
 use moruna_sources::{RowFilter, ScalarValue};
 use pyo3::exceptions::PyKeyboardInterrupt;
@@ -821,15 +822,14 @@ pub fn run(
         ),
     )?;
     credentials.apply(&mut built.spec.object_store);
-    let context = ReportContext {
-        job: job.clone(),
-        parts: built.parts.clone(),
-        sink_targets: built.sink_targets.clone(),
+    let mut context = Report {
         job_digest,
-        plan: explain.then(|| plan.to_value()),
-        trace_path,
-        args: run_args.into_iter().collect(),
-        task_ports: built.task_ports.clone(),
+        context: ReportContext {
+            plan: explain.then(|| plan.to_value()),
+            trace_path,
+            args: run_args.into_iter().collect(),
+            ..ReportContext::of(&job, &built)
+        },
     };
 
     let mut components = match engine_ports {
@@ -866,6 +866,10 @@ pub fn run(
         }
         components.learning = Some(learning);
     }
+    context.context.store = components
+        .learning
+        .as_ref()
+        .map(|learning| learning.online.store().clone());
     drive(py, built.spec, components, &context)
 }
 
@@ -1082,20 +1086,24 @@ fn clone_schema(schema: &IteratorSchema) -> IteratorSchema {
     }
 }
 
-/// What a run's report says about its job beyond the trace's report: the job it ran, which task
-/// each source, stage and sink is, where each sink writes, the spec's digest, the plan when it
-/// was asked for, and the trace file.
-pub(crate) struct ReportContext {
-    pub(crate) job: Job,
-    pub(crate) parts: moruna_runtime::job::Parts,
-    pub(crate) sink_targets: Vec<String>,
+/// What a run's report says beyond the trace's report: the spec's digest, and what the job
+/// adds (`moruna_runtime::report_doc::ReportContext`).
+pub(crate) struct Report {
     pub(crate) job_digest: Option<String>,
-    pub(crate) plan: Option<serde_json::Value>,
-    pub(crate) trace_path: Option<PathBuf>,
-    /// The run's argument values, by name.
-    pub(crate) args: serde_json::Map<String, serde_json::Value>,
-    /// The ports each task calls, by its place in the job: measured per need.
-    pub(crate) task_ports: Vec<(usize, Arc<moruna_kernel::StagePorts>)>,
+    pub(crate) context: ReportContext,
+}
+
+impl Report {
+    /// The report document of `report`, `error` the error the run ended with, when it failed.
+    fn json(&self, report: &moruna_trace::RunReport, error: Option<&MorunaError>) -> String {
+        moruna_runtime::report_doc::document(
+            (&report.run_id, self.job_digest.as_deref()),
+            Some(report),
+            &moruna_runtime::report_doc::Exit::of(report, error),
+            Some(&self.context),
+        )
+        .to_string()
+    }
 }
 
 /// `_core.check_args(declared, given)`: every refusal of the values `given` (a JSON object)
@@ -1123,7 +1131,7 @@ fn drive(
     py: Python<'_>,
     spec: RunSpec,
     components: moruna_runtime::Components,
-    context: &ReportContext,
+    context: &Report,
 ) -> PyResult<String> {
     let cancel = CancelToken::new();
     let thread_cancel = cancel.clone();
@@ -1183,7 +1191,7 @@ fn drive(
     };
 
     match outcome {
-        Ok(report) if !interrupted => Ok(crate::report::report_json(&report, None, context)),
+        Ok(report) if !interrupted => Ok(context.json(&report, None)),
         Ok(report) => {
             // The run finished before the cancellation reached it. PY-I6 still raises, with the
             // whole report attached rather than a partial one.
@@ -1213,14 +1221,11 @@ fn attachments(
     report: Option<moruna_trace::RunReport>,
     manifest: Option<PathBuf>,
     error: Option<&MorunaError>,
-    context: &ReportContext,
+    context: &Report,
 ) -> PyResult<Attachments> {
     let run_id = report.as_ref().map(|r| r.run_id.clone());
     let report = match report {
-        Some(r) => Some(crate::report::to_python(
-            py,
-            &crate::report::report_json(&r, error, context),
-        )?),
+        Some(r) => Some(crate::report::to_python(py, &context.json(&r, error))?),
         None => None,
     };
     Ok(Attachments {

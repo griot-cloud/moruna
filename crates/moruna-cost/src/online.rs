@@ -200,6 +200,7 @@ struct Kept {
     outcome: Outcome,
     prediction: Option<Arc<Prediction>>,
     at_ms: u64,
+    run: Option<Arc<str>>,
 }
 
 struct State {
@@ -346,7 +347,8 @@ impl Online {
 
     /// One unit finished: the models learn it, its drift is judged against `prediction` (what
     /// [`Online::predict`] said when the unit was chosen), and it is kept for the next
-    /// [`Online::flush`]. An outcome that is not a measurement (not finite, negative) is refused
+    /// [`Online::flush`], naming `run`, the run that measured it, when it has one. An outcome
+    /// that is not a measurement (not finite, negative) is refused
     /// with the reason and counted, and nothing learns from it. Once the key has been seen this
     /// allocates nothing: the prediction is shared, and the record is made when it is written.
     pub fn settle(
@@ -356,6 +358,7 @@ impl Online {
         prediction: Option<&Arc<Prediction>>,
         outcome: &Outcome,
         at_ms: u64,
+        run: Option<&Arc<str>>,
     ) -> Result<()> {
         if let Err(why) = outcome.check() {
             let mut state = self.write();
@@ -425,6 +428,7 @@ impl Online {
                 outcome: outcome.clone(),
                 prediction: prediction.cloned(),
                 at_ms,
+                run: run.cloned(),
             });
         }
         Ok(())
@@ -464,9 +468,9 @@ impl Online {
             }
             let observation = Observation::settled(
                 keys[kept.key].clone(),
-                kept.inputs,
-                kept.outcome,
+                (kept.inputs, kept.outcome),
                 kept.at_ms,
+                kept.run.as_deref().map(str::to_string),
                 deciding.clone(),
                 kept.prediction.as_deref(),
             );
@@ -523,6 +527,11 @@ impl Online {
     /// Whether the run has abandoned the store.
     pub fn is_abandoned(&self) -> bool {
         self.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// The store it writes to: what a reader of the run's history scans.
+    pub fn store(&self) -> &Arc<dyn ObservationStore> {
+        &self.store
     }
 
     /// Observations kept and not yet flushed.

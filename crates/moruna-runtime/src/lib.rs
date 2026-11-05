@@ -47,6 +47,7 @@ pub mod observe;
 pub mod packaged;
 pub mod portable;
 pub mod report;
+pub mod report_doc;
 pub mod run;
 pub mod spec;
 

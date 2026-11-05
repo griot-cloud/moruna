@@ -97,24 +97,11 @@ fn report_file(scratch: &Path) -> Value {
     read_report_file(&scratch.join(format!("report-{RUN_ID}.json"))).expect("the report file")
 }
 
-/// What two runs of one job must agree on: everything but timing and memory figures.
-fn projection(report: &Value) -> Value {
-    let stages: Vec<Value> = report["stages"]
-        .as_array()
-        .expect("stages")
-        .iter()
-        .map(|s| {
-            json!([
-                s["stage"],
-                s["rows_in"],
-                s["rows_out"],
-                s["errors"],
-                s["skipped"]
-            ])
-        })
-        .collect();
+/// What two runs of one job must agree on: everything but timing and memory figures. `stages`
+/// is each kernel stage's rows in and out, failed and skipped morsels.
+fn projection(report: &Value, exit: &Value, stages: Vec<Value>) -> Value {
     json!({
-        "exit": report["exit"],
+        "exit": exit,
         "resumed": report["resumed"],
         "limits": [report["limits"]["memory_ceiling"], report["limits"]["cpu_quota"], report["limits"]["source"]],
         "io_paths": report["io_paths"],
@@ -122,6 +109,37 @@ fn projection(report: &Value) -> Value {
         "sizer_used": report["sizer_used"],
         "stages": stages,
     })
+}
+
+/// [`projection`] of the trace's report (`moruna_trace::RunReport`) a library run returns.
+fn trace_projection(report: &Value) -> Value {
+    let stages = report["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .map(|s| json!([s["rows_in"], s["rows_out"], s["errors"], s["skipped"]]))
+        .collect();
+    let exit = json!(report["exit"].as_str().map(str::to_lowercase));
+    projection(report, &exit, stages)
+}
+
+/// [`projection`] of the report document a report file holds: its kernel tasks that ran.
+fn document_projection(document: &Value) -> Value {
+    let stages = document["tasks"]
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .filter(|t| t["role"] == "function" && t.get("rows_in").is_some())
+        .map(|t| {
+            json!([
+                t["rows_in"],
+                t["rows_out"],
+                t["failed_morsels"],
+                t["skipped_morsels"]
+            ])
+        })
+        .collect();
+    projection(document, &document["exit"]["status"], stages)
 }
 
 /// HO-T5 file_run_equals_library_run (H1): the same job as a document and as a `RunSpec` built
@@ -143,7 +161,7 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(from_file["run_id"], RUN_ID);
     let job = JobSpec::from_value(doc.clone()).expect("the document");
     assert_eq!(
-        from_file["spec_digest"],
+        from_file["job_digest"],
         moruna_plan::job_digest(&moruna_job::Job::from_v1(&job))
     );
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
@@ -187,7 +205,8 @@ fn ho_t5_file_run_equals_library_run() {
     spec.profiles_dir = Some(scratch.path().join("profiles"));
     let direct = Runtime::run(spec, CancelToken::new()).expect("the library run");
     let direct = serde_json::to_value(&direct).expect("json");
-    assert_eq!(projection(&from_file["report"]), projection(&direct));
+    assert_eq!(from_file["schema_version"], "2.0");
+    assert_eq!(document_projection(&from_file), trace_projection(&direct));
     assert_eq!(read_back_rows(&out2), rows);
 }
 
@@ -315,9 +334,12 @@ fn ho_t6_heartbeat_cadence_and_report_delivery() {
     assert_eq!(exit_msg["code"], 0);
     let delivered = &messages[messages.len() - 2].1["report"];
     let on_disk = report_file(scratch.path());
-    assert_eq!(delivered["run_id"], on_disk["report"]["run_id"]);
+    assert_eq!(
+        delivered, &on_disk,
+        "the message carries the report file's document"
+    );
     assert_eq!(delivered["run_id"], RUN_ID);
-    assert_eq!(delivered["exit"], json!("Completed"));
+    assert_eq!(delivered["exit"]["status"], "completed");
     let _ = std::fs::remove_file(&socket);
 }
 
@@ -347,9 +369,9 @@ fn ho_t7_peer_gone_the_run_continues() {
     assert_eq!(runner.join().expect("the runner"), exit::COMPLETED);
     let on_disk = report_file(scratch.path());
     assert_eq!(on_disk["exit"]["code"], 0);
-    assert_eq!(on_disk["report"]["exit"], json!("Completed"));
+    assert_eq!(on_disk["exit"]["status"], "completed");
     assert_eq!(read_back_rows(&scratch.path().join("out")), 16_000);
-    let notes = on_disk["host_notes"].as_array().expect("host notes");
+    let notes = on_disk["notes"].as_array().expect("notes");
     assert!(
         notes.iter().any(|n| n
             .as_str()
@@ -431,7 +453,7 @@ fn ho_t8_checkpoint_then_cancel() {
     }
     let on_disk = report_file(scratch.path());
     assert_eq!(on_disk["exit"]["code"], 130);
-    assert_eq!(on_disk["report"]["exit"], json!("Cancelled"));
+    assert_eq!(on_disk["exit"]["status"], "cancelled");
     let _ = std::fs::remove_file(&socket);
 }
 
@@ -481,7 +503,7 @@ fn ho_t10_serve_runs_one_spec() {
     assert_eq!(server.join().expect("the server"), exit::COMPLETED);
     assert_eq!(messages.last().expect("exit").1["code"], 0);
     let on_disk = report_file(scratch.path());
-    let notes: Vec<String> = on_disk["host_notes"]
+    let notes: Vec<String> = on_disk["notes"]
         .as_array()
         .expect("notes")
         .iter()
@@ -529,7 +551,11 @@ fn ho_t11_strict_refusal() {
     );
     let refused = report_file(scratch.path());
     assert_eq!(refused["exit"]["code"], 2);
-    assert_eq!(refused["report"], Value::Null);
+    assert_eq!(refused["exit"]["status"], "refused");
+    assert!(
+        refused.get("host").is_none(),
+        "a run refused before it started has no trace to report"
+    );
     let diagnostic = refused["exit"]["diagnostic"]
         .as_str()
         .expect("a diagnostic");
@@ -549,7 +575,7 @@ fn ho_t11_strict_refusal() {
         exit::COMPLETED
     );
     let ran = report_file(scratch.path());
-    let notes = ran["report"]["notes"].as_array().expect("notes");
+    let notes = ran["notes"].as_array().expect("notes");
     assert!(
         notes
             .iter()
@@ -622,8 +648,9 @@ fn ho_t12_exit_codes() {
     );
     let failed = report_file(scratch.path());
     assert_eq!(failed["exit"]["code"], 4);
+    assert_eq!(failed["exit"]["status"], "terminated");
     assert!(
-        failed["report"].is_object(),
+        failed["tasks"].as_array().is_some_and(|t| !t.is_empty()) && failed.get("host").is_some(),
         "a terminated run still reports"
     );
 
@@ -719,7 +746,7 @@ fn ho_t13_report_file_placement() {
         .join(format!("moruna-{RUN_ID}.report.json"));
     assert_eq!(outcome.report_file.as_deref(), Some(expected.as_path()));
     let on_disk = read_report_file(&expected).expect("the default report file");
-    assert_eq!(on_disk["moruna_report"], 1);
+    assert_eq!(on_disk["schema_version"], "2.0");
     assert!(
         outcome
             .notes
