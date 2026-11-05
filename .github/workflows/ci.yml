@@ -98,6 +98,11 @@ jobs:
           sphinx-build -W --keep-going -q -b html docs docs/_build/html
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
+      - name: The vmm jail may make user namespaces, as it does on a node
+        # Ubuntu 24.04 forbids unprivileged user namespaces through AppArmor. The jail makes one for
+        # every run before QEMU starts, and refuses loudly when it cannot (`deny setgroups:
+        # Permission denied`), so its tests need the host a node is: one that allows them.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Tests
         run: cargo test --workspace --locked --no-fail-fast
       - name: The image kind, for real (SDD 19 k)

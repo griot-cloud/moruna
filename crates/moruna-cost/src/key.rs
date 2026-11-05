@@ -152,7 +152,7 @@ mod tests {
             settings: Digest([2; 32]),
             schema: Digest([3; 32]),
         };
-        assert!(key.canonical().starts_with("kernel/std/0101"));
-        assert_eq!(key.to_string(), "kernel `std` 010101010101");
+        assert!(key.canonical().starts_with("function/std/0101"));
+        assert_eq!(key.to_string(), "function `std` 010101010101");
     }
 }
