@@ -881,11 +881,11 @@ dependencies = [
 
 [[package]]
 name = "moruna-record"
-version = "0.6.2"
+version = "0.6.3"
 
 [[package]]
 name = "moruna-storage-format"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aes",
  "aes-gcm",

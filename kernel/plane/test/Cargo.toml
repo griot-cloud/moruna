@@ -13,4 +13,4 @@ moruna-svc.workspace = true
 moruna-plane.workspace = true
 moruna-ipc-check.workspace = true
 linux-protocol = { path = "../../linux/protocol", version = "=0.1.0" }
-moruna-record = { path = "../../../crates/moruna-record", version = "=0.6.2", default-features = false }
+moruna-record = { path = "../../../crates/moruna-record", version = "=0.6.3", default-features = false }
