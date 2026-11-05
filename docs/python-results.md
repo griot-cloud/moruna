@@ -8,26 +8,26 @@ A report is one JSON document with one canonical form. `report.bytes()` is that 
 
 | Attribute | Type | Meaning |
 | --- | --- | --- |
-| `moruna_report`, `moruna` | `int`, `str` | The document's format (1) and the Moruna that wrote it. |
+| `schema_version`, `moruna` | `str`, `str` | The document's schema, `"MAJOR.MINOR"` (`"2.0"`; a reader refuses an unknown major), and the Moruna that wrote it. |
+| `host`, `args` | `dict`, `dict` | Where it ran (platform, CPUs, memory limit, CPU quota, devices) and the run's argument values. |
 | `run_id` | `str` | The run's id, 32 hex characters. |
 | `job_digest` | `str \| None` | The spec's digest; `None` for a job that holds a task a spec cannot hold. |
 | `exit` | `dict` | `code` (0 completed, 130 cancelled, otherwise the command's exit code for the failure), `status` (`"completed"`, `"terminated"`, `"cancelled"`) and `diagnostic`. |
-| `tasks` | list of dicts | Per task, in job order: `key`, `role`, `kind`, `rows_in`, `rows_out`, `bytes_in`, `bytes_out`, `time_s`, `busy_s`, `excluded_rows`, `skipped_morsels`, `errors`, the `stage` that ran it and the tasks `fused_with` it. A figure the run does not measure for the task is `None`. |
-| `resources` | `dict` | `cpu_ns`, `peak_memory_bytes`, `mem_byte_seconds`, `usage_measured` and `memory_basis`. |
+| `tasks` | list of dicts | Per task, in job order, keyed by its name in the spec: its status, times, CPU, memory, rows, bytes and morsels, waits, needs, what the plan predicted, its observation and a recommendation (see [The run report](run-report.md#task-fields)). A measurement not made is absent. |
+| `resources` | `dict` | `cpu_core_s`, `peak_memory_bytes`, `mem_byte_seconds`, `usage_measured` and `memory_basis`. |
 | `sinks` | list of dicts | Per sink: `task`, `target` (as its settings name it), `rows`, `bytes`, `files`, `excluded_rows`, and `snapshot_id` and `version` when it committed a version. |
-| `plan` | `dict \| None` | The plan the run started from, when `moruna.run(..., explain=True)` asked for it. |
+| `plan`, `plan_steps` | `dict \| None`, list \| None | The plan the run started from, when `moruna.run(..., explain=True)` asked for it, and each step's actual start and end. |
 | `trace_path` | `str \| None` | Written trace file, if requested. |
-| `resumed`, `manifest`, `wall_s` | `bool`, `str \| None`, `float` | Resume state, latest checkpoint path, elapsed seconds. |
+| `resumed`, `manifest`, `wall_ms` | `bool`, `str \| None`, `float` | Resume state, latest checkpoint path, elapsed milliseconds. |
 | `limits_initial`, `limits_timeline` | `dict`, list | Initial host limits and limit changes. |
 | `peak_anon_bytes`, `peak_ceiling_bytes`, `peak_fraction_of_ceiling` | `int`, `int`, `float` | Peak memory, denominator and fraction. |
 | `worker_busy_fraction`, `cpu_throttled_fraction` | `float` | Worker use and CPU throttling. |
-| `cpu_ns`, `mem_byte_seconds`, `usage_measured` | `int`, `int`, `bool` | Measured CPU and memory usage. |
 | `source_bytes_per_s`, `source_bandwidth`, `staging_bandwidth` | `float` | Source and staging rates. |
 | `staging_bytes_written`, `staging_engaged` | `int`, `bool` | Staging volume and whether used. |
 | `io_paths` | `dict` | Direct I/O, io_uring, GDS, pinned and RDMA flags. |
 | `gil`, `gil_serialised` | list of pairs, `bool` | Per-stage GIL state and serialization. |
 | `sizer_used`, `sizer_fallback_at` | `str`, `int \| None` | Sizer and optional fallback morsel. |
-| `stages`, `drains`, `bottleneck_timeline` | lists | Per-stage statistics, arena drains and bottlenecks. |
+| `drains`, `bottleneck_timeline` | lists | Arena drains and bottlenecks. |
 | `notes`, `overflow_failed`, `late_records` | `list[str]`, `bool`, `int` | Decisions and trace completeness. |
 | `write`, `read` | `dict \| None` | What the engine behind a governed sink or source reported. |
 

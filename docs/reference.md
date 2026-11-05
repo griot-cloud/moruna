@@ -40,6 +40,7 @@ What each field of the report means, and where to find it.
 
 python-api
 job-document
+images
 cli
 run-report
 contributing

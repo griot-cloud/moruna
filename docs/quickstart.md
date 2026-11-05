@@ -93,7 +93,7 @@ stage    morsels       rows in      rows out    rows/s  errors  skipped
 
 The job completed in under a second. At its highest, the whole Python process used 52% of its 1 GiB budget. Moruna divided the data into 20 morsels and chose their size by measuring how much memory `score` used on the first one. Your figures will differ with your machine.
 
-The same values are available as attributes, for example `report.peak_fraction_of_ceiling` and `report.stages[0]["rows_out"]`. See [The run report](run-report.md) for every field.
+The same values are available as attributes, for example `report.peak_fraction_of_ceiling` and `report.tasks[1]["rows_out"]`. See [The run report](run-report.md) for every field.
 
 ## 5. Check the output
 

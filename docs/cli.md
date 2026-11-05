@@ -5,13 +5,15 @@ The `moruna` command is installed with the Python package. Run `moruna --help` f
 ## moruna run
 
 ```text
-moruna run JOB [--plan PLAN.mplan] [--strict] [--resolver MODULE:ATTRIBUTE]
+moruna run JOB [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan PLAN.mplan] [--strict]
 moruna run --vm JOB --image IMAGE [--disk PATH[:ro|:rw]]...
 ```
 
 Runs the job described in `JOB`, a job document (version 2 FlatBuffers, such as a `moruna.Job`'s spec, or version 1 JSON), and exits when it ends, printing one line with the exit code and the report's location.
 
-- `--resolver MODULE:ATTRIBUTE` names the `moruna.Resolver` (or a callable that returns one) that supplies what the job's `python` tasks need. Each `python` task is imported by its `ref`, constructed with its `params` and checked against its `fingerprint`; a need the resolver cannot supply, or any need without `--resolver`, refuses the document (exit 2), naming the task and the need. `moruna serve` takes `--resolver` too.
+- `--arg NAME=VALUE` gives a run argument the job declares, read by its declared type; every declared argument must be given, and a missing one, one that does not read as its type and one the job does not declare are refused (exit 2), naming each.
+- `--resolver MODULE:ATTRIBUTE` names the `moruna.Resolver` (or a callable that returns one) that supplies what the job's image tasks need: for each need, a callable taking the request's bytes and returning the answer's, which the run serves as a port ([Images and ports](images.md#the-port-protocol)), and for a registry the job's images are pulled from, its credentials as the need `registry:<HOST>`. A need the resolver cannot supply, or any need without `--resolver`, refuses the document (exit 2), naming the task and the need.
+- A spec whose image tasks are not built (a draft) is refused (exit 2), naming every unbuilt task; the registry images a runnable spec names are pulled into `~/.cache/moruna/images` before the run starts, every digest checked.
 
 - `--plan` runs the job by a plan `moruna explain --out` wrote, instead of the plan Moruna makes for it. A plan of another job, or one that is not a plan of this job, is refused before anything runs.
 - `--strict` refuses a document that would take any setting from an environment variable, naming the setting.
@@ -54,20 +56,18 @@ Checks every function in `TARGET`, a module name, a path to a `.py` file or a pa
 ## moruna build
 
 ```text
-moruna build MODULE:FUNCTION [--out DIR] [--tag NAME] [--platform linux/aarch64|linux/x86_64]
-             [--lock PATH] [--file PATH]... [--json]
+moruna build JOB [--out DIR] [--registry HOST/REPOSITORY] [--platform linux/aarch64|linux/x86_64]
+             [--spec PATH] [--lock PATH] [--file PATH]... [--resolver MODULE:ATTRIBUTE] [--json]
 ```
 
-Builds a Python function as an OCI image the `image` kind runs, as `function.build()` does from Python. `MODULE` is a module name or a path to a `.py` file, and `FUNCTION` is the function in it. The image is written to the OCI layout directory `--out` (default `moruna-image`) under `--tag` (default `FUNCTION:latest`) and has four layers: the Python 3.14 runtime, the dependencies the project's lock pins, Moruna's shim, and the function. Layers 2 to 4 carry compiled bytecode, so a start compiles nothing; the build needs a standard (not free threaded) CPython 3.14 on the path to write it, and installs only wheels. The command prints the image's digest and each layer's digest and size.
+Builds one OCI image per image task of a job, and writes the job's runnable spec. `JOB` is a spec (`JOB.mjob`), whose entries are imported again from the current directory and the interpreter's path and must make the build keys the spec names, or `MODULE:ATTRIBUTE` naming a `moruna.Job` (the module a dotted name or a path to a `.py` file). The images go to the OCI layout `--out` (default `moruna-images`), each named there by its build key, and the spec, its images' digests and locations filled, to `--spec` (default: `JOB.mjob` itself, or `ATTRIBUTE.mjob`). The command prints each task's state, build key, digest and location, then the spec's path and digest; `--json` prints the same as JSON.
 
-- A lock is required: a `uv.lock` or a `requirements.lock` with a hash on every pin, found next to the module or above it, or `--lock PATH`. Nothing is resolved without one.
-- `--platform` defaults to this machine's on Linux and to `linux/aarch64` on a Mac.
-- `--file PATH` adds a file the function reads, below the directory the module is imported from; repeat it for each.
-- `--index-url`, `--find-links` and `--no-index` go to `uv`, which installs the wheels.
+An image has the runtime's layers (Python's official `python:3.14-slim`, by digest), one layer per Python distribution the task's code imports, the shim, and the task's code with its bytecode; the same content is the same blob, stored once, so tasks that import the same distribution share its layer. The code is the task's import closure inside its project, found statically: its module, every project module it imports, transitively, and their packages' `__init__.py`. An import whose module is computed at run time is refused by name; a data file the code reads is named with `--file` (every task) or a task class's `files`. The distributions are those the closure imports, found through installed metadata, and what they require, as the lock installed them. An image already built for a build key is reused: a docstring, comment or formatting change keeps the key and needs no rebuild.
 
-The same function built twice is the same image, and functions with one lock share every layer but their own.
-
-`python -m moruna` accepts the same commands.
+- A lock is required: a `uv.lock` or a `requirements.lock` with a hash on every pin, found next to the code or above it, or `--lock PATH`. Nothing is resolved without one. Building needs a standard (not free-threaded) CPython 3.14 on the path, and installs only wheels.
+- `--platform` defaults to this machine's on Linux and to `linux/aarch64` on a Mac; the platform is part of every build key.
+- `--registry HOST/REPOSITORY` also pushes every image there, by its digest and tagged with its build key; the spec then names the registry reference. Credentials come from the resolver `--resolver` names, as the need `registry:<HOST>`: `{"token": ...}` or `{"username": ..., "password": ...}`, never in the spec.
+- `--index-url`, `--find-links` and `--no-index` go to `uv`, which installs the wheels; `--cache` is where the build keeps installed locks and layers (default `~/.cache/moruna/build`).
 
 ## Exit codes
 
