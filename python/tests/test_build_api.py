@@ -105,7 +105,8 @@ def test_a_job_builds_one_image_per_task_and_its_spec_becomes_runnable(
 ) -> None:
     root, wheels, runtime, alerts = project
     job = alerts.job
-    job.target(runtime=(str(runtime), "python-test"))
+    # The platform the fixture runtime is for, not this machine's: CI's runners are x86_64.
+    job.target(platform="linux/aarch64", runtime=(str(runtime), "python-test"))
     draft = job.spec()
     assert {row["state"] for row in job.status()} == {"not built"}
     with pytest.raises(moruna.ConfigError, match="draft"):
@@ -134,6 +135,7 @@ def test_the_command_builds_a_job_and_rebuilds_only_the_code_of_its_keys(
     command = [
         sys.executable, "-m", "moruna", "build", "alerts:job", "--out", str(tmp_path / "images"),
         "--runtime-layout", str(runtime), "--runtime-reference", "python-test",
+        "--platform", "linux/aarch64",
         "--no-index", "--find-links", str(wheels), "--cache", str(tmp_path / "cache"), "--json",
     ]  # fmt: skip
     env = {"PYTHONPATH": f"{root}:{':'.join(sys.path)}", "PATH": "/usr/bin:/bin"}
