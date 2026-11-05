@@ -43,7 +43,7 @@ Moruna identifies a function by its code. A function whose behaviour depends on 
 
 ## Functions with state
 
-A stateful function builds its state again with `setup` when a job resumes, which suits a function whose state is a loaded model. A function whose state depends on the rows it has seen, such as a running count, would lose that state. Such a function should declare `resume="checkpoint"` and implement `checkpoint` and `restore`; Moruna then saves its state with every checkpoint and restores it on resume. See [Functions that keep state](kernels.md#functions-that-keep-state).
+A stateful function builds its state again with `setup` when a job resumes, which suits a function whose state is a loaded model. A function whose state depends on the rows it has seen, such as a running count, would lose that state. Such a function should declare `resume="checkpoint"` and implement `checkpoint` and `restore`; Moruna then saves its state with every checkpoint and restores it on resume. See [Functions that keep state](functions.md#functions-that-keep-state).
 
 ## Resuming on another machine
 

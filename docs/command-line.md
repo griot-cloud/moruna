@@ -78,6 +78,6 @@ The host connects, sends the document, and receives newline-separated JSON messa
 moruna check functions.py
 ```
 
-See [Checking a function](kernels.md#checking-a-function) for what it tests and what it reports.
+See [Checking a function](functions.md#checking-a-function) for what it tests and what it reports.
 
 Next: [Where Moruna runs](hosting.md).

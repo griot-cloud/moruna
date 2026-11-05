@@ -46,7 +46,7 @@ Run on a laptop, in a container or Kubernetes pod, or in an isolated virtual mac
 
 python
 sources-and-sinks
-kernels
+functions
 command-line
 hosting
 ```

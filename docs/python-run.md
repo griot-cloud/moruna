@@ -82,7 +82,7 @@ Its constructor's arguments are its params, and a spec holds them only when they
 
 A `Function` subclass defines `__call__(self, batch) -> batch` and optionally `finish(self)`, called once when its input has ended, whose batch (or `None`) goes downstream. Moruna calls the one instance added to the job, one batch at a time. A `Source` subclass and a `Sink` subclass follow [their own contracts](python-sources.md); a sink's `finish` may return the version it committed, `{"snapshot_id": ..., "version": ...}`.
 
-`@moruna.function` makes a function of a callable (see [Functions](python-kernels.md)), and `moruna.std` builds Moruna's own; each is a `moruna.Function`. `function.build(out=..., tag=...)` packages a function as an OCI image, as `moruna build <module>:<function>` does.
+`@moruna.function` makes a function of a callable (see [Functions](python-functions.md)), and `moruna.std` builds Moruna's own; each is a `moruna.Function`. `function.build(out=..., tag=...)` packages a function as an OCI image, as `moruna build <module>:<function>` does.
 
 ## Needs and the resolver
 

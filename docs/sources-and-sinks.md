@@ -165,4 +165,4 @@ An exception in your source or sink stops the job, and the message includes your
 | `restore`, or a checkpoint that cannot be used | `moruna.ResumeError` |
 | A class without `plan`, `read` or `write`, or with `checkpoint` but no `restore` | `TypeError` |
 
-Next: [Writing functions](kernels.md).
+Next: [Writing functions](functions.md).

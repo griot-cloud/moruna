@@ -40,7 +40,7 @@ def score(batch):
 
 A function sees only its batch. It does not open files, choose batch sizes or manage threads, which is what lets Moruna run it on any amount of data. A job can chain several functions; each receives what the previous one returned.
 
-Some transformations do not need your own code. Moruna includes **standard functions** for common operations such as filtering rows, selecting and renaming columns, casting types and removing duplicates. Learn more in [Writing functions](kernels.md).
+Some transformations do not need your own code. Moruna includes **standard functions** for common operations such as filtering rows, selecting and renaming columns, casting types and removing duplicates. Learn more in [Writing functions](functions.md).
 
 ## The memory budget
 

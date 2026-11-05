@@ -176,6 +176,10 @@ fn inside(root: &Path, path: &Path) -> Result<CString> {
 
 /// The mount flags the kernel locks on a bind of `path` made in a user namespace: they must be
 /// restated when the bind is restricted.
+/// statvfs(3)'s `ST_RELATIME` (`<sys/statvfs.h>`, Linux 2.6.20 and later), which the `libc`
+/// crate does not export.
+const ST_RELATIME: libc::c_ulong = 0x1000;
+
 fn locked_flags(path: &Path) -> Result<libc::c_ulong> {
     let name = cstring(path.as_os_str().as_bytes())?;
     // SAFETY: statvfs fills a plain C struct for a NUL-terminated path.
@@ -196,13 +200,13 @@ fn locked_flags(path: &Path) -> Result<libc::c_ulong> {
         (libc::ST_NOEXEC, libc::MS_NOEXEC),
         (libc::ST_NOATIME, libc::MS_NOATIME),
         (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
-        (libc::ST_RELATIME, libc::MS_RELATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
     ] {
         if f & st != 0 {
             flags |= ms;
         }
     }
-    if f & (libc::ST_NOATIME | libc::ST_RELATIME) == 0 {
+    if f & (libc::ST_NOATIME | ST_RELATIME) == 0 {
         flags |= libc::MS_STRICTATIME;
     }
     Ok(flags)
