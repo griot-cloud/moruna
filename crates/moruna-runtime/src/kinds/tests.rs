@@ -88,6 +88,12 @@ impl RunnableKind for Probe {
             preserves_columns: Fact::Yes,
             isolation: self.isolation,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -120,9 +126,9 @@ fn kd_t1_resolve_or_refuse() {
     // A name is resolved within its role: no source is called `std`, no sink `std`.
     let e = error_of(kinds.source("source", "std"));
     let sources = if cfg!(feature = "peql") {
-        "arrow_ipc, datafusion, parquet, tensor, vortex"
+        "arrow_ipc, datafusion, image, parquet, tensor, vortex"
     } else {
-        "arrow_ipc, parquet, tensor, vortex"
+        "arrow_ipc, image, parquet, tensor, vortex"
     };
     assert_eq!(
         e.to_string(),
@@ -136,7 +142,7 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(refused_field(&e).as_deref(), Some("sink.kind"));
     assert!(
         e.to_string()
-            .contains("this build writes arrow_ipc, parquet"),
+            .contains("this build writes arrow_ipc, image, parquet"),
         "{e}"
     );
     let e = error_of(kinds.kernel("kernels[3]", "java"));
@@ -307,9 +313,20 @@ fn kd_t4_standard_conformance() {
 #[test]
 fn im_t16_the_image_kind_is_declared() {
     let kind = image::Image;
-    let declared = kind.declaration();
+    let declared = RunnableKind::declaration(&kind);
     assert_eq!(declared.check(Role::Kernel), Ok(()));
-    assert_eq!(declared, kind.declaration());
+    assert_eq!(declared, RunnableKind::declaration(&kind));
+    for role in [Role::Source, Role::Sink] {
+        let other = match role {
+            Role::Source => SourceKind::declaration(&kind),
+            _ => SinkKind::declaration(&kind),
+        };
+        assert_eq!(other.check(role), Ok(()));
+        assert_eq!(
+            other.settings, declared.settings,
+            "one settings schema for every role"
+        );
+    }
     assert_eq!(declared.name, "image");
     assert_eq!(declared.isolation, Isolation::Confined);
     assert_eq!(declared.needs, Needs::nothing());
@@ -330,15 +347,16 @@ fn im_t16_the_image_kind_is_declared() {
             .expect("refused")
             .to_string()
     };
-    let e = build(json!({"kind": "image", "layout": "/l"}));
-    assert!(e.contains("kernels[0]") && e.contains("reference"), "{e}");
-    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "volume": "/v"}));
+    let e = build(json!({"kind": "image"}));
+    assert!(e.contains("kernels[0]") && e.contains("image"), "{e}");
+    let draft = json!({"build_key": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "digest": null, "location": null});
+    let e = build(json!({"kind": "image", "image": draft, "volume": "/v"}));
     assert!(e.contains("kernels[0]") && e.contains("volume"), "{e}");
-    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "command": "ls"}));
+    let e = build(json!({"kind": "image", "image": draft, "command": "ls"}));
     assert!(e.contains("kernels[0]"), "{e}");
-    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r", "env": {"A": 1}}));
+    let e = build(json!({"kind": "image", "image": draft, "env": {"A": 1}}));
     assert!(e.contains("kernels[0]"), "{e}");
-    let e = build(json!({"kind": "image", "layout": "/l", "reference": "r"}));
+    let e = build(json!({"kind": "image", "image": draft}));
     #[cfg(not(target_os = "linux"))]
     assert!(e.contains("needs Linux"), "{e}");
     #[cfg(target_os = "linux")]
@@ -390,10 +408,10 @@ fn kd_t6_listing() {
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
     assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
-    let mut sinks = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
-    let mut sources = vec!["arrow_ipc", "parquet", "tensor", "vortex"];
+    let mut sinks = vec!["arrow_ipc", "image", "parquet", "tensor", "vortex"];
+    let mut sources = vec!["arrow_ipc", "image", "parquet", "tensor", "vortex"];
     if cfg!(feature = "peql") {
-        sinks.insert(2, "peql");
+        sinks.insert(3, "peql");
         sources.insert(1, "datafusion");
     }
     assert_eq!(names(&listing.sinks), sinks);
@@ -578,6 +596,9 @@ fn kd_t11_fusion_through_the_port() {
         notes: Vec::new(),
         packages: crate::packaged::PackageHost::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     };
     let dag = |job: &moruna_job::JobSpec| moruna_job::Job::from_v1(job);
     let plan = |job: &moruna_job::Job| {

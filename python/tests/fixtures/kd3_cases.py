@@ -149,10 +149,11 @@ def cases(args):
     sources["datafusion"] = {"kind": "datafusion", "root": str(root / "governed"),
                              "contract": "kd3/input", "caller": caller}
     kernels = {"std": {"kind": "std", "name": "select", "args": {"columns": ["x"]}},
-               "image": {"kind": "image", "reference": args.image, "layout": str(args.image_layout),
+               "image": {"kind": "image",
+                         "image": {"build_key": None, "digest": args.image,
+                                   "location": str(args.image_layout)},
                          "command": ["/kc1/bin/arrow_echo"]},
-               "fixture.echo": {"kind": "fixture.echo"},
-               "python": {"kind": "python", "ref": f"{root / 'imported.py'}:identity"}}
+               "fixture.echo": {"kind": "fixture.echo"}}
     cells = []
     for case in matrix["cases"]:
         for adapter in ("linux", "native"):
@@ -162,10 +163,10 @@ def cases(args):
                     name = case["id"] + "-" + adapter + "-" + mode
                     staging = str(Path("/tmp/kd3") / run / "staging")
                     identity = {"moruna_spec": 1, "run_id": run,
-                                "source": {"kind": "iterator" if case["id"] == "library.iterator" else "python"},
-                                "kernels": ([{"kind": "python", "module": "__main__", "callable": "main.<locals>.identity"}]
-                                            if case["id"] == "library.python.kernel" else []),
-                                "sink": {"kind": "python"}, "budget": {"memory_bytes": 384 << 20, "cpu": 1.0},
+                                "source": {"kind": "iterator" if case["id"] == "library.iterator" else "image"},
+                                "kernels": ([{"kind": "image", "entry": "__main__:identity"}]
+                                            if case["id"] == "library.image.kernel" else []),
+                                "sink": {"kind": "image"}, "budget": {"memory_bytes": 384 << 20, "cpu": 1.0},
                                 "staging": {"dir": staging, "limit_bytes": 128 << 20}, "ordered": True,
                                 "checkpoint": {"enabled": False}, "allow_gil": True}
                     job_file = "jobs/" + name + ".json"

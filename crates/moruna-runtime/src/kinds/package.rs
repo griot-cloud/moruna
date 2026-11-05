@@ -63,6 +63,12 @@ impl RunnableKind for Package {
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Confined,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 

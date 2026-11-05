@@ -1,5 +1,0 @@
-# What the image's layer 2 installs: pyarrow, pinned exactly with the hashes of its Linux
-# wheels, from this repository's uv.lock. A build installs exactly this and nothing else.
-pyarrow==25.0.1 \
-    --hash=sha256:0b726ad7e7b669be982b0c71c07fe4b037d654354130da79a7902a669e93a66b \
-    --hash=sha256:9171748cdf796972d85a4b60157c279913e242992e350c90c7450182a9838b2a

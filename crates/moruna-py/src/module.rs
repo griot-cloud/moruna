@@ -26,6 +26,7 @@ pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::run::check_job, m)?)?;
     m.add_function(wrap_pyfunction!(crate::run::explain_job, m)?)?;
     m.add_function(wrap_pyfunction!(crate::run::read_job, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::run::check_args, m)?)?;
     m.add_function(wrap_pyfunction!(crate::events::read_events, m)?)?;
     crate::cli::register(m)?;
     crate::output::register(m)?;

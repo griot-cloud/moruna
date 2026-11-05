@@ -8,7 +8,7 @@ A version 1 document is a JSON object describing one job. Only `moruna_spec`, `s
 {
   "moruna_spec": 1,
   "source": {"kind": "parquet", "url": "reviews/"},
-  "kernels": [{"kind": "python", "ref": "reviews.functions:score"}],
+  "kernels": [{"kind": "std", "name": "filter", "args": {"expr": "is_not_null(text)"}}],
   "sink": {"kind": "parquet", "url": "reviews-scored/"},
   "budget": {"memory_bytes": 8589934592}
 }
@@ -68,7 +68,7 @@ A version 1 document is a JSON object describing one job. Only `moruna_spec`, `s
  "caller": {"id": "svc-scoring", "tenant": "acme", "purpose": "reporting"}}
 ```
 
-**`python`**: a `moruna.Source` class by reference: `ref` (`module:Class`), `params`, `needs` and `fingerprint`, as for a [`python` function](#kernels).
+**`image`**: an OCI image's command as a source: `image` (`build_key`, `digest`, `location`), `entry`, `params` and `needs`, as for an [`image` function](#kernels).
 
 An `iterator` source exists only in Python and is refused in a document.
 
@@ -76,7 +76,7 @@ An `iterator` source exists only in Python and is refused in a document.
 
 The functions. Each entry has a `kind`.
 
-**`python`**: code by reference, as for a source or a sink of the `python` kind: `ref` is `module:attribute`, a `moruna.Function` class (constructed with `params`) or a function decorated with `@moruna.function`, on the interpreter's path; `params` are the class's constructor arguments, data only; `needs` names what the runner must supply it (`moruna run --resolver`); `fingerprint` pins its code. The decorator's options are the decorator's, in the code.
+**`image`**: an OCI image's command, in any language, for every role: `image` is `{build_key, digest, location}` (a build key for an image Moruna builds, and once built the manifest's digest and where the image is: an OCI layout's absolute path or a registry reference `HOST/REPOSITORY@sha256:...`); `entry` is what its entry point runs; `params` its data; `needs` the ports the runner serves it. A function's other settings are `command`, `env` (added to the image's; a name starting `MORUNA_` is the runner's), `cache` (where unpacked images go), `plane` (the command makes the data plane's calls on descriptor 3) and `ports` (names routed to the host's peer or a handler of the program). Every task of your own code is an `image` task; its contract is [Images and ports](images.md).
 
 **`std`**: `name` is a standard function, such as `"filter"`, and `args` is an object of its arguments.
 
@@ -84,7 +84,7 @@ The functions. Each entry has a `kind`.
 {"kind": "std", "name": "select", "args": {"columns": ["review_id", "score"]}}
 ```
 
-Any entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded function's fingerprint differs, so a document cannot run a function that has changed since it was checked.
+A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded function's fingerprint differs, so a document cannot run a function that has changed since it was checked.
 
 ## sink
 
@@ -112,7 +112,7 @@ The run report's `write` says what was done: `report.violations` (rows by rule),
  "on_violation": "exclude", "excluded_url": "/staging/excluded"}
 ```
 
-**`python`**: a `moruna.Sink` class by reference: `ref`, `params`, `needs` and `fingerprint`, as for a [`python` function](#kernels). What its `finish` returns as a commit (`snapshot_id`, `version`) is in the report's `sinks`.
+**`image`**: an OCI image's command as a sink: `image`, `entry`, `params` and `needs`, as for an [`image` function](#kernels). What it writes back at its end as a commit (`snapshot_id`, `version`) is in the report's `sinks`.
 
 ## contracts
 
@@ -158,8 +158,31 @@ Without `elastic`, the job keeps the limits it started with. See [Machines that 
 
 ## Version 2: a DAG of tasks
 
-Version 2 holds the job as tasks and edges. A task has an `id` (1 to 128 letters, digits, `_`, `-`, `.` and `:`, starting with a letter or a digit), a `role` (`Source`, `Function` or `Sink`), a `kind` and its `settings` (the kind's settings as above, a FlexBuffers map), its named input and output ports, and optionally `barrier` and `members`. An edge joins one task's output port to another task's input port. One output may feed many inputs; a function may take several inputs, each fed by exactly one edge. The document also has the job's `name` and every top-level field above (`budget`, `staging`, `object_store`, `checkpoint` and the rest), in the same meaning.
+Version 2 holds the job as tasks and edges. A task has an `id` (1 to 128 letters, digits, `_`, `-`, `.` and `:`, starting with a letter or a digit), a `role` (`Source`, `Function` or `Sink`), a `kind` and its `settings` (the kind's settings as above, a FlexBuffers map), its `definition`, its named input and output ports, and optionally `barrier` and `members`. An edge joins one task's output port to another task's input port. One output may feed many inputs; a function may take several inputs, each fed by exactly one edge. The document also has the job's `name` and every top-level field above (`budget`, `staging`, `object_store`, `checkpoint` and the rest), in the same meaning.
 
 A job spec, what `moruna.Job.spec()` writes, is a version 2 document with the job's name, tasks and edges and nothing else: a task gives on its port `out`, a function or a sink of one input takes it on `in`, and one of several inputs takes each on a port named after the task that feeds it. `moruna.Job.read` refuses a document that also sets run settings, naming them, because they are `moruna.run`'s arguments; `moruna run` runs such a document as it is.
 
 `moruna.Job.spec().digest()` is `"sha256:"` and the hex of SHA-256 over exactly the document's bytes, and the run report names it as `job_digest`.
+
+### A task's definition
+
+Every task of a spec carries its definition inline, so a spec is complete for drawing, checking and running without a catalogue: the declaration of its kind (as `moruna kinds` lists it) for one of Moruna's own kinds, and for an `image` task the declaration its code makes. A definition has the declaration's fields (`name`, `role`, `summary`, `settings`, `inputs`, `outputs`, `needs`, `deterministic`, `preserves_columns`, `isolation`) and:
+
+| Field | Meaning |
+| --- | --- |
+| `title` | What a person calls the task: its docstring's first line, else its class or function's name. |
+| `description` | The rest of its docstring. |
+| `settings` | For an image task, the JSON Schema of its params: each of its constructor's params, its type from its annotation (`bool`, `int`, `float`, `str`, `None`, `list`, `dict`, `Literal` or a union of them; an unannotated param takes any data), its default, closed. |
+| `takes`, `gives` | The Arrow schemas it declares: `{"fields": [{"name", "type", "nullable"}]}`, each type as Arrow writes it. |
+| `requires` | What it needs, each `{"name", "description"}` (a task's `needs` may be a mapping of name to description). |
+| `provenance` | For an image Moruna builds: `build_key`, and when its code is in a git repository `source` (the remote, with no credential), `revision` and `dirty` (whether a bundled file differs from the revision). |
+
+The check refuses a definition that is not one, a definition of one of Moruna's kinds that differs from the kind's declaration, params that do not fit an image task's schema, needs that are not what its definition requires, and an edge between two tasks whose declared schemas differ. A docstring is read from the code each time the spec is written, and is not part of a build key.
+
+### Run arguments
+
+A job may declare arguments: `args`, each a `name` (1 to 64 letters, digits and `_`, starting with a letter) and a `type` (`string`, `int`, `float`, `bool`, `date` (`YYYY-MM-DD`) or `timestamp` (RFC 3339)), in name order. The document holds the declaration and never a value. Every run supplies a value of each, and nothing else: `moruna.run(job, args={...})` or `moruna run JOB --arg NAME=VALUE`. A missing argument, one of another type and one the job does not declare are refused by name before anything starts; a task reads them as `self.args` (an image task's process as `MORUNA_ARGS`), and the report records them.
+
+### Draft and runnable specs
+
+An `image` task's image has a build key from the moment it is added: `job.spec()` is instant and complete. Until the job is built its images have no digest, and the spec is a **draft**, refused for running with every unbuilt task named. `job.build()` and `moruna build` fill each digest and location; that spec is **runnable**, and its digest names exactly the images that run. A spec never holds a credential, an argument's value or data.

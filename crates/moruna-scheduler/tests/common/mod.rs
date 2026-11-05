@@ -393,7 +393,7 @@ pub fn run(case: &Case, label: &str) -> Outcome {
     };
     if let Some((online, _)) = &online {
         let keys = (1..=topology.stages()).map(stage_key).collect();
-        if let Err(e) = scheduler.set_cost(Arc::clone(online), keys) {
+        if let Err(e) = scheduler.set_cost(Arc::clone(online), keys, None) {
             panic!("{label}: the cost model: {e}");
         }
     }

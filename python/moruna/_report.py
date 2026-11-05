@@ -8,16 +8,15 @@ over exactly those bytes, and ``moruna.RunReport.from_bytes(data)`` reads them b
 that are not a report in that form. A host that forwards the bytes unchanged can certify them by
 that digest, beside the job's.
 
-Every field of the document is an attribute: ``run_id``; ``job_digest`` (the spec's digest, or
-``None`` for a job that holds a task a spec cannot hold); ``exit`` (``code``, ``status`` and
-``diagnostic``); ``tasks`` (per task: ``key``, ``role``, ``kind``, ``rows_in``, ``rows_out``,
-``bytes_in``, ``bytes_out``, ``time_s``, ``busy_s``, ``excluded_rows``, the ``stage`` that ran
-it and the tasks ``fused_with`` it; a figure the run does not measure is ``None``);
-``resources`` (``cpu_ns``, ``peak_memory_bytes`` and how it was measured); ``sinks`` (per sink:
-``task``, ``target``, ``rows``, ``bytes``, ``files``, ``excluded_rows``, and ``snapshot_id`` and
-``version`` when it committed one); ``plan`` (the plan, when ``moruna.run(..., explain=True)``
-asked for it); and the trace's own fields (``wall_s``, ``stages``, ``notes``, ``limits_initial``,
-``peak_anon_bytes``, ``write``, ``read`` and the rest).
+Every field of the document is an attribute: ``schema_version`` (``"MAJOR.MINOR"``; a reader
+refuses a major it does not know); ``moruna``, ``host`` and ``args`` (what ran it, where, and the
+run's argument values); ``run_id``; ``job_digest`` (the spec's digest, or ``None`` for a job that
+holds a task a spec cannot hold); ``exit`` (``code``, ``status`` and ``diagnostic``); ``tasks``
+(per task, keyed by its name in the spec: everything measured of it, its needs, what the plan
+predicted, its observation and a recommendation for the next run; a measurement not made is
+absent, never zero); ``resources`` (``cpu_core_s``, ``peak_memory_bytes`` and how it was
+measured); ``sinks``; ``plan`` and ``plan_steps``; and the trace's own fields. Every number names
+its unit (see ``docs/run-report.md``).
 """
 
 from __future__ import annotations
@@ -30,10 +29,10 @@ from typing import Any
 
 __all__ = ["RunReport"]
 
-#: The report document's format, its ``moruna_report`` field.
-REPORT_FORMAT = 1
+#: The report document's schema, ``MAJOR.MINOR``: a reader refuses a major it does not know.
+SCHEMA_VERSION = "2.0"
 
-_REQUIRED = ("moruna_report", "run_id", "job_digest", "exit", "tasks", "resources", "sinks")
+_REQUIRED = ("schema_version", "run_id", "job_digest", "exit", "tasks", "resources", "sinks")
 
 
 def _canonical(document: Any) -> bytes:
@@ -54,10 +53,11 @@ class RunReport:
         missing = [key for key in _REQUIRED if key not in document]
         if missing:
             raise ValueError(f"not a run report: it has no {', '.join(missing)}")
-        if document["moruna_report"] != REPORT_FORMAT:
+        version = str(document["schema_version"])
+        if version.split(".")[0] != SCHEMA_VERSION.split(".")[0]:
             raise ValueError(
-                f"a run report of format {document['moruna_report']!r}; this Moruna reads "
-                f"format {REPORT_FORMAT}"
+                f"a run report of schema {version!r}; this Moruna reads major "
+                f"{SCHEMA_VERSION.split('.')[0]} ({SCHEMA_VERSION})"
             )
         object.__setattr__(self, "_document", document)
 
@@ -121,7 +121,7 @@ class RunReport:
         d = self._document
         return (
             f"RunReport(run_id={d['run_id']}, exit={d['exit']['status']}, "
-            f"wall_s={d.get('wall_s', 0.0):.3f})"
+            f"wall_ms={d.get('wall_ms', 0.0):.1f})"
         )
 
     def __str__(self) -> str:
@@ -146,22 +146,25 @@ def _render(d: dict[str, Any]) -> str:
         f"moruna run {d['run_id']} {status} (exit {exit_['code']})"
         + (" (resumed)" if d.get("resumed") else ""),
         f"job {d['job_digest'] or '(no spec)'}",
-        f"wall {d.get('wall_s', 0.0):.2f}s   peak {_size(d['resources']['peak_memory_bytes'])} "
+        f"wall {d.get('wall_ms', 0.0) / 1e3:.2f}s   peak "
+        f"{_size(d['resources']['peak_memory_bytes'])} "
         f"({d.get('peak_fraction_of_ceiling', 0.0) * 100:.0f}% of ceiling "
-        f"{_size(limits.get('memory_ceiling', 0))})   cpu {d['resources']['cpu_ns'] / 1e9:.2f}s",
+        f"{_size(limits.get('memory_ceiling', 0))})   cpu {d['resources']['cpu_core_s']:.2f} "
+        "core-s",
     ]
     if d.get("manifest"):
         lines.append(f"manifest {d['manifest']}")
     lines.append("")
-    lines.append(f"{'task':<24} {'role':<8} {'rows in':>12} {'rows out':>12} {'time s':>8}")
+    lines.append(f"{'task':<24} {'role':<8} {'status':<8} {'rows in':>12} {'rows out':>12} {'wall ms':>10}")
     shown = 20
     for task in d["tasks"][:shown]:
         def cell(value: Any, width: int, fmt: str = "") -> str:
             return f"{'-':>{width}}" if value is None else f"{value:>{width}{fmt}}"
 
         lines.append(
-            f"{task['key'][:24]:<24} {task['role']:<8} {cell(task['rows_in'], 12)} "
-            f"{cell(task['rows_out'], 12)} {cell(task['time_s'], 8, '.3f')}"
+            f"{task['key'][:24]:<24} {task['role']:<8} {task.get('status', '-'):<8} "
+            f"{cell(task.get('rows_in'), 12)} {cell(task.get('rows_out'), 12)} "
+            f"{cell(task.get('wall_ms'), 10, '.1f')}"
         )
     if len(d["tasks"]) > shown:
         lines.append(f"... {len(d['tasks']) - shown} more tasks (report.tasks has them all)")

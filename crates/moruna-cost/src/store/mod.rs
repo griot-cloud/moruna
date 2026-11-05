@@ -62,6 +62,10 @@ pub struct Observation {
     pub outcome: Outcome,
     /// When it finished, milliseconds since the Unix epoch.
     pub at_ms: u64,
+    /// The run that measured it, when the recorder named one: what a reader counts runs by,
+    /// since a run settles many units of one key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// The model that decided, when one did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelId>,
@@ -78,6 +82,7 @@ impl Observation {
             inputs,
             outcome,
             at_ms,
+            run: None,
             model: None,
             predictions: Vec::new(),
         }
@@ -203,6 +208,20 @@ pub struct History {
     pub observations: Vec<Observation>,
     /// Records skipped because a write was cut short (a crash mid-append).
     pub torn: u64,
+}
+
+impl History {
+    /// The distinct runs the kept records name; a record that names none is not counted.
+    pub fn runs(&self) -> u64 {
+        let mut runs: Vec<&str> = self
+            .observations
+            .iter()
+            .filter_map(|o| o.run.as_deref())
+            .collect();
+        runs.sort_unstable();
+        runs.dedup();
+        runs.len() as u64
+    }
 }
 
 /// What a model reads to fit: every key's history.

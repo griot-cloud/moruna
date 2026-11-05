@@ -9,6 +9,7 @@ input and output, from a tree laid out as layer 3 is (``/opt/moruna/shim.py`` an
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -55,16 +56,21 @@ def image(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def run_shim(image: Path, entry: str, stdin: bytes) -> subprocess.CompletedProcess[bytes]:
+def run_shim(
+    image: Path, entry: str, stdin: bytes, **extra: str
+) -> subprocess.CompletedProcess[bytes]:
     """The shim as the image's command runs it: its environment is the image's, so the stand-in
-    ``moruna`` (beside the script) is found and the machine's own is not."""
+    ``moruna`` (beside the script) is found and the machine's own is not; the entry, the role,
+    the params and the arguments in the environment, as the runner gives them."""
     env = {
         "PATH": os.environ.get("PATH", ""),
         "PYTHONPATH": f"{image / 'app'}",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "MORUNA_ENTRY": entry,
+        **extra,
     }
     return subprocess.run(
-        [sys.executable, str(image / "opt" / "moruna" / "shim.py"), entry],
+        [sys.executable, str(image / "opt" / "moruna" / "shim.py")],
         input=stdin,
         capture_output=True,
         env=env,
@@ -270,19 +276,26 @@ def test_bd_t5_the_stand_in_refuses_the_rest_of_moruna(image: Path) -> None:
     assert done.returncode == 1
     assert (
         "moruna.run" in done.stderr.decode()
-        and "holds only function, polars, Task and Function" in done.stderr.decode()
+        and "holds only Task, Source, Function, Sink, Split, function and polars"
+        in done.stderr.decode()
     )
 
 
 def test_bd_t5_usage(image: Path) -> None:
     done = subprocess.run(
-        [sys.executable, str(image / "opt" / "moruna" / "shim.py")],
+        [sys.executable, str(image / "opt" / "moruna" / "shim.py"), "an:entry"],
         capture_output=True,
         input=b"",
         check=False,
         timeout=60,
     )
     assert done.returncode == shim.EXIT_USAGE and b"usage" in done.stderr
+    done = subprocess.run(
+        [sys.executable, str(image / "opt" / "moruna" / "shim.py")],
+        capture_output=True, input=b"", check=False, timeout=60,
+        env={"PATH": os.environ.get("PATH", "")},
+    )  # fmt: skip
+    assert done.returncode == shim.EXIT_FAILED and b"MORUNA_ENTRY names no entry" in done.stderr
 
 
 def test_bd_t6_serve_reads_what_a_pipe_gives_one_message_at_a_time() -> None:
@@ -331,7 +344,8 @@ def test_bd_t6_main_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         shim, "take_streams", lambda: (buffered(stream(batch(1), batch(2, 3))), sink)
     )
-    assert shim.main(["inproc_ok:f"]) == shim.EXIT_DONE
+    monkeypatch.setenv("MORUNA_ENTRY", "inproc_ok:f")
+    assert shim.main([]) == shim.EXIT_DONE
     assert [b.num_rows for b in read_all(sink.getvalue())] == [1, 2]
 
 
@@ -340,11 +354,13 @@ def test_bd_t6_main_names_what_went_wrong(
 ) -> None:
     module_on_path(tmp_path, monkeypatch, "inproc_bad", "def f(batch):\n    raise KeyError('k')\n")
     monkeypatch.setattr(shim, "take_streams", lambda: (buffered(stream(batch(1))), io.BytesIO()))
-    assert shim.main(["inproc_bad:f"]) == shim.EXIT_FAILED
+    monkeypatch.setenv("MORUNA_ENTRY", "inproc_bad:f")
+    assert shim.main([]) == shim.EXIT_FAILED
     assert "the function failed" in capsys.readouterr().err
-    assert shim.main(["inproc_bad"]) == shim.EXIT_FAILED
+    monkeypatch.setenv("MORUNA_ENTRY", "inproc_bad")
+    assert shim.main([]) == shim.EXIT_FAILED
     assert "is not <module>:<name>" in capsys.readouterr().err
-    assert shim.main([]) == shim.EXIT_USAGE and "usage" in capsys.readouterr().err
+    assert shim.main(["x:y"]) == shim.EXIT_USAGE and "usage" in capsys.readouterr().err
 
 
 def test_bd_t6_resolve_and_as_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -362,7 +378,7 @@ def test_bd_t6_resolve_and_as_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     )
     for entry, said in [
         ("inproc_kinds:not_callable", "int, which is not callable"),
-        ("inproc_kinds:spec", "int, which is not callable"),
+        ("inproc_kinds:spec", "SimpleNamespace, which is not callable"),
         ("inproc_kinds:stateful_without_setup", "stateful and has no setup"),
     ]:
         with pytest.raises(shim.ShimError, match=said):
@@ -438,13 +454,12 @@ def test_image_workdir_precedes_user_import_and_preserves_relative_assets(
     args = [sys.executable, str(image / "opt" / "moruna" / "shim.py")]
     if explicit_workdir:
         args += ["--workdir", str(image / "app")]
-    args.append(entry)
     done = subprocess.run(
         args,
         input=stream(batch(1, 2), batch(3)),
         capture_output=True,
         env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(image / "app"),
-             "PYTHONDONTWRITEBYTECODE": "1"},
+             "PYTHONDONTWRITEBYTECODE": "1", "MORUNA_ENTRY": entry},
         cwd="/" if explicit_workdir else image / "app",
         check=False,
         timeout=60,
@@ -457,9 +472,145 @@ def test_image_workdir_precedes_user_import_and_preserves_relative_assets(
 def test_explicit_workdir_failure_is_not_a_completed_stream(image: Path) -> None:
     done = subprocess.run(
         [sys.executable, str(image / "opt" / "moruna" / "shim.py"), "--workdir",
-         str(image / "absent"), "relative_assets:apply"],
+         str(image / "absent")],
         input=stream(batch(1)), capture_output=True, check=False, timeout=60,
+        env={"PATH": os.environ.get("PATH", ""), "MORUNA_ENTRY": "relative_assets:apply"},
     )
     assert done.returncode == shim.EXIT_FAILED
     assert b"FileNotFoundError" in done.stderr
     assert done.stdout == b""
+
+
+TASKS = """
+    import json
+    import moruna
+    import pyarrow as pa
+
+    ROWS = pa.schema([("id", pa.int64())])
+
+
+    class Numbers(moruna.Source):
+        \"\"\"`rows` rows of `id`, in splits of `split`.\"\"\"
+
+        gives = ROWS
+
+        def __init__(self, rows: int, split: int = 4) -> None:
+            self.rows, self.split = rows, split
+
+        def plan(self):
+            count = -(-self.rows // self.split)
+            return [moruna.Split(i, min(self.split, self.rows - i * self.split)) for i in range(count)]
+
+        def read(self, split_id, start, end):
+            first = split_id * self.split + start
+            return pa.record_batch({"id": pa.array(range(first, first + end - start), pa.int64())})
+
+
+    class Offset(moruna.Function):
+        needs = {"warehouse.read": "the warehouse, read only"}
+
+        def __init__(self, by: int) -> None:
+            self.by = by
+            self.seen = 0
+
+        def __call__(self, batch):
+            self.seen += batch.num_rows
+            extra = int(self.ports["warehouse.read"].call(b"orders"))
+            window = self.args["window"]
+            ids = [i + self.by + extra + window for i in batch.column("id").to_pylist()]
+            return pa.record_batch({"id": pa.array(ids, pa.int64())})
+
+        def finish(self):
+            return pa.record_batch({"id": pa.array([-self.seen], pa.int64())})
+
+
+    class Keep(moruna.Sink):
+        takes = ROWS
+
+        def __init__(self) -> None:
+            self.rows = 0
+
+        def write(self, batch):
+            self.rows += batch.num_rows
+
+        def finish(self):
+            return {"snapshot_id": self.rows, "version": "v1"}
+"""
+
+
+def test_a_source_writes_every_row_of_its_plan(image: Path) -> None:
+    """MORUNA_ROLE=source: no input, every split read by position, one stream out."""
+    entry = kernel_module(image, "roles", TASKS) + ":Numbers"
+    done = run_shim(image, entry, b"", MORUNA_ROLE="source", MORUNA_PARAMS='{"rows": 10}')
+    assert done.returncode == 0, done.stderr.decode()
+    assert sum(b.num_rows for b in read_all(done.stdout)) == 10
+    assert [b.num_rows for b in read_all(done.stdout)] == [4, 4, 2]
+    refused = run_shim(image, entry, b"", MORUNA_ROLE="source", MORUNA_PARAMS='{"rowz": 1}')
+    assert refused.returncode == 1 and b"refused its params ['rowz']" in refused.stderr
+    wrong = run_shim(image, entry, b"", MORUNA_ROLE="actor")
+    assert wrong.returncode == 1 and b"MORUNA_ROLE is 'actor'" in wrong.stderr
+
+
+def test_a_sink_writes_back_its_commit(image: Path) -> None:
+    entry = kernel_module(image, "roles", TASKS) + ":Keep"
+    done = run_shim(image, entry, stream(batch(1, 2), batch(3)), MORUNA_ROLE="sink")
+    assert done.returncode == 0, done.stderr.decode()
+    assert json.loads(done.stdout) == {"snapshot_id": 3, "version": "v1"}
+    other = pa.RecordBatch.from_arrays([pa.array(["x"])], names=["id"])
+    bad = run_shim(image, entry, stream(other, schema=other.schema), MORUNA_ROLE="sink")
+    assert bad.returncode == 1 and b"Keep takes" in bad.stderr
+
+
+def test_a_function_has_its_params_arguments_ports_and_finish(image: Path) -> None:
+    """The params construct it, the arguments are self.args, each need is a port called over
+    the port protocol on the socket the runner gives, and finish's batch comes last."""
+    import socket as socket_module  # noqa: PLC0415
+
+    entry = kernel_module(image, "roles", TASKS) + ":Offset"
+    task_end, runner_end = socket_module.socketpair()
+    calls: list[tuple[str, bytes]] = []
+
+    def serve() -> None:
+        with runner_end:
+            while True:
+                head = runner_end.recv(6, socket_module.MSG_WAITALL)
+                if not head:
+                    return
+                assert head[:4] == b"MRP1"
+                name = runner_end.recv(int.from_bytes(head[4:6], "little"), socket_module.MSG_WAITALL)
+                size = int.from_bytes(runner_end.recv(8, socket_module.MSG_WAITALL), "little")
+                body = runner_end.recv(size, socket_module.MSG_WAITALL) if size else b""
+                calls.append((name.decode(), body))
+                answer = b"100"
+                runner_end.sendall(b"\x00" + len(answer).to_bytes(8, "little") + answer)
+
+    server = threading.Thread(target=serve)
+    server.start()
+    env = {
+        "PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(image / "app"),
+        "MORUNA_ENTRY": entry, "MORUNA_ROLE": "function", "MORUNA_PARAMS": '{"by": 1}',
+        "MORUNA_ARGS": '{"window": 1000}', "MORUNA_PORTS": '["warehouse.read"]',
+        "MORUNA_PORT_SOCKET": f"fd:{task_end.fileno()}",
+    }  # fmt: skip
+    done = subprocess.run(
+        [sys.executable, str(image / "opt" / "moruna" / "shim.py")],
+        input=stream(batch(1, 2), batch(3)), capture_output=True, env=env, check=False,
+        timeout=60, pass_fds=(task_end.fileno(),),
+    )  # fmt: skip
+    task_end.close()
+    server.join(timeout=30)
+    assert done.returncode == 0, done.stderr.decode()
+    out = [b.column("id").to_pylist() for b in read_all(done.stdout)]
+    assert out == [[1102, 1103], [1104], [-3]], "one batch per batch in, then finish's"
+    assert calls == [("warehouse.read", b"orders")] * 2
+
+
+def test_a_port_that_refuses_and_a_task_without_a_socket(image: Path) -> None:
+    entry = kernel_module(image, "roles", TASKS) + ":Offset"
+    done = run_shim(
+        image, entry, stream(batch(1)), MORUNA_PARAMS='{"by": 1}', MORUNA_PORTS='["warehouse.read"]'
+    )
+    assert done.returncode == 1 and b"MORUNA_PORT_SOCKET names no socket" in done.stderr
+    connection = shim._Socket("tcp:1")
+    with pytest.raises(shim.ShimError, match="fd:<descriptor> or unix:<path>"):
+        connection.call("x", b"")

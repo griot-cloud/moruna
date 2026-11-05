@@ -101,7 +101,7 @@ def test_py_t44_a_fan_out_and_a_join_equal_the_chain(staging: dict[str, object])
     assert joined.table().schema.names == ["id", "text", "loud", "length"]
     assert joined.table().equals(chained.table())
     assert joined.table().num_rows == ROWS
-    assert [stage["rows_in"] for stage in report.stages] == [ROWS, ROWS, ROWS]
+    assert [stage["rows_in"] for stage in [t for t in report.tasks if t["role"] == "function"]] == [ROWS, ROWS, ROWS]
 
 
 def test_py_t44_a_graph_of_several_sources_and_sinks(staging: dict[str, object]) -> None:

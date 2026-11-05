@@ -50,6 +50,9 @@ fn opts() -> BuildOptions<'static> {
         notes: Vec::new(),
         packages: Default::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     }
 }
 
@@ -210,6 +213,8 @@ fn run(job: Job, plan: Option<Plan>, kinds: &Registry) -> (Outcome, Vec<Value>) 
         packages: Default::default(),
         capture_process: false,
         events: Default::default(),
+        args: Vec::new(),
+        pulled_images: None,
     };
     let outcome = match plan {
         Some(plan) => session::run_plan(plan, job, kinds, &opts, &wire, None, Mode::Run),
@@ -308,15 +313,19 @@ fn pn_t21_a_run_from_its_plan() {
     );
     assert_eq!(behind.blocking, [step_of(&expected, "slow")]);
 
-    // The report file and the `report` message carry the same account.
+    // The report file holds the report document, with the plan the run started from and each
+    // step's actual start and end; the `report` message carries the same document, and how the
+    // run went against the plan beside it.
     let file = outcome.report_file.expect("a report file");
-    let envelope = session::read_report_file(&file).expect("the report file");
-    assert_eq!(envelope["plan"]["plan"], expected.id.as_str());
-    assert_eq!(envelope["plan"]["order"].as_array().map(Vec::len), Some(6));
+    let document = session::read_report_file(&file).expect("the report file");
+    assert_eq!(document["schema_version"], "2.0");
+    assert_eq!(document["plan"]["id"], expected.id.as_str());
+    assert_eq!(document["plan_steps"].as_array().map(Vec::len), Some(6));
     let report = lines
         .iter()
         .find(|l| l["type"] == "report")
         .expect("a report message");
+    assert_eq!(report["report"], document);
     assert_eq!(report["plan"]["plan"], expected.id.as_str());
 }
 
@@ -538,6 +547,8 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
         packages: Default::default(),
         capture_process: false,
         events: Default::default(),
+        args: Vec::new(),
+        pulled_images: None,
     };
     let outcome = session::run_file(&spec, Some(&plan_file), &kinds, &opts);
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
@@ -567,6 +578,7 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
             strict: false,
             packages: Default::default(),
             events_json: false,
+            args: Vec::new(),
         })
     );
     let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

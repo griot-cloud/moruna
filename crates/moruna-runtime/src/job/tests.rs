@@ -100,6 +100,9 @@ fn opts(strict: bool, env: &dyn Fn(&str) -> Option<String>) -> BuildOptions<'_> 
         notes: Vec::new(),
         packages: crate::packaged::PackageHost::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     }
 }
 
@@ -142,6 +145,12 @@ impl RunnableKind for Imports {
             preserves_columns: Fact::No,
             isolation: Isolation::Imported,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -241,6 +250,12 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
             preserves_columns: Fact::No,
             isolation: Isolation::Caller,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
     struct Caller;

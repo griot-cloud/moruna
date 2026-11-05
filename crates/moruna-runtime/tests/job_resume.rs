@@ -61,6 +61,12 @@ impl RunnableKind for Sleep {
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -186,6 +192,9 @@ fn job_resume_child() {
             notes: Vec::new(),
             packages: Default::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .expect("builds");

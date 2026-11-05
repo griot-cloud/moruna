@@ -84,13 +84,21 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
 }
 
-/// Start the image's process (SDD 19 f.5): fork, and in the child confine and execute.
-pub fn spawn(plan: &Plan, streams: Streams) -> io::Result<Spawned> {
+/// The descriptor the port socket is at in the command (SDD 19 f.6): the one after its
+/// streams, 3 for a command of standard streams and 4 for one that makes the plane's calls on 3.
+pub fn port_descriptor(streams_on_plane: bool) -> RawFd {
+    if streams_on_plane { 4 } else { 3 }
+}
+
+/// Start the image's process (SDD 19 f.5): fork, and in the child confine and execute. `ports`,
+/// when the task calls ports, is the task's end of the port socket, which the command gets at
+/// [`port_descriptor`].
+pub fn spawn(plan: &Plan, streams: Streams, ports: Option<OwnedFd>) -> io::Result<Spawned> {
     use std::os::fd::AsRawFd;
     let (err_r, err_w) = pipe()?;
     // What the child is given (it holds them across the fork), its descriptors 0 to 2 (and 3,
-    // the plane) in order, and what Moruna keeps.
-    let (given, raw, stdin, stdout) = match streams {
+    // the plane, and then the port socket) in order, and what Moruna keeps.
+    let (mut given, mut raw, stdin, stdout) = match streams {
         Streams::Stdio => {
             let (in_r, in_w) = pipe()?;
             let (out_r, out_w) = pipe()?;
@@ -113,6 +121,10 @@ pub fn spawn(plan: &Plan, streams: Streams) -> io::Result<Spawned> {
             (vec![null, socket], raw, None, None)
         }
     };
+    if let Some(ports) = ports {
+        raw.push(ports.as_raw_fd());
+        given.push(ports);
+    }
     // What the child needs to ask the system about, asked here.
     // SAFETY: getuid and getgid take nothing and cannot fail.
     let (outer_uid, outer_gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -229,13 +241,13 @@ fn reflect(child: libc::pid_t) -> ! {
     }
 }
 
-/// `ends` become descriptors 0, 1, 2 (and 3), in order; every other descriptor is closed.
-/// Each is moved above them first, so that one already at a target is not overwritten before
-/// it is placed.
+/// `ends` become descriptors 0, 1, 2 (and 3 and 4), in order; every other descriptor is
+/// closed. Each is moved above them first, so that one already at a target is not overwritten
+/// before it is placed.
 fn descriptors(ends: &[RawFd]) -> io::Result<()> {
-    let mut high = [0 as RawFd; 4];
+    let mut high = [0 as RawFd; 5];
     if ends.len() > high.len() {
-        return Err(io::Error::other("more than four descriptors"));
+        return Err(io::Error::other("more than five descriptors"));
     }
     for (h, fd) in high.iter_mut().zip(ends) {
         // SAFETY: fcntl F_DUPFD on a descriptor this process holds.

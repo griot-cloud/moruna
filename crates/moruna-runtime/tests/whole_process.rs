@@ -185,6 +185,9 @@ fn child_run() {
                 notes: Vec::new(),
                 packages: moruna_runtime::packaged::PackageHost::default(),
                 host_ports: None,
+                pulled_images: None,
+                args: Default::default(),
+                held: Vec::new(),
             },
         ) {
             Err(e) => json!({"error": e.to_string()}),

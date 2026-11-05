@@ -110,10 +110,10 @@ fn jb_t7_unknown_kinds() {
         text(&found),
         [
             "source.kind: no source kind `csv` is declared; this catalogue reads arrow_ipc, \
-             parquet, tensor, vortex",
+             image, parquet, tensor, vortex",
             "kernels[0].kind: no function kind `java` is declared; this catalogue runs image, package, std",
-            "sink.kind: no sink kind `std` is declared; this catalogue writes arrow_ipc, parquet, \
-             tensor, vortex",
+            "sink.kind: no sink kind `std` is declared; this catalogue writes arrow_ipc, image, \
+             parquet, tensor, vortex",
         ]
     );
     assert_eq!(
@@ -122,6 +122,7 @@ fn jb_t7_unknown_kinds() {
             role: Role::Source,
             known: vec![
                 "arrow_ipc".into(),
+                "image".into(),
                 "parquet".into(),
                 "tensor".into(),
                 "vortex".into()

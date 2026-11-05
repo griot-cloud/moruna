@@ -46,6 +46,13 @@ pub struct BuildOptions<'a> {
     /// The host protocol's ports, when a peer is there to serve them (MH 4.10); a document that
     /// lists a host port is refused without one.
     pub host_ports: Option<std::sync::Arc<crate::host::ports::HostPorts>>,
+    /// The OCI layout the runner pulled the job's registry images into (SDD 19 d.2).
+    pub pulled_images: Option<PathBuf>,
+    /// The run's argument values, by name, checked against what the job declares.
+    pub args: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The tasks this program runs from objects it holds rather than from their images: an
+    /// image of one of them need not be built.
+    pub held: Vec<String>,
 }
 
 /// The process environment, for [`BuildOptions::env`].
@@ -84,6 +91,13 @@ pub struct Built {
     /// Where each sink writes, sink 0 first, as its kind names the target from its settings
     /// (empty for a sink that names none).
     pub sink_targets: Vec<String>,
+    /// The ports each task calls, by its place in the job: what the report counts per need.
+    pub task_ports: Vec<(usize, Arc<StagePorts>)>,
+    /// What identifies each task's code, by its place in the job, as its cost key names it: an
+    /// image task's build key ([`crate::cost::image_identity`]), else its kind's declaration
+    /// ([`crate::cost::declaration_identity`]); a kernel stage's kernel fingerprint stands
+    /// for a built-in kernel's (its program).
+    pub identities: Vec<moruna_cost::Digest>,
 }
 
 /// The fields of `job` left `null` that an environment variable would fill (MH 4.1).
@@ -195,6 +209,28 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         }
     }
 
+    // The run's arguments: every one the job declares, each of its type, and no other.
+    let args = moruna_job::supply(&job.args, &opts.args)
+        .map_err(|refused| refusal(SpecError::new("args", refused.join("; "))))?;
+    // An image task runs the image its document names, built: a draft is refused before
+    // anything starts, naming every task whose image is not built.
+    let drafts = moruna_job::drafts(job, &opts.held);
+    if !drafts.is_empty() {
+        return Err(refusal(SpecError::new(
+            "tasks",
+            format!(
+                "the job's spec is a draft: {} not built ({}); build the job, and run the spec \
+                 the build wrote",
+                if drafts.len() == 1 {
+                    "an image is"
+                } else {
+                    "images are"
+                },
+                drafts.join("; ")
+            ),
+        )));
+    }
+
     // KD-I1: every kind the document names, resolved before anything is built.
     let entries: Vec<KindDoc> = job.tasks.iter().map(|t| t.entry()).collect();
     let mut declared: Vec<&Declaration> = Vec::with_capacity(job.tasks.len());
@@ -207,6 +243,15 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         };
         declared.push(found);
     }
+    let identities: Vec<moruna_cost::Digest> = job
+        .tasks
+        .iter()
+        .zip(&declared)
+        .map(|(task, found)| {
+            crate::cost::image_identity(task)
+                .unwrap_or_else(|| crate::cost::declaration_identity(found))
+        })
+        .collect();
 
     // KD-I6, 16 PK-I8: a hosted run loads no code by import path.
     if opts.strict {
@@ -228,7 +273,9 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     let mut cx = Context::new(kinds.embedding())
         .packages(opts.packages)
         .host_ports(opts.host_ports)
-        .contracts(job.contracts.clone());
+        .contracts(job.contracts.clone())
+        .pulled(opts.pulled_images)
+        .run_args(args);
 
     // The sources, in document order.
     let source_tasks: Vec<usize> = (0..job.tasks.len())
@@ -345,6 +392,8 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     let mut kernels: Vec<Arc<dyn Kernel>> = Vec::with_capacity(assembled.len());
     let mut packaged = Vec::new();
     let mut stage_ports = Vec::new();
+    let mut port_tasks = cx.take_task_calls();
+    stage_ports.extend(port_tasks.iter().map(|(_, p)| Arc::clone(p)));
     #[cfg(feature = "python")]
     let mut py_kernels = Vec::new();
     for (at, assembling) in assembled.into_iter().enumerate() {
@@ -355,6 +404,7 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         if let Some(calls) = stage.ports {
             let ports = StagePorts::new(id, calls.routes);
             (calls.bind)(Arc::clone(&ports));
+            port_tasks.push((assembling.tasks[0], Arc::clone(&ports)));
             stage_ports.push(ports);
         }
         if let Some(p) = stage.packaged {
@@ -497,6 +547,8 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         env_resolved,
         parts,
         sink_targets,
+        task_ports: port_tasks,
+        identities,
     })
 }
 

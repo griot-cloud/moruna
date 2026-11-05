@@ -69,6 +69,10 @@ pub enum RefusalCode {
     },
     /// The kind needs a contract (`needs.contracts` is `yes`) and the job carries none.
     Contract,
+    /// A task's inline definition is not one (SDD 18 e.1), differs from its kind's declaration,
+    /// or does not describe the task: its params against its schema, its needs, the schema one
+    /// task gives against the schema the next takes.
+    Definition,
 }
 
 /// Check `job` against `catalogue`. Every refusal is collected, not only the first, in the order
@@ -132,6 +136,7 @@ fn walk(job: &Job, catalogue: Option<&Catalogue>) -> Result<(), Vec<Refusal>> {
             });
         }
     }
+    schemas_fit(job, &mut refusals);
     for (i, task) in job.tasks.iter().enumerate() {
         for port in &task.inputs {
             let into = job.edges_into(&task.id, port);
@@ -290,10 +295,130 @@ fn task_entry<'c>(
         &declared.settings,
         &task.settings,
     ));
+    if let Some(definition) = &task.definition {
+        definition_refusals(field, task, declared, definition, refusals);
+    }
     if declared.needs.contracts == Fact::Yes {
         needing.push((field.to_string(), task.kind.clone()));
     }
     Some(declared)
+}
+
+/// The kind whose tasks carry the definition their own code makes, not their kind's.
+pub const IMAGE_KIND: &str = "image";
+
+/// A task's inline definition checked: one a document can carry; its kind's own declaration,
+/// for a kind whose tasks have no code of their own; for an image task, a definition its params
+/// and its needs fit.
+fn definition_refusals(
+    field: &str,
+    task: &Task,
+    declared: &Declaration,
+    definition: &Declaration,
+    refusals: &mut Vec<Refusal>,
+) {
+    let refuse = |at: String, message: String| Refusal {
+        field: at,
+        code: RefusalCode::Definition,
+        message,
+    };
+    let at = format!("{field}.definition");
+    if let Err(why) = definition.check_definition(task.role) {
+        refusals.push(refuse(at.clone(), why));
+        return;
+    }
+    if task.kind != IMAGE_KIND {
+        if definition != declared {
+            refusals.push(refuse(
+                at,
+                format!(
+                    "is not the declaration of the kind `{}` this program has: a task of a kind \
+                     carries its kind's declaration as it is",
+                    task.kind
+                ),
+            ));
+        }
+        return;
+    }
+    let params = task
+        .settings
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let Value::Object(params) = params else {
+        refusals.push(refuse(
+            format!("{field}.settings.params"),
+            "an image task's params are an object".into(),
+        ));
+        return;
+    };
+    refusals.extend(
+        settings_refusals(
+            &format!("{field}.params"),
+            &definition.name,
+            &definition.settings,
+            &params,
+        )
+        .into_iter()
+        .map(|r| Refusal {
+            code: RefusalCode::Definition,
+            ..r
+        }),
+    );
+    let needs: Vec<&str> = task
+        .settings
+        .get("needs")
+        .and_then(Value::as_array)
+        .map(|n| n.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let required: Vec<&str> = definition
+        .requires
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    if needs != required {
+        refusals.push(refuse(
+            format!("{field}.settings.needs"),
+            format!(
+                "names {needs:?}, and the task's definition requires {required:?}: a task's needs \
+                 are what its definition says it requires"
+            ),
+        ));
+    }
+}
+
+/// Along every edge into a task of one input whose two ends' definitions declare one, the
+/// schema the producer gives is the schema the consumer takes (SDD 18 e.1).
+fn schemas_fit(job: &Job, refusals: &mut Vec<Refusal>) {
+    for (i, task) in job.tasks.iter().enumerate() {
+        let Some(takes) = task.definition.as_ref().and_then(|d| d.takes.as_ref()) else {
+            continue;
+        };
+        if task.inputs.len() != 1 {
+            continue;
+        }
+        for edge in job.edges.iter().filter(|e| e.to.task == task.id) {
+            let Some(gives) = job
+                .tasks
+                .iter()
+                .find(|t| t.id == edge.from.task)
+                .and_then(|t| t.definition.as_ref())
+                .and_then(|d| d.gives.as_ref())
+            else {
+                continue;
+            };
+            if gives != takes {
+                refusals.push(Refusal {
+                    field: format!("{}.inputs.{}", job.field(i), edge.to.port),
+                    code: RefusalCode::Definition,
+                    message: format!(
+                        "`{}` takes {takes} and `{}` gives {gives}",
+                        task.id, edge.from.task
+                    ),
+                });
+            }
+        }
+    }
 }
 
 fn flows_fit(declared: &Declaration, role: Role) -> bool {
@@ -681,6 +806,29 @@ fn values(listed: &[Value]) -> String {
     }
 }
 
+/// Every image task of `job` whose image is not built (its `image` names no digest), other than
+/// the tasks `held` (a program running them from objects it holds), each as `<field>
+/// (build key <key>)`: a document with any is a draft, complete for drawing and checking and
+/// refused for running.
+pub fn drafts(job: &Job, held: &[String]) -> Vec<String> {
+    job.tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.kind == IMAGE_KIND && !held.contains(&t.id))
+        .filter_map(|(i, t)| {
+            let image = t.settings.get("image")?;
+            if image.get("digest").is_some_and(|d| !d.is_null()) {
+                return None;
+            }
+            let key = image
+                .get("build_key")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            Some(format!("{} `{}` (build key {key})", job.field(i), t.id))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +854,12 @@ mod tests {
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         };
         catalogue.declare_unchecked(odd(Role::Source, Flow::Batches, Flow::Batches));
         catalogue.declare_unchecked(odd(Role::Kernel, Flow::Files, Flow::Batches));

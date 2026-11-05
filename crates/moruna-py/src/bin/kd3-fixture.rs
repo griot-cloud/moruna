@@ -472,13 +472,20 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
     } else {
         None
     };
-    let mut kinds = _core::kinds::command(None)?.with_embedding(Arc::new(FixtureEmbedding));
+    let mut kinds = _core::kinds::command(std::collections::BTreeMap::new())?
+        .with_embedding(Arc::new(FixtureEmbedding));
     kinds.declare(moruna_job::Declaration {
         name:"fixture.echo".into(),role:moruna_job::Role::Kernel,summary:"KD3 actual embedder identity handler".into(),
         settings:json!({"$schema":moruna_job::SCHEMA_DIALECT,"type":"object","additionalProperties":false,"properties":{},"examples":[{}]}),
         inputs:moruna_job::Flow::Batches,outputs:moruna_job::Flow::Batches,needs:moruna_job::Needs::a_port(),
         deterministic:moruna_job::Fact::Yes,preserves_columns:moruna_job::Fact::Yes,isolation:moruna_job::Isolation::Embedder,
         served:Some(moruna_job::Served {port:moruna_job::PortDoc::guest("fixture.echo"),input_schema:None,output_schema:None}),
+        title: None,
+        description: None,
+        takes: None,
+        gives: None,
+        requires: Vec::new(),
+        provenance: None,
     })?;
     if let Some(declarations) = fixture["declarations"].as_array() {
         for declaration in declarations {
@@ -499,6 +506,9 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
                 sandbox_cgroup: fixture["sandbox_cgroup"].as_str().map(Into::into),
             },
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     );
     let mut built = match built {

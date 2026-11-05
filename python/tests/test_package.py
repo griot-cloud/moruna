@@ -398,8 +398,7 @@ def test_py_t22_run_a_loaded_package(scratch: Path, dataset, capsys) -> None:
     report = moruna.run(moruna.ParquetSource(src), [loaded], moruna.ParquetSink(out))
     written = pq.read_table(out.removeprefix("file://"))
     assert written.num_rows == rows
-    stages = json.loads(report.to_json())["stages"]
-    (stage,) = [s for s in stages if s["stage"] == 1]
+    (stage,) = [t for t in json.loads(report.to_json())["tasks"] if t["role"] == "function"]
     assert stage["rows_in"] == rows
     assert stage["alloc"]["linear"] is not None
 

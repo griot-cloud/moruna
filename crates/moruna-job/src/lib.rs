@@ -20,6 +20,7 @@
 
 #![deny(missing_docs)]
 
+mod args;
 mod call;
 mod canonical;
 mod catalogue;
@@ -46,13 +47,16 @@ mod generated {
 /// [`Job::from_flatbuffer`], which verifies them first.
 pub use generated::moruna::job::fb;
 
+pub use args::{
+    ARG_TYPES, ArgDecl, ArgType, check_value, declaration_faults, is_arg_name, parse_value, supply,
+};
 pub use call::{CALL_HEADER_MAX, CALL_MAGIC, CALL_VERSION, CallError, ServedCall};
 /// The canonical JSON of a value (MH 4.1): object keys sorted by their bytes, no whitespace, whatever
 /// `serde_json`'s features are. What a document's identity is taken over, and a served kind's
 /// fingerprint (SDD 18 e.4).
 pub use canonical::to_string as canonical_json;
 pub use catalogue::{Catalogue, CatalogueError};
-pub use check::{Refusal, RefusalCode, check, check_graph, settings_refusals};
+pub use check::{IMAGE_KIND, Refusal, RefusalCode, check, check_graph, drafts, settings_refusals};
 pub use doc::{
     AzureDoc, BudgetDoc, CHECKPOINT_INTERVAL_BOUNDS_MS, CHECKPOINT_INTERVAL_MS, CheckpointDoc,
     ContractEntry, ElasticDoc, ErrorPolicyDoc, GcsDoc, GuaranteeDoc, HostProfileDoc, JobSpec,
@@ -62,8 +66,8 @@ pub use doc::{
 pub use flatbuffer::{JOB_IDENTIFIER, JobError, is_job_flatbuffer};
 pub use job::{Edge, IN, JOB_VERSION, Job, OUT, PortRef, Reporting, Task, V1_SINK, V1_SOURCE};
 pub use kind::{
-    Declaration, Fact, Flow, Isolation, LISTING_VERSION, Listing, Needs, Role, SCHEMA_DIALECT,
-    Served, Urls, is_kind_name, settings_schema,
+    ArrowField, ArrowSchema, Declaration, Fact, Flow, Isolation, LISTING_VERSION, Listing, Needs,
+    Provenance, Requirement, Role, SCHEMA_DIALECT, Served, Urls, is_kind_name, settings_schema,
 };
 pub use port::{PORT_DEADLINE_MAX_MS, PORT_DEADLINE_MS, Place, PortDoc, PortFault, is_port_name};
 pub use rules::SchemaRules;

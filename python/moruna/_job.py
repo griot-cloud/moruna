@@ -6,22 +6,24 @@ A job holds tasks, each added with the tasks that feed it::
     rows = job.add(moruna.ParquetSource("in/"), name="rows")
     enriched = job.add(Enrich(table="orders"), inputs=rows)
     job.add(moruna.ParquetSink("out/"), inputs=enriched, name="out")
-    print(job)                       # one line per task
+    print(job)                       # one line per task, with its image's state
+    job.build(out="images")          # one image per task of the user's code
     job.write("orders.mjob")         # the spec: the job document, version 2
     report = moruna.run(job, ports={"warehouse": warehouse})
 
 A task is a ``moruna.Source``, a ``moruna.Function`` or a ``moruna.Sink``. One of the library's
-own (``moruna.ParquetSource``, ``moruna.std.select(...)``, a ``@moruna.function``) is written to
-the spec by its kind and settings. One a user writes subclasses ``Source``, ``Function`` or
-``Sink``, declares what it ``takes`` and ``gives`` (Arrow schemas) and what it ``needs`` (names
-the runner supplies, each passed to it in ``self.ports``), and takes data only in its
-constructor; the spec names it as a ``python`` task, ``{"ref": "module:Class", "params": {...},
-"needs": [...], "fingerprint": ...}``, and a runner that reads the spec constructs it again,
-checking the fingerprint first.
+own (``moruna.ParquetSource``, ``moruna.std.select(...)``) is written to the spec by its kind and
+settings. One a user writes (a subclass, or a ``@moruna.function``) is an ``image`` task: the spec
+names its entry, its params, its needs and its image, ``{build_key, digest, location}``, and
+carries its definition inline, made from its code (its docstring, its constructor's params,
+what it takes, gives and needs, and where its code came from). The build key is known before
+anything is built; ``job.build()`` fills the digest and the location. In this process a job's
+tasks run as the objects they are, built or not.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import importlib
@@ -40,7 +42,10 @@ from typing import Any
 from moruna import _core, _declare
 from moruna._ports import load_resolver, resolver_of, writer_of
 
-__all__ = ["Function", "Job", "JobSpec", "Sink", "Source", "Task", "function"]
+#: The types a run argument may have.
+ARG_TYPES = ("string", "int", "float", "bool", "date", "timestamp")
+
+__all__ = ["Function", "Job", "JobSpec", "Sink", "Source", "Task", "function", "image"]
 
 #: The roles of a task, as a spec names them.
 ROLES = ("source", "function", "sink")
@@ -118,6 +123,7 @@ class Task:
     takes: Any = None
     gives: Any = None
     needs: Sequence[str] = ()
+    files: Sequence[str | os.PathLike[str]] = ()
     lockfile: str | os.PathLike[str] | None = None
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Any:
@@ -130,6 +136,11 @@ class Task:
         """What the runner supplied for ``needs``, by name; empty before a run supplies it."""
         return self.__dict__.get("_moruna_ports", types.MappingProxyType({}))
 
+    @property
+    def args(self) -> Mapping[str, Any]:
+        """The run's arguments, by name; empty before a run supplies them."""
+        return self.__dict__.get("_moruna_run_args", types.MappingProxyType({}))
+
 
 def _task_init_subclass(cls: type, role: str) -> None:
     for which in ("takes", "gives"):
@@ -138,11 +149,30 @@ def _task_init_subclass(cls: type, role: str) -> None:
             raise TypeError(f"{cls.__name__}.{which} is a pyarrow.Schema, not {value!r}")
     needs = cls.__dict__.get("needs")
     if needs is not None:
-        if isinstance(needs, str) or not all(isinstance(n, str) and n for n in needs):
+        described: dict[str, str | None]
+        if isinstance(needs, Mapping):
+            described = dict(needs)
+        elif isinstance(needs, str):
             raise TypeError(
-                f"{cls.__name__}.needs is a list of names (strings), not {needs!r}"
+                f"{cls.__name__}.needs is a list of names, or a mapping of name to what it is, "
+                f"not {needs!r}"
             )
-        cls.needs = tuple(needs)
+        else:
+            described = {n: None for n in needs}
+        if not all(isinstance(n, str) and n for n in described) or not all(
+            d is None or isinstance(d, str) for d in described.values()
+        ):
+            raise TypeError(
+                f"{cls.__name__}.needs is a list of names, or a mapping of name to what it is, "
+                f"not {needs!r}"
+            )
+        cls.needs = tuple(described)
+        cls._moruna_need_text = described
+    files = cls.__dict__.get("files")
+    if files is not None:
+        if isinstance(files, (str, os.PathLike)):
+            files = (files,)
+        cls.files = tuple(files)
     if role == "source" and "read" in cls.__dict__:
         cls.read = _checked(cls.__dict__["read"], "gives", argument=False)
     if role == "sink" and "write" in cls.__dict__:
@@ -194,62 +224,13 @@ class Function(Task):
     against ``takes`` and every batch it gives against ``gives`` when they are declared.
 
     ``@moruna.function`` makes a function from a callable, and ``moruna.std`` builds Moruna's own;
-    each is a ``moruna.Function``. ``build()`` packages one as an OCI image.
+    each is a ``moruna.Function``. ``job.build()`` builds a job's functions into images.
     """
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if cls.__module__ != __name__:
             _task_init_subclass(cls, "function")
-
-    def build(
-        self,
-        *,
-        out: str | os.PathLike[str] = "moruna-image",
-        tag: str | None = None,
-        platform: str | None = None,
-        lock: str | os.PathLike[str] | None = None,
-        files: Sequence[str | os.PathLike[str]] = (),
-        runtime_layout: str | os.PathLike[str] | None = None,
-        runtime_reference: str | None = None,
-        cache: str | os.PathLike[str] | None = None,
-        index_url: str | None = None,
-        find_links: Sequence[str] = (),
-        no_index: bool = False,
-    ) -> Any:
-        """Build this function as an OCI image of four layers and return what was built (SDD 30).
-
-        The same as ``moruna build <module>:<name>``: the function is bound to a name at the top
-        level of its module. The image is written to the OCI layout directory ``out`` under
-        ``tag`` (default ``<name>:latest``): the runtime, the dependencies the project's
-        ``uv.lock`` or ``requirements.lock`` pins (``lock``, or the nearest above the module),
-        the shim, and the module with the ``files`` it names. Raises ``moruna.ConfigError``
-        naming the cause when the build is refused.
-        """
-        from moruna import _build  # noqa: PLC0415, the builder is needed by `build` alone
-
-        if isinstance(self, _Handle) and not isinstance(self._handle, _core.KernelSpec):
-            raise _config_error(
-                f"build refused: {self!r} is Moruna's own; only a Python function is built"
-            )
-        try:
-            return _build.build(
-                self,
-                out=out,
-                tag=tag,
-                platform=platform,
-                lock=lock,
-                files=files,
-                runtime_layout=runtime_layout,
-                runtime_reference=runtime_reference,
-                cache=cache,
-                index_url=index_url,
-                find_links=find_links,
-                no_index=no_index,
-                version=_core.__version__,
-            )
-        except _build.Refused as exc:
-            raise _config_error(f"build refused: {exc}") from exc
 
 
 class _Handle(Function):
@@ -273,6 +254,14 @@ class _Handle(Function):
 
     def __repr__(self) -> str:
         return f"moruna.Function({self._handle!r})"
+
+    @property
+    def args(self) -> Any:  # type: ignore[override]
+        """A standard function's arguments, as its handle holds them; otherwise the run's."""
+        handle = self.__dict__["_handle"]
+        if hasattr(handle, "args"):
+            return handle.args
+        return self.__dict__.get("_moruna_run_args", types.MappingProxyType({}))
 
 
 def _wrap(handle: Any) -> Function:
@@ -330,7 +319,7 @@ def function(
         frame = None if stateful else _declare.polars_signature(obj)
         if frame is not None:
             origin, obj = obj, _declare.polars_callable(obj, frame)
-        return _wrap(
+        made = _wrap(
             _core.build_kernel(
                 obj,
                 stateful=stateful,
@@ -350,6 +339,9 @@ def function(
                 memory_guard=memory_guard,
             )
         )
+        # What its definition says it takes and gives, when it declares exact schemas.
+        made.__dict__["_moruna_declared"] = (input_schema, output_schema)
+        return made
 
     if fn is None:
         return decorate
@@ -407,27 +399,6 @@ def _function_handle(task: Function) -> Any:
     return handle
 
 
-def _fingerprint(task: Any) -> str:
-    """What pins a task's code: the fingerprint ``moruna check`` computes for a function (its
-    qualified name, its source, its declaration and its lock file), taken of the class of a
-    ``Source`` or ``Sink`` the same way."""
-    if isinstance(task, _Handle):
-        return f"sha256:{task._handle.fingerprint}"
-    if isinstance(task, Function):
-        return f"sha256:{_function_handle(task).fingerprint}"
-    takes, gives = _declared(task)
-    probe = _core.build_kernel(
-        _Instance(task),  # never called: the class is what is fingerprinted
-        stateful=True,
-        instances=1,
-        input_schema=takes,
-        output_schema=gives,
-        lockfile=_lockfile(task),
-        origin=type(task),
-    )
-    return f"sha256:{probe.fingerprint}"
-
-
 # ---------------------------------------------------------------------------------------------
 # What a task is to a job
 
@@ -444,18 +415,31 @@ _LIBRARY_FUNCTIONS = (_core.StdKernel, _core.PackageKernel, _core.DeclaredTask)
 
 
 class _Read:
-    """A task read from a spec: its role, kind, settings and input ports, written back as read.
-    A ``python`` task is constructed from its reference when the job runs."""
+    """A task read from a spec: its role, kind, settings, definition and input ports, written
+    back as read. An ``image`` task runs its image."""
 
-    def __init__(self, role: str, kind: str, settings: dict[str, Any], ports: list[str]) -> None:
+    def __init__(
+        self,
+        role: str,
+        kind: str,
+        settings: dict[str, Any],
+        ports: list[str],
+        definition: dict[str, Any] | None,
+    ) -> None:
         self.role = role
         self.kind = kind
         self.settings = settings
         self.port_names = ports
+        self.definition = definition
+        self.takes = self.gives = None
 
     @property
     def needs(self) -> tuple[str, ...]:
-        return tuple(self.settings.get("needs", ())) if self.kind == "python" else ()
+        return tuple(self.settings.get("needs", ())) if self.kind == "image" else ()
+
+    @property
+    def image(self) -> dict[str, Any] | None:
+        return self.settings.get("image") if self.kind == "image" else None
 
     def __repr__(self) -> str:
         return f"<{self.role} {self.kind} {json.dumps(self.settings, sort_keys=True)}>"
@@ -582,52 +566,6 @@ def _writable_reference(obj: Any, key: str) -> str:
     return reference
 
 
-def _python_settings(task: Any, key: str, *, strict: bool) -> dict[str, Any]:
-    """The ``python`` settings of a task the user wrote or decorated: its reference, params,
-    needs and fingerprint. ``strict`` (for a spec) refuses what a spec cannot hold: a closure, a
-    param that is not data, a param that names a secret."""
-    if isinstance(task, _Handle):
-        target = task._handle.wrapped
-        target = getattr(target, "__wrapped__", target)
-        params: dict[str, Any] = {}
-        needs: tuple[str, ...] = ()
-    else:
-        target = type(task)
-        needs = tuple(task.needs)
-        if strict:
-            params = _params(task, key)
-        else:
-            # A run or a plan of this process names the params it can, so its digest and its
-            # step ids are the spec's whenever the job has one.
-            try:
-                params = _params(task, key)
-                for name, value in params.items():
-                    _data(value, name)
-            except (TypeError, ValueError):
-                params = {}
-    if strict:
-        if isinstance(task, _Handle):
-            reference = _decorated_reference(task, key)
-        else:
-            reference = _writable_reference(target, key)
-        for name, value in params.items():
-            if _SECRET.search(name):
-                raise ValueError(
-                    f"task {key!r}: the param {name!r} names a secret, and a spec holds none; "
-                    "declare it in `needs` and supply it when the job runs"
-                )
-            _data(value, f"task {key!r}: param {name!r}")
-    else:
-        reference = _reference(target)
-    settings: dict[str, Any] = {"ref": reference}
-    if params:
-        settings["params"] = params
-    if needs:
-        settings["needs"] = list(needs)
-    settings["fingerprint"] = _fingerprint(task)
-    return settings
-
-
 def _decorated_reference(task: _Handle, key: str) -> str:
     """The reference of a decorated function: the name its module binds the function to."""
     wrapped = task._handle.wrapped
@@ -649,120 +587,477 @@ def _decorated_reference(task: _Handle, key: str) -> str:
 
 
 # ---------------------------------------------------------------------------------------------
-# Making a task from its reference
+# A task of the user's code as an image task: its entry, its params, its needs, its image and
+# its definition
 
 
-def _import(reference: str) -> Any:
-    """What ``module:attribute`` names: the module a dotted name on the interpreter's path, or a
-    ``.py`` file by its path, loaded once per path."""
-    module, sep, attribute = reference.rpartition(":")
-    if not sep or not module or not attribute:
-        raise ValueError(f"`{reference}`: a reference is module:attribute")
-    target: Any
-    if module.endswith(".py") or "/" in module:
-        name = "_moruna_job_" + re.sub(r"[^A-Za-z0-9]", "_", module)
-        target = sys.modules.get(name)
-        if target is None:
-            spec = importlib.util.spec_from_file_location(name, module)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"`{module}` is not a Python file")
-            target = importlib.util.module_from_spec(spec)
-            sys.modules[name] = target
-            try:
-                spec.loader.exec_module(target)
-            except BaseException:
-                del sys.modules[name]
-                raise
-    else:
-        target = importlib.import_module(module)
-    for part in attribute.split("."):
-        target = getattr(target, part)
-    return target
+@dataclasses.dataclass(frozen=True)
+class Target:
+    """What a job's images are built for: the platform, the runtime image (its name in a build
+    key), the lock (when given, else the nearest above the code) and the data files every task
+    reads."""
+
+    platform: str
+    runtime: str
+    runtime_layout: str | None = None
+    runtime_reference: str | None = None
+    lock: str | None = None
+    files: tuple[str, ...] = ()
 
 
-def _construct(role: str, settings: Mapping[str, Any], at: str) -> Any:
-    """The task the ``python`` settings name, constructed and its fingerprint checked."""
-    reference = settings["ref"]
-    params = dict(settings.get("params") or {})
-    needs = list(settings.get("needs") or [])
-    try:
-        target = _import(reference)
-    except (ImportError, AttributeError, ValueError) as exc:
-        raise _config_error(f"{at}.ref: `{reference}` does not import: {exc}") from None
-    if isinstance(target, type) and issubclass(target, Task):
+def _default_target() -> Target:
+    from moruna import _build  # noqa: PLC0415
+
+    return Target(platform=_build.parse_platform(None).name, runtime=_build.RUNTIME_INDEX)
+
+
+def _entry(task: Any, key: str) -> tuple[str, Any]:
+    """``module:attribute`` of the code of a task the user wrote or decorated, and that code: the
+    name its module binds it to."""
+    if isinstance(task, _Handle):
+        return _decorated_reference(task, key), task._handle.wrapped
+    return _writable_reference(type(task), key), type(task)
+
+
+def _arrow(schema: Any) -> dict[str, Any] | None:
+    """A ``pyarrow.Schema`` as a definition spells it."""
+    if schema is None or not (hasattr(schema, "names") and hasattr(schema, "field")):
+        return None
+    return {
+        "fields": [
+            {"name": f.name, "type": str(f.type), "nullable": bool(f.nullable)} for f in schema
+        ]
+    }
+
+
+_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+_JSON_TYPES = {int: "integer", float: "number", str: "string", bool: "boolean", type(None): "null"}
+
+
+def _param_schema(annotation: Any, where: str) -> dict[str, Any]:
+    """The JSON Schema of one param from its annotation; an unannotated param takes any data."""
+    import typing  # noqa: PLC0415
+
+    if annotation is inspect.Parameter.empty or annotation is Any:
+        return {}
+    if annotation in _JSON_TYPES:
+        return {"type": _JSON_TYPES[annotation]}
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin in (list, tuple, Sequence) or annotation in (list, tuple):
+        items = args[0] if args and args[-1] is not Ellipsis or len(args) == 2 else None
+        schema: dict[str, Any] = {"type": "array"}
+        if items is not None:
+            schema["items"] = _param_schema(items, where)
+        return schema
+    if origin in (dict, Mapping) or annotation is dict:
+        schema = {"type": "object"}
+        if len(args) == 2:
+            schema["additionalProperties"] = _param_schema(args[1], where)
+        return schema
+    if origin is typing.Literal:
+        return {"enum": list(args)}
+    if origin in (typing.Union, types.UnionType):
+        options = [_param_schema(a, where) for a in args]
+        simple = [o.get("type") for o in options]
+        if all(isinstance(t, str) and len(o) == 1 for t, o in zip(simple, options, strict=True)):
+            return {"type": simple}
+        return {"anyOf": options}
+    raise ValueError(
+        f"{where} is annotated {annotation!r}, which a JSON Schema of data cannot describe: "
+        "annotate a param with bool, int, float, str, None, list, dict, Literal or a union of them"
+    )
+
+
+def _params_schema(cls: type, key: str, strict: bool = True) -> dict[str, Any]:
+    """The JSON Schema of the params a task's constructor takes: each named param with its type
+    (from its annotation) and its default; closed."""
+    import typing  # noqa: PLC0415
+
+    init = cls.__init__
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    if init not in (object.__init__, Task.__init__, _core.Source.__init__, _core.Sink.__init__):
+        signature = inspect.signature(init)
         try:
-            task = target(**params)
-        except Exception as exc:
-            raise _config_error(
-                f"{at}.params: `{reference}` refused its params: {type(exc).__name__}: {exc}"
-            ) from exc
-    elif params:
-        raise _config_error(f"{at}.params: `{reference}` is not a class and takes no params")
-    elif isinstance(target, Function):
-        task = target
-    elif isinstance(target, _core.KernelSpec):
-        task = _wrap(target)
-    elif callable(target):
-        task = function(target)
+            hints = typing.get_type_hints(init)
+        except Exception:  # noqa: BLE001, an annotation that does not evaluate is taken as written
+            hints = {}
+        for name, param in list(signature.parameters.items())[1:]:
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                continue
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                if not strict:
+                    continue
+                raise ValueError(
+                    f"task {key!r}: {cls.__name__} takes **{name}, which a closed schema of its "
+                    "params cannot describe; name each param"
+                )
+            try:
+                schema = _param_schema(
+                    hints.get(name, param.annotation), f"task {key!r}: param {name!r}"
+                )
+            except ValueError:
+                if strict:
+                    raise
+                schema = {}
+            if param.default is inspect.Parameter.empty:
+                required.append(name)
+            else:
+                try:
+                    _data(param.default, name)
+                    schema = {**schema, "default": param.default}
+                except ValueError:
+                    pass
+            properties[name] = schema
+    document: dict[str, Any] = {
+        "$schema": _SCHEMA_DIALECT,
+        "title": cls.__name__,
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        document["required"] = sorted(required)
+    return document
+
+
+def _kind_name(name: str) -> str:
+    snake = _snake(name).replace("__", "_").strip("_") or "task"
+    snake = re.sub(r"[^a-z0-9_.-]", "_", snake)
+    return snake if snake[0].isalpha() else f"task_{snake}"[:64]
+
+
+def _doc(code: Any) -> tuple[str | None, str | None]:
+    """The first line of an object's docstring and the rest."""
+    text = inspect.getdoc(code)
+    if not text:
+        return None, None
+    first, _, rest = text.strip().partition("\n")
+    return first.strip() or None, rest.strip() or None
+
+
+def _definition(
+    task: Any, role: str, key: str, code: Any, build_key: str | None, provenance: Any,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """The task's definition, the kind declaration its code makes (SDD 18 e.1): its name and
+    title, its docstring's first line as its summary and the rest as its description, the JSON
+    Schema of its params, the schemas it takes and gives, what it needs, and its provenance."""
+    first, rest = _doc(code)
+    title = first or getattr(code, "__name__", key)
+    if isinstance(task, _Handle):
+        settings = {
+            "$schema": _SCHEMA_DIALECT,
+            "title": title,
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        takes, gives = task.__dict__.get("_moruna_declared", (None, None))
+        text: dict[str, str | None] = {}
     else:
-        raise _config_error(f"{at}.ref: `{reference}` is a {type(target).__name__}, not a task")
-    found = _role_of(task)
-    if found != role:
-        raise _config_error(f"{at}.ref: `{reference}` is a {found}, and the task is a {role}")
-    declared = list(getattr(task, "needs", ()) or ())
-    if declared != needs:
-        raise _config_error(
-            f"{at}.needs: the spec names {needs} and `{reference}` needs {declared}"
-        )
-    pinned = settings.get("fingerprint")
-    if pinned is not None:
-        have = _fingerprint(task)
-        if pinned.rsplit(":", 1)[-1].lower() != have.rsplit(":", 1)[-1]:
-            raise _config_error(
-                f"{at}.fingerprint: the spec pins {pinned} and `{reference}` here is {have}"
-            )
-    return task
+        settings = _params_schema(type(task), key, strict)
+        takes, gives = task.takes, task.gives
+        text = getattr(type(task), "_moruna_need_text", {})
+    needs = tuple(getattr(task, "needs", ()) or ())
+    flows = {
+        "source": ("nothing", "batches"),
+        "function": ("batches", "batches"),
+        "sink": ("batches", "nothing"),
+    }[role]
+    definition: dict[str, Any] = {
+        "name": _kind_name(getattr(code, "__name__", key)),
+        "role": role,
+        "summary": first or title,
+        "settings": settings,
+        "inputs": flows[0],
+        "outputs": flows[1],
+        "needs": {
+            "network": "no",
+            "egress": [],
+            "gpu": "no",
+            "model_port": "yes" if needs else "no",
+            "contracts": "no",
+        },
+        "deterministic": "no",
+        "preserves_columns": "no",
+        "isolation": "confined",
+        "title": title,
+    }
+    if rest:
+        definition["description"] = rest
+    for which, schema in (("takes", _arrow(takes)), ("gives", _arrow(gives))):
+        if schema is not None:
+            definition[which] = schema
+    if needs:
+        definition["requires"] = [
+            {"name": n, **({"description": text[n]} if text.get(n) else {})} for n in needs
+        ]
+    if build_key is not None:
+        definition["provenance"] = {"build_key": build_key, **{
+            k: v for k, v in provenance.as_dict().items() if v is not None
+        }}
+    return definition
 
 
-def _supply(tasks: Sequence[tuple[str, Any]], resolver: Any) -> None:
-    """Supply every need of every task (each with the label a refusal names it by) through
-    ``resolver`` before the run starts; a need it cannot supply is refused, every one of them
-    named."""
+class _Lowering:
+    """What lowering a job's image tasks shares: the closures found, the provenance read and
+    the lock's digest, once each."""
+
+    def __init__(self, target: Target) -> None:
+        self.target = target
+        self.codes: dict[tuple[str, tuple[str, ...]], Any] = {}
+        self.provenances: dict[tuple[Path, tuple[str, ...]], Any] = {}
+        self.locks: dict[Path, str | None] = {}
+
+    def code(self, module: str, source: Path, files: tuple[str, ...]) -> Any:
+        from moruna import _closure  # noqa: PLC0415
+
+        found = self.codes.get((module, files))
+        if found is None:
+            found = _closure.closure(module, source, [Path(f) for f in files])
+            self.codes[(module, files)] = found
+        return found
+
+    def provenance(self, code: Any) -> Any:
+        from moruna import _closure  # noqa: PLC0415
+
+        key = (code.root, tuple(sorted(code.files)))
+        found = self.provenances.get(key)
+        if found is None:
+            found = _closure.provenance(code)
+            self.provenances[key] = found
+        return found
+
+    def lock(self, root: Path) -> str | None:
+        from moruna import _build  # noqa: PLC0415
+
+        if root not in self.locks:
+            try:
+                found = _build.find_lock(root, Path(self.target.lock) if self.target.lock else None)
+                self.locks[root] = _build.lock_digest(found)
+            except _build.Refused:
+                self.locks[root] = None
+        return self.locks[root]
+
+
+def _code_of(task: Any, key: str, target: Target, lowering: _Lowering) -> tuple[str, Any, Any]:
+    """A task's entry, its code object and its closure."""
+    entry, code = _entry(task, key)
+    module_name = entry.partition(":")[0]
+    module = sys.modules.get(module_name) or sys.modules.get(getattr(code, "__module__", ""))
+    path = getattr(module, "__file__", None)
+    if path is None:
+        raise ValueError(f"task {key!r}: {module_name} is not a file, which a build bundles")
+    own = tuple(str(Path(path).resolve().parent / f) for f in getattr(task, "files", ()) or ())
+    files = tuple(sorted({*own, *target.files}))
+    return entry, code, lowering.code(module_name, Path(path), files)
+
+
+def _image_task(
+    task: Any, role: str, key: str, target: Target, built: Mapping[str, tuple[str, str]],
+    lowering: _Lowering, *, strict: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The settings and the definition of an image task: its image ``{build_key, digest,
+    location}`` (the digest and location of an image built for its key, else null), its entry,
+    its params and its needs. ``strict`` (for a spec) refuses what a spec cannot hold: code
+    defined inside a function, a param that is not data or names a secret, an import the build
+    cannot follow."""
+    from moruna import _build, _closure  # noqa: PLC0415
+
+    try:
+        params: dict[str, Any] = {} if isinstance(task, _Handle) else _params(task, key)
+        for name, value in params.items():
+            if _SECRET.search(name):
+                raise ValueError(
+                    f"task {key!r}: the param {name!r} names a secret, and a spec holds none; "
+                    "declare it in `needs` and supply it when the job runs"
+                )
+            _data(value, f"task {key!r}: param {name!r}")
+    except (TypeError, ValueError):
+        if strict:
+            raise
+        # A run or a plan of this process names the params it can: none, when one is not data.
+        params = {}
+    try:
+        entry, code, closure = _code_of(task, key, target, lowering)
+    except (_closure.Unresolved, ValueError) as exc:
+        if strict:
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError(f"task {key!r}: {exc}") from None
+        # A run of this process holds the object; its image is unknown, and nothing builds it.
+        image = {"build_key": None, "digest": None, "location": None}
+        settings = {"image": image, "params": params, "needs": list(getattr(task, "needs", ()) or ())}
+        code = task._handle.wrapped if isinstance(task, _Handle) else type(task)
+        return settings, _definition(task, role, key, code, None, None, strict=False)
+    build_key = _closure.build_key(
+        closure, entry, lock=lowering.lock(closure.root), runtime=target.runtime,
+        shim=_build.shim_digest(), platform=target.platform,
+    )  # fmt: skip
+    digest, location = built.get(build_key, (None, None))
+    settings = {
+        "image": {"build_key": build_key, "digest": digest, "location": location},
+        "entry": entry,
+        "params": params,
+        "needs": list(getattr(task, "needs", ()) or ()),
+    }
+    if not settings["params"]:
+        del settings["params"]
+    if not settings["needs"]:
+        del settings["needs"]
+    provenance = lowering.provenance(closure)
+    return settings, _definition(task, role, key, code, build_key, provenance, strict=strict)
+
+
+# ---------------------------------------------------------------------------------------------
+# Needs: supplied by the resolver, measured per task
+
+
+class _Measure:
+    """What a task's calls through one need cost: calls, bytes in and out, time."""
+
+    __slots__ = ("bytes_in", "bytes_out", "calls", "ns")
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.bytes_in = 0
+        self.bytes_out = 0
+        self.ns = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "bytes_in": self.bytes_in,
+            "bytes_out": self.bytes_out,
+            "time_ms": round(self.ns / 1e6, 3),
+        }
+
+
+def _size(value: Any) -> int:
+    """The bytes a value carries across a need: a buffer's length, a batch's or a table's
+    Arrow bytes, the sum of a list's or a tuple's; 0 for anything else (a name, a number)."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    if isinstance(value, (list, tuple)):
+        return sum(_size(v) for v in value)
+    return 0
+
+
+class _Measured:
+    """The object a resolver supplied, as the task receives it: every call through it, of a
+    method, of the object itself or of its items, is counted in the task's measure of the need,
+    and the object answers as it would."""
+
+    def __init__(self, target: Any, measure: _Measure) -> None:
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_measure", measure)
+
+    def _timed(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        import time  # noqa: PLC0415
+
+        measure = self._measure
+        measure.calls += 1
+        measure.bytes_in += sum(_size(a) for a in args) + sum(_size(v) for v in kwargs.values())
+        start = time.perf_counter_ns()
+        try:
+            result = call(*args, **kwargs)
+        finally:
+            measure.ns += time.perf_counter_ns() - start
+        measure.bytes_out += _size(result)
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._target, name)
+        if callable(attribute):
+            return functools.partial(self._timed, attribute)
+        return attribute
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._target, name, value)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._timed(self._target, *args, **kwargs)
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._timed(self._target.__getitem__, key)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._target
+
+    def __len__(self) -> int:
+        return len(self._target)
+
+    def __iter__(self) -> Any:
+        return iter(self._target)
+
+    def __repr__(self) -> str:
+        return repr(self._target)
+
+
+def _supply(
+    tasks: Sequence[tuple[str, str, Any]], resolver: Any, args: Mapping[str, Any]
+) -> dict[str, dict[str, _Measure]]:
+    """Supply every need of every task (each with its key and the label a refusal names it by)
+    through ``resolver`` before the run starts, each object measured, and the run's arguments;
+    a need it cannot supply is refused, every one of them named. Returns the measures, by task
+    and need."""
     missing: list[str] = []
     supplied: list[tuple[Any, dict[str, Any]]] = []
-    for key, task in tasks:
+    measures: dict[str, dict[str, _Measure]] = {}
+    for key, at, task in tasks:
         needs = tuple(getattr(task, "needs", ()) or ())
-        if not needs:
-            continue
         got: dict[str, Any] = {}
         for need in needs:
             if resolver is None:
-                missing.append(f"{key} needs {need!r}, and no resolver was given")
+                missing.append(f"{at} needs {need!r}, and no resolver was given")
                 continue
             try:
-                got[need] = resolver.resolve(need)
+                found = resolver.resolve(need)
             except LookupError:
-                missing.append(f"{key} needs {need!r}, which the resolver cannot supply")
+                missing.append(f"{at} needs {need!r}, which the resolver cannot supply")
+                continue
             except Exception as exc:  # the resolver's own failure, named
                 missing.append(
-                    f"{key} needs {need!r}, and the resolver failed: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{at} needs {need!r}, and the resolver failed: {type(exc).__name__}: {exc}"
                 )
+                continue
+            measure = measures.setdefault(key, {}).setdefault(need, _Measure())
+            got[need] = _Measured(found, measure)
         supplied.append((task, got))
     if missing:
         raise _config_error("; ".join(missing))
     for task, got in supplied:
-        task.__dict__["_moruna_ports"] = types.MappingProxyType(got)
+        if isinstance(task, Task):
+            task.__dict__["_moruna_ports"] = types.MappingProxyType(got)
+            task.__dict__["_moruna_run_args"] = types.MappingProxyType(dict(args))
+    return measures
 
 
-def _materialize(role: str, at: str, settings: str, resolver: str | None) -> Any:
-    """The command's ``python`` task (``moruna run JOB``): constructed from its settings, its
-    needs supplied by the resolver ``--resolver`` names, lowered to what the runtime runs."""
-    task = _construct(role, json.loads(settings), at)
-    _supply([(at, task)], load_resolver(resolver) if resolver else None)
-    if role == "function":
-        return _runtime_object(task)
-    return task
+class _Served:
+    """A need of an image task, served from what the resolver supplied: a callable taking the
+    request's bytes, or an object with ``call(request)``; its answer is bytes."""
+
+    def __init__(self, need: str, handler: Any) -> None:
+        call = getattr(handler, "call", None)
+        self.call = call if callable(call) else handler
+        if not callable(self.call):
+            raise TypeError(
+                f"the need {need!r} of an image task is a port: the resolver supplies a "
+                "callable taking bytes, or an object with call(request), not "
+                f"{type(handler).__name__}"
+            )
+        self.need = need
+
+    def __call__(self, request: bytes) -> bytes:
+        answer = self.call(bytes(request))
+        if not isinstance(answer, (bytes, bytearray, memoryview)):
+            raise TypeError(f"port {self.need!r} answered {type(answer).__name__}, not bytes")
+        return bytes(answer)
 
 
 def _runtime_object(task: Any) -> Any:
@@ -797,7 +1092,7 @@ class JobSpec:
     def to_json(self) -> str:
         read = json.loads(_core.read_job(self._bytes))
         return json.dumps(
-            {"version": 2, "name": read["name"], "tasks": read["tasks"],
+            {"version": 2, "name": read["name"], "args": read["args"], "tasks": read["tasks"],
              "settings": read["settings"]},
             indent=2,
             sort_keys=True,
@@ -830,9 +1125,22 @@ class Job:
     their names, in port order) and returns it. A function of one input takes it on its port
     ``in``; one of several takes each on a port named after the task that feeds it. A task's
     output may feed many tasks, and branches ready at once run at once.
+
+    ``platform`` and ``runtime`` say what the job's images are built for (by default this
+    machine's platform, or ``linux/aarch64`` on a Mac, and Python's official
+    ``python:3.14-slim``); ``files`` are data files every task of the user's code reads. Each is
+    part of every build key.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        platform: str | None = None,
+        runtime: tuple[str, str] | None = None,
+        lock: str | os.PathLike[str] | None = None,
+        files: Sequence[str | os.PathLike[str]] = (),
+    ) -> None:
         if not isinstance(name, str) or not name:
             raise TypeError(f"a job is named by a non-empty string, not {name!r}")
         self.name: str | None = name
@@ -841,6 +1149,53 @@ class Job:
         # its spec, its check and its plan keep, and the fields it sets.
         self._base: bytes | None = None
         self._settings: tuple[str, ...] = ()
+        self._args: dict[str, str] = {}
+        # The images built for this job's keys: build key -> (digest, location).
+        self._built: dict[str, tuple[str, str]] = {}
+        self._target = _default_target()
+        self.target(platform=platform, runtime=runtime, lock=lock, files=files)
+
+    def target(
+        self,
+        *,
+        platform: str | None = None,
+        runtime: tuple[str, str] | None = None,
+        lock: str | os.PathLike[str] | None = None,
+        files: Sequence[str | os.PathLike[str]] | None = None,
+    ) -> None:
+        """What the job's images are built for, each given value replacing the job's: the
+        ``platform`` (``linux/aarch64`` or ``linux/x86_64``), the ``runtime`` as ``(layout,
+        reference)`` of an OCI layout holding it, the ``lock`` and the data ``files`` every task
+        reads. The spec's build keys follow."""
+        from moruna import _build  # noqa: PLC0415
+
+        target = self._target
+        try:
+            if platform is not None:
+                target = dataclasses.replace(target, platform=_build.parse_platform(platform).name)
+            if runtime is not None:
+                layout, reference = runtime
+                found = _build.read_runtime_layout(
+                    Path(layout), reference, _build.parse_platform(target.platform)
+                )
+                target = dataclasses.replace(
+                    target, runtime=found.digest, runtime_layout=str(Path(layout).absolute()),
+                    runtime_reference=reference,
+                )  # fmt: skip
+        except _build.Refused as exc:
+            raise _config_error(f"job target refused: {exc}") from exc
+        if lock is not None:
+            target = dataclasses.replace(target, lock=str(Path(lock).absolute()))
+        if files is not None:
+            target = dataclasses.replace(
+                target, files=tuple(sorted(str(Path(f).absolute()) for f in files))
+            )
+        self._target = target
+
+    @property
+    def platform(self) -> str:
+        """The platform the job's images are built for."""
+        return self._target.platform
 
     @property
     def settings(self) -> tuple[str, ...]:
@@ -897,6 +1252,28 @@ class Job:
         self._entries[name] = _Entry(name, role, task, tuple(resolved))
         return task
 
+    def arg(self, name: str, type: str) -> None:  # noqa: A002, the declaration's own word
+        """Declare a run argument: ``name`` (1 to 64 letters, digits and ``_``, starting with a
+        letter) of ``type`` (``string``, ``int``, ``float``, ``bool``, ``date`` or
+        ``timestamp``). The spec carries the declaration; every run supplies the value
+        (``moruna.run(job, args=...)``, ``moruna run JOB --arg NAME=VALUE``) and its tasks read
+        it as ``self.args[name]``."""
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name):
+            raise ValueError(
+                f"an argument's name is 1 to 64 of ASCII letters, digits and `_`, starting with "
+                f"a letter, not {name!r}"
+            )
+        if type not in ARG_TYPES:
+            raise ValueError(f"an argument's type is one of {', '.join(ARG_TYPES)}, not {type!r}")
+        if name in self._args:
+            raise ValueError(f"the job declares the argument {name!r} already")
+        self._args[name] = type
+
+    @property
+    def args(self) -> Mapping[str, str]:
+        """The arguments the job declares, name to type, in name order."""
+        return types.MappingProxyType(dict(sorted(self._args.items())))
+
     @property
     def tasks(self) -> tuple[tuple[str, str, Any, tuple[str, ...]], ...]:
         """``(name, role, task, inputs)`` per task, in the order they were added."""
@@ -911,10 +1288,19 @@ class Job:
     # Reading and writing -------------------------------------------------------------------
 
     def spec(self) -> JobSpec:
-        """The job's spec, at any step of building it. Refused, naming the task, when a task
-        cannot be written: an ``IteratorSource``, code defined inside a function, a param that
-        is not data or that names a secret."""
-        return JobSpec(_core.job_document(self.name, self._lowered(spec=True), self._base))
+        """The job's spec, at any step of building it: every task defined inline, each image
+        task with its build key and, once built, its image's digest and location. Refused,
+        naming the task, when a task cannot be written: an ``IteratorSource``, code defined
+        inside a function, a param that is not data or that names a secret, an import a build
+        cannot follow."""
+        return JobSpec(
+            _core.job_document(
+                self.name, self._lowered(spec=True), self._base, self._arg_list()
+            )
+        )
+
+    def _arg_list(self) -> list[tuple[str, str]]:
+        return sorted(self._args.items())
 
     def write(self, target: Any) -> JobSpec:
         """Write the spec's bytes through the writer ``target`` is: a file path, a callable
@@ -926,10 +1312,9 @@ class Job:
     @classmethod
     def read(cls, source: Any) -> Job:
         """The job a spec holds: a ``JobSpec``, its bytes, or a path to them (a version 2
-        document, or a version 1 JSON document). A ``python`` task is constructed from its
-        reference when the job runs. A document that also sets run settings keeps them, in its
-        spec and its plan (``job.settings`` names them); such a job is run by ``moruna run``,
-        and ``moruna.run`` refuses it."""
+        document, or a version 1 JSON document). Its image tasks run their images. A document
+        that also sets run settings keeps them, in its spec and its plan (``job.settings``
+        names them); such a job is run by ``moruna run``, and ``moruna.run`` refuses it."""
         if isinstance(source, JobSpec):
             data = source.bytes()
         elif isinstance(source, (bytes, bytearray)):
@@ -941,59 +1326,175 @@ class Job:
         job.name = read["name"]
         if read["settings"]:
             job._base, job._settings = data, tuple(read["settings"])
+        job._args = {a["name"]: a["type"] for a in read["args"]}
         for task in read["tasks"]:
-            role = "function" if task["role"] == "function" else task["role"]
-            read = _Read(role, task["kind"], task["settings"], list(task["ports"]))
-            job._entries[task["id"]] = _Entry(task["id"], role, read, tuple(task["inputs"]))
+            role = task["role"]
+            made = _Read(
+                role, task["kind"], task["settings"], list(task["ports"]), task["definition"]
+            )
+            job._entries[task["id"]] = _Entry(task["id"], role, made, tuple(task["inputs"]))
         return job
+
+    # Images ----------------------------------------------------------------------------------
+
+    def status(self) -> list[dict[str, Any]]:
+        """Each image task's image, read from the spec: its key, its role, its state (``not
+        built``, ``built`` into a local layout, ``pushed`` to a registry, or ``external``, an
+        image Moruna did not build), its build key, its digest and its location."""
+        rows = []
+        for e, settings in self._images():
+            image = settings.get("image") or {}
+            key, digest, location = image.get("build_key"), image.get("digest"), image.get("location")
+            if digest is None:
+                state = "not built"
+            elif key is None:
+                state = "external"
+            elif str(location).startswith("/"):
+                state = "built"
+            else:
+                state = "pushed"
+            rows.append({
+                "task": e.key, "role": e.role, "state": state, "build_key": key,
+                "digest": digest, "location": location,
+            })  # fmt: skip
+        return rows
+
+    def _images(self) -> list[tuple[_Entry, dict[str, Any]]]:
+        """Each image task and its settings, as the spec writes them (unspeccable code: its
+        image unknown)."""
+        lowered = {t[1]: t for t in self._lowered(spec=False)}
+        found = []
+        for e in self._entries.values():
+            kind, settings = lowered[e.key][6], lowered[e.key][7]
+            if kind == "image" and settings is not None:
+                found.append((e, json.loads(settings)))
+        return found
+
+    def build(
+        self,
+        out: str | os.PathLike[str] = "moruna-images",
+        *,
+        registry: str | None = None,
+        platform: str | None = None,
+        ports: Any = None,
+        files: Sequence[str | os.PathLike[str]] | None = None,
+        lock: str | os.PathLike[str] | None = None,
+        runtime: tuple[str, str] | None = None,
+        cache: str | os.PathLike[str] | None = None,
+        index_url: str | None = None,
+        find_links: Sequence[str] = (),
+        no_index: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Build one image per task of the user's code into the OCI layout ``out`` and return
+        the job's status (``job.status()``): each image named by its build key, layers shared by
+        content, an image already built for a key reused. ``registry`` (``HOST/REPOSITORY``)
+        also pushes every image there, with credentials the resolver ``ports`` supplies for the
+        need ``registry:<HOST>`` (never in the spec). ``platform``, ``files``, ``lock`` and
+        ``runtime`` retarget the job first, as ``job.target`` does. The spec then names each
+        image's digest and location: the runnable spec. Raises ``moruna.ConfigError`` naming
+        the cause when the build is refused."""
+        from moruna import _build  # noqa: PLC0415
+
+        self.target(platform=platform, runtime=runtime, lock=lock, files=files)
+        resolver = resolver_of(ports)
+        try:
+            options = _build.options(
+                out=out, platform=self._target.platform, lock=self._target.lock,
+                runtime_layout=self._target.runtime_layout,
+                runtime_reference=self._target.runtime_reference, cache=cache,
+                index_url=index_url, find_links=find_links, no_index=no_index,
+                version=_core.__version__, registry=registry,
+                credential=_credential(resolver) if registry else None,
+            )  # fmt: skip
+            tasks = self._build_tasks()
+            built = _build.build_images(tasks, options)
+        except _build.Refused as exc:
+            raise _config_error(f"build refused: {exc}") from exc
+        for image in built:
+            self._built[image.key] = (image.digest, image.location)
+        return self.status()
+
+    def _build_tasks(self) -> list[Any]:
+        """What the build makes of each image task of the user's code: its entry, its closure,
+        its key and the distributions it imports."""
+        from moruna import _build, _closure  # noqa: PLC0415
+
+        lowering = _Lowering(self._target)
+        tasks: dict[str, Any] = {}
+        refusals: list[str] = []
+        for e in self._entries.values():
+            task = e.task
+            if isinstance(task, _Read):
+                if task.kind == "image" and (task.image or {}).get("digest") is None:
+                    refusals.append(
+                        f"job[{e.key!r}]: read from a spec, it has no code here to build; build "
+                        "the job its code makes (moruna build MODULE:JOB)"
+                    )
+                continue
+            if not isinstance(task, Task) or (
+                isinstance(task, _Handle) and not isinstance(task._handle, _core.KernelSpec)
+            ):
+                continue
+            try:
+                settings, definition = _image_task(
+                    task, e.role, e.key, self._target, {}, lowering, strict=True
+                )
+                entry, _, code = _code_of(task, e.key, self._target, lowering)
+            except (ValueError, _closure.Unresolved) as exc:
+                refusals.append(f"job[{e.key!r}]: {exc}")
+                continue
+            key = settings["image"]["build_key"]
+            if key in tasks:
+                continue
+            tasks[key] = _build.Task(
+                name=e.key, entry=entry, code=code, key=key,
+                distributions=_closure.distributions(code.imports),
+                provenance=definition.get("provenance", {}),
+            )  # fmt: skip
+        if refusals:
+            raise _build.Refused("; ".join(refusals))
+        return list(tasks.values())
 
     # Checking and explaining ---------------------------------------------------------------
 
     def check(self) -> None:
         """Check the job without running it: its names, ports and edges, each task's kind and
-        settings, and along every edge whose two ends declare one, that the schema one task
-        gives is the schema the next takes. Raises ``moruna.ConfigError`` naming every
-        refusal."""
+        settings against its definition, and along every edge whose two ends declare one, that
+        the schema one task gives is the schema the next takes. Raises ``moruna.ConfigError``
+        naming every refusal."""
         refusals = list(
-            _core.check_job(self.name, self._lowered(spec=False, make=False), self._base)
+            _core.check_job(
+                self.name, self._lowered(spec=False), self._base, self._arg_list()
+            )
         )
-        for entry in self._entries.values():
-            takes = getattr(entry.task, "takes", None)
-            for port, upstream in enumerate(entry.inputs):
-                feeder = self._entries.get(upstream)
-                gives = getattr(feeder.task, "gives", None) if feeder else None
-                if takes is None or gives is None:
-                    continue
-                if not gives.equals(takes, check_metadata=False):
-                    refusals.append(
-                        f"job[{entry.key!r}].inputs[{port}]: {entry.key!r} takes "
-                        f"{takes.to_string(show_schema_metadata=False)!r} and {upstream!r} "
-                        f"gives {gives.to_string(show_schema_metadata=False)!r}"
-                    )
         if refusals:
             raise _config_error("; ".join(refusals))
 
     def explain(self, planner: str | None = None) -> dict[str, Any]:
         """The plan Moruna would run the job by, as a dict, without running it: its steps in the
         order they start, each with its tasks, the steps it waits for, its group, its resources
-        and its estimated cost; ``groups`` and ``totals``. The same function plans ``moruna
-        explain JOB``. Raises ``moruna.ConfigError`` naming the field when the job is refused,
-        and ``moruna.PlanError`` for an unknown planner."""
+        and its estimated cost; ``groups`` and ``totals``; and ``images``, each image task's
+        image as ``status()`` gives it. The same function plans ``moruna explain JOB``. Raises
+        ``moruna.ConfigError`` naming the field when the job is refused, and
+        ``moruna.PlanError`` for an unknown planner."""
         plan: dict[str, Any] = json.loads(
             _core.explain_job(
-                self.name, self._lowered(spec=False, make=False), self._base, planner=planner
-            )
+                self.name, self._lowered(spec=False), self._base, self._arg_list(),
+                planner=planner,
+            )  # fmt: skip
         )
+        plan["images"] = self.status()
         return plan
 
     # Lowering ------------------------------------------------------------------------------
 
     def _lowered(
-        self, *, spec: bool, make: bool = False, materialized: dict[str, Any] | None = None
+        self, *, spec: bool, make: bool = False
     ) -> list[tuple[Any, ...]]:
         """The tasks as the extension takes them: ``(role, id, at, object, inputs, ports, kind,
-        settings)``. ``spec``: for a spec, refusing what it cannot hold. ``make``: for a run,
-        with ``materialized`` holding the task each read ``python`` task was constructed as."""
+        settings, definition)``. ``spec``: for a spec, refusing what it cannot hold. ``make``:
+        for a run, with each object the run holds."""
+        lowering = _Lowering(self._target)
         lowered = []
         for e in self._entries.values():
             at = f"job[{e.key!r}]"
@@ -1001,17 +1502,19 @@ class Job:
             obj: Any = None
             kind: str | None = None
             settings: str | None = None
+            definition: str | None = None
             ports: list[str] | None = None
             try:
                 if isinstance(task, _Read):
                     kind, settings, ports = task.kind, json.dumps(task.settings), task.port_names
-                    if make and task.kind == "python":
-                        obj = _runtime_object((materialized or {})[e.key])
+                    definition = json.dumps(task.definition) if task.definition else None
                 elif isinstance(task, _Handle) and not isinstance(task._handle, _core.KernelSpec):
                     obj = task._handle
-                elif isinstance(task, (Task,)):
-                    kind = "python"
-                    settings = json.dumps(_python_settings(task, e.key, strict=spec))
+                elif isinstance(task, Task):
+                    made, defined = _image_task(
+                        task, e.role, e.key, self._target, self._built, lowering, strict=spec
+                    )
+                    kind, settings, definition = "image", json.dumps(made), json.dumps(defined)
                     obj = _runtime_object(task) if make else None
                 elif isinstance(task, _core.IteratorSource):
                     if spec:
@@ -1024,7 +1527,9 @@ class Job:
                     obj = task
             except ValueError as exc:
                 raise _config_error(f"{at}: {exc}") from None
-            lowered.append((e.role, e.key, at, obj, list(e.inputs), ports, kind, settings))
+            lowered.append(
+                (e.role, e.key, at, obj, list(e.inputs), ports, kind, settings, definition)
+            )
         return lowered
 
     # Showing ---------------------------------------------------------------------------------
@@ -1033,11 +1538,34 @@ class Job:
         lines = [f"moruna.Job({self.name!r}, {len(self._entries)} tasks)"]
         if self._settings:
             lines.append(f"  settings: {', '.join(self._settings)}")
+        if self._args:
+            lines.append(
+                "  args: " + ", ".join(f"{n}: {t}" for n, t in sorted(self._args.items()))
+            )
+        images = {row["task"]: row for row in self.status()}
         for e in self._entries.values():
-            lines.append("  " + _describe(e))
+            lines.append("  " + _describe(e, images.get(e.key)))
         return "\n".join(lines)
 
     __str__ = __repr__
+
+
+def _credential(resolver: Any) -> Callable[[str], Any]:
+    """Registry credentials through the resolver: the need ``registry:<HOST>``, or none when
+    the resolver cannot supply it."""
+
+    def credential(host: str) -> Any:
+        if resolver is None:
+            return None
+        try:
+            found = resolver.resolve(f"registry:{host}")
+        except LookupError:
+            return None
+        if isinstance(found, str):
+            return {"token": found}
+        return dict(found)
+
+    return credential
 
 
 def _schema_text(schema: Any) -> str:
@@ -1046,54 +1574,90 @@ def _schema_text(schema: Any) -> str:
     return "{" + ", ".join(f"{f.name}: {f.type}" for f in schema) + "}"
 
 
-def _describe(e: _Entry) -> str:
-    """One line of metadata per task: key, role, kind or code reference, params, inputs, needs
-    and schemas."""
+def _definition_schema_text(schema: Any) -> str:
+    if not schema:
+        return "-"
+    return "{" + ", ".join(f"{f['name']}: {f['type']}" for f in schema["fields"]) + "}"
+
+
+def _describe(e: _Entry, image: Mapping[str, Any] | None) -> str:
+    """One line of metadata per task: key, role, kind or entry, params, inputs, needs, schemas
+    and, for an image task, its image's state."""
     task = e.task
     params: Any = {}
+    takes = gives = "-"
     if isinstance(task, _Read):
         what = task.kind
-        if task.kind == "python":
-            what = f"python {task.settings.get('ref')}"
+        if task.kind == "image":
+            what = f"image {task.settings.get('entry') or '-'}"
             params = task.settings.get("params", {})
         else:
             params = task.settings
+        if task.definition:
+            takes = _definition_schema_text(task.definition.get("takes"))
+            gives = _definition_schema_text(task.definition.get("gives"))
     elif isinstance(task, _Handle):
         handle = task._handle
         if isinstance(handle, _core.KernelSpec):
-            what = f"python {_reference(getattr(handle.wrapped, '__wrapped__', handle.wrapped))}"
+            what = f"image {_reference(getattr(handle.wrapped, '__wrapped__', handle.wrapped))}"
         else:
             what = repr(handle)
     elif isinstance(task, Task):
-        what = f"python {_reference(type(task))}"
+        what = f"image {_reference(type(task))}"
         try:
             params = _params(task, e.key)
         except (TypeError, ValueError) as exc:
             params = f"<{exc}>"
     else:
         what = repr(task)
+    if not isinstance(task, _Read):
+        takes = _schema_text(getattr(task, "takes", None))
+        gives = _schema_text(getattr(task, "gives", None))
     needs = ",".join(getattr(task, "needs", ()) or ()) or "-"
     inputs = ",".join(e.inputs) or "-"
     shown = json.dumps(params, sort_keys=True, default=lambda v: f"<{type(v).__name__}>")
-    return (
+    line = (
         f"{e.key}  {e.role}  {what}  params={shown}  inputs={inputs}  needs={needs}  "
-        f"takes={_schema_text(getattr(task, 'takes', None))}  "
-        f"gives={_schema_text(getattr(task, 'gives', None))}"
+        f"takes={takes}  gives={gives}"
     )
+    if image is not None:
+        line += f"  image={image['state']}"
+        if image["build_key"]:
+            line += f" key={image['build_key'][:19]}"
+        if image["digest"]:
+            line += f" digest={image['digest'][:19]} at={image['location']}"
+    return line
 
 
-def _materialize_read(job: Job) -> dict[str, Any]:
-    """Construct every ``python`` task a job read from a spec, its fingerprint checked."""
-    made: dict[str, Any] = {}
-    for e in job._entries.values():
-        if isinstance(e.task, _Read) and e.task.kind == "python":
-            made[e.key] = _construct(e.role, e.task.settings, f"job[{e.key!r}]")
-    return made
+def _pulled(job: Job, resolver: Any) -> str | None:
+    """Every registry image the job's image tasks run, pulled into this machine's image cache
+    before anything starts; the cache, or ``None`` when no task names one."""
+    from moruna import _build  # noqa: PLC0415
+
+    locations = sorted({
+        row["location"] for row in job.status()
+        if row["location"] and not str(row["location"]).startswith("/")
+    })  # fmt: skip
+    if not locations:
+        return None
+    cache = _build.default_pulled()
+    refused: list[str] = []
+    for location in locations:
+        try:
+            _build.pull(location, cache, _credential(resolver))
+        except _build.Refused as exc:
+            refused.append(f"{location}: {exc}")
+    if refused:
+        raise _config_error("images not available: " + "; ".join(refused))
+    return str(cache)
 
 
-def run_job(job: Job, *, ports: Any, spec_to: Any, explain: bool, options: dict[str, Any]) -> Any:
-    """``moruna.run(job, ...)``: the needs supplied, the spec written when asked, the job run,
-    its report written beside the spec."""
+def run_job(
+    job: Job, *, ports: Any, spec_to: Any, explain: bool, args: Any, options: dict[str, Any]
+) -> Any:
+    """``moruna.run(job, ...)``: the arguments checked, the needs supplied, the registry
+    images pulled, the spec written when asked, the job run, its report written beside the
+    spec."""
     from moruna._report import RunReport  # noqa: PLC0415
 
     if not isinstance(job, Job):
@@ -1104,30 +1668,69 @@ def run_job(job: Job, *, ports: Any, spec_to: Any, explain: bool, options: dict[
             "moruna.run's arguments, so run the document as it is with `moruna run`, or run a "
             "spec of tasks and edges"
         )
+    given = dict(args or {})
+    refused = _core.check_args(job._arg_list(), json.dumps(given, default=str))
+    if refused:
+        raise _config_error("; ".join(refused))
     resolver = resolver_of(ports)
-    made = _materialize_read(job)
     live = [
-        (f"job[{e.key!r}]", made.get(e.key, e.task))
+        (e.key, f"job[{e.key!r}]", e.task)
         for e in job._entries.values()
-        if not isinstance(made.get(e.key, e.task), _Read)
+        if not isinstance(e.task, _Read)
     ]
-    _supply(live, resolver)
+    measures = _supply(live, resolver, given)
+    # The needs of the image tasks are ports: each served by what the resolver supplied.
+    served: dict[str, Any] = {}
+    missing: list[str] = []
+    for e in job._entries.values():
+        if not isinstance(e.task, _Read):
+            continue
+        for need in e.task.needs:
+            if need in served:
+                continue
+            if resolver is None:
+                missing.append(f"job[{e.key!r}] needs {need!r}, and no resolver was given")
+                continue
+            try:
+                served[need] = _Served(need, resolver.resolve(need))
+            except LookupError:
+                missing.append(f"job[{e.key!r}] needs {need!r}, which the resolver cannot supply")
+            except TypeError as exc:
+                missing.append(f"job[{e.key!r}]: {exc}")
+    if missing:
+        raise _config_error("; ".join(missing))
     try:
         spec: JobSpec | None = job.spec()
     except _core.ConfigError:
         if spec_to is not None:
             raise
         spec = None
+    held = [k for k, _, _ in live]
+    drafts = [
+        row for row in job.status() if row["digest"] is None and row["task"] not in held
+    ]
+    if drafts:
+        raise _config_error(
+            "the job's spec is a draft: images not built ("
+            + "; ".join(f"job[{r['task']!r}] (build key {r['build_key']})" for r in drafts)
+            + "); build the job, and run the spec the build wrote"
+        )
+    pulled = _pulled(job, resolver)
     writer = writer_of(spec_to) if spec_to is not None else None
     if writer is not None and spec is not None:
         writer.write_spec(spec.bytes())
-    lowered = job._lowered(spec=False, make=True, materialized=made)
+    lowered = job._lowered(spec=False, make=True)
     try:
         text = _core.run(
             job.name or "job",
             lowered,
             job_digest=spec.digest() if spec is not None else None,
             explain=explain,
+            args=json.dumps(given, default=str),
+            arg_types=job._arg_list(),
+            held=held,
+            served=served,
+            pulled_images=pulled,
             **options,
         )
     except _core.MorunaError as exc:
@@ -1135,10 +1738,23 @@ def run_job(job: Job, *, ports: Any, spec_to: Any, explain: bool, options: dict[
         if writer is not None and report is not None:
             writer.write_report(report.bytes())
         raise
-    report = RunReport._from_json(text)
+    report = RunReport._from_json(_with_needs(text, measures))
     if writer is not None:
         writer.write_report(report.bytes())
     return report
+
+
+def _with_needs(text: str, measures: Mapping[str, Mapping[str, _Measure]]) -> str:
+    """The report with each in-process task's needs as the resolver's objects measured them,
+    beside what the ports measured for image tasks."""
+    if not measures:
+        return text
+    document = json.loads(text)
+    for task in document.get("tasks", []):
+        found = measures.get(task.get("key"))
+        if found:
+            task["needs"] = {name: m.as_dict() for name, m in sorted(found.items())}
+    return json.dumps(document)
 
 
 def chain(source: Any, functions: Any, sink: Any) -> Job:
@@ -1153,3 +1769,193 @@ def chain(source: Any, functions: Any, sink: Any) -> Job:
         before = f"function-{i}"
     job.add(sink, inputs=before, name="sink")
     return job
+
+
+# ---------------------------------------------------------------------------------------------
+# `moruna build JOB`
+
+
+def _job_of(target: str, retarget: Mapping[str, Any]) -> tuple[Job, Path]:
+    """The job ``moruna build`` is given, and where its runnable spec goes by default: a spec
+    file (rebuilt from the code its entries name, imported from the current directory and the
+    interpreter's path), or ``<module>:<attribute>`` naming a ``moruna.Job``."""
+    from moruna import _build, _check  # noqa: PLC0415
+
+    path = Path(target)
+    if path.suffix in (".mjob", ".json") and path.is_file():
+        read = Job.read(path)
+        return _rebuilt(read, retarget), path
+    module_name, sep, attribute = target.rpartition(":")
+    if not sep or not module_name or not attribute:
+        raise _build.Refused(
+            f"{target}: name a job's spec (JOB.mjob) or a job as <module>:<attribute>"
+        )
+    try:
+        module = _check._load(module_name)
+    except Exception as exc:  # noqa: BLE001, a module that does not load is a refusal
+        raise _build.Refused(f"{module_name}: {type(exc).__name__}: {exc}") from exc
+    job = getattr(module, attribute, None)
+    if not isinstance(job, Job):
+        raise _build.Refused(f"{target} is not a moruna.Job")
+    if retarget:
+        job.target(**retarget)
+    return job, Path(f"{attribute}.mjob")
+
+
+def _rebuilt(read: Job, retarget: Mapping[str, Any]) -> Job:
+    """A job read from a spec, its image tasks made again from the code their entries name: the
+    class constructed with its params, the decorated function found. Each must make the build key
+    the spec names; a key that differs is refused, naming both, since the spec was written from
+    other code or for another platform."""
+    from moruna import _build  # noqa: PLC0415
+
+    sys.path.insert(0, os.getcwd())
+    job = Job(read.name or "job")
+    job._args = dict(read._args)
+    if retarget:
+        job.target(**retarget)
+    expected: dict[str, str | None] = {}
+    for e in read._entries.values():
+        task = e.task
+        if isinstance(task, _Read) and task.kind == "image" and task.settings.get("entry"):
+            entry = task.settings["entry"]
+            module_name, _, attribute = entry.partition(":")
+            try:
+                target: Any = importlib.import_module(module_name)
+                for part in attribute.split("."):
+                    target = getattr(target, part)
+                made = target(**task.settings.get("params", {})) if isinstance(target, type) else target
+            except Exception as exc:  # noqa: BLE001, the entry's failure is the refusal
+                raise _build.Refused(
+                    f"job[{e.key!r}]: the entry {entry} does not make the task here: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            expected[e.key] = (task.image or {}).get("build_key")
+            job._entries[e.key] = _Entry(e.key, e.role, made, e.inputs)
+        else:
+            job._entries[e.key] = e
+    keys = {row["task"]: row["build_key"] for row in job.status()}
+    differ = [
+        f"job[{k}] names {v} and its code here makes {keys.get(k)}"
+        for k, v in expected.items()
+        if v is not None and keys.get(k) != v
+    ]
+    if differ:
+        raise _build.Refused(
+            "the spec's build keys are not the code's: " + "; ".join(differ)
+            + " (the code changed, or the spec is for another platform, lock or runtime)"
+        )
+    return job
+
+
+def build_command(args: Any) -> dict[str, Any]:
+    """``moruna build JOB``: the job built, its runnable spec written; what the command prints."""
+    from moruna import _build  # noqa: PLC0415
+
+    retarget = {
+        "platform": args.platform,
+        "runtime": (args.runtime_layout, args.runtime_reference) if args.runtime_layout else None,
+        "lock": args.lock,
+        "files": args.file or None,
+    }
+    retarget = {k: v for k, v in retarget.items() if v is not None}
+    try:
+        job, default_spec = _job_of(args.job, retarget)
+    except _core.ConfigError as exc:
+        raise _build.Refused(str(exc)) from exc
+    resolver = load_resolver(args.resolver) if args.resolver else None
+    try:
+        job.build(
+            args.out, registry=args.registry, ports=resolver, cache=args.cache,
+            index_url=args.index_url, find_links=args.find_links, no_index=args.no_index,
+        )  # fmt: skip
+    except _core.ConfigError as exc:
+        raise _build.Refused(str(exc).removeprefix("build refused: ")) from exc
+    spec_path = Path(args.spec) if args.spec else default_spec
+    spec = job.write(spec_path)
+    return {
+        "spec": str(spec_path),
+        "job_digest": spec.digest(),
+        "tasks": job.status(),
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# An image Moruna did not build
+
+
+def image(
+    reference: str,
+    *,
+    role: str = "function",
+    entry: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    needs: Sequence[str] | Mapping[str, str] = (),
+    takes: Any = None,
+    gives: Any = None,
+    title: str | None = None,
+    description: str | None = None,
+) -> Any:
+    """A task of an image Moruna did not build: ``reference`` is ``HOST/REPOSITORY@sha256:...``,
+    ``role`` its role, ``entry`` what its entry point reads as ``MORUNA_ENTRY``, ``params`` its
+    data, ``needs`` the ports it calls (a mapping gives each its description), ``takes`` and
+    ``gives`` the Arrow schemas it declares. Its status is ``external``; the runner pulls it by
+    its digest before the run starts. It follows the contract of ``docs/images.md``."""
+    if role not in ROLES:
+        raise ValueError(f"a task is a source, a function or a sink, not {role!r}")
+    path, at, digest = reference.partition("@")
+    host, _, repository = path.partition("/")
+    if not at or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or not repository or not (
+        "." in host or ":" in host or host == "localhost"
+    ):
+        raise ValueError(
+            f"an image is named HOST/REPOSITORY@sha256:<64 hex>, its digest exact, not "
+            f"{reference!r}"
+        )
+    given = dict(params or {})
+    for name, value in given.items():
+        _data(value, f"param {name!r}")
+    described = dict(needs) if isinstance(needs, Mapping) else {n: None for n in needs}
+    properties = {name: {} for name in sorted(given)}
+    name = _kind_name(repository.rsplit("/", 1)[-1].replace("-", "_"))
+    flows = {
+        "source": ("nothing", "batches"),
+        "function": ("batches", "batches"),
+        "sink": ("batches", "nothing"),
+    }[role]
+    definition: dict[str, Any] = {
+        "name": name,
+        "role": role,
+        "summary": title or f"The image {path}",
+        "settings": {
+            "$schema": _SCHEMA_DIALECT, "title": name, "type": "object",
+            "properties": properties, "additionalProperties": False,
+        },
+        "inputs": flows[0],
+        "outputs": flows[1],
+        "needs": {"network": "no", "egress": [], "gpu": "no",
+                  "model_port": "yes" if described else "no", "contracts": "no"},
+        "deterministic": "no",
+        "preserves_columns": "no",
+        "isolation": "confined",
+        "title": title or name,
+    }  # fmt: skip
+    if description:
+        definition["description"] = description
+    for which, schema in (("takes", _arrow(takes)), ("gives", _arrow(gives))):
+        if schema is not None:
+            definition[which] = schema
+    if described:
+        definition["requires"] = [
+            {"name": n, **({"description": d} if d else {})} for n, d in described.items()
+        ]
+    settings: dict[str, Any] = {
+        "image": {"build_key": None, "digest": digest, "location": reference},
+    }
+    if entry is not None:
+        settings["entry"] = entry
+    if given:
+        settings["params"] = given
+    if described:
+        settings["needs"] = list(described)
+    return _Read(role, "image", settings, None, definition)

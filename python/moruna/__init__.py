@@ -61,7 +61,7 @@ from moruna._core import (
     VortexSource,
     inspect_host,
 )
-from moruna._job import Function, Job, JobSpec, Sink, Source, Task, function
+from moruna._job import Function, Job, JobSpec, Sink, Source, Task, function, image
 from moruna._kinds import DeclaredKind, KindCall, kind, kinds
 from moruna._ports import BytesWriter, FileWriter, Ports, Resolver, Writer
 from moruna._report import RunReport
@@ -106,6 +106,7 @@ __all__ = [
     "__version__",
     "check",
     "function",
+    "image",
     "inspect_host",
     "kind",
     "kinds",
@@ -123,6 +124,7 @@ def run(
     sink: Any = None,
     *,
     ports: Any = None,
+    args: dict[str, Any] | None = None,
     spec_to: Any = None,
     explain: bool = False,
     budget: int | str | None = None,
@@ -149,7 +151,9 @@ def run(
 
     ``ports`` supplies what the job's tasks need: a mapping of need to object (the in-process
     adapter, ``moruna.Ports``) or a ``moruna.Resolver``. Every need is resolved before the run
-    starts, and one the resolver cannot supply is refused by name. ``spec_to`` (a file path, a
+    starts, and one the resolver cannot supply is refused by name. ``args`` gives the run's
+    arguments, every one the job declares (``job.arg``), each of its type; a missing or
+    ill-typed argument is refused by name before the run, and the report records them. ``spec_to`` (a file path, a
     callable taking bytes, or a ``moruna.Writer``) gets the job's spec before the run starts and
     the report's bytes after it ends. ``explain=True`` puts the plan the run started from in the
     report's ``plan``.
@@ -192,6 +196,7 @@ def run(
         ports=ports,
         spec_to=spec_to,
         explain=explain,
+        args=args,
         options={
             "budget": budget,
             "cpu": cpu,

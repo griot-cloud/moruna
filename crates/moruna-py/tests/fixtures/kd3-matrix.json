@@ -373,13 +373,6 @@
       "expect": "rows"
     },
     {
-      "id": "kernel.python.imported",
-      "role": "function",
-      "kind": "python",
-      "runner": "document",
-      "expect": "strict-import-refusal"
-    },
-    {
       "id": "library.iterator",
       "role": "source",
       "kind": "iterator",
@@ -387,23 +380,23 @@
       "expect": "rows"
     },
     {
-      "id": "library.python.source",
+      "id": "library.image.source",
       "role": "source",
-      "kind": "python",
+      "kind": "image",
       "runner": "python-library",
       "expect": "rows"
     },
     {
-      "id": "library.python.sink",
+      "id": "library.image.sink",
       "role": "sink",
-      "kind": "python",
+      "kind": "image",
       "runner": "python-library",
       "expect": "rows"
     },
     {
-      "id": "library.python.kernel",
+      "id": "library.image.kernel",
       "role": "function",
-      "kind": "python",
+      "kind": "image",
       "runner": "python-library",
       "expect": "rows"
     }

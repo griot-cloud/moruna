@@ -168,7 +168,7 @@ pub enum Outbound {
     },
     /// The full run report, before `exit`, whenever the run produced one.
     Report {
-        /// `RunReport` as JSON (04 d.1).
+        /// The report document (`crate::report_doc`, schema 2.0): what the report file holds.
         report: serde_json::Value,
         /// How the run went against its plan (SDD 26 e.3): the plan it ran, the order its steps
         /// started in, each step's start, end and use, and every deviation from the plan.

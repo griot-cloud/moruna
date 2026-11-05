@@ -102,7 +102,7 @@ def test_a_source_through_a_kernel_into_a_sink(staging: dict[str, object]) -> No
     assert sorted(sink.ids) == list(range(ROWS)), "exactly the table's rows, each once"
     assert sorted(sink.loud) == sorted(f"ROW {i}" for i in range(ROWS))
     assert sink.finished == 1, "finish once, after the last write"
-    assert report.stages[0]["rows_in"] == ROWS
+    assert [t for t in report.tasks if t["role"] == "function"][0]["rows_in"] == ROWS
     # Every read asked for a range inside its split, and the reads covered the table.
     assert all(0 <= s <= e <= SPLIT_ROWS for _, s, e in source.reads)
     # A sink that does not checkpoint says so in the report (12 f.7).

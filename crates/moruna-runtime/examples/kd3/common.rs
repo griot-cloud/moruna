@@ -31,7 +31,7 @@ pub fn image_digest(path: &std::path::Path) -> Result<String> {
     Ok(digest.to_owned())
 }
 fn image(digest: &str) -> Value {
-    json!({"kind":"image","layout":"/images/kd2","reference":digest})
+    json!({"kind":"image","image":{"build_key":null,"digest":digest,"location":"/images/kd2"}})
 }
 fn doc(kernels: Vec<Value>) -> Value {
     json!({"moruna_spec":1,"source":{"kind":"arrow_ipc","url":"file:///kd2/input.arrow"},"kernels":kernels,"sink":{"kind":"arrow_ipc","url":"file:///tmp/kd2-out/"},"budget":{"memory_bytes":384u64<<20},"staging":{"dir":"/tmp/kd2-staging"},"report":{"file":"/tmp/kd2-report.json"},"ordered":true})
@@ -218,21 +218,25 @@ pub fn rows(seen: &Seen) -> Result<String> {
         return Err("missing rows or tap figures".into());
     }
     let report = seen.report.as_ref().ok_or("missing report")?;
-    let stages = report["stages"].as_array().ok_or("missing report stages")?;
-    let ids: BTreeSet<_> = stages
+    let tasks = report["tasks"].as_array().ok_or("missing report tasks")?;
+    let functions: Vec<_> = tasks
         .iter()
-        .filter_map(|stage| stage["stage"].as_u64())
+        .filter(|task| task["role"] == "function")
         .collect();
-    if stages.len() != 2
-        || ids != BTreeSet::from([1, 2])
-        || stages.iter().any(|stage| {
-            stage["rows_in"].as_u64() != Some(ROWS as u64)
-                || stage["rows_out"].as_u64() != Some(ROWS as u64)
-                || stage["errors"].as_u64() != Some(0)
-                || stage["skipped"].as_u64() != Some(0)
+    let keys: BTreeSet<_> = functions
+        .iter()
+        .filter_map(|task| task["key"].as_str())
+        .collect();
+    if functions.len() != 2
+        || keys.len() != 2
+        || functions.iter().any(|task| {
+            task["rows_in"].as_u64() != Some(ROWS as u64)
+                || task["rows_out"].as_u64() != Some(ROWS as u64)
+                || task["failed_morsels"].as_u64() != Some(0)
+                || task["skipped_morsels"].as_u64() != Some(0)
         })
     {
-        return Err("kernel stages did not each acknowledge all rows without errors".into());
+        return Err("function tasks did not each acknowledge all rows without errors".into());
     }
     seen.sink_ack.verify(report["run_id"].as_str())?;
     Ok(format!(
@@ -259,18 +263,23 @@ pub fn failure(seen: &Seen, words: &[&str]) -> Result<String> {
         return Err("missing failure summary".into());
     }
     let report = seen.report.as_ref().ok_or("missing failure report")?;
-    let stages = report["stages"]
+    let tasks = report["tasks"]
         .as_array()
-        .ok_or("missing failure report stages")?;
-    if !stages.iter().any(|stage| {
-        stage["stage"].as_u64() == Some(1)
-            && stage["errors"].as_u64().is_some_and(|errors| errors > 0)
+        .ok_or("missing failure report tasks")?;
+    if !tasks.iter().any(|task| {
+        task["key"] == "kernel-1"
+            && task["failed_morsels"]
+                .as_u64()
+                .is_some_and(|failed| failed > 0)
     }) {
         return Err("failure report did not acknowledge kernel-1 error".into());
     }
     // TaskFailed deliberately quotes no data; the canonical report and Exit
     // carry the full failure. Require both to agree before checking its cause.
-    let diagnostic = report["exit"]["Terminated"]["diagnostic"]
+    if report["exit"]["status"] != "terminated" {
+        return Err(format!("failure report exit is not terminated: {}", report["exit"]).into());
+    }
+    let diagnostic = report["exit"]["diagnostic"]
         .as_str()
         .filter(|text| !text.is_empty())
         .ok_or("missing terminated failure diagnostic")?;

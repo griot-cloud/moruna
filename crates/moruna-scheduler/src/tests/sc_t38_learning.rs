@@ -75,7 +75,7 @@ fn sc_t38_a_run_learns_every_unit_and_keeps_it() {
             .stages(2)
             .go();
         rig.scheduler
-            .set_cost(Arc::clone(&online), vec![key(1), key(2)])
+            .set_cost(Arc::clone(&online), vec![key(1), key(2)], None)
             .expect("set before the run");
         match rig.scheduler.run(CancelToken::new()) {
             Ok(crate::RunOutcome::Completed { .. }) => {}
@@ -142,7 +142,7 @@ fn sc_t38_the_model_is_set_once_before_the_run() {
         .go();
     let refused = rig
         .scheduler
-        .set_cost(Arc::clone(&online), vec![key(1)])
+        .set_cost(Arc::clone(&online), vec![key(1)], None)
         .expect_err("one key for two stages");
     assert!(
         refused
@@ -151,11 +151,11 @@ fn sc_t38_the_model_is_set_once_before_the_run() {
         "{refused}"
     );
     rig.scheduler
-        .set_cost(Arc::clone(&online), vec![key(1), key(2)])
+        .set_cost(Arc::clone(&online), vec![key(1), key(2)], None)
         .expect("set");
     let again = rig
         .scheduler
-        .set_cost(Arc::clone(&online), vec![key(1), key(2)])
+        .set_cost(Arc::clone(&online), vec![key(1), key(2)], None)
         .expect_err("set once");
     assert!(again.to_string().contains("set already"), "{again}");
     match rig.scheduler.run(CancelToken::new()) {
@@ -172,7 +172,7 @@ fn sc_t38_the_model_is_set_once_before_the_run() {
     }
     let after = late
         .scheduler
-        .set_cost(online, vec![key(1)])
+        .set_cost(online, vec![key(1)], None)
         .expect_err("not after the run");
     assert!(
         after.to_string().contains("before the run starts"),
@@ -243,7 +243,7 @@ fn sc_t38_a_model_that_turns_wrong_drifts_and_the_run_completes() {
         .kernel(Arc::new(FakeKernel::new()))
         .go();
     rig.scheduler
-        .set_cost(Arc::clone(&online), vec![key(1)])
+        .set_cost(Arc::clone(&online), vec![key(1)], None)
         .expect("set");
     match rig.scheduler.run(CancelToken::new()) {
         Ok(crate::RunOutcome::Completed { .. }) => {}
@@ -306,7 +306,7 @@ fn sc_t38_a_store_that_refuses_is_reported_and_the_run_completes() {
         .stages(1)
         .go();
     rig.scheduler
-        .set_cost(Arc::clone(&online), vec![key(1)])
+        .set_cost(Arc::clone(&online), vec![key(1)], None)
         .expect("set");
     match rig.scheduler.run(CancelToken::new()) {
         Ok(crate::RunOutcome::Completed { .. }) => {}
@@ -415,7 +415,7 @@ fn sc_t38_a_store_that_blocks_never_holds_the_run() {
         .stages(1)
         .go();
     rig.scheduler
-        .set_cost(Arc::clone(&online), vec![key(1)])
+        .set_cost(Arc::clone(&online), vec![key(1)], None)
         .expect("set");
     let (send, receive) = std::sync::mpsc::channel();
     let running = std::thread::spawn({
@@ -519,7 +519,9 @@ fn sc_t38_predictions_follow_workers_and_new_source_statistics() {
         dir.store(),
     ));
     let rig = RigBuilder::new().stages(1).go();
-    rig.scheduler.set_cost(online, vec![key(1)]).expect("set");
+    rig.scheduler
+        .set_cost(online, vec![key(1)], None)
+        .expect("set");
     let shared = &rig.scheduler.shared;
     let learning = shared.learning.get().expect("a model is installed");
     let first = learning.predict(shared, 0, 128);

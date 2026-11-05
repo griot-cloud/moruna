@@ -115,7 +115,7 @@ pub fn check_kernel(
                     .unwrap_or_else(|_| "function".into())
             });
             let mut opts = CheckOptions::new(label);
-            opts.kind = "python";
+            opts.kind = "image";
             opts.fingerprint_scheme = "sha256";
             opts.gil = Some(py_kernel.gil_state());
             opts.memory_guard = Some(py_kernel.memory_guard());

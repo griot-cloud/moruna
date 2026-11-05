@@ -1,56 +1,74 @@
-"""What ``import moruna`` is inside an image built from Python code (SDD 30 f.3).
+"""What ``import moruna`` is inside an image Moruna builds (SDD 30 f.3).
 
-``moruna build`` copies this file into layer 3 as ``/opt/moruna/moruna/__init__.py``, beside
-``_declare.py``, so a function's module, which does ``import moruna`` and decorates a function
-with ``@moruna.function`` (or subclasses ``moruna.Function``), imports in an image that has no
-Moruna engine. It holds the names such a module uses at import time, ``function``, ``polars``,
-``Task`` and ``Function``, and they decorate the way the engine's do:
-a function annotated Polars frame to Polars frame is wrapped the same way (``_declare``), and the
-result carries the ``wrapped`` callable and ``stateful`` flag that the shim reads. The declarations
-(schemas, memory, tier and the rest) are how the engine plans and checks a function, and an image is
-planned by its job document, so they are accepted and not read; ``moruna build`` imports the
-module with the real decorator and refuses a declaration that is wrong. Every other name of
-``moruna`` is refused when it is used, saying so.
+The build copies this file into the shim's layer as ``/opt/moruna/moruna/__init__.py``, beside
+``_declare.py``, so a task's module, which does ``import moruna`` and subclasses
+``moruna.Source``, ``moruna.Function`` or ``moruna.Sink`` (or decorates a function with
+``@moruna.function``), imports in an image that has no Moruna engine. It holds the names such a
+module uses, and they behave as the engine's do for the shim: a task reads its ports as
+``self.ports[name]`` (each a client of the port protocol) and the run's arguments as
+``self.args``; a decorated function carries the ``wrapped`` callable and ``stateful`` flag the
+shim reads. The declarations (schemas, memory, tier and the rest) are how the engine plans and
+checks a task; in an image the shim checks ``takes`` and ``gives`` on every batch and reads
+nothing else. Every other name of ``moruna`` is refused when it is used, saying so.
 """
 
 from __future__ import annotations
 
+import types
 from typing import Any
 
 from moruna import _declare
 
 
 class Task:
-    """A task's base, as a module subclasses it: its declarations are accepted and not read."""
+    """A task's base: its declarations, its ports and the run's arguments."""
 
     takes: Any = None
     gives: Any = None
     needs: Any = ()
+    files: Any = ()
+
+    @property
+    def ports(self) -> Any:
+        """The task's ports, by need: each a client with ``call(bytes) -> bytes``."""
+        return self.__dict__.get("_moruna_ports", types.MappingProxyType({}))
+
+    @property
+    def args(self) -> Any:
+        """The run's arguments, by name."""
+        return self.__dict__.get("_moruna_run_args", types.MappingProxyType({}))
+
+
+class Source(Task):
+    """A source's base: ``plan()`` gives its splits and ``read(split_id, start, end)`` a batch."""
 
 
 class Function(Task):
-    """A function's base: an instance is called with each batch, as the shim calls it."""
-
-    stateful = False
-
-    @property
-    def wrapped(self) -> Any:
-        return self
+    """A function's base: an instance is called with each batch, and ``finish()`` at the end."""
 
 
-class _Decorated(Function):
+class Sink(Task):
+    """A sink's base: ``write(batch)`` each batch, and ``finish()`` returns its commit."""
+
+
+class Split:
+    """One split of a source: its id and its rows."""
+
+    def __init__(self, id: int, rows: int, bytes: int | None = None) -> None:  # noqa: A002
+        self.id = int(id)
+        self.rows = int(rows)
+        self.bytes = bytes
+
+
+class _Decorated:
     """A decorated function as the shim reads it: what it wraps and whether it is stateful."""
 
     def __init__(self, wrapped: Any, stateful: bool) -> None:
-        self._wrapped = wrapped
+        self.wrapped = wrapped
         self.stateful = stateful
 
-    @property
-    def wrapped(self) -> Any:
-        return self._wrapped
-
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrapped(*args, **kwargs)
+        return self.wrapped(*args, **kwargs)
 
 
 def function(fn: Any = None, *, stateful: bool = False, **declarations: Any) -> Any:
@@ -75,6 +93,6 @@ def polars(fn: Any, **declarations: Any) -> _Decorated:
 
 def __getattr__(name: str) -> Any:
     raise AttributeError(
-        f"moruna.{name}: inside an image built by `moruna build` the moruna module holds "
-        "only function, polars, Task and Function; the engine is not in the image"
+        f"moruna.{name}: inside an image Moruna builds the moruna module holds only Task, "
+        "Source, Function, Sink, Split, function and polars; the engine is not in the image"
     )

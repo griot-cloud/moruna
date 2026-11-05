@@ -48,6 +48,12 @@ impl RunnableKind for Scale {
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -185,6 +191,9 @@ fn kd_t5_add_a_kind() {
         notes: Vec::new(),
         packages: Default::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     };
     let refused = build(
         &moruna_job::Job::from_v1(&job),

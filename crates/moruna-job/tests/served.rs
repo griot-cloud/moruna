@@ -35,6 +35,12 @@ fn served(name: &str, input: Option<Value>, output: Option<Value>) -> Declaratio
             input_schema: input,
             output_schema: output,
         }),
+        title: None,
+        description: None,
+        takes: None,
+        gives: None,
+        requires: Vec::new(),
+        provenance: None,
     }
 }
 

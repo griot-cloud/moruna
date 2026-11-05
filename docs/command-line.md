@@ -18,7 +18,7 @@ This document runs the quickstart's scoring function over the reviews dataset, a
   },
   "kernels": [
     {"kind": "std", "name": "filter", "args": {"expr": "is_not_null(text)"}},
-    {"kind": "python", "ref": "functions.py:score"}
+    {"kind": "std", "name": "select", "args": {"columns": ["review_id", "text"]}}
   ],
   "sink": {"kind": "parquet", "url": "reviews-scored/"},
   "budget": {"memory_bytes": 1073741824},
@@ -26,7 +26,7 @@ This document runs the quickstart's scoring function over the reviews dataset, a
 }
 ```
 
-`moruna_spec` is the version of the document format and is always `1`. A Python function is named by its `ref`, `module:attribute`, the module a module name or a path to a `.py` file; a `moruna.Function` class also takes its `params`, and a task with `needs` is given them by the resolver `--resolver` names. A standard function is named by `name`, with its arguments in `args`. Paths in the document are relative to the directory you run the command from.
+`moruna_spec` is the version of the document format and is always `1`. A standard function is named by `name`, with its arguments in `args`. Your own Python code runs from a document as an image: write the job in Python, build it (`moruna build pipeline:job`), and run the spec the build writes (version 2); see [Images and ports](images.md). Paths in the document are relative to the directory you run the command from.
 
 Fields you leave out take the same defaults as `moruna.run`. Every field is described in the [job document reference](job-document.md).
 

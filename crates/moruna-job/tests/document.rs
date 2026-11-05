@@ -260,6 +260,12 @@ fn declared(role: Role) -> Declaration {
         preserves_columns: Fact::Yes,
         isolation: Isolation::Builtin,
         served: None,
+        title: None,
+        description: None,
+        takes: None,
+        gives: None,
+        requires: Vec::new(),
+        provenance: None,
     }
 }
 

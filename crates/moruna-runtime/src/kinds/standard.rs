@@ -58,6 +58,12 @@ impl RunnableKind for Std {
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Builtin,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 

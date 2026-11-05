@@ -802,7 +802,7 @@ fn drive(
     started.scheduler = Some(scheduler.clone());
     if let Some(learning) = components.learning {
         let keys = learning.keys(&kernels, &topology, &schemas)?;
-        scheduler.set_cost(learning.online, keys)?;
+        scheduler.set_cost(learning.online, keys, Some(Arc::from(run_id.to_hex())))?;
     }
     if let Some(hook) = components.stage_hook.clone() {
         scheduler.set_stage_hook(hook);
@@ -1111,7 +1111,23 @@ fn drive(
             msg: "the trace writer produced no view, so no report can be computed".to_string(),
         })
     })?;
-    let computed = report::compute(&view, &limits, &meta);
+    let mut computed = report::compute(&view, &limits, &meta);
+    let digest_of = |q: Option<moruna_kernel::StageId>| {
+        q.and_then(|q| schemas.get(usize::from(q)))
+            .map(moruna_kernel::SourceSchema::hash)
+    };
+    computed.part_digests = moruna_trace::PartDigests {
+        source_schemas: (0..topology.sources())
+            .map(|s| digest_of(topology.source_outputs(s).first().copied()))
+            .collect(),
+        stage_schemas: (1..=topology.stages())
+            .map(|stage| digest_of(topology.inputs(stage).first().copied()))
+            .collect(),
+        stage_fingerprints: kernels.iter().map(|k| k.fingerprint().0).collect(),
+        sink_schemas: (0..topology.sinks())
+            .map(|s| digest_of(topology.sink_input(s)))
+            .collect(),
+    };
     if let Some(cause) = final_failure {
         return Err(RunError::bare(cause)
             .with_report(Some(computed))

@@ -473,6 +473,7 @@ impl<'a> Task<'a> {
   pub const VT_OUTPUTS: ::flatbuffers::VOffsetT = 14;
   pub const VT_BARRIER: ::flatbuffers::VOffsetT = 16;
   pub const VT_MEMBERS: ::flatbuffers::VOffsetT = 18;
+  pub const VT_DEFINITION: ::flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -484,6 +485,7 @@ impl<'a> Task<'a> {
     args: &'args TaskArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Task<'bldr>> {
     let mut builder = TaskBuilder::new(_fbb);
+    if let Some(x) = args.definition { builder.add_definition(x); }
     if let Some(x) = args.members { builder.add_members(x); }
     if let Some(x) = args.outputs { builder.add_outputs(x); }
     if let Some(x) = args.inputs { builder.add_inputs(x); }
@@ -552,6 +554,13 @@ impl<'a> Task<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<&'a str>>>>(Task::VT_MEMBERS, None)}
   }
+  #[inline]
+  pub fn definition(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(Task::VT_DEFINITION, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Task<'_> {
@@ -568,6 +577,7 @@ impl ::flatbuffers::Verifiable for Task<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<&'_ str>>>>("outputs", Self::VT_OUTPUTS, false)?
      .visit_field::<bool>("barrier", Self::VT_BARRIER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<&'_ str>>>>("members", Self::VT_MEMBERS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("definition", Self::VT_DEFINITION, false)?
      .finish();
     Ok(())
   }
@@ -581,6 +591,7 @@ pub struct TaskArgs<'a> {
     pub outputs: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<&'a str>>>>,
     pub barrier: bool,
     pub members: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<&'a str>>>>,
+    pub definition: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
 }
 impl<'a> Default for TaskArgs<'a> {
   #[inline]
@@ -594,6 +605,7 @@ impl<'a> Default for TaskArgs<'a> {
       outputs: None,
       barrier: false,
       members: None,
+      definition: None,
     }
   }
 }
@@ -636,6 +648,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> TaskBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Task::VT_MEMBERS, members);
   }
   #[inline]
+  pub fn add_definition(&mut self, definition: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Task::VT_DEFINITION, definition);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> TaskBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     TaskBuilder {
@@ -663,6 +679,7 @@ impl ::core::fmt::Debug for Task<'_> {
       ds.field("outputs", &self.outputs());
       ds.field("barrier", &self.barrier());
       ds.field("members", &self.members());
+      ds.field("definition", &self.definition());
       ds.finish()
   }
 }
@@ -2577,6 +2594,121 @@ impl ::core::fmt::Debug for Contract<'_> {
       ds.finish()
   }
 }
+pub enum ArgOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct Arg<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for Arg<'a> {
+  type Inner = Arg<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> Arg<'a> {
+  pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
+  pub const VT_TYPE_: ::flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    Arg { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args ArgArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<Arg<'bldr>> {
+    let mut builder = ArgBuilder::new(_fbb);
+    if let Some(x) = args.type_ { builder.add_type_(x); }
+    if let Some(x) = args.name { builder.add_name(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn name(&self) -> &'a str {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Arg::VT_NAME, None).unwrap()}
+  }
+  #[inline]
+  pub fn type_(&self) -> &'a str {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Arg::VT_TYPE_, None).unwrap()}
+  }
+}
+
+impl ::flatbuffers::Verifiable for Arg<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, true)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("type_", Self::VT_TYPE_, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct ArgArgs<'a> {
+    pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub type_: Option<::flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for ArgArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    ArgArgs {
+      name: None, // required field
+      type_: None, // required field
+    }
+  }
+}
+
+pub struct ArgBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ArgBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Arg::VT_NAME, name);
+  }
+  #[inline]
+  pub fn add_type_(&mut self, type_: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Arg::VT_TYPE_, type_);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> ArgBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    ArgBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<Arg<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, Arg::VT_NAME,"name");
+    self.fbb_.required(o, Arg::VT_TYPE_,"type_");
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for Arg<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("Arg");
+      ds.field("name", &self.name());
+      ds.field("type_", &self.type_());
+      ds.finish()
+  }
+}
 pub enum JobOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2612,6 +2744,7 @@ impl<'a> Job<'a> {
   pub const VT_REPORT: ::flatbuffers::VOffsetT = 36;
   pub const VT_CONTRACTS: ::flatbuffers::VOffsetT = 38;
   pub const VT_NAME: ::flatbuffers::VOffsetT = 40;
+  pub const VT_ARGS: ::flatbuffers::VOffsetT = 42;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -2623,6 +2756,7 @@ impl<'a> Job<'a> {
     args: &'args JobArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Job<'bldr>> {
     let mut builder = JobBuilder::new(_fbb);
+    if let Some(x) = args.args { builder.add_args(x); }
     if let Some(x) = args.name { builder.add_name(x); }
     if let Some(x) = args.contracts { builder.add_contracts(x); }
     if let Some(x) = args.report { builder.add_report(x); }
@@ -2779,6 +2913,13 @@ impl<'a> Job<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Job::VT_NAME, None)}
   }
+  #[inline]
+  pub fn args(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Arg<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Arg>>>>(Job::VT_ARGS, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Job<'_> {
@@ -2806,6 +2947,7 @@ impl ::flatbuffers::Verifiable for Job<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<Report>>("report", Self::VT_REPORT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Contract>>>>("contracts", Self::VT_CONTRACTS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Arg>>>>("args", Self::VT_ARGS, false)?
      .finish();
     Ok(())
   }
@@ -2830,6 +2972,7 @@ pub struct JobArgs<'a> {
     pub report: Option<::flatbuffers::WIPOffset<Report<'a>>>,
     pub contracts: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Contract<'a>>>>>,
     pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub args: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Arg<'a>>>>>,
 }
 impl<'a> Default for JobArgs<'a> {
   #[inline]
@@ -2854,6 +2997,7 @@ impl<'a> Default for JobArgs<'a> {
       report: None,
       contracts: None,
       name: None,
+      args: None,
     }
   }
 }
@@ -2940,6 +3084,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> JobBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Job::VT_NAME, name);
   }
   #[inline]
+  pub fn add_args(&mut self, args: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<Arg<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Job::VT_ARGS, args);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> JobBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     JobBuilder {
@@ -2976,6 +3124,7 @@ impl ::core::fmt::Debug for Job<'_> {
       ds.field("report", &self.report());
       ds.field("contracts", &self.contracts());
       ds.field("name", &self.name());
+      ds.field("args", &self.args());
       ds.finish()
   }
 }

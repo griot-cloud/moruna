@@ -56,8 +56,8 @@ back = pq.read_table(str(out))
 print(json.dumps({
     "exit": report.exit["status"],
     "run_id": report.run_id,
-    "rows_in": report.stages[0]["rows_in"],
-    "rows_out": report.stages[0]["rows_out"],
+    "rows_in": [t for t in report.tasks if t["role"] == "function"][0]["rows_in"],
+    "rows_out": [t for t in report.tasks if t["role"] == "function"][0]["rows_out"],
     "rows_back": back.num_rows,
     "ids_match": sorted(back.column("id").to_pylist()) == list(range(rows)),
     "text": str(report),
@@ -121,7 +121,7 @@ def test_a_plain_function_is_wrapped(
         moruna.ParquetSource(src_url), lambda batch: batch, small_sink(out_url), **staging
     )
     assert report.exit["status"] == "completed", report.notes
-    assert report.stages[0]["rows_out"] == rows
+    assert [t for t in report.tasks if t["role"] == "function"][0]["rows_out"] == rows
 
 
 def test_no_kernels_is_a_copy(

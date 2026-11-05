@@ -95,6 +95,24 @@ impl Job {
         for (i, contract) in root.contracts().iter().flatten().enumerate() {
             contracts.push(read_contract(i, contract)?);
         }
+        let mut args = Vec::new();
+        for (i, arg) in root.args().iter().flatten().enumerate() {
+            let ty = crate::ArgType::parse(arg.type_()).ok_or_else(|| {
+                JobError::field(
+                    format!("args[{i}].type"),
+                    format!(
+                        "`{}` is not an argument's type: {}",
+                        arg.type_(),
+                        crate::ARG_TYPES.join(", ")
+                    ),
+                )
+            })?;
+            args.push(crate::ArgDecl::new(arg.name(), ty));
+        }
+        if let Some(fault) = crate::declaration_faults(&args).into_iter().next() {
+            let (field, reason) = fault.split_once(": ").unwrap_or(("args", fault.as_str()));
+            return Err(JobError::field(field, reason));
+        }
         Ok(Job {
             id: root.id().map(str::to_string),
             tasks,
@@ -147,6 +165,7 @@ impl Job {
             },
             allow_gil: root.allow_gil(),
             name: root.name().map(str::to_string),
+            args,
             report: root
                 .report()
                 .map(|r| Reporting {
@@ -220,6 +239,26 @@ impl Job {
         let id = opt_str(&mut b, &self.id);
         let resume = opt_str(&mut b, &self.resume);
         let name = opt_str(&mut b, &self.name);
+        if let Some(fault) = crate::declaration_faults(&self.args).into_iter().next() {
+            let (field, reason) = fault.split_once(": ").unwrap_or(("args", fault.as_str()));
+            return Err(JobError::field(field, reason));
+        }
+        let args: Vec<_> = self
+            .args
+            .iter()
+            .map(|arg| {
+                let name = b.create_string(&arg.name);
+                let type_ = b.create_string(arg.ty.as_str());
+                fb::Arg::create(
+                    &mut b,
+                    &fb::ArgArgs {
+                        name: Some(name),
+                        type_: Some(type_),
+                    },
+                )
+            })
+            .collect();
+        let args = (!args.is_empty()).then(|| b.create_vector(&args));
         let trace = opt_str(&mut b, &self.trace);
         let profiles_dir = opt_str(&mut b, &self.profiles_dir);
         let root = fb::Job::create(
@@ -247,6 +286,7 @@ impl Job {
                 report: Some(report),
                 contracts: Some(contracts),
                 name,
+                args,
             },
         );
         fb::finish_job_buffer(&mut b, root);
@@ -278,6 +318,17 @@ fn read_task(i: usize, task: fb::Task<'_>) -> Result<Task, JobError> {
         Some(bytes) => flex::decode_map(bytes.bytes())
             .map_err(|reason| JobError::field(format!("tasks[{i}].settings"), reason))?,
     };
+    let definition =
+        match task.definition() {
+            None => None,
+            Some(bytes) => {
+                let map = flex::decode_map(bytes.bytes())
+                    .map_err(|reason| JobError::field(format!("tasks[{i}].definition"), reason))?;
+                Some(serde_json::from_value(Value::Object(map)).map_err(|e| {
+                    JobError::field(format!("tasks[{i}].definition"), e.to_string())
+                })?)
+            }
+        };
     Ok(Task {
         id: task.id().to_string(),
         role,
@@ -288,6 +339,7 @@ fn read_task(i: usize, task: fb::Task<'_>) -> Result<Task, JobError> {
         barrier: task.barrier(),
         members: strings(task.members()),
         at: None,
+        definition,
     })
 }
 
@@ -304,6 +356,16 @@ fn write_task<'b>(
     let inputs = string_vector(b, &task.inputs);
     let outputs = string_vector(b, &task.outputs);
     let members = string_vector(b, &task.members);
+    let definition = match &task.definition {
+        None => None,
+        Some(declaration) => {
+            let value = serde_json::to_value(declaration)
+                .map_err(|e| JobError::field(format!("tasks[{i}].definition"), e.to_string()))?;
+            let bytes = flex::encode(&value)
+                .map_err(|reason| JobError::field(format!("tasks[{i}].definition"), reason))?;
+            Some(b.create_vector(&bytes))
+        }
+    };
     Ok(fb::Task::create(
         b,
         &fb::TaskArgs {
@@ -319,6 +381,7 @@ fn write_task<'b>(
             outputs: Some(outputs),
             barrier: task.barrier,
             members: Some(members),
+            definition,
         },
     ))
 }

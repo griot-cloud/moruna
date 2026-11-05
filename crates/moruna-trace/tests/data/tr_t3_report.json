@@ -78,7 +78,15 @@
       "skipped": 0,
       "state_bytes_max": 0,
       "state_growth": 0,
-      "alloc": null
+      "alloc": null,
+      "started_ns": 0,
+      "ended_ns": 3000000000,
+      "cpu_core_s": 0.0012,
+      "peak_memory_bytes": 9000,
+      "instances": 1,
+      "morsels_out": 3,
+      "input_wait_s": 0.0,
+      "output_wait_s": 0.0
     },
     {
       "stage": 2,
@@ -98,7 +106,15 @@
       "skipped": 1,
       "state_bytes_max": 0,
       "state_growth": 0,
-      "alloc": null
+      "alloc": null,
+      "started_ns": 3000000000,
+      "ended_ns": 5000000000,
+      "cpu_core_s": 0.0008,
+      "peak_memory_bytes": 800,
+      "instances": 1,
+      "morsels_out": 1,
+      "input_wait_s": 0.0,
+      "output_wait_s": 0.0
     },
     {
       "stage": 3,
@@ -118,7 +134,15 @@
       "skipped": 0,
       "state_bytes_max": 3000,
       "state_growth": 2000,
-      "alloc": null
+      "alloc": null,
+      "started_ns": 5000000000,
+      "ended_ns": 6600000000,
+      "cpu_core_s": 0.0016,
+      "peak_memory_bytes": 200,
+      "instances": 2,
+      "morsels_out": 4,
+      "input_wait_s": 1.1,
+      "output_wait_s": 0.0
     }
   ],
   "notes": [

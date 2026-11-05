@@ -68,6 +68,8 @@ struct Writer {
 pub(crate) struct Learning {
     online: Arc<Online>,
     keys: Vec<CostKey>,
+    /// The run every unit it settles names, when the embedder named one.
+    run: Option<Arc<str>>,
     /// By stage, the place of its key among the distinct keys.
     key_of: Vec<usize>,
     /// By distinct key, settles so far: what a cached prediction was made at.
@@ -105,7 +107,12 @@ fn bucket_bytes(bucket: i32) -> u64 {
 impl Learning {
     /// `online` for the run's `stages` kernel stages, keyed by `keys`, stage 1 first; refused
     /// when the counts differ.
-    pub(crate) fn new(online: Arc<Online>, keys: Vec<CostKey>, stages: usize) -> Result<Learning> {
+    pub(crate) fn new(
+        online: Arc<Online>,
+        keys: Vec<CostKey>,
+        run: Option<Arc<str>>,
+        stages: usize,
+    ) -> Result<Learning> {
         if keys.len() != stages {
             return Err(MorunaError::Config {
                 name: "cost.model",
@@ -133,6 +140,7 @@ impl Learning {
                 .map(|_| Mutex::new(StageCache::default()))
                 .collect(),
             keys,
+            run,
             key_of,
             versions,
             writer: Writer {
@@ -211,6 +219,7 @@ impl Learning {
             Some(prediction),
             outcome,
             at_ms,
+            self.run.as_ref(),
         );
         self.versions[self.key_of[stage_ix]].fetch_add(1, Ordering::SeqCst);
         self.learn_ns

@@ -16,6 +16,7 @@ another package plugs in.
 
 from __future__ import annotations
 
+import abc
 import importlib
 import os
 from collections.abc import Callable, Mapping
@@ -83,15 +84,17 @@ def load_resolver(reference: str) -> Resolver:
     return target  # type: ignore[no-any-return]
 
 
-class Writer:
+class Writer(abc.ABC):
     """The port that keeps a job's spec and its run's report: each method takes the exact bytes
-    and keeps them, raising when it cannot."""
+    and keeps them, raising when it cannot. A writer of another package defines both."""
 
+    @abc.abstractmethod
     def write_spec(self, data: bytes) -> None:
-        raise NotImplementedError
+        """Keep the spec's bytes."""
 
+    @abc.abstractmethod
     def write_report(self, data: bytes) -> None:
-        raise NotImplementedError
+        """Keep the report's bytes."""
 
 
 class FileWriter(Writer):

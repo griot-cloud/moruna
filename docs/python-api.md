@@ -4,8 +4,8 @@ Moruna requires Python 3.14 or later and `pyarrow>=17`. The names below are avai
 
 | Reference | What you can look up |
 | --- | --- |
-| [Jobs and `moruna.run`](python-run.md) | `moruna.Job`, its spec, `Task`, `Source`, `Function`, `Sink`, needs and the resolver, the writer, and every run argument. |
-| [Functions](python-functions.md) | `moruna.function`, `moruna.polars`, `Function.build`, state methods and declarations. |
+| [Jobs and `moruna.run`](python-run.md) | `moruna.Job`, its spec and its images (`job.build`, `moruna.image`), `Task`, `Source`, `Function`, `Sink`, needs and the resolver, run arguments, the writer, and every argument of `moruna.run`. |
+| [Functions](python-functions.md) | `moruna.function`, `moruna.polars`, state methods and declarations. |
 | [Sources](python-sources.md) | Built-in constructors, `Source` methods and `Split` attributes. |
 | [Sinks](python-sinks.md) | Built-in constructors and `Sink` methods. |
 | [Standard functions](python-standard-functions.md) | Every `moruna.std` function. |

@@ -1,5 +1,6 @@
-//! The `moruna` binary (MH 4.2): `moruna run <spec.json>` and `moruna serve --listen`,
-//! with an embedded interpreter so a document's Python kernels can be imported.
+//! The `moruna` binary (MH 4.2): the `moruna` command (`moruna run JOB`, `moruna serve
+//! --listen`, ...) with an embedded interpreter, which runs the package's command line
+//! (`moruna.__main__.main`) exactly as the console script does.
 //!
 //! The binary registers its own `moruna._core` before anything imports `moruna`, so a kernel
 //! module that says `import moruna` and decorates with `@moruna.kernel` gets this binary's
@@ -15,7 +16,19 @@ fn main() {
             eprintln!("moruna: the embedded interpreter could not be prepared: {error}");
             return moruna_runtime::host::exit::FAILED;
         }
-        _core::cli::run_command(py, std::env::args().skip(1).collect())
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match py
+            .import("moruna.__main__")
+            .and_then(|m| m.getattr("main"))
+            .and_then(|main| main.call1((args,)))
+            .and_then(|code| code.extract::<i32>())
+        {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("moruna: {error}");
+                moruna_runtime::host::exit::FAILED
+            }
+        }
     });
     std::process::exit(code);
 }

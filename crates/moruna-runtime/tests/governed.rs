@@ -247,6 +247,9 @@ fn child_run() {
             notes: Vec::new(),
             packages: moruna_runtime::packaged::PackageHost::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     ) {
         Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -694,6 +697,9 @@ fn refusal(
             notes: Vec::new(),
             packages: moruna_runtime::packaged::PackageHost::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .err()
@@ -867,6 +873,9 @@ fn a_programs_bindings_decide_where_a_contract_is() {
                 notes: Vec::new(),
                 packages: moruna_runtime::packaged::PackageHost::default(),
                 host_ports: None,
+                pulled_images: None,
+                args: Default::default(),
+                held: Vec::new(),
             },
         )
         .map(|_| ())
@@ -930,6 +939,9 @@ fn sc_t24_no_rows_child() {
             notes: Vec::new(),
             packages: moruna_runtime::packaged::PackageHost::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .expect("the document builds");

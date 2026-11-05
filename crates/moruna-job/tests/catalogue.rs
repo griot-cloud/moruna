@@ -39,6 +39,12 @@ fn declaration(role: Role, name: &str) -> Declaration {
         preserves_columns: Fact::Yes,
         isolation: Isolation::Builtin,
         served: None,
+        title: None,
+        description: None,
+        takes: None,
+        gives: None,
+        requires: Vec::new(),
+        provenance: None,
     }
 }
 
@@ -88,22 +94,29 @@ fn jb_t2_embedded_catalogues() {
     let standard = Catalogue::standard().expect("the standard catalogue");
     assert_eq!(
         names(&standard, Role::Source),
-        ["arrow_ipc", "parquet", "tensor", "vortex"]
+        ["arrow_ipc", "image", "parquet", "tensor", "vortex"]
     );
     assert_eq!(names(&standard, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&standard, Role::Sink),
-        ["arrow_ipc", "parquet", "tensor", "vortex"]
+        ["arrow_ipc", "image", "parquet", "tensor", "vortex"]
     );
     let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
     assert_eq!(
         names(&governed, Role::Source),
-        ["arrow_ipc", "datafusion", "parquet", "tensor", "vortex"]
+        [
+            "arrow_ipc",
+            "datafusion",
+            "image",
+            "parquet",
+            "tensor",
+            "vortex"
+        ]
     );
     assert_eq!(names(&governed, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&governed, Role::Sink),
-        ["arrow_ipc", "parquet", "peql", "tensor", "vortex"]
+        ["arrow_ipc", "image", "parquet", "peql", "tensor", "vortex"]
     );
     for catalogue in [&standard, &governed] {
         for role in [Role::Source, Role::Kernel, Role::Sink] {

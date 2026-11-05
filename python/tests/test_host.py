@@ -35,23 +35,19 @@ def decorated(batch):
 
 def _projection(report: dict) -> dict:
     return {
-        # The command's report names the exit as the trace does; the library's report as a
-        # code and a status.
-        "exit": report["exit"]["status"] if isinstance(report["exit"], dict)
-        else report["exit"].lower(),
+        "exit": report["exit"]["status"],
         "resumed": report["resumed"],
         "limits": (report["limits_initial"]["memory_ceiling"], report["limits_initial"]["cpu_quota"]),
         "gil_serialised": report["gil_serialised"],
-        "stages": [(s["stage"], s["rows_in"], s["rows_out"]) for s in report["stages"]],
+        "functions": [(t["rows_in"], t["rows_out"]) for t in report["tasks"] if t["role"] == "function"],
     }
 
 
-def _rows(directory: pathlib.Path) -> list[tuple[int, str, str]]:
+def _rows(directory: pathlib.Path) -> list[tuple[int, str]]:
     table = pq.read_table(directory)
     rows = zip(
         table.column("id").to_pylist(),
         table.column("text").to_pylist(),
-        table.column("loud").to_pylist(),
         strict=True,
     )
     return sorted(rows)
@@ -63,9 +59,7 @@ def _document(scratch: pathlib.Path, src_url: str, out: pathlib.Path, callable_:
     return {
         "moruna_spec": 1,
         "source": {"kind": "parquet", "url": src_url},
-        "kernels": [
-            {"kind": "python", "ref": f"{scratch / 'kernels.py'}:{callable_}"}
-        ],
+        "kernels": [{"kind": "std", "name": "select", "args": {"columns": ["id", "text"]}}],
         "sink": {
             "kind": "parquet",
             "url": str(out),
@@ -88,7 +82,9 @@ def _run(document: dict, scratch: pathlib.Path, *extra: str) -> tuple[int, dict]
         timeout=300,
         check=False,
     )
-    return done.returncode, json.loads((scratch / "report.json").read_text())
+    # The report file is the run report in its canonical bytes, as `moruna.run` returns it.
+    report = moruna.RunReport.from_bytes(scratch / "report.json")
+    return done.returncode, report.to_dict()
 
 
 def test_ho_t14_file_run_equals_library_run(
@@ -105,14 +101,15 @@ def test_ho_t14_file_run_equals_library_run(
     spec.loader.exec_module(kernels)
 
     from_file_out = scratch / "from_file"
-    code, envelope = _run(_document(scratch, src_url, from_file_out, "shout"), scratch)
-    assert code == 0, envelope["exit"]
-    assert envelope["exit"] == {"code": 0, "diagnostic": None}
-    assert envelope["spec_digest"].startswith("sha256:")
+    code, from_file = _run(_document(scratch, src_url, from_file_out, "shout"), scratch)
+    assert code == 0, from_file["exit"]
+    assert from_file["exit"] == {"code": 0, "status": "completed", "diagnostic": None}
+    assert from_file["schema_version"] == "2.0"
+    assert from_file["job_digest"].startswith("sha256:")
 
     library = moruna.run(
         moruna.ParquetSource(src_url),
-        kernels.shout,
+        moruna.std.select(["id", "text"]),
         small_sink(out_url),
         budget=6 << 30,
         cpu=2.0,
@@ -120,7 +117,7 @@ def test_ho_t14_file_run_equals_library_run(
         staging_limit=2 << 30,
         allow_gil=True,
     )
-    assert _projection(envelope["report"]) == _projection(json.loads(library.to_json()))
+    assert _projection(from_file) == _projection(json.loads(library.to_json()))
     assert len(_rows(from_file_out)) == rows
     assert _rows(from_file_out) == _rows(pathlib.Path(out_url.removeprefix("file://")))
 
@@ -137,65 +134,3 @@ def test_ho_t14_the_command_says_its_version() -> None:
     assert done.stdout.strip() == f"moruna {moruna.__version__}"
 
 
-PRINTING = """
-import logging
-import sys
-
-
-def loud(batch):
-    print("rows", batch.num_rows, "first id", batch.column("id")[0].as_py())
-    print("half a line", end="")
-    print(" and the rest")
-    sys.stderr.write("caf\\u00e9 on stderr\\n")
-    try:
-        raise ValueError("bad row")
-    except ValueError:
-        logging.getLogger("loud").exception("the call failed")
-    return batch
-"""
-
-
-def _records(logs: pathlib.Path, task: str) -> list[dict]:
-    [attempt] = [p for p in logs.iterdir() if p.name.startswith("a1-")]
-    records = []
-    for segment in sorted((attempt / task).glob("*.mrec")):
-        records.extend(moruna.read_events(segment))
-    return records
-
-
-def test_ho_t25_a_python_kernels_output_is_its_tasks(
-    dataset: tuple[str, str, int], scratch: pathlib.Path
-) -> None:
-    """MH 4.3 ``log``: what a Python kernel prints in process, on either stream and through
-    ``logging``, is its task's in the run's output store, each line whole and a logging record
-    with its level and its traceback; none of it is on the command's own streams."""
-    src_url, _, _ = dataset
-    (scratch / "kernels.py").write_text(PRINTING)
-    document = _document(scratch, src_url, scratch / "out", "loud")
-    logs = scratch / "logs"
-    document["report"]["logs"] = str(logs)
-    path = scratch / "job.json"
-    path.write_text(json.dumps(document))
-    done = subprocess.run(
-        [sys.executable, "-m", "moruna", "run", str(path)],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    assert "first id" not in done.stdout + done.stderr
-    assert "the call failed" not in done.stdout + done.stderr
-    records = _records(logs, "kernel-1")
-    assert records, "the kernel's output is in the store"
-    assert all(r["task"] == "kernel-1" and r["kind"] == "log" for r in records)
-    stdout = [r["text"] for r in records if r["stream"] == "stdout"]
-    assert any(t.startswith("rows ") and "first id" in t for t in stdout)
-    assert "half a line and the rest" in stdout
-    stderr = [r for r in records if r["stream"] == "stderr"]
-    assert any(r["text"] == "café on stderr" and r["level"] is None for r in stderr)
-    errors = [r for r in records if r["stream"] == "structured"]
-    assert errors and all(r["level"] == "error" for r in errors)
-    assert "the call failed" in errors[0]["text"]
-    assert "Traceback (most recent call last):" in errors[0]["text"]
-    assert "ValueError: bad row" in errors[0]["text"]

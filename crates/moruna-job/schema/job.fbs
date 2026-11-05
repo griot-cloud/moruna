@@ -46,6 +46,11 @@ table Task {
   barrier: bool;
   // The embedder's tasks this one carries, when the embedder fused several into it.
   members: [string];
+  // What the task is, inline (SDD 18 e.1): its kind's declaration, or for an image task the
+  // declaration its code makes (title, description, the JSON Schema of its params, the Arrow
+  // schemas it takes and gives, what it needs and its provenance), a FlexBuffers map. The
+  // document carries every task's definition, so it is checked and drawn without a catalogue.
+  definition: [ubyte] (flexbuffer);
 }
 
 table Endpoint {
@@ -152,6 +157,15 @@ table Contract {
   audiences: [string];
 }
 
+// A run argument the job declares (SDD 22 e.4): its name and its type. The document holds the
+// declaration and never a value: each run supplies its own (`moruna run JOB --arg NAME=VALUE`).
+table Arg {
+  // 1 to 64 of ASCII letters, digits and `_`, starting with a letter.
+  name: string (required);
+  // `string`, `int`, `float`, `bool`, `date` or `timestamp`.
+  type: string (required);
+}
+
 table Job {
   // The document's version: 2.
   version: uint;
@@ -175,6 +189,8 @@ table Job {
   contracts: [Contract];
   // The job's name, as its author gave it; absent: unnamed. Events and the report do not use it.
   name: string;
+  // The arguments every run of the job supplies, in name order.
+  args: [Arg];
 }
 
 root_type Job;

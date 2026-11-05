@@ -60,7 +60,8 @@ def test_py_t39_declare_and_list() -> None:
     assert declaration["summary"] == "Upper-cases `text` into `loud`, with a suffix."
     listing = moruna.kinds(shout)
     kernels = [k["name"] for k in listing["functions"]]
-    assert "shout" in kernels and "std" in kernels and "python" in kernels
+    assert "shout" in kernels and "std" in kernels and "image" in kernels
+    assert "python" not in kernels, "a task of your code is an image task"
     assert [k for k in listing["functions"] if k["name"] == "shout"][0] == declaration
     assert "shout" not in [k["name"] for k in moruna.kinds()["functions"]]
 

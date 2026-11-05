@@ -408,6 +408,12 @@ impl SourceKind for Datafusion {
             preserves_columns: Fact::BySettings,
             isolation: Isolation::Builtin,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -484,6 +490,12 @@ impl SinkKind for Peql {
             preserves_columns: Fact::Yes,
             isolation: Isolation::Builtin,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -566,6 +578,9 @@ mod tests {
             notes: Vec::new(),
             packages: crate::packaged::PackageHost::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         }
     }
 

@@ -22,6 +22,7 @@ use moruna_runtime::job::refusal;
 use moruna_runtime::kinds::parquet::compression_name;
 use moruna_runtime::kinds::tensor::tensor_format_name;
 use moruna_runtime::kinds::{arrow_ipc, parquet, tensor, vortex};
+use moruna_runtime::report_doc::ReportContext;
 use moruna_runtime::{RunSpec, Runtime};
 use moruna_sources::{RowFilter, ScalarValue};
 use pyo3::exceptions::PyKeyboardInterrupt;
@@ -84,10 +85,12 @@ struct Given<'py> {
     inputs: Vec<String>,
     ports: Option<Vec<String>>,
     doc: Option<KindDoc>,
+    definition: Option<moruna_job::Declaration>,
 }
 
 /// A lowered task as Python hands it over: `(role, id, at, object, inputs, ports, kind,
-/// settings)`, `role` being `source`, `function` or `sink` and `settings` JSON.
+/// settings, definition)`, `role` being `source`, `function` or `sink`, `settings` and
+/// `definition` JSON.
 type Lowered<'py> = (
     String,
     String,
@@ -97,14 +100,23 @@ type Lowered<'py> = (
     Option<Vec<String>>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 /// The tasks `moruna._job` lowered a job to, in the order they were added.
 fn given<'py>(tasks: &Bound<'py, PyAny>) -> PyResult<Vec<Given<'py>>> {
     let mut out = Vec::new();
     for entry in tasks.try_iter()? {
-        let (role, id, at, object, inputs, ports, kind, settings): Lowered<'py> =
+        let (role, id, at, object, inputs, ports, kind, settings, definition): Lowered<'py> =
             entry?.extract()?;
+        let definition = match definition {
+            None => None,
+            Some(text) => Some(serde_json::from_str(&text).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "{at}: the task's definition is not one: {e}"
+                ))
+            })?),
+        };
         let role = match role.as_str() {
             "source" => Role::Source,
             "function" => Role::Kernel,
@@ -142,6 +154,7 @@ fn given<'py>(tasks: &Bound<'py, PyAny>) -> PyResult<Vec<Given<'py>>> {
             inputs,
             ports,
             doc,
+            definition,
         });
     }
     Ok(out)
@@ -180,6 +193,7 @@ fn graph_of(tasks: &[Given<'_>], entries: Vec<KindDoc>) -> PyResult<(Vec<Task>, 
             task.inputs = ports.clone();
         }
         task.at = Some(given.at.clone());
+        task.definition = given.definition.clone();
         for (from, port) in given.inputs.iter().zip(&ports) {
             edges.push(Edge::new(from.clone(), OUT, given.id.clone(), port.clone()));
         }
@@ -208,6 +222,7 @@ fn assemble<'py>(
     py: Python<'py>,
     name: Option<&str>,
     base: Option<&[u8]>,
+    args: &[(String, String)],
     tasks: &[Given<'py>],
 ) -> PyResult<Assembled<'py>> {
     let mut entries = Vec::with_capacity(tasks.len());
@@ -216,7 +231,12 @@ fn assemble<'py>(
     let mut sink_notes = Vec::new();
     let mut stages = Vec::new();
     for task in tasks {
-        let python = task.doc.as_ref().is_some_and(|d| d.kind == "python");
+        // A task of the user's code this process holds: an image task with its object.
+        let python = task.object.is_some()
+            && task
+                .doc
+                .as_ref()
+                .is_some_and(|d| d.kind == moruna_job::IMAGE_KIND);
         match task.role {
             Role::Source => {
                 let spec = match (&task.doc, &task.object) {
@@ -240,7 +260,7 @@ fn assemble<'py>(
                     && !crate::extend::is_source(object)?
                 {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{}: a python source is a moruna.Source, not {}",
+                        "{}: an image source this process holds is a moruna.Source, not {}",
                         task.at,
                         type_name(object)
                     )));
@@ -273,7 +293,7 @@ fn assemble<'py>(
                     && !crate::extend::is_sink(object)?
                 {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{}: a python sink is a moruna.Sink, not {}",
+                        "{}: an image sink this process holds is a moruna.Sink, not {}",
                         task.at,
                         type_name(object)
                     )));
@@ -306,6 +326,7 @@ fn assemble<'py>(
     job.tasks = job_tasks;
     job.edges = edges;
     job.name = name.map(str::to_string);
+    job.args = arg_decls(py, args)?;
     Ok(Assembled {
         job,
         sources,
@@ -313,6 +334,48 @@ fn assemble<'py>(
         sink_notes,
         stages,
     })
+}
+
+/// The job's declared arguments, `(name, type)` in name order, as the document holds them.
+fn arg_decls(py: Python<'_>, args: &[(String, String)]) -> PyResult<Vec<moruna_job::ArgDecl>> {
+    let mut out = Vec::with_capacity(args.len());
+    for (name, ty) in args {
+        let ty = moruna_job::ArgType::parse(ty).ok_or_else(|| {
+            map_err(
+                py,
+                &MorunaError::Config {
+                    name: "args",
+                    msg: format!("`{ty}` is not an argument's type"),
+                },
+            )
+        })?;
+        out.push(moruna_job::ArgDecl::new(name.clone(), ty));
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Every task of `job` without a definition given its kind's declaration from `kinds`, so the
+/// document defines every task inline.
+fn define(py: Python<'_>, job: &mut Job, kinds: &moruna_runtime::kinds::Registry) -> PyResult<()> {
+    for i in 0..job.tasks.len() {
+        if job.tasks[i].definition.is_some() {
+            continue;
+        }
+        let field = job.field(i);
+        let task = &job.tasks[i];
+        let found = match task.role {
+            Role::Source => kinds.source(&field, &task.kind).map(|(d, _)| d.clone()),
+            Role::Kernel => kinds.kernel(&field, &task.kind).map(|(d, _)| d.clone()),
+            Role::Sink => kinds.sink(&field, &task.kind).map(|(d, _)| d.clone()),
+        };
+        // A kind this program does not have is refused by the check, naming it.
+        if let Ok(declaration) = found {
+            job.tasks[i].definition = Some(declaration);
+        }
+    }
+    let _ = py;
+    Ok(())
 }
 
 fn missing(at: &str) -> PyErr {
@@ -349,6 +412,7 @@ fn registry_for(
             Vec::new(),
             Vec::new(),
             served_of(py, stages),
+            std::collections::BTreeMap::new(),
         ),
     )
 }
@@ -357,15 +421,18 @@ fn registry_for(
 /// tasks: the job's name, the tasks and the edges, and nothing else set. Every task carries its kind and settings, or
 /// an object of the library's whose settings are written from it.
 #[pyfunction]
-#[pyo3(signature = (name, tasks, base = None))]
+#[pyo3(signature = (name, tasks, base = None, args = Vec::new()))]
 pub fn job_document<'py>(
     py: Python<'py>,
     name: Option<&str>,
     tasks: &Bound<'py, PyAny>,
     base: Option<&[u8]>,
+    args: Vec<(String, String)>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
     let tasks = given(tasks)?;
-    let assembled = assemble(py, name, base, &tasks)?;
+    let mut assembled = assemble(py, name, base, &args, &tasks)?;
+    let kinds = registry_for(py, &assembled.stages)?;
+    define(py, &mut assembled.job, &kinds)?;
     let bytes = assembled.job.to_flatbuffer().map_err(|e| {
         map_err(
             py,
@@ -382,19 +449,21 @@ pub fn job_document<'py>(
 /// its names, ports and edges (SDD 22 JB-I13), then each task's kind and settings against the
 /// kinds `moruna.run` has. Empty when the job is sound.
 #[pyfunction]
-#[pyo3(signature = (name, tasks, base = None))]
+#[pyo3(signature = (name, tasks, base = None, args = Vec::new()))]
 pub fn check_job(
     py: Python<'_>,
     name: Option<&str>,
     tasks: &Bound<'_, PyAny>,
     base: Option<&[u8]>,
+    args: Vec<(String, String)>,
 ) -> PyResult<Vec<String>> {
     let tasks = given(tasks)?;
-    let assembled = assemble(py, name, base, &tasks)?;
+    let mut assembled = assemble(py, name, base, &args, &tasks)?;
     if let Err(refusals) = moruna_job::check_graph(&assembled.job) {
         return Ok(refusals.iter().map(ToString::to_string).collect());
     }
     let kinds = registry_for(py, &assembled.stages)?;
+    define(py, &mut assembled.job, &kinds)?;
     let catalogue = moruna_job::Catalogue::from_listing(kinds.listing()).map_err(|e| {
         map_err(
             py,
@@ -415,18 +484,20 @@ pub fn check_job(
 /// `moruna explain JOB` plans a document with. A refused job is a `ConfigError` naming its
 /// fields; an unknown planner a `PlanError`.
 #[pyfunction]
-#[pyo3(signature = (name, tasks, base = None, *, planner = None))]
+#[pyo3(signature = (name, tasks, base = None, args = Vec::new(), *, planner = None))]
 pub fn explain_job(
     py: Python<'_>,
     name: Option<&str>,
     tasks: &Bound<'_, PyAny>,
     base: Option<&[u8]>,
+    args: Vec<(String, String)>,
     planner: Option<String>,
 ) -> PyResult<String> {
     let tasks = given(tasks)?;
-    let assembled = assemble(py, name, base, &tasks)?;
+    let assembled = assemble(py, name, base, &args, &tasks)?;
     let kinds = registry_for(py, &assembled.stages)?;
-    let job = assembled.job;
+    let mut job = assembled.job;
+    define(py, &mut job, &kinds)?;
     let plan = py
         .detach(|| moruna_runtime::job::plan::explain(&job, planner.as_deref(), &kinds))
         .map_err(|e| map_err(py, &e.into_error()))?;
@@ -448,6 +519,7 @@ pub fn read_job(py: Python<'_>, document: &[u8]) -> PyResult<String> {
     bare.tasks.clear();
     bare.edges.clear();
     bare.name = None;
+    bare.args.clear();
     let set = serde_json::to_value(&bare).map_err(|e| refuse(e.to_string()))?;
     let unset = serde_json::to_value(Job::new(Vec::new(), Vec::new()))
         .map_err(|e| refuse(e.to_string()))?;
@@ -512,16 +584,22 @@ pub fn read_job(py: Python<'_>, document: &[u8]) -> PyResult<String> {
             "settings": task.settings,
             "ports": task.inputs,
             "inputs": inputs,
+            "definition": task.definition,
         }));
     }
-    Ok(serde_json::json!({"name": job.name, "tasks": tasks, "settings": settings}).to_string())
+    Ok(serde_json::json!({
+        "name": job.name, "args": job.args, "tasks": tasks, "settings": settings,
+    })
+    .to_string())
 }
 
 /// `moruna.run` (d.2): the job `moruna._job` lowered (`tasks`) with every other argument
 /// keyword-only and optional, built into the one job model (SDD 22 d.4) and run. Returns the
 /// report as JSON, which `moruna.RunReport` reads.
 #[pyfunction]
-#[pyo3(signature = (name, tasks, *, job_digest = None, explain = false, budget = None,
+#[pyo3(signature = (name, tasks, *, job_digest = None, explain = false, args = None,
+                    arg_types = Vec::new(), held = Vec::new(), served = None,
+                    pulled_images = None, budget = None,
                     cpu = None, trace = None, staging_dir = None, staging_limit = None,
                     on_error = None, ordered = false, sizer = "rule", profiles_dir = None,
                     storage = None, host_profile = None, allow_gil = false, checkpoint = true,
@@ -534,6 +612,11 @@ pub fn run(
     tasks: &Bound<'_, PyAny>,
     job_digest: Option<String>,
     explain: bool,
+    args: Option<String>,
+    arg_types: Vec<(String, String)>,
+    held: Vec<String>,
+    served: Option<std::collections::BTreeMap<String, Py<PyAny>>>,
+    pulled_images: Option<String>,
     budget: Option<&Bound<'_, PyAny>>,
     cpu: Option<f64>,
     trace: Option<String>,
@@ -555,7 +638,13 @@ pub fn run(
 ) -> PyResult<String> {
     let _guard = map(py, RunningGuard::acquire())?;
     let tasks = given(tasks)?;
-    let assembled = assemble(py, Some(name), None, &tasks)?;
+    let assembled = assemble(py, Some(name), None, &arg_types, &tasks)?;
+    let run_args: std::collections::BTreeMap<String, serde_json::Value> = match &args {
+        None => std::collections::BTreeMap::new(),
+        Some(text) => serde_json::from_str(text).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("args are a JSON object: {e}"))
+        })?,
+    };
 
     let any_python = assembled
         .stages
@@ -691,6 +780,7 @@ pub fn run(
             _ => None,
         })
         .collect();
+    let needs = served.unwrap_or_default();
     let served = served_of(py, &assembled.stages);
     let given_kernels: Vec<Option<Arc<moruna_adapters::PyKernel>>> = assembled
         .stages
@@ -702,7 +792,14 @@ pub fn run(
         .collect();
     let kinds = map(
         py,
-        crate::kinds::library(given_kernels, iterables, user_sources, user_sinks, served),
+        crate::kinds::library(
+            given_kernels,
+            iterables,
+            user_sources,
+            user_sinks,
+            served,
+            needs,
+        ),
     )?;
     // A run starts from its plan (SDD 26 f.5): the default planner's, as `moruna run` does.
     let plan = map(py, moruna_runtime::job::plan::default_plan(&job))?;
@@ -718,17 +815,21 @@ pub fn run(
                 notes,
                 packages,
                 host_ports: None,
+                pulled_images: pulled_images.map(PathBuf::from),
+                args: run_args.clone(),
+                held,
             },
         ),
     )?;
     credentials.apply(&mut built.spec.object_store);
-    let context = ReportContext {
-        job: job.clone(),
-        parts: built.parts.clone(),
-        sink_targets: built.sink_targets.clone(),
+    let mut context = Report {
         job_digest,
-        plan: explain.then(|| plan.to_value()),
-        trace_path,
+        context: ReportContext {
+            plan: explain.then(|| plan.to_value()),
+            trace_path,
+            args: run_args.into_iter().collect(),
+            ..ReportContext::of(&job, &built)
+        },
     };
 
     let mut components = match engine_ports {
@@ -765,6 +866,10 @@ pub fn run(
         }
         components.learning = Some(learning);
     }
+    context.context.store = components
+        .learning
+        .as_ref()
+        .map(|learning| learning.online.store().clone());
     drive(py, built.spec, components, &context)
 }
 
@@ -981,16 +1086,44 @@ fn clone_schema(schema: &IteratorSchema) -> IteratorSchema {
     }
 }
 
-/// What a run's report says about its job beyond the trace's report: the job it ran, which task
-/// each source, stage and sink is, where each sink writes, the spec's digest, the plan when it
-/// was asked for, and the trace file.
-pub(crate) struct ReportContext {
-    pub(crate) job: Job,
-    pub(crate) parts: moruna_runtime::job::Parts,
-    pub(crate) sink_targets: Vec<String>,
+/// What a run's report says beyond the trace's report: the spec's digest, and what the job
+/// adds (`moruna_runtime::report_doc::ReportContext`).
+pub(crate) struct Report {
     pub(crate) job_digest: Option<String>,
-    pub(crate) plan: Option<serde_json::Value>,
-    pub(crate) trace_path: Option<PathBuf>,
+    pub(crate) context: ReportContext,
+}
+
+impl Report {
+    /// The report document of `report`, `error` the error the run ended with, when it failed.
+    fn json(&self, report: &moruna_trace::RunReport, error: Option<&MorunaError>) -> String {
+        moruna_runtime::report_doc::document(
+            (&report.run_id, self.job_digest.as_deref()),
+            Some(report),
+            &moruna_runtime::report_doc::Exit::of(report, error),
+            Some(&self.context),
+        )
+        .to_string()
+    }
+}
+
+/// `_core.check_args(declared, given)`: every refusal of the values `given` (a JSON object)
+/// for the arguments `declared` (`(name, type)`): a missing one, one of another type, one the
+/// job does not declare. Empty when they fit.
+#[pyfunction]
+pub fn check_args(declared: Vec<(String, String)>, given: &str) -> PyResult<Vec<String>> {
+    let given: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(given)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("args: {e}")))?;
+    let mut decls = Vec::new();
+    for (name, ty) in declared {
+        let ty = moruna_job::ArgType::parse(&ty).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("`{ty}` is not an argument's type"))
+        })?;
+        decls.push(moruna_job::ArgDecl::new(name, ty));
+    }
+    Ok(match moruna_job::supply(&decls, &given) {
+        Ok(_) => Vec::new(),
+        Err(refusals) => refusals,
+    })
 }
 
 /// f.5: spawn the runtime thread, then poll for signals on the main thread until it finishes.
@@ -998,7 +1131,7 @@ fn drive(
     py: Python<'_>,
     spec: RunSpec,
     components: moruna_runtime::Components,
-    context: &ReportContext,
+    context: &Report,
 ) -> PyResult<String> {
     let cancel = CancelToken::new();
     let thread_cancel = cancel.clone();
@@ -1058,7 +1191,7 @@ fn drive(
     };
 
     match outcome {
-        Ok(report) if !interrupted => Ok(crate::report::report_json(&report, None, context)),
+        Ok(report) if !interrupted => Ok(context.json(&report, None)),
         Ok(report) => {
             // The run finished before the cancellation reached it. PY-I6 still raises, with the
             // whole report attached rather than a partial one.
@@ -1088,14 +1221,11 @@ fn attachments(
     report: Option<moruna_trace::RunReport>,
     manifest: Option<PathBuf>,
     error: Option<&MorunaError>,
-    context: &ReportContext,
+    context: &Report,
 ) -> PyResult<Attachments> {
     let run_id = report.as_ref().map(|r| r.run_id.clone());
     let report = match report {
-        Some(r) => Some(crate::report::to_python(
-            py,
-            &crate::report::report_json(&r, error, context),
-        )?),
+        Some(r) => Some(crate::report::to_python(py, &context.json(&r, error))?),
         None => None,
     };
     Ok(Attachments {

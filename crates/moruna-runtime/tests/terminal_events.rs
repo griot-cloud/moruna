@@ -295,6 +295,8 @@ fn run_cancelled(job: JobSpec, cancel_at: usize, how: Cancel) -> (Outcome, Vec<V
         packages: Default::default(),
         capture_process: false,
         events: Default::default(),
+        args: Vec::new(),
+        pulled_images: None,
     };
     let outcome = session::run_job(
         moruna_job::Job::from_v1(&job),
@@ -498,6 +500,8 @@ fn run_crashing(job: JobSpec, kinds: &Registry) -> (Option<String>, Vec<Value>) 
             packages: Default::default(),
             capture_process: false,
             events: Default::default(),
+            args: Vec::new(),
+            pulled_images: None,
         };
         session::run_job(
             moruna_job::Job::from_v1(&job),
@@ -646,6 +650,9 @@ fn recorded_run(scratch: &Scratch) -> (Layout, Vec<StageEvent>) {
             notes: Vec::new(),
             packages: Default::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .expect("the document builds");
@@ -847,6 +854,9 @@ fn recorded_by_thread(scratch: &Scratch) -> (Layout, Vec<Vec<StageEvent>>) {
             notes: Vec::new(),
             packages: Default::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .expect("the document builds");
@@ -1089,6 +1099,9 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
             notes: Vec::new(),
             packages: Default::default(),
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .expect("the document builds");
