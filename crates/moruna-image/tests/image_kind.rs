@@ -338,8 +338,9 @@ fn im_t22_the_kind_passes_its_suite() {
 }
 
 /// IM-T23 the_process_is_alone: its user is the root of its own namespace, it is process 1, its
-/// environment is the image's and the settings' and nothing of Moruna's, its root is the image's,
-/// its devices are three, and it sees no process but itself.
+/// environment is the image's and the settings', with nothing of Moruna's but the image
+/// contract's (`MORUNA_ROLE`, `MORUNA_PARAMS`, `MORUNA_ARGS`), its root is the image's, its
+/// devices are three, and it sees no process but itself.
 #[test]
 #[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
 fn im_t23_the_process_is_alone() {
@@ -358,8 +359,10 @@ fn im_t23_the_process_is_alone() {
     );
     assert!(e.contains("report: pid 1"), "{e}");
     assert!(
-        e.contains("report: env EXTRA=2 FROM_IMAGE=3 PATH=/bin\n"),
-        "exactly the image's environment with the settings' added: {e}"
+        e.contains(
+            "report: env EXTRA=2 FROM_IMAGE=3 MORUNA_ARGS={} MORUNA_PARAMS={} MORUNA_ROLE=function PATH=/bin\n"
+        ),
+        "exactly the image's environment with the settings' and the image contract's added: {e}"
     );
     assert!(e.contains("report: dev null,urandom,zero"), "{e}");
     assert!(
