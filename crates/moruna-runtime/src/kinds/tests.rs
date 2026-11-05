@@ -126,9 +126,9 @@ fn kd_t1_resolve_or_refuse() {
     // A name is resolved within its role: no source is called `std`, no sink `std`.
     let e = error_of(kinds.source("source", "std"));
     let sources = if cfg!(feature = "peql") {
-        "arrow_ipc, datafusion, parquet, tensor, vortex"
+        "arrow_ipc, datafusion, image, parquet, tensor, vortex"
     } else {
-        "arrow_ipc, parquet, tensor, vortex"
+        "arrow_ipc, image, parquet, tensor, vortex"
     };
     assert_eq!(
         e.to_string(),
@@ -142,7 +142,7 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(refused_field(&e).as_deref(), Some("sink.kind"));
     assert!(
         e.to_string()
-            .contains("this build writes arrow_ipc, parquet"),
+            .contains("this build writes arrow_ipc, image, parquet"),
         "{e}"
     );
     let e = error_of(kinds.kernel("kernels[3]", "java"));

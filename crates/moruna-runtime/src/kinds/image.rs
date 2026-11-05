@@ -272,6 +272,10 @@ impl SourceKind for Image {
 
     fn source(&self, entry: &Entry<'_>, cx: &mut Context) -> Result<BuiltSource> {
         let settings: Settings = entry.settings()?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if moruna_micro::on_kernel() {
+            return Err(entry.refuse("image", ON_KERNEL));
+        }
         process_task(entry, settings, cx, Role::Source).map(|built| match built {
             Built::Source(source) => source,
             Built::Sink(_) => unreachable!("a source is built as one"),
@@ -286,12 +290,21 @@ impl SinkKind for Image {
 
     fn sink(&self, entry: &Entry<'_>, cx: &mut Context) -> Result<BuiltSink> {
         let settings: Settings = entry.settings()?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if moruna_micro::on_kernel() {
+            return Err(entry.refuse("image", ON_KERNEL));
+        }
         process_task(entry, settings, cx, Role::Sink).map(|built| match built {
             Built::Sink(sink) => sink,
             Built::Source(_) => unreachable!("a sink is built as one"),
         })
     }
 }
+
+/// Why a source or a sink of an image is refused on the Moruna kernel in this release.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const ON_KERNEL: &str = "on the Moruna kernel an image is a function, a task of the data plane; a \
+                         source or a sink of an image runs on a Linux node";
 
 /// A source or a sink, built.
 #[allow(dead_code, clippy::large_enum_variant)]
