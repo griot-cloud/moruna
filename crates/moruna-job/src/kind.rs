@@ -193,6 +193,88 @@ pub struct Declaration {
     /// Absent for every kind whose code Moruna runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served: Option<Served>,
+    /// What a person calls it, when that is not its name: a task's title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What it does, beyond its summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The Arrow schema of every batch it takes ([`ArrowSchema`]); absent: undeclared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes: Option<ArrowSchema>,
+    /// The Arrow schema of every batch it gives; absent: undeclared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gives: Option<ArrowSchema>,
+    /// The names the runner must supply a task of it (a task's `needs`), each with what it
+    /// is. Moruna reads none of them: each is a port the runner serves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
+    /// Where its code comes from, for a definition a build made: the build key and the source
+    /// repository and revision the code was read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// An Arrow schema as a definition spells it: its fields in order, each a name, a type as
+/// Arrow writes it (`int64`, `string`, `timestamp[us, tz=UTC]`, `list<item: int64>`) and
+/// whether it may be null.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrowSchema {
+    /// The fields, in order.
+    pub fields: Vec<ArrowField>,
+}
+
+/// One field of an [`ArrowSchema`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrowField {
+    /// The column's name.
+    pub name: String,
+    /// Its type, as Arrow writes it.
+    #[serde(rename = "type")]
+    pub data_type: String,
+    /// Whether it may hold nulls.
+    pub nullable: bool,
+}
+
+impl std::fmt::Display for ArrowSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fields: Vec<String> = self
+            .fields
+            .iter()
+            .map(|c| format!("{}: {}", c.name, c.data_type))
+            .collect();
+        write!(f, "{{{}}}", fields.join(", "))
+    }
+}
+
+/// A name the runner supplies a task, and what it is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requirement {
+    /// The name, as the task asks for it.
+    pub name: String,
+    /// What it is, for the person who supplies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Where a definition's code came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    /// The build key of the image its code is built into, `sha256:...`.
+    pub build_key: String,
+    /// The source repository the code is in, when it is in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The revision the repository was at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Whether any file of the code differed from that revision.
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// How a kind its embedder serves is run (SDD 18 e.4): every batch of a task of the kind is handed
@@ -244,6 +326,23 @@ impl Declaration {
     /// role; a summary; flows a part of that role can have; a closed object schema in the
     /// dialect of KD1 with at least one example, none of whose properties is `kind`.
     pub fn check(&self, role: Role) -> core::result::Result<(), String> {
+        self.checked(role, true)
+    }
+
+    /// Whether this is a task's definition of `role` a document can carry inline (SDD 18 e.1):
+    /// what [`Declaration::check`] asks of a kind, except examples, since a definition made from
+    /// a task's code has its job's values and no others; and a need named once each.
+    pub fn check_definition(&self, role: Role) -> core::result::Result<(), String> {
+        self.checked(role, false)?;
+        for (i, need) in self.requires.iter().enumerate() {
+            if self.requires[..i].iter().any(|n| n.name == need.name) {
+                return Err(format!("`{}` requires `{}` twice", self.name, need.name));
+            }
+        }
+        Ok(())
+    }
+
+    fn checked(&self, role: Role, examples: bool) -> core::result::Result<(), String> {
         if !is_kind_name(&self.name) {
             return Err(format!(
                 "{:?} is not a kind name: 1 to 64 of lowercase ASCII letters, digits, `_`, `-` \
@@ -297,6 +396,7 @@ impl Declaration {
         }
         match schema.get("examples").and_then(|v| v.as_array()) {
             Some(examples) if !examples.is_empty() && examples.iter().all(|e| e.is_object()) => {}
+            None if !examples => {}
             _ => return fail("has no `examples`, or one that is not an object"),
         }
         self.check_served()

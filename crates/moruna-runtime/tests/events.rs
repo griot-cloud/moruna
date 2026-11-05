@@ -79,6 +79,8 @@ fn options(events: EventOptions) -> HostOptions<'static> {
         packages: Default::default(),
         capture_process: false,
         events,
+        args: Vec::new(),
+        pulled_images: None,
     }
 }
 

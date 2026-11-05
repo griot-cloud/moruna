@@ -708,6 +708,8 @@ fn ho_t13_report_file_placement() {
             packages: moruna_runtime::packaged::PackageHost::default(),
             capture_process: false,
             events: Default::default(),
+            args: Vec::new(),
+            pulled_images: None,
         },
     );
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);

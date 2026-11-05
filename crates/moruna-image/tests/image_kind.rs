@@ -118,6 +118,21 @@ fn write_parquet(path: &Path, rows: i64) {
     writer.close().expect("the footer is written");
 }
 
+/// How a document names the fixture's image, `echo` in `layout`: an image Moruna did not
+/// build, by its manifest's digest and where it is.
+fn image_of(layout: &Path) -> Value {
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(layout.join("index.json")).unwrap()).unwrap();
+    let digest = index["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["annotations"]["org.opencontainers.image.ref.name"] == "echo")
+        .expect("the fixture's image is named echo")["digest"]
+        .clone();
+    json!({"build_key": null, "digest": digest, "location": layout.display().to_string()})
+}
+
 /// The document: Parquet in, the image stage with `settings`, Parquet out.
 fn document(scratch: &Path, layout: &Path, settings: Value) -> JobSpec {
     let input = scratch.join("in.parquet");
@@ -126,8 +141,7 @@ fn document(scratch: &Path, layout: &Path, settings: Value) -> JobSpec {
     std::fs::create_dir_all(&out).unwrap();
     let staging = scratch.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
-    let mut kernel = json!({"kind": "image", "layout": layout.display().to_string(),
-                            "reference": "echo",
+    let mut kernel = json!({"kind": "image", "image": image_of(layout),
                             "cache": scratch.join("images").display().to_string()});
     for (k, v) in settings.as_object().expect("settings are an object") {
         kernel[k] = v.clone();
@@ -174,6 +188,9 @@ fn run_settings(
                 sandbox_cgroup: Some(cgroup()),
             },
             host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -311,8 +328,7 @@ fn im_t22_the_kind_passes_its_suite() {
     let harness = Harness::new()
         .context(move || Context::new(Arc::new(Standalone)).packages(host.clone()))
         .examples(vec![json!({
-            "layout": layout.display().to_string(),
-            "reference": "echo",
+            "image": image_of(&layout),
             "cache": scratch.path().join("images").display().to_string(),
             "command": ["/bin/arrow_echo"],
             "env": {"A": "1"},

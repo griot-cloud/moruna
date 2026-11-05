@@ -125,6 +125,17 @@ impl Record {
         Ok(record)
     }
 
+    /// The image `name` names (a build key or a registry reference, SDD 19 d.2), checked
+    /// against this record and the seals of the layers served: the attached manifest is the one
+    /// the name names (its digest, or the build key its annotation carries), then every check
+    /// of [`Record::verify`].
+    pub fn verify_name(&self, name: &crate::ImageName, served: &[[u8; 32]]) -> Result<Verified> {
+        let digest = Digest::of(self.manifest.as_bytes());
+        let manifest = Manifest::parse(digest.clone(), self.manifest.as_bytes())?;
+        name.check(&manifest)?;
+        self.verify(&digest.to_string(), served)
+    }
+
     /// The image `reference` names, checked against this record and the seals of the layers
     /// served, lowest first (the four checks of the module's text). Every refusal names what
     /// was expected and what was found.

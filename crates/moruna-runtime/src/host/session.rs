@@ -57,6 +57,31 @@ pub struct HostOptions<'a> {
     pub capture_process: bool,
     /// Where the run's events go beside the connection and the output store (MH 4.3 version 7).
     pub events: EventOptions,
+    /// The run's arguments as a command line gives them, `(name, text)`, read by the types the
+    /// job declares.
+    pub args: Vec<(String, String)>,
+    /// The OCI layout the job's registry images were pulled into.
+    pub pulled_images: Option<PathBuf>,
+}
+
+/// The values of the run's arguments the command line gives as text, read by the types `job`
+/// declares; a name it does not declare is passed on as a string, for [`moruna_job::supply`]
+/// to refuse by name.
+fn arg_values(
+    job: &Job,
+    given: &[(String, String)],
+) -> std::result::Result<std::collections::BTreeMap<String, serde_json::Value>, MorunaError> {
+    let mut values = std::collections::BTreeMap::new();
+    for (name, text) in given {
+        let value = match job.args.iter().find(|a| &a.name == name) {
+            Some(decl) => moruna_job::parse_value(decl.ty, text).map_err(|why| {
+                crate::job::refusal(moruna_job::SpecError::new(format!("args.{name}"), why))
+            })?,
+            None => serde_json::Value::String(text.clone()),
+        };
+        values.insert(name.clone(), value);
+    }
+    Ok(values)
 }
 
 /// How a job ended.
@@ -576,9 +601,10 @@ fn run_planned(
     };
     // MH 4.10: host ports ride this connection, when there is one to read replies from.
     let host_ports = (wire.has_peer() && reader.is_some()).then(|| HostPorts::new(wire.clone()));
-    let built = match plan {
-        Err(error) => Err((None, error)),
-        Ok(plan) => match build(
+    let built = match (plan, arg_values(&job, &opts.args)) {
+        (Err(error), _) => Err((None, error)),
+        (Ok(plan), Err(error)) => Err((Some(plan), error)),
+        (Ok(plan), Ok(run_args)) => match build(
             &job,
             &plan,
             kinds,
@@ -588,6 +614,9 @@ fn run_planned(
                 notes: Vec::new(),
                 packages: opts.packages.clone(),
                 host_ports: host_ports.clone(),
+                pulled_images: opts.pulled_images.clone(),
+                args: run_args,
+                held: Vec::new(),
             },
         ) {
             Ok(built) => Ok((plan, built)),

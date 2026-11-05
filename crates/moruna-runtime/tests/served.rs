@@ -221,6 +221,12 @@ fn declared(name: &str, port: PortDoc, input: Option<Value>, output: Option<Valu
             input_schema: input,
             output_schema: output,
         }),
+        title: None,
+        description: None,
+        takes: None,
+        gives: None,
+        requires: Vec::new(),
+        provenance: None,
     }
 }
 
@@ -260,6 +266,9 @@ fn opts() -> BuildOptions<'static> {
         notes: Vec::new(),
         packages: Default::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     }
 }
 

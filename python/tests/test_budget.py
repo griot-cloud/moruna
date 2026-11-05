@@ -65,7 +65,7 @@ try:
               "ceiling": report.limits_initial["memory_ceiling"],
               "peak": report.peak_anon_bytes,
               "fraction": report.peak_fraction_of_ceiling,
-              "rows_out": report.stages[0]["rows_out"],
+              "rows_out": [t for t in report.tasks if t["role"] == "function"][0]["rows_out"],
               # The whole report travels with the result. A run that passed its ceiling on a
               # host none of us can log into is a question about arithmetic (what baseline,
               # what arena, what amplification), and the report is a pure function of the
@@ -116,10 +116,10 @@ def _arithmetic(result: dict) -> str:
     if not report:
         return "no report came back with the result"
     lines = [f"exit: {report.get('exit')}"]
-    for stage in report.get("stages", []):
+    for stage in [t for t in report.get("tasks", []) if "morsels_in" in t]:
         lines.append(
-            f"stage {stage['stage']}: {stage['morsels']} morsels, {stage['bytes_in']} bytes in, "
-            f"amplification p50 {stage['amplification_p50']:.1f}, "
+            f"stage {stage['key']}: {stage['morsels_in']} morsels, {stage['bytes_in']} bytes in, "
+            f"amplification p50 {stage['amplification_p50_ratio']:.1f}, "
             f"p95 {stage['amplification_p95']:.1f}"
         )
     lines += [note for note in report.get("notes", []) if "arena sized at" in note or "cgroup" in note]

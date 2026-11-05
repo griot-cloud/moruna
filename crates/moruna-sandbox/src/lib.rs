@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod ports;
 pub mod protocol;
 pub mod regions;
 

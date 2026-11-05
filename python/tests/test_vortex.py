@@ -90,7 +90,7 @@ def test_py_t19_vortex_source_through_a_kernel(
         budget=budget(),
     )
     assert report.exit["status"] == "completed", report.notes
-    assert report.stages[0]["rows_in"] == ROWS, report.stages
+    assert [t for t in report.tasks if t["role"] == "function"][0]["rows_in"] == ROWS, report.tasks
     back = pq.read_table(str(out)).sort_by("id")
     assert back.num_rows == ROWS
     assert back.column("id").to_pylist() == table.column("id").to_pylist()

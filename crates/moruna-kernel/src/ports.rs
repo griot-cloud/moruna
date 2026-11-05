@@ -265,11 +265,25 @@ impl CallFailure {
     }
 }
 
+/// What one port's calls cost the stage that made them: what the report counts per need.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortStats {
+    /// Calls made, answered or not.
+    pub calls: u64,
+    /// The bytes of their requests.
+    pub bytes_in: u64,
+    /// The bytes of the answers that came back.
+    pub bytes_out: u64,
+    /// How long they waited, in nanoseconds.
+    pub wait_ns: u64,
+}
+
 /// The ports one stage may call (its entry's `ports`), bound to the run once it starts.
 pub struct StagePorts {
     stage: StageId,
     routes: BTreeMap<String, Route>,
     run: OnceLock<RunPorts>,
+    stats: std::sync::Mutex<BTreeMap<String, PortStats>>,
 }
 
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
@@ -281,6 +295,7 @@ impl StagePorts {
             stage,
             routes,
             run: OnceLock::new(),
+            stats: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -309,8 +324,37 @@ impl StagePorts {
         let _ = self.run.set(run);
     }
 
+    /// What each listed port's calls have cost so far, by name; a port never called is absent.
+    pub fn stats(&self) -> BTreeMap<String, PortStats> {
+        self.stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Call `name` with `request` and wait for its answer, its deadline or the run's cancel.
+    /// Each call of a listed port is counted ([`StagePorts::stats`]).
     pub fn call(&self, name: &str, request: Vec<u8>) -> Result<Answer, CallFailure> {
+        let bytes_in = request.len() as u64;
+        let started = Instant::now();
+        let answered = self.call_route(name, request);
+        if self.routes.contains_key(name) {
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = stats.entry(name.to_string()).or_default();
+            entry.calls += 1;
+            entry.bytes_in += bytes_in;
+            entry.wait_ns += started.elapsed().as_nanos() as u64;
+            if let Ok(Answer::Ok(bytes)) = &answered {
+                entry.bytes_out += bytes.len() as u64;
+            }
+        }
+        answered
+    }
+
+    fn call_route(&self, name: &str, request: Vec<u8>) -> Result<Answer, CallFailure> {
         let Some(route) = self.routes.get(name) else {
             return Err(CallFailure::Unlisted {
                 name: name.to_string(),

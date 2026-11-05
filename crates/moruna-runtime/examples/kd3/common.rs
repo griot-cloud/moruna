@@ -31,7 +31,7 @@ pub fn image_digest(path: &std::path::Path) -> Result<String> {
     Ok(digest.to_owned())
 }
 fn image(digest: &str) -> Value {
-    json!({"kind":"image","layout":"/images/kd2","reference":digest})
+    json!({"kind":"image","image":{"build_key":null,"digest":digest,"location":"/images/kd2"}})
 }
 fn doc(kernels: Vec<Value>) -> Value {
     json!({"moruna_spec":1,"source":{"kind":"arrow_ipc","url":"file:///kd2/input.arrow"},"kernels":kernels,"sink":{"kind":"arrow_ipc","url":"file:///tmp/kd2-out/"},"budget":{"memory_bytes":384u64<<20},"staging":{"dir":"/tmp/kd2-staging"},"report":{"file":"/tmp/kd2-report.json"},"ordered":true})

@@ -164,6 +164,9 @@ pub struct Context {
     source_targets: Vec<String>,
     sink_target: String,
     shared: HashMap<TypeId, Box<dyn Any + Send>>,
+    pulled: Option<std::path::PathBuf>,
+    args: serde_json::Map<String, serde_json::Value>,
+    calls: Vec<(usize, Arc<moruna_kernel::StagePorts>)>,
 }
 
 impl Context {
@@ -179,7 +182,49 @@ impl Context {
             source_targets: Vec::new(),
             sink_target: String::new(),
             shared: HashMap::new(),
+            pulled: None,
+            args: serde_json::Map::new(),
+            calls: Vec::new(),
         }
+    }
+
+    /// The OCI layout the runner pulled the job's registry images into (SDD 19 d.2).
+    pub fn pulled(mut self, pulled: Option<std::path::PathBuf>) -> Context {
+        self.pulled = pulled;
+        self
+    }
+
+    /// The run's argument values, checked against the job's declaration.
+    pub fn run_args(mut self, args: serde_json::Map<String, serde_json::Value>) -> Context {
+        self.args = args;
+        self
+    }
+
+    /// Where the job's registry images were pulled to, when the runner pulled any.
+    pub fn pulled_images(&self) -> Option<&std::path::Path> {
+        self.pulled.as_deref()
+    }
+
+    /// The run's argument values, by name.
+    pub fn args(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.args
+    }
+
+    /// The ports of a source or a sink (MH 4.10), for task `task` (its place in the job): made
+    /// now, bound to the run when it starts, and counted in the report beside the stages'.
+    pub fn task_calls(
+        &mut self,
+        task: usize,
+        routes: std::collections::BTreeMap<String, moruna_kernel::Route>,
+    ) -> Arc<moruna_kernel::StagePorts> {
+        let ports = moruna_kernel::StagePorts::new(0, routes);
+        self.calls.push((task, Arc::clone(&ports)));
+        ports
+    }
+
+    /// The ports sources and sinks made, by task.
+    pub fn take_task_calls(&mut self) -> Vec<(usize, Arc<moruna_kernel::StagePorts>)> {
+        std::mem::take(&mut self.calls)
     }
 
     /// What a `.pex` package's sandbox needs from the host (17 e.6).
@@ -421,6 +466,7 @@ impl Registry {
         kinds.put_source(Arc::new(parquet::Parquet));
         kinds.put_source(Arc::new(vortex::Vortex));
         kinds.put_source(Arc::new(tensor::Tensor));
+        kinds.put_source(Arc::new(image::Image));
         kinds.put_kernel(Arc::new(standard::Std));
         kinds.put_kernel(Arc::new(package::Package));
         kinds.put_kernel(Arc::new(image::Image));
@@ -428,6 +474,7 @@ impl Registry {
         kinds.put_sink(Arc::new(vortex::Vortex));
         kinds.put_sink(Arc::new(tensor::Tensor));
         kinds.put_sink(Arc::new(arrow_ipc::ArrowIpc));
+        kinds.put_sink(Arc::new(image::Image));
         #[cfg(feature = "peql")]
         {
             kinds.put_source(Arc::new(governed::Datafusion));
@@ -536,6 +583,45 @@ impl Registry {
         Ok(())
     }
 
+    /// Replace the source kind of its name with `kind`, which declares itself exactly as the
+    /// kind it replaces: a program that runs some tasks of a kind from objects it holds and the
+    /// rest as the kind does. Refused when no kind of that name is registered, or the
+    /// declarations differ.
+    pub fn replace_source(&mut self, kind: Arc<dyn SourceKind>) -> Result<()> {
+        let declaration = kind.declaration();
+        same(
+            self.sources.get(&declaration.name).map(|r| &r.declaration),
+            &declaration,
+            Role::Source,
+        )?;
+        self.put_source(kind);
+        Ok(())
+    }
+
+    /// [`Registry::replace_source`] for a runnable kind.
+    pub fn replace_kernel(&mut self, kind: Arc<dyn RunnableKind>) -> Result<()> {
+        let declaration = kind.declaration();
+        same(
+            self.kernels.get(&declaration.name).map(|r| &r.declaration),
+            &declaration,
+            Role::Kernel,
+        )?;
+        self.put_kernel(kind);
+        Ok(())
+    }
+
+    /// [`Registry::replace_source`] for a sink kind.
+    pub fn replace_sink(&mut self, kind: Arc<dyn SinkKind>) -> Result<()> {
+        let declaration = kind.declaration();
+        same(
+            self.sinks.get(&declaration.name).map(|r| &r.declaration),
+            &declaration,
+            Role::Sink,
+        )?;
+        self.put_sink(kind);
+        Ok(())
+    }
+
     /// The source kind a document's `{field}.kind` names, or the refusal of KD-I1.
     pub fn source(&self, field: &str, name: &str) -> Result<(&Declaration, &dyn SourceKind)> {
         match self.sources.get(name) {
@@ -577,6 +663,28 @@ impl Registry {
                 .collect(),
             sinks: self.sinks.values().map(|r| r.declaration.clone()).collect(),
         }
+    }
+}
+
+fn same(registered: Option<&Declaration>, declaration: &Declaration, role: Role) -> Result<()> {
+    match registered {
+        Some(found) if found == declaration => Ok(()),
+        Some(_) => Err(MorunaError::Config {
+            name: "kinds",
+            msg: format!(
+                "the {} kind `{}` is replaced by one that declares itself differently",
+                role.as_str(),
+                declaration.name
+            ),
+        }),
+        None => Err(MorunaError::Config {
+            name: "kinds",
+            msg: format!(
+                "no {} kind `{}` is registered to replace",
+                role.as_str(),
+                declaration.name
+            ),
+        }),
     }
 }
 

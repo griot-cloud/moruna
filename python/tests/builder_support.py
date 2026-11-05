@@ -41,13 +41,20 @@ ARCH = {"linux/aarch64": "aarch64", "linux/x86_64": "x86_64"}
 OCI_ARCH = {"linux/aarch64": "arm64", "linux/x86_64": "amd64"}
 
 
+#: The package the builder's modules are loaded in, so that they import one another as they do
+#: in ``moruna`` (``from . import _closure``) without ``moruna`` itself, and its engine, loading.
+BUILDER_PACKAGE = "moruna_builder"
+
+
 def load(filename: str, name: str) -> ModuleType:
-    """``python/moruna/<filename>`` as a module named ``name``, without importing ``moruna``."""
-    spec = importlib.util.spec_from_file_location(name, PACKAGE / filename)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
+    """``python/moruna/<filename>`` as a module of the package ``moruna_builder`` (also known as
+    ``name``), without importing ``moruna``."""
+    if BUILDER_PACKAGE not in sys.modules:
+        package = ModuleType(BUILDER_PACKAGE)
+        package.__path__ = [str(PACKAGE)]  # type: ignore[attr-defined]
+        sys.modules[BUILDER_PACKAGE] = package
+    module = importlib.import_module(f"{BUILDER_PACKAGE}.{filename.removesuffix('.py')}")
     sys.modules[name] = module
-    spec.loader.exec_module(module)
     return module
 
 

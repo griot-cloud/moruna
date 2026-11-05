@@ -78,6 +78,9 @@ pub struct Job {
     /// The job's name, as its author gave it; absent: unnamed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The arguments every run supplies, in name order: the declaration, never a value.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<crate::ArgDecl>,
 }
 
 /// One task: a kind of a role, its settings and its named ports.
@@ -108,6 +111,10 @@ pub struct Task {
     /// it points at what the author wrote. Not part of the job: neither written nor rendered.
     #[serde(skip)]
     pub at: Option<String>,
+    /// What the task is, inline: its kind's declaration, or the definition an image task's
+    /// code makes ([`crate::Declaration`]); absent in a document that carries none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<crate::Declaration>,
 }
 
 impl Task {
@@ -160,6 +167,7 @@ impl Task {
             barrier: false,
             members: Vec::new(),
             at: None,
+            definition: None,
         }
     }
 
@@ -297,6 +305,7 @@ impl Job {
             report: Reporting::default(),
             contracts: Vec::new(),
             name: None,
+            args: Vec::new(),
         }
     }
 
@@ -376,6 +385,7 @@ impl Job {
             },
             contracts: spec.contracts.clone(),
             name: None,
+            args: Vec::new(),
         }
     }
 

@@ -74,7 +74,7 @@ def main():
             return [moruna.Split(0, 17), moruna.Split(1, len(expected) - 17)]
 
         def read(self, split_id, start, end):
-            if mode == "adapter-refusal" and case_id == "library.python.source":
+            if mode == "adapter-refusal" and case_id == "library.image.source":
                 raise ConnectionError("KD3 real source refusal")
             base = 0 if split_id == 0 else 17
             return batch.slice(base + start, end - start)
@@ -85,7 +85,7 @@ def main():
             self.finished = 0
 
         def write(self, actual):
-            if mode == "adapter-refusal" and case_id == "library.python.sink":
+            if mode == "adapter-refusal" and case_id == "library.image.sink":
                 raise OSError("KD3 real sink refusal")
             if actual.schema != schema:
                 raise ValueError(f"actual schema changed: {actual.schema}")
@@ -111,7 +111,7 @@ def main():
         if case_id == "library.iterator"
         else Input()
     )
-    kernels = [identity] if case_id == "library.python.kernel" else []
+    kernels = [identity] if case_id == "library.image.kernel" else []
     output = Output()
     # Native startup authority is mandatory; off-kernel caller embedding remains explicit.
     try:

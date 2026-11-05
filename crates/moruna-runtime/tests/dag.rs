@@ -426,6 +426,9 @@ fn opts() -> BuildOptions<'static> {
         notes: Vec::new(),
         packages: Default::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     }
 }
 

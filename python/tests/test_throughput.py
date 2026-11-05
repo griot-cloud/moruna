@@ -75,10 +75,10 @@ back = pq.read_table(str(out))
 print(json.dumps({
     "exit": report.exit["status"],
     "run_s": run_s,
-    "rows_out": report.stages[0]["rows_out"],
+    "rows_out": [t for t in report.tasks if t["role"] == "function"][0]["rows_out"],
     "rows_back": back.num_rows,
     "has_upper": "upper" in back.column_names,
-    "morsels": report.stages[0]["morsels"],
+    "morsels": [t for t in report.tasks if t["role"] == "function"][0]["morsels_in"],
     "gil": report.gil,
     "gil_serialised": report.gil_serialised,
 }))

@@ -72,8 +72,8 @@ def _run(scratch: pathlib.Path, guard: bool, policy: str = "terminate") -> tuple
 
 
 def _alloc(result: dict) -> dict:
-    stages = result["report"]["stages"]
-    return stages[0]["alloc"]
+    tasks = [t for t in result["report"]["tasks"] if t["role"] == "function"]
+    return tasks[0]["alloc"]
 
 
 def test_py_t20_refusal_end_to_end(scratch: pathlib.Path) -> None:
@@ -107,9 +107,9 @@ def test_py_t20_refusal_skipped_under_skip(scratch: pathlib.Path) -> None:
     (scratch / "skip").mkdir()
     _, result = _run(scratch / "skip", guard=True, policy="skip")
     assert result["exit"] == "completed", result
-    stage = result["report"]["stages"][0]
-    assert stage["skipped"] >= 1
-    assert stage["alloc"]["numpy"]["refused"] == stage["skipped"] + stage["errors"]
+    stage = [t for t in result["report"]["tasks"] if t["role"] == "function"][0]
+    assert stage["skipped_morsels"] >= 1
+    assert stage["alloc"]["numpy"]["refused"] == stage["skipped_morsels"] + stage["failed_morsels"]
 
 
 def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
@@ -130,10 +130,10 @@ def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
     assert mixed.memory_guard is True
     assert mixed_off.memory_guard is False
     report = moruna.run(moruna.ParquetSource(src), [mixed], moruna.ParquetSink(out))
-    alloc = report.stages[0]["alloc"]
-    assert alloc == json.loads(report.to_json())["stages"][0]["alloc"]
+    alloc = [t for t in report.tasks if t["role"] == "function"][0]["alloc"]
+    assert alloc == [t for t in json.loads(report.to_json())["tasks"] if t["role"] == "function"][0]["alloc"]
     assert set(alloc) == {
-        "refusal_on", "python", "numpy", "arrow", "linear", "lease_wait_us",
+        "refusal_on", "python", "numpy", "arrow", "linear", "lease_wait_ms",
         "peak_bytes", "outside_arrow_peak_bytes", "outside_arrow_fraction",
     }
     for source in ("python", "numpy", "arrow"):

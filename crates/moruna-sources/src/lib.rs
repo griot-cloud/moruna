@@ -24,6 +24,7 @@
 pub mod ipc;
 pub mod parquet;
 pub mod stats;
+pub mod stream;
 pub mod tensor;
 pub mod vortex;
 
@@ -41,6 +42,7 @@ pub use crate::parquet::{ParquetSource, ParquetSourceConfig, RowFilter, ScalarVa
 pub use crate::tensor::{TensorSource, TensorSourceConfig};
 pub use crate::vortex::{VortexSource, VortexSourceConfig};
 pub use stats::SourceStats;
+pub use stream::{ArrowStreamSource, StreamEnd};
 
 #[cfg(feature = "python")]
 pub use py_iter::PyIteratorSource;

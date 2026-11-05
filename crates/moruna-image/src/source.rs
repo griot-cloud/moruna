@@ -50,6 +50,9 @@ pub struct Manifest {
     pub config: Descriptor,
     /// The layers' descriptors, bottom first.
     pub layers: Vec<Descriptor>,
+    /// The manifest's annotations: its provenance and, for an image Moruna built, its build
+    /// key ([`crate::BUILD_KEY`]).
+    pub annotations: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +61,8 @@ struct ManifestDoc {
     media_type: Option<String>,
     config: Descriptor,
     layers: Vec<Descriptor>,
+    #[serde(default)]
+    annotations: std::collections::BTreeMap<String, String>,
 }
 
 impl Manifest {
@@ -80,6 +85,7 @@ impl Manifest {
             digest,
             config: doc.config,
             layers: doc.layers,
+            annotations: doc.annotations,
         })
     }
 }

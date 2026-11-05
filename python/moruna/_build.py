@@ -18,6 +18,7 @@ is tested, wherever a Python 3.14, ``pyarrow`` and ``uv`` are.
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import hashlib
 import http
@@ -522,7 +523,7 @@ def read_runtime_layout(layout: Path, reference: str, platform: Platform) -> Run
     return _runtime_from_manifest(f"{layout}@{digest}", digest, manifest, blob_path, platform)
 
 
-Transport = Callable[[str, dict[str, str]], tuple[int, dict[str, str], IO[bytes]]]
+Transport = Callable[..., tuple[int, dict[str, str], IO[bytes]]]
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -530,10 +531,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def urllib_transport(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], IO[bytes]]:
-    """``GET url``: the status, the headers (lower case names) and the body, redirects not
-    followed (the registry follows them, dropping credentials that must not leave its host)."""
-    request = urllib.request.Request(url, headers=headers)
+def urllib_transport(
+    url: str, headers: dict[str, str], method: str = "GET", body: bytes | Path | None = None
+) -> tuple[int, dict[str, str], IO[bytes]]:
+    """``method url`` with ``body`` (bytes, or a file's): the status, the headers (lower case
+    names) and the body, redirects not followed (the registry follows them, dropping
+    credentials that must not leave its host)."""
+    data = body.read_bytes() if isinstance(body, Path) else body
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         response = opener.open(request, timeout=60)
@@ -544,53 +549,122 @@ def urllib_transport(url: str, headers: dict[str, str]) -> tuple[int, dict[str, 
     return response.status, {k.lower(): v for k, v in response.headers.items()}, response
 
 
-class Registry:
-    """A read-only client of one repository of an OCI registry, anonymous, which verifies every
-    byte against the digest it asked for."""
+Credential = Callable[[str], "dict[str, str] | None"]
 
-    def __init__(self, host: str, repository: str, transport: Transport = urllib_transport) -> None:
+
+def http_scheme(host: str) -> str:
+    """``https``, except for a registry on this machine (``localhost``, ``127.0.0.1``,
+    ``[::1]``), which is spoken to in plain HTTP as registries for development are."""
+    name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+    return "http" if name in ("localhost", "127.0.0.1", "[::1]") else "https"
+
+
+class Registry:
+    """A client of one repository of an OCI registry (the distribution API) that verifies every
+    byte against the digest it names. Anonymous unless the registry asks for credentials: then
+    ``credential(host)`` is asked, once, for ``{"token": ...}`` (sent as a bearer token) or
+    ``{"username": ..., "password": ...}`` (sent to the registry's token service, or as basic
+    credentials when the registry asks for those); ``None`` keeps it anonymous."""
+
+    def __init__(
+        self,
+        host: str,
+        repository: str,
+        transport: Transport | None = None,
+        credential: Credential | None = None,
+    ) -> None:
         self.host = host
         self.repository = repository
-        self.transport = transport
+        self.transport = transport or urllib_transport
+        self.credential = credential
         self.token: str | None = None
+        self.basic: str | None = None
+        self.base = f"{http_scheme(host)}://{host}/v2/{repository}"
 
-    def _open(self, url: str, accept: str) -> IO[bytes]:
-        headers = {"Accept": accept}
+    def _credential(self) -> dict[str, str] | None:
+        if self.credential is None:
+            return None
+        found = self.credential(self.host)
+        if found is not None and not (
+            "token" in found or ("username" in found and "password" in found)
+        ):
+            raise Refused(
+                f"{self.host}: the credential the resolver gave holds neither `token` nor "
+                "`username` and `password`"
+            )
+        return found
+
+    def _headers(self, url: str, headers: dict[str, str]) -> dict[str, str]:
+        out = dict(headers)
+        if urllib.parse.urlsplit(url).netloc == self.host:
+            if self.token:
+                out["Authorization"] = f"Bearer {self.token}"
+            elif self.basic:
+                out["Authorization"] = f"Basic {self.basic}"
+        return out
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | Path | None = None
+    ) -> tuple[int, dict[str, str], IO[bytes]]:
+        """``method url`` with the registry's credentials once it asked for them, following
+        its redirects (and dropping credentials for another host); the status, the headers and
+        the body of the last answer."""
         for _ in range(8):
-            if self.token and urllib.parse.urlsplit(url).netloc == self.host:
-                headers["Authorization"] = f"Bearer {self.token}"
-            else:
-                headers.pop("Authorization", None)
-            status, got, body = self.transport(url, headers)
-            if status == http.HTTPStatus.OK:
-                return body
+            status, got, answer = self.transport(
+                url, self._headers(url, headers), method=method, body=body
+            )  # type: ignore[call-arg]
             if status in (301, 302, 303, 307, 308) and "location" in got:
                 url = urllib.parse.urljoin(url, got["location"])
                 continue
             if (
                 status == http.HTTPStatus.UNAUTHORIZED
                 and self.token is None
+                and self.basic is None
                 and "www-authenticate" in got
             ):
-                self.token = self._authenticate(got["www-authenticate"])
+                self._authenticate(got["www-authenticate"])
                 continue
-            raise Refused(f"{url}: the registry answered {status}")
+            return status, got, answer
         raise Refused(f"{url}: too many redirects")
 
-    def _authenticate(self, challenge: str) -> str:
+    def _open(self, url: str, accept: str) -> IO[bytes]:
+        status, _, body = self.request("GET", url, {"Accept": accept})
+        if status != http.HTTPStatus.OK:
+            raise Refused(f"{url}: the registry answered {status}")
+        return body
+
+    def _authenticate(self, challenge: str) -> None:
+        scheme = challenge.split(" ", 1)[0].lower()
+        credential = self._credential()
+        if scheme == "basic":
+            if credential is None or "username" not in credential:
+                raise Refused(
+                    f"{self.host} asks for a username and a password, and the resolver gave "
+                    f"none for the need `registry:{self.host}`"
+                )
+            pair = f"{credential['username']}:{credential['password']}".encode()
+            self.basic = base64.b64encode(pair).decode()
+            return
+        if credential is not None and "token" in credential:
+            self.token = credential["token"]
+            return
         fields = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
         if "realm" not in fields:
             raise Refused(f"{self.host}: cannot read the challenge {challenge!r}")
         query = {k: fields[k] for k in ("service", "scope") if k in fields}
         url = fields["realm"] + "?" + urllib.parse.urlencode(query)
-        status, _, body = self.transport(url, {"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        if credential is not None:
+            pair = f"{credential['username']}:{credential['password']}".encode()
+            headers["Authorization"] = "Basic " + base64.b64encode(pair).decode()
+        status, _, body = self.transport(url, headers)
         if status != http.HTTPStatus.OK:
             raise Refused(f"{url}: the token service answered {status}")
         document = json.loads(body.read())
         token = document.get("token") or document.get("access_token")
         if not token:
             raise Refused(f"{url}: the token service gave no token")
-        return str(token)
+        self.token = str(token)
 
     def fetch(self, kind: str, digest: str, accept: str, dest: Path) -> Path:
         """``digest`` of ``kind`` (``manifests`` or ``blobs``) into ``dest``, whole and hashed
@@ -598,7 +672,7 @@ class Registry:
         wanted = _digest_hex(digest, self.repository)
         if dest.is_file() and sha256_file(dest) == wanted:
             return dest
-        url = f"https://{self.host}/v2/{self.repository}/{kind}/{digest}"
+        url = f"{self.base}/{kind}/{digest}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         hasher = hashlib.sha256()
         fd, temp = tempfile.mkstemp(dir=dest.parent, prefix=".part-")
@@ -614,6 +688,43 @@ class Registry:
             if os.path.exists(temp):
                 os.unlink(temp)
         return dest
+
+    def has_blob(self, digest: str) -> bool:
+        status, _, body = self.request("HEAD", f"{self.base}/blobs/{digest}", {})
+        body.close()
+        if status == http.HTTPStatus.OK:
+            return True
+        if status == http.HTTPStatus.NOT_FOUND:
+            return False
+        raise Refused(f"{self.base}/blobs/{digest}: the registry answered {status}")
+
+    def push_blob(self, digest: str, source: Path) -> None:
+        """The blob ``digest`` from ``source``, uploaded whole unless the registry has it."""
+        if self.has_blob(digest):
+            return
+        status, got, body = self.request("POST", f"{self.base}/blobs/uploads/", {})
+        body.close()
+        if status != http.HTTPStatus.ACCEPTED or "location" not in got:
+            raise Refused(f"{self.base}: starting an upload, the registry answered {status}")
+        location = urllib.parse.urljoin(self.base + "/", got["location"])
+        joiner = "&" if "?" in location else "?"
+        url = f"{location}{joiner}digest={urllib.parse.quote(digest)}"
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(source.stat().st_size),
+        }
+        status, _, body = self.request("PUT", url, headers, source)
+        body.close()
+        if status != http.HTTPStatus.CREATED:
+            raise Refused(f"{self.base}: uploading {digest}, the registry answered {status}")
+
+    def push_manifest(self, reference: str, data: bytes, media_type: str) -> None:
+        url = f"{self.base}/manifests/{reference}"
+        headers = {"Content-Type": media_type, "Content-Length": str(len(data))}
+        status, _, body = self.request("PUT", url, headers, data)
+        body.close()
+        if status not in (http.HTTPStatus.CREATED, http.HTTPStatus.OK):
+            raise Refused(f"{url}: the registry answered {status}")
 
 
 def fetch_runtime(platform: Platform, cache: Path, registry: Registry | None = None) -> Runtime:
@@ -814,93 +925,184 @@ def clean_install(target: Path) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# Layer 3 and 4: the shim and the function
+# The shim
+
+
+SHIM_PARTS = {
+    "shim.py": "_shim.py",
+    "moruna/__init__.py": "_standin.py",
+    "moruna/_declare.py": "_declare.py",
+}
+
+
+def shim_digest() -> str:
+    """The shim's version: ``sha256:`` over its files by path, which every image of this
+    Moruna holds the same and every build key names."""
+    here = Path(__file__).parent
+    digest = hashlib.sha256()
+    for target, source in sorted(SHIM_PARTS.items()):
+        data = (here / source).read_bytes()
+        digest.update(f"{target}\0{len(data)}\0".encode())
+        digest.update(data)
+    return "sha256:" + digest.hexdigest()
 
 
 def stage_shim(dest: Path) -> None:
-    """Layer 3's files written under ``dest`` as they are at ``/opt/moruna``: the shim, the
-    stand-in ``moruna`` and the module it reads. They are this package's own files, so they
-    are the same for every image of this Moruna."""
+    """The shim layer's files written under ``dest`` as they are at ``/opt/moruna``: the shim,
+    the stand-in ``moruna`` and the module it reads."""
     here = Path(__file__).parent
-    parts = {
-        "shim.py": "_shim.py",
-        "moruna/__init__.py": "_standin.py",
-        "moruna/_declare.py": "_declare.py",
-    }
-    for target, source in parts.items():
+    for target, source in SHIM_PARTS.items():
         path = dest / target
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes((here / source).read_bytes())
         path.chmod(FILE_MODE)
 
 
+# ---------------------------------------------------------------------------------------------
+# The dependencies, one layer per distribution
+
+
+_REQUIRES = re.compile(r"^Requires-Dist:\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)$", re.M)
+
+
+def lock_digest(lock: Path) -> str:
+    return "sha256:" + sha256_file(lock)
+
+
 @dataclasses.dataclass(frozen=True)
-class Function:
-    """What a build needs to know of a function: where it is imported from and what it names."""
+class Site:
+    """Every pin of a lock installed for a platform, compiled for the runtime, and which files
+    each distribution owns; kept in the build cache by the lock's digest and the platform."""
 
-    module: str  # dotted, as the shim imports it
-    name: str  # the attribute of the module
-    source: Path  # the file defining the module
-    files: tuple[Path, ...] = ()  # files it names, under the import root
-    fingerprint: str | None = None
-    stateful: bool = False
-
-    @property
-    def entry(self) -> str:
-        return f"{self.module}:{self.name}"
-
-    @property
-    def root(self) -> Path:
-        """The directory the module is imported from: what a ``sys.path`` entry names."""
-        depth = len(self.module.split("."))
-        package = self.source.name == "__init__.py"
-        return self.source.resolve().parents[depth if package else depth - 1]
+    root: Path
+    owners: dict[str, tuple[str, ...]]  # distribution -> its files, relative to the root
+    requires: dict[str, tuple[str, ...]]  # distribution -> the distributions it requires
 
 
-def function_files(function: Function) -> dict[str, Path]:
-    """Layer 4's files: the one that defines the function at its import path under ``/app``,
-    the ``__init__.py`` of each package above it, and the files it names at their paths below
-    the import root; each path of the image with the file it is made from."""
-    source = function.source.resolve()
-    root = function.root
-    files: dict[str, Path] = {}
-
-    def add(path: Path) -> None:
-        try:
-            relative = path.resolve().relative_to(root)
-        except ValueError:
-            raise Refused(
-                f"{path}: not under {root}, where {function.module} is imported from"
-            ) from None
-        if not path.is_file():
-            raise Refused(f"{path}: no such file")
-        files[f"{APP_DIR}/{relative.as_posix()}"] = path.resolve()
-
-    add(source)
-    directory = source.parent
-    while directory != root:
-        init = directory / "__init__.py"
-        if init.is_file() and init != source:
-            add(init)
-        directory = directory.parent
-    for extra in function.files:
-        add(extra)
-    return files
+def _dist_of(dist_info: str) -> str:
+    return normal(dist_info.removesuffix(".dist-info").rsplit("-", 1)[0])
 
 
-def stage_function(function: Function, dest: Path) -> None:
-    """Layer 4's files written under ``dest`` as they are at ``/app`` (which exists even when
-    nothing is in it), each with the mode the layer gives it."""
-    dest.mkdir(parents=True, exist_ok=True)
-    for target, source in function_files(function).items():
-        path = dest / target.removeprefix(f"{APP_DIR}/")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(source.read_bytes())
-        path.chmod(EXEC_MODE if source.stat().st_mode & 0o111 else FILE_MODE)
+def install_site(
+    lock: Path, pins: list[Pin], platform: Platform, tools: Toolchain, options: Options
+) -> Site:
+    """The lock installed into the build cache once per lock and platform: uv installs every
+    pin (wheels only, hashes required), the tree is compiled for the runtime, and each
+    distribution's files are read from its ``RECORD``. A file no distribution owns is refused."""
+    name = f"{sha256_file(lock)[:24]}-{platform.arch}"
+    root = options.cache / "sites" / name
+    index = root / ".moruna-site.json"
+    if index.is_file():
+        known = json.loads(index.read_bytes())
+        return Site(
+            root / "site",
+            {k: tuple(v) for k, v in known["owners"].items()},
+            {k: tuple(v) for k, v in known["requires"].items()},
+        )
+    work = root.with_name(f".{name}.part")
+    shutil.rmtree(work, ignore_errors=True)
+    site = work / "site"
+    site.mkdir(parents=True)
+    requirements = work / "requirements.txt"
+    requirements.write_text(requirements_text(pins))
+    install(requirements, site, platform, options.uv_options, tools)
+    compile_tree(site, f"/{SITE_PACKAGES}", tools)
+    owners: dict[str, list[str]] = {}
+    requires: dict[str, tuple[str, ...]] = {}
+    for record in sorted(site.glob("*.dist-info/RECORD")):
+        dist = _dist_of(record.parent.name)
+        files: list[str] = []
+        for line in record.read_text(encoding="utf-8").splitlines():
+            path = line.rsplit(",", 2)[0] if line.count(",") >= 2 else line.split(",")[0]
+            if not path or path.startswith(".."):
+                continue
+            if (site / path).is_file():
+                files.append(path)
+                if path.endswith(".py"):
+                    source = Path(path)
+                    for pyc in sorted((site / source.parent / "__pycache__").glob(f"{source.stem}.*.pyc")):
+                        files.append(pyc.relative_to(site).as_posix())
+        owners[dist] = sorted(set(files))
+        metadata = (record.parent / "METADATA").read_text(encoding="utf-8", errors="replace")
+        requires[dist] = tuple(
+            sorted(
+                {
+                    normal(m.group(1))
+                    for m in _REQUIRES.finditer(metadata)
+                    if "extra" not in m.group(2)
+                }
+            )
+        )
+    owned = {f for files in owners.values() for f in files}
+    stray = sorted(
+        p.relative_to(site).as_posix()
+        for p in site.rglob("*")
+        if p.is_file() and p.relative_to(site).as_posix() not in owned
+    )
+    if stray:
+        raise Refused(
+            f"{lock}: installed files no distribution's RECORD names, which no layer would "
+            f"hold: {', '.join(stray[:5])}{' ...' if len(stray) > 5 else ''}"
+        )
+    _write_atomic(
+        work / ".moruna-site.json",
+        canonical({"owners": owners, "requires": {k: list(v) for k, v in requires.items()}}),
+    )
+    shutil.rmtree(root, ignore_errors=True)
+    os.replace(work, root)
+    return Site(root / "site", {k: tuple(v) for k, v in owners.items()}, requires)
+
+
+def needed(site: Site, direct: Iterable[str]) -> list[str]:
+    """``direct`` and every distribution it requires, transitively, as the lock installed them
+    (a requirement whose marker excluded it here is not installed, and is not followed)."""
+    wanted: set[str] = set()
+    pending = [normal(d) for d in direct]
+    while pending:
+        dist = pending.pop()
+        if dist in wanted or dist not in site.owners:
+            continue
+        wanted.add(dist)
+        pending.extend(site.requires.get(dist, ()))
+    return sorted(wanted)
+
+
+def dist_layer(site: Site, dist: str, options: Options) -> Blob:
+    """The layer of one distribution's files at ``/opt/moruna/site-packages``: the same bytes
+    for the same files, written once into the build cache and shared by every image."""
+    index = site.root.parent / ".moruna-layers.json"
+    known = json.loads(index.read_bytes()) if index.is_file() else {}
+    blobs = options.cache / "blobs" / "sha256"
+    if dist in known:
+        path = blobs / _digest_hex(known[dist]["digest"], dist)
+        if path.is_file():
+            return Blob(known[dist]["digest"], known[dist]["size"], path)
+    entries = []
+    for relative in site.owners[dist]:
+        source = site.root / relative
+        mode = EXEC_MODE if source.stat().st_mode & 0o111 else FILE_MODE
+        entries.append(Entry(f"{SITE_PACKAGES}/{relative}", "file", mode, source=source))
+    blob = write_layer(entries, blobs)
+    known[dist] = {"digest": blob.digest, "size": blob.size}
+    _write_atomic(index, canonical(known))
+    return blob
 
 
 # ---------------------------------------------------------------------------------------------
-# The image
+# A task's image
+
+
+@dataclasses.dataclass(frozen=True)
+class Task:
+    """What a build needs to know of one task: its name in the job, its entry, its code (the
+    closure) and its build key, and the distributions its closure imports."""
+
+    name: str
+    entry: str
+    code: Any  # _closure.Code
+    key: str
+    distributions: tuple[str, ...]
+    provenance: dict[str, Any]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -913,58 +1115,66 @@ class LayerInfo:
 
 @dataclasses.dataclass(frozen=True)
 class Built:
-    """A finished build: the layout it is in and what is in it."""
+    """One task's image, built: where it is and what is in it."""
 
-    layout: Path
-    reference: str
+    task: str
+    key: str
     digest: str
+    layout: Path
     layers: tuple[LayerInfo, ...]
-    lock: Path
-    platform: Platform
+    reused: bool
+    reference: str | None = None  # the registry reference, when it was pushed
+    lock: Path | None = None  # the lock its dependencies were installed from
+
+    @property
+    def location(self) -> str:
+        return self.reference or str(self.layout)
 
     def report(self) -> dict[str, Any]:
         return {
-            "moruna_build": 1,
-            "image": self.digest,
-            "layout": str(self.layout),
-            "reference": self.reference,
-            "platform": self.platform.name,
-            "lock": str(self.lock),
+            "task": self.task,
+            "build_key": self.key,
+            "digest": self.digest,
+            "location": self.location,
+            "reused": self.reused,
             "layers": [
-                {
-                    "layer": i,
-                    "role": layer.role,
-                    "digest": layer.blob.digest,
-                    "size": layer.blob.size,
-                    "diff_id": layer.diff_id,
-                }
-                for i, layer in enumerate(self.layers, 1)
+                {"role": l.role, "digest": l.blob.digest, "size_bytes": l.blob.size}  # noqa: E741
+                for l in self.layers  # noqa: E741
             ],
         }
 
 
 @dataclasses.dataclass(frozen=True)
 class Options:
-    """How a build runs: where the image goes and where its inputs come from."""
+    """How a build runs: where the images go and where their inputs come from."""
 
     out: Path
     platform: Platform
     cache: Path
-    tag: str | None = None
     lock: Path | None = None
     runtime: Runtime | None = None  # absent: python:3.14-slim from its registry
     uv_options: tuple[str, ...] = ()
     version: str | None = None  # the Moruna that built it, for the config's labels
+    registry: str | None = None  # HOST/REPOSITORY to push every image to
+    credential: Credential | None = None
+    transport: Transport | None = None
+
+
+def runtime_identity(runtime: Runtime | None) -> str:
+    """What a build key names the runtime by: the pinned index, or a layout's manifest."""
+    return RUNTIME_INDEX if runtime is None else runtime.digest
 
 
 def image_config(
-    runtime: Runtime, function: Function, layers: Sequence[LayerInfo], options: Options
+    runtime: Runtime, task: Task, layers: Sequence[LayerInfo], options: Options
 ) -> dict[str, Any]:
-    """The image config: the runtime's environment with this image's added, the shim as the
-    command with an explicit shim workdir, its initial directory ``/``, and its origin."""
+    """The image config: the runtime's environment with this image's added (its entry among
+    it, so the image runs standalone too), the shim as the entrypoint with an explicit
+    workdir, its initial directory ``/``, and its origin."""
     ours = {
         "PYTHONPATH": f"/{APP_DIR}:/{SITE_PACKAGES}",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "MORUNA_ENTRY": task.entry,
     }
     env = [
         e for e in runtime.config.get("config", {}).get("Env", []) if e.split("=", 1)[0] not in ours
@@ -973,11 +1183,8 @@ def image_config(
     labels = {
         "org.opencontainers.image.base.name": runtime.name,
         "org.opencontainers.image.base.digest": runtime.digest,
-        "org.moruna.entry": function.entry,
-        "org.moruna.stateful": "true" if function.stateful else "false",
+        BUILD_KEY: task.key,
     }
-    if function.fingerprint:
-        labels["org.moruna.fingerprint"] = function.fingerprint
     if options.version:
         labels["org.moruna.version"] = options.version
     return {
@@ -985,7 +1192,7 @@ def image_config(
         "os": "linux",
         "config": {
             "Env": env,
-            "Cmd": [PYTHON, f"/{SHIM_DIR}/shim.py", "--workdir", f"/{APP_DIR}", function.entry],
+            "Entrypoint": [PYTHON, f"/{SHIM_DIR}/shim.py", "--workdir", f"/{APP_DIR}"],
             "WorkingDir": "/",
             "Labels": labels,
         },
@@ -995,6 +1202,28 @@ def image_config(
             for layer in layers
         ],
     }
+
+
+#: The manifest annotation that names an image's build key (`moruna_image::BUILD_KEY`).
+BUILD_KEY = "org.moruna.build.key"
+
+
+def annotations(task: Task, lock: str) -> dict[str, str]:
+    """The manifest's provenance, as standard OCI annotations and Moruna's own: the source and
+    revision (when the code is in a repository) and whether a bundled file differed from it,
+    the entry, the build key, the lock's digest, and each bundled file with its sha256."""
+    found = {
+        BUILD_KEY: task.key,
+        "org.moruna.entry": task.entry,
+        "org.moruna.lock.digest": lock,
+        "org.moruna.files": json.dumps(task.code.file_digests(), sort_keys=True, separators=(",", ":")),
+    }
+    if task.provenance.get("source"):
+        found["org.opencontainers.image.source"] = task.provenance["source"]
+    if task.provenance.get("revision"):
+        found["org.opencontainers.image.revision"] = task.provenance["revision"]
+        found["org.moruna.source.dirty"] = "true" if task.provenance.get("dirty") else "false"
+    return found
 
 
 def _put(layout: Path, digest: str, source: Path | bytes, size: int | None = None) -> None:
@@ -1039,82 +1268,161 @@ def _prepare_layout(layout: Path) -> dict[str, Any]:
             raise Refused(f"{layout}: an OCI layout of a version other than 1.0.0")
         index = json.loads((layout / "index.json").read_bytes())
     except (OSError, ValueError) as exc:
-        raise Refused(f"--out {layout}: holds files and is not an OCI layout ({exc})") from exc
+        raise Refused(f"out {layout}: holds files and is not an OCI layout ({exc})") from exc
     index.setdefault("manifests", [])
     return index
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.part")
     temp.write_bytes(data)
     os.replace(temp, path)
 
 
-def build_image(function: Function, options: Options) -> Built:
-    """Build the four layers of ``function`` into the OCI layout ``options.out`` and add the
-    image to its ``index.json`` under ``options.tag`` (an image of that name already there is
-    replaced). Blobs already in the layout are shared, not written again."""
-    lock = find_lock(function.root, options.lock)
+def _existing(layout: Path, index: dict[str, Any], key: str) -> str | None:
+    """The image of build key ``key`` the layout already holds, whole: its manifest's digest.
+    A key names the code, so its image is reused, whatever a docstring now says."""
+    for entry in index.get("manifests", []):
+        if entry.get("annotations", {}).get(REF_NAME) != key:
+            continue
+        digest = entry["digest"]
+        manifest_path = layout / "blobs" / "sha256" / _digest_hex(digest, key)
+        try:
+            manifest = json.loads(manifest_path.read_bytes())
+        except (OSError, ValueError):
+            return None
+        if sha256_file(manifest_path) != _digest_hex(digest, key):
+            return None
+        blobs = [manifest["config"], *manifest["layers"]]
+
+        def whole(descriptor: dict[str, Any]) -> bool:
+            path = layout / "blobs" / "sha256" / _digest_hex(descriptor["digest"], key)
+            return path.is_file() and path.stat().st_size == descriptor["size"]
+
+        if manifest.get("annotations", {}).get(BUILD_KEY) == key and all(map(whole, blobs)):
+            return str(digest)
+    return None
+
+
+def _function_layer(task: Task, work: Path, tools: Toolchain) -> Blob:
+    """The task's own layer at ``/app``: its closure and its data files, and the bytecode of
+    every module beside its source."""
+    app = work / f"app-{task.key.split(':')[1][:16]}"
+    shutil.rmtree(app, ignore_errors=True)
+    app.mkdir(parents=True)
+    for relative, source in task.code.files.items():
+        path = app / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(source.read_bytes())
+        path.chmod(EXEC_MODE if source.stat().st_mode & 0o111 else FILE_MODE)
+    compile_tree(app, f"/{APP_DIR}", tools)
+    return write_layer(tree_entries(app, APP_DIR), work / "layers")
+
+
+def build_images(tasks: Sequence[Task], options: Options) -> list[Built]:
+    """One image per task into the OCI layout ``options.out``, each named there by its build
+    key: the runtime's layers, one layer per distribution the task's code needs, the shim, and
+    the task's code. Blobs are content addressed, so tasks that share a distribution share its
+    layer and every blob is stored once; an image the layout already holds for a key is
+    reused. With ``options.registry``, every image is then pushed there."""
+    if not tasks:
+        return []
+    root = tasks[0].code.root
+    lock = find_lock(root, options.lock)
     uv = uv_command()
     pins = with_pyarrow(parse_lock(lock_text(lock, uv), str(lock)), str(lock))
     runtime = options.runtime or fetch_runtime(options.platform, options.cache)
     tools = tag_interpreter(runtime_bytecode(runtime))
-    reference = options.tag or f"{function.name}:latest"
+    index = _prepare_layout(options.out)
+    built: list[Built] = []
+    site: Site | None = None
     with tempfile.TemporaryDirectory(prefix="moruna-build-") as scratch:
         work = Path(scratch)
-        requirements = work / "requirements.txt"
-        requirements.write_text(requirements_text(pins))
-        site, shim, app = work / "site-packages", work / "shim", work / "app"
-        site.mkdir()
-        install(requirements, site, options.platform, options.uv_options, tools)
-        stage_shim(shim)
-        stage_function(function, app)
-        compile_tree(site, f"/{SITE_PACKAGES}", tools)
-        compile_tree(shim / "moruna", f"/{SHIM_DIR}/moruna", tools)
-        compile_tree(app, f"/{APP_DIR}", tools)
-        made = {
-            "dependencies": write_layer(tree_entries(site, SITE_PACKAGES), work / "layers"),
-            "shim": write_layer(tree_entries(shim, SHIM_DIR), work / "layers"),
-            "function": write_layer(tree_entries(app, APP_DIR), work / "layers"),
-        }
-        layers = [_runtime_layer(runtime, layer, i) for i, layer in enumerate(runtime.layers)]
-        layers += [LayerInfo(role, blob, MEDIA_LAYER, blob.digest) for role, blob in made.items()]
-        config = canonical(image_config(runtime, function, layers, options))
-        config_digest = f"sha256:{hashlib.sha256(config).hexdigest()}"
-        manifest = canonical(
-            {
-                "schemaVersion": 2,
-                "mediaType": MEDIA_MANIFEST,
-                "config": {"mediaType": MEDIA_CONFIG, "digest": config_digest, "size": len(config)},
-                "layers": [
-                    {"mediaType": l.media_type, "digest": l.blob.digest, "size": l.blob.size}
-                    for l in layers  # noqa: E741
-                ],
-            }
-        )
-        manifest_digest = f"sha256:{hashlib.sha256(manifest).hexdigest()}"
-        index = _prepare_layout(options.out)
-        for layer in layers:
-            source = (
-                runtime.files[layer.blob.digest] if layer.role == "runtime" else layer.blob.path
-            )
-            _put(options.out, layer.blob.digest, source, layer.blob.size)
-        _put(options.out, config_digest, config)
-        _put(options.out, manifest_digest, manifest)
-        index["manifests"] = sorted(
-            [m for m in index["manifests"] if m.get("annotations", {}).get(REF_NAME) != reference]
-            + [
+        shim_dir = work / "shim"
+        stage_shim(shim_dir)
+        compile_tree(shim_dir / "moruna", f"/{SHIM_DIR}/moruna", tools)
+        shim = write_layer(tree_entries(shim_dir, SHIM_DIR), work / "layers")
+        runtime_layers = [_runtime_layer(runtime, layer, i) for i, layer in enumerate(runtime.layers)]
+        for task in tasks:
+            if task.code.root != root:
+                raise Refused(
+                    f"{task.name}: its code is imported from {task.code.root}, and the job's "
+                    f"other tasks from {root}; a job's tasks build from one project and its lock"
+                )
+            existing = _existing(options.out, index, task.key)
+            if existing is not None:
+                manifest = json.loads(
+                    (options.out / "blobs" / "sha256" / _digest_hex(existing, task.key)).read_bytes()
+                )
+                layers = tuple(
+                    LayerInfo("reused", Blob(l["digest"], l["size"], options.out), l["mediaType"], "")  # noqa: E741
+                    for l in manifest["layers"]  # noqa: E741
+                )
+                built.append(
+                    Built(task.name, task.key, existing, options.out, layers, True, lock=lock)
+                )
+                continue
+            if site is None:
+                site = install_site(lock, pins, options.platform, tools, options)
+            dists = needed(site, [*task.distributions, "pyarrow"])
+            missing = sorted({normal(d) for d in task.distributions} - set(site.owners))
+            if missing:
+                raise Refused(
+                    f"{task.name}: its code imports {', '.join(missing)}, which {lock} does not "
+                    "pin"
+                )
+            layers = list(runtime_layers)
+            for dist in dists:
+                blob = dist_layer(site, dist, options)
+                layers.append(LayerInfo(f"dependency {dist}", blob, MEDIA_LAYER, blob.digest))
+            layers.append(LayerInfo("shim", shim, MEDIA_LAYER, shim.digest))
+            own = _function_layer(task, work, tools)
+            layers.append(LayerInfo("function", own, MEDIA_LAYER, own.digest))
+            config = canonical(image_config(runtime, task, layers, options))
+            config_digest = f"sha256:{hashlib.sha256(config).hexdigest()}"
+            manifest = canonical(
                 {
+                    "schemaVersion": 2,
                     "mediaType": MEDIA_MANIFEST,
-                    "digest": manifest_digest,
-                    "size": len(manifest),
-                    "annotations": {REF_NAME: reference},
+                    "config": {"mediaType": MEDIA_CONFIG, "digest": config_digest, "size": len(config)},
+                    "layers": [
+                        {"mediaType": l.media_type, "digest": l.blob.digest, "size": l.blob.size}
+                        for l in layers  # noqa: E741
+                    ],
+                    "annotations": annotations(task, lock_digest(lock)),
                 }
-            ],
-            key=lambda m: (m.get("annotations", {}).get(REF_NAME, ""), m["digest"]),
-        )
-        _write_atomic(options.out / "index.json", canonical(index))
-    return Built(options.out, reference, manifest_digest, tuple(layers), lock, options.platform)
+            )
+            manifest_digest = f"sha256:{hashlib.sha256(manifest).hexdigest()}"
+            for layer in layers:
+                source = (
+                    runtime.files[layer.blob.digest] if layer.role == "runtime" else layer.blob.path
+                )
+                _put(options.out, layer.blob.digest, source, layer.blob.size)
+            _put(options.out, config_digest, config)
+            _put(options.out, manifest_digest, manifest)
+            index["manifests"] = sorted(
+                [m for m in index["manifests"] if m.get("annotations", {}).get(REF_NAME) != task.key]
+                + [
+                    {
+                        "mediaType": MEDIA_MANIFEST,
+                        "digest": manifest_digest,
+                        "size": len(manifest),
+                        "annotations": {REF_NAME: task.key, "org.moruna.task": task.name},
+                    }
+                ],
+                key=lambda m: (m.get("annotations", {}).get(REF_NAME, ""), m["digest"]),
+            )
+            _write_atomic(options.out / "index.json", canonical(index))
+            built.append(
+                Built(
+                    task.name, task.key, manifest_digest, options.out, tuple(layers), False,
+                    lock=lock,
+                )
+            )
+    if options.registry:
+        built = [push(b, options) for b in built]
+    return built
 
 
 def _runtime_layer(runtime: Runtime, descriptor: dict[str, Any], position: int) -> LayerInfo:
@@ -1129,38 +1437,72 @@ def _runtime_layer(runtime: Runtime, descriptor: dict[str, Any], position: int) 
 
 
 # ---------------------------------------------------------------------------------------------
-# The function a build is asked for
+# Registries: push and pull
 
 
-def function_of(target: Any, name: str | None = None) -> Function:
-    """The ``Function`` of a decorated function, or of a plain function or class instance, found in
-    the module that defines it (the build imports it by that name, as the shim will)."""
-    inner = getattr(target, "wrapped", target)
-    while hasattr(inner, "__wrapped__"):
-        inner = inner.__wrapped__
-    module_name = getattr(inner, "__module__", None) or type(inner).__module__
-    module = sys.modules.get(module_name)
-    if module is None or getattr(module, "__file__", None) is None:
+def split_registry(target: str) -> tuple[str, str]:
+    """``HOST/REPOSITORY`` as its two parts; a target with no host is refused."""
+    host, _, repository = target.partition("/")
+    if not repository or not ("." in host or ":" in host or host == "localhost"):
         raise Refused(
-            f"{module_name}: the module that defines the function is not a file that can be imported"
+            f"registry {target!r}: name it as HOST/REPOSITORY, the host with a `.` or a port, "
+            "or `localhost`"
         )
-    if name is None:
-        names = [n for n, v in vars(module).items() if v is target]
-        if not names:
-            raise Refused(
-                f"{module_name} does not bind the function to a name the image could import; "
-                "assign it at the top level of the module"
-            )
-        name = names[0]
-    if module_name == "__main__":
-        module_name = Path(module.__file__).stem
-    return Function(
-        module=module_name,
-        name=name,
-        source=Path(module.__file__),
-        fingerprint=getattr(target, "fingerprint", None),
-        stateful=bool(getattr(target, "stateful", False)),
+    return host, repository
+
+
+def push(built: Built, options: Options) -> Built:
+    """``built``'s image pushed to ``options.registry``: every blob the registry lacks, then
+    the manifest, by its digest and tagged with its build key (``sha256-<hex>``), so a registry
+    that collects untagged manifests keeps it."""
+    assert options.registry is not None
+    host, repository = split_registry(options.registry)
+    registry = Registry(host, repository, options.transport, options.credential)
+    blobs = built.layout / "blobs" / "sha256"
+    manifest = (blobs / _digest_hex(built.digest, built.task)).read_bytes()
+    document = json.loads(manifest)
+    for descriptor in [document["config"], *document["layers"]]:
+        registry.push_blob(descriptor["digest"], blobs / _digest_hex(descriptor["digest"], built.task))
+    registry.push_manifest(built.key.replace(":", "-"), manifest, MEDIA_MANIFEST)
+    registry.push_manifest(built.digest, manifest, MEDIA_MANIFEST)
+    return dataclasses.replace(built, reference=f"{host}/{repository}@{built.digest}")
+
+
+def pull(reference: str, cache: Path, credential: Credential | None = None,
+         transport: Transport | None = None) -> Path:
+    """The image ``HOST/REPOSITORY@sha256:...`` pulled into the OCI layout ``cache`` (every
+    blob verified against its digest, kept by digest, fetched once), named there by the
+    reference; the layout."""
+    path, _, digest = reference.partition("@")
+    host, repository = split_registry(path)
+    _digest_hex(digest, reference)
+    registry = Registry(host, repository, transport, credential)
+    index = _prepare_layout(cache)
+    blobs = cache / "blobs" / "sha256"
+    manifest_file = registry.fetch(
+        "manifests", digest, f"{MEDIA_MANIFEST}, application/vnd.docker.distribution.manifest.v2+json",
+        blobs / _digest_hex(digest, reference),
+    )  # fmt: skip
+    manifest = json.loads(manifest_file.read_bytes())
+    if "layers" not in manifest:
+        raise Refused(f"{reference}: names an index of images, not one image's manifest")
+    for descriptor in [manifest["config"], *manifest["layers"]]:
+        registry.fetch(
+            "blobs", descriptor["digest"], "application/octet-stream",
+            blobs / _digest_hex(descriptor["digest"], reference),
+        )  # fmt: skip
+    entry = {
+        "mediaType": manifest.get("mediaType", MEDIA_MANIFEST),
+        "digest": digest,
+        "size": manifest_file.stat().st_size,
+        "annotations": {REF_NAME: reference},
+    }
+    index["manifests"] = sorted(
+        [m for m in index["manifests"] if m["digest"] != digest] + [entry],
+        key=lambda m: m["digest"],
     )
+    _write_atomic(cache / "index.json", canonical(index))
+    return cache
 
 
 def default_cache() -> Path:
@@ -1168,15 +1510,16 @@ def default_cache() -> Path:
     return Path(base) / "moruna" / "build"
 
 
-def build(  # noqa: PLR0913, the keywords are the command's options
-    target: Any,
+def default_pulled() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "moruna" / "images"
+
+
+def options(  # noqa: PLR0913, the keywords are the command's options
     *,
-    name: str | None = None,
-    out: str | os.PathLike[str] = "moruna-image",
-    tag: str | None = None,
+    out: str | os.PathLike[str] = "moruna-images",
     platform: str | None = None,
     lock: str | os.PathLike[str] | None = None,
-    files: Iterable[str | os.PathLike[str]] = (),
     runtime_layout: str | os.PathLike[str] | None = None,
     runtime_reference: str | None = None,
     cache: str | os.PathLike[str] | None = None,
@@ -1184,13 +1527,10 @@ def build(  # noqa: PLR0913, the keywords are the command's options
     find_links: Iterable[str] = (),
     no_index: bool = False,
     version: str | None = None,
-) -> Built:
-    """Build the function ``target`` (a decorated function, a function or a stateful instance
-    bound to a name of the module that defines it; ``name`` says which when the module binds it
-    twice) as an image: see ``build_image``. The keywords are ``moruna build``'s options."""
-    function = dataclasses.replace(
-        function_of(target, name), files=tuple(Path(f).resolve() for f in files)
-    )
+    registry: str | None = None,
+    credential: Credential | None = None,
+) -> Options:
+    """A build's options from its keywords (``job.build`` and ``moruna build``)."""
     chosen = parse_platform(platform)
     runtime = None
     if runtime_layout is not None:
@@ -1204,97 +1544,65 @@ def build(  # noqa: PLR0913, the keywords are the command's options
         uv_options += ["--find-links", link]
     if no_index:
         uv_options.append("--no-index")
-    return build_image(
-        function,
-        Options(
-            out=Path(out).absolute(),
-            platform=chosen,
-            cache=Path(cache) if cache else default_cache(),
-            tag=tag,
-            lock=Path(lock) if lock else None,
-            runtime=runtime,
-            uv_options=tuple(uv_options),
-            version=version,
-        ),
+    if registry is not None:
+        split_registry(registry)
+    return Options(
+        out=Path(out).absolute(),
+        platform=chosen,
+        cache=Path(cache) if cache else default_cache(),
+        lock=Path(lock) if lock else None,
+        runtime=runtime,
+        uv_options=tuple(uv_options),
+        version=version,
+        registry=registry,
+        credential=credential,
     )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="moruna build",
-        description="Build a Python function as an OCI image of four layers (runtime, locked "
-        "dependencies, shim, function) that the image kind runs.",
+        description="Build one OCI image per task of a job, and write the job's runnable spec.",
     )
     add = parser.add_argument
-    add("function", help="<module>:<function>; the module is a dotted name or a .py path")
-    add("--out", default="moruna-image", help="the OCI layout directory (default: moruna-image)")
-    add("--tag", help="the image's name in the layout (default: <function>:latest)")
+    add("job", help="a job's spec (JOB.mjob), or <module>:<attribute> naming a moruna.Job")
+    add("--out", default="moruna-images", help="the OCI layout (default: moruna-images)")
+    add("--registry", help="HOST/REPOSITORY to push every image to")
     add("--platform", help="linux/aarch64 or linux/x86_64 (default: this Linux's, or aarch64)")
-    add("--lock", help="uv.lock or requirements.lock (default: the nearest above the module)")
-    add("--file", action="append", default=[], help="a file the function names; repeatable")
+    add("--spec", help="where the runnable spec goes (default: JOB.mjob, or <attribute>.mjob)")
+    add("--lock", help="uv.lock or requirements.lock (default: the nearest above the code)")
+    add("--file", action="append", default=[], help="a data file every task reads; repeatable")
+    add("--resolver", help="MODULE:ATTRIBUTE of the resolver that supplies registry credentials")
     add("--runtime-layout", help="an OCI layout holding the runtime, in place of python:3.14-slim")
     add("--runtime-reference", help="the image of --runtime-layout: a digest or a name")
-    add("--cache", help="where the runtime's blobs are kept (default: ~/.cache/moruna/build)")
+    add("--cache", help="where the build keeps what it reuses (default: ~/.cache/moruna/build)")
     add("--index-url", help="passed to uv pip install")
     add("--find-links", action="append", default=[], help="passed to uv pip install")
     add("--no-index", action="store_true", help="passed to uv pip install")
-    add("--json", action="store_true", help="print the report as JSON")
+    add("--json", action="store_true", help="print what was built as JSON")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``moruna build <module>:<function>``: the exit status, 2 for a refusal."""
+    """``moruna build JOB``: the exit status, 2 for a refusal."""
     args = _parser().parse_args(argv)
-    module_name, _, name = args.function.partition(":")
-    if not module_name or not name:
-        print(
-            f"moruna build: {args.function}: name the function as <module>:<function>", file=sys.stderr
-        )
-        return EXIT_REFUSED
-    from moruna import _check, _core  # noqa: PLC0415, only the engine's package loads a module
+    from moruna import _job  # noqa: PLC0415, the command needs the engine to read a job
 
     try:
-        try:
-            module = _check._load(module_name)
-        except Exception as exc:  # noqa: BLE001, a module that does not load is a refusal
-            raise Refused(f"{module_name}: {type(exc).__name__}: {exc}") from exc
-        if not hasattr(module, name):
-            raise Refused(f"{module_name} has no {name}")
-        built = build(
-            getattr(module, name),
-            name=name,
-            out=args.out,
-            tag=args.tag,
-            platform=args.platform,
-            lock=args.lock,
-            files=args.file,
-            runtime_layout=args.runtime_layout,
-            runtime_reference=args.runtime_reference,
-            cache=args.cache,
-            index_url=args.index_url,
-            find_links=args.find_links,
-            no_index=args.no_index,
-            version=_core.__version__,
-        )
+        status = _job.build_command(args)
     except Refused as exc:
         print(f"moruna build: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     if args.json:
-        print(json.dumps(built.report(), indent=2))
+        print(json.dumps(status, indent=2))
     else:
-        print_report(built)
+        for row in status["tasks"]:
+            print(
+                f"{row['task']:<16} {row['state']:<9} {row['build_key']} "
+                f"{row.get('digest') or '-'} {row.get('location') or '-'}"
+            )
+        print(f"spec      {status['spec']} {status['job_digest']}")
     return EXIT_DONE
-
-
-def print_report(built: Built) -> None:
-    """The image's digest and each layer's digest and size, one line each."""
-    print(f"image     {built.digest}")
-    print(f"reference {built.reference}")
-    print(f"layout    {built.layout}")
-    print(f"platform  {built.platform.name}")
-    print(f"lock      {built.lock}")
-    for position, layer in enumerate(built.layers, 1):
-        print(f"layer {position}   {layer.role:<12} {layer.blob.digest} {layer.blob.size}")
 
 
 if __name__ == "__main__":

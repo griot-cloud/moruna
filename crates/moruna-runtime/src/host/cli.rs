@@ -17,7 +17,7 @@ use crate::kinds::Registry;
 use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
-pub const USAGE: &str = "usage: moruna run <spec.json> [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
+pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory>
        moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna kinds [--kinds <kinds.json>]...
@@ -102,6 +102,8 @@ pub enum Command {
         /// Print every event of the run to standard output as a line of JSON, rendered from its
         /// record (MH 4.3 version 7).
         events_json: bool,
+        /// The run's arguments, `--arg NAME=VALUE` each, read by the types the job declares.
+        args: Vec<(String, String)>,
     },
     /// `moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory> [--plan <plan>]`:
     /// boot the checked native node, send the document/plan, relay actual events,
@@ -181,11 +183,24 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             let mut image = None;
             let mut witness = None;
             let mut packages = PackageHost::default();
+            let mut args: Vec<(String, String)> = Vec::new();
             while let Some(arg) = rest.next() {
                 if sandbox_option(arg, &mut rest, &mut packages, "moruna run")? {
                     continue;
                 }
                 match arg {
+                    "--arg" => {
+                        let given = rest
+                            .next()
+                            .ok_or_else(|| "moruna run: --arg needs NAME=VALUE".to_string())?;
+                        let (name, value) = given.split_once('=').ok_or_else(|| {
+                            format!("moruna run: --arg {given}: an argument is NAME=VALUE")
+                        })?;
+                        if args.iter().any(|(n, _)| n == name) {
+                            return Err(format!("moruna run: --arg {name} is given twice"));
+                        }
+                        args.push((name.to_string(), value.to_string()));
+                    }
                     "--strict" => strict = true,
                     "--events-json" => events_json = true,
                     "--vm" => vm = true,
@@ -236,6 +251,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                     strict,
                     packages,
                     events_json,
+                    args,
                 });
             }
             if events_json {
@@ -594,6 +610,7 @@ fn main_as(
             strict,
             packages,
             events_json,
+            args,
         } => {
             let events = if events_json {
                 match events_stream() {
@@ -624,6 +641,8 @@ fn main_as(
                     packages,
                     capture_process,
                     events,
+                    args,
+                    pulled_images: pulled_images(),
                 },
             )
         }
@@ -643,6 +662,8 @@ fn main_as(
                 packages,
                 capture_process,
                 events: EventOptions::default(),
+                args: Vec::new(),
+                pulled_images: pulled_images(),
             },
         ),
     };
@@ -1081,6 +1102,7 @@ mod tests {
                 strict: false,
                 packages: PackageHost::default(),
                 events_json: false,
+                args: Vec::new(),
             })
         );
         assert_eq!(
@@ -1091,6 +1113,7 @@ mod tests {
                 strict: true,
                 packages: PackageHost::default(),
                 events_json: false,
+                args: Vec::new(),
             })
         );
         assert_eq!(
@@ -1101,6 +1124,7 @@ mod tests {
                 strict: false,
                 packages: PackageHost::default(),
                 events_json: true,
+                args: Vec::new(),
             })
         );
         assert!(
@@ -1151,6 +1175,7 @@ mod tests {
                 strict: false,
                 packages: host.clone(),
                 events_json: false,
+                args: Vec::new(),
             })
         );
         assert_eq!(
@@ -1405,4 +1430,15 @@ mod historical_cost_options_tests {
             Command::TaskOutput { chunk: Some(0), .. }
         ));
     }
+}
+
+/// Where the package's `moruna run` pulls a job's registry images to before it starts
+/// (`$XDG_CACHE_HOME/moruna/images`, else `~/.cache/moruna/images`), when it is there.
+pub fn pulled_images() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("moruna").join("images");
+    dir.join("oci-layout").is_file().then_some(dir)
 }

@@ -83,8 +83,8 @@ pub use policy::{
     SchedulingPolicies, SchedulingPolicy, Spread, StageView, is_policy_name,
 };
 pub use ports::{
-    Abandon, Answer, CallFailure, GuestCall, GuestPort, GuestRoute, Port, PortCall, Route,
-    RunPorts, StagePorts, StageWaits,
+    Abandon, Answer, CallFailure, GuestCall, GuestPort, GuestRoute, Port, PortCall, PortStats,
+    Route, RunPorts, StagePorts, StageWaits,
 };
 pub use reactor::{CopyDst, CopySrc, IoPaths, ObjectMeta, ObjectMetadata, Reactor};
 pub use sink::{ExcludedRows, Sink, SinkCommit, SinkSummary, SinkWrite};

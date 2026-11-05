@@ -468,6 +468,27 @@ pub struct StageReport {
     /// What the stage's kernel asked for, per source (f.2; E13); `None` when no record of the
     /// stage was measured.
     pub alloc: Option<crate::alloc::StageAlloc>,
+    /// When its first record started, in nanoseconds after the run started; `None` with no
+    /// record.
+    pub started_ns: Option<u64>,
+    /// When its last record ended, likewise.
+    pub ended_ns: Option<u64>,
+    /// The CPU time its records measured, in core-seconds.
+    pub cpu_core_s: f64,
+    /// The most memory one of its records added while it ran, in bytes: what the stage holds
+    /// beyond what it was given, at its height.
+    pub peak_memory_bytes: u64,
+    /// How many instances ran its records.
+    pub instances: u32,
+    /// Records that gave rows.
+    pub morsels_out: u64,
+    /// Seconds its instances waited between records for their next input to be ready, summed
+    /// over instances: from the end of a record to the end of the upstream record of the next
+    /// morsel, when that came later. `None` with fewer than two records on an instance.
+    pub input_wait_s: Option<f64>,
+    /// Seconds its instances waited between records with their next input ready (held back by
+    /// memory admission or a full queue downstream), summed over instances.
+    pub output_wait_s: Option<f64>,
 }
 
 /// What the user reads and what S1 to S4 are measured from (d.1). Pure in the trace, the
@@ -680,6 +701,12 @@ struct StageAcc {
     /// record's order key so the walk is independent of the order the chunks are read in.
     state: BTreeMap<u16, StateSpan>,
     alloc: crate::alloc::AllocAcc,
+    cpu_us: u64,
+    peak_delta: u64,
+    instances: std::collections::BTreeSet<u16>,
+    morsels_out: u64,
+    /// `(instance, start, end, seq)` of every record, for the waits.
+    spans: Vec<(u16, u64, u64, moruna_kernel::Seq)>,
 }
 
 impl StageAcc {
@@ -709,6 +736,16 @@ impl StageAcc {
         }
         self.state_max = self.state_max.max(r.state_bytes);
         self.alloc.add(r);
+        self.cpu_us += r.cpu_time_us;
+        self.peak_delta = self
+            .peak_delta
+            .max(r.mem_anon_peak.saturating_sub(r.mem_anon_before));
+        self.instances.insert(r.instance);
+        if r.rows_out > 0 {
+            self.morsels_out += 1;
+        }
+        self.spans
+            .push((r.instance, r.t_start_ns, r.t_end_ns, r.seq));
         let key = (r.t_start_ns, r.seq);
         let entry = self.state.entry(r.instance).or_default();
         if r.state_bytes > 0 && entry.0.is_none_or(|(k, _)| key < k) {
@@ -719,7 +756,53 @@ impl StageAcc {
         }
     }
 
-    fn finish(self, stage: StageId) -> StageReport {
+    /// Its waits: for consecutive records of one instance, the gap between them, the part
+    /// before the next morsel's input was ready (the latest end of an earlier stage's record of
+    /// that morsel that ended before this one started) as waiting on input, the rest as waiting
+    /// to go on. `ends` is every record's end, by stage and morsel.
+    fn waits(
+        &self,
+        stage: StageId,
+        ends: &BTreeMap<(moruna_kernel::Seq, StageId), u64>,
+    ) -> (Option<f64>, Option<f64>) {
+        let mut spans = self.spans.clone();
+        spans.sort_unstable();
+        let (mut input, mut output, mut gaps) = (0u64, 0u64, 0u64);
+        for pair in spans.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a.0 != b.0 {
+                continue;
+            }
+            gaps += 1;
+            let free = a.2;
+            let start = b.1.max(free);
+            let ready = ends
+                .range((b.3, 0)..(b.3, stage))
+                .map(|(_, &end)| end)
+                .filter(|&end| end <= b.1)
+                .max();
+            match ready {
+                Some(ready) if ready > free => {
+                    input += ready.min(start) - free;
+                    output += start - ready.min(start);
+                }
+                Some(_) => output += start - free,
+                None => input += start - free,
+            }
+        }
+        if gaps == 0 {
+            return (None, None);
+        }
+        (Some(input as f64 / 1e9), Some(output as f64 / 1e9))
+    }
+
+    fn finish(
+        self,
+        stage: StageId,
+        run_start: u64,
+        ends: &BTreeMap<(moruna_kernel::Seq, StageId), u64>,
+    ) -> StageReport {
+        let (input_wait_s, output_wait_s) = self.waits(stage, ends);
         let wall_s = match self.t_min {
             Some(t) => (self.t_max.saturating_sub(t)) as f64 / 1e9,
             None => 0.0,
@@ -755,6 +838,14 @@ impl StageAcc {
             state_bytes_max: self.state_max,
             state_growth: growth,
             alloc: self.alloc.finish(),
+            started_ns: self.t_min.map(|t| t.saturating_sub(run_start)),
+            ended_ns: self.t_min.map(|_| self.t_max.saturating_sub(run_start)),
+            cpu_core_s: self.cpu_us as f64 / 1e6,
+            peak_memory_bytes: self.peak_delta,
+            instances: self.instances.len() as u32,
+            morsels_out: self.morsels_out,
+            input_wait_s,
+            output_wait_s,
         }
     }
 }
@@ -806,9 +897,17 @@ impl RunReport {
         }
 
         let wall_s = (meta.end_ns.saturating_sub(meta.start_ns)) as f64 / 1e9;
+        let ends: BTreeMap<(moruna_kernel::Seq, StageId), u64> = stages
+            .iter()
+            .flat_map(|(&stage, acc)| {
+                acc.spans
+                    .iter()
+                    .map(move |&(_, _, end, seq)| ((seq, stage), end))
+            })
+            .collect();
         let stage_reports: Vec<StageReport> = stages
             .into_iter()
-            .map(|(stage, acc)| acc.finish(stage))
+            .map(|(stage, acc)| acc.finish(stage, meta.start_ns, &ends))
             .collect();
 
         let busy_total: f64 = stage_reports.iter().map(|s| s.kernel_busy_s).sum();

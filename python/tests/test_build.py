@@ -1,4 +1,5 @@
-"""BD-T7 to BD-T24 (SDD 30 k): the builder, with no engine built and no network.
+"""BD-T7 to BD-T32 (SDD 30 k): the builder, with no engine built and no network; 0.6.3's one
+image per task, a layer per distribution, provenance, reuse by build key, push and pull.
 
 ``uv`` installs hand-made wheels from a directory for a platform other than this machine's, a
 tiny OCI layout stands in for ``python:3.14-slim`` and a fake registry serves the real code path
@@ -8,6 +9,7 @@ time.
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import hashlib
 import http.server
@@ -29,6 +31,7 @@ import builder_support as support
 import pytest
 
 build = support.load("_build.py", "moruna_build")
+closure = support.load("_closure.py", "moruna_closure")
 
 AARCH64 = "linux/aarch64"
 X86_64 = "linux/x86_64"
@@ -47,16 +50,46 @@ class Project:
         """``<name>.py`` of the project, loaded by path."""
         return support.load_path(self.root / f"{name}.py", name)
 
+    def task(
+        self, name: str, attribute: str = "add", files: tuple[Path, ...] = (),
+        platform: str = AARCH64, task: str | None = None, lock: Path | None = None,
+    ) -> Any:
+        """The build's task for ``<name>.py:<attribute>`` of the project, keyed as a spec keys
+        it."""
+        module = name.replace("/", ".").removesuffix(".py")
+        source = self.root / f"{name.replace('.', '/')}.py"
+        if not source.is_file():
+            source = self.root / name.replace(".", "/") / "__init__.py"
+        code = closure.closure(module, source, list(files))
+        entry = f"{module}:{attribute}"
+        try:
+            found = build.find_lock(code.root, lock)
+            lock_digest = build.lock_digest(found)
+        except build.Refused:
+            lock_digest = None
+        runtime = build.read_runtime_layout(
+            self.runtimes[platform], "python-test", build.parse_platform(platform)
+        )
+        key = closure.build_key(
+            code, entry, lock=lock_digest, runtime=runtime.digest, shim=build.shim_digest(),
+            platform=build.parse_platform(platform).name,
+        )  # fmt: skip
+        return build.Task(
+            name=task or name, entry=entry, code=code, key=key,
+            distributions=closure.distributions(code.imports), provenance={},
+        )  # fmt: skip
+
     def kernel(self, name: str) -> Any:
-        """The function ``add`` of ``<name>.py`` in the project."""
-        return self.module(name).add
+        """The task of the function ``add`` of ``<name>.py`` in the project."""
+        return self.task(name)
 
     def build(self, target: Any, out: Path | None = None, **options: Any) -> Any:
+        """Build ``target`` (a task, or a list of them); the image built, or the list."""
         platform = options.pop("platform", AARCH64)
         options.setdefault("runtime_layout", self.runtimes[platform])
         options.setdefault("runtime_reference", "python-test")
-        return build.build(
-            target,
+        transport = options.pop("transport", None)
+        made = build.options(
             out=out or self.scratch / "image",
             platform=platform,
             no_index=True,
@@ -65,6 +98,11 @@ class Project:
             version="test",
             **options,
         )
+        if transport is not None:
+            made = dataclasses.replace(made, transport=transport)
+        tasks = target if isinstance(target, list) else [target]
+        built = build.build_images(tasks, made)
+        return built if isinstance(target, list) else built[0]
 
     def write_lock(self, *lines: str, name: str = "requirements.lock") -> Path:
         path = self.root / name
@@ -144,8 +182,7 @@ def test_bd_t7_the_nearest_lock_above_the_module_is_the_one(project: Project) ->
     sub = project.root / "deep" / "er"
     sub.mkdir(parents=True)
     (sub / "kernel_c.py").write_text("def add(batch):\n    return batch\n")
-    module = support.load_path(sub / "kernel_c.py", "kernel_c")
-    built = project.build(module.add)
+    built = project.build(project.task("deep.er.kernel_c"))
     assert built.lock == (project.root / "requirements.lock").resolve()
 
 
@@ -200,93 +237,6 @@ def test_bd_t9_pyarrow_is_in_every_image(project: Project) -> None:
         build.with_pyarrow([build.Pin("pyarrow", "16.0.0", ("e" * 64,))], "x.lock")
 
 
-def test_bd_t9_pyarrow_is_installed_in_layer_two(project: Project, tmp_path: Path) -> None:
-    built = project.build(project.kernel("kernel_a"))
-    tree = tmp_path / "root"
-    unpack(built, tree)
-    site = tree / "opt" / "moruna" / "site-packages"
-    assert (site / "pyarrow" / "native.so").read_bytes() == b"pyarrow for aarch64"
-    assert (site / "leafdep" / "data.txt").read_bytes() == b"leaf"
-
-
-def test_bd_t10_the_image_is_what_the_kind_reads(project: Project, tmp_path: Path) -> None:
-    """BD-T10 the_layout_is_an_image: the OCI layout KA1 reads, every blob under its digest, a
-    config whose command is the shim, layers 2 to 4 where the shim and the kernel expect them."""
-    built = project.build(project.kernel("kernel_a"), tag="adder:1")
-    layout = built.layout
-    assert json.loads((layout / "oci-layout").read_text()) == {"imageLayoutVersion": "1.0.0"}
-    index = json.loads((layout / "index.json").read_text())
-    [entry] = index["manifests"]
-    assert (
-        entry["digest"]
-        == built.digest
-        == f"sha256:{hashlib.sha256(blob(layout, built.digest)).hexdigest()}"
-    )
-    assert entry["annotations"] == {"org.opencontainers.image.ref.name": "adder:1"}
-    for path in (layout / "blobs" / "sha256").iterdir():
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == path.name, "named by its bytes"
-
-    manifest = manifest_of(built)
-    assert manifest["mediaType"] == "application/vnd.oci.image.manifest.v1+json"
-    assert [layer.role for layer in built.layers] == ["runtime", "dependencies", "shim", "function"]
-    assert [m["mediaType"] for m in manifest["layers"]] == [
-        "application/vnd.oci.image.layer.v1.tar+gzip",
-        "application/vnd.oci.image.layer.v1.tar",
-        "application/vnd.oci.image.layer.v1.tar",
-        "application/vnd.oci.image.layer.v1.tar",
-    ]
-    for described, layer in zip(manifest["layers"], built.layers, strict=True):
-        assert described["digest"] == layer.blob.digest and described["size"] == layer.blob.size
-        assert len(blob(layout, layer.blob.digest)) == layer.blob.size
-    # A layer 2 to 4 digest is its tar's sha256, and is its diff id.
-    for layer in built.layers[1:]:
-        assert (
-            layer.blob.digest
-            == f"sha256:{hashlib.sha256(blob(layout, layer.blob.digest)).hexdigest()}"
-        )
-
-    config = json.loads(blob(layout, manifest["config"]["digest"]))
-    assert (config["os"], config["architecture"]) == ("linux", "arm64")
-    assert config["config"]["Cmd"] == [
-        "/usr/local/bin/python3",
-        "/opt/moruna/shim.py",
-        "--workdir",
-        "/app",
-        "kernel_a:add",
-    ]
-    assert "Entrypoint" not in config["config"]
-    assert config["config"]["WorkingDir"] == "/"
-    env = dict(e.split("=", 1) for e in config["config"]["Env"])
-    assert env["PATH"] == "/usr/local/bin:/usr/bin" and env["LANG"] == "C.UTF-8", "the runtime's"
-    assert env["PYTHONPATH"] == "/app:/opt/moruna/site-packages"
-    labels = config["config"]["Labels"]
-    assert labels["org.moruna.entry"] == "kernel_a:add"
-    assert labels["org.moruna.version"] == "test"
-    assert labels["org.opencontainers.image.base.digest"].startswith("sha256:")
-    diff_ids = config["rootfs"]["diff_ids"]
-    assert diff_ids[1:] == digests(built)[1:]
-    assert (
-        diff_ids[0]
-        == f"sha256:{hashlib.sha256(tar_bytes(blob(layout, digests(built)[0]))).hexdigest()}"
-    )
-
-    root = tmp_path / "root"
-    unpack(built, root)
-    assert (root / "usr/local/bin/python3").is_file(), "layer 1"
-    assert (root / "opt/moruna/shim.py").read_text() == (support.PACKAGE / "_shim.py").read_text()
-    assert (root / "opt/moruna/moruna/__init__.py").is_file()
-    assert (root / "opt/moruna/moruna/_declare.py").read_text() == (
-        support.PACKAGE / "_declare.py"
-    ).read_text()
-    assert (root / "app/kernel_a.py").read_text() == "def add(batch):\n    return batch\n"
-    leftovers = [
-        p
-        for p in (root / "opt/moruna/site-packages").rglob("*")
-        if p.name in ("uv_cache.json", ".lock")
-    ]
-    assert leftovers == []
-    record = (root / "opt/moruna/site-packages/leafdep-1.0.dist-info/RECORD").read_text()
-    assert "uv_cache" not in record
 
 
 def test_bd_t11_the_same_inputs_are_the_same_image(project: Project, tmp_path: Path) -> None:
@@ -315,48 +265,6 @@ def test_bd_t11_the_same_inputs_are_the_same_image(project: Project, tmp_path: P
         assert blob(first.layout, layer.blob.digest) == blob(second.layout, layer.blob.digest)
 
 
-def test_bd_t12_functions_of_one_lock_differ_in_layer_four_only(project: Project) -> None:
-    """BD-T12 shared_layers: two functions of one project share layers 1 to 3 and the layout
-    holds them once; each has its own layer 4."""
-    out = project.scratch / "shared"
-    one = project.build(project.kernel("kernel_a"), out=out, tag="a:1")
-    two = project.build(project.kernel("kernel_b"), out=out, tag="b:1")
-    assert digests(one)[:3] == digests(two)[:3]
-    assert digests(one)[3] != digests(two)[3]
-    assert one.digest != two.digest
-    blobs = {p.name for p in (out / "blobs" / "sha256").iterdir()}
-    # Five layers (the runtime's, dependencies, shim, two functions), two configs, two manifests.
-    assert len(blobs) == 9
-    refs = [
-        m["annotations"]["org.opencontainers.image.ref.name"]
-        for m in json.loads((out / "index.json").read_text())["manifests"]
-    ]
-    assert refs == ["a:1", "b:1"]
-    again = project.build(project.kernel("kernel_a"), out=out, tag="a:1")
-    assert again.digest == one.digest, "a name rebuilt is the same image"
-    assert {p.name for p in (out / "blobs" / "sha256").iterdir()} == blobs, "and writes nothing new"
-    refs = [
-        m["annotations"]["org.opencontainers.image.ref.name"]
-        for m in json.loads((out / "index.json").read_text())["manifests"]
-    ]
-    assert refs == ["a:1", "b:1"], "one entry for each name"
-
-
-def test_bd_t13_a_new_lock_is_a_new_layer_two_and_nothing_else(project: Project) -> None:
-    """BD-T13 a_dependency_change_rebuilds_two: layers 1, 3 and 4 are unchanged."""
-    before = project.build(project.kernel("kernel_a"), out=project.scratch / "before")
-    newer = support.make_wheel(project.wheels, "leafdep", "1.1", {"data.txt": b"newer"})
-    old = project.root / "requirements.lock"
-    text = old.read_text().replace(
-        support.lock_line("leafdep", "1.0", [project.wheels / "leafdep-1.0-py3-none-any.whl"]),
-        support.lock_line("leafdep", "1.1", [newer]),
-    )
-    assert text != old.read_text()
-    old.write_text(text)
-    after = project.build(project.kernel("kernel_a"), out=project.scratch / "after")
-    one, two = digests(before), digests(after)
-    assert (one[0], one[2], one[3]) == (two[0], two[2], two[3])
-    assert one[1] != two[1]
 
 
 def test_bd_t14_each_platform_gets_its_own_wheels(project: Project, tmp_path: Path) -> None:
@@ -554,65 +462,7 @@ def test_bd_t16_a_path_made_twice_and_a_file_that_is_no_file_are_refused(tmp_pat
         list(build.tree_entries(tmp_path, "x"))
 
 
-def test_bd_t17_the_function_layer_holds_its_file_its_packages_and_the_files_it_names(
-    tmp_path: Path,
-) -> None:
-    """BD-T17 layer_four: the defining module at its import path under /app, the __init__.py
-    of every package above it, the files named below the import root; /app always."""
-    root = (tmp_path / "src").resolve()
-    (root / "pkg" / "sub").mkdir(parents=True)
-    (root / "pkg" / "__init__.py").write_text("")
-    (root / "pkg" / "sub" / "__init__.py").write_text("")
-    (root / "pkg" / "sub" / "mod.py").write_text("def f(b):\n    return b\n")
-    (root / "pkg" / "other.py").write_text("")
-    (root / "model.bin").write_bytes(b"weights")
-    function = build.Function(
-        "pkg.sub.mod", "f", root / "pkg" / "sub" / "mod.py", (root / "model.bin",)
-    )
-    assert function.root == root.resolve()
-    assert sorted(build.function_files(function)) == [
-        "app/model.bin",
-        "app/pkg/__init__.py",
-        "app/pkg/sub/__init__.py",
-        "app/pkg/sub/mod.py",
-    ]
-    (root / "kernel.py").write_text("")
-    top = build.Function("kernel", "f", root / "kernel.py")
-    assert top.root == root.resolve()
-    assert sorted(build.function_files(top)) == ["app/kernel.py"]
-    package = build.Function("pkg.sub", "f", root / "pkg" / "sub" / "__init__.py")
-    assert package.root == root.resolve()
-    assert sorted(build.function_files(package)) == [
-        "app/pkg/__init__.py",
-        "app/pkg/sub/__init__.py",
-    ]
-    staged = tmp_path / "staged"
-    build.stage_function(top, staged)
-    assert [p.name for p in staged.iterdir()] == ["kernel.py"]
-    empty = tmp_path / "empty"
-    build.stage_function(build.Function("kernel", "f", root / "kernel.py"), empty)
-    assert empty.is_dir(), "/app exists"
 
-
-def test_bd_t17_a_named_file_outside_the_import_root_or_missing_is_refused(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "k.py").write_text("")
-    (tmp_path / "elsewhere.txt").write_text("x")
-    outside = build.Function("k", "f", tmp_path / "src" / "k.py", (tmp_path / "elsewhere.txt",))
-    with pytest.raises(build.Refused, match="not under"):
-        build.function_files(outside)
-    missing = build.Function("k", "f", tmp_path / "src" / "k.py", (tmp_path / "src" / "gone",))
-    with pytest.raises(build.Refused, match="no such file"):
-        build.function_files(missing)
-
-
-def test_bd_t17_files_the_kernel_names_travel_with_it(project: Project, tmp_path: Path) -> None:
-    (project.root / "weights.bin").write_bytes(b"w")
-    built = project.build(project.kernel("kernel_a"), files=[project.root / "weights.bin"])
-    unpack(built, tmp_path / "root")
-    assert (tmp_path / "root/app/weights.bin").read_bytes() == b"w"
-    bare = project.build(project.kernel("kernel_a"), out=project.scratch / "bare")
-    assert digests(bare)[3] != digests(built)[3] and digests(bare)[:3] == digests(built)[:3]
 
 
 def test_bd_t18_a_directory_that_is_not_a_layout_is_not_written_into(project: Project) -> None:
@@ -645,84 +495,11 @@ def test_bd_t19_the_runtime_layout_is_checked_against_its_names(project: Project
     with pytest.raises(build.Refused, match="has 0 images of that name"):
         project.build(project.kernel("kernel_a"), runtime_reference="nope")
     with pytest.raises(build.Refused, match="needs runtime_reference"):
-        build.build(project.kernel("kernel_a"), runtime_layout=layout)
+        build.options(runtime_layout=layout, platform=AARCH64)
 
 
-def test_bd_t19_the_kernel_a_build_is_asked_for(project: Project) -> None:
-    """BD-T19 function_of: a kernel is found in the module that defines it, by the name the
-    module binds it to."""
-    module = project.module("kernel_a")
-    function = build.function_of(module.add)
-    assert (function.module, function.name, function.source) == (
-        "kernel_a",
-        "add",
-        project.root / "kernel_a.py",
-    )
-    assert function.entry == "kernel_a:add"
-
-    class Spec:
-        """What a decorated kernel is to the builder: a wrapped callable, a fingerprint."""
-
-        wrapped = module.add
-        stateful = True
-        fingerprint = "sha256:abc"
-
-    module.decorated = Spec()
-    found = build.function_of(module.decorated)
-    assert (found.name, found.fingerprint, found.stateful) == ("decorated", "sha256:abc", True)
-    with pytest.raises(build.Refused, match="does not bind the function to a name"):
-        build.function_of(Spec())
-    built = project.build(module.decorated)
-    labels = json.loads(blob(built.layout, manifest_of(built)["config"]["digest"]))["config"][
-        "Labels"
-    ]
-    assert (labels["org.moruna.fingerprint"], labels["org.moruna.stateful"]) == (
-        "sha256:abc",
-        "true",
-    )
 
 
-def test_bd_t19_a_function_in_a_package_is_imported_as_one(
-    project: Project, tmp_path: Path
-) -> None:
-    pkg = project.root / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("")
-    (pkg / "mod.py").write_text("def add(b):\n    return b\n")
-    module = support.load_path(pkg / "mod.py", "pkg.mod")
-    built = project.build(module.add)
-    config = json.loads(blob(built.layout, manifest_of(built)["config"]["digest"]))
-    assert config["config"]["Cmd"][-1] == "pkg.mod:add"
-    unpack(built, tmp_path / "root")
-    assert (tmp_path / "root/app/pkg/mod.py").is_file() and (
-        tmp_path / "root/app/pkg/__init__.py"
-    ).is_file()
-
-
-def test_bd_t20_the_report_prints_the_image_and_each_layer(
-    project: Project, capsys: pytest.CaptureFixture[str]
-) -> None:
-    built = project.build(project.kernel("kernel_a"))
-    build.print_report(built)
-    text = capsys.readouterr().out
-    assert f"image     {built.digest}" in text
-    for position, layer in enumerate(built.layers, 1):
-        assert f"layer {position}" in text and f"{layer.blob.digest} {layer.blob.size}" in text
-    report = built.report()
-    assert report["image"] == built.digest and len(report["layers"]) == 4
-    assert [layer["role"] for layer in report["layers"]] == [
-        "runtime",
-        "dependencies",
-        "shim",
-        "function",
-    ]
-
-
-def test_bd_t20_the_command_refuses_a_kernel_with_no_function(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert build.main(["not_a_kernel_name"]) == build.EXIT_REFUSED
-    assert "name the function as <module>:<function>" in capsys.readouterr().err
 
 
 def test_bd_t21_the_wheels_and_bytecode_are_made_by_the_runtimes_cpython(
@@ -783,55 +560,6 @@ def test_bd_t21_the_runtimes_bytecode_is_read_from_the_image(
         with pytest.raises(build.Refused, match=said):
             build.runtime_bytecode(runtime)
 
-
-def test_bd_t30_layers_two_to_four_carry_bytecode_the_runtime_uses(
-    project: Project, tmp_path: Path
-) -> None:
-    """BD-T30 bytecode_is_shipped: every importable source of layers 2 to 4 has its .pyc beside
-    it for the runtime's interpreter, hash based and unchecked (used whatever the source's time),
-    valid for the source it sits by, naming the path the image has; a .pyc a wheel shipped is
-    not in the layer; the shim script, which Python never caches, has none."""
-    support.make_wheel(
-        project.wheels,
-        "leafdep",
-        "1.2",
-        {"data.txt": b"leaf", "__pycache__/old.cpython-312.pyc": b"another python's"},
-    )
-    leaf = project.wheels / "leafdep-1.2-py3-none-any.whl"
-    old = project.root / "requirements.lock"
-    text = old.read_text().replace(
-        support.lock_line("leafdep", "1.0", [project.wheels / "leafdep-1.0-py3-none-any.whl"]),
-        support.lock_line("leafdep", "1.2", [leaf]),
-    )
-    old.write_text(text)
-    built = project.build(project.kernel("kernel_a"))
-    root = tmp_path / "root"
-    unpack(built, root)
-    tag = sys.implementation.cache_tag
-    checked = 0
-    for source in sorted(root.rglob("*.py")):
-        relative = source.relative_to(root)
-        pyc = source.parent / "__pycache__" / f"{source.stem}.{tag}.pyc"
-        if relative.as_posix() == "opt/moruna/shim.py":
-            assert not pyc.exists(), "a script is compiled at every run and never cached"
-            continue
-        if relative.parts[:2] == ("opt", "moruna") and relative.parts[2] == "site-packages":
-            pass
-        elif relative.parts[0] not in ("opt", "app"):
-            continue
-        data = pyc.read_bytes()
-        assert int.from_bytes(data[:2], "little") == support.this_magic()
-        assert int.from_bytes(data[4:8], "little") == 0b01, "hash based, not checked"
-        assert data[8:16] == importlib.util.source_hash(source.read_bytes())
-        assert marshal.loads(data[16:]).co_filename == "/" + relative.as_posix()
-        checked += 1
-    assert checked >= 5  # leafdep, pyarrow, the stand-in's two, the kernel
-    site = root / "opt/moruna/site-packages"
-    assert sorted(p.name for p in (site / "leafdep/__pycache__").iterdir()) == [
-        f"__init__.{tag}.pyc"
-    ], "the wheel's own bytecode is replaced by this one's"
-    for path in (root / "opt/moruna/moruna", root / "app"):
-        assert (path / "__pycache__").is_dir()
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyarrow") is None, reason="pyarrow")
@@ -949,7 +677,9 @@ class FakeRegistry:
         self.objects[digest] = data
         return digest
 
-    def __call__(self, url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], io.BytesIO]:
+    def __call__(
+        self, url: str, headers: dict[str, str], method: str = "GET", body: Any = None
+    ) -> tuple[int, dict[str, str], io.BytesIO]:
         self.requests.append((url, dict(headers)))
         scheme, _, rest = url.partition("://")
         host, _, path = rest.partition("/")
@@ -1031,7 +761,7 @@ def test_bd_t22_a_platform_the_index_lacks_and_a_registry_error_are_refusals(
     with pytest.raises(build.Refused, match="0 manifests for linux/aarch64"):
         build.fetch_runtime(build.PLATFORMS["aarch64"], tmp_path / "cache", registry)
 
-    def refusing(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], io.BytesIO]:
+    def refusing(url: str, headers: dict[str, str], **_: Any) -> tuple[int, dict[str, str], io.BytesIO]:
         return 404, {}, io.BytesIO(b"")
 
     with pytest.raises(build.Refused, match="the registry answered 404"):
@@ -1106,48 +836,6 @@ def command(project: Project, *extra: str, kernel: str = "kernel_a.py:add") -> l
     ]  # fmt: skip
 
 
-def test_bd_t20_the_command_builds_and_prints_the_image(
-    engine: Project, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """BD-T20 moruna_build_prints_the_image: the digest of the image and each layer's digest
-    and size, in text and as JSON, and the version of the Moruna that built it in the config."""
-    assert build.main(command(engine, "--tag", "adder:1")) == build.EXIT_DONE
-    text = capsys.readouterr().out
-    layout = engine.scratch / "image"
-    [entry] = json.loads((layout / "index.json").read_text())["manifests"]
-    assert f"image     {entry['digest']}" in text and "reference adder:1" in text
-    assert text.count("layer ") == 4
-    assert build.main([*command(engine), "--json"]) == build.EXIT_DONE
-    report = json.loads(capsys.readouterr().out)
-    assert report["moruna_build"] == 1 and report["platform"] == AARCH64
-    assert [layer["role"] for layer in report["layers"]] == [
-        "runtime",
-        "dependencies",
-        "shim",
-        "function",
-    ]
-    assert report["reference"] == "add:latest"
-    manifest = json.loads(blob(layout, report["image"]))
-    config = json.loads(blob(layout, manifest["config"]["digest"]))
-    assert config["config"]["Labels"]["org.moruna.version"] == "9.9.9"
-
-
-def test_bd_t20_the_command_refuses_in_a_sentence(
-    engine: Project, capsys: pytest.CaptureFixture[str]
-) -> None:
-    (engine.root / "requirements.lock").unlink()
-    assert build.main(command(engine)) == build.EXIT_REFUSED
-    assert "moruna build: no lock:" in capsys.readouterr().err
-    assert build.main(command(engine, kernel="kernel_a.py:missing")) == build.EXIT_REFUSED
-    assert "kernel_a.py has no missing" in capsys.readouterr().err
-    (engine.root / "broken.py").write_text("raise RuntimeError('does not load')\n")
-    assert build.main(command(engine, kernel="broken.py:f")) == build.EXIT_REFUSED
-    assert "RuntimeError: does not load" in capsys.readouterr().err
-    assert build.main(command(engine, "--platform", "linux/s390x")) == build.EXIT_REFUSED
-    assert "linux/aarch64 or linux/x86_64" in capsys.readouterr().err
-
-
-# --- the transport ----------------------------------------------------------------------------
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1193,3 +881,207 @@ def test_bd_t22_the_transport_returns_what_the_server_said_and_follows_nothing()
             build.urllib_transport(f"{base}/ok", {})
     finally:
         server.server_close()
+
+
+# ---------------------------------------------------------------------------------------------
+# 0.6.3: one image per task
+
+
+@pytest.fixture
+def pipeline(project: Project, monkeypatch: pytest.MonkeyPatch) -> Project:
+    """A project of a source and two functions sharing a package, which imports `leafdep`, and a
+    sink that imports nothing; `leafdep` mapped to its distribution as installed metadata would."""
+    (project.root / "pipeline").mkdir()
+    (project.root / "pipeline" / "__init__.py").write_text("")
+    (project.root / "pipeline" / "shared.py").write_text("import leafdep\n\ndef tag(b):\n    return b\n")
+    (project.root / "pipeline" / "tasks.py").write_text(
+        "from . import shared\n\n"
+        "class Events:\n    def plan(self):\n        return []\n\n"
+        "class Parse:\n    def __call__(self, batch):\n        return shared.tag(batch)\n\n"
+        "class Score:\n    def __call__(self, batch):\n        return shared.tag(batch)\n"
+    )
+    (project.root / "pipeline" / "sinks.py").write_text("class Store:\n    def write(self, b):\n        pass\n")
+    table = {"leafdep": ("leafdep",), "pyarrow": ("pyarrow",)}
+    monkeypatch.setattr(closure, "_distributions_of", lambda: table)
+    return project
+
+
+def layers_of(built: Any) -> list[dict[str, Any]]:
+    return manifest_of(built)["layers"]
+
+
+def test_one_image_per_task_its_layers_shared_by_content(pipeline: Project) -> None:
+    """Each task's image: the runtime's layers, one layer per distribution its code imports
+    (and pyarrow, which the shim needs), the shim, and its code. Tasks that import the same
+    distribution share its blob; tasks of one package share their code layer too."""
+    tasks = [
+        pipeline.task("pipeline.tasks", "Events", task="events"),
+        pipeline.task("pipeline.tasks", "Parse", task="parse"),
+        pipeline.task("pipeline.tasks", "Score", task="score"),
+        pipeline.task("pipeline.sinks", "Store", task="store"),
+    ]
+    assert len({t.key for t in tasks}) == 4, "the entry is part of the key"
+    built = pipeline.build(tasks)
+    roles = [layer.role for layer in built[1].layers]
+    assert roles == ["runtime", "dependency leafdep", "dependency pyarrow", "shim", "function"]
+    assert [layer.role for layer in built[3].layers] == [
+        "runtime", "dependency pyarrow", "shim", "function"
+    ], "the sink imports no distribution: it has none but the shim's"
+    digests = [[layer.blob.digest for layer in b.layers] for b in built]
+    assert digests[1][1] == digests[2][1], "leafdep's layer is one blob"
+    assert digests[1][-1] == digests[2][-1], "one package, one code layer"
+    assert digests[3][-1] != digests[1][-1]
+    assert len({b.digest for b in built}) == 4, "each entry is its own image"
+    blobs = {d for ds in digests for d in ds}
+    stored = {p.name for p in (pipeline.scratch / "image" / "blobs" / "sha256").iterdir()}
+    assert {d.split(":")[1] for d in blobs} <= stored
+    index = json.loads((pipeline.scratch / "image" / "index.json").read_bytes())
+    names = {m["annotations"][build.REF_NAME] for m in index["manifests"]}
+    assert names == {t.key for t in tasks}, "the layout names each image by its build key"
+    files = sorted(
+        name for name in tarfile.open(fileobj=io.BytesIO(blob(built[1].layout, digests[1][-1]))).getnames()
+        if name.endswith(".py")
+    )
+    assert files == ["app/pipeline/__init__.py", "app/pipeline/shared.py", "app/pipeline/tasks.py"]
+
+
+def test_the_manifest_carries_its_provenance_and_the_config_its_entry(pipeline: Project) -> None:
+    task = dataclasses.replace(
+        pipeline.task("pipeline.tasks", "Parse"),
+        provenance={"source": "https://example.com/p.git", "revision": "a" * 40, "dirty": True},
+    )
+    built = pipeline.build(task)
+    annotations = manifest_of(built)["annotations"]
+    assert annotations["org.moruna.build.key"] == task.key
+    assert annotations["org.moruna.entry"] == "pipeline.tasks:Parse"
+    assert annotations["org.opencontainers.image.source"] == "https://example.com/p.git"
+    assert annotations["org.opencontainers.image.revision"] == "a" * 40
+    assert annotations["org.moruna.source.dirty"] == "true"
+    assert annotations["org.moruna.lock.digest"].startswith("sha256:")
+    files = json.loads(annotations["org.moruna.files"])
+    assert set(files) == {"pipeline/__init__.py", "pipeline/shared.py", "pipeline/tasks.py"}
+    config = json.loads(blob(built.layout, manifest_of(built)["config"]["digest"]))
+    assert config["config"]["Entrypoint"] == [
+        "/usr/local/bin/python3", "/opt/moruna/shim.py", "--workdir", "/app"
+    ]
+    assert "MORUNA_ENTRY=pipeline.tasks:Parse" in config["config"]["Env"]
+
+
+def test_an_image_built_for_a_key_is_reused_and_a_code_edit_rebuilds_one_layer(
+    pipeline: Project,
+) -> None:
+    first = pipeline.build(pipeline.task("pipeline.tasks", "Parse"))
+    again = pipeline.build(pipeline.task("pipeline.tasks", "Parse"))
+    assert again.reused and again.digest == first.digest
+    shared = pipeline.root / "pipeline" / "shared.py"
+    shared.write_text(shared.read_text().replace("return b", "return b  # a comment"))
+    assert pipeline.task("pipeline.tasks", "Parse").key == first.key, "a comment is not code"
+    shared.write_text("import leafdep\n\ndef tag(b):\n    return b.slice(0)\n")
+    edited = pipeline.build(pipeline.task("pipeline.tasks", "Parse"))
+    assert not edited.reused and edited.key != first.key
+    before = [layer.blob.digest for layer in first.layers]
+    after = [layer.blob.digest for layer in edited.layers]
+    assert before[:-1] == after[:-1] and before[-1] != after[-1], "only the code layer changes"
+
+
+def test_a_distribution_the_lock_does_not_pin_is_refused_by_name(
+    pipeline: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = {"leafdep": ("leafdep",), "missingdep": ("missingdep",)}
+    monkeypatch.setattr(closure, "_distributions_of", lambda: table)
+    (pipeline.root / "pipeline" / "shared.py").write_text("import missingdep\n")
+    with pytest.raises(build.Refused, match="imports missingdep, which .* does not pin"):
+        pipeline.build(pipeline.task("pipeline.tasks", "Parse"))
+
+
+class RegistryServer(http.server.BaseHTTPRequestHandler):
+    """A registry of the distribution API, in memory, asking for a bearer token."""
+
+    blobs: dict[str, bytes] = {}
+    manifests: dict[str, bytes] = {}
+    uploads: dict[str, bytes] = {}
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+    def _authorised(self) -> bool:
+        if self.headers.get("Authorization") == "Bearer secret-token":
+            return True
+        self.send_response(401)
+        realm = f"http://127.0.0.1:{self.server.server_address[1]}/token"
+        self.send_header("WWW-Authenticate", f'Bearer realm="{realm}"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def _answer(self, status: int, body: bytes = b"", headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        if self._authorised():
+            digest = self.path.rsplit("/", 1)[1]
+            self._answer(200 if digest in self.blobs else 404)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._authorised():
+            return
+        kind, digest = self.path.split("/")[-2:]
+        store = self.blobs if kind == "blobs" else self.manifests
+        self._answer(200, store[digest]) if digest in store else self._answer(404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self._authorised():
+            self._answer(202, headers={"Location": "/v2/team/p/blobs/uploads/u1"})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if not self._authorised():
+            return
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        if "/blobs/uploads/" in self.path:
+            digest = self.path.split("digest=")[1].replace("%3A", ":")
+            assert "sha256:" + hashlib.sha256(body).hexdigest() == digest
+            self.blobs[digest] = body
+        else:
+            self.manifests[self.path.rsplit("/", 1)[1]] = body
+        self._answer(201)
+
+
+def test_images_are_pushed_by_digest_and_pulled_verified(pipeline: Project, tmp_path: Path) -> None:
+    """A push uploads each blob the registry lacks and the manifest, by its digest and tagged by
+    its key, with the token the resolver gives; a pull fetches every blob, checks each digest
+    and keeps the image in a layout by digest; a blob whose bytes are not its name is refused."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RegistryServer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host = f"127.0.0.1:{server.server_address[1]}"
+    try:
+        asked: list[str] = []
+
+        def credential(at: str) -> dict[str, str]:
+            asked.append(at)
+            return {"token": "secret-token"}
+
+        task = pipeline.task("pipeline.tasks", "Parse")
+        pushed = pipeline.build(task, registry=f"{host}/team/p", credential=credential)
+        assert pushed.reference == f"{host}/team/p@{pushed.digest}"
+        assert asked == [host]
+        assert pushed.digest in RegistryServer.manifests
+        assert task.key.replace(":", "-") in RegistryServer.manifests
+        cache = tmp_path / "pulled"
+        build.pull(pushed.reference, cache, credential)
+        manifest = json.loads(blob(cache, pushed.digest))
+        for layer in manifest["layers"]:
+            assert hashlib.sha256(blob(cache, layer["digest"])).hexdigest() == layer["digest"][7:]
+        with pytest.raises(build.Refused, match="the token service answered 401"):
+            build.pull(pushed.reference, tmp_path / "anonymous", None)
+        some = manifest["layers"][-1]["digest"]
+        RegistryServer.blobs[some] = b"not those bytes"
+        with pytest.raises(build.Refused, match="its bytes hash to"):
+            build.pull(pushed.reference, tmp_path / "again", credential)
+    finally:
+        server.shutdown()

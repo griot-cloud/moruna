@@ -104,7 +104,7 @@ def test_ck_t9_an_agreeing_module_exits_0_and_is_warmed_up(tmp_path: Path) -> No
     warm = kernel["warm_up"]
     assert warm["model"] == {"name": "loglinear", "version": 1}
     assert warm["observations"] > 0
-    assert warm["key"]["kind"] == "python"
+    assert warm["key"]["kind"] == "image"
     assert (store / "models" / "loglinear@1.state").is_file()
     assert any((store / "observations").iterdir()), "the units are in the store"
     assert "warm-up (`loglinear@1`): per 10000 rows" in kernel["summary"]
@@ -121,7 +121,7 @@ def test_ck_t9_h13_a_refused_kernel_names_the_column_and_exits_2(tmp_path: Path)
     module = write(tmp_path, "refused", REFUSED)
     code, out, _ = run_check(str(module), "--no-warm-up")
     assert code == 2
-    assert "halve (python): refused" in out
+    assert "halve (image): refused" in out
     assert "column `half`: declared int64, produced double" in out
 
 
@@ -258,7 +258,9 @@ def test_std_kernels_run_and_fuse_in_moruna_run(tmp_path: Path) -> None:
         profiles_dir=str(tmp_path / "profiles"),
         staging_dir=str(tmp_path / "staging"),
     )
-    assert len(report.stages) == 3, "fill_null+filter and cast+select each ran as one stage"
+    assert len([t for t in report.tasks if "morsels_in" in t]) == 3, (
+        "fill_null+filter and cast+select each ran as one stage"
+    )
     got = pq.read_table(out).sort_by("score").to_pylist()
     assert got == [{"id": 1, "score": 1}, {"id": None, "score": 7}, {"id": 2, "score": 20}]
 

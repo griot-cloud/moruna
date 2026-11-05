@@ -596,6 +596,12 @@ where
             preserves_columns: Fact::No,
             isolation: Isolation::Imported,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -667,6 +673,12 @@ impl<T> Handed<T> {
             preserves_columns: Fact::No,
             isolation: Isolation::Caller,
             served: None,
+            title: None,
+            description: None,
+            takes: None,
+            gives: None,
+            requires: Vec::new(),
+            provenance: None,
         }
     }
 }

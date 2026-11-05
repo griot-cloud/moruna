@@ -50,6 +50,9 @@ fn opts() -> BuildOptions<'static> {
         notes: Vec::new(),
         packages: Default::default(),
         host_ports: None,
+        pulled_images: None,
+        args: Default::default(),
+        held: Vec::new(),
     }
 }
 
@@ -210,6 +213,8 @@ fn run(job: Job, plan: Option<Plan>, kinds: &Registry) -> (Outcome, Vec<Value>) 
         packages: Default::default(),
         capture_process: false,
         events: Default::default(),
+        args: Vec::new(),
+        pulled_images: None,
     };
     let outcome = match plan {
         Some(plan) => session::run_plan(plan, job, kinds, &opts, &wire, None, Mode::Run),
@@ -538,6 +543,8 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
         packages: Default::default(),
         capture_process: false,
         events: Default::default(),
+        args: Vec::new(),
+        pulled_images: None,
     };
     let outcome = session::run_file(&spec, Some(&plan_file), &kinds, &opts);
     assert_eq!(outcome.code, exit::COMPLETED, "{:?}", outcome.diagnostic);
@@ -567,6 +574,7 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
             strict: false,
             packages: Default::default(),
             events_json: false,
+            args: Vec::new(),
         })
     );
     let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

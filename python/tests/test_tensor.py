@@ -94,7 +94,7 @@ def test_a_tensor_job_runs_end_to_end_and_the_kernel_sees_a_dlpack_tensor(
     )
 
     assert report.exit["status"] == "completed", report
-    assert report.stages[0]["rows_out"] == ROWS, report.stages
+    assert [t for t in report.tasks if t["role"] == "function"][0]["rows_out"] == ROWS, report.tasks
     assert seen == {"dlpack": True, "dtype": "float32", "ndim": 2}, seen
 
     files = sorted(out.glob("*.safetensors"))

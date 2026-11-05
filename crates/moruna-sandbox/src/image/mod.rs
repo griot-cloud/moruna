@@ -18,8 +18,11 @@
 //! record per batch read, its input's end, its exit. Either way a record that fails the check
 //! ends the stage with the check's reason.
 
+mod process;
 mod spawn;
 mod stdio;
+
+pub use process::{ProcessEnd, Started, start_process};
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -132,6 +135,8 @@ pub struct ImageKernel {
     plane: bool,
     binding: Mutex<Option<Binding>>,
     memory: Arc<ImageMemory>,
+    /// The ports the task calls (its needs, MH 4.10), once the build has made them.
+    ports: Mutex<Option<Arc<moruna_kernel::StagePorts>>>,
 }
 
 impl std::fmt::Debug for ImageKernel {
@@ -182,7 +187,14 @@ impl ImageKernel {
             plane,
             binding: Mutex::new(None),
             memory: Arc::new(ImageMemory::default()),
+            ports: Mutex::new(None),
         })
+    }
+
+    /// The ports the task calls (MH 4.10): served on the port socket of every process the
+    /// stage starts (`crate::ports`).
+    pub fn bind_ports(&self, ports: Arc<moruna_kernel::StagePorts>) {
+        *lock(&self.ports) = Some(ports);
     }
 
     /// The run's sampler and its starting ceiling, which the stage ceiling is computed from
@@ -254,33 +266,15 @@ impl ImageKernel {
             StageCgroup::create(&self.cgroup, &cgroup_name, ceiling, cores)
                 .map_err(|e| config(format!("the stage's cgroup: {e}")))?,
         );
-        let plan = Plan {
-            cgroup: cgroup.dir().to_path_buf(),
-            rootfs: self.rootfs.clone(),
-            uid: self.launch.uid,
-            gid: self.launch.gid,
-            working_dir: cstring(&self.launch.working_dir, "the working directory")?,
-            candidates: self
-                .launch
-                .candidates()
-                .iter()
-                .map(|c| cstring(c, "the command"))
-                .collect::<Result<_>>()?,
-            argv: self
-                .launch
-                .command
-                .iter()
-                .map(|a| cstring(a, "the command"))
-                .collect::<Result<_>>()?,
-            envp: self
-                .launch
-                .env_entries()
-                .iter()
-                .map(|e| cstring(e, "the environment"))
-                .collect::<Result<_>>()?,
-            tmp_bytes: TMP_BYTES,
-            filters: self.filters.clone(),
-        };
+        let ports = lock(&self.ports).clone().filter(|p| !p.is_empty());
+        let socket = port_socket(&self.name, ports.is_some(), self.plane)?;
+        let plan = plan_of(
+            &self.launch,
+            &self.rootfs,
+            &self.filters,
+            cgroup.dir(),
+            socket.as_ref().map(|(_, _, env)| env.as_str()),
+        )?;
         // The stage's plane: one input, one output, no port. Its budget is a record of the
         // input and a window of the output, each at most the stage's ceiling.
         let mut plane = LinuxPlane::new(ceiling.saturating_mul(2));
@@ -296,7 +290,11 @@ impl ImageKernel {
         } else {
             (Streams::Stdio, Some(end))
         };
-        let started = spawn(&plan, streams).map_err(|e| {
+        let (task_end, runner_end) = match socket {
+            Some((task, runner, _)) => (Some(task), Some(runner)),
+            None => (None, None),
+        };
+        let started = spawn(&plan, streams, task_end).map_err(|e| {
             config(format!(
                 "{}: the process could not be started: {e}",
                 self.name
@@ -312,6 +310,10 @@ impl ImageKernel {
             Arc::clone(&tail),
         );
         *lock(&self.memory.cgroup) = Some(Arc::clone(&cgroup));
+        if let (Some(runner), Some(ports)) = (runner_end, ports) {
+            crate::ports::serve_on_thread(runner, ports, self.name.clone())
+                .map_err(|e| config(format!("{}: the port socket's thread: {e}", self.name)))?;
+        }
         tracing::info!(target: "sandbox", pid = started.pid, image = %self.name, "image process started");
         let child = Child {
             pid: started.pid,
@@ -354,6 +356,63 @@ impl ImageKernel {
             memory: Arc::clone(&self.memory),
         })
     }
+}
+
+/// The port socket of a process that calls ports (MH 4.10): the task's end, which the command
+/// gets at its port descriptor, Moruna's end, which `crate::ports` serves, and the environment
+/// entry that names the descriptor.
+fn port_socket(
+    name: &str,
+    calls: bool,
+    plane: bool,
+) -> Result<Option<(std::os::fd::OwnedFd, std::os::unix::net::UnixStream, String)>> {
+    if !calls {
+        return Ok(None);
+    }
+    let (task, runner) = std::os::unix::net::UnixStream::pair()
+        .map_err(|e| config(format!("{name}: the port socket: {e}")))?;
+    let env = format!(
+        "{}=fd:{}",
+        crate::ports::SOCKET_ENV,
+        spawn::port_descriptor(plane)
+    );
+    Ok(Some((std::os::fd::OwnedFd::from(task), runner, env)))
+}
+
+/// What the child of an image needs, made before the fork: the image's root, its identity,
+/// its command and its environment (with `extra`, when given), its filters and its cgroup.
+fn plan_of(
+    launch: &Launch,
+    rootfs: &std::path::Path,
+    filters: &[BpfProgram],
+    cgroup: &std::path::Path,
+    extra: Option<&str>,
+) -> Result<Plan> {
+    let mut env = launch.env_entries();
+    env.extend(extra.map(str::to_string));
+    Ok(Plan {
+        cgroup: cgroup.to_path_buf(),
+        rootfs: rootfs.to_path_buf(),
+        uid: launch.uid,
+        gid: launch.gid,
+        working_dir: cstring(&launch.working_dir, "the working directory")?,
+        candidates: launch
+            .candidates()
+            .iter()
+            .map(|c| cstring(c, "the command"))
+            .collect::<Result<_>>()?,
+        argv: launch
+            .command
+            .iter()
+            .map(|a| cstring(a, "the command"))
+            .collect::<Result<_>>()?,
+        envp: env
+            .iter()
+            .map(|e| cstring(e, "the environment"))
+            .collect::<Result<_>>()?,
+        tmp_bytes: TMP_BYTES,
+        filters: filters.to_vec(),
+    })
 }
 
 /// One stage's process, Moruna's side.
@@ -420,6 +479,33 @@ impl Child {
         let lines = self.tail.lines(STDERR_WAIT);
         let head = failure_head(&self.name, &cause, self.exit, self.cgroup.oom_kills() > 0);
         kernel_error(with_stderr(head, &lines))
+    }
+}
+
+impl Child {
+    /// Whether the process exited with status 0 within `wait`; else what happened, with the end
+    /// of its standard error. A process still there at the end of `wait` is killed.
+    fn ended_well(&mut self, wait: Duration) -> std::result::Result<(), String> {
+        match self.reap(wait) {
+            Some(Exit::Code(0)) => Ok(()),
+            Some(exit) => {
+                let lines = self.tail.lines(STDERR_WAIT);
+                let oom = self.cgroup.oom_kills() > 0;
+                Err(with_stderr(describe(exit, oom, &self.name), &lines))
+            }
+            None => {
+                self.kill();
+                let lines = self.tail.lines(STDERR_WAIT);
+                Err(with_stderr(
+                    format!(
+                        "image `{}` did not exit within {} seconds of the end of its input",
+                        self.name,
+                        wait.as_secs()
+                    ),
+                    &lines,
+                ))
+            }
+        }
     }
 }
 
@@ -766,27 +852,32 @@ impl Kernel for ImageKernel {
         }
     }
 
-    /// SDD 19 f.6, f.7: the input ends; the output must end where the input did and the process
-    /// must exit with status 0. It gives nothing at its end: every batch an image writes answers one
-    /// it was sent.
+    /// SDD 19 f.6, f.7: the input ends; the process may then write one more batch (what its
+    /// function's `finish` gives), which goes downstream, and its output must end after that
+    /// and the process exit with status 0.
     fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
-        let ended = (|| -> Result<()> {
-            let st = state
-                .as_any_mut()
-                .downcast_mut::<ImageState>()
-                .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
-            if let Err(e) = st.plane.finish(st.task, INPUT) {
-                let words = plane_words(&e, &st.plane);
-                return Err(st.failed(true, format!("its input could not be ended: {words}")));
-            }
-            // A window is there for a batch it should not write, so that one is named.
+        let st = state
+            .as_any_mut()
+            .downcast_mut::<ImageState>()
+            .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
+        if let Err(e) = st.plane.finish(st.task, INPUT) {
+            let words = plane_words(&e, &st.plane);
+            return Err(st.failed(true, format!("its input could not be ended: {words}")));
+        }
+        let mut last: Option<Payload> = None;
+        loop {
+            // A window is there for a batch it may write, so that one more is named.
             st.grant()?;
             match st.next()? {
-                Event::Ended { .. } => {}
+                Event::Ended { .. } => break,
+                Event::Put { batch, .. } if last.is_none() => {
+                    st.granted = false;
+                    last = Some(st.take(batch)?);
+                }
                 Event::Put { batch, .. } => {
                     let _ = st.plane.drop_batch(batch);
                     let cause = format!(
-                        "its output holds more record batches than the {} sent",
+                        "its output holds more record batches than the {} sent and one at its end",
                         st.sent
                     );
                     return Err(st.failed(false, cause));
@@ -799,35 +890,12 @@ impl Kernel for ImageKernel {
                 }
                 other => return Err(st.failed(false, format!("its plane said {other:?}"))),
             }
-            if let Some(fault) = st.bridge.as_ref().and_then(Bridge::fault) {
-                return Err(st.child.failed(false, fault));
-            }
-            let child = &mut st.child;
-            match child.reap(EXIT_WAIT) {
-                Some(Exit::Code(0)) => Ok(()),
-                Some(exit) => {
-                    let lines = child.tail.lines(STDERR_WAIT);
-                    let oom = child.cgroup.oom_kills() > 0;
-                    Err(kernel_error(with_stderr(
-                        describe(exit, oom, &child.name),
-                        &lines,
-                    )))
-                }
-                None => {
-                    child.kill();
-                    let lines = child.tail.lines(STDERR_WAIT);
-                    Err(kernel_error(with_stderr(
-                        format!(
-                            "image `{}` did not exit within {} seconds of the end of its input",
-                            child.name,
-                            EXIT_WAIT.as_secs()
-                        ),
-                        &lines,
-                    )))
-                }
-            }
-        })();
-        ended.map(|()| None)
+        }
+        if let Some(fault) = st.bridge.as_ref().and_then(Bridge::fault) {
+            return Err(st.child.failed(false, fault));
+        }
+        st.child.ended_well(EXIT_WAIT).map_err(kernel_error)?;
+        Ok(last)
     }
 }
 

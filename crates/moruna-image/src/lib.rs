@@ -21,6 +21,7 @@ mod error;
 mod launch;
 mod layer;
 pub mod layerfile;
+mod name;
 pub mod record;
 mod source;
 mod unpack;
@@ -33,6 +34,7 @@ mod tests;
 pub use digest::Digest;
 pub use error::{Error, Result};
 pub use launch::{DEFAULT_PATH, Launch};
+pub use name::{BUILD_KEY, ImageName, ImageRef, Location};
 pub use source::{Config, Descriptor, ImageSource, Manifest, OciLayout};
 pub use unpack::{COMPLETE, Image, unpack};
 

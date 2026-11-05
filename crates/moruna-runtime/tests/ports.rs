@@ -543,6 +543,9 @@ fn po_t6_the_document_refuses_ports_it_cannot_serve() {
                 notes: Vec::new(),
                 packages: Default::default(),
                 host_ports: None,
+                pulled_images: None,
+                args: Default::default(),
+                held: Vec::new(),
             },
         ) {
             Ok(_) => "built".to_string(),

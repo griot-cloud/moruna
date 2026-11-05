@@ -581,6 +581,12 @@ fn jb_t28_check_job_command() {
                 preserves_columns: moruna_job::Fact::Yes,
                 isolation: moruna_job::Isolation::Builtin,
                 served: None,
+                title: None,
+                description: None,
+                takes: None,
+                gives: None,
+                requires: Vec::new(),
+                provenance: None,
             }
         }
 

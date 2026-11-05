@@ -33,6 +33,7 @@ mod parquet_sink;
 mod py_sink;
 mod reorder;
 mod stats;
+mod stream;
 mod tensor_sink;
 mod vortex_sink;
 
@@ -43,6 +44,7 @@ pub use parquet_sink::{ParquetSink, ParquetSinkConfig};
 pub use py_sink::{PySink, PySinkStats};
 pub use reorder::ReorderBuffer;
 pub use stats::SinkStats;
+pub use stream::{ArrowStreamSink, StreamDone, commit_of};
 pub use tensor_sink::{TensorFormat, TensorSink, TensorSinkConfig};
 pub use vortex_sink::{VortexSink, VortexSinkConfig};
 

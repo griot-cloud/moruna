@@ -100,6 +100,179 @@
       "isolation": "builtin"
     },
     {
+      "name": "image",
+      "role": "source",
+      "summary": "An OCI image's command as a source, in a sandboxed process that writes one Arrow IPC stream on its standard output",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "image": {
+            "$ref": "#/$defs/ImageDoc",
+            "description": "The image the task runs."
+          },
+          "entry": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The entry the image's entry point runs, given to the process as `MORUNA_ENTRY`; Moruna\ndoes not read it."
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The task's params, data only, given to the process as `MORUNA_PARAMS`, checked against\nthe JSON Schema of its definition."
+          },
+          "needs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the runner must supply the task: each a port it serves, which the process calls on\nits port socket."
+          },
+          "command": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The command to run, replacing the image's entrypoint and cmd."
+          },
+          "env": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment added to the image's own; the process gets nothing else. A name the runner\ngives (`MORUNA_...`) is refused."
+          },
+          "cache": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where unpacked images are kept; `images` beside the run's output when it is a directory."
+          },
+          "plane": {
+            "type": "boolean",
+            "description": "A function's command makes the data plane's calls (`batch_get`, `batch_put`) on its\ndescriptor 3 instead of reading Arrow IPC on its standard input and writing it on its\nstandard output.",
+            "default": false
+          },
+          "ports": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/$defs/PortDoc"
+            },
+            "description": "Ports the command may call besides its needs, each routed as the document says (MH\n4.10): to the host protocol's peer or to a handler the program registered."
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "description": "An `image` entry's settings (SDD 19 d.2).",
+        "title": "image",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "ImageDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "build_key": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The build key of an image Moruna builds: `sha256:` and 64 hex digits over its code, its\nlock, its runtime, its shim, its platform and its entry; absent for an image it did not\nbuild.",
+                "default": null
+              },
+              "digest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The manifest's digest, `sha256:...`; absent until the image is built.",
+                "default": null
+              },
+              "location": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Where the image is: an OCI layout's absolute path, or a registry reference\n`HOST/REPOSITORY@sha256:...`; absent until the image is built.",
+                "default": null
+              }
+            },
+            "description": "Where an image is, as a document names it ([`moruna_image::ImageRef`])."
+          },
+          "PortDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port the host serves, by the name the host knows it by: the stage's calls go to the\nhost protocol's peer as `port_call` (MH 4.3)."
+              },
+              "guest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name (`Embedding::guest_port`)."
+              },
+              "deadline_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_job::PORT_DEADLINE_MS`), at most a day."
+              }
+            },
+            "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          }
+        },
+        "examples": [
+          {
+            "image": {
+              "build_key": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "digest": null,
+              "location": null
+            },
+            "entry": "scoring.functions:Score",
+            "params": {
+              "column": "text"
+            },
+            "needs": [
+              "model"
+            ]
+          }
+        ]
+      },
+      "inputs": "nothing",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "no",
+      "preserves_columns": "no",
+      "isolation": "confined"
+    },
+    {
       "name": "parquet",
       "role": "source",
       "summary": "Parquet files or prefixes, local or in an object store",
@@ -412,13 +585,28 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "layout": {
-            "type": "string",
-            "description": "A local OCI image layout: a directory holding `oci-layout`, `index.json` and `blobs/`."
+          "image": {
+            "$ref": "#/$defs/ImageDoc",
+            "description": "The image the task runs."
           },
-          "reference": {
-            "type": "string",
-            "description": "The image to run: a manifest digest (`sha256:...`) or the name the layout's `index.json`\ngives it (`org.opencontainers.image.ref.name`)."
+          "entry": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The entry the image's entry point runs, given to the process as `MORUNA_ENTRY`; Moruna\ndoes not read it."
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The task's params, data only, given to the process as `MORUNA_PARAMS`, checked against\nthe JSON Schema of its definition."
+          },
+          "needs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the runner must supply the task: each a port it serves, which the process calls on\nits port socket."
           },
           "command": {
             "type": [
@@ -428,7 +616,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The command to run, replacing the image's entrypoint and cmd. On the Moruna kernel the\nreference is a manifest digest and the image's config, once verified, gives the command\nwhen this does not (SDD 30 f.12)."
+            "description": "The command to run, replacing the image's entrypoint and cmd."
           },
           "env": {
             "type": [
@@ -438,7 +626,7 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Environment added to the image's own; the process gets nothing else."
+            "description": "Environment added to the image's own; the process gets nothing else. A name the runner\ngives (`MORUNA_...`) is refused."
           },
           "cache": {
             "type": [
@@ -449,7 +637,7 @@
           },
           "plane": {
             "type": "boolean",
-            "description": "The command makes the data plane's calls (`batch_get`, `batch_put`) on its descriptor 3\ninstead of reading Arrow IPC on its standard input and writing it on its standard output.",
+            "description": "A function's command makes the data plane's calls (`batch_get`, `batch_put`) on its\ndescriptor 3 instead of reading Arrow IPC on its standard input and writing it on its\nstandard output.",
             "default": false
           },
           "ports": {
@@ -460,31 +648,47 @@
             "additionalProperties": {
               "$ref": "#/$defs/PortDoc"
             },
-            "description": "The ports the command may call (MH 4.10), on the Moruna kernel only: its task's port `n`\nis the `n`th of these in name order, from 1 (SDD 30 f.7)."
+            "description": "Ports the command may call besides its needs, each routed as the document says (MH\n4.10): to the host protocol's peer or to a handler the program registered."
           }
         },
         "required": [
-          "layout",
-          "reference"
+          "image"
         ],
         "description": "An `image` entry's settings (SDD 19 d.2).",
         "title": "image",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "examples": [
-          {
-            "layout": "/disk/images/scorer",
-            "reference": "scorer:1",
-            "command": [
-              "/usr/bin/scorer",
-              "--column",
-              "text"
-            ],
-            "env": {
-              "MODEL": "small"
-            }
-          }
-        ],
         "$defs": {
+          "ImageDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "build_key": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The build key of an image Moruna builds: `sha256:` and 64 hex digits over its code, its\nlock, its runtime, its shim, its platform and its entry; absent for an image it did not\nbuild.",
+                "default": null
+              },
+              "digest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The manifest's digest, `sha256:...`; absent until the image is built.",
+                "default": null
+              },
+              "location": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Where the image is: an OCI layout's absolute path, or a registry reference\n`HOST/REPOSITORY@sha256:...`; absent until the image is built.",
+                "default": null
+              }
+            },
+            "description": "Where an image is, as a document names it ([`moruna_image::ImageRef`])."
+          },
           "PortDoc": {
             "type": "object",
             "additionalProperties": false,
@@ -515,7 +719,23 @@
             },
             "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
           }
-        }
+        },
+        "examples": [
+          {
+            "image": {
+              "build_key": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "digest": null,
+              "location": null
+            },
+            "entry": "scoring.functions:Score",
+            "params": {
+              "column": "text"
+            },
+            "needs": [
+              "model"
+            ]
+          }
+        ]
       },
       "inputs": "batches",
       "outputs": "batches",
@@ -802,6 +1022,179 @@
       "deterministic": "yes",
       "preserves_columns": "yes",
       "isolation": "builtin"
+    },
+    {
+      "name": "image",
+      "role": "sink",
+      "summary": "An OCI image's command as a sink, in a sandboxed process that reads one Arrow IPC stream on its standard input and writes back its commit",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "image": {
+            "$ref": "#/$defs/ImageDoc",
+            "description": "The image the task runs."
+          },
+          "entry": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The entry the image's entry point runs, given to the process as `MORUNA_ENTRY`; Moruna\ndoes not read it."
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The task's params, data only, given to the process as `MORUNA_PARAMS`, checked against\nthe JSON Schema of its definition."
+          },
+          "needs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the runner must supply the task: each a port it serves, which the process calls on\nits port socket."
+          },
+          "command": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The command to run, replacing the image's entrypoint and cmd."
+          },
+          "env": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment added to the image's own; the process gets nothing else. A name the runner\ngives (`MORUNA_...`) is refused."
+          },
+          "cache": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where unpacked images are kept; `images` beside the run's output when it is a directory."
+          },
+          "plane": {
+            "type": "boolean",
+            "description": "A function's command makes the data plane's calls (`batch_get`, `batch_put`) on its\ndescriptor 3 instead of reading Arrow IPC on its standard input and writing it on its\nstandard output.",
+            "default": false
+          },
+          "ports": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/$defs/PortDoc"
+            },
+            "description": "Ports the command may call besides its needs, each routed as the document says (MH\n4.10): to the host protocol's peer or to a handler the program registered."
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "description": "An `image` entry's settings (SDD 19 d.2).",
+        "title": "image",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "ImageDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "build_key": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The build key of an image Moruna builds: `sha256:` and 64 hex digits over its code, its\nlock, its runtime, its shim, its platform and its entry; absent for an image it did not\nbuild.",
+                "default": null
+              },
+              "digest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The manifest's digest, `sha256:...`; absent until the image is built.",
+                "default": null
+              },
+              "location": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Where the image is: an OCI layout's absolute path, or a registry reference\n`HOST/REPOSITORY@sha256:...`; absent until the image is built.",
+                "default": null
+              }
+            },
+            "description": "Where an image is, as a document names it ([`moruna_image::ImageRef`])."
+          },
+          "PortDoc": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port the host serves, by the name the host knows it by: the stage's calls go to the\nhost protocol's peer as `port_call` (MH 4.3)."
+              },
+              "guest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A port answered inside the machine, by the handler the program running the document\nregistered under this name (`Embedding::guest_port`)."
+              },
+              "deadline_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "How long one call may wait for its answer; absent: half an hour\n(`moruna_job::PORT_DEADLINE_MS`), at most a day."
+              }
+            },
+            "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          }
+        },
+        "examples": [
+          {
+            "image": {
+              "build_key": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "digest": null,
+              "location": null
+            },
+            "entry": "scoring.functions:Score",
+            "params": {
+              "column": "text"
+            },
+            "needs": [
+              "model"
+            ]
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "nothing",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no",
+        "contracts": "no"
+      },
+      "deterministic": "no",
+      "preserves_columns": "no",
+      "isolation": "confined"
     },
     {
       "name": "parquet",
