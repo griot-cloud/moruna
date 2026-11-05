@@ -15,4 +15,10 @@ uv venv --python "$MORUNA_PYTHON" "$work/venv" >/dev/null
 uv pip install --python "$work/venv" --quiet "$work"/dist/*.whl pyarrow pytest numpy pyyaml pip
 # Run from a copy of the tests so no stale extension module in python/ is importable.
 cp -R python/tests "$work/tests"
-( cd "$work" && "$work/venv/bin/python" -m pytest -q tests )
+# One process per test file: a run's budget counts what its process already holds, and the
+# files keep their own data alive, so a single process for the whole suite refuses later runs.
+failed=""
+for file in "$work"/tests/test_*.py; do
+  ( cd "$work" && "$work/venv/bin/python" -m pytest -q "tests/$(basename "$file")" ) || failed="$failed $(basename "$file")"
+done
+if [ -n "$failed" ]; then echo "python/tests failed in:$failed" >&2; exit 1; fi
