@@ -672,6 +672,11 @@ jobs:
           mkdir -p dist
           cp target/release/moruna-vmm "dist/moruna-vmm-${{ matrix.target }}"
           ./target/release/moruna-vmm --version
+      - name: The guest image's build may make user namespaces
+        # guest/build.sh roots the image with mmdebstrap, which unshares a user namespace, and
+        # Ubuntu 24.04 forbids unprivileged ones through AppArmor: 0.6.2's release failed here
+        # with `unshare: unshare failed: Operation not permitted`.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: The guest image, built twice to prove it reproduces
         env:
           STANDARD: ${{ steps.standard.outputs.python-path }}
