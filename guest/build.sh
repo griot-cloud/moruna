@@ -69,8 +69,12 @@ rm -f /etc/apt/sources.list.d/*
 # rate-limit loop ("Tried to start delayed item ... but failed", 700 MB of log) and an apt
 # killed mid-loop. Every fetch retries, each attempt is bounded in time, and each step is
 # retried whole. The packages are those of the pinned snapshot whatever the attempt.
+# apt delays a retry and, while the snapshot throttles, spins on the delayed item (0.6.3 on
+# arm64: "Tried to start delayed item ... but failed", a million lines, the job dead): apt
+# retries at once and the waiting between attempts is the retry below.
 cat > /etc/apt/apt.conf.d/80moruna-retries <<RETRIES
 Acquire::Retries "8";
+Acquire::Retries::Delay "false";
 Acquire::http::Timeout "60";
 Acquire::Queue-Mode "access";
 APT::Update::Error-Mode "any";
