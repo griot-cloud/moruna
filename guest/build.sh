@@ -65,8 +65,26 @@ docker run --rm \
 mirror="http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}"
 echo "deb [check-valid-until=no] $mirror $DEBIAN_SUITE main" > /etc/apt/sources.list
 rm -f /etc/apt/sources.list.d/*
-apt-get -o Acquire::Check-Valid-Until=false update -qq
-apt-get install -qq -y --no-install-recommends \
+# snapshot.debian.org throttles and times out: the releases of 0.6.2 and 0.6.3 met a 504, a
+# rate-limit loop ("Tried to start delayed item ... but failed", 700 MB of log) and an apt
+# killed mid-loop. Every fetch retries, each attempt is bounded in time, and each step is
+# retried whole. The packages are those of the pinned snapshot whatever the attempt.
+cat > /etc/apt/apt.conf.d/80moruna-retries <<RETRIES
+Acquire::Retries "8";
+Acquire::http::Timeout "60";
+Acquire::Queue-Mode "access";
+RETRIES
+retry() {
+    local attempt
+    for attempt in 1 2 3 4; do
+        if timeout 1800 "$@"; then return 0; fi
+        echo "attempt $attempt of $1 failed; retrying" >&2
+        sleep $((attempt * 30))
+    done
+    return 1
+}
+retry apt-get -o Acquire::Check-Valid-Until=false update -qq
+retry apt-get install -qq -y --no-install-recommends \
     build-essential bc bison flex libelf-dev libssl-dev xz-utils bzip2 cpio \
     erofs-utils mmdebstrap ca-certificates curl python3 >/dev/null
 
@@ -115,8 +133,9 @@ chmod 0755 initramfs/init initramfs/bin/busybox
 # The root filesystem: Debian minbase with udev, free-threaded CPython 3.14, pyarrow and the
 # moruna wheel, the standard build with its own pyarrow and moruna wheel (for the sandbox), BusyBox,
 # and the Moruna init.
-mmdebstrap --quiet --variant=minbase --include=udev,ca-certificates \
-    "$DEBIAN_SUITE" rootfs "$mirror"
+rootfs() { rm -rf rootfs; mmdebstrap --quiet --variant=minbase --include=udev,ca-certificates \
+    --aptopt=/etc/apt/apt.conf.d/80moruna-retries "$DEBIAN_SUITE" rootfs "$mirror"; }
+retry rootfs
 fetch "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-${ARCH}-unknown-linux-gnu-freethreaded-install_only.tar.gz" \
     python.tar.gz "$PYTHON_SHA256"
 mkdir -p rootfs/opt && tar xf python.tar.gz -C rootfs/opt
