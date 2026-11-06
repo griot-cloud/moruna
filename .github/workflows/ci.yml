@@ -573,7 +573,9 @@ jobs:
       matrix:
         # A named image, not ubuntu-latest: 0.5.7's wheels were built on ubuntu-26.04 when
         # ubuntu-latest moved, maturin found no manylinux tag for its glibc, and PyPI refused them.
-        os: [ubuntu-24.04, macos-14]
+        # macos-15: GitHub retired macos-14 ("The configuration 'macos-14-arm64-us-default' is
+        # not supported"), which left 0.6.3's release with no macOS wheel and nothing published.
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
@@ -591,6 +593,8 @@ jobs:
         env:
           STANDARD: ${{ steps.standard.outputs.python-path }}
           FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
+          # The macOS wheels keep 0.6.2's platform tag on the newer runner's SDK.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --release --out dist --interpreter "$STANDARD" "$FREETHREADED"
