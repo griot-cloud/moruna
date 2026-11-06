@@ -158,7 +158,9 @@ pub struct PyKernel {
     gil: AtomicU8,
     flip_checked: AtomicBool,
     serialise: Mutex<()>,
-    alloc: OnceLock<Arc<dyn Allocator>>,
+    /// The arena of the run the kernel is in: bound when a run starts, released when it ends, so
+    /// a kernel never holds a run's arena after it (0.6.3 kept the first run's for good).
+    alloc: Mutex<Option<Arc<dyn Allocator>>>,
     calls: AtomicU64,
     exceptions: AtomicU64,
     boundary_copies: AtomicU64,
@@ -237,7 +239,7 @@ impl PyKernel {
                 gil: AtomicU8::new(gil),
                 flip_checked: AtomicBool::new(false),
                 serialise: Mutex::new(()),
-                alloc: OnceLock::new(),
+                alloc: Mutex::new(None),
                 calls: AtomicU64::new(0),
                 exceptions: AtomicU64::new(0),
                 boundary_copies: AtomicU64::new(0),
@@ -252,7 +254,20 @@ impl PyKernel {
     /// "kernels built" step, after the arena exists and before the scheduler is constructed; a
     /// second call is ignored, because the arena a run allocates from does not change.
     pub fn bind_allocator(&self, alloc: Arc<dyn Allocator>) {
-        let _ = self.alloc.set(alloc);
+        *self.alloc.lock().unwrap_or_else(|e| e.into_inner()) = Some(alloc);
+    }
+
+    /// Let go of the run's arena and gate when the run ends (05 d.1). A task object outlives the
+    /// run it was in (the user keeps it, or a reference cycle through it does), and while its
+    /// kernel held the arena the whole region stayed mapped: 0.6.3 kept every run's arena of a
+    /// `moruna.Function` subclass, 3 GB or more each, for the life of the process.
+    pub fn release_run(&self) {
+        *self.alloc.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.memory.release();
+    }
+
+    fn bound_alloc(&self) -> Option<Arc<dyn Allocator>> {
+        self.alloc.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The run's allocator gate (05 d.1, f.9); a second call is ignored. Without one the kernel
@@ -562,7 +577,7 @@ impl Kernel for PyKernel {
         if !self.has_finish {
             return Ok(None);
         }
-        let Some(alloc) = self.alloc.get().cloned() else {
+        let Some(alloc) = self.bound_alloc() else {
             return Err(MorunaError::Config {
                 name: "adapter",
                 msg: "finish before bind_allocator; the facade binds the arena in its kernels built step".into(),
@@ -625,7 +640,7 @@ impl Kernel for PyKernel {
     /// alive by a handle until the copy has finished with it and is then released under a brief
     /// attachment.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
-        let Some(alloc) = self.alloc.get().cloned() else {
+        let Some(alloc) = self.bound_alloc() else {
             return Err(MorunaError::Config {
                 name: "adapter",
                 msg: "apply before bind_allocator; the facade binds the arena in its kernels built step".into(),

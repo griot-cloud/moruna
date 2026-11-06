@@ -305,8 +305,11 @@ impl Source for PySource {
         alloc: &'a dyn Allocator,
         tier: Tier,
     ) -> BoxFuture<'a, Result<Payload>> {
-        let outcome = self.read_now(split, rows, alloc, tier);
-        Box::pin(async move { outcome })
+        // The read happens when the future is polled, not when it is issued: the drive issues up
+        // to its read-ahead before it polls (10 f.5), so a read done at issue made every split up
+        // to the read-ahead wait for the slowest, and a kernel saw nothing until they had all
+        // been read (0.6.3: five 0.3 s reads, the first batch processed at 2.1 s, not 0.3 s).
+        Box::pin(async move { self.read_now(split, rows, alloc, tier) })
     }
 
     fn repeatable(&self) -> bool {

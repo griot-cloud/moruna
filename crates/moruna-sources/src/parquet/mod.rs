@@ -189,13 +189,13 @@ impl Source for ParquetSource {
         Ok(self.splits.clone())
     }
 
-    fn read(
-        &self,
-        split: &Split,
+    fn read<'a>(
+        &'a self,
+        split: &'a Split,
         rows: Option<RowRange>,
-        alloc: &dyn Allocator,
+        alloc: &'a dyn Allocator,
         tier: Tier,
-    ) -> BoxFuture<'_, Result<Payload>> {
+    ) -> BoxFuture<'a, Result<Payload>> {
         read::read(self, split, rows, alloc, tier)
     }
 }

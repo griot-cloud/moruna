@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import types
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -351,23 +352,37 @@ def function(
 
 class _Instance:
     """What the runtime calls for a ``Function`` subclass: one stateful instance over the task
-    object, checking each batch against what the task declares."""
+    object, checking each batch against what the task declares.
+
+    It holds the task weakly. The task holds its kernel (``_moruna_handle``) and the kernel holds
+    this object, so a strong reference made a cycle through the extension, which the collector
+    cannot see into: no task of a run, and nothing its kernel held, was ever freed (0.6.3). The
+    job holds the task for as long as a run can call it."""
 
     def __init__(self, task: Function) -> None:
-        self.task = task
+        self._task = weakref.ref(task)
+
+    @property
+    def task(self) -> Function:
+        task = self._task()
+        if task is None:
+            raise RuntimeError("the task this function runs was freed before its run ended")
+        return task
 
     def setup(self, ctx: Any) -> None:
         return None
 
     def __call__(self, state: Any, batch: Any) -> Any:
-        _schema_check(self.task, "takes", batch)
-        return _schema_check(self.task, "gives", self.task(batch))
+        task = self.task
+        _schema_check(task, "takes", batch)
+        return _schema_check(task, "gives", task(batch))
 
     def finish(self, state: Any) -> Any:
-        finish = getattr(self.task, "finish", None)
+        task = self.task
+        finish = getattr(task, "finish", None)
         if finish is None:
             return None
-        return _schema_check(self.task, "gives", finish())
+        return _schema_check(task, "gives", finish())
 
 
 def _lockfile(task: Any) -> bytes | None:

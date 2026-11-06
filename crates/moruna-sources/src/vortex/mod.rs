@@ -172,7 +172,8 @@ impl Source for VortexSource {
         alloc: &'a dyn Allocator,
         tier: Tier,
     ) -> BoxFuture<'a, Result<Payload>> {
-        let outcome = read::read(self, split, rows, alloc, tier);
-        Box::pin(async move { outcome })
+        // Read when polled, not when issued: the drive issues up to its read-ahead before it polls
+        // (10 f.5), and a read done at issue held every earlier one back from the kernels.
+        Box::pin(async move { read::read(self, split, rows, alloc, tier) })
     }
 }

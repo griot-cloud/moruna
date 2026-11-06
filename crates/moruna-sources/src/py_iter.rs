@@ -168,15 +168,16 @@ impl Source for PyIteratorSource {
         Ok(splits)
     }
 
-    fn read(
-        &self,
-        split: &Split,
+    fn read<'a>(
+        &'a self,
+        split: &'a Split,
         _rows: Option<RowRange>,
-        alloc: &dyn Allocator,
+        alloc: &'a dyn Allocator,
         tier: Tier,
-    ) -> BoxFuture<'_, Result<Payload>> {
-        let outcome = self.read_now(split, alloc, tier);
-        Box::pin(async move { outcome })
+    ) -> BoxFuture<'a, Result<Payload>> {
+        // Read when polled, not when issued: the drive issues up to its read-ahead before it polls
+        // (10 f.5), and a read done at issue held every earlier one back from the kernels.
+        Box::pin(async move { self.read_now(split, alloc, tier) })
     }
 
     fn streaming(&self) -> bool {

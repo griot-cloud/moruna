@@ -128,6 +128,16 @@ fn take_next_range(
     Some((index, RowRange { start, end }, seq, whole))
 }
 
+/// Whether every source has nothing left to read: a finite plan whose cursor is past its last
+/// row, or a streaming source that has ended (f.5, f.9). A probe of a stage no source feeds asks
+/// this when no morsel is waiting for it.
+pub(crate) fn nothing_left(shared: &Shared) -> bool {
+    shared.sources.iter().all(|source| {
+        source.exhausted.load(Ordering::SeqCst)
+            || (!source.source.streaming() && peek_next_range(shared, source).is_none())
+    })
+}
+
 /// The range `take_next_range(shared, None)` would issue next, without taking it: its split's
 /// index and its rows. `None` when the plan is exhausted.
 fn peek_next_range(shared: &Shared, source: &SourceEnd) -> Option<(usize, RowRange)> {

@@ -569,6 +569,11 @@ fn drive(
             py_kernel.bind_gate(gate.clone());
         }
     }
+    // Every kernel lets go of this run's arena and gate when the run ends, however it ends: a
+    // kernel outlives its run inside its task object, and one that held the arena kept the
+    // whole region mapped for the life of the process (0.6.3).
+    #[cfg(feature = "python")]
+    let _release = ReleaseRun(py_kernels.iter().map(|(_, k)| k.clone()).collect());
     if let Some(gate) = &gate {
         for stage in packaged.iter().filter(|stage| !stage.native_singleton()) {
             stage.bind(gate, &sampler, limits.memory_ceiling);
@@ -2277,5 +2282,18 @@ mod tests {
         let two = mint_run_id().expect("the host has randomness");
         assert_ne!(one.to_hex(), two.to_hex());
         assert_eq!(one.to_hex().len(), 32);
+    }
+}
+
+/// The Python kernels a run bound to its arena and gate, released when the run's scope ends.
+#[cfg(feature = "python")]
+struct ReleaseRun(Vec<Arc<moruna_adapters::PyKernel>>);
+
+#[cfg(feature = "python")]
+impl Drop for ReleaseRun {
+    fn drop(&mut self) {
+        for kernel in &self.0 {
+            kernel.release_run();
+        }
     }
 }
