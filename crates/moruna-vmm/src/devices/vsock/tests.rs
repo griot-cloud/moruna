@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vm_memory::{Bytes, GuestAddress};
 
@@ -612,6 +612,12 @@ fn vm_t14_refused_streams_are_drained_within_bounds() {
     }
     assert_eq!(g.t.device().muxer().closing_streams(), MAX_CLOSING);
     drop(hosts);
-    g.pump();
+    // Every one is released by CLOSE_LINGER, whether or not its hang-up is seen first: a
+    // runner once saw all 64 still closing after one pump (PR 87), as when a test running
+    // beside this one forks and its child briefly holds the host ends open.
+    let released_by = Instant::now() + CLOSE_LINGER + Duration::from_secs(1);
+    while g.t.device().muxer().closing_streams() > 0 && Instant::now() < released_by {
+        g.pump();
+    }
     assert_eq!(g.t.device().muxer().closing_streams(), 0);
 }
