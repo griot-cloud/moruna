@@ -62,7 +62,7 @@ docker run --rm \
     -v "$(dirname "$wheel"):/in:ro" \
     -v "$out:/out" \
     "$BUILD_IMAGE" bash -euo pipefail -c '
-mirror="http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}"
+export mirror="http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}"
 echo "deb [check-valid-until=no] $mirror $DEBIAN_SUITE main" > /etc/apt/sources.list
 rm -f /etc/apt/sources.list.d/*
 # snapshot.debian.org throttles and times out: the releases of 0.6.2 and 0.6.3 met a 504, a
@@ -75,10 +75,12 @@ Acquire::http::Timeout "60";
 Acquire::Queue-Mode "access";
 APT::Update::Error-Mode "any";
 RETRIES
+# A step is a shell function, and timeout runs only programs: each attempt is a bash given
+# the function by its definition (0.6.3: "timeout: failed to run command tools").
 retry() {
     local attempt
     for attempt in 1 2 3 4; do
-        if timeout 1800 "$@"; then return 0; fi
+        if timeout 1800 bash -euo pipefail -c "$(declare -f "$1"); $1"; then return 0; fi
         echo "attempt $attempt of $1 failed; retrying" >&2
         sleep $((attempt * 30))
     done
