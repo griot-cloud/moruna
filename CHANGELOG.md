@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.4
+
+What moving the first project onto 0.6.3 found; each fix has a test that fails on 0.6.3.
+
+- **Stateful tasks on separate branches run at once.** Every stateful instance's home worker was its index within its stage, so every single-instance stage (every `moruna.Function` subclass) lived on worker 0 and stages on separate branches ran one at a time. The run's instances are dealt to the workers in turn, across stages.
+- **Sources read when polled, not when issued.** The Python, iterator, stream, Parquet and Vortex sources did each read when the drive issued it, and the drive issues up to its read-ahead before it polls, so nothing downstream ran until the source had been read through. The first batch is now processed while later ones are still being read.
+- **A run lets go of its arena when it ends.** A `moruna.Function` subclass's kernel kept the arena of the first run it was in, and a reference cycle kept the task and its kernel for good: every run's arena, gigabytes each, stayed mapped until a run was refused for the memory the process held. The arena and the memory gate are bound to a kernel for one run and released when it ends, and a task is freed with its job.
+- **A source with nothing to read is a run with no rows.** A fresh run whose plan has nothing to read was refused ("nothing to probe with"), and so was a stage after a join in such a run; both are seeded from their hints, the stateful tasks' `finish` runs and what it gives reaches the sink (SDD 11 f.14 amended).
+- **Run arguments take `datetime` and `date`.** They are written as RFC 3339 and `YYYY-MM-DD` (they were written as `str()` and refused); an object JSON cannot write is refused by name. Every task reads an argument as its JSON value, in process as inside an image.
+- **Schema declarations name structs.** `struct<name: type, ...>`, nested in lists and structs, in `takes` and `gives`.
+- **Linux wheels install in task images.** The Linux wheels are built for `manylinux_2_28` (they were `manylinux_2_39`, newer than the images a task is built into) and for aarch64 as well as x86_64 (`tools/release/linux-wheels.sh`).
+
 ## 0.6.3
 
 - **A job spec is one self-contained, language-neutral document.** The `python` kind is gone from every role: a task of your own code (a `moruna.Source`, `moruna.Function` or `moruna.Sink` subclass, or a `@moruna.function`) is an `image` task, `{image: {build_key, digest, location}, entry, params, needs}`, and every task carries its **definition** inline, the kind `Declaration` extended with `title`, `description`, `takes` and `gives` (Arrow schemas), `requires` (each need with its description) and `provenance` (build key, source repository, revision, dirty). A custom task makes its definition from its code: its docstring's first line is its title and summary and the rest its description, its constructor's annotated params the JSON Schema of its params, and its `takes`, `gives` and `needs` (a list, or a mapping of name to description). A built-in kind's task carries the kind's declaration, and `check` refuses one that differs, params that do not fit an image task's schema, needs its definition does not require, and an edge whose declared schemas differ. The job carries its declared run arguments. In-process runs (`moruna.run(job)` with Python objects) build nothing and run as in 0.6.2, macOS included. `moruna.Function.build`, `moruna build MODULE:FUNCTION`, `moruna run --resolver` constructing code by reference, the `fingerprint` of a task and the `python` kinds' adapters are gone.
