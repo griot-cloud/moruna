@@ -595,6 +595,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
         if: env.REUSE == ''
+      # Compiled dependencies and unchanged crates come from the last release's cache, so a
+      # release recompiles only what changed; saved even when the job fails.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: env.REUSE == ''
+        with:
+          key: release-wheels-${{ matrix.os }}
+          cache-on-failure: true
       # Both builds (PY-I7), each named by its own path: the free-threaded install also
       # carries a `python3.14`, so a bare name finds 3.14t twice (0.2.4 shipped only 3.14t).
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -686,6 +693,13 @@ jobs:
           fetch-depth: 1
       - run: rustup toolchain install
         if: env.REUSE == ''
+      # Compiled dependencies and unchanged crates come from the last release's cache, so a
+      # release recompiles only what changed; saved even when the job fails.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: env.REUSE == ''
+        with:
+          key: release-vmm-${{ matrix.target }}
+          cache-on-failure: true
       # Both builds, each named by its own path, as in `wheels`: the guest carries the
       # free-threaded one for the engine and the standard one for the sandbox (SDD 17 f.10),
       # and the free-threaded install also carries a `python3.14`, so a bare name built the
