@@ -35,8 +35,10 @@ ARTIFACTS = {
     "vmm-aarch64-unknown-linux-gnu": GUEST,
 }
 NOT_INPUTS = ["*/tests/*", "*/tests.rs", "python/tests/*"]
-APT_SETTINGS = re.compile(r"^cat > /etc/apt/apt\.conf\.d/80moruna-retries <<RETRIES\n.*?^RETRIES\n",
-                          re.MULTILINE | re.DOTALL)
+APT_SETTINGS = re.compile(
+    r"^cat > /etc/apt/apt\.conf\.d/80moruna-retries <<RETRIES\n.*?^RETRIES\n",
+    re.MULTILINE | re.DOTALL,
+)
 RUNS_LOOKED_AT = 30
 
 
@@ -52,7 +54,8 @@ def gh(path: str) -> dict:
 def build_script(commit: str) -> str:
     """guest/build.sh as it builds: no comment lines, no apt download settings."""
     text = APT_SETTINGS.sub("", git("show", f"{commit}:guest/build.sh"))
-    return "".join(line for line in text.splitlines(keepends=True) if not line.lstrip().startswith("#"))
+    lines = text.splitlines(keepends=True)
+    return "".join(line for line in lines if not line.lstrip().startswith("#"))
 
 
 def fingerprint(commit: str, paths: list[str]) -> str:
@@ -73,7 +76,8 @@ def fingerprint(commit: str, paths: list[str]) -> str:
 def reusable(repo: str, commit: str) -> dict[str, int]:
     wanted = {name: fingerprint(commit, paths) for name, paths in ARTIFACTS.items()}
     found: dict[str, int] = {}
-    runs = gh(f"repos/{repo}/actions/runs?branch=main&event=push&status=completed&per_page={RUNS_LOOKED_AT}")
+    query = f"branch=main&event=push&status=completed&per_page={RUNS_LOOKED_AT}"
+    runs = gh(f"repos/{repo}/actions/runs?{query}")
     for run in runs["workflow_runs"]:
         if run["head_sha"] == commit or len(found) == len(wanted):
             continue
@@ -83,15 +87,17 @@ def reusable(repo: str, commit: str) -> dict[str, int]:
             if name in wanted and name not in found and not artifact["expired"]:
                 if fingerprint(run["head_sha"], ARTIFACTS[name]) == wanted[name]:
                     found[name] = run["id"]
-                    print(f"{name}: built from these inputs by run {run['id']} ({run['head_sha'][:7]})",
-                          file=sys.stderr)
+                    built_by = f"run {run['id']} ({run['head_sha'][:7]})"
+                    print(f"{name}: built from these inputs by {built_by}", file=sys.stderr)
     for name in wanted.keys() - found.keys():
         print(f"{name}: no earlier run built these inputs; it is built", file=sys.stderr)
     return found
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--commit", default="HEAD")
     args = parser.parse_args()
