@@ -11,6 +11,13 @@ What moving the first project onto 0.6.3 found; each fix has a test that fails o
 - **Run arguments take `datetime` and `date`.** They are written as RFC 3339 and `YYYY-MM-DD` (they were written as `str()` and refused); an object JSON cannot write is refused by name. Every task reads an argument as its JSON value, in process as inside an image.
 - **Schema declarations name structs.** `struct<name: type, ...>`, nested in lists and structs, in `takes` and `gives`.
 - **Linux wheels install in task images.** The Linux wheels are built for `manylinux_2_28` (they were `manylinux_2_39`, newer than the images a task is built into) and for aarch64 as well as x86_64 (`tools/release/linux-wheels.sh`).
+- **Python images start in the sandbox.** Every Python image `moruna build` made died at its start: with no home, CPython looked the user up, glibc asked nscd over a Unix socket, and the image filter killed the process for it. Images now run with `HOME=/tmp` and `PYTHONNOUSERSITE=1`, which the build key names, so no image built before is reused.
+- **A job whose sink is its own task runs its images.** With no `cache` setting an image was unpacked beside a file output, so such a job was refused at every image. Images unpack into Moruna's cache (`$XDG_CACHE_HOME/moruna/unpacked`, else `~/.cache/moruna/unpacked`) when the output is not a local directory.
+- **`moruna.run` runs a built job's images.** `moruna.run(..., sandbox_cgroup=, sandbox_python=)` gives the run its sandbox, as `moruna run --sandbox-cgroup` does.
+- **A source image can call its ports while it plans.** The run's ports are bound before any source or sink is built.
+- **An image the filter kills is named.** A source or sink whose process died was reported only by its broken stream; how it ended now leads the message, with its standard error.
+- **A sink image reads what the stage before it gave.** The stream a sink image reads takes the first batch's schema, as the Parquet and Vortex sinks do (an image function plans its input's schema and may give another); a later batch with other columns is refused naming both.
+- **An image reads every batch it is given.** A batch whose last buffer had no bytes (a string column of nulls) was written to an image with the zeros after its body, which a stream reader takes for the end of the stream: the image stopped after its first batch.
 
 ## 0.6.3
 

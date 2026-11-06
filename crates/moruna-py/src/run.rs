@@ -604,7 +604,8 @@ pub fn read_job(py: Python<'_>, document: &[u8]) -> PyResult<String> {
                     on_error = None, ordered = false, sizer = "rule", profiles_dir = None,
                     storage = None, host_profile = None, allow_gil = false, checkpoint = true,
                     checkpoint_interval = 5.0, keep_checkpoint = false, resume = None,
-                    cost = None, engine_ports = None))]
+                    cost = None, engine_ports = None, sandbox_python = None,
+                    sandbox_cgroup = None))]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     py: Python<'_>,
@@ -635,6 +636,8 @@ pub fn run(
     resume: Option<String>,
     cost: Option<PyRef<'_, crate::engine::PyCostSession>>,
     engine_ports: Option<PyRef<'_, crate::engine::PyEnginePorts>>,
+    sandbox_python: Option<String>,
+    sandbox_cgroup: Option<String>,
 ) -> PyResult<String> {
     let _guard = map(py, RunningGuard::acquire())?;
     let tasks = given(tasks)?;
@@ -669,6 +672,27 @@ pub fn run(
             }
             packages = host.clone();
         }
+    }
+    // The run's own sandbox host (`moruna.run(sandbox_python=, sandbox_cgroup=)`, as `moruna run
+    // --sandbox-python --sandbox-cgroup`): what an image task runs in. Without it a run of a built
+    // job from Python could not run its images at all (0.6.3).
+    if sandbox_python.is_some() || sandbox_cgroup.is_some() {
+        let given = moruna_runtime::packaged::PackageHost {
+            sandbox_python: sandbox_python.map(PathBuf::from),
+            sandbox_cgroup: sandbox_cgroup.map(PathBuf::from),
+        };
+        if packages != moruna_runtime::packaged::PackageHost::default() && packages != given {
+            return Err(map_err(
+                py,
+                &MorunaError::Config {
+                    name: "sandbox",
+                    msg: "the run's sandbox_python= and sandbox_cgroup= differ from the sandbox \
+                          host its loaded packages name; a run has one"
+                        .into(),
+                },
+            ));
+        }
+        packages = given;
     }
 
     let raw = RawArgs {

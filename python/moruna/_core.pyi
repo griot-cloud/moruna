@@ -263,6 +263,8 @@ def run(
     resume: str | None = ...,
     cost: CostSession | None = ...,
     engine_ports: EnginePorts | None = ...,
+    sandbox_python: str | None = ...,
+    sandbox_cgroup: str | None = ...,
 ) -> str: ...
 def main(argv: list[str], needs: Mapping[str, Any] | None = ...) -> int: ...
 

@@ -38,7 +38,7 @@ maturin=$(sed -n 's/^requires = \["\(maturin[^"]*\)"\].*/\1/p' "$root/pyproject.
     export PATH=/src/target/manylinux/cargo/bin:\$PATH
     [ -x /src/target/manylinux/cargo/bin/rustup ] \
       || curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
-    rustup toolchain install $toolchain --profile minimal
+    rustup run $toolchain rustc --version >/dev/null 2>&1 || rustup toolchain install $toolchain --profile minimal
     venv=/src/target/manylinux/maturin-$arch
     [ -x \$venv/bin/maturin ] || /opt/python/cp314-cp314t/bin/python -m venv \$venv
     # bindgen (vortex-io's custom-labels) needs libclang, which the image does not carry; the

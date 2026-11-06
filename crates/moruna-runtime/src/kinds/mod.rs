@@ -162,7 +162,6 @@ pub struct Context {
     embedding: Arc<dyn Embedding>,
     notes: Vec<String>,
     source_targets: Vec<String>,
-    sink_target: String,
     shared: HashMap<TypeId, Box<dyn Any + Send>>,
     pulled: Option<std::path::PathBuf>,
     args: serde_json::Map<String, serde_json::Value>,
@@ -180,7 +179,6 @@ impl Context {
             embedding,
             notes: Vec::new(),
             source_targets: Vec::new(),
-            sink_target: String::new(),
             shared: HashMap::new(),
             pulled: None,
             args: serde_json::Map::new(),
@@ -278,18 +276,6 @@ impl Context {
     /// Where the run's source reads, once the source is built: what a sink keeps apart from.
     pub fn source_targets(&self) -> &[String] {
         &self.source_targets
-    }
-
-    /// Where the run's sink writes, once the sink is built: the store a kernel that keeps
-    /// something of its own (an image's unpacked root) keeps it beside. Empty before then, and
-    /// for a sink with no location.
-    pub fn sink_target(&self) -> &str {
-        &self.sink_target
-    }
-
-    /// Record where the sink writes.
-    pub fn set_sink_target(&mut self, target: String) {
-        self.sink_target = target;
     }
 
     /// Record where the source reads.

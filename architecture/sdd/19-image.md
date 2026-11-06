@@ -66,7 +66,7 @@ pub const MOUNT_POINTS: [&str; 3] = ["proc", "dev", "tmp"];
   "command": ["/usr/bin/scorer"], "env": {"MODEL": "small"}, "cache": "/disk/cache/images" }
 ```
 
-`layout` and `reference` are required. `command` replaces the image's entrypoint and cmd. `env` is added to the image's environment, a name replacing the image's. `cache` defaults to `images` under the run's output when that is a directory on this machine (`file://` or a plain path) and is otherwise required. Building the stage unpacks the image and makes the kernel; off Linux it is refused with the sandbox's `unavailable()` error; on Linux without `--sandbox-cgroup` (`PackageHost::sandbox_cgroup`, 17 e.6) it says that is what it needs.
+`layout` and `reference` are required. `command` replaces the image's entrypoint and cmd. `env` is added to the image's environment, a name replacing the image's. `cache` defaults to Moruna's cache, `$XDG_CACHE_HOME/moruna/unpacked` (else `~/.cache/moruna/unpacked`), shared by every run of the user, and is required only when the process has neither (amended 2026-11-06, 0.6.4: it defaulted to `images` under the run's output, inside a Parquet sink's dataset, where the roots were read back as part of it, and a job whose sink is a task of its own had no output to put them under). Building the stage unpacks the image and makes the kernel; off Linux it is refused with the sandbox's `unavailable()` error; on Linux without `--sandbox-cgroup` (`PackageHost::sandbox_cgroup`, 17 e.6) it says that is what it needs.
 
 ### d.3 The kernel (`moruna-sandbox::ImageKernel`, Linux)
 

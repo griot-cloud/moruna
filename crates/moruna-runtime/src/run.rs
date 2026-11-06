@@ -480,6 +480,19 @@ fn drive(
         sinks: topology.sinks(),
         sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
+    // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
+    // scheduler's counters (which the controller reads) and to the stage hook (which the host
+    // hears). They are bound before any source or sink is built: an image's source or sink starts
+    // its process as it is built, and a source plans there, asking its ports (0.6.3 bound them
+    // after, so a source image's plan was refused, "the kernel called a port outside a run").
+    let waits = moruna_kernel::StageWaits::new(components.stage_hook.clone());
+    let run_ports = moruna_kernel::RunPorts {
+        cancel: guard.token(),
+        waits: waits.clone(),
+    };
+    for ports in &stage_ports {
+        ports.bind_run(run_ports.clone());
+    }
     let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
     for spec in source_specs {
         sources.push(spec.build(&ctx)?);
@@ -815,18 +828,7 @@ fn drive(
     if let Some(sink) = components.output.clone() {
         scheduler.set_output(sink);
     }
-    // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
-    // scheduler's counters (which the controller reads) and to the stage hook (which the host
-    // hears).
-    let waits = moruna_kernel::StageWaits::new(components.stage_hook.clone());
-    scheduler.set_waits(waits.clone());
-    let run_ports = moruna_kernel::RunPorts {
-        cancel: guard.token(),
-        waits,
-    };
-    for ports in &stage_ports {
-        ports.bind_run(run_ports.clone());
-    }
+    scheduler.set_waits(waits);
     if staging_url.is_some() {
         return Err(RunError::bare(MorunaError::Config {
             name: "staging.url",

@@ -26,7 +26,10 @@ pub const END: [u8; 8] = frame::END_OF_STREAM;
 pub const MESSAGE_MAX: usize = FRAMING_MAX;
 
 /// The bytes of `record` a stream reader is given: the whole record when it is the stream's
-/// first, its record batch message and body after.
+/// first, its record batch message and body after; either way only to the end of the body the
+/// message declares. A record may run past it (a buffer of no bytes is placed at the next page,
+/// so the record's length is that page's start), and a reader takes the zeros there for the
+/// end of the stream: a program given them stopped after its first batch (0.6.3).
 pub fn stream_bytes(record: &[u8], first: bool) -> Result<&[u8], String> {
     let framing = match record::framing_need(record)? {
         record::Need::Framing(n) => &record[..n],
@@ -38,10 +41,24 @@ pub fn stream_bytes(record: &[u8], first: bool) -> Result<&[u8], String> {
         }
     };
     let (_, batch) = record::stream_parts(framing)?;
+    let body = frame::body_length(&framing[batch.clone()])?;
+    let end = u64::try_from(body)
+        .ok()
+        .and_then(|body| usize::try_from(body).ok())
+        .and_then(|body| framing.len().checked_add(body))
+        .filter(|end| *end <= record.len())
+        .ok_or_else(|| {
+            format!(
+                "a record of {} bytes whose batch message declares a body of {body} bytes after \
+                 its {}-byte framing",
+                record.len(),
+                framing.len()
+            )
+        })?;
     Ok(if first {
-        record
+        &record[..end]
     } else {
-        &record[batch.start..]
+        &record[batch.start..end]
     })
 }
 
@@ -250,5 +267,39 @@ mod tests {
         assert_eq!(schema_of(&r).unwrap(), &r[..r.len() - later.len()]);
         assert!(stream_bytes(&r[..4], true).is_err());
         assert!(schema_of(&[0xff; 4]).is_err());
+    }
+
+    /// A batch whose last buffer has no bytes (a string column of nulls): its record runs a
+    /// page past its body, and a reader given those zeros ended the stream after one batch.
+    #[test]
+    fn a_stream_of_records_holds_every_batch_when_a_last_buffer_is_empty() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("gap", DataType::Utf8, true),
+        ]));
+        let batch = |rows: i64| {
+            let x: ArrayRef = Arc::new(Int64Array::from_iter_values(0..rows));
+            let gap: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; rows as usize]));
+            RecordBatch::try_new(Arc::clone(&schema), vec![x, gap]).unwrap()
+        };
+        let (one, two) = (
+            moruna_testkit::plane::record(&batch(3)).unwrap(),
+            moruna_testkit::plane::record(&batch(5)).unwrap(),
+        );
+        let first = stream_bytes(&one, true).unwrap();
+        assert!(first.len() < one.len(), "the record runs past its body");
+        let mut stream = first.to_vec();
+        stream.extend_from_slice(stream_bytes(&two, false).unwrap());
+        stream.extend_from_slice(&END);
+        let read = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(stream), None)
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .collect::<Vec<_>>();
+        assert_eq!(read, vec![3, 5]);
     }
 }

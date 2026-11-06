@@ -4513,6 +4513,7 @@ dependencies = [
 name = "moruna-plane-linux"
 version = "0.6.4"
 dependencies = [
+ "arrow",
  "libc",
  "moruna-abi",
  "moruna-ipc-check",
