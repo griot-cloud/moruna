@@ -152,8 +152,10 @@ def run(
     ``ports`` supplies what the job's tasks need: a mapping of need to object (the in-process
     adapter, ``moruna.Ports``) or a ``moruna.Resolver``. Every need is resolved before the run
     starts, and one the resolver cannot supply is refused by name. ``args`` gives the run's
-    arguments, every one the job declares (``job.arg``), each of its type; a missing or
-    ill-typed argument is refused by name before the run, and the report records them. ``spec_to`` (a file path, a
+    arguments, every one the job declares (``job.arg``), each of its type (a ``timestamp`` may
+    be a ``datetime`` with its offset, a ``date`` a ``date``); a missing or ill-typed argument is
+    refused by name before the run, and the report records them. A task reads each as its JSON
+    value, as it would inside an image: a timestamp or a date as its text. ``spec_to`` (a file path, a
     callable taking bytes, or a ``moruna.Writer``) gets the job's spec before the run starts and
     the report's bytes after it ends. ``explain=True`` puts the plan the run started from in the
     report's ``plan``.

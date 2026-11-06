@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use moruna_types::{ColumnType, TimeUnit as GrammarUnit, TypeName};
 
 use crate::error::MorunaError;
@@ -468,12 +468,18 @@ pub fn data_type(name: &TypeName) -> DataType {
         TypeName::LargeList(field, item) => {
             DataType::LargeList(Arc::new(Field::new(field, data_type(item), true)))
         }
+        TypeName::Struct(fields) => DataType::Struct(Fields::from(
+            fields
+                .iter()
+                .map(|(field, item)| Field::new(field, data_type(item), true))
+                .collect::<Vec<_>>(),
+        )),
     }
 }
 
 /// The description of the grammar that names `dt`, for writing it: `None` for a type the grammar
-/// does not have. A list's item is named by its field; whether the item may be null is not part
-/// of a spelling, so a list of non-nullable items is named as the list of nullable ones.
+/// does not have. A list's item and a struct's fields are named by their fields; whether one may
+/// be null is not part of a spelling, so a non-nullable one is named as the nullable one.
 pub fn named(dt: &DataType) -> Option<TypeName> {
     Some(match dt {
         DataType::Null => TypeName::Null,
@@ -513,6 +519,12 @@ pub fn named(dt: &DataType) -> Option<TypeName> {
         DataType::LargeList(item) => {
             TypeName::LargeList(item.name().clone(), Box::new(named(item.data_type())?))
         }
+        DataType::Struct(fields) => TypeName::Struct(
+            fields
+                .iter()
+                .map(|field| Some((field.name().clone(), named(field.data_type())?)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
         _ => return None,
     })
 }

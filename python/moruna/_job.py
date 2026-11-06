@@ -24,6 +24,7 @@ tasks run as the objects they are, built or not.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import functools
 import hashlib
 import importlib
@@ -1652,6 +1653,22 @@ def _pulled(job: Job, resolver: Any) -> str | None:
     return str(cache)
 
 
+def _args_json(given: dict[str, Any]) -> str:
+    """A run's arguments as the JSON its checks, its tasks and its report read: a
+    ``datetime.datetime`` as RFC 3339 (``YYYY-MM-DDTHH:MM:SS``, its fraction, its offset) and a
+    ``datetime.date`` as ``YYYY-MM-DD``; every other value as JSON writes it. A value JSON cannot
+    write is refused by name, never written as its ``str``."""
+
+    def encode(value: Any) -> Any:
+        if isinstance(value, datetime.datetime):
+            return value.isoformat()
+        if isinstance(value, datetime.date):
+            return value.isoformat()
+        raise TypeError(f"a run argument is a string, number, bool, date or datetime, not {value!r}")
+
+    return json.dumps(given, default=encode)
+
+
 def run_job(
     job: Job, *, ports: Any, spec_to: Any, explain: bool, args: Any, options: dict[str, Any]
 ) -> Any:
@@ -1668,10 +1685,13 @@ def run_job(
             "moruna.run's arguments, so run the document as it is with `moruna run`, or run a "
             "spec of tasks and edges"
         )
-    given = dict(args or {})
-    refused = _core.check_args(job._arg_list(), json.dumps(given, default=str))
+    encoded = _args_json(dict(args or {}))
+    refused = _core.check_args(job._arg_list(), encoded)
     if refused:
         raise _config_error("; ".join(refused))
+    # Every task reads an argument as its JSON value, as a task inside an image does from
+    # MORUNA_ARGS: a timestamp or a date as its text, whatever object the caller gave.
+    given = json.loads(encoded)
     resolver = resolver_of(ports)
     live = [
         (e.key, f"job[{e.key!r}]", e.task)
@@ -1726,7 +1746,7 @@ def run_job(
             lowered,
             job_digest=spec.digest() if spec is not None else None,
             explain=explain,
-            args=json.dumps(given, default=str),
+            args=encoded,
             arg_types=job._arg_list(),
             held=held,
             served=served,

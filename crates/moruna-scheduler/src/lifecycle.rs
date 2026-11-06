@@ -258,7 +258,6 @@ fn restore_instances(shared: &Arc<Shared>, point: &ResumePoint) -> Result<()> {
 }
 
 fn restore_all(shared: &Arc<Shared>, point: &ResumePoint) -> Result<()> {
-    let workers = shared.cfg.workers_max as usize;
     for index in 0..shared.stages.len() {
         let Some(max) = shared.stages[index].pool.as_ref().map(|pool| pool.max) else {
             continue;
@@ -278,7 +277,7 @@ fn restore_all(shared: &Arc<Shared>, point: &ResumePoint) -> Result<()> {
                                 "the manifest holds no state for stage {stage} instance {instance}"
                             ))
                         })?;
-                    let worker = (instance % workers) as u16;
+                    let worker = crate::instances::home(shared, index, instance);
                     shared.run_on_worker(
                         worker,
                         WorkerJob::Restore {
@@ -291,7 +290,7 @@ fn restore_all(shared: &Arc<Shared>, point: &ResumePoint) -> Result<()> {
             }
             ResumePolicy::Reinit => {
                 for instance in 0..max {
-                    let worker = (instance % workers) as u16;
+                    let worker = crate::instances::home(shared, index, instance);
                     shared.run_on_worker(
                         worker,
                         WorkerJob::Init {

@@ -198,6 +198,63 @@ def test_errors_in_user_code_carry_the_python_message(staging: dict[str, object]
         moruna.run(BadPlan(_table()), [], CollectSink(), **staging)
 
 
+COUNTED = pa.schema([("rows", pa.int64())])
+
+
+class Nothing(moruna.Source):
+    """A source with nothing to read: no splits, or splits that hold no rows."""
+
+    gives = pa.schema([("n", pa.int64())])
+
+    def __init__(self, splits: int):
+        self.splits = splits
+
+    def plan(self) -> list[moruna.Split]:
+        return [moruna.Split(i, 0) for i in range(self.splits)]
+
+    def read(self, split_id: int, start: int, end: int) -> pa.RecordBatch:
+        # The plan's sample (07 f.7) reads the first split's zero rows: nothing else is read.
+        assert start == end == 0, f"rows [{start}, {end}) of an empty split were read"
+        return pa.RecordBatch.from_pylist([], schema=self.gives)
+
+
+class Count(moruna.Function):
+    """How many rows came, once they end."""
+
+    gives = COUNTED
+
+    def __init__(self) -> None:
+        self.rows = 0
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        self.rows += batch.num_rows
+        return pa.RecordBatch.from_pylist([], schema=COUNTED)
+
+    def finish(self) -> pa.RecordBatch:
+        return pa.RecordBatch.from_pylist([{"rows": self.rows}], schema=COUNTED)
+
+
+@pytest.mark.parametrize("splits", [0, 1, 3])
+def test_a_source_with_nothing_to_read_is_a_run_with_no_rows(splits: int) -> None:
+    """No splits, or splits with no rows: the run completes, a stateful task's ``finish`` runs, and
+    what it gives reaches the sink (SC f.5 MA1, RC f.14 amended 2026-11-06). 0.6.3 refused it:
+    "the source plan is exhausted; there is nothing to probe with"."""
+    kept: list[dict] = []
+
+    class Keep(moruna.Sink):
+        """Keeps the rows."""
+
+        def write(self, batch: pa.RecordBatch) -> None:
+            kept.extend(batch.to_pylist())
+
+    job = moruna.Job("nothing")
+    counted = job.add(Count(), inputs=job.add(Nothing(splits), name="nothing"), name="count")
+    job.add(Keep(), inputs=counted, name="out")
+    report = moruna.run(job, checkpoint=False)
+    assert kept == [{"rows": 0}]
+    assert report.to_dict()["exit"]["status"] == "completed"
+
+
 CHILD = r"""
 import json, os, pathlib, sys, time
 import pyarrow as pa, pyarrow.ipc as ipc
