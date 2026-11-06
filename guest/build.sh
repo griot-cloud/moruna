@@ -73,6 +73,7 @@ cat > /etc/apt/apt.conf.d/80moruna-retries <<RETRIES
 Acquire::Retries "8";
 Acquire::http::Timeout "60";
 Acquire::Queue-Mode "access";
+APT::Update::Error-Mode "any";
 RETRIES
 retry() {
     local attempt
@@ -83,10 +84,16 @@ retry() {
     done
     return 1
 }
-retry apt-get -o Acquire::Check-Valid-Until=false update -qq
-retry apt-get install -qq -y --no-install-recommends \
-    build-essential bc bison flex libelf-dev libssl-dev xz-utils bzip2 cpio \
-    erofs-utils mmdebstrap ca-certificates curl python3 >/dev/null
+# An update that failed to fetch an index exits 0 and leaves the install finding nothing
+# ("Unable to locate package mmdebstrap", 0.6.3): the update fails on any error, and update and
+# install are one step, retried together.
+tools() {
+    apt-get -o Acquire::Check-Valid-Until=false update -qq &&
+        apt-get install -qq -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev xz-utils bzip2 cpio \
+            erofs-utils mmdebstrap ca-certificates curl python3 >/dev/null
+}
+retry tools
 
 work=/tmp/build && mkdir -p $work && cd $work
 fetch() { curl -fsSL -o "$2" "$1" && echo "$3  $2" | sha256sum -c --quiet -; }
