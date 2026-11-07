@@ -571,6 +571,67 @@ def test_run_arguments_are_declared_by_the_spec_and_given_by_each_run(
     assert moruna.Job.read(job.spec()).args == {"limit": "int", "start": "timestamp"}
 
 
+def test_a_timestamp_argument_may_be_a_datetime_and_every_task_reads_its_text(
+    tasks, tmp_path: Path
+) -> None:
+    """A ``datetime`` with its offset is a timestamp argument and a ``date`` a date one, written
+    as RFC 3339; every task reads an argument as its JSON value, as it would inside an image.
+    0.6.3 wrote ``str(datetime)``, with a space, and refused it as not a timestamp."""
+    import datetime
+
+    _, tasks_a, _ = tasks
+    job = moruna.Job("dated")
+    job.arg("start", "timestamp")
+    job.arg("day", "date")
+    rows = job.add(tasks_a.Numbers(rows=3), name="rows")
+    window = job.add(tasks_a.Window(), inputs=rows)
+    job.add(moruna.ParquetSink(str(tmp_path / "d")), inputs=window, name="out")
+    start = datetime.datetime(2026, 11, 1, 9, 30, tzinfo=datetime.timezone.utc)
+    report = moruna.run(job, args={"start": start, "day": datetime.date(2026, 11, 1)})
+    assert report.args == {"start": "2026-11-01T09:30:00+00:00", "day": "2026-11-01"}
+    back = pq.read_table(str(tmp_path / "d"))
+    assert set(back.column("start").to_pylist()) == {"2026-11-01T09:30:00+00:00"}
+    with pytest.raises(TypeError, match="a run argument is a string, number, bool, date or datetime"):
+        moruna.run(job, args={"start": object(), "day": "2026-11-01"})
+
+
+RECORD = pa.struct([("id", pa.string()), ("seen", pa.timestamp("us", tz="UTC"))])
+RECORDS = pa.schema([("records", pa.list_(RECORD))])
+
+
+class Records(moruna.Function):
+    """Each row's records."""
+
+    gives = RECORDS
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        return pa.RecordBatch.from_pylist(
+            [{"records": [{"id": "a", "seen": None}]}] * batch.num_rows, schema=RECORDS
+        )
+
+
+def test_a_declaration_names_a_list_of_structs() -> None:
+    """``takes`` and ``gives`` may hold ``list<struct<...>>`` (0.6.3 refused it as an unknown
+    type), and every batch the task gives is checked against it."""
+    kept: list[pa.RecordBatch] = []
+
+    class Keep(moruna.Sink):
+        """Keeps the batches."""
+
+        takes = RECORDS
+
+        def write(self, batch: pa.RecordBatch) -> None:
+            kept.append(batch)
+
+    job = moruna.Job("records")
+    numbers = pa.schema([("n", pa.int64())])
+    batches = iter([pa.record_batch([pa.array([1, 2])], schema=numbers)])
+    rows = job.add(moruna.IteratorSource(batches, schema=numbers), name="rows")
+    job.add(Keep(), inputs=job.add(Records(), inputs=rows, name="records"), name="out")
+    moruna.run(job, checkpoint=False)
+    assert pa.Table.from_batches(kept).schema.field("records").type == pa.list_(RECORD)
+
+
 def test_an_image_moruna_did_not_build_is_external(tasks, tmp_path: Path) -> None:
     _, tasks_a, _ = tasks
     digest = "sha256:" + "ab" * 32

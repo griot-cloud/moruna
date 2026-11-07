@@ -310,11 +310,6 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         sink_targets.push(built.target.clone());
         sinks.push(built);
     }
-    // A kind that keeps files beside the output (an image's unpacked layers, 19 d.2) defaults
-    // to the first sink's target.
-    if let Some(first) = sinks.first() {
-        cx.set_sink_target(first.target.clone());
-    }
 
     // The kernels, in the order the plan starts them (SDD 26 f.5), which is an order in which
     // every edge goes forward, each built on its own. A kernel that takes its one input from a

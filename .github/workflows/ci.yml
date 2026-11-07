@@ -585,7 +585,9 @@ jobs:
         # ubuntu-latest moved, maturin found no manylinux tag for its glibc, and PyPI refused them.
         # macos-15: GitHub retired macos-14 ("The configuration 'macos-14-arm64-us-default' is
         # not supported"), which left 0.6.3's release with no macOS wheel and nothing published.
-        os: [ubuntu-24.04, macos-15]
+        # ubuntu-24.04-arm: Linux on aarch64, which no release had a wheel for, so a task image
+        # for linux/aarch64 could not install Moruna (0.6.4).
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     env:
       REUSE: ${{ fromJSON(needs.version.outputs.reuse)[format('wheels-{0}', matrix.os)] }}
     permissions:
@@ -614,8 +616,17 @@ jobs:
         id: freethreaded
         with:
           python-version: "3.14t"
-      - name: Build the wheels
-        if: env.REUSE == ''
+      # A Linux wheel is built in the manylinux_2_28 image, which is what a task image installs
+      # its lock for: 0.6.3's were built on the runner and tagged manylinux_2_39, so no task
+      # image could install Moruna (0.6.4). tools/release/linux-wheels.sh is the one recipe, run
+      # here and on a Mac alike.
+      - name: Build the Linux wheels
+        if: env.REUSE == '' && runner.os == 'Linux'
+        run: |
+          tools/release/linux-wheels.sh docker dist
+          ls -la dist
+      - name: Build the macOS wheels
+        if: env.REUSE == '' && runner.os == 'macOS'
         env:
           STANDARD: ${{ steps.standard.outputs.python-path }}
           FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}

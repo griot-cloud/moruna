@@ -101,8 +101,8 @@ fn rc_t20_resume_without_a_profile() {
     );
     rig.controller.stop();
 
-    // A fresh run: the same answer is a plan error, because a fresh run with nothing to read
-    // is a plan error.
+    // A fresh run whose source has nothing to read gets the same answer, and it is a run with
+    // no rows, not a failure (f.14, amended 2026-11-06): seeded from the hint, and said so.
     let knobs = FakeKnobs::new();
     let fresh = common::Rig::with_prober(
         config_with_baseline(CEILING, WORKERS, BASELINE),
@@ -112,9 +112,20 @@ fn rc_t20_resume_without_a_profile() {
         common::RecordingProber::failing(knobs, EXHAUSTED),
     );
     fresh.controller.prepare().expect("prepare");
-    let error = fresh
+    fresh
         .controller
         .probe_all()
-        .expect_err("a fresh run keeps the plan error");
-    assert!(error.to_string().contains("nothing to probe with"));
+        .expect("a fresh run with nothing to read is seeded, not refused");
+    fresh
+        .controller
+        .start()
+        .expect("the run starts with nothing to read");
+    let notes = fresh.controller.summary().notes;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n == "stage 1 could not be probed, the plan is exhausted; seeded from hints"),
+        "the note names the stage, without \"resumed: \": {notes:?}"
+    );
+    fresh.controller.stop();
 }

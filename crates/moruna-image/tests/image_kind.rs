@@ -477,3 +477,65 @@ fn im_t29_a_refused_record_ends_the_stage() {
     .expect_err("the run fails");
     assert!(e.contains("more record batches than"), "{e}");
 }
+
+/// IM-T30 a_source_the_filter_kills_is_named (0.6.4): a source image that makes a socket is
+/// killed by the filter before it writes a byte, and the run says so (SDD 19 f.7), not only that
+/// its stream was empty: 0.6.3 killed the process before looking at how it had ended, so every
+/// Python image that died at its start was reported as "its output is not an Arrow IPC stream".
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t30_a_source_the_filter_kills_is_named() {
+    let _serial = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let scratch = Scratch::new("im_t30");
+    let layout = layout(&scratch);
+    let out = scratch.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let staging = scratch.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let spec = JobSpec::from_value(json!({
+        "moruna_spec": 1,
+        "source": {"kind": "image", "image": image_of(&layout),
+                   "cache": scratch.path().join("images").display().to_string(),
+                   "command": ["/bin/arrow_echo", "--socket"]},
+        "kernels": [],
+        "sink": {"kind": "parquet", "url": format!("file://{}", out.display())},
+        "budget": {"memory_bytes": 1u64 << 30, "cpu": 2.0},
+        "staging": {"dir": staging.to_string_lossy(), "limit_bytes": 1u64 << 30},
+        "profiles_dir": scratch.path().join("profiles").to_string_lossy(),
+    }))
+    .unwrap();
+    let job = moruna_job::Job::from_v1(&spec);
+    let plan = moruna_runtime::job::plan::default_plan(&job).unwrap();
+    let built = build(
+        &job,
+        &plan,
+        &Registry::standard(),
+        BuildOptions {
+            strict: true,
+            env: &no_env,
+            notes: Vec::new(),
+            packages: PackageHost {
+                sandbox_python: None,
+                sandbox_cgroup: Some(cgroup()),
+            },
+            host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
+        },
+    )
+    .expect("the job builds");
+    let e = Runtime::run(built.spec, CancelToken::new())
+        .map(drop)
+        .expect_err("the run fails")
+        .to_string();
+    assert!(
+        e.contains("made a system call it is not allowed"),
+        "SDD 19 f.7: {e}"
+    );
+    assert!(e.contains("SIGSYS"), "{e}");
+    assert!(
+        e.contains("its output is not an Arrow IPC stream"),
+        "the stream's fault stays the cause: {e}"
+    );
+}

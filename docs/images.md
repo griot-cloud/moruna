@@ -57,7 +57,7 @@ What it reads and writes depends on its role. Every stream is one Arrow IPC stre
 
 What a process writes on its standard error is the task's log. Any other exit status, a stream that is not Arrow IPC, or a function that writes more or fewer batches than it read, fails the task, and the error quotes the end of the standard error. A run on a Linux node starts the process in its own namespaces and cgroup, with a seccomp filter and no network; on the Moruna kernel a function runs as a task of the data plane.
 
-An image Moruna builds has four kinds of layer: the runtime (`python:3.14-slim`, by digest), one layer per Python distribution its code imports (so tasks that import the same distribution share its layer), the shim, and the task's own code with its bytecode. Its entrypoint is the shim, `python3 /opt/moruna/shim.py --workdir /app`, and its config sets `MORUNA_ENTRY`, so the image also runs by itself under any OCI runtime, Arrow IPC in and out:
+An image Moruna builds has four kinds of layer: the runtime (`python:3.14-slim`, by digest), one layer per Python distribution its code imports (so tasks that import the same distribution share its layer), the shim, and the task's own code with its bytecode. Its entrypoint is the shim, `python3 /opt/moruna/shim.py --workdir /app`, and its config sets `MORUNA_ENTRY`, so the image also runs by itself under any OCI runtime, Arrow IPC in and out: Inside it, the `moruna` module holds only `Task`, `Source`, `Function`, `Sink`, `Split`, `function` and `polars`, not the engine, so a task's module must not build its job when it is imported: write the job in a module of its own that imports the tasks (`jobs.py`), and build that (`moruna build jobs:job`). Each image's process gets `HOME=/tmp`, the one place it may write, and no user site-packages (`PYTHONNOUSERSITE=1`), so nothing at its start looks the user up.
 
 ```sh
 podman run -i --rm -e MORUNA_PARAMS='{"table": "alerts"}' oci:images:sha256:6f1c... < in.arrows > out.arrows
@@ -67,7 +67,7 @@ Its manifest carries its provenance as annotations: `org.opencontainers.image.so
 
 ## The port protocol
 
-A need of an image task is a port: a named request and answer that the runner serves. `moruna.run(job, ports=...)` serves each need of an image task with what the resolver supplies for it, a callable taking the request's bytes and returning the answer's (or an object with `call(request)`); `moruna run JOB --resolver MODULE:ATTRIBUTE` does the same. Under the host protocol a need with no handler in the program goes to the host's peer.
+A need of an image task is a port: a named request and answer that the runner serves. `moruna.run(job, ports=..., sandbox_cgroup=...)` serves each need of an image task with what the resolver supplies for it, a callable taking the request's bytes and returning the answer's (or an object with `call(request)`); `moruna run JOB --resolver MODULE:ATTRIBUTE` does the same. Under the host protocol a need with no handler in the program goes to the host's peer.
 
 The process calls every port over the one connected stream socket `MORUNA_PORT_SOCKET` names, one call at a time: it writes a request and reads its answer before it writes the next.
 

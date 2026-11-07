@@ -28,8 +28,10 @@ import sys
 
 SOURCES = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "pyproject.toml", "crates", "python"]
 GUEST = SOURCES + ["guest"]
+LINUX_WHEELS = SOURCES + ["tools/release/linux-wheels.sh"]
 ARTIFACTS = {
-    "wheels-ubuntu-24.04": SOURCES,
+    "wheels-ubuntu-24.04": LINUX_WHEELS,
+    "wheels-ubuntu-24.04-arm": LINUX_WHEELS,
     "wheels-macos-15": SOURCES,
     "vmm-x86_64-unknown-linux-gnu": GUEST,
     "vmm-aarch64-unknown-linux-gnu": GUEST,

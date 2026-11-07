@@ -71,6 +71,16 @@ fn probe_inner(shared: &Shared, stage: StageId, bytes: u64) -> Result<ProbeResul
             read_for(shared, source, bytes)?;
             port
         }
+        // A stage no source feeds, with nothing waiting for it, in a run whose sources have
+        // nothing left to read: it has nothing to probe with, as a stage a source feeds does
+        // (the controller seeds it from hints, 11 f.14). 0.6.3 called it "no morsel to probe
+        // with", which the controller ended the run on, so a job whose source had nothing to
+        // read failed at its first stage after a join.
+        (None, None) if crate::source_drive::nothing_left(shared) => {
+            return Err(MorunaError::Plan(
+                "the source plan is exhausted; there is nothing to probe with".into(),
+            ));
+        }
         (None, None) => 0,
     };
     tracing::info!(target: "sched.probe", stage, port, bytes, "probing");

@@ -198,6 +198,123 @@ def test_errors_in_user_code_carry_the_python_message(staging: dict[str, object]
         moruna.run(BadPlan(_table()), [], CollectSink(), **staging)
 
 
+COUNTED = pa.schema([("rows", pa.int64())])
+
+
+class Nothing(moruna.Source):
+    """A source with nothing to read: no splits, or splits that hold no rows."""
+
+    gives = pa.schema([("n", pa.int64())])
+
+    def __init__(self, splits: int):
+        self.splits = splits
+
+    def plan(self) -> list[moruna.Split]:
+        return [moruna.Split(i, 0) for i in range(self.splits)]
+
+    def read(self, split_id: int, start: int, end: int) -> pa.RecordBatch:
+        # The plan's sample (07 f.7) reads the first split's zero rows: nothing else is read.
+        assert start == end == 0, f"rows [{start}, {end}) of an empty split were read"
+        return pa.RecordBatch.from_pylist([], schema=self.gives)
+
+
+class Tag(moruna.Function):
+    """A column of its own beside each row."""
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        return pa.RecordBatch.from_pydict({"tag": ["t"] * batch.num_rows})
+
+
+class Count(moruna.Function):
+    """How many rows came, once they end."""
+
+    gives = COUNTED
+
+    def __init__(self) -> None:
+        self.rows = 0
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        self.rows += batch.num_rows
+        return pa.RecordBatch.from_pylist([], schema=COUNTED)
+
+    def finish(self) -> pa.RecordBatch:
+        return pa.RecordBatch.from_pylist([{"rows": self.rows}], schema=COUNTED)
+
+
+@pytest.mark.parametrize("splits", [0, 1, 3])
+def test_a_source_with_nothing_to_read_is_a_run_with_no_rows(splits: int) -> None:
+    """No splits, or splits with no rows: the run completes, a stateful task's ``finish`` runs, and
+    what it gives reaches the sink (SC f.5 MA1, RC f.14 amended 2026-11-06). 0.6.3 refused it:
+    "the source plan is exhausted; there is nothing to probe with"."""
+    kept: list[dict] = []
+
+    class Keep(moruna.Sink):
+        """Keeps the rows."""
+
+        def write(self, batch: pa.RecordBatch) -> None:
+            kept.extend(batch.to_pylist())
+
+    job = moruna.Job("nothing")
+    nothing = job.add(Nothing(splits), name="nothing")
+    # A stage no source feeds (after a join) has nothing to probe with either.
+    joined = job.add(moruna.std.join(), inputs=[nothing, job.add(Tag(), inputs=nothing, name="tag")],
+                     name="join")
+    counted = job.add(Count(), inputs=joined, name="count")
+    job.add(Keep(), inputs=counted, name="out")
+    report = moruna.run(job, checkpoint=False)
+    assert kept == [{"rows": 0}]
+    assert report.to_dict()["exit"]["status"] == "completed"
+
+
+class Trickle(moruna.Source):
+    """Splits of one row whose reads each take a while, as rows arriving over a network."""
+
+    gives = pa.schema([("n", pa.int64())])
+
+    def __init__(self, splits: int, seconds: float, log: list):
+        self.splits, self.seconds, self.log = splits, seconds, log
+
+    def plan(self) -> list[moruna.Split]:
+        return [moruna.Split(i, 1, 8) for i in range(self.splits)]
+
+    def read(self, split_id: int, start: int, end: int) -> pa.RecordBatch:
+        time.sleep(self.seconds)
+        self.log.append(("read", time.monotonic()))
+        return pa.RecordBatch.from_pylist([{"n": split_id}], schema=self.gives)
+
+
+class Note(moruna.Function):
+    """Notes when each batch arrives."""
+
+    def __init__(self, log: list):
+        self.log = log
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        self.log.append(("call", time.monotonic()))
+        return batch
+
+
+def test_a_split_is_processed_while_later_splits_are_still_being_read() -> None:
+    """A read happens when the drive polls it, not when it issues it (07 f.7, 10 f.5): 0.6.3 read
+    every split up to the read-ahead before it pushed the first, so nothing downstream ran until
+    the source had been read through."""
+    log: list = []
+
+    class Drop(moruna.Sink):
+        """Keeps nothing."""
+
+        def write(self, batch: pa.RecordBatch) -> None:
+            pass
+
+    job = moruna.Job("trickle")
+    noted = job.add(Note(log), inputs=job.add(Trickle(5, 0.3, log), name="rows"), name="note")
+    job.add(Drop(), inputs=noted, name="out")
+    moruna.run(job, checkpoint=False)
+    first_call = min(t for kind, t in log if kind == "call")
+    last_read = max(t for kind, t in log if kind == "read")
+    assert first_call < last_read, "the first split was processed only after the last was read"
+
+
 CHILD = r"""
 import json, os, pathlib, sys, time
 import pyarrow as pa, pyarrow.ipc as ipc

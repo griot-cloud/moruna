@@ -480,6 +480,19 @@ fn drive(
         sinks: topology.sinks(),
         sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
+    // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
+    // scheduler's counters (which the controller reads) and to the stage hook (which the host
+    // hears). They are bound before any source or sink is built: an image's source or sink starts
+    // its process as it is built, and a source plans there, asking its ports (0.6.3 bound them
+    // after, so a source image's plan was refused, "the kernel called a port outside a run").
+    let waits = moruna_kernel::StageWaits::new(components.stage_hook.clone());
+    let run_ports = moruna_kernel::RunPorts {
+        cancel: guard.token(),
+        waits: waits.clone(),
+    };
+    for ports in &stage_ports {
+        ports.bind_run(run_ports.clone());
+    }
     let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
     for spec in source_specs {
         sources.push(spec.build(&ctx)?);
@@ -569,6 +582,11 @@ fn drive(
             py_kernel.bind_gate(gate.clone());
         }
     }
+    // Every kernel lets go of this run's arena and gate when the run ends, however it ends: a
+    // kernel outlives its run inside its task object, and one that held the arena kept the
+    // whole region mapped for the life of the process (0.6.3).
+    #[cfg(feature = "python")]
+    let _release = ReleaseRun(py_kernels.iter().map(|(_, k)| k.clone()).collect());
     if let Some(gate) = &gate {
         for stage in packaged.iter().filter(|stage| !stage.native_singleton()) {
             stage.bind(gate, &sampler, limits.memory_ceiling);
@@ -810,18 +828,7 @@ fn drive(
     if let Some(sink) = components.output.clone() {
         scheduler.set_output(sink);
     }
-    // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
-    // scheduler's counters (which the controller reads) and to the stage hook (which the host
-    // hears).
-    let waits = moruna_kernel::StageWaits::new(components.stage_hook.clone());
-    scheduler.set_waits(waits.clone());
-    let run_ports = moruna_kernel::RunPorts {
-        cancel: guard.token(),
-        waits,
-    };
-    for ports in &stage_ports {
-        ports.bind_run(run_ports.clone());
-    }
+    scheduler.set_waits(waits);
     if staging_url.is_some() {
         return Err(RunError::bare(MorunaError::Config {
             name: "staging.url",
@@ -2277,5 +2284,18 @@ mod tests {
         let two = mint_run_id().expect("the host has randomness");
         assert_ne!(one.to_hex(), two.to_hex());
         assert_eq!(one.to_hex().len(), 32);
+    }
+}
+
+/// The Python kernels a run bound to its arena and gate, released when the run's scope ends.
+#[cfg(feature = "python")]
+struct ReleaseRun(Vec<Arc<moruna_adapters::PyKernel>>);
+
+#[cfg(feature = "python")]
+impl Drop for ReleaseRun {
+    fn drop(&mut self) {
+        for kernel in &self.0 {
+            kernel.release_run();
+        }
     }
 }

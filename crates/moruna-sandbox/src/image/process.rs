@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use moruna_image::{Image, Launch};
 use moruna_kernel::{MorunaError, Result, StagePorts};
@@ -32,6 +33,10 @@ pub struct Started {
     pub end: ProcessEnd,
 }
 
+/// How long a process whose stream failed has to end by itself before it is killed: one that ended
+/// (an empty stream) is reaped at once, one still writing what is not Arrow is usually alive.
+const FAULT_WAIT: Duration = Duration::from_secs(1);
+
 /// How a task's process ended, asked once its stream has ended.
 pub struct ProcessEnd {
     child: Child,
@@ -43,10 +48,17 @@ impl ProcessEnd {
     /// (`fault`); else why, with the end of its standard error. For a sink, what it wrote back.
     pub fn wait(mut self, fault: Option<String>) -> std::result::Result<Vec<u8>, String> {
         if let Some(fault) = fault {
+            // The stream's fault is the cause, and how the process ended comes first when it
+            // ended by itself: a process the filter killed (SIGSYS) leaves an empty stream, and
+            // 0.6.3 said only that the stream was empty, killing the process before looking.
+            let by_itself = self.child.reap(FAULT_WAIT);
+            if by_itself.is_none() {
+                self.child.kill();
+            }
             let lines = self.child.tail.lines(super::STDERR_WAIT);
-            self.child.kill();
+            let oom = self.child.cgroup.oom_kills() > 0;
             return Err(super::with_stderr(
-                format!("image `{}`: {fault}", self.child.name),
+                super::failure_head(&self.child.name, &fault, by_itself, oom),
                 &lines,
             ));
         }
