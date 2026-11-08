@@ -6,13 +6,13 @@
 use moruna_vmm::vhost_user::protocol::{self as p, req};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{fs::DirBuilderExt, net::UnixStream},
     },
-    path::PathBuf,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -80,6 +80,36 @@ fn eventfd() -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) }
 }
 
+fn connect_when_listening(path: &Path, backend: &mut Child) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // bind creates the socket path before listen makes it connectable. Only
+        // an actual connection proves readiness, including for the guest muxer.
+        match UnixStream::connect(path) {
+            Ok(conn) => return conn,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                assert!(
+                    backend.try_wait().unwrap().is_none(),
+                    "back end exited before listening on {}: {e}",
+                    path.display()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "back end never listened on {}: {e}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("connecting to {}: {e}", path.display()),
+        }
+    }
+}
+
 #[test]
 fn backend_serves_a_whole_session_inside_its_filter() {
     let nanos = std::time::SystemTime::now()
@@ -104,15 +134,7 @@ fn backend_serves_a_whole_session_inside_its_filter() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(
-            backend.try_wait().unwrap().is_none(),
-            "back end exited before binding"
-        );
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let mut conn = connect_when_listening(&socket, &mut backend);
     let status = fs::read_to_string(format!("/proc/{}/status", backend.id())).unwrap();
     assert!(
         status.lines().any(|l| l == "Seccomp:\t2"),
@@ -120,7 +142,6 @@ fn backend_serves_a_whole_session_inside_its_filter() {
     );
     assert!(status.lines().any(|l| l == "NoNewPrivs:\t1"));
 
-    let mut conn = UnixStream::connect(&socket).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     send(&conn, req::GET_FEATURES, &[], &[]);
@@ -198,16 +219,7 @@ fn backend_serves_a_whole_session_inside_its_filter() {
     }
     // The device is active: its muxer listens for the host. A host connection asks for a guest
     // port; the guest has posted no buffers, so it waits.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !uds.exists() {
-        assert!(
-            backend.try_wait().unwrap().is_none(),
-            "back end died activating"
-        );
-        assert!(Instant::now() < deadline, "muxer never listened");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let mut host = UnixStream::connect(&uds).unwrap();
+    let mut host = connect_when_listening(&uds, &mut backend);
     host.write_all(b"CONNECT 1234\n").unwrap();
     for kick in &kicks {
         // SAFETY: an eventfd write of one counter word.

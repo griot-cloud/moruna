@@ -85,9 +85,7 @@ fn float(f: f64) -> String {
     };
     let point = mantissa.find('.').unwrap_or(mantissa.len()) as i64;
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let first = digits
-        .find(|c| c != '0')
-        .expect("a nonzero float has a digit");
+    let first = digits.len() - digits.trim_start_matches('0').len();
     let exponent = exponent + point - first as i64 - 1;
     let digits = digits[first..].trim_end_matches('0');
     if (-4..16).contains(&exponent) {
