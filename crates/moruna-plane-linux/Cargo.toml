@@ -18,6 +18,7 @@ moruna-ipc-check = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+arrow = { workspace = true }
 moruna-plane = { workspace = true, features = ["model"] }
 moruna-testkit = { workspace = true }
 

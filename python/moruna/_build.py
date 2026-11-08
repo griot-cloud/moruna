@@ -935,15 +935,24 @@ SHIM_PARTS = {
 }
 
 
+# What every image's process is given beside the runtime's environment: a home on the one place it
+# may write (the sandbox's /tmp), and no user site-packages. Without a home, CPython's start looks
+# the user up, glibc asks nscd over a Unix socket, and the image filter kills the process for the
+# socket before it has written a byte (0.6.3: every Python image died at its start, SIGSYS).
+IMAGE_ENV = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "HOME": "/tmp"}
+
+
 def shim_digest() -> str:
-    """The shim's version: ``sha256:`` over its files by path, which every image of this
-    Moruna holds the same and every build key names."""
+    """The shim's version: ``sha256:`` over its files by path and the environment every image is
+    given (``IMAGE_ENV``), which every image of this Moruna holds the same and every build key
+    names: a change to either is a new key, so no image built before it is reused."""
     here = Path(__file__).parent
     digest = hashlib.sha256()
     for target, source in sorted(SHIM_PARTS.items()):
         data = (here / source).read_bytes()
         digest.update(f"{target}\0{len(data)}\0".encode())
         digest.update(data)
+    digest.update(json.dumps(IMAGE_ENV, sort_keys=True).encode())
     return "sha256:" + digest.hexdigest()
 
 
@@ -1173,7 +1182,7 @@ def image_config(
     workdir, its initial directory ``/``, and its origin."""
     ours = {
         "PYTHONPATH": f"/{APP_DIR}:/{SITE_PACKAGES}",
-        "PYTHONDONTWRITEBYTECODE": "1",
+        **IMAGE_ENV,
         "MORUNA_ENTRY": task.entry,
     }
     env = [

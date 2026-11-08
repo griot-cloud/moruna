@@ -26,7 +26,7 @@ This document runs the quickstart's scoring function over the reviews dataset, a
 }
 ```
 
-`moruna_spec` is the version of the document format and is always `1`. A standard function is named by `name`, with its arguments in `args`. Your own Python code runs from a document as an image: write the job in Python, build it (`moruna build pipeline:job`), and run the spec the build writes (version 2); see [Images and ports](images.md). Paths in the document are relative to the directory you run the command from.
+`moruna_spec` is the version of the document format and is always `1`. A standard function is named by `name`, with its arguments in `args`. Your own Python code runs from a document as an image: write the job in Python, in a module its tasks do not import, build it (`moruna build jobs:job`), and run the spec the build writes (version 2); see [Images and ports](images.md). Paths in the document are relative to the directory you run the command from.
 
 Fields you leave out take the same defaults as `moruna.run`. Every field is described in the [job document reference](job-document.md).
 

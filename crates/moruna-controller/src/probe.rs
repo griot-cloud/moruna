@@ -72,15 +72,18 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
         };
         let result = match ctl.peers().prober.probe(stage, bytes) {
             Ok(result) => result,
-            // f.14: a resumed run whose plan the interrupted run consumed has nothing left to
-            // probe with. That is not a failure of this run: seed the stage as f.2 would
-            // without a probe and say so. On a fresh run the error stands.
-            Err(e) if resuming && is_exhausted_plan(&e) => {
+            // A plan with nothing left to read has nothing to probe with: a resumed run whose plan
+            // the interrupted run consumed (f.14), or a fresh run whose source has no rows. Neither
+            // is a failure of this run: seed the stage as f.2 would without a probe and say so.
+            // 0.6.3 let the error stand on a fresh run, so a source with nothing to read could not
+            // run at all.
+            Err(e) if is_exhausted_plan(&e) => {
                 let mut state = ctl.held();
                 state.stages[at].seeded = true;
+                let why = if resuming { "resumed: " } else { "" };
                 state.note(format!(
-                    "resumed: stage {stage} could not be probed, the plan is exhausted; seeded \
-                     from hints"
+                    "{why}stage {stage} could not be probed, the plan is exhausted; seeded from \
+                     hints"
                 ));
                 seeded += 1;
                 continue;
@@ -121,7 +124,8 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
 
 /// Whether a probe failed because the source plan has nothing left to read (f.14). The
 /// scheduler's helper answers with this `Plan` error when the cursor is at the end of the plan
-/// (SC f.9); a resumed run reaches it whenever the interrupted run consumed the plan.
+/// (SC f.9): a resumed run reaches it whenever the interrupted run consumed the plan, and a fresh
+/// run when its source has no rows.
 fn is_exhausted_plan(e: &moruna_kernel::MorunaError) -> bool {
     matches!(e, moruna_kernel::MorunaError::Plan(msg) if msg.contains("nothing to probe with"))
 }

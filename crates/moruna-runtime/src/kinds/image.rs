@@ -459,21 +459,32 @@ fn process_task(
     Err(moruna_sandbox::unavailable())
 }
 
-/// Where unpacked images go when the settings do not say: `images` under the run's output, when
-/// that is a directory on this machine.
+/// Where unpacked images go when the settings do not say: Moruna's cache, beside the images it
+/// pulls (`$XDG_CACHE_HOME/moruna/unpacked`, else `~/.cache/moruna/unpacked`), kept by digest and
+/// shared by every run of this user. Never under the run's output: 0.6.3 put them there, inside
+/// a Parquet sink's directory, where they were read back as part of the dataset, and a job whose
+/// sink is a task of its own had no output to put them under at all.
 #[cfg(target_os = "linux")]
-fn default_cache(entry: &Entry<'_>, sink: &str) -> Result<std::path::PathBuf> {
-    let path = sink.strip_prefix("file://").unwrap_or(sink);
-    if path.is_empty() || path.contains("://") {
-        return Err(entry.refuse(
+fn default_cache(entry: &Entry<'_>) -> Result<std::path::PathBuf> {
+    unpack_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")).ok_or_else(|| {
+        entry.refuse(
             "cache",
-            format!(
-                "is needed: the run's output `{sink}` is not a directory on this machine to keep \
-                 unpacked images beside"
-            ),
-        ));
-    }
-    Ok(std::path::Path::new(path).join("images"))
+            "is needed: the process has neither XDG_CACHE_HOME nor HOME for Moruna's cache",
+        )
+    })
+}
+
+/// `default_cache`'s rule, of the process's `XDG_CACHE_HOME` and `HOME`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unpack_dir(
+    xdg_cache_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let base = xdg_cache_home
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("moruna").join("unpacked"))
 }
 
 /// The task's image, found, checked against what the document names and unpacked; and the
@@ -496,7 +507,7 @@ fn unpacked(
     })?;
     let cache = match &settings.cache {
         Some(cache) => std::path::PathBuf::from(cache),
-        None => default_cache(entry, cx.sink_target())?,
+        None => default_cache(entry)?,
     };
     let (layout, manifest) = settings
         .image
@@ -620,12 +631,36 @@ fn process_task(
                 Ok(Box::new(moruna_sinks::ArrowStreamSink::new(
                     &name,
                     Box::new(stdin),
-                    Box::new(move || end.wait(None)),
+                    Box::new(move |fault| end.wait(fault)),
                 )) as Box<dyn moruna_kernel::Sink>)
             })),
             target: String::new(),
             memory: None,
         })),
         Role::Kernel => Err(entry.refuse("image", "a function is a stage, not a process task")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unpack_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn images_unpack_into_morunas_cache_never_under_the_output() {
+        let home = || Some("/home/u".into());
+        assert_eq!(
+            unpack_dir(None, home()),
+            Some(PathBuf::from("/home/u/.cache/moruna/unpacked"))
+        );
+        assert_eq!(
+            unpack_dir(Some("/c".into()), home()),
+            Some(PathBuf::from("/c/moruna/unpacked"))
+        );
+        assert_eq!(
+            unpack_dir(Some("".into()), home()),
+            Some(PathBuf::from("/home/u/.cache/moruna/unpacked"))
+        );
+        assert_eq!(unpack_dir(None, None), None);
     }
 }

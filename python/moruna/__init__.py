@@ -145,6 +145,8 @@ def run(
     resume: str | None = None,
     cost: CostSession | None = None,
     engine_ports: EnginePorts | None = None,
+    sandbox_python: str | None = None,
+    sandbox_cgroup: str | None = None,
 ) -> RunReport:
     """Run the ``moruna.Job`` ``job``, or the job of one path ``moruna.run(source, functions,
     sink)``, and return its ``moruna.RunReport``.
@@ -152,11 +154,15 @@ def run(
     ``ports`` supplies what the job's tasks need: a mapping of need to object (the in-process
     adapter, ``moruna.Ports``) or a ``moruna.Resolver``. Every need is resolved before the run
     starts, and one the resolver cannot supply is refused by name. ``args`` gives the run's
-    arguments, every one the job declares (``job.arg``), each of its type; a missing or
-    ill-typed argument is refused by name before the run, and the report records them. ``spec_to`` (a file path, a
+    arguments, every one the job declares (``job.arg``), each of its type (a ``timestamp`` may
+    be a ``datetime`` with its offset, a ``date`` a ``date``); a missing or ill-typed argument is
+    refused by name before the run, and the report records them. A task reads each as its JSON
+    value, as it would inside an image: a timestamp or a date as its text. ``spec_to`` (a file path, a
     callable taking bytes, or a ``moruna.Writer``) gets the job's spec before the run starts and
     the report's bytes after it ends. ``explain=True`` puts the plan the run started from in the
-    report's ``plan``.
+    report's ``plan``. ``sandbox_cgroup`` (a cgroup v2 directory with ``memory`` and ``cpu``
+    delegated) and ``sandbox_python`` are the sandbox an image task runs in on Linux, as ``moruna
+    run --sandbox-cgroup --sandbox-python``.
 
     A job's unknown task names, cycles and outputs no task reads are refused with
     ``ConfigError`` naming every one of them, before anything starts. Every other keyword is
@@ -216,6 +222,8 @@ def run(
             "resume": resume,
             "cost": cost,
             "engine_ports": engine_ports,
+            "sandbox_python": sandbox_python,
+            "sandbox_cgroup": sandbox_cgroup,
         },
     )
 

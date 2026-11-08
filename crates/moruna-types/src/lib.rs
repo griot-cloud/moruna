@@ -2,7 +2,7 @@
 //!
 //! A declared column's type is a string: pyarrow's `str(type)` spelling of every type the grammar
 //! has (`int64`, `double`, `string`, `timestamp[us, tz=UTC]`, `decimal128(10, 2)`,
-//! `list<item: int64>`), a few aliases (`boolean`, `float32`, `float64`, `utf8`, `large_utf8`,
+//! `list<item: int64>`, `struct<a: int64, b: string>`), a few aliases (`boolean`, `float32`, `float64`, `utf8`, `large_utf8`,
 //! `str`, `date32`, `date64`, `list<int64>`), and `any`. [`parse`] reads a spelling into a
 //! [`ColumnType`], a description of the type that needs no Arrow; [`TypeName`]'s `Display` writes
 //! the canonical spelling back. Two spellings name the same type exactly when they read as equal
@@ -105,6 +105,8 @@ pub enum TypeName {
     List(String, Box<TypeName>),
     /// `large_list<<name>: <item>>`, likewise.
     LargeList(String, Box<TypeName>),
+    /// `struct<<name>: <type>, ...>`, its fields in order; every field may be null.
+    Struct(Vec<(String, TypeName)>),
 }
 
 /// A declared column's type: any, or exactly one the grammar names.
@@ -215,6 +217,21 @@ fn name(t: &str) -> Option<TypeName> {
             scale.trim().parse().ok()?,
         ));
     }
+    if let Some(inner) = t.strip_prefix("struct<").and_then(|r| r.strip_suffix('>')) {
+        if inner.trim().is_empty() {
+            return Some(TypeName::Struct(Vec::new()));
+        }
+        let mut fields = Vec::new();
+        for part in top_level(inner) {
+            let (field, item) = part.split_once(':')?;
+            let field = field.trim();
+            if field.is_empty() || field.contains(['<', '[', '(']) {
+                return None;
+            }
+            fields.push((field.to_string(), name(item.trim())?));
+        }
+        return Some(TypeName::Struct(fields));
+    }
     for (prefix, large) in [("list<", false), ("large_list<", true)] {
         if let Some(inner) = t.strip_prefix(prefix).and_then(|r| r.strip_suffix('>')) {
             let (field, item) = match inner.split_once(':') {
@@ -233,6 +250,25 @@ fn name(t: &str) -> Option<TypeName> {
         }
     }
     None
+}
+
+/// `s` cut at each comma outside `<>`, `[]` and `()`: a struct's fields, whose types may hold
+/// commas of their own (`timestamp[us, tz=UTC]`, `decimal128(10, 2)`, a nested struct).
+fn top_level(s: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut parts) = (0i32, 0, Vec::new());
+    for (at, c) in s.char_indices() {
+        match c {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 impl core::fmt::Display for TypeName {
@@ -267,6 +303,16 @@ impl core::fmt::Display for TypeName {
             TypeName::Decimal128(p, s) => return write!(f, "decimal128({p}, {s})"),
             TypeName::List(field, item) => return write!(f, "list<{field}: {item}>"),
             TypeName::LargeList(field, item) => return write!(f, "large_list<{field}: {item}>"),
+            TypeName::Struct(fields) => {
+                f.write_str("struct<")?;
+                for (at, (field, item)) in fields.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{field}: {item}")?;
+                }
+                return f.write_str(">");
+            }
         };
         f.write_str(simple)
     }
@@ -319,6 +365,22 @@ mod tests {
             "item".into(),
             Box::new(TypeName::LargeList("v".into(), Box::new(TypeName::Bool))),
         ));
+        let record = TypeName::Struct(
+            leaves
+                .iter()
+                .enumerate()
+                .map(|(at, leaf)| (format!("f{at}"), leaf.clone()))
+                .collect(),
+        );
+        out.push(TypeName::Struct(Vec::new()));
+        out.push(TypeName::List("item".into(), Box::new(record.clone())));
+        out.push(TypeName::Struct(vec![
+            ("inner".into(), record),
+            (
+                "tags".into(),
+                TypeName::List("item".into(), Box::new(TypeName::String)),
+            ),
+        ]));
         out
     }
 
@@ -387,6 +449,11 @@ mod tests {
             "list<>",
             "list<: int64>",
             "map<string, int64>",
+            "struct<a>",
+            "struct<a: nope>",
+            "struct<: int64>",
+            "struct<a: int64,>",
+            "struct<a: int64 not null>",
         ] {
             let refused = parse(bad).expect_err(bad);
             assert_eq!(

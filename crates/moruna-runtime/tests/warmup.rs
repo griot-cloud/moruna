@@ -748,7 +748,13 @@ fn cm_t55_what_warm_up_consumed_is_reported() {
     assert!(used.kernel_worker_seconds.expect("kernel worker time") >= 0.0);
     assert!(used.worker_seconds.expect("worker time") > 0.0, "{used:?}");
     if cfg!(target_vendor = "apple") {
-        assert!(used.memory_peak_bytes.expect("exact OS memory peak") > 0);
+        // Exact only when the warm-up raised the process's lifetime mark: in a process an
+        // earlier, larger run has been through, it may not, and a run gives its memory back
+        // (0.6.4), so the mark is not raised by memory a run before it kept. The sampler's
+        // tests raise the mark deliberately; the warm-up's own pass it through.
+        if let Some(peak) = used.memory_peak_bytes {
+            assert!(peak > 0, "{used:?}");
+        }
     } else {
         // The Linux sampler observes peaks; it cannot assert a total lifetime
         // high-water mark. Billing deliberately omits that non-exact reading.

@@ -1408,6 +1408,10 @@ fn st_t6_real_owned_object_socket_lands_into_caller_arena_and_refuses_body_befor
                 })
                 .await
                 .unwrap();
+                // macOS hands an accepted socket the listener's O_NONBLOCK (Linux does not),
+                // and a non-blocking socket ignores its timeouts: every read the service made
+                // was WouldBlock at once, and the client was answered Unavailable.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();

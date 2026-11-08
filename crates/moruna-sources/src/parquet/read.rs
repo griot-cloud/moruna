@@ -16,25 +16,20 @@ use crate::util::{oversized, page_ceil, page_floor, resolve_range, source_err};
 /// Projected column chunks closer together than this are fetched as one range (f.3).
 const COALESCE_GAP: u64 = 1024 * 1024;
 
-/// Read a split, or a row range of it, into arena buffers of `tier`.
+/// Read a split, or a row range of it, into arena buffers of `tier`, when the future is polled.
 ///
-/// `Source::read` (contracts d.6) returns `BoxFuture<'_, _>`, whose one elided lifetime is
-/// `&self`'s, so the `&dyn Allocator` the call receives cannot be captured by the future. A
-/// Parquet read has to allocate after its bytes arrive, because the decode copy's sizes are
-/// only known once the decoder has run, so the whole read happens here and the future it
-/// returns is already resolved. The ranged reads are still submitted together and so are
-/// still concurrent with each other; what is lost is concurrency between one read and the
-/// next, which the scheduler's read-ahead would otherwise give. Reported as an escalation,
-/// with the one-word contracts change that restores it (`alloc: &'a dyn Allocator`).
+/// The future borrows the allocator for `'a` (contracts d.6), so the read happens when the drive
+/// polls it and not when it issues it: the drive issues up to its read-ahead before it polls
+/// (10 f.5), and a read done at issue held every earlier one back from the kernels (0.6.3). The
+/// ranged reads of one split are still submitted together.
 pub(crate) fn read<'a>(
     source: &'a ParquetSource,
-    split: &Split,
+    split: &'a Split,
     rows: Option<RowRange>,
-    alloc: &dyn Allocator,
+    alloc: &'a dyn Allocator,
     tier: Tier,
 ) -> BoxFuture<'a, Result<Payload>> {
-    let outcome = read_now(source, split, rows, alloc, tier);
-    Box::pin(async move { outcome })
+    Box::pin(async move { read_now(source, split, rows, alloc, tier) })
 }
 
 fn read_now(

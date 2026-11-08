@@ -913,9 +913,9 @@ fn ho_t16_a_real_run_tells_its_task_lifecycle() {
 
 /// HO-T17 empty input (MH 4.3). A copy of an empty source completes: nothing is read, the
 /// source completes with no duration, having never started, and the sink starts at its commit.
-/// A chain with a kernel over the same empty source is refused by the controller's probe (SDD 11
-/// f.14: a fresh run with nothing to read is a plan error); the attempt fails, and every task is
-/// skipped for it, none claimed to have run.
+/// A chain with a kernel over the same empty source completes too, every task with no rows: the
+/// controller seeds the stage it cannot probe from its hint (SDD 11 f.14, RC-T20, amended
+/// 2026-11-06), where 0.6.3 refused the run as a plan error.
 #[test]
 fn ho_t17_empty_input_ends_every_task() {
     let _serial = one_run_at_a_time();
@@ -940,19 +940,17 @@ fn ho_t17_empty_input_ends_every_task() {
 
     doc["kernels"] = json!([{"kind": "python", "module": "tests", "callable": "double"}]);
     let (code, messages) = converse(scratch.path(), doc);
-    assert_eq!(code, exit::SPEC_REFUSED);
+    assert_eq!(code, exit::COMPLETED);
     let events = well_formed(&messages, 1);
-    let failed = events
-        .iter()
-        .find(|e| e["kind"] == "task_failed")
-        .expect("the attempt failed");
-    assert_eq!(failed["scope"], "attempt");
-    assert_eq!(failed["code"], "plan_refused");
+    assert!(
+        events.iter().all(|e| e["kind"] != "task_failed"),
+        "nothing fails"
+    );
     for task in ["source", "kernel-1", "sink"] {
-        assert!(first(&events, task, "task_started").is_none(), "{task}");
         let end = ended(&events, task);
-        assert_eq!(end["kind"], "task_skipped", "{task}: {end}");
-        assert_eq!(end["reason"], "attempt_failed");
+        assert_eq!(end["kind"], "task_completed", "{task}: {end}");
+        assert_eq!(end["outcome"], "succeeded", "{task}");
+        assert_eq!(end["counters"]["rows_out"], 0, "{task}");
     }
 }
 

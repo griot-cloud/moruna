@@ -8,7 +8,7 @@
 
 use core::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use moruna_kernel::{AllocCounts, KernelAlloc, Sampler};
 
@@ -234,7 +234,8 @@ impl MemoryGate {
 #[derive(Debug)]
 pub struct KernelMemory {
     guarded: bool,
-    gate: OnceLock<Arc<MemoryGate>>,
+    /// The gate of the run the kernel is in, bound when it starts and released when it ends.
+    gate: Mutex<Option<Arc<MemoryGate>>>,
     live: AtomicI64,
     peak: AtomicU64,
     refusals: AtomicU64,
@@ -245,16 +246,21 @@ impl KernelMemory {
     pub fn new(guarded: bool) -> Arc<KernelMemory> {
         Arc::new(KernelMemory {
             guarded,
-            gate: OnceLock::new(),
+            gate: Mutex::new(None),
             live: AtomicI64::new(0),
             peak: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
         })
     }
 
-    /// The run's gate; the first call wins.
+    /// The gate of the run the kernel is in.
     pub fn bind(&self, gate: Arc<MemoryGate>) {
-        let _ = self.gate.set(gate);
+        *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+    }
+
+    /// Let go of the run's gate when the run ends.
+    pub fn release(&self) {
+        *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Whether the decorator left refusal on.
@@ -263,9 +269,9 @@ impl KernelMemory {
     }
 
     /// The gate that may refuse this kernel's requests: bound, and refusal on.
-    fn refusing_gate(&self) -> Option<&MemoryGate> {
+    fn refusing_gate(&self) -> Option<Arc<MemoryGate>> {
         if self.guarded {
-            self.gate.get().map(Arc::as_ref)
+            self.gate.lock().unwrap_or_else(|e| e.into_inner()).clone()
         } else {
             None
         }
@@ -295,11 +301,11 @@ impl KernelMemory {
 
     /// f.12: run `f` in a frame of this kernel on the calling thread.
     pub fn frame<R>(self: &Arc<Self>, f: impl FnOnce() -> R) -> (R, FrameEnd) {
+        // The frame's own hold on the gate, for the length of the call: the frame points into it.
+        let held_gate = self.refusing_gate();
         let frame = Frame {
             kernel: Arc::as_ptr(self),
-            gate: self
-                .refusing_gate()
-                .map_or(core::ptr::null(), |g| g as *const MemoryGate),
+            gate: held_gate.as_ref().map_or(core::ptr::null(), Arc::as_ptr),
             counts: Cell::new(KernelAlloc::NONE),
             held: Cell::new(0),
             refusal: Cell::new(None),
@@ -387,8 +393,9 @@ impl Frame {
         if self.gate.is_null() {
             return None;
         }
-        // SAFETY: `gate` points into the `Arc<MemoryGate>` the kernel holds in its `OnceLock`,
-        // which is never replaced or dropped while the kernel lives (see `kernel`).
+        // SAFETY: `gate` points into the `Arc<MemoryGate>` that `KernelMemory::frame` holds in a
+        // local for the length of the call this frame records, and the frame is out of the
+        // thread's slot before that call returns (see `Restore`).
         Some(unsafe { &*self.gate })
     }
 

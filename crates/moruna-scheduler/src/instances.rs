@@ -30,15 +30,38 @@ pub(crate) fn init_instances(shared: &Shared) -> Result<()> {
     outcome
 }
 
+/// The worker that is instance `instance` of stage `stage_ix`'s home (f.4): the run's stateful
+/// instances are dealt to the workers in turn, across stages, not each stage's from worker 0.
+/// Counting each stage's instances from 0 gave every single-instance stage the same home,
+/// worker 0, so stateful stages on separate branches ran one at a time (0.6.3: six branches of
+/// a 0.5 s stateful function took 3.5 s, not 0.5 s).
+pub(crate) fn home(shared: &Shared, stage_ix: usize, instance: usize) -> u16 {
+    let pools = shared
+        .stages
+        .iter()
+        .map(|stage| stage.pool.as_ref().map(|pool| pool.max));
+    dealt_home(pools, stage_ix, instance, shared.cfg.workers_max as usize)
+}
+
+/// `home` over the stages' pool sizes (`None` for a stateless stage) and the workers' count.
+fn dealt_home(
+    pools: impl Iterator<Item = Option<usize>>,
+    stage_ix: usize,
+    instance: usize,
+    workers: usize,
+) -> u16 {
+    let before: usize = pools.take(stage_ix).flatten().sum();
+    ((before + instance) % workers.max(1)) as u16
+}
+
 fn init_all(shared: &Shared) -> Result<()> {
-    let workers = shared.cfg.workers_max as usize;
     for index in 0..shared.stages.len() {
         let Some(max) = shared.stages[index].pool.as_ref().map(|pool| pool.max) else {
             continue;
         };
         let started = std::time::Instant::now();
         for instance in 0..max {
-            let worker = (instance % workers) as u16;
+            let worker = home(shared, index, instance);
             shared.run_on_worker(
                 worker,
                 WorkerJob::Init {
@@ -498,4 +521,43 @@ enum Taken {
     /// The state of an instance waiting on a port, as its `apply` began (MH 4.10); its worker
     /// still holds it.
     Waiting(Vec<u8>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dealt_home;
+
+    #[test]
+    fn single_instance_stages_on_separate_branches_get_separate_homes() {
+        // A source, six stateful stages of one instance each, a join, a sink; eight workers.
+        let pools = || {
+            [
+                None,
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                None,
+                None,
+            ]
+        };
+        let homes: Vec<u16> = (1..=6)
+            .map(|stage| dealt_home(pools().into_iter(), stage, 0, 8))
+            .collect();
+        assert_eq!(homes, [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_stages_instances_and_the_next_stages_continue_the_deal() {
+        let pools = || [Some(3), None, Some(2)];
+        let first: Vec<u16> = (0..3)
+            .map(|i| dealt_home(pools().into_iter(), 0, i, 4))
+            .collect();
+        let second: Vec<u16> = (0..2)
+            .map(|i| dealt_home(pools().into_iter(), 2, i, 4))
+            .collect();
+        assert_eq!((first, second), (vec![0, 1, 2], vec![3, 0]));
+    }
 }

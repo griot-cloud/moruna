@@ -163,9 +163,10 @@ async fn exchange(
     let stream = dial(&target)
         .await
         .map_err(|e| failed(HttpErrorKind::Connect, &target, e))?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|e| failed(HttpErrorKind::Connect, &target, e))?;
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(TokioIo::new(Peer(stream)))
+            .await
+            .map_err(|e| failed(HttpErrorKind::Connect, &target, e))?;
     let driver = tokio::spawn(connection);
     let req = origin_form(req);
     let response = match sender.send_request(req).await {
@@ -264,6 +265,58 @@ fn origin_form(req: HttpRequest) -> HttpRequest {
         }
     }
     HttpRequest::from_parts(parts, body)
+}
+
+/// The socket a request is exchanged on. hyper shuts its side down when a `Connection: close`
+/// response has been read; once the server has closed, macOS answers that `shutdown(2)` with
+/// `ENOTCONN` where Linux answers 0, and hyper made the error the end of a body that had
+/// arrived whole ("error shutting down connection"). A peer that has gone leaves nothing to shut
+/// down, so that one answer is the shutdown done; every other error stays an error.
+struct Peer(tokio::net::UnixStream);
+
+impl tokio::io::AsyncRead for Peer {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Peer {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match Pin::new(&mut self.0).poll_shutdown(cx) {
+            Poll::Ready(Err(e)) if e.kind() == std::io::ErrorKind::NotConnected => {
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
 }
 
 /// A stream to the target. A vsock connection is made blocking on the runtime's blocking pool

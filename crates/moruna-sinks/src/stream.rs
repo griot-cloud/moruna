@@ -1,24 +1,34 @@
 //! A sink that is one Arrow IPC stream (SDD 19 f.6): what an image sink's process reads on its
-//! standard input. Every batch is written to the stream as it comes; at the end the stream is
+//! standard input. The stream adopts the first batch's schema, not the one planned (an image
+//! kernel's planned schema is its input's, f.6), and every later batch must have the same
+//! columns; a run that wrote nothing ends a stream of the planned schema. Every batch is written
+//! to the stream as it comes; at the end the stream is
 //! ended and closed, and the sink's `end` is asked how its reader ended (an image's process
 //! exited with status 0) and what it wrote back: nothing, or one JSON object naming the version
 //! it committed, `{"snapshot_id": ..., "version": ...}`.
 
 use std::io::Write;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use arrow::datatypes::SchemaRef;
 use arrow::ipc::writer::StreamWriter;
 use moruna_kernel::{
     BoxFuture, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkCommit,
     SinkSummary, SourceSchema, TierPref,
 };
 
-/// How a stream's reader ended: what it wrote back when it ended well, else why, in words.
-pub type StreamDone = Box<dyn FnOnce() -> std::result::Result<Vec<u8>, String> + Send>;
+/// How a stream's reader ended, given what went wrong with the stream if anything did: what it
+/// wrote back when it ended well, else why, in words (how the reader ended first, the stream's
+/// fault kept as the cause).
+pub type StreamDone =
+    Box<dyn FnOnce(Option<String>) -> std::result::Result<Vec<u8>, String> + Send>;
 
 enum Phase {
     Created(Box<dyn Write + Send>),
-    Open(Box<StreamWriter<Box<dyn Write + Send>>>),
+    /// Opened with the planned schema; nothing is written before the first batch.
+    Planned(Box<dyn Write + Send>, SchemaRef),
+    /// Written to, with the schema the first batch gave it.
+    Open(Box<StreamWriter<Box<dyn Write + Send>>>, SchemaRef),
     Failed(String),
     Finished,
 }
@@ -63,20 +73,110 @@ impl ArrowStreamSink {
                 self.name
             )));
         };
-        let written = match &mut inner.phase {
-            Phase::Open(writer) => writer.write(&batch).map_err(|e| e.to_string()),
-            Phase::Failed(why) => return Err(MorunaError::Sink(why.clone())),
-            _ => return Err(MorunaError::Sink(format!("{} is not open", self.name))),
+        let (mut writer, adopted) = match std::mem::replace(&mut inner.phase, Phase::Finished) {
+            Phase::Open(writer, adopted) => (writer, adopted),
+            Phase::Planned(stream, _) => {
+                let adopted = batch.schema();
+                match StreamWriter::try_new(stream, &adopted) {
+                    Ok(writer) => (Box::new(writer), adopted),
+                    Err(e) => {
+                        let fault = format!("{}: its input could not be started: {e}", self.name);
+                        return Err(self.failed(&mut inner, fault));
+                    }
+                }
+            }
+            Phase::Failed(why) => {
+                inner.phase = Phase::Failed(why.clone());
+                return Err(MorunaError::Sink(why));
+            }
+            other => {
+                inner.phase = other;
+                return Err(MorunaError::Sink(format!("{} is not open", self.name)));
+            }
         };
-        if let Err(e) = written {
-            let why = format!("{}: its input could not be written: {e}", self.name);
-            inner.phase = Phase::Failed(why.clone());
-            return Err(MorunaError::Sink(why));
+        if let Some(differs) = differs(&adopted, &batch.schema()) {
+            drop(writer);
+            let fault = format!(
+                "{}: a batch with columns {} after a first with {} ({differs}); a stream has one \
+                 schema",
+                self.name,
+                columns(&batch.schema()),
+                columns(&adopted)
+            );
+            return Err(self.failed(&mut inner, fault));
         }
+        if let Err(e) = writer.write(&batch) {
+            // A write fails because the reader is gone: how it ended says why, which the broken
+            // pipe alone does not (0.6.3 said only "Broken pipe" of a sink that had crashed).
+            drop(writer);
+            let fault = format!("{}: its input could not be written: {e}", self.name);
+            return Err(self.failed(&mut inner, fault));
+        }
+        inner.phase = Phase::Open(writer, adopted);
         inner.rows += batch.num_rows() as u64;
         inner.bytes += batch.get_array_memory_size() as u64;
         Ok(())
     }
+
+    /// Ends the stream and closes it, which is how its reader learns it has everything.
+    fn end(
+        &self,
+        mut writer: Box<StreamWriter<Box<dyn Write + Send>>>,
+    ) -> std::result::Result<(), String> {
+        writer
+            .finish()
+            .map_err(|e| format!("{}: its input could not be ended: {e}", self.name))?;
+        writer
+            .into_inner()
+            .map(drop)
+            .map_err(|e| format!("{}: its input could not be closed: {e}", self.name))
+    }
+
+    /// The sink has failed with `fault`: how its reader ended says why, the fault kept as the
+    /// cause; every later call is refused with that.
+    fn failed(&self, inner: &mut Inner, fault: String) -> MorunaError {
+        let why = match inner.done.take() {
+            Some(done) => done(Some(fault.clone())).err().unwrap_or(fault),
+            None => fault,
+        };
+        inner.phase = Phase::Failed(why.clone());
+        MorunaError::Sink(why)
+    }
+}
+
+/// How `next`'s columns differ from `first`'s, by name and type, if they do.
+fn differs(first: &SchemaRef, next: &SchemaRef) -> Option<String> {
+    if first.fields().len() != next.fields().len() {
+        return Some(format!(
+            "{} columns, not {}",
+            next.fields().len(),
+            first.fields().len()
+        ));
+    }
+    first
+        .fields()
+        .iter()
+        .zip(next.fields().iter())
+        .find(|(a, b)| a.name() != b.name() || a.data_type() != b.data_type())
+        .map(|(a, b)| {
+            format!(
+                "`{}` {} where `{}` {} was",
+                b.name(),
+                b.data_type(),
+                a.name(),
+                a.data_type()
+            )
+        })
+}
+
+/// A schema's columns in words: `[name: type, ...]`.
+fn columns(schema: &SchemaRef) -> String {
+    let named: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}: {}", f.name(), f.data_type()))
+        .collect();
+    format!("[{}]", named.join(", "))
 }
 
 /// What a reader wrote back at its end as the version it committed: nothing (or only
@@ -137,14 +237,7 @@ impl Sink for ArrowStreamSink {
             inner.phase = phase;
             return Err(MorunaError::Sink(format!("{} was opened twice", self.name)));
         };
-        inner.phase = match StreamWriter::try_new(stream, schema) {
-            Ok(writer) => Phase::Open(Box::new(writer)),
-            Err(e) => {
-                let why = format!("{}: its input could not be started: {e}", self.name);
-                inner.phase = Phase::Failed(why.clone());
-                return Err(MorunaError::Sink(why));
-            }
-        };
+        inner.phase = Phase::Planned(stream, Arc::clone(schema));
         Ok(())
     }
 
@@ -164,16 +257,11 @@ impl Sink for ArrowStreamSink {
         let mut inner = self.lock();
         let phase = std::mem::replace(&mut inner.phase, Phase::Finished);
         let ended = match phase {
-            Phase::Open(mut writer) => writer
-                .finish()
-                .map_err(|e| format!("{}: its input could not be ended: {e}", self.name))
-                .and_then(|()| {
-                    // Closing the stream is how its reader learns it has everything.
-                    writer
-                        .into_inner()
-                        .map(drop)
-                        .map_err(|e| format!("{}: its input could not be closed: {e}", self.name))
-                }),
+            // A run that wrote nothing gives its reader a stream of the planned schema.
+            Phase::Planned(stream, planned) => StreamWriter::try_new(stream, &planned)
+                .map_err(|e| format!("{}: its input could not be started: {e}", self.name))
+                .and_then(|writer| self.end(Box::new(writer))),
+            Phase::Open(writer, _) => self.end(writer),
             Phase::Created(stream) => {
                 drop(stream);
                 Ok(())
@@ -182,7 +270,8 @@ impl Sink for ArrowStreamSink {
             Phase::Finished => return Err(MorunaError::Sink("finish ran twice".into())),
         };
         let done = inner.done.take();
-        let written = done.map_or(Ok(Vec::new()), |done| done());
+        let fault = ended.as_ref().err().cloned();
+        let written = done.map_or(Ok(Vec::new()), |done| done(fault));
         let written = match (ended, written) {
             (_, Err(why)) | (Err(why), Ok(_)) => return Err(MorunaError::Sink(why)),
             (Ok(()), Ok(written)) => written,
@@ -248,7 +337,7 @@ mod tests {
     #[test]
     fn every_batch_reaches_the_stream_and_the_reader_is_judged() {
         let shared = Shared::default();
-        let done: StreamDone = Box::new(|| Ok(br#"{"snapshot_id": "s1"}"#.to_vec()));
+        let done: StreamDone = Box::new(|_| Ok(br#"{"snapshot_id": "s1"}"#.to_vec()));
         let mut sink = ArrowStreamSink::new("out", Box::new(shared.clone()), done);
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         sink.open(&SourceSchema::Table(Arc::clone(&schema)))
@@ -274,10 +363,142 @@ mod tests {
             arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
         assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 6);
 
-        let failed: StreamDone = Box::new(|| Err("image `out` exited with status 1".into()));
+        let failed: StreamDone = Box::new(|_| Err("image `out` exited with status 1".into()));
         let mut sink = ArrowStreamSink::new("out", Box::new(Shared::default()), failed);
         sink.open(&SourceSchema::Table(schema)).unwrap();
         let e = sink.finish().unwrap_err().to_string();
         assert!(e.contains("exited with status 1"), "{e}");
+    }
+
+    fn written(sink: &ArrowStreamSink, batch: RecordBatch) -> Result<()> {
+        let mut write = sink.write(0, Payload::table(batch).unwrap());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match write.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(done) => done,
+            std::task::Poll::Pending => panic!("a stream write is ready at once"),
+        }
+    }
+
+    /// An image kernel plans its input's schema and gives another (SDD 19 f.6): the stream is
+    /// the first batch's, a later batch with other columns is refused naming both, and a run
+    /// that wrote nothing ends a stream of the planned schema.
+    #[test]
+    fn the_stream_adopts_the_first_batchs_schema_and_keeps_it() {
+        let planned = Arc::new(Schema::new(vec![Field::new("alert", DataType::Utf8, true)]));
+        let given = Arc::new(Schema::new(vec![
+            Field::new("case", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&given),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![7, 9])),
+            ],
+        )
+        .unwrap();
+        let shared = Shared::default();
+        let mut sink = ArrowStreamSink::new(
+            "out",
+            Box::new(shared.clone()),
+            Box::new(|_| Ok(Vec::new())),
+        );
+        sink.open(&SourceSchema::Table(Arc::clone(&planned)))
+            .unwrap();
+        written(&sink, batch.clone()).unwrap();
+        written(&sink, batch).unwrap();
+        sink.finish().unwrap();
+        let bytes = shared.0.lock().unwrap().clone();
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        assert_eq!(reader.schema(), given);
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 4);
+
+        let mut sink = ArrowStreamSink::new(
+            "out",
+            Box::new(Shared::default()),
+            Box::new(|_| Ok(Vec::new())),
+        );
+        sink.open(&SourceSchema::Table(Arc::clone(&planned)))
+            .unwrap();
+        let first = RecordBatch::try_new(
+            Arc::clone(&given),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![7])),
+            ],
+        )
+        .unwrap();
+        written(&sink, first).unwrap();
+        let other = RecordBatch::try_new(
+            Arc::clone(&planned),
+            vec![Arc::new(arrow::array::StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        let e = written(&sink, other).unwrap_err().to_string();
+        assert!(
+            e.contains("[alert: Utf8]") && e.contains("[case: Int64, score: Int64]"),
+            "{e}"
+        );
+        assert!(
+            sink.finish()
+                .unwrap_err()
+                .to_string()
+                .contains("one schema")
+        );
+
+        let shared = Shared::default();
+        let mut sink = ArrowStreamSink::new(
+            "out",
+            Box::new(shared.clone()),
+            Box::new(|_| Ok(Vec::new())),
+        );
+        sink.open(&SourceSchema::Table(Arc::clone(&planned)))
+            .unwrap();
+        sink.finish().unwrap();
+        let bytes = shared.0.lock().unwrap().clone();
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        assert_eq!(reader.schema(), planned);
+        assert_eq!(reader.count(), 0);
+    }
+
+    #[test]
+    fn a_write_the_reader_refuses_says_how_the_reader_ended() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let done: StreamDone = Box::new(|fault| {
+            Err(format!(
+                "image `out` exited with status 1; {}",
+                fault.unwrap_or_default()
+            ))
+        });
+        let mut sink = ArrowStreamSink::new("out", Box::new(Closed), done);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let opened = sink.open(&SourceSchema::Table(Arc::clone(&schema)));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let e = match opened {
+            Err(e) => e.to_string(),
+            Ok(()) => {
+                let mut write = sink.write(0, Payload::table(batch).unwrap());
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                match write.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(done) => done.unwrap_err().to_string(),
+                    std::task::Poll::Pending => panic!("a stream write is ready at once"),
+                }
+            }
+        };
+        assert!(
+            e.contains("exited with status 1"),
+            "how the reader ended: {e}"
+        );
     }
 }

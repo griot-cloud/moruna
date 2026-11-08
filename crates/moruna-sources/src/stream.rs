@@ -170,21 +170,22 @@ impl Source for ArrowStreamSource {
         Ok(planned)
     }
 
-    fn read(
-        &self,
-        _split: &Split,
+    fn read<'a>(
+        &'a self,
+        _split: &'a Split,
         _rows: Option<RowRange>,
-        alloc: &dyn Allocator,
+        alloc: &'a dyn Allocator,
         tier: Tier,
-    ) -> BoxFuture<'_, Result<Payload>> {
-        let outcome = (|| {
+    ) -> BoxFuture<'a, Result<Payload>> {
+        // Read when polled, not when issued: the drive issues up to its read-ahead before it polls
+        // (10 f.5), and a read done at issue held every earlier one back from the kernels.
+        Box::pin(async move {
             let mut state = self.lock();
             match self.pull(&mut state)? {
                 Some(batch) => self.land(&batch, alloc, tier),
                 None => Err(failed(&self.name, "its stream has no more batches".into())),
             }
-        })();
-        Box::pin(async move { outcome })
+        })
     }
 
     fn streaming(&self) -> bool {
