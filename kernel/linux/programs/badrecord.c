@@ -2,7 +2,8 @@
    its output slot's window with the kernel's native batch_get and puts bytes that are not an
    Arrow record with batch_put. The engine's check refuses the record before anything else of the
    engine sees it (SDD 29 DP1), and the kernel ends this process with the check's sentence; it
-   never reaches the line after its put. Its input slot is 0 and its output slot 1, as
+   waits for the next window after its put, and is ended before that wait returns. Its input
+   slot is 0 and its output slot 1, as
    moruna.linux's run_plane gives them. */
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +40,14 @@ int main(void) {
     memset((void *)window, 0x5a, 4096);
     memcpy((void *)window, garbage, sizeof garbage);
     long r = call3(BATCH_PUT, OUTPUT, (unsigned long)window, 4096);
-    fprintf(stderr, "badrecord: batch_put answered %ld and the process was not ended\n", r);
+    if (r != 0) {
+        fprintf(stderr, "badrecord: batch_put refused the window with %ld\n", r);
+        return 5;
+    }
+    /* batch_put only queues the record (SDD 29 f.3). On another CPU the engine may
+       not have checked it yet. Stay alive for its refusal instead of racing that
+       check with a normal exit, which cannot prove the kernel ended this task. */
+    r = call1(BATCH_GET, OUTPUT, &len);
+    fprintf(stderr, "badrecord: batch_get after the bad record answered %ld; not ended\n", r);
     return 5;
 }

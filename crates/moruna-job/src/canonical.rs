@@ -64,16 +64,32 @@ fn float(f: f64) -> String {
     if f == 0.0 {
         return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
-    let scientific = format!("{f:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("a float's scientific form has an exponent");
-    let exponent: i64 = exponent.parse().expect("a float's exponent is an integer");
+    // Rust's float Display rounds a shortest-decimal tie away from zero; Python
+    // chooses the even last digit. serde_json's shortest writer chooses the same
+    // digits as Python. Only the position of those digits needs normalising.
+    let shortest = serde_json::json!(f).to_string();
+    let (mantissa, exponent) =
+        shortest
+            .split_once('e')
+            .map_or((shortest.as_str(), 0), |(mantissa, exponent)| {
+                (
+                    mantissa,
+                    exponent
+                        .parse::<i64>()
+                        .expect("a float's exponent is an integer"),
+                )
+            });
     let (sign, mantissa) = match mantissa.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", mantissa),
     };
+    let point = mantissa.find('.').unwrap_or(mantissa.len()) as i64;
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let first = digits
+        .find(|c| c != '0')
+        .expect("a nonzero float has a digit");
+    let exponent = exponent + point - first as i64 - 1;
+    let digits = digits[first..].trim_end_matches('0');
     if (-4..16).contains(&exponent) {
         let point = exponent + 1;
         let count = digits.len() as i64;
@@ -138,13 +154,17 @@ mod tests {
             9999999999999998.0,
             5e-324,
             1.797_693_134_862_315_7e308,
+            // Exact halfway decimals: Rust's Display chooses the odd digit.
+            f64::from_bits(0x3e60_0000_0000_0000),
+            f64::from_bits(0xc2e7_03c1_5756_ea84),
         ];
         let value = serde_json::Value::Array(floats.iter().map(|f| serde_json::json!(f)).collect());
         // What Python's `json.dumps(floats, separators=(",", ":"))` writes.
         assert_eq!(
             to_string(&value),
             "[2.52e-05,1500.0,0.0001,1e-05,1e+16,1.5e+16,123456789012345.6,-0.0,0.1,1e+22,\
-             -3.25e-07,9999999999999998.0,5e-324,1.7976931348623157e+308]"
+             -3.25e-07,9999999999999998.0,5e-324,1.7976931348623157e+308,\
+             2.9802322387695312e-08,-202439168538452.12]"
         );
         assert_eq!(
             to_string(&serde_json::json!([3, -7, u64::MAX])),

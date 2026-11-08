@@ -8,14 +8,13 @@ run's instances are now dealt to the workers in turn across stages.
 
 from __future__ import annotations
 
-import time
+import threading
 
 import pyarrow as pa
 
 import moruna
 
 SCHEMA = pa.schema([("n", pa.int64())])
-NAP = 0.5
 BRANCHES = 6
 
 
@@ -31,16 +30,25 @@ class One(moruna.Source):
         return pa.record_batch([pa.array([1], pa.int64())], schema=SCHEMA)
 
 
-class Nap(moruna.Function):
-    """Waits, then gives the row a column of its own."""
+class Overlap(moruna.Function):
+    """Requires another branch to enter before giving the row a column of its own."""
 
     takes = SCHEMA
 
-    def __init__(self, column: str):
+    def __init__(self, column: str, entered: set[str], lock, overlapping: threading.Event):
         self.column = column
+        self.entered = entered
+        self.lock = lock
+        self.overlapping = overlapping
 
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-        time.sleep(NAP)
+        with self.lock:
+            self.entered.add(self.column)
+            if len(self.entered) >= 2:
+                self.overlapping.set()
+        # A generous deadlock bound, not a speed requirement. With all stages on
+        # worker 0 the first callback cannot see a second callback enter.
+        assert self.overlapping.wait(10), "separate branches never ran at the same time"
         return pa.RecordBatch.from_pydict({self.column: [self.column] * batch.num_rows})
 
 
@@ -53,13 +61,15 @@ class Drop(moruna.Sink):
 
 def test_function_subclasses_on_separate_branches_run_at_the_same_time() -> None:
     job = moruna.Job("branches")
+    entered: set[str] = set()
+    lock = threading.Lock()
+    overlapping = threading.Event()
     one = job.add(One(), name="one")
-    naps = [job.add(Nap(f"c{i}"), inputs=one, name=f"c{i}") for i in range(BRANCHES)]
+    naps = [
+        job.add(Overlap(f"c{i}", entered, lock, overlapping), inputs=one, name=f"c{i}")
+        for i in range(BRANCHES)
+    ]
     joined = job.add(moruna.std.join(), inputs=[one, *naps], name="join")
     job.add(Drop(), inputs=joined, name="out")
-    started = time.monotonic()
-    moruna.run(job, checkpoint=False, cpu=BRANCHES)
-    took = time.monotonic() - started
-    assert took < NAP * BRANCHES / 2, (
-        f"{BRANCHES} branches of {NAP} s took {took:.2f} s: they ran one after another"
-    )
+    moruna.run(job, checkpoint=False, cpu=2)
+    assert len(entered) == BRANCHES
