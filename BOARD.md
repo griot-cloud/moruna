@@ -13,6 +13,14 @@ The PM agent's working board. It is the one place that says what is done, what i
 - Release remains pending the full Linux gate, PR checks and the normal release workflow. No tag has been created by hand.
 - Brackly resumed the original deployment assignment after the SOC demo changes. The same Germany West Central x86/KVM validation VM was restarted; the full normal quality gate is running again at `26bc99d`, with the installed-wheel Python gate included. Its previous run was interrupted during default tests by the requested deployment pause; the separate wheel build was likewise terminated, not counted as passing. The old preview warehouse credential stays revoked. An automatic shutdown is configured as a cost backstop; explicit deallocation after verification is still required.
 
+- November 11 resumed gate: default Linux tests stopped at two jail tests with
+  `deny setgroups: Permission denied`. A fresh Griot browser x86 task fails at
+  the same identity step. Kernel audit proves Ubuntu AppArmor's
+  `unprivileged_userns` profile denies namespace capabilities after restart.
+  An explicit validation-runner profile and a path-specific preview-engine
+  profile are being installed; global restrictions stay enabled. This is not a
+  runtime code fix or a completed release gate. Full validation must run again.
+
 ## How the board works
 
 - **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).
