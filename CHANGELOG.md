@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.5
+
+- **Built callables describe their interface in OCI metadata.** Versioned, bounded
+  labels expose the callable declaration, entry, build key and target platform
+  without running the image. Other OCI consumers can ignore the labels; the
+  command, environment, layers and execution protocol are unchanged.
+- **Metadata participates in build-cache validation.** An older cached image
+  without the requested callable descriptor is rebuilt. Identical code and
+  metadata reuse the image and its immutable digest in MJS.
+- **Cancellation after an attempt ends leaves its result intact.** A late cancel
+  no longer overwrites the completed attempt's status.
+- **Staging retries retain the failed completion cause.** If promotion fails after
+  both attempts, the original failure remains available for diagnosis. This does
+  not claim to resolve every intermittent staging or budget refusal.
+- **Linux embedded-Python validation finds the selected interpreter's library.**
+  The quality gate derives its shared-library directory before the adapter,
+  coverage and installed-wheel tests run.
+
 ## 0.6.4
 
 What moving the first project onto 0.6.3 found; each fix has a test that fails on 0.6.3.

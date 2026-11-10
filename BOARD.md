@@ -46,6 +46,18 @@ The PM agent's working board. It is the one place that says what is done, what i
   adapter, Python-end, coverage and fresh-wheel checks. Affected integration tests
   are being rerun; no completed full gate or release is claimed.
 
+- Final release review found the missing 0.6.5 changelog section. The normal
+  pre-push gate on `bf270fa` was stopped before completion; it is not recorded as
+  passing. The release entry is now included and the final clean commit will run
+  the complete normal hook again, including Python, coverage and a fresh wheel.
+- Griot's read-only x86 Review passes after a real VM restart with cold task
+  results: all 12 processing tasks plus preview capture, ten active lifecycle
+  tasks at peak, exit 0. Its 4 GiB allocation reports 2,639,396,864 peak bytes.
+  The earlier 3 GiB refusal remains open. Griot also found a separate local
+  authenticated API stall (health still answered), captured a thread sample and
+  recovered its saved draft by restarting only the candidate backend. These
+  Griot UI/backend issues do not establish a Moruna launcher or controller fix.
+
 ## How the board works
 
 - **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).
