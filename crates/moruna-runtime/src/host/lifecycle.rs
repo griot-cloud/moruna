@@ -807,7 +807,9 @@ impl Lifecycle {
     pub fn cancel_acknowledged(&self) {
         let mut inner = self.lock();
         let t = self.now(&inner);
-        if !inner.cancel_acknowledged {
+        // A peer message can arrive after end() won the lifecycle lock.
+        // Such a cancellation cannot affect the completed attempt.
+        if !inner.ended && !inner.cancel_acknowledged {
             inner.cancel_acknowledged = true;
             self.tell(t, Event::CancelAcknowledged);
         }

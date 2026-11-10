@@ -704,3 +704,14 @@ fn an_unplanned_lifecycle_names_no_step() {
     assert_eq!(told[0]["plan"], Value::Null);
     assert!(told.iter().skip(1).all(|e| e["step"] == Value::Null));
 }
+
+#[test]
+fn a_cancel_arriving_after_the_attempt_ends_emits_no_orphan_acknowledgement() {
+    let (lc, told) = lifecycle(&["src", "out"]);
+    lc.begin(false);
+    lc.end(Ending::Completed);
+    let before = said(&told);
+    lc.cancel_acknowledged();
+    lc.end(Ending::Cancelled);
+    assert_eq!(said(&told), before);
+}
