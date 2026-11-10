@@ -21,6 +21,22 @@ The PM agent's working board. It is the one place that says what is done, what i
   profile are being installed; global restrictions stay enabled. This is not a
   runtime code fix or a completed release gate. Full validation must run again.
 
+- The scoped namespace setup passes five jail tests; ordinary unprofiled namespace
+  creation remains denied, and Ubuntu's global restriction remains enabled.
+  The Griot browser read/review probe now passes on the private Docker Hub amd64
+  functions: 12 processing tasks and one preview capture, peak ten active task
+  lifecycles, exit 0. This uses Moruna 0.6.4 and the preview transport, not the
+  production VM launcher. Warehouse writes were disabled and canonical findings
+  remained unchanged.
+- Record for the next runtime investigation: one target-only Review attempt
+  refused its budget in ThreatFox stage 7. The report measured 2,310,443,008 peak
+  bytes against a 3 GiB ceiling, but the controller estimated a 5,441,201,627-byte
+  minimum against 2,245,500,928 bytes of headroom. An isolated trace run passes at
+  1,297,575,936 peak bytes and a browser retry at 1,491,501,056. No memory guard
+  was weakened and a passing retry is not evidence of a root-cause fix. Comparison
+  reports and the Arrow trace are retained outside sample data. Full Linux
+  coverage and fresh-wheel acceptance are still pending.
+
 ## How the board works
 
 - **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).
