@@ -126,6 +126,16 @@ if [ -f Cargo.toml ]; then
     --features moruna-datafusion/peql-iceberg,moruna-runtime/peql -- -D warnings
   quiet test_peql_iceberg cargo test -p moruna-datafusion --features moruna-datafusion/peql-iceberg
   if [ -n "${MORUNA_PYTHON:-}" ]; then
+    # Rust's embedded-interpreter tests start without Python's executable having loaded
+    # libpython. A uv-managed interpreter's library directory is outside ld.so's defaults.
+    # Keep the configured interpreter's library ahead of any inherited search path.
+    if [ "$(uname -s)" = "Linux" ]; then
+      python_library_dir="$("$MORUNA_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')" \
+        || fail "cannot locate MORUNA_PYTHON's shared-library directory"
+      [ -n "$python_library_dir" ] && [ -d "$python_library_dir" ] \
+        || fail "MORUNA_PYTHON reports no shared-library directory"
+      export LD_LIBRARY_PATH="$python_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
     # The adapter's fixtures import pyarrow and numpy inside the embedded interpreter, so
     # MORUNA_PYTHON has to be able to find both. A uv-managed interpreter is externally managed
     # and cannot have them installed into it, so the usual answer is a venv on that same

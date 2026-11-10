@@ -37,6 +37,15 @@ The PM agent's working board. It is the one place that says what is done, what i
   reports and the Arrow trace are retained outside sample data. Full Linux
   coverage and fresh-wheel acceptance are still pending.
 
+- The resumed Linux gate passed default tests (1,770), append-column, Polars /
+  DataFusion, the full governed suite including H6, and Iceberg. Separate pinned
+  cargo-deny 0.20.2 bans/sources/licence checks pass. It then stopped because
+  an embedded Python integration-test executable could not locate
+  `libpython3.14t.so.1.0` from the uv-managed interpreter. The quality runner now
+  derives and exports that interpreter's Linux shared-library directory before
+  adapter, Python-end, coverage and fresh-wheel checks. Affected integration tests
+  are being rerun; no completed full gate or release is claimed.
+
 ## How the board works
 
 - **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).
