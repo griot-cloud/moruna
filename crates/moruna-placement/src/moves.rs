@@ -89,8 +89,8 @@ pub struct MoveInFlight {
     pub op: InFlight,
     /// Completions still outstanding.
     pub pieces_left: usize,
-    /// True once any completion of this move has resolved `Err`.
-    pub failed: bool,
+    /// The first failed completion, retained until every piece has settled.
+    pub failure: Option<String>,
     /// 0 for the first attempt, 1 for the one retry f.10 allows.
     pub attempt: u8,
     /// The reservation to release when the move settles, if any.
@@ -537,7 +537,7 @@ impl PlacementEngine {
                 buffer: task.buffer,
                 op,
                 pieces_left,
-                failed: false,
+                failure: None,
                 attempt: 0,
                 reservation: task.reservation,
                 bytes: task.bytes,
@@ -709,11 +709,11 @@ impl PlacementEngine {
 
     /// Take a move out of the map once its last completion has arrived (g). Returns the
     /// move only when nothing of it is outstanding.
-    fn settle(&self, move_id: u64, failed: bool) -> Option<MoveInFlight> {
+    fn settle(&self, move_id: u64, failure: Option<String>) -> Option<MoveInFlight> {
         let mut moves = self.lock_moves();
         let entry = moves.get_mut(&move_id)?;
-        if failed {
-            entry.failed = true;
+        if let Some(failure) = failure {
+            entry.failure.get_or_insert(failure);
         }
         entry.pieces_left = entry.pieces_left.saturating_sub(1);
         if entry.pieces_left > 0 {
@@ -733,10 +733,10 @@ impl PlacementEngine {
 
     /// One piece of a record write resolved (f.5).
     fn on_piece(&self, move_id: u64, result: moruna_kernel::Result<()>) {
-        let Some(done) = self.settle(move_id, result.is_err()) else {
+        let Some(done) = self.settle(move_id, result.err().map(|error| error.to_string())) else {
             return;
         };
-        if done.failed {
+        if done.failure.is_some() {
             self.after_failure(move_id, done);
             return;
         }
@@ -810,11 +810,11 @@ impl PlacementEngine {
 
     /// A promotion's read resolved (f.6).
     fn on_read(&self, move_id: u64, result: moruna_kernel::Result<(Buffer, usize)>) {
-        let failed = result.is_err();
-        let Some(done) = self.settle(move_id, failed) else {
+        let failure = result.as_ref().err().map(|error| error.to_string());
+        let Some(done) = self.settle(move_id, failure) else {
             return;
         };
-        if done.failed {
+        if done.failure.is_some() {
             self.after_failure(move_id, done);
             return;
         }
@@ -827,7 +827,9 @@ impl PlacementEngine {
             self.after_failure(
                 move_id,
                 MoveInFlight {
-                    failed: true,
+                    failure: Some(format!(
+                        "short staging read: expected at least {need} bytes, received {taken}"
+                    )),
                     ..done
                 },
             );
@@ -851,11 +853,11 @@ impl PlacementEngine {
 
     /// A DMA between resident tiers resolved (e.4).
     fn on_copy(&self, move_id: u64, result: moruna_kernel::Result<Option<Buffer>>) {
-        let failed = result.is_err();
-        let Some(done) = self.settle(move_id, failed) else {
+        let failure = result.as_ref().err().map(|error| error.to_string());
+        let Some(done) = self.settle(move_id, failure) else {
             return;
         };
-        if done.failed {
+        if done.failure.is_some() {
             self.after_failure(move_id, done);
             return;
         }
@@ -911,7 +913,7 @@ impl PlacementEngine {
                         payload: reference.clone(),
                     },
                     pieces_left: 1,
-                    failed: false,
+                    failure: None,
                     attempt: done.attempt,
                     reservation,
                     bytes,
@@ -921,7 +923,7 @@ impl PlacementEngine {
         }
         self.in_flight_bytes.fetch_add(bytes, Ordering::AcqRel);
         if let Err(error) = self.submit_copy(move_id, &reference, to) {
-            let Some(done) = self.settle(move_id, true) else {
+            let Some(done) = self.settle(move_id, Some(error.to_string())) else {
                 return;
             };
             self.fail_settled(&done, move_id, error);
@@ -1003,12 +1005,17 @@ impl PlacementEngine {
     fn after_failure(&self, move_id: u64, done: MoveInFlight) {
         if done.attempt > 0 {
             let error = MorunaError::Staging(format!(
-                "move of batch {} counted in queue {} failed twice",
-                done.buffer.0, done.stage
+                "move of batch {} counted in queue {} failed twice: {}",
+                done.buffer.0,
+                done.stage,
+                done.failure
+                    .as_deref()
+                    .unwrap_or("completion had no failure diagnostic")
             ));
             self.fail_settled(&done, move_id, error);
             return;
         }
+        tracing::warn!(target: "placement.move_retry", stage = done.stage, buffer = done.buffer.0, cause = ?done.failure);
         let MoveInFlight {
             stage,
             buffer,
@@ -1063,7 +1070,7 @@ impl PlacementEngine {
                     buffer,
                     op,
                     pieces_left,
-                    failed: false,
+                    failure: None,
                     attempt: 1,
                     reservation,
                     bytes,
@@ -1078,7 +1085,7 @@ impl PlacementEngine {
             Redo::Read(path, offset, len) => self.submit_read(retry_id, &path, offset, len),
         };
         if let Err(error) = outcome
-            && let Some(done) = self.settle(retry_id, true)
+            && let Some(done) = self.settle(retry_id, Some(error.to_string()))
         {
             self.fail_settled(&done, retry_id, error);
         }
