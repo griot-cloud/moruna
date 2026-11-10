@@ -2,7 +2,7 @@
 
 The PM agent's working board. It is the one place that says what is done, what is next and who is waiting on whom; the documents in `architecture/` remain the specification and this board never restates them. When every box on this board is ticked, `moruna` is a production-ready package: every wave gate of preamble 6.6 is green, every sufficiency criterion S1 to S17 is closed on the reference host or listed as skipped by id with Brackly's acceptance, every decision Q1 to Q10 is decided or its assumption is explicitly accepted, and wheels for the four interpreters are published from a tagged release.
 
-## November 10: Griot image registry and Azure validation
+## November 11: Griot image registry and Azure validation
 
 - Portable OCI callable descriptors and the registry publisher are prepared for 0.6.5. Twelve real amd64 SOC function images were built and pushed to the user's private Docker Hub repository with `Job.build(registry=...)`; their MJS holds immutable OCI references, no local paths. ARM demo artifacts were preserved.
 - Full local Rust tests exposed a late cancellation acknowledgement after terminal completion; the lifecycle now ignores cancellation after the attempt has ended, with a regression test. The 1,653 default tests and feature bridges pass on macOS, but the per-crate coverage gate refuses the push there; the clean Linux/KVM gate in Germany passed default tests and feature bridges, then stopped at the H6 governed write/view test with a twice-failed staging promotion. The exact H6 test passes when rerun alone; the timing-sensitive cause is still under investigation.
@@ -11,6 +11,7 @@ The PM agent's working board. It is the one place that says what is done, what i
 - Linux validation found `lx_t17` assuming a 022 umask when checking an imported file's mode. The fixture now explicitly sets the mode it expects the image to preserve. Production permission preservation is unchanged.
 - Open integration gap: Griot's cloud host still asks for a Linux guest, external run disks, adjustable resource limits and host-owned sockets that the released native descriptor launcher does not accept. Metadata/publication work does not close that launcher contract or the production authoring transport, leases and credential renewal. Do not claim a deployed cloud flow until those are implemented and exercised.
 - Release remains pending the full Linux gate, PR checks and the normal release workflow. No tag has been created by hand.
+- Brackly resumed the original deployment assignment after the SOC demo changes. The same Germany West Central x86/KVM validation VM was restarted; the full normal quality gate is running again at `26bc99d`, with the installed-wheel Python gate included. Its previous run was interrupted during default tests by the requested deployment pause; the separate wheel build was likewise terminated, not counted as passing. The old preview warehouse credential stays revoked. An automatic shutdown is configured as a cost backstop; explicit deallocation after verification is still required.
 
 ## How the board works
 
