@@ -35,4 +35,5 @@ getting-started
 using
 execution
 reference
+image-callable-metadata
 ```

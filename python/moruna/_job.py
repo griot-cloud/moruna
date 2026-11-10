@@ -1466,6 +1466,7 @@ class Job:
                 name=e.key, entry=entry, code=code, key=key,
                 distributions=_closure.distributions(code.imports),
                 provenance=definition.get("provenance", {}),
+                definition=definition,
             )  # fmt: skip
         if refusals:
             raise _build.Refused("; ".join(refusals))

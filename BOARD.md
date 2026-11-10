@@ -95,6 +95,321 @@ Found, not in 0.6.4 (2026-11-06): with the default budget (0.9 of the host's mem
 
 0.6.5 (moved from 0.6.4 on 2026-11-06): the run VM's network (the row below), the per-run jailed process for the vsock services, runtime enforcement of an image task's declared `gives`, the kernel node supervisor's shutdown race, Griot's six launcher items (KF4: boot Griot's Linux guest, attach the run's disk, resize a running VM, a host-made run directory with group access, the vsock back end and QEMU shipped, one job digest), the guest image's kernel and packages cached by content, and the kill-and-resume test that fails under load.
 
+### Wazuh Canvas follow-up : 2026-11-09
+
+- **Live Rust/MJS integration verified (November 10).** Griot's configured
+  owner/tenant-bound Apple Container compute now imports/exports lossless MJS,
+  persists semantic commands and restores a persistent Rust session after VM
+  restart. Existing `default/soc/soc_analytics_demo` was replaced in place by
+  version 5 (13 original native tasks; earlier versions retained). Firing
+  `40f9a590-da91-4e9d-8dc4-fa8e14b68ece` succeeded; 124 native lifecycle events
+  arrived through authenticated cursor SSE. Saved outputs match the independent
+  Python graph: 4 review cases, 17 evidence rows, 1 window; evidence IDs verified.
+  Browser QA verified concurrent Running cards, node Arrow output, unfinished
+  settings recovery after reload, VM-compiled Save, and creating/connecting/
+  running a new native flow. Hidden Canvas streams now pause and resume from
+  their durable cursor, avoiding HTTP/1 connection starvation; switching away
+  during Run and returning replayed all 13 successes. UI dirty comparison
+  ignores JSON object key order. Latest app regression: 73 tests passed.
+
+  This is a Griot Rust adapter using released Moruna 0.6.4 crates, without an
+  upstream engine patch. General platform gaps remain as listed below. Native
+  publication currently supports caller-owned on-demand execution. The final static
+  UI is deployed on localhost:8498. Browser firing
+  `1f8ffc6f-36b0-4b09-b7ee-4a4a76f57cc0` completed all 13 tasks, with
+  124 native events and three simultaneous Running cards captured. The ordered
+  alerts/events/native-analytics rehearsal also passed after deployment; output
+  parity was verified again. Current checks: 73 Wazuh, 13 Linux session,
+  3 journal and 49 focused UI tests passed, plus TypeScript and release builds.
+  Temporary test-job heads were removed with version history retained.
+  Consolidated receipt: Wazuh `runs/demo/critical-path/native-authoring-acceptance.json`.
+
+
+- **Rust compute adapter implementation and direct execution proof (November 9).**
+  Griot now has separate Rust protocol, durable journal, compute-session and
+  Linux-engine crates. The control plane relays semantic commands; Moruna's
+  released 0.6.4 Rust APIs read/check/compile MJS on compute. Direct Linux
+  execution of the original 13-task Wazuh graph succeeded against the real
+  warehouse: 4 cases, 17 evidence rows and 1 window, matching the independent
+  reference. Native lifecycle facts show overlapping tasks. Node execution
+  materialized 210 alert rows and reused the cached result on its second run.
+  Thirteen compute-session tests, three durable-journal tests, 27 focused UI
+  tests and the existing 73 Wazuh tests pass. Browser deployment verification
+  is still pending the Griot build; this entry does not claim a live UI pass.
+
+  Remaining general-platform integration: immutable remote image staging /
+  registry resolution; compute registration and renewable actor credentials;
+  worker leases/fencing across control replicas; external source-version cache
+  bindings; standardized run-ledger/custody/output-manifest integration; and
+  receipt-based idempotent warehouse writes. This demo uses an explicitly
+  owner/workspace-bound Linux VM and replaces its three output tables.
+  Uncertain executions are never blindly replayed. Existing legacy flows
+  remain on their compatibility path until explicitly imported as native MJS.
+  The persistent authoring service is a Griot Rust adapter around Moruna 0.6.4,
+  not a claim that upstream 0.6.4 already exposes that authoring protocol.
+
+
+- **Authoring ownership refined by Brackly: event-driven compute sessions.**
+  UI/CLI/MCP/SDK send semantic edit commands to a persistent compute-side Moruna
+  authoring adapter, not compiler logic in Griot UI/backend. Durable auto-saved
+  draft snapshots/journal and deduplicated commands live outside the VM; Save
+  compiles on compute and publishes immutable `.mjs`. RunTarget and RunGraph use
+  Moruna plans, with revision/input-bound output cache and native lifecycle
+  events over existing Kora/projections/SSE. Replay restores edits/status, never
+  blindly repeats side effects. A compute disconnect must not lose accepted
+  edits or permit stale workers to submit duplicate runs.
+
+  Full proposed protocol, ownership, caching, reconnect/fencing and acceptance:
+  Griot `docs/design/moruna-authoring-sessions.md`. It supersedes the earlier
+  idea that Griot should construct `.mjs` during save for this native route.
+  A compute-side authoring/target-capture capability audit is required; the
+  persistent authoring service is not claimed to exist in Moruna 0.6.4. Initial
+  Griot IR/transport prototype was preserved under Wazuh ignored
+  `runs/demo/critical-path/mjs-prototype/` and removed from the active checkout
+  pending this design; prior deployed compatibility fixes/live demo retained.
+  No authoring-session implementation was deployed and no prototype test pass
+  is claimed (build stopped after the scope changed).
+
+
+- **Architecture requirement clarified by Brackly: bidirectional native job execution.**
+  Canonical Moruna `.mjs` IR must survive Python build → Griot import/edit/export
+  → local execution, with complete graph/ports/arguments/needs semantics. Whole
+  Canvas runs, including drafts, submit the complete DAG to a version-pinned
+  Moruna compute runtime; Moruna owns internal scheduling. Griot resolves
+  governed deployment bindings and records authored/execution identity, not a
+  second competing scheduler. The current successful segmented SQL/WASM demo
+  verifies analytics behavior only, not completion of this contract.
+
+  Griot work: retain complete canonical IR instead of lossy SavedTask projection;
+  native DAG submission (existing JobDoc lowering is a one-source/kernel-chain/
+  one-sink path); registry-pinned image sources/functions/sinks and artifact
+  resolution; governed Warehouse port adapter; integrate Linux image compute;
+  reuse existing lifecycle→Kora→projection→execution/watch SSE in Canvas; same
+  whole-job path for saved/draft, with separate explicit node preview. Exported
+  Griot-specific kinds require the same local runtime plugins and authenticated
+  bindings, not stock Moruna alone. Runtime/task/version IDs must remain mapped
+  through events and UI. Local source paths should be non-portable inspection or
+  explicit remapping, not silently runnable remote references.
+
+  Moruna core DAG/image/port/event capabilities are already exercised by the
+  standalone Wazuh native graph. No engine rewrite or version bump is justified
+  solely by this integration. Validate supported IR/ABI/event versions on both
+  sides. Independently reproduced empty SQL schema loss remains a Moruna fix;
+  image finalization output-window race is still an inferred engine defect with
+  an application workaround, needing a minimal reproduction. Full acceptance:
+  both-direction round trip, concurrent roots, dependency barriers, live events,
+  reconnect replay, cancellation/failure, empty input and retry-safe sinks.
+  These are required changes/tests, not newly implemented functionality.
+
+
+- **Open: Canvas draft scheduling and status delivery : Griot ownership.**
+  User observed near-sequential cards and stalled/burst updates. Verified saved
+  firing `ebd6d2b2-432c-4835-8258-de3cb3fb21ab`: ten source runs overlap, start
+  spread 2.026 seconds. Current UI is a modified draft and uses interactive task
+  execution instead: whole Play silently changes route when draft differs.
+  `pipeline/canvas.rs::advance_task_execution` claims/dispatches one ready task
+  then returns, staggering ready siblings across completions/ticks. Fix bounded
+  ready-wave concurrency with atomic claims, cancellation and no duplicate sinks;
+  label execution modes explicitly. It is not proof of a Moruna DAG bug.
+
+  Interactive cards poll task-run snapshots (200 ms after each response), not
+  engine phases. Backend snapshot reads run records sequentially; separate
+  per-card launches/staging add latency. Saved-job `useFiringExecution` polls
+  every 1.5 s after a complete cycle and waits on all segment projections with
+  `Promise.all`; one slow response blocks all updates, one failure clears them,
+  and no per-request deadline exists. Existing execution SSE watch is unused by
+  these Canvas hooks. Fix independent updates/failure isolation, bounded reads,
+  freshness/phase visibility and SSE with cursor recovery. No transport outage
+  has been established. No behavioral patch or restart made during user's run.
+  Wazuh details: `docs/CANVAS_EXECUTION.md`; timing and screenshot receipts:
+  `runs/demo/critical-path/status-investigation/`.
+
+
+- **Open: empty DataFusion SQL → Arrow IPC loses the schema (0.6.4).**
+  Reproduced both in Griot's Canvas task execution and independently with the
+  published `moruna[package]==0.6.4` CLI on macOS/Python 3.14. A typed zero-row
+  result exits **1**, `sink: the sink has no schema`. Expected: successful empty
+  Arrow IPC output retaining column `n: int64`. This blocks empty-window flows;
+  it is not specific to Wazuh, the Griot SDK, or a warehouse connection.
+  Candidate for 0.6.5 triage; no engine fix was made in this work.
+
+  Minimal legacy job (replace the two absolute directories with writable paths):
+
+  ```json
+  {"moruna_spec":1,"run_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source":{"kind":"datafusion","root":"/absolute/empty-root","sql":"SELECT CAST(1 AS BIGINT) AS n WHERE FALSE","caller":{"id":"empty-repro","tenant":"empty-repro","purpose":"analytics","other":{}}},"sink":{"kind":"arrow_ipc","url":"file:///absolute/empty-output/"}}
+  ```
+
+  Run `moruna run empty-sql.json`. Exact reproduction, stdout and report are in
+  `/Users/brackly/Desktop/Projects/wazuh_analytics/runs/demo/flow-gaps/`:
+  `empty-sql.json`, `empty-sql.log`,
+  `moruna-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.report.json`.
+  Griot reproduction: `runs/demo/domain-migration/clear-old-samples.log`,
+  execution `facc26dd-834a-4381-b51c-ed03fc3a1937`; source task failed and sink
+  task remained blocked. No synthetic case was written.
+
+- **Fixed locally: Griot Canvas rejected the 0.6.4 kind catalogue (integration/UI).**
+  Chrome at `http://localhost:8498/data/canvas?job=default%2Fsoc%2Fnormalize_wazuh_alerts`
+  shows “The engine returned an invalid kind listing: unsupported format version.”
+  The canvas stays empty and Validate/Play are disabled. The released CLI
+  `moruna kinds` returns `moruna_kinds: 2`, `moruna: "0.6.4"` and the groups
+  `sources`, `functions`, `sinks`. Griot's vendored builder still requires
+  `moruna_kinds === 1` and reads `kernels` in
+  `workspace/vendor/job-builder-example/src/kind-schema.ts:21`.
+  Owner: Griot Canvas compatibility with the released Moruna catalogue; do not
+  classify this as an engine execution failure. Align the frontend decoder,
+  declaration types and forms with v2, then verify graph hydration and Run from
+  Canvas. The saved jobs already execute successfully through the SDK.
+  Evidence in the Wazuh project: `runs/demo/flow-gaps/runtime-kinds.json` and
+  `runs/demo/domain-migration/canvas-kind-listing-gap.png`. Now fixed in the
+  Griot integration checkout: v1/v2 decoder plus actual 0.6.4 fixture, 24 focused
+  tests passed. Rebuilt served assets match dist. Canvas full analytics execution
+  visibly succeeded; `runs/demo/critical-path/canvas-analytics-success.png`.
+
+- **Open: importing the app's native `.mjob` is refused (Griot support gap).**
+  Tried `client.job.import_spec("default", "soc", "soc_window", body=Path(...),
+  run_as=owner)` with the existing built `soc_window.mjob`, SHA-256
+  `8176ece0826345527dcb5587317d4b15bed7e7a067d96d166c8f9994f06f23bc`.
+  HTTP 400: `task alerts is a Moruna image source, which Griot does not run yet:
+  Griot reads through its contracts, buckets and files`.
+  Owner: Griot spec importer/runtime integration, not a corrupt Moruna spec.
+  Decide whether to support image sources or explicitly map the app's source
+  onto a Griot contract before importing; then evaluate image functions/sink,
+  image availability, runtime needs and window parameters. Do not silently
+  rewrite or run the case-generating graph. No job/version was created by this
+  refused import and no case rows were written.
+  Exact response: Wazuh `runs/demo/domain-migration/soc-window-import.json`.
+
+- **Full app import/execution scope : source review, 2026-11-09.**
+  Removing the first source refusal is insufficient. Also cover the image sink,
+  translate native Moruna image settings into Griot's registry-backed staging,
+  and bind the app's `warehouse` need with run-as read/write authorization.
+  `crates/runs/src/image.rs` explicitly describes current Container tasks as
+  having no ports; the Wazuh app supplies `WarehouseServer` through Moruna ports.
+  Preserve job argument declarations (`window_start`/`window_end`), inline task
+  definitions and named input/output edges: current `from_spec` retains a task
+  subset and dependencies, while `to_spec` rebuilds default ports/edges and a
+  fresh `Job`. These are compatibility requirements found by code inspection,
+  not additional runtime failures already demonstrated. Verify full import /
+  export fidelity and one actual Linux image-graph run, including empty input,
+  denied warehouse access and retry-safe case/evidence writes.
+
+  **Proposed import policy (Brackly raised registry/local handling):** portable
+  runnable imports require explicit registry/repository plus immutable digest;
+  reuse Griot's workspace registry credentials and verified OCI staging rather
+  than inventing a second credential system. Reject submitter filesystem paths,
+  `file://` layouts and local-daemon image names with an actionable publish
+  instruction. A private/internal registry remains valid if configured and
+  reachable by compute; it is not the same as a local filesystem image.
+  Import must not execute tasks, install credentials or grant requested needs.
+  Missing images, unsupported platforms or unbound needs must prevent execution.
+  Optionally support a clearly non-runnable inspect-only import for local/draft
+  specs; this is a product proposal, not implemented policy. Existing Moruna
+  standalone local-layout use remains valid.
+
+- **Portable analytics admission gaps : 2026-11-09.**
+  Moruna check cannot synthesize struct values inside an input list; Griot
+  refuses that package as not checkable. Moving to column-wise arrays passes
+  schema checks, but costing then fails on `list<item: list<item: string>>`:
+  verdict `agreed`, exit 2, warm-up error names `rule_groups`. Independently
+  reproduced with the released CLI (`moruna check <package> --json --budget 3`).
+  Evidence: Wazuh `runs/demo/critical-path/analytics-build.log` and
+  `pack-warm-check.json`. Candidate checker/costing coverage work; no engine
+  bypass or patch made. Demo integration instead uses ordinary source records
+  serialized into a flat staging representation, with explicit marked empty
+  control rows to retain the SQL source schema.
+
+  The original image spec was also probed directly on macOS: config `sandbox`
+  refuses because image commands require Linux. This is an expected platform
+  limitation, not another engine bug. `image-probe.log` records the exact result.
+  A capture-only run of the existing Python graph against SOC succeeded for
+  2026-09-05 10:38–10:39 UTC: 210 alerts, 428 related events, 4 offline review
+  cases and 17 evidence rows; warehouse writes zero. Portable flow must match
+  that reference before it is called ready (`reference-run.json`).
+
+- **Costing large WASM copy batches : observed during analytics admission.**
+  A stateless record serializer passed schema agreement but costing failed at
+  `1000000 rows (Skewed keys)` with `fuel allocated for hostcalls has been
+  exhausted`. The same package's bounded `moruna check --budget 3` passed;
+  the Griot admission check runs the default budget and reached that larger
+  batch. Evidence: Wazuh `runs/demo/critical-path/recent-registration-check.json`
+  and `recent-check.json`. Triage realistic morsel sizing / host-copy fuel during
+  costing; do not bypass registration. The demo serializer was made more compact
+  by encoding values in declared column order instead of repeating field names
+  per record, then resubmitted for normal admission.
+
+- **Original image graph on Apple Container : 2026-11-09.**
+  Apple Container supports the Linux image runtime: user namespaces and a
+  writable cgroup v2 hierarchy are available. In a dedicated VM, delegate CPU /
+  memory controllers after moving supervisor processes to a leaf. Nested proc
+  mounting needs `--cap-add SYS_ADMIN --masked-path NONE --read-only-path NONE`;
+  these settings are for this private disposable VM, not a shared host. Task
+  images remain confined by Moruna and access the warehouse only through ports.
+  `apple-container-image-nested.log` proves the real source reached its port.
+
+  The full original graph then read real Griot data and reached `agent`, but
+  failed with `its output's window of 891043840 bytes: Unknown("output")`.
+  Evidence: Wazuh `runs/demo/critical-path/image-spec-real-data-2.log`.
+  Source review: image finish grants another output window after consuming its
+  final extra batch; the plane can already have removed the ended task's
+  outputs. This is an inference pending a minimal race reproduction, not an
+  engine fix. The app now uses a declared alert-count boundary so the agent
+  emits on its last data batch, retaining whole-window grouping and evidence
+  checks. Native image execution succeeded with real Griot reads; 4 cases,
+  17 evidence rows and 1 window match Python (capture only, zero writes).
+  The final 73-test application suite, including the 1,001-alert split regression,
+  passed. Empty image windows remain unverified.
+  No Moruna source was changed.
+
+- **Griot flow follow-up fixes / limits : 2026-11-09.**
+  Connected-input SQL previews cast nulls using Arrow Debug type strings, which
+  include Field structs for lists and are not parseable. The Wazuh graph check
+  refused its final three projections with `unknown token: Field`. Changed to
+  Arrow Display (the parseable grammar); rebuilt and full graph checks pass.
+  A reused Cargo build-script executable also embedded another checkout's web
+  assets: use runtime CARGO_MANIFEST_DIR in `crates/griot/web_embed.rs`. Served
+  JS digest did not match current dist; rebuilt deployment now matches dist.
+  Constant-only pipeline SQL was refused a disk key because it names no storage
+  contract. Empty VT/OpenVAS warehouse snapshots were initialized with
+  zero rows so these source branches can read their actual governed contracts;
+  no fabricated observations are inserted. The constant-SQL/storage planning
+  case remains a downstream Griot limitation.
+
+- **Complete Wazuh demo flow verified : November 9, 19:01 EAT.**
+  The 29-task SQL/WASM `default/soc/soc_analytics_demo` v2 ran from Canvas and
+  succeeded through all 14 execution stages. Persisted 4 cases / 17 evidence /
+  1 window match the independent Python graph except run timestamps; cited IDs
+  exist in actual Wazuh rows. A separate repeat preserves output counts and IDs.
+  Then both raw normalizers and analytics were rehearsed in order, all succeeded:
+  744 alerts / 1,578 events → 4/17/1. Final firing
+  `ebd6d2b2-432c-4835-8258-de3cb3fb21ab`; Wazuh receipts under
+  `runs/demo/critical-path/{rehearsal,persisted-output-verification}.json`.
+  Native `.mjs` image parity is separately verified in `image-capture/parity.json`;
+  direct native-spec Griot import/registry/warehouse binding remains open.
+
+  Griot runtime configuration fixes: the first large empty-key source hash join
+  exceeded its default plan allowance; the fixed demo window now skips scans
+  when its indicator set is empty and uses named 1 CPU / 1 GiB compute. A later
+  fanout hit `too many open files` with launchd's 256 limit. Raising the local
+  service soft/hard limit to 8,192 and restarting resolved it; three subsequent
+  complete analytics runs succeeded. These are Griot configuration/query-planning
+  findings, not Moruna engine fixes. Output replacement is demo-scoped, not a
+  multi-table transaction or production retention/exactly-once guarantee.
+
+
+- **Verified nonempty saved-job backend path:** raw Wazuh alerts/events → SQL deduplication
+  → registered WASM normalizer → contract sink in overwrite mode. Both saved
+  Griot jobs succeeded on Moruna 0.6.4. All 744 alert and 1,578 event output rows
+  match the Python reference by complete row hashes. All original 1,446 alert
+  and 3,061 event rows remain in raw tables, including replayed and malformed
+  input. Case generation is a separate flow still to build; prior demo case
+  output was cleared at Brackly's request.
+
+- **Downstream ownership (Griot SDK / ADBC):** SDK `table.write` exposes append
+  only although the backend supports replacement. An empty reader sends no
+  Flight frame (`DoPut with no frame`); explicitly supplying one zero-row batch
+  lets ADBC `mode="replace"` clear a table. This workaround cleared the prior
+  sample outputs. Track it as SDK ergonomics, not a Moruna engine defect.
+
 ## Now
 
 | | |
@@ -775,3 +1090,110 @@ success case passed with 100,000 exact rows and sink acknowledgement. Case 2
 stopped on a verifier diagnostic-field mismatch; its correction is reviewed but
 not yet executed. Remaining CPU cases, native network/storage recovery, KVM
 staging and actual Griot-on-Moruna acceptance remain open.
+
+
+### Griot Task Library follow-up, 2026-11-10
+
+Griot-owned fixes on `integration/local-cloud`: normalize the v2 `functions`
+catalogue before rendering its Task Library; restore Container in Data processing
+and the existing registry/image/command/environment/output drawer; retain the
+shared drawer for imported callable parameters and image pins. Matching explicit
+`definition.provenance.build_key` and `settings.image.build_key` allow Function
+presentation without changing the executable image kind. MJS remains a job IR,
+not an automatic catalog registration. Draft-time required-field diagnostics no
+longer flood cards before explicit validation; incomplete jobs still refuse
+compilation. Hidden browser pages release live streams and resync on return.
+
+Remaining Griot integration work: a governed registry-to-compute image binding
+with credential scope, digest verification, declared Arrow ABI/entry, staging and
+portable import/export. The current semantic registry picker cannot yet run an
+arbitrary image through the native authoring session; its compiler refuses that
+case explicitly. Reusable image-backed catalog function registration/versioning,
+the Griot decorator, and alternate execution hosts such as Ray are not implemented
+by these UI fixes. No Moruna engine release is implied by this Griot work. Demo
+localhost:8498 is held unchanged while the candidate runs separately on 8599.
+
+
+Griot publishing design follow-up (2026-11-10): reuse existing generic OCI push
+and resolver-based registry credentials; keep catalog/domain registration in the
+Griot CLI/SDK integration. Planned UI includes per-callable image/catalog binding
+status plus job-level bulk dependency resolution. Catalog registration is distinct
+from image availability. Named registry profiles are optional generic convenience;
+Griot options are provider-owned and validated outside portable MJS. The proposed
+bulk publication path is not implemented. See Griot `docs/design/moruna-authoring-sessions.md`,
+“Import, dependency resolution and bulk publishing”. Jobs retain no build-server
+affinity; the original MJS remains available when relocated bindings produce a
+new compiled revision.
+
+
+Portable callable delivery map (2026-11-10): Griot design now separates the Moruna
+Function contract from hosting: a Docker/OCI-hosted Moruna callable remains a
+Function, while a plain OCI workload is Container. Moruna owns the stable callable
+descriptor/identification and compatibility rule; Griot owns optional catalog
+name/version bindings, authorization and artifact resolution. Work order and
+acceptance are recorded in Griot `docs/design/moruna-authoring-sessions.md`,
+“Delivery plan: callable identity independent of hosting”. First portable path:
+formalize descriptor → compute OCI resolution → dependency preflight → UI bindings
+→ external-registry acceptance. Catalog image-backed functions and bulk CLI/SDK
+publication follow their stated dependencies. This is a work map, not a shipped
+registry/catalog implementation or a claim that a Moruna release is ready.
+
+
+Storage scope clarification (2026-11-10): Griot plans additive image-backed
+function catalog records, preserving existing WASM/PEX package functions and
+standard-kernel registrations. First delivery references digest-pinned images in
+existing OCI registries; Griot is not to implement an OCI registry for this work.
+Optional OCI archive upload can reuse managed artifact storage with explicit OCI
+validation and compute staging, as a separate backend. See Griot design “Storage
+decision: extend functions; do not build an OCI registry”. No package-to-image
+conversion or retirement of existing function formats has been authorized here.
+
+
+Superseding user decision : image-only Griot functions (2026-11-10): discard the
+additive WASM/PEX compatibility proposal above. Griot function catalog entries
+will reference runnable OCI images plus their Moruna callable definition/entry;
+source code is not stored as a function and package-function upload/execution is
+to be replaced in the candidate. Native built-in select/filter/join operations
+remain Transform tasks, not another registered function format. Existing catalog
+records need an explicit rebuild-to-image or retirement mapping; no automatic
+source build, implicit conversion or protected-demo cleanup. Reuse external OCI
+registries, with Griot-owned catalog resolution. The revised delivery sequence is
+in Griot design “Current decision: image-only functions”. This is the accepted
+target; the catalog/runtime migration remains implementation work.
+
+
+OCI callable metadata implementation (2026-11-10): Moruna's builder now emits
+`org.moruna.callable.version=1` and a canonical config-label descriptor containing
+the existing MJS callable definition, entry, platform and build key. Minimal
+manifest marker; no task params, credentials or Griot-specific metadata. Cache
+reuse checks descriptor equality so older unannotated cached images are rebuilt.
+The full descriptor matches the MJS declaration for source/function/sink builds.
+Targeted builder/SDK/metadata checks: 61 passed, one existing opt-in skipped,
+using a temporary source overlay with the installed 0.6.4 native extension.
+The runtime command/env/layers comparison passes. SDK release remains pending;
+the Griot integration and actual registry-to-compute acceptance are ongoing.
+Contract: docs/image-callable-metadata.md.
+
+Griot image-function acceptance update (2026-11-10): the isolated Griot candidate
+now consumes descriptor v1 through connected OCI registries, versions image-only
+catalog functions, supports bulk reference registration/identity reuse, and
+materializes verified images on the native 0.6.4 compute. Registry-only SOC MJS
+import/compile/export and execution passed: 13 tasks, 124 lifecycle events, peak
+10 active tasks; browser Save/Play and individual node output passed. Warehouse
+reads verified 4 cases/17 evidence/1 window. Reconnect replay preserved the draft
+and MJS. Missing images imported/compiled and failed before tasks started. Source
+package registration is retired in the new Griot path. Existing OCI layers were
+republished with metadata without changing command/env/layers. SDK metadata
+emission remains unreleased.
+
+Open runtime issue from acceptance: at a 2 GiB explicit budget this SOC fan-out
+can stop after its source with `staging: no unit can make progress`, all ten input
+queues staged, and `0 of 0 budget bytes resident`. No unit is admitted despite no
+running work. Reproduction reports (private local candidate):
+`/Users/brackly/griot-kt/wazuh/authoring/state/candidate/state/4e1ebf6c34bb005e0671dccedaf699e7d9e2061968c3ea313cef2f2392d931d2/b7f64d1d8abe4c1893cc5dffdd979125/report.json`
+and `82124267b145409aae7bd3961eefb2f7/report.json` in the same directory.
+Griot now isolates engine accounting per execution and configures this 4 GiB demo
+host with a 3 GiB runtime ceiling; repeat whole and targeted runs pass there.
+This is a tested deployment configuration, not a fix for the lower-budget
+Moruna scheduling diagnostic. Preserve the 0.6.4 runtime pin; investigate an
+admission refusal/recovery regression before claiming that smaller-budget case.

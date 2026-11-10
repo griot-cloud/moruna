@@ -120,6 +120,18 @@ def test_a_job_builds_one_image_per_task_and_its_spec_becomes_runnable(
     rendered = json.loads(runnable.to_json())
     keys = [t["settings"]["image"]["build_key"] for t in rendered["tasks"]]
     assert keys == [row["build_key"] for row in status], "the keys did not change"
+    from moruna import _image_metadata  # noqa: PLC0415
+
+    layout = tmp_path / "images" / "blobs" / "sha256"
+    for node in rendered["tasks"]:
+        image = node["settings"]["image"]
+        manifest = json.loads((layout / image["digest"].split(":")[1]).read_bytes())
+        config = json.loads((layout / manifest["config"]["digest"].split(":")[1]).read_bytes())
+        descriptor = _image_metadata.read(config["config"]["Labels"])
+        assert descriptor["definition"] == node["definition"]
+        assert descriptor["entry"] == node["settings"]["entry"]
+        assert descriptor["build_key"] == image["build_key"]
+        assert descriptor["platform"] == {"os": "linux", "architecture": "arm64"}
     assert "image=built" in repr(job)
     assert job.explain()["images"] == status
     again = job.build(tmp_path / "images", **build_options(wheels, tmp_path))
