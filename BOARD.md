@@ -2,6 +2,14 @@
 
 The PM agent's working board. It is the one place that says what is done, what is next and who is waiting on whom; the documents in `architecture/` remain the specification and this board never restates them. When every box on this board is ticked, `moruna` is a production-ready package: every wave gate of preamble 6.6 is green, every sufficiency criterion S1 to S17 is closed on the reference host or listed as skipped by id with Brackly's acceptance, every decision Q1 to Q10 is decided or its assumption is explicitly accepted, and wheels for the four interpreters are published from a tagged release.
 
+## November 10: Griot image registry and Azure validation
+
+- Portable OCI callable descriptors and the registry publisher are prepared for 0.6.5. Twelve real amd64 SOC function images were built and pushed to the user's private Docker Hub repository with `Job.build(registry=...)`; their MJS holds immutable OCI references, no local paths. ARM demo artifacts were preserved.
+- Full local Rust tests exposed a late cancellation acknowledgement after terminal completion; the lifecycle now ignores cancellation after the attempt has ended, with a regression test. The 1,653 default tests and feature bridges pass on macOS, but the per-crate coverage gate refuses the push there; a clean Linux/KVM gate is running in Germany.
+- Linux validation found `lx_t17` assuming a 022 umask when checking an imported file's mode. The fixture now explicitly sets the mode it expects the image to preserve. Production permission preservation is unchanged.
+- Open integration gap: Griot's cloud host still asks for a Linux guest, external run disks, adjustable resource limits and host-owned sockets that the released native descriptor launcher does not accept. Metadata/publication work does not close that launcher contract or the production authoring transport, leases and credential renewal. Do not claim a deployed cloud flow until those are implemented and exercised.
+- Release remains pending the full Linux gate, PR checks and the normal release workflow. No tag has been created by hand.
+
 ## How the board works
 
 - **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).

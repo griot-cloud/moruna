@@ -572,6 +572,12 @@ fn lx_t17_a_directory_as_a_layer() {
     )
     .unwrap();
     fs::write(root.join("kc1/greeting.txt"), b"greetings\n").unwrap();
+    // The layer preserves permissions; the fixture must not inherit the host's umask.
+    fs::set_permissions(
+        root.join("kc1/greeting.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
     std::os::unix::fs::symlink("bin/hello", root.join("kc1/run")).unwrap();
     let out = scratch.path().join("top.layer");
     let written = write(&tree(&root).unwrap(), &out).unwrap();
