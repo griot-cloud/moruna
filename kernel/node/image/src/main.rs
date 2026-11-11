@@ -339,6 +339,19 @@ mod kd3_command_tests {
     }
 }
 
+fn validate_initial_services(initial: &moruna_node::InitialJob) -> Result<(), String> {
+    for slot in ["linux", "network", "storage.admission", "local.admission"] {
+        if let Some(grant) = initial.grants.iter().find(|grant| grant.slot == slot)
+            && !grant.listener
+        {
+            return Err(format!(
+                "initial {slot} must be retained by admission as a service"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut args: Vec<_> = std::env::args().collect();
     let proof_command = args
@@ -451,6 +464,7 @@ fn run() -> Result<(), String> {
     storage_assets(assets, &node)?;
     let initial = moruna_node::InitialJob::parse(&page(assets, "initial.job")?)
         .map_err(|e| format!("initial job: {e:?}"))?;
+    validate_initial_services(&initial)?;
     let engine_bytes = page(assets, "engine.conf")?;
     let engine = engine::Config::parse(
         std::str::from_utf8(&engine_bytes).map_err(|_| "engine config encoding")?,
@@ -500,6 +514,23 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod maintenance_tests {
     use super::*;
+    #[test]
+    fn initial_service_connections_outlive_the_first_job() {
+        for slot in ["linux", "network", "storage.admission", "local.admission"] {
+            let transferred = moruna_node::InitialJob::parse(
+                format!("moruna-node-job 1\nbudget 8192\ngrant {slot} initial.endpoint\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            assert!(validate_initial_services(&transferred).is_err());
+            let retained = moruna_node::InitialJob::parse(
+                format!("moruna-node-job 1\nbudget 8192\nservice {slot} initial.endpoint\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            assert!(validate_initial_services(&retained).is_ok());
+        }
+    }
     fn config(extra: &str) -> moruna_node::Config {
         moruna_node::Config::parse(format!(
             "moruna-node 1\nservice storage image.storage 4096\nservice worker image.maintenance 4096\nservice tenant image.engine 4096\n{extra}"

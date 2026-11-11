@@ -2,6 +2,11 @@
 
 ## 0.6.5
 
+- **Native node services outlive the first job.** Admission retains the initial
+  Linux and storage service endpoints and lends narrowed copies to the engine.
+  Packaging checks this ownership so job completion cannot close a critical
+  service and race the node supervisor.
+
 - **Image state stays in its own memory budget.** A retained image-process
   footprint remains funded against the run ceiling while placement keeps its
   separate arena allowance. Previously a learned profile could reduce queue

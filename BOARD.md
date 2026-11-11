@@ -44,6 +44,11 @@ Griot. This chat now leaves Griot implementation to the other agent.
   external state through a controller method before preparation. Invalid and
   late registrations are refused atomically. All 66 controller tests and the
   logical-row capture regression pass after this API correction.
+- [x] Native CI exposed a first-job completion race on four CPUs. Initial Linux
+  and storage endpoints were transferred out of admission, allowing critical
+  services to terminate with the job. The assembly now uses existing retained
+  service grants. Packaging rejects transferred service endpoints. All 16 node
+  core/image tests pass locally. Native multi-CPU execution remains pending.
 - [ ] Verify the confined backend's direct exit under Linux continuous coverage.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.

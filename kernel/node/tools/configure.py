@@ -129,14 +129,16 @@ def main():
                  "grant admission initial.checkpoint-binding checkpoint.admission", "grant admission initial.cache-binding cache.admission",
                  "link local storage.authority admission local.authority", "link local storage.admission admission initial.local-admission",
                  "link devices directory-local local storage.block-directory"]
-        extra_initial += ["grant local.admission initial.local-admission", "grant checkpoint.binding initial.checkpoint-binding", "grant cache.binding initial.cache-binding"]
+        extra_initial += ["service local.admission initial.local-admission", "grant checkpoint.binding initial.checkpoint-binding", "grant cache.binding initial.cache-binding"]
         extra_engine += ["grant checkpoint admission local.admission checkpoint.binding", "grant cache admission local.admission cache.binding"]
     if args.maintenance_target is not None:
         node += [f"link {args.maintenance_target} storage.maintenance housekeeping storage.maintenance",
                  f"grant {args.maintenance_target} storage.maintenance-config maintenance.server-config",
                  "grant housekeeping storage.maintenance-config maintenance.client-config"]
     (args.out / "node.conf").write_text("\n".join(node) + "\n")
-    (args.out / "initial.job").write_text(f"moruna-node-job 1\nbudget {profile['job_account_bytes']}\ngrant linux initial.linux\ngrant directory initial.directory\ngrant image initial.image\ngrant engine.bindings initial.bindings\nservice network initial.network\ngrant storage.admission initial.storage-admission\ngrant storage.binding initial.storage-binding\n")
+    # Admission retains service endpoints for the node lifetime and loans narrowed
+    # duplicates to the engine. A completed job must not close a critical service.
+    (args.out / "initial.job").write_text(f"moruna-node-job 1\nbudget {profile['job_account_bytes']}\nservice linux initial.linux\ngrant directory initial.directory\ngrant image initial.image\ngrant engine.bindings initial.bindings\nservice network initial.network\nservice storage.admission initial.storage-admission\ngrant storage.binding initial.storage-binding\n")
     (args.out / "engine.conf").write_text(
         f"program {program}\narg serve\narg --listen\narg vsock://-1:{profile['agent_port']}\n"
         f"env HOME=/tmp\nmemory {profile['job_memory_bytes']}\nscratch {profile['scratch_bytes']}\n"
