@@ -627,7 +627,6 @@ fn drive(
                 fingerprint: kernel.fingerprint(),
                 schema_hash: schemas[usize::from(input)].hash(),
                 hints: kernel.hints(),
-                state_uses_arena: kernel.state_uses_arena(),
                 kind: kernel.kind(),
             }
         })
@@ -946,6 +945,13 @@ fn drive(
         topology.clone(),
         kernel_infos,
     )?);
+    let external_state_stages: Vec<_> = kernels
+        .iter()
+        .enumerate()
+        .filter(|(_, kernel)| !kernel.state_uses_arena())
+        .map(|(at, _)| (at + 1) as moruna_kernel::StageId)
+        .collect();
+    controller.set_external_state(&external_state_stages)?;
     started.controller = Some(controller.clone());
     // A `Weak`, not a clone: the controller holds the scheduler as its `Knobs`, `StatsSource`
     // and `Prober`, so a hook that held the controller strongly would close a reference cycle

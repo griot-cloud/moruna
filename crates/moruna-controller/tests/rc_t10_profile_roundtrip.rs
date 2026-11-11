@@ -221,21 +221,24 @@ fn external_state_profile(dir: &std::path::Path, state_bytes: u64) -> common::Ri
     cfg.profiles_dir = Some(dir.to_path_buf());
     cfg.plan.total_bytes = MIB;
     cfg.plan.total_rows = 1000;
-    let mut stage = common::stateful_kernel(1, 1, KernelHints::default());
-    stage.state_uses_arena = false;
-    common::Rig::new(
+    let rig = common::Rig::new(
         cfg,
-        vec![stage],
+        vec![common::stateful_kernel(1, 1, KernelHints::default())],
         FakeKnobs::new(),
         FakeSampler::new().scripted(steady(GIB + 64 * MIB, 8)),
-    )
+    );
+    rig.controller.set_external_state(&[1]).unwrap();
+    rig
 }
 
 #[test]
 fn rc_t10_external_profile_state_does_not_spend_the_placement_arena() {
     let scratch = Scratch::new("external-state-profile");
     let rig = external_state_profile(scratch.path(), 2 * GIB);
+    assert!(rig.controller.set_external_state(&[0]).is_err());
+    assert!(rig.controller.set_external_state(&[2]).is_err());
     rig.run_up();
+    assert!(rig.controller.set_external_state(&[]).is_err());
     let budgets = common::last_budgets(&rig.placement).unwrap();
     assert!(
         budgets.host > 0,

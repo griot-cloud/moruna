@@ -370,10 +370,6 @@ pub struct KernelInfo {
     pub schema_hash: [u8; 32],
     /// What the kernel says about itself before the probe.
     pub hints: KernelHints,
-    /// Whether this stage's instance footprint may retain arena allocations.
-    /// External state is funded against the run ceiling, without consuming the
-    /// placement queues' arena allowance a second time.
-    pub state_uses_arena: bool,
     /// Stateless or stateful, and with how many instances.
     pub kind: KernelKind,
 }
@@ -621,6 +617,7 @@ pub(crate) struct ControllerState {
     /// The run's shape: its queues and which stages take and give which (contracts d.16).
     pub topology: Topology,
     pub kernels: Vec<KernelInfo>,
+    pub external_state_stages: HashSet<StageId>,
     pub phase: Phase,
     pub budgets: Budgets,
     pub tier_budgets: TierBudgets,
@@ -1003,6 +1000,7 @@ impl Controller {
             cfg,
             topology,
             kernels,
+            external_state_stages: HashSet::new(),
             phase: Phase::Created,
             budgets: Budgets::default(),
             tier_budgets: TierBudgets::default(),
@@ -1060,6 +1058,31 @@ impl Controller {
             tick: Mutex::new(None),
             stop_flag: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Register stages whose complete instance state is held outside the arena.
+    /// Their footprint remains funded against the run ceiling. All other stages
+    /// retain arena accounting. Call before [`Controller::prepare`].
+    /// Invalid stage lists and late calls leave the previous registration intact.
+    pub fn set_external_state(&self, stages: &[StageId]) -> Result<()> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(state.phase, Phase::Created) {
+            return Err(MorunaError::Config {
+                name: "kernels.state",
+                msg: "external state must be registered before prepare".into(),
+            });
+        }
+        if stages
+            .iter()
+            .any(|stage| !(1..=state.kernels.len()).contains(&usize::from(*stage)))
+        {
+            return Err(MorunaError::Config {
+                name: "kernels.state",
+                msg: "external state names a stage outside the run".into(),
+            });
+        }
+        state.external_state_stages = stages.iter().copied().collect();
+        Ok(())
     }
 
     /// Install the factory that builds each stage's sizer, instead of the one

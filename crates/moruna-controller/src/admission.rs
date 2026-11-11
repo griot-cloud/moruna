@@ -77,7 +77,6 @@ mod tests {
     }
     fn kernel(stage: u16, state: u64, instances: usize) -> KernelInfo {
         KernelInfo {
-            state_uses_arena: true,
             stage,
             fingerprint: Fingerprint([0; 32]),
             schema_hash: [0; 32],

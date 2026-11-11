@@ -40,6 +40,10 @@ Griot. This chat now leaves Griot implementation to the other agent.
   placement arena. Separate external state from arena-resident state while
   retaining the complete run-ceiling check. Both new profile regressions, all
   six profile tests and all 66 controller tests pass locally.
+- [x] Preserve existing public `KernelInfo` initializers. The facade registers
+  external state through a controller method before preparation. Invalid and
+  late registrations are refused atomically. All 66 controller tests and the
+  logical-row capture regression pass after this API correction.
 - [ ] Verify the confined backend's direct exit under Linux continuous coverage.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.

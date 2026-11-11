@@ -119,12 +119,7 @@ pub(crate) fn recompute_state(state: &mut ControllerState) {
         let stage_state = per_instance.saturating_mul(instances);
         state.stages[at].state_bytes = stage_state;
         total = total.saturating_add(stage_state);
-        if state
-            .kernels
-            .iter()
-            .find(|kernel| kernel.stage == stage)
-            .is_none_or(|kernel| kernel.state_uses_arena)
-        {
+        if !state.external_state_stages.contains(&stage) {
             arena_total = arena_total.saturating_add(stage_state);
         }
     }
@@ -885,7 +880,6 @@ mod native_commitment_tests {
             .probe_result(2, probe(18 << 20));
         let kernels = (1..=2)
             .map(|stage| KernelInfo {
-                state_uses_arena: true,
                 stage,
                 fingerprint: Fingerprint([stage as u8; 32]),
                 schema_hash: [stage as u8; 32],

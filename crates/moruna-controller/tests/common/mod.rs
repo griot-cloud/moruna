@@ -90,7 +90,6 @@ pub fn config_with_baseline(ceiling: u64, workers: u16, baseline: u64) -> Contro
 pub fn kernel(stage: StageId, hints: KernelHints) -> KernelInfo {
     KernelInfo {
         stage,
-        state_uses_arena: true,
         fingerprint: Fingerprint::compute(&format!("test kernel {stage}"), b""),
         schema_hash: [stage as u8; 32],
         hints,

@@ -50,7 +50,9 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 
 **State.** Per stage, the bytes its instances hold regardless of morsel size: `instances_live × max(state_bytes over the stage's last 32 records)`, grouped by the record's `instance` column when present (f.3).
 
-**Arena state.** The part of `state` whose kernel reports `state_uses_arena = true`.
+**Arena state.** The part of `state` whose kernel reports
+`state_uses_arena = true`. The facade registers external stages through `Controller::set_external_state` before preparation. All other
+stages use arena accounting by default.
 The conservative default is true. Image processes and sandboxed package processes
 report false because their recorded footprints belong to their child processes
 and mappings. Their state remains fully funded in the anonymous inequality.
@@ -135,6 +137,9 @@ impl Controller {
         placement: Arc<dyn Placement>,    // `set_budgets` only; no other placement method is ever called
         kernels: Vec<KernelInfo>,
     ) -> Result<Controller>;
+    /// Before prepare, name stages whose complete instance state is outside the arena.
+    /// Invalid stages or a call after prepare are refused atomically.
+    pub fn set_external_state(&self, stages: &[StageId]) -> Result<()>;
     /// Phase 1: sample the baseline (after `Scheduler::init_instances`, SC f.4), compute budgets,
     /// `placement.set_budgets`. Called by the facade before probes.
     pub fn prepare(&self) -> Result<Budgets>;
@@ -183,7 +188,7 @@ pub const TICK_BOUND_MS: u64 = 5;
 
 /// `schema_hash` is `SourceSchema::hash()` (contracts d.4) of the stage's input schema, which the
 /// facade has from the chain validation.
-pub struct KernelInfo { pub stage: StageId, pub fingerprint: Fingerprint, pub schema_hash: [u8; 32], pub hints: KernelHints, pub state_uses_arena: bool, pub kind: KernelKind }
+pub struct KernelInfo { pub stage: StageId, pub fingerprint: Fingerprint, pub schema_hash: [u8; 32], pub hints: KernelHints, pub kind: KernelKind }
 pub struct Budgets { pub host: u64, pub device: [u64; 8], pub baseline: u64, pub reserve: u64 }
 // `host` is the arena's capacity (f.1); `baseline` is the pre-arena sample the facade took and
 // `reserve` the headroom, both reported rather than subtracted.
