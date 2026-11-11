@@ -69,6 +69,11 @@ Griot. This chat now leaves Griot implementation to the other agent.
 - [x] The confined backend's direct exit completes under Linux continuous
   coverage in run 43023960987. The workspace coverage threshold remains a
   separate refusal, recorded above.
+- [x] A fresh macOS 3.14t wheel passes all 255 executed Python tests. The first
+  isolated run exposed a missing `uv` test dependency and a fusion fixture whose
+  512 MiB allowance was smaller than the process's retained resident memory.
+  The temporary test environment now installs `uv`, and the fusion/Polars fixtures
+  use 1 GiB. The installed-wheel rerun passes. Linux acceptance is repeating.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.
 
