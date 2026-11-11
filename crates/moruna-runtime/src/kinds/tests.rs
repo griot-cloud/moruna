@@ -657,3 +657,117 @@ fn a_context_shares_one_value_per_type() {
     );
     assert_eq!(Role::Sink.as_str(), "sink");
 }
+
+/// A kind of each role that declares what it is given and is never built: what replacement
+/// compares is the declaration alone.
+mod replacement {
+    use std::sync::Arc;
+
+    use moruna_job::Declaration;
+
+    use crate::kinds::{
+        BuiltSink, BuiltSource, Context, Entry, Registry, RunnableKind, SinkKind, SourceKind, Stage,
+    };
+
+    struct Declares(Declaration);
+    impl SourceKind for Declares {
+        fn declaration(&self) -> Declaration {
+            self.0.clone()
+        }
+        fn source(&self, _: &Entry<'_>, _: &mut Context) -> moruna_kernel::Result<BuiltSource> {
+            Err(moruna_kernel::MorunaError::Plan(
+                "not built in this test".into(),
+            ))
+        }
+    }
+    impl RunnableKind for Declares {
+        fn declaration(&self) -> Declaration {
+            self.0.clone()
+        }
+        fn stage(&self, _: &Entry<'_>, _: &mut Context) -> moruna_kernel::Result<Stage> {
+            Err(moruna_kernel::MorunaError::Plan(
+                "not built in this test".into(),
+            ))
+        }
+    }
+    impl SinkKind for Declares {
+        fn declaration(&self) -> Declaration {
+            self.0.clone()
+        }
+        fn sink(&self, _: &Entry<'_>, _: &mut Context) -> moruna_kernel::Result<BuiltSink> {
+            Err(moruna_kernel::MorunaError::Plan(
+                "not built in this test".into(),
+            ))
+        }
+    }
+
+    /// A kind of each role is replaced only by one that declares itself exactly as it does,
+    /// and only when one of that name is registered; the replacement is what is then found.
+    #[test]
+    fn a_kind_is_replaced_only_by_an_identical_declaration() {
+        let mut kinds = Registry::standard();
+        let source = kinds.source("f", "parquet").unwrap().0.clone();
+        let kernel = kinds.kernel("f", "std").unwrap().0.clone();
+        let sink = kinds.sink("f", "parquet").unwrap().0.clone();
+        let differing = |d: &Declaration| {
+            let mut other = d.clone();
+            other.summary = format!("{} (differently)", other.summary);
+            other
+        };
+        let absent = |d: &Declaration| {
+            let mut other = d.clone();
+            other.name = "never-registered".into();
+            other
+        };
+
+        let says = |e: moruna_kernel::MorunaError| e.to_string();
+        assert!(
+            says(
+                kinds
+                    .replace_source(Arc::new(Declares(differing(&source))))
+                    .unwrap_err()
+            )
+            .contains("declares itself differently")
+        );
+        assert!(
+            says(
+                kinds
+                    .replace_source(Arc::new(Declares(absent(&source))))
+                    .unwrap_err()
+            )
+            .contains("no source kind `never-registered`")
+        );
+        kinds
+            .replace_source(Arc::new(Declares(source.clone())))
+            .unwrap();
+        assert!(
+            kinds
+                .replace_kernel(Arc::new(Declares(differing(&kernel))))
+                .is_err()
+        );
+        assert!(
+            kinds
+                .replace_kernel(Arc::new(Declares(absent(&kernel))))
+                .is_err()
+        );
+        kinds
+            .replace_kernel(Arc::new(Declares(kernel.clone())))
+            .unwrap();
+        assert!(
+            kinds
+                .replace_sink(Arc::new(Declares(differing(&sink))))
+                .is_err()
+        );
+        assert!(
+            kinds
+                .replace_sink(Arc::new(Declares(absent(&sink))))
+                .is_err()
+        );
+        kinds
+            .replace_sink(Arc::new(Declares(sink.clone())))
+            .unwrap();
+        assert_eq!(kinds.source("f", "parquet").unwrap().0, &source);
+        assert_eq!(kinds.kernel("f", "std").unwrap().0, &kernel);
+        assert_eq!(kinds.sink("f", "parquet").unwrap().0, &sink);
+    }
+}

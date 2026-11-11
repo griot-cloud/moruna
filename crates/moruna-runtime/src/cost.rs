@@ -506,3 +506,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    /// A session opens its store's model once and shares it; a refresh replaces it for future
+    /// runs while a run that holds the old one keeps it.
+    #[test]
+    fn a_session_shares_one_model_until_it_is_refreshed() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "moruna-cost-session-{}",
+            moruna_kernel::RunId(nonce).to_hex()
+        ));
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(dir.clone());
+        let session = Session::new(CostSettings::directory(&dir));
+        assert_eq!(
+            session.settings().model,
+            CostSettings::directory(&dir).model
+        );
+        let first = session.online().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &session.online().unwrap()),
+            "opened once"
+        );
+        session.refresh().unwrap();
+        let refreshed = session.online().unwrap();
+        assert!(!Arc::ptr_eq(&first, &refreshed), "a refresh replaces it");
+    }
+}
