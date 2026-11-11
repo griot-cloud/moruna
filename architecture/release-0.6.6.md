@@ -30,6 +30,7 @@ relevant host, native-boot and failure-path tests.
 | Guest services | SDD 33 and `kernel/node/` define capability-based admission, carved accounts, service grants and owned child lifetimes | Bind additional per-run authority and prove teardown under races |
 | Network and storage | SDDs 31 and 32 define KE2 networking and exact-action storage authority. Runtime host ports already carry named calls over the run connection | Complete policy-bound access through those existing service boundaries |
 | Image identity | OCI records, sealed layer files and native boot descriptors carry content identities | Complete reusable content caches and the published tool bundle |
+| Job identity | Python `JobSpec.digest()` hashes serialized MJS. `moruna_plan::job_digest` hashes normalized `Job::identity_json()` for execution planning | Give the public document digest and internal execution fingerprint explicit, consistent roles across interfaces |
 
 The jail maps the launching service's host identity into each isolated user
 namespace. Its isolation evidence must cover that actual model. The native
@@ -37,11 +38,11 @@ network service and card drivers remain user processes with explicit capabilitie
 
 ## Execution and authority
 
-1. The host reads and validates MJS with Moruna's existing reader.
-   `moruna_plan::job_digest` computes SHA-256 over `Job::identity_json()`, including
-   its existing normalization of task names, resume and reporting settings.
-   Serialized MJS can carry a separate transport checksum. Native boot-asset
-   identities are checked independently and bound to the launch.
+1. The host reads and validates MJS with Moruna's existing reader. The public job
+   document digest follows `JobSpec.digest()`, SHA-256 of the exact serialized MJS
+   bytes. Native boot-asset identities are checked independently and bound to
+   the launch. The normalized execution fingerprint has its existing planning
+   and recovery role, described below.
 2. The host supplies explicit disk, account, service and policy grants for that
    execution. Grants bind to the job digest, a fresh launch identity, permitted
    operations, deadlines and the intended task/service boundary. Task scope uses
@@ -174,6 +175,15 @@ and publication authority. Concurrent population, corruption and interrupted
 population must yield a verified entry or an explicit failure. Existing layer
 page-integrity checks remain part of use-time validation.
 
+0.6.6 must carry the public MJS document digest consistently through Python,
+CLI, native launch, service grants and execution records. The existing
+`moruna_plan::job_digest` calculation over `Job::identity_json()` supplies the
+normalized execution fingerprint. Its normalization of task names, resume and
+report settings supports the existing planning/recovery behavior. Existing API
+meanings require explicit documentation, and wire changes follow protocol
+versioning. A matching execution fingerprint still requires current data and
+service authority before cache/checkpoint reuse.
+
 The published launcher bundle binds the platform's monitor, QEMU/backend tools,
 native boot assets, manifests and checksums. The same published inputs must boot
 and run a job through the public CLI. Job digest, launch identity, policy and
@@ -190,7 +200,7 @@ and descendants, including children created during shutdown.
 | --- | --- | --- |
 | 1 | Current-code audit | Name each reused API, implementation gap, protocol change and existing proof in the board |
 | 2 | Native launch and ownership | Published descriptor/CLI path, real delegated limits, private services, failed startup and complete teardown |
-| 3 | Disk and identity binding | Correct data reopen, access modes, exclusive writer, wrong-run/digest refusal and interrupted attachment cleanup |
+| 3 | Disk and identity binding | Python/CLI/native agreement on the public MJS digest, normalized planning/recovery behavior, correct data reopen, access modes, exclusive writer, wrong-run/digest refusal and interrupted attachment cleanup |
 | 4 | Service authority | Cross-run, expired, revoked and cancelled calls refused before I/O. Secret canaries absent from shared logs and metadata |
 | 5 | Network policy | Controlled DNS/TCP/TLS peers, IPv4/IPv6, rebinding, name/certificate failures, redirects, connection reuse and inbound refusal |
 | 6 | Resource changes | Live workload during accepted growth/shrink, unsafe requests, concurrent retries and failure during each transition |
