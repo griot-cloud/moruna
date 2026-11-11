@@ -245,6 +245,16 @@ reap and backing-lock release. Forced kill remains an error/fallback, not a clai
 of graceful durable drain. Rust's safe file-lock API is the platform boundary:
 [File::try_lock](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock).
 
+Since 0.6.6 a writable disk may also carry `access` and `grant`. `access` is
+`read_write` (the default) or `read_only`. A read-only disk is opened read-only
+under a shared lock that still excludes any writer, and is attached with
+`readonly=on`. `grant` is `{job_digest, run_id, attempt}`: the public MJS digest,
+the 32-hex run id and the launch attempt it is granted to. `launch_for_run`
+checks every grant against the launch's `RunAuthority` before any disk is opened,
+and refuses a malformed grant, a launch without run authority, another job, or
+another run or attempt. Reusing the path needs a fresh grant. A disk without a
+grant keeps the earlier unbound behaviour until the packaging tools emit grants.
+
 `configure.py` renders actual node/initial/KD2 configs only from explicit resource
 profiles, image records, layer lists, network policy and trusted TLS root input.
 It fetches nothing, generates no production clock/key/credential, and writes a new
