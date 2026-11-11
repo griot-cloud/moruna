@@ -9,6 +9,31 @@ pushed to `integration/local-cloud`, and the primary checkout now uses that bran
 This chat owns the Moruna 0.6.5 release. Validation is moving into the required
 GitHub Actions check at Brackly's request. The Azure VM is deallocated.
 
+### November 11 release-scope reconciliation
+
+Brackly, November 11: move the larger jail, security, networking and launcher
+commitments to 0.6.6. Release 0.6.5 with PR #89's prepared callable-metadata,
+runtime and confined-backend fixes, subject to the required checks and publisher.
+
+The implementation target for 0.6.6 is the native Moruna microkernel guest.
+Linux remains the compute host that runs QEMU/KVM and the process jails. The
+older full-Linux-guest launcher description is superseded by the native
+contract. Tenant disks, resource control and host services must extend that
+native contract. Griot's adapter remains the other agent's work.
+
+| Recorded commitment | Current evidence | Release and remaining work |
+| --- | --- | --- |
+| Jail QEMU and the vsock backend | Existing 0.6.2 implementation, VJ1 and `moruna-vmm/src/jail` | 0.6.5 retains the existing jail and fixes confined shutdown. Required Linux CI acceptance is running |
+| Per-run host-service jail, scoped secrets and run-network enforcement | Network row below | 0.6.6, audit and implement the declared isolation and network contracts |
+| Native launcher capabilities | Public CLI takes a checked native descriptor | 0.6.6, tenant disks, resource control and host-owned service directories through the native contract |
+| Shipped QEMU/backend, one job digest | Release recipes and native descriptor need contract verification | 0.6.6, verify the published launcher bundle through the host entry point |
+| Runtime `gives`, supervisor shutdown, content caching, kill/resume under load | Deferred release paragraph below | 0.6.6, audit current implementations and focused regressions before closing each item |
+
+Brackly, November 11: consult him before any deployment that adds cost, including
+the proposed resources, recurring/minimum charges and expected usage charges.
+The Azure Standard-key migration was explicitly approved and handed back with
+Griot. This chat now leaves Griot implementation to the other agent.
+
 - [x] Reproduced learned-state funding with a retained profile larger than the
   placement arena. Separate external state from arena-resident state while
   retaining the complete run-ceiling check. Both new profile regressions, all
@@ -143,7 +168,7 @@ What can start when, from the solid edges of preamble 1.3 and the fakes of contr
 Gates still close in wave order (E0 to E5), each in its wave report, because the later gates cite the earlier ones.
 
 
-## Releases now (0.6.4, 0.6.5)
+## Releases now (0.6.4, 0.6.5, 0.6.6)
 
 Brackly, 2026-11-06: 0.6.4 is what moving the first project (`wazuh_analytics`) onto 0.6.3 found; the big items move to 0.6.5. Nothing is released until the project's whole flow works on a local build of this branch: its tests, a real window against Griot, the job's spec written, its images built, and the built job run. This branch (`release/0.6.4`) carries this section, updated as each item moves. Tests stay Moruna's own: each is a minimal job of Moruna's tasks, nothing of the project.
 
@@ -182,9 +207,9 @@ The original run passed the workspace Rust tests, image-kind tests, peQL/Iceberg
 | 16 | An image reads every batch it is given. The engine lays a batch as a record whose length runs to the last buffer's page; a buffer of no bytes (a string column of nulls) sits at the next page, so the record runs past the body its message declares. The bridge wrote the whole record to the program, and a stream reader takes those zeros for the end of the stream: the program stopped after its first batch and exited 0 before its input ended ("its input could not be ended: Broken pipe", or its output's window refused) | the project's built job (its agent's input ends with a gap column of nulls) | fixed (`moruna-plane-linux` `stream::stream_bytes`): a stream is given each record only to the end of its declared body. `a_stream_of_records_holds_every_batch_when_a_last_buffer_is_empty`; `test_a_function_image_gives_another_schema_at_its_end_to_a_sink_image` (an image function giving another schema at its end, read by an image sink, its input ending in a column of nulls) |
 | 8 | A run lets go of its arena when it ends. A `moruna.Function` subclass's kernel kept the arena of the first run it was in (bound once, "a second call is ignored"), and a reference cycle through the extension (the task holds its kernel, the kernel held the task) kept both for good: every run's arena, a share of the budget (3 to 4.6 GB on this Mac), stayed mapped, until a run was refused because the process held more than its budget (13.9 GB) before it started | the project's test suite, in one process | fixed (`moruna-adapters` `PyKernel::release_run`, `KernelMemory::release`; `moruna-runtime` `ReleaseRun`; `_Instance` holds its task weakly): the arena and gate are bound per run and released when it ends, however it ends, and a task is collected with its job. `python/tests/test_run_releases.py` |
 
-Found, not in 0.6.4 (2026-11-06): with the default budget (0.9 of the host's memory) a run's arena is a third of the allowance, 4.6 GB on this Mac, and every page of it is touched before the run starts (SDD 02 f.1), about 2 s for a run of one alert; a window job pays it every window. Whether the arena should be sized by what the plan needs rather than by the budget is a design question for 0.6.5.
+Found, not in 0.6.4 (2026-11-06): with the default budget (0.9 of the host's memory) a run's arena is a third of the allowance, 4.6 GB on this Mac, and every page of it is touched before the run starts (SDD 02 f.1), about 2 s for a run of one alert; a window job pays it every window. Plan-sized arena allocation is a design question for 0.6.6.
 
-0.6.5 (moved from 0.6.4 on 2026-11-06): the run VM's network (the row below), the per-run jailed process for the vsock services, runtime enforcement of an image task's declared `gives`, the kernel node supervisor's shutdown race, Griot's six launcher items (KF4: boot Griot's Linux guest, attach the run's disk, resize a running VM, a host-made run directory with group access, the vsock back end and QEMU shipped, one job digest), the guest image's kernel and packages cached by content, and the kill-and-resume test that fails under load.
+0.6.6 (moved from 0.6.5 by Brackly on 2026-11-11): run-VM networking, per-run jailed host/vsock services, scoped secret delivery, runtime enforcement of an image task's declared `gives`, the node supervisor's shutdown race, native launcher support for tenant disks, resource control and host-owned service directories, published QEMU/vsock tools and one job digest, content-addressed guest/runtime inputs, and kill/resume reliability under load. The guest remains Moruna's native microkernel. Existing implementation and proof must be audited before each item is marked complete.
 
 ### Wazuh Canvas follow-up : 2026-11-09
 
@@ -1084,8 +1109,8 @@ Waves are gates, not start order: an item starts when what it needs is merged. T
 | | KD6c | the simulator and the `simulated` planner (`feat/kd6c-simulator`, local): `moruna-plan` on `moruna-cost` (its `Estimate`, `UnitCost` and `CostModel`; `Estimator` gone; `extrapolated` appended to the plan's estimate table); `moruna-cost`'s discrete-event simulator (units, buffers, workers, memory as a hard limit with known-future eviction, disk and worker contention, scaling curves, start-up and checkpoints, the `Policy` port and `admission`, Monte Carlo over 200 draws), the sampling helper, `CostModel::marginal` and morsel sizing; the `simulated` planner, which `explain` takes when a cost model is configured. SDD 24 (new: CM-I12 to CM-I18, CM-T22 to CM-T30, f.6 to f.10); SDD 26 (new: PN-I15 to PN-I17, PN-T28 to PN-T33, f.6, f.7; PN-M1 closed); `architecture/adaptive-runtime.md` sections 8 and 11 | in review |
 | | release | 0.6.0: the kernel runs real jobs inside a VM | todo |
 | | release | 0.6.3: a job spec is language-neutral; one image per task (build keys, shared layers, provenance), image tasks of every role, pulls by digest, params, needs as ports, run arguments, a task-level run report | released 2026-11-06 (v0.6.3, 9d2e7d7; PRs 83, 85, 86, 87; release run 42254040679 reused what run 42209879389 built) |
-| | release | 0.6.4: what the first project found moving onto 0.6.3 (see "Releases now") | in progress (`release/0.6.4`) |
-| | 0.6.5 | **The run VM's network, Moruna's half** (agreed with Brackly, 2026-11-05). (1) virtio-net in `moruna-vmm`. (2) A per-run network enforcer inside the 0.6.2 jail, in the run's own network namespace: DNS answered only for allow-listed names, pinning their addresses; TCP only to pinned addresses on declared ports; for `tls` and `https`, the SNI equal to the declared name, refusing ECH, a mismatch, or a second TLS name on a kept-alive connection; UDP other than its own DNS, ICMP and raw sockets refused, IPv4 and IPv6 alike; cgroup limits; a flow log. (3) The allow-list document `{name, host, port, protocol: tcp|tls|https, private}` as a port. (4) The macOS process path: the enforcer's socket is the only network a sandboxed process gets. (5) `secret` needs delivered to the task only inside its run, never logged. (6) The same per-run jailed process serves the VM's host-side ports. (7) No inbound connections | todo |
+| | release | 0.6.4: what the first project found moving onto 0.6.3 (see "Releases now") | released, `v0.6.4`, PR #88 |
+| | 0.6.6 | **The run VM's network, Moruna's half** (agreed with Brackly, 2026-11-05, moved to 0.6.6 on November 11). The guest is the native Moruna microkernel. (1) virtio-net in `moruna-vmm`. (2) A per-run network enforcer inside the 0.6.2 jail, in the run's own network namespace: DNS answered only for allow-listed names, pinning their addresses; TCP only to pinned addresses on declared ports; for `tls` and `https`, the SNI equal to the declared name, refusing ECH, a mismatch, or a second TLS name on a kept-alive connection; UDP other than its own DNS, ICMP and raw sockets refused, IPv4 and IPv6 alike; cgroup limits; a flow log. (3) The allow-list document `{name, host, port, protocol: tcp|tls|https, private}` as a port. (4) The macOS process path: the enforcer's socket is the only network a sandboxed process gets. (5) `secret` needs delivered to the task only inside its run, never logged. (6) The same per-run jailed process serves the VM's host-side ports. (7) No inbound connections | todo |
 | E. The kernel as a node | KE1 | NVMe and the cloud network card as driver processes | code complete, proof pending (`feat/ke1-nvme-net`, local; SDD 25 f.15, DR-T18 to DR-T27; SDD 29 (new): `moruna.driver.net`, virtio-net, gVNIC, NT-I1 to NT-I8, NT-T1 to NT-T15; ABI 2.1, `memory_flags::CONTIGUOUS`, SDD 20; SDD 23 SV-T16, the boot description's `machine` and `disk` lines; host tests and clippy green; the boot on 1, 2 and 4 CPUs not yet run; gVNIC tested against a model only, not yet proven on hardware: KE3) |
 | | KE2 | the network server: TCP/IP and TLS (smoltcp, rustls) | todo |
 | | KE3 | the node image: bootloader, kernel, servers, a standalone supervisor; boots on Google Cloud | todo |

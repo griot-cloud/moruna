@@ -93,7 +93,7 @@ if [ -f Cargo.toml ]; then
     step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml not checked here, the supply-chain workflow checks it"
   fi
   if [ "$FAST" = "1" ]; then
-    step "OK (fast checks; the tests, the coverage floor and the Python suite run on push)"
+    step "OK (fast checks passed. The full release gate runs in required Linux CI)"
     exit 0
   fi
   step "cargo test"
