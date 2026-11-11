@@ -209,12 +209,18 @@ jobs:
       - name: Prepare Ubuntu package mirrors
         if: steps.changed.outputs.kernel == 'true'
         run: |
-          sudo sed -i -E 's#https?://azure[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
-          sudo apt-get -o Acquire::Retries=3 update
+          # FAU mirrors Ubuntu's signed archive metadata: https://ftp.fau.de/
+          printf '%s\n' 'https://ftp.fau.de/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo tee /etc/apt/apt.conf.d/99moruna-ci >/dev/null <<'EOF'
+          Acquire::Retries "2";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
+          sudo apt-get update
       - name: Build QEMU ${{ env.QEMU_VERSION }}
         if: steps.changed.outputs.kernel == 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
+          sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
           curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
           echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
           mkdir qemu-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-src
@@ -261,7 +267,7 @@ jobs:
           # pinned stable toolchain, not kernel/'s nightly. musl-tools supplies C,
           # but does not install Rust's std for this target.
           rustup target add x86_64-unknown-linux-musl
-          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends musl-tools
+          sudo apt-get install -y -q --no-install-recommends musl-tools
           kernel/tools/python-layout.sh "$RUNNER_TEMP/python"
       - name: Build the kernel, the programs and the boot image
         if: steps.changed.outputs.kernel == 'true'
