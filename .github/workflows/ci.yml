@@ -203,11 +203,15 @@ jobs:
         with:
           path: /opt/qemu
           key: qemu-${{ env.QEMU_VERSION }}-x86_64-softmmu-vhost-user-ubuntu-24.04-v3
+      - name: Prepare Ubuntu package mirrors
+        if: steps.changed.outputs.kernel == 'true'
+        run: |
+          sudo sed -i -E 's#https?://azure[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
+          sudo apt-get -o Acquire::Retries=3 update
       - name: Build QEMU ${{ env.QEMU_VERSION }}
         if: steps.changed.outputs.kernel == 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
+          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
           curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
           echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
           mkdir qemu-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-src
@@ -254,7 +258,7 @@ jobs:
           # pinned stable toolchain, not kernel/'s nightly. musl-tools supplies C,
           # but does not install Rust's std for this target.
           rustup target add x86_64-unknown-linux-musl
-          sudo apt-get install -y -q --no-install-recommends musl-tools
+          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends musl-tools
           kernel/tools/python-layout.sh "$RUNNER_TEMP/python"
       - name: Build the kernel, the programs and the boot image
         if: steps.changed.outputs.kernel == 'true'
