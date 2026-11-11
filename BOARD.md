@@ -15,7 +15,9 @@ Brackly, November 11: move the larger jail, security, networking and launcher
 commitments to 0.6.6. Release 0.6.5 with PR #89's prepared callable-metadata,
 runtime and confined-backend fixes, subject to the required checks and publisher.
 
-The implementation target for 0.6.6 is the native Moruna microkernel guest.
+The canonical [0.6.6 execution and isolation plan](architecture/release-0.6.6.md)
+records current source capabilities, authority boundaries, interfaces and release
+acceptance. It is included in the documentation site. The implementation target for 0.6.6 is the native Moruna microkernel guest.
 Linux remains the compute host that runs QEMU/KVM and the process jails. The
 older full-Linux-guest launcher description is superseded by the native
 contract. Tenant disks, resource control and host services must extend that
@@ -25,7 +27,7 @@ native contract. Griot's adapter remains the other agent's work.
 | --- | --- | --- |
 | Jail QEMU and the vsock backend | Existing 0.6.2 implementation, VJ1 and `moruna-vmm/src/jail` | 0.6.5 retains the existing jail and fixes confined shutdown. Required Linux CI acceptance is running |
 | Per-run host-service jail, scoped secrets and run-network enforcement | Network row below | 0.6.6, audit and implement the declared isolation and network contracts |
-| Native launcher capabilities | Public CLI takes a checked native descriptor | 0.6.6, tenant disks, resource control and host-owned service directories through the native contract |
+| Native launcher capabilities | Checked descriptors, immutable layers, locked writable NVMe files and fixed account limits already exist | 0.6.6, finish authorized disk integration, live resource control and host-owned services through the native contract |
 | Shipped QEMU/backend, one job digest | Release recipes and native descriptor need contract verification | 0.6.6, verify the published launcher bundle through the host entry point |
 | Runtime `gives`, supervisor shutdown, content caching, kill/resume under load | Deferred release paragraph below | 0.6.6, audit current implementations and focused regressions before closing each item |
 
@@ -1110,7 +1112,7 @@ Waves are gates, not start order: an item starts when what it needs is merged. T
 | | release | 0.6.0: the kernel runs real jobs inside a VM | todo |
 | | release | 0.6.3: a job spec is language-neutral; one image per task (build keys, shared layers, provenance), image tasks of every role, pulls by digest, params, needs as ports, run arguments, a task-level run report | released 2026-11-06 (v0.6.3, 9d2e7d7; PRs 83, 85, 86, 87; release run 42254040679 reused what run 42209879389 built) |
 | | release | 0.6.4: what the first project found moving onto 0.6.3 (see "Releases now") | released, `v0.6.4`, PR #88 |
-| | 0.6.6 | **The run VM's network, Moruna's half** (agreed with Brackly, 2026-11-05, moved to 0.6.6 on November 11). The guest is the native Moruna microkernel. (1) virtio-net in `moruna-vmm`. (2) A per-run network enforcer inside the 0.6.2 jail, in the run's own network namespace: DNS answered only for allow-listed names, pinning their addresses; TCP only to pinned addresses on declared ports; for `tls` and `https`, the SNI equal to the declared name, refusing ECH, a mismatch, or a second TLS name on a kept-alive connection; UDP other than its own DNS, ICMP and raw sockets refused, IPv4 and IPv6 alike; cgroup limits; a flow log. (3) The allow-list document `{name, host, port, protocol: tcp|tls|https, private}` as a port. (4) The macOS process path: the enforcer's socket is the only network a sandboxed process gets. (5) `secret` needs delivered to the task only inside its run, never logged. (6) The same per-run jailed process serves the VM's host-side ports. (7) No inbound connections | todo |
+| | 0.6.6 | **Native run isolation and networking**, moved by Brackly on November 11. The [canonical delivery plan](architecture/release-0.6.6.md) covers run-owned jailed services, scoped secrets, policy-bound host/native networking, disk authority, resource control, verified caches, declared outputs and loaded recovery through existing native interfaces. | planned, implementation/proof audit first |
 | E. The kernel as a node | KE1 | NVMe and the cloud network card as driver processes | code complete, proof pending (`feat/ke1-nvme-net`, local; SDD 25 f.15, DR-T18 to DR-T27; SDD 29 (new): `moruna.driver.net`, virtio-net, gVNIC, NT-I1 to NT-I8, NT-T1 to NT-T15; ABI 2.1, `memory_flags::CONTIGUOUS`, SDD 20; SDD 23 SV-T16, the boot description's `machine` and `disk` lines; host tests and clippy green; the boot on 1, 2 and 4 CPUs not yet run; gVNIC tested against a model only, not yet proven on hardware: KE3) |
 | | KE2 | the network server: TCP/IP and TLS (smoltcp, rustls) | todo |
 | | KE3 | the node image: bootloader, kernel, servers, a standalone supervisor; boots on Google Cloud | todo |

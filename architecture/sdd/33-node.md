@@ -4,6 +4,10 @@ Status: declared bounded source implementation complete; integrated compile/link
 
 ## Boundary
 
+The [0.6.6 delivery plan](../release-0.6.6.md) maps the deferred launcher and
+isolation work onto these native node services, capability grants and owned
+process lifetimes. Its acceptance gates are tracked in `BOARD.md`.
+
 The node is a boot image of the existing microkernel and separate user processes.
 `node-supervisor` is the only initial process. It holds service images, explicit
 boot capabilities, and the root process resource. It carves one bounded account
