@@ -374,3 +374,126 @@ impl<W: Write> Write for JsonLines<W> {
         self.out.flush()
     }
 }
+
+#[cfg(test)]
+mod delivery_failure_tests {
+    use super::*;
+    use std::time::Instant;
+
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the stream is gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn record() -> Vec<u8> {
+        let meta = Meta {
+            run: "fedcba9876543210fedcba9876543210".into(),
+            plan: None,
+            attempt: 1,
+            start: "0123456789abcdef0123456789abcdef".into(),
+            epoch_ns: 0,
+        };
+        let mut encoder = Encoder::new();
+        encoder
+            .encode(
+                &meta.stamp(),
+                1,
+                meta.ts_ns(0),
+                0,
+                &Event::Logs {
+                    producers: Vec::new(),
+                },
+            )
+            .unwrap()
+            .to_vec()
+    }
+
+    fn out(wire: &Arc<Wire>, file_path: Option<PathBuf>, options: EventOptions) -> Out {
+        Out {
+            wire: wire.clone(),
+            file: None,
+            file_path,
+            options,
+            refused: 0,
+        }
+    }
+
+    /// Where an event cannot go is a note and never stops the run: an events file that cannot be
+    /// made, a JSON stream that cannot be written (it is then no longer written), a record that
+    /// does not read back, and an embedder's ring with no room.
+    #[test]
+    fn each_place_an_event_cannot_go_is_noted() {
+        let wire = Wire::new(None, Instant::now());
+        let record = record();
+
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let blocker = std::env::temp_dir().join(format!(
+            "moruna-events-blocked-{}",
+            moruna_kernel::RunId(nonce).to_hex()
+        ));
+        std::fs::write(&blocker, b"a file where the store would be").unwrap();
+        let mut to_file = out(
+            &wire,
+            Some(blocker.join("store").join(EVENTS_FILE)),
+            EventOptions::default(),
+        );
+        to_file.deliver(&record);
+        to_file.deliver(&record);
+        let _ = std::fs::remove_file(&blocker);
+        let notes = wire.take_notes();
+        assert_eq!(notes.len(), 1, "told once: {notes:?}");
+        assert!(notes[0].contains("could not be made"), "{notes:?}");
+
+        let json: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(Broken)));
+        let mut printed = out(
+            &wire,
+            None,
+            EventOptions {
+                ring: None,
+                json: Some(json),
+            },
+        );
+        printed.deliver(&record);
+        assert!(printed.options.json.is_none(), "a broken stream is let go");
+        printed.deliver(&record);
+        let notes = wire.take_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("stopped being printed"), "{notes:?}");
+
+        let mut unreadable = out(
+            &wire,
+            None,
+            EventOptions {
+                ring: None,
+                json: Some(Arc::new(Mutex::new(Box::new(Vec::new())))),
+            },
+        );
+        unreadable.write_json(b"not a record");
+        assert!(wire.take_notes()[0].contains("does not read back"));
+
+        let ring = EventRing::new(0).unwrap();
+        let mut full = out(
+            &wire,
+            None,
+            EventOptions {
+                ring: Some(ring.clone()),
+                json: None,
+            },
+        );
+        while ring.push(&record) {}
+        full.deliver(&record);
+        full.finish();
+        let notes = wire.take_notes();
+        assert!(
+            notes.iter().any(|n| n.contains("had no room for 1 events")),
+            "{notes:?}"
+        );
+        assert!(ring.dropped() >= 1);
+    }
+}

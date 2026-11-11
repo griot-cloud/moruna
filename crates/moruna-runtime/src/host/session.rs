@@ -258,7 +258,7 @@ impl Wire {
             .push(note);
     }
 
-    fn take_notes(&self) -> Vec<String> {
+    pub(crate) fn take_notes(&self) -> Vec<String> {
         std::mem::take(&mut *self.notes.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
