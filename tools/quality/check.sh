@@ -205,6 +205,21 @@ if [ -f Cargo.toml ]; then
       coverage_rustflags="${RUSTFLAGS:-$(python3 -c 'import shlex, tomllib; print(shlex.join(tomllib.load(open(".cargo/config.toml", "rb"))["build"]["rustflags"]))')}"
       export RUSTFLAGS="$coverage_rustflags -Cllvm-args=-runtime-counter-relocation"
       export LLVM_PROFILE_FILE_NAME="moruna-%p-%m-%c.profraw"
+      # The strict raw adapter needs a real block device: a loop device over a scratch
+      # file, owned by this user for the run, so its tests measure actual direct IO.
+      if [ -z "${MORUNA_RAW_DEVICE:-}" ] && command -v losetup >/dev/null 2>&1; then
+        as_root=""
+        [ "$(id -u)" = 0 ] || as_root="sudo -n"
+        raw_image="$(mktemp "${TMPDIR:-/tmp}/moruna-raw.XXXXXX")"
+        truncate -s 64M "$raw_image"
+        if raw_dev="$($as_root losetup -f --show "$raw_image" 2>/dev/null)"; then
+          [ -z "$as_root" ] || $as_root chown "$(id -u)" "$raw_dev"
+          export MORUNA_RAW_DEVICE="$raw_dev"
+          trap '$as_root losetup -d "$raw_dev" 2>/dev/null; rm -f "$raw_image"' EXIT
+        else
+          rm -f "$raw_image"
+        fi
+      fi
     fi
     step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
     command -v cargo-llvm-cov >/dev/null 2>&1 \

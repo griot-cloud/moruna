@@ -2230,6 +2230,104 @@ fn re_t22_strict_storage_refuses_probed_paths_and_buffered_descriptors() {
     }
 }
 
+/// A bound O_DIRECT descriptor sends aligned operations to the uring engine and refuses
+/// misaligned ones before they reach it; each answer reaches its caller.
+#[cfg(target_os = "linux")]
+#[test]
+fn re_t22_strict_bound_device_submits_aligned_io_and_refuses_misaligned() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    struct Controlled(HoldingEngine);
+    impl FileEngine for Controlled {
+        fn submit(&self, req: FileReq, done: Done) {
+            self.0.submit(req, done);
+        }
+        fn name(&self) -> &'static str {
+            "uring"
+        }
+        fn terminal_failure(&self) -> Option<String> {
+            None
+        }
+    }
+    let alloc = FakeAllocator::new();
+    let mut host = profile(Guarantee::Probed(false));
+    host.io_uring = Guarantee::Present;
+    host.direct_io_staging = Guarantee::Present;
+    let engine = Arc::new(Controlled(HoldingEngine::default()));
+    let reactor = build(
+        config(host),
+        &alloc,
+        Hooks {
+            force_uring: true,
+            engine: Some(engine.clone()),
+            ..Hooks::default()
+        },
+    );
+    let dir = scratch_dir("strict-direct-bound");
+    let path = dir.join("direct");
+    write_file(&path, &[7; 8192]);
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path);
+    // A filesystem without O_DIRECT cannot host this test; that is not a reactor fact.
+    let Ok(file) = opened else {
+        reactor.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    let device = reactor
+        .strict_storage()
+        .unwrap()
+        .bind(Arc::new(OwnedFd::from(file)))
+        .expect("an O_DIRECT descriptor binds");
+    // Misaligned: refused without reaching the engine.
+    let misaligned = device.read(1, alloc.buffer(4096, Tier::Host)).wait();
+    assert!(matches!(
+        misaligned,
+        Err(MorunaError::Config {
+            name: "raw_storage",
+            ..
+        })
+    ));
+    assert_eq!(engine.0.held(), 0);
+    // Aligned: reaches the engine; its answer reaches the caller.
+    let dst = alloc.buffer(4096, Tier::Host);
+    let aligned = dst
+        .host_ptr()
+        .is_some_and(|p| (p as usize).is_multiple_of(4096));
+    let pending = device.read(0, dst);
+    if aligned {
+        for _ in 0..1000 {
+            if engine.0.held() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(engine.0.held(), 1, "the aligned read reached the engine");
+        let (_, done) = engine.0.held.lock().unwrap().pop().unwrap();
+        done(Ok(4096));
+        assert_eq!(pending.wait().expect("read answered").len(), 4096);
+        // A failed write is the engine's error, named for its operation.
+        let src = Arc::new(alloc.buffer(4096, Tier::Host));
+        let write = device.write(0, src.view());
+        for _ in 0..1000 {
+            if engine.0.held() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (_, done) = engine.0.held.lock().unwrap().pop().unwrap();
+        done(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        assert!(matches!(write.wait(), Err(MorunaError::Io { .. })));
+    } else {
+        assert!(pending.wait().is_err());
+    }
+    reactor.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Native file/SDK executors must not initialize Tokio's Unix signal socket pair,
 /// even when a caller has unified the `signal` feature into the same binary.
 #[cfg(all(
