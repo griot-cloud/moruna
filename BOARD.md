@@ -2,6 +2,89 @@
 
 The PM agent's working board. It is the one place that says what is done, what is next and who is waiting on whom; the documents in `architecture/` remain the specification and this board never restates them. When every box on this board is ticked, `moruna` is a production-ready package: every wave gate of preamble 6.6 is green, every sufficiency criterion S1 to S17 is closed on the reference host or listed as skipped by id with Brackly's acceptance, every decision Q1 to Q10 is decided or its assumption is explicitly accepted, and wheels for the four interpreters are published from a tagged release.
 
+## November 11 release handoff
+
+Brackly requested a committed, pushed handoff for another agent. Work is in
+`/Users/brackly/Desktop/Projects/moruna-guest-fix`, branch
+`codex/moruna-0.6.5-callable-images`, release PR
+[89](https://github.com/griot-cloud/moruna/pull/89). Implementation and CI changes
+through `a74bc575` are committed and pushed. This handoff adds documentation only.
+
+**Release remains pending.** Brackly explicitly answered “stick to the coverage
+rule” after being offered a deferral. Retain the existing 90% per-crate gate.
+Complete genuine coverage work before merging or releasing 0.6.5. The larger
+0.6.6 security and isolation scope stays in
+[the canonical plan](architecture/release-0.6.6.md), with its public documentation
+include at `docs/release-0.6.6.md`. Its warning-as-error Sphinx build passes.
+
+### Verified state at handoff
+
+- [x] Fresh macOS arm64 CPython 3.14t wheel passes 255 tests, with eight
+  platform/optional skips. The isolated environment includes `uv`; fusion/Polars
+  test fixtures now have a 1 GiB allowance.
+- [x] Current [GitHub run 43046710017](https://github.com/griot-cloud/moruna/actions/runs/43046710017)
+  at `a74bc575` passes its complete native job. Native boots, all 15 production
+  cases on 1/2/4 CPUs, deadlines and native Clippy pass. Case 1 on every CPU count
+  exercises legacy version-1 service-grant records. Downloaded receipts confirm
+  passing cases, cleanup and unchanged input files.
+- [ ] That run's required `build, test, lint` job 130612643105 is still running
+  at handoff. Query its final result before claiming any additional acceptance.
+  The fresh Linux wheel now runs before coverage. The `linux-quality-gate`
+  artifact retains full coverage mapping and logs even if the floor refuses.
+- [ ] No merge, manual tag or published 0.6.5 release has been performed.
+
+The preceding full Linux run 43023960987 passed 1,773 default Rust tests and
+optional integration suites. Instrumented tests completed, then these nine
+crates failed the existing floor. This full gate was added to required GitHub CI
+during this work and surfaced existing gaps, including native-only paths.
+
+| Crate | Covered lines | Total lines | Coverage |
+| --- | ---: | ---: | ---: |
+| moruna-image | 2,352 | 2,665 | 88.3% |
+| moruna-micro | 104 | 1,385 | 7.5% |
+| moruna-plane-linux | 1,294 | 1,529 | 84.6% |
+| moruna-reactor | 2,682 | 3,080 | 87.1% |
+| moruna-runtime | 17,061 | 20,877 | 81.7% |
+| moruna-sandbox | 2,218 | 4,594 | 48.3% |
+| moruna-storage | 4,142 | 6,344 | 65.3% |
+| moruna-testkit | 2,921 | 3,280 | 89.1% |
+| moruna-vmm | 6,128 | 7,540 | 81.3% |
+
+### Next agent's critical path
+
+1. Inspect the current run and download `linux-quality-gate`. Use its full
+   `report.json` for per-file and region diagnosis. The local
+   `target/llvm-cov/summary.json` is an older macOS report with no remaining raw
+   profiles and cannot establish current Linux coverage.
+2. Add focused host tests and collect actual native guest counter profiles for
+   `moruna-micro`, sandbox native-child/output/wire paths, storage native paths
+   and runtime native execution. No native coverage implementation has been
+   added yet. An explored starting point is the existing public
+   `moruna-sandbox/src/coverage.rs`, which already serializes LLVM counters for
+   confined processes. Inspect the actual native engine/child exits and stderr
+   path before choosing a transport. Guest profiles need verified completion,
+   matching LLVM tooling and instrumented guest objects when merged with host
+   measurements. Follow the plan's verification profiles and preserve the
+   native microkernel architecture.
+3. Consider reusing the actual delegated-cgroup image integration and public
+   native SDK launcher proofs for instrumented execution. These functional
+   checks currently follow the main floor and cannot contribute profiles to
+   that earlier report. Preserve their real environment requirements.
+4. Repeat the complete Linux gate and fresh-wheel checks with every crate at
+   or above 90%. Use the normal protected PR merge and GitHub publisher, then
+   verify published wheels and installation. Never manufacture success checks
+   or bypass the floor.
+
+Proofs and logs are outside sample data at
+`/Users/brackly/griot-kt/wazuh/candidate/azure/`. Relevant files include
+`moruna-native-a74bc575-proof.zip`, `moruna-native-a74bc575-passed.log`,
+`moruna-065-macos-wheel-tests-fixed.log`, `moruna-066-docs-build.log`,
+`moruna-first-commit-before.log`, `moruna-first-commit-after.log`,
+`moruna-dag-resume-regression.log` and `moruna-dag-resume-default-repeat.log`.
+
+Griot belongs to the other agent. The Azure validation VM remains deallocated.
+Consult Brackly before any deployment that adds cost. Continue without subagents.
+
 ## November 11: Griot image registry and Azure validation
 
 Brackly handed Griot implementation to another agent. Its work is committed and
@@ -75,10 +158,11 @@ Griot. This chat now leaves Griot implementation to the other agent.
   512 MiB allowance was smaller than the process's retained resident memory.
   The temporary test environment now installs `uv`, and the fusion/Polars fixtures
   use 1 GiB. The installed-wheel rerun passes. Linux acceptance is repeating.
-- [ ] Compatibility follow-up removes the new packaging refusal for older
+- [x] Compatibility follow-up removes the new packaging refusal for older
   initial-job grants. The canonical decoder retains critical service endpoints
   from both old and explicit service records. Native case 1 on each CPU count
-  now exercises legacy records. Repeat native acceptance is pending.
+  now exercises legacy records. Run 43046710017 passes the complete native
+  acceptance matrix, including these legacy cases.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.
 
