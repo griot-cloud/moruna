@@ -313,10 +313,17 @@ fn sc_t32_a_dag_killed_mid_run_resumes() {
                 twice.is_empty(),
                 "point {point} (killed after {kill_after:?}) sink {sink}: rows written twice {twice:?}"
             );
-            assert_eq!(
-                &got, wanted,
-                "point {point} (killed after {kill_after:?}) sink {sink} differs from the \
-                 uninterrupted run"
+            assert!(
+                &got == wanted,
+                "point {point} (killed after {kill_after:?}) sink {sink} has {} of {} rows; \
+                 first missing rows {:?}",
+                got.len(),
+                wanted.len(),
+                wanted
+                    .keys()
+                    .filter(|row| !got.contains_key(row))
+                    .take(5)
+                    .collect::<Vec<_>>()
             );
         }
     }

@@ -484,12 +484,13 @@ impl PlacementEngine {
         let engine_committed = self.sink_watermarks();
         let committed: Vec<Option<Seq>> = (0..sinks)
             .map(|sink| {
+                // An explicit None is the snapshot before the first commit.
+                // Replacing it with later progress loses unpreserved output.
                 extras
                     .committed
                     .get(sink)
                     .copied()
-                    .flatten()
-                    .or(engine_committed.get(sink).copied().flatten())
+                    .unwrap_or(engine_committed.get(sink).copied().flatten())
             })
             .collect();
         let above: Vec<Option<Seq>> = (0..self.cfg.topology.sources())

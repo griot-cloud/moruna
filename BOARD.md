@@ -48,7 +48,17 @@ Griot. This chat now leaves Griot implementation to the other agent.
   and storage endpoints were transferred out of admission, allowing critical
   services to terminate with the job. The assembly now uses existing retained
   service grants. Packaging rejects transferred service endpoints. All 16 node
-  core/image tests pass locally. Native multi-CPU execution remains pending.
+  core/image tests and pinned native-user admission Clippy pass locally. GitHub
+  run 43021902235 passes native boots and all 15 production cases on 1/2/4 CPUs,
+  strict deadlines and native Clippy. Its full native job is green.
+- [x] Required Linux tests reproduced SC-T32 losing the first 32,000 rows after
+  kill/resume. A pre-first-commit snapshot's explicit `None` watermark was replaced
+  by newer placement progress. The manifest now preserves the supplied snapshot,
+  while omitted entries retain their documented fallback. The deterministic
+  regression fails before the fix and all 10 manifest/issued-read tests pass after.
+  SC-T32 passes locally for seeds 3398 through 3405. Seed 3406 completed before
+  every kill and correctly refuses to claim mid-run recovery evidence. Full Linux
+  release acceptance is pending.
 - [ ] Verify the confined backend's direct exit under Linux continuous coverage.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.

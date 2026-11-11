@@ -187,6 +187,40 @@ fn pl_t26_committed_since_the_watermark_is_kept() {
     );
 }
 
+/// A snapshot taken before the first commit explicitly records `None`. Later progress
+/// must not replace it and discard roots absent from that snapshot's sink state.
+#[test]
+fn pl_t26_first_commit_after_snapshot_keeps_uncommitted_roots() {
+    let scratch = common::Scratch::new("t26-first-commit");
+    let (engine, alloc, reactor, cfg) = engine_with(&scratch, 6);
+    for _ in 0..5 {
+        engine
+            .pop(0, common::want_host(), Locality::Any)
+            .expect("pop")
+            .expect("a morsel");
+    }
+    engine.set_committed(0, 4);
+    let path = engine
+        .checkpoint(&extras(None, Vec::new()))
+        .expect("checkpoint before first commit");
+    let manifest = read(&path);
+    assert_eq!(manifest.committed, vec![None]);
+    let seqs: Vec<_> = manifest.lineage.iter().map(|row| row.seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5]);
+    let second = common::engine(cfg.clone(), &alloc, &reactor);
+    let point = second
+        .restore(&path, &[common::plan()], &cfg.fingerprints)
+        .expect("restore");
+    let replay: Vec<_> = point.to_recompute[0].iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(replay, vec![0, 1, 2, 3, 4, 5]);
+
+    // Callers omitting a sink entry still inherit the placement watermark.
+    let mut omitted = extras(None, Vec::new());
+    omitted.committed.clear();
+    let path = engine.checkpoint(&omitted).expect("omitted snapshot");
+    assert_eq!(read(&path).committed, vec![Some(4)]);
+}
+
 /// With checkpointing off there is no manifest to wait for, and `set_committed` forgets at once.
 #[test]
 fn pl_t26_without_checkpoints_committed_lineage_goes_at_once() {

@@ -2,6 +2,11 @@
 
 ## 0.6.5
 
+- **Recovery preserves a snapshot taken before the first sink commit.** A later
+  watermark can no longer replace the snapshot's explicit uncommitted state,
+  which could previously make a restart skip output rows. An omitted snapshot
+  entry continues to use the placement watermark.
+
 - **Native node services outlive the first job.** Admission retains the initial
   Linux and storage service endpoints and lends narrowed copies to the engine.
   Packaging checks this ownership so job completion cannot close a critical
