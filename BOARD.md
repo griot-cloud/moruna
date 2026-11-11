@@ -47,8 +47,9 @@ Griot. This chat now leaves Griot implementation to the other agent.
 - [x] Native CI exposed a first-job completion race on four CPUs. Initial Linux
   and storage endpoints were transferred out of admission, allowing critical
   services to terminate with the job. The assembly now uses existing retained
-  service grants. Packaging rejects transferred service endpoints. All 16 node
-  core/image tests and pinned native-user admission Clippy pass locally. GitHub
+  service grants. The decoder retains these endpoints in legacy version-1
+  bootstrap records too. All 16 node core/image tests and pinned native-user
+  admission Clippy pass locally. GitHub
   run 43021902235 passes native boots and all 15 production cases on 1/2/4 CPUs,
   strict deadlines and native Clippy. Its full native job is green.
 - [x] Required Linux tests reproduced SC-T32 losing the first 32,000 rows after
@@ -74,6 +75,10 @@ Griot. This chat now leaves Griot implementation to the other agent.
   512 MiB allowance was smaller than the process's retained resident memory.
   The temporary test environment now installs `uv`, and the fusion/Polars fixtures
   use 1 GiB. The installed-wheel rerun passes. Linux acceptance is repeating.
+- [ ] Compatibility follow-up removes the new packaging refusal for older
+  initial-job grants. The canonical decoder retains critical service endpoints
+  from both old and explicit service records. Native case 1 on each CPU count
+  now exercises legacy records. Repeat native acceptance is pending.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.
 

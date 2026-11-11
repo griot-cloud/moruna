@@ -504,10 +504,16 @@ impl InitialJob {
                     if ["console", "account", "config"].contains(slot) {
                         return Err(ConfigError::Syntax);
                     }
+                    // Version 1 originally transferred these critical endpoints.
+                    // Retain node ownership when reading those older records.
                     grants.push(InitialGrant {
                         slot: (*slot).into(),
                         source: (*source).into(),
-                        listener: *kind == "service",
+                        listener: *kind == "service"
+                            || matches!(
+                                *slot,
+                                "linux" | "network" | "storage.admission" | "local.admission"
+                            ),
                     });
                 }
                 _ => return Err(ConfigError::Syntax),
@@ -523,6 +529,7 @@ impl InitialJob {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+    use alloc::format;
     #[test]
     fn escrow_records_require_exact_version_and_handle_count() {
         let record = ChildRecord {
@@ -545,6 +552,28 @@ mod ownership_tests {
             ),
             None
         );
+    }
+    #[test]
+    fn initial_services_retain_ownership_in_legacy_and_explicit_records() {
+        for slot in ["linux", "network", "storage.admission", "local.admission"] {
+            let legacy = InitialJob::parse(
+                format!("moruna-node-job 1\nbudget 8192\ngrant {slot} initial.endpoint\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let explicit = InitialJob::parse(
+                format!("moruna-node-job 1\nbudget 8192\nservice {slot} initial.endpoint\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(legacy, explicit);
+            assert!(legacy.grants[0].listener);
+        }
+        let data = InitialJob::parse(
+            b"moruna-node-job 1\nbudget 8192\ngrant engine.bindings initial.bindings\n",
+        )
+        .unwrap();
+        assert!(!data.grants[0].listener);
     }
     #[test]
     fn initial_job_has_explicit_budget_and_unique_capability_sources() {

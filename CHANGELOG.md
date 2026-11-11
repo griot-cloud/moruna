@@ -9,8 +9,8 @@
 
 - **Native node services outlive the first job.** Admission retains the initial
   Linux and storage service endpoints and lends narrowed copies to the engine.
-  Packaging checks this ownership so job completion cannot close a critical
-  service and race the node supervisor.
+  The decoder also retains these connections when reading older version-1
+  bootstrap records, so job completion can safely leave the node available.
 
 - **Image state stays in its own memory budget.** A retained image-process
   footprint remains funded against the run ceiling while placement keeps its
