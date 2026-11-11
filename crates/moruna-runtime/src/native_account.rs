@@ -212,6 +212,25 @@ mod tests {
         assert!(!sampler.process_usage().measured);
         assert!(!sampler.process_peak().exact);
     }
+    /// An account whose ledger is not one (no limit, or more charged than its limit) or a run
+    /// with no published ceiling is refused, never sampled.
+    #[test]
+    fn an_invalid_ledger_or_ceiling_is_refused() {
+        let (state, sampler) = fixture();
+        state.limit.store(0, Ordering::SeqCst);
+        assert!(sampler.sample().unwrap_err().to_string().contains("ledger"));
+        state.limit.store(100, Ordering::SeqCst);
+        assert!(
+            sampler.sample().is_err(),
+            "used and reserved exceed the limit"
+        );
+        state.limit.store(1000, Ordering::SeqCst);
+        state.cap.store(0, Ordering::SeqCst);
+        assert!(sampler.sample().is_err(), "no published ceiling");
+        state.cap.store(400, Ordering::SeqCst);
+        sampler.sample().unwrap();
+    }
+
     #[test]
     fn reset_changes_only_observed_interval_not_lifetime_evidence() {
         let (state, sampler) = fixture();
@@ -313,6 +332,17 @@ mod child_share_tests {
         assert_eq!(share, 27959296);
         assert!((32 << 20) + (16 << 20) + 3 * share <= 128 << 20);
         assert_eq!(child_share(0, u64::MAX, u64::MAX, 0).unwrap(), None);
+    }
+
+    /// A page that is not a power of two, or a zero minimum, is not a reservation geometry.
+    #[test]
+    fn an_invalid_reservation_geometry_is_refused() {
+        for (page, minimum) in [(3000, 16 << 20), (4096, 0)] {
+            let refused = super::child_share(1 << 30, 0, 0, 2, page, minimum)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("reservation geometry"), "{refused}");
+        }
     }
 
     #[test]

@@ -473,3 +473,48 @@ mod tests {
         assert!(!sampler.process_usage().measured);
     }
 }
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    struct Fixed(u64, u64);
+    impl moruna_kernel::Sampler for Fixed {
+        fn sample(&self) -> moruna_kernel::Result<moruna_kernel::Sample> {
+            Ok(moruna_kernel::Sample {
+                anon_bytes: self.0,
+                peak_anon_bytes: self.1,
+                ..Default::default()
+            })
+        }
+        fn reset_peak(&self) {}
+        fn process_peak(&self) -> moruna_kernel::ProcessPeak {
+            Default::default()
+        }
+    }
+    struct Holding(u64);
+    impl moruna_kernel::OutsideMemory for Holding {
+        fn in_use(&self) -> moruna_kernel::Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    /// Memory held outside the process that would overflow a byte total is refused, never
+    /// wrapped: across children, onto the sample, and onto its peak.
+    #[test]
+    fn an_outside_total_that_overflows_is_refused() {
+        let says = |sampler: WithOutside| sampler.sample().unwrap_err().to_string();
+        let across = WithOutside::new(
+            Arc::new(Fixed(0, 0)),
+            vec![Arc::new(Holding(u64::MAX)), Arc::new(Holding(1))],
+        );
+        assert!(says(across).contains("accounted byte total overflow"));
+        let onto = WithOutside::new(Arc::new(Fixed(1, 1)), vec![Arc::new(Holding(u64::MAX))]);
+        assert!(says(onto).contains("sample byte total overflow"));
+        let peak = WithOutside::new(Arc::new(Fixed(0, u64::MAX)), vec![Arc::new(Holding(1))]);
+        assert!(says(peak).contains("peak byte total overflow"));
+        let fits = WithOutside::new(Arc::new(Fixed(5, 7)), vec![Arc::new(Holding(3))]);
+        let sample = fits.sample().unwrap();
+        assert_eq!((sample.anon_bytes, sample.peak_anon_bytes), (8, 10));
+    }
+}
