@@ -8,10 +8,11 @@ A report is one JSON document with one canonical form. `report.bytes()` is that 
 
 | Attribute | Type | Meaning |
 | --- | --- | --- |
-| `schema_version`, `moruna` | `str`, `str` | The document's schema, `"MAJOR.MINOR"` (`"2.0"`; a reader refuses an unknown major), and the Moruna that wrote it. |
+| `schema_version`, `moruna` | `str`, `str` | The document's schema, `"MAJOR.MINOR"` (`"2.1"`; a reader refuses an unknown major), and the Moruna that wrote it. |
 | `host`, `args` | `dict`, `dict` | Where it ran (platform, CPUs, memory limit, CPU quota, devices) and the run's argument values. |
 | `run_id` | `str` | The run's id, 32 hex characters. |
-| `job_digest` | `str \| None` | The spec's digest; `None` for a job that holds a task a spec cannot hold. |
+| `job_digest` | `str \| None` | The spec's public digest, SHA-256 of its exact bytes (`JobSpec.digest()`), the same from `moruna.run` and `moruna run`; `None` for a job that holds a task a spec cannot hold. |
+| `execution_fingerprint` | `str \| None` | The normalized execution fingerprint the planner and recovery use. It differs from `job_digest` and is not a document identity; `None` for a run refused before its job was built. |
 | `exit` | `dict` | `code` (0 completed, 130 cancelled, otherwise the command's exit code for the failure), `status` (`"completed"`, `"terminated"`, `"cancelled"`) and `diagnostic`. |
 | `tasks` | list of dicts | Per task, in job order, keyed by its name in the spec: its status, times, CPU, memory, rows, bytes and morsels, waits, needs, what the plan predicted, its observation and a recommendation (see [The run report](run-report.md#task-fields)). A measurement not made is absent. |
 | `resources` | `dict` | `cpu_core_s`, `peak_memory_bytes`, `mem_byte_seconds`, `usage_measured` and `memory_basis`. |

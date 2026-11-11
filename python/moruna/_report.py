@@ -10,8 +10,10 @@ that digest, beside the job's.
 
 Every field of the document is an attribute: ``schema_version`` (``"MAJOR.MINOR"``; a reader
 refuses a major it does not know); ``moruna``, ``host`` and ``args`` (what ran it, where, and the
-run's argument values); ``run_id``; ``job_digest`` (the spec's digest, or ``None`` for a job that
-holds a task a spec cannot hold); ``exit`` (``code``, ``status`` and ``diagnostic``); ``tasks``
+run's argument values); ``run_id``; ``job_digest`` (the spec's public digest, SHA-256 of its exact
+bytes as ``JobSpec.digest()`` gives it, or ``None`` for a job that holds a task a spec cannot
+hold); ``execution_fingerprint`` (the normalized planning and recovery identity, which differs
+from ``job_digest``; ``None`` for a run refused before its job was built); ``exit`` (``code``, ``status`` and ``diagnostic``); ``tasks``
 (per task, keyed by its name in the spec: everything measured of it, its needs, what the plan
 predicted, its observation and a recommendation for the next run; a measurement not made is
 absent, never zero); ``resources`` (``cpu_core_s``, ``peak_memory_bytes`` and how it was
@@ -30,7 +32,7 @@ from typing import Any
 __all__ = ["RunReport"]
 
 #: The report document's schema, ``MAJOR.MINOR``: a reader refuses a major it does not know.
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 _REQUIRED = ("schema_version", "run_id", "job_digest", "exit", "tasks", "resources", "sinks")
 

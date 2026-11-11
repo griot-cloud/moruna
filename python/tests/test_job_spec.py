@@ -401,6 +401,9 @@ def test_the_report(tasks, tmp_path: Path) -> None:
     assert written[0] == spec.bytes()
     assert written[1] == report.bytes()
     assert report.job_digest == spec.digest()
+    # 0.6.6: the normalized execution fingerprint is reported beside the public digest.
+    assert report.execution_fingerprint.startswith("sha256:")
+    assert report.execution_fingerprint != report.job_digest
     assert report.exit == {"code": 0, "status": "completed", "diagnostic": None}
     assert len(report.run_id) == 32
     by_key = {t["key"]: t for t in report.tasks}
@@ -412,7 +415,7 @@ def test_the_report(tasks, tmp_path: Path) -> None:
     assert by_key["kept"]["needs"]["store"]["calls"] > 0, "measured through the resolver's object"
     assert by_key["kept"]["needs"]["store"]["bytes_in"] > 0
     assert report.resources["cpu_core_s"] >= 0 and report.resources["peak_memory_bytes"] > 0
-    assert report.schema_version == "2.0" and report.moruna == moruna.__version__
+    assert report.schema_version == "2.1" and report.moruna == moruna.__version__
     assert "stages" not in report.to_dict()
     sinks = {s["task"]: s for s in report.sinks}
     assert sinks["kept"]["snapshot_id"] == str(41 + len(store))

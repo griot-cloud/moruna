@@ -113,6 +113,10 @@ pub struct Wire {
     epoch_ns: i64,
     /// The frame being written, kept for its capacity.
     frame: Mutex<Vec<u8>>,
+    /// The public digest of the document this run was given (0.6.6): SHA-256 of its exact
+    /// bytes, as `JobSpec.digest()` computes it. Absent for a version 1 document sent as JSON
+    /// over `moruna serve`, whose bytes are not the document's.
+    document_digest: Mutex<Option<String>>,
 }
 
 impl Wire {
@@ -125,7 +129,24 @@ impl Wire {
             started,
             epoch_ns: unix_ns_now().saturating_sub(started.elapsed().as_nanos() as i64),
             frame: Mutex::new(Vec::new()),
+            document_digest: Mutex::new(None),
         })
+    }
+
+    /// Record the exact bytes of the document this run was given, by their public digest.
+    pub fn set_document(&self, bytes: &[u8]) {
+        *self
+            .document_digest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(crate::report_doc::document_digest(bytes));
+    }
+
+    /// The public digest of the run's document, when its exact bytes were given.
+    pub fn document_digest(&self) -> Option<String> {
+        self.document_digest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Send one event as a frame (MH 4.3): the same failure rule as [`Wire::send`].
@@ -356,6 +377,7 @@ pub fn run_file(
             }
         },
     };
+    wire.set_document(&bytes);
     wire.send(&Outbound::Hello {
         moruna_version: VERSION.to_string(),
         spec_digest: Some(moruna_plan::job_digest(&job)),
@@ -433,7 +455,11 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
                             .map_err(|e| {
                                 SpecError::new("spec", format!("not base64 FlatBuffers: {e}"))
                             })
-                            .and_then(|bytes| Job::from_flatbuffer(&bytes).map_err(job_refusal))
+                            .and_then(|bytes| {
+                                let job = Job::from_flatbuffer(&bytes).map_err(job_refusal)?;
+                                wire.set_document(&bytes);
+                                Ok(job)
+                            })
                     }
                     other => JobSpec::from_value(other).map(|spec| Job::from_v1(&spec)),
                 };
@@ -582,7 +608,9 @@ fn run_planned(
             .or_else(|| crate::run::mint_run_id().ok())
             .unwrap_or(RunId([0; 16]))
     });
-    let digest = moruna_plan::job_digest(&job);
+    // The report's `job_digest` is the public document digest (`JobSpec.digest()`), as
+    // `moruna.run` reports it; the normalized execution fingerprint is reported beside it.
+    let digest = wire.document_digest().unwrap_or_default();
     // This process's own id in its events: two processes of one attempt are two producers.
     let start = match crate::run::mint_run_id() {
         Ok(id) => id.to_hex(),
@@ -1255,6 +1283,21 @@ mod wire_failure_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// 0.6.6: a wire knows its document's public digest only once its exact bytes are given.
+    #[test]
+    fn the_wire_carries_the_documents_public_digest() {
+        let wire = Wire::new(None, Instant::now());
+        assert_eq!(wire.document_digest(), None);
+        wire.set_document(b"abc");
+        assert_eq!(
+            wire.document_digest().as_deref(),
+            Some("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        // Notes drained for the report leave the identity in place.
+        let _ = wire.take_notes();
+        assert!(wire.document_digest().is_some());
     }
 
     #[test]
