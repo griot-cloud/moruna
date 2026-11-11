@@ -370,6 +370,10 @@ pub struct KernelInfo {
     pub schema_hash: [u8; 32],
     /// What the kernel says about itself before the probe.
     pub hints: KernelHints,
+    /// Whether this stage's instance footprint may retain arena allocations.
+    /// External state is funded against the run ceiling, without consuming the
+    /// placement queues' arena allowance a second time.
+    pub state_uses_arena: bool,
     /// Stateless or stateful, and with how many instances.
     pub kind: KernelKind,
 }
@@ -628,6 +632,7 @@ pub(crate) struct ControllerState {
     pub high_water: u64,
     pub split_bytes: u64,
     pub state_total: u64,
+    pub arena_state_total: u64,
     pub last_state_total: u64,
     pub notes: Vec<String>,
     pub timeline: Vec<(f64, Bottleneck)>,
@@ -1008,6 +1013,7 @@ impl Controller {
             high_water: 0,
             split_bytes: 0,
             state_total: 0,
+            arena_state_total: 0,
             last_state_total: 0,
             notes: Vec::new(),
             timeline: Vec::new(),

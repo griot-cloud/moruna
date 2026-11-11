@@ -2,6 +2,17 @@
 
 ## 0.6.5
 
+- **Image state stays in its own memory budget.** A retained image-process
+  footprint remains funded against the run ceiling while placement keeps its
+  separate arena allowance. Previously a learned profile could reduce queue
+  memory to zero and prevent the same job from running again.
+- **The confined vsock backend exits without foreign shutdown handlers.** Linux
+  coverage uses continuously mapped counters so the real confined process is
+  measured with its existing syscall filter.
+- **GitHub Actions runs the full release quality gate.** Portable commit and push
+  hooks run the fast checks. Required Linux checks cover tests, per-crate
+  coverage and a freshly installed Python wheel before a release merge.
+
 - **Built callables describe their interface in OCI metadata.** Versioned, bounded
   labels expose the callable declaration, entry, build key and target platform
   without running the image. Other OCI consumers can ignore the labels; the

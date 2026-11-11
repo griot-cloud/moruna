@@ -25,7 +25,7 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 
 **Working set.** Two inequalities, both of which a knob set must satisfy (f.3).
 
-* **Arena.** `Σ_stages share(stage) × allowance(stage) + Σ_queues high_water + read_ahead × split_bytes + state`, which must fit `arena_bytes`. This is what the runtime may hold.
+* **Arena.** `Σ_stages share(stage) × allowance(stage) + Σ_queues high_water + read_ahead × split_bytes + arena_state`, which must fit `arena_bytes`. This is what the runtime may hold.
 * **Anonymous.** `resting_anon + state + Σ_stages share(stage) × anon_allowance(stage)`, which must fit `limits.memory_ceiling`. This is what the *process* may hold, and it is the quantity S1 is measured from.
 
 **Resting anonymous memory.** `baseline + arena_bytes`. 02 f.1 touches every page of the region at `new`, so the process holds this much from the moment the arena exists, whether the runtime is using it or not. The controller cannot move it.
@@ -49,6 +49,14 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 **Profile.** A stored summary of a kernel's measured behaviour keyed by fingerprint and input schema hash.
 
 **State.** Per stage, the bytes its instances hold regardless of morsel size: `instances_live × max(state_bytes over the stage's last 32 records)`, grouped by the record's `instance` column when present (f.3).
+
+**Arena state.** The part of `state` whose kernel reports `state_uses_arena = true`.
+The conservative default is true. Image processes and sandboxed package processes
+report false because their recorded footprints belong to their child processes
+and mappings. Their state remains fully funded in the anonymous inequality.
+It does not consume the placement arena, including when seeded from a previous
+run's profile. Profiles remain intact and continue to bound the run's memory.
+
 
 ## c. Invariants
 
@@ -175,7 +183,7 @@ pub const TICK_BOUND_MS: u64 = 5;
 
 /// `schema_hash` is `SourceSchema::hash()` (contracts d.4) of the stage's input schema, which the
 /// facade has from the chain validation.
-pub struct KernelInfo { pub stage: StageId, pub fingerprint: Fingerprint, pub schema_hash: [u8; 32], pub hints: KernelHints, pub kind: KernelKind }
+pub struct KernelInfo { pub stage: StageId, pub fingerprint: Fingerprint, pub schema_hash: [u8; 32], pub hints: KernelHints, pub state_uses_arena: bool, pub kind: KernelKind }
 pub struct Budgets { pub host: u64, pub device: [u64; 8], pub baseline: u64, pub reserve: u64 }
 // `host` is the arena's capacity (f.1); `baseline` is the pre-arena sample the facade took and
 // `reserve` the headroom, both reported rather than subtracted.

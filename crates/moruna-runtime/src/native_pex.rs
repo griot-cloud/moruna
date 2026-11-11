@@ -292,6 +292,9 @@ impl Kernel for NativePex {
     fn hints(&self) -> KernelHints {
         self.hints.clone()
     }
+    fn state_uses_arena(&self) -> bool {
+        false
+    }
     fn declared(&self) -> moruna_kernel::Declared {
         self.declared.clone()
     }

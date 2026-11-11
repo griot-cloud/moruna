@@ -226,6 +226,12 @@ pub trait Kernel: Send + Sync + 'static {
     fn hints(&self) -> KernelHints {
         KernelHints::default()
     }
+    /// Whether the reported instance state may retain bytes in the run's arena.
+    /// False is reserved for state held entirely outside that arena, such as an
+    /// image process. Its footprint still counts against the run's memory ceiling.
+    fn state_uses_arena(&self) -> bool {
+        true
+    }
     /// The kernel's declared input and output schemas (MH 4.9). Optional: the default
     /// declares nothing, which leaves the kernel runnable and not checkable. The runtime never
     /// reads it on the library path; `moruna check` (MH 4.9) does.

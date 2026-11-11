@@ -4,6 +4,20 @@ The PM agent's working board. It is the one place that says what is done, what i
 
 ## November 11: Griot image registry and Azure validation
 
+Brackly handed Griot implementation to another agent. Its work is committed and
+pushed to `integration/local-cloud`, and the primary checkout now uses that branch.
+This chat owns the Moruna 0.6.5 release. Validation is moving into the required
+GitHub Actions check at Brackly's request. The Azure VM is deallocated.
+
+- [x] Reproduced learned-state funding with a retained profile larger than the
+  placement arena. Separate external state from arena-resident state while
+  retaining the complete run-ceiling check. Both new profile regressions, all
+  six profile tests and all 66 controller tests pass locally.
+- [ ] Verify the confined backend's direct exit under Linux continuous coverage.
+- [ ] Complete the required GitHub Actions quality gate, then merge the release
+  PR and verify its published artifacts and package installation.
+
+
 - Portable OCI callable descriptors and the registry publisher are prepared for 0.6.5. Twelve real amd64 SOC function images were built and pushed to the user's private Docker Hub repository with `Job.build(registry=...)`; their MJS holds immutable OCI references, no local paths. ARM demo artifacts were preserved.
 - Full local Rust tests exposed a late cancellation acknowledgement after terminal completion; the lifecycle now ignores cancellation after the attempt has ended, with a regression test. The 1,653 default tests and feature bridges pass on macOS, but the per-crate coverage gate refuses the push there; the clean Linux/KVM gate in Germany passed default tests and feature bridges, then stopped at the H6 governed write/view test with a twice-failed staging promotion. The exact H6 test passes when rerun alone; the timing-sensitive cause is still under investigation.
 - All 13 SOC tasks now run successfully on Germany x86 compute through an owner-scoped Griot CLI preview, peak ten active tasks, using the private Docker Hub images. This does not establish the production node launcher or authoring transport.

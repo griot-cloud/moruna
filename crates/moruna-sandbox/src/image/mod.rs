@@ -782,6 +782,10 @@ impl Kernel for ImageKernel {
         KernelHints::default()
     }
 
+    fn state_uses_arena(&self) -> bool {
+        false
+    }
+
     fn declared(&self) -> Declared {
         Declared::default()
     }

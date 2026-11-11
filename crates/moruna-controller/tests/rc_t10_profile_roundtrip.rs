@@ -209,6 +209,53 @@ fn check_row(dir: &std::path::Path, schema: &str, a_k: f64) -> std::path::PathBu
     path
 }
 
+fn external_state_profile(dir: &std::path::Path, state_bytes: u64) -> common::Rig {
+    let file = check_row(dir, &"01".repeat(32), 1.0);
+    let mut row: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    row["state_bytes_max"] = state_bytes.into();
+    std::fs::write(file, serde_json::to_vec(&row).unwrap()).unwrap();
+
+    let mut cfg = config(4 * GIB, 2);
+    cfg.arena_bytes = GIB;
+    cfg.baseline_bytes = 64 * MIB;
+    cfg.profiles_dir = Some(dir.to_path_buf());
+    cfg.plan.total_bytes = MIB;
+    cfg.plan.total_rows = 1000;
+    let mut stage = common::stateful_kernel(1, 1, KernelHints::default());
+    stage.state_uses_arena = false;
+    common::Rig::new(
+        cfg,
+        vec![stage],
+        FakeKnobs::new(),
+        FakeSampler::new().scripted(steady(GIB + 64 * MIB, 8)),
+    )
+}
+
+#[test]
+fn rc_t10_external_profile_state_does_not_spend_the_placement_arena() {
+    let scratch = Scratch::new("external-state-profile");
+    let rig = external_state_profile(scratch.path(), 2 * GIB);
+    rig.run_up();
+    let budgets = common::last_budgets(&rig.placement).unwrap();
+    assert!(
+        budgets.host > 0,
+        "state outside the arena must leave room for queued batches"
+    );
+    assert!(budgets.host < GIB, "placement remains bounded by its arena");
+    rig.controller.stop();
+}
+
+#[test]
+fn rc_t10_external_profile_state_is_still_funded_below_the_run_ceiling() {
+    let scratch = Scratch::new("external-state-ceiling");
+    let rig = external_state_profile(scratch.path(), 4 * GIB);
+    rig.controller.prepare().unwrap();
+    rig.controller.probe_all().unwrap();
+    let error = rig.controller.start().unwrap_err();
+    assert!(error.to_string().contains("budget cannot hold this job"));
+    rig.controller.stop();
+}
+
 /// The notes of a run of kernel 1 over the store, probed at `probed`.
 fn seeded_notes(dir: &std::path::Path, probed: f64) -> Vec<String> {
     let mut cfg = config(8 * GIB, 2);

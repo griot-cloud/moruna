@@ -1,10 +1,10 @@
 //! The working-set model: the envelope, the equation of b, and the initial knobs of f.3.
 //!
 //! The budget is divided once and the division is what every later decision moves inside.
-//! Writing it out, with `avail = host_budget - state`:
+//! Writing it out, with `avail = host_budget - arena_state`:
 //!
 //! ```text
-//! host_budget = state                                   the bytes instances hold
+//! host_budget = arena_state                             the state retained in the arena
 //!             + avail / 2                               the workers' in-flight allowance
 //!             + avail / 2                               the queues and the read-ahead
 //! ```
@@ -99,6 +99,7 @@ pub(crate) fn damping(state: &ControllerState) -> u32 {
 /// grows with morsels seen is exactly the case the linear model `a_k x bytes_in` cannot see.
 pub(crate) fn recompute_state(state: &mut ControllerState) {
     let mut total = 0u64;
+    let mut arena_total = 0u64;
     for at in 0..state.stages.len() {
         let stage = state.stages[at].stage;
         let hint = state.hints(stage).state_bytes.unwrap_or(0);
@@ -118,13 +119,22 @@ pub(crate) fn recompute_state(state: &mut ControllerState) {
         let stage_state = per_instance.saturating_mul(instances);
         state.stages[at].state_bytes = stage_state;
         total = total.saturating_add(stage_state);
+        if state
+            .kernels
+            .iter()
+            .find(|kernel| kernel.stage == stage)
+            .is_none_or(|kernel| kernel.state_uses_arena)
+        {
+            arena_total = arena_total.saturating_add(stage_state);
+        }
     }
     state.state_total = total;
+    state.arena_state_total = arena_total;
 }
 
-/// The bytes left once the instances have been funded (f.3).
+/// Arena bytes left after funding state retained in that arena (f.3).
 pub(crate) fn available(state: &ControllerState) -> u64 {
-    state.budgets.host.saturating_sub(state.state_total)
+    state.budgets.host.saturating_sub(state.arena_state_total)
 }
 
 /// The workers' half of what is left (f.3).
@@ -301,7 +311,7 @@ pub(crate) fn refresh_envelopes(state: &mut ControllerState) {
 
 /// The working set of b for a proposed set of targets, in bytes.
 pub(crate) fn working_set(state: &ControllerState, targets: &[u64]) -> u64 {
-    let mut total = state.state_total;
+    let mut total = state.arena_state_total;
     for (at, target) in targets.iter().enumerate() {
         let ctl = &state.stages[at];
         let allowance = ctl.allowance(*target);
@@ -875,6 +885,7 @@ mod native_commitment_tests {
             .probe_result(2, probe(18 << 20));
         let kernels = (1..=2)
             .map(|stage| KernelInfo {
+                state_uses_arena: true,
                 stage,
                 fingerprint: Fingerprint([stage as u8; 32]),
                 schema_hash: [stage as u8; 32],

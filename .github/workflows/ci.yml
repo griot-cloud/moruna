@@ -20,10 +20,9 @@
 # here once PyPI has accepted the upload, and a tag therefore always marks something
 # that shipped. Pushing one by hand triggers nothing at all.
 #
-# What is deliberately NOT here:
-#   coverage      tools/quality/check.sh enforces 90% per crate in the hook,
-#                 before every commit. Running cargo-llvm-cov again in CI
-#                 doubles the build for a number we already have.
+# The required Linux check owns the full quality gate, including per-crate
+# coverage. Local hooks run the portable fast checks.
+# Checks on their own cadence:
 #   cargo-deny    licences and advisories change with the world, not with a
 #                 commit, so they run weekly and on demand, below.
 #   the container the cgroup ceiling and MinIO matter at a wave gate, not on
@@ -68,7 +67,10 @@ jobs:
     # request, and running it again on the other side of the merge buys a second
     # opinion on the same commit for twice the minutes.
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned toolchain (rust-toolchain.toml)
@@ -96,20 +98,29 @@ jobs:
         run: |
           python -m pip install --quiet -r docs/requirements.txt
           sphinx-build -W --keep-going -q -b html docs docs/_build/html
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
-      - name: The vmm jail may make user namespaces, as it does on a node
-        # Ubuntu 24.04 forbids unprivileged user namespaces through AppArmor. The jail makes one for
-        # every run before QEMU starts, and refuses loudly when it cannot (`deny setgroups:
-        # Permission denied`), so its tests need the host a node is: one that allows them.
+      - name: Install the quality gate tools and Python dependencies
+        env:
+          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked --version 0.8.5
+          "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
+      - name: The vmm jail may make user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: Tests
-        run: cargo test --workspace --locked --no-fail-fast
-      - name: The image kind, for real (SDD 19 k)
-        # An image's command runs in its own namespaces, under Landlock and seccomp, in a cgroup
-        # Moruna made: that needs root and a cgroup v2 directory with `memory` and `cpu` handed to
-        # its children, which the runner has once it is asked. The tests are `--ignored` for a
-        # machine with neither; here they run, as root, with the directory.
+      - name: Full Linux quality gate including coverage and the installed wheel
+        env:
+          MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
+          PYO3_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_BUILD_JOBS: "2"
+          RUST_TEST_THREADS: "1"
+        run: |
+          export PATH="$(dirname "$STANDARD"):$PATH"
+          export PYTHONPATH="$("$MORUNA_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          tools/quality/check.sh
+      - name: The image kind in its delegated cgroup
         run: |
           bin="$(cargo test -p moruna-image --test image_kind --locked --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "image_kind") | .executable')"
@@ -118,70 +129,15 @@ jobs:
           echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
           echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-ci/cgroup.subtree_control
           sudo env MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-ci "$bin" --ignored --test-threads=1
-      - name: peQL with its Iceberg binding compiled in (moruna-datafusion's peql-iceberg)
-        # A host that embeds peQL with `iceberg` unifies that feature into Moruna's build, so the
-        # governed ends must compile and pass with it on, not only in the default graph.
-        run: |
-          cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets --locked \
-            --features moruna-datafusion/peql-iceberg,moruna-runtime/peql -- -D warnings
-          cargo test -p moruna-datafusion --locked --features moruna-datafusion/peql-iceberg
-      - name: CT-T12 boundary, moruna-kernel has no runtime dependency
+      - name: CT-T12 kernel dependency boundary
         run: |
           cargo tree -p moruna-kernel > kernel-tree.txt
           if grep -E -i '\b(tokio|cudarc|pyo3|parquet|object_store)\b' kernel-tree.txt; then
-            echo "moruna-kernel must not depend on tokio, cudarc, pyo3, parquet or object_store (01 section a, CT-T12)" >&2
+            echo "moruna-kernel has a forbidden runtime dependency" >&2
             exit 1
           fi
-      - name: The Python kernels
-        env:
-          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
-        run: |
-          python -c 'import sys, sysconfig; print(sys.version); print("free-threaded:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")), "gil now:", sys._is_gil_enabled())'
-          PYTHON_GIL=1 python -c 'import sys; assert sys._is_gil_enabled()'
-          # pyarrow is not optional: python/moruna/__init__.py refuses to import
-          # without it, because it is the format the runtime hands a kernel and takes
-          # back with no copy. It publishes cp314t manylinux wheels, so --only-binary
-          # is satisfiable; if that ever stops being true this step fails loudly, which
-          # is what we want, because the Python surface would not work on Linux.
-          # pyyaml is the `package` extra's (pip is already here): `moruna package` reads
-          # function.yaml (SDD 16 e.3), and python/tests packages projects.
-          "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
-          "$FREETHREADED" -m uv --version
-          cd bench/python && python -m pytest -q
-      - name: The wheel builds, installs and runs on Linux
-        # The check that matters for a release: not "does the source tree import", which
-        # cannot work without the compiled extension, but "does the artefact we would
-        # publish work on the platform we publish it for". python/tests drives a real
-        # pass through the installed wheel, so this is also where a Linux-only runtime
-        # defect would surface (2026-09-23; before this, nothing proved either).
-        env:
-          STANDARD: ${{ steps.standard.outputs.python-path }}
-          FREETHREADED: ${{ steps.freethreaded.outputs.python-path }}
-        run: |
-          "$STANDARD" -c 'import sysconfig; assert not sysconfig.get_config_var("Py_GIL_DISABLED")'
-          # Public image builds discover standard CPython through PATH; wheel
-          # building, installation and testing remain explicitly free-threaded.
-          export PATH="$(dirname "$STANDARD"):$PATH"
-          "$FREETHREADED" -m uv --version
-          "$FREETHREADED" -m maturin build --release --out dist --interpreter "$FREETHREADED"
-          "$FREETHREADED" -m pip install --no-index --find-links dist moruna
-          "$FREETHREADED" -c 'import moruna; print("moruna", moruna.__version__)'
-          # From outside the tree, always. pytest puts the test's own root on sys.path,
-          # so running python/tests in place lets python/moruna (the source package,
-          # with no compiled _core) shadow the wheel that was just installed, and the
-          # suite then tests something that cannot work while reporting on something
-          # that can.
-          cp -R python/tests /tmp/moruna-tests
-          # One process per test file. A run's budget counts the memory its process already
-          # holds (by design), and the files keep their own data alive, so one process for
-          # the whole suite grows to about 6 GB and refuses later runs for reasons of
-          # its own. A run gives its memory back (a run moving 1.9 GB leaves about 70 MiB).
-          cd /tmp
-          failed=""
-          for file in /tmp/moruna-tests/test_*.py; do
-            "$FREETHREADED" -m pytest -q "$file" || failed="$failed $(basename "$file")"
-          done
-          if [ -n "$failed" ]; then echo "::error::python/tests failed in:$failed"; exit 1; fi
+      - name: Python kernel benchmarks
+        run: cd bench/python && python -m pytest -q
 
   # The microkernel (SDD 20 k, SDD 23 k), on a pull request that touches kernel/ or this
   # file, and never on a push: kernel/ is its own Cargo workspace on a pinned nightly,

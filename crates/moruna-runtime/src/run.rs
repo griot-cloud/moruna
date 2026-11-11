@@ -627,6 +627,7 @@ fn drive(
                 fingerprint: kernel.fingerprint(),
                 schema_hash: schemas[usize::from(input)].hash(),
                 hints: kernel.hints(),
+                state_uses_arena: kernel.state_uses_arena(),
                 kind: kernel.kind(),
             }
         })

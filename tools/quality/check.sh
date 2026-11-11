@@ -169,34 +169,43 @@ sys.stdout.write(", ".join(absent))
     step "python adapter not measured: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
   fi
   step "tests: $(grep -hE '^test result:' target/quality/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
-  step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
-  command -v cargo-llvm-cov >/dev/null 2>&1 \
-    || fail "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview"
-  mkdir -p target/llvm-cov
-  # A workspace in which no crate has an instrumented line (every member a
-  # stub, wave 0 before F0.2 lands) yields no profile at all, and llvm-cov
-  # reports "no coverage data found" instead of an empty summary. That is the
-  # "stub, not measured" case of preamble 6.7, not a failure; any other error
-  # from cargo-llvm-cov still fails the gate.
-  if ! cargo llvm-cov --workspace --json --summary-only --output-path target/llvm-cov/summary.json \
-      >/dev/null 2>target/llvm-cov/stderr.log; then
-    if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
-      step "no instrumented lines in any crate (all stubs); coverage not measured"
-    else
-      cat target/llvm-cov/stderr.log >&2
-      fail "cargo llvm-cov failed"
+  (
+    # The confined backend exits without atexit handlers. Keep instrumented
+    # counters mapped before confinement so its coverage survives _exit too.
+    if [ "$(uname -s)" = "Linux" ]; then
+      coverage_rustflags="${RUSTFLAGS:-$(python3 -c 'import shlex, tomllib; print(shlex.join(tomllib.load(open(".cargo/config.toml", "rb"))["build"]["rustflags"]))')}"
+      export RUSTFLAGS="$coverage_rustflags -Cllvm-args=-runtime-counter-relocation"
+      export LLVM_PROFILE_FILE_NAME="moruna-%p-%m-%c.profraw"
     fi
-  else
-    python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
-  fi
-  if [ -n "${MORUNA_PYTHON:-}" ]; then
-    step "line coverage >= ${MIN}% for moruna-sources and moruna-sinks with --features python"
-    PYO3_PYTHON="$MORUNA_PYTHON" cargo llvm-cov -p moruna-sources -p moruna-sinks \
-      --features moruna-sources/python,moruna-sinks/python --json --summary-only \
-      --output-path target/llvm-cov/summary-python.json >/dev/null 2>target/llvm-cov/stderr-python.log \
-      || { cat target/llvm-cov/stderr-python.log >&2; fail "cargo llvm-cov --features python failed"; }
-    python3 tools/quality/coverage_gate.py target/llvm-cov/summary-python.json "$MIN"
-  fi
+    step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
+    command -v cargo-llvm-cov >/dev/null 2>&1 \
+      || fail "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview"
+    mkdir -p target/llvm-cov
+    # A workspace in which no crate has an instrumented line (every member a
+    # stub, wave 0 before F0.2 lands) yields no profile at all, and llvm-cov
+    # reports "no coverage data found" instead of an empty summary. That is the
+    # "stub, not measured" case of preamble 6.7, not a failure; any other error
+    # from cargo-llvm-cov still fails the gate.
+    if ! cargo llvm-cov --workspace --json --summary-only --output-path target/llvm-cov/summary.json \
+        >/dev/null 2>target/llvm-cov/stderr.log; then
+      if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
+        step "no instrumented lines in any crate (all stubs); coverage not measured"
+      else
+        cat target/llvm-cov/stderr.log >&2
+        fail "cargo llvm-cov failed"
+      fi
+    else
+      python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
+    fi
+    if [ -n "${MORUNA_PYTHON:-}" ]; then
+      step "line coverage >= ${MIN}% for moruna-sources and moruna-sinks with --features python"
+      PYO3_PYTHON="$MORUNA_PYTHON" cargo llvm-cov -p moruna-sources -p moruna-sinks \
+        --features moruna-sources/python,moruna-sinks/python --json --summary-only \
+        --output-path target/llvm-cov/summary-python.json >/dev/null 2>target/llvm-cov/stderr-python.log \
+        || { cat target/llvm-cov/stderr-python.log >&2; fail "cargo llvm-cov --features python failed"; }
+      python3 tools/quality/coverage_gate.py target/llvm-cov/summary-python.json "$MIN"
+    fi
+  )
 else
   step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"
 fi

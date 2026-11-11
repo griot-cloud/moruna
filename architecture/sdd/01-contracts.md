@@ -586,6 +586,8 @@ pub trait Kernel: Send + Sync + 'static {
     fn fingerprint(&self) -> Fingerprint;
     fn kind(&self) -> KernelKind;
     fn hints(&self) -> KernelHints { KernelHints::default() }
+    /// False only when reported state is held entirely outside the run arena.
+    fn state_uses_arena(&self) -> bool { true }
     /// What this kernel wants delivered.
     fn accepts(&self) -> PayloadSpec;
     /// Output schema for the given input schema; errors are plan-time errors.

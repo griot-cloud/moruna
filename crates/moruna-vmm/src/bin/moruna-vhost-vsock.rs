@@ -7,7 +7,11 @@
 //! outside it kills the process.
 
 fn main() {
-    std::process::exit(run());
+    let code = run();
+    // The server has dropped its resources. Exit directly so foreign atexit
+    // handlers cannot attempt file or process operations after confinement.
+    // SAFETY: _exit terminates this process and never accesses Rust memory.
+    unsafe { libc::_exit(code) }
 }
 
 const USAGE: &str = "usage: moruna-vhost-vsock --socket PATH --cid CID --uds PATH";
