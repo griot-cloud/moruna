@@ -328,6 +328,9 @@ impl Kernel for FinalRows {
     fn hints(&self) -> moruna_kernel::KernelHints {
         self.kernel.hints()
     }
+    fn state_uses_arena(&self) -> bool {
+        self.kernel.state_uses_arena()
+    }
     fn declared(&self) -> moruna_kernel::Declared {
         self.kernel.declared()
     }
@@ -1033,6 +1036,9 @@ mod tests {
     }
     struct IdentityKernel;
     impl Kernel for IdentityKernel {
+        fn state_uses_arena(&self) -> bool {
+            false
+        }
         fn fingerprint(&self) -> moruna_kernel::Fingerprint {
             moruna_kernel::Fingerprint::compute("history-single-task-test", b"")
         }
@@ -1085,6 +1091,7 @@ mod tests {
             rows: rows.clone(),
         };
         assert_eq!(bound.fingerprint(), original.fingerprint());
+        assert_eq!(bound.state_uses_arena(), original.state_uses_arena());
         let expected = batch();
         let mut state = moruna_kernel::NoState;
         let actual = bound
