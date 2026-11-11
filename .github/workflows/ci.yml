@@ -132,6 +132,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
       - name: The image kind in its delegated cgroup
+        if: ${{ !cancelled() }}
         run: |
           bin="$(cargo test -p moruna-image --test image_kind --locked --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "image_kind") | .executable')"
@@ -141,6 +142,7 @@ jobs:
           echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-ci/cgroup.subtree_control
           sudo env MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-ci "$bin" --ignored --test-threads=1
       - name: CT-T12 kernel dependency boundary
+        if: ${{ !cancelled() }}
         run: |
           cargo tree -p moruna-kernel > kernel-tree.txt
           if grep -E -i '\b(tokio|cudarc|pyo3|parquet|object_store)\b' kernel-tree.txt; then
@@ -148,6 +150,7 @@ jobs:
             exit 1
           fi
       - name: Python kernel benchmarks
+        if: ${{ !cancelled() }}
         run: cd bench/python && python -m pytest -q
 
   # The microkernel (SDD 20 k, SDD 23 k), on a pull request that touches kernel/ or this
