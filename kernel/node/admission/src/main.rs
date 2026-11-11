@@ -119,7 +119,7 @@ fn launch_job(
             // The engine gives its Linux child a narrowed personality listener.
             // Other retained services only need to establish their own connection.
             if service == "linux" {
-                rights |= Rights::DUPLICATE;
+                rights = rights | Rights::DUPLICATE;
             }
             let grant = listener
                 .0
