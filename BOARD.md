@@ -66,7 +66,9 @@ Griot. This chat now leaves Griot implementation to the other agent.
   sandbox 48.3%, storage 65.3% and vmm 81.3%. Native-only guest paths require their
   actual kernel execution profile. The other gaps need per-file diagnosis.
   CI now retains full coverage mapping and test logs before the gate refuses.
-- [ ] Verify the confined backend's direct exit under Linux continuous coverage.
+- [x] The confined backend's direct exit completes under Linux continuous
+  coverage in run 43023960987. The workspace coverage threshold remains a
+  separate refusal, recorded above.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.
 

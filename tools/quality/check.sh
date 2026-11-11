@@ -169,6 +169,35 @@ sys.stdout.write(", ".join(absent))
     step "python adapter not measured: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
   fi
   step "tests: $(grep -hE '^test result:' target/quality/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
+
+else
+  step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"
+fi
+
+if [ -d python/tests ]; then
+  # The package's own tests. This used to be gated on python/pyproject.toml, which lives
+  # at the repository root, so 32 tests including the one guarding the surface's
+  # throughput were run by nothing at all: that is the structural reason a wheel whose
+  # first user program hung for ever passed a green gate (found 2026-09-23).
+  if [ -n "${MORUNA_PYTHON:-}" ]; then
+    step "python/tests on ${MORUNA_PYTHON}"
+    # A stale python/moruna/_core*.so shadows an installed wheel, so the suite must run
+    # against a build made now, not whatever was left in the tree.
+    quiet python_tests env MORUNA_PYTHON="$MORUNA_PYTHON" tools/quality/python_tests.sh
+  else
+    step "python/tests not run: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
+  fi
+fi
+
+if [ -f python/pyproject.toml ]; then
+  step "ruff and pytest with coverage >= ${MIN}%"
+  command -v ruff >/dev/null 2>&1 || fail "ruff is not installed"
+  ruff check python
+  ( cd python && python3 -m pytest -q --cov=moruna --cov-fail-under="$MIN" )
+fi
+
+# Run the coverage floor after package validation so both produce release evidence.
+if [ -f Cargo.toml ]; then
   (
     # The confined backend exits without atexit handlers. Keep instrumented
     # counters mapped before confinement so its coverage survives _exit too.
@@ -209,30 +238,6 @@ sys.stdout.write(", ".join(absent))
       python3 tools/quality/coverage_gate.py target/llvm-cov/summary-python.json "$MIN"
     fi
   )
-else
-  step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"
-fi
-
-if [ -d python/tests ]; then
-  # The package's own tests. This used to be gated on python/pyproject.toml, which lives
-  # at the repository root, so 32 tests including the one guarding the surface's
-  # throughput were run by nothing at all: that is the structural reason a wheel whose
-  # first user program hung for ever passed a green gate (found 2026-09-23).
-  if [ -n "${MORUNA_PYTHON:-}" ]; then
-    step "python/tests on ${MORUNA_PYTHON}"
-    # A stale python/moruna/_core*.so shadows an installed wheel, so the suite must run
-    # against a build made now, not whatever was left in the tree.
-    quiet python_tests env MORUNA_PYTHON="$MORUNA_PYTHON" tools/quality/python_tests.sh
-  else
-    step "python/tests not run: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
-  fi
-fi
-
-if [ -f python/pyproject.toml ]; then
-  step "ruff and pytest with coverage >= ${MIN}%"
-  command -v ruff >/dev/null 2>&1 || fail "ruff is not installed"
-  ruff check python
-  ( cd python && python3 -m pytest -q --cov=moruna --cov-fail-under="$MIN" )
 fi
 
 step "OK"

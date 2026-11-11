@@ -194,6 +194,17 @@ checkpoint activity, and service interruption. It verifies output equivalence,
 publication ordering and the original failure cause. Teardown checks creators
 and descendants, including children created during shutdown.
 
+## Verification profiles
+
+Linux host tests exercise the launcher, jails, runtime, storage adapters and public
+package. Native guest tests exercise capability calls and services on the Moruna
+microkernel. Modules such as `moruna-micro`, native storage bindings and native
+child execution require that guest profile for their kernel-backed paths.
+
+The audit records the execution profile, coverage command, measured files,
+functional proofs and unmeasured paths for each component. Guest measurements use
+actual native execution. Each release claim names the profile that established it.
+
 ## Acceptance and delivery order
 
 | Order | Gate | Required evidence |
