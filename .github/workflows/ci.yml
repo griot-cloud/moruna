@@ -120,6 +120,17 @@ jobs:
           export PATH="$(dirname "$STANDARD"):$PATH"
           export PYTHONPATH="$("$MORUNA_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
           tools/quality/check.sh
+      - name: Retain Linux quality-gate diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-quality-gate
+          path: |
+            target/llvm-cov/*.json
+            target/llvm-cov/*.log
+            target/quality/*.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: The image kind in its delegated cgroup
         run: |
           bin="$(cargo test -p moruna-image --test image_kind --locked --no-run --message-format=json \

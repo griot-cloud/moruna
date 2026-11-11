@@ -195,6 +195,9 @@ sys.stdout.write(", ".join(absent))
         fail "cargo llvm-cov failed"
       fi
     else
+      cargo llvm-cov report --json --output-path target/llvm-cov/report.json \
+        >/dev/null 2>target/llvm-cov/report-stderr.log \
+        || { cat target/llvm-cov/report-stderr.log >&2; fail "cargo llvm-cov report failed"; }
       python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
     fi
     if [ -n "${MORUNA_PYTHON:-}" ]; then

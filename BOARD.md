@@ -59,6 +59,13 @@ Griot. This chat now leaves Griot implementation to the other agent.
   SC-T32 passes locally for seeds 3398 through 3405. Seed 3406 completed before
   every kill and correctly refuses to claim mid-run recovery evidence. Full Linux
   release acceptance is pending.
+- [ ] GitHub run 43023960987 passes the complete native check, 1,773 default
+  tests and the optional bridge, peQL, Iceberg and Python feature tests. Continuous
+  coverage completes through the confined backend but the 90% per-crate floor
+  refuses nine crates. Linux results include moruna-micro 7.5%, runtime 81.7%,
+  sandbox 48.3%, storage 65.3% and vmm 81.3%. Native-only guest paths require their
+  actual kernel execution profile. The other gaps need per-file diagnosis.
+  CI now retains full coverage mapping and test logs before the gate refuses.
 - [ ] Verify the confined backend's direct exit under Linux continuous coverage.
 - [ ] Complete the required GitHub Actions quality gate, then merge the release
   PR and verify its published artifacts and package installation.
