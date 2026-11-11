@@ -58,6 +58,27 @@ The PM agent's working board. It is the one place that says what is done, what i
   recovered its saved draft by restarting only the candidate backend. These
   Griot UI/backend issues do not establish a Moruna launcher or controller fix.
 
+- Final normal pre-push on `84ffae4` passed 1,770 default tests (54 ignored),
+  append-column, Polars/DataFusion, governed peQL/Iceberg, and the Python adapter
+  and Source/Sink checks. It then failed during instrumented coverage at
+  `vsock_backend_seccomp`: the filtered backend dies on
+  `prctl(PR_GET_PDEATHSIG)` during process exit. The same uninstrumented test
+  passes. The failed hook receipt and syscall trace are retained; coverage and
+  fresh-wheel acceptance are incomplete. No push, PR merge, tag or release was
+  accepted, and the production syscall filter was not relaxed.
+- A separate Griot engine compiled against these actual 0.6.5 crates passes the
+  read-only SOC project window: all 12 processing tasks plus preview capture,
+  exit 0 in 24.60 s, peak 2,537,074,688 bytes under 4 GiB / two CPUs. Its own
+  learned-profile follow-up also passes: 16.80 s, peak 1,592,258,560 bytes.
+  The protected demo still uses 0.6.4; warehouse writes were disabled and every
+  temporary access credential was revoked and removed.
+- A retained older learning-profile set reproduces a zero-byte placement budget
+  and ten spilled queues before task execution. Those profiles sum to
+  1,338,421,248 state bytes against a 1,283,719,168-byte arena; the successful
+  isolated-profile set sums to 1,258,938,368 bytes after two runs. This narrows
+  the investigation to learned-state funding, but neither deleting profiles nor
+  a successful retry establishes a controller fix. Keep this open for release.
+
 ## How the board works
 
 - **Epic** = one wave of preamble 6.6 (E0 to E5), the release-readiness epic (E6) and the documentation epic (E7). Waves are the gate order, not the start order: an executor starts when its crate's dependencies are merged and its fakes exist (preamble 6.6, rule set by Brackly 2026-09-22), so most of E1 to E4 runs concurrently after wave 0; the "Start ladder" below is the actual schedule. Executors run in separate git worktrees. The PM launches every ready feature at once, bounded only by the build host (about six concurrent cargo builds on the 10-core laptop; more on a bigger host).
