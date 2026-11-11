@@ -25,7 +25,23 @@ use serde_json::{Map, Value, json};
 
 /// The report document's schema: `MAJOR.MINOR`. 2: `tasks` holds every figure of a task, and
 /// `stages` is gone.
-pub const SCHEMA_VERSION: &str = "2.0";
+/// 2.1 adds `execution_fingerprint`, and `job_digest` is the public document digest from every
+/// interface.
+pub const SCHEMA_VERSION: &str = "2.1";
+
+/// The public digest of a job document (0.6.6): `sha256:` and the hex of SHA-256 over its exact
+/// bytes, as Python's `JobSpec.digest()` computes it. The normalized execution fingerprint,
+/// `moruna_plan::job_digest`, is a different identity with its own planning and recovery role.
+pub fn document_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes);
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in hash {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
 
 /// What the document adds to the trace's report, which only the job knows.
 pub struct ReportContext {
@@ -191,6 +207,10 @@ pub fn document(
     object.insert("schema_version".into(), json!(SCHEMA_VERSION));
     object.insert("moruna".into(), json!(env!("CARGO_PKG_VERSION")));
     object.insert("job_digest".into(), json!(job_digest));
+    object.insert(
+        "execution_fingerprint".into(),
+        json!(context.map(|c| moruna_plan::job_digest(&c.job))),
+    );
     if let Some(report) = report {
         object.insert("host".into(), host(report));
     }
@@ -1214,6 +1234,32 @@ mod tests {
         assert!(value.get("host").is_none() && value.get("resources").is_none());
         let bare = document(("ab", None), None, &exit, None);
         assert_eq!(bare["tasks"], json!([]));
+        assert_eq!(bare["execution_fingerprint"], Value::Null);
+    }
+
+    /// 0.6.6: the public document digest is SHA-256 of the exact bytes, as `JobSpec.digest()`
+    /// computes it, and the normalized execution fingerprint is reported beside it, distinct.
+    #[test]
+    fn the_document_digest_and_the_execution_fingerprint_are_distinct() {
+        assert_eq!(
+            document_digest(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            document_digest(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let exit = Exit {
+            code: 0,
+            diagnostic: None,
+        };
+        let context = context();
+        let public = document_digest(b"the document");
+        let value = document(("ab", Some(&public)), None, &exit, Some(&context));
+        assert_eq!(value["job_digest"], public);
+        let fingerprint = moruna_plan::job_digest(&context.job);
+        assert_eq!(value["execution_fingerprint"], fingerprint);
+        assert_ne!(value["job_digest"], value["execution_fingerprint"]);
     }
 
     /// A run that ended before a task ran says it was skipped; one whose morsels failed, failed.

@@ -22,6 +22,7 @@ use serde::de::DeserializeOwned;
 
 pub mod arrow_ipc;
 pub mod conformance;
+pub mod gives;
 #[cfg(feature = "peql")]
 pub mod governed;
 pub mod image;

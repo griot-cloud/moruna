@@ -114,6 +114,26 @@ native contract. Griot's adapter remains the other agent's work.
 | Shipped QEMU/backend, one job digest | Release recipes and native descriptor need contract verification | 0.6.6, verify the published launcher bundle through the host entry point |
 | Runtime `gives`, supervisor shutdown, content caching, kill/resume under load | Deferred release paragraph below | 0.6.6, audit current implementations and focused regressions before closing each item |
 
+### 0.6.6 gate 1: current-code audit (November 11, side session)
+
+Recorded on branch `feature/moruna-0-6-6-security-isolation-610baa`, local
+macOS arm64 only. No Linux, KVM or native-guest profile was available to this
+session (the Podman VM failed to start; CI was off-limits), so every Linux/native
+claim below is a source reading, not a proof.
+
+| Plan area | Reused API | Gap found | Protocol change | Proof now |
+| --- | --- | --- | --- | --- |
+| Job identity | `JobSpec.digest()` (Python), `moruna_plan::job_digest`, launch witness `Key.spec_digest` | The CLI wrote the execution fingerprint into the report's `job_digest`, and `moruna.run` wrote the public MJS digest into the same field | Report schema 2.1: `job_digest` is the public digest from every interface, and `execution_fingerprint` is new. Hello `spec_digest` and the witness key are unchanged (fingerprint) | **Done (gate 3).** HO-T5, the HO-T10 v1/v2 serve tests, `report_doc` unit tests and the Python `test_job_spec` assertion |
+| Disks | `WritableDisk`, exclusive `try_lock`, `launch_owned` | No run/digest binding and no access mode on writable disks | Descriptor: optional `access` (`read_write`/`read_only`) and `grant {job_digest, run_id, attempt}`. `launch_for_run` and `RunAuthority`. The native runtime launches through it | **Partly done (gate 3).** Grant refusal before any disk is opened is unit-tested. Read-only attach (`readonly=on`, shared lock) and interrupted-attachment cleanup need a Linux/KVM run. Ungranted disks stay accepted until `kernel/node/tools/{package,proof}.py` emit grants |
+| Declared `gives` | `Declaration.gives`, `Task.definition`, static `check.rs` edge check, the type grammar `moruna_types` | No runtime check existed. Python spells types as pyarrow does (`int64`), not as Arrow `Display` does | None. Comparison uses the shared grammar's spelling | **Done for host stages and sources (gate 7).** `GuardedKernel` (apply/apply_port/apply_aligned/finish) and `GuardedSource` (read/read_next) are wired in `job/build.rs`. Fused inner tasks and native image tasks (`on_kernel`) are not separately checked |
+| Host isolation | `moruna-vmm/src/jail` (namespaces, seccomp, cgroup leaf) for QEMU and the vsock backend | Host-side *service* processes (port/vsock helpers per run) are not yet given run-owned jails, queues or cgroup allocation | None yet | Not started (gate 2): needs Linux |
+| Service authority | `moruna-storage-format/src/grants.rs` (exact actions, expiry, revocation) | Grants carry no run or launch binding, so cross-run refusal is not expressible | Would change the native storage grant codec (version bump) | Not started (gate 4): needs a native guest proof |
+| Secrets | Resolver/ports carry needs. The jail holds an empty environment | No secret-bearing log policy and no canary test | None yet | Not started (gate 4) |
+| Network | Descriptor `user_network` (slirp in an empty jailed netns) | No policy object, no DNS/TCP/TLS enforcement point and no flow records exist in source | New policy input and flow-record schema | Not started (gate 5): needs Linux, and native KE2 for the guest path |
+| Resources | `microkernel::Resources::admit` (fixed), legacy `machine.rs` CPU hotplug (Linux guest only) | No acknowledged live change across host, guest and runtime | New control message | Not started (gate 6) |
+| Caches | Layer seals, `moruna-storage/src/cache.rs` | Concurrent or corrupt population behaviour unaudited | None yet | Not started (gate 7, caches) |
+| Recovery | Launch witness, checkpoints | No loaded kill/resume harness | None | Not started (gate 8) |
+
 Brackly, November 11: consult him before any deployment that adds cost, including
 the proposed resources, recurring/minimum charges and expected usage charges.
 The Azure Standard-key migration was explicitly approved and handed back with

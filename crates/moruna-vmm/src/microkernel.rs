@@ -52,6 +52,98 @@ pub struct WritableDisk {
     pub bytes: u64,
     /// Explicit bounded NVMe controller serial identity.
     pub serial: String,
+    /// How the guest may use it; read-write unless the host grants less (0.6.6).
+    #[serde(default)]
+    pub access: DiskAccess,
+    /// The run this disk is granted to (0.6.6). A granted disk attaches only to a launch whose
+    /// [`RunAuthority`] matches it exactly; reusing the path needs a fresh grant.
+    #[serde(default)]
+    pub grant: Option<DiskGrant>,
+}
+
+/// How a writable disk is attached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskAccess {
+    /// Read and write, under an exclusive lock for the VM's lifetime.
+    #[default]
+    ReadWrite,
+    /// Read only: opened read-only, attached `readonly=on`, under a shared lock that still
+    /// excludes any writer.
+    ReadOnly,
+}
+
+/// A host's grant of one writable disk to one launch of one job.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskGrant {
+    /// The public job document digest (`sha256:` and 64 lowercase hex digits).
+    pub job_digest: String,
+    /// The run it is granted to, 32 lowercase hex digits.
+    pub run_id: String,
+    /// The launch attempt it is granted to.
+    pub attempt: u32,
+}
+
+/// The identity of the launch a host is starting: what disk grants are checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunAuthority {
+    /// The public job document digest of the run's MJS.
+    pub job_digest: String,
+    /// The run, 32 lowercase hex digits.
+    pub run_id: String,
+    /// This launch's attempt number.
+    pub attempt: u32,
+}
+
+fn lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Check every writable disk's grant against the launch, before any disk is opened. A granted
+/// disk needs a launch identity, and attaches only to that job digest, run and attempt; a
+/// malformed grant is refused. A disk without a grant keeps the unbound 0.6.5 behaviour.
+pub fn authorize_disks(disks: &[WritableDisk], run: Option<&RunAuthority>) -> Result<()> {
+    for disk in disks {
+        let Some(grant) = &disk.grant else {
+            continue;
+        };
+        if !grant
+            .job_digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| lower_hex(hex, 64))
+            || !lower_hex(&grant.run_id, 32)
+        {
+            return Err(bad(format!(
+                "disk {} has a malformed grant: a job digest `sha256:` and 64 hex digits and a \
+                 run id of 32",
+                disk.serial
+            )));
+        }
+        let Some(run) = run else {
+            return Err(bad(format!(
+                "disk {} is granted to a run, and this launch carries no run authority",
+                disk.serial
+            )));
+        };
+        if grant.job_digest != run.job_digest {
+            return Err(bad(format!(
+                "disk {} is granted to job {}, and this launch runs {}",
+                disk.serial, grant.job_digest, run.job_digest
+            )));
+        }
+        if grant.run_id != run.run_id || grant.attempt != run.attempt {
+            return Err(bad(format!(
+                "disk {} is granted to run {} attempt {}, and this launch is run {} attempt {}: \
+                 reuse needs a fresh grant",
+                disk.serial, grant.run_id, grant.attempt, run.run_id, run.attempt
+            )));
+        }
+    }
+    Ok(())
 }
 /// Fixed resources actually provisioned in the immutable initial node image.
 #[derive(Debug, Deserialize)]
@@ -513,6 +605,30 @@ pub fn launch(
         vhost_backend,
         cgroup,
         Acceleration::Kvm,
+        None,
+    )
+}
+
+/// [`launch`] for one run's launch: every granted writable disk is checked against `run`
+/// ([`authorize_disks`]) before any disk is opened.
+pub fn launch_for_run(
+    descriptor: &Path,
+    budget: Budget,
+    runtime_dir: &Path,
+    qemu: &Path,
+    vhost_backend: &Path,
+    cgroup: &Cgroup,
+    run: &RunAuthority,
+) -> Result<RunningNode> {
+    launch_owned(
+        descriptor,
+        budget,
+        runtime_dir,
+        qemu,
+        vhost_backend,
+        cgroup,
+        Acceleration::Kvm,
+        Some(run),
     )
 }
 
@@ -537,6 +653,31 @@ pub fn launch_tcg_proof(
         vhost_backend,
         cgroup,
         Acceleration::TcgProof,
+        None,
+    )
+}
+
+/// [`launch_tcg_proof`] for one run's launch, with its disk grants checked as
+/// [`launch_for_run`] checks them.
+#[cfg(feature = "native-tcg-proof")]
+pub fn launch_tcg_proof_for_run(
+    descriptor: &Path,
+    budget: Budget,
+    runtime_dir: &Path,
+    qemu: &Path,
+    vhost_backend: &Path,
+    cgroup: &Cgroup,
+    run: &RunAuthority,
+) -> Result<RunningNode> {
+    launch_owned(
+        descriptor,
+        budget,
+        runtime_dir,
+        qemu,
+        vhost_backend,
+        cgroup,
+        Acceleration::TcgProof,
+        Some(run),
     )
 }
 
@@ -641,6 +782,7 @@ fn launch_owned(
     vhost_backend: &Path,
     cgroup: &Cgroup,
     acceleration: Acceleration,
+    run: Option<&RunAuthority>,
 ) -> Result<RunningNode> {
     acceleration.check_host()?;
     let qemu = jail::resolve_program(qemu)?;
@@ -649,6 +791,7 @@ fn launch_owned(
         .canonicalize()
         .map_err(|e| VmmError::io("resolve", descriptor.display().to_string(), &e))?;
     let artifacts = inspect(&descriptor)?;
+    authorize_disks(&artifacts.writable_disks, run)?;
     let budget = artifacts.resources.admit(budget)?;
     if artifacts.kernel.bytes > 256 * 1024 * 1024
         || artifacts.initramfs.bytes >= budget.memory_bytes / 2
@@ -775,7 +918,7 @@ fn launch_owned(
         }
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(disk.access == DiskAccess::ReadWrite)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(|e| VmmError::io("open", path.display().to_string(), &e))?;
@@ -793,9 +936,12 @@ fn launch_owned(
         if !disk_identities.insert((metadata.dev(), metadata.ino())) {
             return Err(bad("duplicate NVMe backing object"));
         }
-        file.try_lock()
-            .map_err(|e| bad(format!("NVMe backing already owned or unavailable: {e}")))?;
-        writable.push((path, disk.serial.clone()));
+        match disk.access {
+            DiskAccess::ReadWrite => file.try_lock(),
+            DiskAccess::ReadOnly => file.try_lock_shared(),
+        }
+        .map_err(|e| bad(format!("NVMe backing already owned or unavailable: {e}")))?;
+        writable.push((path, disk.serial.clone(), disk.access));
         disk_leases.push(file);
     }
     // Each socket lives in a directory of its own, so each jail is shown only the sockets it
@@ -943,14 +1089,21 @@ fn launch_owned(
         ]);
         qemu_entries.push(file_entry(disk, jail::Access::Read));
     }
-    for (index, (path, serial)) in writable.iter().enumerate() {
+    for (index, (path, serial, access)) in writable.iter().enumerate() {
+        let (readonly, entry) = match access {
+            DiskAccess::ReadWrite => ("", jail::Access::Write),
+            DiskAccess::ReadOnly => (",readonly=on", jail::Access::Read),
+        };
         push(&[
             "-drive",
-            &format!("file={},format=raw,if=none,id=home{index}", path.display()),
+            &format!(
+                "file={},format=raw,if=none,id=home{index}{readonly}",
+                path.display()
+            ),
             "-device",
             &format!("nvme,drive=home{index},serial={serial}"),
         ]);
-        qemu_entries.push(file_entry(path, jail::Access::Write));
+        qemu_entries.push(file_entry(path, entry));
     }
     // The descriptor may ask for QEMU's user-mode network (Moruna knows nothing of the host
     // it runs on). In the jail it is the guest's only network path, and it ends at the jail's
@@ -1087,6 +1240,106 @@ mod tests {
         .expect("unsupported host must refuse");
         assert!(error.to_string().contains("Linux x86_64"));
     }
+    fn disk(grant: Option<DiskGrant>) -> WritableDisk {
+        WritableDisk {
+            path: "home.raw".into(),
+            bytes: 4096,
+            serial: "home-0".into(),
+            access: DiskAccess::ReadWrite,
+            grant,
+        }
+    }
+    fn authority() -> RunAuthority {
+        RunAuthority {
+            job_digest: format!("sha256:{}", "a".repeat(64)),
+            run_id: "0".repeat(32),
+            attempt: 1,
+        }
+    }
+    fn grant() -> DiskGrant {
+        let run = authority();
+        DiskGrant {
+            job_digest: run.job_digest,
+            run_id: run.run_id,
+            attempt: run.attempt,
+        }
+    }
+
+    /// 0.6.6 gate 3: a granted disk attaches only to the job, run and attempt it is granted to,
+    /// refused before any disk is opened; an ungranted disk keeps the unbound behaviour.
+    #[test]
+    fn disk_grants_bind_to_the_job_run_and_attempt() {
+        let run = authority();
+        authorize_disks(&[disk(None)], None).unwrap();
+        authorize_disks(&[disk(None)], Some(&run)).unwrap();
+        authorize_disks(&[disk(Some(grant()))], Some(&run)).unwrap();
+        let refusal = |disks: &[WritableDisk], run: Option<&RunAuthority>| {
+            authorize_disks(disks, run).unwrap_err().to_string()
+        };
+        assert!(refusal(&[disk(Some(grant()))], None).contains("carries no run authority"));
+        let other_job = RunAuthority {
+            job_digest: format!("sha256:{}", "b".repeat(64)),
+            ..authority()
+        };
+        assert!(
+            refusal(&[disk(Some(grant()))], Some(&other_job)).contains("granted to job sha256:aaa")
+        );
+        let other_run = RunAuthority {
+            run_id: "1".repeat(32),
+            ..authority()
+        };
+        assert!(refusal(&[disk(Some(grant()))], Some(&other_run)).contains("fresh grant"));
+        let retried = RunAuthority {
+            attempt: 2,
+            ..authority()
+        };
+        assert!(refusal(&[disk(Some(grant()))], Some(&retried)).contains("attempt 1"));
+        for malformed in [
+            DiskGrant {
+                job_digest: "a".repeat(64),
+                ..grant()
+            },
+            DiskGrant {
+                job_digest: format!("sha256:{}", "A".repeat(64)),
+                ..grant()
+            },
+            DiskGrant {
+                run_id: "0".repeat(31),
+                ..grant()
+            },
+        ] {
+            assert!(refusal(&[disk(Some(malformed))], Some(&run)).contains("malformed grant"));
+        }
+        // One bad disk among good ones refuses the whole launch.
+        assert!(authorize_disks(&[disk(None), disk(Some(grant()))], Some(&other_run)).is_err());
+    }
+
+    /// The descriptor reads a disk's access mode and grant, and an older descriptor without
+    /// them still reads as read-write and ungranted.
+    #[test]
+    fn writable_disk_access_and_grant_read_from_the_descriptor() {
+        let old: WritableDisk = serde_json::from_value(serde_json::json!(
+            {"path": "h.raw", "bytes": 4096, "serial": "s"}
+        ))
+        .unwrap();
+        assert_eq!(old.access, DiskAccess::ReadWrite);
+        assert_eq!(old.grant, None);
+        let granted: WritableDisk = serde_json::from_value(serde_json::json!({
+            "path": "h.raw", "bytes": 4096, "serial": "s", "access": "read_only",
+            "grant": {"job_digest": grant().job_digest, "run_id": grant().run_id, "attempt": 1}
+        }))
+        .unwrap();
+        assert_eq!(granted.access, DiskAccess::ReadOnly);
+        assert_eq!(granted.grant, Some(grant()));
+        for bad in [
+            serde_json::json!({"path": "h.raw", "bytes": 4096, "serial": "s", "access": "write"}),
+            serde_json::json!({"path": "h.raw", "bytes": 4096, "serial": "s",
+                "grant": {"job_digest": "x", "run_id": "y", "attempt": 1, "extra": 1}}),
+        ] {
+            assert!(serde_json::from_value::<WritableDisk>(bad).is_err());
+        }
+    }
+
     #[test]
     fn requested_job_cannot_change_fixed_node_or_engine_resources() {
         let resources = Resources {

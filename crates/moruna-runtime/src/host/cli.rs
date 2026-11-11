@@ -1442,3 +1442,145 @@ pub fn pulled_images() -> Option<PathBuf> {
     let dir = base.join("moruna").join("images");
     dir.join("oci-layout").is_file().then_some(dir)
 }
+
+#[cfg(test)]
+mod surface_refusal_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+    fn refused(values: &[&str]) -> String {
+        parse(&args(values)).expect_err("refused")
+    }
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+    fn exit_of(values: &[&str]) -> i32 {
+        main_with(
+            &args(values),
+            &Registry::standard(),
+            CancelToken::new(),
+            &no_env,
+            Duration::from_secs(1),
+        )
+    }
+
+    /// Every malformed command line is refused with the option it is about named.
+    #[test]
+    fn malformed_command_lines_are_refused_by_name() {
+        assert!(refused(&["run", "j.json", "--arg"]).contains("--arg needs NAME=VALUE"));
+        assert!(refused(&["run", "j.json", "--arg", "x"]).contains("is NAME=VALUE"));
+        assert!(refused(&["run", "j.json", "--arg", "x=1", "--arg", "x=2"]).contains("twice"));
+        assert!(refused(&["run", "j.json", "--plan"]).contains("--plan needs a path"));
+        assert!(refused(&["run", "j.json", "--image"]).contains("--image needs a path"));
+        assert!(refused(&["run", "j.json", "--sandbox-python"]).contains("needs a path"));
+        assert!(
+            refused(&[
+                "run",
+                "j.json",
+                "--launch-witness",
+                "/a",
+                "--launch-witness",
+                "/b"
+            ])
+            .contains("duplicate")
+        );
+        assert!(refused(&["task-output", "p.json", "--chunk"]).contains("needs a value"));
+        assert!(refused(&["task-output", "p.json", "--chunk", "x"]).contains("nonnegative"));
+        assert!(refused(&["task-output", "p.json", "--max-bytes", "-1"]).contains("byte budget"));
+        assert!(
+            refused(&["task-output", "p.json", "--out", "a", "--out", "b"]).contains("repeated")
+        );
+        assert!(refused(&["task-output", "p.json", "--out", "a"]).contains("requires --out"));
+        assert!(refused(&["kinds", "extra"]).contains("takes no arguments"));
+        assert!(refused(&["check-job"]).contains("which document"));
+        assert!(refused(&["check-job", "a", "b"]).contains("is a second"));
+        assert!(refused(&["explain"]).contains("which document"));
+        assert!(refused(&["explain", "a", "b"]).contains("is a second"));
+        assert!(refused(&["explain", "a", "--planner"]).contains("needs a name"));
+        assert!(refused(&["explain", "a", "--out"]).contains("needs a path"));
+        assert!(refused(&["explain", "a", "--bogus"]).contains("unknown option"));
+        assert!(refused(&["frobnicate"]).contains("unknown command"));
+        assert!(refused(&[]).contains("which command"));
+        assert_eq!(
+            parse(&args(&[
+                "explain",
+                "a",
+                "--planner",
+                "levels",
+                "--out",
+                "o"
+            ])),
+            Ok(Command::Explain {
+                spec: "a".into(),
+                planner: Some("levels".into()),
+                out: Some(PathBuf::from("o")),
+            })
+        );
+        for version in ["--version", "-V", "version"] {
+            assert_eq!(parse(&args(&[version])), Ok(Command::Version));
+        }
+        for help in ["--help", "-h", "help"] {
+            assert_eq!(parse(&args(&[help])), Ok(Command::Help));
+        }
+    }
+
+    /// The surface's exits: what needs no run completes, a refused line or option is a refusal,
+    /// and a task-output read without an authorized reader is refused before anything is read.
+    #[test]
+    fn the_surface_exits_by_command() {
+        assert_eq!(exit_of(&["--version"]), exit::COMPLETED);
+        assert_eq!(exit_of(&["help"]), exit::COMPLETED);
+        assert_eq!(exit_of(&["kinds"]), exit::COMPLETED);
+        assert_eq!(exit_of(&["frobnicate"]), exit::SPEC_REFUSED);
+        assert_eq!(
+            exit_of(&["run", "j.json", "--cost-store", "a", "--cost-store", "b"]),
+            exit::SPEC_REFUSED
+        );
+        assert_eq!(
+            exit_of(&["task-output", "/nonexistent/pin.json"]),
+            exit::SPEC_REFUSED
+        );
+        let mut printed = Vec::new();
+        let refused = task_output(
+            &Registry::standard(),
+            Path::new("/nonexistent/pin.json"),
+            None,
+            None,
+            None,
+            &mut printed,
+        )
+        .unwrap_err();
+        assert!(refused.contains("historical output reader"), "{refused}");
+        assert!(printed.is_empty());
+        assert_ne!(
+            exit_of(&["check-job", "/nonexistent/job.json"]),
+            exit::COMPLETED
+        );
+    }
+
+    /// The guest's budget is the document's own: absent memory or CPU, or a CPU count that is
+    /// not one, is refused naming the field; a fractional CPU rounds up.
+    #[test]
+    fn a_vm_budget_comes_only_from_the_document() {
+        let mut job = moruna_job::Job::from_v1(&moruna_job::JobSpec::new(
+            moruna_job::KindDoc::new("parquet", serde_json::Map::new()),
+            Vec::new(),
+            moruna_job::KindDoc::new("parquet", serde_json::Map::new()),
+        ));
+        job.budget.memory_bytes = None;
+        job.budget.cpu = Some(1.0);
+        assert_eq!(vm_budget(&job).unwrap_err().field, "budget.memory_bytes");
+        job.budget.memory_bytes = Some(1 << 30);
+        job.budget.cpu = None;
+        assert_eq!(vm_budget(&job).unwrap_err().field, "budget.cpu");
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            job.budget.cpu = Some(bad);
+            assert_eq!(vm_budget(&job).unwrap_err().field, "budget.cpu");
+        }
+        job.budget.cpu = Some(1.5);
+        let budget = vm_budget(&job).unwrap();
+        assert_eq!(budget.cpus, 2);
+    }
+}

@@ -209,6 +209,32 @@ impl Control {
         })
     }
 }
+/// The launch identity a native run's disk grants are checked against (0.6.6): the public
+/// digest of the exact MJS bytes the Spec carries, and the witness key's run and attempt. A
+/// version 1 Spec sent as JSON has no exact document bytes, so it carries no job digest and a
+/// granted disk is refused for it.
+fn run_authority(
+    key: &super::launch_witness::Key,
+    spec: &Inbound,
+) -> moruna_vmm::microkernel::RunAuthority {
+    use base64::Engine as _;
+    let job_digest = match spec {
+        Inbound::Spec {
+            spec: serde_json::Value::String(encoded),
+            ..
+        } => base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map(|bytes| crate::report_doc::document_digest(&bytes))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    moruna_vmm::microkernel::RunAuthority {
+        job_digest,
+        run_id: key.run_id.clone(),
+        attempt: key.attempt,
+    }
+}
+
 /// The exact installed launcher tools; no downloading or fallback backend.
 pub struct Tools<'a> {
     /// Explicit QEMU KVM executable.
@@ -218,8 +244,15 @@ pub struct Tools<'a> {
     /// Where the run's jail is accounted: a delegated cgroup, or none.
     pub cgroup: &'a moruna_vmm::jail::Cgroup,
 }
-type NodeLauncher =
-    fn(&Path, Budget, &Path, &Path, &Path, &moruna_vmm::jail::Cgroup) -> Result<RunningNode>;
+type NodeLauncher = fn(
+    &Path,
+    Budget,
+    &Path,
+    &Path,
+    &Path,
+    &moruna_vmm::jail::Cgroup,
+    &moruna_vmm::microkernel::RunAuthority,
+) -> Result<RunningNode>;
 struct NodeBackend<'a> {
     tools: Tools<'a>,
     launch: NodeLauncher,
@@ -424,7 +457,7 @@ impl NativeRun {
             runtime_dir,
             NodeBackend {
                 tools,
-                launch: moruna_vmm::microkernel::launch,
+                launch: moruna_vmm::microkernel::launch_for_run,
             },
             prepared,
             deadline,
@@ -451,7 +484,7 @@ impl NativeRun {
             runtime_dir,
             NodeBackend {
                 tools,
-                launch: moruna_vmm::microkernel::launch_tcg_proof,
+                launch: moruna_vmm::microkernel::launch_tcg_proof_for_run,
             },
             prepared,
             deadline,
@@ -520,6 +553,7 @@ impl NativeRun {
         if Instant::now() >= deadline {
             return Err(refused("launch deadline expired after dispatch intent"));
         }
+        let authority = run_authority(witness.key(), &spec);
         let node = (backend.launch)(
             descriptor,
             budget,
@@ -527,6 +561,7 @@ impl NativeRun {
             backend.tools.qemu,
             backend.tools.vsock,
             backend.tools.cgroup,
+            &authority,
         )?;
         witness.advance(Phase::Launched)?;
         let reader = node.connect(
@@ -778,6 +813,44 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    /// 0.6.6: a native launch's disk authority is the public digest of the Spec's exact MJS
+    /// bytes, with the witness key's run and attempt; a JSON version 1 Spec carries no digest.
+    #[test]
+    fn run_authority_binds_the_public_digest_and_the_launch_identity() {
+        use base64::Engine as _;
+        let key = super::super::launch_witness::Key {
+            run_id: "01".repeat(16),
+            spec_digest: "sha256:fingerprint".into(),
+            host_plan_digest: "plan".into(),
+            node_boot: "02".repeat(16),
+            attempt: 3,
+        };
+        let bytes = b"canonical mjs bytes";
+        let v2 = Inbound::Spec {
+            spec: serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ),
+            plan: None,
+        };
+        let authority = run_authority(&key, &v2);
+        assert_eq!(
+            authority.job_digest,
+            crate::report_doc::document_digest(bytes)
+        );
+        assert_eq!(authority.run_id, key.run_id);
+        assert_eq!(authority.attempt, 3);
+        let v1 = Inbound::Spec {
+            spec: serde_json::json!({"moruna_spec": 1}),
+            plan: None,
+        };
+        assert_eq!(run_authority(&key, &v1).job_digest, "");
+        let garbled = Inbound::Spec {
+            spec: serde_json::Value::String("not base64!".into()),
+            plan: None,
+        };
+        assert_eq!(run_authority(&key, &garbled).job_digest, "");
+    }
+
     #[test]
     fn prepared_key_survives_failed_dispatch_and_never_authorizes_respawn() {
         use super::super::launch_witness::{Probe, probe};

@@ -1177,3 +1177,77 @@ fn report_tasks_name_the_chain_and_are_not_the_job() {
         "report"
     );
 }
+
+/// 0.6.6 gate 7: a task whose inline definition declares what it gives has its stage's output
+/// checked at the runtime boundary, refusing a batch of another schema naming the task and the
+/// field; a task that declares nothing runs unchecked.
+#[test]
+fn a_declared_gives_is_enforced_on_the_stage_output() {
+    use moruna_kernel::arrow::array::{ArrayRef, Int64Array};
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    use moruna_kernel::arrow::record_batch::RecordBatch;
+    use moruna_kernel::{InitCtx, Payload, Tier};
+
+    let mut spec = minimal("/out");
+    spec.kernels.push(doc(
+        json!({"kind": "std", "name": "select", "args": {"columns": ["a"]}}),
+    ));
+    let input = || {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let column = || Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
+        Payload::Table(
+            RecordBatch::try_new(schema, vec![column(), column()]).expect("a batch"),
+            Tier::Host,
+        )
+    };
+    let declaring = |ty: &str| {
+        let mut job = Job::from_v1(&spec);
+        let kinds = kinds();
+        let mut definition = kinds.kernel(&job.field(1), "std").expect("std").0.clone();
+        definition.gives = Some(ArrowSchema {
+            fields: vec![ArrowField {
+                name: "a".into(),
+                data_type: ty.into(),
+                nullable: false,
+            }],
+        });
+        job.tasks[1].definition = Some(definition);
+        let plan = crate::job::plan::default_plan(&job).expect("a plan");
+        build::build(&job, &plan, &kinds, opts(false, &no_env)).expect("builds")
+    };
+    let ctx = InitCtx {
+        instance: 0,
+        device: None,
+        alloc: Arc::new(moruna_testkit::FakeAllocator::new()),
+    };
+
+    // Declared as it gives: the batch passes.
+    let built = declaring("int64");
+    let kernel = &built.spec.kernels[0];
+    let mut state = kernel.init(&ctx).expect("init");
+    kernel.apply(state.as_mut(), input()).expect("fits");
+
+    // Declared otherwise: refused naming the task and the field.
+    let built = declaring("double");
+    let kernel = &built.spec.kernels[0];
+    let mut state = kernel.init(&ctx).expect("init");
+    let refused = kernel
+        .apply(state.as_mut(), input())
+        .expect_err("refused")
+        .to_string();
+    let task = &Job::from_v1(&spec).tasks[1].id;
+    assert!(refused.contains(&format!("`{task}`")), "{refused}");
+    assert!(
+        refused.contains("field `a` is int64, declared double"),
+        "{refused}"
+    );
+
+    // Undeclared: the same kernel's own output, unchecked.
+    let built = v1::build(&spec, &kinds(), opts(false, &no_env)).expect("builds");
+    let kernel = &built.spec.kernels[0];
+    let mut state = kernel.init(&ctx).expect("init");
+    kernel.apply(state.as_mut(), input()).expect("unchecked");
+}

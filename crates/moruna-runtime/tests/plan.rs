@@ -318,7 +318,7 @@ fn pn_t21_a_run_from_its_plan() {
     // run went against the plan beside it.
     let file = outcome.report_file.expect("a report file");
     let document = session::read_report_file(&file).expect("the report file");
-    assert_eq!(document["schema_version"], "2.0");
+    assert_eq!(document["schema_version"], "2.1");
     assert_eq!(document["plan"]["id"], expected.id.as_str());
     assert_eq!(document["plan_steps"].as_array().map(Vec::len), Some(6));
     let report = lines
