@@ -263,6 +263,7 @@ impl Client {
 }
 fn validate_reply(request: &Request<'_>, outcome: &Outcome) -> Result<()> {
     match (&request.operation, outcome) {
+        (Command::Current, Outcome::Head(metadata)) if metadata.object == request.object => Ok(()),
         (Command::Head { version }, Outcome::Head(metadata))
             if metadata.object == request.object && metadata.version == *version =>
         {

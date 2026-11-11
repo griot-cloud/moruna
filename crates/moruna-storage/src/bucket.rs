@@ -682,7 +682,8 @@ fn payload_bytes(view: BufferView) -> Result<Bytes> {
 
 impl Backend for Bucket {
     fn role(&self) -> Option<moruna_storage_format::auth::SessionRole> {
-        Some(moruna_storage_format::auth::SessionRole::BucketHome)
+        // Only a typed `Home` conveys bucket-home; `unclassified` adapters never do.
+        self.role
     }
 
     fn current<'a>(&'a self, scope: &'a Scope, object: &'a Object) -> Operation<'a, Metadata> {
