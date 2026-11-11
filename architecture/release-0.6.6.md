@@ -37,12 +37,16 @@ network service and card drivers remain user processes with explicit capabilitie
 
 ## Execution and authority
 
-1. The host reads and validates MJS with Moruna's existing reader. The job identity
-   is SHA-256 of the canonical MJS bytes. Native boot-asset identities are checked
-   independently and bound to the launch.
+1. The host reads and validates MJS with Moruna's existing reader.
+   `moruna_plan::job_digest` computes SHA-256 over `Job::identity_json()`, including
+   its existing normalization of task names, resume and reporting settings.
+   Serialized MJS can carry a separate transport checksum. Native boot-asset
+   identities are checked independently and bound to the launch.
 2. The host supplies explicit disk, account, service and policy grants for that
    execution. Grants bind to the job digest, a fresh launch identity, permitted
-   operations, deadlines and the intended task/service boundary.
+   operations, deadlines and the intended task/service boundary. Task scope uses
+   its canonical position and declared needs, with display names carried for UI
+   and diagnostics.
 3. Moruna admits the job inside the actual provisioned guest resources. The
    native supervisor and admission service move the required handles into the
    engine and tasks using the current ownership rules.
