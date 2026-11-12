@@ -134,3 +134,30 @@ fn a_task_that_hangs_up_is_closed_to_new_windows() {
         "{after:?}"
     );
 }
+
+#[test]
+fn pidfds_kill_once_and_tolerate_a_process_already_gone() {
+    use moruna_plane_linux::sys;
+    use std::os::fd::AsFd;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let fd = sys::pidfd(child.id()).expect("a pidfd for a live child");
+    sys::kill(fd.as_fd()).expect("killed");
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    // The process has exited and been reaped: a second kill is not an error.
+    sys::kill(fd.as_fd()).expect("an exited process is not an error");
+    // No such process has no pidfd.
+    assert!(sys::pidfd(u32::MAX >> 1).is_err());
+    // A descriptor this process does not hold cannot be claimed.
+    assert!(sys::claim(1 << 20).is_err());
+    // A socket that is not one cannot be shut down.
+    let file = std::fs::File::open("/dev/null").unwrap();
+    assert!(sys::shutdown(file.as_fd()).is_err());
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    sys::shutdown(a.as_fd()).expect("a socket shuts down");
+    drop(b);
+    assert!(sys::now() > 0);
+}

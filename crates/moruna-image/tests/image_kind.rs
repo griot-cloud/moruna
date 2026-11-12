@@ -545,3 +545,23 @@ fn im_t30_a_source_the_filter_kills_is_named() {
         "the stream's fault stays the cause: {e}"
     );
 }
+
+/// IM-T31 a_plane_task_that_ends_before_it_answers_is_named: a plane program that ends before
+/// it answers its first batch ends its stage with its exit status and the batches it owed.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t31_a_plane_task_that_ends_before_it_answers_is_named() {
+    let scratch = Scratch::new("im_t31");
+    let first = layout(&scratch);
+    let quit = run_settings(
+        &scratch,
+        &first,
+        json!({"command": ["/bin/plane_echo", "--quit-first"], "plane": true}),
+    )
+    .expect_err("a task that ends before it answers fails its stage");
+    assert!(
+        quit.contains("kernels[0]") && quit.contains("exited with status 5"),
+        "{quit}"
+    );
+    assert!(quit.contains("for 1 sent"), "{quit}");
+}

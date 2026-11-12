@@ -28,6 +28,10 @@ fn main() {
     };
     let mut input = plane.input(0).unwrap_or_else(|| die("input 0", "taken"));
     let mut output = plane.output(1).unwrap_or_else(|| die("output 1", "taken"));
+    // `--quit-first`: end before the first batch is answered.
+    if flag("--quit-first") {
+        std::process::exit(5);
+    }
     let times = if flag("--twice") { 2 } else { 1 };
     loop {
         let batch = match input.get() {
