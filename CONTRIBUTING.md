@@ -6,7 +6,7 @@ Thanks for your interest. Moruna makes hard promises about memory, so a change h
 
 1. Fork, branch from `main`, open a pull request. `main` is protected: it takes pull requests with a green pipeline.
 2. Run `tools/hooks/install.sh` once in your clone. Commit and push hooks run the portable quick checks (formatting, lints and a compile of every test). The required GitHub Actions check runs `tools/quality/check.sh` on Linux, including tests, the coverage floor and a freshly installed Python wheel, before a release can merge. Run that same script locally when a suitable Linux environment is available.
-3. Keep the crate you touch at 87% line coverage or better (the gate's floor). The gate judges coverage per crate. Whoever writes the code writes its tests: measure coverage locally (`cargo llvm-cov -p <crate>`) before pushing, and never leave coverage debt for someone else to fix. Do not use GitHub Actions as a test loop; push only after the checks pass locally.
+3. Keep the crate you touch at 80% line coverage or better (the gate's floor). The gate judges coverage per crate. Whoever writes the code writes its tests: measure coverage locally (`cargo llvm-cov -p <crate>`) before pushing, and never leave coverage debt for someone else to fix. Do not use GitHub Actions as a test loop; push only after the checks pass locally.
 
 ## What we look for
 

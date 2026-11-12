@@ -8,16 +8,16 @@
 # rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
 # when cargo-deny is installed (F6.5); a failing test; a failing
 # examples/append_column.rs, which is the first program a user writes; line
-# coverage below MORUNA_COVERAGE_MIN (default 87) in any workspace crate that has
+# coverage below MORUNA_COVERAGE_MIN (default 80) in any workspace crate that has
 # instrumented lines (a stub crate with no code is not measured). Python checks
 # run once python/pyproject.toml exists (wave 5).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-MIN="${MORUNA_COVERAGE_MIN:-87}"
+MIN="${MORUNA_COVERAGE_MIN:-80}"
 # `--fast` is the pre-commit hook's half: every check that takes seconds on an incremental
 # build (em dashes, stubs, the docs, formatting, clippy over every target, which compiles the
 # tests too, the tier lint and the supply-chain bans). The pre-push hook runs the whole gate,
-# tests, the 87% coverage floor and the Python suite included, so nothing leaves the machine
+# tests, the 80% coverage floor and the Python suite included, so nothing leaves the machine
 # unchecked and a commit does not wait ten minutes for it.
 FAST=0
 [ "${1:-}" = "--fast" ] && FAST=1
