@@ -110,8 +110,14 @@ jobs:
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov --locked --version 0.8.5
           "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
-      - name: The vmm jail may make user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: The vmm jail may make user namespaces, and reach the programs it binds in
+        # The jail's child binds moruna-vhost-vsock into its root from inside a user namespace
+        # that does not map the runner's user, so it walks the path as "other". An installed
+        # program is on a world-readable path; this one is in target/ under the runner's
+        # home, which is mode 750 ("bind an entry: Permission denied", run 43308583923).
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          chmod o+x "$HOME"
       - name: Delegated cgroups for the measured privileged tests (sandbox, vmm jail)
         run: |
           sudo mkdir -p /sys/fs/cgroup/moruna-cov /sys/fs/cgroup/moruna-jail
