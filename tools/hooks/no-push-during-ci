@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Refuse a push while GitHub Actions still has a run queued or running for the branch
+# being pushed. A new push to a pull request's branch starts another full run and
+# throws away the minutes the running one already spent, so nothing is pushed until
+# the current run has finished. Called by pre-push with the hook's arguments
+# (remote name, remote URL) and its stdin (one line per ref being pushed).
+#
+# Fails closed: when whether CI is running cannot be read (no gh, no network, not
+# signed in), the push is refused.
+set -euo pipefail
+
+remote_url="${2:-}"
+repo="$(printf '%s' "$remote_url" \
+  | sed -nE 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)([^/]+/[^/]+)$#\2#p' \
+  | sed -E 's#\.git$##')"
+# Not a GitHub remote: there are no Actions runs to wait for.
+[ -n "$repo" ] || exit 0
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "pre-push: gh is not installed, so whether CI is running cannot be checked; push refused" >&2
+  exit 1
+fi
+
+refused=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac # tags and other refs
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac        # deleting a branch
+  branch="${remote_ref#refs/heads/}"
+  if ! running="$(gh run list -R "$repo" --branch "$branch" --limit 50 \
+      --json status,workflowName,url \
+      --jq '.[] | select(.status != "completed") | "\(.workflowName) (\(.status)) \(.url)"')"; then
+    echo "pre-push: could not read GitHub Actions runs for $branch; push refused" >&2
+    refused=1
+    continue
+  fi
+  if [ -n "$running" ]; then
+    echo "pre-push: CI is still running for $branch; push refused until it finishes:" >&2
+    printf '  %s\n' "$running" >&2
+    refused=1
+  fi
+done
+exit "$refused"
