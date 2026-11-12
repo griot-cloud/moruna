@@ -451,11 +451,20 @@ def holds(batch):
     let k = kernel(pex(&dir, "holds", function, json!({}), &[]), 2 * GIB);
     let outside = k.outside();
     assert_eq!(outside.in_use().unwrap(), 0, "no child yet");
+    // No child, no peak to read or reset.
+    assert_eq!(outside.peak().unwrap(), None);
+    assert!(!outside.reset_peak().unwrap());
     let mut state = k.init(&ctx()).unwrap();
+    // A mark is started on the child's cgroup before the call; its peak then covers it.
+    let marked = outside.reset_peak().unwrap();
     let before = outside.in_use().unwrap();
     call(&k, state.as_mut()).unwrap();
     let after = outside.in_use().unwrap();
     assert!(after >= before + (60 << 20), "{before} then {after}");
+    if marked {
+        let peak = outside.peak().unwrap().expect("a child has a peak");
+        assert!(peak >= 60 << 20, "{peak}");
+    }
     drop(state);
     assert_eq!(outside.in_use().unwrap(), 0, "the child is gone");
     let _ = std::fs::remove_dir_all(dir);

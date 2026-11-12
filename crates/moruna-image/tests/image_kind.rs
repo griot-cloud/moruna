@@ -352,6 +352,12 @@ fn im_t23_the_process_is_alone() {
         json!({"command": ["/bin/arrow_echo", "--report"], "env": {"EXTRA": "2", "FROM_IMAGE": "3"}}),
     )
     .expect_err("the report exits with status 9");
+    // Under a coverage build the fixture is itself instrumented, and LLVM's profile runtime
+    // sets this marker in the fixture's own environment before it reports: not the launcher's.
+    let e = e.replace(
+        " __LLVM_PROFILE_RT_INIT_ONCE=__LLVM_PROFILE_RT_INIT_ONCE",
+        "",
+    );
     assert!(e.contains("exited with status 9"), "{e}");
     assert!(
         e.contains("report: Uid:\t0\t0\t0\t0"),
