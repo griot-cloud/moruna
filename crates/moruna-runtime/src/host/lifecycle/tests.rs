@@ -715,3 +715,139 @@ fn a_cancel_arriving_after_the_attempt_ends_emits_no_orphan_acknowledgement() {
     lc.end(Ending::Cancelled);
     assert_eq!(said(&told), before);
 }
+
+#[test]
+fn every_engine_error_is_attributed_with_its_code_and_retryability() {
+    use moruna_kernel::{ConvertError, MorunaError, Tier};
+    let layout = Layout {
+        nodes: Vec::new(),
+        sources: vec![0],
+        stages: vec![1],
+        sinks: vec![2],
+        queues: Vec::new(),
+        places: Vec::new(),
+    };
+    let cases: Vec<(MorunaError, Option<usize>, FailureCode, bool)> = vec![
+        (
+            MorunaError::Refused {
+                stage: 1,
+                seq: 3,
+                kernel: "k".into(),
+                requested: 10,
+                in_use: 1,
+                ceiling: 5,
+                features: None,
+            },
+            Some(1),
+            FailureCode::MemoryRefused,
+            false,
+        ),
+        (
+            MorunaError::Source {
+                split: 4,
+                msg: "x".into(),
+            },
+            Some(0),
+            FailureCode::SourceError,
+            true,
+        ),
+        (
+            MorunaError::Sink("x".into()),
+            Some(2),
+            FailureCode::SinkError,
+            true,
+        ),
+        (
+            MorunaError::Alloc {
+                bytes: 1,
+                tier: Tier::Host,
+                budget: 0,
+                in_use: 0,
+            },
+            None,
+            FailureCode::AllocRefused,
+            true,
+        ),
+        (
+            MorunaError::Io {
+                op: "read",
+                target: "t".into(),
+                msg: "m".into(),
+            },
+            None,
+            FailureCode::IoError,
+            true,
+        ),
+        (
+            MorunaError::Staging("x".into()),
+            None,
+            FailureCode::StagingError,
+            true,
+        ),
+        (
+            MorunaError::Convert(ConvertError::MixedDTypes),
+            None,
+            FailureCode::ConvertError,
+            false,
+        ),
+        (
+            MorunaError::Config {
+                name: "spec",
+                msg: "x".into(),
+            },
+            None,
+            FailureCode::SpecRefused,
+            false,
+        ),
+        (
+            MorunaError::Config {
+                name: "other",
+                msg: "x".into(),
+            },
+            None,
+            FailureCode::ConfigRefused,
+            false,
+        ),
+        (
+            MorunaError::Plan("x".into()),
+            None,
+            FailureCode::PlanRefused,
+            false,
+        ),
+        (
+            MorunaError::Resume("x".into()),
+            None,
+            FailureCode::ResumeRefused,
+            false,
+        ),
+        (
+            MorunaError::Unsupported("x"),
+            None,
+            FailureCode::Unsupported,
+            false,
+        ),
+        (MorunaError::Cancelled, None, FailureCode::Cancelled, true),
+    ];
+    for (error, place, code, retry) in cases {
+        let (got_place, got_code, sentence, got_retry) = attribute(&error, &layout);
+        assert_eq!(
+            (got_place, got_code, got_retry),
+            (place, code, retry),
+            "{error}"
+        );
+        assert!(!sentence.is_empty());
+    }
+    // With two sources, a source error belongs to the attempt, not to either.
+    let two = Layout {
+        sources: vec![0, 3],
+        ..layout
+    };
+    let (place, _, _, _) = attribute(
+        &MorunaError::Source {
+            split: 0,
+            msg: String::new(),
+        },
+        &two,
+    );
+    assert_eq!(place, None);
+}
