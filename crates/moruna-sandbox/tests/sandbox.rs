@@ -592,7 +592,7 @@ fn the_child_refuses_what_it_cannot_load() {
         pex(
             &dir,
             "decorated",
-            "import moruna\n\n@moruna.kernel\ndef decorated(b):\n    return b\n",
+            "import moruna\n\n@moruna.function\ndef decorated(b):\n    return b\n",
             json!({}),
             &[],
         ),
@@ -1073,10 +1073,11 @@ fn sb_t23_a_childs_output_is_its_stages() {
     let got = kept.got.lock().unwrap().clone();
     assert!(got.iter().all(|(stage, _)| *stage == Some(2)), "{got:?}");
     let all = joined();
-    assert!(all.contains("Stdout:imported\n"), "{all}");
-    // Written through: the partial line arrives without its newline or a flush.
+    // Written through, write by write: print's text and its newline may arrive as two
+    // writes, and the partial line arrives without its newline or a flush.
+    assert!(all.contains("Stdout:imported"), "{all}");
     assert!(all.contains("Stdout:partial"), "{all}");
-    assert!(all.contains("Stderr:on stderr\n"), "{all}");
+    assert!(all.contains("Stderr:on stderr"), "{all}");
     let record = got
         .iter()
         .find(|(_, t)| t.starts_with("Some(Error):"))

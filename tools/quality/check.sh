@@ -230,8 +230,54 @@ if [ -f Cargo.toml ]; then
     # reports "no coverage data found" instead of an empty summary. That is the
     # "stub, not measured" case of preamble 6.7, not a failure; any other error
     # from cargo-llvm-cov still fails the gate.
-    if ! cargo llvm-cov --workspace --json --summary-only --output-path target/llvm-cov/summary.json \
-        >/dev/null 2>target/llvm-cov/stderr.log; then
+    # The confined-child paths (sandbox, the image kind) are exercised only by their
+    # privileged tests. When this host gives them a delegated cgroup and a standard CPython
+    # 3.14, build that interpreter's wheel and run those tests into the same profile set,
+    # so the floor measures the code they actually run.
+    privileged=""
+    if [ "$(uname -s)" = "Linux" ] && [ -n "${MORUNA_SANDBOX_CGROUP:-}" ] \
+        && [ -z "${MORUNA_SANDBOX_PYTHON:-}" ] && [ -n "${STANDARD:-}" ]; then
+      step "standard CPython 3.14 with this wheel, for the sandbox's privileged tests"
+      sandbox_env="$PWD/target/quality/sandbox-venv"
+      rm -rf "$sandbox_env" target/quality/sandbox-wheel
+      uv venv --quiet --python "$STANDARD" "$sandbox_env"
+      quiet sandbox_wheel uv tool run --from "maturin>=1.15,<2.0" maturin build --release \
+        -i "$sandbox_env/bin/python" -o target/quality/sandbox-wheel
+      uv pip install --quiet --python "$sandbox_env/bin/python" target/quality/sandbox-wheel/*.whl pyarrow numpy
+      export MORUNA_SANDBOX_PYTHON="$sandbox_env/bin/python"
+    fi
+    if [ -n "${MORUNA_SANDBOX_PYTHON:-}" ] && [ -n "${MORUNA_SANDBOX_CGROUP:-}" ]; then
+      privileged=1
+    fi
+    # Run the privileged test targets through cargo-llvm-cov itself, so they are the same
+    # instrumented build and their profiles join the workspace's. Only the test binary runs
+    # as root (moving a child into the delegated cgroup needs it), through cargo's runner;
+    # its profiles are handed back to this user before the report reads them.
+    run_privileged() (
+      if [ "$(id -u)" != 0 ]; then
+        triple="$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')"
+        export "CARGO_TARGET_${triple}_RUNNER=sudo -n -E env PATH=$PATH"
+      fi
+      status=0
+      cargo llvm-cov --no-report -p moruna-sandbox --test sandbox -- --ignored --test-threads=1 \
+        || status=1
+      cargo llvm-cov --no-report -p moruna-image --test image_kind -- --ignored --test-threads=1 \
+        || status=1
+      [ "$(id -u)" = 0 ] || sudo -n chown -R "$(id -u):$(id -g)" target
+      return $status
+    )
+    cargo llvm-cov clean --workspace >/dev/null 2>&1 || true
+    if cargo llvm-cov --workspace --no-report >target/llvm-cov/test.log 2>target/llvm-cov/stderr.log \
+        && { [ -z "$privileged" ] || {
+          step "privileged sandbox and image-kind tests, measured"
+          run_privileged >>target/llvm-cov/test.log 2>>target/llvm-cov/stderr.log; }; } \
+        && cargo llvm-cov report --json --summary-only --output-path target/llvm-cov/summary.json \
+          >/dev/null 2>>target/llvm-cov/stderr.log; then
+      coverage_ok=1
+    else
+      coverage_ok=""
+    fi
+    if [ -z "$coverage_ok" ]; then
       if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
         step "no instrumented lines in any crate (all stubs); coverage not measured"
       else

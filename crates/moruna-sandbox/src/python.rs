@@ -212,11 +212,20 @@ pub(crate) fn load_at(
     for part in attribute.split('.') {
         target = target.getattr(part).map_err(|e| failed(entry, e))?;
     }
-    let type_name = target
-        .get_type()
-        .qualname()
-        .map(|q| q.to_string())
-        .unwrap_or_default();
+    let qualname = |value: &Bound<'_, PyAny>| {
+        value
+            .get_type()
+            .qualname()
+            .map(|q| q.to_string())
+            .unwrap_or_default()
+    };
+    // `@moruna.function` wraps its KernelSpec in a `moruna.Function`; look through it.
+    let type_name = match target.getattr("_handle") {
+        Ok(handle) if matches!(qualname(&handle).as_str(), "KernelSpec" | "StdKernel") => {
+            qualname(&handle)
+        }
+        _ => qualname(&target),
+    };
     if matches!(type_name.as_str(), "KernelSpec" | "StdKernel") {
         return Err(format!(
             "load: `{entry}` is a {type_name}; a package declares its kernel in function.yaml, \

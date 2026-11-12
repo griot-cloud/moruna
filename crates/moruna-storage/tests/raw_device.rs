@@ -119,5 +119,22 @@ fn raw_device_provisions_then_serves_exclusive_aligned_direct_io() {
                 .is_err()
         );
         assert!(device.writer().is_ok());
+        // The same device through the volume layer's block port.
+        use moruna_storage::blocks::Blocks;
+        let blocks: Arc<Device> = Arc::clone(&device);
+        assert_eq!(Blocks::capacity(blocks.as_ref()), capacity);
+        assert_eq!(Blocks::alignment(blocks.as_ref()), alignment);
+        assert_eq!(Blocks::role(blocks.as_ref()), Role::CacheScratch);
+        let tx = Blocks::begin(Arc::clone(&blocks)).unwrap();
+        let mut page = alloc.alloc(alignment, Tier::Host).unwrap();
+        page.as_mut().fill(0x3c);
+        tx.write(at, Arc::new(page).view()).await.unwrap();
+        tx.sync().await.unwrap();
+        let read = tx
+            .read(at, alloc.alloc(alignment, Tier::Host).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read.as_ref()[0], 0x3c);
+        drop(tx);
     });
 }

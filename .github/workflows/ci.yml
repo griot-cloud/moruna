@@ -107,6 +107,13 @@ jobs:
           "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
       - name: The vmm jail may make user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: A delegated cgroup for the sandbox's measured privileged tests
+        run: |
+          sudo mkdir -p /sys/fs/cgroup/moruna-cov
+          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-cov/cgroup.subtree_control
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/moruna-cov
+          echo "MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-cov" >> "$GITHUB_ENV"
       - name: Full Linux quality gate including coverage and the installed wheel
         env:
           MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}

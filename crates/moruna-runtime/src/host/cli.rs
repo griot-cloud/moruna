@@ -1584,3 +1584,50 @@ mod surface_refusal_tests {
         assert_eq!(budget.cpus, 2);
     }
 }
+
+/// `moruna run --vm` refuses what it cannot boot before any VM, jail or run directory exists.
+#[cfg(all(test, target_os = "linux"))]
+mod run_vm_refusals {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("m-runvm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn refused(spec: &Path, plan: Option<&Path>) -> i32 {
+        let dir = spec.parent().unwrap();
+        run_vm(
+            spec,
+            &dir.join("no-image.json"),
+            plan,
+            &dir.join("witness"),
+            CancelToken::new(),
+        )
+    }
+
+    #[test]
+    fn a_missing_oversized_or_invalid_spec_is_refused_before_boot() {
+        let dir = scratch("spec");
+        assert_ne!(refused(&dir.join("absent.json"), None), 0);
+        let big = dir.join("big.json");
+        std::fs::write(&big, vec![b' '; super::super::protocol::MAX_SPEC_LINE + 1]).unwrap();
+        assert_ne!(refused(&big, None), 0);
+        let garbage = dir.join("garbage.json");
+        std::fs::write(&garbage, b"{not json").unwrap();
+        assert_ne!(refused(&garbage, None), 0);
+        assert!(
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .all(
+                    |e| !e.file_name().to_string_lossy().starts_with("moruna-node-")
+                        || e.path().metadata().is_ok()
+                ),
+            "no run directory is left behind for a refused spec"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

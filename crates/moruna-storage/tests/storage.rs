@@ -3524,3 +3524,84 @@ fn st_t6_service_refuses_role_mismatch_and_cache_commands_over_the_socket() {
         }
     });
 }
+
+#[test]
+fn st_t6_staging_catalog_binds_one_scope_to_the_runs_host_budget() {
+    use moruna_storage::{Scope, staging::Catalog, staging::Staging};
+    let scope = Scope {
+        workspace: "workspace".into(),
+        run: "run".into(),
+    };
+    let residency = Arc::new(moruna_testkit::placement::FakePlacement::new().with_budget(100));
+    assert!(matches!(
+        Catalog::new(
+            residency.clone(),
+            Tier::Device(moruna_kernel::DeviceId(0)),
+            scope.clone()
+        ),
+        Err(Error::Invalid(_))
+    ));
+    let bad = Scope {
+        workspace: String::new(),
+        run: "run".into(),
+    };
+    assert!(Catalog::new(residency.clone(), Tier::Host, bad.clone()).is_err());
+    let catalog = Catalog::new(residency.clone(), Tier::Host, scope.clone()).unwrap();
+    let granted = catalog.reserve(&scope, 60).expect("within budget");
+    assert!(matches!(
+        catalog.reserve(&scope, 60),
+        Err(Error::StagingRefused { budget: 100, .. })
+    ));
+    drop(granted);
+    let other = Scope {
+        workspace: "workspace".into(),
+        run: "other".into(),
+    };
+    assert!(matches!(catalog.reserve(&other, 1), Err(Error::Denied)));
+    assert!(catalog.reserve(&bad, 1).is_err());
+}
+
+#[test]
+fn st_t6_uncached_prefetch_reads_each_planned_range_into_its_destination() {
+    use moruna_storage::prefetch::{PlannedRange, fetch};
+    let store = bucket(Arc::new(Verifier::new()));
+    let alloc = FakeAllocator::new();
+    runtime().block_on(async {
+        let meta = store
+            .write(
+                &context(),
+                &object("pf/a"),
+                Arc::new(bytes(&alloc, b"0123456789")).view(),
+            )
+            .await
+            .unwrap();
+        let plan = |offset: u64, len: usize, next_use: u64| PlannedRange {
+            object: meta.object.clone(),
+            version: meta.version.clone(),
+            offset,
+            destination: alloc.alloc(len, Tier::Host).unwrap(),
+            next_use,
+        };
+        let ready = fetch(
+            &store,
+            &context(),
+            vec![plan(5, 3, 2), plan(0, 2, 1)],
+            2,
+            64,
+        )
+        .await
+        .unwrap();
+        let mut got: Vec<(u64, Vec<u8>)> = ready
+            .into_iter()
+            .map(|r| (r.offset, r.buffer.as_ref().to_vec()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(0, b"01".to_vec()), (5, b"567".to_vec())]);
+        // A plan larger than the byte budget is refused before any read.
+        assert!(
+            fetch(&store, &context(), vec![plan(0, 8, 1)], 1, 4)
+                .await
+                .is_err()
+        );
+    });
+}
