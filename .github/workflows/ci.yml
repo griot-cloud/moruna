@@ -201,6 +201,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+      # The standard build too: `moruna build` makes an image's wheels and bytecode with the
+      # runtime's CPython, the standard 3.14, and finds it on the path (test_build*.py).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: standard
+        with:
+          python-version: "3.14"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         id: freethreaded
         with:
@@ -211,7 +217,11 @@ jobs:
       - name: python/tests against a wheel built from this commit
         env:
           MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
-        run: tools/quality/check.sh --python
+          STANDARD: ${{ steps.standard.outputs.python-path }}
+        run: |
+          PATH="$(dirname "$STANDARD"):$PATH"
+          export PATH
+          tools/quality/check.sh --python
       - name: Retain the Python tests' diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
