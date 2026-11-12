@@ -39,7 +39,7 @@ fn a_task_reads_its_input_in_place_and_gets_its_window_back_when_a_put_is_refuse
     let mut input = plane.input(0).expect("input 0");
     {
         let got = input.get().expect("get").expect("a batch");
-        assert_eq!(got.len() as usize >= record.len(), true);
+        assert!(got.len() as usize >= record.len());
         assert!(!got.is_empty());
         assert_ne!(got.addr(), 0);
         assert_eq!(&got.bytes()[..record.len()], &record[..]);
@@ -66,8 +66,7 @@ fn a_task_reads_its_input_in_place_and_gets_its_window_back_when_a_put_is_refuse
     }
     stop.store(true, Ordering::Release);
     engine.join().unwrap();
-    drop(output);
-    drop(input);
+    let _ = (output, input);
     plane.close();
     assert!(
         plane.batch_get(0).is_err(),
