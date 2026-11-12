@@ -7,10 +7,22 @@ Every workspace crate under crates/<name>/ that has at least one instrumented
 line must reach <min_percent> line coverage. Crates with no instrumented lines
 (compiling stubs) are listed and not judged. Files outside crates/ (the bench
 runner, tools) are reported under their top-level directory and judged too.
+
+A crate in EXEMPT is still measured and printed, but not judged: its code runs only
+where no host test can reach it, and another required check proves it instead.
 """
 import json
 import sys
 from collections import defaultdict
+
+# Decided 2026-11-12 (release 0.6.5+0.6.6): moruna-micro is the engine's binding to the
+# Moruna microkernel. Every call it makes is a kernel call that exists only inside the
+# native guest, so host tests reach only its "not on the kernel" answers. The required
+# native boot job runs all production cases through it on the real kernel instead. Remove
+# this entry once guest-side coverage profiles are collected and merged.
+EXEMPT = {
+    "moruna-micro": "guest-only kernel calls; proven by the native boot job, not host lines",
+}
 
 
 def crate_of(path: str) -> str:
@@ -48,6 +60,9 @@ def main() -> int:
             print(f"{crate:<22}{total:>8}{covered:>9}{'n/a':>9}  stub, not measured")
             continue
         pct = 100.0 * covered / total
+        if crate in EXEMPT:
+            print(f"{crate:<22}{total:>8}{covered:>9}{pct:>8.1f}%  exempt: {EXEMPT[crate]}")
+            continue
         ok = pct + 1e-9 >= minimum
         print(f"{crate:<22}{total:>8}{covered:>9}{pct:>8.1f}%  {'ok' if ok else 'BELOW ' + str(minimum) + '%'}")
         if not ok:
