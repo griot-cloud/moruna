@@ -61,13 +61,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  ci:
-    name: build, test, lint
-    # Not on the merge: this job's whole output is the required check on the pull
+  # The pull request's tests run as two jobs side by side, Rust (`rust`) and the Python
+  # package (`python`), so neither waits for the other and a failure in one does not hide
+  # the other's result. `ci` below joins them into the one required check.
+  rust:
+    name: "rust: lints, tests and coverage"
+    # Not on the merge: this job's whole output is part of the required check on the pull
     # request, and running it again on the other side of the merge buys a second
     # opinion on the same commit for twice the minutes.
     if: github.event_name != 'push'
     runs-on: ubuntu-24.04
+    # A hang fails here instead of at GitHub's six-hour default.
+    timeout-minutes: 180
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -138,7 +143,7 @@ jobs:
         run: |
           sudo apt-get install -y -q --no-install-recommends libseccomp2 libslirp0 libglib2.0-0t64
           echo "MORUNA_QEMU=/opt/qemu-proof/bin/qemu-system-x86_64" >> "$GITHUB_ENV"
-      - name: Full Linux quality gate including coverage and the installed wheel
+      - name: Rust quality gate, every workspace test measured against the coverage floor
         env:
           MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
           PYO3_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
@@ -150,7 +155,7 @@ jobs:
         run: |
           export PATH="$(dirname "$STANDARD"):$PATH"
           export PYTHONPATH="$("$MORUNA_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          tools/quality/check.sh
+          tools/quality/check.sh --rust
       - name: Retain Linux quality-gate diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -180,9 +185,60 @@ jobs:
             echo "moruna-kernel has a forbidden runtime dependency" >&2
             exit 1
           fi
+
+  python:
+    name: "python: the package's tests on a wheel built from this commit"
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: freethreaded
+        with:
+          python-version: "3.14t"
+      - name: uv, and the benchmarks' dependencies
+        run: |
+          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow uv
+      - name: python/tests against a wheel built from this commit
+        env:
+          MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
+        run: tools/quality/check.sh --python
+      - name: Retain the Python tests' diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-tests
+          path: target/quality/*.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Python kernel benchmarks
         if: ${{ !cancelled() }}
         run: cd bench/python && python -m pytest -q
+
+  # The required check (branch protection names it, and `tested` below reads it): green only
+  # when both test jobs are. A job of its own so the check's name stays what protection asks
+  # for while the work behind it runs in parallel.
+  ci:
+    name: build, test, lint
+    needs: [rust, python]
+    if: ${{ !cancelled() && github.event_name != 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RUST: ${{ needs.rust.result }}
+          PYTHON: ${{ needs.python.result }}
+        run: |
+          echo "rust: $RUST, python: $PYTHON"
+          [ "$RUST" = success ] && [ "$PYTHON" = success ]
 
   # The microkernel (SDD 20 k, SDD 23 k), on a pull request that touches kernel/ or this
   # file, and never on a push: kernel/ is its own Cargo workspace on a pinned nightly,

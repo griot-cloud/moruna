@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Moruna quality gate. Run by the pre-commit hook (tools/hooks/pre-commit) and by
-# the first CI job (preamble 6.6). It fails on: an em dash in any tracked text
+# Moruna quality gate. Run by the git hooks (tools/hooks, `--fast`) and by CI's two test
+# jobs (preamble 6.6). It fails on: an em dash in any tracked text
 # file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
 # StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab
 # or a page in no toctree under docs/ (tools/docs/check_docs.py; CI also builds
@@ -9,18 +9,25 @@
 # when cargo-deny is installed (F6.5); a failing test; a failing
 # examples/append_column.rs, which is the first program a user writes; line
 # coverage below MORUNA_COVERAGE_MIN (default 80) in any workspace crate that has
-# instrumented lines (a stub crate with no code is not measured). Python checks
-# run once python/pyproject.toml exists (wave 5).
+# instrumented lines (a stub crate with no code is not measured); a failing
+# python/tests run against a wheel built from this commit.
+#
+# Modes:
+#   (none)    the whole gate, everything below.
+#   --fast    the hooks' half: every check that takes seconds on an incremental build (em
+#             dashes, stubs, the docs, formatting, clippy over every target, which compiles
+#             the tests too, the tier lint and the supply-chain bans).
+#   --rust    CI's Rust job: everything except python/tests.
+#   --python  CI's Python job: python/tests against a freshly built wheel, and nothing else.
+#             The two jobs run side by side, so neither waits for the other and a failure in
+#             one does not hide the other's result.
+#
+# The workspace's tests run once, instrumented: the coverage run is the test run. A plain
+# `cargo test --workspace` before it ran every test a second time for nothing (the workspace
+# has no doctests, which cargo-llvm-cov would skip).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 MIN="${MORUNA_COVERAGE_MIN:-80}"
-# `--fast` is the pre-commit hook's half: every check that takes seconds on an incremental
-# build (em dashes, stubs, the docs, formatting, clippy over every target, which compiles the
-# tests too, the tier lint and the supply-chain bans). The pre-push hook runs the whole gate,
-# tests, the 80% coverage floor and the Python suite included, so nothing leaves the machine
-# unchecked and a commit does not wait ten minutes for it.
-FAST=0
-[ "${1:-}" = "--fast" ] && FAST=1
 
 fail() { printf 'quality: FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf 'quality: %s\n' "$*"; }
@@ -41,6 +48,154 @@ quiet() {
     fail "$name (full log: target/quality/$name.log)"
   fi
 }
+
+MODE=all
+case "${1:-}" in
+  "") ;;
+  --fast) MODE=fast ;;
+  --rust) MODE=rust ;;
+  --python) MODE=python ;;
+  *) fail "unknown option ${1}: use --fast, --rust or --python, or none for the whole gate" ;;
+esac
+
+# The coverage build's flags, set inside a subshell. The confined backend exits without
+# atexit handlers. Keep instrumented counters mapped before confinement so its coverage
+# survives _exit too.
+coverage_env() {
+  if [ "$(uname -s)" = "Linux" ]; then
+    coverage_rustflags="${RUSTFLAGS:-$(python3 -c 'import shlex, tomllib; print(shlex.join(tomllib.load(open(".cargo/config.toml", "rb"))["build"]["rustflags"]))')}"
+    export RUSTFLAGS="$coverage_rustflags -Cllvm-args=-runtime-counter-relocation"
+    export LLVM_PROFILE_FILE_NAME="moruna-%p-%m-%c.profraw"
+  fi
+}
+
+# The evidence of a failed measured run: the failing tests from its output, then the end of
+# its errors. A workspace test log is thousands of "ok" lines.
+show_failure() {
+  grep -hE 'FAILED|panicked at|^error|test result: FAILED' "$1" "$2" | head -40 >&2 || true
+  echo "--- last 20 lines of $2 ---" >&2
+  tail -20 "$2" >&2
+}
+
+# Every workspace test, run once and instrumented, then judged per crate against the floor.
+measure_workspace() (
+  coverage_env
+  if [ "$(uname -s)" = "Linux" ]; then
+    # The strict raw adapter needs a real block device: a loop device over a scratch
+    # file, owned by this user for the run, so its tests measure actual direct IO.
+    if [ -z "${MORUNA_RAW_DEVICE:-}" ] && command -v losetup >/dev/null 2>&1; then
+      as_root=""
+      [ "$(id -u)" = 0 ] || as_root="sudo -n"
+      raw_image="$(mktemp "${TMPDIR:-/tmp}/moruna-raw.XXXXXX")"
+      truncate -s 64M "$raw_image"
+      if raw_dev="$($as_root losetup -f --show "$raw_image" 2>/dev/null)"; then
+        [ -z "$as_root" ] || $as_root chown "$(id -u)" "$raw_dev"
+        export MORUNA_RAW_DEVICE="$raw_dev"
+        trap '$as_root losetup -d "$raw_dev" 2>/dev/null; rm -f "$raw_image"' EXIT
+      else
+        rm -f "$raw_image"
+      fi
+    fi
+  fi
+  step "cargo test, measured: line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
+  command -v cargo-llvm-cov >/dev/null 2>&1 \
+    || fail "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview"
+  mkdir -p target/llvm-cov
+  # A workspace in which no crate has an instrumented line (every member a
+  # stub, wave 0 before F0.2 lands) yields no profile at all, and llvm-cov
+  # reports "no coverage data found" instead of an empty summary. That is the
+  # "stub, not measured" case of preamble 6.7, not a failure; any other error
+  # from cargo-llvm-cov still fails the gate.
+  # The confined-child paths (sandbox, the image kind) are exercised only by their
+  # privileged tests. When this host gives them a delegated cgroup and a standard CPython
+  # 3.14, build that interpreter's wheel and run those tests into the same profile set,
+  # so the floor measures the code they actually run.
+  privileged=""
+  if [ "$(uname -s)" = "Linux" ] && [ -n "${MORUNA_SANDBOX_CGROUP:-}" ] \
+      && [ -z "${MORUNA_SANDBOX_PYTHON:-}" ] && [ -n "${STANDARD:-}" ]; then
+    step "standard CPython 3.14 with this wheel, for the sandbox's privileged tests"
+    sandbox_env="$PWD/target/quality/sandbox-venv"
+    rm -rf "$sandbox_env" target/quality/sandbox-wheel
+    uv venv --quiet --python "$STANDARD" "$sandbox_env"
+    quiet sandbox_wheel uv tool run --from "maturin>=1.15,<2.0" maturin build --release \
+      -i "$sandbox_env/bin/python" -o target/quality/sandbox-wheel
+    uv pip install --quiet --python "$sandbox_env/bin/python" target/quality/sandbox-wheel/*.whl pyarrow numpy
+    export MORUNA_SANDBOX_PYTHON="$sandbox_env/bin/python"
+  fi
+  if [ -n "${MORUNA_SANDBOX_PYTHON:-}" ] && [ -n "${MORUNA_SANDBOX_CGROUP:-}" ]; then
+    privileged=1
+  fi
+  # Run the privileged test targets through cargo-llvm-cov itself, so they are the same
+  # instrumented build and their profiles join the workspace's. Only the test binary runs
+  # as root (moving a child into the delegated cgroup needs it), through cargo's runner;
+  # its profiles are handed back to this user before the report reads them.
+  run_privileged() (
+    if [ "$(id -u)" != 0 ]; then
+      triple="$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')"
+      export "CARGO_TARGET_${triple}_RUNNER=sudo -n -E env PATH=$PATH"
+    fi
+    status=0
+    cargo llvm-cov --no-report -p moruna-sandbox --test sandbox -- --ignored --test-threads=1 \
+      || status=1
+    cargo llvm-cov --no-report -p moruna-image --test image_kind -- --ignored --test-threads=1 \
+      || status=1
+    # The launcher's real QEMU boots (software TCG, no KVM needed), inside its jail.
+    if [ -n "${MORUNA_QEMU:-}" ] && [ -n "${MORUNA_JAIL_CGROUP:-}" ]; then
+      cargo llvm-cov --no-report -p moruna-vmm --features native-tcg-proof --test jail_tcg_boot \
+        -- --ignored --test-threads=1 || status=1
+    fi
+    [ "$(id -u)" = 0 ] || sudo -n chown -R "$(id -u):$(id -g)" target
+    return $status
+  )
+  cargo llvm-cov clean --workspace >/dev/null 2>&1 || true
+  if cargo llvm-cov --workspace --no-report >target/llvm-cov/test.log 2>target/llvm-cov/stderr.log \
+      && { [ -z "$privileged" ] || {
+        step "privileged sandbox and image-kind tests, measured"
+        run_privileged >>target/llvm-cov/test.log 2>>target/llvm-cov/stderr.log; }; } \
+      && cargo llvm-cov report --json --summary-only --output-path target/llvm-cov/summary.json \
+        >/dev/null 2>>target/llvm-cov/stderr.log; then
+    coverage_ok=1
+  else
+    coverage_ok=""
+  fi
+  if [ -z "$coverage_ok" ]; then
+    if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
+      step "no instrumented lines in any crate (all stubs); coverage not measured"
+    else
+      show_failure target/llvm-cov/test.log target/llvm-cov/stderr.log
+      fail "cargo llvm-cov failed (full logs: target/llvm-cov/test.log, target/llvm-cov/stderr.log)"
+    fi
+  else
+    cargo llvm-cov report --json --output-path target/llvm-cov/report.json \
+      >/dev/null 2>target/llvm-cov/report-stderr.log \
+      || { cat target/llvm-cov/report-stderr.log >&2; fail "cargo llvm-cov report failed"; }
+    python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
+  fi
+)
+
+# The package's own tests. This used to be gated on python/pyproject.toml, which lives
+# at the repository root, so 32 tests including the one guarding the surface's
+# throughput were run by nothing at all: that is the structural reason a wheel whose
+# first user program hung for ever passed a green gate (found 2026-09-23).
+run_python_tests() {
+  [ -d python/tests ] || return 0
+  if [ -n "${MORUNA_PYTHON:-}" ]; then
+    step "python/tests on ${MORUNA_PYTHON}"
+    # A stale python/moruna/_core*.so shadows an installed wheel, so the suite must run
+    # against a build made now, not whatever was left in the tree.
+    quiet python_tests env MORUNA_PYTHON="$MORUNA_PYTHON" tools/quality/python_tests.sh
+  elif [ "$MODE" = python ]; then
+    fail "--python needs MORUNA_PYTHON, a CPython 3.14t"
+  else
+    step "python/tests not run: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
+  fi
+}
+
+if [ "$MODE" = python ]; then
+  run_python_tests
+  step "OK (python/tests)"
+  exit 0
+fi
 
 step "em dashes"
 EM="$(printf '\xe2\x80\x94')"
@@ -92,12 +247,11 @@ if [ -f Cargo.toml ]; then
   else
     step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml not checked here, the supply-chain workflow checks it"
   fi
-  if [ "$FAST" = "1" ]; then
+  if [ "$MODE" = fast ]; then
     step "OK (fast checks passed. The full release gate runs in required Linux CI)"
     exit 0
   fi
-  step "cargo test"
-  quiet test cargo test --workspace
+  measure_workspace
   # The feature-gated crates are invisible to a default-feature run: moruna-adapters,
   # moruna-polars and moruna-datafusion compile to nothing without `python`, `polars`
   # and `datafusion`, so the gate reported them as stubs and their coverage as "not
@@ -161,149 +315,29 @@ sys.stdout.write(", ".join(absent))
     # A user's `moruna.Source` and `moruna.Sink` (07 e.6, 08 f.10, 2026-09-29): their bridges
     # compile only with `python`, so a default-feature run neither tests nor measures them. The
     # SO-T17..22 and SI-T18..22 tests run here, and the two crates' coverage with the feature on
-    # is judged by the same per-crate rule as the workspace's, below.
-    step "cargo test --features python (moruna-sources, moruna-sinks: the user's Source and Sink)"
-    PYO3_PYTHON="$MORUNA_PYTHON" quiet test_python_ends cargo test -p moruna-sources -p moruna-sinks \
-      --features moruna-sources/python,moruna-sinks/python
+    # is judged by the same per-crate rule as the workspace's, here.
+    step "cargo test --features python, measured: line coverage >= ${MIN}% (moruna-sources, moruna-sinks: the user's Source and Sink)"
+    (
+      coverage_env
+      PYO3_PYTHON="$MORUNA_PYTHON" cargo llvm-cov -p moruna-sources -p moruna-sinks \
+        --features moruna-sources/python,moruna-sinks/python --json --summary-only \
+        --output-path target/llvm-cov/summary-python.json \
+        >target/llvm-cov/test-python.log 2>target/llvm-cov/stderr-python.log \
+        || { show_failure target/llvm-cov/test-python.log target/llvm-cov/stderr-python.log
+             fail "cargo llvm-cov --features python failed (full logs: target/llvm-cov/test-python.log, target/llvm-cov/stderr-python.log)"; }
+    )
+    python3 tools/quality/coverage_gate.py target/llvm-cov/summary-python.json "$MIN"
   else
     step "python adapter not measured: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
   fi
-  step "tests: $(grep -hE '^test result:' target/quality/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
+  step "tests: $(grep -hE '^test result:' target/llvm-cov/test.log 2>/dev/null | awk '{p+=$4; f+=$6; i+=$8} END{print p" passed, "f" failed, "i" ignored"}')"
 
 else
   step "no Cargo.toml at the repository root; Rust checks skipped (wave 0 creates the workspace)"
 fi
 
-if [ -d python/tests ]; then
-  # The package's own tests. This used to be gated on python/pyproject.toml, which lives
-  # at the repository root, so 32 tests including the one guarding the surface's
-  # throughput were run by nothing at all: that is the structural reason a wheel whose
-  # first user program hung for ever passed a green gate (found 2026-09-23).
-  if [ -n "${MORUNA_PYTHON:-}" ]; then
-    step "python/tests on ${MORUNA_PYTHON}"
-    # A stale python/moruna/_core*.so shadows an installed wheel, so the suite must run
-    # against a build made now, not whatever was left in the tree.
-    quiet python_tests env MORUNA_PYTHON="$MORUNA_PYTHON" tools/quality/python_tests.sh
-  else
-    step "python/tests not run: set MORUNA_PYTHON to a CPython 3.14t with pyarrow"
-  fi
-fi
-
-if [ -f python/pyproject.toml ]; then
-  step "ruff and pytest with coverage >= ${MIN}%"
-  command -v ruff >/dev/null 2>&1 || fail "ruff is not installed"
-  ruff check python
-  ( cd python && python3 -m pytest -q --cov=moruna --cov-fail-under="$MIN" )
-fi
-
-# Run the coverage floor after package validation so both produce release evidence.
-if [ -f Cargo.toml ]; then
-  (
-    # The confined backend exits without atexit handlers. Keep instrumented
-    # counters mapped before confinement so its coverage survives _exit too.
-    if [ "$(uname -s)" = "Linux" ]; then
-      coverage_rustflags="${RUSTFLAGS:-$(python3 -c 'import shlex, tomllib; print(shlex.join(tomllib.load(open(".cargo/config.toml", "rb"))["build"]["rustflags"]))')}"
-      export RUSTFLAGS="$coverage_rustflags -Cllvm-args=-runtime-counter-relocation"
-      export LLVM_PROFILE_FILE_NAME="moruna-%p-%m-%c.profraw"
-      # The strict raw adapter needs a real block device: a loop device over a scratch
-      # file, owned by this user for the run, so its tests measure actual direct IO.
-      if [ -z "${MORUNA_RAW_DEVICE:-}" ] && command -v losetup >/dev/null 2>&1; then
-        as_root=""
-        [ "$(id -u)" = 0 ] || as_root="sudo -n"
-        raw_image="$(mktemp "${TMPDIR:-/tmp}/moruna-raw.XXXXXX")"
-        truncate -s 64M "$raw_image"
-        if raw_dev="$($as_root losetup -f --show "$raw_image" 2>/dev/null)"; then
-          [ -z "$as_root" ] || $as_root chown "$(id -u)" "$raw_dev"
-          export MORUNA_RAW_DEVICE="$raw_dev"
-          trap '$as_root losetup -d "$raw_dev" 2>/dev/null; rm -f "$raw_image"' EXIT
-        else
-          rm -f "$raw_image"
-        fi
-      fi
-    fi
-    step "line coverage >= ${MIN}% per crate (cargo-llvm-cov, test code excluded)"
-    command -v cargo-llvm-cov >/dev/null 2>&1 \
-      || fail "cargo-llvm-cov is not installed: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview"
-    mkdir -p target/llvm-cov
-    # A workspace in which no crate has an instrumented line (every member a
-    # stub, wave 0 before F0.2 lands) yields no profile at all, and llvm-cov
-    # reports "no coverage data found" instead of an empty summary. That is the
-    # "stub, not measured" case of preamble 6.7, not a failure; any other error
-    # from cargo-llvm-cov still fails the gate.
-    # The confined-child paths (sandbox, the image kind) are exercised only by their
-    # privileged tests. When this host gives them a delegated cgroup and a standard CPython
-    # 3.14, build that interpreter's wheel and run those tests into the same profile set,
-    # so the floor measures the code they actually run.
-    privileged=""
-    if [ "$(uname -s)" = "Linux" ] && [ -n "${MORUNA_SANDBOX_CGROUP:-}" ] \
-        && [ -z "${MORUNA_SANDBOX_PYTHON:-}" ] && [ -n "${STANDARD:-}" ]; then
-      step "standard CPython 3.14 with this wheel, for the sandbox's privileged tests"
-      sandbox_env="$PWD/target/quality/sandbox-venv"
-      rm -rf "$sandbox_env" target/quality/sandbox-wheel
-      uv venv --quiet --python "$STANDARD" "$sandbox_env"
-      quiet sandbox_wheel uv tool run --from "maturin>=1.15,<2.0" maturin build --release \
-        -i "$sandbox_env/bin/python" -o target/quality/sandbox-wheel
-      uv pip install --quiet --python "$sandbox_env/bin/python" target/quality/sandbox-wheel/*.whl pyarrow numpy
-      export MORUNA_SANDBOX_PYTHON="$sandbox_env/bin/python"
-    fi
-    if [ -n "${MORUNA_SANDBOX_PYTHON:-}" ] && [ -n "${MORUNA_SANDBOX_CGROUP:-}" ]; then
-      privileged=1
-    fi
-    # Run the privileged test targets through cargo-llvm-cov itself, so they are the same
-    # instrumented build and their profiles join the workspace's. Only the test binary runs
-    # as root (moving a child into the delegated cgroup needs it), through cargo's runner;
-    # its profiles are handed back to this user before the report reads them.
-    run_privileged() (
-      if [ "$(id -u)" != 0 ]; then
-        triple="$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')"
-        export "CARGO_TARGET_${triple}_RUNNER=sudo -n -E env PATH=$PATH"
-      fi
-      status=0
-      cargo llvm-cov --no-report -p moruna-sandbox --test sandbox -- --ignored --test-threads=1 \
-        || status=1
-      cargo llvm-cov --no-report -p moruna-image --test image_kind -- --ignored --test-threads=1 \
-        || status=1
-      # The launcher's real QEMU boots (software TCG, no KVM needed), inside its jail.
-      if [ -n "${MORUNA_QEMU:-}" ] && [ -n "${MORUNA_JAIL_CGROUP:-}" ]; then
-        cargo llvm-cov --no-report -p moruna-vmm --features native-tcg-proof --test jail_tcg_boot \
-          -- --ignored --test-threads=1 || status=1
-      fi
-      [ "$(id -u)" = 0 ] || sudo -n chown -R "$(id -u):$(id -g)" target
-      return $status
-    )
-    cargo llvm-cov clean --workspace >/dev/null 2>&1 || true
-    if cargo llvm-cov --workspace --no-report >target/llvm-cov/test.log 2>target/llvm-cov/stderr.log \
-        && { [ -z "$privileged" ] || {
-          step "privileged sandbox and image-kind tests, measured"
-          run_privileged >>target/llvm-cov/test.log 2>>target/llvm-cov/stderr.log; }; } \
-        && cargo llvm-cov report --json --summary-only --output-path target/llvm-cov/summary.json \
-          >/dev/null 2>>target/llvm-cov/stderr.log; then
-      coverage_ok=1
-    else
-      coverage_ok=""
-    fi
-    if [ -z "$coverage_ok" ]; then
-      if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
-        step "no instrumented lines in any crate (all stubs); coverage not measured"
-      else
-        cat target/llvm-cov/stderr.log >&2
-        fail "cargo llvm-cov failed"
-      fi
-    else
-      cargo llvm-cov report --json --output-path target/llvm-cov/report.json \
-        >/dev/null 2>target/llvm-cov/report-stderr.log \
-        || { cat target/llvm-cov/report-stderr.log >&2; fail "cargo llvm-cov report failed"; }
-      python3 tools/quality/coverage_gate.py target/llvm-cov/summary.json "$MIN"
-    fi
-    if [ -n "${MORUNA_PYTHON:-}" ]; then
-      step "line coverage >= ${MIN}% for moruna-sources and moruna-sinks with --features python"
-      PYO3_PYTHON="$MORUNA_PYTHON" cargo llvm-cov -p moruna-sources -p moruna-sinks \
-        --features moruna-sources/python,moruna-sinks/python --json --summary-only \
-        --output-path target/llvm-cov/summary-python.json >/dev/null 2>target/llvm-cov/stderr-python.log \
-        || { cat target/llvm-cov/stderr-python.log >&2; fail "cargo llvm-cov --features python failed"; }
-      python3 tools/quality/coverage_gate.py target/llvm-cov/summary-python.json "$MIN"
-    fi
-  )
+if [ "$MODE" = all ]; then
+  run_python_tests
 fi
 
 step "OK"

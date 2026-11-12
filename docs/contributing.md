@@ -10,7 +10,7 @@ Use the Rust toolchain pinned in `rust-toolchain.toml`. From the repository root
 tools/hooks/install.sh
 ```
 
-Before each commit, a hook runs the quick checks in a few seconds: formatting, lints and a compile of every test. Before each push, it runs the full gate that the continuous integration runs, which also runs every test and requires at least 90% line coverage in each crate. You can run either yourself with `tools/quality/check.sh --fast` or `tools/quality/check.sh`. A change to what Moruna does should include a test that shows it, on any machine: assert a property, such as the peak memory staying under the budget, rather than a figure measured on your own computer.
+Before each commit, a hook runs the quick checks in a few seconds: formatting, lints and a compile of every test. Before each push, it refuses to push while continuous integration is still running for the branch, then runs the quick checks again. The full gate runs in continuous integration as two jobs side by side: the Rust half runs every test once, measured, and requires at least 80% line coverage in each crate; the Python half runs the package's tests against a wheel built from the commit. You can run the quick checks with `tools/quality/check.sh --fast`, the whole gate with `tools/quality/check.sh`, or one half with `--rust` or `--python`. A change to what Moruna does should include a test that shows it, on any machine: assert a property, such as the peak memory staying under the budget, rather than a figure measured on your own computer.
 
 ## Build the Python package
 
