@@ -77,3 +77,60 @@ fn a_record_the_engine_fails_to_write_is_refused_and_its_pages_returned() {
     let garbage = vec![0xffu8; 64];
     assert!(p.load(&garbage).is_err(), "garbage is not a record");
 }
+
+fn shape(inputs: u32, outputs: u32) -> moruna_plane::Shape {
+    moruna_plane::Shape {
+        inputs,
+        outputs,
+        port: false,
+    }
+}
+
+#[test]
+fn grants_offers_and_finishes_refuse_what_the_task_does_not_have() {
+    use moruna_plane::DataPlane;
+    let mut p = LinuxPlane::new(1 << 22);
+    let (task, _end) = p.open(shape(1, 1)).expect("open");
+    assert!(matches!(
+        p.grant(TaskId(99), 0, 4096),
+        Err(PlaneError::Unknown(_))
+    ));
+    assert!(matches!(
+        p.grant(task, 5, 4096),
+        Err(PlaneError::Unknown(_))
+    ));
+    assert!(p.offer(TaskId(99), 0, BatchId(1)).is_err());
+    assert!(
+        p.offer(task, 0, BatchId(12345)).is_err(),
+        "a batch the engine does not hold"
+    );
+    assert!(p.finish(TaskId(99), 0).is_err());
+    assert!(p.drop_batch(BatchId(12345)).is_err());
+    // Windows queue up to the slot's depth, then the slot is full.
+    let mut granted = 0;
+    let full = loop {
+        match p.grant(task, 0, 4096) {
+            Ok(()) => granted += 1,
+            Err(e) => break e,
+        }
+        assert!(granted < 1000, "a slot has a finite depth");
+    };
+    assert!(granted > 0);
+    assert!(matches!(full, PlaneError::Full), "{full:?}");
+}
+
+#[test]
+fn a_task_that_hangs_up_is_closed_to_new_windows() {
+    use moruna_plane::DataPlane;
+    let mut p = LinuxPlane::new(1 << 22);
+    let (task, end) = p.open(shape(1, 1)).expect("open");
+    drop(end);
+    // The engine reads the hang-up and ends the task.
+    let deadline = moruna_plane_linux::sys::now() + 200_000_000;
+    while p.next(deadline).expect("next").is_some() {}
+    let after = p.grant(task, 0, 4096);
+    assert!(
+        matches!(after, Err(PlaneError::Closed) | Err(PlaneError::Unknown(_))),
+        "{after:?}"
+    );
+}

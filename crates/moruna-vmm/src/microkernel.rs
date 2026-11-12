@@ -452,18 +452,21 @@ impl RunningNode {
     /// runs, or has failed at all (a signal, its filter's `SIGSYS` among them, or a nonzero
     /// code), is an error naming its status and its log, whatever QEMU did after it.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>> {
-        let status = self
-            .qemu
-            .lock()
-            .map_err(|_| VmmError::Control("owned QEMU state poisoned".into()))?
-            .try_wait()
-            .map_err(|e| VmmError::io("wait", "owned node QEMU", &e))?;
+        // The back end ends after QEMU disconnects it, so it is read first: a back end seen
+        // ended with QEMU then still running really did end under a live node, rather than
+        // QEMU and then its back end both ending between the two reads.
         let backend = self
             .backend
             .lock()
             .map_err(|_| VmmError::Control("owned vsock state poisoned".into()))?
             .try_wait()
             .map_err(|e| VmmError::io("wait", "owned vsock backend", &e))?;
+        let status = self
+            .qemu
+            .lock()
+            .map_err(|_| VmmError::Control("owned QEMU state poisoned".into()))?
+            .try_wait()
+            .map_err(|e| VmmError::io("wait", "owned node QEMU", &e))?;
         if let Some(ended) = backend
             && (status.is_none() || !ended.success())
         {

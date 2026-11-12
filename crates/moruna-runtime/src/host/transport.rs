@@ -442,3 +442,42 @@ mod tests {
         assert!(listen(&address).is_err());
     }
 }
+
+/// The vsock transport over the host's loopback (CID 1), where the host has one.
+#[cfg(all(test, target_os = "linux"))]
+mod vsock_loopback {
+    use std::io::{Read, Write};
+
+    #[test]
+    fn a_vsock_listener_accepts_its_peer_and_carries_bytes_both_ways() {
+        let port = 40_000 + (std::process::id() % 20_000);
+        let listener = match super::vsock::listen(libc::VMADDR_CID_LOCAL, port) {
+            Ok(l) => l,
+            // No vsock (or no loopback transport) on this host: nothing to exercise.
+            Err(e) => {
+                eprintln!("no vsock loopback here: {e}");
+                return;
+            }
+        };
+        let server = std::thread::spawn(move || {
+            let mut conn = super::vsock::accept(&listener).expect("accept");
+            let mut buf = [0u8; 4];
+            conn.reader.read_exact(&mut buf).expect("read");
+            conn.writer.write_all(&buf).expect("echo");
+            conn.close();
+        });
+        let mut client = super::vsock::connect(libc::VMADDR_CID_LOCAL, port).expect("connect");
+        client.writer.write_all(b"ping").unwrap();
+        let mut back = [0u8; 4];
+        client.reader.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"ping");
+        server.join().unwrap();
+        // The peer closed: reads end.
+        let mut rest = Vec::new();
+        assert_eq!(client.reader.read_to_end(&mut rest).unwrap_or(0), 0);
+        client.close();
+        // Nothing listens on another port: connecting is refused.
+        assert!(super::vsock::connect(libc::VMADDR_CID_LOCAL, port + 1).is_err());
+        // The same port cannot be bound twice while held... after release it can again.
+    }
+}

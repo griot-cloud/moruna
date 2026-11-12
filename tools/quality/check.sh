@@ -263,6 +263,11 @@ if [ -f Cargo.toml ]; then
         || status=1
       cargo llvm-cov --no-report -p moruna-image --test image_kind -- --ignored --test-threads=1 \
         || status=1
+      # The launcher's real QEMU boots (software TCG, no KVM needed), inside its jail.
+      if [ -n "${MORUNA_QEMU:-}" ] && [ -n "${MORUNA_JAIL_CGROUP:-}" ]; then
+        cargo llvm-cov --no-report -p moruna-vmm --features native-tcg-proof --test jail_tcg_boot \
+          -- --ignored --test-threads=1 || status=1
+      fi
       [ "$(id -u)" = 0 ] || sudo -n chown -R "$(id -u):$(id -g)" target
       return $status
     )

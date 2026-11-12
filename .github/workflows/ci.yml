@@ -107,13 +107,37 @@ jobs:
           "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
       - name: The vmm jail may make user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: A delegated cgroup for the sandbox's measured privileged tests
+      - name: Delegated cgroups for the measured privileged tests (sandbox, vmm jail)
         run: |
-          sudo mkdir -p /sys/fs/cgroup/moruna-cov
-          echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/moruna-cov /sys/fs/cgroup/moruna-jail
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
           echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-cov/cgroup.subtree_control
-          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/moruna-cov
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/moruna-jail/cgroup.subtree_control
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/moruna-cov /sys/fs/cgroup/moruna-jail
           echo "MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-cov" >> "$GITHUB_ENV"
+          echo "MORUNA_JAIL_CGROUP=/sys/fs/cgroup/moruna-jail" >> "$GITHUB_ENV"
+      - id: qemu-proof-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/qemu-proof
+          key: qemu-10.2.1-x86_64-softmmu-tcg-seccomp-slirp-vhost-user-ubuntu-24.04-v1
+      - name: QEMU 10.2.1 with seccomp, slirp and vhost-user, for the launcher's TCG boots
+        if: steps.qemu-proof-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev flex bison libseccomp-dev libslirp-dev
+          curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-10.2.1.tar.xz"
+          echo "a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1  qemu.tar.xz" | sha256sum -c -
+          mkdir qemu-proof-src && tar xf qemu.tar.xz --strip-components=1 -C qemu-proof-src
+          cd qemu-proof-src
+          ./configure --prefix=/opt/qemu-proof --target-list=x86_64-softmmu \
+            --without-default-features --enable-tcg --enable-vhost-user --enable-seccomp --enable-slirp \
+            --disable-docs --disable-werror
+          make -j"$(nproc)"
+          sudo make install
+      - name: The proof QEMU's runtime libraries
+        run: |
+          sudo apt-get install -y -q --no-install-recommends libseccomp2 libslirp0 libglib2.0-0t64
+          echo "MORUNA_QEMU=/opt/qemu-proof/bin/qemu-system-x86_64" >> "$GITHUB_ENV"
       - name: Full Linux quality gate including coverage and the installed wheel
         env:
           MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
