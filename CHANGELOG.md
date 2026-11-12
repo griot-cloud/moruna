@@ -2,6 +2,23 @@
 
 ## 0.6.5
 
+This release also carries the security and isolation work planned for 0.6.6.
+
+- **Report schema 2.1: `job_digest` is the public MJS digest everywhere.** `moruna
+  run`, `moruna serve` (version 2) and `moruna.run` all report SHA-256 of the exact
+  MJS bytes, as `JobSpec.digest()` gives it. The CLI previously reported the
+  normalized execution fingerprint there; that is now reported beside it as
+  `execution_fingerprint`. The host protocol's hello `spec_digest` is unchanged.
+- **A task's declared gives are enforced on every batch it produces.** When a task,
+  or else its kind, declares gives, every batch its kernel or source produces is
+  checked against them, in pyarrow's spelling of the types. A mismatch is refused
+  naming the task, the batch and the field, before anything downstream sees it.
+- **Writable disks are bound to their run.** A writable disk in the native
+  descriptor can carry an access mode (`read_write`, or `read_only`, opened under a
+  shared lock and attached read-only) and a grant naming the public job digest,
+  the run and the attempt. Every grant is checked against the launch's authority
+  before any disk is opened. A disk without a grant behaves as before.
+
 - **Recovery preserves a snapshot taken before the first sink commit.** A later
   watermark can no longer replace the snapshot's explicit uncommitted state,
   which could previously make a restart skip output rows. An omitted snapshot
