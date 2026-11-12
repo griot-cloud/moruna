@@ -1091,3 +1091,75 @@ fn sb_t23_a_childs_output_is_its_stages() {
     drop(state);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The whole confinement in one forked child, as the sandbox applies it: the package tree and
+/// assets mounted read only at their places, the host's other files gone, capabilities dropped,
+/// Landlock and the seccomp filter in force. The child reports what it could and could not do.
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn sb_t12_the_whole_confinement_in_a_child() {
+    use moruna_sandbox::confine::{ASSETS, Confinement, TREE, confine};
+    let dir = scratch();
+    let root = dir.join("root");
+    let tree = dir.join("tree");
+    let assets = dir.join("assets");
+    for d in [&root, &tree, &assets] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(tree.join("function.py"), b"def f(b):\n    return b\n").unwrap();
+    std::fs::write(assets.join("weights.bin"), b"w").unwrap();
+    let secret = dir.join("host-only.txt");
+    std::fs::write(&secret, b"not for the child").unwrap();
+    let python_root = PathBuf::from(std::env::var("MORUNA_SANDBOX_PYTHON").expect(TAG))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap();
+    // SAFETY: the child confines only itself and ends with `_exit` and a code naming the
+    // first check that failed.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        moruna_sandbox::coverage::open();
+        let code = match confine(&Confinement {
+            cgroup: PathBuf::from(std::env::var("MORUNA_SANDBOX_CGROUP").expect(TAG)),
+            root: root.clone(),
+            tree: tree.clone(),
+            roots: vec![python_root.clone()],
+            assets: Some(assets.clone()),
+        }) {
+            Err(_) => 10,
+            Ok(()) => {
+                if std::fs::read(Path::new(TREE).join("function.py")).is_err() {
+                    11
+                } else if std::fs::read(Path::new(ASSETS).join("weights.bin")).is_err() {
+                    12
+                } else if std::fs::read(&secret).is_ok() {
+                    13
+                } else if std::fs::write(Path::new(TREE).join("new.py"), b"x").is_ok() {
+                    14
+                } else if !python_root.exists() {
+                    15
+                } else {
+                    0
+                }
+            }
+        };
+        moruna_sandbox::coverage::write();
+        // SAFETY: ends the forked child without the parent's exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: waiting for the child this test forked.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert!(
+        libc::WIFEXITED(status),
+        "the child ended by a signal: {status}"
+    );
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "10 refused, 11 no tree, 12 no assets, 13 host file visible, 14 tree writable, 15 no interpreter"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
