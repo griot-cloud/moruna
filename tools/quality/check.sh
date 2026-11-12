@@ -77,15 +77,48 @@ show_failure() {
   tail -20 "$2" >&2
 }
 
+# What a measured run that has gone on too long is waiting in: the disk, the memory, and for
+# every test process each thread's state, its kernel wait and stack, and its user stack.
+stuck_report() {
+  echo "quality: the measured run is still going after $1s; what it is waiting in:"
+  df -h . "${TMPDIR:-/tmp}" 2>/dev/null || true
+  free -m 2>/dev/null || true
+  for pid in $(pgrep -f 'llvm-cov-target/.*/deps/'); do
+    echo "=== $pid: $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-200)"
+    for task in /proc/"$pid"/task/*; do
+      echo "--- thread ${task##*/} $(cat "$task/comm" 2>/dev/null): state $(awk '{print $3}' "$task/stat" 2>/dev/null), waiting in $(cat "$task/wchan" 2>/dev/null)"
+      $as_root cat "$task/stack" 2>/dev/null | head -20
+    done
+    if command -v gdb >/dev/null 2>&1; then
+      $as_root gdb -p "$pid" -batch -ex 'thread apply all bt 25' 2>/dev/null | grep -E '^(Thread|#)' | head -150
+    fi
+  done
+}
+
+# A hung test must fail the gate and say where it hung. Run 43248792016 sat 55 minutes in
+# SB-T26, which takes seconds anywhere else, until it was cancelled by hand, with nothing to
+# show for it. Past `$1` seconds this prints `stuck_report` and ends the test processes, so the
+# run fails with the evidence; `$2` is the file whose existence means the run finished.
+watchdog() {
+  waited=0
+  while [ "$waited" -lt "$1" ]; do
+    sleep 10
+    waited=$((waited + 10))
+    [ ! -e "$2" ] || return 0
+  done
+  stuck_report "$1" >&2
+  $as_root pkill -KILL -f 'llvm-cov-target/.*/deps/' || true
+}
+
 # Every workspace test, run once and instrumented, then judged per crate against the floor.
 measure_workspace() (
   coverage_env
+  as_root=""
+  [ "$(id -u)" = 0 ] || as_root="sudo -n"
   if [ "$(uname -s)" = "Linux" ]; then
     # The strict raw adapter needs a real block device: a loop device over a scratch
     # file, owned by this user for the run, so its tests measure actual direct IO.
     if [ -z "${MORUNA_RAW_DEVICE:-}" ] && command -v losetup >/dev/null 2>&1; then
-      as_root=""
-      [ "$(id -u)" = 0 ] || as_root="sudo -n"
       raw_image="$(mktemp "${TMPDIR:-/tmp}/moruna-raw.XXXXXX")"
       truncate -s 64M "$raw_image"
       if raw_dev="$($as_root losetup -f --show "$raw_image" 2>/dev/null)"; then
@@ -148,6 +181,17 @@ measure_workspace() (
     return $status
   )
   cargo llvm-cov clean --workspace >/dev/null 2>&1 || true
+  # The host's disk and memory before and after, kept with the logs: a run that slows to a
+  # halt on a full disk or in swap says so.
+  { date -u; df -h . 2>/dev/null; free -m 2>/dev/null; } >target/llvm-cov/resources.log || true
+  finished="$PWD/target/llvm-cov/finished"
+  rm -f "$finished"
+  watchdog_pid=""
+  if [ "$(uname -s)" = "Linux" ]; then
+    # The whole measured run, build included, took 20 minutes on CI's runner.
+    watchdog "${MORUNA_TEST_WATCHDOG:-3600}" "$finished" &
+    watchdog_pid=$!
+  fi
   if cargo llvm-cov --workspace --no-report >target/llvm-cov/test.log 2>target/llvm-cov/stderr.log \
       && { [ -z "$privileged" ] || {
         step "privileged sandbox and image-kind tests, measured"
@@ -158,6 +202,9 @@ measure_workspace() (
   else
     coverage_ok=""
   fi
+  touch "$finished"
+  [ -z "$watchdog_pid" ] || kill "$watchdog_pid" 2>/dev/null || true
+  { date -u; df -h . 2>/dev/null; free -m 2>/dev/null; } >>target/llvm-cov/resources.log || true
   if [ -z "$coverage_ok" ]; then
     if grep -q "no coverage data found" target/llvm-cov/stderr.log; then
       step "no instrumented lines in any crate (all stubs); coverage not measured"
