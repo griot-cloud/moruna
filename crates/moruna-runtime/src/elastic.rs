@@ -91,6 +91,8 @@ pub(crate) struct WatchState {
     draining_since: Option<u64>,
     /// Notes for the report, each once.
     notes: Vec<String>,
+    /// The cap on the arena's host bytes in force, when the ceiling is below its regions (RB4).
+    capped: Option<u64>,
 }
 
 impl WatchState {
@@ -101,6 +103,7 @@ impl WatchState {
             drains: Vec::new(),
             draining_since: None,
             notes: Vec::new(),
+            capped: None,
         }
     }
 
@@ -250,9 +253,9 @@ fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
         // ceiling through its sampler.
         return;
     };
-    let capacity = arena.host_capacity();
-    if capacity >= target.saturating_add(HUGE_PAGE_BYTES) {
-        let marked = arena.shrink(capacity - target);
+    let regions = arena.regions_capacity();
+    if regions >= target.saturating_add(HUGE_PAGE_BYTES) {
+        let marked = arena.shrink(regions - target);
         if marked > 0 {
             let now = crate::report::now_ns();
             state.drains.push(DrainSummary {
@@ -264,21 +267,35 @@ fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
             // A region that was already empty is unmapped at once.
             check_drain(ctx, state);
         }
-        if arena.host_capacity() > target {
-            state.note(format!(
-                "the ceiling fell to {ceiling} bytes, which is below the arena's first region: \
-                 that region is not given back, and the controller holds less of it instead"
-            ));
-        }
-    } else if target >= capacity.saturating_add(HUGE_PAGE_BYTES) {
+    } else if target >= regions.saturating_add(HUGE_PAGE_BYTES) {
         if arena.draining_bytes() > 0 {
             // Pacing (MH 7.1): no new region while an old one is still resident.
             return;
         }
-        match arena.grow(target - capacity) {
+        match arena.grow(target - regions) {
             Ok(_) => {}
             Err(error) => state.note(format!("the arena could not grow: {error}")),
         }
+    }
+    // RB4: the first region never drains, so a ceiling below it is met by capping what the arena
+    // hands out at the arena's share and giving every page no buffer holds back to the operating
+    // system at once; buffers already out stay, and drain as the run moves on. Before, the
+    // region stayed resident whole, and a cgroup limit lowered beneath it killed the run (the
+    // live squeezes of the 0.6.5 benchmark). A ceiling that comes back lifts the cap.
+    let cap = (target < arena.regions_capacity()).then_some(target);
+    if cap != state.capped {
+        arena.cap_host(cap);
+        if let Some(cap) = cap
+            && state.capped.is_none_or(|before| cap < before)
+        {
+            let released = arena.release_free();
+            state.note(format!(
+                "the ceiling fell to {ceiling} bytes, below the arena's first region: the arena \
+                 now hands out at most {cap} bytes, and gave {released} bytes no buffer held back \
+                 to the operating system"
+            ));
+        }
+        state.capped = cap;
     }
     let told = (target.min(arena.host_capacity()), arena.draining_bytes());
     if told != state.budget {

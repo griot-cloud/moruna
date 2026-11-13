@@ -556,6 +556,38 @@ fn an_inelastic_run_is_followed_down() {
     assert!(kernel.max_concurrent_after(changes[0].0 + Duration::from_millis(200)) <= 1);
 }
 
+/// RB4: a ceiling that falls below the arena's first region, which never drains, is met by
+/// capping what the arena hands out and giving the pages no buffer holds back at once; the run
+/// completes and the report says so. Before, the region stayed resident whole, and a cgroup
+/// limit lowered beneath it killed the run (the 0.6.5 benchmark's live squeezes).
+#[test]
+fn a_ceiling_below_the_first_region_is_given_back() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("below");
+    let machine = Machine::new(384 * MIB, 2.0);
+    let start = machine.ceiling();
+    let lower = start / 2;
+    let kernel = Arc::new(Spinner::new(Duration::from_millis(10)));
+    let applies = Arc::clone(&kernel.applies);
+    let spec = spec(&scratch, kernel.clone(), 140);
+    let (report, _, _) = run_on(&machine, spec, move |script| {
+        if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
+            return;
+        }
+        script.set(reading(lower, 2.0));
+    });
+    assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.contains("below the arena's first region"))
+        .unwrap_or_else(|| panic!("the cap is reported: {:?}", report.notes));
+    assert!(
+        note.contains("hands out at most") && note.contains("back to the operating system"),
+        "{note}"
+    );
+}
+
 /// The inelastic default with the host's own files: nothing is injected but the discovery
 /// findings, the machine does not move, and the report has no timeline and no drain.
 #[test]

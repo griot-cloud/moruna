@@ -134,6 +134,9 @@ struct Inner {
     /// Regions retired after draining, and the bytes they held (section j).
     retired_regions: AtomicU64,
     retired_bytes: AtomicU64,
+    /// The most host bytes the arena may have in use, set when the ceiling falls below what its
+    /// regions hold and the first region cannot drain (RB4); `u64::MAX` when uncapped.
+    host_cap: AtomicU64,
     /// Double releases counted by regions that have since been retired.
     retired_double_release: AtomicU64,
 }
@@ -248,6 +251,7 @@ impl Arena {
                 memlock: cfg.memlock,
                 retired_regions: AtomicU64::new(0),
                 retired_bytes: AtomicU64::new(0),
+                host_cap: AtomicU64::new(u64::MAX),
                 retired_double_release: AtomicU64::new(0),
             }),
         }))
@@ -350,12 +354,49 @@ impl Arena {
     /// budget arithmetic compares its target with this and with [`Arena::region_bytes`], which
     /// counts the draining regions too, because they are still resident.
     pub fn host_capacity(&self) -> u64 {
+        self.regions_capacity()
+            .min(self.inner.host_cap.load(Ordering::SeqCst))
+    }
+
+    /// Host bytes in the regions that are not draining, whatever the cap.
+    pub fn regions_capacity(&self) -> u64 {
         self.inner
             .read_host()
             .iter()
             .filter(|r| !r.draining.load(Ordering::SeqCst))
             .map(|r| r.space.bytes())
             .sum()
+    }
+
+    /// Hand out at most `cap` host bytes at once, or lift the cap with `None` (RB4). What the
+    /// limits watcher sets when the ceiling falls below the first region, which never drains:
+    /// buffers already out stay where they are, and an allocation that would take the arena
+    /// past the cap is refused like one the regions cannot serve.
+    pub fn cap_host(&self, cap: Option<u64>) {
+        self.inner
+            .host_cap
+            .store(cap.unwrap_or(u64::MAX), Ordering::SeqCst);
+    }
+
+    /// Give every whole page of the host regions that no buffer holds back to the operating
+    /// system, keeping the mappings (RB4). The next use of a page faults it in and charges it
+    /// then. Nothing is given back from a page-locked region. Returns the bytes given back.
+    pub fn release_free(&self) -> u64 {
+        if self.inner.pinned {
+            return 0;
+        }
+        let page = self.inner.page_bytes as u64;
+        let released: u64 = self
+            .inner
+            .read_host()
+            .iter()
+            .filter(|r| !r.draining.load(Ordering::SeqCst))
+            .map(|r| r.space.release_free(page))
+            .sum();
+        if released > 0 {
+            tracing::info!(target: "arena.release", bytes = released, "free pages given back");
+        }
+        released
     }
 
     #[cfg(feature = "cuda")]
@@ -544,6 +585,13 @@ impl Inner {
     /// (f.3). Oldest first, so the regions a shrink would pick are the last to fill.
     fn alloc_host(&self, bytes: u64) -> core::result::Result<(*mut u8, Tier), (u64, u64)> {
         let host = self.read_host();
+        let cap = self.host_cap.load(Ordering::SeqCst);
+        if cap != u64::MAX {
+            let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+            if in_use.saturating_add(bytes) > cap {
+                return Err((cap, in_use));
+            }
+        }
         for region in host.iter() {
             if region.draining.load(Ordering::SeqCst) {
                 continue;
@@ -572,6 +620,7 @@ impl Allocator for Arena {
             let (bytes, in_use) = live.fold((0u64, 0u64), |(b, u), r| {
                 (b + r.space.bytes(), u + r.space.in_use())
             });
+            let bytes = bytes.min(self.inner.host_cap.load(Ordering::SeqCst));
             return Some(bytes.saturating_sub(in_use));
         }
         self.inner
@@ -722,6 +771,49 @@ mod tests {
         );
         #[cfg(feature = "cuda")]
         let _ = r;
+    }
+
+    /// AR-T15 (RB4). A capped arena refuses what would take it past the cap and serves what fits;
+    /// the pages no buffer holds are given back, and a buffer later carved from them is whole
+    /// and writable; a lifted cap serves the region again.
+    #[test]
+    fn a_capped_arena_gives_back_what_it_does_not_hold() {
+        let arena = Arena::new(cfg(64 << 20)).expect("arena");
+        let kept = arena.alloc(8 << 20, Tier::Host).expect("kept");
+        let freed = arena.alloc(8 << 20, Tier::Host).expect("freed");
+        drop(freed);
+        let released = arena.release_free();
+        assert!(
+            released >= 8 << 20,
+            "at least the freed buffer goes back: {released}"
+        );
+        let in_use = arena.stats().host_in_use;
+        arena.cap_host(Some(in_use + (4 << 20)));
+        assert!(arena.host_capacity() <= in_use + (4 << 20));
+        assert!(
+            matches!(
+                arena.alloc(8 << 20, Tier::Host),
+                Err(MorunaError::Alloc { .. })
+            ),
+            "past the cap is refused"
+        );
+        assert_eq!(
+            arena.available(Tier::Host),
+            Some(4 << 20),
+            "what is left under the cap"
+        );
+        let mut fits = arena.alloc(2 << 20, Tier::Host).expect("under the cap");
+        fits.fill(7);
+        assert!(
+            fits.iter().all(|b| *b == 7),
+            "a given-back page is writable"
+        );
+        arena.cap_host(None);
+        let mut again = arena
+            .alloc(16 << 20, Tier::Host)
+            .expect("the cap is lifted");
+        again.fill(1);
+        drop((kept, fits, again));
     }
 
     #[test]

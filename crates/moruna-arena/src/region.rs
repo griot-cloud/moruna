@@ -244,6 +244,30 @@ fn madvise_hugepage(_m: &Mapping) -> Option<String> {
     Some("MADV_HUGEPAGE is a Linux facility; this host has none".into())
 }
 
+/// Give the pages of `[ptr, ptr + len)` back to the operating system, keeping the mapping: the
+/// next write to them faults a zeroed page in and is charged then (RB4). `len` is a whole number
+/// of pages and the range holds no live buffer. Linux drops them at once (`MADV_DONTNEED`, which
+/// uncharges the cgroup); macOS marks them reusable (`MADV_FREE_REUSABLE`, which takes them out
+/// of the footprint it enforces limits against). Elsewhere, nothing.
+///
+/// # Safety
+/// The range lies inside a mapping this arena owns, is not page-locked, and no buffer is live in
+/// it nor can become live in it until the caller's lock is released.
+pub(crate) unsafe fn discard(ptr: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    // SAFETY: as the caller promises; MADV_DONTNEED on private anonymous memory only discards.
+    let done = unsafe { libc::madvise(ptr.cast(), len, libc::MADV_DONTNEED) == 0 };
+    #[cfg(target_os = "macos")]
+    // SAFETY: as the caller promises; MADV_FREE_REUSABLE only marks the pages reusable.
+    let done = unsafe { libc::madvise(ptr.cast(), len, libc::MADV_FREE_REUSABLE) == 0 };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let done = {
+        let _ = (ptr, len);
+        false
+    };
+    done
+}
+
 /// Touch every page of the region once so the cgroup charge happens at start and the
 /// footprint is flat from the first morsel (f.1, AR-T11). The stride is the page size, or
 /// 2 MiB when transparent huge pages backed the region.
