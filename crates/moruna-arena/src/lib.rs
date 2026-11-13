@@ -62,6 +62,13 @@ pub struct ArenaConfig {
     /// extension: `Arena::new` refuses a run that asks for it with `Unsupported("rdma")`
     /// (E11, CT-I11).
     pub register_rdma: bool,
+    /// Touch every page of the host region at `new` and `grow`, so the whole region is charged
+    /// at start and the footprint is flat from the first morsel (f.1, AR-T11). Off by default
+    /// (RB4, 2026-11-14): a page is charged when a buffer first lands on it. Touching a 6.9 GB
+    /// region took the better part of a second before the first morsel on the benchmark VM, and
+    /// charged gigabytes a run never used; the controller's model already counts the whole
+    /// region as resident (11 f.3), so a region that is not is only a figure it errs above.
+    pub pretouch: bool,
 }
 
 impl Default for ArenaConfig {
@@ -74,6 +81,7 @@ impl Default for ArenaConfig {
             huge_pages: Guarantee::Absent,
             memlock: Guarantee::Absent,
             register_rdma: false,
+            pretouch: false,
         }
     }
 }
@@ -131,6 +139,7 @@ struct Inner {
     align: u64,
     huge_pages: Guarantee,
     memlock: Guarantee,
+    pretouch: bool,
     /// Regions retired after draining, and the bytes they held (section j).
     retired_regions: AtomicU64,
     retired_bytes: AtomicU64,
@@ -208,6 +217,7 @@ impl Arena {
             host_tier == Tier::PinnedHost,
             cfg.huge_pages,
             cfg.memlock,
+            cfg.pretouch,
         )?;
         let pinned = host.pinned;
         let host_tier = if pinned { Tier::PinnedHost } else { Tier::Host };
@@ -249,6 +259,7 @@ impl Arena {
                 align,
                 huge_pages: cfg.huge_pages,
                 memlock: cfg.memlock,
+                pretouch: cfg.pretouch,
                 retired_regions: AtomicU64::new(0),
                 retired_bytes: AtomicU64::new(0),
                 host_cap: AtomicU64::new(u64::MAX),
@@ -278,6 +289,7 @@ impl Arena {
             inner.pinned,
             inner.huge_pages,
             inner.memlock,
+            inner.pretouch,
         )?;
         if host.pinned != inner.pinned {
             // The mapping drops here and is released: the grown region could not be locked, and a

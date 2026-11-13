@@ -60,6 +60,7 @@ struct Inner {
     state_bytes: u64,
     resume: ResumePolicy,
     fail_on: Vec<usize>,
+    refuse_on: Vec<usize>,
     panic_on: Vec<usize>,
     grow_state_by: u64,
     init_calls: AtomicU64,
@@ -71,7 +72,8 @@ struct Inner {
 /// controller and the scheduler are sized against.
 ///
 /// Knobs: `amplification(f64)`, `latency(Duration)`, `stateful(instances, state_bytes)`,
-/// `resume(ResumePolicy)`, `fail_on(applies)`, `panic_on(applies)`, `grow_state_by(bytes)`.
+/// `resume(ResumePolicy)`, `fail_on(applies)`, `refuse_on(applies)`, `panic_on(applies)`,
+/// `grow_state_by(bytes)`.
 /// Observables: `applies()`, `init_calls()`, `restore_calls()`, `checkpoint_calls()`.
 #[derive(Clone)]
 pub struct FakeKernel {
@@ -96,6 +98,7 @@ impl FakeKernel {
                 state_bytes: 0,
                 resume: ResumePolicy::Reinit,
                 fail_on: Vec::new(),
+                refuse_on: Vec::new(),
                 panic_on: Vec::new(),
                 grow_state_by: 0,
                 init_calls: AtomicU64::new(0),
@@ -134,6 +137,13 @@ impl FakeKernel {
     pub fn fail_on(self, applies: &[usize]) -> FakeKernel {
         let applies = applies.to_vec();
         self.rebuild(|b| b.fail_on = applies)
+    }
+
+    /// Knob: these applies, by index, fail with `Alloc`, as a kernel does when the arena cannot
+    /// take its output, so a test can prove the worker waits and applies again (RB5).
+    pub fn refuse_on(self, applies: &[usize]) -> FakeKernel {
+        let applies = applies.to_vec();
+        self.rebuild(|b| b.refuse_on = applies)
     }
 
     /// Knob: these applies, by index, panic, so a test can prove a worker survives one.
@@ -180,6 +190,7 @@ impl FakeKernel {
             state_bytes: self.inner.state_bytes,
             resume: self.inner.resume,
             fail_on: self.inner.fail_on.clone(),
+            refuse_on: self.inner.refuse_on.clone(),
             panic_on: self.inner.panic_on.clone(),
             grow_state_by: self.inner.grow_state_by,
         };
@@ -194,6 +205,7 @@ impl FakeKernel {
                 state_bytes: builder.state_bytes,
                 resume: builder.resume,
                 fail_on: builder.fail_on,
+                refuse_on: builder.refuse_on,
                 panic_on: builder.panic_on,
                 grow_state_by: builder.grow_state_by,
                 init_calls: AtomicU64::new(self.init_calls()),
@@ -221,6 +233,7 @@ struct Builder {
     state_bytes: u64,
     resume: ResumePolicy,
     fail_on: Vec<usize>,
+    refuse_on: Vec<usize>,
     panic_on: Vec<usize>,
     grow_state_by: u64,
 }
@@ -310,6 +323,14 @@ impl Kernel for FakeKernel {
             if fake.grow_by > 0 {
                 fake.ballast.resize(fake.bytes as usize, 0);
             }
+        }
+        if self.inner.refuse_on.contains(&call) {
+            return Err(MorunaError::Alloc {
+                bytes: input.bytes(),
+                tier: input.tier(),
+                budget: 0,
+                in_use: 0,
+            });
         }
         if self.inner.fail_on.contains(&call) {
             return Err(MorunaError::Kernel {

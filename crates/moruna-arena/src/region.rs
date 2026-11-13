@@ -136,6 +136,7 @@ pub(crate) fn new_host(
     want_pinned: bool,
     huge_pages: Guarantee,
     memlock: Guarantee,
+    pretouch: bool,
 ) -> Result<HostRegion> {
     let raw_len =
         usize::try_from(bytes.saturating_add(align)).map_err(|_| MorunaError::Config {
@@ -182,7 +183,11 @@ pub(crate) fn new_host(
     };
 
     let huge_pages_active = apply_huge_pages(&mapping, huge_pages)?;
-    touch(&mapping, if huge_pages_active { 2 << 20 } else { align });
+    // RB4: touched only when asked; otherwise each page is charged when a buffer first lands on
+    // it, and the region costs nothing it is not using (f.1).
+    if pretouch {
+        touch(&mapping, if huge_pages_active { 2 << 20 } else { align });
+    }
     let pinned = if want_pinned {
         apply_memlock(&mapping, memlock)?
     } else {
@@ -421,6 +426,7 @@ mod tests {
             false,
             Guarantee::Unknown,
             Guarantee::Absent,
+            true,
         );
         assert!(matches!(r, Err(MorunaError::Config { name, .. }) if name == "host_profile"));
         let r = new_host(
@@ -429,6 +435,7 @@ mod tests {
             true,
             Guarantee::Absent,
             Guarantee::Unknown,
+            true,
         );
         assert!(matches!(r, Err(MorunaError::Config { name, .. }) if name == "host_profile"));
     }
@@ -441,6 +448,7 @@ mod tests {
             true,
             Guarantee::Absent,
             Guarantee::Probed(false),
+            true,
         );
         assert!(matches!(r, Err(MorunaError::Config { name, .. }) if name == "arena.pin"));
     }
@@ -456,6 +464,7 @@ mod tests {
             false,
             Guarantee::Present,
             Guarantee::Absent,
+            true,
         );
         match r {
             Err(MorunaError::Config { name, .. }) => assert_eq!(name, "host_profile"),
@@ -482,6 +491,7 @@ mod tests {
             false,
             Guarantee::Probed(false),
             Guarantee::Absent,
+            true,
         )
         .expect("a 4 MiB region");
         assert_eq!(region.mapping.base() as usize % (1 << 16), 0);

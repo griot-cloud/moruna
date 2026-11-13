@@ -421,6 +421,7 @@ fn drive(
                 huge_pages: discovered.profile.huge_pages,
                 memlock: discovered.profile.memlock,
                 register_rdma: false,
+                pretouch: false,
             })?;
             (arena.clone() as Arc<dyn Allocator>, Some(arena))
         }

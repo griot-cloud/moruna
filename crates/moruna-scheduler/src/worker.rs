@@ -24,6 +24,23 @@ use crate::instances;
 use crate::shared::{JobOutput, JobRequest, Shared, WorkerJob};
 use crate::slots::BusySlot;
 
+/// How many times a unit whose output the arena refused is applied again (RB5).
+const ALLOC_RETRIES: u32 = 200;
+
+/// Between two attempts of a unit the arena refused: run the offloaded jobs that are queued, on
+/// the slot this worker already holds (a sink's encode is what gives the arena back), until a
+/// backoff of 2 ms doubling to 200 ms has passed.
+fn help_drain(shared: &Shared, attempt: u32) {
+    let wait = Duration::from_millis((2u64 << attempt.min(7)).min(200));
+    let until = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < until {
+        match shared.offload.take() {
+            Some(job) => job(),
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
 /// Run one offloaded job (RB1) under a slot claim, if one is queued and a slot is free.
 fn run_offloaded(shared: &Shared, worker: u16) -> bool {
     if shared.offload.queued() == 0 {
@@ -456,16 +473,41 @@ pub(crate) fn run_task(
             None => &mut no_state,
         };
         let kernel = entry.kernel.clone();
-        std::panic::catch_unwind(AssertUnwindSafe(move || {
-            if joined {
+        if joined {
+            std::panic::catch_unwind(AssertUnwindSafe(move || {
                 let mut inputs = Vec::with_capacity(others.len() + 1);
                 inputs.push(payload);
                 inputs.extend(others);
                 kernel.apply_aligned(state, inputs)
-            } else {
-                kernel.apply_port(state, port, payload)
+            }))
+        } else {
+            // RB5: an arena that cannot take the unit's output is a wall, not an error. The
+            // worker keeps a share of its input, helps the sink drain (the queued encodes free
+            // the arena), waits, and applies again; only a wall that does not move in about forty
+            // seconds goes to the policy. Before, the first refusal ended the run: Enrich over the
+            // whole dataset, a 4.7 MB output with the arena at nine tenths (2026-11-14).
+            let mut payload = payload;
+            let mut attempt = 0u32;
+            loop {
+                let retained = payload.share();
+                let st: &mut dyn KernelState = &mut *state;
+                let kernel = kernel.clone();
+                let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    kernel.apply_port(st, port, payload)
+                }));
+                if matches!(result, Ok(Err(MorunaError::Alloc { .. })))
+                    && attempt < ALLOC_RETRIES
+                    && shared.run_state().is_live()
+                    && !shared.has_exit()
+                {
+                    attempt += 1;
+                    help_drain(shared, attempt);
+                    payload = retained;
+                    continue;
+                }
+                break result;
             }
-        }))
+        }
     };
     let c1 = thread_cpu_ns();
     let t1 = now_ns();

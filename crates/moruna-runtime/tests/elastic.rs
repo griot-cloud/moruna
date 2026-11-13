@@ -330,12 +330,10 @@ fn memory_follows_the_machine() {
     );
     assert_eq!(report.limits_timeline[0].1.memory_ceiling, high);
     assert_eq!(report.limits_timeline[1].1.memory_ceiling, low);
-    assert!(
-        report.peak_anon_bytes > low,
-        "H3: the grown arena is resident, so the run held more than the starting ceiling \
-         ({} against {low})",
-        report.peak_anon_bytes
-    );
+    // H3 asked that the grown region be resident, so the run held more than its starting
+    // ceiling. The arena is charged as buffers land on it since RB4 (02 f.1), so a grown region
+    // costs what the run puts in it and no more; that the run followed the machine up and back
+    // down is the timeline above and the drain below.
     assert!(
         report.peak_fraction_of_ceiling <= 1.0,
         "and it stayed under the ceiling in force at its peak ({} of {})",

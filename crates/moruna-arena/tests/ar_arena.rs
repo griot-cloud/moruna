@@ -293,6 +293,7 @@ fn ar_t12_contains_and_tier_of() {
         huge_pages: Guarantee::Probed(false),
         memlock: Guarantee::Probed(true),
         register_rdma: false,
+        pretouch: false,
     })
     .expect("a pinned arena, or its fallback");
     let tier = if pinned.is_pinned() {
@@ -329,6 +330,7 @@ mod ar_t7 {
             huge_pages: Guarantee::Probed(false),
             memlock: Guarantee::Absent,
             register_rdma: false,
+            pretouch: false,
         })
         .expect("a device arena");
         let b = arena

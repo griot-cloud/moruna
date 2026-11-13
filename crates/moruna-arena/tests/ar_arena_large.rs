@@ -147,7 +147,8 @@ fn ar_t11_flat_footprint() {
     let _big = common::big_region_gate();
     let region = 256u64 << 20;
     let before = resident_bytes();
-    let arena = common::host_arena(region);
+    // The flat footprint is what `pretouch` asks for (f.1); a lazy region is AR-T16.
+    let arena = common::host_arena_touched(region, true);
     let after_new = resident_bytes();
     assert_eq!(arena.region_bytes(Tier::Host), region);
 
@@ -293,4 +294,33 @@ fn ar_t13_region_serves_its_free_space() {
         .alloc(80_000, Tier::Host)
         .expect("the region serves again once its buffers are back");
     assert_eq!(again.len(), 80_000);
+}
+
+// AR-T16 lazy_footprint (RB4, f.1): with `pretouch` off, the default, `new` charges the region
+// almost nothing, and the bytes a run uses are charged as buffers land on them.
+#[test]
+fn ar_t16_lazy_footprint() {
+    let _big = common::big_region_gate();
+    let region = 256u64 << 20;
+    let before = resident_bytes();
+    let arena = common::host_arena_touched(region, false);
+    let after_new = resident_bytes();
+    assert_eq!(arena.region_bytes(Tier::Host), region);
+    let Some((before, after_new)) = before.zip(after_new) else {
+        println!("AR-T16: no /proc/self/statm here; the resident-size check runs in CI on Linux");
+        return;
+    };
+    assert!(
+        after_new.saturating_sub(before) < region / 10,
+        "a lazy region is not charged at new: {} of {region}",
+        after_new.saturating_sub(before)
+    );
+    let mut used = arena.alloc(64 << 20, Tier::Host).expect("64 MiB");
+    used.fill(1);
+    let after_use = resident_bytes().expect("statm");
+    assert!(
+        after_use.saturating_sub(after_new) >= (60 << 20),
+        "the bytes written are charged: {}",
+        after_use.saturating_sub(after_new)
+    );
 }

@@ -17,6 +17,12 @@ pub const MAX_CLASS: u64 = 512 * 1024 * 1024;
 /// A host arena of `host_bytes`, unpinned, with no huge pages: what every test that does
 /// not exercise f.1's guarantee rules wants.
 pub fn host_arena(host_bytes: u64) -> Arc<Arena> {
+    host_arena_touched(host_bytes, false)
+}
+
+/// [`host_arena`], touched at `new` when `pretouch` is set (f.1, AR-T11; RB4 made it off by
+/// default).
+pub fn host_arena_touched(host_bytes: u64, pretouch: bool) -> Arc<Arena> {
     Arena::new(ArenaConfig {
         host_bytes,
         host_tier: TierKind::Host,
@@ -25,6 +31,7 @@ pub fn host_arena(host_bytes: u64) -> Arc<Arena> {
         huge_pages: Guarantee::Probed(false),
         memlock: Guarantee::Absent,
         register_rdma: false,
+        pretouch,
     })
     .expect("a host arena")
 }
