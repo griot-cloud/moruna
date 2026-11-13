@@ -1681,3 +1681,45 @@ fn fact_row_selection_skips() {
         narrow.as_secs_f64() / whole.as_secs_f64()
     );
 }
+
+// SO-T44 fetch_then_decode (RB1, `architecture/worker-io.md`): a Parquet source's read splits
+// into `fetch`, which the drive runs, and `decode`, which any worker runs; on another thread, the
+// two halves give exactly the rows `read` gives, for the whole split and for a row range.
+#[test]
+fn so_t44_fetch_then_decode() {
+    let dir = scratch();
+    let ledger = write_parquet(&dir, "t44", 150, 150, 0);
+    let source = Arc::new(parquet_over(
+        &ledger,
+        seed(FakeReactor::new(), &ledger.path),
+    ));
+    assert!(
+        source.decodes_on_workers(),
+        "RB1: parquet decodes on workers"
+    );
+    let alloc = Arc::new(FakeAllocator::new());
+    let split = source.plan().expect("the plan").remove(0);
+
+    for rows in [None, Some(RowRange { start: 17, end: 93 })] {
+        let whole = block_on(source.read(&split, rows, alloc.as_ref(), Tier::Host)).expect("read");
+        let fetched =
+            block_on(source.fetch(&split, rows, alloc.as_ref(), Tier::Host)).expect("fetch");
+        let (decoder, owned, worker_alloc) =
+            (Arc::clone(&source), split.clone(), Arc::clone(&alloc));
+        // The worker's side: decode on another thread, as a worker would (its error is turned
+        // into a message there, so the thread's result stays small).
+        let decoded = std::thread::spawn(move || {
+            decoder
+                .decode(&owned, fetched, worker_alloc.as_ref(), Tier::Host)
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("the decoding thread")
+        .expect("decode");
+        assert_eq!(
+            table(&decoded),
+            table(&whole),
+            "fetch then decode is the same read ({rows:?})"
+        );
+    }
+}

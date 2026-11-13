@@ -29,16 +29,39 @@ pub(crate) fn read<'a>(
     alloc: &'a dyn Allocator,
     tier: Tier,
 ) -> BoxFuture<'a, Result<Payload>> {
-    Box::pin(async move { read_now(source, split, rows, alloc, tier) })
+    Box::pin(async move {
+        let fetched = fetch_now(source, split, rows, alloc, tier)?;
+        decode_fetched(source, split, fetched, alloc, tier)
+    })
 }
 
-fn read_now(
+/// A split's projected column chunks, fetched and not yet decoded (RB1,
+/// `architecture/worker-io.md`): what the drive hands a worker to decode.
+pub(crate) struct ParquetFetched {
+    chunks: ArenaChunks,
+    range: RowRange,
+}
+
+/// The I/O half of a read: the byte ranges of a split's projected columns, into arena buffers
+/// of `tier`. Waits on the reactor, so it runs on the drive.
+pub(crate) fn fetch<'a>(
+    source: &'a ParquetSource,
+    split: &'a Split,
+    rows: Option<RowRange>,
+    alloc: &'a dyn Allocator,
+    tier: Tier,
+) -> BoxFuture<'a, Result<ParquetFetched>> {
+    Box::pin(async move { fetch_now(source, split, rows, alloc, tier) })
+}
+
+fn fetch_now(
     source: &ParquetSource,
     split: &Split,
     rows: Option<RowRange>,
     alloc: &dyn Allocator,
     tier: Tier,
-) -> Result<Payload> {
+) -> Result<ParquetFetched> {
+    let _ = tier;
     let (file, entry) = source.entry(split)?;
     let range = resolve_range(split, rows)?;
     Counters::add(&source.counters().reads, 1);
@@ -116,7 +139,23 @@ fn read_now(
         fetched.push((start, bytes));
     }
 
-    let chunks = ArenaChunks::new(file_len, fetched);
+    Ok(ParquetFetched {
+        chunks: ArenaChunks::new(file_len, fetched),
+        range,
+    })
+}
+
+/// The CPU half of a read: decode a fetched split into a payload in arena buffers of `tier`.
+/// Never waits on the reactor, so any worker may run it, several at once (RB1).
+pub(crate) fn decode_fetched(
+    source: &ParquetSource,
+    split: &Split,
+    fetched: ParquetFetched,
+    alloc: &dyn Allocator,
+    tier: Tier,
+) -> Result<Payload> {
+    let (file, entry) = source.entry(split)?;
+    let ParquetFetched { chunks, range } = fetched;
     let mask = ProjectionMask::leaves(
         file.metadata.file_metadata().schema_descr(),
         file.projected.iter().copied(),

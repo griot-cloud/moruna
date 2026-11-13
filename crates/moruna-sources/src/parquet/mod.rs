@@ -17,8 +17,8 @@ mod reader;
 use std::sync::Arc;
 
 use moruna_kernel::{
-    Allocator, BoxFuture, ObjectMetadata, Payload, Reactor, Result, RowRange, Source, SourceSchema,
-    Split, Tier,
+    Allocator, BoxFuture, Fetched, ObjectMetadata, Payload, Reactor, Result, RowRange, Source,
+    SourceSchema, Split, Tier,
 };
 
 use crate::stats::{Counters, SourceStats};
@@ -197,5 +197,35 @@ impl Source for ParquetSource {
         tier: Tier,
     ) -> BoxFuture<'a, Result<Payload>> {
         read::read(self, split, rows, alloc, tier)
+    }
+
+    fn decodes_on_workers(&self) -> bool {
+        true
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        split: &'a Split,
+        rows: Option<RowRange>,
+        alloc: &'a dyn Allocator,
+        tier: Tier,
+    ) -> BoxFuture<'a, Result<Fetched>> {
+        Box::pin(async move {
+            let fetched = read::fetch(self, split, rows, alloc, tier).await?;
+            Ok(Fetched(Box::new(fetched)))
+        })
+    }
+
+    fn decode(
+        &self,
+        split: &Split,
+        fetched: Fetched,
+        alloc: &dyn Allocator,
+        tier: Tier,
+    ) -> Result<Payload> {
+        let fetched = fetched.0.downcast::<read::ParquetFetched>().map_err(|_| {
+            crate::util::source_err(split.id, "decode was given another source's fetch")
+        })?;
+        read::decode_fetched(self, split, *fetched, alloc, tier)
     }
 }

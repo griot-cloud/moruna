@@ -411,16 +411,25 @@ fn ho_t8_checkpoint_then_cancel() {
     let (reader, mut writer, _close) = conn.into_parts();
     let mut reader = BufReader::new(reader);
     assert_eq!(read_one(&mut reader)["type"], "hello");
+    // Every message is kept: a task may end before the cancel (a source whose reads all landed
+    // while the one worker was still on the kernel), and its end is part of the conversation.
+    let mut earlier: Vec<(Instant, Value)> = Vec::new();
+    let mut heartbeats = 0;
     // Two heartbeats in, the probe is over and the scheduler is running.
-    assert_eq!(read_beside_events(&mut reader)["type"], "heartbeat");
-    assert_eq!(read_beside_events(&mut reader)["type"], "heartbeat");
+    while heartbeats < 2 {
+        let message = read_one(&mut reader);
+        if message["type"] == "heartbeat" {
+            heartbeats += 1;
+        }
+        earlier.push((Instant::now(), message));
+    }
     assert!(!manifest.exists(), "no manifest before it is asked for");
     writer
         .write_all(b"{\"type\":\"checkpoint\"}\n")
         .expect("checkpoint");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !manifest.exists() && Instant::now() < deadline {
-        let _ = read_one(&mut reader);
+        earlier.push((Instant::now(), read_one(&mut reader)));
     }
     assert!(manifest.exists(), "the manifest was written on request");
     writer
@@ -431,9 +440,11 @@ fn ho_t8_checkpoint_then_cancel() {
     let exit_msg = &messages.last().expect("exit").1;
     assert_eq!(exit_msg["type"], "exit");
     assert_eq!(exit_msg["code"], 130);
-    // The cancel reached the run, every task ended by it, and the cancel's end came last of the
-    // events: a task running was cancelled, one that never started was skipped.
-    let events = events_of(&messages);
+    // The cancel reached the run, every task still running ended by it, and the cancel's end
+    // came last of the events: a task running was cancelled, one that never started was
+    // skipped, and one that had already finished had completed before the cancel.
+    let everything: Vec<(Instant, Value)> = earlier.into_iter().chain(messages.clone()).collect();
+    let events = events_of(&everything);
     let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
     let acknowledged = kinds
         .iter()
@@ -450,12 +461,21 @@ fn ho_t8_checkpoint_then_cancel() {
     assert_eq!(lifecycle.last().unwrap()["disposition"], "cancelled");
     for task in ["source", "kernel-1", "sink"] {
         let end = ended(&events, task);
+        let at = position(&events, &end);
+        let finished_first = end["kind"] == "task_completed"
+            && end["outcome"] == "succeeded"
+            && at < acknowledged
+            && task == "source";
         assert!(
-            (end["kind"] == "task_completed" && end["outcome"] == "cancelled")
+            finished_first
+                || (end["kind"] == "task_completed" && end["outcome"] == "cancelled")
                 || (end["kind"] == "task_skipped" && end["reason"] == "cancelled"),
             "{task}: {end}"
         );
-        assert!(position(&events, &end) > acknowledged);
+        assert!(
+            finished_first || at > acknowledged,
+            "{task} ended by the cancel"
+        );
     }
     let on_disk = report_file(scratch.path());
     assert_eq!(on_disk["exit"]["code"], 130);

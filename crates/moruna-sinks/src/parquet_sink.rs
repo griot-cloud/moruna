@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use moruna_kernel::arrow::datatypes::SchemaRef;
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    Allocator, BoxFuture, Buffer, Completion, MorunaError, Payload, PayloadKind, PayloadSpec,
-    Reactor, Result, RunId, Seq, Sink, SinkSummary, SourceSchema, TierPref,
+    Allocator, BoxFuture, Buffer, Completion, Encoded, MorunaError, Payload, PayloadKind,
+    PayloadSpec, Reactor, Result, RunId, Seq, Sink, SinkSummary, SourceSchema, TierPref,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
@@ -86,6 +86,16 @@ struct Current {
     rows: u64,
 }
 
+/// One file an encode can write into, and the byte count it rolls at (f.1). The sink keeps as
+/// many lanes as encodes have run at once (RB1, `architecture/worker-io.md`): a worker takes a
+/// free lane or opens one, so encodes never contend for one writer and there is no setting for
+/// how many there are. Lock order: a lane, then `Inner`, never the other way.
+#[derive(Default)]
+struct Lane {
+    current: Option<Current>,
+    roll_bytes: u64,
+}
+
 /// A rolled file whose bytes are with the reactor and not yet committed.
 struct Pending {
     entry: CommittedFile,
@@ -102,12 +112,8 @@ struct Inner {
     declared: Option<SchemaRef>,
     /// The output schema, adopted from the first payload that arrives (f.1).
     schema: Option<SchemaRef>,
-    current: Option<Current>,
     ledger: Ledger,
     stats: SinkStats,
-    /// The byte count the open file rolls at (f.1): `file_bytes`, or the smaller buffer the
-    /// arena could serve.
-    roll_bytes: u64,
 }
 
 /// A sink that writes Arrow batches as Parquet files under a prefix (e.2).
@@ -119,6 +125,8 @@ pub struct ParquetSink {
     alloc: Arc<dyn Allocator>,
     run_id: RunId,
     inner: Mutex<Inner>,
+    /// The files encodes write into, one per encode that has run at once (RB1).
+    lanes: Mutex<Vec<Arc<Mutex<Lane>>>>,
     /// The file buffers, the two taken at `open` and the one kept after each write (f.1).
     buffers: FileBuffers,
 }
@@ -150,11 +158,10 @@ impl ParquetSink {
                 phase: Phase::Created,
                 declared: None,
                 schema: None,
-                current: None,
                 ledger: Ledger::new(KIND),
                 stats: SinkStats::default(),
-                roll_bytes: 0,
             }),
+            lanes: Mutex::new(Vec::new()),
             buffers,
         })
     }
@@ -175,26 +182,41 @@ impl ParquetSink {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Allocate the next file's buffer and its writer, and settle the byte count the file will
-    /// roll at. `min_bytes` is 0 for an ordinary file and twice a single oversized morsel's
-    /// bytes when one is on its way in (section h).
+    /// Every lane the sink has opened so far.
+    fn lanes(&self) -> Vec<Arc<Mutex<Lane>>> {
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Allocate the next file's buffer and its writer in `lane`, and settle the byte count the
+    /// file will roll at. `min_bytes` is 0 for an ordinary file and twice a single oversized
+    /// morsel's bytes when one is on its way in (section h).
     ///
     /// f.1: the buffer is not `file_bytes` reserved in advance. The sink asks for
     /// `file_bytes + footer`, halves on `Alloc` down to `row_group_bytes + footer`, and rolls
     /// at whatever it got, so `sink.file_bytes` is an upper bound on the file and the arena's
     /// free space is the other. A 1 GiB default that reserved a gigabyte could not open inside
-    /// any budget below about 1.2 GiB, which is most of them.
-    fn open_file(&self, inner: &mut Inner, min_bytes: u64) -> Result<()> {
-        let Some(schema) = inner.schema.clone() else {
-            return Err(MorunaError::Sink("the sink has no schema".into()));
+    /// any budget below about 1.2 GiB, which is most of them. With several lanes the file
+    /// target is shared between them, so the lanes together ask for what one file would.
+    fn open_file(&self, lane: &mut Lane, min_bytes: u64) -> Result<()> {
+        let (schema, index) = {
+            let mut inner = self.lock();
+            let Some(schema) = inner.schema.clone() else {
+                return Err(MorunaError::Sink("the sink has no schema".into()));
+            };
+            (schema, inner.ledger.take_index())
         };
-        let (buf, roll_bytes) = self.buffers.alloc_file_buf(
-            min_bytes,
-            self.cfg.row_group_bytes,
-            self.cfg.file_bytes,
-        )?;
-        inner.roll_bytes = roll_bytes;
-        inner.stats.roll_bytes = roll_bytes;
+        let lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            .max(1) as u64;
+        let file_bytes = (self.cfg.file_bytes / lanes).max(self.cfg.row_group_bytes);
+        let (buf, roll_bytes) =
+            self.buffers
+                .alloc_file_buf(min_bytes, self.cfg.row_group_bytes, file_bytes)?;
+        lane.roll_bytes = roll_bytes;
+        self.lock().stats.roll_bytes = roll_bytes;
         let shared = Arc::new(Mutex::new(FileBuf {
             buf: Some(buf),
             used: 0,
@@ -207,8 +229,7 @@ impl ParquetSink {
             Some(self.props.clone()),
         )
         .map_err(|e| MorunaError::Sink(format!("parquet writer: {e}")))?;
-        let index = inner.ledger.take_index();
-        inner.current = Some(Current {
+        lane.current = Some(Current {
             name: part_name(index, "parquet"),
             writer,
             shared,
@@ -218,9 +239,10 @@ impl ParquetSink {
         Ok(())
     }
 
-    /// Close the open file, hand its bytes to the reactor, and open the next one (f.1, f.5).
-    fn roll(&self, inner: &mut Inner, next_min_bytes: u64, reopen: bool) -> Result<Pending> {
-        let Some(current) = inner.current.take() else {
+    /// Close `lane`'s open file and hand its bytes to the reactor (f.1, f.5). The lane opens
+    /// its next file when the next encode reaches it.
+    fn roll(&self, lane: &mut Lane) -> Result<Pending> {
+        let Some(current) = lane.current.take() else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
         let Current {
@@ -257,11 +279,8 @@ impl ParquetSink {
         let buf = Arc::new(buf);
         let view = buf.view().slice(0, used);
         let completion = self.dest.put(&*self.reactor, &name, view);
-        inner.stats.rolls += 1;
+        self.lock().stats.rolls += 1;
         tracing::info!(target: "sink.roll", file = %name, bytes = used, "rolled a parquet file");
-        if reopen {
-            self.open_file(inner, next_min_bytes)?;
-        }
         Ok(Pending {
             entry: CommittedFile {
                 name,
@@ -284,19 +303,56 @@ impl ParquetSink {
         inner.ledger.commit(entry, seqs);
     }
 
-    /// Move to `Failed`; the file being written is released, the committed files stay (h).
+    /// Move to `Failed`; the files being written are released, the committed files stay (h).
     fn fail(&self, error: &MorunaError) {
-        let mut inner = self.lock();
-        if !matches!(inner.phase, Phase::Failed(_)) {
-            inner.phase = Phase::Failed(error.to_string());
+        {
+            let mut inner = self.lock();
+            if !matches!(inner.phase, Phase::Failed(_)) {
+                inner.phase = Phase::Failed(error.to_string());
+            }
         }
-        inner.current = None;
+        for lane in self.lanes() {
+            lane.lock().unwrap_or_else(|e| e.into_inner()).current = None;
+        }
     }
 
-    /// Prepare one write under the lock: roll if this morsel would overflow the file, encode
-    /// it, release its bytes. Returns the rolled file, if there was one, to await outside.
-    fn encode(&self, inner: &mut Inner, seq: Seq, payload: Payload) -> Result<Option<Pending>> {
-        inner.phase.require_open()?;
+    /// Await a rolled file's outcome and record it (f.5, f.7).
+    fn settle(&self, pending: Pending) -> Result<()> {
+        let Pending {
+            entry,
+            seqs,
+            completion,
+            buf,
+        } = pending;
+        let outcome = completion.wait();
+        self.settle_outcome(entry, &seqs, buf, outcome)
+    }
+
+    /// Record a rolled file whose completion resolved with `outcome` (f.5, f.7).
+    fn settle_outcome(
+        &self,
+        entry: CommittedFile,
+        seqs: &[Seq],
+        buf: Arc<Buffer>,
+        outcome: Result<()>,
+    ) -> Result<()> {
+        self.buffers.keep_spare(buf);
+        match outcome {
+            Ok(()) => {
+                self.commit(entry, seqs);
+                Ok(())
+            }
+            Err(e) => {
+                self.fail(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// The CPU half of a write (RB1): validate the morsel, take a free lane (or open one),
+    /// roll its file if this morsel would overflow it, and encode. Returns the rolled file, if
+    /// there was one, for `put` to await.
+    fn encode_morsel(&self, seq: Seq, payload: Payload) -> Result<Option<Pending>> {
         require_host(&payload)?;
         let rows = payload.rows();
         let Payload::Table(batch, _) = payload else {
@@ -305,63 +361,81 @@ impl ParquetSink {
             ));
         };
         let bytes = rows_bytes(&batch);
-        // f.1: the first payload settles the output schema; every later one is checked
-        // against it, so a kernel that appends a column is written as it is and a kernel that
-        // drifts between morsels is still an error.
-        let first = inner.schema.is_none();
-        if first {
-            inner.schema = Some(batch.schema());
-        } else {
-            self.check_schema(inner, &batch)?;
+        {
+            let mut inner = self.lock();
+            inner.phase.require_open()?;
+            // f.1: the first payload settles the output schema; every later one is checked
+            // against it, so a kernel that appends a column is written as it is and a kernel
+            // that drifts between morsels is still an error.
+            if inner.schema.is_none() {
+                inner.schema = Some(batch.schema());
+            } else {
+                self.check_schema(&inner, &batch)?;
+            }
         }
+        let lanes = self.lanes();
+        let mut taken = None;
+        for lane in &lanes {
+            if let Ok(guard) = lane.try_lock() {
+                taken = Some(guard);
+                break;
+            }
+        }
+        let fresh;
+        let mut lane = match taken {
+            Some(guard) => guard,
+            None => {
+                fresh = Arc::new(Mutex::new(Lane::default()));
+                self.lanes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Arc::clone(&fresh));
+                fresh.lock().unwrap_or_else(|e| e.into_inner())
+            }
+        };
         // Validation is done: from here a failure is the encoder's or the store's, and it moves
         // the sink to `Failed` (e.1), where `finish` reports it and the committed files stand.
-        let out = if inner.current.is_none() {
-            match self.open_file(inner, 0) {
-                Ok(()) => self.encode_checked(inner, seq, batch, rows, bytes),
-                Err(e) => Err(e),
-            }
-        } else {
-            self.encode_checked(inner, seq, batch, rows, bytes)
-        };
+        let out = self.encode_checked(&mut lane, seq, batch, rows, bytes);
         if let Err(e) = &out {
+            lane.current = None;
+            let mut inner = self.lock();
             inner.phase = Phase::Failed(e.to_string());
-            inner.current = None;
         }
         out
     }
 
     fn encode_checked(
         &self,
-        inner: &mut Inner,
+        lane: &mut Lane,
         seq: Seq,
         batch: RecordBatch,
         rows: u64,
         bytes: u64,
     ) -> Result<Option<Pending>> {
-        let (so_far, started) = match inner.current.as_ref() {
-            Some(current) => (
-                current.writer.bytes_written() as u64 + current.writer.in_progress_size() as u64,
-                !current.seqs.is_empty(),
-            ),
-            None => return Err(MorunaError::Sink("the sink has no open file".into())),
-        };
-        let pending = if started && so_far + bytes > inner.roll_bytes {
-            // A morsel larger than a file gets a file of its own, sized for it (h); one that
-            // fits an ordinary file gets an ordinary file. Asking every roll for twice the
-            // morsel doubled the buffer's class whenever morsels were a large share of it, and
-            // at the smallest budget that was the allocation the arena could not give (F8.8).
-            let need = if bytes > inner.roll_bytes {
-                bytes.saturating_mul(2)
-            } else {
-                0
-            };
-            Some(self.roll(inner, need, true)?)
-        } else {
-            None
-        };
-
-        let Some(current) = inner.current.as_mut() else {
+        let mut pending = None;
+        match lane.current.as_ref() {
+            None => self.open_file(lane, 0)?,
+            Some(current) => {
+                let so_far = current.writer.bytes_written() as u64
+                    + current.writer.in_progress_size() as u64;
+                if !current.seqs.is_empty() && so_far + bytes > lane.roll_bytes {
+                    // A morsel larger than a file gets a file of its own, sized for it (h); one
+                    // that fits an ordinary file gets an ordinary file. Asking every roll for
+                    // twice the morsel doubled the buffer's class whenever morsels were a large
+                    // share of it, and at the smallest budget that was the allocation the arena
+                    // could not give (F8.8).
+                    let need = if bytes > lane.roll_bytes {
+                        bytes.saturating_mul(2)
+                    } else {
+                        0
+                    };
+                    pending = Some(self.roll(lane)?);
+                    self.open_file(lane, need)?;
+                }
+            }
+        }
+        let roll_bytes = lane.roll_bytes;
+        let Some(current) = lane.current.as_mut() else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
         current
@@ -375,20 +449,51 @@ impl ParquetSink {
         current.seqs.push(seq);
         // The footer shares the buffer, so a row group may not be allowed to grow past the roll
         // size: `row_group_bytes` is a target, and `roll_bytes` is what the arena agreed to.
-        if current.writer.in_progress_size() as u64
-            >= self.cfg.row_group_bytes.min(inner.roll_bytes)
-        {
+        if current.writer.in_progress_size() as u64 >= self.cfg.row_group_bytes.min(roll_bytes) {
             current
                 .writer
                 .flush()
                 .map_err(|e| encode_error(&e.to_string()))?;
         }
-        inner.stats.writes += 1;
-        inner.stats.encode_bytes += bytes;
+        {
+            let mut inner = self.lock();
+            inner.stats.writes += 1;
+            inner.stats.encode_bytes += bytes;
+        }
         tracing::trace!(target: "sink.encode", seq, bytes, "encoded a morsel");
         // The encode is the symmetric exception to G-I2 and the arena is where it is counted.
         self.alloc.note_payload_copy(bytes);
         Ok(pending)
+    }
+
+    /// Roll every lane whose file holds a morsel, and settle each file (f.1, f.12).
+    fn roll_all(&self) -> Result<()> {
+        let mut pendings = Vec::new();
+        for lane in self.lanes() {
+            let mut lane = lane.lock().unwrap_or_else(|e| e.into_inner());
+            if lane
+                .current
+                .as_ref()
+                .is_some_and(|file| !file.seqs.is_empty())
+            {
+                match self.roll(&mut lane) {
+                    Ok(pending) => pendings.push(pending),
+                    Err(error) => {
+                        lane.current = None;
+                        drop(lane);
+                        self.fail(&error);
+                        return Err(error);
+                    }
+                }
+            } else {
+                // An empty file is never written: its buffer goes back to the arena.
+                lane.current = None;
+            }
+        }
+        for pending in pendings {
+            self.settle(pending)?;
+        }
+        Ok(())
     }
 
     fn check_schema(&self, inner: &Inner, batch: &RecordBatch) -> Result<()> {
@@ -453,33 +558,39 @@ impl Sink for ParquetSink {
         }
     }
 
-    fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, Result<()>> {
+    fn encodes_on_workers(&self) -> bool {
+        true
+    }
+
+    fn encode(&self, seq: Seq, payload: Payload) -> Result<Encoded> {
+        Ok(Encoded(Box::new(self.encode_morsel(seq, payload)?)))
+    }
+
+    fn put(&self, encoded: Encoded) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let pending = {
-                let mut inner = self.lock();
-                self.encode(&mut inner, seq, payload)?
-            };
-            let Some(pending) = pending else {
+            let pending = encoded
+                .0
+                .downcast::<Option<Pending>>()
+                .map_err(|_| MorunaError::Sink("put was given another sink's encode".into()))?;
+            let Some(pending) = *pending else {
                 return Ok(());
             };
+            let pending = Box::new(pending);
             let Pending {
                 entry,
                 seqs,
                 completion,
                 buf,
-            } = pending;
+            } = *pending;
             let outcome = completion.await;
-            self.buffers.keep_spare(buf);
-            match outcome {
-                Ok(()) => {
-                    self.commit(entry, &seqs);
-                    Ok(())
-                }
-                Err(e) => {
-                    self.fail(&e);
-                    Err(e)
-                }
-            }
+            self.settle_outcome(entry, &seqs, buf, outcome)
+        })
+    }
+
+    fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let encoded = self.encode(seq, payload)?;
+            self.put(encoded).await
         })
     }
 
@@ -496,47 +607,42 @@ impl Sink for ParquetSink {
                 Phase::Open => None,
             };
             if failed.is_some() {
-                inner.current = None;
                 inner.phase = Phase::Finished;
             }
             failed
         };
         if let Some(msg) = failed {
+            for lane in self.lanes() {
+                lane.lock().unwrap_or_else(|e| e.into_inner()).current = None;
+            }
             // The reactor aborted the multipart upload already (06 f.4); a local destination
             // may still hold temporary files, which go here.
             self.clear_tmps();
             return Err(MorunaError::Sink(msg));
         }
-        let pending = {
-            let mut inner = self.lock();
-            // A run that wrote nothing never adopted a schema, so the one `open` was given is
-            // what the empty file carries (h).
-            if inner.current.is_none() && inner.ledger.committed().is_empty() {
+        // A run that wrote nothing never adopted a schema, so the one `open` was given is what
+        // the empty file carries (h).
+        let wrote_nothing = {
+            let inner = self.lock();
+            inner.ledger.committed().is_empty()
+        } && self.lanes().iter().all(|lane| {
+            lane.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .current
+                .as_ref()
+                .is_none_or(|file| file.seqs.is_empty())
+        });
+        if wrote_nothing {
+            {
+                let mut inner = self.lock();
                 inner.schema = inner.declared.clone();
-                self.open_file(&mut inner, 0)?;
             }
-            if inner.current.is_some() {
-                Some(self.roll(&mut inner, 0, false)?)
-            } else {
-                None
-            }
-        };
-        if let Some(Pending {
-            entry,
-            seqs,
-            completion,
-            buf,
-        }) = pending
-        {
-            let outcome = completion.wait();
-            self.buffers.keep_spare(buf);
-            match outcome {
-                Ok(()) => self.commit(entry, &seqs),
-                Err(e) => {
-                    self.fail(&e);
-                    return Err(e);
-                }
-            }
+            let mut lane = Lane::default();
+            self.open_file(&mut lane, 0)?;
+            let pending = self.roll(&mut lane)?;
+            self.settle(pending)?;
+        } else {
+            self.roll_all()?;
         }
         self.write_success()?;
         let mut inner = self.lock();
@@ -560,46 +666,14 @@ impl Sink for ParquetSink {
     }
 
     fn checkpoint_flush(&self) -> Result<()> {
-        let pending = {
-            let mut inner = self.lock();
+        {
+            let inner = self.lock();
             if matches!(inner.phase, Phase::Finished) {
                 return Ok(());
             }
             inner.phase.require_open()?;
-            if inner
-                .current
-                .as_ref()
-                .is_none_or(|file| file.seqs.is_empty())
-            {
-                return Ok(());
-            }
-            match self.roll(&mut inner, 0, false) {
-                Ok(pending) => pending,
-                Err(error) => {
-                    inner.phase = Phase::Failed(error.to_string());
-                    inner.current = None;
-                    return Err(error);
-                }
-            }
-        };
-        let Pending {
-            entry,
-            seqs,
-            completion,
-            buf,
-        } = pending;
-        let outcome = completion.wait();
-        self.buffers.keep_spare(buf);
-        match outcome {
-            Ok(()) => {
-                self.commit(entry, &seqs);
-                Ok(())
-            }
-            Err(error) => {
-                self.fail(&error);
-                Err(error)
-            }
         }
+        self.roll_all()
     }
 
     fn checkpoint(&self) -> Result<Option<Vec<u8>>> {

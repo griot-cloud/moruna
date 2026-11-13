@@ -450,7 +450,7 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
         state,
         targets.first().copied().unwrap_or(state.cfg.morsel_max),
     );
-    let read_ahead = read_ahead(queue_half, split_bytes);
+    let read_ahead = read_ahead(queue_half, split_bytes, active_workers);
     let for_queues = queue_half.saturating_sub(u64::from(read_ahead).saturating_mul(split_bytes));
     let queues = state.queue_count() as u64;
     let high_water = for_queues / queues.max(1);
@@ -539,13 +539,15 @@ fn split_bytes(state: &ControllerState, first_target: u64) -> u64 {
 }
 
 /// The read-ahead depth that fits in the queue half (f.3), floor 1.
-fn read_ahead(queue_half: u64, split_bytes: u64) -> u16 {
+fn read_ahead(queue_half: u64, split_bytes: u64, workers: u16) -> u16 {
     if split_bytes == 0 {
         return READ_AHEAD_INITIAL;
     }
     let room = scale(queue_half, READ_AHEAD_SHARE) / split_bytes;
     let allowed = u16::try_from(room).unwrap_or(u16::MAX);
-    allowed.clamp(1, READ_AHEAD_INITIAL)
+    // RB1, RB3: the decodes of the reads in flight run on the workers, so the read-ahead may
+    // follow the pool rather than stop at a fixed two.
+    allowed.clamp(1, workers.max(READ_AHEAD_INITIAL))
 }
 
 /// f.3. The initial knobs, then the tick thread.

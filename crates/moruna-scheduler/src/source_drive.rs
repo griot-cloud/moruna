@@ -512,9 +512,29 @@ fn submit<'a>(
     };
     let range = if whole { None } else { Some(rows) };
     shared.source_reading(source);
-    let future = source
-        .source
-        .read(split, range, shared.alloc.as_ref(), tier0(shared));
+    let tier = tier0(shared);
+    let future: BoxFuture<'a, Result<Payload>> = if source.source.decodes_on_workers() {
+        // RB1: the drive fetches the bytes and any worker decodes them.
+        let decoder = Arc::clone(&source.source);
+        let alloc = Arc::clone(&shared.alloc);
+        let owned = split.clone();
+        Box::pin(async move {
+            let fetched = source
+                .source
+                .fetch(split, range, shared.alloc.as_ref(), tier)
+                .await?;
+            crate::offload::on_worker(
+                &shared.offload,
+                || shared.offload_inline(),
+                move || decoder.decode(&owned, fetched, alloc.as_ref(), tier),
+            )
+            .await
+        })
+    } else {
+        source
+            .source
+            .read(split, range, shared.alloc.as_ref(), tier)
+    };
     shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
     inflight.push(InFlight {
         future,

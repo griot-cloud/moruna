@@ -356,6 +356,8 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_pause: AtomicBool,
     /// Published only after every worker and original IO drive has actually joined.
     pub(crate) checkpoint_quiet: AtomicBool,
+    /// The decodes and encodes the drives hand to the workers (RB1, `offload`).
+    pub(crate) offload: crate::offload::Offload,
 
     pub(crate) last_manifest: Mutex<Option<std::path::PathBuf>>,
 
@@ -686,6 +688,7 @@ impl Shared {
             control_active: AtomicBool::new(false),
             checkpoint_pause: AtomicBool::new(false),
             checkpoint_quiet: AtomicBool::new(false),
+            offload: crate::offload::Offload::default(),
             last_manifest: Mutex::new(None),
             jobs,
             job_inbox: Mutex::new(inbox),
@@ -987,6 +990,16 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// True when no worker will take offloaded work now, so a drive runs its own decode or
+    /// encode inline (RB1): before the run is live, while the gate is up, while stopping, or
+    /// with no active worker.
+    pub(crate) fn offload_inline(&self) -> bool {
+        !self.run_state().is_live()
+            || self.gated()
+            || self.stopping.load(Ordering::SeqCst)
+            || self.knobs.active_workers() == 0
     }
 
     /// Whether the gate is up: while it is, no worker takes a task, so `init_instances`, a

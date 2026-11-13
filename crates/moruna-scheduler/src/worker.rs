@@ -51,6 +51,18 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         }
+        // RB1: a decode or an encode a drive handed over goes ahead of a function's morsel,
+        // because it is what feeds the functions or frees the memory behind the sink. It runs
+        // under the same slot claim as any unit, so the CPU limit in force binds it too.
+        if shared.offload.queued() > 0
+            && let Some(slot) = shared.knobs.slots.try_claim(worker)
+        {
+            if let Some(job) = shared.offload.take() {
+                job();
+            }
+            drop(slot);
+            continue;
+        }
         // f.3: the run's policy decides, and the unit runs only under a claim on what it is
         // predicted to make (contracts d.18, adaptive-runtime 9.4).
         let (stage, port, claim, learn) = match crate::decide::decide(&shared, worker) {

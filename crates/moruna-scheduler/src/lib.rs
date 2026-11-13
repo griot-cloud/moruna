@@ -41,6 +41,7 @@ mod instances;
 mod knobs;
 mod learning;
 mod lifecycle;
+mod offload;
 mod pipeline;
 pub mod policies;
 mod policy;

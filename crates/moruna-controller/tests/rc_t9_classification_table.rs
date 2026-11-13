@@ -52,6 +52,20 @@ fn row_rig(stats: SchedulerStats, samples: Vec<Sample>) -> common::Rig {
     )
 }
 
+/// The read-ahead the initial solution sets on this rig: row 4 is "every read the read-ahead
+/// allows is in flight", and that depth follows the pool (RB1), so the rows read it rather than
+/// assume a figure.
+fn initial_read_ahead() -> u16 {
+    let rig = row_rig(scheduler_stats(8, 1), vec![sample(BASELINE, 1_000)]);
+    rig.run_up();
+    let depth = read_aheads(&rig.writes())
+        .last()
+        .copied()
+        .expect("the initial solution sets a read-ahead");
+    rig.controller.stop();
+    depth
+}
+
 /// The record that tells the controller how full Q0 and Qn are (f.6 reads both off the trace).
 fn queued(seq: u64, q0: u64, qn: u64) -> TraceRecord {
     TraceRecord {
@@ -172,7 +186,7 @@ fn rc_t9_row3_cpu_quota() {
 #[test]
 fn rc_t9_row4_io_read() {
     let mut stats = scheduler_stats(8, 1);
-    stats.reads_in_flight = 2;
+    stats.reads_in_flight = initial_read_ahead();
     let rig = row_rig(
         stats,
         vec![
@@ -322,7 +336,7 @@ fn rc_t9_row7_compute_and_row8_idle() {
 #[test]
 fn rc_t9_row4_short_tail_is_not_evidence() {
     let mut stats = scheduler_stats(8, 1);
-    stats.reads_in_flight = 2;
+    stats.reads_in_flight = initial_read_ahead();
     let rig = row_rig(
         stats,
         vec![

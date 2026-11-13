@@ -1,7 +1,8 @@
 //! `SinkHandle`, the one type the scheduler drives (08 f.9, d.1).
 
 use moruna_kernel::{
-    BoxFuture, Payload, PayloadSpec, Result, Seq, Sink, SinkSummary, SourceSchema,
+    BoxFuture, Encoded, MorunaError, Payload, PayloadSpec, Result, Seq, Sink, SinkSummary,
+    SourceSchema,
 };
 
 use crate::reorder::ReorderBuffer;
@@ -82,6 +83,35 @@ impl Sink for SinkHandle {
         match self {
             SinkHandle::Plain(sink) => sink.write(seq, payload),
             SinkHandle::Ordered(buffer) => buffer.write(seq, payload),
+        }
+    }
+
+    /// An ordered handle writes in sequence through its buffer, so it never encodes on workers
+    /// (`architecture/worker-io.md`).
+    fn encodes_on_workers(&self) -> bool {
+        match self {
+            SinkHandle::Plain(sink) => sink.encodes_on_workers(),
+            SinkHandle::Ordered(_) => false,
+        }
+    }
+
+    fn encode(&self, seq: Seq, payload: Payload) -> Result<Encoded> {
+        match self {
+            SinkHandle::Plain(sink) => sink.encode(seq, payload),
+            SinkHandle::Ordered(_) => Err(MorunaError::Sink(
+                "an ordered sink does not encode on workers".into(),
+            )),
+        }
+    }
+
+    fn put(&self, encoded: Encoded) -> BoxFuture<'_, Result<()>> {
+        match self {
+            SinkHandle::Plain(sink) => sink.put(encoded),
+            SinkHandle::Ordered(_) => Box::pin(async {
+                Err(MorunaError::Sink(
+                    "an ordered sink does not encode on workers".into(),
+                ))
+            }),
         }
     }
 
