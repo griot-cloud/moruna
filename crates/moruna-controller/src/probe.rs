@@ -28,16 +28,12 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
                 msg: format!("probe called in phase {:?}", state.phase),
             });
         }
-        state.tiny = model::is_tiny(&state);
-        if state.tiny {
-            state.note("small dataset: no adaptation".into());
-        }
         // The profile store is the controller's memory across runs, and on a resumed run it is
         // its memory of the run that was interrupted (f.14). It is read once, here.
         load_profiles(&mut state);
-        // Nothing to probe for: a run with no kernels has no amplification, and a dataset that
-        // fits four times over in the budget is not worth a measurement (RC-I6, f.3, f.10).
-        if state.stage_count() == 0 || state.tiny {
+        // Nothing to probe for: a run with no kernels has no amplification. Every other run is
+        // measured, however small its dataset (RC-I6, RB2).
+        if state.stage_count() == 0 {
             state.phase = Phase::Probed;
             return Ok(());
         }

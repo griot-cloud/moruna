@@ -50,7 +50,7 @@ pub fn limits_with_device(ceiling: u64, free: u64) -> Limits {
     }
 }
 
-/// A plan far larger than any budget a test uses, so the tiny-dataset path of f.10 is off.
+/// A plan far larger than any budget a test uses.
 pub fn plan() -> PlanSummary {
     PlanSummary {
         total_bytes: 100 * GIB,

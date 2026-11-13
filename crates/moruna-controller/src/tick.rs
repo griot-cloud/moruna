@@ -185,7 +185,7 @@ pub(crate) fn tick(ctl: &Inner) {
 
         // The sizers run after the classification, so a stage that the class has just halved
         // is not immediately proposed back up in the same tick.
-        if actions.terminate.is_none() && !state.tiny {
+        if actions.terminate.is_none() {
             for (at, (stage, records)) in tails.into_iter().enumerate() {
                 if at >= state.stages.len() || state.stages[at].stage != stage {
                     continue;

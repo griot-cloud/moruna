@@ -566,7 +566,7 @@ The runtime has to be the same library in five hosts, and the design must say wh
 
 **Tensor and analytics workloads compete for the same design attention.** The tensor path is smaller in code but larger in hardware surface. Accepted position: v1 gates are analytics gates; tensor gates are v1.1 (Phase 5 and 9); nothing in v1 is allowed to preclude them, which is why Payload, Tier and the arena are in the v1 types even though only the host tier is exercised.
 
-**A tiny dataset pays runtime overhead it does not need.** If the source's total uncompressed size is under a quarter of the budget, the runtime skips the probe, sets one morsel per split at full size, and uses all workers; this costs nothing and removes the objection.
+**A tiny dataset pays runtime overhead it does not need.** It pays one probe morsel per stage and no more: the probe is what tells a cheap kernel from a greedy one, so every dataset is measured, and on a large machine the solve then gives a small dataset large morsels on every worker (RB2, 2026-11-13; the fast path that skipped the probe was removed after it sized a model kernel from the 4.0 default and ran out of memory).
 
 **Rust is not the team's product language.** Accepted for the reasons in D4; the surface area maintained in Rust is bounded to the crates in section 6, and kernel authors do not touch it.
 
