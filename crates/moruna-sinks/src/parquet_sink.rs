@@ -205,8 +205,8 @@ impl ParquetSink {
     }
 
     /// Allocate the next file's buffer and its writer in `lane`, and settle the byte count the
-    /// file will roll at. `min_bytes` is 0 for an ordinary file and twice a single oversized
-    /// morsel's bytes when one is on its way in (section h).
+    /// file will roll at. `min_bytes` is 0 for an ordinary file and a single oversized morsel's
+    /// bytes when one is on its way in (section h); the footer is added to either.
     ///
     /// f.1: the buffer is not `file_bytes` reserved in advance. The sink asks for
     /// `file_bytes + footer`, halves on `Alloc` down to `row_group_bytes + footer`, and rolls
@@ -448,12 +448,12 @@ impl ParquetSink {
                     // that fits an ordinary file gets an ordinary file. Asking every roll for
                     // twice the morsel doubled the buffer's class whenever morsels were a large
                     // share of it, and at the smallest budget that was the allocation the arena
-                    // could not give (F8.8).
-                    let need = if bytes > lane.roll_bytes {
-                        bytes.saturating_mul(2)
-                    } else {
-                        0
-                    };
+                    // could not give (F8.8). The file of its own is the morsel and its footer
+                    // (`alloc_file_buf` adds the footer), not twice the morsel: its encoded bytes
+                    // are no more than its decoded ones, and twice took a function's output a
+                    // little past the lane's roll size (Enrich adds columns) into the next class,
+                    // 256 MiB the arena did not have in one piece, and ended the run (2026-11-14).
+                    let need = if bytes > lane.roll_bytes { bytes } else { 0 };
                     pending = Some(self.roll(lane)?);
                     self.open_file(lane, need)?;
                 }
