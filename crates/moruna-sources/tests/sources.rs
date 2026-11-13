@@ -1723,3 +1723,46 @@ fn so_t44_fetch_then_decode() {
         );
     }
 }
+
+/// SO-T46 decoded_split_bytes (RB3, f.2). A Parquet split's bytes are what a read of it decodes
+/// to, not its encoded pages: a fixed-width column is its width per row and a validity bitmap
+/// when it holds nulls, a string column its offsets and values, and a whole read comes to about
+/// the split's bytes rather than several times them.
+#[test]
+fn so_t46_decoded_split_bytes() {
+    let dir = scratch();
+    let ledger = write_parquet(&dir, "t46", 400, 200, 11);
+    let source = ParquetSource::new(
+        ParquetSourceConfig {
+            urls: vec![ledger.path.display().to_string()],
+            columns: Some(vec!["i64_0".into(), "str_0".into()]),
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(seed(FakeReactor::new(), &ledger.path)) as Arc<dyn Reactor>,
+        Arc::new(NoObjectStore) as Arc<dyn ObjectMetadata>,
+    )
+    .expect("the parquet source");
+    let alloc = FakeAllocator::new();
+    for (index, split) in source.plan().expect("the plan").iter().enumerate() {
+        let rows = split.rows;
+        let validity = if ledger.nulls_in_group(index) > 0 {
+            rows.div_ceil(8)
+        } else {
+            0
+        };
+        assert_eq!(
+            split.column_bytes[0],
+            rows * 8 + validity,
+            "an Int64 column is eight bytes a row and its nulls' bitmap (group {index})"
+        );
+        assert!(!split.estimated, "the writer recorded the strings' sizes");
+        let payload = block_on(source.read(split, None, &alloc, Tier::Host)).expect("read");
+        let ratio = payload.bytes() as f64 / split.uncompressed_bytes as f64;
+        assert!(
+            (0.9..2.5).contains(&ratio),
+            "a whole read comes to about the split's bytes: {} of {} (group {index})",
+            payload.bytes(),
+            split.uncompressed_bytes
+        );
+    }
+}

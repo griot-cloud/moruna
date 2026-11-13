@@ -334,21 +334,31 @@ pub(crate) fn splits(
                 skipped += 1;
                 continue;
             }
+            let rows = group.num_rows().max(0) as u64;
             let mut column_bytes = Vec::with_capacity(file.projected.len());
             let mut null_counts = Vec::with_capacity(file.projected.len());
-            for leaf in &file.projected {
+            let mut estimated = false;
+            // A flat projection maps leaf to field one to one; a nested one is sized by its
+            // encoded bytes, which the drive's learned ratio then corrects (10 f.5).
+            let flat = file.schema.fields().len() == file.projected.len();
+            for (position, leaf) in file.projected.iter().enumerate() {
                 let (chunk, _) = chunk_span(&file.path, group, rg, *leaf, file.len)
                     .map_err(|msg| source_err(next, msg))?;
-                column_bytes.push(chunk.uncompressed_size().max(0) as u64);
-                null_counts.push(chunk.statistics().and_then(|s| s.null_count_opt()));
+                let nulls = chunk.statistics().and_then(|s| s.null_count_opt());
+                let field = flat.then(|| file.schema.field(position));
+                let (bytes, exact) =
+                    decoded_bytes(field.map(|f| f.data_type()), chunk, rows, nulls);
+                estimated |= !exact;
+                column_bytes.push(bytes);
+                null_counts.push(nulls);
             }
             splits.push(Split {
                 id: next,
-                rows: group.num_rows().max(0) as u64,
+                rows,
                 uncompressed_bytes: column_bytes
                     .iter()
                     .fold(0u64, |sum, b| sum.saturating_add(*b)),
-                estimated: false,
+                estimated,
                 column_bytes,
                 null_counts,
                 sub_splittable: true,
@@ -361,6 +371,67 @@ pub(crate) fn splits(
         }
     }
     Ok((entries, splits, skipped))
+}
+
+/// What one projected column of a row group comes to once decoded into Arrow, and whether that
+/// is exact (f.2, RB3). A split's bytes are what a read of it will hold in memory, which is what
+/// the scheduler sizes reads and morsels by (10 f.5): the column chunk's uncompressed size is its
+/// encoded pages, several times smaller for dictionary- or run-length-encoded columns, and a
+/// read sized from it came back at five or six times its target. That made the run's first read,
+/// the probe, a whole row group: 91 MiB decoded on one worker for a quarter of a second before
+/// any other worker started, a fifth of a one-second run.
+///
+/// A fixed-width column is exact: its width per row, and a validity bitmap when it holds nulls.
+/// A string or binary column is its offsets and its values, the values from the chunk's size
+/// statistics when the writer recorded them (exact), else its encoded size (an estimate). A
+/// dictionary column is decoded to its values (f.4). Anything else is its encoded size.
+fn decoded_bytes(
+    data_type: Option<&arrow::datatypes::DataType>,
+    chunk: &ColumnChunkMetaData,
+    rows: u64,
+    nulls: Option<u64>,
+) -> (u64, bool) {
+    use arrow::datatypes::DataType;
+    let encoded = chunk.uncompressed_size().max(0) as u64;
+    let validity = if nulls.unwrap_or(1) > 0 {
+        rows.div_ceil(8)
+    } else {
+        0
+    };
+    let value_type = match data_type {
+        Some(DataType::Dictionary(_, value)) => Some(value.as_ref()),
+        other => other,
+    };
+    match value_type {
+        Some(DataType::Boolean) => (rows.div_ceil(8).saturating_add(validity), true),
+        Some(t) if t.primitive_width().is_some() => {
+            let width = t.primitive_width().unwrap_or(8) as u64;
+            (rows.saturating_mul(width).saturating_add(validity), true)
+        }
+        Some(
+            t @ (DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary),
+        ) => {
+            let offset = if matches!(t, DataType::LargeUtf8 | DataType::LargeBinary) {
+                8
+            } else {
+                4
+            };
+            let offsets = rows.saturating_add(1).saturating_mul(offset);
+            match chunk.unencoded_byte_array_data_bytes() {
+                Some(values) => (
+                    offsets
+                        .saturating_add(values.max(0) as u64)
+                        .saturating_add(validity),
+                    true,
+                ),
+                None => (
+                    offsets.saturating_add(encoded).saturating_add(validity),
+                    false,
+                ),
+            }
+        }
+        _ => (encoded, false),
+    }
 }
 
 /// One projected column chunk of row group `rg` and its byte span `[start, end)`, checked

@@ -285,6 +285,9 @@ pub(crate) struct SourceEnd {
     pub(crate) out: EndCounters,
     /// What a row decodes to in memory over what the split's metadata says it is (f.5, RB3).
     pub(crate) decoded: crate::decode_ratio::DecodeRatio,
+    /// Reads that met a full arena and wait to be issued again (RB5): in flight, for the stall
+    /// detector.
+    pub(crate) waiting_reads: std::sync::atomic::AtomicUsize,
     pub(crate) helper_tx: Sender<HelperRequest>,
     pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
     pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
@@ -644,6 +647,7 @@ impl Shared {
                 checkpoint_paused: AtomicBool::new(false),
                 out: EndCounters::default(),
                 decoded: crate::decode_ratio::DecodeRatio::default(),
+                waiting_reads: std::sync::atomic::AtomicUsize::new(0),
                 helper_tx,
                 helper_rx: Mutex::new(Some(helper_rx)),
                 handle: Mutex::new(None),

@@ -879,6 +879,10 @@ pub(crate) fn stall_check(shared: &Shared) {
     let stats = shared.placement.stats();
     let quiet = shared.knobs.slots.busy() == 0
         && shared.reads_in_flight.load(Ordering::SeqCst) == 0
+        && shared
+            .sources
+            .iter()
+            .all(|s| s.waiting_reads.load(Ordering::SeqCst) == 0)
         && shared.writes_in_flight.load(Ordering::SeqCst) == 0
         && shared.pushes_waiting.load(Ordering::SeqCst) == 0
         && stats.in_flight_bytes == 0

@@ -374,6 +374,9 @@ pub(crate) fn drive(
                 close_when_exhausted(&shared, source, &inflight);
             }
         }
+        // A read waiting out its backoff is work in flight for the stall detector (RB5): it will
+        // be issued again, and the run is not stuck while it waits.
+        source.waiting_reads.store(retry.len(), Ordering::SeqCst);
         if !worked {
             parker.park_timeout(Duration::from_millis(1));
         }
