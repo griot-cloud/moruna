@@ -167,6 +167,56 @@ mod tests {
         s.split_whitespace().map(str::to_owned).collect()
     }
     #[test]
+    fn run_answers_help_and_version_and_refuses_with_a_named_error() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run(&args("--help"), &mut out, &mut err), 0);
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), USAGE);
+        out.clear();
+        assert_eq!(run(&args("--version"), &mut out, &mut err), 0);
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap().trim(),
+            env!("CARGO_PKG_VERSION")
+        );
+        out.clear();
+        assert_ne!(run(&args("start --now"), &mut out, &mut err), 0);
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("expected native boot command")
+        );
+        err.clear();
+        // A descriptor that does not exist is refused before any emulator or directory exists.
+        let missing =
+            std::env::temp_dir().join(format!("m-cli-absent-{}.json", std::process::id()));
+        let runtime = std::env::temp_dir().join(format!("m-cli-run-{}", std::process::id()));
+        let line = format!(
+            "boot --descriptor {} --runtime-dir {} --qemu /bin/false --vsock-backend /bin/false --lifetime-seconds 5 --cgroup none",
+            missing.display(),
+            runtime.display()
+        );
+        let code = run(&args(&line), &mut out, &mut err);
+        assert_ne!(code, 0);
+        assert!(!err.is_empty(), "the refusal is named");
+        assert!(!runtime.exists(), "nothing was created for a refused boot");
+    }
+
+    #[test]
+    fn options_outside_the_contract_and_bad_lifetimes_are_refused() {
+        for line in [
+            "boot --descriptor a --descriptor b",
+            "boot --descriptor",
+            "boot --memory 4G",
+            "boot --descriptor a --runtime-dir b --qemu c --vsock-backend d --lifetime-seconds 0 --cgroup none",
+            "boot --descriptor a --runtime-dir b --qemu c --vsock-backend d --lifetime-seconds 86401 --cgroup none",
+            "boot --descriptor a --runtime-dir b --qemu c --vsock-backend d --lifetime-seconds soon --cgroup none",
+            "boot --runtime-dir b --qemu c --vsock-backend d --lifetime-seconds 5 --cgroup none",
+        ] {
+            assert!(parse(&args(line)).is_err(), "{line}");
+        }
+        assert_eq!(parse(&args("help")).unwrap(), Command::Help);
+    }
+
+    #[test]
     fn native_command_requires_actual_artifacts_tools_owner_and_finite_lifetime() {
         let valid = "boot --descriptor node.json --runtime-dir new --qemu qemu --vsock-backend helper --lifetime-seconds 30 --cgroup none";
         assert!(matches!(

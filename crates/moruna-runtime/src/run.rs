@@ -945,6 +945,13 @@ fn drive(
         topology.clone(),
         kernel_infos,
     )?);
+    let external_state_stages: Vec<_> = kernels
+        .iter()
+        .enumerate()
+        .filter(|(_, kernel)| !kernel.state_uses_arena())
+        .map(|(at, _)| (at + 1) as moruna_kernel::StageId)
+        .collect();
+    controller.set_external_state(&external_state_stages)?;
     started.controller = Some(controller.clone());
     // A `Weak`, not a clone: the controller holds the scheduler as its `Knobs`, `StatsSource`
     // and `Prober`, so a hook that held the controller strongly would close a reference cycle
@@ -1266,7 +1273,7 @@ fn check_spec_digest(manifest: &std::path::Path, digest: &str) -> Result<()> {
     match value.get("config").and_then(|c| c.get("spec.digest")) {
         Some(serde_json::Value::String(theirs)) if theirs != digest => {
             Err(RunError::bare(MorunaError::Resume(format!(
-                "{}: the manifest was written by the job document {theirs}, and this one is                  {digest}",
+                "{}: the manifest was written by the job document {theirs}, and this one is {digest}",
                 manifest.display()
             ))))
         }
@@ -2297,5 +2304,57 @@ impl Drop for ReleaseRun {
         for kernel in &self.0 {
             kernel.release_run();
         }
+    }
+}
+
+#[cfg(test)]
+mod spec_digest_tests {
+    use super::*;
+
+    /// A resume is refused when its manifest was written under another document, naming both
+    /// digests in one plain sentence; an unreadable or non-JSON manifest is refused; a manifest
+    /// that records no digest, or this one, is left to the placement's own checks.
+    #[test]
+    fn a_resume_manifest_of_another_document_is_refused() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "moruna-spec-digest-{}",
+            moruna_kernel::RunId(nonce).to_hex()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(dir.clone());
+        let manifest = dir.join("manifest.json");
+        let write = |text: &str| std::fs::write(&manifest, text).unwrap();
+        let said = |digest: &str| {
+            check_spec_digest(&manifest, digest).map_err(|e| e.into_parts().error.to_string())
+        };
+
+        write(r#"{"config": {"spec.digest": "sha256:theirs"}}"#);
+        let refused = said("sha256:ours").unwrap_err();
+        assert!(
+            refused.ends_with(
+                "the manifest was written by the job document sha256:theirs, and this one is \
+                 sha256:ours"
+            ),
+            "{refused}"
+        );
+        said("sha256:theirs").unwrap();
+        write(r#"{"config": {}}"#);
+        said("sha256:ours").unwrap();
+        write("not json");
+        assert!(said("sha256:ours").unwrap_err().contains("is not JSON"));
+        std::fs::remove_file(&manifest).unwrap();
+        assert!(
+            said("sha256:ours")
+                .unwrap_err()
+                .contains("could not be read")
+        );
     }
 }

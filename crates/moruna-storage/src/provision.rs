@@ -320,3 +320,75 @@ pub(crate) fn initialize(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_and_uncertainty_are_reported_per_failure_kind() {
+        let preflight = invalid("x");
+        assert_eq!(preflight.phase(), Phase::Preflight);
+        assert!(!preflight.target_may_have_changed());
+        let readback = Error::Invalid {
+            phase: Phase::Readback,
+            reason: "x",
+        };
+        assert!(readback.target_may_have_changed());
+        let write = io(Phase::WriteRoot, true, std::io::Error::other("w"));
+        assert_eq!(write.phase(), Phase::WriteRoot);
+        assert!(write.target_may_have_changed());
+        let read = io(Phase::ReadRoots, false, std::io::Error::other("r"));
+        assert!(!read.target_may_have_changed());
+        let format = Error::Format {
+            phase: Phase::Readback,
+            uncertain: true,
+            source: moruna_storage_format::Error::Integrity,
+        };
+        assert_eq!(format.phase(), Phase::Readback);
+        assert!(format.target_may_have_changed());
+        let raw = Error::Raw(Box::new(crate::Error::Denied));
+        assert_eq!(raw.phase(), Phase::Preflight);
+        assert!(!raw.target_may_have_changed());
+        assert!(position(u64::MAX, 1).is_err());
+        assert_eq!(position(4, 8).unwrap(), 12);
+    }
+
+    #[test]
+    fn image_refuses_relative_missing_and_non_regular_targets_before_mutation() {
+        let root = Root::initial(
+            4 << 20,
+            4096,
+            1 << 20,
+            Role::CheckpointMetadata,
+            "workspace".into(),
+            "bucket".into(),
+        )
+        .unwrap();
+        validate_root(&root).unwrap();
+        assert!(image(Path::new("relative.img"), &root, None).is_err());
+        let missing = std::env::temp_dir().join(format!("m-prov-missing-{}", std::process::id()));
+        assert!(matches!(
+            image(&missing, &root, None),
+            Err(Error::Io {
+                phase: Phase::Preflight,
+                uncertain: false,
+                ..
+            })
+        ));
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        assert!(image(&dir, &root, None).is_err());
+        // A capacity mismatch with the root plan is refused before any write.
+        let path = std::env::temp_dir().join(format!("m-prov-small-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+        let refused = image(&path, &root, None);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            refused,
+            Err(Error::Invalid {
+                phase: Phase::Preflight,
+                ..
+            })
+        ));
+    }
+}

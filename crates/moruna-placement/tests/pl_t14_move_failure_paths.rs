@@ -83,6 +83,10 @@ fn pl_t14_two_failures_surface_through_pop() {
     assert!(matches!(error, MorunaError::Staging(_)), "got {text}");
     assert!(text.contains('7'), "the message names the morsel: {text}");
     assert!(
+        text.contains("FakeReactor::fail_next"),
+        "the second failed completion retains its actual cause: {text}"
+    );
+    assert!(
         !engine.is_full(0),
         "the error is taken by the pop that returned it (f.10)"
     );

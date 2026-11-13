@@ -160,10 +160,16 @@ fn ho_t5_file_run_equals_library_run() {
     assert_eq!(from_file["exit"]["code"], 0);
     assert_eq!(from_file["run_id"], RUN_ID);
     let job = JobSpec::from_value(doc.clone()).expect("the document");
+    // 0.6.6: `job_digest` is the public digest of the document's exact bytes, as
+    // `JobSpec.digest()` gives it from Python; the execution fingerprint is reported beside it.
+    let bytes = std::fs::read(&path).expect("the document's bytes");
     assert_eq!(
         from_file["job_digest"],
-        moruna_plan::job_digest(&moruna_job::Job::from_v1(&job))
+        moruna_runtime::report_doc::document_digest(&bytes)
     );
+    let fingerprint = moruna_plan::job_digest(&moruna_job::Job::from_v1(&job));
+    assert_eq!(from_file["execution_fingerprint"], fingerprint);
+    assert_ne!(from_file["job_digest"], from_file["execution_fingerprint"]);
     assert_eq!(read_back_rows(&scratch.path().join("out")), rows);
 
     // The same run through the library's own construction.
@@ -205,7 +211,7 @@ fn ho_t5_file_run_equals_library_run() {
     spec.profiles_dir = Some(scratch.path().join("profiles"));
     let direct = Runtime::run(spec, CancelToken::new()).expect("the library run");
     let direct = serde_json::to_value(&direct).expect("json");
-    assert_eq!(from_file["schema_version"], "2.0");
+    assert_eq!(from_file["schema_version"], "2.1");
     assert_eq!(document_projection(&from_file), trace_projection(&direct));
     assert_eq!(read_back_rows(&out2), rows);
 }
@@ -480,6 +486,7 @@ fn ho_t10_serve_runs_one_spec() {
     let scratch = Scratch::new("ho_t10");
     let socket = socket_path(scratch.path());
     let doc = document(scratch.path(), 16_000, 4, Some("sleep"));
+    let doc_for_digest = doc.clone();
     let listen = format!("unix://{}", socket.display());
     // The test's kernel is a Python callable named by import path, which a strict serve refuses
     // (16 PK-I8): the protocol is what this test is about, so the server is not strict.
@@ -530,6 +537,54 @@ fn ho_t10_serve_runs_one_spec() {
     assert!(
         !socket.exists(),
         "the listener's socket is gone once the peer is in"
+    );
+    // A version 1 document sent as JSON has no exact bytes of its own: no public digest, and
+    // its execution fingerprint is still reported.
+    assert_eq!(on_disk["job_digest"], Value::Null);
+    let job = JobSpec::from_value(doc_for_digest).expect("the document");
+    assert_eq!(
+        on_disk["execution_fingerprint"],
+        moruna_plan::job_digest(&moruna_job::Job::from_v1(&job))
+    );
+}
+
+/// 0.6.6 gate 3: a version 2 document served as base64 FlatBuffers reports the public digest of
+/// exactly those bytes, which is what `JobSpec.digest()` gives from Python, beside its execution
+/// fingerprint.
+#[test]
+fn ho_t10_serve_reports_the_public_digest_of_a_version_2_document() {
+    use base64::Engine as _;
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("ho_t10_v2");
+    let socket = socket_path(scratch.path());
+    let doc = document(scratch.path(), 4_000, 2, Some("sleep"));
+    let job = moruna_job::Job::from_v1(&JobSpec::from_value(doc).expect("the document"));
+    let bytes = job.to_flatbuffer().expect("the document's FlatBuffers");
+    let listen = format!("unix://{}", socket.display());
+    let server = std::thread::spawn(move || {
+        run_cli(&["serve", "--no-strict", "--listen", &listen], &no_env)
+    });
+    let conn = connect_when_ready(&socket);
+    let (reader, mut writer, _close) = conn.into_parts();
+    let mut reader = BufReader::new(reader);
+    assert_eq!(read_one(&mut reader)["type"], "hello");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let message = json!({"type": "spec", "spec": encoded});
+    writer
+        .write_all(format!("{message}\n").as_bytes())
+        .expect("the spec");
+    let messages = drain(&mut reader);
+    assert_eq!(server.join().expect("the server"), exit::COMPLETED);
+    assert_eq!(messages.last().expect("exit").1["code"], 0);
+    let on_disk = report_file(scratch.path());
+    assert_eq!(
+        on_disk["job_digest"],
+        moruna_runtime::report_doc::document_digest(&bytes)
+    );
+    let read = moruna_job::Job::from_flatbuffer(&bytes).expect("read back");
+    assert_eq!(
+        on_disk["execution_fingerprint"],
+        moruna_plan::job_digest(&read)
     );
 }
 
@@ -746,7 +801,7 @@ fn ho_t13_report_file_placement() {
         .join(format!("moruna-{RUN_ID}.report.json"));
     assert_eq!(outcome.report_file.as_deref(), Some(expected.as_path()));
     let on_disk = read_report_file(&expected).expect("the default report file");
-    assert_eq!(on_disk["schema_version"], "2.0");
+    assert_eq!(on_disk["schema_version"], "2.1");
     assert!(
         outcome
             .notes

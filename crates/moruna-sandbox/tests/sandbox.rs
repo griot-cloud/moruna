@@ -451,11 +451,20 @@ def holds(batch):
     let k = kernel(pex(&dir, "holds", function, json!({}), &[]), 2 * GIB);
     let outside = k.outside();
     assert_eq!(outside.in_use().unwrap(), 0, "no child yet");
+    // No child, no peak to read or reset.
+    assert_eq!(outside.peak().unwrap(), None);
+    assert!(!outside.reset_peak().unwrap());
     let mut state = k.init(&ctx()).unwrap();
+    // A mark is started on the child's cgroup before the call; its peak then covers it.
+    let marked = outside.reset_peak().unwrap();
     let before = outside.in_use().unwrap();
     call(&k, state.as_mut()).unwrap();
     let after = outside.in_use().unwrap();
     assert!(after >= before + (60 << 20), "{before} then {after}");
+    if marked {
+        let peak = outside.peak().unwrap().expect("a child has a peak");
+        assert!(peak >= 60 << 20, "{peak}");
+    }
     drop(state);
     assert_eq!(outside.in_use().unwrap(), 0, "the child is gone");
     let _ = std::fs::remove_dir_all(dir);
@@ -592,7 +601,7 @@ fn the_child_refuses_what_it_cannot_load() {
         pex(
             &dir,
             "decorated",
-            "import moruna\n\n@moruna.kernel\ndef decorated(b):\n    return b\n",
+            "import moruna\n\n@moruna.function\ndef decorated(b):\n    return b\n",
             json!({}),
             &[],
         ),
@@ -1073,10 +1082,11 @@ fn sb_t23_a_childs_output_is_its_stages() {
     let got = kept.got.lock().unwrap().clone();
     assert!(got.iter().all(|(stage, _)| *stage == Some(2)), "{got:?}");
     let all = joined();
-    assert!(all.contains("Stdout:imported\n"), "{all}");
-    // Written through: the partial line arrives without its newline or a flush.
+    // Written through, write by write: print's text and its newline may arrive as two
+    // writes, and the partial line arrives without its newline or a flush.
+    assert!(all.contains("Stdout:imported"), "{all}");
     assert!(all.contains("Stdout:partial"), "{all}");
-    assert!(all.contains("Stderr:on stderr\n"), "{all}");
+    assert!(all.contains("Stderr:on stderr"), "{all}");
     let record = got
         .iter()
         .find(|(_, t)| t.starts_with("Some(Error):"))
@@ -1088,5 +1098,77 @@ fn sb_t23_a_childs_output_is_its_stages() {
     );
     assert!(record.1.contains("ValueError: bad row"), "{record:?}");
     drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The whole confinement in one forked child, as the sandbox applies it: the package tree and
+/// assets mounted read only at their places, the host's other files gone, capabilities dropped,
+/// Landlock and the seccomp filter in force. The child reports what it could and could not do.
+#[test]
+#[ignore = "Linux, sandbox host: MORUNA_SANDBOX_PYTHON and MORUNA_SANDBOX_CGROUP"]
+fn sb_t12_the_whole_confinement_in_a_child() {
+    use moruna_sandbox::confine::{ASSETS, Confinement, TREE, confine};
+    let dir = scratch();
+    let root = dir.join("root");
+    let tree = dir.join("tree");
+    let assets = dir.join("assets");
+    for d in [&root, &tree, &assets] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(tree.join("function.py"), b"def f(b):\n    return b\n").unwrap();
+    std::fs::write(assets.join("weights.bin"), b"w").unwrap();
+    let secret = dir.join("host-only.txt");
+    std::fs::write(&secret, b"not for the child").unwrap();
+    let python_root = PathBuf::from(std::env::var("MORUNA_SANDBOX_PYTHON").expect(TAG))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap();
+    // SAFETY: the child confines only itself and ends with `_exit` and a code naming the
+    // first check that failed.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        moruna_sandbox::coverage::open();
+        let code = match confine(&Confinement {
+            cgroup: PathBuf::from(std::env::var("MORUNA_SANDBOX_CGROUP").expect(TAG)),
+            root: root.clone(),
+            tree: tree.clone(),
+            roots: vec![python_root.clone()],
+            assets: Some(assets.clone()),
+        }) {
+            Err(_) => 10,
+            Ok(()) => {
+                if std::fs::read(Path::new(TREE).join("function.py")).is_err() {
+                    11
+                } else if std::fs::read(Path::new(ASSETS).join("weights.bin")).is_err() {
+                    12
+                } else if std::fs::read(&secret).is_ok() {
+                    13
+                } else if std::fs::write(Path::new(TREE).join("new.py"), b"x").is_ok() {
+                    14
+                } else if !python_root.exists() {
+                    15
+                } else {
+                    0
+                }
+            }
+        };
+        moruna_sandbox::coverage::write();
+        // SAFETY: ends the forked child without the parent's exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: waiting for the child this test forked.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert!(
+        libc::WIFEXITED(status),
+        "the child ended by a signal: {status}"
+    );
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "10 refused, 11 no tree, 12 no assets, 13 host file visible, 14 tree writable, 15 no interpreter"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

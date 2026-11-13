@@ -211,3 +211,136 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args(list: &[&str]) -> impl Iterator<Item = String> {
+        list.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+    fn fields(list: &[&str]) -> BTreeMap<String, String> {
+        options(args(list)).unwrap()
+    }
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn dir() -> Dir {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("m-prov-{}-{name}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        Dir(path.canonicalize().unwrap())
+    }
+
+    #[test]
+    fn options_refuse_positional_missing_and_duplicate_values() {
+        assert!(options(args(&["plan"])).is_err());
+        assert!(options(args(&["--output"])).is_err());
+        assert!(options(args(&["--a", "--b"])).is_err());
+        assert!(options(args(&["--a", "1", "--a", "2"])).is_err());
+        assert_eq!(fields(&["--a", "1"]).get("--a").unwrap(), "1");
+    }
+
+    #[test]
+    fn numbers_paths_and_leftovers_are_strict() {
+        assert!(number(&mut fields(&["--n", "12x"]), "--n").is_err());
+        assert!(number(&mut fields(&["--n", "99999999999999999999999"]), "--n").is_err());
+        assert!(number(&mut BTreeMap::new(), "--n").is_err());
+        assert_eq!(number(&mut fields(&["--n", "42"]), "--n").unwrap(), 42);
+        assert!(path("relative".into()).is_err());
+        assert!(leftovers(fields(&["--extra", "1"])).is_err());
+        assert!(leftovers(BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn execute_refuses_unknown_commands_roles_and_targets() {
+        assert_eq!(execute("nope", BTreeMap::new()).unwrap_err(), USAGE);
+        let bad_role = fields(&[
+            "--output",
+            "/tmp/x",
+            "--capacity",
+            "1",
+            "--alignment",
+            "1",
+            "--log-bytes",
+            "1",
+            "--role",
+            "wrong",
+            "--workspace",
+            "w",
+            "--bucket",
+            "b",
+        ]);
+        assert!(execute("plan", bad_role).unwrap_err().contains("role"));
+        let wide = fields(&[
+            "--output",
+            "/tmp/x",
+            "--capacity",
+            "1",
+            "--alignment",
+            "4294967296",
+            "--log-bytes",
+            "1",
+        ]);
+        assert!(execute("plan", wide).unwrap_err().contains("alignment"));
+        assert!(execute("format", fields(&["--root", "/nonexistent/root"])).is_err());
+    }
+
+    #[test]
+    fn plan_writes_once_and_format_reads_it_back_with_strict_target_selection() {
+        let scratch = dir();
+        let root = scratch.0.join("root.bin");
+        let plan = |output: &Path| {
+            fields(&[
+                "--output",
+                output.to_str().unwrap(),
+                "--capacity",
+                "67108864",
+                "--alignment",
+                "4096",
+                "--log-bytes",
+                "1048576",
+                "--role",
+                "checkpoint-metadata",
+                "--workspace",
+                "workspace",
+                "--bucket",
+                "bucket",
+            ])
+        };
+        match execute("plan", plan(&root)) {
+            Ok(()) => {
+                // Never overwrites an existing artifact.
+                assert!(execute("plan", plan(&root)).is_err());
+                assert!(read_root(&root).is_ok());
+                // Format needs exactly one target.
+                let none = fields(&["--root", root.to_str().unwrap()]);
+                assert!(execute("format", none).unwrap_err().contains("exactly one"));
+                let image = scratch.0.join("missing.img");
+                let missing = fields(&[
+                    "--root",
+                    root.to_str().unwrap(),
+                    "--image",
+                    image.to_str().unwrap(),
+                ]);
+                assert!(execute("format", missing).is_err());
+            }
+            // A geometry the format refuses is still a typed refusal, not a panic.
+            Err(error) => assert!(error.contains("root")),
+        }
+        // Layout and root readers refuse non-files and garbage.
+        assert!(read_layout(&scratch.0).is_err());
+        let junk = scratch.0.join("junk");
+        std::fs::write(&junk, b"not a layout").unwrap();
+        assert!(read_layout(&junk).is_err());
+        assert!(read_root(&junk).is_err());
+        assert!(read_root(&scratch.0).is_err());
+    }
+}

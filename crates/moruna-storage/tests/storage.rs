@@ -2703,3 +2703,905 @@ fn st_t4_provisioner_uses_canonical_single_device_regions_without_touching_neigh
         assert_eq!(Root::decode(&bytes).unwrap(), expected);
     }
 }
+
+/// In-process connector: each connect hands one end of a fresh socket pair to the
+/// real `Service` on the test runtime, exercising the full client/service protocol.
+struct PairConnector {
+    service: Arc<moruna_storage::port::Service>,
+    allocator: Arc<FakeAllocator>,
+    runtime: tokio::runtime::Handle,
+    served: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<Result<()>>>>>,
+}
+impl moruna_storage::port::Connector for PairConnector {
+    fn connect(&self) -> Result<Box<dyn moruna_storage::port::Stream>> {
+        use std::{os::unix::net::UnixStream, time::Duration};
+        let (client, server) = UnixStream::pair().unwrap();
+        for s in [&client, &server] {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        let control = self
+            .allocator
+            .alloc(moruna_storage_format::wire::MAX_HEADER, Tier::Host)
+            .unwrap();
+        let service = self.service.clone();
+        let handle = self
+            .runtime
+            .spawn(async move { service.serve(Box::new(server), control).await });
+        self.served.lock().unwrap().push(handle);
+        Ok(Box::new(client))
+    }
+}
+
+#[test]
+fn st_t6_socket_client_authorizes_remotely_replaces_pages_lists_and_maps_refusals() {
+    use moruna_storage::port::{Client, Service, Unix, from_refusal, refusal};
+    use moruna_storage_format::wire::Refusal;
+    use std::time::Duration;
+
+    // Constructor refusals need no runtime.
+    assert!(Unix::new(PathBuf::from("relative.sock"), Duration::from_secs(1)).is_err());
+    assert!(Unix::new(PathBuf::from("/abs.sock"), Duration::ZERO).is_err());
+    // A configured endpoint with nothing listening is a typed IO refusal.
+    use moruna_storage::port::Connector;
+    assert!(
+        Unix::new(
+            std::env::temp_dir().join(format!("m-absent-{}.sock", std::process::id())),
+            Duration::from_millis(50)
+        )
+        .unwrap()
+        .connect()
+        .is_err()
+    );
+    let allocator = Arc::new(FakeAllocator::new());
+    let arenas: Arc<dyn moruna_storage::volume::Arenas> = Arc::new(VolumeArena(allocator.clone()));
+    let remote_verifier = Arc::new(Verifier::new());
+    let home = bucket(remote_verifier.clone());
+    assert!(matches!(
+        Service::new(home.clone(), arenas.clone(), 0),
+        Err(Error::Invalid(_))
+    ));
+
+    // Every refusal round-trips through the canonical public mapping.
+    for code in [
+        Refusal::Denied,
+        Refusal::Missing,
+        Refusal::Conflict,
+        Refusal::Integrity,
+        Refusal::Unavailable,
+        Refusal::Unsupported,
+        Refusal::Capacity,
+        Refusal::Invalid,
+        Refusal::Busy,
+    ] {
+        assert_eq!(refusal(&from_refusal(code)), code);
+    }
+    assert_eq!(refusal(&Error::Invalid("x")), Refusal::Invalid);
+    assert_eq!(refusal(&Error::Unavailable("x")), Refusal::Unavailable);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let service = Arc::new(Service::new(home, arenas.clone(), 1 << 10).unwrap());
+        let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = Arc::new(PairConnector {
+            service,
+            allocator: allocator.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            served: served.clone(),
+        });
+        let client = Arc::new(Client::new(connector, Arc::new(context()), arenas).unwrap());
+        // Run-facing port whose authorizer is the remote exact-action verifier itself.
+        let store = client.clone().governed().unwrap();
+        // A socket client never claims a durability role on its own.
+        assert_eq!(Backend::role(client.as_ref()), None);
+        let target = object("pages/a");
+        let first = store
+            .write(
+                &context(),
+                &target,
+                Arc::new(bytes(allocator.as_ref(), b"one")).view(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.current(&context(), &target).await.unwrap(), first);
+        let second = store
+            .replace(
+                &context(),
+                &target,
+                Condition::Match(first.version.clone()),
+                Arc::new(bytes(allocator.as_ref(), b"two!")).view(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.bytes, 4);
+        assert_eq!(store.current(&context(), &target).await.unwrap(), second);
+        // A stale conditional publish is a typed conflict, not a silent overwrite.
+        assert!(matches!(
+            store
+                .replace(
+                    &context(),
+                    &target,
+                    Condition::Match(first.version.clone()),
+                    Arc::new(bytes(allocator.as_ref(), b"old")).view(),
+                )
+                .await,
+            Err(Error::Conflict)
+        ));
+        let fresh = object("pages/b");
+        store
+            .replace(
+                &context(),
+                &fresh,
+                Condition::Absent,
+                Arc::new(bytes(allocator.as_ref(), b"b")).view(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.current(&context(), &object("pages/none")).await,
+            Err(Error::Missing)
+        ));
+        // Body ceiling refuses before payload is admitted.
+        let large = Arc::new(bytes(allocator.as_ref(), &[7u8; 2048]));
+        assert!(
+            store
+                .write(&context(), &object("pages/huge"), large.view())
+                .await
+                .is_err()
+        );
+        // A range larger than the service body ceiling is refused before any read.
+        assert!(
+            store
+                .read(
+                    &context(),
+                    &target,
+                    &second.version,
+                    0,
+                    allocator.alloc(2048, Tier::Host).unwrap()
+                )
+                .await
+                .is_err()
+        );
+
+        // More than one 64-entry page forces continuation through `after`.
+        for i in 0..70 {
+            store
+                .write(
+                    &context(),
+                    &object(&format!("list/{i:03}")),
+                    Arc::new(bytes(allocator.as_ref(), b"x")).view(),
+                )
+                .await
+                .unwrap();
+        }
+        let listed = store.list(&context(), &object("list/")).await.unwrap();
+        assert_eq!(listed.len(), 70);
+        assert!(listed.windows(2).all(|w| w[0].object.key < w[1].object.key));
+
+        // Remote authority denial reaches the caller as Denied.
+        remote_verifier.allowed.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            store.current(&context(), &target).await,
+            Err(Error::Denied)
+        ));
+        remote_verifier.allowed.store(true, Ordering::SeqCst);
+
+        // A scope the client was not bound to never reaches the socket.
+        let foreign = Access {
+            workspace: "other".into(),
+            run: "run".into(),
+            credential: Credential::new(b"TEST-ONLY".to_vec()).unwrap(),
+        };
+        assert!(store.current(&foreign, &target).await.is_err());
+
+        let handles: Vec<_> = served.lock().unwrap().drain(..).collect();
+        for handle in handles {
+            let _ = handle.await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn st_t6_bucket_multipart_publishes_verified_bytes_and_refuses_bad_config_and_reserved_keys() {
+    let staging = || Arc::new(TestStaging::new(64 << 20));
+    let memory = || Arc::new(object_store::memory::InMemory::new());
+    let base = || Config::new("workspace".into(), "bucket".into());
+    // Every configuration bound is enforced before any IO.
+    let mut bad = Vec::new();
+    for edit in [
+        (|c: &mut Config| c.workspace.clear()) as fn(&mut Config),
+        |c| c.bucket.clear(),
+        |c| c.parallel_parts = 0,
+        |c| c.parallel_parts = 1025,
+        |c| c.part_bytes = (5 << 20) - 1,
+        |c| c.part_bytes = (1 << 30) + 1,
+        |c| c.single_put_bytes = c.part_bytes - 1,
+        |c| c.range_bytes = 0,
+        |c| c.range_bytes = (64 << 20) + 1,
+        |c| c.parallel_ranges = 0,
+        |c| c.parallel_ranges = 1025,
+    ] {
+        let mut cfg = base();
+        edit(&mut cfg);
+        bad.push(Bucket::unclassified(memory(), cfg, staging()).is_err());
+    }
+    assert!(bad.iter().all(|refused| *refused));
+
+    let mut cfg = base();
+    cfg.part_bytes = 5 << 20;
+    cfg.single_put_bytes = 5 << 20;
+    cfg.range_bytes = 1 << 20;
+    let backend = Arc::new(Bucket::unclassified(memory(), cfg, staging()).unwrap());
+    let store = Governed::new(backend.clone(), Arc::new(Verifier::new())).unwrap();
+    let alloc = FakeAllocator::new();
+    runtime().block_on(async {
+        // Larger than single_put_bytes: multipart under a temporary key, then
+        // copy-if-absent publication verified range by range.
+        let data: Vec<u8> = (0..(11usize << 20)).map(|i| (i % 251) as u8).collect();
+        let target = object("multi/part");
+        let written = store
+            .write(&context(), &target, Arc::new(bytes(&alloc, &data)).view())
+            .await
+            .unwrap();
+        assert_eq!(written.bytes, data.len() as u64);
+        let back = store
+            .read(
+                &context(),
+                &target,
+                &written.version,
+                0,
+                alloc.alloc(data.len(), Tier::Host).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(back.as_ref() == data.as_slice());
+        assert!(backend.ingress_bytes() >= data.len() as u64);
+        // Create never overwrites an existing object, even through multipart.
+        assert!(
+            store
+                .write(&context(), &target, Arc::new(bytes(&alloc, &data)).view())
+                .await
+                .is_err()
+        );
+        // No temporary upload objects remain visible.
+        assert_eq!(store.list(&context(), &object("")).await.unwrap().len(), 1);
+        // The reserved upload prefix and foreign buckets are never addressable.
+        assert!(
+            store
+                .write(
+                    &context(),
+                    &object(".moruna-upload/x"),
+                    Arc::new(bytes(&alloc, b"x")).view()
+                )
+                .await
+                .is_err()
+        );
+        // Keys the object store would silently rewrite are refused, not normalized.
+        for key in ["dir/", "a//b", "a/../b"] {
+            assert!(
+                store
+                    .write(
+                        &context(),
+                        &object(key),
+                        Arc::new(bytes(&alloc, b"x")).view()
+                    )
+                    .await
+                    .is_err(),
+                "{key} must not be accepted"
+            );
+        }
+        let mut foreign = object("k");
+        foreign.bucket = "elsewhere".into();
+        assert!(store.current(&context(), &foreign).await.is_err());
+    });
+}
+
+#[test]
+fn st_t5_checkpoint_dependencies_export_restore_and_refuse_mismatched_identity() {
+    use moruna_storage::checkpoint::{Checkpoints, Dependency};
+    let alloc = Arc::new(FakeAllocator::new());
+    let verifier = Arc::new(Verifier::new());
+    let local = bucket(verifier.clone());
+    let home = bucket(verifier.clone());
+    assert!(matches!(
+        Checkpoints::new(local.clone(), home.clone(), alloc.clone(), 0),
+        Err(Error::Invalid(_))
+    ));
+    let checkpoints =
+        Checkpoints::new(local.clone(), home.clone(), alloc.clone(), 1 << 16).unwrap();
+    runtime().block_on(async {
+        let access = context();
+        // Engine-owned bytes published directly.
+        let direct = checkpoints
+            .export_bytes(
+                &access,
+                &object("ckpt/direct"),
+                Arc::new(bytes(alloc.as_ref(), b"segment")).view(),
+            )
+            .await
+            .unwrap();
+        let restored = checkpoints
+            .dependency(&access, &direct, alloc.alloc(7, Tier::Host).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(restored.as_ref(), b"segment");
+        // A wrong-length destination is refused before any IO.
+        assert!(matches!(
+            checkpoints
+                .dependency(&access, &direct, alloc.alloc(3, Tier::Host).unwrap())
+                .await,
+            Err(Error::Invalid(_))
+        ));
+        // A recorded hash that does not match the persisted bytes is an integrity failure.
+        let forged = Dependency {
+            metadata: direct.metadata.clone(),
+            content_hash: blake3::hash(b"other").to_hex().to_string(),
+        };
+        assert!(matches!(
+            checkpoints
+                .dependency(&access, &forged, alloc.alloc(7, Tier::Host).unwrap())
+                .await,
+            Err(Error::Integrity)
+        ));
+
+        // Copy one local object into home through exact identity.
+        let source = local
+            .write(
+                &access,
+                &object("spill/one"),
+                Arc::new(bytes(alloc.as_ref(), b"local-bytes")).view(),
+            )
+            .await
+            .unwrap();
+        let copied = checkpoints
+            .export_dependency(
+                &access,
+                &local,
+                &source,
+                &object("ckpt/copied"),
+                alloc.alloc(11, Tier::Host).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            copied.content_hash,
+            blake3::hash(b"local-bytes").to_hex().to_string()
+        );
+        assert!(matches!(
+            checkpoints
+                .export_dependency(
+                    &access,
+                    &local,
+                    &source,
+                    &object("ckpt/short"),
+                    alloc.alloc(2, Tier::Host).unwrap(),
+                )
+                .await,
+            Err(Error::Invalid(_))
+        ));
+        // Stale source metadata (wrong length claim) is refused as an integrity failure.
+        let mut stale = source.clone();
+        stale.bytes = 12;
+        assert!(
+            checkpoints
+                .export_dependency(
+                    &access,
+                    &local,
+                    &stale,
+                    &object("ckpt/stale"),
+                    alloc.alloc(12, Tier::Host).unwrap(),
+                )
+                .await
+                .is_err()
+        );
+    });
+}
+
+#[test]
+fn st_t4_local_file_store_refuses_bad_scope_stale_versions_and_bad_ranges() {
+    let scratch = Scratch::new();
+    let open = |role, workspace: &str, bucket: &str| {
+        FileStore::open(
+            scratch.0.join("store"),
+            workspace.into(),
+            bucket.into(),
+            role,
+        )
+    };
+    assert!(open(Role::CacheScratch, "workspace", "bucket").is_err());
+    assert!(open(Role::CheckpointMetadata, "", "bucket").is_err());
+    assert!(open(Role::CheckpointMetadata, "workspace", "").is_err());
+    let local = open(Role::CheckpointMetadata, "workspace", "bucket").unwrap();
+    assert_eq!(local.role(), Role::CheckpointMetadata);
+    let store = Governed::new(Arc::new(local), Arc::new(Verifier::new())).unwrap();
+    let alloc = FakeAllocator::new();
+    runtime().block_on(async {
+        let target = object("local/one");
+        assert!(matches!(
+            store.current(&context(), &target).await,
+            Err(Error::Missing)
+        ));
+        let first = store
+            .write(
+                &context(),
+                &target,
+                Arc::new(bytes(&alloc, b"abcdef")).view(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.current(&context(), &target).await.unwrap(), first);
+        let second = store
+            .replace(
+                &context(),
+                &target,
+                Condition::Match(first.version.clone()),
+                Arc::new(bytes(&alloc, b"ghijkl")).view(),
+            )
+            .await
+            .unwrap();
+        // Superseded versions are a conflict for head and read, never stale bytes.
+        assert!(matches!(
+            store.head(&context(), &target, &first.version).await,
+            Err(Error::Conflict)
+        ));
+        assert!(
+            store
+                .read(
+                    &context(),
+                    &target,
+                    &first.version,
+                    0,
+                    alloc.alloc(2, Tier::Host).unwrap()
+                )
+                .await
+                .is_err()
+        );
+        // Range past the object is refused.
+        assert!(
+            store
+                .read(
+                    &context(),
+                    &target,
+                    &second.version,
+                    4,
+                    alloc.alloc(4, Tier::Host).unwrap()
+                )
+                .await
+                .is_err()
+        );
+        let tail = store
+            .read(
+                &context(),
+                &target,
+                &second.version,
+                4,
+                alloc.alloc(2, Tier::Host).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tail.as_ref(), b"kl");
+        // Foreign bucket and empty keys never reach disk.
+        let mut foreign = object("local/one");
+        foreign.bucket = "other".into();
+        assert!(store.current(&context(), &foreign).await.is_err());
+        assert!(
+            store
+                .write(
+                    &context(),
+                    &object(""),
+                    Arc::new(bytes(&alloc, b"x")).view()
+                )
+                .await
+                .is_err()
+        );
+        // Replaying the log after reopen yields the same current commit.
+        let reopened = Governed::new(
+            Arc::new(open(Role::CheckpointMetadata, "workspace", "bucket").unwrap()),
+            Arc::new(Verifier::new()),
+        )
+        .unwrap();
+        assert_eq!(reopened.current(&context(), &target).await.unwrap(), second);
+    });
+}
+
+#[test]
+fn st_t7_artifact_capture_refuses_misordered_lifecycle_and_bad_identity() {
+    use moruna_storage::artifact::{Boundary, Capture, Identity, Request};
+    runtime().block_on(async {
+        let access = context();
+        let store = bucket(Arc::new(Verifier::new()));
+        let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
+        let request = |task: &str, budget: u64| Request {
+            identity: Identity {
+                workspace: "workspace".into(),
+                run: "run".into(),
+                attempt: "attempt".into(),
+                task: task.into(),
+                port: "rows".into(),
+            },
+            required: false,
+            byte_budget: budget,
+            policy: "TEST-POLICY".into(),
+        };
+        let prepare = |req: Request, key: &str| {
+            Capture::prepare(
+                req,
+                Boundary::LogicalRows,
+                object(key),
+                Arc::clone(&store),
+                Arc::clone(&alloc),
+                4096,
+            )
+        };
+        // Empty identity fields and a zero budget are refused up front.
+        assert!(prepare(request("", 10), "a").is_err());
+        assert!(prepare(request("t", 0), "a").is_err());
+
+        let mut capture = prepare(request("t", 1 << 20), "life").unwrap();
+        // Completing before begin is refused.
+        assert!(capture.complete(&access).await.is_err());
+        capture.begin(&access).await.unwrap();
+        // Begin is one-shot.
+        assert!(capture.begin(&access).await.is_err());
+        // Snapshot onto its own live target is refused.
+        assert!(capture.snapshot(&access, &object("life")).await.is_err());
+        // An empty capture still snapshots to an immutable prefix and completes.
+        let prefix = capture
+            .snapshot(&access, &object("life.prefix"))
+            .await
+            .unwrap();
+        let done = capture.complete(&access).await.unwrap();
+        // Completion is idempotent and re-verified against the persisted manifest.
+        assert_eq!(capture.complete(&access).await.unwrap(), done);
+
+        // Resume needs a fresh prepared capture; a begun one is refused.
+        let mut begun = prepare(request("t", 1 << 20), "life2").unwrap();
+        begun.begin(&access).await.unwrap();
+        assert!(begun.resume(&access, &prefix).await.is_err());
+        // A prefix from another task identity is an integrity failure.
+        let mut other = prepare(request("other-task", 1 << 20), "life3").unwrap();
+        assert!(matches!(
+            other.resume(&access, &prefix).await,
+            Err(Error::Integrity)
+        ));
+        // Same identity resumes from the immutable prefix.
+        let mut again = prepare(request("t", 1 << 20), "life4").unwrap();
+        again.resume(&access, &prefix).await.unwrap();
+
+        // Explicit refusal is published and blocks snapshots.
+        let mut refused = prepare(request("t", 1 << 20), "life5").unwrap();
+        refused.begin(&access).await.unwrap();
+        refused.refuse(&access, "operator stop").await.unwrap();
+        assert!(
+            refused
+                .snapshot(&access, &object("life5.prefix"))
+                .await
+                .is_err()
+        );
+        assert!(refused.complete(&access).await.is_err());
+        // A different run's access is refused.
+        let foreign = Access {
+            workspace: "workspace".into(),
+            run: "other-run".into(),
+            credential: Credential::new(b"TEST-ONLY".to_vec()).unwrap(),
+        };
+        assert!(again.complete(&foreign).await.is_err());
+    });
+}
+
+#[test]
+fn st_t6_service_describes_provider_role_and_rejects_bad_control_and_drains_by_scope() {
+    use moruna_storage::{Scope, port::Service};
+    use moruna_storage_format::provider::{Description, Request as Query};
+    use std::{io::Read, os::unix::net::UnixStream, time::Duration};
+    let allocator = Arc::new(FakeAllocator::new());
+    let arenas: Arc<dyn moruna_storage::volume::Arenas> = Arc::new(VolumeArena(allocator.clone()));
+    let service =
+        Arc::new(Service::new(bucket(Arc::new(Verifier::new())), arenas, 1 << 10).unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        // A control buffer smaller than one header is refused before any read.
+        let (_a, b) = UnixStream::pair().unwrap();
+        assert!(
+            service
+                .clone()
+                .serve(Box::new(b), allocator.alloc(8, Tier::Host).unwrap())
+                .await
+                .is_err()
+        );
+        // The provider query is answered with the store's actual (unclassified) role.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut query = vec![0u8; moruna_storage_format::wire::MAX_HEADER];
+        let n = Query { id: 9 }.encode_into(&mut query).unwrap();
+        client.write_all(&query[..n]).unwrap();
+        service
+            .clone()
+            .serve(
+                Box::new(server),
+                allocator
+                    .alloc(moruna_storage_format::wire::MAX_HEADER, Tier::Host)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        let described = Description::decode(&reply).unwrap();
+        assert_eq!(described.id, 9);
+        assert_eq!(described.role, None);
+    });
+    // Drain returns only this scope's detached records (none after clean completion).
+    let backend = Bucket::unclassified(
+        Arc::new(object_store::memory::InMemory::new()),
+        Config::new("workspace".into(), "bucket".into()),
+        Arc::new(TestStaging::new(1 << 20)),
+    )
+    .unwrap();
+    runtime().block_on(async {
+        let scope = Scope {
+            workspace: "workspace".into(),
+            run: "run".into(),
+        };
+        assert!(backend.drain(&scope).await.unwrap().is_empty());
+        let bad = Scope {
+            workspace: String::new(),
+            run: "run".into(),
+        };
+        assert!(backend.drain(&bad).await.is_err());
+        // A non-host source is refused before any upload starts.
+        assert_eq!(backend.ingress_bytes(), 0);
+    });
+}
+
+#[test]
+fn st_t2_cache_budget_read_through_and_recycle_refuse_without_leaking_plaintext() {
+    runtime().block_on(async {
+        let scratch = Scratch::new();
+        let alloc = FakeAllocator::new();
+        let access = context();
+        let store = bucket(Arc::new(Verifier::new()));
+        let keys = || Arc::new(TestKeys(AtomicU8::new(3)));
+        assert!(Cache::create(scratch.0.join("zero"), keys(), store.clone(), 0).is_err());
+        // A cache epoch under a missing parent is a typed IO refusal.
+        assert!(
+            Cache::create(scratch.0.join("absent/epoch"), keys(), store.clone(), 1024).is_err()
+        );
+        let cache = Cache::create(scratch.0.join("small"), keys(), store.clone(), 1024).unwrap();
+        // The same epoch directory cannot be created twice.
+        assert!(Cache::create(scratch.0.join("small"), keys(), store.clone(), 1024).is_err());
+        let payload = vec![5u8; 2000];
+        let meta = store
+            .write(
+                &access,
+                &object("big"),
+                Arc::new(bytes(&alloc, &payload)).view(),
+            )
+            .await
+            .unwrap();
+        // Read-through fetches from the store, then refuses to exceed the byte budget.
+        let refused = cache
+            .read_through(
+                &access,
+                &meta.object,
+                &meta.version,
+                0,
+                alloc.alloc(2000, Tier::Host).unwrap(),
+            )
+            .await;
+        assert!(matches!(refused, Err(Error::Unavailable(_))));
+        // A small object fits; the second read-through is a cache hit.
+        let small = store
+            .write(
+                &access,
+                &object("small"),
+                Arc::new(bytes(&alloc, b"tiny")).view(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let got = cache
+                .read_through(
+                    &access,
+                    &small.object,
+                    &small.version,
+                    0,
+                    alloc.alloc(4, Tier::Host).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(got.as_ref(), b"tiny");
+        }
+        // After recycle no read or insert can use this epoch.
+        cache.recycle().unwrap();
+        // Recycled epochs can never serve a hit (a miss or a refusal are both safe).
+        assert!(!matches!(
+            cache
+                .read(
+                    &access,
+                    &small.object,
+                    &small.version,
+                    0,
+                    alloc.alloc(4, Tier::Host).unwrap()
+                )
+                .await,
+            Ok(Lookup::Hit(_))
+        ));
+        assert!(
+            cache
+                .insert(
+                    &access,
+                    &small.object,
+                    &small.version,
+                    0,
+                    bytes(&alloc, b"tiny")
+                )
+                .await
+                .is_err()
+        );
+    });
+}
+
+#[test]
+fn st_t6_service_refuses_role_mismatch_and_cache_commands_over_the_socket() {
+    use moruna_storage_format::{
+        auth::{Proof, SessionRole},
+        wire::{self, Outcome, Refusal, Request, Response},
+    };
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let allocator = Arc::new(FakeAllocator::new());
+        let service = Arc::new(
+            moruna_storage::port::Service::new(
+                bucket(Arc::new(Verifier::new())),
+                Arc::new(VolumeArena(allocator.clone())),
+                1 << 20,
+            )
+            .unwrap(),
+        );
+        let ask = |role: Option<SessionRole>, operation: wire::Operation| {
+            let mut control = vec![0; wire::MAX_HEADER];
+            let n = Request {
+                id: 4,
+                scope: moruna_storage::Scope {
+                    workspace: "workspace".into(),
+                    run: "run".into(),
+                },
+                object: object("role/target"),
+                expected_role: role,
+                proof: Proof::Application(b"TEST-ONLY"),
+                operation,
+            }
+            .encode_into(&mut control)
+            .unwrap();
+            control.truncate(n);
+            control
+        };
+        for control in [
+            // An unclassified store never satisfies a caller that requires bucket-home.
+            ask(Some(SessionRole::BucketHome), wire::Operation::Current),
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client.write_all(&control).unwrap();
+            let served = service
+                .clone()
+                .serve(
+                    Box::new(server),
+                    allocator.alloc(wire::MAX_HEADER, Tier::Host).unwrap(),
+                )
+                .await;
+            assert!(served.is_err());
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).unwrap();
+            let response = Response::decode(&reply).unwrap();
+            assert_eq!(response.id, 4);
+            assert!(matches!(
+                response.outcome,
+                Outcome::Refused(Refusal::Unsupported)
+            ));
+        }
+    });
+}
+
+#[test]
+fn st_t6_staging_catalog_binds_one_scope_to_the_runs_host_budget() {
+    use moruna_storage::{Scope, staging::Catalog, staging::Staging};
+    let scope = Scope {
+        workspace: "workspace".into(),
+        run: "run".into(),
+    };
+    let residency = Arc::new(moruna_testkit::placement::FakePlacement::new().with_budget(100));
+    assert!(matches!(
+        Catalog::new(
+            residency.clone(),
+            Tier::Device(moruna_kernel::DeviceId(0)),
+            scope.clone()
+        ),
+        Err(Error::Invalid(_))
+    ));
+    let bad = Scope {
+        workspace: String::new(),
+        run: "run".into(),
+    };
+    assert!(Catalog::new(residency.clone(), Tier::Host, bad.clone()).is_err());
+    let catalog = Catalog::new(residency.clone(), Tier::Host, scope.clone()).unwrap();
+    let granted = catalog.reserve(&scope, 60).expect("within budget");
+    assert!(matches!(
+        catalog.reserve(&scope, 60),
+        Err(Error::StagingRefused { budget: 100, .. })
+    ));
+    drop(granted);
+    let other = Scope {
+        workspace: "workspace".into(),
+        run: "other".into(),
+    };
+    assert!(matches!(catalog.reserve(&other, 1), Err(Error::Denied)));
+    assert!(catalog.reserve(&bad, 1).is_err());
+}
+
+#[test]
+fn st_t6_uncached_prefetch_reads_each_planned_range_into_its_destination() {
+    use moruna_storage::prefetch::{PlannedRange, fetch};
+    let store = bucket(Arc::new(Verifier::new()));
+    let alloc = FakeAllocator::new();
+    runtime().block_on(async {
+        let meta = store
+            .write(
+                &context(),
+                &object("pf/a"),
+                Arc::new(bytes(&alloc, b"0123456789")).view(),
+            )
+            .await
+            .unwrap();
+        let plan = |offset: u64, len: usize, next_use: u64| PlannedRange {
+            object: meta.object.clone(),
+            version: meta.version.clone(),
+            offset,
+            destination: alloc.alloc(len, Tier::Host).unwrap(),
+            next_use,
+        };
+        let ready = fetch(
+            &store,
+            &context(),
+            vec![plan(5, 3, 2), plan(0, 2, 1)],
+            2,
+            64,
+        )
+        .await
+        .unwrap();
+        let mut got: Vec<(u64, Vec<u8>)> = ready
+            .into_iter()
+            .map(|r| (r.offset, r.buffer.as_ref().to_vec()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(0, b"01".to_vec()), (5, b"567".to_vec())]);
+        // A plan larger than the byte budget is refused before any read.
+        assert!(
+            fetch(&store, &context(), vec![plan(0, 8, 1)], 1, 4)
+                .await
+                .is_err()
+        );
+    });
+}

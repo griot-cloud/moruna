@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.6.5
+
+This release also carries the security and isolation work planned for 0.6.6.
+
+- **Report schema 2.1: `job_digest` is the public MJS digest everywhere.** `moruna
+  run`, `moruna serve` (version 2) and `moruna.run` all report SHA-256 of the exact
+  MJS bytes, as `JobSpec.digest()` gives it. The CLI previously reported the
+  normalized execution fingerprint there; that is now reported beside it as
+  `execution_fingerprint`. The host protocol's hello `spec_digest` is unchanged.
+- **A task's declared gives are enforced on every batch it produces.** When a task,
+  or else its kind, declares gives, every batch its kernel or source produces is
+  checked against them, in pyarrow's spelling of the types. A mismatch is refused
+  naming the task, the batch and the field, before anything downstream sees it.
+- **Writable disks are bound to their run.** A writable disk in the native
+  descriptor can carry an access mode (`read_write`, or `read_only`, opened under a
+  shared lock and attached read-only) and a grant naming the public job digest,
+  the run and the attempt. Every grant is checked against the launch's authority
+  before any disk is opened. A disk without a grant behaves as before.
+
+- **Recovery preserves a snapshot taken before the first sink commit.** A later
+  watermark can no longer replace the snapshot's explicit uncommitted state,
+  which could previously make a restart skip output rows. An omitted snapshot
+  entry continues to use the placement watermark.
+
+- **Native node services outlive the first job.** Admission retains the initial
+  Linux and storage service endpoints and lends narrowed copies to the engine.
+  The decoder also retains these connections when reading older version-1
+  bootstrap records, so job completion can safely leave the node available.
+
+- **Image state stays in its own memory budget.** A retained image-process
+  footprint remains funded against the run ceiling while placement keeps its
+  separate arena allowance. Previously a learned profile could reduce queue
+  memory to zero and prevent the same job from running again.
+- **The confined vsock backend exits without foreign shutdown handlers.** Linux
+  coverage uses continuously mapped counters so the real confined process is
+  measured with its existing syscall filter.
+- **GitHub Actions runs the full release quality gate.** Portable commit and push
+  hooks run the fast checks. Required Linux checks cover tests, per-crate
+  coverage and a freshly installed Python wheel before a release merge.
+
+- **Built callables describe their interface in OCI metadata.** Versioned, bounded
+  labels expose the callable declaration, entry, build key and target platform
+  without running the image. Other OCI consumers can ignore the labels; the
+  command, environment, layers and execution protocol are unchanged.
+- **Metadata participates in build-cache validation.** An older cached image
+  without the requested callable descriptor is rebuilt. Identical code and
+  metadata reuse the image and its immutable digest in MJS.
+- **Cancellation after an attempt ends leaves its result intact.** A late cancel
+  no longer overwrites the completed attempt's status.
+- **Staging retries retain the failed completion cause.** If promotion fails after
+  both attempts, the original failure remains available for diagnosis. This does
+  not claim to resolve every intermittent staging or budget refusal.
+- **Linux embedded-Python validation finds the selected interpreter's library.**
+  The quality gate derives its shared-library directory before the adapter,
+  coverage and installed-wheel tests run.
+
 ## 0.6.4
 
 What moving the first project onto 0.6.3 found; each fix has a test that fails on 0.6.3.

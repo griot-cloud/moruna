@@ -483,3 +483,209 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+    use moruna_kernel::{Allocator, Tier};
+    use moruna_storage::{Credential, Role, local::FileStore};
+    use moruna_testkit::FakeAllocator;
+
+    struct Allow;
+    impl Authorizer for Allow {
+        fn verify<'a>(
+            &'a self,
+            access: &'a Access,
+            object: &'a Object,
+            _: Action,
+            _: Option<&'a Version>,
+        ) -> Operation<'a, ()> {
+            Box::pin(async move {
+                if object.workspace == access.workspace {
+                    Ok(())
+                } else {
+                    Err(Error::Denied)
+                }
+            })
+        }
+    }
+    /// A cache that always misses and accepts every fill.
+    struct Missing;
+    impl Ranges for Missing {
+        fn lookup<'a>(
+            &'a self,
+            _: &'a Access,
+            _: &'a Object,
+            _: &'a Version,
+            _: u64,
+            destination: Buffer,
+        ) -> Operation<'a, Lookup> {
+            Box::pin(async move { Ok(Lookup::Miss(destination)) })
+        }
+        fn fill<'a>(
+            &'a self,
+            _: &'a Access,
+            _: &'a Object,
+            _: &'a Version,
+            _: u64,
+            _: BufferView,
+        ) -> Operation<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Every operation other than a read goes to home under the run's own authority, a scope of
+    /// another workspace or run is refused before home is asked, and a read past the home
+    /// object's end is refused.
+    #[test]
+    fn non_read_operations_pass_to_home_and_foreign_scopes_are_refused() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let run = moruna_kernel::RunId(nonce).to_hex();
+        let root = std::env::temp_dir().join(format!("moruna-runtime-cache-pass-{run}"));
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(root.clone());
+        let home = Arc::new(
+            Governed::new(
+                Arc::new(
+                    FileStore::open(root, "pass".into(), "home".into(), Role::FormatProof).unwrap(),
+                ),
+                Arc::new(Allow),
+            )
+            .unwrap(),
+        );
+        let access = Arc::new(Access {
+            workspace: "pass".into(),
+            run: run.clone(),
+            credential: Credential::new(b"TEST-ONLY-CACHE".to_vec()).unwrap(),
+        });
+        let object = Object {
+            workspace: "pass".into(),
+            bucket: "home".into(),
+            key: "dir/one".into(),
+        };
+        let owner = Arc::new(Cached {
+            home: home.clone(),
+            cache: Arc::new(Missing),
+            access: access.clone(),
+        });
+        let cached = Cached::wrap(home.clone(), Arc::new(Missing), access.clone()).unwrap();
+        let alloc = FakeAllocator::new();
+        let bytes = |data: &[u8]| {
+            let mut b = alloc.alloc(data.len(), Tier::Host).unwrap();
+            b.as_mut().copy_from_slice(data);
+            Arc::new(b)
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_eq!(cached.role(), home.role());
+            let first = cached
+                .write(&access, &object, bytes(b"one").view())
+                .await
+                .unwrap();
+            assert_eq!(
+                cached.current(&access, &object).await.unwrap().version,
+                first.version
+            );
+            assert_eq!(
+                cached
+                    .head(&access, &object, &first.version)
+                    .await
+                    .unwrap()
+                    .bytes,
+                3
+            );
+            let prefix = Object {
+                key: "dir/".into(),
+                ..object.clone()
+            };
+            assert_eq!(cached.list(&access, &prefix).await.unwrap().len(), 1);
+            let second = cached
+                .replace(
+                    &access,
+                    &object,
+                    Condition::Match(first.version.clone()),
+                    bytes(b"two").view(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(second.version, first.version);
+            // A miss reads home and fills; a range past the object's end is refused.
+            let read = cached
+                .read(
+                    &access,
+                    &object,
+                    &second.version,
+                    0,
+                    alloc.alloc(3, Tier::Host).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(read.as_ref(), b"two");
+            assert!(matches!(
+                cached
+                    .read(
+                        &access,
+                        &object,
+                        &second.version,
+                        1,
+                        alloc.alloc(3, Tier::Host).unwrap()
+                    )
+                    .await,
+                Err(Error::Invalid(_))
+            ));
+
+            let foreign = Scope {
+                workspace: "pass".into(),
+                run: "another-run".into(),
+            };
+            assert!(matches!(
+                owner.current(&foreign, &object).await,
+                Err(Error::Denied)
+            ));
+            assert!(matches!(
+                owner.head(&foreign, &object, &second.version).await,
+                Err(Error::Denied)
+            ));
+            assert!(matches!(
+                owner.list(&foreign, &prefix).await,
+                Err(Error::Denied)
+            ));
+            assert!(matches!(
+                owner.write(&foreign, &object, bytes(b"x").view()).await,
+                Err(Error::Denied)
+            ));
+            assert!(matches!(
+                owner
+                    .replace(
+                        &foreign,
+                        &object,
+                        Condition::Match(second.version.clone()),
+                        bytes(b"x").view()
+                    )
+                    .await,
+                Err(Error::Denied)
+            ));
+            assert!(matches!(
+                owner
+                    .read(
+                        &foreign,
+                        &object,
+                        &second.version,
+                        0,
+                        alloc.alloc(3, Tier::Host).unwrap()
+                    )
+                    .await,
+                Err(Error::Denied)
+            ));
+        });
+    }
+}

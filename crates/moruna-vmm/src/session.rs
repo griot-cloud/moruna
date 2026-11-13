@@ -121,3 +121,94 @@ fn try_connect(uds: &Path, port: u32, deadline: Instant) -> Option<BufReader<Uni
     r.get_ref().set_read_timeout(None).ok()?;
     Some(r)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    fn socket(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("m-vs-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A vsock helper that answers each `CONNECT` with one scripted reply.
+    fn helper(path: &Path, replies: Vec<&'static [u8]>) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut asked = [0u8; 64];
+                let n = s.read(&mut asked).unwrap();
+                assert!(asked[..n].starts_with(b"CONNECT 5000\n"));
+                s.write_all(reply).unwrap();
+                if reply.ends_with(b"\n") && reply.starts_with(b"OK ") {
+                    s.write_all(b"hello\n").unwrap();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn spec_bytes_are_json_or_canonical_binary() {
+        assert_eq!(spec_value(br#"{"a":1}"#).unwrap()["a"], 1);
+        assert!(spec_value(b"not json").is_err());
+        let mut binary = vec![0u8; 16];
+        binary[4..8].copy_from_slice(b"MJB2");
+        assert!(spec_value(&binary).unwrap().is_string());
+        assert!(
+            ExitStatus {
+                code: 0,
+                messages: 1
+            }
+            .success()
+        );
+        assert!(
+            !ExitStatus {
+                code: 2,
+                messages: 0
+            }
+            .success()
+        );
+    }
+
+    #[test]
+    fn connect_retries_until_the_guest_answers_ok() {
+        let path = socket("ok");
+        // First the guest is not listening (the helper closes), then a split OK line.
+        let server = helper(&path, vec![b"", b"OK 1234\n"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut r = connect_guest(&path, 5000, deadline, &|| true).expect("connected");
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert_eq!(line, "hello\n");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_refused_connect_an_overlong_answer_or_a_dead_owner_never_connects() {
+        let path = socket("refused");
+        let long: &'static [u8] = Box::leak(vec![b'x'; 300].into_boxed_slice());
+        let server = helper(&path, vec![b"ERR no\n", long]);
+        // Each refusal is retried until the short deadline; the owner is alive throughout.
+        let deadline = Instant::now() + Duration::from_millis(400);
+        assert!(connect_guest(&path, 5000, deadline, &|| true).is_err());
+        drop(server);
+        let _ = std::fs::remove_file(&path);
+        // A VM that has gone is reported at once, with no socket at all.
+        let missing = socket("missing");
+        let gone = connect_guest(
+            &missing,
+            5000,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+        );
+        assert!(matches!(gone, Err(VmmError::Control(_))));
+        // An expired deadline with a live owner and no helper is a connect failure.
+        assert!(connect_guest(&missing, 5000, Instant::now(), &|| true).is_err());
+    }
+}

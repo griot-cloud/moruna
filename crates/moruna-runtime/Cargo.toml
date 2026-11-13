@@ -64,6 +64,9 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 getrandom = { workspace = true }
+# The type grammar's one reader (MH 4.9): a task's declared `gives` is compared in its spelling
+# (0.6.6). Also KD-T15's descriptions, converted by moruna-kernel.
+moruna-types = { workspace = true }
 
 # The vsock transport of `moruna serve` (MH 4.3) is Linux only: AF_VSOCK has no other home. The
 # process's own standard output and error are captured into the run's output on any Unix.
@@ -74,8 +77,6 @@ libc = { workspace = true }
 zip = { workspace = true }
 # PN-T34: the simulated planner, which needs a cost model, sees the run's checkpoint cadence.
 moruna-cost = { workspace = true }
-# KD-T15: the type grammar's descriptions, converted by moruna-kernel.
-moruna-types = { workspace = true }
 arrow = { workspace = true }
 # The test components of a .wasm package (SDD 17 k).
 moruna-wasm = { workspace = true, features = ["testing"] }

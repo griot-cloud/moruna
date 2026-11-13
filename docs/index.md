@@ -35,4 +35,6 @@ getting-started
 using
 execution
 reference
+image-callable-metadata
+release-0.6.6
 ```

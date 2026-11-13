@@ -115,9 +115,15 @@ fn launch_job(
                 .backends
                 .get(&service)
                 .ok_or(admission::Error::Unavailable)?;
+            let mut rights = Rights::READ | Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
+            // The engine gives its Linux child a narrowed personality listener.
+            // Other retained services only need to establish their own connection.
+            if service == "linux" {
+                rights = rights | Rights::DUPLICATE;
+            }
             let grant = listener
                 .0
-                .duplicate(Rights::READ | Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
+                .duplicate(rights)
                 .map_err(|_| admission::Error::Unavailable)?;
             names.push(service);
             grants.push(grant);

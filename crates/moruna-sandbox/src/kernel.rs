@@ -781,6 +781,10 @@ impl Kernel for SandboxKernel {
         self.hints.clone()
     }
 
+    fn state_uses_arena(&self) -> bool {
+        false
+    }
+
     fn declared(&self) -> Declared {
         self.declared.clone()
     }

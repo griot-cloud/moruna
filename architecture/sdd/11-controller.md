@@ -25,7 +25,7 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 
 **Working set.** Two inequalities, both of which a knob set must satisfy (f.3).
 
-* **Arena.** `Σ_stages share(stage) × allowance(stage) + Σ_queues high_water + read_ahead × split_bytes + state`, which must fit `arena_bytes`. This is what the runtime may hold.
+* **Arena.** `Σ_stages share(stage) × allowance(stage) + Σ_queues high_water + read_ahead × split_bytes + arena_state`, which must fit `arena_bytes`. This is what the runtime may hold.
 * **Anonymous.** `resting_anon + state + Σ_stages share(stage) × anon_allowance(stage)`, which must fit `limits.memory_ceiling`. This is what the *process* may hold, and it is the quantity S1 is measured from.
 
 **Resting anonymous memory.** `baseline + arena_bytes`. 02 f.1 touches every page of the region at `new`, so the process holds this much from the moment the arena exists, whether the runtime is using it or not. The controller cannot move it.
@@ -49,6 +49,16 @@ It refuses to know: morsel bytes; queue internals; how the scheduler picks; how 
 **Profile.** A stored summary of a kernel's measured behaviour keyed by fingerprint and input schema hash.
 
 **State.** Per stage, the bytes its instances hold regardless of morsel size: `instances_live × max(state_bytes over the stage's last 32 records)`, grouped by the record's `instance` column when present (f.3).
+
+**Arena state.** The part of `state` whose kernel reports
+`state_uses_arena = true`. The facade registers external stages through `Controller::set_external_state` before preparation. All other
+stages use arena accounting by default.
+The conservative default is true. Image processes and sandboxed package processes
+report false because their recorded footprints belong to their child processes
+and mappings. Their state remains fully funded in the anonymous inequality.
+It does not consume the placement arena, including when seeded from a previous
+run's profile. Profiles remain intact and continue to bound the run's memory.
+
 
 ## c. Invariants
 
@@ -127,6 +137,9 @@ impl Controller {
         placement: Arc<dyn Placement>,    // `set_budgets` only; no other placement method is ever called
         kernels: Vec<KernelInfo>,
     ) -> Result<Controller>;
+    /// Before prepare, name stages whose complete instance state is outside the arena.
+    /// Invalid stages or a call after prepare are refused atomically.
+    pub fn set_external_state(&self, stages: &[StageId]) -> Result<()>;
     /// Phase 1: sample the baseline (after `Scheduler::init_instances`, SC f.4), compute budgets,
     /// `placement.set_budgets`. Called by the facade before probes.
     pub fn prepare(&self) -> Result<Budgets>;

@@ -23,6 +23,7 @@ import sys
 import tarfile
 import threading
 import types
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1085,3 +1086,76 @@ def test_images_are_pushed_by_digest_and_pulled_verified(pipeline: Project, tmp_
             build.pull(pushed.reference, tmp_path / "again", credential)
     finally:
         server.shutdown()
+
+
+def test_callable_descriptor_is_passive_and_old_cached_images_are_upgraded(
+    pipeline: Project,
+) -> None:
+    task = pipeline.task("pipeline.tasks", "Parse")
+    first = pipeline.build(task)
+    first_config = json.loads(blob(first.layout, manifest_of(first)["config"]["digest"]))
+    definition = {
+        "name": "parse",
+        "role": "function",
+        "settings": {"type": "object"},
+        "provenance": {"build_key": task.key},
+    }
+    described = dataclasses.replace(task, definition=definition)
+    upgraded = pipeline.build(described)
+    assert not upgraded.reused and upgraded.digest != first.digest
+    config = json.loads(blob(upgraded.layout, manifest_of(upgraded)["config"]["digest"]))
+    labels = config["config"]["Labels"]
+    descriptor = build._image_metadata.read(labels)
+    assert descriptor["definition"] == definition
+    assert descriptor["entry"] == task.entry
+    assert descriptor["build_key"] == task.key
+    assert manifest_of(upgraded)["annotations"]["org.moruna.callable.version"] == "1"
+    before = json.loads(json.dumps(first_config))
+    after = json.loads(json.dumps(config))
+    before["config"].pop("Labels")
+    after["config"].pop("Labels")
+    assert after == before  # commands, environment and layers are unchanged
+    assert pipeline.build(described).reused
+    edited = dataclasses.replace(described, definition={**definition, "summary": "More context"})
+    rebuilt = pipeline.build(edited)
+    assert not rebuilt.reused and rebuilt.digest != upgraded.digest
+
+
+def test_registry_upgrades_a_pull_token_when_upload_requests_push_scope(tmp_path: Path) -> None:
+    """Docker Hub may grant HEAD a pull token before POST asks for pull,push."""
+    scopes = []
+    uploaded = []
+    host = "registry.example"
+    realm = "https://auth.example/token"
+
+    def transport(url, headers, *, method="GET", body=None):
+        if url.startswith(realm):
+            scope = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["scope"][0]
+            scopes.append(scope)
+            token = "push-token" if scope.endswith("pull,push") else "pull-token"
+            return 200, {}, io.BytesIO(json.dumps({"token": token}).encode())
+        token = headers.get("Authorization")
+        need = "pull" if method == "HEAD" else "pull,push"
+        if token is None or (method != "HEAD" and token != "Bearer push-token"):
+            return (
+                401,
+                {
+                    "www-authenticate": f'Bearer realm="{realm}",service="registry.example",scope="repository:team/p:{need}"'
+                },
+                io.BytesIO(),
+            )
+        if method == "HEAD":
+            return 404, {}, io.BytesIO()
+        if method == "POST":
+            return 202, {"location": "/v2/team/p/blobs/uploads/one"}, io.BytesIO()
+        uploaded.append(body.read_bytes())
+        return 201, {}, io.BytesIO()
+
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"callable-layer")
+    registry = build.Registry(
+        host, "team/p", transport, lambda _: {"username": "author", "password": "test-token"}
+    )
+    registry.push_blob("sha256:" + hashlib.sha256(blob.read_bytes()).hexdigest(), blob)
+    assert scopes == ["repository:team/p:pull", "repository:team/p:pull,push"]
+    assert uploaded == [b"callable-layer"]

@@ -352,6 +352,12 @@ fn im_t23_the_process_is_alone() {
         json!({"command": ["/bin/arrow_echo", "--report"], "env": {"EXTRA": "2", "FROM_IMAGE": "3"}}),
     )
     .expect_err("the report exits with status 9");
+    // Under a coverage build the fixture is itself instrumented, and LLVM's profile runtime
+    // sets this marker in the fixture's own environment before it reports: not the launcher's.
+    let e = e.replace(
+        " __LLVM_PROFILE_RT_INIT_ONCE=__LLVM_PROFILE_RT_INIT_ONCE",
+        "",
+    );
     assert!(e.contains("exited with status 9"), "{e}");
     assert!(
         e.contains("report: Uid:\t0\t0\t0\t0"),
@@ -538,4 +544,24 @@ fn im_t30_a_source_the_filter_kills_is_named() {
         e.contains("its output is not an Arrow IPC stream"),
         "the stream's fault stays the cause: {e}"
     );
+}
+
+/// IM-T31 a_plane_task_that_ends_before_it_answers_is_named: a plane program that ends before
+/// it answers its first batch ends its stage with its exit status and the batches it owed.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t31_a_plane_task_that_ends_before_it_answers_is_named() {
+    let scratch = Scratch::new("im_t31");
+    let first = layout(&scratch);
+    let quit = run_settings(
+        &scratch,
+        &first,
+        json!({"command": ["/bin/plane_echo", "--quit-first"], "plane": true}),
+    )
+    .expect_err("a task that ends before it answers fails its stage");
+    assert!(
+        quit.contains("kernels[0]") && quit.contains("exited with status 5"),
+        "{quit}"
+    );
+    assert!(quit.contains("for 1 sent"), "{quit}");
 }

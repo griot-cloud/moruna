@@ -244,6 +244,7 @@ def test_std_kernels_run_and_fuse_in_moruna_run(tmp_path: Path) -> None:
     src = tmp_path / "in.parquet"
     pq.write_table(table, src)
     out = tmp_path / "out"
+    # Earlier check probes retain library and allocator pages in this process.
     report = moruna.run(
         moruna.ParquetSource(str(src)),
         [
@@ -254,7 +255,7 @@ def test_std_kernels_run_and_fuse_in_moruna_run(tmp_path: Path) -> None:
             moruna.std.dedupe(keys="id"),
         ],
         moruna.ParquetSink(str(out)),
-        budget="512MiB",
+        budget="1GiB",
         profiles_dir=str(tmp_path / "profiles"),
         staging_dir=str(tmp_path / "staging"),
     )
@@ -281,7 +282,7 @@ def test_ck_t8_a_polars_signature_checks_and_runs(tmp_path: Path) -> None:
         moruna.ParquetSource(str(src)),
         doubled,
         moruna.ParquetSink(str(out_dir)),
-        budget="512MiB",
+        budget="1GiB",
         allow_gil=True,
         profiles_dir=str(tmp_path / "profiles"),
         staging_dir=str(tmp_path / "staging"),

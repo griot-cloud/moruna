@@ -104,7 +104,7 @@ def test_ho_t14_file_run_equals_library_run(
     code, from_file = _run(_document(scratch, src_url, from_file_out, "shout"), scratch)
     assert code == 0, from_file["exit"]
     assert from_file["exit"] == {"code": 0, "status": "completed", "diagnostic": None}
-    assert from_file["schema_version"] == "2.0"
+    assert from_file["schema_version"] == "2.1"
     assert from_file["job_digest"].startswith("sha256:")
 
     library = moruna.run(

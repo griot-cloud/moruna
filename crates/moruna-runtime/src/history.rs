@@ -328,6 +328,9 @@ impl Kernel for FinalRows {
     fn hints(&self) -> moruna_kernel::KernelHints {
         self.kernel.hints()
     }
+    fn state_uses_arena(&self) -> bool {
+        self.kernel.state_uses_arena()
+    }
     fn declared(&self) -> moruna_kernel::Declared {
         self.kernel.declared()
     }
@@ -1033,6 +1036,9 @@ mod tests {
     }
     struct IdentityKernel;
     impl Kernel for IdentityKernel {
+        fn state_uses_arena(&self) -> bool {
+            false
+        }
         fn fingerprint(&self) -> moruna_kernel::Fingerprint {
             moruna_kernel::Fingerprint::compute("history-single-task-test", b"")
         }
@@ -1085,6 +1091,7 @@ mod tests {
             rows: rows.clone(),
         };
         assert_eq!(bound.fingerprint(), original.fingerprint());
+        assert_eq!(bound.state_uses_arena(), original.state_uses_arena());
         let expected = batch();
         let mut state = moruna_kernel::NoState;
         let actual = bound
@@ -1270,6 +1277,387 @@ mod tests {
             }
         });
     }
+    /// A governed file store, its live access and one required output, as the publisher
+    /// fixture above sets them up; removed when dropped.
+    struct Fixture {
+        root: std::path::PathBuf,
+        store: Arc<Governed>,
+        output: Output,
+        run: String,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn fixture() -> Fixture {
+        use moruna_storage::{Action, Authorizer, Credential, Operation, Role, local::FileStore};
+        struct Allow;
+        impl Authorizer for Allow {
+            fn verify<'a>(
+                &'a self,
+                access: &'a Access,
+                object: &'a Object,
+                _: Action,
+                _: Option<&'a moruna_storage::Version>,
+            ) -> Operation<'a, ()> {
+                Box::pin(async move {
+                    if object.workspace == access.workspace {
+                        Ok(())
+                    } else {
+                        Err(moruna_storage::Error::Denied)
+                    }
+                })
+            }
+        }
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let run = moruna_kernel::RunId(nonce).to_hex();
+        let root = std::env::temp_dir().join(format!("moruna-history-cover-{run}"));
+        std::fs::create_dir(&root).unwrap();
+        let backend = FileStore::open(
+            root.join("home"),
+            "history-fixture".into(),
+            "home".into(),
+            Role::FormatProof,
+        )
+        .unwrap();
+        let store = Arc::new(Governed::new(Arc::new(backend), Arc::new(Allow)).unwrap());
+        let access = Arc::new(Access {
+            workspace: "history-fixture".into(),
+            run: run.clone(),
+            credential: Credential::new(b"TEST-ONLY-HISTORY".to_vec()).unwrap(),
+        });
+        let output = Output {
+            request: Request {
+                identity: moruna_storage::artifact::Identity {
+                    workspace: access.workspace.clone(),
+                    run: run.clone(),
+                    attempt: "attempt".into(),
+                    task: "task".into(),
+                    port: "out".into(),
+                },
+                required: true,
+                byte_budget: 65536,
+                policy: "test-only-explicit-grant".into(),
+            },
+            target: Object {
+                workspace: access.workspace.clone(),
+                bucket: "home".into(),
+                key: "rows".into(),
+            },
+            access,
+        };
+        Fixture {
+            root,
+            store,
+            output,
+            run,
+        }
+    }
+    fn historical(f: &Fixture, metadata_bytes: usize) -> Arc<Historical> {
+        Historical::new(
+            f.store.clone(),
+            vec![f.output.clone()],
+            vec![vec![LogicalTaskRows {
+                task: "task".into(),
+                ports: vec!["out".into()],
+            }]],
+            65536,
+            4,
+            65536,
+            metadata_bytes,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    /// The checkpoint hook rewrites the manifest with the acknowledged capture prefixes, in
+    /// place and atomically, and refuses a manifest it cannot read or bound.
+    #[test]
+    fn checkpoint_preparation_records_prefixes_and_refuses_unreadable_manifests() {
+        let f = fixture();
+        let plan = historical(&f, 4096);
+        let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
+        let mut kernels: Vec<Arc<dyn Kernel>> = vec![Arc::new(IdentityKernel)];
+        let running = plan
+            .start(
+                &mut kernels,
+                alloc.clone(),
+                CancelToken::new(),
+                &f.run,
+                None,
+            )
+            .unwrap();
+        kernels[0]
+            .apply(
+                &mut moruna_kernel::NoState,
+                moruna_kernel::Payload::Table(batch(), Tier::Host),
+            )
+            .unwrap();
+        let checkpoint = running.checkpoint();
+        let prepare = checkpoint.preparation(alloc.clone());
+        let manifest = f.root.join("manifest.json");
+        std::fs::write(&manifest, br#"{"written_ns": 1, "kept": true}"#).unwrap();
+        let hook = prepare().unwrap();
+        hook(&manifest).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(written["kept"], true, "the manifest's own fields are kept");
+        assert!(written[crate::portable::HISTORY_FIELD].is_array());
+        assert!(!manifest.with_extension("history-pending").exists());
+        let consumed = hook(&manifest).unwrap_err().to_string();
+        assert!(consumed.contains("admission consumed"), "{consumed}");
+
+        let refused = |bytes: Option<&[u8]>| {
+            let path = f.root.join("other.json");
+            let _ = std::fs::remove_file(&path);
+            if let Some(bytes) = bytes {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            prepare().unwrap()(&path).unwrap_err().to_string()
+        };
+        assert!(!refused(None).is_empty(), "an absent manifest");
+        assert!(refused(Some(&[b' '; 5000])).contains("metadata ceiling"));
+        assert!(refused(Some(b"not json")).contains("checkpoint manifest"));
+        assert!(refused(Some(br#"{"other": 1}"#)).contains("checkpoint sequence"));
+        assert!(refused(Some(br#"{"written_ns": "1"}"#)).contains("checkpoint sequence"));
+        running.finish(true).unwrap();
+    }
+
+    /// Every method of the single-task boundary is the wrapped kernel's, a non-table schema or
+    /// payload is refused, and a final output is captured like any other.
+    #[test]
+    fn the_final_rows_boundary_forwards_and_refuses_non_tables() {
+        struct Finishing;
+        impl Kernel for Finishing {
+            fn fingerprint(&self) -> moruna_kernel::Fingerprint {
+                moruna_kernel::Fingerprint::compute("finishing", b"")
+            }
+            fn kind(&self) -> moruna_kernel::KernelKind {
+                moruna_kernel::KernelKind::Stateless
+            }
+            fn accepts(&self) -> moruna_kernel::PayloadSpec {
+                IdentityKernel.accepts()
+            }
+            fn output_schema(&self, input: &SourceSchema) -> moruna_kernel::Result<SourceSchema> {
+                Ok(input.clone())
+            }
+            fn init(
+                &self,
+                _: &moruna_kernel::InitCtx,
+            ) -> moruna_kernel::Result<Box<dyn moruna_kernel::KernelState>> {
+                Ok(Box::new(moruna_kernel::NoState))
+            }
+            fn apply(
+                &self,
+                _: &mut dyn moruna_kernel::KernelState,
+                input: moruna_kernel::Payload,
+            ) -> moruna_kernel::Result<moruna_kernel::Payload> {
+                Ok(input)
+            }
+            fn finish(
+                &self,
+                _: &mut dyn moruna_kernel::KernelState,
+            ) -> moruna_kernel::Result<Option<moruna_kernel::Payload>> {
+                Ok(Some(moruna_kernel::Payload::Table(batch(), Tier::Host)))
+            }
+        }
+        let rows = Arc::new(Collected(Mutex::new(Vec::new())));
+        let bound = FinalRows {
+            kernel: Arc::new(Finishing),
+            task: LogicalTaskRows {
+                task: "t".into(),
+                ports: vec!["out".into()],
+            },
+            rows: rows.clone(),
+        };
+        let mut state = moruna_kernel::NoState;
+        assert!(bound.finish(&mut state).unwrap().is_some());
+        assert_eq!(
+            rows.0.lock().unwrap().len(),
+            1,
+            "the final output is captured"
+        );
+        let table = SourceSchema::Table(batch().schema());
+        assert!(bound.output_schema(&table).is_ok());
+        assert!(bound.output_schema_of(std::slice::from_ref(&table)).is_ok());
+        let tensor = SourceSchema::Tensor {
+            dtype: moruna_kernel::DType::I64,
+            shape: vec![1],
+        };
+        assert!(bound.output_schema(&tensor).is_err());
+        let ctx = moruna_kernel::InitCtx {
+            instance: 0,
+            device: None,
+            alloc: Arc::new(FakeAllocator::new()),
+        };
+        assert!(bound.init(&ctx).is_ok());
+        assert!(bound.restore(&ctx, b"").is_err());
+        assert!(
+            bound.apply_aligned(&mut state, vec![]).is_err(),
+            "the wrapped kernel does not align"
+        );
+        assert!(!bound.aligns_inputs());
+        assert_eq!(bound.max_inputs(), 1);
+        assert_eq!(bound.waiting_state(0), None);
+        assert!(bound.state_uses_arena());
+        let _ = (
+            bound.kind(),
+            bound.hints(),
+            bound.declared(),
+            bound.accepts(),
+        );
+        let alloc = FakeAllocator::new();
+        let buffer = alloc.alloc(8, Tier::Host).unwrap();
+        let tensor = moruna_kernel::ManagedTensor::from_buffer(
+            buffer,
+            0,
+            moruna_kernel::DType::I64,
+            vec![1],
+        )
+        .unwrap();
+        let refused = bound
+            .apply(
+                &mut state,
+                moruna_kernel::Payload::Tensor(tensor, Tier::Host),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("non-table payload"), "{refused}");
+    }
+
+    /// A plan without explicit outputs and budgets is refused; requested ports resolve only to
+    /// a function task's own output port.
+    #[test]
+    fn a_plan_needs_explicit_budgets_and_resolves_only_function_outputs() {
+        let f = fixture();
+        let refused = |outputs: Vec<Output>, queue: u64| {
+            Historical::new(
+                f.store.clone(),
+                outputs,
+                Vec::new(),
+                queue,
+                1,
+                1,
+                1,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        };
+        assert!(refused(Vec::new(), 1));
+        assert!(refused(vec![f.output.clone()], 0));
+        let mut optional = f.output.clone();
+        optional.request.required = false;
+        assert!(refused(vec![optional], 1));
+
+        let mut spec = moruna_job::JobSpec::new(
+            moruna_job::KindDoc::new(
+                "parquet",
+                serde_json::json!({"url": "file:///in.parquet"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            Vec::new(),
+            moruna_job::KindDoc::new(
+                "parquet",
+                serde_json::json!({"url": "/out"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        );
+        spec.kernels.push(moruna_job::KindDoc::new(
+            "std",
+            serde_json::json!({"name": "select", "args": {"columns": ["a"]}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        let job = moruna_job::Job::from_v1(&spec);
+        let kernel = job
+            .tasks
+            .iter()
+            .position(|t| t.role == moruna_job::Role::Kernel)
+            .unwrap();
+        let source = job
+            .tasks
+            .iter()
+            .position(|t| t.role == moruna_job::Role::Source)
+            .unwrap();
+        let parts = crate::job::Parts {
+            sources: vec![source],
+            stages: vec![vec![kernel]],
+            sinks: Vec::new(),
+        };
+        let asking = |task: &str, port: &str| {
+            let mut output = f.output.clone();
+            output.request.identity.task = task.into();
+            output.request.identity.port = port.into();
+            output
+        };
+        let task = job.tasks[kernel].id.clone();
+        let port = job.tasks[kernel].outputs[0].clone();
+        let bound = Historical::bindings_for_job(&job, &parts, &[asking(&task, &port)]).unwrap();
+        assert_eq!(bound[0][0].task, task);
+        assert_eq!(bound[0][0].ports, vec![port.clone()]);
+        assert!(Historical::bindings_for_job(&job, &parts, &[asking("absent", &port)]).is_err());
+        let source_task = job.tasks[source].id.clone();
+        assert!(
+            Historical::bindings_for_job(&job, &parts, &[asking(&source_task, &port)]).is_err()
+        );
+        assert!(Historical::bindings_for_job(&job, &parts, &[asking(&task, "nope")]).is_err());
+        let beyond = crate::job::Parts {
+            sources: Vec::new(),
+            stages: vec![vec![job.tasks.len()]],
+            sinks: Vec::new(),
+        };
+        assert!(Historical::bindings_for_job(&job, &beyond, &[]).is_err());
+    }
+
+    /// The row tap refuses after capture ended, after a recorded failure, and for a boundary
+    /// that was not requested; each refusal leaves nothing queued.
+    #[test]
+    fn the_row_tap_refuses_ended_failed_and_unrequested_boundaries() {
+        let shared = Arc::new(Shared {
+            queued: AtomicU64::new(0),
+            error: Mutex::new(None),
+            finishing: Mutex::new(None),
+            deadline: Mutex::new(None),
+            cancel: CancelToken::new(),
+        });
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let tap = Tap {
+            tx,
+            identities: HashMap::from([(("task".into(), "out".into()), 0)]),
+            shared: shared.clone(),
+            budget: 1 << 20,
+        };
+        let unrequested = tap
+            .append("task", "other", &batch())
+            .unwrap_err()
+            .to_string();
+        assert!(unrequested.contains("unrequested"), "{unrequested}");
+        shared.fail("the store refused".into());
+        let failed = tap.append("task", "out", &batch()).unwrap_err().to_string();
+        assert!(failed.contains("the store refused"), "{failed}");
+        assert!(shared.cancel.is_cancelled());
+        *shared.finishing.lock().unwrap() = Some(true);
+        let ended = tap.append("task", "out", &batch()).unwrap_err().to_string();
+        assert!(ended.contains("capture has ended"), "{ended}");
+        assert_eq!(shared.queued.load(Ordering::Acquire), 0);
+        // The drain deadline bounds an operation's limit once it is set.
+        assert_eq!(
+            shared.timeout(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        *shared.deadline.lock().unwrap() = Some(Instant::now());
+        assert!(shared.timeout(Duration::from_secs(3)) <= Duration::from_millis(1));
+    }
+
     #[test]
     fn every_artifact_chunk_is_a_complete_charged_arrow_stream_or_refuses_encoding() {
         let rows = batch();

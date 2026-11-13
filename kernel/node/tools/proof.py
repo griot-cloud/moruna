@@ -203,6 +203,11 @@ def main():
                  "--storage-admission", out / "canonical/storage.admission",
                  *(["--kd3-conformance-proof", args.kd3_conformance_proof] if fixture_mode else []),
                  *(["--kd3-case", case_grant] if case_grant else [])])
+        if args.case == 1 and not (args.io_phase or args.sdk_proof or fixture_mode):
+            # Exercise version-1 bootstrap records through the real node decoder.
+            initial = out / "assets/initial.job"
+            initial.write_text(initial.read_text().replace("\nservice ", "\ngrant "))
+            record["initial_service_records"] = "legacy-grant"
         if args.io_phase:
             # Explicit fixture assembly uses the unmodified production node parser,
             # supervisor, authority and storage owner, not a substitute service.

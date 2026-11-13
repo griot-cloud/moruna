@@ -4,7 +4,7 @@ Every job produces a run report, computed from a record Moruna keeps of every mo
 
 ## The schema
 
-`schema_version` is `"MAJOR.MINOR"`. A reader refuses a report whose major it does not know, and reads a later minor of its major, which only adds fields. This release's schema is `2.0`: `tasks` holds every figure of a task, and the `stages` of schema 1 are gone.
+`schema_version` is `"MAJOR.MINOR"`. A reader refuses a report whose major it does not know, and reads a later minor of its major, which only adds fields. This release's schema is `2.1`, which adds `execution_fingerprint` to `2.0`. In `2.0`, `tasks` holds every figure of a task, and the `stages` of schema 1 are gone.
 
 A measurement that was not made is absent from the report, never zero: a zero is a measured zero. A task that ran no morsel has no `wall_ms`; a sink's `snapshot_id` is `null` only when it committed none.
 
@@ -35,7 +35,8 @@ The trace's own fields follow the same rule: a field it measures in seconds, nan
 | `schema_version` | The report's schema, `"MAJOR.MINOR"`. |
 | `moruna` | The version of Moruna that ran the job. |
 | `run_id` | The job's id. |
-| `job_digest` | The digest of the job's spec, `sha256:` and hex; `null` for a job a spec cannot hold. |
+| `job_digest` | The public digest of the job's spec, `sha256:` and the hex of SHA-256 over its exact bytes, the same from `moruna.run` and `moruna run`; `null` for a job a spec cannot hold. |
+| `execution_fingerprint` | The normalized execution fingerprint (`sha256:` and hex) the planner and recovery use. It is not the document's identity; `null` for a run refused before its job was built. Added in schema 2.1. |
 | `args` | The run's argument values, by name. |
 | `host` | Where it ran: `platform` (`os/arch`), `cpus`, `memory_limit_bytes`, `cpu_quota_cores`, `limits_source` and `devices`. |
 | `exit` | `code`, `status` (`"completed"`, `"terminated"`, `"cancelled"`, or `"refused"` when the document, its budget or its resume was refused before the run started) and `diagnostic`, the reason the job stopped. A run refused before it started has no trace: its document has its identity, `exit`, `notes`, `args`, `plan` and each task `skipped`. |

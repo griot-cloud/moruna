@@ -290,6 +290,13 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
             &mut cx,
         )?;
         targets.extend(built.targets.iter().cloned());
+        let mut built = built;
+        // 0.6.6: every batch a source declares it gives is checked before it is published.
+        if let Some(guard) =
+            crate::kinds::gives::GivesGuard::of(&job.tasks[i].id, gives_of(job, &declared, i))
+        {
+            built.spec = crate::kinds::gives::guard_source(built.spec, guard);
+        }
         sources.push(built);
     }
     cx.set_source_targets(targets.clone());
@@ -352,6 +359,17 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         }
     }
     notes.extend(cx.take_notes());
+    // 0.6.6: a stage's every output, and its final one, is checked against what the task whose
+    // output it is declares it gives, before it is published downstream.
+    for assembling in &mut assembled {
+        let task = assembling.output_task;
+        if let Some(guard) =
+            crate::kinds::gives::GivesGuard::of(&job.tasks[task].id, gives_of(job, &declared, task))
+        {
+            assembling.stage.kernel =
+                crate::kinds::gives::GuardedKernel::wrap(assembling.stage.kernel.clone(), guard);
+        }
+    }
 
     let mut topology = topology_of(job, &source_tasks, &sink_tasks, &assembled, &stage_of)?;
     // d.16: a kernel that joins its inputs by morsel takes branches of one upstream, numbered
@@ -549,6 +567,20 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
 
 /// The stage kernel task `i` may join (MH 4.9): the stage of the kernel its one input comes from,
 /// when that kernel's one output goes to it alone.
+/// What task `i` declares it gives: its inline definition's, else its kind's; `None` when
+/// neither declares it.
+fn gives_of<'a>(
+    job: &'a Job,
+    declared: &[&'a Declaration],
+    i: usize,
+) -> Option<&'a moruna_job::ArrowSchema> {
+    job.tasks[i]
+        .definition
+        .as_ref()
+        .and_then(|d| d.gives.as_ref())
+        .or(declared[i].gives.as_ref())
+}
+
 fn fusable_predecessor(job: &Job, i: usize, stage_of: &[Option<usize>]) -> Option<usize> {
     let task = &job.tasks[i];
     let [port] = task.inputs.as_slice() else {

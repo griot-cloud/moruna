@@ -768,6 +768,53 @@ mod tests {
     use moruna_testkit::FakeAllocator;
 
     #[test]
+    fn a_reservation_answers_for_its_source_and_refuses_what_it_cannot_cover() {
+        let source = Arc::new(FakeAllocator::new());
+        let pool = source.alloc(8192, Tier::Host).unwrap();
+        let inside = pool.host_ptr().unwrap() as *const u8;
+        let reservation = ReservedAllocator {
+            source: source.clone(),
+            pool: Mutex::new(Some(pool)),
+        };
+        assert_eq!(
+            reservation.page_bytes(),
+            Allocator::page_bytes(source.as_ref())
+        );
+        assert_eq!(
+            reservation.is_pinned(),
+            Allocator::is_pinned(source.as_ref())
+        );
+        assert_eq!(
+            reservation.contains(inside),
+            Allocator::contains(source.as_ref(), inside)
+        );
+        assert_eq!(
+            reservation.tier_of(inside),
+            Allocator::tier_of(source.as_ref(), inside)
+        );
+        reservation.note_payload_copy(3);
+        reservation.note_boundary_copy(5);
+        assert_eq!(
+            reservation.stats().allocations_total,
+            Allocator::stats(source.as_ref()).allocations_total
+        );
+        // More than the reservation holds is an allocation refusal, never a new source alloc.
+        assert!(matches!(
+            reservation.alloc(1 << 20, Tier::Host),
+            Err(MorunaError::Alloc { .. })
+        ));
+        // A different tier than the reservation's is refused and the pool is kept.
+        assert!(matches!(
+            reservation.alloc(16, Tier::PinnedHost),
+            Err(MorunaError::Resume(_))
+        ));
+        assert!(
+            reservation.alloc(16, Tier::Host).is_ok(),
+            "the pool was kept"
+        );
+    }
+
+    #[test]
     fn checkpoint_codec_admission_never_allocates_from_the_live_run() {
         let source = Arc::new(FakeAllocator::new());
         let pool = source.alloc(8192, Tier::Host).unwrap();

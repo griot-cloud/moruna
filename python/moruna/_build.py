@@ -40,6 +40,8 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import IO, Any
 
+from . import _image_metadata
+
 EXIT_DONE = 0
 EXIT_REFUSED = 2
 
@@ -537,15 +539,19 @@ def urllib_transport(
     """``method url`` with ``body`` (bytes, or a file's): the status, the headers (lower case
     names) and the body, redirects not followed (the registry follows them, dropping
     credentials that must not leave its host)."""
-    data = body.read_bytes() if isinstance(body, Path) else body
+    file = body.open("rb") if isinstance(body, Path) else None
+    data = file if file is not None else body
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        response = opener.open(request, timeout=60)
+        response = opener.open(request, timeout=600 if file is not None else 60)
     except urllib.error.HTTPError as exc:
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc
     except urllib.error.URLError as exc:
         raise Refused(f"{url}: {exc.reason}") from exc
+    finally:
+        if file is not None:
+            file.close()
     return response.status, {k.lower(): v for k, v in response.headers.items()}, response
 
 
@@ -609,6 +615,7 @@ class Registry:
         """``method url`` with the registry's credentials once it asked for them, following
         its redirects (and dropping credentials for another host); the status, the headers and
         the body of the last answer."""
+        challenges: set[str] = set()
         for _ in range(8):
             status, got, answer = self.transport(
                 url, self._headers(url, headers), method=method, body=body
@@ -618,11 +625,16 @@ class Registry:
                 continue
             if (
                 status == http.HTTPStatus.UNAUTHORIZED
-                and self.token is None
-                and self.basic is None
                 and "www-authenticate" in got
+                and got["www-authenticate"] not in challenges
             ):
-                self._authenticate(got["www-authenticate"])
+                # HEAD can grant pull-only access; uploads may then need a
+                # fresh token with push scope. Retry each challenge once.
+                challenge = got["www-authenticate"]
+                challenges.add(challenge)
+                answer.close()
+                self.token = self.basic = None
+                self._authenticate(challenge)
                 continue
             return status, got, answer
         raise Refused(f"{url}: too many redirects")
@@ -1112,6 +1124,7 @@ class Task:
     key: str
     distributions: tuple[str, ...]
     provenance: dict[str, Any]
+    definition: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1194,6 +1207,7 @@ def image_config(
         "org.opencontainers.image.base.digest": runtime.digest,
         BUILD_KEY: task.key,
     }
+    labels.update(callable_labels(task, options))
     if options.version:
         labels["org.moruna.version"] = options.version
     return {
@@ -1217,6 +1231,18 @@ def image_config(
 BUILD_KEY = "org.moruna.build.key"
 
 
+def callable_labels(task: Task, options: Options) -> dict[str, str]:
+    try:
+        return _image_metadata.labels(
+            entry=task.entry,
+            build_key=task.key,
+            definition=task.definition,
+            architecture=options.platform.arch,
+        )
+    except (TypeError, ValueError) as exc:
+        raise Refused(f"{task.name}: invalid callable metadata: {exc}") from exc
+
+
 def annotations(task: Task, lock: str) -> dict[str, str]:
     """The manifest's provenance, as standard OCI annotations and Moruna's own: the source and
     revision (when the code is in a repository) and whether a bundled file differed from it,
@@ -1225,8 +1251,12 @@ def annotations(task: Task, lock: str) -> dict[str, str]:
         BUILD_KEY: task.key,
         "org.moruna.entry": task.entry,
         "org.moruna.lock.digest": lock,
-        "org.moruna.files": json.dumps(task.code.file_digests(), sort_keys=True, separators=(",", ":")),
+        "org.moruna.files": json.dumps(
+            task.code.file_digests(), sort_keys=True, separators=(",", ":")
+        ),
     }
+    if task.definition is not None:
+        found[_image_metadata.VERSION_LABEL] = _image_metadata.VERSION
     if task.provenance.get("source"):
         found["org.opencontainers.image.source"] = task.provenance["source"]
     if task.provenance.get("revision"):
@@ -1289,9 +1319,29 @@ def _write_atomic(path: Path, data: bytes) -> None:
     os.replace(temp, path)
 
 
-def _existing(layout: Path, index: dict[str, Any], key: str) -> str | None:
+def _metadata_matches(layout: Path, manifest: dict[str, Any], metadata: dict[str, str]) -> bool:
+    """A cached config is verified before its passive descriptor is reused."""
+    digest = manifest["config"]["digest"]
+    config_path = layout / "blobs" / "sha256" / _digest_hex(digest, "callable config")
+    try:
+        if sha256_file(config_path) != _digest_hex(digest, "callable config"):
+            return False
+        config = json.loads(config_path.read_bytes())
+        labels = config.get("config", {}).get("Labels", {})
+    except (OSError, ValueError, AttributeError):
+        return False
+    keys = (_image_metadata.LABEL, _image_metadata.VERSION_LABEL)
+    return all(labels.get(key) == metadata.get(key) for key in keys) and (
+        manifest.get("annotations", {}).get(_image_metadata.VERSION_LABEL)
+        == metadata.get(_image_metadata.VERSION_LABEL)
+    )
+
+
+def _existing(layout: Path, index: dict[str, Any], key: str,
+              metadata: dict[str, str] | None = None) -> str | None:
     """The image of build key ``key`` the layout already holds, whole: its manifest's digest.
-    A key names the code, so its image is reused, whatever a docstring now says."""
+    Reuse also requires the current callable metadata, so older cached images
+    without a descriptor cannot masquerade as newly described builds."""
     for entry in index.get("manifests", []):
         if entry.get("annotations", {}).get(REF_NAME) != key:
             continue
@@ -1310,6 +1360,8 @@ def _existing(layout: Path, index: dict[str, Any], key: str) -> str | None:
             return path.is_file() and path.stat().st_size == descriptor["size"]
 
         if manifest.get("annotations", {}).get(BUILD_KEY) == key and all(map(whole, blobs)):
+            if metadata is not None and not _metadata_matches(layout, manifest, metadata):
+                return None
             return str(digest)
     return None
 
@@ -1359,7 +1411,7 @@ def build_images(tasks: Sequence[Task], options: Options) -> list[Built]:
                     f"{task.name}: its code is imported from {task.code.root}, and the job's "
                     f"other tasks from {root}; a job's tasks build from one project and its lock"
                 )
-            existing = _existing(options.out, index, task.key)
+            existing = _existing(options.out, index, task.key, callable_labels(task, options))
             if existing is not None:
                 manifest = json.loads(
                     (options.out / "blobs" / "sha256" / _digest_hex(existing, task.key)).read_bytes()

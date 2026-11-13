@@ -3,8 +3,8 @@
 # core.hooksPath at tools/hooks. It runs the fast half of the quality gate
 # (tools/quality/check.sh --fast): formatting, clippy over every target, the lints
 # and the documentation checks, in seconds on an incremental build. The tests, the
-# 90% coverage floor and the Python suite run in the pre-push hook, before anything
-# reaches GitHub. MORUNA_SKIP_QUALITY=1 skips both, for a human committing
+# coverage floor and the Python suite run in the GitHub Actions gate, and locally
+# through tools/quality/check.sh. MORUNA_SKIP_QUALITY=1 skips the quality checks, for a human committing
 # documentation on a machine without the Rust toolchain; CI re-runs the gate on the
 # pull request regardless.
 set -euo pipefail

@@ -907,6 +907,10 @@ impl Kernel for ImageTask {
         KernelHints::default()
     }
 
+    fn state_uses_arena(&self) -> bool {
+        false
+    }
+
     fn accepts(&self) -> PayloadSpec {
         PayloadSpec {
             kind: PayloadKind::Table,

@@ -4,6 +4,10 @@ Status: declared bounded source implementation complete; integrated compile/link
 
 ## Boundary
 
+The [0.6.6 delivery plan](../release-0.6.6.md) maps the deferred launcher and
+isolation work onto these native node services, capability grants and owned
+process lifetimes. Its acceptance gates are tracked in `BOARD.md`.
+
 The node is a boot image of the existing microkernel and separate user processes.
 `node-supervisor` is the only initial process. It holds service images, explicit
 boot capabilities, and the root process resource. It carves one bounded account
@@ -240,6 +244,16 @@ VMM path metadata grants none of that authority. Owned QMP quit precedes emulato
 reap and backing-lock release. Forced kill remains an error/fallback, not a claim
 of graceful durable drain. Rust's safe file-lock API is the platform boundary:
 [File::try_lock](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock).
+
+Since 0.6.6 a writable disk may also carry `access` and `grant`. `access` is
+`read_write` (the default) or `read_only`. A read-only disk is opened read-only
+under a shared lock that still excludes any writer, and is attached with
+`readonly=on`. `grant` is `{job_digest, run_id, attempt}`: the public MJS digest,
+the 32-hex run id and the launch attempt it is granted to. `launch_for_run`
+checks every grant against the launch's `RunAuthority` before any disk is opened,
+and refuses a malformed grant, a launch without run authority, another job, or
+another run or attempt. Reusing the path needs a fresh grant. A disk without a
+grant keeps the earlier unbound behaviour until the packaging tools emit grants.
 
 `configure.py` renders actual node/initial/KD2 configs only from explicit resource
 profiles, image records, layer lists, network policy and trusted TLS root input.
