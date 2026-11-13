@@ -33,6 +33,9 @@ pub struct BuildCtx {
     pub arena_bytes: u64,
     /// How many sinks the run has: they share the arena's file buffer share (contracts d.16).
     pub sinks: u16,
+    /// The workers the run may have at most: a sink that encodes on workers opens a file per
+    /// worker that may encode at once (08 f.12, RB1).
+    pub workers: u16,
     /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
     pub(crate) sink_buffer: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -406,6 +409,7 @@ mod tests {
             run_id: RunId([3; 16]),
             arena_bytes: 139_198_464,
             sinks: 1,
+            workers: 1,
             sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }

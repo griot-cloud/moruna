@@ -36,6 +36,7 @@ use moruna_kernel::{
 mod checkpoint;
 mod cputime;
 mod decide;
+mod decode_ratio;
 mod heartbeat;
 mod instances;
 mod knobs;

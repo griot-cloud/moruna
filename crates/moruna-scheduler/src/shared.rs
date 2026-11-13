@@ -283,6 +283,8 @@ pub(crate) struct SourceEnd {
     /// Drive-owned acknowledgement: no read/helper can publish until the barrier opens.
     pub(crate) checkpoint_paused: AtomicBool,
     pub(crate) out: EndCounters,
+    /// What a row decodes to in memory over what the split's metadata says it is (f.5, RB3).
+    pub(crate) decoded: crate::decode_ratio::DecodeRatio,
     pub(crate) helper_tx: Sender<HelperRequest>,
     pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
     pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
@@ -641,6 +643,7 @@ impl Shared {
                 exhausted: AtomicBool::new(false),
                 checkpoint_paused: AtomicBool::new(false),
                 out: EndCounters::default(),
+                decoded: crate::decode_ratio::DecodeRatio::default(),
                 helper_tx,
                 helper_rx: Mutex::new(Some(helper_rx)),
                 handle: Mutex::new(None),

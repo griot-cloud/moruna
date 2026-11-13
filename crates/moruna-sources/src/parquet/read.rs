@@ -65,6 +65,10 @@ fn fetch_now(
     let (file, entry) = source.entry(split)?;
     let range = resolve_range(split, rows)?;
     Counters::add(&source.counters().reads, 1);
+    let last = range.end >= split.rows;
+    if let Some(chunks) = source.fetched_last(split.id, last) {
+        return Ok(ParquetFetched { chunks, range });
+    }
 
     let group = file
         .metadata
@@ -139,10 +143,9 @@ fn fetch_now(
         fetched.push((start, bytes));
     }
 
-    Ok(ParquetFetched {
-        chunks: ArenaChunks::new(file_len, fetched),
-        range,
-    })
+    let chunks = ArenaChunks::new(file_len, fetched);
+    source.keep_fetched(split.id, &chunks, last);
+    Ok(ParquetFetched { chunks, range })
 }
 
 /// The CPU half of a read: decode a fetched split into a payload in arena buffers of `tier`.
@@ -160,21 +163,28 @@ pub(crate) fn decode_fetched(
         file.metadata.file_metadata().schema_descr(),
         file.projected.iter().copied(),
     );
-    let arrow_meta = ArrowReaderMetadata::try_new(
-        std::sync::Arc::clone(&file.metadata),
-        ArrowReaderOptions::new(),
-    )
-    .map_err(|e| source_err(split.id, e.to_string()))?;
+    // A range of a group decodes only the pages it covers when they can be located (`pages`):
+    // the group alone, with its page locations, as row group 0.
+    let partial = range.start != 0 || range.end != split.rows;
+    let (metadata, row_group) = match partial
+        .then(|| source.paged(split, file, entry, &chunks))
+        .flatten()
+    {
+        Some(indexed) => (indexed, 0),
+        None => (std::sync::Arc::clone(&file.metadata), entry.row_group),
+    };
+    let arrow_meta = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+        .map_err(|e| source_err(split.id, e.to_string()))?;
     let wanted = (range.end - range.start).max(1);
     let selection = RowSelection::from_consecutive_ranges(
         std::iter::once(range.start as usize..range.end as usize),
         split.rows as usize,
     );
     let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, arrow_meta)
-        .with_row_groups(vec![entry.row_group])
+        .with_row_groups(vec![row_group])
         .with_projection(mask)
         .with_batch_size(usize::try_from(wanted).unwrap_or(usize::MAX));
-    if range.start != 0 || range.end != split.rows {
+    if partial {
         builder = builder.with_row_selection(selection);
     }
     let started = std::time::Instant::now();

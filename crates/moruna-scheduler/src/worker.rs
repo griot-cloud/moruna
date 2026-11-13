@@ -24,6 +24,25 @@ use crate::instances;
 use crate::shared::{JobOutput, JobRequest, Shared, WorkerJob};
 use crate::slots::BusySlot;
 
+/// Run one offloaded job (RB1) under a slot claim, if one is queued and a slot is free.
+fn run_offloaded(shared: &Shared, worker: u16) -> bool {
+    if shared.offload.queued() == 0 {
+        return false;
+    }
+    let Some(slot) = shared.knobs.slots.try_claim(worker) else {
+        return false;
+    };
+    let ran = match shared.offload.take() {
+        Some(job) => {
+            job();
+            true
+        }
+        None => false,
+    };
+    drop(slot);
+    ran
+}
+
 /// The per-worker loop of e.1: `Parked` -> `Idle` -> `Running(stage, seq)` -> `Idle`.
 pub(crate) fn worker_loop(
     shared: Arc<Shared>,
@@ -31,6 +50,9 @@ pub(crate) fn worker_loop(
     jobs: Receiver<JobRequest>,
     parker: Parker,
 ) {
+    // Whether this worker's last unit was an offloaded job (RB1): the next turn is a function's,
+    // if the policy has one.
+    let mut offloaded_last = false;
     loop {
         shared.heartbeat.touch(worker);
         if shared.stopping.load(Ordering::SeqCst) {
@@ -51,18 +73,19 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         }
-        // RB1: a decode or an encode a drive handed over goes ahead of a function's morsel,
-        // because it is what feeds the functions or frees the memory behind the sink. It runs
-        // under the same slot claim as any unit, so the CPU limit in force binds it too.
-        if shared.offload.queued() > 0
-            && let Some(slot) = shared.knobs.slots.try_claim(worker)
-        {
-            if let Some(job) = shared.offload.take() {
-                job();
-            }
-            drop(slot);
+        // RB1: a decode or an encode a drive handed over is what feeds the functions or frees
+        // the memory behind the sink, so a worker takes one ahead of a function's morsel, under
+        // the same slot claim as any unit so the CPU limit in force binds it too. But not two in
+        // a row while the policy has a function's morsel to give: a worker that always put the
+        // drives' jobs first could be kept on them for good, and was. On Score with two workers
+        // active the queue's entries were evicted for room and read again, every re-read was a
+        // decode, the decodes kept both workers, no morsel at the head was ever taken, and the
+        // queue never shrank: 44,065 re-reads in two minutes and no row out (2026-11-14).
+        if !offloaded_last && run_offloaded(&shared, worker) {
+            offloaded_last = true;
             continue;
         }
+        offloaded_last = false;
         // f.3: the run's policy decides, and the unit runs only under a claim on what it is
         // predicted to make (contracts d.18, adaptive-runtime 9.4).
         let (stage, port, claim, learn) = match crate::decide::decide(&shared, worker) {
@@ -73,6 +96,11 @@ pub(crate) fn worker_loop(
                 learn,
             }) => (stage, port, claim, learn),
             Ok(crate::decide::Decision::Idle { ready }) => {
+                // Nothing of a function's to run: a drive's job, if one is waiting, before idling.
+                if run_offloaded(&shared, worker) {
+                    offloaded_last = true;
+                    continue;
+                }
                 let started = std::time::Instant::now();
                 idle(&shared, worker, &parker);
                 if ready {
@@ -637,6 +665,7 @@ pub(crate) fn run_task(
         return Ok(Some(ProbeResult {
             bytes_in,
             rows_in,
+            bytes_out,
             peak_delta: s1.peak_anon_bytes.saturating_sub(s0.anon_bytes),
             dev_peak_delta: s1.device_used[0].saturating_sub(s0.device_used[0]),
             wall_ns: t1.saturating_sub(t0),

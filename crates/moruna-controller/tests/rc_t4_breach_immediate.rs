@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{GIB, MIB, kernel, morsel_targets, probe, record, steady};
+use common::{GIB, MIB, kernel, morsel_targets, probe, record, started_now, steady};
 use moruna_kernel::KernelHints;
 use moruna_testkit::{FakeKnobs, FakeSampler};
 
@@ -30,6 +30,11 @@ fn rc_t4_breach_immediate() {
     let resting = cfg.baseline_bytes + cfg.arena_bytes;
     let headroom = ceiling - resting;
     let line = (resting + headroom / 2).min(ceiling);
+    // The stop line: a quarter of the reserve under the ceiling.
+    let reserve = (ceiling as f64
+        * f64::from(moruna_controller::ControllerConfig::default().reserve_fraction))
+        as u64;
+    let stop = ceiling - reserve / 4;
     let rig = common::Rig::new(
         cfg,
         vec![kernel(1, KernelHints::default())],
@@ -76,8 +81,11 @@ fn rc_t4_breach_immediate() {
         if target == morsel_min && at_floor.is_none() {
             at_floor = Some(seq);
         }
-        let mut breach = record(seq, 1, target, 0);
-        breach.mem_anon_peak = line + MIB;
+        // Each is a morsel picked up after the shrink before it, at the target that shrink set,
+        // and each takes the process past the stop line: at the floor that is the measurement
+        // that agrees with the model (f.7, RB5).
+        let mut breach = started_now(record(seq, 1, target, 0));
+        breach.mem_anon_peak = stop + MIB;
         rig.feed(&breach);
         seq += 1;
     }

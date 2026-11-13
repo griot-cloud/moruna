@@ -1005,7 +1005,9 @@ pub struct SchedulerStats {
 pub trait Prober: Send + Sync { fn probe(&self, stage: StageId, bytes: u64) -> Result<ProbeResult>; }
 
 #[derive(Clone, Debug)]
-pub struct ProbeResult { pub bytes_in: u64, pub rows_in: u64, pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_ns: u64, pub cpu_ns: u64 }
+pub struct ProbeResult { pub bytes_in: u64, pub rows_in: u64, pub bytes_out: u64, pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_ns: u64, pub cpu_ns: u64 }
+
+`ProbeResult::bytes_out` (RB3, 2026-11-13): the probe's output payload bytes. With `bytes_in` it is what the morsel held in the arena when `apply` returned, which `peak_delta` cannot see: the arena is touched when it is made, so taking a buffer from it moves nothing the operating system counts (11 f.2).
 
 /// What happens after a kernel error (preamble `errors.policy`).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

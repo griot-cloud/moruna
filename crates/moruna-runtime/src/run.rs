@@ -478,6 +478,7 @@ fn drive(
         run_id,
         arena_bytes,
         sinks: topology.sinks(),
+        workers: workers_max,
         sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
@@ -512,15 +513,22 @@ fn drive(
         0 => 0,
         _ => ctx.file_buffer_share(),
     };
+    // A sink that encodes on workers (08 f.12) divides the same bytes into one buffer per
+    // worker that may encode at once, so a morsel is at most half of one of those.
+    let buffers = if built_sinks.iter().any(|sink| sink.encodes_on_workers()) {
+        u64::from(workers_max.max(2))
+    } else {
+        2
+    };
     let mut morsel_max = match claim {
         0 => config::MORSEL_MAX_BYTES,
-        claim => (claim / 4).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
+        claim => (claim / (2 * buffers)).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
     };
     if morsel_max < config::MORSEL_MAX_BYTES {
         notes.push(format!(
-            "morsels are at most {morsel_max} bytes, half of one of the sink's two {} byte file \
-             buffers",
-            claim / 2
+            "morsels are at most {morsel_max} bytes, half of one of the sink's {buffers} {} byte \
+             file buffers",
+            claim / buffers
         ));
     }
     // An engine sink holds working memory in proportion to the morsel it writes, so its share

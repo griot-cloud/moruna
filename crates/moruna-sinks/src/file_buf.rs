@@ -100,6 +100,9 @@ pub(crate) struct FileBuffers {
     /// takes one rather than asking the arena again, so the sink's buffers are found once, when
     /// they can be, and not in an arena the queues have since divided up (F8.8).
     spare: Mutex<Vec<Buffer>>,
+    /// How many spares the pool keeps: one for a sink with one open file, one per lane for a
+    /// sink that encodes into several at once (08 f.12).
+    keep: std::sync::atomic::AtomicUsize,
 }
 
 impl FileBuffers {
@@ -107,6 +110,7 @@ impl FileBuffers {
         FileBuffers {
             alloc,
             spare: Mutex::new(Vec::new()),
+            keep: std::sync::atomic::AtomicUsize::new(1),
         }
     }
 
@@ -187,7 +191,7 @@ impl FileBuffers {
     pub(crate) fn keep_spare(&self, buf: Arc<Buffer>) {
         if let Ok(buf) = Arc::try_unwrap(buf) {
             let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
-            if spare.is_empty() {
+            if spare.len() < self.keep.load(std::sync::atomic::Ordering::SeqCst) {
                 spare.push(buf);
             }
         }
@@ -199,26 +203,39 @@ impl FileBuffers {
     /// at least half of itself; when the arena cannot give the pair, both halve together, down
     /// to the smallest class, below which the sink cannot open.
     pub(crate) fn alloc_pair(&self, file_bytes: u64) -> Result<()> {
+        self.alloc_set(file_bytes, 2).map(|_| ())
+    }
+
+    /// The pair's bytes, `2 x file_bytes`, as `count` buffers (08 f.12): a sink that encodes
+    /// into `count` files at once holds what one with two buffers held, divided between them,
+    /// and keeps up to `count` spares. Taken at `open` while the arena is still empty, as the
+    /// pair is. Returns the size of each buffer.
+    pub(crate) fn alloc_set(&self, file_bytes: u64, count: usize) -> Result<u64> {
+        let count = count.max(2);
         let tier = host_tier(&*self.alloc);
         let floor = class_ceil(GRANULE);
-        let mut want = class_ceil(file_bytes).max(floor);
+        let share = file_bytes.saturating_mul(2) / count as u64;
+        let mut want = class_ceil(share).max(floor);
         if let Some(free) = self.alloc.available(tier) {
-            want = want.min(class_floor(free / 4).max(floor));
+            want = want.min(class_floor(free / (2 * count as u64)).max(floor));
         }
+        self.keep.store(
+            if count == 2 { 1 } else { count },
+            std::sync::atomic::Ordering::SeqCst,
+        );
         loop {
             let capacity = usize::try_from(want).map_err(|_| {
                 MorunaError::Sink(format!(
                     "a file buffer of {want} bytes does not fit this platform"
                 ))
             })?;
-            let pair = self
-                .alloc
-                .alloc(capacity, tier)
-                .and_then(|first| Ok(vec![first, self.alloc.alloc(capacity, tier)?]));
-            match pair {
-                Ok(pair) => {
-                    *self.spare.lock().unwrap_or_else(|e| e.into_inner()) = pair;
-                    return Ok(());
+            let set: Result<Vec<Buffer>> = (0..count)
+                .map(|_| self.alloc.alloc(capacity, tier))
+                .collect();
+            match set {
+                Ok(set) => {
+                    *self.spare.lock().unwrap_or_else(|e| e.into_inner()) = set;
+                    return Ok(want);
                 }
                 Err(e) if want <= floor => return Err(e),
                 Err(_) => want = (want / 2).max(floor),

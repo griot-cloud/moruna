@@ -278,6 +278,8 @@ A block NumPy obtains through a kernel's guard handler (f.11) is `16 + n` bytes 
 
 **f.14 Arrow from its pool's statistics.** pyarrow is imported for every crossing (e.2), so its default pool is always there to read. Under the same attachment as the call, the adapter reads `bytes_allocated()`, `max_memory()`, `total_bytes_allocated()` and `num_allocations()` of `pyarrow.default_memory_pool()` before the call and again after it. The call's Arrow counts are: bytes requested `total_after - total_before`, requests `num_after - num_before`, peak held `max(bytes_after - bytes_before, max_after - bytes_before when max_after > max_before, 0)` (a lower bound: `max_memory` is the pool's high-water mark for the life of the process, so a call's own peak shows only when it set a new mark), largest request and refusals unmeasured (zero in the record, absent in the report). A pool read that fails (a pyarrow without these methods) leaves the Arrow counts zero and a warning says so once; the rest of the call is unaffected. The pool is the process's: concurrent calls on other workers land in the same interval, so a call's Arrow figures are exact with one worker and an upper bound on its requests otherwise (AD-I15).
 
+**f.13 A refused batch is split, not failed (RB5, 2026-11-13).** When `apply` on a batch of more than one row is refused for memory (`MorunaError::Refused`, the arena would not take the output), the Python adapter applies the kernel to each half of the batch in turn, recursively, concatenates the outputs and lands the joined table in the arena as one payload. A refusal at one row is returned as it is (h). A wall is a reason to work in smaller pieces, not an error: the run's morsel sizing answers it next time, and this morsel finishes now.
+
 ## g. Concurrency within the component
 
 `PyKernel` is `Send + Sync`; each `apply` attaches on the calling worker thread. Under a GIL build, one adapter-level mutex per `PyKernel`. Deleters (AD-I5) attach on whatever thread drops; PyO3 0.28's `Py<T>` drop is safe from any thread when attached, which the deleter hook ensures.
@@ -353,6 +355,8 @@ The guard's tests (E13, 2026-10-02). AD-T13 needs no interpreter; the rest embed
 **AD-T22 arrow_from_the_pool.** A kernel that builds a `pyarrow` array of a known size and returns its input: the call's Arrow counts have bytes requested at least the array's buffers, requests at least one, peak at least the array's buffers when it is the pool's new high-water mark, and largest and refused zero; a kernel that allocates only in NumPy has Arrow bytes requested zero (one worker). f.14, AD-I15.
 
 **AD-T23 counts_reach_the_record.** One call of a Python kernel leaves its counts in `moruna_kernel::take_kernel_alloc()` on the calling thread, `measured` and with `refusal_on` the kernel's; a second `take` returns the default; a failed call and a refused call leave theirs too. f.12, AD-I9.
+
+**AD-T24 a_refused_batch_finishes_in_halves.** (`tests/ad_guard.rs`) A kernel taking 4 MiB a row, refused on three rows against 10 MiB of headroom, finishes as one row and two; the output is every row once, in order, after one refusal. AD-T15 now counts two refusals for a kernel whose request does not shrink with the batch: the batch and its one-row half, whose refusal is returned as it is. f.13, RB5.
 
 ## l. Implementation notes for the agent
 

@@ -843,6 +843,7 @@ mod native_commitment_tests {
         let probe = |peak_delta| ProbeResult {
             bytes_in: cfg.probe_bytes,
             rows_in: 100,
+            bytes_out: 0,
             peak_delta,
             dev_peak_delta: 0,
             wall_ns: 1,

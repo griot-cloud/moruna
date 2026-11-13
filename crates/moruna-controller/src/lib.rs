@@ -103,8 +103,11 @@ pub(crate) const ANON_SPREAD: f64 = 0.05;
 /// measured from, so a pair that bounds both bounds it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AnonReading {
-    /// The bytes the model believed were in flight: `share x max(target, bytes_in)`.
+    /// This morsel's bytes: `max(target, bytes_in)`.
     pub(crate) x: f64,
+    /// The bytes of the other morsels the model believed were in flight beside it:
+    /// `(share - 1) x max(target, bytes_in)`, zero on one worker.
+    pub(crate) others: f64,
     /// Anonymous bytes resident before `apply`, above the resting figure and the funded state.
     pub(crate) fixed: f64,
     /// Anonymous bytes the process grew by across `apply`.
@@ -129,9 +132,22 @@ pub(crate) struct AnonFit {
 /// is never free.
 ///
 /// The constant is then the larger of two things at every reading: the residency measured before
-/// `apply`, which no morsel size can remove, and whatever the reading needs above the slope's
-/// line. So the pair bounds every point in the window, which is what RC-I1 asks of the sizing,
-/// and it never prices the fixed part below what the process was actually holding.
+/// `apply` less what the other morsels in flight beside it are modelled to hold, which no morsel
+/// size can remove, and whatever the reading needs above the line through all of them. So
+/// `c + a x (x + others)`, which is what `anon_footprint` charges (`c` once and `a` per morsel
+/// in flight), bounds every point in the window, which is what RC-I1 asks of the sizing.
+///
+/// Concurrency (RB3, 2026-11-13). The slope is per morsel: a morsel's growth over that morsel's
+/// bytes, which is what the probe measures (one morsel on one worker) and what `anon_footprint`
+/// multiplies by the morsels in flight. Until then `x` was the bytes of every morsel in flight
+/// while the growth was one morsel's (the workers run staggered, so the process grows by about
+/// one morsel across any one `apply`), which made the slope a factor of the worker count too
+/// small; and the residency before `apply` holds the other workers' morsels, which went into the
+/// constant whole. The pair matched the process at the configuration it was measured at and at
+/// no other: on eight workers of a kernel holding seventeen bytes per morsel byte, the constant
+/// carried seven workers' heaps, the controller shrank to one worker at the smallest morsel, the
+/// constant did not move, and the floor rule ended the run as not fitting (Score on one month of
+/// taxi trips, "footprint 3217887648 exceeds budget 2989555316").
 ///
 /// Rationale (PM, 2026-09-23). The fit was one term: the whole of `mem_anon_peak - resting_anon`
 /// divided by the bytes in flight. A Python job's 92 MiB of allocator and interpreter retention
@@ -169,7 +185,8 @@ pub(crate) fn fit_anon(points: &VecDeque<AnonReading>, seed: f64) -> AnonFit {
     }
     .max(MIN_AMPLIFICATION);
     let c = points.iter().fold(0.0f64, |acc, r| {
-        acc.max(r.fixed).max(r.fixed + r.growth - a * r.x)
+        acc.max(r.fixed - a * r.others)
+            .max(r.fixed + r.growth - a * (r.x + r.others))
     });
     AnonFit {
         // Rounded up, not truncated: a fit one byte short of the window is not a bound.
@@ -487,14 +504,19 @@ impl StageCtl {
     /// `x` is the bytes the model believed were in flight, `fixed` the anonymous bytes the
     /// process held before `apply` above the resting figure and this stage's funded state, and
     /// `growth` what it grew by across `apply`. `fit_anon` separates the two terms from them.
-    pub(crate) fn observe_anon(&mut self, x: f64, fixed: f64, growth: f64) {
-        if !x.is_finite() || x <= 0.0 {
+    pub(crate) fn observe_anon(&mut self, x: f64, others: f64, fixed: f64, growth: f64) {
+        if !x.is_finite() || x <= 0.0 || !others.is_finite() || others < 0.0 {
             return;
         }
         if !fixed.is_finite() || fixed < 0.0 || !growth.is_finite() || growth < 0.0 {
             return;
         }
-        self.anon_points.push_back(AnonReading { x, fixed, growth });
+        self.anon_points.push_back(AnonReading {
+            x,
+            others,
+            fixed,
+            growth,
+        });
         while self.anon_points.len() > WINDOW {
             self.anon_points.pop_front();
         }
@@ -666,6 +688,16 @@ pub(crate) struct ControllerState {
     /// `apply` started before it was measured against a resting figure and a ceiling that no
     /// longer hold, so it feeds neither the fit of f.3 nor the breach path of f.7.
     pub limits_epoch_ns: u64,
+    /// When a breach last shrank the run (its target or its workers), on the clock records are
+    /// stamped with. A record whose `apply` started before it was measured on the configuration
+    /// the breach left, which that shrink has already answered (f.7, RB5).
+    pub shrunk_epoch_ns: u64,
+    /// The last `WINDOW` records' `apply` durations: how long a morsel picked up before a shrink
+    /// can still be running after it (`settled`).
+    pub apply_ns: VecDeque<u64>,
+    /// The latest end of a morsel picked up before the last shrink, among those that have
+    /// reported: a morsel that started before it ran beside one of them (`settled`).
+    pub stale_end_ns: u64,
     /// How many times the facade's watcher has handed the controller limits of its own
     /// (`follow_limits`, `set_arena`, `set_engine`). The tick reads it before it samples and
     /// takes the sample's limits only if it has not moved since: a sample taken before the
@@ -709,6 +741,46 @@ impl ControllerState {
     /// S1 has already failed, so the halving is a post-mortem rather than a guard. The line
     /// therefore sits inside the headroom, at `BREACH_SHARE` of it, which leaves the rest as
     /// the cushion the reaction has to work in and agrees with f.6's memory rows.
+    /// Note how long a record's `apply` took.
+    pub(crate) fn observe_apply(&mut self, r: &TraceRecord) {
+        if r.t_start_ns < self.shrunk_epoch_ns {
+            self.stale_end_ns = self.stale_end_ns.max(r.t_end_ns);
+        }
+        self.apply_ns
+            .push_back(r.t_end_ns.saturating_sub(r.t_start_ns));
+        while self.apply_ns.len() > WINDOW {
+            self.apply_ns.pop_front();
+        }
+    }
+
+    /// Whether a morsel picked up at `t_start_ns` ran on the configuration the last shrink set
+    /// up and on nothing from before it (f.7, RB5). The memory a record carries is the whole
+    /// process's, so a morsel that ran beside the larger morsels the shrink left behind, still
+    /// finishing on the other workers, is charged their heaps: on Score, a 4 MiB morsel "on one
+    /// worker" read as 1,252 bytes per byte and 3.2 GB fixed. Nothing picked up before the shrink
+    /// should run much longer than the longest `apply` lately seen, so twice that after it, and
+    /// after every one of them that has reported has ended, the process holds only what the new
+    /// configuration put there. Once was not enough: a morsel picked up just before the shrink
+    /// on a loaded machine ran past it, overlapped a 4 MiB morsel on one worker, charged it
+    /// 1,250 bytes per byte, and on one run in nine the floor rule ended a run that fits.
+    pub(crate) fn settled(&self, t_start_ns: u64) -> bool {
+        if self.shrunk_epoch_ns == 0 {
+            return true;
+        }
+        let drain = self.apply_ns.iter().copied().max().unwrap_or(0);
+        t_start_ns >= self.shrunk_epoch_ns.saturating_add(drain.saturating_mul(2))
+            && t_start_ns >= self.stale_end_ns
+    }
+
+    /// The line a run is stopped at rather than let the operating system stop it: within
+    /// `RESERVE_STOP` of the reserve below the ceiling. Above the breach line and below this one
+    /// the controller shrinks and waits (f.7, RB5); past it, with nothing left to shrink, it
+    /// ends the run with a diagnostic (F8.9).
+    pub(crate) fn stop_line(&self) -> u64 {
+        let ceiling = self.cfg.limits.memory_ceiling;
+        ceiling.saturating_sub(model::scale(self.budgets.reserve, classify::RESERVE_STOP))
+    }
+
     pub(crate) fn breach_line(&self) -> u64 {
         let resting = model::resting_anon(self);
         let headroom = self.cfg.limits.memory_ceiling.saturating_sub(resting);
@@ -1036,6 +1108,9 @@ impl Controller {
             arena_draining: 0,
             drain_pending: 0,
             limits_epoch_ns: 0,
+            shrunk_epoch_ns: 0,
+            apply_ns: VecDeque::new(),
+            stale_end_ns: 0,
             facade_limits: 0,
         };
         Ok(Controller {
@@ -1311,6 +1386,7 @@ mod anon_fit_tests {
         xs.iter()
             .map(|&x| AnonReading {
                 x,
+                others: 0.0,
                 fixed: FIXED,
                 growth: SLOPE * x,
             })
@@ -1462,6 +1538,7 @@ mod anon_fit_tests {
             .iter()
             .map(|&x| AnonReading {
                 x,
+                others: 0.0,
                 fixed: FIXED,
                 growth: 0.0,
             })
@@ -1482,5 +1559,72 @@ mod anon_fit_tests {
                 a: MIN_AMPLIFICATION
             }
         );
+    }
+
+    /// RC-T23 (RB3). Eight workers, staggered: each reading's residency before `apply` holds the
+    /// other seven morsels part-way through theirs, and its growth is one morsel's. The slope
+    /// comes out per morsel, the pair bounds every reading at eight workers, and on one worker
+    /// at a quarter of the morsel it predicts what one worker holds, not the seven it left.
+    #[test]
+    fn concurrent_morsels_are_not_the_fixed_cost() {
+        const PER_BYTE: f64 = 17.0;
+        let workers = 8.0;
+        let morsel = 20.0 * MIB;
+        // The others are on average half-way through their growth.
+        let others_held = (workers - 1.0) * PER_BYTE * morsel / 2.0;
+        let readings: VecDeque<AnonReading> = (0..WINDOW)
+            .map(|i| {
+                let jitter = 1.0 + (i % 5) as f64 * 0.05;
+                AnonReading {
+                    x: morsel,
+                    others: (workers - 1.0) * morsel,
+                    fixed: FIXED + others_held * jitter,
+                    growth: PER_BYTE * morsel,
+                }
+            })
+            .collect();
+        let fit = fit_anon(&readings, 4.0);
+        assert!((fit.a - PER_BYTE).abs() < 1e-9, "per morsel: {}", fit.a);
+        for r in &readings {
+            assert!(
+                fit.c as f64 + fit.a * (r.x + r.others) >= r.fixed + r.growth,
+                "bounds the reading"
+            );
+        }
+        // One worker at a quarter of the morsel: the truth is the fixed cost and one morsel.
+        let small = morsel / 4.0;
+        let truth = FIXED + PER_BYTE * small;
+        let predicted = fit.c as f64 + fit.a * small;
+        assert!(
+            predicted < truth + others_held / 2.0,
+            "the others' heaps are not carried into one worker: {predicted} vs {truth}"
+        );
+
+        // The reading as it was before RB3, every morsel in flight as `x` and no `others`,
+        // carried the seven workers into the constant.
+        let before_rb3: VecDeque<AnonReading> = readings
+            .iter()
+            .map(|r| AnonReading {
+                x: r.x + r.others,
+                others: 0.0,
+                fixed: r.fixed,
+                growth: r.growth,
+            })
+            .collect();
+        let old = fit_anon(&before_rb3, 4.0);
+        assert!(old.c as f64 >= FIXED + others_held, "{}", old.c);
+        assert!(old.a < PER_BYTE / 4.0, "{}", old.a);
+
+        // And readings taken alone pin the constant at what the process holds.
+        let alone: VecDeque<AnonReading> = (0..WINDOW)
+            .map(|_| AnonReading {
+                x: small,
+                others: 0.0,
+                fixed: FIXED,
+                growth: PER_BYTE * small,
+            })
+            .collect();
+        let fit = fit_anon(&alone, 4.0);
+        assert!((fit.c as f64 - FIXED).abs() < 1.0, "{}", fit.c);
     }
 }

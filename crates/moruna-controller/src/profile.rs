@@ -220,10 +220,12 @@ pub(crate) fn write(dir: &Path, profile: &Profile, file: &Path) -> std::io::Resu
 pub(crate) fn from_stage(state: &crate::ControllerState, at: usize) -> Option<Profile> {
     let ctl = state.stages.get(at)?;
     let kernel = state.kernels.iter().find(|k| k.stage == ctl.stage)?;
+    // With no record, the probe's anonymous figure: the profile's ratios are the records'
+    // anonymous growth per byte, which `a_k` stopped being at RB3.
     let mean = if ctl.var_count > 0 {
         ctl.var_mean
     } else {
-        ctl.a_k
+        ctl.a_anon_seed
     };
     let variance = if ctl.var_count > 1 {
         ctl.var_m2 / (ctl.var_count - 1) as f64

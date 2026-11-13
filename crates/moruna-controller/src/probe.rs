@@ -249,12 +249,21 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             // A stage whose amplification measures below the floor (a filter that drops most
             // rows) is held at the floor, so the allowance stays conservative (h).
             let measured = result.peak_delta as f64 / result.bytes_in as f64;
-            ctl.a_k = measured.max(MIN_AMPLIFICATION);
+            // The arena's side of f.3: what one morsel holds in the arena, its input and the
+            // output it lands there. The anonymous growth cannot say it, because the arena is
+            // touched when it is made and a buffer taken from it moves nothing the operating
+            // system counts; and it is not the arena's, because it is the kernel's own heap,
+            // which the anon inequality charges. Until RB3 (2026-11-13) it was both: a numpy
+            // kernel holding fifty bytes of heap per input byte was charged fifty in the arena
+            // too, two of eight workers fit, and the queue's high water was halved to nothing,
+            // so its entries were evicted and read again as fast as they were read.
+            let in_arena = (result.bytes_in + result.bytes_out) as f64 / result.bytes_in as f64;
+            ctl.a_k = in_arena.max(MIN_AMPLIFICATION);
             // The probe runs one morsel on one worker (SC f.9), so a process-wide delta over it
             // is already the per-in-flight-morsel figure f.3's anon inequality wants, with none
             // of the concurrency the steady-state fit in 10 f.3 has to divide back out.
-            ctl.a_anon = ctl.a_k;
-            ctl.a_anon_seed = ctl.a_k;
+            ctl.a_anon = measured.max(MIN_AMPLIFICATION);
+            ctl.a_anon_seed = ctl.a_anon;
             // And the whole of the probe's growth is seeded as the fixed term, until a real
             // record lets `fit_anon` separate the two (11 f.3). One observation cannot tell a
             // kernel that costs 160 MB whatever the morsel from one that costs ten bytes per
@@ -273,7 +282,8 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
         if let Some(found) = &profile
             && found.a_k_p95 > 0.0
         {
-            let distance = (ctl.a_k - found.a_k_p95).abs() / found.a_k_p95;
+            // A profile's figures are the records' anonymous growth per byte (f.9).
+            let distance = (ctl.a_anon - found.a_k_p95).abs() / found.a_k_p95;
             if distance > DRIFT {
                 // The probe is what is true now; the profile is what was true before. Trust
                 // the probe and put the margin back where an unseen kernel starts.

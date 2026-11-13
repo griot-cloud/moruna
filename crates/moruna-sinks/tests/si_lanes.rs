@@ -31,7 +31,8 @@ fn si_t33_parallel_encodes() {
         Arc::new(reactor.clone()),
         Arc::clone(&alloc) as Arc<dyn Allocator>,
     )
-    .expect("parquet sink");
+    .expect("parquet sink")
+    .with_lanes(THREADS as usize);
     sink.open(&table_source_schema()).expect("open");
     assert!(
         sink.encodes_on_workers(),

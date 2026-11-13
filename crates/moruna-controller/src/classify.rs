@@ -19,7 +19,7 @@ const RESERVE_TRIP: f64 = 0.5;
 /// The fraction of the reserve left under the ceiling at which a run with no kernel stage, whose
 /// process is still growing past everything the memory rows took back, is stopped (see
 /// `outgrown`).
-const RESERVE_STOP: f64 = 0.25;
+pub(crate) const RESERVE_STOP: f64 = 0.25;
 /// The fraction of a tick spent throttled that means the CPU quota is the bottleneck.
 const THROTTLE_TRIP: f64 = 0.10;
 /// How much a high water shrinks when a row calls for it.
@@ -135,6 +135,20 @@ pub(crate) fn classify(
         return Bottleneck::Sink;
     }
     if busy > BUSY_HIGH {
+        // Every active worker is computing and none is held by memory, CPU or a port: the run is
+        // short of workers, so it takes one more while both halves of f.3 still hold it (the
+        // arena's, and the anon inequality's at the targets as they stand) and the CPU bound
+        // allows it, once the last shrink has settled (RB3). Without this a run a breach had cut
+        // to one worker stayed there to its end, whatever the budget left: workers came back
+        // only through the Memory row, which needs them idle, and a compute-bound worker never
+        // is (Score on two months of taxi trips, one worker of eight for the rest of the run).
+        let allowed = workers_allowed(state).min(crate::breach::anon_workers(state));
+        if state.active_workers < allowed && state.settled(crate::elastic::now_ns()) {
+            state.active_workers += 1;
+            actions
+                .knobs
+                .push(Knob::ActiveWorkers(state.active_workers));
+        }
         return Bottleneck::Compute;
     }
     Bottleneck::Idle
@@ -155,7 +169,7 @@ fn outgrown(
     actions: &mut Actions,
 ) -> bool {
     let ceiling = state.cfg.limits.memory_ceiling;
-    let stop = ceiling.saturating_sub(model::scale(state.budgets.reserve, RESERVE_STOP));
+    let stop = state.stop_line();
     if !state.stages.is_empty() || state.terminated || anon < stop {
         return false;
     }

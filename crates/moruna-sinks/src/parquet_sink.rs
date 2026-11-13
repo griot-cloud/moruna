@@ -127,8 +127,15 @@ pub struct ParquetSink {
     inner: Mutex<Inner>,
     /// The files encodes write into, one per encode that has run at once (RB1).
     lanes: Mutex<Vec<Arc<Mutex<Lane>>>>,
-    /// The file buffers, the two taken at `open` and the one kept after each write (f.1).
+    /// The file buffers, the set taken at `open` and the ones kept after each write (f.1, f.12).
     buffers: FileBuffers,
+    /// The most lanes the sink opens: one per worker that may encode at once (f.12). The
+    /// facade sets it from the run's workers; a sink built on its own encodes into two.
+    max_lanes: usize,
+    /// The file target of one lane: the set's buffer size, settled at `open`.
+    lane_bytes: std::sync::atomic::AtomicU64,
+    /// Where a worker that finds every lane busy waits next, round robin.
+    next_lane: std::sync::atomic::AtomicUsize,
 }
 
 impl ParquetSink {
@@ -163,7 +170,17 @@ impl ParquetSink {
             }),
             lanes: Mutex::new(Vec::new()),
             buffers,
+            max_lanes: 2,
+            lane_bytes: std::sync::atomic::AtomicU64::new(0),
+            next_lane: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Encode into at most `lanes` files at once: the run's workers (f.12). The sink's buffers
+    /// are the same bytes whatever this is, divided between the lanes.
+    pub fn with_lanes(mut self, lanes: usize) -> ParquetSink {
+        self.max_lanes = lanes.max(1);
+        self
     }
 
     /// Name the run whose id goes into every file's footer metadata (e.2). Unset, the footer
@@ -205,13 +222,12 @@ impl ParquetSink {
             };
             (schema, inner.ledger.take_index())
         };
-        let lanes = self
-            .lanes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
-            .max(1) as u64;
-        let file_bytes = (self.cfg.file_bytes / lanes).max(self.cfg.row_group_bytes);
+        // f.12: a lane's file is the set's buffer, so every lane together holds what the sink's
+        // two buffers held; a morsel larger than that still gets the buffer it needs (h).
+        let file_bytes = match self.lane_bytes.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => self.cfg.file_bytes,
+            lane => lane,
+        };
         let (buf, roll_bytes) =
             self.buffers
                 .alloc_file_buf(min_bytes, self.cfg.row_group_bytes, file_bytes)?;
@@ -384,13 +400,22 @@ impl ParquetSink {
         let fresh;
         let mut lane = match taken {
             Some(guard) => guard,
-            None => {
+            None if lanes.len() < self.max_lanes => {
                 fresh = Arc::new(Mutex::new(Lane::default()));
                 self.lanes
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(Arc::clone(&fresh));
                 fresh.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            // Every lane is busy and there are as many as workers may encode: wait for one,
+            // round robin, which is no longer than one encode.
+            None => {
+                let at = self
+                    .next_lane
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    % lanes.len();
+                lanes[at].lock().unwrap_or_else(|e| e.into_inner())
             }
         };
         // Validation is done: from here a failure is the encoder's or the store's, and it moves
@@ -467,27 +492,66 @@ impl ParquetSink {
     }
 
     /// Roll every lane whose file holds a morsel, and settle each file (f.1, f.12).
+    /// Close every lane's open file and write it. The lanes close at once, one thread each: a
+    /// close encodes and compresses the file's last row group, and done one lane after another
+    /// on the drive that called `finish` it was a tail the whole run waited on, a quarter of a
+    /// one-second job's wall on eight lanes (RB1). The lanes are the run's workers, which are idle
+    /// by the time a run finishes, so the threads take no CPU the run was not given.
     fn roll_all(&self) -> Result<()> {
-        let mut pendings = Vec::new();
-        for lane in self.lanes() {
+        let lanes = self.lanes();
+        let roll_one = |lane: &Arc<Mutex<Lane>>| -> Result<Option<Pending>> {
             let mut lane = lane.lock().unwrap_or_else(|e| e.into_inner());
             if lane
                 .current
                 .as_ref()
                 .is_some_and(|file| !file.seqs.is_empty())
             {
-                match self.roll(&mut lane) {
-                    Ok(pending) => pendings.push(pending),
-                    Err(error) => {
-                        lane.current = None;
-                        drop(lane);
-                        self.fail(&error);
-                        return Err(error);
-                    }
-                }
+                self.roll(&mut lane).map(Some).inspect_err(|_| {
+                    lane.current = None;
+                })
             } else {
                 // An empty file is never written: its buffer goes back to the arena.
                 lane.current = None;
+                Ok(None)
+            }
+        };
+        let open = lanes
+            .iter()
+            .filter(|lane| {
+                lane.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .current
+                    .as_ref()
+                    .is_some_and(|file| !file.seqs.is_empty())
+            })
+            .count();
+        let rolled: Vec<Result<Option<Pending>>> = if open <= 1 {
+            lanes.iter().map(roll_one).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = lanes
+                    .iter()
+                    .map(|lane| scope.spawn(move || roll_one(lane)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(MorunaError::Sink("closing a parquet file panicked".into()))
+                        })
+                    })
+                    .collect()
+            })
+        };
+        let mut pendings = Vec::new();
+        for outcome in rolled {
+            match outcome {
+                Ok(Some(pending)) => pendings.push(pending),
+                Ok(None) => {}
+                Err(error) => {
+                    self.fail(&error);
+                    return Err(error);
+                }
             }
         }
         for pending in pendings {
@@ -545,8 +609,13 @@ impl Sink for ParquetSink {
         // output schema is the first payload's, so the writer is built there and this one is
         // kept only for a run that writes nothing.
         inner.declared = Some(Arc::clone(schema));
-        // The file buffers, now, while the arena holds nothing else.
-        self.buffers.alloc_pair(self.cfg.file_bytes)?;
+        // The file buffers, now, while the arena holds nothing else: the pair's bytes, one
+        // buffer per lane (f.12).
+        let lane = self
+            .buffers
+            .alloc_set(self.cfg.file_bytes, self.max_lanes)?;
+        self.lane_bytes
+            .store(lane, std::sync::atomic::Ordering::SeqCst);
         inner.phase = Phase::Open;
         Ok(())
     }

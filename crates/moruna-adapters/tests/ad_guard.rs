@@ -34,6 +34,10 @@ def big(batch):
     np.empty(32 * 1024 * 1024, dtype=np.uint8)
     return batch
 
+def per_row(batch):
+    np.empty(batch.num_rows * 4 * 1024 * 1024, dtype=np.uint8)
+    return batch
+
 def big_bytes(batch):
     bytes(32 * 1024 * 1024)
     return batch
@@ -238,7 +242,37 @@ fn ad_t15_numpy_request_refused() {
     assert_eq!((*in_use, *ceiling), (100 * MIB, 110 * MIB));
     assert_eq!(counts.numpy.refused, 1);
     assert!(counts.refusal_on && counts.measured);
-    assert_eq!(r.kernel.memory().refusals, 1);
+    // RB5 (05 f.13): a refused batch is applied again in halves. This kernel asks for 32 MiB
+    // whatever the batch, so the three rows are refused and then their first half, one row,
+    // which cannot be split and is returned as it is: two refusals, and the same error.
+    assert_eq!(r.kernel.memory().refusals, 2);
+}
+
+/// AD-T24 (RB5, 05 f.13). A kernel whose memory grows with its rows, refused on the whole batch
+/// (three rows, twelve MiB, against ten of headroom), finishes in halves: one row, then two,
+/// and the joined output is every row once, in order.
+#[test]
+fn ad_t24_a_refused_batch_finishes_in_halves() {
+    let _serial = serial();
+    let r = rig("per_row", true);
+    let (result, _) = Python::attach(|_| r.call());
+    let out = result.expect("the halves fit");
+    let Payload::Table(batch, _) = &out else {
+        panic!("a table");
+    };
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("int64")
+        .values()
+        .to_vec();
+    assert_eq!(values, vec![1, 2, 3], "every row once, in order");
+    assert_eq!(
+        r.kernel.memory().refusals,
+        1,
+        "the whole batch was refused and its halves were not"
+    );
 }
 
 #[test]

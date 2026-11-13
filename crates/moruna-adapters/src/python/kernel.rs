@@ -640,6 +640,61 @@ impl Kernel for PyKernel {
     /// alive by a handle until the copy has finished with it and is then released under a brief
     /// attachment.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        self.apply_splitting(state, input)
+    }
+}
+
+impl PyKernel {
+    /// RB5 (2026-11-13): a refused allocation is a wall, not an error. When the allocator guard
+    /// refuses a call on a table of more than one row, the kernel is applied to each half
+    /// instead, halving again as far as one row, and the halves' outputs are joined into one
+    /// payload over arena buffers, so the morsel's one output stays one output. A table that
+    /// cannot be split further, a tensor, or any other error is returned as it was.
+    fn apply_splitting(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        let keep = match &input {
+            Payload::Table(batch, tier) if batch.num_rows() > 1 => Some((batch.clone(), *tier)),
+            _ => None,
+        };
+        let refusal = match self.apply_once(state, input) {
+            Err(refusal @ MorunaError::Refused { .. }) => refusal,
+            other => return other,
+        };
+        let Some((batch, tier)) = keep else {
+            return Err(refusal);
+        };
+        let Some(alloc) = self.bound_alloc() else {
+            return Err(refusal);
+        };
+        let half = batch.num_rows() / 2;
+        tracing::info!(
+            target: "adapter.guard",
+            kernel = %self.name,
+            rows = batch.num_rows(),
+            "a call was refused memory; applying the kernel to each half of its morsel"
+        );
+        let first = self.apply_splitting(state, Payload::Table(batch.slice(0, half), tier))?;
+        let second = self.apply_splitting(
+            state,
+            Payload::Table(batch.slice(half, batch.num_rows() - half), tier),
+        )?;
+        let (Payload::Table(first, _), Payload::Table(second, _)) = (first, second) else {
+            return Err(refusal);
+        };
+        let joined =
+            moruna_kernel::arrow::compute::concat_batches(&first.schema(), [&first, &second])
+                .map_err(|e| MorunaError::Kernel {
+                    stage: UNKNOWN_STAGE,
+                    seq: UNKNOWN_SEQ,
+                    msg: format!("joining the halves of a split morsel: {e}"),
+                    features: None,
+                })?;
+        drop((first, second));
+        let (payload, _) = crate::land::land_table(joined, &alloc)?;
+        Ok(payload)
+    }
+
+    /// One call of the kernel on `input`, its output landed in the arena.
+    fn apply_once(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         let Some(alloc) = self.bound_alloc() else {
             return Err(MorunaError::Config {
                 name: "adapter",
