@@ -735,7 +735,12 @@ fn drive(
                     staging_dir: staging_dir.clone(),
                     durable_staging: discovered.profile.durable_staging.is_guaranteed(),
                     disk_budget,
-                    segment_bytes: config::STAGING_SEGMENT_BYTES,
+                    // RB6: a segment holds the run's largest morsel. A fixed 128 MiB segment
+                    // met a 256 MiB morsel on its first spill and the run ended ("a record of
+                    // ... bytes does not fit a segment", the 0.6.5 benchmark's staging runs).
+                    // Twice the most a morsel may be, so one is never the last thing to fit, and
+                    // a whole number of 128 MiB units.
+                    segment_bytes: staging_segment_bytes(morsel_max),
                     codec: moruna_kernel::StagingCodec::Raw,
                     page_bytes: limits.page_bytes,
                     gds: discovered.profile.gds.is_available()
@@ -745,20 +750,23 @@ fn drive(
                     plan_digests: plans.iter().map(|plan| plan_digest(plan)).collect(),
                     fingerprints: kernels.iter().map(|k| k.fingerprint()).collect(),
                     resume_policy: kernels.iter().map(|k| k.hints().resume).collect(),
-                    config: with_spec_digest(
-                        config::resolved(
-                            limits.memory_ceiling,
-                            disk_budget,
-                            workers_max,
-                            config::READAHEAD_SPLITS,
-                            &error_policy,
-                            ordered,
-                            sizer,
-                            checkpoint_enabled,
-                            checkpoint_interval_ms,
-                            &policy,
+                    config: with_segment_bytes(
+                        with_spec_digest(
+                            config::resolved(
+                                limits.memory_ceiling,
+                                disk_budget,
+                                workers_max,
+                                config::READAHEAD_SPLITS,
+                                &error_policy,
+                                ordered,
+                                sizer,
+                                checkpoint_enabled,
+                                checkpoint_interval_ms,
+                                &policy,
+                            ),
+                            spec_digest.as_deref(),
                         ),
-                        spec_digest.as_deref(),
+                        staging_segment_bytes(morsel_max),
                     ),
                     checkpoint_enabled,
                     eviction: Arc::new(moruna_placement::catalog::KnownFuture),
@@ -2364,5 +2372,42 @@ mod spec_digest_tests {
                 .unwrap_err()
                 .contains("could not be read")
         );
+    }
+}
+
+/// The resolved configuration with the segment size the run actually stages with (RB6), so a
+/// resume compares what was used and not the default.
+fn with_segment_bytes(mut config: serde_json::Value, bytes: u64) -> serde_json::Value {
+    if let Some(map) = config.as_object_mut() {
+        map.insert(
+            "staging.segment_bytes".to_string(),
+            serde_json::json!(bytes),
+        );
+    }
+    config
+}
+
+/// The staging segment for a run whose morsels are at most `morsel_max` bytes (RB6): the
+/// configured 128 MiB unit, or the whole number of units that holds two of the largest morsel.
+fn staging_segment_bytes(morsel_max: u64) -> u64 {
+    let unit = config::STAGING_SEGMENT_BYTES;
+    morsel_max
+        .saturating_mul(2)
+        .div_ceil(unit)
+        .max(1)
+        .saturating_mul(unit)
+}
+
+#[cfg(test)]
+mod staging_segment_tests {
+    use super::staging_segment_bytes;
+
+    #[test]
+    fn a_segment_holds_two_of_the_largest_morsel() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(staging_segment_bytes(4 * MIB), 128 * MIB);
+        assert_eq!(staging_segment_bytes(64 * MIB), 128 * MIB);
+        assert_eq!(staging_segment_bytes(256 * MIB), 512 * MIB);
+        assert_eq!(staging_segment_bytes(300 * MIB), 640 * MIB);
     }
 }
