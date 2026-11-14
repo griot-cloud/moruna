@@ -1201,6 +1201,20 @@ fn drive(
     }
 
     let joined = py.detach(|| handle.join());
+    // A second interrupt that arrived while the cancellation was finishing, after the loop's
+    // last look and before the runtime thread came home, is still pending in the interpreter:
+    // unanswered it would be raised as `KeyboardInterrupt` at the caller's next bytecode, in
+    // place of the `Cancelled` this call is about to raise. It is swallowed with the message the
+    // loop gives one (f.5, 2026-11-14).
+    if interrupted {
+        match Python::check_signals(py) {
+            Err(e) if e.is_instance_of::<PyKeyboardInterrupt>(py) => {
+                eprintln!("moruna: cancelling; the run stops once in-flight functions return");
+            }
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
+    }
     let outcome = match joined {
         Ok(outcome) => outcome,
         Err(_) => {
