@@ -47,7 +47,7 @@ Some platforms add memory or cores to a running machine, or take them away. Moru
 
 Moruna checks the machine's limits several times a second. When memory or cores are added, it uses them. When they are removed, it reduces what it uses. Reducing memory is gradual, because Moruna waits for data in use to be released rather than discarding it, so a host should wait for the job to settle before removing more. The run report records each change.
 
-Without `elastic`, Moruna follows the machine up to all of its memory and to the most cores the machine can have: the cores online, or, in a virtual machine started with room to add cores, the cores it can be given. Set `elastic` to grow less than that. A job that sets `budget.host` or `budget.cpu` keeps that figure and does not grow past it.
+Without `elastic`, Moruna follows the machine up to all of its memory and to the cores it had online when the job started. Set `elastic` to grow less than that, or to follow cores added to the machine after the job started. A job that sets `budget.host` or `budget.cpu` keeps that figure and does not grow past it.
 
 ## An isolated virtual machine
 
