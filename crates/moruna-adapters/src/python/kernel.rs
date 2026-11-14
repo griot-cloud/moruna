@@ -203,6 +203,13 @@ impl PyKernel {
                     }
                 }
             }
+            // f.13: what the function shares across workers is taken out of reference counting,
+            // here, on the thread that builds the kernel.
+            let deferred = super::shared::defer_shared(
+                callable,
+                spec.origin.as_ref().map(|origin| origin.bind(py)),
+            );
+            tracing::debug!(target: "adapter.shared", deferred, "deferred reference counting");
             let has_footprint = callable.hasattr("footprint").unwrap_or(false);
             let has_finish = spec.stateful && callable.hasattr("finish").unwrap_or(false);
             let printed = fingerprint::compute(py, &spec);
