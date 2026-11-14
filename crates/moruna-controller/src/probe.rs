@@ -72,14 +72,19 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
             // the interrupted run consumed (f.14), or a fresh run whose source has no rows. Neither
             // is a failure of this run: seed the stage as f.2 would without a probe and say so.
             // 0.6.3 let the error stand on a fresh run, so a source with nothing to read could not
-            // run at all.
+            // run at all. Nor is a stage that no morsel reached because the one before it was
+            // skipped under the error policy (2026-11-14).
             Err(e) if is_exhausted_plan(&e) => {
                 let mut state = ctl.held();
                 state.stages[at].seeded = true;
                 let why = if resuming { "resumed: " } else { "" };
+                let cause = if nothing_reached(&e) {
+                    "no morsel reached it"
+                } else {
+                    "the plan is exhausted"
+                };
                 state.note(format!(
-                    "{why}stage {stage} could not be probed, the plan is exhausted; seeded from \
-                     hints"
+                    "{why}stage {stage} could not be probed, {cause}; seeded from hints"
                 ));
                 seeded += 1;
                 continue;
@@ -124,6 +129,12 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
 /// run when its source has no rows.
 fn is_exhausted_plan(e: &moruna_kernel::MorunaError) -> bool {
     matches!(e, moruna_kernel::MorunaError::Plan(msg) if msg.contains("nothing to probe with"))
+}
+
+/// Whether the stage had nothing to probe with because no morsel reached it, its sources still
+/// having rows: the morsel the stage before it was probed with was skipped (SC f.9).
+fn nothing_reached(e: &moruna_kernel::MorunaError) -> bool {
+    matches!(e, moruna_kernel::MorunaError::Plan(msg) if msg.contains("no morsel reached it"))
 }
 
 /// Read the profile store once, per stage (e.3). A file that cannot be parsed is ignored with

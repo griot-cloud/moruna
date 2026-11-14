@@ -258,3 +258,68 @@ fn sc_f9_a_worker_past_its_pick_does_not_run_beside_the_probe() {
     }
     assert!(joined.is_ok(), "the run thread panicked");
 }
+
+/// SC-T10b: a stage that keeps instances is probed on its instance's home (f.9, f.4). With the
+/// instances dealt across workers, stage 2's one instance lives on worker 1, which the probe on
+/// worker 0 may not borrow; every stateful stage after the first failed its probe.
+#[test]
+fn sc_t10b_stateful_stages_after_the_first_are_probed() {
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 4;
+            cfg.workers_active = 4;
+            cfg.initial_morsel_target = 16;
+        })
+        .source(FakeSource::new().splits(1, 64, 512))
+        .kernel(Arc::new(StatefulKernel::new(1)))
+        .kernel(Arc::new(StatefulKernel::new(1)))
+        .go();
+    if let Err(e) = rig.scheduler.init_instances() {
+        panic!("init_instances: {e}");
+    }
+    for stage in 1..=2 {
+        if let Err(e) = rig.scheduler.probe(stage, 16) {
+            panic!("probe({stage}): {e}");
+        }
+    }
+    assert_eq!(
+        rig.fake_placement.pushed(2).len(),
+        1,
+        "stage 2's probe output is in Q2"
+    );
+}
+
+/// SC-T10c: when the morsel stage 1 was probed with is skipped under the error policy, stage 2
+/// has nothing to probe with, and says so in the words the controller seeds a stage on (RC
+/// f.2), at once, rather than ending the run with "no morsel to probe with" (f.9).
+#[test]
+fn sc_t10c_a_stage_no_morsel_reached_is_left_to_be_seeded() {
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 2;
+            cfg.workers_active = 2;
+            cfg.initial_morsel_target = 16;
+            cfg.error_policy = moruna_kernel::ErrorPolicy::Skip;
+        })
+        .source(FakeSource::new().splits(1, 64, 512))
+        .kernel(Arc::new(FakeKernel::new().fail_on(&[0])))
+        .kernel(Arc::new(FakeKernel::new()))
+        .go();
+    if let Err(e) = rig.scheduler.probe(1, 16) {
+        panic!("probe(1): {e}");
+    }
+    let started = std::time::Instant::now();
+    match rig.scheduler.probe(2, 16) {
+        Err(moruna_kernel::MorunaError::Plan(msg)) => {
+            assert!(
+                msg.contains("nothing to probe with") && msg.contains("no morsel reached it"),
+                "{msg}"
+            );
+        }
+        other => panic!("probe(2) should have had nothing to probe with: {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the probe did not wait for a morsel that cannot come"
+    );
+}

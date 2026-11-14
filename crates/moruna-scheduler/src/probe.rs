@@ -17,8 +17,26 @@ use moruna_kernel::{MorunaError, ProbeResult, Result, StageId};
 
 use crate::shared::{HelperRequest, JobOutput, Shared, WorkerJob};
 
-/// The probing worker: worker 0, the one left running while the rest are held off.
+/// Why a stage had nothing to probe with when its sources still have rows (f.9); the controller
+/// names it in the note it leaves (RC f.2).
+const NOTHING_REACHED: &str = "no morsel reached it";
+
+/// The probing worker for a stage that keeps no instances: worker 0, the one left running while
+/// the rest are held off. A stage that keeps instances is probed on its first instance's home.
 const PROBING_WORKER: u16 = 0;
+
+/// The worker that probes stage `stage_ix` (f.9): the home of its first instance when it keeps
+/// instances, so the probe takes the instance a task would; worker 0 otherwise. Every stage was
+/// probed on worker 0, which may not borrow an instance whose home is another active worker
+/// (f.4, SC-I6): with instances dealt across workers, every stateful stage after the first
+/// failed its probe with "no morsel to probe with" (2026-11-14, found once RB2 probed small
+/// datasets too).
+fn probing_worker(shared: &Shared, stage_ix: usize) -> u16 {
+    match shared.stages[stage_ix].pool {
+        Some(_) => crate::instances::home(shared, stage_ix, 0),
+        None => PROBING_WORKER,
+    }
+}
 
 /// `Prober::probe(stage, bytes)` (f.9).
 pub(crate) fn probe(shared: &Shared, stage: StageId, bytes: u64) -> Result<ProbeResult> {
@@ -81,13 +99,25 @@ fn probe_inner(shared: &Shared, stage: StageId, bytes: u64) -> Result<ProbeResul
                 "the source plan is exhausted; there is nothing to probe with".into(),
             ));
         }
-        (None, None) => 0,
+        // Nothing is waiting and no source feeds it, so nothing can arrive while the others are
+        // held off: the stage before it was probed and its morsel was skipped (RC f.2 seeds it).
+        (None, None) => {
+            return Err(MorunaError::Plan(format!(
+                "stage {stage} has nothing to probe with: {NOTHING_REACHED}"
+            )));
+        }
     };
-    tracing::info!(target: "sched.probe", stage, port, bytes, "probing");
-    match shared.run_on_worker(PROBING_WORKER, WorkerJob::Probe { stage, port })? {
+    let worker = probing_worker(shared, usize::from(stage) - 1);
+    tracing::info!(target: "sched.probe", stage, port, bytes, worker, "probing");
+    match shared.run_on_worker(worker, WorkerJob::Probe { stage, port })? {
         JobOutput::Probe(result) => Ok(result),
+        // Nothing reached the stage: the morsel the stage before it was probed with was skipped
+        // under the error policy, or, at a join, one of its inputs was. Like a plan with nothing
+        // left to read, this is not a failure of the run, and the controller seeds the stage
+        // from hints (RC f.2). It ended the run with "no morsel to probe with" until 2026-11-14,
+        // so a bad first batch under `skip` failed a job it should only have dropped a batch of.
         JobOutput::Done => Err(MorunaError::Plan(format!(
-            "stage {stage} had no morsel to probe with"
+            "stage {stage} has nothing to probe with: {NOTHING_REACHED}"
         ))),
     }
 }
