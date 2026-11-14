@@ -23,6 +23,8 @@ pub struct SinkStats {
     pub stalls: u64,
     /// Files a `resume` removed because their sequence range lay above the watermark.
     pub resumed_files_removed: u64,
+    /// An earlier run's part files and `_SUCCESS` a fresh `open` removed from the prefix.
+    pub earlier_files_removed: u64,
     /// The byte count a Parquet file actually rolls at: `sink.file_bytes`, or less when the
     /// arena could not serve a buffer that large (08 f.1).
     pub roll_bytes: u64,

@@ -14,6 +14,29 @@ use moruna_kernel::{BufferView, Completion, MorunaError, Reactor, Result};
 /// The suffix an incomplete local file carries until it is committed.
 pub(crate) const TMP_SUFFIX: &str = ".tmp";
 
+/// True for a name an earlier run of a sink writing `extension` files left under its prefix:
+/// `part-NNNNN.<extension>`, the same with `.tmp`, or `_SUCCESS` (08 f.1, 2026-11-14).
+pub(crate) fn earlier_output(name: &str, extension: &str) -> bool {
+    if name == "_SUCCESS" {
+        return true;
+    }
+    let name = name.strip_suffix(TMP_SUFFIX).unwrap_or(name);
+    name.strip_prefix("part-")
+        .and_then(|rest| rest.strip_suffix(extension))
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove what [`earlier_output`] names from `names`, through `remove`, and count it. A name that
+/// cannot be removed is left: the run's own files overwrite the ones it can.
+fn clear(names: Vec<String>, extension: &str, mut remove: impl FnMut(&str) -> Result<()>) -> u64 {
+    names
+        .iter()
+        .filter(|name| earlier_output(name, extension))
+        .filter(|name| remove(name).is_ok())
+        .count() as u64
+}
+
 /// A URL prefix a sink writes objects under (f.1, f.5).
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectPrefix {
@@ -68,6 +91,18 @@ impl ObjectPrefix {
         match &self.local {
             Some(dir) => remove_file(&dir.join(name)),
             None => Err(MorunaError::Resume("cannot list destination".into())),
+        }
+    }
+
+    /// A fresh run's start (08 f.1, 2026-11-14): remove an earlier run's part files and its
+    /// `_SUCCESS` from the prefix, so this run's output is the prefix's whole content. A run that
+    /// finished, whose host never heard so and ran it again, otherwise left the files of the
+    /// first run that the second did not overwrite: its rows were in the prefix twice. Nothing
+    /// else under the prefix is touched; a prefix that cannot be listed is left as it is.
+    pub(crate) fn clear_earlier_output(&self, extension: &str) -> u64 {
+        match self.list() {
+            Ok(names) => clear(names, extension, |name| self.remove(name)),
+            Err(_) => 0,
         }
     }
 }
@@ -127,6 +162,14 @@ impl LocalDir {
         remove_file(&self.final_of(name))
     }
 
+    /// [`ObjectPrefix::clear_earlier_output`] for a directory.
+    pub(crate) fn clear_earlier_output(&self, extension: &str) -> u64 {
+        match self.list() {
+            Ok(names) => clear(names, extension, |name| remove_file(&self.dir.join(name))),
+            Err(_) => 0,
+        }
+    }
+
     /// Remove every temporary file in the directory, which is what an aborted or resumed sink
     /// leaves behind (SI-I3, f.8).
     pub(crate) fn remove_tmps(&self) -> Result<u64> {
@@ -171,5 +214,27 @@ fn io_err(op: &'static str, path: &Path, e: &std::io::Error) -> MorunaError {
         op,
         target: path.display().to_string(),
         msg: e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod earlier_output_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_earlier_runs_files_are_its_output() {
+        for name in ["part-00000.parquet", "part-00042.parquet.tmp", "_SUCCESS"] {
+            assert!(earlier_output(name, "parquet"), "{name}");
+        }
+        for name in [
+            "part-00000.arrow",
+            "part-.parquet",
+            "part-0a.parquet",
+            "notes.txt",
+            "data.parquet",
+            "moruna-part-00001.parquet",
+        ] {
+            assert!(!earlier_output(name, "parquet"), "{name}");
+        }
     }
 }

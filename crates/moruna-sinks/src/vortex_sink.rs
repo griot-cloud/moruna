@@ -534,6 +534,8 @@ impl Sink for VortexSink {
         let mut inner = self.lock();
         inner.phase.require_created()?;
         inner.declared = Some(Arc::clone(schema));
+        // A fresh run's output is the prefix's whole content (f.1, 2026-11-14).
+        inner.stats.earlier_files_removed = self.dest.clear_earlier_output(EXTENSION);
         // The file buffers, now, while the arena holds nothing else.
         self.buffers.alloc_pair(self.cfg.file_bytes)?;
         inner.phase = Phase::Open;

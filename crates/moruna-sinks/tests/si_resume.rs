@@ -581,3 +581,46 @@ fn si_t14_unresumable_says_so() {
         "a skip reaches the inner sink's watermark"
     );
 }
+
+/// SI-T28 a_fresh_run_owns_its_prefix (f.1, 2026-11-14): a sink opened fresh over a prefix an
+/// earlier run wrote removes that run's part files and `_SUCCESS`, and nothing else. A run that
+/// finished, whose host never heard so and ran it again, otherwise left the first run's files
+/// that the second did not overwrite, and their rows stood in the prefix twice.
+#[test]
+fn si_t28_a_fresh_run_owns_its_prefix() {
+    let scratch = Scratch::new("t28");
+    let dir = scratch.path().to_path_buf();
+    std::fs::create_dir_all(&dir).expect("the prefix");
+    for name in [
+        "part-00009.parquet",
+        "part-00010.parquet.tmp",
+        "_SUCCESS",
+        "notes.txt",
+    ] {
+        std::fs::write(dir.join(name), b"an earlier run").expect("a file");
+    }
+    let alloc = FakeAllocator::new();
+    let reactor = FakeReactor::new();
+    let mut sink = ParquetSink::new(
+        ParquetSinkConfig {
+            url: scratch.url(),
+            ..ParquetSinkConfig::default()
+        },
+        Arc::new(reactor.clone()),
+        Arc::new(alloc.clone()),
+    )
+    .expect("parquet sink");
+    sink.open(&table_source_schema()).expect("open");
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the prefix")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["notes.txt".to_string()],
+        "only what no run of a sink writes"
+    );
+    assert_eq!(sink.stats().earlier_files_removed, 3);
+}

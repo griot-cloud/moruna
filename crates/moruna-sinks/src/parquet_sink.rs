@@ -609,6 +609,8 @@ impl Sink for ParquetSink {
         // output schema is the first payload's, so the writer is built there and this one is
         // kept only for a run that writes nothing.
         inner.declared = Some(Arc::clone(schema));
+        // A fresh run's output is the prefix's whole content (f.1, 2026-11-14).
+        inner.stats.earlier_files_removed = self.dest.clear_earlier_output("parquet");
         // The file buffers, now, while the arena holds nothing else: the pair's bytes, one
         // buffer per lane (f.12).
         let lane = self

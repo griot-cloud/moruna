@@ -31,7 +31,7 @@ print(report.resumed)
 
 With `resume="auto"`, Moruna looks in the staging directory for the newest checkpoint of the same job and continues from it; if there is none, it starts from the beginning. `report.resumed` says which happened. You can also name a checkpoint directly, with the run's 32-character id or the path to its `manifest.json`. The id is in the report, and in `error.run_id` when a job stops with an error.
 
-The staging directory must already exist. If it does not, Moruna runs without a disk to spill to or checkpoint in, and adds a note to the report.
+If the staging directory does not exist, Moruna creates it. If it cannot be created or written, Moruna runs without a disk to spill to or checkpoint in, and adds a note to the report.
 
 In a job document, the same settings are `"staging": {"dir": "staging"}` and `"resume": "auto"`.
 
