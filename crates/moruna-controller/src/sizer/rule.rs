@@ -40,7 +40,15 @@ pub struct RuleSizer {
     /// The start of the newest record seen when the target last changed: a record that
     /// started after it was sized at the current target.
     changed_at_ns: u64,
+    /// The target at the previous proposal, and how many growths in a row left it where it
+    /// was: the working-set check and the anon bound cap a target below the envelope, and a
+    /// growth they refuse is the memory rule's top as surely as the envelope is (f.4b).
+    last_target: u64,
+    stalls: u8,
 }
+
+/// Growths in a row that left the target where it was before the search starts (f.4b).
+const STALLS: u8 = 2;
 
 impl RuleSizer {
     /// A rule sizer with `controller.target_fraction` and `controller.increase_step`.
@@ -52,6 +60,8 @@ impl RuleSizer {
             observations: 0,
             search: Search::Growing,
             changed_at_ns: 0,
+            last_target: 0,
+            stalls: 0,
         }
     }
 
@@ -76,16 +86,8 @@ impl RuleSizer {
         (n >= SEARCH_RECORDS && bytes > 0).then(|| cpu_us as f64 / bytes as f64)
     }
 
-    /// The proposal, remembering when it changes the target.
-    fn propose_target(&mut self, obs: &Observation, target: u64) -> Proposal {
-        if target != obs.target {
-            self.changed_at_ns = obs
-                .recent
-                .iter()
-                .map(|r| r.t_start_ns)
-                .max()
-                .unwrap_or(self.changed_at_ns);
-        }
+    /// The proposal.
+    fn propose_target(&mut self, _obs: &Observation, target: u64) -> Proposal {
         Proposal {
             morsel_target: target,
             predicted_peak: None,
@@ -145,7 +147,23 @@ impl Sizer for RuleSizer {
             return self.propose_target(obs, halved);
         }
         let grown = crate::model::scale(obs.target, 1.0 + self.increase_step);
-        let can_grow = ratio < INCREASE_BELOW && grown <= envelope.max;
+        if obs.target > self.last_target {
+            self.stalls = 0;
+        } else {
+            self.stalls = self.stalls.saturating_add(1);
+        }
+        if self.last_target != 0 && obs.target != self.last_target {
+            // The target moved: what ran before now was sized at the old one. A proposal that
+            // was not taken moves nothing, and the first proposal finds the target as it was.
+            self.changed_at_ns = obs
+                .recent
+                .iter()
+                .map(|r| r.t_start_ns)
+                .max()
+                .unwrap_or(self.changed_at_ns);
+        }
+        self.last_target = obs.target;
+        let can_grow = ratio < INCREASE_BELOW && grown <= envelope.max && self.stalls < STALLS;
         // f.4b: the memory rule says how large a morsel may be; the kernel's CPU per byte says
         // whether as large is better. A Python kernel that walks its columns value by value is
         // cheaper on morsels that stay in the cache (Occupancy: 421 ns a row at 30k rows, 490 at
@@ -374,7 +392,10 @@ mod tests {
         let mut obs = observation(64 * MIB, 3.5, 0);
         obs.recent = records(12, 64 * MIB, 4.0, 0);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
+        // The sizer sees each new target first beside the records that ran before it.
         let mut obs = observation(32 * MIB, 3.5, 0);
+        obs.recent = records(12, 64 * MIB, 4.0, 0);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         obs.recent = records(12, 32 * MIB, 3.0, 100);
         assert_eq!(
             sizer.propose(&obs, &envelope).morsel_target,
@@ -382,6 +403,8 @@ mod tests {
             "25% cheaper: kept, and its half tried"
         );
         let mut obs = observation(16 * MIB, 3.5, 0);
+        obs.recent = records(12, 32 * MIB, 3.0, 100);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 16 * MIB);
         obs.recent = records(12, 16 * MIB, 2.95, 200);
         assert_eq!(
             sizer.propose(&obs, &envelope).morsel_target,
@@ -404,6 +427,8 @@ mod tests {
         obs.recent = records(12, 64 * MIB, 2.0, 0);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         let mut obs = observation(32 * MIB, 3.5, 0);
+        obs.recent = records(12, 64 * MIB, 2.0, 0);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         obs.recent = records(12, 32 * MIB, 2.6, 100);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 64 * MIB);
         assert_eq!(sizer.settled_target(), Some(64 * MIB));
@@ -417,6 +442,32 @@ mod tests {
         obs.recent = records(5, 64 * MIB, 2.0, 0);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 64 * MIB);
         assert_eq!(sizer.settled_target(), None);
+    }
+
+    /// RC-T24: growth the controller does not take is the memory rule's top: after two growths
+    /// in a row that left the target where it was, the search starts. On the benchmark VM the
+    /// working-set check held every stage below the envelope, the sizer kept asking to grow,
+    /// and no search ever began.
+    #[test]
+    fn rc_t24_growth_that_is_not_taken_starts_the_search() {
+        let (mut sizer, envelope) = at_the_top();
+        let wide = Envelope {
+            min: envelope.min,
+            max: 256 * MIB,
+        };
+        let mut obs = observation(16 * MIB, 3.5, 0);
+        assert_eq!(sizer.propose(&obs, &wide).morsel_target, 20 * MIB, "grows");
+        assert_eq!(
+            sizer.propose(&obs, &wide).morsel_target,
+            20 * MIB,
+            "the growth was not taken; asks once more"
+        );
+        obs.recent = records(12, 16 * MIB, 2.0, 0);
+        assert_eq!(
+            sizer.propose(&obs, &wide).morsel_target,
+            8 * MIB,
+            "not taken twice: the search tries half"
+        );
     }
 
     /// RC-T24: an earlier run's settled target is where the sizer starts, settled, so the memory
