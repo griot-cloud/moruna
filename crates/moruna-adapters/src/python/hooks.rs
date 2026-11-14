@@ -31,12 +31,18 @@ static MEM: OnceLock<Saved> = OnceLock::new();
 static OBJ: OnceLock<Saved> = OnceLock::new();
 static INSTALLED: Once = Once::new();
 
+// A request below `GUARD_MIN_BYTES` goes to the allocator underneath from the hook itself, with no
+// call into the guard: every Python object passes through here, and on the benchmark VM the guard
+// call alone, for requests it only passed on, was 1.9 of Audit's 106 CPU-seconds (2026-11-14).
 macro_rules! domain_hooks {
     ($saved:ident, $malloc:ident, $calloc:ident) => {
         extern "C" fn $malloc(ctx: *mut c_void, size: usize) -> *mut c_void {
             let Some(underlying) = $saved.get().and_then(|s| s.0.malloc) else {
                 return core::ptr::null_mut();
             };
+            if (size as u64) < guard::GUARD_MIN_BYTES {
+                return underlying(ctx, size);
+            }
             guard::allocate(size as u64, || underlying(ctx, size))
         }
 
@@ -47,6 +53,9 @@ macro_rules! domain_hooks {
             match nelem.checked_mul(elsize) {
                 // An overflowing product is the allocator underneath's to refuse.
                 None => underlying(ctx, nelem, elsize),
+                Some(bytes) if (bytes as u64) < guard::GUARD_MIN_BYTES => {
+                    underlying(ctx, nelem, elsize)
+                }
                 Some(bytes) => guard::allocate(bytes as u64, || underlying(ctx, nelem, elsize)),
             }
         }
