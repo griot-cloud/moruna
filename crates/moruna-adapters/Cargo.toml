@@ -101,3 +101,8 @@ required-features = ["python"]
 name = "ad_guard"
 path = "tests/ad_guard.rs"
 required-features = ["python"]
+
+[[test]]
+name = "ad_t26_one_thread_state_per_worker"
+path = "tests/ad_t26_one_thread_state_per_worker.rs"
+required-features = ["python"]

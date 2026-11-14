@@ -533,6 +533,7 @@ impl Kernel for PyKernel {
         if !self.stateful {
             return Ok(Box::new(NoState));
         }
+        super::thread::keep();
         Python::attach(|py| {
             let ctx_obj = self.ctx_object(py, ctx)?;
             let state = self
@@ -555,6 +556,7 @@ impl Kernel for PyKernel {
         if self.resume != ResumePolicy::Checkpoint {
             return Err(missing_restore());
         }
+        super::thread::keep();
         Python::attach(|py| {
             let ctx_obj = self.ctx_object(py, ctx)?;
             let restored = PyState::restored(
@@ -579,6 +581,7 @@ impl Kernel for PyKernel {
         if !self.has_finish {
             return Ok(None);
         }
+        super::thread::keep();
         let Some(alloc) = self.bound_alloc() else {
             return Err(MorunaError::Config {
                 name: "adapter",
@@ -653,6 +656,9 @@ impl PyKernel {
     /// payload over arena buffers, so the morsel's one output stays one output. A table that
     /// cannot be split further, a tensor, or any other error is returned as it was.
     fn apply_splitting(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        // Every call on this worker in one thread state (thread.rs): it was made and deleted
+        // around each one.
+        super::thread::keep();
         let keep = match &input {
             Payload::Table(batch, tier) if batch.num_rows() > 1 => Some((batch.clone(), *tier)),
             _ => None,
