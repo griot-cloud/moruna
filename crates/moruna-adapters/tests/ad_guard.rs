@@ -306,7 +306,9 @@ fn ad_t16_python_domain_request_refused() {
     let r = rig("grows", true);
     let (result, counts) = r.call();
     result.expect("growth and small requests pass");
-    assert!(counts.python.requests >= 1000, "{counts:?}");
+    // The thousand 100-byte objects never reach the guard, so they are not among its counts
+    // (05 "Guarded request", 2026-11-14).
+    assert!(counts.python.requests < 1000, "{counts:?}");
     assert_eq!(counts.python.refused, 0);
 }
 

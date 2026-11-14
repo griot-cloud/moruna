@@ -203,7 +203,7 @@ fn ad_t13_frame_counts_python_requests_and_refuses_guarded_ones() {
     assert!(kernel.guarded());
     let (calls, end) = kernel.frame(|| {
         let mut calls = 0;
-        // Small: counted, never examined.
+        // Small: straight through, neither counted nor examined.
         assert!(
             !allocate(100, || {
                 calls += 1;
@@ -233,8 +233,8 @@ fn ad_t13_frame_counts_python_requests_and_refuses_guarded_ones() {
     });
     assert_eq!(calls, 2);
     let python = end.counts.python;
-    assert_eq!(python.requests, 4);
-    assert_eq!(python.bytes, 100 + 5 * MIB + 50 * MIB + 60 * MIB);
+    assert_eq!(python.requests, 3);
+    assert_eq!(python.bytes, 5 * MIB + 50 * MIB + 60 * MIB);
     assert_eq!(python.largest, 60 * MIB);
     assert_eq!(python.refused, 2);
     assert_eq!(python.peak, 0, "Python objects' peak is not measured");
@@ -284,13 +284,15 @@ fn ad_t13_frames_nest_and_restore() {
     let outer = KernelMemory::new(false);
     let inner = KernelMemory::new(false);
     let (_, end) = outer.frame(|| {
-        allocate(10, some);
-        let (_, inner_end) = inner.frame(|| allocate(20, some));
-        assert_eq!(inner_end.counts.python.bytes, 20);
+        allocate(10 * MIB, some);
+        let (_, inner_end) = inner.frame(|| allocate(20 * MIB, some));
+        assert_eq!(inner_end.counts.python.bytes, 20 * MIB);
+        allocate(30 * MIB, some);
         allocate(30, some);
     });
     assert_eq!(
-        end.counts.python.bytes, 40,
+        end.counts.python.bytes,
+        40 * MIB,
         "the outer frame came back after the inner"
     );
     assert!(allocate(1, some) == some(), "and no frame is left behind");
@@ -381,8 +383,9 @@ fn ad_t13_the_allocator_underneath_a_numpy_block_is_not_counted_again() {
         2,
         "only the refused request measured"
     );
-    // The frame's `inside` is down again: a Python request now is counted.
-    let (_, end) = owner.frame(|| allocate(10, some));
+    // The frame's `inside` is down again: a Python request the guard sees is counted now.
+    let (p, end) = owner.frame(|| allocate(GUARD_MIN_BYTES, some));
+    assert!(!p.is_null());
     assert_eq!(end.counts.python.requests, 1);
 }
 

@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use moruna_kernel::{AllocCounts, KernelAlloc, Sampler};
 
-/// `guard.min_bytes` (05 i): the smallest request the gate examines. Every request inside a
-/// frame is counted whatever its size; only these can be refused.
+/// `guard.min_bytes` (05 i): the smallest request the guard sees. Only these are counted
+/// inside a frame, and only these can be refused; a smaller one goes straight through.
 pub const GUARD_MIN_BYTES: u64 = 64 * 1024;
 
 /// Index of Python objects in `KernelAlloc` (contracts e.5).
@@ -518,6 +518,14 @@ fn answer(bytes: u64, allocated: bool) {
 
 /// f.10: a Python domain hook's request for `bytes`; `underlying` calls the allocator underneath.
 pub fn allocate<T>(bytes: u64, underlying: impl FnOnce() -> *mut T) -> *mut T {
+    // Every Python object a call makes comes through here. A request no gate could refuse goes
+    // straight to the allocator underneath, before the frame is even looked up: on the benchmark
+    // VM the lookup and count alone were 3.4 of Audit's 91 CPU-seconds (a call that makes a
+    // float per value makes millions), and what a small request cannot do is grow the process
+    // past its ceiling on its own; the sampler sees what many of them add up to (2026-11-14).
+    if bytes < GUARD_MIN_BYTES {
+        return underlying();
+    }
     let ptr = FRAME.try_with(Cell::get).unwrap_or(core::ptr::null());
     if ptr.is_null() {
         return underlying();
@@ -529,10 +537,9 @@ pub fn allocate<T>(bytes: u64, underlying: impl FnOnce() -> *mut T) -> *mut T {
         return underlying();
     }
     frame.python.count(bytes);
-    // Every Python object a call makes comes through here: a request no gate can refuse (below
-    // `GUARD_MIN_BYTES`, or no gate) takes one look at the frame and the allocator underneath,
-    // with the frame marked so what that allocator asks of the domains is not counted twice.
-    if bytes < GUARD_MIN_BYTES || frame.gate.is_null() {
+    // With no gate the request is only counted, and the frame is marked so what the allocator
+    // underneath asks of the domains is not counted twice.
+    if frame.gate.is_null() {
         let was = frame.inside.replace(true);
         let p = underlying();
         frame.inside.set(was);
