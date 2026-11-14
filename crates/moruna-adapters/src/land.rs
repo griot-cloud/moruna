@@ -39,7 +39,17 @@ pub(crate) fn table(batch: RecordBatch, alloc: &dyn Allocator) -> Result<(Payloa
     let mut copied = 0u64;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
     for column in batch.columns() {
-        let data = copy_array_data(&column.to_data(), alloc, tier, &mut copied)?;
+        // A column the arena already owns is kept as it is: a kernel that returns its input with
+        // a column appended (`append_column`, `select`) hands back the input's columns, which are
+        // arena buffers, beside the one it made. Every column was copied whenever one was not,
+        // so such a kernel's whole output crossed again (2026-11-14).
+        let mut any = false;
+        let data = column.to_data();
+        if data_is_arena_owned(&data, alloc, &mut any) && any {
+            columns.push(Arc::clone(column));
+            continue;
+        }
+        let data = copy_array_data(&data, alloc, tier, &mut copied)?;
         columns.push(make_array(data));
     }
     let schema = batch.schema();
@@ -131,7 +141,7 @@ fn copy_buffer(
 mod tests {
     use std::sync::Arc;
 
-    use moruna_kernel::arrow::array::{Int64Array, StringArray};
+    use moruna_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
     use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
     use moruna_kernel::arrow::record_batch::RecordBatch;
     use moruna_kernel::{Allocator, Payload, Tier};
@@ -185,5 +195,44 @@ mod tests {
         let pinned: Arc<dyn Allocator> = Arc::new(FakeAllocator::new().pinned(true));
         let (payload, _) = land_table(heap_batch(), &pinned).unwrap();
         assert_eq!(payload.tier(), Tier::PinnedHost);
+    }
+
+    /// AD-T27 (f.3, 2026-11-14): a batch of arena columns with one heap column appended copies
+    /// the heap column alone; the arena columns are kept as they are.
+    #[test]
+    fn only_the_columns_the_arena_does_not_own_are_copied() {
+        let fake = Arc::new(FakeAllocator::new());
+        let alloc: Arc<dyn Allocator> = fake.clone();
+        let (landed, first) = land_table(heap_batch(), &alloc).unwrap();
+        let Payload::Table(arena_batch, _) = landed else {
+            panic!("a table lands as a table");
+        };
+        let extra: ArrayRef = Arc::new(Int64Array::from(vec![7, 8, 9]));
+        let mut fields: Vec<Field> = arena_batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new("extra", DataType::Int64, false));
+        let mut columns = arena_batch.columns().to_vec();
+        columns.push(Arc::clone(&extra));
+        let mixed = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let (payload, copied) = land_table(mixed.clone(), &alloc).unwrap();
+        assert_eq!(
+            copied, 24,
+            "the appended column's three values, and nothing else"
+        );
+        assert_eq!(fake.boundary_copies(), first + 24);
+        let Payload::Table(landed, _) = payload else {
+            panic!("a table lands as a table");
+        };
+        assert_eq!(landed, mixed);
+        for (kept, given) in landed.columns().iter().zip(arena_batch.columns()) {
+            assert!(
+                kept.to_data().ptr_eq(&given.to_data()),
+                "an arena column is kept, not copied"
+            );
+        }
     }
 }
