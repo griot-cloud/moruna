@@ -39,11 +39,26 @@ pub use crate::watch::{
 };
 pub use arc_swap::ArcSwap;
 
-/// The CPUs this machine has online now, whatever a cgroup lets the process use: the most
-/// workers a run that follows the machine up can ever be given (RB4). The operating system's
-/// logical core count.
+/// The most CPUs this machine can give the process, whatever a cgroup lets it use now: the most
+/// workers a run that follows the machine up can ever be given (RB4). The CPUs online, or, where
+/// Linux says more may come (`/sys/devices/system/cpu/possible`: a VM booted with room to
+/// hot-plug CPUs, which is how Moruna's own VM is given more), that many, at most
+/// [`MACHINE_CORES_MAX`].
 pub fn machine_cores() -> f64 {
-    os::logical_cores()
+    let possible = std::fs::read_to_string("/sys/devices/system/cpu/possible")
+        .ok()
+        .and_then(|text| parse_cpu_list(&text));
+    machine_cores_from(os::logical_cores(), possible)
+}
+
+/// The most worker threads [`machine_cores`] creates room for, parked until CPUs come: a host
+/// whose firmware lists hundreds of possible CPUs does not get a thread for each.
+pub const MACHINE_CORES_MAX: f64 = 256.0;
+
+/// [`machine_cores`] from the CPUs online and the CPUs Linux lists as possible.
+fn machine_cores_from(online: f64, possible: Option<u32>) -> f64 {
+    let possible = possible.map_or(0.0, f64::from).min(MACHINE_CORES_MAX);
+    online.max(possible)
 }
 
 /// What the caller already knows, and what it wants to override (d.1).
@@ -1150,6 +1165,17 @@ mod tests {
                 .any(|note| note.contains("could not be created"))
         );
         assert!(found.notes.iter().any(|note| note.contains("no disk tier")));
+    }
+
+    /// RB4: the most CPUs a run may grow to are those online, or the CPUs Linux lists as possible
+    /// (a VM with room to hot-plug), at most `MACHINE_CORES_MAX`.
+    #[test]
+    fn machine_cores_reach_the_possible_cpus() {
+        assert_eq!(machine_cores_from(8.0, None), 8.0);
+        assert_eq!(machine_cores_from(4.0, Some(32)), 32.0);
+        assert_eq!(machine_cores_from(8.0, Some(4)), 8.0);
+        assert_eq!(machine_cores_from(8.0, Some(240_000)), MACHINE_CORES_MAX);
+        assert!(machine_cores() >= 1.0);
     }
 
     /// A staging directory the caller names that does not exist yet is made and used.

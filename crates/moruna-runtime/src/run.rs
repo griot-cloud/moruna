@@ -230,10 +230,10 @@ fn drive(
     }
     let staging_dir = discovered.profile.staging_dir.clone();
     // RB4 (2026-11-13): a run follows the machine both ways by default. The pool is created up
-    // to `budget.elastic.cpu_max` or, without one, up to the CPUs the machine has online, and
-    // parked; the starting N is what is active. An explicit CPU count is the caller's own figure
-    // and is not grown past. A machine that adds CPUs beyond those online at start (a hot-plug)
-    // is followed only as far as the pool.
+    // to `budget.elastic.cpu_max` or, without one, up to the most CPUs the machine can give
+    // (`moruna_discovery::machine_cores`: those online, or those Linux lists as possible in a VM
+    // with room to hot-plug, Moruna's own VM among them), and parked; the starting N is what is
+    // active. An explicit CPU count is the caller's own figure and is not grown past.
     let workers_start = workers_from(limits.cpu_quota);
     let machine_cores = match (&components.limits_source, host_discovered) {
         (Some(source), _) => source.read().cpus_online,
