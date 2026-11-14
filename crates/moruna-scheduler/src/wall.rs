@@ -72,7 +72,11 @@ impl Wall {
         own_slots: usize,
     ) -> Next {
         self.looks = self.looks.saturating_add(1);
-        let made = room == Room::Make && make_room(shared, bytes);
+        // Room asked for at the last look and still on its way (a spill being written) is not
+        // asked for again: each look would otherwise take another `bytes` out of memory, and a
+        // wall that lasts a write would empty the queues.
+        let moving = shared.placement_stats().in_flight_bytes > 0;
+        let made = room == Room::Make && !moving && make_room(shared, bytes);
         let now = progress(shared);
         let moved = now != self.signature;
         self.signature = now;
