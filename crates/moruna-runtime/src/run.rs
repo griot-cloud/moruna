@@ -216,6 +216,15 @@ fn drive(
     notes.extend(discovered.notes.iter().cloned());
     notes.extend(spec_notes);
     let limits = discovered.limits.clone();
+    // 02 f.9: what the C heap frees stays for reuse, so the buffers a run takes and frees morsel
+    // after morsel are not faulted in and zeroed by the kernel each time.
+    if let Some(heap) = moruna_arena::heap::keep_freed(limits.memory_ceiling) {
+        notes.push(format!(
+            "the C heap keeps freed memory for reuse: blocks under {} bytes stay in it, and up to {} \
+             bytes free at a heap's top are kept (02 f.9)",
+            heap.mmap_threshold, heap.trim_threshold
+        ));
+    }
     if let Some(observer) = &observer {
         observer.discovered(&limits, kernels.len());
     }

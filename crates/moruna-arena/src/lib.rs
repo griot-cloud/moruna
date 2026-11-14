@@ -25,6 +25,7 @@
 
 mod classes;
 mod handle;
+pub mod heap;
 mod large;
 pub mod region;
 mod stats;
