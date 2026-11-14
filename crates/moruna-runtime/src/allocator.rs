@@ -9,7 +9,8 @@
 //! grouped aggregation that spills held 30 MB more than on macOS, whose allocator returns large
 //! freed buffers at once. The runtime fixes the threshold, which stops it climbing, so every
 //! buffer of 256 KiB or more is mapped on its own and unmapped when it is freed, and holds glibc
-//! to four heaps. On every other platform this is nothing.
+//! to two heaps a CPU (four until 2026-11-14; see [`arenas`]). On every other platform this is
+//! nothing.
 //!
 //! What the heaps keep at their tops (2026-11-14) is the other half. glibc trims a heap's top
 //! once it has more than 128 KiB free there and grows it a page at a time, so the buffers below
@@ -26,9 +27,20 @@
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const MMAP_THRESHOLD_BYTES: libc::c_int = 256 << 10;
 
-/// The most heaps glibc keeps.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-const ARENA_MAX: libc::c_int = 4;
+/// The heaps glibc keeps: two per CPU the process may use, so that each thread that allocates
+/// (the workers, the drives, the reactor, the controller, Python's own) has one to itself.
+///
+/// F8.9 held glibc to four (2026-11-14 measured it at last): a kernel that makes and frees
+/// objects in C from every worker queued them on four locks. On the benchmark VM, Overture's
+/// building shapes (shapely, a billion GEOS geometries) spent the top of Moruna's profile in
+/// glibc's `malloc`, `_int_free` and the kernel's futex path, and ran 38.3 s on eight files
+/// against the plain loop's 31.4; with glibc's own count, 26.4 s, at 2.7 GiB resident against
+/// 2.4. What the heaps keep stays bounded: [`keep_heap_tops`] shares its sixteenth of the
+/// ceiling across them.
+fn arenas() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (2 * cpus).clamp(4, 64)
+}
 
 /// Set once per process, before the first run's baseline is sampled.
 pub(crate) fn give_freed_memory_back() {
@@ -39,7 +51,10 @@ pub(crate) fn give_freed_memory_back() {
         // documents both options as safe to set at any time from any thread.
         unsafe {
             libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES);
-            libc::mallopt(libc::M_ARENA_MAX, ARENA_MAX);
+            libc::mallopt(
+                libc::M_ARENA_MAX,
+                libc::c_int::try_from(arenas()).unwrap_or(4),
+            );
         }
     });
 }
@@ -51,18 +66,20 @@ const TRIM_MAX: u64 = i32::MAX as u64;
 /// The largest step a heap grows by.
 const PAD_MAX: u64 = 64 << 20;
 
-/// What [`keep_heap_tops`] keeps for a run under `ceiling`: the bytes free at a heap's top that
-/// stay, and the step a heap grows by.
-pub(crate) fn heap_tops_for(ceiling: u64) -> (u64, u64) {
-    let trim = (ceiling / 16).clamp(TRIM_MIN, TRIM_MAX);
-    let pad = (ceiling / 64).min(PAD_MAX);
+/// What [`keep_heap_tops`] keeps for a run under `ceiling` with `heaps` heaps: the bytes free at
+/// one heap's top that stay, and the step a heap grows by. Both are per heap, so the run's
+/// sixteenth (and sixty-fourth) of the ceiling is shared among them.
+pub(crate) fn heap_tops_for(ceiling: u64, heaps: usize) -> (u64, u64) {
+    let heaps = u64::try_from(heaps.max(1)).unwrap_or(u64::MAX);
+    let trim = (ceiling / 16 / heaps).clamp(TRIM_MIN, TRIM_MAX);
+    let pad = (ceiling / 64 / heaps).min(PAD_MAX);
     (trim, pad)
 }
 
 /// Keep what a heap frees at its top for the next morsel, for a run under `ceiling` (2026-11-14).
 /// `Some((trim, pad))` where it was set, on glibc; `None` elsewhere.
 pub(crate) fn keep_heap_tops(ceiling: u64) -> Option<(u64, u64)> {
-    let (trim, pad) = heap_tops_for(ceiling);
+    let (trim, pad) = heap_tops_for(ceiling, arenas());
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         let as_int = |bytes: u64| libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
@@ -87,17 +104,26 @@ mod tests {
 
     #[test]
     fn the_heap_tops_kept_are_a_share_of_the_ceiling() {
-        assert_eq!(heap_tops_for(256 << 20), (16 << 20, 4 << 20));
-        assert_eq!(heap_tops_for(24 << 30), (1536 << 20, PAD_MAX));
-        assert_eq!(heap_tops_for(4 << 20), (TRIM_MIN, 64 << 10));
-        assert_eq!(heap_tops_for(u64::MAX).0, TRIM_MAX);
+        assert_eq!(heap_tops_for(256 << 20, 1), (16 << 20, 4 << 20));
+        assert_eq!(heap_tops_for(24 << 30, 1), (1536 << 20, PAD_MAX));
+        assert_eq!(heap_tops_for(4 << 20, 1), (TRIM_MIN, 64 << 10));
+        assert_eq!(heap_tops_for(u64::MAX, 1).0, TRIM_MAX);
+        // Shared among the heaps: sixteen heaps under 24 GiB keep 96 MiB each, 1.5 GiB in all.
+        assert_eq!(heap_tops_for(24 << 30, 16), (96 << 20, 24 << 20));
+        assert_eq!(heap_tops_for(256 << 20, 16), (TRIM_MIN, 256 << 10));
+    }
+
+    #[test]
+    fn there_are_two_heaps_a_cpu_within_bounds() {
+        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        assert_eq!(arenas(), (2 * cpus).clamp(4, 64));
     }
 
     #[test]
     fn keep_heap_tops_is_set_only_on_glibc() {
         let kept = keep_heap_tops(8 << 30);
         if cfg!(all(target_os = "linux", target_env = "gnu")) {
-            assert_eq!(kept, Some(heap_tops_for(8 << 30)));
+            assert_eq!(kept, Some(heap_tops_for(8 << 30, arenas())));
         } else {
             assert_eq!(kept, None);
         }
