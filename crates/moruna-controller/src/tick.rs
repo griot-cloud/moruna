@@ -194,6 +194,18 @@ pub(crate) fn tick(ctl: &Inner) {
                 let envelope = state.stages[at].envelope;
                 let proposal = state.stages[at].sizer.propose(&observation, &envelope);
                 apply::apply_proposal(&mut state, at, proposal, &mut actions);
+                // f.4b: say once where the throughput search settled, so the report shows it.
+                if let Some(best) = state.stages[at].sizer.settled_target()
+                    && state.stages[at].settled_noted != Some(best)
+                {
+                    state.stages[at].settled_noted = Some(best);
+                    if observation.learned_target != Some(best) {
+                        state.note(format!(
+                            "stage {stage} settled at {best} bytes a morsel, where its function \
+                             spent the least CPU per byte"
+                        ));
+                    }
+                }
                 let seq = state.stages[at].last.as_ref().map(|r| r.seq).unwrap_or(0);
                 apply::maybe_fall_back(&mut state, at, seq);
             }

@@ -394,3 +394,36 @@ fn rc_t10b_too_little_evidence_is_probed_and_an_identical_probe_is_not_drift() {
     assert_eq!(probes.len(), 1, "eight records do not stand in for a probe");
     assert!(!notes.iter().any(|n| n.contains("drift")), "{notes:?}");
 }
+
+/// RC-T24 (f.2, f.4b, 2026-11-14): a run sized from earlier runs starts at the target their
+/// throughput search settled on, when that is below what memory allows.
+#[test]
+fn rc_t24_a_repeat_run_starts_at_the_settled_target() {
+    let scratch = Scratch::new("profile-settled");
+    complete_run_seen(scratch.path(), 4.0, 40);
+    let file = profile_path(scratch.path(), 1);
+    let mut stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("written")).expect("json");
+    stored["best_target"] = (6 * MIB).into();
+    std::fs::write(&file, serde_json::to_string(&stored).expect("json")).expect("write");
+
+    let mut cfg = config(8 * GIB, 2);
+    cfg.profiles_dir = Some(scratch.path().to_path_buf());
+    let probe_bytes = cfg.probe_bytes;
+    let rig = common::Rig::new(
+        cfg,
+        vec![kernel(1, KernelHints::default())],
+        FakeKnobs::new()
+            .probe_result(1, probe(probe_bytes, 4.0))
+            .stats(exhausted()),
+        FakeSampler::new().scripted(steady(400 * MIB, 64)),
+    );
+    rig.run_up();
+    let first = common::morsel_targets(&rig.writes())
+        .first()
+        .map(|(_, bytes)| *bytes)
+        .expect("a target at start");
+    assert_eq!(first, 6 * MIB, "the settled target, not the memory rule's");
+    assert!(rig.prober.calls().is_empty(), "and not probed");
+    rig.controller.stop();
+}

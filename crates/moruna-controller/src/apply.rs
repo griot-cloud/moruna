@@ -115,6 +115,10 @@ pub(crate) fn observation(
         a_k: ctl.a_k,
         a_anon: ctl.a_anon,
         anon_fixed: ctl.c_anon,
+        learned_target: match (&ctl.profile, ctl.seeded) {
+            (Some(found), true) if found.best_target > 0 => Some(found.best_target),
+            _ => None,
+        },
         safety: ctl.safety,
         target: ctl.target,
         completions_since_adjust: ctl.completions_since_adjust,

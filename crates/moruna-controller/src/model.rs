@@ -606,7 +606,18 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Result<Actions> {
 
     // RC-I1: the check happens before the batch, not after it, and what it returns is what is
     // written. A set of targets that does not fit is never a set of knobs that was written.
-    let targets = enforce(state, &solution.targets);
+    // A stage sized from earlier runs starts at the target their throughput search settled on,
+    // when that is below what memory allows (f.2, f.4b): the size the kernel was found cheapest
+    // at, not the largest the budget holds.
+    let mut start = solution.targets.clone();
+    for (at, target) in start.iter_mut().enumerate() {
+        if let (true, Some(found)) = (state.stages[at].seeded, &state.stages[at].profile)
+            && found.best_target > 0
+        {
+            *target = (*target).min(found.best_target.max(state.cfg.morsel_min));
+        }
+    }
+    let targets = enforce(state, &start);
     fit_scalars(state, &targets);
     // And a floor that still does not fit is not a run to start. `enforce` halves until the
     // targets fit or reach `morsel_min`, and the floor reaching it without fitting was left to

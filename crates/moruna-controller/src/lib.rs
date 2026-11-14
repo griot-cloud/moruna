@@ -476,6 +476,8 @@ pub(crate) struct StageCtl {
     /// Whether `profile` is the row for this run's own input schema, not the nearest one for the
     /// same kernel (e.3): only such a row can be trusted in place of a probe (f.2).
     pub profile_exact: bool,
+    /// The settled target the run has noted (f.4b), so the note is said once per settling.
+    pub settled_noted: Option<u64>,
     /// `peak_delta / bytes_in` per record, newest last, bounded by `WINDOW`.
     pub peak_ratios: VecDeque<f64>,
     /// `bytes_in` per record, newest last, bounded by `WINDOW`: what this stage's morsels come
@@ -564,6 +566,7 @@ impl StageCtl {
             profile: None,
             seeded: false,
             profile_exact: false,
+            settled_noted: None,
             peak_ratios: VecDeque::new(),
             bytes_in_window: VecDeque::new(),
             state_by_instance: HashMap::new(),

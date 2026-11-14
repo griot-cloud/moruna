@@ -73,6 +73,11 @@ pub(crate) struct Profile {
     /// compared with for drift, like with like (f.2). Zero before 2026-11-14.
     #[serde(default)]
     pub probe_a_anon: f64,
+    /// The morsel target the rule sizer's throughput search settled on (f.4b): the size below
+    /// the memory rule's at which the kernel spent the least CPU per byte. Zero when no search
+    /// finished.
+    #[serde(default)]
+    pub best_target: u64,
 }
 
 /// Records a profile must hold, summed across runs, before a fresh run trusts it in place of
@@ -225,6 +230,12 @@ pub(crate) fn merge(stored: &Profile, fresh: &Profile) -> Profile {
         a_anon: blend_known(stored.a_anon, fresh.a_anon),
         c_anon: blend_known(stored.c_anon as f64, fresh.c_anon as f64).round() as u64,
         probe_a_anon: blend_known(stored.probe_a_anon, fresh.probe_a_anon),
+        // The newest search's answer, or the stored one when this run did not search.
+        best_target: if fresh.best_target > 0 {
+            fresh.best_target
+        } else {
+            stored.best_target
+        },
     }
 }
 
@@ -305,6 +316,7 @@ pub(crate) fn from_stage(state: &crate::ControllerState, at: usize) -> Option<Pr
             (Some(found), true) => found.probe_a_anon,
             _ => ctl.a_anon_seed,
         },
+        best_target: ctl.sizer.settled_target().unwrap_or(0),
     })
 }
 

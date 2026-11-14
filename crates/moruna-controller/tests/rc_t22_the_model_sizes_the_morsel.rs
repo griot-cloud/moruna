@@ -62,6 +62,7 @@ fn observation(target: u64, ready: bool) -> Observation {
         a_k: 1.0,
         a_anon: 1.0,
         anon_fixed: 0,
+        learned_target: None,
         safety: 1.5,
         target,
         completions_since_adjust: if ready { 8 } else { 0 },
