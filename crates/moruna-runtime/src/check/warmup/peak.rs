@@ -148,8 +148,11 @@ fn counted(delta: i64) {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         INSTALLED.store(true, Ordering::Relaxed);
-        // SAFETY: forwarded unchanged; the caller upholds `alloc`'s contract.
-        let ptr = unsafe { System.alloc(layout) };
+        // SAFETY: a block of a class comes from the run's kept blocks or at its class's size
+        // (`allocator::reuse`); any other is forwarded unchanged.
+        let ptr = unsafe {
+            crate::allocator::reuse::alloc(layout, false).unwrap_or_else(|| System.alloc(layout))
+        };
         if !ptr.is_null() {
             counted(layout.size() as i64);
         }
@@ -158,8 +161,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         INSTALLED.store(true, Ordering::Relaxed);
-        // SAFETY: forwarded unchanged.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
+        // SAFETY: as in `alloc`, zeroed.
+        let ptr = unsafe {
+            crate::allocator::reuse::alloc(layout, true)
+                .unwrap_or_else(|| System.alloc_zeroed(layout))
+        };
         if !ptr.is_null() {
             counted(layout.size() as i64);
         }
@@ -167,14 +173,44 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged; `ptr` was allocated by `System` with `layout`.
-        unsafe { System.dealloc(ptr, layout) };
+        // SAFETY: a block of a class goes back to `allocator::reuse`, which made it; any other
+        // to `System` with the layout it was allocated with.
+        unsafe {
+            if !crate::allocator::reuse::dealloc(ptr, layout) {
+                System.dealloc(ptr, layout);
+            }
+        }
         counted(-(layout.size() as i64));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: forwarded unchanged.
-        let moved = unsafe { System.realloc(ptr, layout, new_size) };
+        let moved = match crate::allocator::reuse::same_class(layout, new_size) {
+            // Neither of a class: forwarded unchanged.
+            // SAFETY: the caller upholds `realloc`'s contract.
+            None => unsafe { System.realloc(ptr, layout, new_size) },
+            // The same class: the block already has the room.
+            Some(true) => ptr,
+            // Into or out of a class, or another class: a new block, the bytes copied, the old
+            // one freed, each by the path its size takes.
+            Some(false) => {
+                let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+                    return core::ptr::null_mut();
+                };
+                // SAFETY: as in `alloc` and `dealloc`; the copy is of what both blocks hold.
+                unsafe {
+                    let fresh = crate::allocator::reuse::alloc(new_layout, false)
+                        .unwrap_or_else(|| System.alloc(new_layout));
+                    if fresh.is_null() {
+                        return fresh;
+                    }
+                    core::ptr::copy_nonoverlapping(ptr, fresh, layout.size().min(new_size));
+                    if !crate::allocator::reuse::dealloc(ptr, layout) {
+                        System.dealloc(ptr, layout);
+                    }
+                    fresh
+                }
+            }
+        };
         if !moved.is_null() {
             counted(new_size as i64 - layout.size() as i64);
         }

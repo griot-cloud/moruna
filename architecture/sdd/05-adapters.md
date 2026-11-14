@@ -358,6 +358,8 @@ The guard's tests (E13, 2026-10-02). AD-T13 needs no interpreter; the rest embed
 
 **AD-T23 counts_reach_the_record.** One call of a Python kernel leaves its counts in `moruna_kernel::take_kernel_alloc()` on the calling thread, `measured` and with `refusal_on` the kernel's; a second `take` returns the default; a failed call and a refused call leave theirs too. f.12, AD-I9.
 
+**f.10 The Python domains' counts are three cells (2026-11-14).** `guard::allocate`, which every Python object a guarded call makes goes through, keeps the Python counts (bytes, requests, largest) in three cells of the frame, folded into the call's `KernelAlloc` when the frame ends, and takes one look at the thread's frame; a request below `guard.min_bytes`, or with no gate, goes to the allocator underneath with the frame marked as before and no other work. It copied the whole `KernelAlloc` out and back in on every object and looked the frame up twice: 2.6 of Audit's 96 CPU-seconds on the benchmark VM.
+
 **AD-T25 numpy_blocks_reused.** (`tests/ad_guard.rs`) A kernel that takes and frees a 2 MiB array twenty times is served from the cache for at least nineteen of them, keeps at least twenty blocks, a `numpy.zeros` served from a reused block is all zeros, and the run's end (`release_run`) leaves the cache empty. f.11.
 
 **AD-T24 a_refused_batch_finishes_in_halves.** (`tests/ad_guard.rs`) A kernel taking 4 MiB a row, refused on three rows against 10 MiB of headroom, finishes as one row and two; the output is every row once, in order, after one refusal. AD-T15 now counts two refusals for a kernel whose request does not shrink with the batch: the batch and its one-row half, whose refusal is returned as it is. f.13, RB5.

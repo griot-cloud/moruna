@@ -320,11 +320,13 @@ impl KernelMemory {
             refusal: Cell::new(None),
             accounting_failure: RefCell::new(None),
             inside: Cell::new(false),
+            python: PythonCounts::default(),
         };
         let restore = Restore(FRAME.with(|slot| slot.replace(&frame as *const Frame)));
         let value = f();
         drop(restore);
         let mut counts = frame.counts.get();
+        frame.python.fold_into(&mut counts.python);
         counts.measured = true;
         counts.refusal_on = !frame.gate.is_null();
         (
@@ -361,6 +363,34 @@ struct Frame {
     accounting_failure: RefCell<Option<moruna_kernel::MorunaError>>,
     /// Set while the guard calls the allocator underneath.
     inside: Cell<bool>,
+    /// The Python domains' counts, kept apart from `counts` because they are bumped on every
+    /// object a call allocates: three cells, not a copy of the whole `KernelAlloc` in and out
+    /// (2026-11-14: 2.6 of Audit's 96 CPU-seconds on the benchmark VM went to that copy).
+    python: PythonCounts,
+}
+
+/// The Python domains' request counts of one frame, folded into its `KernelAlloc` at its end.
+#[derive(Default)]
+struct PythonCounts {
+    bytes: Cell<u64>,
+    requests: Cell<u64>,
+    largest: Cell<u64>,
+}
+
+impl PythonCounts {
+    fn count(&self, bytes: u64) {
+        self.bytes.set(self.bytes.get().saturating_add(bytes));
+        self.requests.set(self.requests.get() + 1);
+        if bytes > self.largest.get() {
+            self.largest.set(bytes);
+        }
+    }
+
+    fn fold_into(&self, counts: &mut AllocCounts) {
+        counts.bytes = counts.bytes.saturating_add(self.bytes.get());
+        counts.requests += self.requests.get();
+        counts.largest = counts.largest.max(self.largest.get());
+    }
 }
 
 thread_local! {
@@ -492,18 +522,25 @@ pub fn allocate<T>(bytes: u64, underlying: impl FnOnce() -> *mut T) -> *mut T {
     if ptr.is_null() {
         return underlying();
     }
-    let decided = with_frame(|frame| {
-        if frame.inside.get() {
-            return None;
-        }
-        frame.count(PYTHON, bytes);
-        Some(frame.examine(PYTHON, bytes))
-    })
-    .flatten();
-    match decided {
-        None => underlying(),
-        Some(Err(())) => core::ptr::null_mut(),
-        Some(Ok(charged)) => {
+    // SAFETY: as in `with_frame`: a non-null slot points at the frame open on this thread,
+    // which outlives every call made inside it.
+    let frame = unsafe { &*ptr };
+    if frame.inside.get() {
+        return underlying();
+    }
+    frame.python.count(bytes);
+    // Every Python object a call makes comes through here: a request no gate can refuse (below
+    // `GUARD_MIN_BYTES`, or no gate) takes one look at the frame and the allocator underneath,
+    // with the frame marked so what that allocator asks of the domains is not counted twice.
+    if bytes < GUARD_MIN_BYTES || frame.gate.is_null() {
+        let was = frame.inside.replace(true);
+        let p = underlying();
+        frame.inside.set(was);
+        return p;
+    }
+    match frame.examine(PYTHON, bytes) {
+        Err(()) => core::ptr::null_mut(),
+        Ok(charged) => {
             let p = underneath(underlying);
             if charged {
                 answer(bytes, !p.is_null());

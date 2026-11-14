@@ -49,6 +49,8 @@ impl Runtime {
         let mut guard = CancelOnDrop::new(cancel);
         let outcome = drive(spec, &mut guard, components, &mut started);
         guard.disarm();
+        // The run's kept buffers go back with it (12 l).
+        crate::allocator::reuse::end();
         match outcome {
             Ok(report) => Ok(report),
             Err(error) => {
@@ -219,6 +221,9 @@ fn drive(
     // 12 l (2026-11-14): what a heap frees at its top stays for the next morsel, a share of the
     // ceiling, so the buffers a run takes and frees morsel after morsel are not faulted in and
     // zeroed by the kernel each time. F8.9's threshold and heap count stand.
+    // 12 l (2026-11-14): Moruna's own large buffers are kept for reuse while the run lasts, up
+    // to a sixteenth of its ceiling, in a program that installs the counting allocator.
+    crate::allocator::reuse::keep_up_to(limits.memory_ceiling / 16);
     if let Some((trim, pad)) = crate::allocator::keep_heap_tops(limits.memory_ceiling) {
         notes.push(format!(
             "the C heap keeps up to {trim} bytes free at a heap's top for the next morsel and grows \

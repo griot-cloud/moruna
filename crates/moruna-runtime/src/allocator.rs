@@ -103,3 +103,232 @@ mod tests {
         }
     }
 }
+
+/// Moruna's own large buffers kept for reuse while a run lasts (2026-11-14).
+///
+/// What the run allocates in Rust outside the arena (a source's decode buffers, a sink's encode
+/// and compression buffers, the adapters' copies) comes from the process allocator. Under F8.9
+/// glibc maps every block of 256 KiB or more on its own and unmaps it on `free`, and musl (the
+/// engine on the microkernel) does the same, so buffers taken and freed morsel after morsel were
+/// faulted in and zeroed by the kernel each time: on the benchmark VM the kernel's time was 17%
+/// of Moruna's Enrich CPU against 6% for the plain loop, whose pyarrow keeps a pool. A program
+/// that installs [`crate::check::warmup::CountingAllocator`] (the Python extension, the engine
+/// binary) allocates such blocks at a class size, the next of 1, 1.25, 1.5 and 1.75 times a power
+/// of two, so a freed block serves any later request of its class; while a run lasts, a freed
+/// block is kept, up to a sixteenth of the run's ceiling, and the run's end gives every kept
+/// block back. Outside a run nothing is kept. It is Moruna's own code, so it is the same on
+/// every C library; F8.9's concern, a process allocator holding freed memory past the ceiling
+/// (mimalloc held 1.5 to 4.7 times it), is met by the bound and by the run's end.
+pub(crate) mod reuse {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The smallest block allocated at a class size.
+    pub(crate) const MIN: usize = 256 << 10;
+    /// The largest alignment a class block is given.
+    const ALIGN: usize = 16;
+    /// Classes per power of two.
+    const STEPS: usize = 4;
+    /// Classes up to 2^63.
+    const CLASSES: usize = 64 * STEPS;
+    /// The most blocks a class keeps: its list then never grows past 32 KiB, so growing it never
+    /// asks for a block of a class, whose lock this thread may hold.
+    const PER_CLASS: usize = 4096;
+
+    /// What the cache may hold now: zero outside a run.
+    static LIMIT: AtomicU64 = AtomicU64::new(0);
+    /// What it holds.
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    /// Requests it served, for the report.
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static KEPT: [Mutex<Vec<usize>>; CLASSES] = [EMPTY; CLASSES];
+
+    /// The class and capacity of a block of `size` bytes and `align`, when it is one.
+    pub(crate) fn class_of(size: usize, align: usize) -> Option<(usize, usize)> {
+        if size < MIN || align > ALIGN {
+            return None;
+        }
+        let power = (usize::BITS - 1 - size.leading_zeros()) as usize;
+        let base = 1usize << power;
+        (0..=STEPS).find_map(|step| {
+            let capacity = base.checked_add((base / STEPS) * step)?;
+            (capacity >= size).then_some((power * STEPS + step, capacity))
+        })
+    }
+
+    fn capacity_of(class: usize) -> usize {
+        let base = 1usize << (class / STEPS);
+        base + (base / STEPS) * (class % STEPS)
+    }
+
+    /// A block for `layout` when it is of a class: a kept one, else a fresh one of the class's
+    /// capacity. `None` when it is not of a class (the caller allocates it as asked).
+    ///
+    /// # Safety
+    /// As `GlobalAlloc::alloc`.
+    pub(crate) unsafe fn alloc(layout: Layout, zeroed: bool) -> Option<*mut u8> {
+        let (class, capacity) = class_of(layout.size(), layout.align())?;
+        let kept = KEPT[class].lock().unwrap_or_else(|e| e.into_inner()).pop();
+        if let Some(block) = kept {
+            HELD.fetch_sub(capacity as u64, Ordering::AcqRel);
+            HITS.fetch_add(1, Ordering::Relaxed);
+            let block = block as *mut u8;
+            if zeroed {
+                // SAFETY: a kept block of `capacity >= layout.size()` bytes nobody holds.
+                unsafe { block.write_bytes(0, layout.size()) };
+            }
+            return Some(block);
+        }
+        let whole = Layout::from_size_align(capacity, layout.align()).ok()?;
+        // SAFETY: a non-zero size and a valid alignment.
+        Some(unsafe {
+            if zeroed {
+                System.alloc_zeroed(whole)
+            } else {
+                System.alloc(whole)
+            }
+        })
+    }
+
+    /// Free `ptr` of `layout` when it is of a class: kept while a run allows, else given back.
+    /// False when it is not of a class (the caller frees it as asked).
+    ///
+    /// # Safety
+    /// As `GlobalAlloc::dealloc`, for a block [`alloc`] gave.
+    pub(crate) unsafe fn dealloc(ptr: *mut u8, layout: Layout) -> bool {
+        let Some((class, capacity)) = class_of(layout.size(), layout.align()) else {
+            return false;
+        };
+        let room = {
+            let mut kept = KEPT[class].lock().unwrap_or_else(|e| e.into_inner());
+            let room = kept.len() < PER_CLASS
+                && HELD
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                        let limit = LIMIT.load(Ordering::Acquire);
+                        (held + capacity as u64 <= limit).then_some(held + capacity as u64)
+                    })
+                    .is_ok();
+            if room {
+                kept.push(ptr as usize);
+            }
+            room
+        };
+        if !room && let Ok(whole) = Layout::from_size_align(capacity, layout.align()) {
+            // SAFETY: the block `alloc` made at the class's capacity.
+            unsafe { System.dealloc(ptr, whole) };
+        }
+        true
+    }
+
+    /// Whether a block of `old` stays where it is when resized to `new` bytes: both of the same
+    /// class.
+    pub(crate) fn same_class(old: Layout, new: usize) -> Option<bool> {
+        match (
+            class_of(old.size(), old.align()),
+            class_of(new, old.align()),
+        ) {
+            (None, None) => None,
+            (Some((a, _)), Some((b, _))) => Some(a == b),
+            _ => Some(false),
+        }
+    }
+
+    /// Keep freed blocks up to `bytes` from now: a run has started.
+    pub(crate) fn keep_up_to(bytes: u64) {
+        LIMIT.store(bytes, Ordering::Release);
+    }
+
+    /// Keep nothing more and give every kept block back: the run has ended. Returns the requests
+    /// the kept blocks served since the last end.
+    pub(crate) fn end() -> u64 {
+        LIMIT.store(0, Ordering::Release);
+        for (class, kept) in KEPT.iter().enumerate() {
+            let blocks = std::mem::take(&mut *kept.lock().unwrap_or_else(|e| e.into_inner()));
+            let capacity = capacity_of(class);
+            for block in blocks {
+                HELD.fetch_sub(capacity as u64, Ordering::AcqRel);
+                if let Ok(whole) = Layout::from_size_align(capacity, ALIGN) {
+                    // SAFETY: a kept block `alloc` made at this capacity; an alignment of at most
+                    // `ALIGN` frees the same way (`free`) on every platform `System` serves.
+                    unsafe { System.dealloc(block as *mut u8, whole) };
+                }
+            }
+        }
+        HITS.swap(0, Ordering::AcqRel)
+    }
+
+    /// What the cache holds now.
+    #[cfg(test)]
+    pub(crate) fn held() -> u64 {
+        HELD.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::reuse::*;
+    use std::alloc::Layout;
+
+    #[test]
+    fn a_class_holds_its_request_and_wastes_a_quarter_at_most() {
+        assert_eq!(class_of(MIN - 1, 8), None);
+        assert_eq!(
+            class_of(MIN, 64),
+            None,
+            "an alignment above 16 is not a class's"
+        );
+        for size in [MIN, MIN + 1, 300 << 10, 1 << 20, 7_000_000, 1 << 30] {
+            let (class, capacity) = class_of(size, 8).expect("a class");
+            assert!(
+                capacity >= size && capacity <= size + size / 4 + 1,
+                "{size}"
+            );
+            assert_eq!(class_of(capacity, 8).map(|(c, _)| c), Some(class));
+        }
+        // 1 MiB + 1 is of the 1.25 MiB class, as is 1.2 MiB.
+        assert_eq!(
+            same_class(
+                Layout::from_size_align((1 << 20) + 1, 8).unwrap(),
+                1_200_000
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_class(Layout::from_size_align(1 << 20, 8).unwrap(), 2 << 20),
+            Some(false)
+        );
+        assert_eq!(
+            same_class(Layout::from_size_align(100, 8).unwrap(), 200),
+            None
+        );
+    }
+
+    #[test]
+    fn blocks_are_kept_only_while_a_run_allows_and_all_go_back_at_its_end() {
+        let layout = Layout::from_size_align(1 << 20, 8).unwrap();
+        // SAFETY: blocks this module made, each freed once.
+        unsafe {
+            let a = alloc(layout, false).expect("a class block");
+            assert!(!a.is_null());
+            assert!(dealloc(a, layout));
+            assert_eq!(held(), 0, "outside a run nothing is kept");
+            keep_up_to(8 << 20);
+            let b = alloc(layout, false).expect("a class block");
+            assert!(dealloc(b, layout));
+            assert!(held() > 0, "kept while the run allows");
+            let c = alloc(layout, true).expect("served from the kept block");
+            assert_eq!(c, b);
+            assert!(
+                std::slice::from_raw_parts(c, layout.size())
+                    .iter()
+                    .all(|&x| x == 0)
+            );
+            assert!(dealloc(c, layout));
+            assert!(end() >= 1);
+            assert_eq!(held(), 0, "the run's end gives every block back");
+        }
+    }
+}
