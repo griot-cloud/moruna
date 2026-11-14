@@ -34,17 +34,18 @@ use crate::spec::EngineMemory;
 
 /// The largest figures a run may follow the machine up to (MH 4.1 `budget.elastic`).
 ///
-/// Both default to the run's starting figures, so a spec that says nothing never grows (MH H-Q4):
-/// the arena stays one region and the worker pool stays the starting N, exactly as before. A
-/// machine that shrinks is followed whatever these say. F8.1 maps the JSON spec's
+/// `None` follows the machine (RB4, which superseded MH H-Q4): the ceiling up to what the machine
+/// has, and the worker pool up to the CPUs online at start. An explicit `budget` or `cpu` is not
+/// grown past. A machine that shrinks is followed whatever these say. F8.1 maps the JSON spec's
 /// `budget.elastic.memory_max_bytes` and `budget.elastic.cpu_max` onto these two fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ElasticBudget {
-    /// The highest memory ceiling the run follows the machine to, in bytes. `None`: the starting
-    /// ceiling.
+    /// The highest memory ceiling the run follows the machine to, in bytes. `None`: what the
+    /// machine has (the starting ceiling for an explicit budget).
     pub memory_max_bytes: Option<u64>,
     /// The most CPUs the run follows the machine to, which is also the worker thread pool the
-    /// scheduler creates at start and parks. `None`: the starting N.
+    /// scheduler creates at start and parks. `None`: the CPUs online at start (the starting N for
+    /// an explicit CPU count).
     pub cpu_max: Option<u16>,
 }
 
@@ -321,9 +322,9 @@ mod tests {
         assert_eq!(workers_for(4.0, 0), 1);
     }
 
-    /// The default elastic budget is the starting figures, which is what H-Q4 asks for.
+    /// The default elastic budget names no maximum, which the facade reads as the machine (RB4).
     #[test]
-    fn the_default_elastic_budget_never_grows() {
+    fn the_default_elastic_budget_names_no_maximum() {
         let elastic = ElasticBudget::default();
         assert_eq!(elastic.memory_max_bytes, None);
         assert_eq!(elastic.cpu_max, None);

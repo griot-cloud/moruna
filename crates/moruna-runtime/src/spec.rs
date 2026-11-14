@@ -190,8 +190,8 @@ pub struct RunSpec {
     /// An explicit CPU quota in cores; discovery clamps it.
     pub cpu: Option<f64>,
     /// How far the run follows the machine up while it is in progress. The
-    /// default is the starting figures: an inelastic run never grows, and every run follows the
-    /// machine down. The JSON spec's `budget.elastic` (MH 4.1) maps onto it; F8.1 adds that serde.
+    /// default (RB4) is the machine itself: all its memory and the CPUs online at start, except
+    /// that an explicit `budget` or `cpu` is not grown past. Every run follows the machine down. The JSON spec's `budget.elastic` (MH 4.1) maps onto it; F8.1 adds that serde.
     pub elastic: crate::elastic::ElasticBudget,
     /// Where the trace file goes; `None` keeps the trace in memory.
     pub trace_path: Option<PathBuf>,

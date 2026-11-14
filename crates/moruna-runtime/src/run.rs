@@ -220,26 +220,40 @@ fn drive(
         observer.discovered(&limits, kernels.len());
     }
     let staging_dir = discovered.profile.staging_dir.clone();
-    // The pool is created up to `budget.elastic.cpu_max` and parked; the starting
-    // N is what is active. With no `elastic` the two are the same N, as before.
+    // RB4 (2026-11-13): a run follows the machine both ways by default. The pool is created up
+    // to `budget.elastic.cpu_max` or, without one, up to the CPUs the machine has online, and
+    // parked; the starting N is what is active. An explicit CPU count is the caller's own figure
+    // and is not grown past. A machine that adds CPUs beyond those online at start (a hot-plug)
+    // is followed only as far as the pool.
     let workers_start = workers_from(limits.cpu_quota);
-    let workers_max = match elastic_budget.cpu_max {
-        Some(cpu_max) => cpu_max.clamp(1, 1024),
-        None => workers_start,
+    let machine_cores = match (&components.limits_source, host_discovered) {
+        (Some(source), _) => source.read().cpus_online,
+        (None, true) => moruna_discovery::machine_cores(),
+        (None, false) => limits.cpu_quota,
+    };
+    let workers_max = match (elastic_budget.cpu_max, cpu) {
+        (Some(cpu_max), _) => cpu_max.clamp(1, 1024),
+        (None, Some(_)) => workers_start,
+        (None, None) => workers_from(machine_cores).max(workers_start),
     };
     let workers_start = workers_start.min(workers_max);
     if workers_max > workers_start {
         notes.push(format!(
             "{workers_max} worker threads created and {workers_start} active: the pool follows \
-             the machine up to budget.elastic.cpu_max"
+             the machine up to {workers_max} CPUs"
         ));
     }
 
     // The limits watcher starts from what discovery found, and the sampler reads the limits
-    // it publishes, so every sample carries the ceiling of its moment.
-    let memory_max = elastic_budget
-        .memory_max_bytes
-        .unwrap_or(limits.memory_ceiling);
+    // it publishes, so every sample carries the ceiling of its moment. Without
+    // `budget.elastic.memory_max_bytes` the ceiling follows the machine up to all it has, which
+    // e.3's derivation already holds it to (0.9 x memory.max, or 0.9 x total RAM); an explicit
+    // budget is the caller's own figure and stays where it is set (RB4).
+    let memory_max = match (elastic_budget.memory_max_bytes, budget) {
+        (Some(max), _) => max,
+        (None, Some(_)) => limits.memory_ceiling,
+        (None, None) => u64::MAX,
+    };
     if memory_max < limits.memory_ceiling {
         notes.push(format!(
             "budget.elastic.memory_max_bytes ({memory_max}) is below the starting ceiling \

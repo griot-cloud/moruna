@@ -39,6 +39,13 @@ pub use crate::watch::{
 };
 pub use arc_swap::ArcSwap;
 
+/// The CPUs this machine has online now, whatever a cgroup lets the process use: the most
+/// workers a run that follows the machine up can ever be given (RB4). The operating system's
+/// logical core count.
+pub fn machine_cores() -> f64 {
+    os::logical_cores()
+}
+
 /// What the caller already knows, and what it wants to override (d.1).
 #[derive(Clone, Debug, Default)]
 pub struct DiscoveryInput {

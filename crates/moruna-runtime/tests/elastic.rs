@@ -1,5 +1,5 @@
 //! The budget follows the machine, end to end (MH 4.4, H3, H4):
-//! memory_follows_the_machine, cpus_follow_the_machine, an_inelastic_run_is_as_before,
+//! memory_follows_the_machine, cpus_follow_the_machine, a_run_follows_the_machine_up_by_default,
 //! and , the same two gates under a real cgroup v2 whose limits are rewritten mid-run
 //! (reference host, E1).
 //!
@@ -158,6 +158,18 @@ fn reading(ceiling: u64, cpus: f64) -> LimitsReading {
     }
 }
 
+/// A cgroup reading: `memory.high` at `ceiling`, `cpu.max` at `quota` cores, on a machine with
+/// four times the memory and `online` CPUs.
+fn contained_reading(ceiling: u64, quota: f64, online: f64) -> LimitsReading {
+    LimitsReading {
+        memory_high: Some(ceiling),
+        cpu_max: Some(quota),
+        total_ram: Some(ram_for(ceiling).saturating_mul(4)),
+        cpus_online: online,
+        ..LimitsReading::default()
+    }
+}
+
 impl Machine {
     /// A guest with no cgroup whose ceiling is the process's resident memory plus `room`, and
     /// `cpus` CPUs online.
@@ -177,6 +189,16 @@ impl Machine {
             source: ManualLimitsSource::new(reading(ceiling, cpus)),
             baseline,
         }
+    }
+
+    /// [`Machine::new`] in a container: a cgroup holds the run to `quota` of the machine's
+    /// `online` CPUs and to a quarter of its memory.
+    fn contained(room: u64, quota: f64, online: f64) -> Machine {
+        let mut machine = Machine::new(room, quota);
+        let ceiling = machine.ceiling();
+        machine.discovered.limits.source = LimitSource::Cgroup;
+        machine.source = ManualLimitsSource::new(contained_reading(ceiling, quota, online));
+        machine
     }
 
     fn ceiling(&self) -> u64 {
@@ -481,25 +503,76 @@ fn cpus_follow_the_machine() {
     );
 }
 
-/// an_inelastic_run_is_as_before (MH H-Q4). With no `elastic`, a machine that grows is not
-/// followed up: no timeline entry, the arena stays one region, the pool stays the starting N. A
-/// machine that shrinks under it is still followed down.
+/// RB4 (2026-11-13, which superseded MH H-Q4): with no `elastic`, a run follows the machine
+/// up. A container held to two of the machine's eight CPUs is given all eight mid-run, and four
+/// times the memory: the timeline has the change, the pool was created at the eight CPUs online,
+/// more than two applies run at once after it, and the ceiling in force rises.
 #[test]
-fn an_inelastic_run_is_as_before() {
+fn a_run_follows_the_machine_up_by_default() {
     let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("rt_t11");
-    let machine = Machine::new(192 * MIB, 2.0);
+    let scratch = Scratch::new("rb4_up");
+    let machine = Machine::contained(1024 * MIB, 2.0, 8.0);
+    let start = machine.ceiling();
+    let kernel = Arc::new(Spinner::new(Duration::from_millis(20)));
+    let applies = Arc::clone(&kernel.applies);
+    let watched = Arc::clone(&kernel);
+    let spec = spec_of(&scratch, kernel.clone(), 600, 16_384);
+    let (report, _, changes) = run_on(&machine, spec, move |script| {
+        if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
+            return;
+        }
+        script.set(contained_reading(start * 4, 8.0, 8.0));
+        let raised_at = Instant::now();
+        script.wait("more than two workers on the bigger machine", || {
+            watched.max_concurrent_after(raised_at) > 2
+        });
+    });
+    assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
+    assert_eq!(
+        report.limits_timeline.len(),
+        1,
+        "{:?}",
+        report.limits_timeline
+    );
+    assert!(report.limits_timeline[0].1.memory_ceiling > start);
+    assert!((report.limits_timeline[0].1.cpu_quota - 8.0).abs() < f64::EPSILON);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("8 worker threads created and 2 active")),
+        "{:?}",
+        report.notes
+    );
+    let Some(&(changed_at, _)) = changes.first() else {
+        panic!("the change was never published");
+    };
+    assert!(
+        kernel.max_concurrent_after(changed_at) > 2,
+        "the pool did not grow past the starting two"
+    );
+    assert!(report.peak_ceiling_bytes > start);
+}
+
+/// RB4's exception: an explicit budget and CPU count are the caller's figures. The machine grows
+/// under the run and the run does not follow: no timeline entry, the pool is the starting N, the
+/// ceiling stays.
+#[test]
+fn an_explicit_budget_is_not_grown_past() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("rb4_explicit");
+    let machine = Machine::contained(192 * MIB, 2.0, 8.0);
     let start = machine.ceiling();
     let kernel = Arc::new(Spinner::new(Duration::from_millis(5)));
     let applies = Arc::clone(&kernel.applies);
-    let spec = spec(&scratch, kernel.clone(), 200);
-
+    let mut spec = spec(&scratch, kernel.clone(), 200);
+    spec.budget = Some(start);
+    spec.cpu = Some(2.0);
     let (report, _, _) = run_on(&machine, spec, move |script| {
         if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 10) {
             return;
         }
-        // A machine four times the size, with four times the CPUs: not the run's to take.
-        script.set(reading(start * 4, 8.0));
+        script.set(contained_reading(start * 4, 8.0, 8.0));
         let at = applies.load(Ordering::SeqCst);
         script.wait("a few ticks at the bigger machine", || {
             applies.load(Ordering::SeqCst) >= at + 100
@@ -508,10 +581,9 @@ fn an_inelastic_run_is_as_before() {
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     assert!(
         report.limits_timeline.is_empty(),
-        "an inelastic run does not follow the machine up: {:?}",
+        "an explicit budget does not follow the machine up: {:?}",
         report.limits_timeline
     );
-    assert!(report.drains.is_empty());
     assert!(kernel.max_concurrent_after(Instant::now() - Duration::from_secs(3600)) <= 2);
     assert!(
         !report
@@ -523,7 +595,7 @@ fn an_inelastic_run_is_as_before() {
     assert_eq!(report.peak_ceiling_bytes, start);
 }
 
-/// , the other half: an inelastic run is still followed down. The machine loses a CPU and a
+/// , the other half: a run is always followed down. The machine loses a CPU and a
 /// third of its memory mid-run; the timeline has the change and the pool parks down to one.
 #[test]
 fn an_inelastic_run_is_followed_down() {
