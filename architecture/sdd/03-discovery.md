@@ -176,7 +176,7 @@ source    = Explicit | Cgroup | Os by which branch supplied the ceiling
 | `direct_io_staging` | open a temp file in the staging dir with `O_DIRECT`, write one page from an aligned buffer, read it back, delete | all succeed |
 | `gds` | `cuFileDriverOpen` (feature `gds`) else Absent | returns success |
 | `rdma` | `ibv_get_device_list` non-empty (feature `rdma`) else Absent | at least one device |
-| `staging_dir` | if None: first writable of `$MORUNA_SPILL_DIR`, `/local_disk0`, `/scratch`, `$TMPDIR`, `/tmp` | writable and ≥ 1 GiB free |
+| `staging_dir` | if None: first writable of `$MORUNA_SPILL_DIR`, `/local_disk0`, `/scratch`, `$TMPDIR`, `/tmp`. A directory named explicitly or by `$MORUNA_SPILL_DIR` that does not exist is created first, parents included, with a note (2026-11-14: dropping it for being absent left the benchmark's staging runs with no disk tier and no error) | writable and ≥ 1 GiB free |
 | `durable_staging` | never probed: `Unknown` resolves to `Probed(false)` (contracts d.12 treats it as `Absent`); a `Present` declaration on a `tmpfs` or `overlay` filesystem (`statfs` magic) is refused with `Config { name: "durable_staging" }` | n/a |
 
 Probes run in this order; each is bounded to 100 ms. For an `Unknown` field the result is recorded as `Probed(true)` or `Probed(false)`; a probe that times out resolves to `Probed(false)` with a note. For a `Present` field the same probe runs and its failure is `Config` (DS-I5); the field stays `Present`. `staging_dir` is not a `Guarantee`: a probe that finds no writable directory leaves it `None`.
