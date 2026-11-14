@@ -439,20 +439,29 @@ impl PlacementEngine {
             .map_err(Refusal::DiskBound)?;
         let body_offset = record_start + page;
         let payload_len = laid_out.payload_len;
-        let mut header = self
+        // A record reserved and never submitted is released, or its segment is never reclaimed.
+        let header = self
             .alloc
             .alloc(page as usize, self.host_tier)
-            .map_err(Refusal::Other)?;
-        RecordHeader {
-            seq: task.seq,
-            stage: task.stage_id,
-            kind,
-            codec: self.cfg.codec,
-            payload_len,
-            body_offset,
-        }
-        .write(&mut header)
-        .map_err(Refusal::Other)?;
+            .and_then(|mut header| {
+                RecordHeader {
+                    seq: task.seq,
+                    stage: task.stage_id,
+                    kind,
+                    codec: self.cfg.codec,
+                    payload_len,
+                    body_offset,
+                }
+                .write(&mut header)
+                .map(|()| header)
+            });
+        let header = match header {
+            Ok(header) => header,
+            Err(error) => {
+                self.release_record(segment);
+                return Err(Refusal::Other(error));
+            }
+        };
         let list = Arc::new(pieces(laid_out, header, record_start, page));
         let count = list.len();
         self.install_move(
@@ -468,7 +477,11 @@ impl PlacementEngine {
             count,
         );
         self.submit_write(task.move_id, &path, &list)
-            .map_err(Refusal::Other)
+            .map_err(|error| {
+                // Nothing was written: the record it reserved is released.
+                self.release_record(segment);
+                Refusal::Other(error)
+            })
     }
 
     /// A DMA between two resident tiers (e.4).
@@ -780,9 +793,11 @@ impl PlacementEngine {
                 .get(id)
                 .is_some_and(|buffer| buffer.move_id == Some(move_id));
             if !current {
+                // Landed for a batch that has moved on: nothing will read the record.
+                drop(catalog);
+                self.release_record(seg.segment);
                 return;
             }
-            self.record_written(seg.segment);
             catalog.update(id, |buffer| {
                 buffer.move_id = None;
                 buffer.disk = Some(seg);
@@ -1043,6 +1058,11 @@ impl PlacementEngine {
                 if let Some((slot, held)) = reservation {
                     catalog.unreserve(slot, held);
                 }
+                drop(catalog);
+                if let InFlight::Write { segment, .. } = &op {
+                    // Not retried: the record it reserved is abandoned.
+                    self.release_record(*segment);
+                }
                 return;
             }
             catalog.update(buffer, |b| b.move_id = Some(retry_id));
@@ -1104,6 +1124,11 @@ impl PlacementEngine {
     /// `pop` of each queue it heads (f.10).
     fn fail_settled(&self, done: &MoveInFlight, move_id: u64, error: MorunaError) {
         let id = done.buffer;
+        if let InFlight::Write { segment, .. } = &done.op {
+            // A write that failed twice leaves its pages abandoned in the segment (f.10); the
+            // record they were reserved for is released, so the segment can still be reclaimed.
+            self.release_record(*segment);
+        }
         let (consumers, waiting, events, outside) = {
             let mut catalog = self.lock_catalog();
             let outside = catalog.get(id).is_some_and(|buffer| buffer.outside);

@@ -25,7 +25,7 @@ pub struct Segment {
     /// Bytes of the file the engine has laid records into, including abandoned pages of a
     /// failed write (f.10), so the file stays append-only.
     pub bytes_written: u64,
-    /// Records laid into the segment.
+    /// Records reserved in the segment, landed or still being written (2026-11-14).
     pub records_total: u64,
     /// Records whose entry is `Consumed` or whose lineage the watermark dropped (f.7).
     pub records_released: u64,
@@ -174,6 +174,14 @@ impl PlacementEngine {
                 {
                     let start = segment.bytes_written;
                     segment.bytes_written += need;
+                    // The record is the segment's from here, not from when it lands
+                    // (2026-11-14): counted when it lands, a segment that rolled while a write
+                    // was in flight looked reclaimable once its landed records were released,
+                    // and was unlinked under the write. The write then recreated the file empty
+                    // or could not open it ("io open"), and the other records read back as zeros
+                    // ("record magic is not MORUNSEG"). Every way a reserved record ends releases
+                    // it once: consumed, abandoned by a failed write, or landed unwanted.
+                    segment.records_total += 1;
                     let path = segment.path.clone();
                     return Ok((number, path, start));
                 }
@@ -269,14 +277,6 @@ impl PlacementEngine {
         }
         tracing::info!(target: "placement.segment_roll", stage, segment = number, bytes = self.cfg.segment_bytes);
         Ok(number)
-    }
-
-    /// One record landed in a segment (f.5).
-    pub(crate) fn record_written(&self, segment: u32) {
-        let mut staging = self.lock_staging();
-        if let Some(entry) = staging.segments.get_mut(&segment) {
-            entry.records_total += 1;
-        }
     }
 
     /// A record's entry was consumed, or the watermark dropped its lineage (f.7). Unlinks
