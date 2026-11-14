@@ -39,7 +39,10 @@ fn write_profile(dir: &std::path::Path, p95: f64, samples: u64, variance: f64) {
         "final_workers": 4,
         "final_safety": 1.2,
         "runs": 3,
-        "prediction_error_p95": 0.1
+        "prediction_error_p95": 0.1,
+        // What the probes of the runs that wrote it measured, which a probe today is compared
+        // with for drift (f.2, 2026-11-14).
+        "probe_a_anon": p95
     });
     std::fs::write(dir, serde_json::to_string(&stored).expect("json")).expect("write");
 }

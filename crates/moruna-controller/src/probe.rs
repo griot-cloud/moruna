@@ -42,9 +42,20 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
     let mut seeded = 0usize;
     let mut probed = 0usize;
     let mut upstream: Option<ProbeResult> = None;
-    let stages = {
+    // What earlier runs taught (f.2, RC-I6, 2026-11-14): when every stage has a profile that a
+    // completed run of the same kernel over the same input schema wrote from enough records, the
+    // run starts from what those runs measured and probes nothing. All or none, because a later
+    // stage is probed on the output of the probe before it. Every run measured itself from
+    // scratch until then, and the profile set only the margin: the probe ran one morsel alone
+    // while every other worker waited, and the targets then moved from the probe's size to the
+    // one the steady state supports, on every run of a job that had run before.
+    let (stages, learned) = {
         let state = ctl.held();
-        state.stages.len()
+        let learned = !resuming
+            && state.stages.iter().all(|stage| {
+                stage.profile_exact && stage.profile.as_ref().is_some_and(|p| p.trusted())
+            });
+        (state.stages.len(), learned)
     };
 
     for at in 0..stages {
@@ -52,7 +63,17 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
         let request = {
             let mut state = ctl.held();
             seed(&mut state, at);
-            if resuming && state.stages[at].profile.is_some() {
+            if learned {
+                state.stages[at].seeded = true;
+                if let Some(found) = state.stages[at].profile.clone() {
+                    let stage = state.stages[at].stage;
+                    state.note(format!(
+                        "stage {stage} sized from {} earlier runs ({} records); not probed",
+                        found.runs, found.a_k_samples
+                    ));
+                }
+                None
+            } else if resuming && state.stages[at].profile.is_some() {
                 state.stages[at].seeded = true;
                 None
             } else {
@@ -152,12 +173,13 @@ fn load_profiles(state: &mut crate::ControllerState) {
             profile::load_nearest(&dir, &kernel.fingerprint, &kernel.schema_hash);
         match loaded {
             profile::Loaded::Found(found) => {
-                if let Some(schema) = other_schema {
+                if let Some(schema) = &other_schema {
                     state.note(format!(
                         "profile for stage {stage} seeded from the same kernel's row for input \
                          schema {schema}: no row matches this run's input schema"
                     ));
                 }
+                state.stages[at].profile_exact = other_schema.is_none();
                 state.stages[at].profile = Some(found);
             }
             profile::Loaded::Missing => {}
@@ -179,6 +201,17 @@ fn seed(state: &mut crate::ControllerState, at: usize) {
     let profile = state.stages[at].profile.clone();
     let ctl = &mut state.stages[at];
     match &profile {
+        // A profile written since 2026-11-14 holds the figures the solve of f.3 takes, as the
+        // run that wrote it ended: the in-arena ratio, both terms of the anonymous fit, and the
+        // probe's own slope, which governs the fit until this run's window can support one.
+        Some(found) if found.a_anon > 0.0 && found.a_k_arena > 0.0 => {
+            ctl.a_k = found.a_k_arena.max(MIN_AMPLIFICATION);
+            ctl.a_anon = found.a_anon.max(MIN_AMPLIFICATION);
+            ctl.a_anon_seed = ctl.a_anon;
+            ctl.c_anon = found.c_anon;
+            ctl.a_k_dev = found.a_k_dev_p95;
+            ctl.safety = safety_from_evidence(found, safety_floor, safety_initial);
+        }
         Some(found) => {
             ctl.a_k = found.a_k_p95.max(MIN_AMPLIFICATION);
             ctl.a_k_dev = found.a_k_dev_p95;
@@ -291,10 +324,14 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             }
         }
         if let Some(found) = &profile
-            && found.a_k_p95 > 0.0
+            && found.probe_a_anon > 0.0
         {
-            // A profile's figures are the records' anonymous growth per byte (f.9).
-            let distance = (ctl.a_anon - found.a_k_p95).abs() / found.a_k_p95;
+            // Like with like: this probe against the probes before it, one morsel on one worker
+            // each. It was compared with the records' steady-state p95, a different quantity
+            // (every morsel of the run at its own size, fixed cost and all), so an identical
+            // second run could read as drift and lose the margin its evidence had bought
+            // (2026-11-14). A file without the probe's figure is not compared.
+            let distance = (ctl.a_anon - found.probe_a_anon).abs() / found.probe_a_anon;
             if distance > DRIFT {
                 // The probe is what is true now; the profile is what was true before. Trust
                 // the probe and put the margin back where an unseen kernel starts.

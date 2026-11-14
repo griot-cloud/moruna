@@ -471,8 +471,11 @@ pub(crate) struct StageCtl {
     pub records: u64,
     /// The profile the store had for this stage, if any.
     pub profile: Option<profile::Profile>,
-    /// Whether this stage was seeded from a profile instead of probed (f.14).
+    /// Whether this stage was seeded from a profile instead of probed (f.2, f.14).
     pub seeded: bool,
+    /// Whether `profile` is the row for this run's own input schema, not the nearest one for the
+    /// same kernel (e.3): only such a row can be trusted in place of a probe (f.2).
+    pub profile_exact: bool,
     /// `peak_delta / bytes_in` per record, newest last, bounded by `WINDOW`.
     pub peak_ratios: VecDeque<f64>,
     /// `bytes_in` per record, newest last, bounded by `WINDOW`: what this stage's morsels come
@@ -560,6 +563,7 @@ impl StageCtl {
             records: 0,
             profile: None,
             seeded: false,
+            profile_exact: false,
             peak_ratios: VecDeque::new(),
             bytes_in_window: VecDeque::new(),
             state_by_instance: HashMap::new(),
