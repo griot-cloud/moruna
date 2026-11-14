@@ -323,7 +323,7 @@ Rationale (PM, 2026-09-23). The fit was one term: the whole of `mem_anon_peak �
 | throttled_delta / tick > 10% | CpuQuota | `ActiveWorkers −1` (min 1) |
 | busy < 0.7 and q0_bytes < low(q0) and reads_in_flight == read_ahead | IoRead | `ReadAhead +1` (max 64) if the working set allows; else shrink queue high waters by 10% (`Knob::HighWater`) to fund it |
 | busy < 0.7 and q0_bytes ≥ low(q0) | Memory (workers parked by budget) | shrink queue high waters by 10% (`Knob::HighWater`) and re-run f.3's worker formula (`ActiveWorkers +1` if it now allows) |
-| busy > 0.9 and qn_bytes rising 4 ticks and writes_in_flight == sink_concurrency | Sink | `Knob::StagingTrigger { stage: n, on: true }`; `ReadAhead −1` (min 1) |
+| busy > 0.9 and qn_bytes rising 4 ticks and writes_in_flight == sink_concurrency | Sink | `ReadAhead −1` (min 1). No staging (amended 2026-11-14): the sink's encodes run on the workers (RB1), so staging its queue writes and reads back every batch on the CPUs the encodes need and finishes nothing sooner; back-pressure is the answer, and staging stays the Memory row's |
 | busy > 0.9 | Compute | none; record |
 | otherwise | Idle | none |
 

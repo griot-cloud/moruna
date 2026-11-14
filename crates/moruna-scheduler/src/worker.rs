@@ -606,7 +606,7 @@ pub(crate) fn run_task(
             if push_error.is_some() {
                 // The release failed: the run ends on that error, and nothing is pushed.
             } else if let Err(e) =
-                crate::decide::admit_push(shared, &entry.outputs, out_morsel, claim)
+                crate::decide::admit_push_on_worker(shared, &entry.outputs, out_morsel, claim)
             {
                 push_error = Some(e);
             } else {

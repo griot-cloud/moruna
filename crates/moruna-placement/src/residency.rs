@@ -87,6 +87,22 @@ impl PlacementEngine {
         scope: Option<StageId>,
         demand: Option<BufferId>,
     ) -> bool {
+        self.shed_as(slot, need, scope, demand, true)
+    }
+
+    /// [`PlacementEngine::shed`]; `spill` false keeps only what leaves for nothing (a disk copy
+    /// dropped, a device batch copied down): no batch written to disk and no source's batch
+    /// dropped to be read and decoded again, which is what a queue's own high water asks for
+    /// when staging was not asked for (2026-11-14). A source's queue at its high water then holds
+    /// the reads back instead of throwing decoded batches away.
+    pub(crate) fn shed_as(
+        &self,
+        slot: usize,
+        need: u64,
+        scope: Option<StageId>,
+        demand: Option<BufferId>,
+        spill: bool,
+    ) -> bool {
         if need == 0 || self.is_shutting_down() {
             return false;
         }
@@ -96,6 +112,10 @@ impl PlacementEngine {
         let (found, waiting, events, dropped) = {
             let mut catalog = self.lock_catalog();
             let mut candidates = catalog.candidates(slot, scope, &views, disk, demand);
+            if !spill {
+                candidates
+                    .retain(|candidate| matches!(candidate.how, Shed::DropCopy | Shed::CopyDown));
+            }
             if candidates.is_empty() {
                 return false;
             }

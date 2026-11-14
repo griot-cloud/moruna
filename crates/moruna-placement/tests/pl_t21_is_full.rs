@@ -27,7 +27,9 @@ fn pl_t21_is_full() {
         .expect("push");
     assert!(!engine.is_full(1), "below high water");
 
-    // Above high water with staging on and demotions in flight: draining, not full.
+    // Above high water with staging on and demotions in flight: draining, not full. Staging is
+    // asked for: a queue's own high water writes only then (2026-11-14).
+    engine.set_staging(1, true);
     engine.set_promotion_window(1, 1);
     engine.set_water(1, TierKind::Host, bytes, bytes);
     for seq in 1..6u64 {
@@ -58,7 +60,9 @@ fn pl_t21_is_full() {
         "staging off and nothing recomputable: full (PL-I6, f.14)"
     );
 
-    // Staging off on Q0, whose entries are recomputable: evictions happen and it is not full.
+    // Staging off on Q0, whose entries are recomputable: its own high water holds the reads back
+    // rather than dropping decoded batches to read and decode them again (2026-11-14); it
+    // writes nothing either way (PL-I6). A tier short of memory still drops them (`shed`).
     let before = reactor
         .ops()
         .iter()
@@ -73,8 +77,13 @@ fn pl_t21_is_full() {
     }
     common::settle(&reactor);
     assert!(
-        !engine.is_full(0),
-        "Q0 with staging off is never full: it evicts (PL-I6)"
+        engine.is_full(0),
+        "Q0 at its high water holds the reads back"
+    );
+    assert_eq!(engine.detailed_stats().per_queue[0].evictions, 0);
+    assert!(
+        moruna_kernel::Residency::shed(&*engine, TierKind::Host, bytes * 2),
+        "memory short: Q0 drops"
     );
     assert!(engine.detailed_stats().per_queue[0].evictions > 0);
     assert_eq!(
@@ -134,4 +143,44 @@ fn pl_t21_a_stage_outside_the_run_is_full() {
     assert!(engine.evicted(7).is_empty());
     assert!(!engine.peek_resident(7, common::want_host(), Locality::Any));
     assert!(engine.pop(7, common::want_host(), Locality::Any).is_err());
+}
+
+/// PL-T21 (b) (2026-11-14): a kernel output's queue over its high water, with a disk tier and
+/// staging allowed by default but not asked for, writes nothing and reports full, so its
+/// producers are held back; asking for staging makes the same pressure write.
+#[test]
+fn pl_t21_high_water_holds_producers_back_unless_staging_is_asked() {
+    let scratch = common::Scratch::new("t21b");
+    let alloc = FakeAllocator::new();
+    let reactor = FakeReactor::new();
+    let cfg = common::config(
+        2,
+        Some(scratch.path().to_path_buf()),
+        common::budgets(1 << 30, 0, 1 << 30),
+    );
+    let engine = common::engine(cfg, &alloc, &reactor);
+    engine.set_promotion_window(1, 1);
+    let sample = common::table_morsel(&alloc, 0, 1, 128);
+    let bytes = sample.bytes;
+    drop(sample);
+    engine.set_water(1, TierKind::Host, bytes, bytes);
+    for seq in 0..4u64 {
+        engine
+            .push(1, common::table_morsel(&alloc, seq, 1, 128))
+            .expect("push");
+    }
+    common::settle(&reactor);
+    let writes = |reactor: &FakeReactor| {
+        reactor
+            .ops()
+            .into_iter()
+            .filter(|op| op.kind == moruna_testkit::OpKind::WriteFile)
+            .count()
+    };
+    assert_eq!(writes(&reactor), 0, "no batch went to disk");
+    assert!(engine.is_full(1), "the producers are held back (f.14)");
+
+    engine.set_staging(1, true);
+    common::settle(&reactor);
+    assert!(writes(&reactor) > 0, "asked for, the same pressure writes");
 }

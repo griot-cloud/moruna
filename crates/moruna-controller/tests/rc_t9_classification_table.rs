@@ -281,10 +281,10 @@ fn rc_t9_row6_sink() {
 
     assert_eq!(last_class(&rig), Bottleneck::Sink, "f.6 row 6");
     let fresh = &rig.writes()[mark..];
-    assert_eq!(
-        staging_triggers(fresh),
-        vec![(1, true)],
-        "f.6 row 6: staging on for the last queue"
+    assert!(
+        staging_triggers(fresh).is_empty(),
+        "f.6 row 6 (2026-11-14): a slow sink is answered by back-pressure, not by staging its \
+         queue, whose encodes run on the same workers (RB1)"
     );
     assert_eq!(
         read_aheads(fresh),

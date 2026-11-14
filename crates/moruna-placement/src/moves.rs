@@ -196,18 +196,26 @@ impl PlacementEngine {
             },
             target,
             epoch,
+            asked,
         ) = {
             let mut queue = self.lock_queue(index);
             queue.epoch += 1;
             let pass = self.plan_locked(index, &mut queue);
-            (pass, queue.target, queue.epoch)
+            (pass, queue.target, queue.epoch, queue.staging_asked)
         };
         for task in tasks {
             self.issue(task);
         }
         let stage = index as StageId;
+        // A queue's own high water writes its batches to disk only when staging was asked for
+        // (2026-11-14). Otherwise it drops what costs nothing to drop (a disk copy, a source's
+        // batch to read again) and, finding nothing, holds its producers back (f.14): a queue at
+        // its high water in front of a sink that keeps up wants back-pressure, and writing its
+        // batches out and reading them back took the CPUs the encodes run on (RB1). Enrich on
+        // the benchmark VM went from 7.5 s to 21 s with the disk tier on, 5.4 GB written and
+        // read back at a fifth of its memory.
         for (kind, need) in pressure {
-            let found = self.shed(kind.index(), need, Some(stage), None);
+            let found = self.shed_as(kind.index(), need, Some(stage), None, asked);
             if !found && kind == target.kind() {
                 // Recorded only when no later pass has looked at the queue since this one did:
                 // a pop or a landing in between planned it again, and its finding stands (f.14).

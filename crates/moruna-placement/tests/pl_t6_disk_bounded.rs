@@ -22,7 +22,9 @@ fn pl_t6_disk_bounded() {
     cfg.segment_bytes = segment;
     cfg.disk_budget = budget;
     let engine = common::engine(cfg, &alloc, &reactor);
-    // Stage 1 is a kernel output: not recomputable, and staging is on by default (b).
+    // Stage 1 is a kernel output: not recomputable, and staging is allowed by default (b); its own
+    // high water writes once staging is asked for (2026-11-14).
+    engine.set_staging(1, true);
     engine.set_promotion_window(1, 1);
     let sample = common::table_morsel(&alloc, 0, 1, 512);
     let bytes = sample.bytes;

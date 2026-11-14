@@ -127,7 +127,12 @@ pub(crate) fn classify(
         && rising(state)
         && inputs.stats.writes_in_flight == inputs.stats.sink_concurrency
     {
-        stage_sink_queues(state, actions);
+        // A slow sink is answered by back-pressure, not by staging its queue (2026-11-14). The
+        // sink's encodes run on the workers (RB1), so writing its queue to disk and reading it
+        // back takes the same CPUs a second and third pass over every batch and finishes nothing
+        // sooner: Enrich on the benchmark VM went from 7.5 s to 21 s with the disk tier on,
+        // 5.5 GB spilled at a fifth of its budget. Staging is the Memory row's answer, when
+        // memory, not the sink, is what is short.
         if state.read_ahead > 1 {
             state.read_ahead -= 1;
             actions.knobs.push(Knob::ReadAhead(state.read_ahead));

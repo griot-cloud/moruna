@@ -487,6 +487,7 @@ impl Placement for PlacementEngine {
         {
             let mut queue = self.lock_queue(index);
             queue.staging_enabled = enabled;
+            queue.staging_asked = enabled;
         }
         self.plan_and_issue(index);
     }
