@@ -430,6 +430,10 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_served: AtomicU64,
     pub(crate) resumed: AtomicBool,
     pub(crate) recomputed: AtomicU64,
+    /// Walls at which placement made room for work under way (RB5, `wall::make_room`).
+    pub(crate) walls_room_made: AtomicU64,
+    /// Workers standing at a memory wall now, each holding its slot (`wall::Wall`).
+    pub(crate) wall_waiters: std::sync::atomic::AtomicUsize,
     pub(crate) shutdown_done: AtomicBool,
     pub(crate) exit_claimed: AtomicBool,
     /// A stage's `finish` has given a batch (f.6, f.12): from then on no manifest is written,
@@ -742,6 +746,8 @@ impl Shared {
             checkpoint_served: AtomicU64::new(0),
             resumed: AtomicBool::new(false),
             recomputed: AtomicU64::new(0),
+            walls_room_made: AtomicU64::new(0),
+            wall_waiters: std::sync::atomic::AtomicUsize::new(0),
             shutdown_done: AtomicBool::new(false),
             exit_claimed: AtomicBool::new(false),
             finish_gave: AtomicBool::new(false),

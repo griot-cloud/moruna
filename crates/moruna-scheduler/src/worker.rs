@@ -24,14 +24,10 @@ use crate::instances;
 use crate::shared::{JobOutput, JobRequest, Shared, WorkerJob};
 use crate::slots::BusySlot;
 
-/// How many times a unit whose output the arena refused is applied again (RB5).
-const ALLOC_RETRIES: u32 = 200;
-
 /// Between two attempts of a unit the arena refused: run the offloaded jobs that are queued, on
-/// the slot this worker already holds (a sink's encode is what gives the arena back), until a
-/// backoff of 2 ms doubling to 200 ms has passed.
-fn help_drain(shared: &Shared, attempt: u32) {
-    let wait = Duration::from_millis((2u64 << attempt.min(7)).min(200));
+/// the slot this worker already holds (a sink's encode is what gives the arena back), for
+/// `wait` (`wall::Wall` says how long).
+fn help_drain(shared: &Shared, wait: Duration) {
     let until = std::time::Instant::now() + wait;
     while std::time::Instant::now() < until {
         match shared.offload.take() {
@@ -482,31 +478,45 @@ pub(crate) fn run_task(
             }))
         } else {
             // RB5: an arena that cannot take the unit's output is a wall, not an error. The
-            // worker keeps a share of its input, helps the sink drain (the queued encodes free
-            // the arena), waits, and applies again; only a wall that does not move in about forty
-            // seconds goes to the policy. Before, the first refusal ended the run: Enrich over the
-            // whole dataset, a 4.7 MB output with the arena at nine tenths (2026-11-14).
+            // worker keeps a share of its input and asks placement for room (queued batches,
+            // needed later, leave memory cheapest-to-bring-back first), helps the sink drain (the
+            // queued encodes free the arena), and applies again. It gives up only when nothing in
+            // the run can free memory (`wall`). Before, the first refusal ended the run: Enrich
+            // over the whole dataset, a 4.7 MB output with the arena at nine tenths (2026-11-14).
             let mut payload = payload;
-            let mut attempt = 0u32;
-            loop {
+            let mut wall: Option<crate::wall::Wall> = None;
+            let result = loop {
                 let retained = payload.share();
                 let st: &mut dyn KernelState = &mut *state;
                 let kernel = kernel.clone();
                 let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
                     kernel.apply_port(st, port, payload)
                 }));
-                if matches!(result, Ok(Err(MorunaError::Alloc { .. })))
-                    && attempt < ALLOC_RETRIES
+                if let Ok(Err(MorunaError::Alloc { bytes, .. })) = &result
                     && shared.run_state().is_live()
                     && !shared.has_exit()
                 {
-                    attempt += 1;
-                    help_drain(shared, attempt);
-                    payload = retained;
-                    continue;
+                    let at = wall.get_or_insert_with(|| {
+                        shared.wall_waiters.fetch_add(1, Ordering::SeqCst);
+                        crate::wall::Wall::new(shared)
+                    });
+                    match at.refused(shared, *bytes, crate::wall::Room::Make, 1) {
+                        crate::wall::Next::Retry(wait) => {
+                            help_drain(shared, wait);
+                            payload = retained;
+                            continue;
+                        }
+                        crate::wall::Next::GiveUp(why) => {
+                            tracing::warn!(target: "sched.wall", stage = entry.stage, seq = seq_in, %why, "memory wall");
+                        }
+                    }
                 }
                 break result;
+            };
+            if wall.is_some() {
+                shared.wall_waiters.fetch_sub(1, Ordering::SeqCst);
             }
+            result
         }
     };
     let c1 = thread_cpu_ns();

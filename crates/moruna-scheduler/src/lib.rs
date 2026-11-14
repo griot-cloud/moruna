@@ -52,6 +52,7 @@ mod sink_drive;
 mod slots;
 mod source_drive;
 mod stats;
+mod wall;
 mod worker;
 
 pub use decide::{Clock, DISK_BYTES_PER_SECOND, SystemClock};

@@ -61,9 +61,17 @@ struct InFlight<'a> {
 }
 
 /// RB5 (2026-11-13): a read whose arena allocation failed is a wall, not an error. It keeps its
-/// sequence number and its rows and is issued again once memory has come back, waiting longer
-/// each time; only a read that still cannot be served after `RETRY_LIMIT` attempts ends the run,
-/// with the allocation error it last met.
+/// sequence number and its rows and is issued again once memory has come back. A read at the
+/// cursor takes no room from the batches queued before it, which are needed sooner: it waits for
+/// the consumers (`wall::Room::Wait`), and ends the run only when nothing in the run can free
+/// memory (amended 2026-11-14; it was a fixed 24 timed attempts).
+/// The reads that met a full arena, in order, and the wall they stand at (RB5).
+#[derive(Default)]
+struct Waits {
+    retry: Vec<Retry>,
+    wall: Option<crate::wall::Wall>,
+}
+
 struct Retry {
     seq: Seq,
     split: u32,
@@ -74,9 +82,6 @@ struct Retry {
     not_before: std::time::Instant,
     error: MorunaError,
 }
-
-/// How many times a read that met a full arena is tried again before the run ends on it.
-const RETRY_LIMIT: u32 = 24;
 
 /// The tier a read lands in: the run's one host tier (contracts e.1, f.5).
 fn tier0(shared: &Shared) -> Tier {
@@ -278,8 +283,9 @@ pub(crate) fn drive(
     // The most a read has come to over its split's estimate, which scales the next read's
     // admission (f.5).
     let mut learned = 1.0f64;
-    // Reads that met a full arena, to issue again once memory has come back (RB5).
-    let mut retry: Vec<Retry> = Vec::new();
+    // Reads that met a full arena, to issue again once memory has come back (RB5), and the wall
+    // they stand at.
+    let mut waits = Waits::default();
 
     loop {
         let mode = shared.source_mode.get();
@@ -289,7 +295,7 @@ pub(crate) fn drive(
             &mut inflight,
             &mut replacing,
             &mut learned,
-            &mut retry,
+            &mut waits,
             &mut cx,
         );
         if let Some(future) = stream_read.as_mut()
@@ -365,10 +371,10 @@ pub(crate) fn drive(
                 }
                 worked |=
                     issue_replacements(&shared, source, &mut inflight, &mut replacing, learned);
-                worked |= issue_retries(&shared, source, &mut inflight, &mut retry);
+                worked |= issue_retries(&shared, source, &mut inflight, &mut waits);
                 // A read waiting for memory goes before any new one, so the cursor does not
                 // run ahead of what the arena can hold.
-                if retry.is_empty() {
+                if waits.retry.is_empty() {
                     worked |= issue_reads(&shared, source, &mut inflight, learned);
                 }
                 close_when_exhausted(&shared, source, &inflight);
@@ -376,7 +382,9 @@ pub(crate) fn drive(
         }
         // A read waiting out its backoff is work in flight for the stall detector (RB5): it will
         // be issued again, and the run is not stuck while it waits.
-        source.waiting_reads.store(retry.len(), Ordering::SeqCst);
+        source
+            .waiting_reads
+            .store(waits.retry.len(), Ordering::SeqCst);
         if !worked {
             parker.park_timeout(Duration::from_millis(1));
         }
@@ -591,33 +599,38 @@ fn submit<'a>(
     });
 }
 
-/// The wait before a read that met a full arena is issued again: 2 ms doubling, at most 1 s.
-fn retry_wait(attempts: u32) -> Duration {
-    Duration::from_millis((2u64 << attempts.min(9)).min(1_000))
-}
-
 /// RB5: issue again, in order, every read that met a full arena and whose wait is over, while
-/// admission says it fits. A read that has met a full arena `RETRY_LIMIT` times ends the run.
+/// admission says it fits. One that does not fit counts as the wall standing; the wall ends the
+/// run only when nothing in the run can free memory (`wall`).
 fn issue_retries<'a>(
     shared: &'a Shared,
     source: &'a SourceEnd,
     inflight: &mut Vec<InFlight<'a>>,
-    retry: &mut Vec<Retry>,
+    waits: &mut Waits,
 ) -> bool {
+    let Waits { retry, wall } = waits;
     let mut issued = false;
     while let Some(next) = retry.first() {
-        if next.attempts > RETRY_LIMIT {
-            let failed = retry.remove(0);
-            crate::policy::terminate(
-                shared,
-                source_diagnostic(failed.error, failed.split, failed.rows),
-            );
-            retry.clear();
-            return true;
+        let now = std::time::Instant::now();
+        if now < next.not_before {
+            break;
         }
-        if std::time::Instant::now() < next.not_before
-            || !arena_admits(shared, inflight, next.charge)
-        {
+        if !arena_admits(shared, inflight, next.charge) {
+            let charge = next.charge;
+            let at = wall.get_or_insert_with(|| crate::wall::Wall::new(shared));
+            match at.refused(shared, charge, crate::wall::Room::Wait, 0) {
+                crate::wall::Next::Retry(wait) => retry[0].not_before = now + wait,
+                crate::wall::Next::GiveUp(why) => {
+                    let failed = retry.remove(0);
+                    tracing::warn!(target: "sched.wall", split = failed.split, %why, "memory wall");
+                    crate::policy::terminate(
+                        shared,
+                        source_diagnostic(failed.error, failed.split, failed.rows),
+                    );
+                    retry.clear();
+                    return true;
+                }
+            }
             break;
         }
         let again = retry.remove(0);
@@ -653,9 +666,10 @@ fn poll_inflight(
     inflight: &mut Vec<InFlight<'_>>,
     replacing: &mut HashSet<(StageId, Seq)>,
     learned: &mut f64,
-    retry: &mut Vec<Retry>,
+    waits: &mut Waits,
     cx: &mut Context<'_>,
 ) -> bool {
+    let Waits { retry, wall } = waits;
     let mut progressed = false;
     let mut index = 0;
     while index < inflight.len() {
@@ -678,6 +692,8 @@ fn poll_inflight(
                 }
                 match result {
                     Ok(payload) => {
+                        // A read that lands is the wall moving.
+                        *wall = None;
                         learn(source, &entry, &payload, learned);
                         let (rows, bytes) = (payload.rows(), payload.bytes());
                         let morsel = Morsel::new(entry.seq, 0, payload, entry.origin.clone());
@@ -705,17 +721,28 @@ fn poll_inflight(
                     }
                     Err(e @ MorunaError::Alloc { .. }) => {
                         // RB5: the arena was full when this read landed; it waits for memory
-                        // to come back and is issued again (`issue_retries`).
-                        retry.push(Retry {
-                            seq: entry.seq,
-                            split: entry.split,
-                            rows: entry.rows,
-                            kind: entry.kind,
-                            charge: entry.charge,
-                            attempts: entry.attempts + 1,
-                            not_before: std::time::Instant::now() + retry_wait(entry.attempts + 1),
-                            error: e,
-                        });
+                        // to come back and is issued again (`issue_retries`), unless nothing in
+                        // the run can free memory.
+                        let at = wall.get_or_insert_with(|| crate::wall::Wall::new(shared));
+                        match at.refused(shared, entry.charge, crate::wall::Room::Wait, 0) {
+                            crate::wall::Next::Retry(wait) => retry.push(Retry {
+                                seq: entry.seq,
+                                split: entry.split,
+                                rows: entry.rows,
+                                kind: entry.kind,
+                                charge: entry.charge,
+                                attempts: entry.attempts + 1,
+                                not_before: std::time::Instant::now() + wait,
+                                error: e,
+                            }),
+                            crate::wall::Next::GiveUp(why) => {
+                                tracing::warn!(target: "sched.wall", split = entry.split, %why, "memory wall");
+                                crate::policy::terminate(
+                                    shared,
+                                    source_diagnostic(e, entry.split, entry.rows),
+                                );
+                            }
+                        }
                         progressed = true;
                     }
                     Err(e) => {

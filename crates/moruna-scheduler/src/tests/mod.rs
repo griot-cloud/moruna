@@ -37,6 +37,7 @@ mod sc_t38_learning;
 mod sc_t39_a_finish_gives_downstream;
 mod sc_t3_source_admission;
 mod sc_t43_a_refused_output_waits;
+mod sc_t44_a_refused_output_asks_for_room;
 mod sc_t4_one_record_per_morsel_stage;
 mod sc_t5_knobs_immediate;
 mod sc_t6_instance_affinity;

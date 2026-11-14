@@ -89,6 +89,8 @@ struct Inner {
     manifest_store: bool,
     staging_dir: Option<PathBuf>,
     shutdown_calls: AtomicU64,
+    /// Every `shed` asked for, in order: the tier and the bytes (RB5's walls ask for room).
+    sheds: Mutex<Vec<(moruna_kernel::TierKind, u64)>>,
 }
 
 /// The placement engine as a test sees it: FIFO queues per stage, with knobs for the two
@@ -96,7 +98,8 @@ struct Inner {
 ///
 /// Knobs: `with_pressure(stage, evict_after_bytes)`, `with_delay(Duration)`,
 /// `with_manifest_store()`. Observables: `pushed(stage)`, `popped(stage)`, `released(stage)`,
-/// `held()`, `committed()`, `manifests_written()`, `budgets_set()`, `shutdown_calls()`.
+/// `held()`, `committed()`, `manifests_written()`, `budgets_set()`, `shutdown_calls()`,
+/// `sheds()`.
 #[derive(Clone)]
 pub struct FakePlacement {
     inner: Arc<Inner>,
@@ -120,8 +123,19 @@ impl FakePlacement {
                 manifest_store: false,
                 staging_dir: None,
                 shutdown_calls: AtomicU64::new(0),
+                sheds: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Observable: every `shed` asked for, in order, as `(tier, bytes)`. The fake frees nothing,
+    /// so each answers `false`.
+    pub fn sheds(&self) -> Vec<(moruna_kernel::TierKind, u64)> {
+        self.inner
+            .sheds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Knob: entries beyond `evict_after_bytes` on this queue become `Evicted`, which is what a
@@ -243,6 +257,7 @@ impl FakePlacement {
                 manifest_store: builder.manifest_store,
                 staging_dir: builder.staging_dir,
                 shutdown_calls: AtomicU64::new(self.shutdown_calls()),
+                sheds: Mutex::new(self.sheds()),
             }),
         }
     }
@@ -773,7 +788,12 @@ impl moruna_kernel::Residency for FakePlacement {
         Ok(())
     }
 
-    fn shed(&self, _tier: moruna_kernel::TierKind, _bytes: u64) -> bool {
+    fn shed(&self, tier: moruna_kernel::TierKind, bytes: u64) -> bool {
+        self.inner
+            .sheds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((tier, bytes));
         false
     }
 
