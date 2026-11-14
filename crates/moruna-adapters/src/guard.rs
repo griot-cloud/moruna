@@ -258,6 +258,15 @@ impl KernelMemory {
         *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
     }
 
+    /// The ceiling of the run the kernel is in, while one is bound.
+    pub fn run_ceiling(&self) -> Option<u64> {
+        self.gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|gate| gate.ceiling())
+    }
+
     /// Let go of the run's gate when the run ends.
     pub fn release(&self) {
         *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = None;

@@ -264,6 +264,8 @@ impl PyKernel {
     pub fn release_run(&self) {
         *self.alloc.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.memory.release();
+        // The NumPy blocks the run's kernels freed go back to the C heap with it (f.11).
+        super::hooks::drain_numpy_cache();
     }
 
     fn bound_alloc(&self) -> Option<Arc<dyn Allocator>> {

@@ -102,6 +102,15 @@ def arrow_only(batch):
     pa.array(range(1_000_000), pa.int64())
     return batch
 
+def reuses(batch):
+    for _ in range(20):
+        a = np.empty(2 * 1024 * 1024, dtype=np.uint8)
+        a[::4096] = 1
+        del a
+    z = np.zeros(2 * 1024 * 1024, dtype=np.uint8)
+    assert not z.any(), "a reused block handed out by calloc is zeroed"
+    return batch
+
 def numpy_only(batch):
     np.ones(4 * 1024 * 1024, dtype=np.uint8)
     return batch
@@ -486,4 +495,31 @@ fn ad_t23_counts_reach_the_record() {
         "unguarded: {error}"
     );
     assert!(counts.measured && !counts.refusal_on);
+}
+
+/// AD-T25 numpy_blocks_reused (f.11, 2026-11-14): a kernel that takes and frees a 2 MiB array
+/// twenty times is served from the blocks it freed, a reused block `calloc` hands out is zeroed,
+/// and the blocks go back to the C heap when the run ends.
+#[test]
+fn ad_t25_numpy_blocks_reused() {
+    let _serial = serial();
+    // Earlier tests' runs never ended, so their blocks may fill the cache to its bound (a
+    // sixteenth of the 110 MiB ceiling): a run's end empties it.
+    rig("reuses", true).kernel.release_run();
+    let r = rig("reuses", true);
+    let before = moruna_adapters::python::hooks::numpy_cache_stats();
+    let (result, _) = r.call();
+    result.expect("the call completes");
+    let after = moruna_adapters::python::hooks::numpy_cache_stats();
+    assert!(
+        after.hits - before.hits >= 19,
+        "every array after the first came from the cache: {before:?} -> {after:?}"
+    );
+    assert!(after.kept - before.kept >= 20, "{before:?} -> {after:?}");
+    r.kernel.release_run();
+    assert_eq!(
+        moruna_adapters::python::hooks::numpy_cache_stats().held_bytes,
+        0,
+        "the run's end gives every block back"
+    );
 }
