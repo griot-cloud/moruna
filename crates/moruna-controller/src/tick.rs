@@ -266,6 +266,7 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
             let slot = ctl.state_by_instance.entry(0).or_insert(0);
             *slot = (*slot).max(summary.state_bytes);
         }
+        ctl.observe_bytes_in(summary.bytes_in);
         if summary.bytes_in > 0 && current {
             let ratio = summary.peak_delta as f64 / summary.bytes_in as f64;
             // f.3's anon fit. Two readings of the same record, and the model takes the larger,
@@ -295,7 +296,11 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
             // f.4's margin, which tightens only on an accepted increase, would never tighten.
             // Per morsel (RB3): this morsel's bytes carry the slope, and the other morsels the
             // model believed in flight beside it are taken out of the residency before it.
-            let morsel = (morsel_target.max(summary.bytes_in) as f64).max(1.0);
+            // The slope is per byte of the morsel as it came (2026-11-14): measured over the
+            // target, a stage whose morsels arrive smaller than it had a slope that only the
+            // target could be multiplied by, and the worker count, which is funded at the
+            // morsels as they are (`StageCtl::in_flight`), could not use it.
+            let morsel = (summary.bytes_in as f64).max(1.0);
             let others = (in_flight_morsels.max(1.0) - 1.0) * morsel;
             let before = summary.mem_anon_peak.saturating_sub(summary.peak_delta);
             let fixed = before.saturating_sub(resting).saturating_sub(funded) as f64;

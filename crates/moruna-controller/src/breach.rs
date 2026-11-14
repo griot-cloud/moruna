@@ -42,7 +42,7 @@ fn refit_anon(state: &mut ControllerState, at: usize, r: &TraceRecord) {
     // The same reading and the same unit as the tick thread's fit (11 f.3): the bytes the model
     // believed were in flight, the residency before `apply` above the resting figure and the
     // state the inequality has already funded, and the growth across `apply`.
-    let morsel = (target.max(r.bytes_in) as f64).max(1.0);
+    let morsel = (r.bytes_in as f64).max(1.0);
     let others = (in_flight - 1.0).max(0.0) * morsel;
     let fixed = r
         .mem_anon_before
@@ -55,7 +55,7 @@ fn refit_anon(state: &mut ControllerState, at: usize, r: &TraceRecord) {
 /// The workers the anon inequality of f.3 allows at the targets as they now stand, floor 1.
 pub(crate) fn anon_workers(state: &ControllerState) -> u16 {
     let max_anon_allowance = (0..state.stages.len())
-        .map(|at| model::anon_allowance(state, at, state.stages[at].target))
+        .map(|at| model::anon_allowance(state, at, state.stages[at].in_flight()))
         .max()
         .unwrap_or(0);
     match model::anon_for_kernels(state).checked_div(max_anon_allowance) {

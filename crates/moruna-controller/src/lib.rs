@@ -475,6 +475,9 @@ pub(crate) struct StageCtl {
     pub seeded: bool,
     /// `peak_delta / bytes_in` per record, newest last, bounded by `WINDOW`.
     pub peak_ratios: VecDeque<f64>,
+    /// `bytes_in` per record, newest last, bounded by `WINDOW`: what this stage's morsels come
+    /// to, which the target only bounds (a source's splits or row groups can be smaller).
+    pub bytes_in_window: VecDeque<u64>,
     /// The largest `state_bytes` seen per instance (f.3).
     pub state_by_instance: HashMap<u16, u64>,
     /// Instances the scheduler reports alive.
@@ -558,6 +561,7 @@ impl StageCtl {
             profile: None,
             seeded: false,
             peak_ratios: VecDeque::new(),
+            bytes_in_window: VecDeque::new(),
             state_by_instance: HashMap::new(),
             instances_live: 0,
             sizer_errors: VecDeque::new(),
@@ -574,6 +578,30 @@ impl StageCtl {
     /// The allowance of b: the bytes one in-flight morsel of this stage may hold at peak.
     pub(crate) fn allowance(&self, target: u64) -> u64 {
         model::scale(target, self.a_k * f64::from(self.safety))
+    }
+
+    /// The bytes one of this stage's morsels in flight comes to now: the target, or the largest
+    /// morsel of the window when the morsels arrive smaller (RB3, 2026-11-14). A worker count
+    /// is a count of morsels in flight, so it is funded at what they are and not at a target
+    /// the source's splits never reach: at the target, a kernel on 128 KiB morsels whose target
+    /// was 4 MiB was given two workers of eight, and the benchmark's Occupancy squeeze one of
+    /// four, with an eighth of the memory in use. A proposed target is still judged at itself.
+    pub(crate) fn in_flight(&self) -> u64 {
+        match self.bytes_in_window.iter().max() {
+            Some(&largest) if largest > 0 => largest.min(self.target),
+            _ => self.target,
+        }
+    }
+
+    /// Fold one record's `bytes_in` into the window `in_flight` reads.
+    pub(crate) fn observe_bytes_in(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.bytes_in_window.push_back(bytes);
+        while self.bytes_in_window.len() > WINDOW {
+            self.bytes_in_window.pop_front();
+        }
     }
 }
 

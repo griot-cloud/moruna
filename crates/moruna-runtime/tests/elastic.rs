@@ -41,6 +41,9 @@ const MIB: u64 = 1024 * 1024;
 struct Spinner {
     spin: Duration,
     busy: bool,
+    /// Heap bytes each apply allocates and touches, per input byte: a kernel whose working set
+    /// is outside the arena and many times its input (the benchmark's Occupancy).
+    amp: u64,
     applies: Arc<AtomicU64>,
     running: Arc<AtomicU64>,
     starts: Arc<Mutex<Vec<(Instant, u64)>>>,
@@ -51,6 +54,7 @@ impl Spinner {
         Spinner {
             spin,
             busy: false,
+            amp: 0,
             applies: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicU64::new(0)),
             starts: Arc::new(Mutex::new(Vec::new())),
@@ -62,6 +66,29 @@ impl Spinner {
     fn busy(mut self) -> Spinner {
         self.busy = true;
         self
+    }
+
+    /// Each apply allocates and touches `amp` heap bytes per input byte while it runs.
+    fn amplify(mut self, amp: u64) -> Spinner {
+        self.amp = amp;
+        self
+    }
+
+    /// The mean count running at each start after `from`, and how many starts that is.
+    fn mean_concurrent_after(&self, from: Instant) -> (f64, usize) {
+        let starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+        let after: Vec<u64> = starts
+            .iter()
+            .filter(|(at, _)| *at >= from)
+            .map(|(_, n)| *n)
+            .collect();
+        if after.is_empty() {
+            return (0.0, 0);
+        }
+        (
+            after.iter().sum::<u64>() as f64 / after.len() as f64,
+            after.len(),
+        )
     }
 
     fn max_concurrent_after(&self, from: Instant) -> u64 {
@@ -90,7 +117,7 @@ impl Kernel for Spinner {
             // About as much outside the arena as in it: the arena takes two thirds of the
             // allowance (12 f.1), which leaves the controller real headroom above it at every
             // ceiling a test sets, and the arena's growth is still most of the process's.
-            expected_amplification: Some(1.0),
+            expected_amplification: Some(1.0 + self.amp as f64),
             ..Default::default()
         }
     }
@@ -120,6 +147,15 @@ impl Kernel for Spinner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((Instant::now(), now));
+        let heap = if self.amp > 0 {
+            let mut bytes = vec![0u8; (input.bytes() * self.amp) as usize];
+            for page in bytes.chunks_mut(4096) {
+                page[0] = 1;
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         if self.busy {
             let until = Instant::now() + self.spin;
             let mut spins = 0u64;
@@ -131,6 +167,7 @@ impl Kernel for Spinner {
         } else {
             std::thread::sleep(self.spin);
         }
+        drop(std::hint::black_box(heap));
         self.running.fetch_sub(1, Ordering::SeqCst);
         self.applies.fetch_add(1, Ordering::SeqCst);
         Ok(input)
@@ -804,4 +841,53 @@ fn read_trace(path: &std::path::Path) -> Vec<(u64, u64)> {
         }
     }
     out
+}
+
+/// The squeeze of the 2026-11-14 benchmark rerun (Occupancy over the whole dataset): a kernel
+/// whose working set is outside the arena and many times its input runs on eight CPUs; mid-run
+/// the machine halves its CPUs and cuts memory to a small fraction that still has room for four
+/// workers' working sets. The run follows the CPUs down and keeps the workers memory has room for,
+/// rather than falling to one and staying there (the rerun ran on about one core of the four
+/// allowed for 25 s, with an eighth of the memory in use).
+#[test]
+fn a_squeeze_keeps_the_workers_it_has_room_for() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("squeeze");
+    let machine = Machine::new(1536 * MIB, 8.0);
+    // A morsel is 128 KiB; each apply holds 8 MiB of heap; four at once hold 32 MiB.
+    let kernel = Arc::new(Spinner::new(Duration::from_millis(20)).amplify(64));
+    let applies = Arc::clone(&kernel.applies);
+    let low = (ram_for(machine.baseline + 384 * MIB) as f64 * 0.9) as u64;
+    let spec = spec_of(&scratch, kernel.clone(), 1500, 16_384);
+    let cut = Arc::new(Mutex::new(None::<Instant>));
+    let marked = Arc::clone(&cut);
+    let (report, _, _) = run_on(&machine, spec, move |script| {
+        if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 60) {
+            return;
+        }
+        script.set(reading(low, 4.0));
+        *marked.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let at = applies.load(Ordering::SeqCst);
+        script.wait("work at the lower limits", || {
+            applies.load(Ordering::SeqCst) >= at + 400
+        });
+    });
+    assert_eq!(
+        report.exit,
+        moruna_runtime::ExitReason::Completed,
+        "{:?}",
+        report.notes
+    );
+    let Some(cut) = *cut.lock().unwrap_or_else(|e| e.into_inner()) else {
+        panic!("the run ended before the squeeze");
+    };
+    // A second to settle, then the workers that ran.
+    let (mean, starts) = kernel.mean_concurrent_after(cut + Duration::from_secs(1));
+    assert!(starts >= 100, "{starts} applies after the squeeze settled");
+    assert!(
+        mean >= 2.5,
+        "after the squeeze {mean:.2} applies ran at once on average, with room for four: {:?}",
+        report.notes
+    );
+    assert!(kernel.max_concurrent_after(cut + Duration::from_secs(1)) <= 4);
 }

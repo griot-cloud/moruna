@@ -358,7 +358,7 @@ pub(crate) fn workers_allowed(state: &ControllerState) -> u16 {
     let max_allowance = state
         .stages
         .iter()
-        .map(|ctl| ctl.allowance(ctl.target))
+        .map(|ctl| ctl.allowance(ctl.in_flight()))
         .max()
         .unwrap_or(0);
     let bound = crate::elastic::workers_bound(state);
