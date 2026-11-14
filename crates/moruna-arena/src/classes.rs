@@ -55,6 +55,18 @@ pub(crate) fn class_size(c: usize) -> u64 {
     GRANULE << c
 }
 
+/// What a request of `bytes` costs against the budget (e.2): its class, or the granule-rounded
+/// size of a large allocation.
+pub(crate) fn charge_of(bytes: u64) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    match class_for(bytes) {
+        Some(c) => class_size(c),
+        None => crate::region::align_up(bytes, GRANULE),
+    }
+}
+
 /// The class that serves `bytes`, or `None` when the request is a large allocation (e.2).
 pub(crate) fn class_for(bytes: u64) -> Option<usize> {
     if bytes <= GRANULE {
@@ -331,13 +343,7 @@ impl Space {
 
     /// What a request of `bytes` costs against the budget (e.2).
     pub(crate) fn charged(&self, bytes: u64) -> u64 {
-        if bytes == 0 {
-            return 0;
-        }
-        match class_for(bytes) {
-            Some(c) => class_size(c),
-            None => crate::region::align_up(bytes, GRANULE),
-        }
+        charge_of(bytes)
     }
 
     fn alloc_class(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {

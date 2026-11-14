@@ -243,10 +243,13 @@ fn ar_t13_region_serves_its_free_space() {
             Ok(b) => live.push(b),
             Err(_) => {
                 refusals += 1;
-                // Every refusal is honest: the region cannot serve a request this size.
+                // Every refusal is honest: the region cannot serve a request this size, or the
+                // budget as a whole has no room for it while a side region holds part of it
+                // (RB5).
                 let largest = arena.largest_free(Tier::Host);
+                let whole = arena.stats().host_in_use + common::charged(bytes as u64);
                 assert!(
-                    largest < bytes as u64,
+                    largest < bytes as u64 || whole > region,
                     "step {step}: {bytes} bytes refused while {largest} bytes were servable \
                      (AR-I2, e.1)"
                 );
@@ -260,9 +263,11 @@ fn ar_t13_region_serves_its_free_space() {
                      bytes committed (e.1)"
                 );
                 // And the bytes are accounted for: what is in use plus what the class free
-                // lists hold plus what is still free never exceeds the region.
+                // lists hold plus what is still free never exceeds the region. A side region's
+                // buffer is outside the region (RB5), and the budget holds it as a whole.
                 let stats = arena.arena_stats();
-                let in_use = arena.stats().host_in_use;
+                let in_use = arena.stats().host_in_use - arena.side_in_use();
+                assert!(arena.stats().host_in_use <= region);
                 assert!(
                     in_use + stats.stranded_bytes <= region,
                     "step {step}: {in_use} in use and {} stranded in a {region} byte region",
@@ -323,4 +328,62 @@ fn ar_t16_lazy_footprint() {
         "the bytes written are charged: {}",
         after_use.saturating_sub(after_new)
     );
+}
+
+// AR-T17 side_region (02 f.3, RB5): a large request the regions have room for by charge but
+// not in one piece is served from a side region, the budget holds as a whole while it is live,
+// and the side region is gone when its buffer comes home.
+
+#[test]
+fn ar_t17_side_region() {
+    const MIB: usize = 1 << 20;
+    let arena = common::host_arena(128 << 20);
+    let tier = Tier::Host;
+    // Fill the region with 2 MiB buffers, then free every other one: half the budget is free,
+    // in 2 MiB pieces no buddy of which can merge.
+    let mut held: Vec<Option<Buffer>> = Vec::new();
+    while let Ok(buffer) = arena.alloc(2 * MIB, tier) {
+        held.push(Some(buffer));
+    }
+    assert!(held.len() >= 60, "the region took {} buffers", held.len());
+    for slot in held.iter_mut().step_by(2) {
+        *slot = None;
+    }
+    let free = arena.available(tier).expect("a host tier");
+    assert!(free >= 60 * MIB as u64, "{free} bytes free");
+    assert!(arena.largest_free(tier) < 8 * MIB as u64);
+
+    // 8 MiB has no piece to come from, and the budget has room for it.
+    let big = arena
+        .alloc(8 * MIB, tier)
+        .expect("served from a side region");
+    assert_eq!(big.len(), 8 * MIB);
+    assert_eq!(arena.side_regions(), 1);
+    assert_eq!(
+        arena.available(tier).expect("a host tier"),
+        free - 8 * MIB as u64,
+        "the side region's bytes count against the budget"
+    );
+
+    // The holes left take what the budget has left and not a byte more, though there are
+    // holes to spare: the budget is checked as a whole while the side region is live.
+    let room = (free as usize - 8 * MIB) / (2 * MIB);
+    let mut more = Vec::new();
+    for _ in 0..room {
+        more.push(arena.alloc(2 * MIB, tier).expect("inside the budget"));
+    }
+    assert!(
+        arena.alloc(2 * MIB, tier).is_err(),
+        "a hole remains, but the budget is spent"
+    );
+
+    // The side region goes when its buffer comes home, and the hole is the budget's again.
+    drop(big);
+    let last = arena
+        .alloc(2 * MIB, tier)
+        .expect("the side region's bytes came back");
+    drop(last);
+    drop(more);
+    drop(held);
+    assert_eq!(arena.available(tier), Some(arena.regions_capacity()));
 }

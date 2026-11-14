@@ -102,7 +102,16 @@ struct HostRegion {
     /// True for the region `new` made. It never drains: the run's first region is what every
     /// zero-length buffer points into, and the budget arithmetic of 11 f.1 sized it.
     base: bool,
+    /// True for a side region (RB5, [`Inner::alloc_side`]): one large buffer the other regions
+    /// had room for by charge but not in one piece. Draining from birth, so it takes nothing
+    /// else, and unmapped when that buffer comes home; not capacity, so neither the watcher's
+    /// arithmetic nor its pacing counts it.
+    side: bool,
 }
+
+/// The smallest request a side region is made for: below it a refusal is the arena being full,
+/// not fragmented, and a region per request would cost a mapping for each.
+const SIDE_MIN: u64 = 1024 * 1024;
 
 /// One reserved device region and the size-class allocator over it.
 struct RegionAlloc {
@@ -146,6 +155,11 @@ struct Inner {
     /// The most host bytes the arena may have in use, set when the ceiling falls below what its
     /// regions hold and the first region cannot drain (RB4); `u64::MAX` when uncapped.
     host_cap: AtomicU64,
+    /// Side regions mapped and not yet retired (RB5): while any is, every host allocation is
+    /// checked against the budget as a whole.
+    side_live: AtomicU64,
+    /// Side regions made over the run.
+    side_made: AtomicU64,
     /// Double releases counted by regions that have since been retired.
     retired_double_release: AtomicU64,
 }
@@ -233,6 +247,7 @@ impl Arena {
             _mapping: host.mapping,
             draining: AtomicBool::new(false),
             base: true,
+            side: false,
         });
         let devices = Self::devices(&cfg, align)?;
         tracing::info!(
@@ -263,6 +278,8 @@ impl Arena {
                 retired_regions: AtomicU64::new(0),
                 retired_bytes: AtomicU64::new(0),
                 host_cap: AtomicU64::new(u64::MAX),
+                side_live: AtomicU64::new(0),
+                side_made: AtomicU64::new(0),
                 retired_double_release: AtomicU64::new(0),
             }),
         }))
@@ -313,6 +330,7 @@ impl Arena {
             _mapping: host.mapping,
             draining: AtomicBool::new(false),
             base: false,
+            side: false,
         });
         inner.write_host().push(grown);
         tracing::info!(target: "arena.grow", bytes = added, "arena grew by a region");
@@ -357,7 +375,7 @@ impl Arena {
         self.inner
             .read_host()
             .iter()
-            .filter(|r| r.draining.load(Ordering::SeqCst))
+            .filter(|r| !r.side && r.draining.load(Ordering::SeqCst))
             .map(|r| r.space.bytes())
             .sum()
     }
@@ -372,11 +390,22 @@ impl Arena {
 
     /// Host bytes in the regions that are not draining, whatever the cap.
     pub fn regions_capacity(&self) -> u64 {
+        self.inner.live_capacity(&self.inner.read_host())
+    }
+
+    /// Side regions made over the run (RB5): large buffers the regions had room for by charge
+    /// but not in one piece.
+    pub fn side_regions(&self) -> u64 {
+        self.inner.side_made.load(Ordering::Relaxed)
+    }
+
+    /// Host bytes in use in side regions now (RB5).
+    pub fn side_in_use(&self) -> u64 {
         self.inner
             .read_host()
             .iter()
-            .filter(|r| !r.draining.load(Ordering::SeqCst))
-            .map(|r| r.space.bytes())
+            .filter(|r| r.side)
+            .map(|r| r.space.in_use())
             .sum()
     }
 
@@ -566,6 +595,12 @@ impl Inner {
     fn retire_drained(&self, host: &mut Vec<Arc<HostRegion>>) {
         host.retain(|region| {
             let empty = region.draining.load(Ordering::SeqCst) && region.space.in_use() == 0;
+            if empty && region.side {
+                self.side_live.fetch_sub(1, Ordering::SeqCst);
+                self.retired_double_release
+                    .fetch_add(region.space.double_releases(), Ordering::Relaxed);
+                return false;
+            }
             if empty {
                 self.retired_regions.fetch_add(1, Ordering::Relaxed);
                 self.retired_bytes
@@ -604,6 +639,16 @@ impl Inner {
                 return Err((cap, in_use));
             }
         }
+        // A side region's bytes are outside the regions' capacity, so while one is live the
+        // budget is checked as a whole: the regions together never hold more than their
+        // capacity, whichever of them the bytes are in (RB5).
+        if self.side_live.load(Ordering::SeqCst) > 0 {
+            let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+            let limit = self.live_capacity(&host).min(cap);
+            if in_use.saturating_add(crate::classes::charge_of(bytes)) > limit {
+                return Err((limit, in_use));
+            }
+        }
         for region in host.iter() {
             if region.draining.load(Ordering::SeqCst) {
                 continue;
@@ -620,6 +665,68 @@ impl Inner {
         let in_use = host.iter().map(|r| r.space.in_use()).sum();
         Err((budget, in_use))
     }
+
+    /// Host bytes in the regions that serve allocations: neither draining nor side regions.
+    fn live_capacity(&self, host: &[Arc<HostRegion>]) -> u64 {
+        host.iter()
+            .filter(|r| !r.side && !r.draining.load(Ordering::SeqCst))
+            .map(|r| r.space.bytes())
+            .sum()
+    }
+
+    /// RB5 (2026-11-14): a large host request the regions have room for by charge but not in
+    /// one piece is served from a side region of its own, mapped untouched (so it costs only the
+    /// pages written), draining from birth (so it takes nothing else) and unmapped when the
+    /// buffer comes home. Its charge counts against the budget like any other, and while it is
+    /// live every allocation is checked against the budget as a whole (`alloc_host`). Before, a
+    /// 128 MiB sink buffer was refused with a gigabyte free in pieces and the run ended (Enrich
+    /// over the whole dataset). `None` when the arena is page-locked or touched at reservation
+    /// (a side region would have to be prepared the same way), the request is small, or the
+    /// budget has no room for it.
+    fn alloc_side(&self, bytes: u64) -> Option<(*mut u8, Tier)> {
+        if self.pinned || self.pretouch || bytes < SIDE_MIN {
+            return None;
+        }
+        let charge = crate::classes::charge_of(bytes);
+        let mut host = self.write_host();
+        let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+        let limit = self
+            .live_capacity(&host)
+            .min(self.host_cap.load(Ordering::SeqCst));
+        if in_use.saturating_add(charge) > limit {
+            return None;
+        }
+        // The pages the regions hold free go back to the operating system first: freed buffers
+        // leave their pages resident until something lands on them again, and a side region on
+        // top of those would put the process past what the controller counts the arena as
+        // (11 f.3: the regions' bytes). After this the arena is resident in what is in use.
+        let page = self.page_bytes as u64;
+        for region in host.iter().filter(|r| !r.draining.load(Ordering::SeqCst)) {
+            region.space.release_free(page);
+        }
+        let len = region::align_up(charge, self.align.max(GRANULE));
+        let mapped =
+            region::new_host(len, self.align, false, self.huge_pages, self.memlock, false).ok()?;
+        let side = Arc::new(HostRegion {
+            space: Space::new(
+                mapped.mapping.base(),
+                mapped.mapping.bytes(),
+                self.host_tier,
+                crate::classes::class_for(bytes).is_some(),
+                Arc::clone(&self.host_watermark),
+            ),
+            _mapping: mapped.mapping,
+            draining: AtomicBool::new(true),
+            base: false,
+            side: true,
+        });
+        let (ptr, _) = side.space.alloc(bytes).ok()?;
+        host.push(side);
+        self.side_live.fetch_add(1, Ordering::SeqCst);
+        self.side_made.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(target: "arena.side", bytes, charge, "a large buffer got a side region");
+        Some((ptr, self.host_tier))
+    }
 }
 
 /// Contracts d.3. The arena overrides every method, including the three with defaults
@@ -632,8 +739,14 @@ impl Allocator for Arena {
             let (bytes, in_use) = live.fold((0u64, 0u64), |(b, u), r| {
                 (b + r.space.bytes(), u + r.space.in_use())
             });
+            // A side region's bytes count against the budget too (RB5).
+            let side: u64 = host
+                .iter()
+                .filter(|r| r.side)
+                .map(|r| r.space.in_use())
+                .sum();
             let bytes = bytes.min(self.inner.host_cap.load(Ordering::SeqCst));
-            return Some(bytes.saturating_sub(in_use));
+            return Some(bytes.saturating_sub(in_use.saturating_add(side)));
         }
         self.inner
             .space_of(tier)
@@ -658,7 +771,9 @@ impl Allocator for Arena {
         }
         let inner = &self.inner;
         let served = if inner.is_host(tier) {
-            inner.alloc_host(bytes as u64)
+            inner
+                .alloc_host(bytes as u64)
+                .or_else(|refused| inner.alloc_side(bytes as u64).ok_or(refused))
         } else {
             match inner.space_of(tier) {
                 Some(space) => match space.alloc(bytes as u64) {
