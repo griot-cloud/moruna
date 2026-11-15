@@ -1,7 +1,9 @@
-# A managed agent is kept for up to seven days, so a job finds its earlier build under target/:
-# the checkout leaves it, and every other untracked file an earlier run left goes. Every job of
-# this pipeline shares one checkout on the agent, and the job disk (/mnt, 75 GB) is too small for
-# all of their builds together, so target/ is the pool's 128 GB data disk, bound in once.
+# A managed agent is kept for up to seven days, so a job finds its earlier build under target/
+# and kernel/target/: the checkout leaves them, and every other untracked file an earlier run
+# left goes. They stay on the job disk (/mnt, the VM's local SSD). Bound onto the pool's 128 GB
+# Standard SSD data disk instead, a cold Rust gate ran past 90 minutes, against about 45 on the
+# job disk (2026-11-15). Every job of this pipeline shares the one checkout, so when the job disk
+# has under 20 GB free the builds are dropped and the job starts cold.
 parameters:
   - name: fetchDepth
     type: number
@@ -12,16 +14,13 @@ steps:
     clean: false
   - bash: |
       set -euo pipefail
-      if [ -d /mnt/storage ] && mountpoint -q /mnt/storage; then
-        store=/mnt/storage/moruna-target
-        sudo mkdir -p "$store"
-        sudo chown "$(id -u):$(id -g)" "$store"
-        if ! mountpoint -q target; then
-          # A target/ left on the job disk by a run before this one gives its space back.
-          rm -rf target && mkdir target
-          sudo mount --bind "$store" target
-        fi
+      # An earlier version of this template bound target/ onto the data disk.
+      if mountpoint -q target; then sudo umount target; fi
+      git clean -ffdxq -e /target/ -e /kernel/target/
+      free_gb=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
+      if [ "$free_gb" -lt 20 ]; then
+        echo "the job disk has ${free_gb} GB free: the earlier build goes"
+        rm -rf target kernel/target
       fi
-      git clean -ffdxq -e /target/
-      df -h . target | tail -2
-    displayName: An earlier run's untracked files go; target/ stays, on the data disk
+      df -h . | tail -1
+    displayName: An earlier run's untracked files go; target/ stays while the job disk has room

@@ -48,15 +48,22 @@ def main(commit: str) -> int:
     pr = merged[0]["pullRequestId"]
     builds = get(
         f"{api}/build/builds?definitions={definition}&branchName=refs/pull/{pr}/merge"
-        "&statusFilter=completed&resultFilter=succeeded&$top=1&api-version=7.1"
+        "&statusFilter=completed&resultFilter=succeeded&$top=20&api-version=7.1"
     )["value"]
-    if not builds:
-        print(f"pull request {pr}'s validation build of this pipeline did not succeed, so "
-              f"{commit} is not published")
-        return 1
-    print(f"{commit} is the merge of pull request {pr}, whose validation build "
-          f"{builds[0]['buildNumber']} succeeded")
-    return 0
+    # What was tested is what merged: a squash merge is a new commit, so the check is that a
+    # passing build ran on the same tree.
+    tree = get(f"{api}/git/repositories/{repo}/commits/{commit}?api-version=7.1")["treeId"]
+    for build in builds:
+        tested = get(
+            f"{api}/git/repositories/{repo}/commits/{build['sourceVersion']}?api-version=7.1"
+        )["treeId"]
+        if tested == tree:
+            print(f"{commit} is the merge of pull request {pr}, and validation build "
+                  f"{build['buildNumber']} passed on the same tree ({tree})")
+            return 0
+    print(f"no passing validation build of pull request {pr} ran on {commit}'s tree ({tree}), "
+          "so it is not published")
+    return 1
 
 
 if __name__ == "__main__":
