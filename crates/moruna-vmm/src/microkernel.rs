@@ -449,24 +449,31 @@ impl RunningNode {
 
     /// Observe the actual emulator process exit, independently of job result
     /// delivery over the guest service protocol. A vsock back end that has ended while QEMU
-    /// runs, or has failed at all (a signal, its filter's `SIGSYS` among them, or a nonzero
-    /// code), is an error naming its status and its log, whatever QEMU did after it.
+    /// runs (QEMU still running `BACKEND_EXIT_GRACE` after the back end was seen ended), or
+    /// has failed at all (a signal, its filter's `SIGSYS` among them, or a nonzero code), is an
+    /// error naming its status and its log, whatever QEMU did after it.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>> {
         // The back end ends after QEMU disconnects it, so it is read first: a back end seen
-        // ended with QEMU then still running really did end under a live node, rather than
-        // QEMU and then its back end both ending between the two reads.
+        // ended with QEMU then still running either ended under a live node, or QEMU is on its
+        // way out (it disconnects the back end before its own process ends and is reaped), and
+        // `settle` gives QEMU a moment to show which.
         let backend = self
             .backend
             .lock()
             .map_err(|_| VmmError::Control("owned vsock state poisoned".into()))?
             .try_wait()
             .map_err(|e| VmmError::io("wait", "owned vsock backend", &e))?;
-        let status = self
-            .qemu
-            .lock()
-            .map_err(|_| VmmError::Control("owned QEMU state poisoned".into()))?
-            .try_wait()
-            .map_err(|e| VmmError::io("wait", "owned node QEMU", &e))?;
+        let status = settle(
+            backend,
+            || {
+                self.qemu
+                    .lock()
+                    .map_err(|_| VmmError::Control("owned QEMU state poisoned".into()))?
+                    .try_wait()
+                    .map_err(|e| VmmError::io("wait", "owned node QEMU", &e))
+            },
+            BACKEND_EXIT_GRACE,
+        )?;
         if let Some(ended) = backend
             && (status.is_none() || !ended.success())
         {
@@ -483,6 +490,31 @@ impl RunningNode {
         Ok(status)
     }
 }
+/// How long QEMU is given to be seen ending after its back end ended cleanly: QEMU disconnects
+/// the back end on its way out, and its own process ends, and is reaped, after. The jailed TCG
+/// boot test read the gap as a back end ending under a live node about once in 26 runs on the
+/// benchmark VM (2026-11-15).
+const BACKEND_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// QEMU's status, read by `qemu`, once the back end's is known. While a back end that ended
+/// cleanly has QEMU still running, QEMU is read again until it has ended or `grace` has passed;
+/// otherwise it is read once. Which of these is an error is the caller's to say.
+fn settle(
+    backend: Option<std::process::ExitStatus>,
+    mut qemu: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
+    grace: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let mut status = qemu()?;
+    if backend.is_some_and(|ended| ended.success()) {
+        let deadline = Instant::now() + grace;
+        while status.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            status = qemu()?;
+        }
+    }
+    Ok(status)
+}
+
 fn qmp_reply(reader: &mut BufReader<UnixStream>) -> Result<serde_json::Value> {
     for _ in 0..16 {
         let mut line = String::new();
@@ -1144,6 +1176,61 @@ fn launch_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// A back end that ended cleanly gives QEMU the grace to be seen ending: QEMU read as
+    /// running twice, then ended, is QEMU's exit, not a back end that ended under a live node.
+    #[test]
+    fn a_cleanly_ended_back_end_waits_for_qemus_exit() {
+        let mut reads = 0;
+        let status = settle(
+            Some(ExitStatusExt::from_raw(0)),
+            || {
+                reads += 1;
+                Ok((reads > 2).then(|| ExitStatusExt::from_raw(0x10 << 8)))
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(status.and_then(|s| s.code()), Some(0x10));
+        assert_eq!(reads, 3);
+    }
+
+    /// Past the grace, QEMU still running is what `try_wait` reports as a back end that ended
+    /// under a live node; a failed back end and a running one are read once, with no wait.
+    #[test]
+    fn qemu_is_read_once_unless_the_back_end_ended_cleanly() {
+        let started = Instant::now();
+        let still_running = settle(
+            Some(ExitStatusExt::from_raw(0)),
+            || Ok(None),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert!(still_running.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        for backend in [None, Some(ExitStatusExt::from_raw(1 << 8))] {
+            let mut reads = 0;
+            let status = settle(
+                backend,
+                || {
+                    reads += 1;
+                    Ok(None)
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(status.is_none());
+            assert_eq!(reads, 1, "{backend:?}");
+        }
+        let refused = settle(
+            Some(ExitStatusExt::from_raw(0)),
+            || Err(VmmError::Control("poisoned".into())),
+            Duration::from_secs(5),
+        );
+        assert!(refused.is_err());
+    }
+
     #[test]
     fn production_acceleration_never_selects_a_fallback() {
         assert_eq!(
