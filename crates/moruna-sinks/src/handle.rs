@@ -143,6 +143,13 @@ impl Sink for SinkHandle {
         }
     }
 
+    fn lagging(&self) -> bool {
+        match self {
+            SinkHandle::Plain(sink) => sink.lagging(),
+            SinkHandle::Ordered(buffer) => buffer.lagging(),
+        }
+    }
+
     fn checkpoint(&self) -> Result<Option<Vec<u8>>> {
         match self {
             SinkHandle::Plain(sink) => sink.checkpoint(),

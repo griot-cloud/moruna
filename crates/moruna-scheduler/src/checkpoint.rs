@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use moruna_kernel::{CheckpointExtras, MorunaError, Result, ResumePolicy, Sink, StageId};
+use moruna_kernel::{CheckpointExtras, MorunaError, Result, ResumePolicy, Seq, Sink, StageId};
 
 use crate::instances;
 use crate::shared::Shared;
@@ -77,6 +77,22 @@ impl Drop for Barrier<'_> {
 /// Why no manifest is written once a stage's finish has given a batch (f.12).
 const FINISH_GAVE: &str = "a stage's finish gave batches made at the end of its input, which no \
                            manifest can record; the run's last manifest is the one before them";
+
+/// Whether a sink's watermark is stuck: it read `before` at the last checkpoint and `reached`
+/// now, and its queue has delivered up to `highest`. Stuck means it has not moved since a
+/// checkpoint that has already seen it, and morsels past it were delivered.
+pub(crate) fn stuck(
+    before: Option<Option<Seq>>,
+    reached: Option<Seq>,
+    highest: Option<Seq>,
+) -> bool {
+    let delivered_past = match (highest, reached) {
+        (Some(highest), Some(reached)) => highest > reached,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    before == Some(reached) && delivered_past
+}
 
 /// How many manifest writes may fail in a row before the run ends (f.12, placement h).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -238,6 +254,42 @@ pub(crate) fn checkpoint_now(shared: &Shared) -> Result<PathBuf> {
                 sink.checkpoint_flush()?;
             }
             crate::sink_drive::update_watermark(shared, end);
+        }
+    } else {
+        // A sink that writes several files at once (08 f.12) commits a morsel when the file it
+        // went into is full, so the morsel at its watermark can sit in a file that stopped
+        // filling, a held or stalled run's, while later ones commit around it, and the manifest
+        // says nothing past it however long the run stays there (KD-T17 on a four-CPU agent,
+        // 2026-11-15). A sink whose watermark has not moved since the last checkpoint while its
+        // queue delivered past it, and which has committed past it (`Sink::lagging`), is
+        // flushed now; one whose watermark moves, or whose output commits in order, is left to
+        // fill its files. Each sink's flush takes its own locks, so no barrier is needed, and a
+        // held run never reaches one.
+        for end in &shared.sinks {
+            let reached = end
+                .committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reached;
+            let highest = *end.highest.lock().unwrap_or_else(|e| e.into_inner());
+            let before = end
+                .checkpointed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(reached);
+            if stuck(before, reached, highest) {
+                {
+                    let sink = end.sink.read().unwrap_or_else(|e| e.into_inner());
+                    // Only output committed out of order: a sink with one writer whose file is
+                    // still filling is not behind, and flushing it would move where its files
+                    // end, which a resumed run must reproduce byte for byte (PL-T17).
+                    if !sink.lagging() {
+                        continue;
+                    }
+                    sink.checkpoint_flush()?;
+                }
+                crate::sink_drive::update_watermark(shared, end);
+            }
         }
     }
     let mut kernel_states: Vec<(StageId, usize, Vec<u8>)> = Vec::new();

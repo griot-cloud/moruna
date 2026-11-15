@@ -732,6 +732,10 @@ impl Sink for ParquetSink {
         self.lock().ledger.committed_seq()
     }
 
+    fn lagging(&self) -> bool {
+        self.lock().ledger.lagging()
+    }
+
     fn skip(&self, seq: Seq) {
         self.lock().ledger.skip(seq);
     }

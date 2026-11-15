@@ -209,6 +209,8 @@ A standard Vortex file (magic `VTXF`, segments, footer, postscript) as the `vort
 
 **f.12 Lane buffers and the close (amended 2026-11-14).** The lanes' file buffers are allocated together at `open` (`FileBuffers::alloc_set`): as many as the run has workers, each `class_ceil(2 x file_bytes / lanes)` and at most what the arena has free over twice the count, halving on a refusal; the set is kept for the run, so the lanes take from the arena what the sink's pair of buffers did. The runtime bounds a morsel by one lane's buffer, not one file's (`morsels are at most ... half of one of the sink's N ... byte file buffers`), so no encode needs a buffer larger than its lane's. `finish` and `checkpoint_flush` close the lanes at once, one thread per lane with a file open: a close encodes and compresses the file's last row group, and one lane after another on the drive it was a quarter of a one-second job's wall on eight lanes. The lanes are the run's workers, idle by then, so the threads take no CPU the run was not given. SI-T33 covers both.
 
+**f.12 A lane can hold the watermark back (amended 2026-11-15).** A lane commits a file when it is full, so the morsel at the watermark can wait in a lane whose file stopped filling (a held or stalled run's) while other lanes commit later morsels, and the watermark (f.7) stays where it is for as long as that lane does. `Sink::lagging` is true while the ledger holds a sequence number committed past a gap or a committed file straddling the watermark (`Ledger::lagging`), which output committed in order, one writer's, never leaves; the scheduler flushes such a sink at a checkpoint once its watermark has stood still (10 f.12). SI-T34.
+
 ## g. Concurrency within the component
 
 `write` may be called concurrently for different payloads (the scheduler's sink driver issues up to `sink.concurrency`); the Parquet writer is single-threaded by nature, so `ParquetSink` serialises appends with a mutex around the writer and lets encodes of different row groups overlap only at roll boundaries. `ArrowIpcSink` and per-morsel `TensorSink` are concurrent up to the reactor's file depth. `ReorderBuffer` holds a mutex across `write`'s and `skip`'s bookkeeping only, not across the inner `write`. Every reactor call a sink makes returns at once (RE-I6); the sink's `write` future awaits the completions, and the scheduler's sink drive is what polls it. `SinkHandle` adds no lock of its own.
@@ -303,6 +305,8 @@ The Vortex sink's tests (2026-09-29) are in `tests/si_vortex.rs` and read every 
 **SI-T32 pyarrow_opens_compressed_files.** (`python/tests/test_ipc.py`) Files the sink compresses with `zstd`, `zstd` at level 19 and `lz4`, ordered and not, are opened by `pyarrow.ipc.open_file`, memory mapped as well, and read equal; they are smaller than the sink's uncompressed files; and they read back through `moruna.ArrowIpcSource` equal.
 
 **SI-T33 parallel_encodes.** (`tests/si_lanes.rs`) Eight threads encode 25 morsels each into one Parquet sink at once and the drive puts them; every row is in exactly one committed, readable file and `committed_seq` reaches the last sequence number. A `write` is the same encode and put. f.12, RB1.
+
+**SI-T34 a_ledger_lags_only_past_a_gap (2026-11-15).** (`checkpoint.rs`) A file holding 1 and 2 committed before 0 makes the ledger lag, with no watermark; committing 0 ends it and moves the watermark to 2; files committed in order never lag. f.12.
 
 ## l. Implementation notes for the agent
 

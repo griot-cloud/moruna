@@ -318,6 +318,9 @@ pub(crate) struct SinkEnd {
     pub(crate) drained: AtomicBool,
     /// Drive-owned acknowledgement after every admitted write future resolved.
     pub(crate) checkpoint_paused: AtomicBool,
+    /// The watermark the last checkpoint read, once one has (f.12: a sink stuck below what its
+    /// queue delivered is flushed at the next).
+    pub(crate) checkpointed: Mutex<Option<Option<Seq>>>,
     pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
     pub(crate) unparker: Mutex<Option<Unparker>>,
 }
@@ -607,6 +610,7 @@ impl Shared {
                 highest: Mutex::new(None),
                 drained: AtomicBool::new(false),
                 checkpoint_paused: AtomicBool::new(false),
+                checkpointed: Mutex::new(None),
                 handle: Mutex::new(None),
                 unparker: Mutex::new(None),
             });

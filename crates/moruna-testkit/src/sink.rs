@@ -16,6 +16,9 @@ struct State {
     rows: u64,
     bytes: u64,
     committed: Option<Seq>,
+    /// What a `checkpoint_flush` committed (with `commits_on_flush`): the watermark never
+    /// falls below it.
+    flushed: Option<Seq>,
     state_bytes: Vec<u8>,
 }
 
@@ -26,18 +29,22 @@ struct Inner {
     fail_at: Option<Seq>,
     latency: Duration,
     requires_order: bool,
+    commits_on_flush: bool,
+    lags: bool,
     open_calls: AtomicU64,
     resume_calls: AtomicU64,
     finish_calls: AtomicU64,
     shutdown_calls: AtomicU64,
+    flush_calls: AtomicU64,
 }
 
 /// The sink as a test sees it: it remembers the sequence numbers it was given and advances its
 /// commit watermark in blocks, so a resume test can see uncommitted output (d.15).
 ///
 /// Knobs: `commit_every(n)`, `resumable(bool)`, `fail_at(seq)`, `latency(Duration)`,
-/// `requires_order(bool)`. Observables: `written()`, `skipped()`, `committed_seq()`,
-/// `open_calls()`, `resume_calls()`, `finish_calls()`, `shutdown_calls()`.
+/// `requires_order(bool)`, `commits_on_flush(bool)`, `lags(bool)`. Observables: `written()`, `skipped()`,
+/// `committed_seq()`, `open_calls()`, `resume_calls()`, `finish_calls()`, `shutdown_calls()`,
+/// `checkpoint_flush_calls()`.
 ///
 /// `Sink` has no `shutdown` method (d.8), so `shutdown_calls()` counts this fake's own
 /// inherent `shutdown()`, which a facade-level test calls to prove the shutdown sequence of
@@ -64,10 +71,13 @@ impl FakeSink {
                 fail_at: None,
                 latency: Duration::ZERO,
                 requires_order: false,
+                commits_on_flush: false,
+                lags: false,
                 open_calls: AtomicU64::new(0),
                 resume_calls: AtomicU64::new(0),
                 finish_calls: AtomicU64::new(0),
                 shutdown_calls: AtomicU64::new(0),
+                flush_calls: AtomicU64::new(0),
             }),
         }
     }
@@ -96,6 +106,24 @@ impl FakeSink {
     /// Knob: whether the sink needs morsels in sequence order.
     pub fn requires_order(self, requires_order: bool) -> FakeSink {
         self.rebuild(|b| b.requires_order = requires_order)
+    }
+
+    /// Knob: whether `checkpoint_flush` commits every contiguous number written, as a file
+    /// sink commits what its open files hold when it rolls them (08 f.12). Off, a flush commits
+    /// nothing, as the trait's default does.
+    pub fn commits_on_flush(self, commits_on_flush: bool) -> FakeSink {
+        self.rebuild(|b| b.commits_on_flush = commits_on_flush)
+    }
+
+    /// Knob: what `lagging` answers: whether the sink says it committed output past a gap, as a
+    /// sink with several writers does (08 f.12).
+    pub fn lags(self, lags: bool) -> FakeSink {
+        self.rebuild(|b| b.lags = lags)
+    }
+
+    /// Observable: how many times `checkpoint_flush` was called.
+    pub fn checkpoint_flush_calls(&self) -> u64 {
+        self.inner.flush_calls.load(Ordering::SeqCst)
     }
 
     /// Observable: the sequence numbers written, in call order.
@@ -144,6 +172,8 @@ impl FakeSink {
             fail_at: self.inner.fail_at,
             latency: self.inner.latency,
             requires_order: self.inner.requires_order,
+            commits_on_flush: self.inner.commits_on_flush,
+            lags: self.inner.lags,
         };
         f(&mut builder);
         let state = std::mem::take(&mut *self.lock());
@@ -155,10 +185,13 @@ impl FakeSink {
                 fail_at: builder.fail_at,
                 latency: builder.latency,
                 requires_order: builder.requires_order,
+                commits_on_flush: builder.commits_on_flush,
+                lags: builder.lags,
                 open_calls: AtomicU64::new(self.open_calls()),
                 resume_calls: AtomicU64::new(self.resume_calls()),
                 finish_calls: AtomicU64::new(self.finish_calls()),
                 shutdown_calls: AtomicU64::new(self.shutdown_calls()),
+                flush_calls: AtomicU64::new(self.checkpoint_flush_calls()),
             }),
         }
     }
@@ -187,7 +220,25 @@ impl FakeSink {
                 committed = Some(blocks * self.inner.commit_every - 1);
             }
         }
-        state.committed = committed;
+        state.committed = committed.max(state.flushed);
+    }
+
+    /// The highest number below which every number was written or skipped.
+    fn contiguous(state: &State) -> Option<Seq> {
+        let mut seen: Vec<Seq> = state
+            .written
+            .iter()
+            .chain(state.skipped.iter())
+            .copied()
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let run = seen
+            .iter()
+            .enumerate()
+            .take_while(|(i, s)| **s == *i as u64)
+            .count();
+        (run > 0).then(|| run as u64 - 1)
     }
 }
 
@@ -197,6 +248,8 @@ struct Builder {
     fail_at: Option<Seq>,
     latency: Duration,
     requires_order: bool,
+    commits_on_flush: bool,
+    lags: bool,
 }
 
 impl Sink for FakeSink {
@@ -252,6 +305,20 @@ impl Sink for FakeSink {
 
     fn committed_seq(&self) -> Option<Seq> {
         self.lock().committed
+    }
+
+    fn checkpoint_flush(&self) -> Result<()> {
+        self.inner.flush_calls.fetch_add(1, Ordering::SeqCst);
+        if self.inner.commits_on_flush {
+            let mut state = self.lock();
+            state.flushed = Self::contiguous(&state);
+            self.recompute_committed(&mut state);
+        }
+        Ok(())
+    }
+
+    fn lagging(&self) -> bool {
+        self.inner.lags
     }
 
     fn skip(&self, seq: Seq) {

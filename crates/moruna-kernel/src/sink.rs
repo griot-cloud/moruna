@@ -137,6 +137,15 @@ pub trait Sink: Send + Sync {
     fn checkpoint_flush(&self) -> crate::Result<()> {
         Ok(())
     }
+    /// Whether output holding a later sequence number is committed while an earlier one,
+    /// given to the sink, is not: a sink that writes several files at once commits a file when
+    /// it is full, so the morsel at its watermark can wait in a file that stopped filling while
+    /// later ones commit around it. The scheduler flushes such a sink at a checkpoint once its
+    /// watermark has stood still (SC f.12). Default: `false`, which is right for a sink with one
+    /// writer, whose output commits in order.
+    fn lagging(&self) -> bool {
+        false
+    }
     /// Opaque sink state for the run manifest (for a file sink: committed file
     /// names and the next file index). Called at every manifest write, and once at
     /// startup: a resumable sink returns `Some` even before its first write (an

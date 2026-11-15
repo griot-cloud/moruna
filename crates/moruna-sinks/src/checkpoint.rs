@@ -126,6 +126,13 @@ impl Ledger {
         self.watermark_next.checked_sub(1)
     }
 
+    /// Whether anything is committed above the watermark: a sequence number past a gap, or a
+    /// committed file that straddles it. Output committed in order, as one writer's is, never
+    /// leaves either (the kernel's `Sink::lagging`, SC f.12).
+    pub(crate) fn lagging(&self) -> bool {
+        !self.done.is_empty() || self.watermark_next < self.contiguous_next
+    }
+
     fn advance(&mut self) {
         while self.done.remove(&self.contiguous_next) {
             self.contiguous_next += 1;
@@ -232,5 +239,38 @@ impl Ledger {
             },
             above,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str, seq_min: Seq, seq_max: Seq) -> CommittedFile {
+        CommittedFile {
+            name: name.to_string(),
+            seq_min,
+            seq_max,
+            rows: 1,
+            bytes: 1,
+        }
+    }
+
+    /// SI-T34 (f.12): a ledger lags while a later sequence number is committed and an earlier
+    /// one is not, and stops once the gap is filled; output committed in order never lags.
+    #[test]
+    fn si_t34_a_ledger_lags_only_past_a_gap() {
+        let mut lanes = Ledger::new("parquet");
+        lanes.commit(file("part-00000.parquet", 1, 2), &[1, 2]);
+        assert!(lanes.lagging(), "1 and 2 committed, 0 not");
+        assert_eq!(lanes.committed_seq(), None);
+        lanes.commit(file("part-00001.parquet", 0, 0), &[0]);
+        assert!(!lanes.lagging());
+        assert_eq!(lanes.committed_seq(), Some(2));
+
+        let mut one = Ledger::new("parquet");
+        one.commit(file("part-00000.parquet", 0, 1), &[0, 1]);
+        one.commit(file("part-00001.parquet", 2, 3), &[2, 3]);
+        assert!(!one.lagging(), "one writer's output commits in order");
     }
 }
