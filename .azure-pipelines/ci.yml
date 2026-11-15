@@ -2,7 +2,9 @@
 # billing stopped every job. One pipeline, four stages in order, each deciding whether it
 # applies to the run:
 #
-#   version            every run: is the version in Cargo.toml without a tag yet?
+#   version            every run: an older unfinished run of the same pull request or branch is
+#                      cancelled (never on main: a superseded release is a half published one),
+#                      and is the version in Cargo.toml without a tag yet?
 #   build, test, lint  a pull request into main (build validation on main's branch policy, which
 #                      is how Azure Repos builds a pull request; a `pr:` key is ignored): fmt,
 #                      clippy, every test measured against the coverage floor, the Python suite on
@@ -75,6 +77,10 @@ stages:
           - checkout: self
             fetchDepth: 0
             fetchTags: true
+          - bash: python3 tools/release/azure_supersede.py
+            displayName: An older run of this pull request or branch stops (never on main)
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
           - bash: |
               set -euo pipefail
               version="$(awk '/^\[workspace.package\]/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.toml)"
