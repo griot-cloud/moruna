@@ -594,7 +594,17 @@ fn a_run_follows_the_machine_up_by_default() {
         kernel.max_concurrent_after(changed_at) > 2,
         "the pool did not grow past the starting two"
     );
-    assert!(report.peak_ceiling_bytes > start);
+    // The report judges its peak against the ceiling in force when the peak was sampled: the
+    // raised one when the peak came after the change, the starting one when it came before.
+    // With a container's limit as the ceiling the sampler counts the whole cgroup (DS-I4), whose
+    // peak the test harness or a CI agent sharing it can set before the change (Azure's managed
+    // agent, 2026-11-15), so either is right; that the ceiling rose is the timeline's, above.
+    let raised = report.limits_timeline[0].1.memory_ceiling;
+    assert!(
+        report.peak_ceiling_bytes == start || report.peak_ceiling_bytes == raised,
+        "the peak was judged against {} bytes, neither the starting {start} nor the raised {raised}",
+        report.peak_ceiling_bytes
+    );
 }
 
 /// RB4's exception: an explicit budget and CPU count are the caller's figures. The machine grows

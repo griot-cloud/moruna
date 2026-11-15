@@ -235,7 +235,12 @@ fn im_t17_an_image_is_a_stage() {
     let scratch = Scratch::new("im_t17");
     let report = run(&scratch, &[]).unwrap_or_else(|e| panic!("{e}"));
     let (n, id) = read_back(&scratch.path().join("out"));
-    assert_eq!(id, (0..ROWS).collect::<Vec<_>>(), "every row, in order");
+    // Every row exactly once. Across the sink's files the rows are in no order: Parquet encodes
+    // into as many lanes as encodes ran at once (08 f.12, RB1), and on a four-CPU agent the
+    // files' names and their rows no longer line up (2026-11-15).
+    let mut every = id.clone();
+    every.sort_unstable();
+    assert_eq!(every, (0..ROWS).collect::<Vec<_>>(), "every row, once");
     assert_eq!(n.len() as i64, ROWS);
     assert_eq!(n[0], 0);
     assert!(
@@ -409,7 +414,8 @@ fn im_t24_a_missing_command_is_named() {
     assert!(e.contains("user `app` is not numeric"), "{e}");
 }
 
-/// The `id` column of the Parquet files under `out`, in file order.
+/// The `id` column of the Parquet files under `out`, sorted: across the sink's files rows are in
+/// no order, since Parquet encodes into as many lanes as encodes ran at once (08 f.12, RB1).
 fn ids(out: &Path) -> Vec<i64> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(out)
         .unwrap()
@@ -430,6 +436,7 @@ fn ids(out: &Path) -> Vec<i64> {
             id.extend((0..array.len()).map(|i| array.value(i)));
         }
     }
+    id.sort_unstable();
     id
 }
 
