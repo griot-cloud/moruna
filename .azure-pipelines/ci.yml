@@ -56,6 +56,10 @@ variables:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TERM_COLOR: never
+  # No incremental caches: a CI build is never edited and rebuilt in place, and on the managed
+  # agent they filled the job disk at the Rust gate's last clippy (2026-11-15). GitHub's cache
+  # action set the same.
+  CARGO_INCREMENTAL: "0"
   QEMU_VERSION: "10.2.1"
   QEMU_SHA256: a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1
   isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
@@ -144,6 +148,8 @@ stages:
           name: griot-ci
         steps:
           - template: templates/checkout-kept.yml
+            parameters:
+              needGb: 40
           - template: templates/pythons.yml
           - template: templates/linux-gate-host.yml
           - bash: |

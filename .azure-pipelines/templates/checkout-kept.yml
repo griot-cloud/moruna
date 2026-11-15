@@ -3,11 +3,16 @@
 # left goes. They stay on the job disk (/mnt, the VM's local SSD). Bound onto the pool's 128 GB
 # Standard SSD data disk instead, a cold Rust gate ran past 90 minutes, against about 45 on the
 # job disk (2026-11-15). Every job of this pipeline shares the one checkout, so when the job disk
-# has under 20 GB free the builds are dropped and the job starts cold.
+# has less free than the job needs (`needGb`) the builds are dropped and the job starts cold.
 parameters:
   - name: fetchDepth
     type: number
     default: 1
+  # What the job's own build takes on the job disk at most. The Rust gate's (instrumented tests,
+  # clippy with every feature, the sandbox's wheel) ran a 74 GB disk with 34 GB free out of room.
+  - name: needGb
+    type: number
+    default: 20
 steps:
   - checkout: self
     fetchDepth: ${{ parameters.fetchDepth }}
@@ -18,8 +23,8 @@ steps:
       if mountpoint -q target; then sudo umount target; fi
       git clean -ffdxq -e /target/ -e /kernel/target/
       free_gb=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
-      if [ "$free_gb" -lt 20 ]; then
-        echo "the job disk has ${free_gb} GB free: the earlier build goes"
+      if [ "$free_gb" -lt ${{ parameters.needGb }} ]; then
+        echo "the job disk has ${free_gb} GB free, under the ${{ parameters.needGb }} GB this job needs: the earlier builds go"
         rm -rf target kernel/target
       fi
       df -h . | tail -1
