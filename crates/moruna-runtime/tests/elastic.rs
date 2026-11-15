@@ -229,11 +229,17 @@ impl Machine {
     }
 
     /// [`Machine::new`] in a container: a cgroup holds the run to `quota` of the machine's
-    /// `online` CPUs and to a quarter of its memory.
+    /// `online` CPUs and to a quarter of its memory. The ceiling is `room` above what the run
+    /// will count: with the cgroup's limit as the ceiling, the run measures the whole cgroup
+    /// (DS-I4), which holds the test harness and whatever else shares it (on a CI runner, the
+    /// runner itself), not only this process.
     fn contained(room: u64, quota: f64, online: f64) -> Machine {
         let mut machine = Machine::new(room, quota);
-        let ceiling = machine.ceiling();
         machine.discovered.limits.source = LimitSource::Cgroup;
+        let sampler = moruna_discovery::Sampler::new(&machine.discovered).expect("a sampler");
+        machine.baseline = sampler.sample().unwrap().anon_bytes;
+        let ceiling = (ram_for(machine.baseline + room) as f64 * 0.9) as u64;
+        machine.discovered.limits.memory_ceiling = ceiling;
         machine.source = ManualLimitsSource::new(contained_reading(ceiling, quota, online));
         machine
     }
