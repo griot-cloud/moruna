@@ -50,7 +50,7 @@ parameters:
         tag: cp314-cp314
       - name: cp314t
         python: "3.14t"
-        tag: cp314t-cp314t
+        tag: cp314-cp314t
 
 variables:
   CARGO_PROFILE_DEV_DEBUG: "0"
