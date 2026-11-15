@@ -637,6 +637,8 @@ impl Sink for ArrowIpcSink {
         // The file itself carries no schema until a record is written, so `open_file` (the
         // magic bytes) is unaffected.
         let _ = schema;
+        // A fresh run's output is the directory's whole content (f.1, 2026-11-14).
+        inner.stats.earlier_files_removed = self.dir.clear_earlier_output("arrow");
         self.open_file(&mut inner)?;
         inner.phase = Phase::Open;
         Ok(())

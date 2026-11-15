@@ -1,5 +1,5 @@
 //! The budget follows the machine, end to end (MH 4.4, H3, H4):
-//! memory_follows_the_machine, cpus_follow_the_machine, an_inelastic_run_is_as_before,
+//! memory_follows_the_machine, cpus_follow_the_machine, a_run_follows_the_machine_up_by_default,
 //! and , the same two gates under a real cgroup v2 whose limits are rewritten mid-run
 //! (reference host, E1).
 //!
@@ -41,6 +41,9 @@ const MIB: u64 = 1024 * 1024;
 struct Spinner {
     spin: Duration,
     busy: bool,
+    /// Heap bytes each apply allocates and touches, per input byte: a kernel whose working set
+    /// is outside the arena and many times its input (the benchmark's Occupancy).
+    amp: u64,
     applies: Arc<AtomicU64>,
     running: Arc<AtomicU64>,
     starts: Arc<Mutex<Vec<(Instant, u64)>>>,
@@ -51,6 +54,7 @@ impl Spinner {
         Spinner {
             spin,
             busy: false,
+            amp: 0,
             applies: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicU64::new(0)),
             starts: Arc::new(Mutex::new(Vec::new())),
@@ -62,6 +66,29 @@ impl Spinner {
     fn busy(mut self) -> Spinner {
         self.busy = true;
         self
+    }
+
+    /// Each apply allocates and touches `amp` heap bytes per input byte while it runs.
+    fn amplify(mut self, amp: u64) -> Spinner {
+        self.amp = amp;
+        self
+    }
+
+    /// The mean count running at each start after `from`, and how many starts that is.
+    fn mean_concurrent_after(&self, from: Instant) -> (f64, usize) {
+        let starts = self.starts.lock().unwrap_or_else(|e| e.into_inner());
+        let after: Vec<u64> = starts
+            .iter()
+            .filter(|(at, _)| *at >= from)
+            .map(|(_, n)| *n)
+            .collect();
+        if after.is_empty() {
+            return (0.0, 0);
+        }
+        (
+            after.iter().sum::<u64>() as f64 / after.len() as f64,
+            after.len(),
+        )
     }
 
     fn max_concurrent_after(&self, from: Instant) -> u64 {
@@ -90,7 +117,7 @@ impl Kernel for Spinner {
             // About as much outside the arena as in it: the arena takes two thirds of the
             // allowance (12 f.1), which leaves the controller real headroom above it at every
             // ceiling a test sets, and the arena's growth is still most of the process's.
-            expected_amplification: Some(1.0),
+            expected_amplification: Some(1.0 + self.amp as f64),
             ..Default::default()
         }
     }
@@ -120,6 +147,15 @@ impl Kernel for Spinner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((Instant::now(), now));
+        let heap = if self.amp > 0 {
+            let mut bytes = vec![0u8; (input.bytes() * self.amp) as usize];
+            for page in bytes.chunks_mut(4096) {
+                page[0] = 1;
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         if self.busy {
             let until = Instant::now() + self.spin;
             let mut spins = 0u64;
@@ -131,6 +167,7 @@ impl Kernel for Spinner {
         } else {
             std::thread::sleep(self.spin);
         }
+        drop(std::hint::black_box(heap));
         self.running.fetch_sub(1, Ordering::SeqCst);
         self.applies.fetch_add(1, Ordering::SeqCst);
         Ok(input)
@@ -158,6 +195,18 @@ fn reading(ceiling: u64, cpus: f64) -> LimitsReading {
     }
 }
 
+/// A cgroup reading: `memory.high` at `ceiling`, `cpu.max` at `quota` cores, on a machine with
+/// four times the memory and `online` CPUs.
+fn contained_reading(ceiling: u64, quota: f64, online: f64) -> LimitsReading {
+    LimitsReading {
+        memory_high: Some(ceiling),
+        cpu_max: Some(quota),
+        total_ram: Some(ram_for(ceiling).saturating_mul(4)),
+        cpus_online: online,
+        ..LimitsReading::default()
+    }
+}
+
 impl Machine {
     /// A guest with no cgroup whose ceiling is the process's resident memory plus `room`, and
     /// `cpus` CPUs online.
@@ -177,6 +226,22 @@ impl Machine {
             source: ManualLimitsSource::new(reading(ceiling, cpus)),
             baseline,
         }
+    }
+
+    /// [`Machine::new`] in a container: a cgroup holds the run to `quota` of the machine's
+    /// `online` CPUs and to a quarter of its memory. The ceiling is `room` above what the run
+    /// will count: with the cgroup's limit as the ceiling, the run measures the whole cgroup
+    /// (DS-I4), which holds the test harness and whatever else shares it (on a CI runner, the
+    /// runner itself), not only this process.
+    fn contained(room: u64, quota: f64, online: f64) -> Machine {
+        let mut machine = Machine::new(room, quota);
+        machine.discovered.limits.source = LimitSource::Cgroup;
+        let sampler = moruna_discovery::Sampler::new(&machine.discovered).expect("a sampler");
+        machine.baseline = sampler.sample().unwrap().anon_bytes;
+        let ceiling = (ram_for(machine.baseline + room) as f64 * 0.9) as u64;
+        machine.discovered.limits.memory_ceiling = ceiling;
+        machine.source = ManualLimitsSource::new(contained_reading(ceiling, quota, online));
+        machine
     }
 
     fn ceiling(&self) -> u64 {
@@ -330,12 +395,10 @@ fn memory_follows_the_machine() {
     );
     assert_eq!(report.limits_timeline[0].1.memory_ceiling, high);
     assert_eq!(report.limits_timeline[1].1.memory_ceiling, low);
-    assert!(
-        report.peak_anon_bytes > low,
-        "H3: the grown arena is resident, so the run held more than the starting ceiling \
-         ({} against {low})",
-        report.peak_anon_bytes
-    );
+    // H3 asked that the grown region be resident, so the run held more than its starting
+    // ceiling. The arena is charged as buffers land on it since RB4 (02 f.1), so a grown region
+    // costs what the run puts in it and no more; that the run followed the machine up and back
+    // down is the timeline above and the drain below.
     assert!(
         report.peak_fraction_of_ceiling <= 1.0,
         "and it stayed under the ceiling in force at its peak ({} of {})",
@@ -483,25 +546,76 @@ fn cpus_follow_the_machine() {
     );
 }
 
-/// an_inelastic_run_is_as_before (MH H-Q4). With no `elastic`, a machine that grows is not
-/// followed up: no timeline entry, the arena stays one region, the pool stays the starting N. A
-/// machine that shrinks under it is still followed down.
+/// RB4 (2026-11-13, which superseded MH H-Q4): with no `elastic`, a run follows the machine
+/// up. A container held to two of the machine's eight CPUs is given all eight mid-run, and four
+/// times the memory: the timeline has the change, the pool was created at the eight CPUs online,
+/// more than two applies run at once after it, and the ceiling in force rises.
 #[test]
-fn an_inelastic_run_is_as_before() {
+fn a_run_follows_the_machine_up_by_default() {
     let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("rt_t11");
-    let machine = Machine::new(192 * MIB, 2.0);
+    let scratch = Scratch::new("rb4_up");
+    let machine = Machine::contained(1024 * MIB, 2.0, 8.0);
+    let start = machine.ceiling();
+    let kernel = Arc::new(Spinner::new(Duration::from_millis(20)));
+    let applies = Arc::clone(&kernel.applies);
+    let watched = Arc::clone(&kernel);
+    let spec = spec_of(&scratch, kernel.clone(), 600, 16_384);
+    let (report, _, changes) = run_on(&machine, spec, move |script| {
+        if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
+            return;
+        }
+        script.set(contained_reading(start * 4, 8.0, 8.0));
+        let raised_at = Instant::now();
+        script.wait("more than two workers on the bigger machine", || {
+            watched.max_concurrent_after(raised_at) > 2
+        });
+    });
+    assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
+    assert_eq!(
+        report.limits_timeline.len(),
+        1,
+        "{:?}",
+        report.limits_timeline
+    );
+    assert!(report.limits_timeline[0].1.memory_ceiling > start);
+    assert!((report.limits_timeline[0].1.cpu_quota - 8.0).abs() < f64::EPSILON);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("8 worker threads created and 2 active")),
+        "{:?}",
+        report.notes
+    );
+    let Some(&(changed_at, _)) = changes.first() else {
+        panic!("the change was never published");
+    };
+    assert!(
+        kernel.max_concurrent_after(changed_at) > 2,
+        "the pool did not grow past the starting two"
+    );
+    assert!(report.peak_ceiling_bytes > start);
+}
+
+/// RB4's exception: an explicit budget and CPU count are the caller's figures. The machine grows
+/// under the run and the run does not follow: no timeline entry, the pool is the starting N, the
+/// ceiling stays.
+#[test]
+fn an_explicit_budget_is_not_grown_past() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("rb4_explicit");
+    let machine = Machine::contained(192 * MIB, 2.0, 8.0);
     let start = machine.ceiling();
     let kernel = Arc::new(Spinner::new(Duration::from_millis(5)));
     let applies = Arc::clone(&kernel.applies);
-    let spec = spec(&scratch, kernel.clone(), 200);
-
+    let mut spec = spec(&scratch, kernel.clone(), 200);
+    spec.budget = Some(start);
+    spec.cpu = Some(2.0);
     let (report, _, _) = run_on(&machine, spec, move |script| {
         if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 10) {
             return;
         }
-        // A machine four times the size, with four times the CPUs: not the run's to take.
-        script.set(reading(start * 4, 8.0));
+        script.set(contained_reading(start * 4, 8.0, 8.0));
         let at = applies.load(Ordering::SeqCst);
         script.wait("a few ticks at the bigger machine", || {
             applies.load(Ordering::SeqCst) >= at + 100
@@ -510,10 +624,9 @@ fn an_inelastic_run_is_as_before() {
     assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
     assert!(
         report.limits_timeline.is_empty(),
-        "an inelastic run does not follow the machine up: {:?}",
+        "an explicit budget does not follow the machine up: {:?}",
         report.limits_timeline
     );
-    assert!(report.drains.is_empty());
     assert!(kernel.max_concurrent_after(Instant::now() - Duration::from_secs(3600)) <= 2);
     assert!(
         !report
@@ -525,7 +638,7 @@ fn an_inelastic_run_is_as_before() {
     assert_eq!(report.peak_ceiling_bytes, start);
 }
 
-/// , the other half: an inelastic run is still followed down. The machine loses a CPU and a
+/// , the other half: a run is always followed down. The machine loses a CPU and a
 /// third of its memory mid-run; the timeline has the change and the pool parks down to one.
 #[test]
 fn an_inelastic_run_is_followed_down() {
@@ -554,6 +667,38 @@ fn an_inelastic_run_is_followed_down() {
     );
     assert!(report.limits_timeline[0].1.memory_ceiling < start);
     assert!(kernel.max_concurrent_after(changes[0].0 + Duration::from_millis(200)) <= 1);
+}
+
+/// RB4: a ceiling that falls below the arena's first region, which never drains, is met by
+/// capping what the arena hands out and giving the pages no buffer holds back at once; the run
+/// completes and the report says so. Before, the region stayed resident whole, and a cgroup
+/// limit lowered beneath it killed the run (the 0.6.5 benchmark's live squeezes).
+#[test]
+fn a_ceiling_below_the_first_region_is_given_back() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("below");
+    let machine = Machine::new(384 * MIB, 2.0);
+    let start = machine.ceiling();
+    let lower = start / 2;
+    let kernel = Arc::new(Spinner::new(Duration::from_millis(10)));
+    let applies = Arc::clone(&kernel.applies);
+    let spec = spec(&scratch, kernel.clone(), 140);
+    let (report, _, _) = run_on(&machine, spec, move |script| {
+        if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 20) {
+            return;
+        }
+        script.set(reading(lower, 2.0));
+    });
+    assert_eq!(report.exit, moruna_runtime::ExitReason::Completed);
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.contains("below the arena's first region"))
+        .unwrap_or_else(|| panic!("the cap is reported: {:?}", report.notes));
+    assert!(
+        note.contains("hands out at most") && note.contains("back to the operating system"),
+        "{note}"
+    );
 }
 
 /// The inelastic default with the host's own files: nothing is injected but the discovery
@@ -702,4 +847,53 @@ fn read_trace(path: &std::path::Path) -> Vec<(u64, u64)> {
         }
     }
     out
+}
+
+/// The squeeze of the 2026-11-14 benchmark rerun (Occupancy over the whole dataset): a kernel
+/// whose working set is outside the arena and many times its input runs on eight CPUs; mid-run
+/// the machine halves its CPUs and cuts memory to a small fraction that still has room for four
+/// workers' working sets. The run follows the CPUs down and keeps the workers memory has room for,
+/// rather than falling to one and staying there (the rerun ran on about one core of the four
+/// allowed for 25 s, with an eighth of the memory in use).
+#[test]
+fn a_squeeze_keeps_the_workers_it_has_room_for() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("squeeze");
+    let machine = Machine::new(1536 * MIB, 8.0);
+    // A morsel is 128 KiB; each apply holds 8 MiB of heap; four at once hold 32 MiB.
+    let kernel = Arc::new(Spinner::new(Duration::from_millis(20)).amplify(64));
+    let applies = Arc::clone(&kernel.applies);
+    let low = (ram_for(machine.baseline + 384 * MIB) as f64 * 0.9) as u64;
+    let spec = spec_of(&scratch, kernel.clone(), 1500, 16_384);
+    let cut = Arc::new(Mutex::new(None::<Instant>));
+    let marked = Arc::clone(&cut);
+    let (report, _, _) = run_on(&machine, spec, move |script| {
+        if !script.wait("the run to start", || applies.load(Ordering::SeqCst) >= 60) {
+            return;
+        }
+        script.set(reading(low, 4.0));
+        *marked.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let at = applies.load(Ordering::SeqCst);
+        script.wait("work at the lower limits", || {
+            applies.load(Ordering::SeqCst) >= at + 400
+        });
+    });
+    assert_eq!(
+        report.exit,
+        moruna_runtime::ExitReason::Completed,
+        "{:?}",
+        report.notes
+    );
+    let Some(cut) = *cut.lock().unwrap_or_else(|e| e.into_inner()) else {
+        panic!("the run ended before the squeeze");
+    };
+    // A second to settle, then the workers that ran.
+    let (mean, starts) = kernel.mean_concurrent_after(cut + Duration::from_secs(1));
+    assert!(starts >= 100, "{starts} applies after the squeeze settled");
+    assert!(
+        mean >= 2.5,
+        "after the squeeze {mean:.2} applies ran at once on average, with room for four: {:?}",
+        report.notes
+    );
+    assert!(kernel.max_concurrent_after(cut + Duration::from_secs(1)) <= 4);
 }

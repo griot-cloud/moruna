@@ -59,6 +59,16 @@ pub struct ExcludedRows {
     pub rows: u64,
 }
 
+/// A morsel a sink has encoded on a worker and not yet put (RB1, `architecture/worker-io.md`).
+/// Opaque to the scheduler: only the sink that made it reads it, in `Sink::put`.
+pub struct Encoded(pub Box<dyn std::any::Any + Send>);
+
+impl std::fmt::Debug for Encoded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Encoded(..)")
+    }
+}
+
 /// Where a run's output goes (component 8).
 pub trait Sink: Send + Sync {
     /// Once, before the first write.
@@ -74,6 +84,31 @@ pub trait Sink: Send + Sync {
     /// `seq` is the morsel's sequence number, which the sink records with the
     /// output it lands in so a resume can identify uncommitted output.
     fn write(&self, seq: Seq, payload: Payload) -> BoxFuture<'_, crate::Result<()>>;
+    /// True when `encode` and `put` replace `write` (RB1): any worker encodes a morsel, several
+    /// at once, and the drive puts what they made. A sink that leaves this false is written
+    /// whole by `write`, on the drive, as before.
+    fn encodes_on_workers(&self) -> bool {
+        false
+    }
+    /// The CPU half of a write: take `payload` into the sink's output on the calling worker.
+    /// May be called from several workers at once; must not wait on a `Completion` (SC-I1).
+    /// Called only when `encodes_on_workers`.
+    fn encode(&self, seq: Seq, payload: Payload) -> crate::Result<Encoded> {
+        let _ = (seq, payload);
+        Err(MorunaError::Sink(
+            "this sink does not encode on workers".into(),
+        ))
+    }
+    /// The I/O half of a write: hand what `encode` made to the store, and record its commit
+    /// when it lands. Runs on the drive. Called only when `encodes_on_workers`.
+    fn put(&self, encoded: Encoded) -> BoxFuture<'_, crate::Result<()>> {
+        let _ = encoded;
+        Box::pin(async {
+            Err(MorunaError::Sink(
+                "this sink does not encode on workers".into(),
+            ))
+        })
+    }
     /// Exactly once, after the last `write` completed.
     fn finish(&mut self) -> crate::Result<SinkSummary>;
 

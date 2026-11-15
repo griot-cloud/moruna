@@ -69,7 +69,7 @@ pub(crate) fn drive(shared: Arc<Shared>, index: usize, parker: Parker) {
             parker.park_timeout(Duration::from_millis(1));
             continue;
         }
-        match write_loop(s, end, &parker, &mut cx) {
+        match write_loop(&shared, end, &parker, &mut cx) {
             Drained::Finished => {
                 end.drained.store(true, Ordering::SeqCst);
                 if s.sinks.iter().all(|e| e.drained.load(Ordering::SeqCst)) {
@@ -87,7 +87,12 @@ pub(crate) fn drive(shared: Arc<Shared>, index: usize, parker: Parker) {
 
 /// f.6's loop. The read guard on the sink lives for the whole loop, because every write future
 /// borrows the sink; `finish` takes the write guard afterwards, once the guard is gone.
-fn write_loop(shared: &Shared, end: &SinkEnd, parker: &Parker, cx: &mut Context<'_>) -> Drained {
+fn write_loop(
+    shared: &Arc<Shared>,
+    end: &SinkEnd,
+    parker: &Parker,
+    cx: &mut Context<'_>,
+) -> Drained {
     let guard = end.sink.read().unwrap_or_else(|e| e.into_inner());
     let sink: &SinkHandle = &guard;
     let queue = end.queue;
@@ -143,8 +148,14 @@ fn write_loop(shared: &Shared, end: &SinkEnd, parker: &Parker, cx: &mut Context<
         // handle the limit that applies is the buffer's own byte bound, which it reports
         // through `is_stalled`; reported to the PM as a finding on f.6.
         let ordered = sink.is_ordered();
-        let room = inflight.len() < shared.cfg.sink_concurrency as usize
-            || (ordered && !sink.is_stalled());
+        // RB1: a sink that encodes on workers may have a write in flight per active worker,
+        // so the encodes run as wide as the pool; the others keep `sink.concurrency`.
+        let limit = if sink.encodes_on_workers() {
+            usize::from(shared.cfg.sink_concurrency).max(usize::from(shared.knobs.active_workers()))
+        } else {
+            usize::from(shared.cfg.sink_concurrency)
+        };
+        let room = inflight.len() < limit || (ordered && !sink.is_stalled());
         if room {
             let popped = if blocking && inflight.is_empty() {
                 shared
@@ -180,7 +191,31 @@ fn write_loop(shared: &Shared, end: &SinkEnd, parker: &Parker, cx: &mut Context<
                     if !ends.started.swap(true, Ordering::SeqCst) {
                         shared.tell(moruna_kernel::StageEvent::SinkWriting { sink: end.index });
                     }
-                    let future = sink.write(morsel.seq, morsel.payload);
+                    let future: BoxFuture<'_, Result<()>> = if sink.encodes_on_workers() {
+                        // RB1: any worker encodes; this drive puts what it made.
+                        let owner = Arc::clone(shared);
+                        let index = usize::from(end.index);
+                        let (seq, payload) = (morsel.seq, morsel.payload);
+                        let offload = &shared.offload;
+                        let inline = Arc::clone(shared);
+                        Box::pin(async move {
+                            let encoded = crate::offload::on_worker(
+                                offload,
+                                move || inline.offload_inline(),
+                                move || {
+                                    let end = owner.sinks.get(index).ok_or_else(|| {
+                                        MorunaError::Sink(format!("no sink {index}"))
+                                    })?;
+                                    let guard = end.sink.read().unwrap_or_else(|e| e.into_inner());
+                                    guard.encode(seq, payload)
+                                },
+                            )
+                            .await?;
+                            sink.put(encoded).await
+                        })
+                    } else {
+                        sink.write(morsel.seq, morsel.payload)
+                    };
                     shared.writes_in_flight.fetch_add(1, Ordering::SeqCst);
                     inflight.push((morsel.seq, future));
                     worked = true;

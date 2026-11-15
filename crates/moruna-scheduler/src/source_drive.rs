@@ -56,6 +56,31 @@ struct InFlight<'a> {
     kind: ReadKind,
     /// What the arena may charge for this read, as admission counted it (f.5).
     charge: u64,
+    /// How many times this read has already met a full arena (RB5).
+    attempts: u32,
+}
+
+/// RB5 (2026-11-13): a read whose arena allocation failed is a wall, not an error. It keeps its
+/// sequence number and its rows and is issued again once memory has come back. A read at the
+/// cursor takes no room from the batches queued before it, which are needed sooner: it waits for
+/// the consumers (`wall::Room::Wait`), and ends the run only when nothing in the run can free
+/// memory (amended 2026-11-14; it was a fixed 24 timed attempts).
+/// The reads that met a full arena, in order, and the wall they stand at (RB5).
+#[derive(Default)]
+struct Waits {
+    retry: Vec<Retry>,
+    wall: Option<crate::wall::Wall>,
+}
+
+struct Retry {
+    seq: Seq,
+    split: u32,
+    rows: RowRange,
+    kind: ReadKind,
+    charge: u64,
+    attempts: u32,
+    not_before: std::time::Instant,
+    error: MorunaError,
 }
 
 /// The tier a read lands in: the run's one host tier (contracts e.1, f.5).
@@ -83,7 +108,19 @@ fn range_end(
     let target = bytes
         .unwrap_or_else(|| shared.knobs.morsel_target(end.target_stage))
         .clamp(shared.cfg.morsel_min, shared.cfg.morsel_max);
-    (start + rows_for(split, target)).min(split.rows)
+    // RB3: the target is bytes in memory and the split's estimate is bytes on disk, so the rows
+    // are sized by what reads have actually decoded to (f.5).
+    let ratio = end.decoded.ratio();
+    let decoded_target = ((target as f64) / ratio).max(1.0) as u64;
+    let rows = rows_for(split, decoded_target);
+    let end = (start + rows).min(split.rows);
+    // A remainder under half a read is taken with this one, not read on its own: a read pays
+    // for its split's fetch and its buffers' fixed cost whatever its rows (RB3).
+    if split.rows - end < rows / 2 {
+        split.rows
+    } else {
+        end
+    }
 }
 
 /// Step the cursor past every split it has no rows left in: a split it has read to the end,
@@ -246,6 +283,9 @@ pub(crate) fn drive(
     // The most a read has come to over its split's estimate, which scales the next read's
     // admission (f.5).
     let mut learned = 1.0f64;
+    // Reads that met a full arena, to issue again once memory has come back (RB5), and the wall
+    // they stand at.
+    let mut waits = Waits::default();
 
     loop {
         let mode = shared.source_mode.get();
@@ -255,6 +295,7 @@ pub(crate) fn drive(
             &mut inflight,
             &mut replacing,
             &mut learned,
+            &mut waits,
             &mut cx,
         );
         if let Some(future) = stream_read.as_mut()
@@ -330,10 +371,20 @@ pub(crate) fn drive(
                 }
                 worked |=
                     issue_replacements(&shared, source, &mut inflight, &mut replacing, learned);
-                worked |= issue_reads(&shared, source, &mut inflight, learned);
+                worked |= issue_retries(&shared, source, &mut inflight, &mut waits);
+                // A read waiting for memory goes before any new one, so the cursor does not
+                // run ahead of what the arena can hold.
+                if waits.retry.is_empty() {
+                    worked |= issue_reads(&shared, source, &mut inflight, learned);
+                }
                 close_when_exhausted(&shared, source, &inflight);
             }
         }
+        // A read waiting out its backoff is work in flight for the stall detector (RB5): it will
+        // be issued again, and the run is not stuck while it waits.
+        source
+            .waiting_reads
+            .store(waits.retry.len(), Ordering::SeqCst);
         if !worked {
             parker.park_timeout(Duration::from_millis(1));
         }
@@ -512,9 +563,29 @@ fn submit<'a>(
     };
     let range = if whole { None } else { Some(rows) };
     shared.source_reading(source);
-    let future = source
-        .source
-        .read(split, range, shared.alloc.as_ref(), tier0(shared));
+    let tier = tier0(shared);
+    let future: BoxFuture<'a, Result<Payload>> = if source.source.decodes_on_workers() {
+        // RB1: the drive fetches the bytes and any worker decodes them.
+        let decoder = Arc::clone(&source.source);
+        let alloc = Arc::clone(&shared.alloc);
+        let owned = split.clone();
+        Box::pin(async move {
+            let fetched = source
+                .source
+                .fetch(split, range, shared.alloc.as_ref(), tier)
+                .await?;
+            crate::offload::on_worker(
+                &shared.offload,
+                || shared.offload_inline(),
+                move || decoder.decode(&owned, fetched, alloc.as_ref(), tier),
+            )
+            .await
+        })
+    } else {
+        source
+            .source
+            .read(split, range, shared.alloc.as_ref(), tier)
+    };
     shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
     inflight.push(InFlight {
         future,
@@ -524,7 +595,68 @@ fn submit<'a>(
         rows,
         kind,
         charge,
+        attempts: 0,
     });
+}
+
+/// RB5: issue again, in order, every read that met a full arena and whose wait is over, while
+/// admission says it fits. One that does not fit counts as the wall standing; the wall ends the
+/// run only when nothing in the run can free memory (`wall`).
+fn issue_retries<'a>(
+    shared: &'a Shared,
+    source: &'a SourceEnd,
+    inflight: &mut Vec<InFlight<'a>>,
+    waits: &mut Waits,
+) -> bool {
+    let Waits { retry, wall } = waits;
+    let mut issued = false;
+    while let Some(next) = retry.first() {
+        let now = std::time::Instant::now();
+        if now < next.not_before {
+            break;
+        }
+        if !arena_admits(shared, inflight, next.charge) {
+            let charge = next.charge;
+            let at = wall.get_or_insert_with(|| crate::wall::Wall::new(shared));
+            match at.refused(shared, charge, crate::wall::Room::Wait, 0) {
+                crate::wall::Next::Retry(wait) => retry[0].not_before = now + wait,
+                crate::wall::Next::GiveUp(why) => {
+                    let failed = retry.remove(0);
+                    tracing::warn!(target: "sched.wall", split = failed.split, %why, "memory wall");
+                    crate::policy::terminate(
+                        shared,
+                        source_diagnostic(failed.error, failed.split, failed.rows),
+                    );
+                    retry.clear();
+                    return true;
+                }
+            }
+            break;
+        }
+        let again = retry.remove(0);
+        let Some(index) = source.plan.iter().position(|split| split.id == again.split) else {
+            crate::policy::terminate(shared, again.error);
+            return true;
+        };
+        let whole = !source.plan[index].sub_splittable;
+        submit(
+            shared,
+            source,
+            inflight,
+            index,
+            again.rows,
+            again.seq,
+            whole,
+            again.kind,
+            again.charge,
+        );
+        // Should it meet a full arena again, it comes back with one more attempt counted.
+        if let Some(entry) = inflight.last_mut() {
+            entry.attempts = again.attempts;
+        }
+        issued = true;
+    }
+    issued
 }
 
 /// Poll every read once; a resolved one is pushed, replaced or fails the run (f.5, h).
@@ -534,8 +666,10 @@ fn poll_inflight(
     inflight: &mut Vec<InFlight<'_>>,
     replacing: &mut HashSet<(StageId, Seq)>,
     learned: &mut f64,
+    waits: &mut Waits,
     cx: &mut Context<'_>,
 ) -> bool {
+    let Waits { retry, wall } = waits;
     let mut progressed = false;
     let mut index = 0;
     while index < inflight.len() {
@@ -546,11 +680,20 @@ fn poll_inflight(
                 let entry = inflight.remove(index);
                 shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
                 progressed = true;
-                if let ReadKind::Replacement(queue) = entry.kind {
+                // A replacement stays in `replacing` while it waits to be issued again (RB5):
+                // let go here, the entry still evicted would draw a second read, and whichever
+                // landed second would find the entry already back and end the run ("replace: no
+                // evicted entry", Enrich at 2 GiB).
+                let retried = matches!(result, Err(MorunaError::Alloc { .. }));
+                if let ReadKind::Replacement(queue) = entry.kind
+                    && !retried
+                {
                     replacing.remove(&(queue, entry.seq));
                 }
                 match result {
                     Ok(payload) => {
+                        // A read that lands is the wall moving.
+                        *wall = None;
                         learn(source, &entry, &payload, learned);
                         let (rows, bytes) = (payload.rows(), payload.bytes());
                         let morsel = Morsel::new(entry.seq, 0, payload, entry.origin.clone());
@@ -576,10 +719,35 @@ fn poll_inflight(
                             Err(e) => crate::policy::terminate(shared, e),
                         }
                     }
+                    Err(e @ MorunaError::Alloc { .. }) => {
+                        // RB5: the arena was full when this read landed; it waits for memory
+                        // to come back and is issued again (`issue_retries`), unless nothing in
+                        // the run can free memory.
+                        let at = wall.get_or_insert_with(|| crate::wall::Wall::new(shared));
+                        match at.refused(shared, entry.charge, crate::wall::Room::Wait, 0) {
+                            crate::wall::Next::Retry(wait) => retry.push(Retry {
+                                seq: entry.seq,
+                                split: entry.split,
+                                rows: entry.rows,
+                                kind: entry.kind,
+                                charge: entry.charge,
+                                attempts: entry.attempts + 1,
+                                not_before: std::time::Instant::now() + wait,
+                                error: e,
+                            }),
+                            crate::wall::Next::GiveUp(why) => {
+                                tracing::warn!(target: "sched.wall", split = entry.split, %why, "memory wall");
+                                crate::policy::terminate(
+                                    shared,
+                                    source_diagnostic(e, entry.split, entry.rows),
+                                );
+                            }
+                        }
+                        progressed = true;
+                    }
                     Err(e) => {
                         // h: there is no skip for a source error; the diagnostic names the
-                        // split and the row range, including the `Alloc` of a single row
-                        // larger than the budget.
+                        // split and the row range.
                         crate::policy::terminate(
                             shared,
                             source_diagnostic(e, entry.split, entry.rows),
@@ -592,17 +760,18 @@ fn poll_inflight(
     progressed
 }
 
-/// f.5: a split's bytes are an estimate (`Split::estimated`), so the drive keeps the most any
-/// read has come to over its estimate and scales the next read's admission by it. It never
-/// falls, so one read that came to more than its estimate keeps the bound honest for the rest
-/// of the run.
+/// f.5: a split's bytes are an estimate (`Split::estimated`), so the drive learns what reads
+/// come to over their estimate (`DecodeRatio`) and scales the next read's admission and rows by
+/// it, for every reader of this source's cursor, the probe's helper included.
 fn learn(source: &SourceEnd, entry: &InFlight<'_>, payload: &Payload, learned: &mut f64) {
     let Some(split) = source.plan.iter().find(|split| split.id == entry.split) else {
         return;
     };
     let estimate = estimated_bytes(split, entry.rows);
     if estimate > 0 {
-        *learned = learned.max(payload.bytes() as f64 / estimate as f64);
+        *learned = source
+            .decoded
+            .observe(payload.rows(), payload.bytes() as f64 / estimate as f64);
     }
 }
 
@@ -822,6 +991,15 @@ fn service_helper(
     shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
     let answer = match result {
         Ok(payload) => {
+            // The probe's read is the run's first: what it decoded to sizes every read after it
+            // (`range_end`), so the first wave behind the probe is not sized from the file's
+            // encoded bytes.
+            let estimate = estimated_bytes(split, rows);
+            if estimate > 0 {
+                source
+                    .decoded
+                    .observe(payload.rows(), payload.bytes() as f64 / estimate as f64);
+            }
             let (rows, bytes) = (payload.rows(), payload.bytes());
             let pushed_ok = shared
                 .placement

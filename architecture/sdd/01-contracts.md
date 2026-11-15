@@ -1005,7 +1005,9 @@ pub struct SchedulerStats {
 pub trait Prober: Send + Sync { fn probe(&self, stage: StageId, bytes: u64) -> Result<ProbeResult>; }
 
 #[derive(Clone, Debug)]
-pub struct ProbeResult { pub bytes_in: u64, pub rows_in: u64, pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_ns: u64, pub cpu_ns: u64 }
+pub struct ProbeResult { pub bytes_in: u64, pub rows_in: u64, pub bytes_out: u64, pub peak_delta: u64, pub dev_peak_delta: u64, pub wall_ns: u64, pub cpu_ns: u64 }
+
+`ProbeResult::bytes_out` (RB3, 2026-11-13): the probe's output payload bytes. With `bytes_in` it is what the morsel held in the arena when `apply` returned, which `peak_delta` cannot see: the arena is touched when it is made, so taking a buffer from it moves nothing the operating system counts (11 f.2).
 
 /// What happens after a kernel error (preamble `errors.policy`).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -1364,6 +1366,8 @@ The testkit is built by this component's agent in wave 0 (preamble 6.4) because 
 Every fake records a `shutdown_calls` counter wherever the trait it implements has a `shutdown` method, so a test can assert that shutdown ran exactly once. `Sink` and `TraceSink` have no `shutdown` in the contract, so `FakeSink::shutdown_calls` and `FakeTrace::finish_calls` count the fakes' own inherent `shutdown()` and `finish()`, which the facade calls; a test naming them is asserting about the facade's lifecycle (preamble 4.3), not about a trait method.
 
 Also in the testkit: the data generator and the benchmark kernels of preamble 6.5 are not here; they belong to the `bench` agent (wave 1). `moruna-testkit` depends on `moruna-kernel`, and on `lz4_flex`, `zstd` and `flatbuffers` for the compressed streams it builds by hand (e.8).
+
+**d.19 Reads and writes in two halves (RB1, 2026-11-13; `architecture/worker-io.md`).** `Source` gains `decodes_on_workers` (default false), `fetch` (the I/O half: a split's bytes into arena buffers, may wait on the reactor, returns an opaque `Fetched`) and `decode` (the CPU half: `Fetched` into a payload, never waits on a `Completion`, deterministic as `read` is under CT-I12). `Sink` gains `encodes_on_workers` (default false), `encode` (the CPU half: a morsel into the sink's output, callable from several threads at once, never waits on a `Completion`, returns an opaque `Encoded`) and `put` (the I/O half: hand what `encode` made to the store and record its commit). A source or sink that keeps the defaults is read with `read` and written with `write`, on its drive, as before; one that opts in has its CPU half run by any worker (10 f.25). `Fetched` and `Encoded` are `Box<dyn Any + Send>` so that only the component that made one reads it.
 
 ## e. Data model, formats and state machines
 

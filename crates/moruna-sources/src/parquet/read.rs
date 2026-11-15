@@ -29,19 +29,46 @@ pub(crate) fn read<'a>(
     alloc: &'a dyn Allocator,
     tier: Tier,
 ) -> BoxFuture<'a, Result<Payload>> {
-    Box::pin(async move { read_now(source, split, rows, alloc, tier) })
+    Box::pin(async move {
+        let fetched = fetch_now(source, split, rows, alloc, tier)?;
+        decode_fetched(source, split, fetched, alloc, tier)
+    })
 }
 
-fn read_now(
+/// A split's projected column chunks, fetched and not yet decoded (RB1,
+/// `architecture/worker-io.md`): what the drive hands a worker to decode.
+pub(crate) struct ParquetFetched {
+    chunks: ArenaChunks,
+    range: RowRange,
+}
+
+/// The I/O half of a read: the byte ranges of a split's projected columns, into arena buffers
+/// of `tier`. Waits on the reactor, so it runs on the drive.
+pub(crate) fn fetch<'a>(
+    source: &'a ParquetSource,
+    split: &'a Split,
+    rows: Option<RowRange>,
+    alloc: &'a dyn Allocator,
+    tier: Tier,
+) -> BoxFuture<'a, Result<ParquetFetched>> {
+    Box::pin(async move { fetch_now(source, split, rows, alloc, tier) })
+}
+
+fn fetch_now(
     source: &ParquetSource,
     split: &Split,
     rows: Option<RowRange>,
     alloc: &dyn Allocator,
     tier: Tier,
-) -> Result<Payload> {
+) -> Result<ParquetFetched> {
+    let _ = tier;
     let (file, entry) = source.entry(split)?;
     let range = resolve_range(split, rows)?;
     Counters::add(&source.counters().reads, 1);
+    let last = range.end >= split.rows;
+    if let Some(chunks) = source.fetched_last(split.id, last) {
+        return Ok(ParquetFetched { chunks, range });
+    }
 
     let group = file
         .metadata
@@ -117,25 +144,47 @@ fn read_now(
     }
 
     let chunks = ArenaChunks::new(file_len, fetched);
+    source.keep_fetched(split.id, &chunks, last);
+    Ok(ParquetFetched { chunks, range })
+}
+
+/// The CPU half of a read: decode a fetched split into a payload in arena buffers of `tier`.
+/// Never waits on the reactor, so any worker may run it, several at once (RB1).
+pub(crate) fn decode_fetched(
+    source: &ParquetSource,
+    split: &Split,
+    fetched: ParquetFetched,
+    alloc: &dyn Allocator,
+    tier: Tier,
+) -> Result<Payload> {
+    let (file, entry) = source.entry(split)?;
+    let ParquetFetched { chunks, range } = fetched;
     let mask = ProjectionMask::leaves(
         file.metadata.file_metadata().schema_descr(),
         file.projected.iter().copied(),
     );
-    let arrow_meta = ArrowReaderMetadata::try_new(
-        std::sync::Arc::clone(&file.metadata),
-        ArrowReaderOptions::new(),
-    )
-    .map_err(|e| source_err(split.id, e.to_string()))?;
+    // A range of a group decodes only the pages it covers when they can be located (`pages`):
+    // the group alone, with its page locations, as row group 0.
+    let partial = range.start != 0 || range.end != split.rows;
+    let (metadata, row_group) = match partial
+        .then(|| source.paged(split, file, entry, &chunks))
+        .flatten()
+    {
+        Some(indexed) => (indexed, 0),
+        None => (std::sync::Arc::clone(&file.metadata), entry.row_group),
+    };
+    let arrow_meta = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+        .map_err(|e| source_err(split.id, e.to_string()))?;
     let wanted = (range.end - range.start).max(1);
     let selection = RowSelection::from_consecutive_ranges(
         std::iter::once(range.start as usize..range.end as usize),
         split.rows as usize,
     );
     let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, arrow_meta)
-        .with_row_groups(vec![entry.row_group])
+        .with_row_groups(vec![row_group])
         .with_projection(mask)
         .with_batch_size(usize::try_from(wanted).unwrap_or(usize::MAX));
-    if range.start != 0 || range.end != split.rows {
+    if partial {
         builder = builder.with_row_selection(selection);
     }
     let started = std::time::Instant::now();

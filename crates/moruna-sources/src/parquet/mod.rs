@@ -10,6 +10,7 @@
 
 pub(crate) mod decode_copy;
 mod hint;
+mod pages;
 mod plan;
 mod read;
 mod reader;
@@ -17,9 +18,10 @@ mod reader;
 use std::sync::Arc;
 
 use moruna_kernel::{
-    Allocator, BoxFuture, ObjectMetadata, Payload, Reactor, Result, RowRange, Source, SourceSchema,
-    Split, Tier,
+    Allocator, BoxFuture, Fetched, ObjectMetadata, Payload, Reactor, Result, RowRange, Source,
+    SourceSchema, Split, SplitId, Tier,
 };
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::stats::{Counters, SourceStats};
 
@@ -79,7 +81,17 @@ pub struct ParquetSource {
     splits: Vec<Split>,
     schema: SourceSchema,
     counters: Counters,
+    /// Row groups with their pages located (`pages`), by split, most recent last; `None` for a
+    /// group whose pages could not be located. Bounded by `PAGED_KEPT`.
+    paged: std::sync::Mutex<std::collections::VecDeque<(SplitId, Option<Arc<ParquetMetaData>>)>>,
+    /// The split the drive fetched last, while ranges of it remain to be read: the next range
+    /// decodes from these bytes rather than fetching the group's columns again. Fetches run on
+    /// the drive one at a time, so one is enough (f.3, RB3).
+    last_fetch: std::sync::Mutex<Option<(SplitId, reader::ArenaChunks)>>,
 }
+
+/// How many row groups' page locations a source keeps: more than the reads a run has in flight.
+const PAGED_KEPT: usize = 64;
 
 impl ParquetSource {
     /// Read every footer now (the plan cache), so `plan` is a clone and is complete before the
@@ -147,7 +159,58 @@ impl ParquetSource {
             splits,
             schema,
             counters,
+            paged: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            last_fetch: std::sync::Mutex::new(None),
         })
+    }
+
+    /// `split`'s row group alone, with its pages located, for a ranged read (`pages`); `None`
+    /// when they cannot be located from the fetched headers.
+    pub(crate) fn paged(
+        &self,
+        split: &Split,
+        file: &plan::FileMeta,
+        entry: &plan::Entry,
+        chunks: &reader::ArenaChunks,
+    ) -> Option<Arc<ParquetMetaData>> {
+        {
+            let kept = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, hit)) = kept.iter().find(|(id, _)| *id == split.id) {
+                return hit.clone();
+            }
+        }
+        // Two workers decoding ranges of one group at once may both locate it; the walk reads
+        // headers only, and the second result is dropped.
+        let built =
+            pages::one_group_indexed(&file.metadata, entry.row_group, &file.projected, chunks);
+        let mut kept = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.iter().any(|(id, _)| *id == split.id) {
+            kept.push_back((split.id, built.clone()));
+            if kept.len() > PAGED_KEPT {
+                kept.pop_front();
+            }
+        }
+        built
+    }
+
+    /// The fetched columns of `split` if the drive fetched them last; taking the split's final
+    /// range (`last`) lets them go.
+    pub(crate) fn fetched_last(&self, split: SplitId, last: bool) -> Option<reader::ArenaChunks> {
+        let mut kept = self.last_fetch.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = match kept.as_ref() {
+            Some((id, chunks)) if *id == split => Some(chunks.clone()),
+            _ => None,
+        };
+        if hit.is_some() && last {
+            *kept = None;
+        }
+        hit
+    }
+
+    /// Keep `chunks` for the next range of `split`, unless this was its final range.
+    pub(crate) fn keep_fetched(&self, split: SplitId, chunks: &reader::ArenaChunks, last: bool) {
+        *self.last_fetch.lock().unwrap_or_else(|e| e.into_inner()) =
+            (!last).then(|| (split, chunks.clone()));
     }
 
     /// What this source has done so far (j).
@@ -197,5 +260,35 @@ impl Source for ParquetSource {
         tier: Tier,
     ) -> BoxFuture<'a, Result<Payload>> {
         read::read(self, split, rows, alloc, tier)
+    }
+
+    fn decodes_on_workers(&self) -> bool {
+        true
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        split: &'a Split,
+        rows: Option<RowRange>,
+        alloc: &'a dyn Allocator,
+        tier: Tier,
+    ) -> BoxFuture<'a, Result<Fetched>> {
+        Box::pin(async move {
+            let fetched = read::fetch(self, split, rows, alloc, tier).await?;
+            Ok(Fetched(Box::new(fetched)))
+        })
+    }
+
+    fn decode(
+        &self,
+        split: &Split,
+        fetched: Fetched,
+        alloc: &dyn Allocator,
+        tier: Tier,
+    ) -> Result<Payload> {
+        let fetched = fetched.0.downcast::<read::ParquetFetched>().map_err(|_| {
+            crate::util::source_err(split.id, "decode was given another source's fetch")
+        })?;
+        read::decode_fetched(self, split, *fetched, alloc, tier)
     }
 }

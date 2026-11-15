@@ -36,11 +36,13 @@ use moruna_kernel::{
 mod checkpoint;
 mod cputime;
 mod decide;
+mod decode_ratio;
 mod heartbeat;
 mod instances;
 mod knobs;
 mod learning;
 mod lifecycle;
+mod offload;
 mod pipeline;
 pub mod policies;
 mod policy;
@@ -50,6 +52,7 @@ mod sink_drive;
 mod slots;
 mod source_drive;
 mod stats;
+mod wall;
 mod worker;
 
 pub use decide::{Clock, DISK_BYTES_PER_SECOND, SystemClock};

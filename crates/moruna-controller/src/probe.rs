@@ -28,16 +28,12 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
                 msg: format!("probe called in phase {:?}", state.phase),
             });
         }
-        state.tiny = model::is_tiny(&state);
-        if state.tiny {
-            state.note("small dataset: no adaptation".into());
-        }
         // The profile store is the controller's memory across runs, and on a resumed run it is
         // its memory of the run that was interrupted (f.14). It is read once, here.
         load_profiles(&mut state);
-        // Nothing to probe for: a run with no kernels has no amplification, and a dataset that
-        // fits four times over in the budget is not worth a measurement (RC-I6, f.3, f.10).
-        if state.stage_count() == 0 || state.tiny {
+        // Nothing to probe for: a run with no kernels has no amplification. Every other run is
+        // measured, however small its dataset (RC-I6, RB2).
+        if state.stage_count() == 0 {
             state.phase = Phase::Probed;
             return Ok(());
         }
@@ -46,9 +42,20 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
     let mut seeded = 0usize;
     let mut probed = 0usize;
     let mut upstream: Option<ProbeResult> = None;
-    let stages = {
+    // What earlier runs taught (f.2, RC-I6, 2026-11-14): when every stage has a profile that a
+    // completed run of the same kernel over the same input schema wrote from enough records, the
+    // run starts from what those runs measured and probes nothing. All or none, because a later
+    // stage is probed on the output of the probe before it. Every run measured itself from
+    // scratch until then, and the profile set only the margin: the probe ran one morsel alone
+    // while every other worker waited, and the targets then moved from the probe's size to the
+    // one the steady state supports, on every run of a job that had run before.
+    let (stages, learned) = {
         let state = ctl.held();
-        state.stages.len()
+        let learned = !resuming
+            && state.stages.iter().all(|stage| {
+                stage.profile_exact && stage.profile.as_ref().is_some_and(|p| p.trusted())
+            });
+        (state.stages.len(), learned)
     };
 
     for at in 0..stages {
@@ -56,7 +63,17 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
         let request = {
             let mut state = ctl.held();
             seed(&mut state, at);
-            if resuming && state.stages[at].profile.is_some() {
+            if learned {
+                state.stages[at].seeded = true;
+                if let Some(found) = state.stages[at].profile.clone() {
+                    let stage = state.stages[at].stage;
+                    state.note(format!(
+                        "stage {stage} sized from {} earlier runs ({} records); not probed",
+                        found.runs, found.a_k_samples
+                    ));
+                }
+                None
+            } else if resuming && state.stages[at].profile.is_some() {
                 state.stages[at].seeded = true;
                 None
             } else {
@@ -76,14 +93,19 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
             // the interrupted run consumed (f.14), or a fresh run whose source has no rows. Neither
             // is a failure of this run: seed the stage as f.2 would without a probe and say so.
             // 0.6.3 let the error stand on a fresh run, so a source with nothing to read could not
-            // run at all.
+            // run at all. Nor is a stage that no morsel reached because the one before it was
+            // skipped under the error policy (2026-11-14).
             Err(e) if is_exhausted_plan(&e) => {
                 let mut state = ctl.held();
                 state.stages[at].seeded = true;
                 let why = if resuming { "resumed: " } else { "" };
+                let cause = if nothing_reached(&e) {
+                    "no morsel reached it"
+                } else {
+                    "the plan is exhausted"
+                };
                 state.note(format!(
-                    "{why}stage {stage} could not be probed, the plan is exhausted; seeded from \
-                     hints"
+                    "{why}stage {stage} could not be probed, {cause}; seeded from hints"
                 ));
                 seeded += 1;
                 continue;
@@ -130,6 +152,12 @@ fn is_exhausted_plan(e: &moruna_kernel::MorunaError) -> bool {
     matches!(e, moruna_kernel::MorunaError::Plan(msg) if msg.contains("nothing to probe with"))
 }
 
+/// Whether the stage had nothing to probe with because no morsel reached it, its sources still
+/// having rows: the morsel the stage before it was probed with was skipped (SC f.9).
+fn nothing_reached(e: &moruna_kernel::MorunaError) -> bool {
+    matches!(e, moruna_kernel::MorunaError::Plan(msg) if msg.contains("no morsel reached it"))
+}
+
 /// Read the profile store once, per stage (e.3). A file that cannot be parsed is ignored with
 /// a note: a stale opinion is not worth failing a run over.
 fn load_profiles(state: &mut crate::ControllerState) {
@@ -145,12 +173,13 @@ fn load_profiles(state: &mut crate::ControllerState) {
             profile::load_nearest(&dir, &kernel.fingerprint, &kernel.schema_hash);
         match loaded {
             profile::Loaded::Found(found) => {
-                if let Some(schema) = other_schema {
+                if let Some(schema) = &other_schema {
                     state.note(format!(
                         "profile for stage {stage} seeded from the same kernel's row for input \
                          schema {schema}: no row matches this run's input schema"
                     ));
                 }
+                state.stages[at].profile_exact = other_schema.is_none();
                 state.stages[at].profile = Some(found);
             }
             profile::Loaded::Missing => {}
@@ -172,6 +201,17 @@ fn seed(state: &mut crate::ControllerState, at: usize) {
     let profile = state.stages[at].profile.clone();
     let ctl = &mut state.stages[at];
     match &profile {
+        // A profile written since 2026-11-14 holds the figures the solve of f.3 takes, as the
+        // run that wrote it ended: the in-arena ratio, both terms of the anonymous fit, and the
+        // probe's own slope, which governs the fit until this run's window can support one.
+        Some(found) if found.a_anon > 0.0 && found.a_k_arena > 0.0 => {
+            ctl.a_k = found.a_k_arena.max(MIN_AMPLIFICATION);
+            ctl.a_anon = found.a_anon.max(MIN_AMPLIFICATION);
+            ctl.a_anon_seed = ctl.a_anon;
+            ctl.c_anon = found.c_anon;
+            ctl.a_k_dev = found.a_k_dev_p95;
+            ctl.safety = safety_from_evidence(found, safety_floor, safety_initial);
+        }
         Some(found) => {
             ctl.a_k = found.a_k_p95.max(MIN_AMPLIFICATION);
             ctl.a_k_dev = found.a_k_dev_p95;
@@ -253,12 +293,21 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             // A stage whose amplification measures below the floor (a filter that drops most
             // rows) is held at the floor, so the allowance stays conservative (h).
             let measured = result.peak_delta as f64 / result.bytes_in as f64;
-            ctl.a_k = measured.max(MIN_AMPLIFICATION);
+            // The arena's side of f.3: what one morsel holds in the arena, its input and the
+            // output it lands there. The anonymous growth cannot say it, because the arena is
+            // touched when it is made and a buffer taken from it moves nothing the operating
+            // system counts; and it is not the arena's, because it is the kernel's own heap,
+            // which the anon inequality charges. Until RB3 (2026-11-13) it was both: a numpy
+            // kernel holding fifty bytes of heap per input byte was charged fifty in the arena
+            // too, two of eight workers fit, and the queue's high water was halved to nothing,
+            // so its entries were evicted and read again as fast as they were read.
+            let in_arena = (result.bytes_in + result.bytes_out) as f64 / result.bytes_in as f64;
+            ctl.a_k = in_arena.max(MIN_AMPLIFICATION);
             // The probe runs one morsel on one worker (SC f.9), so a process-wide delta over it
             // is already the per-in-flight-morsel figure f.3's anon inequality wants, with none
             // of the concurrency the steady-state fit in 10 f.3 has to divide back out.
-            ctl.a_anon = ctl.a_k;
-            ctl.a_anon_seed = ctl.a_k;
+            ctl.a_anon = measured.max(MIN_AMPLIFICATION);
+            ctl.a_anon_seed = ctl.a_anon;
             // And the whole of the probe's growth is seeded as the fixed term, until a real
             // record lets `fit_anon` separate the two (11 f.3). One observation cannot tell a
             // kernel that costs 160 MB whatever the morsel from one that costs ten bytes per
@@ -275,9 +324,14 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             }
         }
         if let Some(found) = &profile
-            && found.a_k_p95 > 0.0
+            && found.probe_a_anon > 0.0
         {
-            let distance = (ctl.a_k - found.a_k_p95).abs() / found.a_k_p95;
+            // Like with like: this probe against the probes before it, one morsel on one worker
+            // each. It was compared with the records' steady-state p95, a different quantity
+            // (every morsel of the run at its own size, fixed cost and all), so an identical
+            // second run could read as drift and lose the margin its evidence had bought
+            // (2026-11-14). A file without the probe's figure is not compared.
+            let distance = (ctl.a_anon - found.probe_a_anon).abs() / found.probe_a_anon;
             if distance > DRIFT {
                 // The probe is what is true now; the profile is what was true before. Trust
                 // the probe and put the margin back where an unseen kernel starts.

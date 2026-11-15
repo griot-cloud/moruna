@@ -30,7 +30,7 @@ main_thread = threading.main_thread().ident
 
 @moruna.function
 def slow(batch):
-    time.sleep(1.0)
+    time.sleep(3.0)
     return batch
 
 print(json.dumps({"ready": True, "main_thread": main_thread}), flush=True)
@@ -82,7 +82,11 @@ def test_py_t6_keyboard_interrupt(scratch: pathlib.Path) -> None:
         time.sleep(4.0)
         proc.send_signal(signal.SIGINT)
         # f.5: a second interrupt during cancellation is swallowed, not re-raised. It has to
-        # arrive while the main thread is still in `run`, which the one second kernel guarantees.
+        # arrive while the main thread is still in `run`: the cancellation waits for the calls in
+        # flight, and a three second kernel leaves them about two seconds to go at the first
+        # interrupt. With a one second kernel every worker started its calls in step at 1.1, 2.1
+        # and 3.1 s, so the first interrupt at 4 s landed 0.1 s before they returned and the
+        # second raced the run's return (2026-11-14).
         time.sleep(0.05)
         proc.send_signal(signal.SIGINT)
         out, err = proc.communicate(timeout=120)

@@ -837,6 +837,7 @@ fn fake_knobs() {
     let probe = ProbeResult {
         bytes_in: 1024,
         rows_in: 8,
+        bytes_out: 0,
         peak_delta: 2048,
         dev_peak_delta: 0,
         wall_ns: 10,

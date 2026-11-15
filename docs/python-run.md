@@ -139,7 +139,7 @@ Runs the job `job`, or the job of one path `moruna.run(source, functions, sink)`
 | `on_error` | `str \| tuple[str, int] = "terminate"` | `"terminate"`, `"skip"`, or `("budget", n)` to allow at most `n` failed morsels. |
 | `ordered` | `bool = False` | Deliver results to each sink in source order. |
 | `sizer` | `str = "rule"` | `"rule"` or `"learned"` morsel sizing. |
-| `profiles_dir` | `str \| None = None` | Profile directory; defaults to `~/.moruna/profiles`. |
+| `profiles_dir` | `str \| None = None` | Profile directory; defaults to `~/.moruna/profiles`. What a completed run measured about each function is kept there, per function and input schema; a later run of the same functions over the same schema starts from it instead of measuring again (the report notes "sized from N earlier runs; not probed"). |
 | `storage` | `dict \| None = None` | The object store: `endpoint`, `region`, `bucket`, `account`, `container`, `local_root`, `allow_http`, and its credentials, `access_key_id`, `secret_access_key`, `session_token`, `service_account_path`, `service_account_json`, `access_key`. Credentials reach the run, never a spec; settings not given are read from the provider's usual environment variables. |
 | `host_profile` | `None` | Reserved. A non-`None` value raises `ConfigError`; use `MORUNA_HOST_PROFILE`. |
 | `allow_gil` | `bool = False` | Permit Python functions on a GIL-enabled interpreter. |

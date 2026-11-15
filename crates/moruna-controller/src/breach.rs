@@ -22,7 +22,7 @@
 
 use moruna_kernel::{Knob, MorunaError, TraceRecord};
 
-use crate::{Actions, BREACH_SHARE, ControllerState, SAFETY_CAP, features_of, model};
+use crate::{Actions, ControllerState, SAFETY_CAP, features_of, model};
 
 /// How much a breach raises the stage's safety multiplier (RC-I4).
 const SAFETY_BUMP: f32 = 0.2;
@@ -42,19 +42,20 @@ fn refit_anon(state: &mut ControllerState, at: usize, r: &TraceRecord) {
     // The same reading and the same unit as the tick thread's fit (11 f.3): the bytes the model
     // believed were in flight, the residency before `apply` above the resting figure and the
     // state the inequality has already funded, and the growth across `apply`.
-    let in_flight_bytes = (in_flight * target.max(r.bytes_in) as f64).max(1.0);
+    let morsel = (r.bytes_in as f64).max(1.0);
+    let others = (in_flight - 1.0).max(0.0) * morsel;
     let fixed = r
         .mem_anon_before
         .saturating_sub(resting)
         .saturating_sub(funded) as f64;
     let growth = r.mem_anon_peak.saturating_sub(r.mem_anon_before) as f64;
-    state.stages[at].observe_anon(in_flight_bytes, fixed, growth);
+    state.stages[at].observe_anon(morsel, others, fixed, growth);
 }
 
 /// The workers the anon inequality of f.3 allows at the targets as they now stand, floor 1.
-fn anon_workers(state: &ControllerState) -> u16 {
+pub(crate) fn anon_workers(state: &ControllerState) -> u16 {
     let max_anon_allowance = (0..state.stages.len())
-        .map(|at| model::anon_allowance(state, at, state.stages[at].target))
+        .map(|at| model::anon_allowance(state, at, state.stages[at].in_flight()))
         .max()
         .unwrap_or(0);
     match model::anon_for_kernels(state).checked_div(max_anon_allowance) {
@@ -100,13 +101,23 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     if !host_breach && !device_breach {
         return;
     }
+    state.breaches = state.breaches.saturating_add(1);
+    // A morsel that started before the last shrink ran on the configuration that shrink left,
+    // and one that started after it but ran beside those still finishing was charged their
+    // heaps (`settled`). Either way its breach is the one the shrink answered, arriving late,
+    // and every worker that was busy then delivers one: acting on each would halve the target
+    // and raise the safety once per worker for one event, fit the old morsels' heaps to the new
+    // ones, and count them against a floor that has not run yet (RB5). It is counted, and the
+    // next breach of a morsel that ran on the new configuration alone is acted on.
+    if !state.settled(r.t_start_ns) {
+        return;
+    }
     if host_breach {
         refit_anon(state, at, r);
     }
-
-    state.breaches = state.breaches.saturating_add(1);
     let morsel_min = state.cfg.morsel_min;
     let at_floor = state.stages[at].target <= morsel_min;
+    let (target_before, workers_before) = (state.stages[at].target, state.active_workers);
     {
         let ctl = &mut state.stages[at];
         ctl.safety = (ctl.safety + SAFETY_BUMP).min(SAFETY_CAP);
@@ -151,6 +162,9 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
                 .push(Knob::ActiveWorkers(state.active_workers));
         }
     }
+    if state.stages[at].target < target_before || state.active_workers < workers_before {
+        state.shrunk_epoch_ns = crate::elastic::now_ns();
+    }
 
     if !at_floor {
         return;
@@ -167,32 +181,73 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     // above the arena, so the run is diagnosed here rather than finished over budget or killed
     // by the host (S6, G-I8). The model decides it, so a run with three morsels ends on the same
     // evidence as a run with three million.
+    // The record must itself be the evidence: measured at the smallest morsel on one worker.
+    // One measured on more workers or a larger morsel is the configuration the controller has
+    // just left, and the fit it leaves behind has not yet seen the one it moved to (RB5: a wall
+    // is a reason to shrink and wait, not an error, until the floor itself does not fit).
+    let measured_at_floor = r.knob_active_workers <= 1 && r.knob_morsel_target <= morsel_min;
+    // And the floor's own measurement must agree. A record at the smallest morsel on one worker
+    // is that configuration's footprint, measured; when the process it describes is short of the
+    // stop line, the floor fits, whatever the model extrapolates from figures that also move
+    // with the drives' decode buffers, the sink's encoders and what the allocator keeps (Score:
+    // four runs in ten ended at 0.7 of their ceiling on a model that said 7.2 GB, RB5).
+    let measured_in_danger = r.mem_anon_peak > state.stop_line();
     if host_breach
+        && measured_at_floor
+        && measured_in_danger
         && state.active_workers <= 1
         && floor_footprint(state) > model::anon_headroom(state)
     {
+        let (footprint, headroom) = (floor_footprint(state), model::anon_headroom(state));
+        let ctl = &state.stages[at];
+        let note = format!(
+            "the run was ended on morsel {} of stage {stage}: measured at the smallest morsel \
+             ({} bytes) on one worker, the model of what the kernel holds outside the arena \
+             ({} bytes fixed, {:.2} bytes per morsel byte, safety {:.2}) puts that morsel at \
+             {footprint} bytes against {headroom} bytes of headroom above the arena (f.7)",
+            r.seq, state.cfg.morsel_min, ctl.c_anon, ctl.a_anon, ctl.safety
+        );
+        state.note(note);
         state.terminated = true;
         actions.terminate = Some(MorunaError::Budget {
             seq: r.seq,
             stage,
-            footprint: floor_footprint(state),
-            budget: model::anon_headroom(state),
+            footprint,
+            budget: headroom,
             features: features_of(r),
         });
         return;
     }
-    if floor_breaches >= BREACHES_BEFORE_TERMINATE && state.active_workers <= 1 {
-        // The backstop: the model says this set fits and the process keeps saying otherwise.
+    // The backstop: the model says this set fits and the process keeps saying otherwise, close
+    // enough to the ceiling that waiting risks the operating system's verdict instead of ours.
+    // A host breach between the breach line and the stop line is the signal to shrink, and the
+    // shrink has been made: what is resident then is mostly the morsels picked up before it,
+    // still finishing on the other workers, and the allocator's hold on what they freed, and
+    // both drain without the run doing anything. Ending the run there ended a Score run at
+    // 0.68 of its ceiling a second after it started (RB5, 2026-11-13).
+    let danger = if host_breach {
+        r.mem_anon_peak > state.stop_line()
+    } else {
+        true
+    };
+    if danger && floor_breaches >= BREACHES_BEFORE_TERMINATE && state.active_workers <= 1 {
         // The figures are the measured footprint above the resting anonymous memory against the
         // line it crossed, so the two are comparable and the first is the larger by definition.
         let (footprint, budget) = if host_breach {
             (
                 r.mem_anon_peak.saturating_sub(model::resting_anon(state)),
-                model::scale(model::anon_headroom(state), BREACH_SHARE),
+                state.stop_line().saturating_sub(model::resting_anon(state)),
             )
         } else {
             (r.dev_mem_peak, device_budget)
         };
+        state.note(format!(
+            "the run was ended on morsel {} of stage {stage}: {floor_breaches} morsels at the \
+             smallest morsel on one worker each took the process to within a quarter of its \
+             reserve of the ceiling, the last to {footprint} bytes above its resting figure \
+             against {budget} (f.7)",
+            r.seq
+        ));
         state.terminated = true;
         actions.terminate = Some(MorunaError::Budget {
             seq: r.seq,
@@ -205,6 +260,7 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     }
     if floor_breaches >= BREACHES_BEFORE_WORKERS && state.active_workers > 1 {
         state.active_workers -= 1;
+        state.shrunk_epoch_ns = crate::elastic::now_ns();
         actions
             .knobs
             .push(Knob::ActiveWorkers(state.active_workers));

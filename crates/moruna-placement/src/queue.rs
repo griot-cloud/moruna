@@ -62,6 +62,11 @@ pub struct Queue {
     pub water_set: [bool; TIER_COUNT],
     /// `set_staging`; false for a queue a source gives, true otherwise (b).
     pub staging_enabled: bool,
+    /// Staging was asked for (`set_staging(_, true)`: the controller's Memory row, a one-shot
+    /// source, portable checkpoints), not only allowed by default. Only then does the queue's own
+    /// high water write its batches to disk; otherwise a queue over its high water holds its
+    /// producers back, and disk is for memory that is short (a wall, a tier over budget).
+    pub staging_asked: bool,
     /// The promotion window `k`.
     pub promotion_window: u16,
     /// A failed move of the head, surfaced by the next `pop` (f.10) and by `is_full` (f.14).
@@ -99,6 +104,7 @@ impl Queue {
             water: [(0, u64::MAX); TIER_COUNT],
             water_set: [false; TIER_COUNT],
             staging_enabled: !recomputable,
+            staging_asked: false,
             promotion_window: moruna_kernel::DEFAULT_PROMOTION_WINDOW,
             head_error: None,
             blocked: false,

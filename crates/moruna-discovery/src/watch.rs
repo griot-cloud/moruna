@@ -229,10 +229,10 @@ impl LimitsWatch {
         })
     }
 
-    /// Clamp every later reading to `bounds` (`budget.elastic`). A run that sets none still
-    /// follows the machine down; it follows it up only as far as the bounds say, and the facade
-    /// passes the starting figures when the spec has no `elastic`, so an inelastic run never
-    /// grows (MH H-Q4).
+    /// Clamp every later reading to `bounds` (`budget.elastic`). A run always follows the machine
+    /// down; it follows it up only as far as the bounds say. Without `elastic` the facade passes
+    /// the machine's own size (RB4, which superseded MH H-Q4), and the starting figures for an
+    /// explicit budget or CPU count.
     pub fn with_bounds(mut self, bounds: ElasticBounds) -> LimitsWatch {
         self.bounds = Some(bounds);
         self

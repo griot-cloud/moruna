@@ -16,7 +16,9 @@ use bytes::{Buf, Bytes};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 
-/// The byte ranges of one file that are resident in the arena, by absolute offset.
+/// The byte ranges of one file that are resident in the arena, by absolute offset. A clone
+/// shares the buffers.
+#[derive(Clone)]
 pub(crate) struct ArenaChunks {
     file_len: u64,
     ranges: Vec<(u64, Bytes)>,

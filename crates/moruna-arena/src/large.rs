@@ -59,6 +59,17 @@ impl TopArea {
         }
     }
 
+    /// Every range of the top area no slab or large allocation holds: the gap, and the
+    /// freed large blocks inside the large end. What `Space::release_free` may give back.
+    pub(crate) fn free_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::with_capacity(self.free.len() + 1);
+        if self.gap() > 0 {
+            ranges.push((self.slab_top, self.gap()));
+        }
+        ranges.extend(self.free.iter().map(|(off, len)| (*off, *len)));
+        ranges
+    }
+
     /// Bytes between the highest slab and the lowest large allocation.
     pub(crate) fn gap(&self) -> u64 {
         self.large_bottom.saturating_sub(self.slab_top)

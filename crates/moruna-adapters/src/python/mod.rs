@@ -15,8 +15,10 @@ pub mod fingerprint;
 pub mod gil;
 pub mod hooks;
 pub mod kernel;
+pub(crate) mod shared;
 pub mod state;
 pub mod tensor_obj;
+pub(crate) mod thread;
 
 pub use gil::{python_build_info, python_gil_enabled};
 pub use kernel::{PyKernel, PyKernelSpec, PyKernelStats};

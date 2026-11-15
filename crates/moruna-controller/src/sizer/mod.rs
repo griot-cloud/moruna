@@ -41,8 +41,17 @@ pub struct Observation {
     pub features: MorselFeatures,
     /// Workers allowed to take tasks right now.
     pub active_workers: u16,
-    /// The stage's measured amplification.
+    /// The stage's measured amplification: in the arena, input and landed output per input
+    /// byte since RB3.
     pub a_k: f64,
+    /// The slope of the stage's anonymous fit (f.3): what the process grows per byte of a
+    /// morsel, the quantity a record's `peak_delta / bytes_in` measures.
+    pub a_anon: f64,
+    /// The fixed term of the same fit: what the process grows per morsel whatever its size.
+    pub anon_fixed: u64,
+    /// The target an earlier run's throughput search settled on, from a trusted profile (e.3,
+    /// f.4b): the sizer starts settled there instead of searching again.
+    pub learned_target: Option<u64>,
     /// The safety multiplier in force.
     pub safety: f32,
     /// The stage's current morsel target.
@@ -93,4 +102,9 @@ pub trait Sizer: Send {
     fn confidence(&self) -> f32;
     /// The name the run report calls it by.
     fn name(&self) -> &'static str;
+    /// The target a throughput search settled on, if the sizer ran one to the end: what the
+    /// profile keeps for the next run of the kernel (e.3, f.4b). `None` by default.
+    fn settled_target(&self) -> Option<u64> {
+        None
+    }
 }

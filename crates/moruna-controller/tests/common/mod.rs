@@ -50,7 +50,7 @@ pub fn limits_with_device(ceiling: u64, free: u64) -> Limits {
     }
 }
 
-/// A plan far larger than any budget a test uses, so the tiny-dataset path of f.10 is off.
+/// A plan far larger than any budget a test uses.
 pub fn plan() -> PlanSummary {
     PlanSummary {
         total_bytes: 100 * GIB,
@@ -108,11 +108,14 @@ pub fn stateful_kernel(stage: StageId, instances: usize, hints: KernelHints) -> 
     }
 }
 
-/// A probe result with the given amplification over the given input bytes.
+/// A probe result with the given amplification over the given input bytes, on both sides of
+/// f.3: the anonymous growth, and what the morsel held in the arena (its input and an output
+/// that makes up the rest), so a test's one figure is the kernel's in the arena and out of it.
 pub fn probe(bytes_in: u64, amplification: f64) -> ProbeResult {
     ProbeResult {
         bytes_in,
         rows_in: bytes_in / 100,
+        bytes_out: (bytes_in as f64 * (amplification - 1.0).max(0.0)) as u64,
         peak_delta: (bytes_in as f64 * amplification) as u64,
         dev_peak_delta: 0,
         wall_ns: 1_000_000,
@@ -694,3 +697,18 @@ impl WatchedPlacement {
 
 /// The default sizer kind, named so a test that changes it says so.
 pub const RULE: SizerKind = SizerKind::Rule;
+
+/// `record` stamped as a morsel picked up now, on the clock the controller's epochs use: one
+/// the controller's last shrink cannot have answered already (11 f.7, RB5).
+pub fn started_now(mut r: TraceRecord) -> TraceRecord {
+    // Past the last shrink and the longest `apply` behind it, on a clock that may tick in
+    // microseconds.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    r.t_start_ns = now;
+    r.t_end_ns = now + 500;
+    r
+}

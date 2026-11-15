@@ -31,7 +31,19 @@ fn pl_t5_q0_evicts() {
     }
     common::settle(&reactor);
 
-    // Staging is off for stage 0 by default (b), so pressure evicted instead of writing.
+    // Q0's own high water holds the reads back and drops nothing (2026-11-14); a tier short of
+    // memory drops (`shed`). Staging is off for stage 0 by default (b), so what leaves is
+    // evicted, never written.
+    assert!(
+        engine.evicted(0).is_empty(),
+        "high water alone drops nothing"
+    );
+    assert!(engine.is_full(0), "it holds the reads back");
+    assert!(
+        moruna_kernel::Residency::shed(&*engine, TierKind::Host, bytes * 5),
+        "memory short: Q0 drops"
+    );
+    common::settle(&reactor);
     assert!(
         !reactor.ops().iter().any(|op| op.kind == OpKind::WriteFile),
         "Q0 must not write source morsels to disk (PL-I6)"

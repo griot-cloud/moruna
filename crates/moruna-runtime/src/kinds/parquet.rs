@@ -238,7 +238,8 @@ impl SinkKind for Parquet {
                 };
                 // The run id goes into every file's footer (08 e.2).
                 let sink = ParquetSink::new(cfg, ctx.reactor.clone(), ctx.alloc.clone())?
-                    .with_run_id(ctx.run_id);
+                    .with_run_id(ctx.run_id)
+                    .with_lanes(usize::from(ctx.workers.max(1)));
                 Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
             })),
             target,

@@ -34,17 +34,18 @@ use crate::spec::EngineMemory;
 
 /// The largest figures a run may follow the machine up to (MH 4.1 `budget.elastic`).
 ///
-/// Both default to the run's starting figures, so a spec that says nothing never grows (MH H-Q4):
-/// the arena stays one region and the worker pool stays the starting N, exactly as before. A
-/// machine that shrinks is followed whatever these say. F8.1 maps the JSON spec's
+/// `None` follows the machine (RB4, which superseded MH H-Q4): the ceiling up to what the machine
+/// has, and the worker pool up to the CPUs online at start. An explicit `budget` or `cpu` is not
+/// grown past. A machine that shrinks is followed whatever these say. F8.1 maps the JSON spec's
 /// `budget.elastic.memory_max_bytes` and `budget.elastic.cpu_max` onto these two fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ElasticBudget {
-    /// The highest memory ceiling the run follows the machine to, in bytes. `None`: the starting
-    /// ceiling.
+    /// The highest memory ceiling the run follows the machine to, in bytes. `None`: what the
+    /// machine has (the starting ceiling for an explicit budget).
     pub memory_max_bytes: Option<u64>,
     /// The most CPUs the run follows the machine to, which is also the worker thread pool the
-    /// scheduler creates at start and parks. `None`: the starting N.
+    /// scheduler creates at start and parks. `None`: the CPUs online at start (the starting N for
+    /// an explicit CPU count).
     pub cpu_max: Option<u16>,
 }
 
@@ -91,6 +92,8 @@ pub(crate) struct WatchState {
     draining_since: Option<u64>,
     /// Notes for the report, each once.
     notes: Vec<String>,
+    /// The cap on the arena's host bytes in force, when the ceiling is below its regions (RB4).
+    capped: Option<u64>,
 }
 
 impl WatchState {
@@ -101,6 +104,7 @@ impl WatchState {
             drains: Vec::new(),
             draining_since: None,
             notes: Vec::new(),
+            capped: None,
         }
     }
 
@@ -250,9 +254,9 @@ fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
         // ceiling through its sampler.
         return;
     };
-    let capacity = arena.host_capacity();
-    if capacity >= target.saturating_add(HUGE_PAGE_BYTES) {
-        let marked = arena.shrink(capacity - target);
+    let regions = arena.regions_capacity();
+    if regions >= target.saturating_add(HUGE_PAGE_BYTES) {
+        let marked = arena.shrink(regions - target);
         if marked > 0 {
             let now = crate::report::now_ns();
             state.drains.push(DrainSummary {
@@ -264,21 +268,35 @@ fn resize_arena(ctx: &WatchCtx, state: &mut WatchState) {
             // A region that was already empty is unmapped at once.
             check_drain(ctx, state);
         }
-        if arena.host_capacity() > target {
-            state.note(format!(
-                "the ceiling fell to {ceiling} bytes, which is below the arena's first region: \
-                 that region is not given back, and the controller holds less of it instead"
-            ));
-        }
-    } else if target >= capacity.saturating_add(HUGE_PAGE_BYTES) {
+    } else if target >= regions.saturating_add(HUGE_PAGE_BYTES) {
         if arena.draining_bytes() > 0 {
             // Pacing (MH 7.1): no new region while an old one is still resident.
             return;
         }
-        match arena.grow(target - capacity) {
+        match arena.grow(target - regions) {
             Ok(_) => {}
             Err(error) => state.note(format!("the arena could not grow: {error}")),
         }
+    }
+    // RB4: the first region never drains, so a ceiling below it is met by capping what the arena
+    // hands out at the arena's share and giving every page no buffer holds back to the operating
+    // system at once; buffers already out stay, and drain as the run moves on. Before, the
+    // region stayed resident whole, and a cgroup limit lowered beneath it killed the run (the
+    // live squeezes of the 0.6.5 benchmark). A ceiling that comes back lifts the cap.
+    let cap = (target < arena.regions_capacity()).then_some(target);
+    if cap != state.capped {
+        arena.cap_host(cap);
+        if let Some(cap) = cap
+            && state.capped.is_none_or(|before| cap < before)
+        {
+            let released = arena.release_free();
+            state.note(format!(
+                "the ceiling fell to {ceiling} bytes, below the arena's first region: the arena \
+                 now hands out at most {cap} bytes, and gave {released} bytes no buffer held back \
+                 to the operating system"
+            ));
+        }
+        state.capped = cap;
     }
     let told = (target.min(arena.host_capacity()), arena.draining_bytes());
     if told != state.budget {
@@ -304,9 +322,9 @@ mod tests {
         assert_eq!(workers_for(4.0, 0), 1);
     }
 
-    /// The default elastic budget is the starting figures, which is what H-Q4 asks for.
+    /// The default elastic budget names no maximum, which the facade reads as the machine (RB4).
     #[test]
-    fn the_default_elastic_budget_never_grows() {
+    fn the_default_elastic_budget_names_no_maximum() {
         let elastic = ElasticBudget::default();
         assert_eq!(elastic.memory_max_bytes, None);
         assert_eq!(elastic.cpu_max, None);

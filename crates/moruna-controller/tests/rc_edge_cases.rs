@@ -95,6 +95,7 @@ fn rc_f3_a_tiny_probe_that_caught_a_fixed_cost_does_not_refuse() {
     let one_time = moruna_kernel::ProbeResult {
         bytes_in: 256,
         rows_in: 16,
+        bytes_out: 0,
         peak_delta: 8 * MIB,
         dev_peak_delta: 0,
         wall_ns: 1_000_000,

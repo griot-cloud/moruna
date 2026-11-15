@@ -136,6 +136,7 @@ pub(crate) fn new_host(
     want_pinned: bool,
     huge_pages: Guarantee,
     memlock: Guarantee,
+    pretouch: bool,
 ) -> Result<HostRegion> {
     let raw_len =
         usize::try_from(bytes.saturating_add(align)).map_err(|_| MorunaError::Config {
@@ -182,7 +183,11 @@ pub(crate) fn new_host(
     };
 
     let huge_pages_active = apply_huge_pages(&mapping, huge_pages)?;
-    touch(&mapping, if huge_pages_active { 2 << 20 } else { align });
+    // RB4: touched only when asked; otherwise each page is charged when a buffer first lands on
+    // it, and the region costs nothing it is not using (f.1).
+    if pretouch {
+        touch(&mapping, if huge_pages_active { 2 << 20 } else { align });
+    }
     let pinned = if want_pinned {
         apply_memlock(&mapping, memlock)?
     } else {
@@ -242,6 +247,30 @@ fn madvise_hugepage(m: &Mapping) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn madvise_hugepage(_m: &Mapping) -> Option<String> {
     Some("MADV_HUGEPAGE is a Linux facility; this host has none".into())
+}
+
+/// Give the pages of `[ptr, ptr + len)` back to the operating system, keeping the mapping: the
+/// next write to them faults a zeroed page in and is charged then (RB4). `len` is a whole number
+/// of pages and the range holds no live buffer. Linux drops them at once (`MADV_DONTNEED`, which
+/// uncharges the cgroup); macOS marks them reusable (`MADV_FREE_REUSABLE`, which takes them out
+/// of the footprint it enforces limits against). Elsewhere, nothing.
+///
+/// # Safety
+/// The range lies inside a mapping this arena owns, is not page-locked, and no buffer is live in
+/// it nor can become live in it until the caller's lock is released.
+pub(crate) unsafe fn discard(ptr: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    // SAFETY: as the caller promises; MADV_DONTNEED on private anonymous memory only discards.
+    let done = unsafe { libc::madvise(ptr.cast(), len, libc::MADV_DONTNEED) == 0 };
+    #[cfg(target_os = "macos")]
+    // SAFETY: as the caller promises; MADV_FREE_REUSABLE only marks the pages reusable.
+    let done = unsafe { libc::madvise(ptr.cast(), len, libc::MADV_FREE_REUSABLE) == 0 };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let done = {
+        let _ = (ptr, len);
+        false
+    };
+    done
 }
 
 /// Touch every page of the region once so the cgroup charge happens at start and the
@@ -397,6 +426,7 @@ mod tests {
             false,
             Guarantee::Unknown,
             Guarantee::Absent,
+            true,
         );
         assert!(matches!(r, Err(MorunaError::Config { name, .. }) if name == "host_profile"));
         let r = new_host(
@@ -405,6 +435,7 @@ mod tests {
             true,
             Guarantee::Absent,
             Guarantee::Unknown,
+            true,
         );
         assert!(matches!(r, Err(MorunaError::Config { name, .. }) if name == "host_profile"));
     }
@@ -417,6 +448,7 @@ mod tests {
             true,
             Guarantee::Absent,
             Guarantee::Probed(false),
+            true,
         );
         assert!(matches!(r, Err(MorunaError::Config { name, .. }) if name == "arena.pin"));
     }
@@ -432,6 +464,7 @@ mod tests {
             false,
             Guarantee::Present,
             Guarantee::Absent,
+            true,
         );
         match r {
             Err(MorunaError::Config { name, .. }) => assert_eq!(name, "host_profile"),
@@ -458,6 +491,7 @@ mod tests {
             false,
             Guarantee::Probed(false),
             Guarantee::Absent,
+            true,
         )
         .expect("a 4 MiB region");
         assert_eq!(region.mapping.base() as usize % (1 << 16), 0);

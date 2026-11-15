@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.6.6
+
+Moruna adapts to the job and the machine it runs on. On one fixed node (8 CPUs, 24 GiB) it is
+level with or faster than a plain thread pool over pyarrow on every benchmark below: four
+workloads over the 2024 NYC taxi trips, and two datasets several times larger than memory
+(Overture building footprints, 130 GB; FineWeb web text, about 100 GB decoded).
+
+| Benchmark (wall time, lower is better) | Moruna | Loop | Ray Data |
+| --- | --- | --- | --- |
+| NYC Score: model scoring in NumPy | 25.2 s | 27.0 s | |
+| NYC Occupancy: per-minute counts in pyarrow | 7.6 s | 8.0 s | |
+| NYC Enrich: vectorised columns and a filter | 7.0 s | 7.5 s | |
+| NYC Audit: pure Python per trip | 14.8 s (14.2 to 14.8) | 14.5 s (14.4 to 14.6) | |
+| Overture building shapes: 1.19 billion footprints | 723 s | 870 s | 941 s |
+| Overture building attributes: Python per building | 1,118 s | 1,142 s | 1,111 s |
+| FineWeb MinHash: 21 million documents | 2,144 s | 2,184 s | |
+
+NYC figures are repeat runs, which start from what the first run learned (a first run of Audit
+pays about 2% for its one measured batch); the large jobs ran once each. The loop is the best of
+a grid: 16 threads (8 for Occupancy) over 250,000-row batches (20,000 for FineWeb). Ray Data runs
+on standard Python 3.14 at the same batch size.
+
+- **Every dataset is measured.** The small-dataset path (SDD 11 f.10) is gone: it sized every
+  stage from a default amplification, and a model kernel took whole million-row batches on every
+  worker until the allocation guard refused. Every stage of a job can be measured, a stateful
+  one on the worker that holds its instance, and a stage no batch reaches is sized from its
+  hints instead of ending the run.
+- **Repeat runs start from what earlier runs measured.** A completed run leaves a profile per
+  function and input schema. Once a profile has enough samples, a later run of the same function
+  over the same schema skips the measuring step and starts at the batch size the last run
+  settled on.
+- **Each stage's batch is sized for throughput.** Once memory is quiet, the controller tries
+  larger and smaller batches and keeps the size with the lowest CPU time per byte. The rule
+  sizer now compares a batch's heap growth with its own heap figure, not with its in-memory
+  ratio, which halved batches to 22 MB with memory at a sixth of its limit.
+- **Any worker decodes and encodes.** Parquet reads decode, and writes encode, on the worker
+  pool rather than on one thread each, and a Parquet sink writes several files at once.
+- **Reads are charged for what they decode to.** A split states its projected columns' decoded
+  Arrow bytes, and a ranged read of a row group without a page index no longer decompresses
+  every page. Workers are funded for the batches as they come, not for the stage's target.
+- **Memory walls make room before they wait, and end a run only when nothing can move them.**
+  A refused allocation asks placement once for room for the bytes it needs. A large request
+  the budget has room for, but no single gap, gets a region of its own.
+- **Disk only when memory is short.** A queue in front of a sink that keeps up holds its
+  producers back instead of writing batches out. A staging segment holds the run's largest
+  batch. A named staging directory that does not exist is created. A spill file is no longer
+  deleted while a write into it is in flight; that was the cause of "record magic is not
+  MORUNSEG" and "move of batch ... failed twice".
+- **The arena is charged as used.** The host region is no longer touched whole at start. A
+  ceiling lowered below the first region gives pages back instead of holding them. Without an
+  explicit budget, a run follows its container's limits up.
+- **Less memory work the plain loop does not do.** On Linux, glibc keeps its heap tops and has
+  two heaps per CPU (4 to 64), not four in all. Freed NumPy blocks and Moruna's own large
+  buffers are reused within the run's budget. Python requests under 64 KiB go past the
+  allocation guard, which can only refuse larger ones. A returned batch copies only the
+  columns the arena does not own.
+- **A worker keeps one Python thread state for its life.** Every batch made and deleted one,
+  so each started with cold allocator heaps and an empty `threading.local`.
+- **What a Python function shares across workers uses deferred reference counting** on
+  free-threaded 3.14. Eight workers reading the same module-level tables no longer contend
+  on their reference counts.
+- **Sinks.** A batch too large for a file gets a file of its own size, not twice it. A fresh
+  run removes an earlier run's part files from its output prefix.
+- **A second Ctrl-C that arrives as a cancellation finishes is swallowed**, not raised as
+  `KeyboardInterrupt`.
+- **A microVM whose guest exits is not reported as a failed back end.** QEMU disconnects its
+  vsock back end on its way out and ends a moment later; the launcher read that moment as the
+  back end ending under a running node, about once in 26 jailed boots. A back end that ends
+  cleanly now gives QEMU two seconds to be seen ending; one that fails is still an error at
+  once.
+
 ## 0.6.5
 
 This release also carries the security and isolation work planned for 0.6.6.

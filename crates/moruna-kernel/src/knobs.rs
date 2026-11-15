@@ -161,6 +161,9 @@ pub struct ProbeResult {
     pub bytes_in: u64,
     /// Input rows.
     pub rows_in: u64,
+    /// Output payload bytes. With the input, what the morsel held in the arena when `apply`
+    /// returned: the arena is touched when it is made, so `peak_delta` never sees it (RB3).
+    pub bytes_out: u64,
     /// Peak anonymous host bytes above the sample taken before `apply`.
     pub peak_delta: u64,
     /// Peak device bytes above the sample taken before `apply`.

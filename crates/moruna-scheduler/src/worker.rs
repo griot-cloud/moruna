@@ -24,6 +24,38 @@ use crate::instances;
 use crate::shared::{JobOutput, JobRequest, Shared, WorkerJob};
 use crate::slots::BusySlot;
 
+/// Between two attempts of a unit the arena refused: run the offloaded jobs that are queued, on
+/// the slot this worker already holds (a sink's encode is what gives the arena back), for
+/// `wait` (`wall::Wall` says how long).
+fn help_drain(shared: &Shared, wait: Duration) {
+    let until = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < until {
+        match shared.offload.take() {
+            Some(job) => job(),
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
+/// Run one offloaded job (RB1) under a slot claim, if one is queued and a slot is free.
+fn run_offloaded(shared: &Shared, worker: u16) -> bool {
+    if shared.offload.queued() == 0 {
+        return false;
+    }
+    let Some(slot) = shared.knobs.slots.try_claim(worker) else {
+        return false;
+    };
+    let ran = match shared.offload.take() {
+        Some(job) => {
+            job();
+            true
+        }
+        None => false,
+    };
+    drop(slot);
+    ran
+}
+
 /// The per-worker loop of e.1: `Parked` -> `Idle` -> `Running(stage, seq)` -> `Idle`.
 pub(crate) fn worker_loop(
     shared: Arc<Shared>,
@@ -31,6 +63,9 @@ pub(crate) fn worker_loop(
     jobs: Receiver<JobRequest>,
     parker: Parker,
 ) {
+    // Whether this worker's last unit was an offloaded job (RB1): the next turn is a function's,
+    // if the policy has one.
+    let mut offloaded_last = false;
     loop {
         shared.heartbeat.touch(worker);
         if shared.stopping.load(Ordering::SeqCst) {
@@ -51,6 +86,19 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         }
+        // RB1: a decode or an encode a drive handed over is what feeds the functions or frees
+        // the memory behind the sink, so a worker takes one ahead of a function's morsel, under
+        // the same slot claim as any unit so the CPU limit in force binds it too. But not two in
+        // a row while the policy has a function's morsel to give: a worker that always put the
+        // drives' jobs first could be kept on them for good, and was. On Score with two workers
+        // active the queue's entries were evicted for room and read again, every re-read was a
+        // decode, the decodes kept both workers, no morsel at the head was ever taken, and the
+        // queue never shrank: 44,065 re-reads in two minutes and no row out (2026-11-14).
+        if !offloaded_last && run_offloaded(&shared, worker) {
+            offloaded_last = true;
+            continue;
+        }
+        offloaded_last = false;
         // f.3: the run's policy decides, and the unit runs only under a claim on what it is
         // predicted to make (contracts d.18, adaptive-runtime 9.4).
         let (stage, port, claim, learn) = match crate::decide::decide(&shared, worker) {
@@ -61,6 +109,11 @@ pub(crate) fn worker_loop(
                 learn,
             }) => (stage, port, claim, learn),
             Ok(crate::decide::Decision::Idle { ready }) => {
+                // Nothing of a function's to run: a drive's job, if one is waiting, before idling.
+                if run_offloaded(&shared, worker) {
+                    offloaded_last = true;
+                    continue;
+                }
                 let started = std::time::Instant::now();
                 idle(&shared, worker, &parker);
                 if ready {
@@ -416,16 +469,55 @@ pub(crate) fn run_task(
             None => &mut no_state,
         };
         let kernel = entry.kernel.clone();
-        std::panic::catch_unwind(AssertUnwindSafe(move || {
-            if joined {
+        if joined {
+            std::panic::catch_unwind(AssertUnwindSafe(move || {
                 let mut inputs = Vec::with_capacity(others.len() + 1);
                 inputs.push(payload);
                 inputs.extend(others);
                 kernel.apply_aligned(state, inputs)
-            } else {
-                kernel.apply_port(state, port, payload)
+            }))
+        } else {
+            // RB5: an arena that cannot take the unit's output is a wall, not an error. The
+            // worker keeps a share of its input and asks placement for room (queued batches,
+            // needed later, leave memory cheapest-to-bring-back first), helps the sink drain (the
+            // queued encodes free the arena), and applies again. It gives up only when nothing in
+            // the run can free memory (`wall`). Before, the first refusal ended the run: Enrich
+            // over the whole dataset, a 4.7 MB output with the arena at nine tenths (2026-11-14).
+            let mut payload = payload;
+            let mut wall: Option<crate::wall::Wall> = None;
+            let result = loop {
+                let retained = payload.share();
+                let st: &mut dyn KernelState = &mut *state;
+                let kernel = kernel.clone();
+                let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    kernel.apply_port(st, port, payload)
+                }));
+                if let Ok(Err(MorunaError::Alloc { bytes, .. })) = &result
+                    && shared.run_state().is_live()
+                    && !shared.has_exit()
+                {
+                    let at = wall.get_or_insert_with(|| {
+                        shared.wall_waiters.fetch_add(1, Ordering::SeqCst);
+                        crate::wall::Wall::new(shared)
+                    });
+                    match at.refused(shared, *bytes, crate::wall::Room::Make, 1) {
+                        crate::wall::Next::Retry(wait) => {
+                            help_drain(shared, wait);
+                            payload = retained;
+                            continue;
+                        }
+                        crate::wall::Next::GiveUp(why) => {
+                            tracing::warn!(target: "sched.wall", stage = entry.stage, seq = seq_in, %why, "memory wall");
+                        }
+                    }
+                }
+                break result;
+            };
+            if wall.is_some() {
+                shared.wall_waiters.fetch_sub(1, Ordering::SeqCst);
             }
-        }))
+            result
+        }
     };
     let c1 = thread_cpu_ns();
     let t1 = now_ns();
@@ -514,7 +606,7 @@ pub(crate) fn run_task(
             if push_error.is_some() {
                 // The release failed: the run ends on that error, and nothing is pushed.
             } else if let Err(e) =
-                crate::decide::admit_push(shared, &entry.outputs, out_morsel, claim)
+                crate::decide::admit_push_on_worker(shared, &entry.outputs, out_morsel, claim)
             {
                 push_error = Some(e);
             } else {
@@ -625,6 +717,7 @@ pub(crate) fn run_task(
         return Ok(Some(ProbeResult {
             bytes_in,
             rows_in,
+            bytes_out,
             peak_delta: s1.peak_anon_bytes.saturating_sub(s0.anon_bytes),
             dev_peak_delta: s1.device_used[0].saturating_sub(s0.device_used[0]),
             wall_ns: t1.saturating_sub(t0),

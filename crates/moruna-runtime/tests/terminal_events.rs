@@ -1077,9 +1077,13 @@ fn py_t28_any_interleaving_tells_each_task_in_order() {
 
 /// PY-T29 a_start_that_outruns_its_feed (HO-T16): a real run of one kernel stage whose every
 /// producer, on its own thread, is held where it tells its queue's first `Fed` until the
-/// consumer, on another thread, has taken that morsel and told its start. The interleaving
-/// that left HO-T16 without a `task_ready` happens on every run here, once for each queue, and
-/// every task is still told registered, waiting, ready and started, in that order, once each.
+/// consumer, on another thread, has taken that morsel and told its start, and every task is
+/// still told registered, waiting, ready and started, in that order, once each.
+///
+/// Since every run is probed (RB2, 2026-11-13) a queue's first morsel is pushed during the
+/// probe, before any stage is told started, so the hold usually times out and the order comes
+/// out ready-then-started on its own; the hold stays so that a run that does reach the
+/// interleaving still exercises it, and the order is what is asserted either way.
 #[test]
 fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
     use moruna_runtime::host::lifecycle::Ending;
@@ -1124,7 +1128,7 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
             let (lock, signal) = &*starts;
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let (_guard, waited) = signal
-                .wait_timeout_while(guard, Duration::from_secs(20), |s| !s[consumer])
+                .wait_timeout_while(guard, Duration::from_secs(2), |s| !s[consumer])
                 .unwrap_or_else(|e| e.into_inner());
             if !waited.timed_out() {
                 held.fetch_add(1, Ordering::SeqCst);
@@ -1151,10 +1155,9 @@ fn py_t29_a_start_that_outruns_its_feed_is_told_ready_first() {
     )
     .expect("the held run completes");
     lifecycle.end(Ending::Completed);
-    assert_eq!(
-        forced.load(Ordering::SeqCst),
-        sink,
-        "every consumer told its start before its feed was told"
+    assert!(
+        forced.load(Ordering::SeqCst) <= sink,
+        "at most one held feed per queue"
     );
     let events = told.lock().unwrap_or_else(|e| e.into_inner()).clone();
     one_end_each(&events, "a start that outran its feed");

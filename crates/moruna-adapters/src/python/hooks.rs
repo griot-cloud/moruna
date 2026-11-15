@@ -3,6 +3,7 @@
 //! a call. Every hook hands its decision to `crate::guard`, which needs no interpreter.
 
 use core::ffi::{c_char, c_uint, c_void};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Once, OnceLock};
 
 use moruna_kernel::AllocCounts;
@@ -30,12 +31,18 @@ static MEM: OnceLock<Saved> = OnceLock::new();
 static OBJ: OnceLock<Saved> = OnceLock::new();
 static INSTALLED: Once = Once::new();
 
+// A request below `GUARD_MIN_BYTES` goes to the allocator underneath from the hook itself, with no
+// call into the guard: every Python object passes through here, and on the benchmark VM the guard
+// call alone, for requests it only passed on, was 1.9 of Audit's 106 CPU-seconds (2026-11-14).
 macro_rules! domain_hooks {
     ($saved:ident, $malloc:ident, $calloc:ident) => {
         extern "C" fn $malloc(ctx: *mut c_void, size: usize) -> *mut c_void {
             let Some(underlying) = $saved.get().and_then(|s| s.0.malloc) else {
                 return core::ptr::null_mut();
             };
+            if (size as u64) < guard::GUARD_MIN_BYTES {
+                return underlying(ctx, size);
+            }
             guard::allocate(size as u64, || underlying(ctx, size))
         }
 
@@ -46,6 +53,9 @@ macro_rules! domain_hooks {
             match nelem.checked_mul(elsize) {
                 // An overflowing product is the allocator underneath's to refuse.
                 None => underlying(ctx, nelem, elsize),
+                Some(bytes) if (bytes as u64) < guard::GUARD_MIN_BYTES => {
+                    underlying(ctx, nelem, elsize)
+                }
                 Some(bytes) => guard::allocate(bytes as u64, || underlying(ctx, nelem, elsize)),
             }
         }
@@ -260,15 +270,192 @@ unsafe fn handed(base: *mut c_void, size: usize) -> *mut c_void {
     }
 }
 
-/// The block's start and the size its header records.
+/// The block's start, the size its header records, and its class capacity (0: not a cached
+/// class, so the C heap's to free).
 ///
 /// # Safety
-/// `ptr` was returned by `handed`.
-unsafe fn block_of(ptr: *mut c_void) -> (*mut c_void, u64) {
-    // SAFETY: the caller's contract: `HEADER` bytes before `ptr` are the header `handed` wrote.
+/// `ptr` was returned by `handed` or `handed_classed`.
+unsafe fn block_of(ptr: *mut c_void) -> (*mut c_void, u64, usize) {
+    // SAFETY: the caller's contract: `HEADER` bytes before `ptr` are the header written for it.
     unsafe {
         let base = (ptr as *mut u8).sub(HEADER) as *mut c_void;
-        (base, (base as *const u64).read())
+        let header = base as *const u64;
+        (base, header.read(), header.add(1).read() as usize)
+    }
+}
+
+/// [`handed`] for a block of a cache class: the header records its capacity too.
+///
+/// # Safety
+/// As for `handed`, with `base` heading at least `capacity` bytes.
+unsafe fn handed_classed(base: *mut c_void, size: usize, capacity: usize) -> *mut c_void {
+    // SAFETY: the caller's contract, as for `handed`.
+    unsafe {
+        let p = handed(base, size);
+        if !p.is_null() {
+            (base as *mut u64).add(1).write(capacity as u64);
+        }
+        p
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// f.11 (2026-11-14): a freed NumPy block of CACHE_MIN bytes or more is kept for the next request
+// of its class instead of going back to the C heap.
+//
+// F8.9 (12 l) fixes glibc's mmap threshold at 256 KiB so the process stays under small ceilings,
+// which hands every block that large back to the system on `free`: a kernel that takes and frees
+// arrays of a few mebibytes morsel after morsel had each one faulted in and zeroed again. On the
+// benchmark VM that was the larger part of the kernel's time in the process, 35% of Occupancy's
+// CPU against 22% for the plain loop, whose arrays the C heap keeps. The cache is Moruna's, in
+// the hooks it already owns, so it is the same on every C library: glibc, musl (the engine on
+// the microkernel), macOS. It holds at most a sixteenth of the run's ceiling (256 MiB with no
+// run bound), and every block goes back to the C heap when the run ends.
+
+/// The smallest block kept: below it the C heap keeps freed blocks itself.
+const CACHE_MIN: usize = 256 << 10;
+/// Classes per power of two: a block is allocated at the next of 1, 1.25, 1.5 and 1.75 times a
+/// power of two, so a freed one serves any request of its class and wastes at most a quarter.
+const STEPS: usize = 4;
+/// Classes up to 2^63.
+const CLASSES: usize = 64 * STEPS;
+/// What the cache may hold when no run is bound.
+const CACHE_UNBOUND: u64 = 256 << 20;
+
+/// The class of a block of `total` bytes and the capacity it is allocated at; `None` below
+/// `CACHE_MIN`.
+fn class_of(total: usize) -> Option<(usize, usize)> {
+    if total < CACHE_MIN {
+        return None;
+    }
+    let power = (usize::BITS - 1 - total.leading_zeros()) as usize;
+    let base = 1usize << power;
+    (0..=STEPS).find_map(|step| {
+        let capacity = base.checked_add((base / STEPS) * step)?;
+        (capacity >= total).then_some((power * STEPS + step, capacity))
+    })
+}
+
+/// The capacity of class `class`.
+fn capacity_of(class: usize) -> usize {
+    let base = 1usize << (class / STEPS);
+    base + (base / STEPS) * (class % STEPS)
+}
+
+/// What the cache may hold for a kernel: a sixteenth of its run's ceiling.
+fn cache_limit(owner: &KernelMemory) -> u64 {
+    owner
+        .run_ceiling()
+        .map_or(CACHE_UNBOUND, |ceiling| ceiling / 16)
+}
+
+/// Freed blocks by class, as addresses, and the bytes they hold together.
+struct BlockCache {
+    classes: Box<[std::sync::Mutex<Vec<usize>>]>,
+    held: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    kept: std::sync::atomic::AtomicU64,
+}
+
+/// What the NumPy block cache has done in this process (f.11): requests it served from a freed
+/// block, blocks it kept on `free`, and the bytes it holds now.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NumpyCacheStats {
+    /// Requests served from a block the cache held.
+    pub hits: u64,
+    /// Freed blocks the cache kept instead of giving them back to the C heap.
+    pub kept: u64,
+    /// Bytes the cache holds now.
+    pub held_bytes: u64,
+}
+
+/// The NumPy block cache's figures for this process.
+pub fn numpy_cache_stats() -> NumpyCacheStats {
+    let cache = cache();
+    NumpyCacheStats {
+        hits: cache.hits.load(Ordering::Relaxed),
+        kept: cache.kept.load(Ordering::Relaxed),
+        held_bytes: cache.held.load(Ordering::Acquire),
+    }
+}
+
+impl BlockCache {
+    fn new() -> BlockCache {
+        BlockCache {
+            classes: (0..CLASSES)
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect(),
+            held: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            kept: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// A block of `class` the cache holds, taken out of it.
+    fn take(&self, class: usize) -> Option<*mut c_void> {
+        let base = self.classes[class]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()?;
+        self.held
+            .fetch_sub(capacity_of(class) as u64, Ordering::AcqRel);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(base as *mut c_void)
+    }
+
+    /// Keep `base`, a block of `class`, if the cache stays within `limit`; false when it is the
+    /// caller's to free.
+    fn put(&self, class: usize, base: *mut c_void, limit: u64) -> bool {
+        let capacity = capacity_of(class) as u64;
+        let room = self
+            .held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held + capacity <= limit).then_some(held + capacity)
+            })
+            .is_ok();
+        if room {
+            self.classes[class]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(base as usize);
+            self.kept.fetch_add(1, Ordering::Relaxed);
+        }
+        room
+    }
+
+    /// Every block the cache holds, with its capacity, taken out of it.
+    fn drain(&self) -> Vec<(*mut c_void, usize)> {
+        let mut out = Vec::new();
+        for (class, blocks) in self.classes.iter().enumerate() {
+            let taken = std::mem::take(&mut *blocks.lock().unwrap_or_else(|e| e.into_inner()));
+            for base in taken {
+                self.held
+                    .fetch_sub(capacity_of(class) as u64, Ordering::AcqRel);
+                out.push((base as *mut c_void, capacity_of(class)));
+            }
+        }
+        out
+    }
+}
+
+static CACHE: OnceLock<BlockCache> = OnceLock::new();
+
+fn cache() -> &'static BlockCache {
+    CACHE.get_or_init(BlockCache::new)
+}
+
+/// Give every block the cache holds back to the C heap: what the facade calls when a run ends
+/// (`PyKernel::release_run`), so nothing a run's kernels freed outlives it.
+pub(crate) fn drain_numpy_cache() {
+    let Some(api) = NUMPY.get().and_then(Option::as_ref) else {
+        return;
+    };
+    let Some(free) = api.default.free else {
+        return;
+    };
+    for (base, capacity) in cache().drain() {
+        // SAFETY: a block NumPy's default allocator made at `capacity` bytes, freed once, here.
+        unsafe { free(api.default.ctx, base, capacity) };
     }
 }
 
@@ -286,6 +473,16 @@ unsafe extern "C" fn np_malloc(ctx: *mut c_void, size: usize) -> *mut c_void {
     let (Some(total), Some(malloc)) = (size.checked_add(HEADER), h.underneath.malloc) else {
         return core::ptr::null_mut();
     };
+    if let Some((class, capacity)) = class_of(total) {
+        let base = guard::allocate_owned(&h.owner, size as u64, || {
+            cache().take(class).unwrap_or_else(|| {
+                // SAFETY: NumPy's default allocator, with its own context.
+                unsafe { malloc(h.underneath.ctx, capacity) }
+            })
+        });
+        // SAFETY: a cached block or the default allocator's: null or `capacity >= total` bytes.
+        return unsafe { handed_classed(base, size, capacity) };
+    }
     let base = guard::allocate_owned(&h.owner, size as u64, || {
         // SAFETY: NumPy's default allocator, with its own context.
         unsafe { malloc(h.underneath.ctx, total) }
@@ -304,6 +501,20 @@ unsafe extern "C" fn np_calloc(ctx: *mut c_void, nelem: usize, elsize: usize) ->
     let Some(total) = size.checked_add(HEADER) else {
         return core::ptr::null_mut();
     };
+    if let Some((class, capacity)) = class_of(total) {
+        let base = guard::allocate_owned(&h.owner, size as u64, || match cache().take(class) {
+            Some(base) => {
+                // SAFETY: a cached block of `capacity >= total` bytes nobody else holds; the
+                // bytes NumPy will see are zeroed, as `calloc` promises.
+                unsafe { (base as *mut u8).add(HEADER).write_bytes(0, size) };
+                base
+            }
+            // SAFETY: NumPy's default allocator, with its own context; one element.
+            None => unsafe { calloc(h.underneath.ctx, 1, capacity) },
+        });
+        // SAFETY: as in `np_malloc`.
+        return unsafe { handed_classed(base, size, capacity) };
+    }
     let base = guard::allocate_owned(&h.owner, size as u64, || {
         // SAFETY: NumPy's default allocator, with its own context; one element of `total`.
         unsafe { calloc(h.underneath.ctx, 1, total) }
@@ -318,10 +529,33 @@ unsafe extern "C" fn np_realloc(ctx: *mut c_void, ptr: *mut c_void, new: usize) 
         return unsafe { np_malloc(ctx, new) };
     }
     // SAFETY: NumPy calls with the handler's own context and a block this handler made.
-    let (h, (base, old)) = unsafe { (handler_of(ctx), block_of(ptr)) };
+    let (h, (base, old, capacity)) = unsafe { (handler_of(ctx), block_of(ptr)) };
     let (Some(total), Some(realloc)) = (new.checked_add(HEADER), h.underneath.realloc) else {
         return core::ptr::null_mut();
     };
+    if capacity > 0 {
+        if total <= capacity && total >= CACHE_MIN {
+            // Still its class's: resized where it is.
+            let same = guard::resize_owned(&h.owner, old, new as u64, || base);
+            // SAFETY: the block heads `capacity >= total` bytes; null leaves it as it was.
+            return unsafe { handed_classed(same, new, capacity) };
+        }
+        // Another class, or none: a new block, the bytes copied, the old one freed.
+        // SAFETY: the handler's own allocation and free, each with its own context.
+        unsafe {
+            let moved = np_malloc(ctx, new);
+            if moved.is_null() {
+                return moved;
+            }
+            core::ptr::copy_nonoverlapping(
+                ptr as *const u8,
+                moved as *mut u8,
+                new.min(old as usize),
+            );
+            np_free(ctx, ptr, old as usize);
+            return moved;
+        }
+    }
     let moved = guard::resize_owned(&h.owner, old, new as u64, || {
         // SAFETY: the block's start, which the default allocator made.
         unsafe { realloc(h.underneath.ctx, base, total) }
@@ -335,11 +569,22 @@ unsafe extern "C" fn np_free(ctx: *mut c_void, ptr: *mut c_void, _size: usize) {
         return;
     }
     // SAFETY: NumPy calls with the handler's own context and a block this handler made.
-    let (h, (base, old)) = unsafe { (handler_of(ctx), block_of(ptr)) };
+    let (h, (base, old, capacity)) = unsafe { (handler_of(ctx), block_of(ptr)) };
     guard::release_owned(&h.owner, old);
+    if capacity > 0
+        && let Some((class, _)) = class_of(capacity)
+        && cache().put(class, base, cache_limit(&h.owner))
+    {
+        return;
+    }
+    let whole = if capacity > 0 {
+        capacity
+    } else {
+        old as usize + HEADER
+    };
     if let Some(free) = h.underneath.free {
         // SAFETY: the block's start and its whole size, to the allocator that made it.
-        unsafe { free(h.underneath.ctx, base, old as usize + HEADER) };
+        unsafe { free(h.underneath.ctx, base, whole) };
     }
 }
 
@@ -464,5 +709,64 @@ pub(crate) fn arrow_counts(
             });
             AllocCounts::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod block_cache_tests {
+    use super::*;
+
+    #[test]
+    fn a_class_is_the_next_quarter_step_and_holds_its_request() {
+        assert_eq!(class_of(CACHE_MIN - 1), None);
+        assert_eq!(class_of(CACHE_MIN).map(|(_, c)| c), Some(CACHE_MIN));
+        for total in [
+            CACHE_MIN + 1,
+            300 << 10,
+            1 << 20,
+            (1 << 20) + 1,
+            7_000_000,
+            1 << 30,
+        ] {
+            let (class, capacity) = class_of(total).expect("a class");
+            assert!(capacity >= total, "{total}");
+            assert!(
+                capacity <= total + total / STEPS + 1,
+                "a quarter at most: {total} {capacity}"
+            );
+            assert_eq!(capacity_of(class), capacity);
+            // A block of that capacity is of the same class.
+            assert_eq!(class_of(capacity).map(|(c, _)| c), Some(class));
+        }
+    }
+
+    #[test]
+    fn the_cache_keeps_within_its_limit_and_gives_everything_back() {
+        let cache = BlockCache::new();
+        let (class, capacity) = class_of(1 << 20).expect("a class");
+        let limit = (capacity * 2) as u64;
+        let a = 0x1000 as *mut c_void;
+        let b = 0x2000 as *mut c_void;
+        let c = 0x3000 as *mut c_void;
+        assert!(cache.put(class, a, limit));
+        assert!(cache.put(class, b, limit));
+        assert!(
+            !cache.put(class, c, limit),
+            "past the limit, the caller frees it"
+        );
+        assert_eq!(cache.take(class), Some(b));
+        assert!(cache.put(class, c, limit));
+        let mut drained: Vec<usize> = cache
+            .drain()
+            .into_iter()
+            .map(|(p, cap)| {
+                assert_eq!(cap, capacity);
+                p as usize
+            })
+            .collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![0x1000, 0x3000]);
+        assert_eq!(cache.held.load(Ordering::Acquire), 0);
+        assert_eq!(cache.take(class), None);
     }
 }

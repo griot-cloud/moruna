@@ -283,6 +283,11 @@ pub(crate) struct SourceEnd {
     /// Drive-owned acknowledgement: no read/helper can publish until the barrier opens.
     pub(crate) checkpoint_paused: AtomicBool,
     pub(crate) out: EndCounters,
+    /// What a row decodes to in memory over what the split's metadata says it is (f.5, RB3).
+    pub(crate) decoded: crate::decode_ratio::DecodeRatio,
+    /// Reads that met a full arena and wait to be issued again (RB5): in flight, for the stall
+    /// detector.
+    pub(crate) waiting_reads: std::sync::atomic::AtomicUsize,
     pub(crate) helper_tx: Sender<HelperRequest>,
     pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
     pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
@@ -356,6 +361,8 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_pause: AtomicBool,
     /// Published only after every worker and original IO drive has actually joined.
     pub(crate) checkpoint_quiet: AtomicBool,
+    /// The decodes and encodes the drives hand to the workers (RB1, `offload`).
+    pub(crate) offload: crate::offload::Offload,
 
     pub(crate) last_manifest: Mutex<Option<std::path::PathBuf>>,
 
@@ -423,6 +430,10 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_served: AtomicU64,
     pub(crate) resumed: AtomicBool,
     pub(crate) recomputed: AtomicU64,
+    /// Walls at which placement made room for work under way (RB5, `wall::make_room`).
+    pub(crate) walls_room_made: AtomicU64,
+    /// Workers standing at a memory wall now, each holding its slot (`wall::Wall`).
+    pub(crate) wall_waiters: std::sync::atomic::AtomicUsize,
     pub(crate) shutdown_done: AtomicBool,
     pub(crate) exit_claimed: AtomicBool,
     /// A stage's `finish` has given a batch (f.6, f.12): from then on no manifest is written,
@@ -639,6 +650,8 @@ impl Shared {
                 exhausted: AtomicBool::new(false),
                 checkpoint_paused: AtomicBool::new(false),
                 out: EndCounters::default(),
+                decoded: crate::decode_ratio::DecodeRatio::default(),
+                waiting_reads: std::sync::atomic::AtomicUsize::new(0),
                 helper_tx,
                 helper_rx: Mutex::new(Some(helper_rx)),
                 handle: Mutex::new(None),
@@ -686,6 +699,7 @@ impl Shared {
             control_active: AtomicBool::new(false),
             checkpoint_pause: AtomicBool::new(false),
             checkpoint_quiet: AtomicBool::new(false),
+            offload: crate::offload::Offload::default(),
             last_manifest: Mutex::new(None),
             jobs,
             job_inbox: Mutex::new(inbox),
@@ -732,6 +746,8 @@ impl Shared {
             checkpoint_served: AtomicU64::new(0),
             resumed: AtomicBool::new(false),
             recomputed: AtomicU64::new(0),
+            walls_room_made: AtomicU64::new(0),
+            wall_waiters: std::sync::atomic::AtomicUsize::new(0),
             shutdown_done: AtomicBool::new(false),
             exit_claimed: AtomicBool::new(false),
             finish_gave: AtomicBool::new(false),
@@ -987,6 +1003,16 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// True when no worker will take offloaded work now, so a drive runs its own decode or
+    /// encode inline (RB1): before the run is live, while the gate is up, while stopping, or
+    /// with no active worker.
+    pub(crate) fn offload_inline(&self) -> bool {
+        !self.run_state().is_live()
+            || self.gated()
+            || self.stopping.load(Ordering::SeqCst)
+            || self.knobs.active_workers() == 0
     }
 
     /// Whether the gate is up: while it is, no worker takes a task, so `init_instances`, a

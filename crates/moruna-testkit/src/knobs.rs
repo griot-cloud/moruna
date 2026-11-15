@@ -165,6 +165,7 @@ impl Prober for FakeKnobs {
             None => Ok(ProbeResult {
                 bytes_in: bytes,
                 rows_in: 0,
+                bytes_out: 0,
                 peak_delta: 0,
                 dev_peak_delta: 0,
                 wall_ns: 0,

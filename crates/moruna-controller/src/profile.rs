@@ -1,8 +1,9 @@
 //! The profile store (e.3, f.9).
 //!
-//! One JSON file per kernel fingerprint and input schema hash, advisory only: it seeds the
-//! amplification and the margin, and the probe overrides it whenever the two disagree by more
-//! than half (f.2). It is the controller's memory across runs, and on a resumed run it is its
+//! One JSON file per kernel fingerprint and input schema hash. It seeds the amplification and
+//! the margin; a profile a completed run of the same kernel over the same schema wrote from
+//! enough records is trusted in place of the probe, and otherwise the probe overrides it, and
+//! says so when the two probes disagree by more than half (f.2). It is the controller's memory across runs, and on a resumed run it is its
 //! memory of the run that was interrupted (f.14), which is why it is written periodically and
 //! not only at the end.
 
@@ -58,6 +59,43 @@ pub(crate) struct Profile {
     pub runs: u32,
     /// The 95th percentile of the active sizer's prediction error (f.8).
     pub prediction_error_p95: f64,
+    /// The in-arena amplification `a_k` the run ended at: input and landed output per input
+    /// byte (f.3, RB3). Zero in a file written before 2026-11-14.
+    #[serde(default)]
+    pub a_k_arena: f64,
+    /// The slope of f.3's anonymous fit the run ended at. Zero before 2026-11-14.
+    #[serde(default)]
+    pub a_anon: f64,
+    /// The fixed term of f.3's anonymous fit the run ended at. Zero before 2026-11-14.
+    #[serde(default)]
+    pub c_anon: u64,
+    /// What the kernel's probe measured, one morsel on one worker: the figure a later probe is
+    /// compared with for drift, like with like (f.2). Zero before 2026-11-14.
+    #[serde(default)]
+    pub probe_a_anon: f64,
+    /// The morsel target the rule sizer's throughput search settled on (f.4b): the size below
+    /// the memory rule's at which the kernel spent the least CPU per byte. Zero when no search
+    /// finished.
+    #[serde(default)]
+    pub best_target: u64,
+}
+
+/// Records a profile must hold, summed across runs, before a fresh run trusts it in place of
+/// a probe (f.2, RC-I6).
+pub(crate) const TRUSTED_SAMPLES: u64 = 32;
+
+impl Profile {
+    /// Whether a fresh run may size this kernel from the profile alone, without probing it
+    /// (f.2, RC-I6, 2026-11-14): written by a completed run of the same kernel over the same
+    /// input schema (the caller knows the file matched exactly), from enough records, and
+    /// holding every figure the solve of f.3 needs.
+    pub(crate) fn trusted(&self) -> bool {
+        self.runs >= 1
+            && self.a_k_samples >= TRUSTED_SAMPLES
+            && self.a_k_arena > 0.0
+            && self.a_anon > 0.0
+            && self.probe_a_anon > 0.0
+    }
 }
 
 /// What the store had for one stage.
@@ -188,6 +226,26 @@ pub(crate) fn merge(stored: &Profile, fresh: &Profile) -> Profile {
         final_safety: fresh.final_safety,
         runs: stored.runs.saturating_add(1),
         prediction_error_p95: blend(stored.prediction_error_p95, fresh.prediction_error_p95),
+        a_k_arena: blend_known(stored.a_k_arena, fresh.a_k_arena),
+        a_anon: blend_known(stored.a_anon, fresh.a_anon),
+        c_anon: blend_known(stored.c_anon as f64, fresh.c_anon as f64).round() as u64,
+        probe_a_anon: blend_known(stored.probe_a_anon, fresh.probe_a_anon),
+        // The newest search's answer, or the stored one when this run did not search.
+        best_target: if fresh.best_target > 0 {
+            fresh.best_target
+        } else {
+            stored.best_target
+        },
+    }
+}
+
+/// e.3's blend for a figure a file may not have: one side unknown (zero, as in a file written
+/// before the figure existed) gives the other as it stands rather than a blend with zero.
+fn blend_known(old: f64, new: f64) -> f64 {
+    match (old > 0.0, new > 0.0) {
+        (true, true) => old * (1.0 - NEW_RUN_WEIGHT) + new * NEW_RUN_WEIGHT,
+        (false, _) => new,
+        (true, false) => old,
     }
 }
 
@@ -220,10 +278,12 @@ pub(crate) fn write(dir: &Path, profile: &Profile, file: &Path) -> std::io::Resu
 pub(crate) fn from_stage(state: &crate::ControllerState, at: usize) -> Option<Profile> {
     let ctl = state.stages.get(at)?;
     let kernel = state.kernels.iter().find(|k| k.stage == ctl.stage)?;
+    // With no record, the probe's anonymous figure: the profile's ratios are the records'
+    // anonymous growth per byte, which `a_k` stopped being at RB3.
     let mean = if ctl.var_count > 0 {
         ctl.var_mean
     } else {
-        ctl.a_k
+        ctl.a_anon_seed
     };
     let variance = if ctl.var_count > 1 {
         ctl.var_m2 / (ctl.var_count - 1) as f64
@@ -247,6 +307,16 @@ pub(crate) fn from_stage(state: &crate::ControllerState, at: usize) -> Option<Pr
         final_safety: ctl.safety,
         runs: 1,
         prediction_error_p95: percentile(&ctl.sizer_errors, 0.95),
+        a_k_arena: ctl.a_k,
+        a_anon: ctl.a_anon,
+        c_anon: ctl.c_anon,
+        // A stage this run did not probe has nothing new to say about its probe: it carries
+        // the stored figure forward.
+        probe_a_anon: match (&ctl.profile, ctl.seeded) {
+            (Some(found), true) => found.probe_a_anon,
+            _ => ctl.a_anon_seed,
+        },
+        best_target: ctl.sizer.settled_target().unwrap_or(0),
     })
 }
 

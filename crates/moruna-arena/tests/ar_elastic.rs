@@ -198,6 +198,7 @@ fn grown_regions_keep_the_one_host_tier() {
         huge_pages: Guarantee::Probed(false),
         memlock: Guarantee::Probed(true),
         register_rdma: false,
+        pretouch: false,
     })
     .expect("arena");
     let tier = if pinned.is_pinned() {

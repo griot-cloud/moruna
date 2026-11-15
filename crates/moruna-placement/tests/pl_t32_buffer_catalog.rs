@@ -506,7 +506,7 @@ fn pl_t35_events_and_reservations() {
 
 #[test]
 fn pl_t36_evicted_once_and_resumed_once() {
-    // A source's batch, dropped under pressure with staging off, is listed once and one
+    // A source's batch, dropped with memory short and staging off, is listed once and one
     // `replace` brings it back for both queues.
     let scratch = common::Scratch::new("t36a");
     let alloc = FakeAllocator::new();
@@ -521,7 +521,13 @@ fn pl_t36_evicted_once_and_resumed_once() {
             .push_to(&[0, 1], batch(&alloc, seq))
             .expect("fans out");
     }
+    // A queue's own high water no longer drops a source's batch (2026-11-14); memory short does.
     engine.set_water(0, TierKind::Host, 2 * b, 2 * b);
+    assert!(
+        matches!(state(&engine, 0, 2), State::Resident(_)),
+        "high water alone drops nothing"
+    );
+    assert!(Residency::shed(&*engine, TierKind::Host, b), "memory short");
     assert!(
         matches!(state(&engine, 0, 2), State::Evicted),
         "the furthest left"

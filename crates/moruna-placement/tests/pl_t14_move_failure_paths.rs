@@ -114,6 +114,9 @@ fn pl_t14_a_failed_write_leaves_the_bytes_resident() {
         common::budgets(1 << 30, 0, 1 << 30),
     );
     let engine = common::engine(cfg, &alloc, &reactor);
+    // Staging asked for, so the queue's own high water writes (2026-11-14: allowed by default,
+    // written only when asked).
+    engine.set_staging(1, true);
     engine.set_promotion_window(1, 1);
     let sample = common::table_morsel(&alloc, 0, 1, 128);
     let bytes = sample.bytes;

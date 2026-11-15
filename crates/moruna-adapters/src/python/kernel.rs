@@ -203,6 +203,13 @@ impl PyKernel {
                     }
                 }
             }
+            // f.13: what the function shares across workers is taken out of reference counting,
+            // here, on the thread that builds the kernel.
+            let deferred = super::shared::defer_shared(
+                callable,
+                spec.origin.as_ref().map(|origin| origin.bind(py)),
+            );
+            tracing::debug!(target: "adapter.shared", deferred, "deferred reference counting");
             let has_footprint = callable.hasattr("footprint").unwrap_or(false);
             let has_finish = spec.stateful && callable.hasattr("finish").unwrap_or(false);
             let printed = fingerprint::compute(py, &spec);
@@ -264,6 +271,8 @@ impl PyKernel {
     pub fn release_run(&self) {
         *self.alloc.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.memory.release();
+        // The NumPy blocks the run's kernels freed go back to the C heap with it (f.11).
+        super::hooks::drain_numpy_cache();
     }
 
     fn bound_alloc(&self) -> Option<Arc<dyn Allocator>> {
@@ -531,6 +540,7 @@ impl Kernel for PyKernel {
         if !self.stateful {
             return Ok(Box::new(NoState));
         }
+        super::thread::keep();
         Python::attach(|py| {
             let ctx_obj = self.ctx_object(py, ctx)?;
             let state = self
@@ -553,6 +563,7 @@ impl Kernel for PyKernel {
         if self.resume != ResumePolicy::Checkpoint {
             return Err(missing_restore());
         }
+        super::thread::keep();
         Python::attach(|py| {
             let ctx_obj = self.ctx_object(py, ctx)?;
             let restored = PyState::restored(
@@ -577,6 +588,7 @@ impl Kernel for PyKernel {
         if !self.has_finish {
             return Ok(None);
         }
+        super::thread::keep();
         let Some(alloc) = self.bound_alloc() else {
             return Err(MorunaError::Config {
                 name: "adapter",
@@ -640,6 +652,64 @@ impl Kernel for PyKernel {
     /// alive by a handle until the copy has finished with it and is then released under a brief
     /// attachment.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        self.apply_splitting(state, input)
+    }
+}
+
+impl PyKernel {
+    /// RB5 (2026-11-13): a refused allocation is a wall, not an error. When the allocator guard
+    /// refuses a call on a table of more than one row, the kernel is applied to each half
+    /// instead, halving again as far as one row, and the halves' outputs are joined into one
+    /// payload over arena buffers, so the morsel's one output stays one output. A table that
+    /// cannot be split further, a tensor, or any other error is returned as it was.
+    fn apply_splitting(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+        // Every call on this worker in one thread state (thread.rs): it was made and deleted
+        // around each one.
+        super::thread::keep();
+        let keep = match &input {
+            Payload::Table(batch, tier) if batch.num_rows() > 1 => Some((batch.clone(), *tier)),
+            _ => None,
+        };
+        let refusal = match self.apply_once(state, input) {
+            Err(refusal @ MorunaError::Refused { .. }) => refusal,
+            other => return other,
+        };
+        let Some((batch, tier)) = keep else {
+            return Err(refusal);
+        };
+        let Some(alloc) = self.bound_alloc() else {
+            return Err(refusal);
+        };
+        let half = batch.num_rows() / 2;
+        tracing::info!(
+            target: "adapter.guard",
+            kernel = %self.name,
+            rows = batch.num_rows(),
+            "a call was refused memory; applying the kernel to each half of its morsel"
+        );
+        let first = self.apply_splitting(state, Payload::Table(batch.slice(0, half), tier))?;
+        let second = self.apply_splitting(
+            state,
+            Payload::Table(batch.slice(half, batch.num_rows() - half), tier),
+        )?;
+        let (Payload::Table(first, _), Payload::Table(second, _)) = (first, second) else {
+            return Err(refusal);
+        };
+        let joined =
+            moruna_kernel::arrow::compute::concat_batches(&first.schema(), [&first, &second])
+                .map_err(|e| MorunaError::Kernel {
+                    stage: UNKNOWN_STAGE,
+                    seq: UNKNOWN_SEQ,
+                    msg: format!("joining the halves of a split morsel: {e}"),
+                    features: None,
+                })?;
+        drop((first, second));
+        let (payload, _) = crate::land::land_table(joined, &alloc)?;
+        Ok(payload)
+    }
+
+    /// One call of the kernel on `input`, its output landed in the arena.
+    fn apply_once(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         let Some(alloc) = self.bound_alloc() else {
             return Err(MorunaError::Config {
                 name: "adapter",

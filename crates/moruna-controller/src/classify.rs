@@ -19,7 +19,7 @@ const RESERVE_TRIP: f64 = 0.5;
 /// The fraction of the reserve left under the ceiling at which a run with no kernel stage, whose
 /// process is still growing past everything the memory rows took back, is stopped (see
 /// `outgrown`).
-const RESERVE_STOP: f64 = 0.25;
+pub(crate) const RESERVE_STOP: f64 = 0.25;
 /// The fraction of a tick spent throttled that means the CPU quota is the bottleneck.
 const THROTTLE_TRIP: f64 = 0.10;
 /// How much a high water shrinks when a row calls for it.
@@ -127,7 +127,12 @@ pub(crate) fn classify(
         && rising(state)
         && inputs.stats.writes_in_flight == inputs.stats.sink_concurrency
     {
-        stage_sink_queues(state, actions);
+        // A slow sink is answered by back-pressure, not by staging its queue (2026-11-14). The
+        // sink's encodes run on the workers (RB1), so writing its queue to disk and reading it
+        // back takes the same CPUs a second and third pass over every batch and finishes nothing
+        // sooner: Enrich on the benchmark VM went from 7.5 s to 21 s with the disk tier on,
+        // 5.5 GB spilled at a fifth of its budget. Staging is the Memory row's answer, when
+        // memory, not the sink, is what is short.
         if state.read_ahead > 1 {
             state.read_ahead -= 1;
             actions.knobs.push(Knob::ReadAhead(state.read_ahead));
@@ -135,6 +140,20 @@ pub(crate) fn classify(
         return Bottleneck::Sink;
     }
     if busy > BUSY_HIGH {
+        // Every active worker is computing and none is held by memory, CPU or a port: the run is
+        // short of workers, so it takes one more while both halves of f.3 still hold it (the
+        // arena's, and the anon inequality's at the targets as they stand) and the CPU bound
+        // allows it, once the last shrink has settled (RB3). Without this a run a breach had cut
+        // to one worker stayed there to its end, whatever the budget left: workers came back
+        // only through the Memory row, which needs them idle, and a compute-bound worker never
+        // is (Score on two months of taxi trips, one worker of eight for the rest of the run).
+        let allowed = workers_allowed(state).min(crate::breach::anon_workers(state));
+        if state.active_workers < allowed && state.settled(crate::elastic::now_ns()) {
+            state.active_workers += 1;
+            actions
+                .knobs
+                .push(Knob::ActiveWorkers(state.active_workers));
+        }
         return Bottleneck::Compute;
     }
     Bottleneck::Idle
@@ -155,7 +174,7 @@ fn outgrown(
     actions: &mut Actions,
 ) -> bool {
     let ceiling = state.cfg.limits.memory_ceiling;
-    let stop = ceiling.saturating_sub(model::scale(state.budgets.reserve, RESERVE_STOP));
+    let stop = state.stop_line();
     if !state.stages.is_empty() || state.terminated || anon < stop {
         return false;
     }
@@ -344,7 +363,7 @@ pub(crate) fn workers_allowed(state: &ControllerState) -> u16 {
     let max_allowance = state
         .stages
         .iter()
-        .map(|ctl| ctl.allowance(ctl.target))
+        .map(|ctl| ctl.allowance(ctl.in_flight()))
         .max()
         .unwrap_or(0);
     let bound = crate::elastic::workers_bound(state);

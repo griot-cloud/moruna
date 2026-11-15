@@ -109,7 +109,10 @@ def test_py_t20_refusal_skipped_under_skip(scratch: pathlib.Path) -> None:
     assert result["exit"] == "completed", result
     stage = [t for t in result["report"]["tasks"] if t["role"] == "function"][0]
     assert stage["skipped_morsels"] >= 1
-    assert stage["alloc"]["numpy"]["refused"] == stage["skipped_morsels"] + stage["failed_morsels"]
+    # Every morsel skipped or failed was refused. Since RB5 a refused morsel is applied again in
+    # halves, down to one row, and every refused half is a refusal of its own (AD-T24), so a
+    # morsel can account for several.
+    assert stage["alloc"]["numpy"]["refused"] >= stage["skipped_morsels"] + stage["failed_morsels"]
 
 
 def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
@@ -121,6 +124,9 @@ def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
     @moruna.function
     def mixed(batch):
         np.ones(1024 * 1024, dtype=np.uint8)
+        # One Python object the guard sees: requests under `guard.min_bytes` (64 KiB) go
+        # straight to Python's allocator and are not counted (05 "Guarded request").
+        bytes(256 * 1024)
         return batch.append_column("twice", pa.array([v * 2 for v in batch.column("id").to_pylist()]))
 
     @moruna.function(memory_guard=False)
@@ -143,6 +149,7 @@ def test_py_t21_alloc_reported(dataset: tuple[str, str, int]) -> None:
     assert alloc["refusal_on"] is True
     assert alloc["numpy"]["requested_bytes"] >= 1024 * 1024
     assert alloc["python"]["requests"] > 0
+    assert alloc["python"]["largest_request_bytes"] >= 256 * 1024
     assert alloc["python"]["peak_bytes"] is None
     assert alloc["arrow"]["largest_request_bytes"] is None
     assert alloc["arrow"]["requested_bytes"] > 0

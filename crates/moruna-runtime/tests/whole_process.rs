@@ -240,7 +240,10 @@ fn the_controller_stops_a_process_outgrowing_its_ceiling() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("whole_hoard");
     let file = scratch.path().join("in.parquet");
-    input(&file, ROWS);
+    // Twice the rows of the other runs: the arena is charged as it is used (RB4), so the
+    // process starts further below its ceiling and the hoard needs more morsels to reach it.
+    // A mebibyte a morsel still grows it slower than a tick can miss.
+    input(&file, ROWS * 2);
     let budget = BUDGETS[0];
     let outcome = apart::run(
         "child_run",

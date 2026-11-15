@@ -185,7 +185,7 @@ pub(crate) fn tick(ctl: &Inner) {
 
         // The sizers run after the classification, so a stage that the class has just halved
         // is not immediately proposed back up in the same tick.
-        if actions.terminate.is_none() && !state.tiny {
+        if actions.terminate.is_none() {
             for (at, (stage, records)) in tails.into_iter().enumerate() {
                 if at >= state.stages.len() || state.stages[at].stage != stage {
                     continue;
@@ -194,6 +194,18 @@ pub(crate) fn tick(ctl: &Inner) {
                 let envelope = state.stages[at].envelope;
                 let proposal = state.stages[at].sizer.propose(&observation, &envelope);
                 apply::apply_proposal(&mut state, at, proposal, &mut actions);
+                // f.4b: say once where the throughput search settled, so the report shows it.
+                if let Some(best) = state.stages[at].sizer.settled_target()
+                    && state.stages[at].settled_noted != Some(best)
+                {
+                    state.stages[at].settled_noted = Some(best);
+                    if observation.learned_target != Some(best) {
+                        state.note(format!(
+                            "stage {stage} settled at {best} bytes a morsel, where its function \
+                             spent the least CPU per byte"
+                        ));
+                    }
+                }
                 let seq = state.stages[at].last.as_ref().map(|r| r.seq).unwrap_or(0);
                 apply::maybe_fall_back(&mut state, at, seq);
             }
@@ -248,8 +260,10 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
     let funded = state.state_total;
     let stage = summary.stage;
     // A record measured before the limits or the arena last moved was measured against a
-    // resting figure that no longer holds, so it is counted and not fitted.
-    let current = !crate::elastic::stale(state, summary.t_start_ns);
+    // resting figure that no longer holds, and one that ran beside the morsels a breach's shrink
+    // left behind was charged their heaps (`settled`), so either is counted and not fitted.
+    let current =
+        !crate::elastic::stale(state, summary.t_start_ns) && state.settled(summary.t_start_ns);
     let mut over_target = false;
     {
         let ctl = &mut state.stages[at];
@@ -264,6 +278,7 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
             let slot = ctl.state_by_instance.entry(0).or_insert(0);
             *slot = (*slot).max(summary.state_bytes);
         }
+        ctl.observe_bytes_in(summary.bytes_in);
         if summary.bytes_in > 0 && current {
             let ratio = summary.peak_delta as f64 / summary.bytes_in as f64;
             // f.3's anon fit. Two readings of the same record, and the model takes the larger,
@@ -291,11 +306,17 @@ fn absorb(state: &mut ControllerState, summary: &RecordSummary) {
             // The fit bounds a window of records rather than the run (`observe_anon`): a fit
             // that could only rise would leave a kernel sized for its worst morsel forever and
             // f.4's margin, which tightens only on an accepted increase, would never tighten.
-            let in_flight_bytes =
-                (in_flight_morsels.max(1.0) * morsel_target.max(summary.bytes_in) as f64).max(1.0);
+            // Per morsel (RB3): this morsel's bytes carry the slope, and the other morsels the
+            // model believed in flight beside it are taken out of the residency before it.
+            // The slope is per byte of the morsel as it came (2026-11-14): measured over the
+            // target, a stage whose morsels arrive smaller than it had a slope that only the
+            // target could be multiplied by, and the worker count, which is funded at the
+            // morsels as they are (`StageCtl::in_flight`), could not use it.
+            let morsel = (summary.bytes_in as f64).max(1.0);
+            let others = (in_flight_morsels.max(1.0) - 1.0) * morsel;
             let before = summary.mem_anon_peak.saturating_sub(summary.peak_delta);
             let fixed = before.saturating_sub(resting).saturating_sub(funded) as f64;
-            ctl.observe_anon(in_flight_bytes, fixed, summary.peak_delta as f64);
+            ctl.observe_anon(morsel, others, fixed, summary.peak_delta as f64);
             ctl.peak_ratios.push_back(ratio);
             while ctl.peak_ratios.len() > WINDOW {
                 ctl.peak_ratios.pop_front();
@@ -365,6 +386,7 @@ pub(crate) fn on_record(ctl: &Inner, r: &TraceRecord) {
         if state.terminated {
             return;
         }
+        state.observe_apply(r);
         let mut actions = Actions::default();
         if r.outcome == Outcome::Error {
             device::check(&mut state, r, &mut actions);

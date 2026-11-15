@@ -129,3 +129,44 @@ fn rc_t20_resume_without_a_profile() {
     );
     fresh.controller.stop();
 }
+
+/// RC-T20b: a stage that no morsel reached, because the morsel the stage before it was probed
+/// with was skipped under the error policy, is seeded from its hint and the run goes on, with a
+/// note that says so (f.2, SC f.9, 2026-11-14). The run ended with "no morsel to probe with".
+#[test]
+fn rc_t20b_a_stage_no_morsel_reached_is_seeded() {
+    let hinted = KernelHints {
+        expected_amplification: Some(6.0),
+        ..KernelHints::default()
+    };
+    let knobs = FakeKnobs::new();
+    let rig = common::Rig::with_prober(
+        config_with_baseline(CEILING, WORKERS, BASELINE),
+        vec![kernel(1, hinted)],
+        knobs.clone(),
+        FakeSampler::new().scripted(steady(BASELINE, 8)),
+        common::RecordingProber::failing(
+            knobs,
+            "stage 1 has nothing to probe with: no morsel reached it",
+        ),
+    );
+    rig.controller.prepare().expect("prepare");
+    rig.controller
+        .probe_all()
+        .expect("a stage no morsel reached is seeded, not a failure");
+    rig.controller.start().expect("start");
+    let notes = rig.controller.summary().notes;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n == "stage 1 could not be probed, no morsel reached it; seeded from hints"),
+        "{notes:?}"
+    );
+    assert!(
+        morsel_targets(&rig.writes())
+            .last()
+            .is_some_and(|(_, bytes)| *bytes > 0),
+        "the stage is sized from its hint"
+    );
+    rig.controller.stop();
+}

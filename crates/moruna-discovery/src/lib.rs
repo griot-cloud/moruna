@@ -39,6 +39,13 @@ pub use crate::watch::{
 };
 pub use arc_swap::ArcSwap;
 
+/// The CPUs this machine has online now, whatever a cgroup lets the process use: the most
+/// workers a run that follows the machine up can ever be given (RB4). The operating system's
+/// logical core count.
+pub fn machine_cores() -> f64 {
+    os::logical_cores()
+}
+
 /// What the caller already knows, and what it wants to override (d.1).
 #[derive(Clone, Debug, Default)]
 pub struct DiscoveryInput {
@@ -470,6 +477,21 @@ fn resolve_staging_dir(
     }
     let chosen = candidates.first().cloned();
     if let Some((source, dir)) = chosen {
+        // A directory the caller named that does not exist yet is made, as `mkdir -p` would:
+        // naming one is asking for a disk tier, and dropping it for being absent left the
+        // benchmark's staging runs with none and no error (2026-11-14).
+        if !dir.exists() {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => notes.push(format!(
+                    "staging directory {} ({source}) did not exist and was created",
+                    dir.display()
+                )),
+                Err(error) => notes.push(format!(
+                    "staging directory {} ({source}) does not exist and could not be created:                      {error}",
+                    dir.display()
+                )),
+            }
+        }
         if probes::staging_dir_is_usable(&dir) {
             notes.push(format!("staging directory {} ({source})", dir.display()));
             return Some(dir);
@@ -1113,11 +1135,38 @@ mod tests {
         let tmp = TempDir::new("no-staging");
         proc_fixture(tmp.path(), "0::/\n", 16 * 1024 * 1024);
         let roots = roots_at(tmp.path());
-        let env = MapEnv::with(&[("MORUNA_SPILL_DIR", "/moruna/definitely/absent")]);
+        // Below a regular file, so it can be neither found nor made, whoever runs the test.
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"not a directory").expect("a file");
+        let absent = file.join("staging");
+        let env = MapEnv::with(&[("MORUNA_SPILL_DIR", absent.to_str().expect("utf-8"))]);
         let found = discover_with(&env, &roots, &DiscoveryInput::default()).expect("discovery");
         assert_eq!(found.profile.staging_dir, None);
         assert_eq!(found.profile.direct_io_staging, Guarantee::Probed(false));
+        assert!(
+            found
+                .notes
+                .iter()
+                .any(|note| note.contains("could not be created"))
+        );
         assert!(found.notes.iter().any(|note| note.contains("no disk tier")));
+    }
+
+    /// A staging directory the caller names that does not exist yet is made and used.
+    #[test]
+    fn a_named_staging_directory_that_is_absent_is_made() {
+        let tmp = TempDir::new("make-staging");
+        proc_fixture(tmp.path(), "0::/\n", 16 * 1024 * 1024);
+        let roots = roots_at(tmp.path());
+        let named = tmp.path().join("deep").join("staging");
+        let input = DiscoveryInput {
+            explicit_staging_dir: Some(named.clone()),
+            ..DiscoveryInput::default()
+        };
+        let found = discover_with(&MapEnv::with(&[]), &roots, &input).expect("discovery");
+        assert!(named.is_dir());
+        assert_eq!(found.profile.staging_dir, Some(named));
+        assert!(found.notes.iter().any(|note| note.contains("was created")));
     }
 
     /// e.2: the v1 fallback is reported as such, and the sampler reads the v1 field names.

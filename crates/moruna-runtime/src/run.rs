@@ -49,6 +49,8 @@ impl Runtime {
         let mut guard = CancelOnDrop::new(cancel);
         let outcome = drive(spec, &mut guard, components, &mut started);
         guard.disarm();
+        // The run's kept buffers go back with it (12 l).
+        crate::allocator::reuse::end();
         match outcome {
             Ok(report) => Ok(report),
             Err(error) => {
@@ -216,30 +218,56 @@ fn drive(
     notes.extend(discovered.notes.iter().cloned());
     notes.extend(spec_notes);
     let limits = discovered.limits.clone();
+    // 12 l (2026-11-14): what a heap frees at its top stays for the next morsel, a share of the
+    // ceiling, so the buffers a run takes and frees morsel after morsel are not faulted in and
+    // zeroed by the kernel each time. F8.9's threshold and heap count stand.
+    // 12 l (2026-11-14): Moruna's own large buffers are kept for reuse while the run lasts, up
+    // to a sixteenth of its ceiling, in a program that installs the counting allocator.
+    crate::allocator::reuse::keep_up_to(limits.memory_ceiling / 16);
+    if let Some((trim, pad)) = crate::allocator::keep_heap_tops(limits.memory_ceiling) {
+        notes.push(format!(
+            "the C heap keeps up to {trim} bytes free at a heap's top for the next morsel and grows \
+             a heap {pad} bytes at a time (12 l)"
+        ));
+    }
     if let Some(observer) = &observer {
         observer.discovered(&limits, kernels.len());
     }
     let staging_dir = discovered.profile.staging_dir.clone();
-    // The pool is created up to `budget.elastic.cpu_max` and parked; the starting
-    // N is what is active. With no `elastic` the two are the same N, as before.
+    // RB4 (2026-11-13): a run follows the machine both ways by default. The pool is created up
+    // to `budget.elastic.cpu_max` or, without one, up to the CPUs the machine has online, and
+    // parked; the starting N is what is active. An explicit CPU count is the caller's own figure
+    // and is not grown past. A machine that adds CPUs beyond those online at start (a hot-plug)
+    // is followed only as far as the pool.
     let workers_start = workers_from(limits.cpu_quota);
-    let workers_max = match elastic_budget.cpu_max {
-        Some(cpu_max) => cpu_max.clamp(1, 1024),
-        None => workers_start,
+    let machine_cores = match (&components.limits_source, host_discovered) {
+        (Some(source), _) => source.read().cpus_online,
+        (None, true) => moruna_discovery::machine_cores(),
+        (None, false) => limits.cpu_quota,
+    };
+    let workers_max = match (elastic_budget.cpu_max, cpu) {
+        (Some(cpu_max), _) => cpu_max.clamp(1, 1024),
+        (None, Some(_)) => workers_start,
+        (None, None) => workers_from(machine_cores).max(workers_start),
     };
     let workers_start = workers_start.min(workers_max);
     if workers_max > workers_start {
         notes.push(format!(
             "{workers_max} worker threads created and {workers_start} active: the pool follows \
-             the machine up to budget.elastic.cpu_max"
+             the machine up to {workers_max} CPUs"
         ));
     }
 
     // The limits watcher starts from what discovery found, and the sampler reads the limits
-    // it publishes, so every sample carries the ceiling of its moment.
-    let memory_max = elastic_budget
-        .memory_max_bytes
-        .unwrap_or(limits.memory_ceiling);
+    // it publishes, so every sample carries the ceiling of its moment. Without
+    // `budget.elastic.memory_max_bytes` the ceiling follows the machine up to all it has, which
+    // e.3's derivation already holds it to (0.9 x memory.max, or 0.9 x total RAM); an explicit
+    // budget is the caller's own figure and stays where it is set (RB4).
+    let memory_max = match (elastic_budget.memory_max_bytes, budget) {
+        (Some(max), _) => max,
+        (None, Some(_)) => limits.memory_ceiling,
+        (None, None) => u64::MAX,
+    };
     if memory_max < limits.memory_ceiling {
         notes.push(format!(
             "budget.elastic.memory_max_bytes ({memory_max}) is below the starting ceiling \
@@ -421,6 +449,7 @@ fn drive(
                 huge_pages: discovered.profile.huge_pages,
                 memlock: discovered.profile.memlock,
                 register_rdma: false,
+                pretouch: false,
             })?;
             (arena.clone() as Arc<dyn Allocator>, Some(arena))
         }
@@ -478,6 +507,7 @@ fn drive(
         run_id,
         arena_bytes,
         sinks: topology.sinks(),
+        workers: workers_max,
         sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
@@ -512,15 +542,22 @@ fn drive(
         0 => 0,
         _ => ctx.file_buffer_share(),
     };
+    // A sink that encodes on workers (08 f.12) divides the same bytes into one buffer per
+    // worker that may encode at once, so a morsel is at most half of one of those.
+    let buffers = if built_sinks.iter().any(|sink| sink.encodes_on_workers()) {
+        u64::from(workers_max.max(2))
+    } else {
+        2
+    };
     let mut morsel_max = match claim {
         0 => config::MORSEL_MAX_BYTES,
-        claim => (claim / 4).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
+        claim => (claim / (2 * buffers)).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
     };
     if morsel_max < config::MORSEL_MAX_BYTES {
         notes.push(format!(
-            "morsels are at most {morsel_max} bytes, half of one of the sink's two {} byte file \
-             buffers",
-            claim / 2
+            "morsels are at most {morsel_max} bytes, half of one of the sink's {buffers} {} byte \
+             file buffers",
+            claim / buffers
         ));
     }
     // An engine sink holds working memory in proportion to the morsel it writes, so its share
@@ -727,7 +764,12 @@ fn drive(
                     staging_dir: staging_dir.clone(),
                     durable_staging: discovered.profile.durable_staging.is_guaranteed(),
                     disk_budget,
-                    segment_bytes: config::STAGING_SEGMENT_BYTES,
+                    // RB6: a segment holds the run's largest morsel. A fixed 128 MiB segment
+                    // met a 256 MiB morsel on its first spill and the run ended ("a record of
+                    // ... bytes does not fit a segment", the 0.6.5 benchmark's staging runs).
+                    // Twice the most a morsel may be, so one is never the last thing to fit, and
+                    // a whole number of 128 MiB units.
+                    segment_bytes: staging_segment_bytes(morsel_max),
                     codec: moruna_kernel::StagingCodec::Raw,
                     page_bytes: limits.page_bytes,
                     gds: discovered.profile.gds.is_available()
@@ -737,20 +779,23 @@ fn drive(
                     plan_digests: plans.iter().map(|plan| plan_digest(plan)).collect(),
                     fingerprints: kernels.iter().map(|k| k.fingerprint()).collect(),
                     resume_policy: kernels.iter().map(|k| k.hints().resume).collect(),
-                    config: with_spec_digest(
-                        config::resolved(
-                            limits.memory_ceiling,
-                            disk_budget,
-                            workers_max,
-                            config::READAHEAD_SPLITS,
-                            &error_policy,
-                            ordered,
-                            sizer,
-                            checkpoint_enabled,
-                            checkpoint_interval_ms,
-                            &policy,
+                    config: with_segment_bytes(
+                        with_spec_digest(
+                            config::resolved(
+                                limits.memory_ceiling,
+                                disk_budget,
+                                workers_max,
+                                config::READAHEAD_SPLITS,
+                                &error_policy,
+                                ordered,
+                                sizer,
+                                checkpoint_enabled,
+                                checkpoint_interval_ms,
+                                &policy,
+                            ),
+                            spec_digest.as_deref(),
                         ),
-                        spec_digest.as_deref(),
+                        staging_segment_bytes(morsel_max),
                     ),
                     checkpoint_enabled,
                     eviction: Arc::new(moruna_placement::catalog::KnownFuture),
@@ -2356,5 +2401,42 @@ mod spec_digest_tests {
                 .unwrap_err()
                 .contains("could not be read")
         );
+    }
+}
+
+/// The resolved configuration with the segment size the run actually stages with (RB6), so a
+/// resume compares what was used and not the default.
+fn with_segment_bytes(mut config: serde_json::Value, bytes: u64) -> serde_json::Value {
+    if let Some(map) = config.as_object_mut() {
+        map.insert(
+            "staging.segment_bytes".to_string(),
+            serde_json::json!(bytes),
+        );
+    }
+    config
+}
+
+/// The staging segment for a run whose morsels are at most `morsel_max` bytes (RB6): the
+/// configured 128 MiB unit, or the whole number of units that holds two of the largest morsel.
+fn staging_segment_bytes(morsel_max: u64) -> u64 {
+    let unit = config::STAGING_SEGMENT_BYTES;
+    morsel_max
+        .saturating_mul(2)
+        .div_ceil(unit)
+        .max(1)
+        .saturating_mul(unit)
+}
+
+#[cfg(test)]
+mod staging_segment_tests {
+    use super::staging_segment_bytes;
+
+    #[test]
+    fn a_segment_holds_two_of_the_largest_morsel() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(staging_segment_bytes(4 * MIB), 128 * MIB);
+        assert_eq!(staging_segment_bytes(64 * MIB), 128 * MIB);
+        assert_eq!(staging_segment_bytes(256 * MIB), 512 * MIB);
+        assert_eq!(staging_segment_bytes(300 * MIB), 640 * MIB);
     }
 }

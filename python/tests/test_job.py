@@ -232,17 +232,19 @@ class Sleeper:
 
 
 def test_py_t46_ready_branches_run_at_once() -> None:
-    """PY-T46: a fan-out to four kernels that each block for T on the one batch takes about T
-    for the batch, not 4T: the four calls overlap, every one running while every other is.
+    """PY-T46: a fan-out to four kernels that each block for T on a batch takes about T for the
+    batch, not 4T: the four calls overlap, every one running while every other is.
 
-    The bound is generous so load cannot flake it: the four calls must share an instant (the
-    latest start before the earliest end), and the span from the first start to the last end
-    must be under 2.5 T, where a serial run is at least 4 T."""
+    Each kernel's first batch is the one it is probed with, alone, so its memory is measured
+    without the others' (SC f.9; every dataset is measured since RB2, 2026-11-13). The overlap is
+    asserted on the batch after it. The bound is generous so load cannot flake it: the four calls
+    must share an instant (the latest start before the earliest end), and the span from the first
+    start to the last end must be under 2.5 T, where a serial run is at least 4 T."""
     branches, pause = 4, 1.0
     calls: list[tuple[str, float, float]] = []
     batch = pa.record_batch({"id": pa.array(range(100), pa.int64())})
     g = moruna.Job("graph")
-    g.add(name="rows", task=moruna.IteratorSource([batch], schema=batch.schema))
+    g.add(name="rows", task=moruna.IteratorSource([batch, batch], schema=batch.schema))
     names = [f"b{i}" for i in range(branches)]
     for name in names:
         g.add(name=name, task=moruna.function(Sleeper(pause, calls, name)), inputs="rows")
@@ -251,11 +253,13 @@ def test_py_t46_ready_branches_run_at_once() -> None:
     g.add(name="out", task=out, inputs="all")
     moruna.run(g, cpu=float(branches + 2), checkpoint=False)
 
-    assert sorted(name for name, _, _ in calls) == names, calls
-    starts = [s for _, s, _ in calls]
-    ends = [e for _, _, e in calls]
+    assert sorted(name for name, _, _ in calls) == sorted(names * 2), calls
+    # Each kernel's second call: the batch after its probe.
+    second = [[c for c in calls if c[0] == name][1] for name in names]
+    starts = [s for _, s, _ in second]
+    ends = [e for _, _, e in second]
     span = max(ends) - min(starts)
-    assert max(starts) < min(ends), f"the branches did not overlap: {calls}"
+    assert max(starts) < min(ends), f"the branches did not overlap: {second}"
     assert span < 2.5 * pause, f"{branches} branches of {pause}s took {span:.2f}s"
     assert out.table().column_names == names
     print(f"PY-T46: {branches} branches of {pause}s each, the batch took {span:.3f}s; "

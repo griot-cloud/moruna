@@ -20,6 +20,7 @@ fn cfg(host_tier: TierKind, memlock: Guarantee) -> ArenaConfig {
         huge_pages: Guarantee::Probed(false),
         memlock,
         register_rdma: false,
+        pretouch: false,
     }
 }
 

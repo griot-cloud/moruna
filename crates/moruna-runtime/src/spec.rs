@@ -33,6 +33,9 @@ pub struct BuildCtx {
     pub arena_bytes: u64,
     /// How many sinks the run has: they share the arena's file buffer share (contracts d.16).
     pub sinks: u16,
+    /// The workers the run may have at most: a sink that encodes on workers opens a file per
+    /// worker that may encode at once (08 f.12, RB1).
+    pub workers: u16,
     /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
     pub(crate) sink_buffer: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -187,8 +190,8 @@ pub struct RunSpec {
     /// An explicit CPU quota in cores; discovery clamps it.
     pub cpu: Option<f64>,
     /// How far the run follows the machine up while it is in progress. The
-    /// default is the starting figures: an inelastic run never grows, and every run follows the
-    /// machine down. The JSON spec's `budget.elastic` (MH 4.1) maps onto it; F8.1 adds that serde.
+    /// default (RB4) is the machine itself: all its memory and the CPUs online at start, except
+    /// that an explicit `budget` or `cpu` is not grown past. Every run follows the machine down. The JSON spec's `budget.elastic` (MH 4.1) maps onto it; F8.1 adds that serde.
     pub elastic: crate::elastic::ElasticBudget,
     /// Where the trace file goes; `None` keeps the trace in memory.
     pub trace_path: Option<PathBuf>,
@@ -406,6 +409,7 @@ mod tests {
             run_id: RunId([3; 16]),
             arena_bytes: 139_198_464,
             sinks: 1,
+            workers: 1,
             sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }

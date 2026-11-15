@@ -20,6 +20,14 @@ pub(crate) fn run(
     resumed: bool,
 ) -> Result<crate::RunOutcome> {
     if shared.run_state() != RunState::Init {
+        // A run that terminated before it started (a probe whose kernel refused its morsel;
+        // RB2 probes every run) ends as any terminated run does, with its own diagnostic,
+        // rather than as a call to `run` that came too late.
+        let early = shared.exit.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match early {
+            Some(exit @ Exit::Terminated(_)) => return Ok(finalize(shared, exit)),
+            other => *shared.exit.lock().unwrap_or_else(|e| e.into_inner()) = other,
+        }
         return Err(MorunaError::Plan(format!(
             "run was called in state {:?}; it is only valid once, from Init",
             shared.run_state()

@@ -37,7 +37,7 @@ If the staging directory is on a disk that outlives the machine, a job can resum
 
 ## Machines that change size
 
-Some platforms add memory or cores to a running machine, or take them away. A job document can allow Moruna to follow those changes with `budget.elastic`:
+Some platforms add memory or cores to a running machine, or take them away. Moruna follows those changes by default, and a job document can cap how far it grows with `budget.elastic`:
 
 ```json
 "budget": {
@@ -45,7 +45,9 @@ Some platforms add memory or cores to a running machine, or take them away. A jo
 }
 ```
 
-Moruna checks the machine's limits several times a second. When memory or cores are added, it uses them, up to the maximums in `elastic`. When they are removed, it reduces what it uses. Reducing memory is gradual, because Moruna waits for data in use to be released rather than discarding it, so a host should wait for the job to settle before removing more. The run report records each change. A job without `elastic` keeps the limits it started with.
+Moruna checks the machine's limits several times a second. When memory or cores are added, it uses them. When they are removed, it reduces what it uses. Reducing memory is gradual, because Moruna waits for data in use to be released rather than discarding it, so a host should wait for the job to settle before removing more. The run report records each change.
+
+Without `elastic`, Moruna follows the machine up to all of its memory and to the cores it had online when the job started. Set `elastic` to grow less than that, or to follow cores added to the machine after the job started. A job that sets `budget.host` or `budget.cpu` keeps that figure and does not grow past it.
 
 ## An isolated virtual machine
 

@@ -25,6 +25,17 @@ pub struct Split {
     pub sub_splittable: bool,
 }
 
+/// A split's bytes, fetched by `Source::fetch` and not yet decoded (RB1,
+/// `architecture/worker-io.md`). Opaque to the scheduler: only the source that made it reads it,
+/// in `Source::decode`, on whichever worker takes the decode.
+pub struct Fetched(pub Box<dyn std::any::Any + Send>);
+
+impl std::fmt::Debug for Fetched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Fetched(..)")
+    }
+}
+
 /// A half-open row range within a split.
 #[derive(Copy, Clone, Debug)]
 pub struct RowRange {
@@ -62,6 +73,43 @@ pub trait Source: Send + Sync {
         alloc: &'a dyn Allocator,
         tier: Tier,
     ) -> BoxFuture<'a, crate::Result<Payload>>;
+    /// True when `fetch` and `decode` replace `read` (RB1): the drive fetches a split's bytes
+    /// and any worker decodes them, several at once. A source that leaves this false is read
+    /// whole by `read`, on the drive, as before.
+    fn decodes_on_workers(&self) -> bool {
+        false
+    }
+    /// The I/O half of a read: a split's (or a row range's) bytes, into buffers from `alloc`.
+    /// Runs on the drive and may wait on the reactor. Called only when `decodes_on_workers`.
+    fn fetch<'a>(
+        &'a self,
+        split: &'a Split,
+        rows: Option<RowRange>,
+        alloc: &'a dyn Allocator,
+        tier: Tier,
+    ) -> BoxFuture<'a, crate::Result<Fetched>> {
+        let _ = (split, rows, alloc, tier);
+        Box::pin(async {
+            Err(crate::MorunaError::Plan(
+                "this source does not decode on workers".into(),
+            ))
+        })
+    }
+    /// The CPU half of a read: decode what `fetch` returned for `split` into a payload in
+    /// buffers from `alloc`. Runs on any worker and must not wait on a `Completion` (SC-I1).
+    /// Called only when `decodes_on_workers`; deterministic exactly as `read` is (CT-I12).
+    fn decode(
+        &self,
+        split: &Split,
+        fetched: Fetched,
+        alloc: &dyn Allocator,
+        tier: Tier,
+    ) -> crate::Result<Payload> {
+        let _ = (split, fetched, alloc, tier);
+        Err(crate::MorunaError::Plan(
+            "this source does not decode on workers".into(),
+        ))
+    }
     /// Opt in to one-at-a-time streaming reads instead of exhausting the finite plan.
     /// Such sources must be non-repeatable; their plan is only an initial size estimate.
     fn streaming(&self) -> bool {

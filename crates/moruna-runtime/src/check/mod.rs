@@ -561,6 +561,7 @@ impl Harness {
             huge_pages: moruna_kernel::Guarantee::Absent,
             memlock: moruna_kernel::Guarantee::Absent,
             register_rdma: false,
+            pretouch: false,
         })?;
         let alloc: Arc<dyn Allocator> = Arc::clone(&arena) as Arc<dyn Allocator>;
         let sampler = moruna_discovery::Sampler::new(&discovered).ok();

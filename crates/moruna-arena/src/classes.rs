@@ -55,6 +55,18 @@ pub(crate) fn class_size(c: usize) -> u64 {
     GRANULE << c
 }
 
+/// What a request of `bytes` costs against the budget (e.2): its class, or the granule-rounded
+/// size of a large allocation.
+pub(crate) fn charge_of(bytes: u64) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    match class_for(bytes) {
+        Some(c) => class_size(c),
+        None => crate::region::align_up(bytes, GRANULE),
+    }
+}
+
 /// The class that serves `bytes`, or `None` when the request is a large allocation (e.2).
 pub(crate) fn class_for(bytes: u64) -> Option<usize> {
     if bytes <= GRANULE {
@@ -264,6 +276,51 @@ impl Space {
     }
 
     /// Serve `bytes` (f.3). Returns the address and what it was charged.
+    /// Give back to the operating system every whole page of this region that no buffer holds
+    /// and no allocation can take while it is given back (RB4): the top area's free ranges under
+    /// its lock, and the free slots of every class of a page or more under that class's lock, the
+    /// locks an allocation takes those bytes under. A slot taken afterwards faults zeroed pages
+    /// in. Returns the bytes given back.
+    pub(crate) fn release_free(&self, page: u64) -> u64 {
+        let page = page.max(1);
+        let mut released = 0u64;
+        {
+            let top = self.lock_top();
+            for (off, len) in top.free_ranges() {
+                released += self.discard(off, len, page);
+            }
+        }
+        for c in 0..CLASS_COUNT {
+            let size = class_size(c);
+            if size < page {
+                continue;
+            }
+            let free = self.lock_free(c);
+            for &off in free.iter() {
+                released += self.discard(off, size, page);
+            }
+        }
+        released
+    }
+
+    /// The whole pages of `[off, off + len)` given back; the caller holds the lock that keeps
+    /// the range free.
+    fn discard(&self, off: u64, len: u64, page: u64) -> u64 {
+        let start = off.div_ceil(page) * page;
+        let end = (off.saturating_add(len)).min(self.bytes) / page * page;
+        if end <= start {
+            return 0;
+        }
+        // SAFETY: `[start, end)` lies inside this region (`end <= bytes`), which the arena's
+        // mapping owns; the caller holds the lock under which these bytes are free, so no buffer
+        // is live in them and none can be handed out until it is released; the arena does not
+        // call this on a page-locked region.
+        let done = unsafe {
+            crate::region::discard(self.base.add(start as usize), (end - start) as usize)
+        };
+        if done { end - start } else { 0 }
+    }
+
     pub(crate) fn alloc(&self, bytes: u64) -> Result<(*mut u8, u64), OutOfSpace> {
         // A zero-length request owns nothing: it is served from the region's first byte,
         // charged nothing, and its release is a no-op, so it can never free a live slot
@@ -286,13 +343,7 @@ impl Space {
 
     /// What a request of `bytes` costs against the budget (e.2).
     pub(crate) fn charged(&self, bytes: u64) -> u64 {
-        if bytes == 0 {
-            return 0;
-        }
-        match class_for(bytes) {
-            Some(c) => class_size(c),
-            None => crate::region::align_up(bytes, GRANULE),
-        }
+        charge_of(bytes)
     }
 
     fn alloc_class(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {

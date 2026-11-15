@@ -59,10 +59,6 @@ const READ_AHEAD_SHARE: f64 = 0.5;
 const READ_AHEAD_INITIAL: u16 = 2;
 /// The promotion window f.3 starts from (`queue.promotion_window`).
 const PROMOTION_WINDOW_INITIAL: u16 = 2;
-/// The read-ahead the tiny-dataset path allows at most (f.10).
-const TINY_READ_AHEAD_MAX: u32 = 8;
-/// The fraction of the budget below which a dataset needs no adaptation (f.10).
-const TINY_FRACTION: u64 = 4;
 
 /// `bytes x factor`, saturating and never negative (l, numerics).
 pub(crate) fn scale(bytes: u64, factor: f64) -> u64 {
@@ -419,19 +415,10 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
     let worker_half = worker_half(state);
     let queue_half = queue_half(state);
 
-    let target = if state.tiny {
-        // f.10. A dataset smaller than a quarter of the budget cannot fill the pipeline, so
-        // there is nothing to adapt to: take the largest morsel allowed and stop moving.
-        //
-        // The anon inequality is not an adaptation, though, and this path does not escape it: a
-        // small dataset does not make a greedy kernel cheap, and the ceiling S1 measures against
-        // is the process's either way. Capping the target here rather than leaving it to the
-        // worker count is what keeps the workers: a 512 MiB morsel guessed at four times its
-        // input funds one worker, and the same headroom funds all of them at 34 MiB.
-        state.cfg.morsel_max.min(anon_target(state))
-    } else {
-        common_target(state, worker_half)
-    };
+    // One solve for every dataset, large or small (RB2): what a small dataset gets on a large
+    // machine, large morsels on every worker, is what this yields from the measured
+    // amplification, not a path of its own.
+    let target = common_target(state, worker_half);
     let targets: Vec<u64> = (0..stages)
         .map(|_| target.clamp(state.cfg.morsel_min, state.cfg.morsel_max))
         .collect();
@@ -447,16 +434,11 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
         .map(|at| anon_allowance(state, at, targets[at]))
         .max()
         .unwrap_or(0);
-    // RC-I7: no more workers than either budget can feed one morsel each. The arena cap is
-    // skipped on the tiny path (f.10), which has nothing to adapt to; the anon cap never is,
-    // because a small dataset does not make a greedy kernel cheap and the process's peak is
-    // what S1 measures either way.
+    // RC-I7: no more workers than either budget can feed one morsel each.
     // The pool, bounded by the CPU limit in force.
     let workers_max = crate::elastic::workers_bound(state);
     let mut allowed = workers_max;
-    if !state.tiny
-        && let Some(arena_cap) = worker_half.checked_div(max_allowance)
-    {
+    if let Some(arena_cap) = worker_half.checked_div(max_allowance) {
         allowed = allowed.min(u16::try_from(arena_cap).unwrap_or(u16::MAX));
     }
     if let Some(anon_cap) = anon_for_kernels(state).checked_div(max_anon_allowance) {
@@ -468,7 +450,7 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
         state,
         targets.first().copied().unwrap_or(state.cfg.morsel_max),
     );
-    let read_ahead = read_ahead(state, queue_half, split_bytes);
+    let read_ahead = read_ahead(queue_half, split_bytes, active_workers);
     let for_queues = queue_half.saturating_sub(u64::from(read_ahead).saturating_mul(split_bytes));
     let queues = state.queue_count() as u64;
     let high_water = for_queues / queues.max(1);
@@ -527,7 +509,7 @@ fn common_target(state: &ControllerState, worker_half: u64) -> u64 {
 /// is funded, over `share x S a_anon x safety`.
 ///
 /// This is the bound S1 is measured against, expressed as a morsel size. It is applied on every
-/// path that writes a target, the tiny-dataset path of f.10 included.
+/// path that writes a target.
 fn anon_target(state: &ControllerState) -> u64 {
     let stages = state.stage_count();
     if stages == 0 {
@@ -557,17 +539,15 @@ fn split_bytes(state: &ControllerState, first_target: u64) -> u64 {
 }
 
 /// The read-ahead depth that fits in the queue half (f.3), floor 1.
-fn read_ahead(state: &ControllerState, queue_half: u64, split_bytes: u64) -> u16 {
-    if state.tiny {
-        let splits = state.cfg.plan.splits.clamp(1, TINY_READ_AHEAD_MAX);
-        return u16::try_from(splits).unwrap_or(u16::MAX);
-    }
+fn read_ahead(queue_half: u64, split_bytes: u64, workers: u16) -> u16 {
     if split_bytes == 0 {
         return READ_AHEAD_INITIAL;
     }
     let room = scale(queue_half, READ_AHEAD_SHARE) / split_bytes;
     let allowed = u16::try_from(room).unwrap_or(u16::MAX);
-    allowed.clamp(1, READ_AHEAD_INITIAL)
+    // RB1, RB3: the decodes of the reads in flight run on the workers, so the read-ahead may
+    // follow the pool rather than stop at a fixed two.
+    allowed.clamp(1, workers.max(READ_AHEAD_INITIAL))
 }
 
 /// f.3. The initial knobs, then the tick thread.
@@ -577,7 +557,7 @@ pub(crate) fn start(ctl: &Inner) -> Result<()> {
         // RC-I6 is the controller's own rule and not the facade's good manners: a caller that
         // skipped `probe_all` would be sized from a hint or from 4.0, which is exactly the
         // guess the probe exists to replace. Both probe entry points reach `Probed`, including
-        // on the tiny-dataset and zero-kernel paths that have nothing to probe for.
+        // on the zero-kernel path that has nothing to probe for.
         if state.phase != Phase::Probed {
             return Err(moruna_kernel::MorunaError::Config {
                 name: "controller",
@@ -626,7 +606,18 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Result<Actions> {
 
     // RC-I1: the check happens before the batch, not after it, and what it returns is what is
     // written. A set of targets that does not fit is never a set of knobs that was written.
-    let targets = enforce(state, &solution.targets);
+    // A stage sized from earlier runs starts at the target their throughput search settled on,
+    // when that is below what memory allows (f.2, f.4b): the size the kernel was found cheapest
+    // at, not the largest the budget holds.
+    let mut start = solution.targets.clone();
+    for (at, target) in start.iter_mut().enumerate() {
+        if let (true, Some(found)) = (state.stages[at].seeded, &state.stages[at].profile)
+            && found.best_target > 0
+        {
+            *target = (*target).min(found.best_target.max(state.cfg.morsel_min));
+        }
+    }
+    let targets = enforce(state, &start);
     fit_scalars(state, &targets);
     // And a floor that still does not fit is not a run to start. `enforce` halves until the
     // targets fit or reach `morsel_min`, and the floor reaching it without fitting was left to
@@ -731,13 +722,6 @@ fn cannot_be_sized(state: &ControllerState, targets: &[u64]) -> moruna_kernel::M
         name: "budget",
         msg,
     }
-}
-
-/// f.10: a dataset smaller than a quarter of the host budget needs no adaptation.
-pub(crate) fn is_tiny(state: &ControllerState) -> bool {
-    state.budgets.host > 0
-        && state.cfg.plan.total_bytes > 0
-        && state.cfg.plan.total_bytes < state.budgets.host / TINY_FRACTION
 }
 
 /// Shrink the queue high waters until the arena's half of the working set fits (RC-I1).
@@ -870,6 +854,7 @@ mod native_commitment_tests {
         let probe = |peak_delta| ProbeResult {
             bytes_in: cfg.probe_bytes,
             rows_in: 100,
+            bytes_out: 0,
             peak_delta,
             dev_peak_delta: 0,
             wall_ns: 1,

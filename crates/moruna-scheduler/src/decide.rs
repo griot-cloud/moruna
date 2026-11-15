@@ -39,6 +39,10 @@ const DURATIONS_KEPT: usize = 64;
 pub(crate) const PUSH_STALL: Duration = Duration::from_secs(30);
 /// How long a push waiting for room parks between tries.
 const PUSH_PARK: Duration = Duration::from_millis(1);
+/// How long a push the budget refuses waits for consumers to make room before it writes the
+/// batch straight to disk (2026-11-14). A consumer that is working frees room within an encode
+/// or two; one that has not in this long is not going to soon.
+const SPILL_AFTER: Duration = Duration::from_millis(500);
 
 /// What a push waiting for room tells the time by and waits with (f.20): the system's clock in a
 /// run, a clock a test steps in a test, so a wait of `PUSH_STALL` is proved in milliseconds.
@@ -705,15 +709,43 @@ fn live(shared: &Shared) -> bool {
 }
 
 /// Push `morsel` into `stages` under a claim (12.5): `claim` when the unit ran under one, topped
-/// up to the batch's bytes; a pending top-up waits for the room on its way; a refused one writes
-/// the batch straight to disk; with no disk to write to, it waits for consumers to make room,
-/// and after `PUSH_STALL` with none the run ends saying why. A shared share of the payload is
-/// what `push_spilled` is handed, so a refusal loses nothing.
+/// up to the batch's bytes; a pending top-up waits for the room on its way; a refused one waits
+/// for consumers to make room and, when none has come in `SPILL_AFTER`, writes the batch
+/// straight to disk; with no disk to write to, it waits on, and after `PUSH_STALL` with none the
+/// run ends saying why. A shared share of the payload is what `push_spilled` is handed, so a
+/// refusal loses nothing. From a reader, which runs no worker's jobs.
 pub(crate) fn admit_push(
     shared: &Shared,
     stages: &[StageId],
     morsel: Morsel,
     claim: Option<Reservation>,
+) -> Result<()> {
+    admit_push_as(shared, stages, morsel, claim, false)
+}
+
+/// [`admit_push`] from a worker that holds its slot: while the budget refuses it, it runs the
+/// offloaded jobs that are queued (a sink's encode is what frees the room it waits for) before it
+/// waits, and before it writes anything to disk.
+pub(crate) fn admit_push_on_worker(
+    shared: &Shared,
+    stages: &[StageId],
+    morsel: Morsel,
+    claim: Option<Reservation>,
+) -> Result<()> {
+    admit_push_as(shared, stages, morsel, claim, true)
+}
+
+/// Room first, disk last (2026-11-14). A refused push went straight to disk whenever the run
+/// had a disk tier, so a queue at its budget in front of a sink that was keeping up had every
+/// batch written and read back on the same CPUs that do the encodes (RB1): Enrich on the
+/// benchmark VM went from 7.5 s to 21 s with the disk tier on, 5.5 GB spilled at a fifth of its
+/// memory. Back-pressure was what the run needed; the disk is for room that does not come.
+fn admit_push_as(
+    shared: &Shared,
+    stages: &[StageId],
+    morsel: Morsel,
+    claim: Option<Reservation>,
+    helper: bool,
 ) -> Result<()> {
     let tier = morsel.payload.tier();
     let bytes = morsel.bytes;
@@ -732,6 +764,7 @@ pub(crate) fn admit_push(
     let clock = &shared.cfg.clock;
     let started = clock.now();
     let mut waited = false;
+    let mut refused_since: Option<Duration> = None;
     let _waiting = Waiting::enter(shared);
     loop {
         if claim.bytes() >= bytes {
@@ -741,9 +774,24 @@ pub(crate) fn admit_push(
         let last = match shared.placement.reserve(tier, more)? {
             Reserve::Granted(top) => {
                 claim.join(top)?;
+                refused_since = None;
                 continue;
             }
             Reserve::Pending { need } => format!("{need} bytes are on their way out"),
+            Reserve::Refused { need, budget }
+                if helper && let Some(job) = shared.offload.take() =>
+            {
+                job();
+                format!("{need} bytes more than a budget of {budget} holds; helped a queued job")
+            }
+            Reserve::Refused { need, budget }
+                if clock
+                    .now()
+                    .saturating_sub(*refused_since.get_or_insert_with(|| clock.now()))
+                    < SPILL_AFTER =>
+            {
+                format!("{need} bytes more than a budget of {budget} holds; waiting for room")
+            }
             Reserve::Refused { need, budget } => {
                 let copy = Morsel {
                     seq: morsel.seq,
@@ -879,6 +927,10 @@ pub(crate) fn stall_check(shared: &Shared) {
     let stats = shared.placement.stats();
     let quiet = shared.knobs.slots.busy() == 0
         && shared.reads_in_flight.load(Ordering::SeqCst) == 0
+        && shared
+            .sources
+            .iter()
+            .all(|s| s.waiting_reads.load(Ordering::SeqCst) == 0)
         && shared.writes_in_flight.load(Ordering::SeqCst) == 0
         && shared.pushes_waiting.load(Ordering::SeqCst) == 0
         && stats.in_flight_bytes == 0

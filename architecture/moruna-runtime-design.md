@@ -540,7 +540,7 @@ The runtime has to be the same library in five hosts, and the design must say wh
 
 ## 8. Explicit risks and accepted positions
 
-**Memory accounting is approximate.** Arrow's `get_array_memory_size` undercounts allocator overhead; anon memory as reported by the cgroup lags the allocator's view; allocators hold freed memory. Accepted position: the runtime budgets against the cgroup's anon figure with a 10% reserve and a safety factor learned from the probe, not against Arrow's numbers, and it uses the platform allocator, with glibc's mmap threshold fixed at 256 KiB and its arenas capped at four so freed memory returns promptly (F8.9: mimalloc held freed memory at 1.5 to 4.7 times the ceiling, measured). The residual risk is a burst of allocations between two samples; the 250 ms tick and the per-completion sample bound the window.
+**Memory accounting is approximate.** Arrow's `get_array_memory_size` undercounts allocator overhead; anon memory as reported by the cgroup lags the allocator's view; allocators hold freed memory. Accepted position: the runtime budgets against the cgroup's anon figure with a 10% reserve and a safety factor learned from the probe, not against Arrow's numbers, and it uses the platform allocator, with glibc's mmap threshold fixed at 256 KiB and its arenas capped at four so freed memory returns promptly (F8.9: mimalloc held freed memory at 1.5 to 4.7 times the ceiling, measured), and, since 2026-11-14, a heap's top kept up to a sixteenth of the ceiling so small buffers freed and taken again morsel after morsel are not faulted in each time (SDD 12 l). The residual risk is a burst of allocations between two samples; the 250 ms tick and the per-completion sample bound the window.
 
 **Page cache is charged to the cgroup.** `memory.current` includes file-backed pages and can approach `memory.max` while anon is well under budget. The kernel reclaims those pages before invoking the OOM killer, so this is not a kill risk, but it does mean `memory.current` alone is the wrong signal. Accepted position: budget against anon plus unevictable from `memory.stat`; document the distinction in the report.
 
@@ -566,7 +566,7 @@ The runtime has to be the same library in five hosts, and the design must say wh
 
 **Tensor and analytics workloads compete for the same design attention.** The tensor path is smaller in code but larger in hardware surface. Accepted position: v1 gates are analytics gates; tensor gates are v1.1 (Phase 5 and 9); nothing in v1 is allowed to preclude them, which is why Payload, Tier and the arena are in the v1 types even though only the host tier is exercised.
 
-**A tiny dataset pays runtime overhead it does not need.** If the source's total uncompressed size is under a quarter of the budget, the runtime skips the probe, sets one morsel per split at full size, and uses all workers; this costs nothing and removes the objection.
+**A tiny dataset pays runtime overhead it does not need.** It pays one probe morsel per stage and no more: the probe is what tells a cheap kernel from a greedy one, so every dataset is measured, and on a large machine the solve then gives a small dataset large morsels on every worker (RB2, 2026-11-13; the fast path that skipped the probe was removed after it sized a model kernel from the 4.0 default and ran out of memory).
 
 **Rust is not the team's product language.** Accepted for the reasons in D4; the surface area maintained in Rust is bounded to the crates in section 6, and kernel authors do not touch it.
 
