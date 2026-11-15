@@ -4266,7 +4266,7 @@ version = "0.1.0"
 
 [[package]]
 name = "moruna-adapters"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "dlpark",
@@ -4282,7 +4282,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-arena"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "cudarc",
  "libc",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-bench"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "blake3",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-controller"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "moruna-cost",
  "moruna-job",
@@ -4324,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-cost"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "moruna-job",
  "serde",
@@ -4334,7 +4334,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-datafusion"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "datafusion",
  "futures",
@@ -4349,7 +4349,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-discovery"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arc-swap",
  "cudarc",
@@ -4360,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-event"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "flatbuffers",
  "moruna-record",
@@ -4371,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-image"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "flate2",
@@ -4401,7 +4401,7 @@ version = "0.1.0"
 
 [[package]]
 name = "moruna-job"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "flatbuffers",
  "flexbuffers",
@@ -4414,7 +4414,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernel"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "blake3",
@@ -4431,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-kernels"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "blake3",
  "moruna-kernel",
@@ -4442,7 +4442,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-micro"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "imagefs-protocol",
  "libc",
@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-package"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "moruna-job",
  "moruna-kernel",
@@ -4472,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-placement"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-plan"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "flatbuffers",
  "moruna-cost",
@@ -4512,7 +4512,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-plane-linux"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "libc",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-polars"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "moruna-kernel",
  "polars",
@@ -4534,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-py"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "moruna-adapters",
@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-reactor"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "bytes",
  "cudarc",
@@ -4596,11 +4596,11 @@ dependencies = [
 
 [[package]]
 name = "moruna-record"
-version = "0.6.5"
+version = "0.6.6"
 
 [[package]]
 name = "moruna-runtime"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sandbox"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "landlock",
  "libc",
@@ -4681,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-scheduler"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "crossbeam",
  "libc",
@@ -4697,7 +4697,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sinks"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "bytes",
@@ -4715,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-sources"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "bytes",
@@ -4733,7 +4733,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-storage"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4764,7 +4764,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-storage-format"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-testkit"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "flatbuffers",
@@ -4817,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-trace"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arrow",
  "crossbeam",
@@ -4831,11 +4831,11 @@ dependencies = [
 
 [[package]]
 name = "moruna-types"
-version = "0.6.5"
+version = "0.6.6"
 
 [[package]]
 name = "moruna-vmm"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "acpi_tables",
  "base64 0.23.1",
@@ -4858,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "moruna-wasm"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "moruna-adapters",
  "moruna-kernel",
