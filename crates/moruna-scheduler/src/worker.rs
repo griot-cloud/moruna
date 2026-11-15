@@ -698,11 +698,17 @@ pub(crate) fn run_task(
         hook(&record);
     }
 
+    // A probe's record says it was the probe only when its apply succeeded. A probe that failed
+    // keeps the outcome the error policy gave it (`Error`, `Skip`), so the run report counts the
+    // stage's failed morsel: since RB2 measures every dataset, a kernel that fails on its first
+    // batch fails in the probe, and its report showed no failed morsel (KD3 case 3 on the
+    // microkernel, 2026-11-15).
+    let probed = probing && failure.is_none();
     if let Some(e) = failure {
         entry.errors.fetch_add(1, Ordering::SeqCst);
         record.outcome = crate::policy::apply_policy(shared, stage_ix, input, seq_in, e);
     }
-    if probing {
+    if probed {
         record.outcome = Outcome::Probe;
     }
 

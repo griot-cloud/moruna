@@ -289,6 +289,36 @@ fn sc_t10b_stateful_stages_after_the_first_are_probed() {
     );
 }
 
+/// SC-T10d: a probe whose apply fails is a failed morsel. Under `terminate` its record's outcome
+/// is `Error`, not `Probe`, so the run report counts the stage's failure: since RB2 measures every
+/// dataset, a kernel that fails on its first batch fails in the probe, and the microkernel's KD3
+/// case 3 found its report with no failed morsel (2026-11-15). f.9.
+#[test]
+fn sc_t10d_a_probe_that_fails_is_recorded_as_a_failure() {
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 2;
+            cfg.workers_active = 2;
+            cfg.initial_morsel_target = 16;
+        })
+        .source(FakeSource::new().splits(1, 64, 512))
+        .kernel(Arc::new(FakeKernel::new().fail_on(&[0])))
+        .go();
+    let _ = rig.scheduler.probe(1, 16);
+    let outcomes: Vec<_> = rig
+        .trace
+        .records()
+        .into_iter()
+        .filter(|r| r.stage == 1)
+        .map(|r| r.outcome)
+        .collect();
+    assert_eq!(
+        outcomes,
+        [moruna_kernel::Outcome::Error],
+        "the failed probe is the stage's failed morsel, not a probe"
+    );
+}
+
 /// SC-T10c: when the morsel stage 1 was probed with is skipped under the error policy, stage 2
 /// has nothing to probe with, and says so in the words the controller seeds a stage on (RC
 /// f.2), at once, rather than ending the run with "no morsel to probe with" (f.9).
@@ -308,6 +338,18 @@ fn sc_t10c_a_stage_no_morsel_reached_is_left_to_be_seeded() {
     if let Err(e) = rig.scheduler.probe(1, 16) {
         panic!("probe(1): {e}");
     }
+    let outcomes: Vec<_> = rig
+        .trace
+        .records()
+        .into_iter()
+        .filter(|r| r.stage == 1)
+        .map(|r| r.outcome)
+        .collect();
+    assert_eq!(
+        outcomes,
+        [moruna_kernel::Outcome::Skipped],
+        "the failed probe is the stage's skipped morsel, not a probe"
+    );
     let started = std::time::Instant::now();
     match rig.scheduler.probe(2, 16) {
         Err(moruna_kernel::MorunaError::Plan(msg)) => {
