@@ -1,15 +1,17 @@
 # Moruna's CI on Azure Pipelines, moved from GitHub Actions on 2026-11-15 when GitHub's
-# billing stopped every job. It keeps .github/workflows/ci.yml's rules:
+# billing stopped every job. One pipeline, four stages in order, each deciding whether it
+# applies to the run:
 #
-#   a pull request into main   the gate (build validation on main's branch policy, which is
-#                              how Azure Repos builds a pull request; a `pr:` key is ignored):
-#                              fmt, clippy, every test measured against the coverage floor,
-#                              the Python suite on a wheel built from the commit, and the
-#                              microkernel's boots when its inputs changed.
-#   a merge to main            the release path, and only when the version in Cargo.toml has
-#                              no tag yet: the wheels for every platform we ship, the upload to
-#                              PyPI, then the tag. No tests: the tree that merged is the tree
-#                              the pull request's build tested.
+#   version            every run: is the version in Cargo.toml without a tag yet?
+#   build, test, lint  a pull request into main (build validation on main's branch policy, which
+#                      is how Azure Repos builds a pull request; a `pr:` key is ignored): fmt,
+#                      clippy, every test measured against the coverage floor, the Python suite on
+#                      a wheel built from the commit, and the microkernel's boots when its inputs
+#                      changed. Not on a merge to main: the tree that merged is the tree its pull
+#                      request tested.
+#   wheels             when the version is new, on its pull request (after the tests pass) and on
+#                      the merge: the six wheels, each installed and imported where it can be.
+#   release            a merge to main with a new version: the upload to PyPI, then the tag.
 #
 # Where jobs run. Microsoft's hosted agents are free here up to 1,800 minutes a month, 60 minutes
 # a job, on 2 CPUs and 13 GB of disk (Linux) or an Intel Mac. The project's Managed DevOps Pool
@@ -37,10 +39,6 @@ parameters:
     type: string
     default: hosted
     values: [hosted, managed]
-  - name: releaseDryRun
-    displayName: Build every release artifact on this branch without publishing (proves the release jobs)
-    type: boolean
-    default: false
   # The macOS wheels, one job each (PY-I7: both builds of CPython 3.14).
   - name: macBuilds
     type: object
@@ -62,9 +60,41 @@ variables:
 
 stages:
   # ------------------------------------------------------------------------------------------
+  - stage: version
+    displayName: version
+    jobs:
+      - job: version
+        displayName: is the version new?
+        timeoutInMinutes: 15
+        pool:
+          ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
+            vmImage: ubuntu-24.04
+          ${{ else }}:
+            name: griot-ci
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            fetchTags: true
+          - bash: |
+              set -euo pipefail
+              version="$(awk '/^\[workspace.package\]/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.toml)"
+              [ -n "$version" ] || { echo "no version under [workspace.package] in Cargo.toml" >&2; exit 1; }
+              echo "##vso[task.setvariable variable=version;isOutput=true]$version"
+              if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+                echo "v$version is tagged already, so this is not a release"
+                echo "##vso[task.setvariable variable=release;isOutput=true]false"
+              else
+                echo "v$version has no tag, so this releases it"
+                echo "##vso[task.setvariable variable=release;isOutput=true]true"
+              fi
+            name: check
+            displayName: Is the version in Cargo.toml already released?
+
+  # ------------------------------------------------------------------------------------------
   - stage: gate
     displayName: build, test, lint
-    condition: and(ne(variables.isMain, true), eq('${{ parameters.releaseDryRun }}', 'False'))
+    dependsOn: version
+    condition: and(succeeded(), ne(variables.isMain, true))
     jobs:
       # The quick checks, on a hosted agent while the managed one takes the long ones.
       - job: lint
@@ -363,47 +393,18 @@ stages:
             condition: and(always(), eq(variables.KERNEL, 'true'))
 
   # ------------------------------------------------------------------------------------------
-  - stage: release
-    displayName: release
-    dependsOn: []
-    condition: or(eq(variables.isMain, true), eq('${{ parameters.releaseDryRun }}', 'True'))
+  - stage: wheels
+    displayName: wheels
+    dependsOn: [version, gate]
+    condition: >-
+      and(
+        eq(dependencies.version.result, 'Succeeded'),
+        in(dependencies.gate.result, 'Succeeded', 'Skipped'),
+        eq(dependencies.version.outputs['version.check.release'], 'true')
+      )
     jobs:
-      - job: version
-        displayName: a version to release
-        timeoutInMinutes: 15
-        pool:
-          ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
-            vmImage: ubuntu-24.04
-          ${{ else }}:
-            name: griot-ci
-        steps:
-          - checkout: self
-            fetchDepth: 0
-            fetchTags: true
-          - bash: |
-              set -euo pipefail
-              version="$(awk '/^\[workspace.package\]/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.toml)"
-              [ -n "$version" ] || { echo "no version under [workspace.package] in Cargo.toml" >&2; exit 1; }
-              echo "##vso[task.setvariable variable=version;isOutput=true]$version"
-              if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-                echo "v$version is tagged already, so this is not a release"
-                echo "##vso[task.setvariable variable=release;isOutput=true]false"
-              else
-                echo "v$version has no tag, so this releases it"
-                echo "##vso[task.setvariable variable=release;isOutput=true]true"
-              fi
-            name: check
-            displayName: Is the version in Cargo.toml already released?
-          - bash: python3 tools/release/azure_tested.py "$(Build.SourceVersion)"
-            displayName: The merged change passed its checks
-            condition: and(succeeded(), eq(variables.isMain, true))
-            env:
-              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-
       - job: wheels_linux_x86_64
         displayName: build the wheels (linux x86_64)
-        dependsOn: version
-        condition: and(succeeded(), or(eq(dependencies.version.outputs['check.release'], 'true'), eq('${{ parameters.releaseDryRun }}', 'True')))
         timeoutInMinutes: 120
         pool:
           name: griot-ci
@@ -431,8 +432,6 @@ stages:
 
       - job: wheels_linux_aarch64
         displayName: build the wheels (linux aarch64, cross-built)
-        dependsOn: version
-        condition: and(succeeded(), or(eq(dependencies.version.outputs['check.release'], 'true'), eq('${{ parameters.releaseDryRun }}', 'True')))
         timeoutInMinutes: 150
         pool:
           name: griot-ci
@@ -466,8 +465,6 @@ stages:
       - ${{ each build in parameters.macBuilds }}:
         - job: wheels_macos_${{ build.name }}
           displayName: build the wheel (macOS arm64, ${{ build.python }}, cross-built)
-          dependsOn: version
-          condition: and(succeeded(), or(eq(dependencies.version.outputs['check.release'], 'true'), eq('${{ parameters.releaseDryRun }}', 'True')))
           timeoutInMinutes: 60
           pool:
             vmImage: macOS-15
@@ -495,18 +492,22 @@ stages:
             - publish: dist
               artifact: wheels-macos-${{ build.name }}
 
+  # ------------------------------------------------------------------------------------------
+  - stage: release
+    displayName: release
+    dependsOn: [version, wheels]
+    condition: >-
+      and(
+        succeeded(),
+        eq(variables.isMain, true),
+        eq(dependencies.version.outputs['version.check.release'], 'true')
+      )
+    jobs:
       - job: publish
         displayName: publish to PyPI and tag
-        dependsOn:
-          - version
-          - wheels_linux_x86_64
-          - wheels_linux_aarch64
-          - ${{ each build in parameters.macBuilds }}:
-            - wheels_macos_${{ build.name }}
-        condition: and(succeeded(), eq(variables.isMain, true), eq(dependencies.version.outputs['check.release'], 'true'))
         timeoutInMinutes: 20
         variables:
-          version: $[ dependencies.version.outputs['check.version'] ]
+          version: $[ stageDependencies.version.version.outputs['check.version'] ]
         pool:
           ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
             vmImage: ubuntu-24.04
@@ -516,6 +517,10 @@ stages:
           - checkout: self
             fetchDepth: 1
             persistCredentials: true
+          - bash: python3 tools/release/azure_tested.py "$(Build.SourceVersion)"
+            displayName: The merged change passed its checks
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
           - download: current
             patterns: "wheels-*/*.whl"
           - bash: |
