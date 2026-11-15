@@ -1,0 +1,15 @@
+# A managed agent is kept for up to seven days, so a job finds its earlier build under target/:
+# the checkout leaves it, and every other untracked file an earlier run left goes.
+parameters:
+  - name: fetchDepth
+    type: number
+    default: 1
+steps:
+  - checkout: self
+    fetchDepth: ${{ parameters.fetchDepth }}
+    clean: false
+  - bash: |
+      set -euo pipefail
+      git clean -ffdxq -e /target/
+      df -h . | tail -1
+    displayName: An earlier run's untracked files go; target/ stays for the incremental build

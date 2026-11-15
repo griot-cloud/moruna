@@ -1,0 +1,40 @@
+# What the measured privileged tests need from a Linux agent (the sandbox, the image kind and
+# the vmm jail): user namespaces, a world-traversable home for the jail's binds, delegated
+# cgroups, and QEMU 10.2.1 with seccomp, slirp and vhost-user for the launcher's TCG boots,
+# built once per agent into /opt/qemu-proof.
+steps:
+  - bash: |
+      set -euo pipefail
+      # The jail's child binds moruna-vhost-vsock into its root from inside a user namespace that
+      # does not map the agent's user, so it walks the path as "other".
+      sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      chmod o+x "$HOME"
+      sudo mkdir -p /sys/fs/cgroup/moruna-cov /sys/fs/cgroup/moruna-jail
+      echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+      echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-cov/cgroup.subtree_control
+      echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/moruna-jail/cgroup.subtree_control
+      sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/moruna-cov /sys/fs/cgroup/moruna-jail
+      echo "##vso[task.setvariable variable=MORUNA_SANDBOX_CGROUP]/sys/fs/cgroup/moruna-cov"
+      echo "##vso[task.setvariable variable=MORUNA_JAIL_CGROUP]/sys/fs/cgroup/moruna-jail"
+    displayName: User namespaces and delegated cgroups for the measured privileged tests
+  - bash: |
+      set -euo pipefail
+      sudo apt-get update -q
+      sudo apt-get install -y -q --no-install-recommends libseccomp2 libslirp0 libglib2.0-0t64 jq
+      if [ ! -x /opt/qemu-proof/bin/qemu-system-x86_64 ] \
+          || ! /opt/qemu-proof/bin/qemu-system-x86_64 --version | grep -q "$QEMU_VERSION"; then
+        sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev flex bison libseccomp-dev libslirp-dev
+        work="$(Agent.TempDirectory)/qemu-proof"
+        rm -rf "$work" && mkdir -p "$work" && cd "$work"
+        curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
+        echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
+        mkdir src && tar xf qemu.tar.xz --strip-components=1 -C src && cd src
+        ./configure --prefix=/opt/qemu-proof --target-list=x86_64-softmmu \
+          --without-default-features --enable-tcg --enable-vhost-user --enable-seccomp --enable-slirp \
+          --disable-docs --disable-werror
+        make -j"$(nproc)"
+        sudo make install
+      fi
+      /opt/qemu-proof/bin/qemu-system-x86_64 --version
+      echo "##vso[task.setvariable variable=MORUNA_QEMU]/opt/qemu-proof/bin/qemu-system-x86_64"
+    displayName: QEMU $(QEMU_VERSION) with seccomp, slirp and vhost-user, for the launcher's TCG boots

@@ -1,0 +1,22 @@
+# CPython 3.14 in both builds, from uv (the agents' tool caches carry no free-threaded build):
+# STANDARD and FREETHREADED name the interpreters, MORUNA_PYTHON and PYO3_PYTHON a free-threaded
+# environment with the gate's packages, as the Linux gate on the benchmark VM ran them.
+steps:
+  - bash: |
+      set -euo pipefail
+      command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.local/bin:$PATH"
+      uv python install 3.14 3.14t
+      standard="$(uv python find 3.14)"
+      freethreaded="$(uv python find 3.14t)"
+      "$standard" -c 'import sys; assert sys._is_gil_enabled(), sys.version'
+      "$freethreaded" -c 'import sys; assert not sys._is_gil_enabled(), sys.version'
+      venv="$(Agent.TempDirectory)/venv-ft"
+      rm -rf "$venv" && uv venv -q -p "$freethreaded" "$venv"
+      uv pip install -q -p "$venv/bin/python" --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
+      echo "##vso[task.prependpath]$HOME/.local/bin"
+      echo "##vso[task.setvariable variable=STANDARD]$standard"
+      echo "##vso[task.setvariable variable=FREETHREADED]$freethreaded"
+      echo "##vso[task.setvariable variable=MORUNA_PYTHON]$venv/bin/python"
+      echo "##vso[task.setvariable variable=PYO3_PYTHON]$venv/bin/python"
+    displayName: CPython 3.14, standard and free-threaded, and the gate's Python packages

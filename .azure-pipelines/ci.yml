@@ -1,0 +1,547 @@
+# Moruna's CI on Azure Pipelines, moved from GitHub Actions on 2026-11-15 when GitHub's
+# billing stopped every job. It keeps .github/workflows/ci.yml's rules:
+#
+#   a pull request into main   the gate (build validation on main's branch policy, which is
+#                              how Azure Repos builds a pull request; a `pr:` key is ignored):
+#                              fmt, clippy, every test measured against the coverage floor,
+#                              the Python suite on a wheel built from the commit, and the
+#                              microkernel's boots when its inputs changed.
+#   a merge to main            the release path, and only when the version in Cargo.toml has
+#                              no tag yet: the wheels for every platform we ship, the upload to
+#                              PyPI, then the tag. No tests: the tree that merged is the tree
+#                              the pull request's build tested.
+#
+# Where jobs run. Microsoft's hosted agents are free here up to 1,800 minutes a month, 60 minutes
+# a job, on 2 CPUs and 13 GB of disk (Linux) or an Intel Mac. The project's Managed DevOps Pool
+# (`griot-ci`: 4 CPUs, 16 GB, 128 GB, agents kept for up to seven days, one at a time, shared
+# with Griot's pipelines) takes what does not fit them: the Rust gate, the Python suite, the
+# kernel boots and the Linux wheels. The small jobs run on the hosted agents; queue a run with
+# `smallJobsPool: managed` (or change its default) when the month's free minutes are spent.
+# Neither has an arm64 machine, so both arm64 wheels are cross-built from x86_64.
+#
+# Nobody creates a tag. A version bump merged to main is the release; the tag is pushed here
+# once PyPI has accepted the upload, so a tag always marks something that shipped.
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include: [main]
+
+pr: none
+
+parameters:
+  - name: smallJobsPool
+    displayName: Where the small jobs run (hosted is free until the month's minutes are spent)
+    type: string
+    default: hosted
+    values: [hosted, managed]
+  - name: releaseDryRun
+    displayName: Build every release artifact on this branch without publishing (proves the release jobs)
+    type: boolean
+    default: false
+  # The macOS wheels, one job each (PY-I7: both builds of CPython 3.14).
+  - name: macBuilds
+    type: object
+    default:
+      - name: cp314
+        python: "3.14"
+        tag: cp314-cp314
+      - name: cp314t
+        python: "3.14t"
+        tag: cp314t-cp314t
+
+variables:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+  QEMU_VERSION: "10.2.1"
+  QEMU_SHA256: a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+stages:
+  # ------------------------------------------------------------------------------------------
+  - stage: gate
+    displayName: build, test, lint
+    condition: and(ne(variables.isMain, true), eq('${{ parameters.releaseDryRun }}', 'False'))
+    jobs:
+      # The quick checks, on a hosted agent while the managed one takes the long ones.
+      - job: lint
+        displayName: "lint: fmt, the docs site, generated code, Python benchmarks"
+        timeoutInMinutes: 60
+        pool:
+          ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
+            vmImage: ubuntu-24.04
+          ${{ else }}:
+            name: griot-ci
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - template: templates/pythons.yml
+          - bash: |
+              set -euo pipefail
+              rustup toolchain install
+              cargo fmt --all -- --check
+              tools/lint/no_tier_wildcard.sh
+              tools/docs/check_docs.py
+            displayName: Format, lints and the documentation checker
+          - bash: tools/flatc/generate.sh --check
+            displayName: JB-I12 and PN-I14, the job and plan documents' generated code is what their schemas generate
+          - bash: |
+              set -euo pipefail
+              uv venv -q -p "$STANDARD" "$(Agent.TempDirectory)/docs"
+              uv pip install -q -p "$(Agent.TempDirectory)/docs/bin/python" -r docs/requirements.txt
+              "$(Agent.TempDirectory)/docs/bin/sphinx-build" -W --keep-going -q -b html docs docs/_build/html
+            displayName: The documentation site builds, warnings as errors
+          - bash: |
+              set -euo pipefail
+              uv venv -q -p "$FREETHREADED" "$(Agent.TempDirectory)/bench"
+              uv pip install -q -p "$(Agent.TempDirectory)/bench/bin/python" --only-binary=:all: numpy pytest pyarrow
+              cd bench/python && "$(Agent.TempDirectory)/bench/bin/python" -m pytest -q
+            displayName: Python kernel benchmarks
+
+      - job: rust
+        displayName: "rust: lints, tests and coverage"
+        timeoutInMinutes: 180
+        pool:
+          name: griot-ci
+        steps:
+          - template: templates/checkout-kept.yml
+          - template: templates/pythons.yml
+          - template: templates/linux-gate-host.yml
+          - bash: |
+              set -euo pipefail
+              rustup toolchain install
+              rustup component add llvm-tools-preview
+              command -v cargo-llvm-cov >/dev/null && cargo llvm-cov --version | grep -q 0.8.5 \
+                || cargo install cargo-llvm-cov --locked --version 0.8.5
+            displayName: The pinned toolchain and cargo-llvm-cov
+          - bash: |
+              set -euo pipefail
+              export STANDARD MORUNA_PYTHON PYO3_PYTHON
+              export PATH="$(dirname "$STANDARD"):$PATH"
+              export PYTHONPATH="$("$MORUNA_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+              tools/quality/check.sh --rust
+            displayName: Rust quality gate, every workspace test measured against the coverage floor
+            env:
+              CARGO_BUILD_JOBS: "3"
+              RUST_TEST_THREADS: "1"
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/gate"
+              cp target/llvm-cov/*.json target/llvm-cov/*.log target/quality/*.log "$(Build.ArtifactStagingDirectory)/gate/" 2>/dev/null || true
+            displayName: Collect the quality gate's diagnostics
+            condition: always()
+          - publish: $(Build.ArtifactStagingDirectory)/gate
+            artifact: linux-quality-gate-$(System.JobAttempt)
+            displayName: Retain the quality gate's diagnostics
+            condition: always()
+          - bash: |
+              set -euo pipefail
+              bin="$(cargo test -p moruna-image --test image_kind --locked --no-run --message-format=json \
+                | jq -r 'select(.executable != null and .target.name == "image_kind") | .executable')"
+              test -x "$bin"
+              sudo mkdir -p /sys/fs/cgroup/moruna-ci
+              echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+              echo "+memory +cpu" | sudo tee /sys/fs/cgroup/moruna-ci/cgroup.subtree_control
+              sudo env MORUNA_SANDBOX_CGROUP=/sys/fs/cgroup/moruna-ci "$bin" --ignored --test-threads=1
+            displayName: The image kind in its delegated cgroup
+            condition: succeededOrFailed()
+          - bash: |
+              set -euo pipefail
+              cargo tree -p moruna-kernel > kernel-tree.txt
+              if grep -E -i '\b(tokio|cudarc|pyo3|parquet|object_store)\b' kernel-tree.txt; then
+                echo "moruna-kernel has a forbidden runtime dependency" >&2
+                exit 1
+              fi
+            displayName: CT-T12 kernel dependency boundary
+            condition: succeededOrFailed()
+
+      - job: python
+        displayName: "python: the package's tests on a wheel built from this commit"
+        timeoutInMinutes: 90
+        pool:
+          name: griot-ci
+        steps:
+          - template: templates/checkout-kept.yml
+          - template: templates/pythons.yml
+          - bash: |
+              set -euo pipefail
+              rustup toolchain install
+              export STANDARD MORUNA_PYTHON
+              export PATH="$(dirname "$STANDARD"):$PATH"
+              tools/quality/check.sh --python
+            displayName: python/tests against a wheel built from this commit
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/python"
+              cp target/quality/*.log "$(Build.ArtifactStagingDirectory)/python/" 2>/dev/null || true
+            displayName: Collect the Python tests' diagnostics
+            condition: always()
+          - publish: $(Build.ArtifactStagingDirectory)/python
+            artifact: python-tests-$(System.JobAttempt)
+            displayName: Retain the Python tests' diagnostics
+            condition: always()
+
+      # The microkernel (SDD 20 k, SDD 23 k): kernel/ is its own Cargo workspace on a pinned
+      # nightly, built for x86_64-unknown-none and booted under QEMU (KVM when the agent has it,
+      # TCG otherwise) on one, two and four CPUs, when the pull request changed a native boot or
+      # engine input.
+      - job: kernel
+        displayName: the microkernel builds and boots (KB1)
+        timeoutInMinutes: 180
+        pool:
+          name: griot-ci
+        steps:
+          - template: templates/checkout-kept.yml
+            parameters:
+              fetchDepth: 0
+          - bash: |
+              set -euo pipefail
+              git fetch -q origin main
+              base="$(git merge-base origin/main HEAD)"
+              echo "##vso[task.setvariable variable=BASE]$base"
+              if git diff --quiet "$base" HEAD -- kernel/ crates/ Cargo.toml Cargo.lock rust-toolchain.toml .azure-pipelines/; then
+                echo "native boot, engine, codec and pinned build inputs are unchanged"
+                echo "##vso[task.setvariable variable=KERNEL]false"
+              else
+                echo "##vso[task.setvariable variable=KERNEL]true"
+              fi
+            displayName: Did this change a native boot or engine proof input?
+          - bash: |
+              set -euo pipefail
+              if [ ! -x /opt/qemu/bin/qemu-system-x86_64 ] || ! /opt/qemu/bin/qemu-system-x86_64 --version | grep -q "$QEMU_VERSION"; then
+                sudo apt-get update -q
+                sudo apt-get install -y -q --no-install-recommends ninja-build pkg-config libglib2.0-dev python3-venv flex bison
+                work="$(Agent.TempDirectory)/qemu"
+                rm -rf "$work" && mkdir -p "$work" && cd "$work"
+                curl -fsSL -o qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
+                echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -
+                mkdir src && tar xf qemu.tar.xz --strip-components=1 -C src && cd src
+                # vhost-user builds vhost-user-vsock-pci, the vsock every boot has (SDD 30 f.11).
+                ./configure --prefix=/opt/qemu --target-list=x86_64-softmmu \
+                  --without-default-features --enable-kvm --enable-tcg --enable-vhost-user \
+                  --disable-docs --disable-werror
+                make -j"$(nproc)"
+                sudo make install
+              fi
+              echo "##vso[task.prependpath]/opt/qemu/bin"
+              /opt/qemu/bin/qemu-system-x86_64 --version
+              if [ -e /dev/kvm ]; then
+                echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+                  | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+                sudo udevadm control --reload-rules
+                sudo udevadm trigger --name-match=kvm
+              fi
+              ls -l /dev/kvm || echo "no /dev/kvm: the boot runs under TCG"
+            displayName: QEMU $(QEMU_VERSION), and KVM for this user when the agent has it
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              cd kernel
+              rustup toolchain install
+              cargo fmt --all -- --check
+              host="$(rustc -vV | sed -n 's/^host: //p')"
+              packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-quota -p moruna-svc -p moruna-image
+                -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
+                -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol)
+              cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
+              cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
+            displayName: Format and host tests of ABI, loaders, handles, quotas, SDK, image and device libraries
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: kernel/tools/check-examples.sh "$BASE" HEAD
+            displayName: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              rustup toolchain install
+              rustup target add x86_64-unknown-linux-musl
+              sudo apt-get install -y -q --no-install-recommends musl-tools
+              rm -rf "$(Agent.TempDirectory)/python"
+              kernel/tools/python-layout.sh "$(Agent.TempDirectory)/python"
+            displayName: The Linux personality's image (SDD 28 k), musl for its static programs, and python:3.14-slim's layers
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              rm -rf "$(Agent.TempDirectory)/boot"
+              kernel/tools/build.sh "$(Agent.TempDirectory)/boot" kernel/initramfs/boot.image "$(Agent.TempDirectory)/python"
+            displayName: Build the kernel, the programs and the boot image
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -uo pipefail
+              boot="$(Agent.TempDirectory)/boot"
+              fail=0
+              for cpus in 1 2 4; do
+                echo "##[group]boot on $cpus CPUs"
+                kernel/tools/boot.sh "$boot" 900 "$cpus" | tee "$(Agent.TempDirectory)/serial-$cpus.log"
+                status="${PIPESTATUS[0]}"
+                echo "##[endgroup]"
+                echo "verdict of the boot on $cpus CPUs:"
+                kernel/tools/check-boot.sh "$(Agent.TempDirectory)/serial-$cpus.log" "$status" "$boot/expect" "$cpus" || fail=1
+              done
+              exit "$fail"
+            displayName: Boot under QEMU on one, two and four CPUs and judge each serial line
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              python3 kernel/tools/net-proof.py prepare "$(Agent.TempDirectory)/boot"
+              rm -rf "$(Agent.TempDirectory)/native-node-ci"
+              kernel/tools/node-fixtures.sh "$(Agent.TempDirectory)/boot" "$(Agent.TempDirectory)/native-node-ci" \
+                "$(command -v qemu-system-x86_64)" "$(Agent.TempDirectory)/boot/ke2/roots" 180
+            displayName: Required five production-node job cases on one, two and four CPUs
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              rm -rf "$(Agent.TempDirectory)/deadline-boot"
+              kernel/tools/deadline-boot.sh "$(Agent.TempDirectory)/boot" "$(Agent.TempDirectory)/deadline-boot"
+            displayName: Strict deadline latency on one, two and four CPUs, with bounded contenders
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              cd kernel
+              unset CARGO_ENCODED_RUSTFLAGS
+              build_std=(-Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
+              cargo clippy --release --locked --target x86_64-unknown-none "${build_std[@]}" \
+                -p moruna-microkernel-boot -- -D warnings
+              RUSTFLAGS="$RUSTFLAGS -Zunstable-options -C link-arg=-T$PWD/sys/user.ld -C link-arg=-static" \
+                cargo clippy -Zunstable-options -Zjson-target-spec --release --locked \
+                --target "$PWD/targets/x86_64-moruna-user.json" "${build_std[@]}" --workspace \
+                --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image -- -D warnings
+            displayName: Clippy for the builtin kernel target and canonical native-user target
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+            env:
+              RUSTFLAGS: --cfg polyval_force_soft -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y
+              # Match build.sh: ring's freestanding JSON target requires Clang.
+              CC_x86_64_moruna_user: clang
+              CFLAGS_x86_64_moruna_user: --target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector
+          - bash: |
+              set -euo pipefail
+              command -v cargo-deny >/dev/null && cargo deny --version | grep -q 0.20.2 \
+                || cargo install cargo-deny --locked --version 0.20.2
+              cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
+            displayName: Licences of the kernel workspace (MPL-2.0 for OSTD, DECISIONS.md MK1)
+            condition: and(succeeded(), eq(variables.KERNEL, 'true'))
+          - bash: |
+              set -euo pipefail
+              out="$(Build.ArtifactStagingDirectory)/kernel"
+              mkdir -p "$out"
+              cp "$(Agent.TempDirectory)"/serial-*.log "$out/" 2>/dev/null || true
+              cp "$(Agent.TempDirectory)"/boot/manifest "$(Agent.TempDirectory)"/boot/expect "$out/" 2>/dev/null || true
+              cp "$(Agent.TempDirectory)"/boot/console*.log "$out/" 2>/dev/null || true
+              # Bounded production-node logs, as the GitHub job kept them.
+              python3 - "$(Agent.TempDirectory)/native-node-ci" "$out/native-node-ci-logs" <<'PY'
+              import json, pathlib, sys
+              source, output = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+              output.mkdir(parents=True, exist_ok=True)
+              retained = []
+              for cpu in (1, 2, 4):
+                  for case in range(1, 6):
+                      for name in ("result.json", "prepare.log", "backend.log", "qemu.log", "peer.log", "serial.log"):
+                          relative = pathlib.Path(f"cpu{cpu}/case{case}") / name
+                          path = source / relative
+                          if not path.is_file() or path.is_symlink():
+                              continue
+                          size = path.stat().st_size
+                          bound = 256 * 1024 if name == "result.json" else 64 * 1024
+                          with path.open("rb") as stream:
+                              stream.seek(max(0, size - bound))
+                              data = stream.read(bound)
+                          destination = output / relative
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          destination.write_bytes(data)
+                          retained.append({"path": str(relative), "original_bytes": size, "retained_bytes": len(data)})
+              (output / "retained.json").write_text(json.dumps(retained, indent=2) + "\n")
+              PY
+            displayName: Collect bounded production-node diagnostics
+            condition: and(always(), eq(variables.KERNEL, 'true'))
+          - publish: $(Build.ArtifactStagingDirectory)/kernel
+            artifact: kernel-serial-logs-$(System.JobAttempt)
+            displayName: Retain the kernel's serial and node logs
+            condition: and(always(), eq(variables.KERNEL, 'true'))
+
+  # ------------------------------------------------------------------------------------------
+  - stage: release
+    displayName: release
+    dependsOn: []
+    condition: or(eq(variables.isMain, true), eq('${{ parameters.releaseDryRun }}', 'True'))
+    jobs:
+      - job: version
+        displayName: a version to release
+        timeoutInMinutes: 15
+        pool:
+          ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
+            vmImage: ubuntu-24.04
+          ${{ else }}:
+            name: griot-ci
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            fetchTags: true
+          - bash: |
+              set -euo pipefail
+              version="$(awk '/^\[workspace.package\]/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.toml)"
+              [ -n "$version" ] || { echo "no version under [workspace.package] in Cargo.toml" >&2; exit 1; }
+              echo "##vso[task.setvariable variable=version;isOutput=true]$version"
+              if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+                echo "v$version is tagged already, so this is not a release"
+                echo "##vso[task.setvariable variable=release;isOutput=true]false"
+              else
+                echo "v$version has no tag, so this releases it"
+                echo "##vso[task.setvariable variable=release;isOutput=true]true"
+              fi
+            name: check
+            displayName: Is the version in Cargo.toml already released?
+          - bash: python3 tools/release/azure_tested.py "$(Build.SourceVersion)"
+            displayName: The merged change passed its checks
+            condition: and(succeeded(), eq(variables.isMain, true))
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+      - job: wheels_linux_x86_64
+        displayName: build the wheels (linux x86_64)
+        dependsOn: version
+        condition: and(succeeded(), or(eq(dependencies.version.outputs['check.release'], 'true'), eq('${{ parameters.releaseDryRun }}', 'True')))
+        timeoutInMinutes: 120
+        pool:
+          name: griot-ci
+        steps:
+          - template: templates/checkout-kept.yml
+          - template: templates/pythons.yml
+          - bash: |
+              set -euo pipefail
+              rm -rf dist
+              tools/release/linux-wheels.sh docker dist
+              ls -la dist
+            displayName: Build the Linux wheels in the manylinux_2_28 image
+          - bash: |
+              set -euo pipefail
+              for py in "$STANDARD" "$FREETHREADED"; do
+                env="$(Agent.TempDirectory)/try-$(basename "$py")"
+                rm -rf "$env" && uv venv -q -p "$py" "$env"
+                uv pip install -q -p "$env/bin/python" --only-binary=:all: pyarrow
+                uv pip install -q -p "$env/bin/python" --no-index --find-links dist moruna
+                "$env/bin/python" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
+              done
+            displayName: The wheel installs and runs before it is published
+          - publish: dist
+            artifact: wheels-linux-x86_64
+
+      - job: wheels_linux_aarch64
+        displayName: build the wheels (linux aarch64, cross-built)
+        dependsOn: version
+        condition: and(succeeded(), or(eq(dependencies.version.outputs['check.release'], 'true'), eq('${{ parameters.releaseDryRun }}', 'True')))
+        timeoutInMinutes: 150
+        pool:
+          name: griot-ci
+        steps:
+          - template: templates/checkout-kept.yml
+          - bash: |
+              set -euo pipefail
+              rm -rf dist
+              MORUNA_WHEEL_TARGET=aarch64 tools/release/linux-wheels.sh docker dist
+              ls -la dist
+            displayName: Cross-build the aarch64 wheels in the manylinux_2_28 cross image
+          - bash: |
+              set -euo pipefail
+              # An aarch64 container under QEMU's user-mode emulation, registered with the
+              # fix-binary flag, so the wheel is installed and imported on its own architecture.
+              sudo apt-get install -y -q --no-install-recommends qemu-user-static binfmt-support
+              docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
+                uname -m
+                for py in /opt/python/cp314-cp314/bin/python /opt/python/cp314-cp314t/bin/python; do
+                  "$py" -m pip install --quiet --only-binary=:all: pyarrow
+                  "$py" -m pip install --quiet --no-index --find-links /dist moruna
+                  "$py" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()[\"limits\"])"
+                done'
+            displayName: The wheel installs and runs on aarch64 (emulated) before it is published
+          - publish: dist
+            artifact: wheels-linux-aarch64
+
+      # macOS arm64, cross-built on the hosted Intel Mac, one interpreter build a job so each
+      # stays inside the free tier's 60 minutes. Neither can be imported on an Intel Mac, so the
+      # check is the wheel's tag and its library's architecture.
+      - ${{ each build in parameters.macBuilds }}:
+        - job: wheels_macos_${{ build.name }}
+          displayName: build the wheel (macOS arm64, ${{ build.python }}, cross-built)
+          dependsOn: version
+          condition: and(succeeded(), or(eq(dependencies.version.outputs['check.release'], 'true'), eq('${{ parameters.releaseDryRun }}', 'True')))
+          timeoutInMinutes: 60
+          pool:
+            vmImage: macOS-15
+          steps:
+            - checkout: self
+              fetchDepth: 1
+            - bash: |
+                set -euo pipefail
+                rustup toolchain install
+                rustup target add aarch64-apple-darwin
+                command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+                export PATH="$HOME/.local/bin:$PATH"
+                uv python install ${{ build.python }}
+                python="$(uv python find ${{ build.python }})"
+                maturin="$(sed -n 's/^requires = \["\(maturin[^"]*\)"\].*/\1/p' pyproject.toml)"
+                uv tool run --from "$maturin" maturin build --release --target aarch64-apple-darwin --out dist -i "$python"
+                ls -la dist
+                whl="$(ls dist/*-${{ build.tag }}-macosx_11_0_arm64.whl)"
+                mkdir -p "$(Agent.TempDirectory)/whl" && cd "$(Agent.TempDirectory)/whl" && unzip -q -o "$OLDPWD/$whl"
+                lipo -archs moruna/_core*.so | tee /dev/stderr | grep -qx arm64
+              displayName: Cross-build the macOS arm64 wheel, and check its tag and architecture
+              env:
+                # The macOS wheels keep 0.6.2's platform tag on the newer SDK.
+                MACOSX_DEPLOYMENT_TARGET: "11.0"
+            - publish: dist
+              artifact: wheels-macos-${{ build.name }}
+
+      - job: publish
+        displayName: publish to PyPI and tag
+        dependsOn:
+          - version
+          - wheels_linux_x86_64
+          - wheels_linux_aarch64
+          - ${{ each build in parameters.macBuilds }}:
+            - wheels_macos_${{ build.name }}
+        condition: and(succeeded(), eq(variables.isMain, true), eq(dependencies.version.outputs['check.release'], 'true'))
+        timeoutInMinutes: 20
+        variables:
+          version: $[ dependencies.version.outputs['check.version'] ]
+        pool:
+          ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
+            vmImage: ubuntu-24.04
+          ${{ else }}:
+            name: griot-ci
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            persistCredentials: true
+          - download: current
+            patterns: "wheels-*/*.whl"
+          - bash: |
+              set -euo pipefail
+              mkdir -p dist
+              find "$(Pipeline.Workspace)" -path '*/wheels-*/*.whl' -exec cp {} dist/ \;
+              ls -la dist
+              test "$(ls dist/*.whl | wc -l)" -eq 6
+            displayName: Every wheel that was built is here (six)
+          - bash: |
+              set -euo pipefail
+              # An undefined variable reaches the step as its own macro text.
+              case "${TWINE_PASSWORD:-}" in
+                "" | '$(PYPI_API_TOKEN)') echo "the pipeline has no PYPI_API_TOKEN secret variable" >&2; exit 1 ;;
+              esac
+              python3 -m pip install --quiet twine
+              python3 -m twine upload --non-interactive --skip-existing dist/*.whl
+            displayName: Publish to PyPI
+            env:
+              TWINE_USERNAME: __token__
+              TWINE_PASSWORD: $(PYPI_API_TOKEN)
+          - bash: |
+              set -euo pipefail
+              # After the upload and not before it: a tag made first survives a failed publish
+              # (v0.1.1 and v0.1.2 named releases that did not exist, 2026-09-23).
+              notes="$(awk -v v="## $(version)" '$0 == v {f=1; next} f && /^## /{exit} f' CHANGELOG.md)"
+              [ -n "$notes" ] || notes="See CHANGELOG.md"
+              git -c user.name="Moruna release" -c user.email="agents@griotdata.com" \
+                tag -a "v$(version)" -m "$(version)" -m "$notes" "$(Build.SourceVersion)"
+              git push origin "v$(version)"
+            displayName: Tag what was published
