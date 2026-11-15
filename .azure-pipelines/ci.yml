@@ -199,7 +199,7 @@ stages:
               fetchDepth: 0
           - bash: |
               set -euo pipefail
-              git fetch -q origin main
+              git -c http.extraheader="AUTHORIZATION: bearer $SYSTEM_ACCESSTOKEN" fetch -q origin main
               base="$(git merge-base origin/main HEAD)"
               echo "##vso[task.setvariable variable=BASE]$base"
               if git diff --quiet "$base" HEAD -- kernel/ crates/ Cargo.toml Cargo.lock rust-toolchain.toml .azure-pipelines/; then
@@ -209,6 +209,8 @@ stages:
                 echo "##vso[task.setvariable variable=KERNEL]true"
               fi
             displayName: Did this change a native boot or engine proof input?
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
           - bash: |
               set -euo pipefail
               if [ ! -x /opt/qemu/bin/qemu-system-x86_64 ] || ! /opt/qemu/bin/qemu-system-x86_64 --version | grep -q "$QEMU_VERSION"; then

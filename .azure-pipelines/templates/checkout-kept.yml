@@ -1,5 +1,7 @@
 # A managed agent is kept for up to seven days, so a job finds its earlier build under target/:
-# the checkout leaves it, and every other untracked file an earlier run left goes.
+# the checkout leaves it, and every other untracked file an earlier run left goes. Every job of
+# this pipeline shares one checkout on the agent, and the job disk (/mnt, 75 GB) is too small for
+# all of their builds together, so target/ is the pool's 128 GB data disk, bound in once.
 parameters:
   - name: fetchDepth
     type: number
@@ -10,6 +12,16 @@ steps:
     clean: false
   - bash: |
       set -euo pipefail
+      if [ -d /mnt/storage ] && mountpoint -q /mnt/storage; then
+        store=/mnt/storage/moruna-target
+        sudo mkdir -p "$store"
+        sudo chown "$(id -u):$(id -g)" "$store"
+        if ! mountpoint -q target; then
+          # A target/ left on the job disk by a run before this one gives its space back.
+          rm -rf target && mkdir target
+          sudo mount --bind "$store" target
+        fi
+      fi
       git clean -ffdxq -e /target/
-      df -h . | tail -1
-    displayName: An earlier run's untracked files go; target/ stays for the incremental build
+      df -h . target | tail -2
+    displayName: An earlier run's untracked files go; target/ stays, on the data disk
