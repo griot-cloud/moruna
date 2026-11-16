@@ -1,6 +1,6 @@
 # Writing your own source or sink
 
-Moruna reads Parquet, Vortex and tensor files, and writes Parquet, Vortex, tensor and Arrow IPC files. For anything else, write a class of your own in Python. Subclass `moruna.Source` to read from somewhere Moruna does not, and `moruna.Sink` to write somewhere it does not. `moruna.run` accepts an instance of either wherever it accepts the built-in ones:
+Moruna reads Parquet, Arrow IPC and tensor files, and writes Parquet, tensor and Arrow IPC files. For anything else (Vortex, a database, an API), write a class of your own in Python. Subclass `moruna.Source` to read from somewhere Moruna does not, and `moruna.Sink` to write somewhere it does not. `moruna.run` accepts an instance of either wherever it accepts the built-in ones:
 
 ```python
 report = moruna.run(MySource(...), [function], MySink(...), budget="8GiB")
@@ -62,6 +62,30 @@ class TableSource(moruna.Source):
 - **Split ids are unique.** Use whole numbers from 0 to 4,294,967,295.
 - **The size is an estimate.** When you leave out `bytes`, Moruna reads up to 1,024 rows of the first split that has any, once, to measure the size of a row. Giving `bytes` and defining `schema()` avoids that read.
 - **Returning a slice is fine.** Moruna copies the rows you return into its own memory, not the whole batch a slice belongs to.
+
+### Reading another format: Vortex, for example
+
+Moruna holds no code for any one format beyond Parquet, Arrow IPC and tensor files. To read
+another one, call its own Python package in a source and hand Moruna Arrow. For Vortex, one split
+per file, with its row count, and each read returning a row range of that file:
+
+```python
+import moruna
+
+class VortexFiles(moruna.Source):
+    def __init__(self, paths):
+        self.paths = paths
+
+    def plan(self):
+        return [moruna.Split(i, rows=row_count(p)) for i, p in enumerate(self.paths)]
+
+    def read(self, split_id, start, end):
+        return read_rows(self.paths[split_id], start, end)  # a pyarrow.RecordBatch
+```
+
+`row_count` and `read_rows` are two short functions over Vortex's Python package: the file's row
+count, and rows `start` to `end` as Arrow. The source gets everything a source gets: the plan
+before any read, row ranges, and resume.
 
 ### When reads can change: `repeatable`
 

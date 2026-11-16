@@ -57,8 +57,6 @@ from moruna._core import (
     Split,
     TensorSink,
     TensorSource,
-    VortexSink,
-    VortexSource,
     inspect_host,
 )
 from moruna._job import Function, Job, JobSpec, Sink, Source, Task, function, image
@@ -100,8 +98,6 @@ __all__ = [
     "Task",
     "TensorSink",
     "TensorSource",
-    "VortexSink",
-    "VortexSource",
     "Writer",
     "__version__",
     "check",
@@ -111,7 +107,6 @@ __all__ = [
     "kind",
     "kinds",
     "load",
-    "polars",
     "read_events",
     "run",
     "std",
@@ -251,28 +246,6 @@ def read_events(source: str | os.PathLike[str] | bytes) -> list[dict[str, Any]]:
     data = bytes(source) if isinstance(source, (bytes, bytearray)) else Path(source).read_bytes()
     events: list[dict[str, Any]] = json.loads(_core.read_events(data))
     return events
-
-
-def polars(fn: Any, *, accepts: str = "table", **declarations: Any) -> Function:
-    """Wrap a function from a Polars frame to a Polars frame as a stateless function (MH 4.9).
-
-    The same path the decorator takes for a function annotated ``pl.DataFrame ->
-    pl.DataFrame``, for a function that carries no annotations: the batch enters Polars through
-    the Arrow C data interface and the result leaves the same way. ``declarations`` are the
-    decorator's ``input_schema``, ``output_schema`` and ``lockfile``.
-    """
-    from moruna._job import _wrap  # noqa: PLC0415
-
-    kind = _declare.polars_signature(fn) or "eager"
-    wrapped = _declare.polars_callable(fn, kind)
-    return _wrap(_core.build_kernel(
-        wrapped,
-        accepts=accepts,
-        input_schema=_declare.declaration(declarations.get("input_schema"), "input_schema"),
-        output_schema=_declare.declaration(declarations.get("output_schema"), "output_schema"),
-        lockfile=_declare.lockfile_bytes(declarations.get("lockfile")),
-        origin=fn,
-    ))
 
 
 from moruna import std  # noqa: E402, the standard functions need the names above

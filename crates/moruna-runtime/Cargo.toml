@@ -86,17 +86,14 @@ hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
-# Reads back what the Vortex round trip in `tests/end_to_end.rs` wrote (07 SO-T30); already in
-# the graph through moruna-sources and moruna-sinks.
-vortex = { workspace = true }
 
-# The first program a user writes, kept at the repository root so it reads as an example and
-# not as a test; the quality gate runs it on every commit.
 # The engine's command line without the Python adapter (SDD 30 d.4): what the Moruna kernel runs.
 [[bin]]
 name = "moruna-engine"
 path = "src/bin/moruna-engine.rs"
 
+# The first program a user writes, kept at the repository root so it reads as an example and
+# not as a test; the quality gate runs it on every commit.
 [[example]]
 name = "append_column"
 path = "../../examples/append_column.rs"

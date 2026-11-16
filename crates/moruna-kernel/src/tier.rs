@@ -62,7 +62,7 @@ pub enum TierKind {
 
 /// How a staging segment's records are encoded. `Raw` is the payload's in-memory
 /// layout written as is (page-aligned Arrow IPC or MRB1), moved by DMA with no CPU
-/// in the path (PL-I4). Reserved for a compressed variant (a Vortex-encoded record,
+/// in the path (PL-I4). Reserved for a compressed variant (a compressed record,
 /// architecture 5.6) that trades CPU on the demotion path for disk bytes when the
 /// controller decides the run is disk-bound with idle cores; every v1 `match`
 /// handles the enum explicitly (CT-I11) and the segment record header carries

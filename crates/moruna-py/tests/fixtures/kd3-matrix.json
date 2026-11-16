@@ -275,13 +275,6 @@
       "expect": "rows"
     },
     {
-      "id": "source.vortex",
-      "role": "source",
-      "kind": "vortex",
-      "runner": "document",
-      "expect": "rows"
-    },
-    {
       "id": "source.tensor",
       "role": "source",
       "kind": "tensor",
@@ -299,13 +292,6 @@
       "id": "sink.parquet",
       "role": "sink",
       "kind": "parquet",
-      "runner": "document",
-      "expect": "rows"
-    },
-    {
-      "id": "sink.vortex",
-      "role": "sink",
-      "kind": "vortex",
       "runner": "document",
       "expect": "rows"
     },

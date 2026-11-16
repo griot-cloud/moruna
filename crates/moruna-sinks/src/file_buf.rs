@@ -1,5 +1,5 @@
-//! The arena file buffer an encoding sink writes its file into (08 f.1), shared by the Parquet
-//! and Vortex sinks (f.11).
+//! The arena file buffer an encoding sink writes its file into (08 f.1): the Parquet sink's
+//! (f.11).
 //!
 //! An encoder writes straight into one arena buffer per open file, and the reactor writes the
 //! finished file from a view over that buffer. The buffer is one whole size class of 02 e.2
@@ -195,15 +195,6 @@ impl FileBuffers {
                 spare.push(buf);
             }
         }
-    }
-
-    /// The sink's two file buffers, taken at `open` (f.1): the file being encoded and the one a
-    /// roll opens while the first is still being written. Each is the class `file_bytes` asks
-    /// for and no more than a quarter of what the arena has free, so the pair leaves the arena
-    /// at least half of itself; when the arena cannot give the pair, both halve together, down
-    /// to the smallest class, below which the sink cannot open.
-    pub(crate) fn alloc_pair(&self, file_bytes: u64) -> Result<()> {
-        self.alloc_set(file_bytes, 2).map(|_| ())
     }
 
     /// The pair's bytes, `2 x file_bytes`, as `count` buffers (08 f.12): a sink that encodes

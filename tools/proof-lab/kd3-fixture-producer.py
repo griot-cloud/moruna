@@ -180,7 +180,7 @@ def main():
     report = {'version': 1, 'passed': False, 'target': target, 'toolchain': '1.98.1',
               'profile': 'dev-debug0', 'jobs': 1, 'scope': 'actual fixture/library artifact build only; no job/VM execution or performance claim',
               'global_opt_level': 1,
-              'package_optimization': {'vortex-fastlanes': 1, 'vortex-array': 1, 'moruna-py': 1},
+              'package_optimization': {'moruna-py': 1},
               'commands': [], 'files': []}
 
     def save():
@@ -343,8 +343,6 @@ def main():
         base = ['rustup', 'run', '1.98.1', 'cargo', 'build', '--locked', '--offline', '--target', target,
                 '--config', 'profile.dev.debug=0', '--config', 'profile.dev.incremental=false',
                 '--config', 'profile.dev.opt-level=1',
-                '--config', 'profile.dev.package.vortex-fastlanes.opt-level=1',
-                '--config', 'profile.dev.package.vortex-array.opt-level=1',
                 '--config', 'profile.dev.package.moruna-py.opt-level=1', '-j1',
                 '-p', 'moruna-py', '--features', 'python', '--lib', '--bin', 'moruna-kd3-fixture']
         call(base, 'cargo-build')

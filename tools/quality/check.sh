@@ -314,21 +314,17 @@ if [ -f Cargo.toml ]; then
   fi
   measure_workspace
   lean coverage
-  # The feature-gated crates are invisible to a default-feature run: moruna-adapters and
-  # moruna-polars compile to nothing without `python` and `polars`, so the gate reported them
-  # as stubs and their coverage as "not measured" while they held thousands of lines (found by
-  # the component 5 agent, 2026-09-22). The Polars bridge needs no interpreter and is always
-  # built; the Python adapter needs an interpreter with pyarrow, so it runs when one is
-  # configured and says so plainly when it is not.
+  # The feature-gated crates are invisible to a default-feature run: moruna-adapters compiles
+  # to nothing without `python`, so the gate reported it as a stub and its coverage as "not
+  # measured" while it held thousands of lines (found by the component 5 agent, 2026-09-22).
+  # The Python adapter needs an interpreter with pyarrow, so it runs when one is configured and
+  # says so plainly when it is not.
   # The first program a user writes, run for real: a Parquet file in, a kernel that appends a
   # column, a Parquet file out, at a 512 MiB budget and otherwise nothing but defaults. Four
   # defects reached a built wheel while the suite was green, and every one of them would have
   # failed this (PM, 2026-09-22).
   step "cargo run --example append_column (examples/append_column.rs)"
   quiet example cargo run -p moruna-runtime --example append_column
-  step "cargo test --features polars (the Polars bridge)"
-  quiet test_bridges cargo test -p moruna-polars --features moruna-polars/polars
-  lean
   if [ -n "${MORUNA_PYTHON:-}" ]; then
     # Rust's embedded-interpreter tests start without Python's executable having loaded
     # libpython. A uv-managed interpreter's library directory is outside ld.so's defaults.

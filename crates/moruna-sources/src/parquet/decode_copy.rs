@@ -29,9 +29,8 @@ pub fn copy_batch(
 }
 
 /// [`copy_batch`], leaving in place every buffer `resident` says is already in the arena in
-/// `tier`. The Vortex source (e.8) decodes a column in a canonical encoding over the very buffer
-/// the reactor landed its segment in, so that column needs no copy at all; every other buffer is
-/// copied as Parquet's are. Returns the new batch and the bytes copied.
+/// `tier`. An Arrow IPC block (e.10) decodes over the very buffer the reactor landed it in, so its
+/// columns need no copy at all; every other buffer is copied as Parquet's are. Returns the new batch and the bytes copied.
 pub(crate) fn copy_batch_except(
     batch: &RecordBatch,
     alloc: &dyn Allocator,

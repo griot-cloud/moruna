@@ -98,10 +98,10 @@ fn jb_t7_unknown_kinds() {
         text(&found),
         [
             "source.kind: no source kind `csv` is declared; this catalogue reads arrow_ipc, \
-             image, parquet, tensor, vortex",
+             image, parquet, tensor",
             "kernels[0].kind: no function kind `java` is declared; this catalogue runs image, package, std",
             "sink.kind: no sink kind `std` is declared; this catalogue writes arrow_ipc, image, \
-             parquet, tensor, vortex",
+             parquet, tensor",
         ]
     );
     assert_eq!(
@@ -112,8 +112,7 @@ fn jb_t7_unknown_kinds() {
                 "arrow_ipc".into(),
                 "image".into(),
                 "parquet".into(),
-                "tensor".into(),
-                "vortex".into()
+                "tensor".into()
             ]
         }
     );
@@ -282,7 +281,7 @@ fn jb_t9_every_refusal_is_collected() {
             json!({"kind": "std"}),
             json!({"kind": "std", "name": "cast", "x": 1, "y": 2}),
         ],
-        json!({"kind": "vortex", "url": 3}),
+        json!({"kind": "parquet", "url": 3}),
     );
     let fields: Vec<String> = refusals(&doc).into_iter().map(|r| r.field).collect();
     assert_eq!(

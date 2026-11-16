@@ -3,8 +3,8 @@
 A ``.wasm`` or ``.pex`` package is checked through its own runtime (SDD 16 f.9), never in
 process, so the verdict is the one a hosted run would give; its fingerprint is the file's.
 
-Loads a module or a file, finds its functions (decorated functions, standard functions, and plain
-functions whose annotated signature is Polars frame to Polars frame), runs each through the
+Loads a module or a file, finds its functions (decorated functions and standard functions), runs
+each through the
 check harness of ``moruna-runtime`` on synthetic batches from its declared input schema, and
 reports: the verdict, the fingerprint, every refusal naming the column and the types. A function
 that agrees is then warmed up (AR section 6): run at sizes, workers and distinct counts on
@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 from moruna import _core
-from moruna._declare import polars_signature
 
 EXIT_AGREED = 0
 EXIT_REFUSED = 2
@@ -55,10 +54,8 @@ def _load(target: str) -> Any:
 
 def functions_of(module: Any, only: str | None = None) -> list[tuple[str, Any]]:
     """The module's functions, in definition order, as the extension's objects: every
-    ``@moruna.function``, every standard function, and every function defined in the module
-    whose signature is a Polars frame to a frame, which is wrapped as ``@moruna.function`` would
-    wrap it (MH 4.9)."""
-    from moruna._job import _Handle, function  # noqa: PLC0415, the package imports this module
+    ``@moruna.function`` and every standard function (MH 4.9)."""
+    from moruna._job import _Handle  # noqa: PLC0415, the package imports this module
 
     found: list[tuple[str, Any]] = []
     for name, value in vars(module).items():
@@ -68,13 +65,6 @@ def functions_of(module: Any, only: str | None = None) -> list[tuple[str, Any]]:
             value._handle, _core.KernelSpec | _core.StdKernel
         ):
             found.append((name, value._handle))
-        elif (
-            callable(value)
-            and not isinstance(value, type)
-            and getattr(value, "__module__", None) == module.__name__
-            and polars_signature(value) is not None
-        ):
-            found.append((name, function(value)._handle))
     return found
 
 

@@ -746,53 +746,6 @@ fn build_refusals() {
     let _ = std::fs::remove_dir_all(&staging);
 }
 
-/// The Vortex kinds (07 e.6, 08 f.10): a document names them, the canonical form keeps their
-/// options, both build, a small `file_bytes` is clamped with the library's note, and an empty
-/// url, a zero split size or an option Vortex does not have is refused naming the field.
-#[test]
-fn vortex_kinds_parse_and_build() {
-    let text = r#"{"moruna_spec":1,
-        "source":{"kind":"vortex","url":["/in/a.vortex","s3://b/in/"],
-                  "options":{"columns":["id"],"split_bytes":1048576}},
-        "sink":{"kind":"vortex","url":"/out","options":{"file_bytes":1048576}}}"#;
-    let job = JobSpec::from_json(text).expect("vortex source and sink");
-    assert_eq!(
-        job.source,
-        doc(
-            json!({"kind": "vortex", "url": ["/in/a.vortex", "s3://b/in/"],
-                   "options": {"columns": ["id"], "split_bytes": 1048576}})
-        )
-    );
-    let canonical = job.canonical_json();
-    assert!(canonical.contains(r#""kind":"vortex""#), "{canonical}");
-    assert_eq!(
-        JobSpec::from_json(&canonical).expect("the canonical form reads back"),
-        job
-    );
-    let built = v1::build(&job, &Registry::standard(), opts(false, &no_env)).expect("vortex");
-    assert_eq!(
-        built.spec.notes,
-        vec!["clamped sink.file_bytes from 1048576 to 67108864".to_string()]
-    );
-    let with_source = |value: Value| {
-        let mut j = job.clone();
-        j.source = doc(value);
-        j
-    };
-    assert_refused(
-        &with_source(json!({"kind": "vortex", "url": "/i", "options": {"filters": []}})),
-        "source",
-    );
-    assert_refused(
-        &with_source(json!({"kind": "vortex", "url": []})),
-        "source.url",
-    );
-    assert_refused(
-        &with_source(json!({"kind": "vortex", "url": "/in", "options": {"split_bytes": 0}})),
-        "source.options.split_bytes",
-    );
-}
-
 /// SI-T31 ipc_sink_compression_setting (08 e.3, KA10): the `arrow_ipc` sink reads `compression`
 /// (`none`, `zstd`, `lz4`) and a zstd `level`, and refuses a name it does not know, a level for
 /// a codec that has none, and a level zstd does not take, each at the field.
@@ -971,10 +924,6 @@ fn kd_t9_v1_documents_resolve() {
                    "options": {"columns": ["id"], "filters": [["id", ">", 5]]}}),
             json!({"kind": "parquet", "url": "file:///data/out/",
                    "options": {"row_group_bytes": 33554432, "compression": "snappy"}}),
-        ),
-        (
-            json!({"kind": "vortex", "url": "/in"}),
-            json!({"kind": "vortex", "url": "/out"}),
         ),
         (
             json!({"kind": "tensor", "url": "/in/w.safetensors"}),

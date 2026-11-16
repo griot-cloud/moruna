@@ -387,7 +387,7 @@ fn pk_t16_run_a_pex_package() {
     );
 }
 
-/// PK-T14 check_a_pex (Linux, sandbox host): a packaged Polars kernel agrees through its child,
+/// PK-T14 check_a_pex (Linux, sandbox host): a packaged kernel agrees through its child,
 /// and the allocation figures are the child's.
 #[cfg(target_os = "linux")]
 #[test]
@@ -413,7 +413,7 @@ fn pk_t14_check_a_pex() {
     zip.write_all(manifest.to_string().as_bytes()).unwrap();
     zip.start_file("src/function.py", opts).unwrap();
     zip.write_all(
-        b"import polars as pl\n\ndef shout(df: pl.DataFrame) -> pl.DataFrame:\n    return df.with_columns(pl.col(\"s\").str.to_uppercase().alias(\"loud\"))\n",
+        b"import pyarrow.compute as pc\n\ndef shout(batch):\n    return batch.append_column(\"loud\", pc.utf8_upper(batch.column(\"s\")))\n",
     )
     .unwrap();
     zip.finish().unwrap();

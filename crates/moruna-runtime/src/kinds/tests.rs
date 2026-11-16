@@ -120,7 +120,7 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(declared.role, Role::Kernel);
     // A name is resolved within its role: no source is called `std`, no sink `std`.
     let e = error_of(kinds.source("source", "std"));
-    let sources = "arrow_ipc, image, parquet, tensor, vortex";
+    let sources = "arrow_ipc, image, parquet, tensor";
     assert_eq!(
         e.to_string(),
         refusal(SpecError::new(
@@ -268,22 +268,12 @@ fn kd_t3_registration_refusals() {
 #[test]
 fn kd_t4_standard_conformance() {
     let harness = Harness::new();
-    let sources: [&dyn SourceKind; 4] = [
-        &arrow_ipc::ArrowIpc,
-        &parquet::Parquet,
-        &vortex::Vortex,
-        &tensor::Tensor,
-    ];
+    let sources: [&dyn SourceKind; 3] = [&arrow_ipc::ArrowIpc, &parquet::Parquet, &tensor::Tensor];
     for kind in sources {
         let passed = conformance::source(kind, &harness).unwrap_or_else(|v| panic!("{v}"));
         assert!(passed.cases > 4, "{passed:?}");
     }
-    let sinks: [&dyn SinkKind; 4] = [
-        &parquet::Parquet,
-        &vortex::Vortex,
-        &tensor::Tensor,
-        &arrow_ipc::ArrowIpc,
-    ];
+    let sinks: [&dyn SinkKind; 3] = [&parquet::Parquet, &tensor::Tensor, &arrow_ipc::ArrowIpc];
     for kind in sinks {
         let passed = conformance::sink(kind, &harness).unwrap_or_else(|v| panic!("{v}"));
         assert!(passed.cases > 4, "{passed:?}");
@@ -399,8 +389,8 @@ fn kd_t6_listing() {
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
     assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
-    let sinks = ["arrow_ipc", "image", "parquet", "tensor", "vortex"];
-    let sources = ["arrow_ipc", "image", "parquet", "tensor", "vortex"];
+    let sinks = ["arrow_ipc", "image", "parquet", "tensor"];
+    let sources = ["arrow_ipc", "image", "parquet", "tensor"];
     assert_eq!(names(&listing.sinks), sinks);
     assert_eq!(names(&listing.sources), sources);
     for (role, list) in [

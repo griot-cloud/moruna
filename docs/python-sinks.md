@@ -1,6 +1,6 @@
 # Sinks
 
-These constructors return frozen handles for `moruna.run(sink=...)`. A bare local `url` for Parquet or Vortex is resolved as a local file URL.
+These constructors return frozen handles for `moruna.run(sink=...)`. A bare local `url` for Parquet is resolved as a local file URL.
 
 ## `moruna.ParquetSink`
 
@@ -9,14 +9,6 @@ moruna.ParquetSink(url, *, row_group_bytes=None, file_bytes=None, compression="z
 ```
 
 `url: str` is the output directory or prefix. `row_group_bytes: int | str | None` defaults to 128 MiB; `file_bytes: int | str | None` defaults to 1 GiB. `compression: str` accepts `"zstd"`, `"snappy"`, `"gzip"`, `"lz4"`, `"none"`, or `"uncompressed"` (case-insensitive).
-
-## `moruna.VortexSink`
-
-```python
-moruna.VortexSink(url, *, file_bytes=None)
-```
-
-`url: str` is an output directory or prefix. `file_bytes: int | str | None` defaults to 1 GiB.
 
 ## `moruna.TensorSink`
 

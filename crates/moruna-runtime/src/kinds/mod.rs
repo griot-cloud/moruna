@@ -30,7 +30,6 @@ pub mod ports;
 pub mod served;
 pub mod standard;
 pub mod tensor;
-pub mod vortex;
 
 /// One entry of the document as its adapter reads it: where it is (`source`, `kernels[2]`,
 /// `sink`), so a refusal names its field (MH 4.1), and what it says.
@@ -429,21 +428,19 @@ impl Registry {
         }
     }
 
-    /// Every kind this build of the runtime has (f.1): the Arrow IPC, Parquet, Vortex and tensor sources;
-    /// the Parquet, Vortex, tensor and Arrow IPC sinks; the standard kernels and function
+    /// Every kind this build of the runtime has (f.1): the Arrow IPC, Parquet and tensor sources;
+    /// the Parquet, tensor and Arrow IPC sinks; the standard kernels and function
     /// packages. No `rust` kind is among them (KD-I7). A program adds its own with the `register_` calls.
     pub fn standard() -> Registry {
         let mut kinds = Registry::empty();
         kinds.put_source(Arc::new(arrow_ipc::ArrowIpc));
         kinds.put_source(Arc::new(parquet::Parquet));
-        kinds.put_source(Arc::new(vortex::Vortex));
         kinds.put_source(Arc::new(tensor::Tensor));
         kinds.put_source(Arc::new(image::Image));
         kinds.put_kernel(Arc::new(standard::Std));
         kinds.put_kernel(Arc::new(package::Package));
         kinds.put_kernel(Arc::new(image::Image));
         kinds.put_sink(Arc::new(parquet::Parquet));
-        kinds.put_sink(Arc::new(vortex::Vortex));
         kinds.put_sink(Arc::new(tensor::Tensor));
         kinds.put_sink(Arc::new(arrow_ipc::ArrowIpc));
         kinds.put_sink(Arc::new(image::Image));

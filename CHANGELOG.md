@@ -12,6 +12,12 @@ plan is in `architecture/arrow-core-0.7.md`.
 - **The report's schema is 3.0.** A sink's `excluded_rows`, and the `write` and `read` an engine
   reported, are gone with the peQL kinds.
 - **The kinds listing is version 3.** A declaration's `needs` no longer has `contracts`.
+- **Polars is gone from Moruna.** `moruna.polars`, the `pl.DataFrame` annotation wrapping, Polars
+  type names in declarations, the `polars` extra and the `moruna-polars` crate are removed. A
+  function gets Arrow and converts it itself: `pl.from_arrow(batch)`, and back with `to_arrow()`.
+- **Vortex is gone from Moruna.** The `vortex` source and sink kinds, `moruna.VortexSource` and
+  `moruna.VortexSink` are removed, with the 131 crates they brought. Read Vortex with its own Python
+  package in a `moruna.Source` (`docs/sources-and-sinks.md`), or convert the data to Parquet.
 
 ## 0.6.6
 

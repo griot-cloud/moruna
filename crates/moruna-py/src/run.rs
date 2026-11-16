@@ -21,7 +21,7 @@ use moruna_runtime::job::build::process_env;
 use moruna_runtime::job::refusal;
 use moruna_runtime::kinds::parquet::compression_name;
 use moruna_runtime::kinds::tensor::tensor_format_name;
-use moruna_runtime::kinds::{arrow_ipc, parquet, tensor, vortex};
+use moruna_runtime::kinds::{arrow_ipc, parquet, tensor};
 use moruna_runtime::report_doc::ReportContext;
 use moruna_runtime::{RunSpec, Runtime};
 use moruna_sources::{RowFilter, ScalarValue};
@@ -942,16 +942,6 @@ fn source_doc(source: &SourceSpec) -> Result<KindDoc, SpecError> {
                 },
             },
         ),
-        SourceSpec::Vortex(cfg) => KindDoc::of(
-            "vortex",
-            &vortex::SourceSettings {
-                url: Urls(cfg.urls.clone()),
-                options: vortex::SourceOptions {
-                    columns: cfg.columns.clone(),
-                    split_bytes: cfg.split_bytes,
-                },
-            },
-        ),
         SourceSpec::ArrowIpc(cfg) => KindDoc::of(
             "arrow_ipc",
             &arrow_ipc::SourceSettings {
@@ -1010,15 +1000,6 @@ fn sink_doc(sink: &SinkSpec) -> Result<KindDoc, SpecError> {
                     row_group_bytes: Some(cfg.row_group_bytes),
                     file_bytes: Some(cfg.file_bytes),
                     compression: Some(compression_name(cfg.compression).to_string()),
-                },
-            },
-        ),
-        SinkSpec::Vortex(cfg) => KindDoc::of(
-            "vortex",
-            &vortex::SinkSettings {
-                url: cfg.url.clone(),
-                options: vortex::SinkOptions {
-                    file_bytes: Some(cfg.file_bytes),
                 },
             },
         ),

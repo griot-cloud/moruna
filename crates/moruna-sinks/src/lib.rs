@@ -35,7 +35,6 @@ mod reorder;
 mod stats;
 mod stream;
 mod tensor_sink;
-mod vortex_sink;
 
 pub use handle::SinkHandle;
 pub use ipc_sink::{ArrowIpcSink, ArrowIpcSinkConfig};
@@ -46,7 +45,6 @@ pub use reorder::ReorderBuffer;
 pub use stats::SinkStats;
 pub use stream::{ArrowStreamSink, StreamDone, commit_of};
 pub use tensor_sink::{TensorFormat, TensorSink, TensorSinkConfig};
-pub use vortex_sink::{VortexSink, VortexSinkConfig};
 
 use moruna_kernel::{Allocator, MorunaError, Payload, Result, Tier};
 

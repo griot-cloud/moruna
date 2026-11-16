@@ -25,7 +25,7 @@ import moruna
 
 
 def budget() -> int:
-    """A budget with room above what this process already holds (see test_vortex.budget)."""
+    """A budget with room above what this process already holds."""
     held = moruna.inspect_host()["anon_bytes"]
     return int((held + (512 << 20)) / 0.9)
 

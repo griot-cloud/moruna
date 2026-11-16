@@ -28,7 +28,7 @@ Functions you run often have a **profile**: Moruna saves what it measured about 
 
 ## Engines inside a job
 
-A function can hand its batch to another engine without copying it: Polars functions receive their batch as a Polars frame. See the [job document reference](job-document.md) for the kinds a job can name.
+A function gets its batch as Arrow, which any library that reads Arrow takes without a copy: Polars, DuckDB or your own code. See the [job document reference](job-document.md) for the kinds a job can name.
 
 ```{toctree}
 :hidden:

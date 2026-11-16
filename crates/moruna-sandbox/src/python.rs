@@ -244,26 +244,10 @@ pub(crate) fn load_at(
             .call1((given,))
             .map_err(|e| failed(&format!("{entry}(args)"), e))?;
     }
-    let declare = py
-        .import("moruna._declare")
-        .map_err(|e| failed("load", e))?;
-    let mut origin = None;
-    if hints.stateful {
-        if target.is_instance_of::<pyo3::types::PyType>() {
-            target = target
-                .call0()
-                .map_err(|e| failed(&format!("{entry}()"), e))?;
-        }
-    } else if let Some(kind) = declare
-        .call_method1("polars_signature", (&target,))
-        .map_err(|e| failed("load", e))?
-        .extract::<Option<String>>()
-        .map_err(|e| failed("load", e))?
-    {
-        origin = Some(target.clone().unbind());
-        target = declare
-            .call_method1("polars_callable", (&target, kind))
-            .map_err(|e| failed("load", e))?;
+    if hints.stateful && target.is_instance_of::<pyo3::types::PyType>() {
+        target = target
+            .call0()
+            .map_err(|e| failed(&format!("{entry}()"), e))?;
     }
     let mut spec = PyKernelSpec::new(target.unbind());
     spec.stateful = hints.stateful;
@@ -280,7 +264,6 @@ pub(crate) fn load_at(
         _ => ResumePolicy::Reinit,
     };
     spec.declared = manifest.declared().map_err(|e| e.to_string())?;
-    spec.origin = origin;
     spec.memory_guard = hints.memory_guard;
     PyKernel::new(spec).map_err(|e| failed("load", e))
 }

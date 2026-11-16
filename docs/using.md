@@ -9,7 +9,7 @@ You can use Moruna from Python, where a job is a call to `moruna.run`, or from t
 :link: python
 :link-type: doc
 
-Read Parquet, Vortex or tensor files or your own iterator, write the results, and set the budget and other options.
+Read Parquet, Arrow IPC or tensor files or your own iterator, write the results, and set the budget and other options.
 :::
 
 :::{grid-item-card} Writing your own source or sink
@@ -23,7 +23,7 @@ Read from, or write to, anything Moruna does not support itself, with a Python c
 :link: functions
 :link-type: doc
 
-Write Python and Polars functions, keep state between batches, use the standard functions, and check a function before you run it.
+Write Python functions with any library that reads Arrow, keep state between batches, use the standard functions, and check a function before you run it.
 :::
 
 :::{grid-item-card} Running jobs from the command line

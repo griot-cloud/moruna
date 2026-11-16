@@ -310,17 +310,10 @@ def function(
     its ceiling is refused before the memory exists, and the run ends with a budget error naming
     the function and the request.
 
-    A function annotated ``pl.DataFrame -> pl.DataFrame`` (or ``pl.LazyFrame``) is a Polars
-    function: the batch reaches it as a Polars frame through the Arrow C data interface.
-
     Usable bare (``@moruna.function``) or with arguments (``@moruna.function(stateful=True)``).
     """
 
     def decorate(obj: Any) -> Function:
-        origin = None
-        frame = None if stateful else _declare.polars_signature(obj)
-        if frame is not None:
-            origin, obj = obj, _declare.polars_callable(obj, frame)
         made = _wrap(
             _core.build_kernel(
                 obj,
@@ -337,7 +330,6 @@ def function(
                 input_schema=_declare.declaration(input_schema, "input_schema"),
                 output_schema=_declare.declaration(output_schema, "output_schema"),
                 lockfile=_declare.lockfile_bytes(lockfile),
-                origin=origin,
                 memory_guard=memory_guard,
             )
         )
@@ -421,12 +413,11 @@ def _function_handle(task: Function) -> Any:
 
 _BUILTIN_SOURCES = (
     _core.ParquetSource,
-    _core.VortexSource,
     _core.ArrowIpcSource,
     _core.TensorSource,
     _core.IteratorSource,
 )
-_BUILTIN_SINKS = (_core.ParquetSink, _core.VortexSink, _core.TensorSink, _core.ArrowIpcSink)
+_BUILTIN_SINKS = (_core.ParquetSink, _core.TensorSink, _core.ArrowIpcSink)
 _LIBRARY_FUNCTIONS = (_core.StdKernel, _core.PackageKernel, _core.DeclaredTask)
 
 

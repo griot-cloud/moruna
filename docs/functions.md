@@ -62,20 +62,21 @@ score (python): refused
 
 The command exits with 0 when every function agrees and 2 when any is refused, so you can run it in continuous integration. A function that agrees is then warmed up: it runs on generated data of growing size, at more than one worker, and with skewed as well as even keys, and the cost model learns from every measurement. The report gives what the function costs per 10,000 rows, how much faster it is with more workers, how much skew slows it, and what the warm-up itself took. The measurements are kept (by default in `~/.moruna/observations`), so what is learned here is what a plan of a job uses. The **fingerprint** identifies this exact function; a job document can require it, so that a changed function is not run by mistake. Pass `--json` for a machine-readable report and `--function NAME` to check one function in a module.
 
-## Polars functions
+## Any library that reads Arrow
 
-A function annotated as taking and returning a Polars `DataFrame` is a Polars function. The batch reaches it as a Polars frame without being copied, and the frame it returns goes back the same way:
+A function gets its batch as a `pyarrow.RecordBatch`, which any library that reads Arrow takes without a copy, and may return any Arrow batch or single-chunk table. With Polars, for example:
 
 ```python
 import polars as pl
 import moruna
 
 @moruna.function
-def shout(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns(pl.col("text").str.to_uppercase().alias("loud"))
+def shout(batch):
+    df = pl.from_arrow(batch)
+    return df.with_columns(pl.col("text").str.to_uppercase().alias("loud")).to_arrow()
 ```
 
-`pl.LazyFrame` works the same way. For a function without annotations, wrap it with `moruna.polars(fn)`.
+Moruna holds no code for any one library: the conversion is yours, and the contract is Arrow.
 
 ## Functions that keep state
 

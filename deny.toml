@@ -9,7 +9,7 @@
 #               across the workspace. A second version of any of them is how the
 #               S7 portability claim and the S13 zero-copy claim break: two
 #               incompatible `RecordBatch` types cannot be handed between the
-#               kernel crate, the Polars bridge and the Python
+#               kernel crate and the Python
 #               surface without a copy, and the compiler reports it as a type
 #               mismatch nobody can read. Decided by the PM on 2026-09-22
 #               (preamble 6.2, the paragraph under the pinned version table).
@@ -23,10 +23,9 @@
 # an E2 escalation for the human (preamble section 7).
 
 [graph]
-# Every optional feature is resolved, so the `cuda`, `uring`, `python` and `polars`
-# graphs are policed too. The Polars bridge is the reason: `polars` pulls its own
-# `arrow`, and an unfeatured scan would never see the duplicate the bans section
-# below exists to catch.
+# Every optional feature is resolved, so the `cuda`, `uring` and `python` graphs are
+# policed too, and the duplicate the bans section below exists to catch is seen
+# wherever a feature brings it.
 all-features = true
 # The platforms Moruna ships, and the only ones the graph is resolved for.
 # Decided by the PM on 2026-09-22 and written into preamble 6.2 as the
@@ -70,12 +69,6 @@ ignore = [
   # reactor first enables an object-store backend. See issue #9.
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
-  # paste 1.0.15 is archived by its author (unmaintained, not a vulnerability). It
-  # came in with Vortex 0.86.1 on 2026-09-30, approved by Brackly: a compile-time
-  # macro only, reached only through vortex-array and vortex-fastlanes, with no
-  # maintained alternative the Vortex crates accept. Re-decided when the vortex pin
-  # moves.
-  { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15, archived: a compile-time macro only, reached only through vortex-array and vortex-fastlanes (vortex 0.86.1), with no maintained alternative Vortex accepts; approved by Brackly 2026-09-30, re-decided when the vortex pin moves" },
 ]
 
 [licenses]
@@ -101,25 +94,6 @@ confidence-threshold = 0.93
 # Exceptions: a licence granted to one named crate and to nothing else. Each one
 # says which crate and why. Anything not listed here and not in `allow` fails.
 
-# xxhash-rust is BSL-1.0 only (Boost Software License 1.0): permissive, OSI
-# approved, no attribution requirement, compatible with Apache-2.0 distribution.
-# It arrives through polars-core, so it is in the `polars` bridge only.
-[[licenses.exceptions]]
-crate = "xxhash-rust"
-allow = ["BSL-1.0"]
-
-# enum-iterator and enum-iterator-derive are 0BSD only (BSD Zero Clause: public
-# domain equivalent, no attribution requirement, more permissive than MIT). They
-# came in with Vortex 0.86.1 on 2026-09-30, approved by Brackly, through
-# vortex-array. 0BSD is granted to these two crates only, not to the allow list.
-[[licenses.exceptions]]
-crate = "enum-iterator"
-allow = ["0BSD"]
-
-[[licenses.exceptions]]
-crate = "enum-iterator-derive"
-allow = ["0BSD"]
-
 # ar_archive_writer and target-lexicon are "Apache-2.0 WITH LLVM-exception"
 # only, which the allow list above already covers; they need no exception and
 # are named here so a reader who sees them in a report knows they were looked at.
@@ -132,8 +106,7 @@ allow = ["0BSD"]
 # was added, and the licence question comes back with it (PM, 2026-09-22).
 
 [bans]
-# The workspace is allowed to carry duplicate versions in general: the Polars
-# bridge is a separate crate a user opts into, and forbidding every
+# The workspace is allowed to carry duplicate versions in general: forbidding every
 # duplicate would turn an unrelated transitive bump into a stop-the-world event.
 multiple-versions = "allow"
 # A `*` version requirement defeats the exact pins of preamble 6.2.

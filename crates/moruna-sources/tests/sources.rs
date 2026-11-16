@@ -6,7 +6,6 @@
 mod ipc;
 mod malformed;
 mod support;
-mod vortex;
 
 use std::sync::Arc;
 

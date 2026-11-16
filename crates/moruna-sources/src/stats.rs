@@ -2,8 +2,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// What a source has done so far. Read through `ParquetSource::stats`, `VortexSource::stats`,
-/// `TensorSource::stats` and `PyIteratorSource::stats`.
+/// What a source has done so far. Read through `ParquetSource::stats`, `TensorSource::stats`
+/// and `PyIteratorSource::stats`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceStats {
     /// Splits the plan produced.
@@ -27,8 +27,8 @@ pub struct SourceStats {
     /// Bytes a `PySource` compacted out of a sliced batch before its decode copy (f.7); zero for
     /// every other source.
     pub compacted_bytes: u64,
-    /// Payload bytes a Vortex read returned in the arena buffers the reactor landed the file's
-    /// segments in, with no decode copy: columns in a canonical encoding.
+    /// Payload bytes a read returned in the arena buffers the reactor landed the file's bytes
+    /// in, with no decode copy: an Arrow IPC block decoded over its own buffer.
     pub zero_copy_bytes: u64,
 }
 

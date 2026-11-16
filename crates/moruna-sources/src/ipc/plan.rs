@@ -5,7 +5,7 @@
 //! plan reads the footer, and from each block only its message header, whose record batch table
 //! says how many rows the block holds and how many nulls each column has: no body is read, and
 //! the rows of a split are exact (SO-I2). Footers and headers are read with `std::fs`, as a
-//! Parquet or Vortex footer is; bodies are the reactor's.
+//! Parquet footer is; bodies are the reactor's.
 
 use std::collections::HashSet;
 use std::ops::Range;

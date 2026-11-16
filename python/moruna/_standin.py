@@ -17,8 +17,6 @@ from __future__ import annotations
 import types
 from typing import Any
 
-from moruna import _declare
-
 
 class Task:
     """A task's base: its declarations, its ports and the run's arguments."""
@@ -75,9 +73,6 @@ def function(fn: Any = None, *, stateful: bool = False, **declarations: Any) -> 
     """``@moruna.function`` and ``@moruna.function(stateful=True, ...)``."""
 
     def decorate(obj: Any) -> _Decorated:
-        frame = None if stateful else _declare.polars_signature(obj)
-        if frame is not None:
-            obj = _declare.polars_callable(obj, frame)
         return _Decorated(obj, stateful)
 
     if fn is None:
@@ -85,14 +80,8 @@ def function(fn: Any = None, *, stateful: bool = False, **declarations: Any) -> 
     return decorate(fn)
 
 
-def polars(fn: Any, **declarations: Any) -> _Decorated:
-    """A function from a Polars frame to a Polars frame as a stateless function."""
-    kind = _declare.polars_signature(fn) or "eager"
-    return _Decorated(_declare.polars_callable(fn, kind), False)
-
-
 def __getattr__(name: str) -> Any:
     raise AttributeError(
         f"moruna.{name}: inside an image Moruna builds the moruna module holds only Task, "
-        "Source, Function, Sink, Split, function and polars; the engine is not in the image"
+        "Source, Function, Sink, Split and function; the engine is not in the image"
     )

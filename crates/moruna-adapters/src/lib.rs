@@ -3,7 +3,7 @@
 //!
 //! Design: `architecture/sdd/05-adapters.md`. Adapters make things that are not Rust
 //! [`moruna_kernel::Kernel`]s into `Kernel`s. This crate holds the Python adapter; the two engine
-//! bridges are the separate thin crates `moruna-polars` and `moruna-datafusion` (preamble 6.1).
+//! bridges to other engines are gone since 0.7: a function takes and returns Arrow.
 //!
 //! The Python adapter is where the zero copy claim meets the interpreter. A payload crosses into
 //! Python by pointer (Arrow through the C Data Interface, tensors through DLPack) and comes back

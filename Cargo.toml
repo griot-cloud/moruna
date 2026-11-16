@@ -86,7 +86,6 @@ libc = { version = "=0.2.189" }
 bytes = { version = "=1.12.1" }
 getrandom = { version = "=0.4.3" }
 hostname = { version = "=0.4.2" }
-polars = { version = "=0.55.2" }
 # The sources' asynchronous reads.
 futures = { version = "=0.3.34" }
 # Each job document task's settings as a FlexBuffers map (SDD 22 e.4, KA5), the version of
@@ -117,11 +116,6 @@ hyper-util = { version = "=0.1.20", default-features = false }
 http = { version = "=1.5.0" }
 http-body-util = { version = "=0.1.5" }
 socket2 = { version = "=0.6.5" }
-# The Vortex file format as a source and a sink (07 SO-O1, 08 SK-O1): the facade crate with its
-# file reader and writer only (no wasm, no cloud registry, no memmap). Added under E2 on
-# 2026-09-29 by the PM on Brackly's approval; `arrow` ^59.2 and `object_store` ^0.13.2 inside it
-# resolve to the pins above, so the graph keeps one arrow.
-vortex = { version = "=0.86.1", default-features = false, features = ["files"] }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON.
 sha2 = { version = "=0.11.0" }
 # The settings schema each kind declares (SDD 18, decision KD1): JSON Schema 2020-12, derived from

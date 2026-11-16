@@ -14,14 +14,6 @@ moruna.ParquetSource(urls, *, columns=None, filters=None)
 | `columns` | `list[str] \| None = None` | Columns to read. |
 | `filters` | `list[tuple[str, str, scalar]] \| None = None` | Row-group predicates `(column, op, value)`. Operators: `>`, `<`, `==` (also `gt`, `lt`, `=`, `eq`). Scalars: Boolean, integer, float, or string. |
 
-## `moruna.VortexSource`
-
-```python
-moruna.VortexSource(urls, *, columns=None, split_bytes=None)
-```
-
-`urls` is a path, prefix, URL, or nonempty sequence of them. `columns: list[str] | None` projects columns. `split_bytes: int | None` sets target split size; it must be positive and defaults to about 128 MiB.
-
 ## `moruna.ArrowIpcSource`
 
 ```python

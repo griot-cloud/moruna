@@ -12,7 +12,7 @@ moruna.function(
 ) -> moruna.Function | decorator
 ```
 
-Use `@moruna.function`, `@moruna.function(...)`, or `moruna.function(obj, ...)`. When `fn` is omitted, the call returns a decorator; otherwise it returns a `moruna.Function`, which a job takes as a task. A stateless function receives and returns a `pyarrow.RecordBatch`. An annotated Polars `DataFrame` or `LazyFrame` function is converted through Polars.
+Use `@moruna.function`, `@moruna.function(...)`, or `moruna.function(obj, ...)`. When `fn` is omitted, the call returns a decorator; otherwise it returns a `moruna.Function`, which a job takes as a task. A stateless function receives a `pyarrow.RecordBatch` and returns Arrow.
 
 | Parameter | Type and default | Meaning |
 | --- | --- | --- |
@@ -32,7 +32,7 @@ Use `@moruna.function`, `@moruna.function(...)`, or `moruna.function(obj, ...)`.
 | `lockfile` | path or bytes, optional | Contents are included in the fingerprint; paths are read at decoration time. |
 | `memory_guard` | `bool = True` | Refuse an allocation that crosses the process memory ceiling. |
 
-Schema mappings accept Arrow types, their string spellings, Python `int`, `float`, `str`, `bool`, and supported Polars types. A stateful object supplies `setup(self, ctx) -> state` and `__call__(self, state, batch) -> batch`; `ctx` has `instance` and `device`. It may supply `footprint(self, state)`, and `finish(self, state) -> batch | None`, which is called once per instance when the function's input has ended, after its last `__call__`. A batch `finish` returns goes downstream like any other; `None` gives nothing; an exception ends the run with a `FunctionError` naming the function. A function that must see the whole run before giving its result (one that collects every batch) gives it from `finish` and takes `instances=1`: with more instances, each instance's `finish` gives what that instance saw. On resume, a `resume="reinit"` function's `finish` sees only the batches after the checkpoint, so a whole-run function that must survive a resume uses `resume="checkpoint"`. With `resume="checkpoint"`, it must also implement `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Invalid declarations or options raise `TypeError` or `ValueError` at decoration time.
+Schema mappings accept Arrow types, their string spellings, and Python `int`, `float`, `str` and `bool`. A stateful object supplies `setup(self, ctx) -> state` and `__call__(self, state, batch) -> batch`; `ctx` has `instance` and `device`. It may supply `footprint(self, state)`, and `finish(self, state) -> batch | None`, which is called once per instance when the function's input has ended, after its last `__call__`. A batch `finish` returns goes downstream like any other; `None` gives nothing; an exception ends the run with a `FunctionError` naming the function. A function that must see the whole run before giving its result (one that collects every batch) gives it from `finish` and takes `instances=1`: with more instances, each instance's `finish` gives what that instance saw. On resume, a `resume="reinit"` function's `finish` sees only the batches after the checkpoint, so a whole-run function that must survive a resume uses `resume="checkpoint"`. With `resume="checkpoint"`, it must also implement `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Invalid declarations or options raise `TypeError` or `ValueError` at decoration time.
 
 ## A decorated `moruna.Function`
 
@@ -46,14 +46,6 @@ What `moruna.function` returns is a `moruna.Function` (see [Tasks](python-run.md
 | `memory_guard` | `bool` | Whether allocation refusal is on. |
 | `fingerprint` | `str` | 64-character lowercase hexadecimal fingerprint. |
 | `build(...)` | method | Packages the function as an OCI image; see below. |
-
-## `moruna.polars`
-
-```python
-moruna.polars(fn, *, accepts="table", **declarations) -> moruna.Function
-```
-
-Wraps an unannotated Polars function taking and returning a `DataFrame` or `LazyFrame`. `accepts` has the same choices as `moruna.function`. Supported declaration names are `input_schema`, `output_schema`, and `lockfile`, with the same meanings above. Returns a stateless `moruna.Function`.
 
 ## Building functions into images
 

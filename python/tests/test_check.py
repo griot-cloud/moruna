@@ -1,10 +1,8 @@
-"""MH 4.9 through the package: ``python -m moruna check`` (CK-T5, CK-T8, CK-T9), the schema
-declarations on ``@moruna.function`` (MH 4.9), the Python fingerprint (MH 4.9), and the Polars
-signature (MH 4.9)."""
+"""MH 4.9 through the package: ``python -m moruna check`` (CK-T5, CK-T9), the schema
+declarations on ``@moruna.function`` (MH 4.9) and the Python fingerprint (MH 4.9)."""
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import subprocess
 import sys
@@ -17,11 +15,6 @@ import pytest
 
 import moruna
 from moruna import _check
-
-HAS_POLARS = importlib.util.find_spec("polars") is not None
-needs_polars = pytest.mark.skipif(
-    not HAS_POLARS, reason="polars has no wheel for this interpreter (CK-T8 runs where it has)"
-)
 
 AGREEING = """
 import pyarrow as pa
@@ -53,23 +46,6 @@ def undeclared(batch):
     return batch
 """
 )
-
-POLARS = """
-import polars as pl
-import moruna
-
-def doubled(frame: pl.DataFrame) -> pl.DataFrame:
-    return frame.with_columns((pl.col("n") * 2).alias("twice"))
-
-@moruna.function(input_schema={"n": "int64", "s": "string"},
-               output_schema={"adds": {}})
-def lazily(frame: pl.LazyFrame) -> pl.LazyFrame:
-    return frame.filter(pl.col("n") > 0).with_columns(pl.col("s").str.to_uppercase())
-
-doubled = moruna.function(doubled, input_schema={"n": "int64"},
-                        output_schema={"adds": {"twice": "int64"}})
-"""
-
 
 def write(tmp_path: Path, name: str, text: str) -> Path:
     path = tmp_path / f"{name}.py"
@@ -264,60 +240,6 @@ def test_std_kernels_run_and_fuse_in_moruna_run(tmp_path: Path) -> None:
     )
     got = pq.read_table(out).sort_by("score").to_pylist()
     assert got == [{"id": 1, "score": 1}, {"id": None, "score": 7}, {"id": 2, "score": 20}]
-
-
-@needs_polars
-def test_ck_t8_a_polars_signature_checks_and_runs(tmp_path: Path) -> None:
-    module = write(tmp_path, "frames", POLARS)
-    code, out, _ = run_check(str(module), "--json", "--no-warm-up")
-    report = json.loads(out)
-    assert code == 0, out
-    assert {k["function"] for k in report["functions"]} == {"doubled", "lazily"}
-    loaded = _check._load(str(module))
-    doubled = loaded.doubled
-    src = tmp_path / "in.parquet"
-    pq.write_table(pa.table({"n": pa.array([1, 2, 3], pa.int64())}), src)
-    out_dir = tmp_path / "out"
-    moruna.run(
-        moruna.ParquetSource(str(src)),
-        doubled,
-        moruna.ParquetSink(str(out_dir)),
-        budget="1GiB",
-        allow_gil=True,
-        profiles_dir=str(tmp_path / "profiles"),
-        staging_dir=str(tmp_path / "staging"),
-    )
-    got = pq.read_table(out_dir).sort_by("n").to_pylist()
-    assert got == [{"n": 1, "twice": 2}, {"n": 2, "twice": 4}, {"n": 3, "twice": 6}]
-
-
-@needs_polars
-def test_an_undecorated_polars_function_is_found_and_wrapped(tmp_path: Path) -> None:
-    import polars as pl  # noqa: PLC0415, polars is optional
-
-    module = write(
-        tmp_path,
-        "bare",
-        """
-        import polars as pl
-
-        def plain(frame: pl.DataFrame) -> pl.DataFrame:
-            return frame
-        """,
-    )
-    loaded = _check._load(str(module))
-    [(name, kernel)] = _check.functions_of(loaded)
-    assert name == "plain"
-    report = _check.check_one(name, kernel, 0, _check._warm_up(False, None, 60.0, None, None))
-    assert report["verdict"] == "not_checkable"
-
-    def not_frames(frame: pl.DataFrame) -> int:
-        return 1
-
-    assert moruna._declare.polars_signature(not_frames) is None
-    wrapped = moruna.polars(lambda f: f.with_columns(pl.lit(1).alias("one")))
-    batch = pa.RecordBatch.from_pydict({"s": ["a"]})
-    assert wrapped(batch).num_columns == 2
 
 
 def test_cm_t58_python_check_returns_the_fitted_cost(tmp_path: Path) -> None:

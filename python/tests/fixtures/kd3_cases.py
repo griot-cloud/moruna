@@ -99,13 +99,6 @@ def assets(args):
         out.write(struct.pack("<Q", len(header)))
         out.write(header)
         out.write(raw)
-    # Produce genuine Vortex via the public adapter, not a renamed Arrow file.
-    result = moruna.run(moruna.ArrowIpcSource(str(root / "data/input.arrow")), [],
-                        moruna.VortexSink(str(root / "data/vortex")),
-                        budget=768 << 20, staging_dir=str(root / "staging/prepare-vortex"),
-                        staging_limit=128 << 20, checkpoint=False)
-    if result.exit["status"] != "completed":
-        raise RuntimeError("actual Vortex preparation did not complete")
     write(root / "packages.json", packages)
     print(json.dumps({"prepared_assets": str(root), "executed_matrix_cells": 0}))
 
@@ -129,7 +122,7 @@ def cases(args):
     caller = {"id": "kd3", "tenant": "kd3", "purpose": "conformance"}
     sources = {kind: {"kind": kind, "url": str(root / "data" / file)}
                for kind, file in (("arrow_ipc", "input.arrow"), ("parquet", "input.parquet"),
-                                  ("vortex", "vortex"), ("tensor", "input.safetensors"))}
+                                  ("tensor", "input.safetensors"))}
     kernels = {"std": {"kind": "std", "name": "select", "args": {"columns": ["x"]}},
                "image": {"kind": "image",
                          "image": {"build_key": None, "digest": args.image,

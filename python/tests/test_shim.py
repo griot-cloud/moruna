@@ -276,7 +276,7 @@ def test_bd_t5_the_stand_in_refuses_the_rest_of_moruna(image: Path) -> None:
     assert done.returncode == 1
     assert (
         "moruna.run" in done.stderr.decode()
-        and "holds only Task, Source, Function, Sink, Split, function and polars"
+        and "holds only Task, Source, Function, Sink, Split and function"
         in done.stderr.decode()
     )
 
