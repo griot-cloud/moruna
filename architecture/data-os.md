@@ -389,6 +389,21 @@ takes the same posture.
   - It provides no terminals, `devpts` or login records.
   - A refused call answers `EPERM` or `ENOSYS` and is counted, as `kernel/linux` counts them
     today.
+  - **The list** (stream B2, `kernel/linuxlayer/core/src/syscall/refused.rs`). `EPERM` is checked
+    before any handler runs, which is what Linux answers an unprivileged process:
+    - mounts: `mount`, `umount2`, and the new mount API (`open_tree`, `move_mount`, `fsopen`,
+      `fsconfig`, `fsmount`, `fspick`, `mount_setattr`);
+    - `pivot_root` and `chroot`;
+    - namespaces: `unshare`, `setns`, and `clone` and `clone3` with a `CLONE_NEW*` flag;
+    - `ptrace`, and the calls that need its permission (`process_vm_readv`,
+      `process_vm_writev`, `pidfd_getfd`);
+    - modules: `init_module`, `finit_module`, `delete_module`;
+    - `kexec_load`, `kexec_file_load`, `reboot`, `swapon`, `swapoff`;
+    - time: `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`;
+    - names: `sethostname`, `setdomainname`.
+
+    Every number the table lacks answers `ENOSYS`. Sockets keep their answers from
+    `no_socket.rs`. Each refusal is counted per process and printed when the process ends.
 
 ## 4. User space: Asterinas's Linux layer as the personality
 
