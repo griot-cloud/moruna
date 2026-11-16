@@ -206,3 +206,69 @@ def test_driver_commands(tmp_path, monkeypatch):
     r = driver.vm_result(vm, str(rp), 10.0)
     assert (r["boot_s"], r["function"], r["moruna"]["split"]["function_s"]) == (0.85, "rust", 3.0)
     assert "error" in driver.vm_result(vm, str(tmp_path / "missing.json"), 1.0)
+
+
+# ---------------------------------------------------------------------------------------------
+# The node fixtures' KVM mode (kernel/node/tools/proof.py, kernel/tools/node-fixtures.sh): the
+# parts a host without /dev/kvm can check.
+
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+
+
+def load_proof():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("proof", os.path.join(ROOT, "kernel", "node", "tools", "proof.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def evidence(root, mode, broken=None):
+    import hashlib as h
+    inputs = {"kernel_elf": "a" * 64}
+    census = h.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    proof = load_proof()
+    for cpus in (1, 2, 4):
+        for case, name in enumerate(proof.NAMES, 1):
+            out = root / f"cpu{cpus}" / f"case{case}"
+            out.mkdir(parents=True)
+            rec = {"version": 1, "cpus": cpus, "case": case, "passed": True, "cleanup": True, "mode": mode,
+                   "qemu_exit": 33, "cleanup_method": "guest-normal33", "inputs": inputs, "inputs_sha256": census}
+            if broken == (cpus, case):
+                rec["passed"] = False
+            (out / "result.json").write_text(json.dumps(rec))
+            serial = f"kk: {cpus} CPUs online\n"
+            if case == 3:
+                serial += "faulted: its record on slot 1 was refused by the engine's check: x\n"
+            (out / "serial.log").write_text(serial)
+            (out / "peer.log").write_text(f"embedder: ok: run {case} ({name}): done\n")
+
+
+def test_proof_kvm_mode(tmp_path):
+    proof = load_proof()
+    assert proof.accel_args("kvm") == ["-accel", "kvm", "-cpu", "host"]
+    assert proof.accel_args("tcg") == ["-accel", "tcg", "-cpu", "max"]
+    with pytest.raises(ValueError):
+        proof.accel_args("hvf")
+    assert proof.kvm_ready(str(tmp_path / "no-kvm")) is False
+    evidence(tmp_path / "kvm", "explicit-kvm")
+    assert "all15" in proof.check(tmp_path / "kvm", "kvm")
+    # TCG evidence is not KVM evidence, and a failed case fails the check.
+    with pytest.raises(ValueError):
+        proof.check(tmp_path / "kvm", "tcg")
+    evidence(tmp_path / "bad", "explicit-kvm", broken=(2, 3))
+    with pytest.raises(ValueError):
+        proof.check(tmp_path / "bad", "kvm")
+
+
+def test_node_fixtures_arguments(tmp_path):
+    import subprocess
+    script = os.path.join(ROOT, "kernel", "tools", "node-fixtures.sh")
+    base = ["bash", script, str(tmp_path / "b"), str(tmp_path / "e"), "/q", "/r"]
+    run = lambda *a: subprocess.run(base + list(a), capture_output=True, text=True)
+    p = run("--accel", "hvf")
+    assert p.returncode == 2 and "--accel tcg|kvm" in p.stderr
+    p = run("60", "--accel", "kvm", "--sdk-proof", "/bin/ls")
+    assert p.returncode == 2 and "SDK proof launches its own TCG VM" in p.stderr
+    p = run("--bogus")
+    assert p.returncode == 2 and "unknown argument" in p.stderr
