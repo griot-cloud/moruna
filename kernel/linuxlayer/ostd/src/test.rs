@@ -652,3 +652,262 @@ fn atomic_cpu_ids_and_either() {
     assert_eq!(u32::from(CpuId::new(0)), 0);
     crate::task::atomic_mode::might_sleep();
 }
+
+mod vm {
+    use alloc::sync::Arc;
+
+    use crate::{
+        Error,
+        mm::{
+            CachePolicy, FallibleVmRead, FallibleVmWrite, FrameAllocOptions, HasPaddr, PAGE_SIZE,
+            PageFlags, PageProperty, UFrame, VmIo, VmReader, VmSpace, VmWriter,
+            tlb::{TlbFlushOp, TlbFlusher},
+            vm_space::VmQueriedItem,
+        },
+        prelude::*,
+        task::disable_preempt,
+    };
+
+    fn rw() -> PageProperty {
+        PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback)
+    }
+
+    fn frame() -> UFrame {
+        FrameAllocOptions::new().alloc_frame().unwrap().into()
+    }
+
+    #[ktest]
+    fn cursors_map_query_protect_unmap() {
+        let space = VmSpace::new();
+        let guard = disable_preempt();
+        let range = PAGE_SIZE..16 * PAGE_SIZE;
+        assert!(space.cursor(&guard, &(1..PAGE_SIZE)).is_err());
+        assert!(space.cursor(&guard, &(PAGE_SIZE..PAGE_SIZE)).is_err());
+        let first = frame();
+        {
+            let mut c = space.cursor_mut(&guard, &range).unwrap();
+            let (hole, item) = c.query().unwrap();
+            assert!(item.is_none());
+            assert_eq!(hole, range.clone());
+            c.jump(4 * PAGE_SIZE).unwrap();
+            c.map(first.clone(), rw());
+            assert_eq!(c.virt_addr(), 5 * PAGE_SIZE);
+            c.map(
+                frame(),
+                PageProperty::new_guest(PageFlags::R, CachePolicy::Writeback),
+            );
+            assert!(c.jump(32 * PAGE_SIZE).is_err());
+            c.jump(PAGE_SIZE).unwrap();
+            assert_eq!(c.find_next(8 * PAGE_SIZE), Some(4 * PAGE_SIZE));
+            match c.query().unwrap() {
+                (r, Some(VmQueriedItem::MappedRam { frame, prop })) => {
+                    assert_eq!(r, 4 * PAGE_SIZE..5 * PAGE_SIZE);
+                    assert_eq!(frame.paddr(), first.paddr());
+                    assert_eq!(prop.flags, PageFlags::RW);
+                }
+                _ => panic!("no frame"),
+            }
+            assert!(c.find_iomem_by_paddr(0).is_none());
+            let r = c.protect_next(PAGE_SIZE, |flags, _| *flags = PageFlags::R);
+            assert_eq!(r, Some(4 * PAGE_SIZE..5 * PAGE_SIZE));
+            c.jump(10 * PAGE_SIZE).unwrap();
+            assert_eq!(c.protect_next(2 * PAGE_SIZE, |_, _| {}), None);
+            assert_eq!(c.virt_addr(), 12 * PAGE_SIZE);
+            c.flusher()
+                .issue_tlb_flush(TlbFlushOp::for_single(4 * PAGE_SIZE));
+            c.flusher().dispatch_tlb_flush();
+        }
+        assert_eq!(space.mapped_pages(), 2);
+        {
+            let mut c = space.cursor(&guard, &range).unwrap();
+            c.jump(4 * PAGE_SIZE).unwrap();
+            assert_eq!(c.virt_addr(), 4 * PAGE_SIZE);
+            assert_eq!(c.query().unwrap().1.unwrap().prop().flags, PageFlags::R);
+            assert_eq!(c.find_next(PAGE_SIZE), Some(4 * PAGE_SIZE));
+            c.jump(6 * PAGE_SIZE).unwrap();
+            assert_eq!(c.find_next(PAGE_SIZE), None);
+            assert!(c.jump(64 * PAGE_SIZE).is_err());
+        }
+        {
+            let mut c = space.cursor_mut(&guard, &range).unwrap();
+            assert_eq!(c.unmap(15 * PAGE_SIZE), 2);
+            assert_eq!(c.virt_addr(), 16 * PAGE_SIZE);
+            assert!(c.query().is_err());
+        }
+        assert_eq!(space.mapped_pages(), 0);
+        assert_eq!(VmSpace::default().mapped_pages(), 0);
+        assert!(alloc::format!("{space:?}").contains("VmSpace"));
+    }
+
+    #[ktest]
+    #[should_panic(expected = "already mapped")]
+    fn mapping_twice_panics() {
+        let space = VmSpace::new();
+        let guard = disable_preempt();
+        let mut c = space
+            .cursor_mut(&guard, &(PAGE_SIZE..4 * PAGE_SIZE))
+            .unwrap();
+        c.map(frame(), rw());
+        c.jump(PAGE_SIZE).unwrap();
+        c.map(frame(), rw());
+    }
+
+    // The fault path: a write to a program page nothing maps yet asks the handler, which
+    // maps one, and the copy goes on.
+    fn map_on_fault(e: &crate::arch::cpu::context::CpuException) -> core::result::Result<(), ()> {
+        let crate::arch::cpu::context::CpuException::PageFault(info) = e else {
+            return Err(());
+        };
+        if info.addr >= 64 * PAGE_SIZE {
+            return Err(());
+        }
+        let space = ACTIVE.get().ok_or(())?;
+        let guard = disable_preempt();
+        let page = info.addr & !(PAGE_SIZE - 1);
+        let mut c = space
+            .cursor_mut(&guard, &(page..page + PAGE_SIZE))
+            .map_err(|_| ())?;
+        // A page already there was refused for its property: nothing to map.
+        if c.query().map_err(|_| ())?.1.is_some() {
+            return Err(());
+        }
+        c.map(frame(), rw());
+        Ok(())
+    }
+
+    static ACTIVE: spin::Once<Arc<VmSpace>> = spin::Once::new();
+
+    #[ktest]
+    fn program_memory_through_the_active_space() {
+        let space = ACTIVE.call_once(|| Arc::new(VmSpace::new())).clone();
+        space.activate();
+        crate::mm::fault::inject_user_page_fault_handler(map_on_fault);
+        let data = [7u8; 3 * PAGE_SIZE];
+        // Two pages from 8: mapped on fault, then written.
+        let mut w = space.writer(8 * PAGE_SIZE + 100, 2 * PAGE_SIZE).unwrap();
+        let mut r = VmReader::from(&data[..2 * PAGE_SIZE]);
+        assert_eq!(w.write_fallible(&mut r), Ok(2 * PAGE_SIZE));
+        let mut back = [0u8; 2 * PAGE_SIZE];
+        let mut r = space.reader(8 * PAGE_SIZE + 100, 2 * PAGE_SIZE).unwrap();
+        let mut bw = VmWriter::from(&mut back[..]);
+        assert_eq!(r.read_fallible(&mut bw), Ok(2 * PAGE_SIZE));
+        assert_eq!(back, [7u8; 2 * PAGE_SIZE]);
+        // The handler refuses past page 64: a fault there stays a fault.
+        let mut w = space.writer(70 * PAGE_SIZE, 8).unwrap();
+        assert_eq!(w.write_val(&1u64), Err(Error::PageFault));
+        let mut z = space.writer(8 * PAGE_SIZE, 16).unwrap();
+        assert_eq!(z.fill_zeros(16), Ok(16));
+        let word = space.reader(8 * PAGE_SIZE, 4).unwrap();
+        assert_eq!(word.atomic_load::<u32>(), Ok(0));
+        // A read-only page: a write faults, the handler cannot map over it.
+        let guard = disable_preempt();
+        {
+            let mut c = space
+                .cursor_mut(&guard, &(20 * PAGE_SIZE..21 * PAGE_SIZE))
+                .unwrap();
+            let f = frame();
+            f.write_val(0, &5u32).unwrap();
+            c.map(
+                f,
+                PageProperty::new_user(PageFlags::R, CachePolicy::Writeback),
+            );
+        }
+        drop(guard);
+        let mut w = space.writer(20 * PAGE_SIZE, 4).unwrap();
+        assert_eq!(w.write_val(&1u32), Err(Error::PageFault));
+        let mut r = space.reader(20 * PAGE_SIZE, 4).unwrap();
+        assert_eq!(r.read_val::<u32>(), Ok(5));
+        let (mut r2, _w2) = space.reader_writer(20 * PAGE_SIZE, 4).unwrap();
+        assert_eq!(r2.read_val::<u32>(), Ok(5));
+        assert!(space.reader(usize::MAX - 8, 4).is_err());
+        assert!(space.writer(usize::MAX - 8, 4).is_err());
+        assert!(space.reader_writer(usize::MAX - 8, 4).is_err());
+        let cmp = space.writer(8 * PAGE_SIZE, 4).unwrap();
+        let cmp_r = space.reader(8 * PAGE_SIZE, 4).unwrap();
+        assert_eq!(
+            cmp.atomic_compare_exchange(&cmp_r, 0u32, 9u32),
+            Ok((0, true))
+        );
+    }
+
+    #[ktest]
+    fn tlb_flushes_and_ops() {
+        assert_eq!(TlbFlushOp::for_range(0..8).range(), &(0..8));
+        assert_eq!(
+            TlbFlushOp::for_single(PAGE_SIZE).range(),
+            &(PAGE_SIZE..2 * PAGE_SIZE)
+        );
+        assert_eq!(TlbFlushOp::for_all().range().start, 0);
+        TlbFlushOp::for_all().perform_on_current();
+        let mut f = TlbFlusher::new(disable_preempt());
+        f.issue_tlb_flush(TlbFlushOp::for_all());
+        let fr: crate::mm::Frame<dyn crate::mm::AnyFrameMeta> =
+            FrameAllocOptions::new().alloc_frame().unwrap().into();
+        f.issue_tlb_flush_with(TlbFlushOp::for_all(), crate::sync::RcuDrop::new(fr));
+        f.sync_tlb_flush();
+    }
+}
+
+#[ktest]
+fn frames_as_rcu_pointers() {
+    use crate::{mm::frame::FrameRef, sync::non_null::NonNullPtr};
+    let frame = FrameAllocOptions::new()
+        .alloc_frame_with(Meta::default())
+        .unwrap();
+    let paddr = frame.paddr();
+    let raw = NonNullPtr::into_raw(frame.clone());
+    assert_eq!(frame.reference_count(), 2);
+    // SAFETY: `raw` came from `into_raw` and its count is still held.
+    let r: FrameRef<'_, Meta> = unsafe { <Frame<Meta> as NonNullPtr>::raw_as_ref(raw) };
+    assert_eq!(r.paddr(), paddr);
+    assert!(alloc::format!("{r:?}").contains("Frame"));
+    let again = <Frame<Meta> as NonNullPtr>::ref_as_raw(r);
+    assert_eq!(again, raw);
+    // SAFETY: as above, once.
+    let back: Frame<Meta> = unsafe { NonNullPtr::from_raw(raw) };
+    assert_eq!(back.reference_count(), 2);
+    drop(back);
+    assert_eq!(frame.reference_count(), 1);
+}
+
+#[ktest]
+fn panic_power_io_and_scheduler_stand_ins() {
+    use crate::{
+        io::IoMem,
+        task::scheduler::{
+            EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags, enable_preemption_on_cpu,
+            inject_scheduler,
+        },
+    };
+    assert_eq!(crate::panic::catch_unwind(|| 5).ok(), Some(5));
+    crate::panic::print_stack_trace();
+    assert!(IoMem::acquire(0..PAGE_SIZE).is_err());
+    fn on_power(_: crate::power::ExitCode) {}
+    crate::power::inject_poweroff_handler(on_power);
+    crate::power::inject_restart_handler(on_power);
+    struct Nothing;
+    impl Scheduler for Nothing {
+        fn enqueue(&self, _: Arc<Task>, _: EnqueueFlags) -> Option<CpuId> {
+            None
+        }
+        fn local_rq_with(&self, _: &mut dyn FnMut(&dyn LocalRunQueue)) {}
+        fn mut_local_rq_with(&self, _: &mut dyn FnMut(&mut dyn LocalRunQueue)) {}
+    }
+    static NOTHING: Nothing = Nothing;
+    inject_scheduler(&NOTHING);
+    enable_preemption_on_cpu();
+    assert_ne!(EnqueueFlags::Spawn, EnqueueFlags::Wake);
+    assert_ne!(UpdateFlags::Tick, UpdateFlags::Exit);
+    // A bottom half runs on each tick.
+    static HALVES: AtomicUsize = AtomicUsize::new(0);
+    fn half(g: crate::irq::DisabledLocalIrqGuard, _: u8) -> crate::irq::DisabledLocalIrqGuard {
+        HALVES.fetch_add(1, Ordering::Relaxed);
+        g
+    }
+    crate::irq::register_bottom_half_handler_l2(|_| {});
+    crate::irq::register_bottom_half_handler_l1(half);
+    crate::timer::tick();
+    assert!(HALVES.load(Ordering::Relaxed) >= 1);
+    crate::task::halt_cpu();
+    let _ = crate::arch::cpu::context::CpuException::new(14, 2, 0x1000);
+}

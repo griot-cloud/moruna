@@ -56,7 +56,7 @@ pub mod timer;
 pub mod user;
 pub mod util;
 
-#[cfg(ktest)]
+#[cfg(all(test, ktest))]
 mod test;
 
 #[doc(hidden)]

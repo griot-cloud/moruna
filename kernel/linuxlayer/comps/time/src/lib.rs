@@ -68,11 +68,7 @@ pub fn default_clocksource() -> Arc<ClockSource> {
 mod test {
     use core::time::Duration;
 
-    use ostd::{
-        boot::{BootInfo, init},
-        prelude::*,
-        timer::monotonic_nanos,
-    };
+    use ostd::prelude::*;
 
     use super::*;
 
@@ -80,12 +76,8 @@ mod test {
     // the start gives plus the monotonic time since.
     #[ktest]
     fn clocks_from_the_core_and_the_start() {
-        let at_start = Duration::from_secs(1_700_000_000);
-        init(BootInfo {
-            wall_clock_at_start: at_start,
-            monotonic_at_start: monotonic_nanos(),
-            ..Default::default()
-        });
+        // The test runner gave the start's information, as a personality's start does.
+        let at_start = ostd::boot::boot_info().wall_clock_at_start;
         time_init().unwrap();
         let a = read_monotonic_time();
         let b = read_monotonic_time();
