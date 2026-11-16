@@ -13,9 +13,13 @@ Brackly approved this plan on 2026-11-16, and the PM session agreed it the same 
 decisions are folded in below.
 
 - **0.7.0 is this plan, plus finishing Goal A.** That means KD2 booted, KD3 and KD4.
-- **Goal B moves to 0.8.0.** The kernel as the node, the network server and Linux server programs
-  (KE1 to KE3, KS1, KC3 to KC5) do not serve the analytical gain. Production is Moruna in a VM
-  under KVM on the D4ls_v5.
+- **Open (Brackly's, raised by the PM on 2026-11-16): where the kernel runs in 0.7.0.**
+  - Either the kernel boots as the Azure machine itself, with the platform drivers of
+    `architecture/kernel-is-the-machine.md` §4.5 (on `design/kernel-is-the-machine`): VMBus, NVMe
+    over VMBus vPCI, MANA or netvsc, the Hyper-V clock and the wireserver's ready report.
+  - Or it runs inside a VM on a Linux host first, as this plan assumes.
+  - BOARD's goals stay as they are until he decides. Steps 1 and 2 measure the engine on the
+    kernel and serve either answer; §4 and §6 depend on it.
 - **Every step is this branch's.**
   - It builds on the work still on `feat/kd2-engine-process`, `feat/kd1-data-plane`,
     `feat/ka2-plane-linux` (its conformance suite is KD3's base) and `feat/kb5-memory-quota` (the
