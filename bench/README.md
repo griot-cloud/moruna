@@ -5,8 +5,8 @@ in two parts. This document covers the part that exists today.
 
 - Wave 1 (here now): the data generator, `moruna-bench`. It writes Parquet with a
   controllable row count, column mix, null ratio and row group size, and
-  safetensors and `MRB1` aligned binary tensors of controllable shape and dtype,
-  to a local directory and to an S3 compatible store.
+  safetensors tensors of controllable shape and dtype, to a local directory and
+  to an S3 compatible store.
 - Wave 1 (here now): the kernels (identity, normalise, tokenise-explode,
   adversarial, wide-intermediate, embed-score), in `bench/src/kernels/` and
   `bench/python/`. torch-score is not built: it needs the reference GPU host and
@@ -89,9 +89,9 @@ in total.
 | `embed-weights` | safetensors: `weight` f32 [128,64], `bias` f32 [64] | a 128 wide feature vector | `moruna-bench dataset embed-weights --out bench/data` |
 | `embed-weights-numeric` | safetensors: `weight` f32 [18,64], `bias` f32 [64] | embed-score over `numeric-embed`, whose 2 i64 and 16 f64 make 18 numeric columns | `moruna-bench dataset embed-weights-numeric --out bench/data` |
 | `embed-weights-half` | safetensors: `weight` f16 [256,128], `bias` bf16 [128] | half precision weights | `moruna-bench dataset embed-weights-half --out bench/data` |
-| `embed-weights-mrb1` | `MRB1` f32 [128,64] | `TensorSource` | `moruna-bench dataset embed-weights-mrb1 --out bench/data` |
-| `score-bias-mrb1` | `MRB1` f64 [64] | `TensorSource` | `moruna-bench dataset score-bias-mrb1 --out bench/data` |
-| `token-blocks-mrb1` | `MRB1` i64 [32,16,8] | rank 3 tensors | `moruna-bench dataset token-blocks-mrb1 --out bench/data` |
+| `embed-weights-single` | safetensors: `weight` f32 [128,64] alone | a single tensor `TensorSource` load | `moruna-bench dataset embed-weights-single --out bench/data` |
+| `score-bias` | safetensors: `bias` f64 [64] | a single tensor `TensorSource` load | `moruna-bench dataset score-bias --out bench/data` |
+| `token-blocks` | safetensors: `tokens` i64 [32,16,8] | rank 3 tensors | `moruna-bench dataset token-blocks --out bench/data` |
 
 Any shape outside the suite is written directly:
 
@@ -109,8 +109,8 @@ moruna-bench parquet --text-mean-len 512 --text-len-variance 36864 --out bench/d
 moruna-bench safetensors --name model --tensor weight:f32:512,256 \
   --tensor bias:bf16:256 --out bench/data
 
-# one MRB1 tensor (contracts e.4), any dtype, up to 8 dimensions
-moruna-bench mrb1 --name weights --dtype f32 --shape 128,64 --out bench/data
+# a safetensors file of one tensor, any dtype, up to 8 dimensions
+moruna-bench safetensors --name weights --dtype f32 --shape 128,64 --out bench/data
 ```
 
 `--seed <u64>` (default 20260922) selects the corpus, `--out <dir>` the
@@ -154,13 +154,8 @@ AWS_ACCESS_KEY_ID=moruna AWS_SECRET_ACCESS_KEY=moruna-ci-secret \
   data. The writer is fed batches of exactly `--row-group-rows` rows, so every
   row group but the last holds exactly that many.
 - **safetensors.** Written by the `safetensors` crate itself, so what the
-  generator writes is what that crate reads back.
-- **`MRB1`.** The aligned binary format of `architecture/sdd/01-contracts.md`
-  section e.4, written here by a small writer of this crate's own
-  (`src/mrb1.rs`). It does not depend on `moruna-kernel`: a generator that shared
-  the runtime's code could not catch a disagreement between the two, so the
-  header test is written against the table in that section rather than against
-  another implementation.
+  generator writes is what that crate reads back. Every tensor dataset is
+  safetensors, because Moruna 0.7 reads tensors from safetensors and `.npy` only.
 
 ## The kernels
 
@@ -293,9 +288,9 @@ test over a `wide-mixed` shaped morsel built in the test runs everywhere.
 declared amplification measured on its dataset, the adversarial jump at six
 morsel sizes, determinism, and the weights `embed-score` will and will not
 accept) and, for the generator, determinism by seed, the null ratio and the
-text length statistics read back out of the written file, the row group size, the
-`MRB1` header byte for byte against contracts e.4, and the safetensors round trip
-through the `safetensors` crate. The S3 test is skipped, with its reason printed,
+text length statistics read back out of the written file, the row group size,
+and the safetensors round trip through the `safetensors` crate, a single tensor
+file's payload compared byte for byte. The S3 test is skipped, with its reason printed,
 on a host with no store configured; it runs in CI's MinIO job.
 
 `tools/quality/check.sh` is the gate (preamble 6.7): em dashes, `cargo fmt`,

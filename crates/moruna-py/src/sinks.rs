@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use moruna_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorFormat, TensorSinkConfig};
+use moruna_sinks::{ArrowIpcSinkConfig, ParquetSinkConfig, TensorSinkConfig};
 use parquet::basic::{Compression, ZstdLevel};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
@@ -84,7 +84,7 @@ impl PyParquetSink {
     }
 }
 
-/// A sink that writes tensors, in the aligned binary format or safetensors.
+/// A sink that writes tensors as safetensors files.
 #[pyclass(frozen, module = "moruna._core", name = "TensorSink")]
 pub struct PyTensorSink {
     pub(crate) cfg: TensorSinkConfig,
@@ -93,22 +93,15 @@ pub struct PyTensorSink {
 #[pymethods]
 impl PyTensorSink {
     #[new]
-    #[pyo3(signature = (path, *, format = "mrb1", one_file_per_morsel = false, name = "tensor"))]
+    #[pyo3(signature = (path, *, format = "safetensors", one_file_per_morsel = false, name = "tensor"))]
     fn new(
         path: String,
         format: &str,
         one_file_per_morsel: bool,
         name: &str,
     ) -> PyResult<PyTensorSink> {
-        let format = match format.to_ascii_lowercase().as_str() {
-            "mrb1" => TensorFormat::Amb1,
-            "safetensors" => TensorFormat::SafeTensors,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unknown tensor format `{other}` (use \"mrb1\" or \"safetensors\")"
-                )));
-            }
-        };
+        let format = moruna_runtime::kinds::tensor::parse_tensor_format(format)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(PyTensorSink {
             cfg: TensorSinkConfig {
                 path: PathBuf::from(path),

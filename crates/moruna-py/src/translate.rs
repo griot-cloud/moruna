@@ -400,7 +400,7 @@ mod tests {
         // A tensor sink and a tensor source compare as paths.
         let tensor_sink = SinkSpec::Tensor(TensorSinkConfig {
             path: PathBuf::from("/data/t"),
-            format: moruna_sinks::TensorFormat::Amb1,
+            format: moruna_sinks::TensorFormat::SafeTensors,
             one_file_per_morsel: false,
             name: "tensor".into(),
         });

@@ -62,7 +62,7 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    /// An empty ledger for a sink of this kind (`parquet`, `ipc` or `amb1_per_morsel`).
+    /// An empty ledger for a sink of this kind (`parquet`, `ipc` or `safetensors_per_morsel`).
     pub(crate) fn new(kind: &'static str) -> Ledger {
         Ledger {
             kind,

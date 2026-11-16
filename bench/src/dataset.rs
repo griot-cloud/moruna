@@ -3,19 +3,17 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{BenchError, Result};
-use crate::mrb1::{self, TensorSpec};
 use crate::parquet_out::{self, ParquetSpec};
 use crate::safetensors_out;
+use crate::tensor::TensorSpec;
 
-/// The three shapes preamble 6.5 names.
+/// What a dataset holds: Parquet, or tensors (preamble 6.5).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DatasetKind {
     /// A Parquet file.
     Parquet(ParquetSpec),
     /// A safetensors file holding one or more tensors.
     SafeTensors(Vec<TensorSpec>),
-    /// A single `MRB1` tensor file (contracts e.4).
-    Amb1(TensorSpec),
 }
 
 /// A dataset the generator can write.
@@ -51,7 +49,6 @@ impl Dataset {
         match self.kind {
             DatasetKind::Parquet(_) => format!("{}.parquet", self.name),
             DatasetKind::SafeTensors(_) => format!("{}.safetensors", self.name),
-            DatasetKind::Amb1(_) => format!("{}.mrb1", self.name),
         }
     }
 
@@ -78,9 +75,6 @@ impl Dataset {
                     .collect();
                 format!("safetensors: {}", parts.join(", "))
             }
-            DatasetKind::Amb1(spec) => {
-                format!("mrb1: {} {}", spec.dtype.name(), spec.shape_text())
-            }
         }
     }
 
@@ -97,11 +91,6 @@ impl Dataset {
             }
             DatasetKind::SafeTensors(specs) => {
                 let bytes = safetensors_out::encode(&self.name, specs, seed)?;
-                write_bytes(&path, &bytes)?;
-                self.detail()
-            }
-            DatasetKind::Amb1(spec) => {
-                let bytes = mrb1::encode(spec, seed);
                 write_bytes(&path, &bytes)?;
                 self.detail()
             }
@@ -160,11 +149,6 @@ mod tests {
             kind: DatasetKind::SafeTensors(vec![tensor("a", DType::F32, vec![2])]),
         };
         assert_eq!(st.file_name(), "w.safetensors");
-        let amb = Dataset {
-            name: "t".into(),
-            kind: DatasetKind::Amb1(tensor("t", DType::F32, vec![2])),
-        };
-        assert_eq!(amb.file_name(), "t.mrb1");
     }
 
     #[test]
@@ -191,12 +175,12 @@ mod tests {
         .detail();
         assert_eq!(st, "safetensors: weight f32 [4,2]");
 
-        let amb = Dataset {
+        let single = Dataset {
             name: "t".into(),
-            kind: DatasetKind::Amb1(tensor("t", DType::I64, vec![8])),
+            kind: DatasetKind::SafeTensors(vec![tensor("t", DType::I64, vec![8])]),
         }
         .detail();
-        assert_eq!(amb, "mrb1: i64 [8]");
+        assert_eq!(single, "safetensors: t i64 [8]");
     }
 
     #[test]
@@ -221,14 +205,6 @@ mod tests {
             written.detail
         );
 
-        let amb = Dataset {
-            name: "t".into(),
-            kind: DatasetKind::Amb1(tensor("t", DType::F32, vec![16])),
-        }
-        .write(&dir, 1)
-        .expect("write");
-        assert_eq!(amb.bytes, 4096 + 64);
-
         let st = Dataset {
             name: "w".into(),
             kind: DatasetKind::SafeTensors(vec![tensor("weight", DType::F32, vec![4, 2])]),
@@ -248,7 +224,7 @@ mod tests {
         std::fs::write(&file, b"x").expect("fixture");
         let err = Dataset {
             name: "t".into(),
-            kind: DatasetKind::Amb1(tensor("t", DType::F32, vec![1])),
+            kind: DatasetKind::SafeTensors(vec![tensor("t", DType::F32, vec![1])]),
         }
         .write(&dir, 1)
         .expect_err("should fail");

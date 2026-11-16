@@ -34,7 +34,7 @@ source = moruna.ArrowIpcSource("features/", columns=["id", "x"])
 
 Only the file format is read, and a stream is refused. Each record batch is read from disk into Moruna's own memory and used where it lies, with no copy, so it counts against the budget as it is read. A file compressed with `zstd` or `lz4_frame`, as `pyarrow` writes with `compression=`, is read too: Moruna checks every size a file declares before it allocates anything, then decompresses each record batch into its own memory, which counts against the budget, and refuses a file that declares more than the memory it may use. A column whose values are dictionary encoded is not read yet.
 
-**Tensor files.** `moruna.TensorSource` reads safetensors files, or files in Moruna's aligned binary format, and passes each tensor to functions that declare `accepts="tensor"`. Name the files, not a directory:
+**Tensor files.** `moruna.TensorSource` reads safetensors and `.npy` files and passes each tensor to functions that declare `accepts="tensor"`. Name the files, not a directory:
 
 ```python
 source = moruna.TensorSource(["embeddings/part-0.safetensors", "embeddings/part-1.safetensors"], tensors=["vectors"])
@@ -57,7 +57,7 @@ A sink writes what the last function returns.
 | Sink | Writes | Options |
 | --- | --- | --- |
 | `moruna.ParquetSink(url)` | Parquet files under a directory or prefix | `row_group_bytes` (default 128 MiB), `file_bytes` (default 1 GiB), `compression` (`zstd`, `snappy`, `gzip`, `lz4` or `none`; default `zstd`) |
-| `moruna.TensorSink(path)` | Tensor files | `format` (`mrb1`, the default, or `safetensors`), `one_file_per_morsel`, `name` |
+| `moruna.TensorSink(path)` | Tensor files | `format` (`safetensors`, the default and only format), `one_file_per_morsel`, `name` |
 | `moruna.ArrowIpcSink(path)` | Arrow IPC files | `file_bytes`, `compression` (`none`, the default, `zstd` or `lz4`), `level` (`zstd` only) |
 
 To write anywhere else, subclass `moruna.Sink`; see [Writing your own source or sink](sources-and-sinks.md).

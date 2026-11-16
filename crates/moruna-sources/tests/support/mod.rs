@@ -215,24 +215,34 @@ pub fn write_one_huge_row(dir: &Path, name: &str, huge_bytes: usize) -> PathBuf 
     path
 }
 
-/// Write an `MRB1` tensor (contracts e.4) of `f32` values `base + i`.
-pub fn write_amb1(dir: &Path, name: &str, shape: Vec<i64>, base: f32) -> (PathBuf, Vec<f32>) {
-    let path = dir.join(format!("{name}.mrb1"));
-    let header = moruna_kernel::mrb1::Header {
-        dtype: moruna_kernel::DType::F32,
-        shape: shape.clone(),
-        data_offset: moruna_kernel::mrb1::Header::data_offset_for(shape.len(), 4096)
-            .expect("a data offset"),
-    };
-    let count = header.element_count() as usize;
+/// Write a safetensors file of one `f32` tensor named `name`, values `base + i`, with the
+/// header padded so the data section starts at 4096: the layout Moruna's own tensor sink writes.
+pub fn write_aligned_safetensors(
+    dir: &Path,
+    name: &str,
+    shape: Vec<i64>,
+    base: f32,
+) -> (PathBuf, Vec<f32>) {
+    let path = dir.join(format!("{name}.safetensors"));
+    let count: i64 = shape.iter().product();
     let values: Vec<f32> = (0..count).map(|i| base + i as f32).collect();
-    let mut bytes = vec![0u8; header.payload_end() as usize];
-    header.write(&mut bytes).expect("the header");
-    let start = header.data_offset as usize;
-    for (i, v) in values.iter().enumerate() {
-        bytes[start + 4 * i..start + 4 * i + 4].copy_from_slice(&v.to_le_bytes());
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut header = format!(
+        "{{\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{dims}],\"data_offsets\":[0,{}]}}}}",
+        values.len() * 4
+    );
+    header.extend(std::iter::repeat_n(' ', 4096 - 8 - header.len()));
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for v in &values {
+        bytes.extend_from_slice(&v.to_le_bytes());
     }
-    std::fs::write(&path, &bytes).expect("the mrb1 file");
+    std::fs::write(&path, &bytes).expect("the safetensors file");
     (path, values)
 }
 

@@ -13,10 +13,10 @@ moruna.ParquetSink(url, *, row_group_bytes=None, file_bytes=None, compression="z
 ## `moruna.TensorSink`
 
 ```python
-moruna.TensorSink(path, *, format="mrb1", one_file_per_morsel=False, name="tensor")
+moruna.TensorSink(path, *, format="safetensors", one_file_per_morsel=False, name="tensor")
 ```
 
-`path: str` is the output directory. `format: str` accepts `"mrb1"` or `"safetensors"` (case-insensitive). `one_file_per_morsel: bool` selects whether each morsel gets its own file. `name: str` is the output tensor name.
+`path: str` is the output directory. `format: str` accepts `"safetensors"` (case-insensitive), the default and only format; the data section of every file starts on a page boundary. `one_file_per_morsel: bool` selects whether each morsel gets its own file. `name: str` is the output tensor name.
 
 ## `moruna.ArrowIpcSink`
 

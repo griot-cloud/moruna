@@ -10,8 +10,8 @@
 use crate::dataset::{Dataset, DatasetKind};
 use crate::dtype::DType;
 use crate::error::{BenchError, Result};
-use crate::mrb1::TensorSpec;
 use crate::parquet_out::{Codec, ParquetSpec};
+use crate::tensor::TensorSpec;
 
 /// How large the suite is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,20 +209,21 @@ pub fn datasets(scale: Scale) -> Result<Vec<Dataset>> {
                 tensor("bias", DType::BF16, vec![128])?,
             ]),
         },
-        // the same weights again in the aligned binary format of contracts e.4.
+        // single tensor files: the weight of `embed-weights` alone, and an f64
+        // bias, the shape a TensorSource loads one tensor from.
         Dataset {
-            name: "embed-weights-mrb1".to_string(),
-            kind: DatasetKind::Amb1(tensor("weight", DType::F32, vec![128, 64])?),
+            name: "embed-weights-single".to_string(),
+            kind: DatasetKind::SafeTensors(vec![tensor("weight", DType::F32, vec![128, 64])?]),
         },
         Dataset {
-            name: "score-bias-mrb1".to_string(),
-            kind: DatasetKind::Amb1(tensor("bias", DType::F64, vec![64])?),
+            name: "score-bias".to_string(),
+            kind: DatasetKind::SafeTensors(vec![tensor("bias", DType::F64, vec![64])?]),
         },
         // a rank 3 integer tensor: the tokenise-explode kernel's identifier
         // blocks, and the generator's proof that ndim above 2 writes.
         Dataset {
-            name: "token-blocks-mrb1".to_string(),
-            kind: DatasetKind::Amb1(tensor("tokens", DType::I64, vec![32, 16, 8])?),
+            name: "token-blocks".to_string(),
+            kind: DatasetKind::SafeTensors(vec![tensor("tokens", DType::I64, vec![32, 16, 8])?]),
         },
     ])
 }
@@ -262,7 +263,7 @@ mod tests {
         let all = datasets(Scale::Small).expect("suite");
         let mut parquet = 0;
         let mut safetensors = 0;
-        let mut mrb1 = 0;
+        let mut single_tensor = 0;
         let mut with_text = 0;
         let mut with_nulls = 0;
         let mut compressed = 0;
@@ -284,13 +285,15 @@ mod tests {
                 DatasetKind::SafeTensors(specs) => {
                     safetensors += 1;
                     assert!(!specs.is_empty());
+                    if specs.len() == 1 {
+                        single_tensor += 1;
+                    }
                 }
-                DatasetKind::Amb1(_) => mrb1 += 1,
             }
         }
         assert_eq!(parquet, 7);
-        assert_eq!(safetensors, 3);
-        assert_eq!(mrb1, 3);
+        assert_eq!(safetensors, 6);
+        assert_eq!(single_tensor, 3);
         assert!(with_text >= 4);
         assert!(with_nulls >= 3);
         assert_eq!(compressed, 1);

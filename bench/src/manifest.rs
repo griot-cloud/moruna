@@ -34,7 +34,7 @@ pub fn build(seed: u64, scale: &str, written: &[Written]) -> Value {
         "generator": "moruna-bench",
         "version": crate::GENERATOR_VERSION,
         "format": crate::GENERATOR_FORMAT,
-        "traces_to": "architecture/sdd/00-preamble.md section 6.5; MRB1 from 01-contracts.md section e.4",
+        "traces_to": "architecture/sdd/00-preamble.md section 6.5",
         "seed": seed,
         "scale": scale,
         "machine": host::machine(),

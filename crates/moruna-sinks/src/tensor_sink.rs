@@ -1,8 +1,8 @@
 //! `TensorSink` (08 f.3, e.4).
 //!
 //! Tensor bytes go from the payload's own arena memory to the file through `BufferView`, so
-//! nothing is copied. The MRB1 header and the safetensors header are metadata, written from
-//! small arena buffers of their own.
+//! nothing is copied. The safetensors header is metadata, written from a small arena buffer of
+//! its own and padded with spaces so the data section starts on a page boundary.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use moruna_kernel::{
     Allocator, BoxFuture, Buffer, BufferView, Completion, DType, ManagedTensor, MorunaError,
     Payload, PayloadKind, PayloadSpec, Reactor, Result, Seq, Sink, SinkSummary, SourceSchema,
-    TierPref, mrb1,
+    TierPref,
 };
 
 use crate::checkpoint::{CommittedFile, Ledger};
@@ -19,21 +19,16 @@ use crate::commit::{LocalDir, TMP_SUFFIX};
 use crate::stats::SinkStats;
 use crate::{Phase, host_tier, require_host};
 
-/// The kind a per-morsel MRB1 sink writes into its checkpoint (e.5).
-const KIND: &str = "amb1_per_morsel";
-
-/// Bytes reserved at the start of a safetensors file for the header, which is written at
-/// `finish` when the total shape is known and padded with spaces, as the spec allows (f.3).
-const SAFETENSORS_HEADER_BYTES: usize = 512;
+/// The kind a per-morsel sink writes into its checkpoint (e.5).
+const KIND: &str = "safetensors_per_morsel";
 
 /// Which tensor format a `TensorSink` writes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TensorFormat {
-    /// The safetensors format; the data section is unaligned by the spec, so a file this sink
-    /// writes is not DMA-loadable and the run report says so.
+    /// The safetensors format. The header is padded with spaces, as the spec allows, so the
+    /// data section starts at the page size and a reader can map or read it aligned.
+    #[default]
     SafeTensors,
-    /// The Moruna aligned binary format of contracts e.4.
-    Amb1,
 }
 
 /// Where a tensor sink writes and in which shape.
@@ -42,7 +37,7 @@ pub struct TensorSinkConfig {
     pub path: PathBuf,
     /// Output format.
     pub format: TensorFormat,
-    /// One file per morsel (MRB1 only), rather than one file for the run.
+    /// One file per morsel, rather than one file for the run. Only this shape can resume.
     pub one_file_per_morsel: bool,
     /// The tensor's name: the file stem, and the safetensors entry name.
     pub name: String,
@@ -52,7 +47,7 @@ impl Default for TensorSinkConfig {
     fn default() -> TensorSinkConfig {
         TensorSinkConfig {
             path: PathBuf::new(),
-            format: TensorFormat::Amb1,
+            format: TensorFormat::SafeTensors,
             one_file_per_morsel: false,
             name: "tensor".to_string(),
         }
@@ -81,7 +76,7 @@ struct Inner {
     stats: SinkStats,
 }
 
-/// A sink that writes tensors as safetensors or MRB1 files (e.4).
+/// A sink that writes tensors as safetensors files (e.4).
 pub struct TensorSink {
     cfg: TensorSinkConfig,
     dir: LocalDir,
@@ -106,6 +101,17 @@ impl TensorSink {
         reactor: Arc<dyn Reactor>,
         alloc: Arc<dyn Allocator>,
     ) -> Result<TensorSink> {
+        // The name becomes a file name in `path`; a separator or `..` would put it elsewhere.
+        if cfg.name.is_empty()
+            || cfg.name == "."
+            || cfg.name == ".."
+            || cfg.name.contains(['/', '\\', '\0'])
+        {
+            return Err(MorunaError::Sink(format!(
+                "tensor name {:?} is not a plain file name",
+                cfg.name
+            )));
+        }
         let dir = LocalDir::new(&cfg.path)?;
         Ok(TensorSink {
             cfg,
@@ -128,39 +134,51 @@ impl TensorSink {
         self.lock().stats.clone()
     }
 
-    /// True for the one shape of this sink that tracks commits: MRB1, one file per morsel.
-    /// Every other shape leaves the resume methods at their defaults, which is how the
-    /// scheduler learns at startup that the run is not resumable (d.1, SC f.11).
+    /// True for the one shape of this sink that tracks commits: one file per morsel. The run
+    /// file leaves the resume methods at their defaults, which is how the scheduler learns at
+    /// startup that the run is not resumable (d.1, SC f.11).
     pub fn is_resumable(&self) -> bool {
-        self.cfg.format == TensorFormat::Amb1 && self.cfg.one_file_per_morsel
+        self.cfg.one_file_per_morsel
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The page size MRB1 aligns to: the host's, and never below the 4096 e.4 fixes.
-    fn page(&self) -> u64 {
+    /// Where the data section starts: the host's page size, never below 4096. The header and
+    /// its padding fill everything before it.
+    fn data_offset(&self) -> u64 {
         (self.alloc.page_bytes() as u64).max(4096)
     }
 
     fn file_name(&self, seq: Option<Seq>) -> String {
         match (seq, self.cfg.format) {
-            (Some(seq), _) => format!("{}-{seq:012}.mrb1", self.cfg.name),
-            (None, TensorFormat::Amb1) => format!("{}.mrb1", self.cfg.name),
+            (Some(seq), TensorFormat::SafeTensors) => {
+                format!("{}-{seq:012}.safetensors", self.cfg.name)
+            }
             (None, TensorFormat::SafeTensors) => format!("{}.safetensors", self.cfg.name),
         }
     }
 
+    /// The header bytes of one file: the length, the JSON and the spaces up to `data_offset`.
+    fn header(&self, dtype: DType, shape: &[i64], payload_len: u64) -> Result<Buffer> {
+        let data_offset = self.data_offset() as usize;
+        let json = safetensors_header(&self.cfg.name, dtype, shape, payload_len, data_offset - 8)?;
+        let mut buf = self.alloc.alloc(data_offset, host_tier(&*self.alloc))?;
+        buf[0..8].copy_from_slice(&((data_offset - 8) as u64).to_le_bytes());
+        buf[8..8 + json.len()].copy_from_slice(json.as_bytes());
+        for byte in buf[8 + json.len()..data_offset].iter_mut() {
+            *byte = b' ';
+        }
+        Ok(buf)
+    }
+
     /// The run file, opened at the offset its format reserves for a header written at `finish`.
     fn open_run_file(&self, inner: &mut Inner) -> Result<()> {
-        let Some(shape) = inner.shape.as_ref() else {
+        if inner.shape.is_none() {
             return Err(MorunaError::Sink("the sink has no schema".into()));
-        };
-        let data_offset = match self.cfg.format {
-            TensorFormat::Amb1 => mrb1::Header::data_offset_for(shape.len(), self.page())?,
-            TensorFormat::SafeTensors => 8 + SAFETENSORS_HEADER_BYTES as u64,
-        };
+        }
+        let data_offset = self.data_offset();
         let name = self.file_name(None);
         inner.run_file = Some(RunFile {
             tmp: self.dir.tmp_of(&name),
@@ -206,8 +224,8 @@ impl TensorSink {
         }
     }
 
-    /// One MRB1 file for this morsel: the header at 0, the tensor at the page-aligned data
-    /// offset, straight from the arena (f.3). The sequence number is the file name, so the
+    /// One safetensors file for this morsel: the header at 0, the tensor at the page-aligned
+    /// data offset, straight from the arena (f.3). The sequence number is the file name, so the
     /// file needs no metadata of its own (SI-I8).
     #[allow(clippy::type_complexity)]
     fn submit_per_morsel(
@@ -221,23 +239,15 @@ impl TensorSink {
         Option<Arc<Buffer>>,
         Option<CommittedFile>,
     )> {
-        let header = mrb1::Header {
-            dtype: tensor.dtype(),
-            shape: tensor.shape().to_vec(),
-            data_offset: mrb1::Header::data_offset_for(tensor.shape().len(), self.page())?,
-        };
-        let mut buf = self
-            .alloc
-            .alloc(header.data_offset as usize, host_tier(&*self.alloc))?;
-        header.write(&mut buf)?;
-        let buf = Arc::new(buf);
-        let name = self.file_name(Some(seq));
-        let tmp = self.dir.tmp_of(&name);
-        let view = buf.view().slice(0, header.data_offset as usize);
-        let mut completions = vec![self.reactor.write_file(&tmp, 0, view)];
         let body = BufferView::of_tensor(tensor)?;
         let bytes = body.len() as u64;
-        completions.push(self.reactor.write_file(&tmp, header.data_offset, body));
+        let data_offset = self.data_offset();
+        let buf = Arc::new(self.header(tensor.dtype(), tensor.shape(), bytes)?);
+        let name = self.file_name(Some(seq));
+        let tmp = self.dir.tmp_of(&name);
+        let view = buf.view().slice(0, data_offset as usize);
+        let mut completions = vec![self.reactor.write_file(&tmp, 0, view)];
+        completions.push(self.reactor.write_file(&tmp, data_offset, body));
         let _ = inner.ledger.take_index();
         Ok((
             completions,
@@ -247,7 +257,7 @@ impl TensorSink {
                 seq_min: seq,
                 seq_max: seq,
                 rows,
-                bytes: header.data_offset + bytes,
+                bytes: data_offset + bytes,
             }),
         ))
     }
@@ -341,42 +351,10 @@ impl TensorSink {
             *first = file.rows as i64;
         }
         let payload_len = file.cursor - file.data_offset;
-        let (at, bytes) = match self.cfg.format {
-            TensorFormat::Amb1 => {
-                let header = mrb1::Header {
-                    dtype,
-                    shape: total,
-                    data_offset: file.data_offset,
-                };
-                if header.payload_len() != payload_len {
-                    return Err(MorunaError::Sink(format!(
-                        "the run file holds {payload_len} bytes, the header declares {}",
-                        header.payload_len()
-                    )));
-                }
-                let mut buf = self
-                    .alloc
-                    .alloc(file.data_offset as usize, host_tier(&*self.alloc))?;
-                header.write(&mut buf)?;
-                (0u64, buf)
-            }
-            TensorFormat::SafeTensors => {
-                let json = safetensors_header(&self.cfg.name, dtype, &total, payload_len)?;
-                let mut buf = self
-                    .alloc
-                    .alloc(8 + SAFETENSORS_HEADER_BYTES, host_tier(&*self.alloc))?;
-                buf[0..8].copy_from_slice(&(SAFETENSORS_HEADER_BYTES as u64).to_le_bytes());
-                buf[8..8 + json.len()].copy_from_slice(json.as_bytes());
-                for byte in buf[8 + json.len()..8 + SAFETENSORS_HEADER_BYTES].iter_mut() {
-                    *byte = b' ';
-                }
-                (0u64, buf)
-            }
-        };
-        let len = bytes.len();
+        let bytes = self.header(dtype, &total, payload_len)?;
         let bytes = Arc::new(bytes);
-        let view = bytes.view().slice(0, len);
-        let completion = self.reactor.write_file(&file.tmp, at, view);
+        let view = bytes.view().slice(0, file.data_offset as usize);
+        let completion = self.reactor.write_file(&file.tmp, 0, view);
         Ok((
             CommittedFile {
                 name: file.name,
@@ -391,20 +369,29 @@ impl TensorSink {
     }
 }
 
-/// The safetensors header of one tensor entry, padded by the caller (f.3).
-fn safetensors_header(name: &str, dtype: DType, shape: &[i64], payload_len: u64) -> Result<String> {
+/// The safetensors header of one tensor entry, at most `room` bytes, padded by the caller (f.3).
+fn safetensors_header(
+    name: &str,
+    dtype: DType,
+    shape: &[i64],
+    payload_len: u64,
+    room: usize,
+) -> Result<String> {
     let dims = shape
         .iter()
         .map(|d| d.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    // The name is the user's: serialised, so a quote or a backslash in it stays inside the key.
+    let key = serde_json::to_string(name)
+        .map_err(|e| MorunaError::Sink(format!("the tensor name does not serialise: {e}")))?;
     let json = format!(
-        "{{\"{name}\":{{\"dtype\":\"{}\",\"shape\":[{dims}],\"data_offsets\":[0,{payload_len}]}}}}",
+        "{{{key}:{{\"dtype\":\"{}\",\"shape\":[{dims}],\"data_offsets\":[0,{payload_len}]}}}}",
         safetensors_dtype(dtype)
     );
-    if json.len() > SAFETENSORS_HEADER_BYTES {
+    if json.len() > room {
         return Err(MorunaError::Sink(format!(
-            "the safetensors header is {} bytes, the file reserved {SAFETENSORS_HEADER_BYTES}",
+            "the safetensors header is {} bytes, the file reserved {room}",
             json.len()
         )));
     }
@@ -430,10 +417,10 @@ fn safetensors_dtype(dtype: DType) -> &'static str {
     }
 }
 
-/// The sequence number a per-morsel MRB1 file name carries (e.4).
+/// The sequence number a per-morsel file name carries (e.4).
 fn seq_of(name: &str, stem: &str) -> Option<Seq> {
     let rest = name.strip_prefix(stem)?.strip_prefix('-')?;
-    rest.strip_suffix(".mrb1")?.parse().ok()
+    rest.strip_suffix(".safetensors")?.parse().ok()
 }
 
 impl Sink for TensorSink {

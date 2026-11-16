@@ -234,7 +234,9 @@ mod tests {
         let mut pairs = full();
         pairs.push(("MORUNA_S3_PREFIX", "/"));
         match discover(env(&pairs)) {
-            Discovery::Configured(target) => assert_eq!(target.key("x.mrb1"), "x.mrb1"),
+            Discovery::Configured(target) => {
+                assert_eq!(target.key("x.safetensors"), "x.safetensors")
+            }
             Discovery::Missing(missing) => panic!("missing {missing:?}"),
         }
     }

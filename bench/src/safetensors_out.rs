@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::mrb1::TensorSpec;
+use crate::tensor::TensorSpec;
 
 /// One tensor's bytes, ready for the `safetensors` writer.
 struct OwnedView {

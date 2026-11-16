@@ -18,6 +18,13 @@ plan is in `architecture/arrow-core-0.7.md`.
 - **Vortex is gone from Moruna.** The `vortex` source and sink kinds, `moruna.VortexSource` and
   `moruna.VortexSink` are removed, with the 131 crates they brought. Read Vortex with its own Python
   package in a `moruna.Source` (`docs/sources-and-sinks.md`), or convert the data to Parquet.
+- **MRB1 is no longer a tensor file format.** The `tensor` source reads safetensors and `.npy`,
+  and refuses an MRB1 file by name. The `tensor` sink and `moruna.TensorSink` write safetensors,
+  now the default; `format="mrb1"` is refused. Every file the sink writes pads its header so the
+  data section starts on a page boundary, as MRB1's did, and `one_file_per_morsel` is still the
+  resumable shape, one safetensors file per batch. A 0.6 per-batch MRB1 checkpoint does not
+  resume. The benchmark generator's three MRB1 datasets are safetensors: `embed-weights-single`,
+  `score-bias` and `token-blocks`.
 
 ## 0.6.6
 

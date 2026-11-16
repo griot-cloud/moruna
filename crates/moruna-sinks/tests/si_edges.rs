@@ -358,10 +358,10 @@ fn a_nested_batch_writes_and_reads_back() {
     assert_eq!(read, vec![batch]);
 }
 
-/// Every dtype the aligned binary format names is spelled the same way in a safetensors
-/// header, so a reader of either format sees the same tensor (e.4).
+/// Every dtype Moruna names is spelled the way a safetensors header wants it, so the reference
+/// reader reads every one back (e.4).
 #[test]
-fn every_dtype_reaches_both_formats() {
+fn every_dtype_reaches_safetensors() {
     let alloc = FakeAllocator::new();
     for dtype in DType::ALL {
         let scratch = Scratch::new("dtypes");
@@ -403,7 +403,7 @@ fn a_tensor_sink_refuses_drift_and_reports_failure() {
     let mut sink = TensorSink::new(
         TensorSinkConfig {
             path: scratch.path().to_path_buf(),
-            format: TensorFormat::Amb1,
+            format: TensorFormat::SafeTensors,
             one_file_per_morsel: true,
             name: "w".to_string(),
         },
@@ -434,7 +434,7 @@ fn a_tensor_sink_refuses_drift_and_reports_failure() {
     let mut sink = TensorSink::new(
         TensorSinkConfig {
             path: scratch.path().to_path_buf(),
-            format: TensorFormat::Amb1,
+            format: TensorFormat::SafeTensors,
             one_file_per_morsel: true,
             name: "w".to_string(),
         },
@@ -608,7 +608,7 @@ fn a_per_morsel_tensor_sink_resumes() {
     let alloc = FakeAllocator::new();
     let config = || TensorSinkConfig {
         path: scratch.path().to_path_buf(),
-        format: TensorFormat::Amb1,
+        format: TensorFormat::SafeTensors,
         one_file_per_morsel: true,
         name: "w".to_string(),
     };
@@ -625,7 +625,11 @@ fn a_per_morsel_tensor_sink_resumes() {
     }
     drop(first);
     materialise(&reactor, scratch.path());
-    std::fs::write(scratch.path().join("w-000000000009.mrb1.tmp"), b"partial").expect("write");
+    std::fs::write(
+        scratch.path().join("w-000000000009.safetensors.tmp"),
+        b"partial",
+    )
+    .expect("write");
 
     let mut second = TensorSink::new(config(), Arc::new(reactor.clone()), Arc::new(alloc.clone()))
         .expect("tensor sink");
@@ -638,7 +642,7 @@ fn a_per_morsel_tensor_sink_resumes() {
         6,
         "only the committed files are left: {names:?}"
     );
-    assert!(names.iter().all(|n| n.ends_with(".mrb1")));
+    assert!(names.iter().all(|n| n.ends_with(".safetensors")));
     assert!(second.stats().resumed_files_removed >= 4);
     assert_eq!(second.committed_seq(), Some(5));
 
@@ -739,7 +743,7 @@ fn finish_before_open_and_after_failure() {
     )
     .expect("tensor sink");
     sink.open(&tensor_source_schema(4)).expect("open");
-    std::fs::write(scratch.path().join("tensor.mrb1.tmp"), b"partial").expect("write");
+    std::fs::write(scratch.path().join("tensor.safetensors.tmp"), b"partial").expect("write");
     assert!(block_on(sink.write(0, arena_tensor(&alloc, 4, 4, 0.0))).is_err());
     assert!(sink.finish().is_err());
     assert!(
@@ -760,7 +764,7 @@ fn a_safetensors_header_that_does_not_fit_is_refused() {
             path: scratch.path().to_path_buf(),
             format: TensorFormat::SafeTensors,
             one_file_per_morsel: false,
-            name: "w".repeat(600),
+            name: "w".repeat(5000),
         },
         Arc::new(FakeReactor::new()),
         Arc::new(alloc.clone()),

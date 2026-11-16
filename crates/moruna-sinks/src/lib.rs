@@ -1,8 +1,8 @@
 //! Moruna component 8, the sinks (`Sink`, `SinkHandle`, `ReorderBuffer`).
 //!
 //! Design: `architecture/sdd/08-sinks.md`. A sink absorbs morsels and produces durable output:
-//! `ParquetSink` to an object store or a local directory, `TensorSink` to safetensors or the
-//! aligned binary format of contracts e.4, `ArrowIpcSink` to an Arrow IPC file whose record
+//! `ParquetSink` to an object store or a local directory, `TensorSink` to safetensors files whose
+//! data section is page aligned, `ArrowIpcSink` to an Arrow IPC file whose record
 //! batches are the page-aligned records of contracts e.7, and, with the `python` feature,
 //! `PySink` to a user's `moruna.Sink` subclass (f.10). `ReorderBuffer` wraps any sink and
 //! delivers morsels in sequence order within a byte bound, and `SinkHandle` is the one type the

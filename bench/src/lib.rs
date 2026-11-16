@@ -5,9 +5,9 @@
 //! floats, short strings, long text with configurable mean length and variance),
 //! null ratio and row-group size, to local disk and to an S3-compatible store
 //! (MinIO in a container), and writes safetensors and aligned binary tensors of
-//! controllable shape". The aligned binary format is `MRB1`, defined in
-//! `architecture/sdd/01-contracts.md` section e.4, the one section of that
-//! document this crate reads.
+//! controllable shape". Every tensor is written as safetensors: Moruna 0.7
+//! reads tensors from safetensors and `.npy` only, so the aligned binary format
+//! is no longer written.
 //!
 //! Three properties hold across the whole crate:
 //!
@@ -34,12 +34,12 @@ pub mod error;
 pub mod host;
 pub mod kernels;
 pub mod manifest;
-pub mod mrb1;
 pub mod parquet_out;
 pub mod rng;
 pub mod s3;
 pub mod safetensors_out;
 pub mod suite;
+pub mod tensor;
 
 use std::io::Write;
 
@@ -248,9 +248,9 @@ mod tests {
             "embed-weights",
             "embed-weights-numeric",
             "embed-weights-half",
-            "embed-weights-mrb1",
-            "score-bias-mrb1",
-            "token-blocks-mrb1",
+            "embed-weights-single",
+            "score-bias",
+            "token-blocks",
         ] {
             assert!(text.contains(name), "{name} missing from {text}");
         }
@@ -261,14 +261,14 @@ mod tests {
     fn writing_one_dataset_reports_it_and_leaves_a_manifest() {
         let dir = temp("one");
         let (text, result) = run_line(&format!(
-            "dataset score-bias-mrb1 --scale small --local-only --out {}",
+            "dataset score-bias --scale small --local-only --out {}",
             dir.display()
         ));
         assert!(result.is_ok(), "{text}");
-        assert!(text.contains("score-bias-mrb1.mrb1"), "{text}");
+        assert!(text.contains("score-bias.safetensors"), "{text}");
         assert!(text.contains("blake3"), "{text}");
         assert!(text.contains("S3 upload skipped: --local-only"), "{text}");
-        assert!(dir.join("score-bias-mrb1.mrb1").exists());
+        assert!(dir.join("score-bias.safetensors").exists());
         assert!(dir.join(manifest::FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -310,7 +310,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let plan = cli::parse(&[
             "dataset".to_string(),
-            "score-bias-mrb1".to_string(),
+            "score-bias".to_string(),
             "--out".to_string(),
             dir.display().to_string(),
         ])

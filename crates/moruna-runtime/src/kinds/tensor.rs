@@ -21,7 +21,7 @@ pub struct Tensor;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSettings {
-    /// Local paths or `file://` URLs of safetensors or aligned binary tensor files.
+    /// Local paths or `file://` URLs of safetensors or `.npy` tensor files.
     pub url: Urls,
     /// Which tensors.
     #[serde(default, deserialize_with = "super::object")]
@@ -52,7 +52,7 @@ pub struct SinkSettings {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SinkOptions {
-    /// `mrb1` (absent) or `safetensors`.
+    /// `safetensors`, the only one and the default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// One file per morsel rather than one per size bound.
@@ -67,7 +67,7 @@ impl SourceKind for Tensor {
         Declaration {
             name: "tensor".into(),
             role: Role::Source,
-            summary: "Safetensors or aligned binary tensor files on a local disk".into(),
+            summary: "Safetensors or .npy tensor files on a local disk".into(),
             settings: settings_schema::<SourceSettings>(
                 "tensor",
                 vec![
@@ -121,7 +121,7 @@ impl SinkKind for Tensor {
         Declaration {
             name: "tensor".into(),
             role: Role::Sink,
-            summary: "Tensor files in a local directory, `mrb1` or safetensors".into(),
+            summary: "Safetensors tensor files in a local directory".into(),
             settings: settings_schema::<SinkSettings>(
                 "tensor",
                 vec![
@@ -149,8 +149,9 @@ impl SinkKind for Tensor {
 
     fn sink(&self, entry: &Entry<'_>, _cx: &mut Context) -> Result<BuiltSink> {
         let settings: SinkSettings = entry.settings()?;
-        let format = parse_tensor_format(settings.options.format.as_deref().unwrap_or("mrb1"))
-            .map_err(|reason| entry.refuse("options.format", reason))?;
+        let format =
+            parse_tensor_format(settings.options.format.as_deref().unwrap_or("safetensors"))
+                .map_err(|reason| entry.refuse("options.format", reason))?;
         let cfg = TensorSinkConfig {
             path: translate::local_path(&settings.url),
             format,
@@ -176,10 +177,10 @@ impl SinkKind for Tensor {
 /// A tensor file format by the name a document and `TensorSink(format=)` use.
 pub fn parse_tensor_format(name: &str) -> core::result::Result<TensorFormat, String> {
     match name.to_ascii_lowercase().as_str() {
-        "mrb1" => Ok(TensorFormat::Amb1),
         "safetensors" => Ok(TensorFormat::SafeTensors),
+        "mrb1" => Err("MRB1 is not a tensor file format since 0.7; use \"safetensors\"".into()),
         other => Err(format!(
-            "unknown tensor format `{other}` (use \"mrb1\" or \"safetensors\")"
+            "unknown tensor format `{other}` (use \"safetensors\")"
         )),
     }
 }
@@ -187,7 +188,6 @@ pub fn parse_tensor_format(name: &str) -> core::result::Result<TensorFormat, Str
 /// The name [`parse_tensor_format`] reads for a format.
 pub fn tensor_format_name(format: TensorFormat) -> &'static str {
     match format {
-        TensorFormat::Amb1 => "mrb1",
         TensorFormat::SafeTensors => "safetensors",
     }
 }

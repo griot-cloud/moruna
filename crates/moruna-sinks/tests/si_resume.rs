@@ -482,18 +482,14 @@ fn si_t14_unresumable_says_so() {
     let reactor = FakeReactor::new();
     let alloc = FakeAllocator::new();
 
-    // Not resumable: the run-mode tensor sinks leave the contract's defaults in place.
-    for (format, per_morsel) in [
-        (TensorFormat::Amb1, false),
-        (TensorFormat::SafeTensors, false),
-        (TensorFormat::SafeTensors, true),
-    ] {
+    // Not resumable: the run-mode tensor sink leaves the contract's defaults in place.
+    {
         let scratch = Scratch::new("t14-unresumable");
         let mut sink = TensorSink::new(
             TensorSinkConfig {
                 path: scratch.path().to_path_buf(),
-                format,
-                one_file_per_morsel: per_morsel,
+                format: TensorFormat::SafeTensors,
+                one_file_per_morsel: false,
                 name: "weights".to_string(),
             },
             Arc::new(reactor.clone()),
@@ -522,7 +518,7 @@ fn si_t14_unresumable_says_so() {
     let per_morsel = TensorSink::new(
         TensorSinkConfig {
             path: scratch.path().to_path_buf(),
-            format: TensorFormat::Amb1,
+            format: TensorFormat::SafeTensors,
             one_file_per_morsel: true,
             name: "weights".to_string(),
         },
@@ -541,7 +537,7 @@ fn si_t14_unresumable_says_so() {
     .expect("parquet sink");
     let ipc = ipc_sink(&scratch, &reactor, &alloc, 1 << 20);
     for (name, state) in [
-        ("mrb1 per morsel", per_morsel.checkpoint()),
+        ("safetensors per morsel", per_morsel.checkpoint()),
         ("parquet", parquet.checkpoint()),
         ("ipc", ipc.checkpoint()),
     ] {

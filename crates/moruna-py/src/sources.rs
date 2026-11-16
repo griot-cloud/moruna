@@ -84,7 +84,7 @@ impl PyArrowIpcSource {
     }
 }
 
-/// A source over safetensors or aligned binary tensor files.
+/// A source over safetensors or `.npy` tensor files.
 #[pyclass(frozen, module = "moruna._core", name = "TensorSource")]
 pub struct PyTensorSource {
     pub(crate) cfg: TensorSourceConfig,

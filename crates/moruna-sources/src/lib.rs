@@ -1,4 +1,4 @@
-//! Moruna component 7, the sources (`Source` over Parquet, safetensors, aligned binary, a
+//! Moruna component 7, the sources (`Source` over Parquet, safetensors, `.npy`, a
 //! Python iterator and a user's `moruna.Source` subclass).
 //!
 //! Design: `architecture/sdd/07-sources.md`. A source turns a dataset into splits with

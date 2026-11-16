@@ -7,7 +7,7 @@
 //! cannot be written; that is reported as an escalation and this is the plan-time metadata
 //! read d.1 already grants local paths for size and listing. No payload byte is read here.
 
-use moruna_kernel::{DType, MorunaError, Result, SourceSchema, Split, SplitId};
+use moruna_kernel::{MorunaError, Result, SourceSchema, Split, SplitId};
 
 use super::Entry;
 use crate::util::plan_err;
@@ -15,12 +15,11 @@ use crate::util::plan_err;
 /// The bytes read speculatively to find a header (e.3).
 pub(crate) const PROBE_BYTES: u64 = 64 * 1024;
 
-/// Which of the three formats a file is.
+/// Which of the two formats a file is.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Format {
     Safetensors,
     Npy,
-    Amb1,
 }
 
 /// Read at most `len` bytes of `path` from `offset`; a short read at end of file is fine.
@@ -61,7 +60,10 @@ pub(crate) fn file_len(path: &std::path::Path) -> Result<u64> {
 /// Which format a file is, by extension and then by magic (e.3).
 pub(crate) fn detect(path: &std::path::Path, prefix: &[u8]) -> Result<Format> {
     if prefix.starts_with(b"MRB1") {
-        return Ok(Format::Amb1);
+        return Err(plan_err(format!(
+            "{}: MRB1 is not a tensor file format since 0.7; write safetensors or .npy",
+            path.display()
+        )));
     }
     if prefix.starts_with(b"\x93NUMPY") {
         return Ok(Format::Npy);
@@ -75,7 +77,7 @@ pub(crate) fn detect(path: &std::path::Path, prefix: &[u8]) -> Result<Format> {
         return Ok(Format::Safetensors);
     }
     Err(plan_err(format!(
-        "{}: not a safetensors, .npy or MRB1 file (extension {extension:?}, no known magic)",
+        "{}: not a safetensors or .npy file (extension {extension:?}, no known magic)",
         path.display()
     )))
 }
@@ -98,7 +100,6 @@ pub(crate) fn plan(cfg: &super::TensorSourceConfig) -> Result<Vec<Entry>> {
         let mut entries = match detect(path, &prefix)? {
             Format::Safetensors => super::safetensors::plan(path, len, &prefix)?,
             Format::Npy => super::npy::plan(path, len, &prefix)?,
-            Format::Amb1 => amb1_plan(path, len, &prefix)?,
         };
         if let Some(wanted) = &cfg.tensors {
             entries.retain(|e| wanted.iter().any(|w| w == &e.name));
@@ -125,86 +126,6 @@ pub(crate) fn plan(cfg: &super::TensorSourceConfig) -> Result<Vec<Entry>> {
         return Err(plan_err("no tensor matched the configuration"));
     }
     Ok(out)
-}
-
-/// The `MRB1` header (contracts e.4).
-///
-/// `mrb1::Header::read` validates that the buffer holds the payload too, so it cannot parse a
-/// header out of a 64 KiB probe of a large file. The fields are read here and then handed
-/// straight back to the contracts writer: a header that does not reproduce the file's own
-/// bytes exactly, padding included, is rejected. The contracts crate stays the authority on
-/// the layout, the magic, the version and the offset rules; this is reported as an escalation.
-fn amb1_plan(path: &std::path::Path, len: u64, prefix: &[u8]) -> Result<Vec<Entry>> {
-    use moruna_kernel::mrb1::Header;
-    let bad = |msg: String| MorunaError::Io {
-        op: "mrb1",
-        target: path.display().to_string(),
-        msg,
-    };
-    if prefix.len() < 16 {
-        return Err(bad(format!("file of {len} bytes is shorter than a header")));
-    }
-    let Some(dtype) = DType::from_code(prefix[6]) else {
-        return Err(bad(format!("unknown dtype code {}", prefix[6])));
-    };
-    let ndim = prefix[7] as usize;
-    if ndim > moruna_kernel::mrb1::MAX_NDIM {
-        return Err(bad(format!(
-            "ndim {ndim} exceeds {}",
-            moruna_kernel::mrb1::MAX_NDIM
-        )));
-    }
-    let end = Header::header_end(ndim) as usize;
-    if prefix.len() < end {
-        return Err(bad(format!(
-            "file of {len} bytes is short of the {end}-byte header"
-        )));
-    }
-    let mut shape = Vec::with_capacity(ndim);
-    for i in 0..ndim {
-        let mut d = [0u8; 8];
-        d.copy_from_slice(&prefix[8 + 8 * i..16 + 8 * i]);
-        shape.push(i64::from_le_bytes(d));
-    }
-    let mut offset = [0u8; 8];
-    offset.copy_from_slice(&prefix[8 + 8 * ndim..16 + 8 * ndim]);
-    let header = Header {
-        dtype,
-        shape,
-        data_offset: u64::from_le_bytes(offset),
-    };
-    let width = usize::try_from(header.data_offset).unwrap_or(usize::MAX);
-    let mut rebuilt = vec![0u8; width];
-    header.write(&mut rebuilt)?;
-    let Some(actual) = prefix.get(..width) else {
-        return Err(bad(format!(
-            "file of {len} bytes is short of the {width}-byte header and its padding"
-        )));
-    };
-    if rebuilt != actual {
-        return Err(bad(
-            "the header does not match the bytes the MRB1 writer would produce".to_string(),
-        ));
-    }
-    if len < header.payload_end() {
-        return Err(bad(format!(
-            "file of {len} bytes is short of the {} bytes the header claims",
-            header.payload_end()
-        )));
-    }
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tensor")
-        .to_string();
-    Ok(vec![Entry {
-        path: path.to_path_buf(),
-        name,
-        dtype: header.dtype,
-        shape: header.shape,
-        data_offset: header.data_offset,
-        file_len: len,
-    }])
 }
 
 /// One `Split` per entry, ids in plan order (e.3).

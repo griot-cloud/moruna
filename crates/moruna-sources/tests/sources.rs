@@ -21,8 +21,8 @@ use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
 
 use support::{
     CountingAllocator, Ledger, NoObjectStore, block_on, err, scratch, seed, seed_truncated,
-    write_amb1, write_dictionary_parquet, write_npy, write_one_huge_row, write_parquet,
-    write_safetensors, write_safetensors_padded,
+    write_aligned_safetensors, write_dictionary_parquet, write_npy, write_one_huge_row,
+    write_parquet, write_safetensors, write_safetensors_padded,
 };
 
 /// A Parquet source over one generated file, reading its bytes through the fake.
@@ -108,7 +108,7 @@ fn so_t1_plan_before_read() {
         "{error}"
     );
 
-    let (path, _) = write_amb1(&dir, "t1", vec![8, 4], 0.0);
+    let (path, _) = write_aligned_safetensors(&dir, "t1", vec![8, 4], 0.0);
     let tensor = tensor_over(&path, seed(FakeReactor::new(), &path));
     let splits = tensor.plan().expect("the plan");
     assert_eq!(splits.len(), 1);
@@ -162,7 +162,7 @@ fn so_t2_metadata_exact() {
         splits.iter().map(|s| s.uncompressed_bytes).sum::<u64>()
     );
 
-    let (path, values) = write_amb1(&dir, "t2", vec![16, 4], 0.0);
+    let (path, values) = write_aligned_safetensors(&dir, "t2", vec![16, 4], 0.0);
     let tensor = tensor_over(&path, seed(FakeReactor::new(), &path));
     let splits = tensor.plan().expect("the plan");
     assert_eq!(splits[0].rows, 16);
@@ -176,7 +176,7 @@ fn so_t2_metadata_exact() {
 fn so_t3_resident_tier() {
     let dir = scratch();
     let ledger = write_parquet(&dir, "t3", 64, 64, 0);
-    let (mrb1, _) = write_amb1(&dir, "t3", vec![8, 4], 0.0);
+    let (aligned, _) = write_aligned_safetensors(&dir, "t3", vec![8, 4], 0.0);
 
     for pinned in [false, true] {
         let host = if pinned { Tier::PinnedHost } else { Tier::Host };
@@ -205,7 +205,7 @@ fn so_t3_resident_tier() {
             "{error}"
         );
 
-        let tensor = tensor_over(&mrb1, seed(FakeReactor::new(), &mrb1));
+        let tensor = tensor_over(&aligned, seed(FakeReactor::new(), &aligned));
         let splits = tensor.plan().expect("the plan");
         let payload = block_on(tensor.read(&splits[0], None, &alloc, host)).expect("a tensor read");
         assert_eq!(payload.tier(), host);
@@ -311,7 +311,7 @@ fn so_t5_one_decode_copy() {
     }
     assert_eq!(alloc.payload_copies(), splits.len() as u64);
 
-    let (path, _) = write_amb1(&dir, "t5", vec![8, 4], 0.0);
+    let (path, _) = write_aligned_safetensors(&dir, "t5", vec![8, 4], 0.0);
     let tensor = tensor_over(&path, seed(FakeReactor::new(), &path));
     let alloc = CountingAllocator::new(FakeAllocator::new());
     let splits = tensor.plan().expect("the plan");
@@ -363,7 +363,7 @@ fn so_t6_stateless() {
 fn so_t7_zero_rows() {
     let dir = scratch();
     // A zero-row tensor: the split plans with rows 0 and the read issues no IO.
-    let (path, _) = write_amb1(&dir, "t7", vec![0, 4], 0.0);
+    let (path, _) = write_aligned_safetensors(&dir, "t7", vec![0, 4], 0.0);
     let reactor = seed(FakeReactor::new(), &path);
     let observer = reactor.clone();
     let tensor = tensor_over(&path, reactor);
@@ -482,7 +482,7 @@ fn so_t8_pruning() {
 fn so_t9_tensor_view_in_arena() {
     let dir = scratch();
     let cases = [
-        write_amb1(&dir, "t9", vec![64, 8], 1.0),
+        write_aligned_safetensors(&dir, "t9-aligned", vec![64, 8], 1.0),
         write_safetensors(&dir, "t9", vec![64, 8], 1000.0),
     ];
     for (path, values) in cases {
@@ -535,7 +535,7 @@ fn so_t9_tensor_view_in_arena() {
 
     // A file whose bytes stop short of what its header claims is a `Source` error naming the
     // file and the length the tensor needed (h).
-    let (path, _) = write_amb1(&dir, "t9-short", vec![64, 8], 1.0);
+    let (path, _) = write_aligned_safetensors(&dir, "t9-short", vec![64, 8], 1.0);
     let full = std::fs::metadata(&path).expect("the file").len() as usize;
     // The file keeps its header and the first page of its payload, so the read's offset is
     // still inside it. Truncating further makes `FakeReactor::read_file_opt` panic rather than
@@ -776,7 +776,7 @@ fn so_t13_repeatable_reads() {
         assert_eq!(table(&a), table(&b));
     }
 
-    let (path, _) = write_amb1(&dir, "t13", vec![32, 4], 0.0);
+    let (path, _) = write_aligned_safetensors(&dir, "t13", vec![32, 4], 0.0);
     let tensor = tensor_over(&path, seed(FakeReactor::new(), &path));
     assert!(tensor.repeatable());
     let split = tensor.plan().expect("the plan").remove(0);
@@ -819,7 +819,7 @@ fn so_t14_oversized_row_natural_size() {
 
     // The same for a tensor whose one row is above the bound.
     let rows_of = (huge / 4) as i64;
-    let (tensor_path, _) = write_amb1(&dir, "t14", vec![1, rows_of], 0.0);
+    let (tensor_path, _) = write_aligned_safetensors(&dir, "t14", vec![1, rows_of], 0.0);
     let tensor = tensor_over(&tensor_path, seed(FakeReactor::new(), &tensor_path));
     let split = tensor.plan().expect("the plan").remove(0);
     let payload = block_on(tensor.read(&split, None, &alloc, Tier::Host)).expect("the huge row");
@@ -864,7 +864,7 @@ fn so_t15_read_failure_paths() {
     assert_eq!(observer.ops().len(), ops_before);
 
     // The same on the tensor path.
-    let (path, _) = write_amb1(&dir, "t15", vec![16, 4], 0.0);
+    let (path, _) = write_aligned_safetensors(&dir, "t15", vec![16, 4], 0.0);
     let reactor = seed(FakeReactor::new(), &path).fail_next(OpKind::ReadFile, 1);
     let observer = reactor.clone();
     let tensor = tensor_over(&path, reactor);
@@ -1228,7 +1228,7 @@ fn schemas_describe_the_plan() {
     };
     assert_eq!(schema.fields().len(), 3);
 
-    let (path, _) = write_amb1(&dir, "schema", vec![4, 2], 0.0);
+    let (path, _) = write_aligned_safetensors(&dir, "schema", vec![4, 2], 0.0);
     let tensor = tensor_over(&path, seed(FakeReactor::new(), &path));
     let SourceSchema::Tensor { dtype, shape } = tensor.schema() else {
         panic!("a tensor schema");
@@ -1466,61 +1466,26 @@ fn npy_headers_are_validated() {
     assert!(error.contains("version 2 header"), "{error}");
 }
 
-/// Every way an `MRB1` header can be wrong is named, not panicked on (contracts e.4, h).
+/// MRB1 is not a tensor file format since 0.7: a file with its magic is refused by name, and
+/// an `.mrb1` file without it is refused as an unknown format (h).
 #[test]
-fn amb1_headers_are_validated() {
+fn mrb1_files_are_refused() {
     let dir = scratch();
-    let good = |dtype: u8, ndim: u8, shape: &[i64], data_offset: u64, payload: usize| {
-        let mut bytes = b"MRB1".to_vec();
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.push(dtype);
-        bytes.push(ndim);
-        for d in shape {
-            bytes.extend_from_slice(&d.to_le_bytes());
-        }
-        bytes.extend_from_slice(&data_offset.to_le_bytes());
-        bytes.resize(data_offset as usize, 0);
-        bytes.extend(std::iter::repeat_n(0u8, payload));
-        bytes
-    };
-    for (name, bytes, wanted) in [
-        (
-            "tiny.mrb1",
-            b"MRB1\x01\x00".to_vec(),
-            "shorter than a header",
-        ),
-        (
-            "dtype.mrb1",
-            good(200, 1, &[4], 4096, 16),
-            "unknown dtype code",
-        ),
-        ("ndim.mrb1", good(10, 9, &[4], 4096, 16), "ndim 9 exceeds"),
-        (
-            "offset.mrb1",
-            good(10, 1, &[4], 4000, 16),
-            "not a multiple of 4096",
-        ),
-        (
-            "short.mrb1",
-            good(10, 1, &[4], 4096, 4),
-            "short of the 4112 bytes",
-        ),
-    ] {
-        let error = tensor_err(&dir, name, &bytes).to_string();
-        assert!(error.contains(wanted), "{name}: {error}");
-    }
-
-    // A header whose padding is not what the MRB1 writer would produce is rejected.
-    let mut tampered = good(10, 1, &[4], 4096, 16);
-    tampered[100] = 0xff;
-    let error = tensor_err(&dir, "tampered.mrb1", &tampered).to_string();
-    assert!(error.contains("would produce"), "{error}");
-
-    // A file whose header is cut before its padding ends.
-    let mut cut = good(10, 1, &[4], 4096, 16);
-    cut.truncate(64);
-    let error = tensor_err(&dir, "cut.mrb1", &cut).to_string();
-    assert!(error.contains("short of"), "{error}");
+    let mut bytes = b"MRB1".to_vec();
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.resize(4096 + 16, 0);
+    let error = tensor_err(&dir, "old.mrb1", &bytes).to_string();
+    assert!(
+        error.contains("MRB1 is not a tensor file format"),
+        "{error}"
+    );
+    let error = tensor_err(&dir, "renamed.safetensors", &bytes).to_string();
+    assert!(
+        error.contains("MRB1 is not a tensor file format"),
+        "{error}"
+    );
+    let error = tensor_err(&dir, "plain.mrb1", b"not a tensor at all").to_string();
+    assert!(error.contains("not a safetensors or .npy file"), "{error}");
 }
 
 /// The rest of the plan and read failures of h.

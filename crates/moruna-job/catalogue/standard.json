@@ -391,14 +391,14 @@
     {
       "name": "tensor",
       "role": "source",
-      "summary": "Safetensors or aligned binary tensor files on a local disk",
+      "summary": "Safetensors or .npy tensor files on a local disk",
       "settings": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "url": {
             "$ref": "#/$defs/Urls",
-            "description": "Local paths or `file://` URLs of safetensors or aligned binary tensor files."
+            "description": "Local paths or `file://` URLs of safetensors or `.npy` tensor files."
           },
           "options": {
             "$ref": "#/$defs/SourceOptions",
@@ -1176,7 +1176,7 @@
     {
       "name": "tensor",
       "role": "sink",
-      "summary": "Tensor files in a local directory, `mrb1` or safetensors",
+      "summary": "Safetensors tensor files in a local directory",
       "settings": {
         "type": "object",
         "additionalProperties": false,
@@ -1209,7 +1209,7 @@
                   "string",
                   "null"
                 ],
-                "description": "`mrb1` (absent) or `safetensors`."
+                "description": "`safetensors`, the only one and the default."
               },
               "one_file_per_morsel": {
                 "type": "boolean",

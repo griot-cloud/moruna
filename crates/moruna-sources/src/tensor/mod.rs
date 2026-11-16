@@ -1,5 +1,4 @@
-//! `TensorSource`: safetensors, NumPy `.npy` and the Moruna aligned binary format `MRB1`
-//! (sections e.3, e.4).
+//! `TensorSource`: safetensors and NumPy `.npy` (sections e.3, e.4).
 //!
 //! A read computes the enclosing page-aligned byte range of the rows it was asked for,
 //! allocates one arena buffer of that length, has the reactor land the bytes in it, and
@@ -62,7 +61,7 @@ impl Entry {
     }
 }
 
-/// A source over tensor files: safetensors, `.npy` and `MRB1` (d.1).
+/// A source over tensor files: safetensors and `.npy` (d.1).
 pub struct TensorSource {
     reactor: Arc<dyn Reactor>,
     entries: Vec<Entry>,

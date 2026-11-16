@@ -52,7 +52,7 @@ A version 1 document is a JSON object describing one job. Only `moruna_spec`, `s
 {"kind": "arrow_ipc", "url": "/data/features/", "options": {"columns": ["id", "x"]}}
 ```
 
-**`tensor`**: `url` is a path or a list of paths to safetensors or aligned binary tensor files; `options.tensors` lists the tensors to read.
+**`tensor`**: `url` is a path or a list of paths to safetensors or `.npy` tensor files; `options.tensors` lists the tensors to read.
 
 **`image`**: an OCI image's command as a source: `image` (`build_key`, `digest`, `location`), `entry`, `params` and `needs`, as for an [`image` function](#kernels).
 
@@ -76,7 +76,7 @@ A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna th
 
 **`parquet`**: `url` is a directory or prefix. `options.row_group_bytes` (default 128 MiB), `options.file_bytes` (default 1 GiB) and `options.compression`: `zstd` (default), `snappy`, `gzip`, `lz4` or `none`.
 
-**`tensor`**: `url` is a directory. `options.format` is `mrb1` (default) or `safetensors`; `options.one_file_per_morsel` and `options.name` (default `tensor`).
+**`tensor`**: `url` is a directory. `options.format` is `safetensors`, the default and only format; `options.one_file_per_morsel` (one file per batch, the only resumable shape) and `options.name` (default `tensor`).
 
 **`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB); `options.compression` is `none` (default), `zstd` or `lz4`, and `options.level` the zstd level (default 3). A compressed file is smaller and is opened by any Arrow reader, `pyarrow.ipc.open_file` included.
 

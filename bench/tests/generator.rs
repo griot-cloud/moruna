@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use moruna_bench::cli;
 use moruna_bench::dataset::{Dataset, DatasetKind};
 use moruna_bench::dtype::DType;
-use moruna_bench::mrb1;
 use moruna_bench::parquet_out::ParquetSpec;
 use moruna_bench::s3;
 use moruna_bench::suite::{self, Scale};
+use moruna_bench::tensor::TensorSpec;
 
 use arrow::array::Array;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -216,50 +216,24 @@ fn the_row_group_size_is_honoured() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An `MRB1` file on disk matches the table of contracts e.4 byte for byte, and
-/// passes the four checks that section says a reader makes.
+/// A single tensor suite file holds exactly that tensor: its dtype, its rank 3
+/// shape and its own payload bytes, row major, read back through the
+/// `safetensors` crate.
 #[test]
-fn an_amb1_file_on_disk_matches_contracts_e4() {
-    let dir = scratch("mrb1");
+fn a_single_tensor_file_holds_the_tensor_s_own_bytes() {
+    let dir = scratch("single");
     run(&format!(
-        "mrb1 --name weights --dtype f32 --shape 128,64 --local-only --seed 5 --out {}",
+        "dataset token-blocks --scale small --seed 5 --local-only --out {}",
         dir.display()
     ));
-    let bytes = read(&dir.join("weights.mrb1"));
-
-    let mut expected = Vec::new();
-    expected.extend_from_slice(b"MRB1");
-    expected.extend_from_slice(&1u16.to_le_bytes());
-    expected.push(10); // F32
-    expected.push(2); // ndim
-    expected.extend_from_slice(&128i64.to_le_bytes());
-    expected.extend_from_slice(&64i64.to_le_bytes());
-    expected.extend_from_slice(&4096u64.to_le_bytes());
-    assert_eq!(&bytes[..expected.len()], expected.as_slice());
-    assert!(bytes[expected.len()..4096].iter().all(|b| *b == 0));
-
-    // The reader's checks: magic, version, ndim, data_offset a multiple of 4096
-    // and at or above the header end, and the file long enough for the payload.
-    let data_offset = u64::from_le_bytes([
-        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
-    ]);
-    assert_eq!(data_offset % mrb1::PAGE_BYTES, 0);
-    assert!(data_offset >= mrb1::header_end(2));
-    let payload_len = 128 * 64 * 4;
-    assert!(bytes.len() as u64 >= data_offset + payload_len);
-    assert_eq!(bytes.len() as u64 % mrb1::TAIL_ALIGN, 0);
-    assert!(
-        bytes[(data_offset + payload_len) as usize..]
-            .iter()
-            .all(|b| *b == 0)
-    );
-
-    // The payload is the tensor's own bytes, at data_offset, row major.
-    let spec = mrb1::TensorSpec::new("weights", DType::F32, vec![128, 64]).expect("spec");
-    assert_eq!(
-        &bytes[data_offset as usize..(data_offset + payload_len) as usize],
-        spec.payload(5).as_slice()
-    );
+    let bytes = read(&dir.join("token-blocks.safetensors"));
+    let parsed = safetensors::SafeTensors::deserialize(&bytes).expect("deserialize");
+    assert_eq!(parsed.len(), 1);
+    let view = parsed.tensor("tokens").expect("tokens");
+    assert_eq!(view.dtype(), safetensors::Dtype::I64);
+    assert_eq!(view.shape(), &[32, 16, 8]);
+    let spec = TensorSpec::new("tokens", DType::I64, vec![32, 16, 8]).expect("spec");
+    assert_eq!(view.data(), spec.payload(5).as_slice());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -305,7 +279,7 @@ fn one_dataset_matches_what_the_whole_suite_writes() {
         "suite --scale small --seed 77 --local-only --out {}",
         all.display()
     ));
-    for name in ["numeric-embed", "embed-weights", "token-blocks-mrb1"] {
+    for name in ["numeric-embed", "embed-weights", "token-blocks"] {
         run(&format!(
             "dataset {name} --scale small --seed 77 --local-only --out {}",
             one.display()
@@ -392,7 +366,9 @@ fn the_same_datasets_reach_the_s3_compatible_store() {
     let dir = scratch("s3");
     let dataset = Dataset {
         name: "s3-probe".to_string(),
-        kind: DatasetKind::Amb1(mrb1::TensorSpec::new("probe", DType::I64, vec![8]).expect("spec")),
+        kind: DatasetKind::SafeTensors(vec![
+            TensorSpec::new("probe", DType::I64, vec![8]).expect("spec"),
+        ]),
     };
     let written = dataset.write(&dir, 21).expect("write");
     let mut out: Vec<u8> = Vec::new();

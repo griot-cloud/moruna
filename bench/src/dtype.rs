@@ -1,10 +1,5 @@
-//! Tensor element types, their `MRB1` codes and their deterministic payloads.
-//!
-//! The codes and the item sizes are exactly the `dtype` row of the aligned
-//! binary format table in `architecture/sdd/01-contracts.md` section e.4, the one
-//! section of that document this crate reads (preamble section 9 permits a cited
-//! section). The same set is mapped to the safetensors names for the safetensors
-//! writer.
+//! Tensor element types, their item sizes, their safetensors names and their
+//! deterministic payloads.
 
 use crate::error::{BenchError, Result};
 use crate::rng::Rng;
@@ -12,35 +7,35 @@ use crate::rng::Rng;
 /// An element type of a generated tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
-    /// Signed 8 bit integer, `MRB1` code 0.
+    /// Signed 8 bit integer.
     I8,
-    /// Signed 16 bit integer, `MRB1` code 1.
+    /// Signed 16 bit integer.
     I16,
-    /// Signed 32 bit integer, `MRB1` code 2.
+    /// Signed 32 bit integer.
     I32,
-    /// Signed 64 bit integer, `MRB1` code 3.
+    /// Signed 64 bit integer.
     I64,
-    /// Unsigned 8 bit integer, `MRB1` code 4.
+    /// Unsigned 8 bit integer.
     U8,
-    /// Unsigned 16 bit integer, `MRB1` code 5.
+    /// Unsigned 16 bit integer.
     U16,
-    /// Unsigned 32 bit integer, `MRB1` code 6.
+    /// Unsigned 32 bit integer.
     U32,
-    /// Unsigned 64 bit integer, `MRB1` code 7.
+    /// Unsigned 64 bit integer.
     U64,
-    /// Half precision float, `MRB1` code 8.
+    /// Half precision float.
     F16,
-    /// Brain float, `MRB1` code 9.
+    /// Brain float.
     BF16,
-    /// Single precision float, `MRB1` code 10.
+    /// Single precision float.
     F32,
-    /// Double precision float, `MRB1` code 11.
+    /// Double precision float.
     F64,
-    /// Boolean, one byte per element, `MRB1` code 12.
+    /// Boolean, one byte per element.
     Bool,
 }
 
-/// Every type the generator writes, in `MRB1` code order.
+/// Every type the generator writes, in a fixed order.
 pub const ALL: [DType; 13] = [
     DType::I8,
     DType::I16,
@@ -58,25 +53,6 @@ pub const ALL: [DType; 13] = [
 ];
 
 impl DType {
-    /// The `MRB1` dtype code (contracts e.4).
-    pub fn code(self) -> u8 {
-        match self {
-            DType::I8 => 0,
-            DType::I16 => 1,
-            DType::I32 => 2,
-            DType::I64 => 3,
-            DType::U8 => 4,
-            DType::U16 => 5,
-            DType::U32 => 6,
-            DType::U64 => 7,
-            DType::F16 => 8,
-            DType::BF16 => 9,
-            DType::F32 => 10,
-            DType::F64 => 11,
-            DType::Bool => 12,
-        }
-    }
-
     /// The size of one element in bytes.
     pub fn item_size(self) -> usize {
         match self {
@@ -190,7 +166,7 @@ fn finite_half(rng: &mut Rng, exp_bits: u32, mant_bits: u32, exp_lo: u32, exp_hi
 }
 
 /// The number of elements a shape holds. An empty shape is one scalar, which is
-/// what a product over no dimensions means and what `MRB1` `ndim` 0 encodes.
+/// what a product over no dimensions means.
 pub fn element_count(shape: &[i64]) -> u64 {
     shape.iter().map(|d| *d as u64).product()
 }
@@ -200,24 +176,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codes_and_sizes_match_contracts_e4() {
-        let expected: [(DType, u8, usize); 13] = [
-            (DType::I8, 0, 1),
-            (DType::I16, 1, 2),
-            (DType::I32, 2, 4),
-            (DType::I64, 3, 8),
-            (DType::U8, 4, 1),
-            (DType::U16, 5, 2),
-            (DType::U32, 6, 4),
-            (DType::U64, 7, 8),
-            (DType::F16, 8, 2),
-            (DType::BF16, 9, 2),
-            (DType::F32, 10, 4),
-            (DType::F64, 11, 8),
-            (DType::Bool, 12, 1),
+    fn item_sizes_are_the_width_of_each_type() {
+        let expected: [(DType, usize); 13] = [
+            (DType::I8, 1),
+            (DType::I16, 2),
+            (DType::I32, 4),
+            (DType::I64, 8),
+            (DType::U8, 1),
+            (DType::U16, 2),
+            (DType::U32, 4),
+            (DType::U64, 8),
+            (DType::F16, 2),
+            (DType::BF16, 2),
+            (DType::F32, 4),
+            (DType::F64, 8),
+            (DType::Bool, 1),
         ];
-        for (dtype, code, size) in expected {
-            assert_eq!(dtype.code(), code, "{}", dtype.name());
+        for (dtype, size) in expected {
             assert_eq!(dtype.item_size(), size, "{}", dtype.name());
         }
         assert_eq!(ALL.len(), 13);

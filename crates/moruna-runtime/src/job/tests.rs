@@ -830,10 +830,10 @@ fn every_sink_kind_builds() {
         let c = parquet::parse_compression(name).expect("known");
         assert_eq!(parquet::compression_name(c), back);
     }
-    for name in ["mrb1", "safetensors"] {
-        let f = tensor::parse_tensor_format(name).expect("known");
-        assert_eq!(tensor::tensor_format_name(f), name);
-    }
+    let f = tensor::parse_tensor_format("safetensors").expect("known");
+    assert_eq!(tensor::tensor_format_name(f), "safetensors");
+    let refused = tensor::parse_tensor_format("mrb1").expect_err("MRB1 is gone");
+    assert!(refused.contains("since 0.7"), "{refused}");
     assert!(build::is_spec_refusal(&MorunaError::Plan(String::new())));
     assert!(!build::is_spec_refusal(&MorunaError::Cancelled));
 }
