@@ -460,3 +460,15 @@ and switches to the new one when the call answers.
   - No Python on the gate's path: P's proof is a native Rust task, and B2's 0.7.0 targets are
     musl and glibc. CPython waits for `arrow-core-0.7.md` §8.
   - The gate needs C, P, D and E, and no longer waits on B2.
+- **2026-11-16: B2-vm final** at `94a30bfd` (`feature/data-os-b2-vm`), merged into B2's branch
+  (`bf6f8db4`).
+  - Frames are pages of memory-object chunks (2 to 64 MiB) from an injected source (B2's region
+    allocator), kept as (object, offset) plus address.
+  - `process_map`, `process_unmap` and `process_protect` are batched per cursor: fault-around's
+    16 pages are 1 call, and fork through `process_clone` is 0 calls a page.
+  - Private-file copy-on-write is done on frames, not `memory_snapshot`.
+  - Host tests: ostd 91, core 147. Coverage 85.7% to 100% per file, ostd 92.3%.
+  - Timings wait for B2's slot (`kernel/linuxlayer/vmcost`).
+  - **Open for the core, decided after those timings:** each `process_map` creates one area
+    (96 bytes charged), and adjacent areas of one object are never merged, so anonymous memory
+    faulted a page at a time costs an area a page.
