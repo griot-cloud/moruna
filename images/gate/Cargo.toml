@@ -1,0 +1,34 @@
+# The gate's image-side code (architecture/arrow-core-0.7.md section 9, stream E): the seven
+# benchmark jobs' functions ported to Rust, their record codec for the data plane, the plain Rust
+# baseline and the canonical-hash tool. It is not Moruna's runtime, so it is its own workspace,
+# as images/python is P's. The native tasks build for the kernel's user target on the kernel's
+# toolchain, so they are a workspace of their own too (tasks/), as is 0.6.6's extension (py066/),
+# which builds against a Python.
+[workspace]
+resolver = "3"
+members = ["functions", "record", "baseline"]
+exclude = ["tasks", "py066"]
+
+[workspace.package]
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# The root workspace's pins (Cargo.toml), so a port runs on the arrow-rs the engine runs on.
+arrow = { version = "=59.3.0", default-features = false }
+parquet = { version = "=59.3.0", default-features = false }
+sha2 = { version = "=0.11.0", default-features = false }
+# Pure Rust floating point (musl's), so the native task, the baseline and 0.6.6's wrapper all
+# compute the same bits on any host: std's own functions call the platform's libm.
+libm = { version = "=0.2.16" }
+rayon = { version = "=1.12.0" }
+bytemuck = { version = "=1.25.0", default-features = false }
+moruna-gate-functions = { path = "functions", default-features = false }
+moruna-gate-record = { path = "record" }
+moruna-ipc-check = { path = "../../kernel/plane/check" }
+
+[profile.release]
+debug = 1

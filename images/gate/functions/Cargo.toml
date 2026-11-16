@@ -1,0 +1,26 @@
+[package]
+name = "moruna-gate-functions"
+description = "The seven 0.6.6 benchmark functions in Rust: a no_std core over column slices, and Arrow RecordBatch in, RecordBatch out"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["arrow"]
+# RecordBatch in, RecordBatch out on the workspace's arrow-rs, and the canonical hash. Without
+# it the crate is no_std with alloc: what the native tasks link.
+arrow = ["std", "dep:arrow", "dep:sha2"]
+std = []
+
+[dependencies]
+libm.workspace = true
+# `_norm_name`'s NFKC (Unicode 17; Python 3.14's tables are 16.0).
+unicode-normalization = { version = "=0.1.25", default-features = false }
+arrow = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+arrow = { workspace = true, features = ["ipc"] }
+serde_json = { version = "=1.0.151" }

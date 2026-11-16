@@ -1,0 +1,26 @@
+[package]
+name = "moruna-gate-baseline"
+description = "The PM's control 2: the gate's Rust functions in a plain rayon pool over arrow-rs and parquet, and gate-canon, the canonical hash of any engine's output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gate-baseline"
+path = "src/bin/gate-baseline.rs"
+
+[[bin]]
+name = "gate-canon"
+path = "src/bin/gate-canon.rs"
+
+[dependencies]
+moruna-gate-functions = { workspace = true, features = ["arrow"] }
+arrow.workspace = true
+parquet = { workspace = true, features = ["arrow", "zstd", "snap", "lz4", "brotli"] }
+rayon.workspace = true
+
+[dev-dependencies]
+arrow = { workspace = true, features = ["ipc"] }
+serde_json = { version = "=1.0.151" }
