@@ -2,7 +2,7 @@
 
 use crate::{
     fs::{
-        fs_impls::ramfs::{self, RamFs},
+        fs_impls::ramfs::{self, RamFs, quota::Quota},
         pseudofs::AnonDeviceId,
         vfs::{
             file_system::{FileSystem, SuperBlock},
@@ -53,6 +53,28 @@ impl TmpFs {
             super_block
         };
         Self::new_with_sb(name, anon_device_id, sb, revalidation_policy)
+    }
+
+    /// Creates a task's scratch: a tmpfs holding at most `quota` bytes, the limit of
+    /// the task's scratch account.
+    pub(in crate::fs) fn new_scratch(quota: usize) -> Result<Arc<Self>> {
+        let anon_device_id = AnonDeviceId::acquire()
+            .ok_or_else(|| Error::with_message(Errno::ENOMEM, "no device ID for the scratch"))?;
+        let mut sb = SuperBlock::new(
+            TMPFS_MAGIC,
+            ramfs::BLOCK_SIZE,
+            ramfs::NAME_MAX,
+            anon_device_id.id(),
+        );
+        let max_inodes = quota / ramfs::quota::ENTRY_COST;
+        sb.files = max_inodes;
+        sb.ffree = max_inodes;
+        Ok(Self::new_with_quota(
+            "tmpfs",
+            anon_device_id,
+            sb,
+            Quota::new(quota),
+        ))
     }
 }
 

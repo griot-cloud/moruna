@@ -1,84 +1,131 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Root filesystem mounting during boot.
+//! A task's root filesystem (Moruna: rewritten from Asterinas's block-device root).
 //!
-//! Asterinas first tries to boot from the initramfs. It checks the path specified by `rdinit`, or
-//! `/init` when `rdinit` is not provided. If the selected path is accessible, Asterinas runs it as
-//! the first userspace process. Otherwise, Asterinas boots from the root filesystem.
+//! The root is the image's verified layers, read only, through the image filesystem
+//! (SDD 27, [`ImageFs`]). Over it the start mounts, before the task's first process:
 //!
-//! For root filesystem boot, this module mounts a supported filesystem from the block device
-//! specified by `root`. The mounted filesystem replaces the bootstrap root in the initial mount
-//! namespace and becomes the root and working directory of the first userspace process. The
-//! bootstrap root is then detached. The `root` parameter is required when this boot path is
-//! selected, and [`SUPPORTED_ROOTFS_TYPES`] lists the supported filesystem types.
+//! - `/tmp`: the task's scratch, a tmpfs holding at most the scratch account's limit,
+//!   the only place a task writes;
+//! - `/proc` and `/sys`, cut to what a task's programs read;
+//! - `/dev`: `null`, `zero` and `urandom`.
 //!
-//! The following kernel parameters configure root filesystem boot:
-//!
-//! - `root` specifies the block device to mount.
-//! - `rootfstype` specifies a comma-separated list of filesystem type candidates. All supported
-//!   types are tried when it is not provided.
-//! - `ro` and `rw` select read-only or read-write mounting. The root filesystem is read-only by
-//!   default. They use last-wins semantics: the last `ro` or `rw` parameter determines the mount
-//!   mode.
-//! - `init` specifies the init executable on the mounted filesystem. If it is not provided,
-//!   Asterinas tries `/sbin/init`, `/etc/init`, `/bin/init`, and `/bin/sh` in order.
+//! No program mounts anything (data-os.md section 3a): the start's own mounts are the
+//! only ones. Asterinas's root on a block device (ext2, `root=`, `rootfstype=`, `ro`,
+//! `rw`) is gone with ext2.
 
-// Set this module's log prefix for `ostd::log`.
-macro_rules! __log_prefix {
-    () => {
-        "rootfs: "
-    };
-}
-
-use core::{
-    str::FromStr,
-    sync::atomic::{AtomicBool, Ordering},
-};
-
-use aster_cmdline::parse::ParamStorage;
 use spin::once::Once;
 
 use super::{
-    ext2,
+    devtmpfs,
+    fs_impls::{
+        imagefs::{ImageFs, ImageSource},
+        procfs,
+        sysfs::SysFs,
+        tmpfs::TmpFs,
+    },
+    task_streams::TaskStreams,
     vfs::{
-        file_system::FsFlags,
         path::{FsPath, Mount, MountNamespace, Path, PathResolver, PerMountFlags},
-        registry::{DynFsType, FsAndRoot, FsCreationCtx},
+        registry::FsAndRoot,
     },
 };
 use crate::prelude::*;
 
-/// Filesystem types supported for the root filesystem.
-pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] = &[&ext2::EXT2_TYPE];
+/// What the start gives a task's filesystems.
+pub(crate) struct TaskFs {
+    /// The task's connection to the image filesystem.
+    pub(crate) image: Arc<dyn ImageSource>,
+    /// The bytes the scratch may hold: the scratch account's limit.
+    pub(crate) scratch_quota: usize,
+    /// Descriptors 0, 1 and 2.
+    pub(crate) streams: TaskStreams,
+}
 
-/// Mounts and switches to the root filesystem configured by the kernel command line.
-///
-/// The filesystem replaces the bootstrap root mount and becomes the resolver's root and working
-/// directory.
-///
-/// Returns an error if `root` is not provided or the root filesystem cannot be opened or mounted.
-pub(crate) fn switch_to_rootfs(path_resolver: &mut PathResolver) -> Result<()> {
-    let root = ROOT_PATH.get().ok_or_else(|| {
-        Error::with_message(Errno::EINVAL, "the `root` parameter was not provided")
-    })?;
-    let (fs_flags, mount_flags) = rootfs_flags();
-    let fs_and_root = open_rootfs(root, fs_flags)?;
-    let rootfs_mount = Mount::new_detached(
-        fs_and_root,
-        mount_flags,
-        Arc::downgrade(MountNamespace::get_init_singleton()),
-        Some(root.to_string()),
-    )?;
-    path_resolver.switch_root_for_boot(rootfs_mount);
-    println!("[kernel] rootfs is ready (mounted from {})", root);
+static TASK_FS: Once<TaskFs> = Once::new();
+
+/// Gives the task's filesystems, once, before the first process starts.
+#[cfg_attr(
+    not(ktest),
+    expect(dead_code, reason = "the launcher (stream B2) calls it")
+)]
+pub(crate) fn set_task_fs(task_fs: TaskFs) -> Result<()> {
+    let mut given = Some(task_fs);
+    TASK_FS.call_once(|| given.take().unwrap());
+    if given.is_some() {
+        return_errno_with_message!(Errno::EBUSY, "the task's filesystems were given already");
+    }
     Ok(())
 }
 
-/// Finds the init program specified for booting from the root filesystem.
+/// The task's filesystems, if the start gave them.
+pub(crate) fn task_fs() -> Option<&'static TaskFs> {
+    TASK_FS.get()
+}
+
+/// Mounts the task's root and switches to it: it becomes the resolver's root and working
+/// directory, and the bootstrap root is detached.
+pub(crate) fn switch_to_rootfs(path_resolver: &mut PathResolver) -> Result<()> {
+    let task_fs = task_fs().ok_or_else(|| {
+        Error::with_message(Errno::EINVAL, "the start gave no image to make the root of")
+    })?;
+    let root = mount_task_root(
+        task_fs.image.clone(),
+        task_fs.scratch_quota,
+        Arc::downgrade(MountNamespace::get_init_singleton()),
+    )?;
+    path_resolver.switch_root_for_boot(root);
+    ostd::early_println!("[kernel] the image's root is ready");
+    Ok(())
+}
+
+/// Makes the task's root: the image, and the scratch, `/proc`, `/sys` and `/dev` over
+/// it. The mounts are not attached to a namespace's tree yet.
+pub(in crate::fs) fn mount_task_root(
+    image: Arc<dyn ImageSource>,
+    scratch_quota: usize,
+    mnt_ns: Weak<MountNamespace>,
+) -> Result<Arc<Mount>> {
+    let image_fs = ImageFs::new(image)?;
+    let root = Mount::new_detached(
+        FsAndRoot::new(image_fs),
+        PerMountFlags::RDONLY,
+        mnt_ns,
+        Some("image".to_string()),
+    )?;
+    let nothing_runs = PerMountFlags::NOSUID | PerMountFlags::NODEV;
+    root.mount_child_for_boot(
+        "tmp",
+        FsAndRoot::new(TmpFs::new_scratch(scratch_quota)?),
+        nothing_runs,
+        Some("scratch".to_string()),
+    )?;
+    let fixed = nothing_runs | PerMountFlags::NOEXEC;
+    root.mount_child_for_boot(
+        "proc",
+        FsAndRoot::new(procfs::new_procfs()),
+        fixed,
+        Some("proc".to_string()),
+    )?;
+    root.mount_child_for_boot(
+        "sys",
+        FsAndRoot::new(SysFs::new()?),
+        fixed | PerMountFlags::RDONLY,
+        Some("sysfs".to_string()),
+    )?;
+    root.mount_child_for_boot(
+        "dev",
+        FsAndRoot::new(devtmpfs::singleton().clone()),
+        PerMountFlags::NOSUID | PerMountFlags::NOEXEC,
+        Some("devtmpfs".to_string()),
+    )?;
+    Ok(root)
+}
+
+/// Finds the init program the `init` parameter names.
 ///
-/// Resolves the path specified by `init` and returns the resolved path together with the original
-/// pathname. Returns `Ok(None)` when `init` is not provided, and an error if the configured
-/// pathname is invalid or cannot be resolved.
+/// Returns `Ok(None)` when `init` is not given, and an error if the pathname is invalid
+/// or cannot be resolved.
 pub(crate) fn find_init(path_resolver: &PathResolver) -> Result<Option<(Path, &'static str)>> {
     let Some(init_path) = INIT_PATH.get().map(String::as_str) else {
         return Ok(None);
@@ -88,116 +135,124 @@ pub(crate) fn find_init(path_resolver: &PathResolver) -> Result<Option<(Path, &'
     Ok(Some((path, init_path)))
 }
 
-fn open_rootfs(root: &str, fs_flags: FsFlags) -> Result<FsAndRoot> {
-    // Treat a `/dev/...` value of `root` as a Linux-compatible root device spec, not as a VFS path
-    // lookup.
-    // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/base/devtmpfs.c#L358-L359>.
-    let device_name = root
-        .strip_prefix("/dev/")
-        .ok_or_else(|| Error::with_message(Errno::EINVAL, "root must name a /dev block device"))?;
-    let device = aster_block::lookup_by_name(device_name)
-        .ok_or_else(|| Error::with_message(Errno::ENODEV, "root block device not found"))?;
-    open_rootfs_from_candidates(device, rootfs_types(), fs_flags)
-}
-
-fn open_rootfs_from_candidates(
-    device: Arc<dyn aster_block::BlockDevice>,
-    rootfs_types: &[&dyn DynFsType],
-    fs_flags: FsFlags,
-) -> Result<FsAndRoot> {
-    let mut fs_creation_ctx = FsCreationCtx::from_block_device(device, fs_flags, None);
-    for rootfs_type in rootfs_types {
-        match rootfs_type.get_or_create(&mut fs_creation_ctx) {
-            Ok(fs_and_root) => return Ok(fs_and_root),
-            Err(err) if err.error() == Errno::EINVAL => continue,
-            Err(err) => return Err(err),
-        }
-    }
-
-    return_errno_with_message!(Errno::ENODEV, "no root filesystem type could mount root")
-}
-
-fn rootfs_flags() -> (FsFlags, PerMountFlags) {
-    let mut fs_flags = FsFlags::empty();
-    let mut mount_flags = PerMountFlags::default();
-    if ROOT_MOUNT_READ_ONLY.load(Ordering::Relaxed) {
-        fs_flags.insert(FsFlags::RDONLY);
-        mount_flags.insert(PerMountFlags::RDONLY);
-    }
-    (fs_flags, mount_flags)
-}
-
-fn rootfs_types() -> &'static [&'static dyn DynFsType] {
-    ROOTFS_TYPES
-        .get()
-        .map(RootFsTypes::as_slice)
-        .unwrap_or(SUPPORTED_ROOTFS_TYPES)
-}
-
-static ROOT_PATH: Once<String> = Once::new();
-aster_cmdline::define_kv_param!("root", ROOT_PATH);
-
 static INIT_PATH: Once<String> = Once::new();
 aster_cmdline::define_kv_param!("init", INIT_PATH);
 
-/// Root filesystem type candidates.
-struct RootFsTypes(Vec<&'static dyn DynFsType>);
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::ktest;
 
-impl RootFsTypes {
-    /// Returns the root filesystem type candidates as a slice.
-    fn as_slice(&self) -> &[&'static dyn DynFsType] {
-        self.0.as_slice()
+    use super::*;
+    use crate::fs::{
+        file::{InodeType, mkmod},
+        fs_impls::imagefs::test::MemImage,
+        task_streams::ConsoleText,
+    };
+
+    fn image() -> MemImage {
+        MemImage::new()
+            .dir("/dev")
+            .dir("/etc")
+            .file("/etc/hostname", b"moruna\n")
+            .link("/lib", b"usr/lib")
+            .dir("/proc")
+            .dir("/tmp")
+            .dir("/usr")
+            .dir("/usr/lib")
+            .file("/usr/lib/libc.so", b"\x7fELF")
     }
-}
 
-impl FromStr for RootFsTypes {
-    type Err = core::convert::Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let candidates = value
-            .split(',')
-            .filter(|type_name| !type_name.is_empty())
-            .filter_map(|type_name| {
-                SUPPORTED_ROOTFS_TYPES
-                    .iter()
-                    .copied()
-                    .find(|fs_type| fs_type.name() == type_name)
-            })
-            .collect();
-
-        Ok(Self(candidates))
+    fn read(resolver: &PathResolver, path: &str) -> String {
+        let path = resolver.lookup(&FsPath::try_from(path).unwrap()).unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = path.inode().read_bytes_at(0, &mut buf).unwrap();
+        String::from_utf8(buf[..n].to_vec()).unwrap()
     }
-}
 
-static ROOTFS_TYPES: Once<RootFsTypes> = Once::new();
-aster_cmdline::define_kv_param!("rootfstype", ROOTFS_TYPES);
-
-static ROOT_MOUNT_READ_ONLY: AtomicBool = AtomicBool::new(true);
-
-struct SetRootMountReadOnly;
-struct SetRootMountReadWrite;
-
-impl ParamStorage for SetRootMountReadOnly {
-    type Value = bool;
-
-    fn store_param(&self, value: Self::Value) {
-        if value {
-            ROOT_MOUNT_READ_ONLY.store(true, Ordering::Relaxed);
+    fn errno<T>(result: Result<T>) -> Errno {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(error) => error.error(),
         }
     }
-}
 
-impl ParamStorage for SetRootMountReadWrite {
-    type Value = bool;
+    #[ktest]
+    fn the_root_is_the_image_with_the_scratch_and_the_synthetic_filesystems_over_it() {
+        let root = mount_task_root(Arc::new(image()), 4 * PAGE_SIZE, Weak::new()).unwrap();
+        let resolver = PathResolver::new_at(root);
 
-    fn store_param(&self, value: Self::Value) {
-        if value {
-            ROOT_MOUNT_READ_ONLY.store(false, Ordering::Relaxed);
+        // The image, its links followed.
+        assert_eq!(read(&resolver, "/etc/hostname"), "moruna\n");
+        assert_eq!(read(&resolver, "/lib/libc.so"), "\x7fELF");
+        let etc = resolver.lookup(&FsPath::try_from("/etc").unwrap()).unwrap();
+        assert_eq!(
+            errno(etc.new_child("new", InodeType::File, mkmod!(u+rw))),
+            Errno::EROFS
+        );
+
+        // `/proc` and `/sys`, as the allocators and glibc read them.
+        assert_eq!(read(&resolver, "/proc/sys/vm/overcommit_memory"), "0\n");
+        let overcommit = resolver
+            .lookup(&FsPath::try_from("/proc/sys/vm/overcommit_memory").unwrap())
+            .unwrap();
+        assert_eq!(
+            errno(overcommit.inode().write_bytes_at(0, b"2")),
+            Errno::EPERM
+        );
+        let cpus = read(&resolver, "/sys/devices/system/cpu/online");
+        assert!(cpus.starts_with('0'));
+        assert_eq!(
+            read(&resolver, "/sys/kernel/mm/transparent_hugepage/enabled"),
+            "always madvise [never]\n"
+        );
+        let dev = resolver.lookup(&FsPath::try_from("/dev").unwrap()).unwrap();
+        assert_eq!(dev.type_(), InodeType::Dir);
+        assert_eq!(dev.mount_node().fs().name(), "devtmpfs");
+
+        // The scratch takes what its quota allows and no more.
+        let tmp = resolver.lookup(&FsPath::try_from("/tmp").unwrap()).unwrap();
+        let file = tmp.new_child("out", InodeType::File, mkmod!(u+rw)).unwrap();
+        file.inode()
+            .write_bytes_at(0, &[1u8; 3 * PAGE_SIZE])
+            .unwrap();
+        assert_eq!(
+            errno(
+                file.inode()
+                    .write_bytes_at(3 * PAGE_SIZE, &[1u8; PAGE_SIZE])
+            ),
+            Errno::ENOSPC
+        );
+        assert_eq!(read(&resolver, "/tmp/out").len(), 256);
+    }
+
+    #[ktest]
+    fn an_image_that_cannot_be_read_makes_no_root() {
+        let broken = MemImage::new().file("/tmp", b"not a directory");
+        assert_eq!(
+            errno(mount_task_root(Arc::new(broken), PAGE_SIZE, Weak::new())),
+            Errno::ENOTDIR
+        );
+    }
+
+    #[ktest]
+    fn the_start_gives_the_filesystems_once_and_the_root_switches_to_them() {
+        // No other test reads the first namespace, whose root this replaces.
+        let mut resolver = MountNamespace::get_init_singleton().new_path_resolver();
+        if task_fs().is_none() {
+            assert_eq!(errno(switch_to_rootfs(&mut resolver)), Errno::EINVAL);
         }
+
+        let task = || TaskFs {
+            image: Arc::new(image()),
+            scratch_quota: PAGE_SIZE,
+            streams: TaskStreams::text_only(Arc::new(ConsoleText)),
+        };
+        let _ = set_task_fs(task());
+        assert_eq!(errno(set_task_fs(task())), Errno::EBUSY);
+        assert_eq!(task_fs().unwrap().scratch_quota, PAGE_SIZE);
+
+        switch_to_rootfs(&mut resolver).unwrap();
+        assert_eq!(read(&resolver, "/etc/hostname"), "moruna\n");
+        assert!(find_init(&resolver).unwrap().is_none());
     }
 }
-
-static RO_PARAM: SetRootMountReadOnly = SetRootMountReadOnly;
-static RW_PARAM: SetRootMountReadWrite = SetRootMountReadWrite;
-aster_cmdline::define_flag_param!("ro", RO_PARAM);
-aster_cmdline::define_flag_param!("rw", RW_PARAM);

@@ -44,14 +44,8 @@ impl PidDirOps {
         &self.0
     }
 
-    const STATIC_ENTRIES: &[StaticEntryWithOps<PidDirOps>] = &[
-        ("task", InodeType::Dir, TaskDirOps::new_inode),
-        (
-            "stat",
-            InodeType::File,
-            task::stat::StatFileOps::new_process_inode,
-        ),
-    ];
+    const STATIC_ENTRIES: &[StaticEntryWithOps<PidDirOps>] =
+        &[("task", InodeType::Dir, TaskDirOps::new_inode)];
 }
 
 impl ProcDirOps for PidDirOps {
@@ -94,15 +88,9 @@ impl ProcDirOps for PidDirOps {
             return_errno_with_message!(Errno::ENOENT, "the process does not exist");
         }
 
-        const PROCESS_OVERRIDE_NAMES: &[&str] = &["stat"];
-
-        // Add the children that are inherited from `/proc/<pid>/task/<tid>` but not overridden
-        // by process-specific entries under `/proc/<pid>`.
-        let listed_entries = listed_entries_from_table(Self::STATIC_ENTRIES).chain(
-            self.0
-                .static_listed_entries()
-                .filter(|entry| !PROCESS_OVERRIDE_NAMES.contains(&entry.name())),
-        );
+        // Add the children that are inherited from `/proc/<pid>/task/<tid>`.
+        let listed_entries =
+            listed_entries_from_table(Self::STATIC_ENTRIES).chain(self.0.static_listed_entries());
 
         visit_listed_entries(offset, listed_entries, visit_fn)
     }

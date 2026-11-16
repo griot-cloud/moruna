@@ -110,6 +110,7 @@ impl Path {
     /// Looks up a direct child within the current mount.
     ///
     /// This does not interpret special names, check search permissions, or traverse mount points.
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     pub(crate) fn lookup_child(&self, name: &str) -> Result<Self> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         let child_dentry = dir_dentry.lookup_child(name)?;

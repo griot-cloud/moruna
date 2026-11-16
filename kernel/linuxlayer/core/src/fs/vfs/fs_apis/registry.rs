@@ -31,6 +31,7 @@ pub(crate) trait FsType: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Gets the properties of this FS type.
+    #[expect(dead_code, reason = "only the mount calls, refused, read it")]
     fn properties(&self) -> FsProperties;
 
     /// Creates an instance of this FS type.
@@ -65,6 +66,7 @@ pub(crate) trait DynFsType: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Gets the properties of this FS type.
+    #[expect(dead_code, reason = "only the mount calls, refused, read it")]
     fn properties(&self) -> FsProperties;
 
     /// Gets or creates a file system instance along with its root dentry.
@@ -131,6 +133,7 @@ impl<'a> FsCreationCtx<'a> {
     }
 
     /// Creates a file system creation context from an already resolved block device.
+    #[expect(dead_code, reason = "only the block-device root, cut, used it")]
     pub(in crate::fs) fn from_block_device(
         block_device: Arc<dyn BlockDevice>,
         flags: FsFlags,
@@ -160,6 +163,7 @@ impl<'a> FsCreationCtx<'a> {
     }
 
     /// Returns the task context the creation started from; `None` once a block device replaced it.
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     pub(in crate::fs) fn ctx(&self) -> Option<&'a Context<'a>> {
         match &self.block_device {
             BlockDeviceResolution::Pending(task_ctx) => Some(*task_ctx),
@@ -247,6 +251,7 @@ pub(crate) fn look_up(name: &str) -> Option<&'static dyn DynFsType> {
 
 /// Executes a user-provided operation with an iterator that can access each
 /// and every FS type.
+#[expect(dead_code, reason = "only /proc/filesystems, cut, used it")]
 pub(crate) fn with_iter<F, R>(f: F) -> R
 where
     F: FnOnce(&mut dyn Iterator<Item = (&str, &dyn DynFsType)>) -> R,

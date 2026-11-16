@@ -7,15 +7,7 @@ use crate::{
         file::{InodeType, mkmod},
         procfs::{
             ProcDir, StaticEntry,
-            sys::kernel::{
-                cap_last_cap::CapLastCapFileOps,
-                overflow_gid::OverflowGidFileOps,
-                overflow_uid::OverflowUidFileOps,
-                pid_max::PidMaxFileOps,
-                tainted::TaintedFileOps,
-                uts::{DomainnameFileOps, HostnameFileOps, OsReleaseFileOps, VersionFileOps},
-                yama::YamaDirOps,
-            },
+            sys::kernel::yama::YamaDirOps,
             template::{
                 ListedEntry, ProcDirOps, ReaddirEntry, listed_entries_from_table,
                 lookup_child_from_table, visit_listed_entries,
@@ -27,11 +19,13 @@ use crate::{
     security::lsm::is_yama_enabled,
 };
 
-mod cap_last_cap;
+// Moruna: cut from `/proc` (`procfs/mod.rs`). These stay until the
+// credentials and names only they read are cut from `process/` and `net/`.
+#[expect(dead_code, reason = "cut from /proc")]
 mod overflow_gid;
+#[expect(dead_code, reason = "cut from /proc")]
 mod overflow_uid;
-mod pid_max;
-mod tainted;
+#[expect(dead_code, reason = "cut from /proc")]
 mod uts;
 mod yama;
 
@@ -46,29 +40,9 @@ impl KernelDirOps {
         ProcDir::new(Self, parent, mkmod!(a+rx))
     }
 
-    const STATIC_ENTRIES: &'static [StaticEntry] = &[
-        (
-            "cap_last_cap",
-            InodeType::File,
-            CapLastCapFileOps::new_inode,
-        ),
-        ("domainname", InodeType::File, DomainnameFileOps::new_inode),
-        ("hostname", InodeType::File, HostnameFileOps::new_inode),
-        ("osrelease", InodeType::File, OsReleaseFileOps::new_inode),
-        (
-            "overflowgid",
-            InodeType::File,
-            OverflowGidFileOps::new_inode,
-        ),
-        (
-            "overflowuid",
-            InodeType::File,
-            OverflowUidFileOps::new_inode,
-        ),
-        ("pid_max", InodeType::File, PidMaxFileOps::new_inode),
-        ("tainted", InodeType::File, TaintedFileOps::new_inode),
-        ("version", InodeType::File, VersionFileOps::new_inode),
-    ];
+    // Moruna: only `yama`, whose scope the security module's calls read and set; no
+    // program here reads the rest (`procfs/mod.rs`).
+    const STATIC_ENTRIES: &'static [StaticEntry] = &[];
 }
 
 impl ProcDirOps for KernelDirOps {
