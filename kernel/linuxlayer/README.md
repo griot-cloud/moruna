@@ -226,6 +226,26 @@ mappings and copies run on the host.
 A copy of program memory the personality has not mapped yet asks the layer's fault handler
 (`ostd::mm::fault`) to map it and goes on, as OSTD's fault path does.
 
+## The gVisor system-call tests
+
+`test/gvisor` runs gVisor's system-call tests (release-20260622.0, the build Asterinas
+a0de2258 runs) in a booted personality:
+
+- `applies` lists the 66 tests that apply: Asterinas's 83, less sockets and the network,
+  mounting, terminals, `ptrace`, namespaces and the vDSO, which 0.7.0 leaves out;
+- `blocklists/` is Asterinas's (`test/initramfs/src/conformance/gvisor/blocklists`,
+  MPL-2.0), one file a test, for the tests that apply;
+- `runner/` takes the place of Asterinas's `run_gvisor_test.sh`, since there is no shell.
+  It is the first program (`init=/gvisor/runner -- /gvisor`): it runs each test with its
+  blocklist as the gtest filter in an empty `/tmp`, reaps what the test leaves behind, and
+  prints `gvisor: ok: NAME` or `gvisor: FAIL: NAME ...`, then a count. It is a Linux
+  program (static musl), outside the workspace; its host tests use stand-in test
+  binaries.
+
+The binaries are built from gVisor's source at that tag (`bazel build
+--test_tag_filters=native //test/syscalls/...`) and run on dynamic glibc. Which cases
+fail here, beyond Asterinas's blocklists, is the judgement Brackly's rule asks for.
+
 ## How the tree is judged
 
 Brackly's rule (data-os-streams.md, 2026-11-16): files carried from Asterinas are judged by

@@ -1,0 +1,4 @@
+WriteTest.PartialWriteSIGBUS
+WriteTest.PartialWriteSIGSEGV
+WriteTest.WriteExceedsRLimit
+WriteTest.WriteNoExceedsRLimit
