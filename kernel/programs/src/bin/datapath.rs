@@ -23,6 +23,12 @@
 //!   gives the record back, refusals change nothing, and `dp-task`'s write to a page
 //!   revoked this way faults.
 //!
+//! - C5's stretched tick: a thread queued on a CPU whose tick is stretched (it ran one
+//!   thread) runs there within 20 ms, and then two threads share the CPU; and grace
+//!   periods complete while a CPU runs one thread in user mode, switching no task: CPU 0
+//!   makes and frees more memory than the machine has, each freed frame waiting for a
+//!   grace period.
+//!
 //! It also measures what C4, C5 and C8 are judged by: a touch a page through large pages
 //! and through 4 KiB ones, the time a pinned CPU loses to the kernel, and a read of the
 //! page against a `clock_get`. `dp-revoke` shows a write to a revoked window faults.
@@ -34,7 +40,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
@@ -86,6 +92,12 @@ fn run() -> i64 {
         Err(code) => return code,
     };
     if let Err(code) = ticks(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = share(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = rcu(&out, cpus) {
         return code;
     }
     if let Err(code) = clock(&out) {
@@ -935,6 +947,189 @@ fn slot_form(out: &Out, resource: &Handle, image: &Handle) -> Result<(), i64> {
     println!(
         out,
         "DS-A slot: ok: windows revoked and granted back through an output slot alone, their bytes kept; a window put while two of its pages were revoked came back whole; every refusal changed nothing; and the task's write to a page revoked so faulted"
+    );
+    Ok(())
+}
+
+/// Set to stop the spinning threads of `share` and `rcu`.
+static STOP: AtomicU32 = AtomicU32::new(0);
+/// Set once the first spinner runs on its CPU.
+static SPINNING: AtomicU32 = AtomicU32::new(0);
+/// Set once the second thread runs on the spinner's CPU.
+static JOINED: AtomicU32 = AtomicU32::new(0);
+static COUNT_A: AtomicU64 = AtomicU64::new(0);
+static COUNT_B: AtomicU64 = AtomicU64::new(0);
+/// How long the second thread's placement on the spinner's CPU took, in nanoseconds.
+static JOIN_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Spins on CPU `cpu`, counting, until `STOP`.
+extern "C" fn spinner(cpu: u64) -> ! {
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        SPINNING.store(1, Ordering::Release);
+        while STOP.load(Ordering::Relaxed) == 0 {
+            COUNT_A.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    thread_exit()
+}
+
+/// Places itself on CPU `cpu`, beside the spinner, timing it; then spins there too.
+extern "C" fn joiner(cpu: u64) -> ! {
+    let start = now();
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        JOIN_NS.store(now() - start, Ordering::Relaxed);
+        JOINED.store(1, Ordering::Release);
+        while STOP.load(Ordering::Relaxed) == 0 {
+            COUNT_B.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    thread_exit()
+}
+
+/// A thread started at `entry(arg)` on a stack of its own, which it keeps.
+fn start(out: &Out, test: &str, entry: extern "C" fn(u64) -> !, arg: u64) -> Result<Thread, i64> {
+    let stack = Memory::create(64 * 1024).map_err(|e| fail(out, test, "a stack", e))?;
+    let mapping = stack
+        .map_detached(0, 64 * 1024, map::WRITE)
+        .map_err(|e| fail(out, test, "mapping a stack", e))?;
+    let top = mapping.end();
+    // The stack stays mapped for good: the thread exits on it.
+    core::mem::forget(mapping);
+    core::mem::forget(stack);
+    Thread::spawn(entry, top, arg).map_err(|e| fail(out, test, "thread_create", e))
+}
+
+/// Waits until `flag` is set, for at most `ms` milliseconds.
+fn until(flag: &AtomicU32, limit: u64) -> bool {
+    let end = now() + ms(limit);
+    while flag.load(Ordering::Acquire) == 0 {
+        if now() > end {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+fn join(out: &Out, test: &str, thread: &Thread) -> Result<(), i64> {
+    match wait_one(&thread.0, Signals::TERMINATED, now() + ms(10_000)) {
+        Ok(s) if s.contains(Signals::TERMINATED) => Ok(()),
+        other => {
+            println!(
+                out,
+                "DS-A {}: FAIL: a thread did not end: {:?}", test, other
+            );
+            Err(1)
+        }
+    }
+}
+
+/// A thread queued on the spinner's CPU, whose tick is stretched, runs there within
+/// 20 ms, and then the two share the CPU.
+fn share(out: &Out, cpus: u32) -> Result<(), i64> {
+    let last = u64::from(cpus - 1);
+    STOP.store(0, Ordering::Relaxed);
+    pin_current_thread(Some(0)).map_err(|e| fail(out, "share", "pinning", e))?;
+    let a = start(out, "share", spinner, last)?;
+    if !until(&SPINNING, 10_000) {
+        println!(out, "DS-A share: FAIL: the spinner never ran");
+        return Err(1);
+    }
+    // Long enough for its CPU to stretch its tick.
+    let _ = futex_wait(&READY, 1, now() + ms(20));
+    let b = start(out, "share", joiner, last)?;
+    if !until(&JOINED, 10_000) {
+        println!(
+            out,
+            "DS-A share: FAIL: the second thread never ran beside the spinner"
+        );
+        return Err(1);
+    }
+    let joined = JOIN_NS.load(Ordering::Relaxed);
+    let (a0, b0) = (
+        COUNT_A.load(Ordering::Relaxed),
+        COUNT_B.load(Ordering::Relaxed),
+    );
+    let _ = futex_wait(&READY, 1, now() + ms(300));
+    let (a1, b1) = (
+        COUNT_A.load(Ordering::Relaxed),
+        COUNT_B.load(Ordering::Relaxed),
+    );
+    STOP.store(1, Ordering::Relaxed);
+    join(out, "share", &a)?;
+    join(out, "share", &b)?;
+    pin_current_thread(None).map_err(|e| fail(out, "share", "unpinning", e))?;
+    let (da, db) = (a1 - a0, b1 - b0);
+    let total = (da + db).max(1);
+    if joined > ms(20) || da * 4 < total || db * 4 < total {
+        println!(
+            out,
+            "DS-A share: FAIL: the second thread took {} ns to run beside the spinner, and they counted {} and {}",
+            joined,
+            da,
+            db
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A share: ok: a thread queued on CPU {}, its tick stretched, ran there after {} ns, and the two then shared it {}% and {}%",
+        last,
+        joined,
+        da * 100 / total,
+        db * 100 / total
+    );
+    Ok(())
+}
+
+/// Grace periods complete while a CPU runs one thread in user mode: CPU 0 makes, maps and
+/// frees more memory than the machine has (3 GiB in 128 MiB objects) while the spinner
+/// runs on the last CPU. OSTD frees an unmapped frame only after a grace period, so had
+/// grace periods stalled, memory would run out.
+fn rcu(out: &Out, cpus: u32) -> Result<(), i64> {
+    const CHUNK: u64 = 128 << 20;
+    const ROUNDS: u64 = 24;
+    let last = u64::from(cpus - 1);
+    STOP.store(0, Ordering::Relaxed);
+    SPINNING.store(0, Ordering::Relaxed);
+    pin_current_thread(Some(0)).map_err(|e| fail(out, "rcu", "pinning", e))?;
+    let spin = start(out, "rcu", spinner, last)?;
+    if !until(&SPINNING, 10_000) {
+        println!(out, "DS-A rcu: FAIL: the spinner never ran");
+        return Err(1);
+    }
+    let started = now();
+    for round in 0..ROUNDS {
+        let made = Memory::create(CHUNK).and_then(|object| {
+            let m = object.map(0, CHUNK, map::WRITE | map::HUGE)?;
+            for at in (0..CHUNK as usize).step_by(2 << 20) {
+                m.write(at, &[round as u8])?;
+            }
+            Ok(())
+        });
+        if let Err(e) = made {
+            STOP.store(1, Ordering::Relaxed);
+            println!(
+                out,
+                "DS-A rcu: FAIL: round {} of {} ({} MiB made and freed): {}",
+                round,
+                ROUNDS,
+                round * (CHUNK >> 20),
+                e.name()
+            );
+            return Err(1);
+        }
+    }
+    let took = now() - started;
+    STOP.store(1, Ordering::Relaxed);
+    join(out, "rcu", &spin)?;
+    pin_current_thread(None).map_err(|e| fail(out, "rcu", "unpinning", e))?;
+    println!(
+        out,
+        "DS-A rcu: ok: {} MiB made, mapped and freed on CPU 0 in {} ms while CPU {} ran one thread in user mode",
+        ROUNDS * (CHUNK >> 20),
+        took / 1_000_000,
+        last
     );
     Ok(())
 }
