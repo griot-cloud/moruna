@@ -30,6 +30,14 @@ first, and iterates until Moruna is significantly better than the other engines.
   - Add a dependency in your own crate's `Cargo.toml` only.
   - `Cargo.lock` and the root `Cargo.toml`'s `[workspace.dependencies]` conflicts are the
     integrator's to settle at merge. Name each new dependency in your report.
+- **Build to your contracts.** Each stream builds its components to the contracts named for it
+  below (`data-os.md` §1a). A contract governs the engine's data path, never user programs.
+  No contract may break the gate.
+- **A speedup lands wherever it measures best** (Brackly: "feel free to move it to moruna or
+  retrofit it or any version of a solution that works").
+  - A contract-driven gain found here may also land in the engine on today's Linux host.
+  - An OS component may be replaced by an engine-side solution, or the reverse.
+  - Say which you chose and show the measurement.
 - **Wiring keeps Moruna.**
   - The arena, scheduler, controller, placement, reactor, resume, the report and the events keep
     their decisions. Change only what is under their ports.
@@ -86,6 +94,8 @@ and switches to the new one when the call answers.
   - the stream A blocks in `memory.rs` and `process.rs`;
   - if large user pages need OSTD changes, a vendored `ostd` under `kernel/vendor/` and its
     `[patch]` line in `kernel/Cargo.toml`.
+- **Contracts:** C1 (`windows_protect`), C4 (`map::HUGE`, `map::POPULATE`), C5 (pinning, and
+  no ticks or device interrupts on worker cores if measured worth it), C8 (the clock page).
 - **Builds:**
   - `thread_set_cpu`: a thread on one core, never bound to work;
   - `clock_page` and its updates;
@@ -108,6 +118,8 @@ and switches to the new one when the call answers.
   - in `vm.rs`: `Space::fault` and the stream B1 block;
   - the stream B1 blocks in `memory.rs` and `process.rs`;
   - the user-mode loop's syscall branch in `process.rs` (lines around 976).
+- **Contracts:** none of the data path's. Its measure is the kernel-mode cost in `data-os.md` §0,
+  and C6's restart of a task as a fresh process.
 - **Builds:** `kernel-is-the-machine.md` §4.1:
   - a personality entry on the calling thread, an upper region the program cannot reach (in the
     shape of Zircon's restricted mode);
@@ -133,6 +145,8 @@ and switches to the new one when the call answers.
     Asterinas `a0de2258` (version 0.19.0, the OSTD Moruna uses), its files kept MPL-2.0 with
     their source;
   - the personality process that hosts it.
+- **Contracts:** C6 (a task's process model is the personality's, inside user code). The contracts
+  stop at the user-code boundary, so user programs keep full POSIX behaviour.
 - **Builds:** `kernel-is-the-machine.md` §4.2, cut to 0.7.0:
   - processes, files, pipes, signals, epoll and the synthetic filesystems;
   - the mechanical swaps (OSTD's locks and wait queues on the core's futex, user memory through
@@ -161,6 +175,17 @@ and switches to the new one when the call answers.
   - `crates/moruna-runtime/src/bin/moruna-engine.rs` and the engine's adapter wiring in
     `crates/moruna-runtime/src/run.rs`;
   - `kernel/engine` (the supervisor's grants of memory and devices to the engine).
+- **Contracts:**
+  - C2: planned reads, readahead from the scheduler's next splits, DMA into the arena, no page
+    cache;
+  - C3: the output layer;
+  - C4: the arena on one fixed budget, populated, huge pages, no zeroing on reuse;
+  - C5: the pool pinned to cores, any worker any function;
+  - C7: the engine drives its own disk;
+  - C8: the engine's clock on the clock page.
+
+  C2's readahead and C4's "no zeroing on reuse" may land in the engine on a Linux host too, if
+  they measure better there.
 - **Builds:**
   - the arena on memory objects granted at start, populated, with huge pages (falling back while
     A's flags answer `BadSyscall`);
@@ -186,6 +211,10 @@ and switches to the new one when the call answers.
   - `kernel/sys/src/plane.rs` (the task's API);
   - a new `images/python/` holding the Python shim, which is image-side code, not part of
     Moruna's runtime.
+- **Contracts:**
+  - C1: immutable records shared as frames, the grouped revoke;
+  - C4's trust boundary: pages are zeroed before a task first sees them;
+  - C6: a failed stateless task is restarted as a fresh process.
 - **Builds:** `data-os.md` §5:
   - per-task input regions mapped read-only once;
   - the engine decoding a batch straight into the region of the task that consumes it;
@@ -214,6 +243,8 @@ and switches to the new one when the call answers.
     `logs.rs`);
   - `crates/moruna-vmm`;
   - `kernel/node/` (the image the launcher boots).
+- **Contracts:** C3 (reading the output layer on the host), C7 (one job per VM, nothing kept
+  between runs).
 - **Builds:** `moruna run JOB` on a Linux x86-64 node with KVM, which:
   - stages remote inputs on the host;
   - attaches each input as a read-only virtio-blk device and an output disk (`devices.rs`), the
@@ -240,6 +271,9 @@ and switches to the new one when the call answers.
   - `kernel/node/tools/proof.py`;
   - `kernel/tools/node-fixtures.sh`;
   - a new `images/gate/` for the gate's images.
+- **Contracts:** measures every contract's gain as `data-os.md` §1a names it (copies, faults,
+  calls per batch, interrupts on worker cores, bytes through a page cache), against 0.6.6 and
+  against today's microkernel figures from step 1.
 - **Builds:**
   - a KVM mode for the node fixtures (`proof.py` forces TCG today, line 356);
   - KD3's conformance on the data OS (same rows, refusals and decisions as on a Linux host);
