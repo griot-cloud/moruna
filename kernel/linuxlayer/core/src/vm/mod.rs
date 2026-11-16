@@ -14,6 +14,9 @@ use osdk_heap_allocator::{HeapAllocator, type_from_layout};
 
 pub mod page_cache;
 pub(crate) mod perms;
+// Moruna: vm/ on the core's mappings, on an emulated core.
+#[cfg(ktest)]
+mod shown_tests;
 pub mod vmar;
 
 #[ostd::global_frame_allocator]
