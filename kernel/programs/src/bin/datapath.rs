@@ -29,6 +29,9 @@
 //!   makes and frees more memory than the machine has, each freed frame waiting for a
 //!   grace period.
 //!
+//! - AVX state (`avx_fixture.rs`): one more thread than there are CPUs keeps its own
+//!   values in all 16 `ymm` registers through preemption, and one moves between CPUs with
+//!   `thread_set_cpu`, every lane checked at the end;
 //! - C5's placement: unpinned threads that first ran on a core keep off it once a worker
 //!   is pinned there, while another core has no pinned thread, so they no longer take the
 //!   worker's turns.
@@ -39,7 +42,9 @@
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
+// The AVX check's assembly region (`avx_fixture.rs`) is the one place unsafe code is
+// allowed.
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -57,6 +62,9 @@ use moruna_sys::{
     plane::{Slot, SlotEvent, attach},
     println, raw, thread_exit, wait_one,
 };
+
+#[path = "../avx_fixture.rs"]
+mod avx;
 
 moruna_sys::main!(run);
 
@@ -105,6 +113,9 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = placement(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = avx::check(&out, cpus) {
         return code;
     }
     if let Err(code) = clock(&out) {
