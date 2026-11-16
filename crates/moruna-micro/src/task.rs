@@ -115,9 +115,6 @@ pub(crate) fn personality() -> std::result::Result<&'static Channel, String> {
 #[derive(Default)]
 pub struct TaskMemory {
     account: Mutex<Option<(Account, u64)>>,
-    /// The stage's plane budget while its task lives: the records it hands on as they lie
-    /// are held there, outside the run's arena.
-    plane: std::sync::atomic::AtomicU64,
     /// Sticky uncertainty is a typed accounting failure, never a zero reservation.
     failure: Mutex<Option<String>>,
 }
@@ -140,10 +137,9 @@ impl moruna_kernel::OutsideMemory for TaskMemory {
                 "task account cleanup uncertain: {why}"
             )));
         }
-        let plane = self.plane.load(std::sync::atomic::Ordering::Relaxed);
-        Ok(lock(&self.account)
-            .as_ref()
-            .map_or(0, |(_, limit)| *limit + plane))
+        // The plane's objects, records handed on as they lie included, are charged to the
+        // engine's own account, which the run samples: they are not outside it.
+        Ok(lock(&self.account).as_ref().map_or(0, |(_, limit)| *limit))
     }
 }
 
@@ -526,9 +522,6 @@ impl ImageTask {
         // Publish the retained account only after request construction and transfer
         // succeeded. Failed startup drops every local handle and returns its limit.
         *lock(&memory.account) = Some((kept, limit));
-        memory
-            .plane
-            .store(budget, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(target: "micro", image = %name, command = ?self.command, rings = self.rings, "image task asked of the personality");
         Ok(TaskState {
             memory: Arc::clone(memory),
